@@ -737,7 +737,43 @@ pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
+    // The rename's own directory entry must reach disk too, or a crash can
+    // resurrect the pre-write file even though every staged byte fsynced.
+    // Best-effort: where opening a directory as a file fails (Windows) the
+    // rename is already durable, so the failure is a safe no-op.
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
     Ok(())
+}
+
+/// Remove orphaned `.migrate-tmp-*` staging files from `dir`, returning how
+/// many were deleted.
+///
+/// [`write_file_atomic`] names its temp files `.<name>.migrate-tmp-<pid>-<seq>`
+/// in the destination's own directory; a crash between the `sync_all` and the
+/// rename leaves one behind. Orphans are never adopted — a torn staging file
+/// is indistinguishable from a complete one — they are debris the next
+/// migration would have replaced anyway, so reopen-time cleanup just deletes
+/// them. A non-directory `dir` reports `Ok(0)`; an unreadable directory
+/// reports the listing error.
+pub fn cleanup_stale_migrate_temps(dir: &Path) -> io::Result<usize> {
+    if !dir.is_dir() {
+        return Ok(0);
+    }
+    let mut removed = 0usize;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let is_stale_tmp = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with('.') && name.contains(".migrate-tmp-"));
+        if is_stale_tmp && entry.file_type().is_ok_and(|t| t.is_file()) {
+            std::fs::remove_file(entry.path())?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -1295,6 +1331,27 @@ mod tests {
         let missing = dir.join("no-such-dir").join("out.bin");
         assert!(write_file_atomic(&missing, b"x").is_err());
         assert!(!dir.join("no-such-dir").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_migrate_temps_are_swept_without_touching_committed_files() {
+        let dir = test_dir("stale-temps");
+        // Two staged-write orphans from crashed runs plus a committed file and
+        // a look-alike name that must survive the sweep.
+        std::fs::write(dir.join(".out.bin.migrate-tmp-1-0"), b"torn").unwrap();
+        std::fs::write(dir.join(".snap.stv.migrate-tmp-9-3"), b"also torn").unwrap();
+        std::fs::write(dir.join("out.bin"), b"committed").unwrap();
+        std::fs::write(dir.join("notes.migrate-tmp"), b"not ours").unwrap();
+        assert_eq!(cleanup_stale_migrate_temps(&dir).unwrap(), 2);
+        assert_eq!(std::fs::read(dir.join("out.bin")).unwrap(), b"committed");
+        assert_eq!(
+            std::fs::read(dir.join("notes.migrate-tmp")).unwrap(),
+            b"not ours"
+        );
+        assert!(!dir.join(".out.bin.migrate-tmp-1-0").exists());
+        // A missing directory is an empty answer, not an error.
+        assert_eq!(cleanup_stale_migrate_temps(&dir.join("nope")).unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

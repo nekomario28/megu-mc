@@ -369,62 +369,14 @@ fn anvil_compress(compression: u8, nbt: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// Read one `r.<rx>.<rz>.mca`: the 4 KiB location table, the 4 KiB timestamp
-/// table, then each live slot's `len | compression | payload` record.
+/// table, then each live slot's `len | compression | payload` record. Strict:
+/// the first corrupt slot aborts the read — the merge-write path depends on
+/// never rewriting a file it could not fully parse. The slot loop lives in
+/// `src/region.rs` (`read_region_file_impl`), shared with the tolerant import
+/// reader.
 #[allow(dead_code)] // The console/import command is a later phase; tests drive it today.
 fn read_region_file(path: &std::path::Path) -> Result<AnvilRegion, String> {
-    let (rx, rz) = anvil_region_coords(path)?;
-    let file = std::fs::read(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    if file.len() < 2 * ANVIL_SECTOR {
-        return Err(format!("region file too small: {}", path.display()));
-    }
-    let (locations, timestamps) = file.split_at(ANVIL_SECTOR);
-    let mut region = AnvilRegion::default();
-    for slot in 0..1024usize {
-        let le = &locations[slot * 4..slot * 4 + 4];
-        let offset =
-            (usize::from(le[0]) << 16) | (usize::from(le[1]) << 8) | usize::from(le[2]);
-        let sectors = usize::from(le[3]);
-        if offset == 0 && sectors == 0 {
-            continue;
-        }
-        // The two header sectors are not legal payload space, and the recorded
-        // run must fit inside the file.
-        if offset < 2 || sectors == 0 {
-            return Err(format!(
-                "invalid location entry {offset}+{sectors} in {}",
-                path.display()
-            ));
-        }
-        let start = offset
-            .checked_mul(ANVIL_SECTOR)
-            .filter(|&s| (offset + sectors) * ANVIL_SECTOR <= file.len() && s + 5 <= file.len())
-            .ok_or_else(|| format!("chunk sector run outside {}", path.display()))?;
-        let len = u32::from_be_bytes(file[start..start + 4].try_into().unwrap()) as usize;
-        if len < 2 || 4 + len > sectors * ANVIL_SECTOR {
-            return Err(format!(
-                "invalid chunk payload length {len} in {}",
-                path.display()
-            ));
-        }
-        let compression = file[start + 4];
-        let raw = anvil_decompress(compression, &file[start + 5..start + 4 + len])?;
-        let (_, nbt) = crate::nbt::read_named(&raw)
-            .map_err(|e| format!("invalid chunk NBT in {}: {e}", path.display()))?;
-        let timestamp =
-            u32::from_be_bytes(timestamps[slot * 4..slot * 4 + 4].try_into().unwrap());
-        let cx = rx * 32 + (slot % 32) as i32;
-        let cz = rz * 32 + (slot / 32) as i32;
-        region.chunks.insert(
-            (cx, cz),
-            AnvilChunkRecord {
-                timestamp,
-                compression,
-                nbt,
-            },
-        );
-    }
-    Ok(region)
+    read_region_file_impl(path, false).map(|(region, _)| region)
 }
 
 /// `path.tmp` -> `path`, fsynced before the rename — the same discipline
@@ -445,7 +397,11 @@ fn anvil_atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("cannot rename {} over {}: {e}", tmp.display(), path.display())
-    })
+    })?;
+    // Pin the directory entry too: without it a crash can roll the rename back
+    // even though every staged byte was fsynced first.
+    anvil_sync_parent_dir(path);
+    Ok(())
 }
 
 /// Write `region` to `path`, which must be named `r.<rx>.<rz>.mca` for the chunk
@@ -491,6 +447,11 @@ fn write_region_file(path: &std::path::Path, region: &AnvilRegion) -> Result<(),
     file.extend_from_slice(&body);
     anvil_atomic_write(path, &file)
 }
+
+// PERF-DISK-SAVE: the content-hash skip, incremental save queue, dir-sync and
+// staging-recovery machinery, and the shared strict/tolerant region-slot
+// reader live in the sibling file (same translation unit as this one).
+include!("region.rs");
 
 // ---------- chunk NBT <-> mc-spine section/state model ----------
 
@@ -1224,9 +1185,16 @@ fn anvil_import_region_dir(
         .collect();
     files.sort();
     for file in files {
-        let region = read_region_file(&file).map_err(|e| {
+        // Tolerant read: one corrupt slot degrades to a chunk error and its
+        // valid neighbors still import — a single torn record must not take a
+        // whole 1024-chunk file's good data down with it. The merge-write
+        // paths keep the strict reader for the opposite reason.
+        let (region, slot_errors) = read_region_file_tolerant(&file).map_err(|e| {
             format!("{}: {e}", file.display())
         })?;
+        report
+            .chunk_errors
+            .extend(slot_errors.iter().map(|e| format!("{}: {e}", file.display())));
         report.region_files += 1;
         for (&slot, record) in &region.chunks {
             match anvil_chunk_from_nbt(&record.nbt, slot) {
@@ -1709,6 +1677,13 @@ struct AnvilSaveSummary {
     backup_rotated: bool,
     region_files: usize,
     chunks_written: usize,
+    /// Dirty chunks and playerdata records whose serialized payload matched
+    /// `anvil_persisted_hashes`/`anvil_playerdata_hashes` exactly: no zlib
+    /// re-encode, no sector rewrite, no `.tmp` staging — the whole point of
+    /// the content-hash skip.
+    skipped_unchanged_writes: usize,
+    /// Total `.mca` bytes committed through `anvil_atomic_write` this save.
+    region_bytes_written: u64,
     /// `playerdata/<uuid>.dat` files written under the world directory.
     players_written: usize,
 }
@@ -1768,7 +1743,10 @@ fn write_level_dat_rotating(
         rotated = true;
     }
     match std::fs::rename(&staged, path) {
-        Ok(()) => Ok(rotated),
+        Ok(()) => {
+            anvil_sync_parent_dir(path);
+            Ok(rotated)
+        }
         Err(e) => {
             let _ = std::fs::remove_file(&staged);
             // The rotation already moved the old file aside; put it back so a
@@ -2136,9 +2114,10 @@ fn playerdata_from_nbt(tag: &AnvilNbt) -> Result<PlayerSave, String> {
     })
 }
 
-/// The gzip wrapper every `playerdata/*.dat` carries; same encode level.dat
-/// uses.
-fn playerdata_to_bytes(uuid: &[u8; 16], save: &PlayerSave) -> Result<Vec<u8>, String> {
+/// The complete playerdata root compound (`PlayerSave` fields + `UUID` int
+/// array) — what `playerdata_to_bytes` serializes, and what the content
+/// fingerprint skips re-gzipping and rewriting when unchanged.
+fn playerdata_nbt_root(uuid: &[u8; 16], save: &PlayerSave) -> AnvilNbt {
     let mut root = playerdata_nbt_of(save);
     if let AnvilNbt::Compound(map) = &mut root {
         map.insert(
@@ -2146,8 +2125,17 @@ fn playerdata_to_bytes(uuid: &[u8; 16], save: &PlayerSave) -> Result<Vec<u8>, St
             AnvilNbt::IntArray(uuid_to_int_array(uuid)),
         );
     }
-    let nbt = crate::nbt::write_named(&crate::nbt::NbtString(Vec::new()), &root)
-        .map_err(|e| format!("cannot encode playerdata: {e}"))?;
+    root
+}
+
+/// The gzip wrapper every `playerdata/*.dat` carries; same encode level.dat
+/// uses.
+fn playerdata_to_bytes(uuid: &[u8; 16], save: &PlayerSave) -> Result<Vec<u8>, String> {
+    let nbt = crate::nbt::write_named(
+        &crate::nbt::NbtString(Vec::new()),
+        &playerdata_nbt_root(uuid, save),
+    )
+    .map_err(|e| format!("cannot encode playerdata: {e}"))?;
     let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     e.write_all(&nbt)
         .and_then(|_| e.finish())
@@ -2185,19 +2173,38 @@ fn write_playerdata_dat(
     )
 }
 
-/// Every live `saved_players` record flushed to `playerdata/`. Files left from
-/// players who no longer exist stay on disk, as vanilla keeps them.
-fn write_all_playerdata_dat(world_dir: &std::path::Path) -> Result<usize, String> {
+/// Every live `saved_players` record flushed to `playerdata/`, returning
+/// `(written, skipped_unchanged)`. Files left from players who no longer
+/// exist stay on disk, as vanilla keeps them. A record whose NBT fingerprint
+/// still matches what the last save committed is skipped outright — no gzip
+/// re-encode, no staging write — as long as its file is still on disk.
+fn write_all_playerdata_dat(world_dir: &std::path::Path) -> Result<(usize, usize), String> {
     let players: Vec<([u8; 16], PlayerSave)> = saved_players()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
         .map(|(uuid, save)| (*uuid, save.clone()))
         .collect();
+    let dir = world_dir.join("playerdata");
+    let mut hashes = anvil_playerdata_hashes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut written = 0;
+    let mut skipped = 0;
     for (uuid, save) in &players {
+        let fresh_hash = anvil_nbt_fingerprint(&playerdata_nbt_root(uuid, save));
+        let key = (world_dir.to_path_buf(), *uuid);
+        if hashes.get(&key) == Some(&fresh_hash)
+            && dir.join(playerdata_file_name(uuid)).is_file()
+        {
+            skipped += 1;
+            continue;
+        }
         write_playerdata_dat(world_dir, uuid, save)?;
+        hashes.insert(key, fresh_hash);
+        written += 1;
     }
-    Ok(players.len())
+    Ok((written, skipped))
 }
 
 /// Load every `playerdata/*.dat` into `saved_players`. Symlinked or
@@ -2266,6 +2273,10 @@ fn load_all_playerdata_dat(world_dir: &std::path::Path) -> Result<usize, String>
 /// load closed rather than silently dropping a player.
 #[allow(dead_code)]
 fn live_anvil_load_dir(dir: &std::path::Path) -> Result<AnvilLoadSummary, String> {
+    // Fold any interrupted rotation/staging back into a clean tree first: a
+    // crash that left `level.dat_new` or a `*.tmp` orphan is repaired before
+    // the shape check, so a recovered `level.dat` still counts as world data.
+    anvil_recover_world_staging(dir)?;
     if !anvil_dir_has_data(dir) {
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
@@ -2331,6 +2342,9 @@ fn live_anvil_save_dir(dir: &std::path::Path) -> Result<AnvilSaveSummary, String
                 .push((cx, cz));
         }
     }
+    let mut hashes = anvil_persisted_hashes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     for ((dim, rx, rz), chunks) in by_region {
         let rel = anvil_dim_region_dir(dim).expect("vanilla dims only");
         let region_dir = dir.join(rel);
@@ -2345,6 +2359,8 @@ fn live_anvil_save_dir(dir: &std::path::Path) -> Result<AnvilSaveSummary, String
         } else {
             AnvilRegion::default()
         };
+        let mut region_dirty = false;
+        let mut committed_hashes: Vec<(AnvilPersistedKey, u64)> = Vec::new();
         for (cx, cz) in chunks {
             let overlay = snapshot
                 .get(&(dim, cx, cz))
@@ -2360,20 +2376,109 @@ fn live_anvil_save_dir(dir: &std::path::Path) -> Result<AnvilSaveSummary, String
                 unknown_states: 0,
                 dropped_sections: 0,
             };
+            let fresh_nbt = anvil_chunk_to_nbt(&chunk, dim.min_y() >> 4);
+            let fresh_hash = anvil_nbt_fingerprint(&fresh_nbt);
+            // Dirty-but-identical: the payload on disk already holds exactly
+            // this content, so re-encoding and rewriting it would be pure
+            // SSD wear. The on-disk record (its timestamp, its compression
+            // flavour, every preserved field) stays untouched.
+            let key: AnvilPersistedKey = (dir.to_path_buf(), dim, cx, cz);
+            if anvil_payload_unchanged(
+                key.clone(),
+                fresh_hash,
+                region.chunks.get(&(cx, cz)).map(|record| &record.nbt),
+                &mut hashes,
+            ) {
+                summary.skipped_unchanged_writes += 1;
+                continue;
+            }
             region.chunks.insert(
                 (cx, cz),
                 AnvilChunkRecord {
                     timestamp,
                     compression: 2,
-                    nbt: anvil_chunk_to_nbt(&chunk, dim.min_y() >> 4),
+                    nbt: fresh_nbt,
                 },
             );
+            committed_hashes.push((key, fresh_hash));
             summary.chunks_written += 1;
+            region_dirty = true;
         }
-        write_region_file(&region_path, &region)?;
-        summary.region_files += 1;
+        if region_dirty {
+            write_region_file(&region_path, &region)?;
+            summary.region_files += 1;
+            summary.region_bytes_written = summary
+                .region_bytes_written
+                .saturating_add(anvil_file_len(&region_path));
+            // The new payload is only "persisted" once the rename landed.
+            for (key, hash) in committed_hashes {
+                hashes.insert(key, hash);
+            }
+        }
     }
-    summary.players_written = write_all_playerdata_dat(dir)?;
+    drop(hashes);
+    let (players_written, players_skipped) = write_all_playerdata_dat(dir)?;
+    summary.players_written = players_written;
+    summary.skipped_unchanged_writes += players_skipped;
+    // A merged full save persists everything the incremental queue tracked:
+    // the queued entries are durable now, so the queue starts the next tick
+    // empty rather than re-checking what was just written.
+    anvil_incremental_saves()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain_pending();
+    Ok(summary)
+}
+
+/// File length for `region_bytes_written` accounting; `0` when the file is
+/// missing (first write) or unreadable (the subsequent error path reports
+/// the real problem).
+fn anvil_file_len(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// What one incremental autosave tick did: how many dirty chunks were newly
+/// enqueued and what the budgeted drain spent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+struct AnvilIncrementalSaveSummary {
+    newly_queued: usize,
+    drain: IncrementalDrainStats,
+}
+
+/// One incremental autosave step: every dirty overlay chunk is enqueued
+/// (idempotent, oldest-first), then the oldest pending chunks flush through
+/// `flush_single_chunk_to_anvil_dir` until the `IncrementalSaveBudget` caps
+/// trip. This is the autosave path that replaces the classic every-5-minutes
+/// 100-400ms world-save stall with bounded per-tick work; `/save-all` and
+/// shutdown keep calling `live_anvil_save_dir`, which drains everything.
+#[allow(dead_code)] // The autosave tick hook is wired by the tick lane.
+fn live_anvil_save_tick(dir: &std::path::Path) -> Result<AnvilIncrementalSaveSummary, String> {
+    let snapshot: HashMap<DimChunkKey, usize> = world()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|(&(dim, _, _), _)| anvil_dim_region_dir(dim).is_some())
+        .map(|(key, edits)| (*key, edits.len()))
+        .collect();
+    let mut summary = AnvilIncrementalSaveSummary::default();
+    {
+        let mut queue = anvil_incremental_saves()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (&(dim, cx, cz), cells) in &snapshot {
+            // Pacing estimate only: ~8 bytes per overlay cell plus one sector
+            // of header/NBT slack bounds the tick's byte leg within an order
+            // of magnitude of the true payload.
+            let est_bytes = cells.saturating_mul(8).saturating_add(4096);
+            if queue.mark_dirty(dim, cx, cz, est_bytes) {
+                summary.newly_queued += 1;
+            }
+        }
+        summary.drain = queue.drain_budgeted(|item| {
+            flush_single_chunk_to_anvil_dir_outcome(dir, item.dim, item.cx, item.cz)
+        })?;
+    }
     Ok(summary)
 }
 
@@ -2637,6 +2742,20 @@ fn flush_single_chunk_to_anvil_dir(
     cx: i32,
     cz: i32,
 ) -> Result<usize, String> {
+    Ok(flush_single_chunk_to_anvil_dir_outcome(dir, dim, cx, cz)?.blocks_flushed)
+}
+
+/// `flush_single_chunk_to_anvil_dir` plus the persistence counters the
+/// incremental save queue needs: bytes committed and whether the flush was a
+/// content-hash skip (`blocks_flushed` still reports the preserved overlay
+/// cells either way — they are durable, the write was just unnecessary).
+#[allow(dead_code)]
+fn flush_single_chunk_to_anvil_dir_outcome(
+    dir: &std::path::Path,
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+) -> Result<AnvilChunkFlushOutcome, String> {
     let rel = anvil_dim_region_dir(dim)
         .ok_or_else(|| format!("dimension {dim:?} has no anvil region directory"))?;
     let region_dir = dir.join(rel);
@@ -2672,17 +2791,41 @@ fn flush_single_chunk_to_anvil_dir(
         unknown_states: 0,
         dropped_sections: 0,
     };
-    let timestamp = (border_now_ms() / 1000).min(u64::from(u32::MAX)) as u32;
-    region.chunks.insert(
-        (cx, cz),
-        AnvilChunkRecord {
-            timestamp,
-            compression: 2,
-            nbt: anvil_chunk_to_nbt(&chunk, dim.min_y() >> 4),
-        },
-    );
-    write_region_file(&region_path, &region)?;
-    Ok(flushed)
+    let fresh_nbt = anvil_chunk_to_nbt(&chunk, dim.min_y() >> 4);
+    let fresh_hash = anvil_nbt_fingerprint(&fresh_nbt);
+    let key: AnvilPersistedKey = (dir.to_path_buf(), dim, cx, cz);
+    let mut outcome = AnvilChunkFlushOutcome {
+        blocks_flushed: flushed,
+        bytes_written: 0,
+        skipped_unchanged: false,
+    };
+    {
+        let mut hashes = anvil_persisted_hashes()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if anvil_payload_unchanged(
+            key.clone(),
+            fresh_hash,
+            region.chunks.get(&(cx, cz)).map(|record| &record.nbt),
+            &mut hashes,
+        ) {
+            outcome.skipped_unchanged = true;
+            return Ok(outcome);
+        }
+        let timestamp = (border_now_ms() / 1000).min(u64::from(u32::MAX)) as u32;
+        region.chunks.insert(
+            (cx, cz),
+            AnvilChunkRecord {
+                timestamp,
+                compression: 2,
+                nbt: fresh_nbt,
+            },
+        );
+        write_region_file(&region_path, &region)?;
+        outcome.bytes_written = anvil_file_len(&region_path);
+        hashes.insert(key, fresh_hash);
+    }
+    Ok(outcome)
 }
 
 /// Re-home one flushed chunk's `block_entities` into the live stores: `Items`
@@ -4107,6 +4250,334 @@ mod anvil_io_tests {
             .unwrap();
             assert_eq!(load_all_playerdata_dat(&dir).unwrap(), 0);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------- PERF-DISK-SAVE lane tests -----------------
+
+    /// The fingerprint machinery itself: deterministic, tag-shape-sensitive.
+    #[test]
+    fn perf_disk_save_nbt_fingerprint_is_deterministic_and_sensitive() {
+        let a = sample_chunk_nbt(0, 0);
+        let b = sample_chunk_nbt(0, 0);
+        let c = sample_chunk_nbt(0, 1);
+        assert_eq!(anvil_nbt_fingerprint(&a), anvil_nbt_fingerprint(&b));
+        assert_ne!(anvil_nbt_fingerprint(&a), anvil_nbt_fingerprint(&c));
+        // One changed leaf deep in the tree changes the whole fingerprint.
+        let mut d = sample_chunk_nbt(0, 0);
+        if let AnvilNbt::Compound(fields) = &mut d {
+            fields.insert(
+                crate::nbt::NbtString::text("yPos"),
+                AnvilNbt::Int(-3),
+            );
+        }
+        assert_ne!(anvil_nbt_fingerprint(&a), anvil_nbt_fingerprint(&d));
+        // Byte fingerprints agree across calls and differ on one flipped bit.
+        assert_eq!(anvil_bytes_fingerprint(b"payload"), anvil_bytes_fingerprint(b"payload"));
+        assert_ne!(anvil_bytes_fingerprint(b"payload"), anvil_bytes_fingerprint(b"payloae"));
+    }
+
+    /// Goal 1: a re-save whose serialized payload is unchanged skips zlib +
+    /// disk entirely; one block edit invalidates the hash and persists.
+    #[test]
+    fn perf_disk_save_unchanged_chunk_resave_skips_disk_write() {
+        let _guard = world_guard();
+        let _fixture = AnvilWorldFixture::capture(&[]);
+        let stone = name_to_state("stone").expect("stone state");
+        let dirt = name_to_state("dirt").expect("dirt state");
+        let key = (DimId::Overworld, 0i32, 0i32);
+        {
+            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+            w.clear();
+            w.insert(key, HashMap::from([(local_idx(1, 70, 2), stone)]));
+        }
+        let dir = anvil_tmp_dir("perf-skip");
+        let first = live_anvil_save_dir(&dir).unwrap();
+        assert_eq!(first.chunks_written, 1);
+        assert_eq!(first.region_files, 1);
+        let mca = dir.join("region").join("r.0.0.mca");
+        let committed = std::fs::read(&mca).unwrap();
+
+        // Second save, identical world: zero chunks re-encoded, zero region
+        // bytes committed, and the file is byte-identical afterwards.
+        let second = live_anvil_save_dir(&dir).unwrap();
+        assert_eq!(second.chunks_written, 0, "unchanged payload must not re-encode");
+        assert!(
+            second.skipped_unchanged_writes >= 1,
+            "the dirty-but-identical chunk counts as a skipped write"
+        );
+        assert_eq!(
+            second.region_bytes_written, 0,
+            "a fully skipped region commits no bytes"
+        );
+        assert_eq!(std::fs::read(&mca).unwrap(), committed);
+
+        // A single changed block breaks the fingerprint and persists cleanly.
+        {
+            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+            w.get_mut(&key)
+                .unwrap()
+                .insert(local_idx(5, 71, 5), dirt);
+        }
+        let third = live_anvil_save_dir(&dir).unwrap();
+        assert_eq!(third.chunks_written, 1);
+        assert!(third.region_bytes_written > 0);
+        let region = read_region_file(&mca).unwrap();
+        let chunk = anvil_chunk_from_nbt(&region.chunks[&(0, 0)].nbt, (0, 0)).unwrap();
+        let edits = anvil_chunk_edits(&chunk, DimId::Overworld);
+        assert_eq!(edits[&local_idx(1, 70, 2)], stone);
+        assert_eq!(edits[&local_idx(5, 71, 5)], dirt, "the edit persisted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Goal 2: the bounded FIFO drain spreads work across ticks; flush_all
+    /// guarantees the full synchronous drain.
+    #[test]
+    fn perf_disk_save_incremental_queue_bounded_slices_and_flush_all() {
+        let mut queue = IncrementalSaveQueue::new(IncrementalSaveBudget {
+            max_chunks_per_tick: 7,
+            max_bytes_per_tick: usize::MAX,
+        });
+        for i in 0..100i32 {
+            assert!(queue.mark_dirty(DimId::Overworld, i % 10, i / 10, 128));
+        }
+        assert_eq!(queue.len(), 100);
+        // Re-marking a queued chunk keeps its oldest position: no duplicates.
+        assert!(!queue.mark_dirty(DimId::Overworld, 0, 0, 256));
+        assert_eq!(queue.len(), 100);
+
+        let mut order = Vec::new();
+        let mut total = 0usize;
+        loop {
+            let stats = queue
+                .drain_budgeted(|item| {
+                    order.push((item.cx, item.cz));
+                    Ok::<_, String>(AnvilChunkFlushOutcome {
+                        blocks_flushed: 1,
+                        bytes_written: 128,
+                        skipped_unchanged: false,
+                    })
+                })
+                .unwrap();
+            assert!(
+                stats.chunks_flushed <= 7,
+                "one tick never exceeds max_chunks_per_tick"
+            );
+            total += stats.chunks_flushed;
+            if stats.remaining == 0 {
+                break;
+            }
+        }
+        assert_eq!(total, 100);
+        // FIFO / oldest-dirty: the first mark flushes first.
+        assert_eq!(order.first().copied(), Some((0, 0)));
+        assert_eq!(order.len(), 100);
+
+        // Byte budget leg: 300-byte cap admits exactly two 150-byte items.
+        let mut queue = IncrementalSaveQueue::new(IncrementalSaveBudget {
+            max_chunks_per_tick: usize::MAX,
+            max_bytes_per_tick: 300,
+        });
+        for i in 0..10i32 {
+            queue.mark_dirty(DimId::Overworld, i, 0, 150);
+        }
+        let stats = queue
+            .drain_budgeted(|_| {
+                Ok::<_, String>(AnvilChunkFlushOutcome {
+                    blocks_flushed: 1,
+                    bytes_written: 150,
+                    skipped_unchanged: false,
+                })
+            })
+            .unwrap();
+        assert_eq!(stats.chunks_flushed, 2);
+        assert_eq!(stats.bytes_charged, 300);
+        assert_eq!(stats.remaining, 8);
+        // flush_all drains every queued chunk in one synchronous pass.
+        let stats = queue
+            .flush_all(|_| {
+                Ok::<_, String>(AnvilChunkFlushOutcome {
+                    blocks_flushed: 1,
+                    bytes_written: 150,
+                    skipped_unchanged: false,
+                })
+            })
+            .unwrap();
+        assert_eq!(stats.chunks_flushed, 8);
+        assert_eq!(stats.remaining, 0);
+        assert!(queue.is_empty());
+    }
+
+    /// Goal 2 live path: `live_anvil_save_tick` enqueues the dirty set once
+    /// and flushes the oldest chunks under the budget; the second tick's
+    /// identical payloads all skip.
+    #[test]
+    fn perf_disk_save_live_tick_drains_queue_and_skips_unchanged() {
+        let _guard = world_guard();
+        let _fixture = AnvilWorldFixture::capture(&[]);
+        let stone = name_to_state("stone").expect("stone state");
+        {
+            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+            w.clear();
+            for cx in 0..2i32 {
+                w.insert(
+                    (DimId::Overworld, cx, 0i32),
+                    HashMap::from([(local_idx(cx * 16 + 1, 70, 2), stone)]),
+                );
+            }
+        }
+        // A tight budget forces multi-tick drainage.
+        anvil_incremental_saves()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .budget = IncrementalSaveBudget {
+            max_chunks_per_tick: 1,
+            max_bytes_per_tick: usize::MAX,
+        };
+        let dir = anvil_tmp_dir("perf-tick");
+        let t1 = live_anvil_save_tick(&dir).unwrap();
+        assert_eq!(t1.newly_queued, 2);
+        assert_eq!(t1.drain.chunks_flushed, 1);
+        assert_eq!(t1.drain.remaining, 1);
+        // The still-queued chunk is not re-marked; the chunk flushed last
+        // tick re-enters because its overlay edits are still dirty.
+        let t2 = live_anvil_save_tick(&dir).unwrap();
+        assert_eq!(t2.newly_queued, 1);
+        assert_eq!(t2.drain.chunks_flushed, 1);
+        // Both chunks are now persisted on disk. Every further drain hits the
+        // unchanged-payload fast path: zero bytes committed.
+        let mut skipped = 0usize;
+        let mut flushed = 0usize;
+        let mut bytes = 0u64;
+        for _ in 0..4 {
+            let t = live_anvil_save_tick(&dir).unwrap();
+            assert!(t.drain.chunks_flushed <= 1, "tick respects the budget");
+            skipped += t.drain.chunks_skipped_unchanged;
+            flushed += t.drain.chunks_flushed;
+            bytes += t.drain.bytes_flushed;
+        }
+        assert!(flushed >= 2, "the queue keeps rotating through dirty chunks");
+        assert_eq!(skipped, flushed, "every drain of an unchanged chunk skips");
+        assert_eq!(bytes, 0, "skipped chunks commit zero bytes");
+        // Restore the default budget for other tests sharing the process.
+        anvil_incremental_saves()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .budget = IncrementalSaveBudget::default();
+        // A full save after partial queue work drains everything and clears
+        // the queue.
+        let save = live_anvil_save_dir(&dir).unwrap();
+        assert!(save.chunks_written <= 2);
+        assert_eq!(
+            anvil_incremental_saves()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            0
+        );
+        let region = read_region_file(&dir.join("region").join("r.0.0.mca")).unwrap();
+        assert!(region.chunks.contains_key(&(0, 0)));
+        assert!(region.chunks.contains_key(&(1, 0)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Goal 3: torn `.tmp` staging and interrupted `level.dat` rotation are
+    /// folded back on reopen without clobbering the committed file.
+    #[test]
+    fn perf_disk_save_corrupt_tmp_staging_never_clobbers_committed_file() {
+        let dir = anvil_tmp_dir("perf-staging");
+        let mut region = AnvilRegion::default();
+        region.chunks.insert(
+            (0, 0),
+            AnvilChunkRecord {
+                timestamp: 0xbeef,
+                compression: 2,
+                nbt: sample_chunk_nbt(0, 0),
+            },
+        );
+        let mca = dir.join("r.0.0.mca");
+        write_region_file(&mca, &region).unwrap();
+        let committed = std::fs::read(&mca).unwrap();
+
+        // A crash that died mid-`write_all` leaves a torn `.tmp` sibling.
+        let tmp = dir.join("r.0.0.mca.tmp");
+        std::fs::write(&tmp, b"torn-partial-write-not-a-region").unwrap();
+        let swept = anvil_recover_world_staging(&dir).unwrap();
+        assert!(swept >= 1, "the orphan tmp is swept");
+        assert!(!tmp.exists());
+        assert_eq!(
+            std::fs::read(&mca).unwrap(),
+            committed,
+            "the committed region file is never clobbered by staging debris"
+        );
+        assert_eq!(read_region_file(&mca).unwrap(), region);
+
+        // Interrupted level.dat rotation: `level.dat` + `level.dat_new`
+        // means the staged copy never took the name — it is deleted.
+        let level = anvil_level_dat_from_state("world", ANVIL_DATA_VERSION);
+        write_level_dat_path(&dir.join("level.dat"), &level).unwrap();
+        let staged = dir.join("level.dat_new");
+        std::fs::write(&staged, b"interrupted rotation").unwrap();
+        anvil_recover_world_staging(&dir).unwrap();
+        assert!(!staged.exists());
+        assert!(read_level_dat_path(&dir.join("level.dat")).is_ok());
+
+        // Crash between the two renames: staged fsynced bytes adopt the live
+        // name (they were fully written before the rename began).
+        std::fs::rename(dir.join("level.dat"), &staged).unwrap();
+        anvil_recover_world_staging(&dir).unwrap();
+        assert!(read_level_dat_path(&dir.join("level.dat")).is_ok());
+        assert!(!staged.exists());
+
+        // A lone `level.dat_old` is a normal post-save artifact — recovery
+        // leaves it untouched and does not resurrect a live `level.dat`.
+        std::fs::rename(dir.join("level.dat"), dir.join("level.dat_old")).unwrap();
+        let old_bytes = std::fs::read(dir.join("level.dat_old")).unwrap();
+        anvil_recover_world_staging(&dir).unwrap();
+        assert!(!dir.join("level.dat").exists());
+        assert_eq!(std::fs::read(dir.join("level.dat_old")).unwrap(), old_bytes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Goal 3 read-side: one corrupt slot degrades to a diagnostic while its
+    /// valid neighbor still decodes; the strict reader stays fatal.
+    #[test]
+    fn perf_disk_save_tolerant_region_read_keeps_neighbors_of_corrupt_slot() {
+        let dir = anvil_tmp_dir("perf-tolerant");
+        let mut region = AnvilRegion::default();
+        for slot in [(0i32, 0i32), (1, 0)] {
+            region.chunks.insert(
+                slot,
+                AnvilChunkRecord {
+                    timestamp: 7,
+                    compression: 2,
+                    nbt: sample_chunk_nbt(slot.0, slot.1),
+                },
+            );
+        }
+        let mca = dir.join("r.0.0.mca");
+        write_region_file(&mca, &region).unwrap();
+        // Corrupt chunk (0,0)'s location entry: point it inside the header.
+        let mut file = std::fs::read(&mca).unwrap();
+        file[0] = 0;
+        file[1] = 0;
+        file[2] = 0; // offset 0
+        file[3] = 4; // sectors 4 -> "offset < 2" corruption
+        std::fs::write(&mca, &file).unwrap();
+
+        assert!(read_region_file(&mca).is_err(), "strict read fails closed");
+        let (recovered, errors) = read_region_file_tolerant(&mca).unwrap();
+        assert_eq!(errors.len(), 1, "exactly the corrupt slot is reported");
+        assert!(errors[0].contains("slot 0"));
+        assert!(!recovered.chunks.contains_key(&(0, 0)));
+        assert_eq!(
+            recovered.chunks.get(&(1, 0)).unwrap(),
+            &region.chunks[&(1, 0)],
+            "the corrupt slot's valid neighbor still decodes"
+        );
+        // Header-level corruption is still fatal in both modes.
+        std::fs::write(dir.join("r.9.9.mca"), [0u8; 100]).unwrap();
+        assert!(read_region_file_tolerant(&dir.join("r.9.9.mca")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

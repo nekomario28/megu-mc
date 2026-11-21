@@ -70,10 +70,18 @@
 //!   [`pregen::ChunkTicketLruUnloader`], which pins resident chunks through
 //!   reference-counted [`pregen::TicketKind`]s and evicts unticketed ones in
 //!   strict LRU order, flushing their overlays back to the caller.
+//! * [`incremental_save`] — the autosave anti-stall machinery: a deterministic
+//!   FIFO/oldest-dirty [`incremental_save::IncrementalSaveQueue`] drained
+//!   under a per-tick [`incremental_save::IncrementalSaveBudget`]
+//!   (`max_items_per_tick`, `max_bytes_per_tick`) with a guaranteed
+//!   `flush_all` for `/save-all` and shutdown, plus the
+//!   [`incremental_save::PersistedFingerprints`] content-hash cache that lets
+//!   an unchanged payload skip its disk write entirely.
 
 pub mod anvil_inspect;
 pub mod audit_log;
 pub mod datafix;
+pub mod incremental_save;
 pub mod migrate;
 pub mod pregen;
 pub mod region_tick;
@@ -92,9 +100,14 @@ pub use audit_log::{
     AuditAction, AuditLog, AuditQuery, AuditRecord, BlockRollbackDelta,
 };
 pub use datafix::{DataFixError, DataFixReport, DataFixStep, DataFixer, DataValue, DV_1_21_1, DV_26_3};
+pub use incremental_save::{
+    content_fingerprint, DrainStats, FlushOutcome, IncrementalSaveBudget, IncrementalSaveQueue,
+    PersistedFingerprints, QueuedSave,
+};
 pub use migrate::{
-    inspect_snapshot, migrate_json_document, migrate_snapshot, parse_data_json, to_data_json,
-    write_file_atomic, JsonError, MigrationError, SnapshotMigrationReport, SnapshotSummary,
+    cleanup_stale_migrate_temps, inspect_snapshot, migrate_json_document, migrate_snapshot,
+    parse_data_json, to_data_json, write_file_atomic, JsonError, MigrationError,
+    SnapshotMigrationReport, SnapshotSummary,
 };
 pub use pregen::{
     spiral_order, ChunkTicketLruUnloader, FlushedChunk, PregenJob, PregenProgress, PregenShape,
