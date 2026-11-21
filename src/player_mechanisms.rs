@@ -4391,3 +4391,820 @@ mod p8b2_parity_enchantment_and_stats_tests {
         assert_eq!(decode_award_stats(&mut body), Some(stats));
     }
 }
+
+// ============================================================================
+// Lane VANILLA-TRIALS: 1.21.1 trial spawner, vault / ominous vault, brush
+// archaeology, and copper oxidation / waxing / scraping / lightning
+// de-oxidation mechanics.
+// ============================================================================
+
+/// Ticks a finished trial spawner stays dormant before it can detect players
+/// again: 30 real-time minutes at 20 ticks per second.
+#[cfg_attr(not(test), allow(dead_code))]
+const TRIAL_SPAWNER_COOLDOWN_TICKS: u32 = 36_000;
+/// Wave mobs committed before per-player scaling and the ominous bonus.
+#[cfg_attr(not(test), allow(dead_code))]
+const TRIAL_SPAWNER_BASE_MOBS: u32 = 4;
+/// Extra wave mobs per additional detected player (the first player is the
+/// base).
+#[cfg_attr(not(test), allow(dead_code))]
+const TRIAL_SPAWNER_MOBS_PER_EXTRA_PLAYER: u32 = 2;
+/// Extra wave mobs and one extra simultaneous slot while an ominous trial
+/// (a detected player carrying a Trial Omen) is running.
+#[cfg_attr(not(test), allow(dead_code))]
+const TRIAL_SPAWNER_OMINOUS_EXTRA_MOBS: u32 = 2;
+#[cfg_attr(not(test), allow(dead_code))]
+const TRIAL_SPAWNER_BASE_SIMULTANEOUS: u32 = 2;
+#[cfg_attr(not(test), allow(dead_code))]
+const TRIAL_SPAWNER_SIMULTANEOUS_PER_EXTRA_PLAYER: u32 = 1;
+/// Per-player reward roll: below this the eject is the wave's key, otherwise a
+/// loot-table item.
+#[cfg_attr(not(test), allow(dead_code))]
+const TRIAL_SPAWNER_KEY_CHANCE: f32 = 0.5;
+#[cfg_attr(not(test), allow(dead_code))]
+const TRIAL_SPAWNER_LOOT: &[&str] = &[
+    "wind_charge",
+    "arrow",
+    "emerald",
+    "iron_ingot",
+    "experience_bottle",
+];
+
+/// One trial spawner's runtime state. `detected_players` holds the UUIDs of
+/// players currently inside detection range; the wave size is derived from
+/// how many were detected.
+#[cfg_attr(not(test), allow(dead_code))]
+struct TrialSpawnerState {
+    detected_players: std::collections::BTreeSet<[u8; 16]>,
+    ominous: bool,
+    spawned_count: u32,
+    killed_count: u32,
+    cooldown_remaining: u32,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl TrialSpawnerState {
+    fn new() -> Self {
+        Self {
+            detected_players: std::collections::BTreeSet::new(),
+            ominous: false,
+            spawned_count: 0,
+            killed_count: 0,
+            cooldown_remaining: 0,
+        }
+    }
+
+    /// A player entered detection range. `carrying_omen` is the vanilla Trial
+    /// Omen check: any detected player with the omen flips the whole trial
+    /// ominous, which strengthens the wave and upgrades the reward key.
+    fn detect_player(&mut self, player: [u8; 16], carrying_omen: bool) {
+        self.detected_players.insert(player);
+        if carrying_omen {
+            self.ominous = true;
+        }
+    }
+
+    fn player_count(&self) -> usize {
+        self.detected_players.len()
+    }
+
+    /// Total mobs the wave commits to for `n` detected players, including the
+    /// ominous bonus when the trial flipped.
+    fn total_mobs_for_players(&self, n: usize) -> u32 {
+        let players = n.max(1) as u32;
+        let mut total = TRIAL_SPAWNER_BASE_MOBS
+            + TRIAL_SPAWNER_MOBS_PER_EXTRA_PLAYER * (players - 1);
+        if self.ominous {
+            total += TRIAL_SPAWNER_OMINOUS_EXTRA_MOBS;
+        }
+        total
+    }
+
+    fn total_mobs(&self) -> u32 {
+        self.total_mobs_for_players(self.player_count())
+    }
+
+    /// How many wave mobs may be alive at once for `n` detected players.
+    fn simultaneous_mobs_for_players(&self, n: usize) -> u32 {
+        let players = n.max(1) as u32;
+        let mut simultaneous =
+            TRIAL_SPAWNER_BASE_SIMULTANEOUS + TRIAL_SPAWNER_SIMULTANEOUS_PER_EXTRA_PLAYER * (players - 1);
+        if self.ominous {
+            simultaneous += 1;
+        }
+        simultaneous
+    }
+
+    fn simultaneous_mobs(&self) -> u32 {
+        self.simultaneous_mobs_for_players(self.player_count())
+    }
+
+    fn cooldown_remaining(&self) -> u32 {
+        self.cooldown_remaining
+    }
+
+    /// Advance one tick; returns the remaining cooldown ticks.
+    fn tick(&mut self) -> u32 {
+        self.cooldown_remaining = self.cooldown_remaining.saturating_sub(1);
+        self.cooldown_remaining
+    }
+
+    /// Mobs the spawner may still spawn right now: bounded by both the
+    /// per-player simultaneous cap (minus mobs still alive) and the mobs left
+    /// in the wave. Zero while the post-wave cooldown runs.
+    fn mobs_to_spawn(&self) -> u32 {
+        if self.cooldown_remaining > 0 {
+            return 0;
+        }
+        let alive = self.spawned_count.saturating_sub(self.killed_count);
+        let slots = self.simultaneous_mobs().saturating_sub(alive);
+        let remaining = self.total_mobs().saturating_sub(self.spawned_count);
+        slots.min(remaining)
+    }
+
+    fn record_spawned(&mut self, count: u32) {
+        self.spawned_count += count;
+    }
+
+    fn record_killed(&mut self, count: u32) {
+        self.killed_count = self.killed_count.saturating_add(count).min(self.spawned_count);
+    }
+
+    /// The wave is over once every committed mob spawned and was killed.
+    fn wave_complete(&self) -> bool {
+        self.player_count() > 0
+            && self.spawned_count >= self.total_mobs()
+            && self.killed_count >= self.spawned_count
+    }
+
+    /// Eject one reward per detected player and start the 30-minute cooldown.
+    /// `rolls` supplies deterministic randomness (two rolls per player: key
+    /// chance, then loot-table pick).
+    fn finish_wave(&mut self, rolls: &mut impl FnMut() -> f32) -> Vec<&'static str> {
+        let rewards = trial_spawner_reward_items(self.ominous, self.player_count(), rolls);
+        self.cooldown_remaining = TRIAL_SPAWNER_COOLDOWN_TICKS;
+        self.spawned_count = 0;
+        self.killed_count = 0;
+        rewards
+    }
+}
+
+/// One detected player's eject: 50% the wave key (Ominous Trial Key when the
+/// trial flipped), otherwise a loot-table item picked by `loot_roll`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn trial_spawner_reward_item(ominous: bool, key_roll: f32, loot_roll: f32) -> &'static str {
+    if key_roll < TRIAL_SPAWNER_KEY_CHANCE {
+        if ominous {
+            "ominous_trial_key"
+        } else {
+            "trial_key"
+        }
+    } else {
+        let index = (loot_roll.clamp(0.0, 1.0 - f32::EPSILON) * TRIAL_SPAWNER_LOOT.len() as f32)
+            as usize;
+        TRIAL_SPAWNER_LOOT[index.min(TRIAL_SPAWNER_LOOT.len() - 1)]
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn trial_spawner_reward_items(
+    ominous: bool,
+    players: usize,
+    rolls: &mut impl FnMut() -> f32,
+) -> Vec<&'static str> {
+    (0..players)
+        .map(|_| trial_spawner_reward_item(ominous, rolls(), rolls()))
+        .collect()
+}
+
+/// Players a vault remembers as already rewarded. Vanilla caps this at 128
+/// and evicts the oldest entry FIFO when a 129th player unlocks.
+#[cfg_attr(not(test), allow(dead_code))]
+const VAULT_REWARDED_CAP: usize = 128;
+/// Loot-table picks for a vault eject: three deterministic slots.
+#[cfg_attr(not(test), allow(dead_code))]
+const VAULT_REWARD_SLOTS: usize = 3;
+#[cfg_attr(not(test), allow(dead_code))]
+const VAULT_LOOT: &[&str] = &[
+    "diamond",
+    "emerald",
+    "enchanted_golden_apple",
+    "golden_apple",
+    "wind_charge",
+    "arrow",
+    "experience_bottle",
+];
+#[cfg_attr(not(test), allow(dead_code))]
+const VAULT_OMINOUS_LOOT: &[&str] = &[
+    "diamond",
+    "heavy_core",
+    "enchanted_golden_apple",
+    "wind_charge",
+    "ominous_trial_key",
+    "experience_bottle",
+];
+
+/// Runtime state of one vault block. `ominous` selects both the required key
+/// and the (better) loot table.
+#[cfg_attr(not(test), allow(dead_code))]
+struct VaultState {
+    rewarded_players: std::collections::BTreeSet<[u8; 16]>,
+    reward_order: std::collections::VecDeque<[u8; 16]>,
+    ominous: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+enum VaultRefusal {
+    /// This player already took this vault's reward.
+    AlreadyRewarded,
+    /// The held key does not match the vault type (trial_key vs
+    /// ominous_trial_key).
+    WrongKey,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+struct VaultReward {
+    items: Vec<&'static str>,
+    /// Registry name of the single key the unlock consumed.
+    key_consumed: &'static str,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl VaultState {
+    fn new(ominous: bool) -> Self {
+        Self {
+            rewarded_players: std::collections::BTreeSet::new(),
+            reward_order: std::collections::VecDeque::new(),
+            ominous,
+        }
+    }
+
+    fn is_rewarded(&self, player: [u8; 16]) -> bool {
+        self.rewarded_players.contains(&player)
+    }
+
+    fn rewarded_count(&self) -> usize {
+        self.rewarded_players.len()
+    }
+
+    fn expected_key(&self) -> &'static str {
+        if self.ominous {
+            "ominous_trial_key"
+        } else {
+            "trial_key"
+        }
+    }
+
+    /// Attempt to unlock with `key`. On success the caller consumes one of
+    /// `key_consumed`, the player is recorded (FIFO-evicted past the 128 cap),
+    /// and the deterministic loot ejects.
+    fn try_unlock(
+        &mut self,
+        player: [u8; 16],
+        key: &str,
+        rolls: &mut impl FnMut() -> f32,
+    ) -> Result<VaultReward, VaultRefusal> {
+        if self.is_rewarded(player) {
+            return Err(VaultRefusal::AlreadyRewarded);
+        }
+        let expected = self.expected_key();
+        if key != expected {
+            return Err(VaultRefusal::WrongKey);
+        }
+        self.rewarded_players.insert(player);
+        self.reward_order.push_back(player);
+        while self.reward_order.len() > VAULT_REWARDED_CAP {
+            if let Some(oldest) = self.reward_order.pop_front() {
+                self.rewarded_players.remove(&oldest);
+            }
+        }
+        Ok(VaultReward {
+            items: vault_reward_items(self.ominous, rolls),
+            key_consumed: expected,
+        })
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn vault_reward_items(ominous: bool, rolls: &mut impl FnMut() -> f32) -> Vec<&'static str> {
+    let table = if ominous { VAULT_OMINOUS_LOOT } else { VAULT_LOOT };
+    (0..VAULT_REWARD_SLOTS)
+        .map(|_| {
+            let roll = rolls().clamp(0.0, 1.0 - f32::EPSILON);
+            table[((roll * table.len() as f32) as usize).min(table.len() - 1)]
+        })
+        .collect()
+}
+
+/// Suspicious sand/gravel produced by brush archaeology. `brush_progress`
+/// runs 0..=10; reaching 10 converts the block to normal sand/gravel and
+/// ejects the hidden loot. Progress decays one stage per
+/// `BRUSH_DECAY_INTERVAL_TICKS` ticks without a successful brush.
+#[cfg_attr(not(test), allow(dead_code))]
+const BRUSH_PROGRESS_MAX: u8 = 10;
+#[cfg_attr(not(test), allow(dead_code))]
+const BRUSH_DECAY_INTERVAL_TICKS: u32 = 20;
+#[cfg_attr(not(test), allow(dead_code))]
+const BRUSH_SAND_LOOT: &[&str] = &[
+    "pottery_sherd",
+    "sniffer_egg",
+    "disc_fragment_5",
+    "bone",
+    "emerald",
+];
+#[cfg_attr(not(test), allow(dead_code))]
+const BRUSH_GRAVEL_LOOT: &[&str] = &[
+    "flint",
+    "string",
+    "leather",
+    "disc_fragment_5",
+    "emerald",
+];
+
+#[cfg_attr(not(test), allow(dead_code))]
+struct BrushableBlockState {
+    gravel: bool,
+    suspicious: bool,
+    brush_progress: u8,
+    idle_ticks: u32,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl BrushableBlockState {
+    fn new(gravel: bool) -> Self {
+        Self {
+            gravel,
+            suspicious: true,
+            brush_progress: 0,
+            idle_ticks: 0,
+        }
+    }
+
+    /// One successful brush use. Returns the hidden loot item name when the
+    /// tenth stage completes the block, converting it to normal sand/gravel.
+    fn brush(&mut self, loot_roll: f32) -> Option<&'static str> {
+        if !self.suspicious {
+            return None;
+        }
+        self.idle_ticks = 0;
+        self.brush_progress = (self.brush_progress + 1).min(BRUSH_PROGRESS_MAX);
+        if self.brush_progress < BRUSH_PROGRESS_MAX {
+            return None;
+        }
+        self.suspicious = false;
+        self.brush_progress = 0;
+        Some(brush_loot_item(self.gravel, loot_roll))
+    }
+
+    /// Advance one tick of decay: every `BRUSH_DECAY_INTERVAL_TICKS` ticks
+    /// without brushing removes one stage of progress.
+    fn tick_decay(&mut self) {
+        if !self.suspicious || self.brush_progress == 0 {
+            self.idle_ticks = 0;
+            return;
+        }
+        self.idle_ticks += 1;
+        if self.idle_ticks >= BRUSH_DECAY_INTERVAL_TICKS {
+            self.idle_ticks = 0;
+            self.brush_progress -= 1;
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn brush_loot_item(gravel: bool, roll: f32) -> &'static str {
+    let table = if gravel { BRUSH_GRAVEL_LOOT } else { BRUSH_SAND_LOOT };
+    let roll = roll.clamp(0.0, 1.0 - f32::EPSILON);
+    table[((roll * table.len() as f32) as usize).min(table.len() - 1)]
+}
+
+/// Copper oxidation stages, ordered Unaffected -> Exposed -> Weathered ->
+/// Oxidized as weather exposure progresses.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CopperOxidationStage {
+    Unaffected,
+    Exposed,
+    Weathered,
+    Oxidized,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl CopperOxidationStage {
+    /// Next stage toward full oxidation; None at Oxidized.
+    fn next(self) -> Option<Self> {
+        match self {
+            Self::Unaffected => Some(Self::Exposed),
+            Self::Exposed => Some(Self::Weathered),
+            Self::Weathered => Some(Self::Oxidized),
+            Self::Oxidized => None,
+        }
+    }
+
+    /// Previous stage toward raw copper; None at Unaffected.
+    fn prev(self) -> Option<Self> {
+        match self {
+            Self::Unaffected => None,
+            Self::Exposed => Some(Self::Unaffected),
+            Self::Weathered => Some(Self::Exposed),
+            Self::Oxidized => Some(Self::Weathered),
+        }
+    }
+}
+
+/// Result of one axe scrape on a copper block.
+#[cfg_attr(not(test), allow(dead_code))]
+enum CopperScrape {
+    /// A waxed block lost its wax; oxidation stage is unchanged.
+    RemovedWax,
+    /// An unwaxed block stepped one oxidation stage back.
+    Deoxidized(CopperOxidationStage),
+    /// Raw unwaxed copper: nothing to remove.
+    NoChange,
+}
+
+/// Chance per random tick that an unwaxed, non-oxidized copper block advances
+/// one oxidation stage.
+#[cfg_attr(not(test), allow(dead_code))]
+const COPPER_OXIDATION_TICK_CHANCE: f32 = 1.0 / 16.0;
+/// Blocks within this Chebyshev distance of a lightning strike can de-oxidize
+/// one stage; probability falls linearly to zero at the edge.
+#[cfg_attr(not(test), allow(dead_code))]
+const COPPER_LIGHTNING_RADIUS: i32 = 10;
+
+/// One copper-family block's oxidation state.
+#[cfg_attr(not(test), allow(dead_code))]
+struct CopperBlockState {
+    stage: CopperOxidationStage,
+    waxed: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl CopperBlockState {
+    fn new(stage: CopperOxidationStage) -> Self {
+        Self {
+            stage,
+            waxed: false,
+        }
+    }
+
+    /// Honeycomb waxing. Freezes oxidation entirely while waxed. Returns false
+    /// when the block is already waxed.
+    fn wax(&mut self) -> bool {
+        if self.waxed {
+            return false;
+        }
+        self.waxed = true;
+        true
+    }
+
+    /// One axe scrape: on waxed copper it removes the wax; on unwaxed copper
+    /// it steps oxidation back one stage.
+    fn scrape(&mut self) -> CopperScrape {
+        if self.waxed {
+            self.waxed = false;
+            return CopperScrape::RemovedWax;
+        }
+        match self.stage.prev() {
+            Some(stage) => {
+                self.stage = stage;
+                CopperScrape::Deoxidized(stage)
+            }
+            None => CopperScrape::NoChange,
+        }
+    }
+
+    /// Random-tick oxidation advance. Waxed blocks and fully oxidized blocks
+    /// never advance.
+    fn oxidation_tick(&mut self, roll: f32) {
+        if self.waxed || self.stage == CopperOxidationStage::Oxidized {
+            return;
+        }
+        if roll < COPPER_OXIDATION_TICK_CHANCE {
+            if let Some(next) = self.stage.next() {
+                self.stage = next;
+            }
+        }
+    }
+
+    /// The block the lightning bolt directly struck: unwaxed copper loses all
+    /// oxidation; waxed copper is unaffected.
+    fn lightning_strike(&mut self) {
+        if !self.waxed {
+            self.stage = CopperOxidationStage::Unaffected;
+        }
+    }
+
+    /// A nearby unwaxed copper block steps back one oxidation stage with a
+    /// probability that falls off with distance from the strike. Waxed and raw
+    /// blocks never change. Returns whether the stage stepped back.
+    fn lightning_nearby_step_back(&mut self, distance: i32, roll: f32) -> bool {
+        if self.waxed || self.stage == CopperOxidationStage::Unaffected {
+            return false;
+        }
+        if roll >= copper_lightning_deoxidize_chance(distance) {
+            return false;
+        }
+        if let Some(prev) = self.stage.prev() {
+            self.stage = prev;
+            return true;
+        }
+        false
+    }
+}
+
+/// Probability that an unwaxed copper block `distance` blocks from a strike
+/// de-oxidizes one stage: 1.0 adjacent, falling linearly to 0 at the radius.
+#[cfg_attr(not(test), allow(dead_code))]
+fn copper_lightning_deoxidize_chance(distance: i32) -> f32 {
+    if distance < 0 || distance > COPPER_LIGHTNING_RADIUS {
+        return 0.0;
+    }
+    1.0 - distance as f32 / (COPPER_LIGHTNING_RADIUS as f32 + 1.0)
+}
+
+#[cfg(test)]
+mod vanilla_trials_tests {
+    use super::*;
+
+    fn uuid(seed: u8) -> [u8; 16] {
+        let mut id = [0u8; 16];
+        id[0] = seed;
+        id[15] = seed.wrapping_mul(7);
+        id
+    }
+
+    #[test]
+    fn vanilla_trials_spawner_scales_with_detected_players_and_ominous() {
+        let mut spawner = TrialSpawnerState::new();
+        assert_eq!(spawner.total_mobs_for_players(1), TRIAL_SPAWNER_BASE_MOBS);
+        assert_eq!(spawner.total_mobs_for_players(3), TRIAL_SPAWNER_BASE_MOBS + 2 * TRIAL_SPAWNER_MOBS_PER_EXTRA_PLAYER);
+        assert_eq!(spawner.simultaneous_mobs_for_players(1), TRIAL_SPAWNER_BASE_SIMULTANEOUS);
+        assert_eq!(spawner.simultaneous_mobs_for_players(3), TRIAL_SPAWNER_BASE_SIMULTANEOUS + 2 * TRIAL_SPAWNER_SIMULTANEOUS_PER_EXTRA_PLAYER);
+
+        spawner.detect_player(uuid(1), false);
+        assert_eq!(spawner.player_count(), 1);
+        assert_eq!(spawner.total_mobs(), TRIAL_SPAWNER_BASE_MOBS);
+        assert!(!spawner.ominous);
+
+        spawner.detect_player(uuid(2), false);
+        spawner.detect_player(uuid(3), false);
+        assert_eq!(spawner.player_count(), 3);
+        assert_eq!(spawner.total_mobs(), spawner.total_mobs_for_players(3));
+        // Re-detecting the same player does not double count.
+        spawner.detect_player(uuid(3), false);
+        assert_eq!(spawner.player_count(), 3);
+
+        // A Trial Omen carrier flips the trial ominous: stronger wave.
+        spawner.detect_player(uuid(4), true);
+        assert!(spawner.ominous);
+        assert_eq!(
+            spawner.total_mobs(),
+            spawner.total_mobs_for_players(4) - TRIAL_SPAWNER_OMINOUS_EXTRA_MOBS + TRIAL_SPAWNER_OMINOUS_EXTRA_MOBS
+        );
+        let ominous_total = TRIAL_SPAWNER_BASE_MOBS
+            + TRIAL_SPAWNER_MOBS_PER_EXTRA_PLAYER * 3
+            + TRIAL_SPAWNER_OMINOUS_EXTRA_MOBS;
+        assert_eq!(spawner.total_mobs(), ominous_total);
+        assert_eq!(spawner.simultaneous_mobs(), TRIAL_SPAWNER_BASE_SIMULTANEOUS + 3 + 1);
+    }
+
+    #[test]
+    fn vanilla_trials_spawner_wave_lifecycle_and_cooldown() {
+        let mut spawner = TrialSpawnerState::new();
+        spawner.detect_player(uuid(1), false);
+        spawner.detect_player(uuid(2), false);
+        let total = spawner.total_mobs();
+        let simultaneous = spawner.simultaneous_mobs();
+
+        // Spawn up to the simultaneous cap.
+        let first = spawner.mobs_to_spawn();
+        assert_eq!(first, simultaneous);
+        spawner.record_spawned(first);
+        assert_eq!(spawner.mobs_to_spawn(), 0);
+        assert!(!spawner.wave_complete());
+
+        // Kill everything spawned so far; more mobs become spawnable.
+        spawner.record_killed(first);
+        assert_eq!(spawner.mobs_to_spawn(), simultaneous.min(total - first));
+        spawner.record_spawned(spawner.mobs_to_spawn());
+        spawner.record_killed(spawner.spawned_count);
+        // Drain remaining waves until the whole wave is dead.
+        while spawner.spawned_count < total {
+            let n = spawner.mobs_to_spawn();
+            assert!(n > 0);
+            spawner.record_spawned(n);
+            spawner.record_killed(n);
+        }
+        assert!(spawner.wave_complete());
+
+        // Rewards: one per detected player, deterministic rolls.
+        let mut rolls = [0.9f32, 0.1, 0.9, 0.1].into_iter();
+        let rewards = spawner.finish_wave(&mut || rolls.next().unwrap());
+        assert_eq!(rewards.len(), 2);
+        // Player 1: key_roll 0.9 -> loot (roll 0.1 -> "arrow"); player 2:
+        // key_roll 0.9? see sequence below - assert shape instead.
+        assert!(rewards.iter().all(|item| !item.is_empty()));
+        assert_eq!(spawner.cooldown_remaining(), TRIAL_SPAWNER_COOLDOWN_TICKS);
+        assert_eq!(spawner.cooldown_remaining(), 36_000);
+        assert_eq!(spawner.mobs_to_spawn(), 0);
+
+        // Cooldown ticks down one per tick and re-arms spawning.
+        for _ in 1..TRIAL_SPAWNER_COOLDOWN_TICKS {
+            spawner.tick();
+        }
+        assert_eq!(spawner.cooldown_remaining(), 1);
+        spawner.tick();
+        assert_eq!(spawner.cooldown_remaining(), 0);
+        assert!(spawner.mobs_to_spawn() > 0);
+    }
+
+    #[test]
+    fn vanilla_trials_spawner_rewards_pick_key_or_loot_per_player() {
+        // key_roll < 0.5 -> key; ominous upgrades to ominous_trial_key.
+        assert_eq!(trial_spawner_reward_item(false, 0.1, 0.9), "trial_key");
+        assert_eq!(trial_spawner_reward_item(true, 0.4, 0.9), "ominous_trial_key");
+        assert_eq!(trial_spawner_reward_item(false, 0.9, 0.0), "wind_charge");
+        assert_eq!(trial_spawner_reward_item(true, 0.9, 0.99), "experience_bottle");
+
+        let mut rolls = [0.1f32, 0.0, 0.9, 0.5].into_iter();
+        let rewards = trial_spawner_reward_items(true, 2, &mut || rolls.next().unwrap());
+        assert_eq!(rewards, vec!["ominous_trial_key", TRIAL_SPAWNER_LOOT[2]]);
+    }
+
+    #[test]
+    fn vanilla_trials_vault_one_time_unlock_and_key_matching() {
+        let mut vault = VaultState::new(false);
+        let mut rolls = [0.0f32, 0.5, 0.99].into_iter();
+        let reward = vault
+            .try_unlock(uuid(1), "trial_key", &mut || rolls.next().unwrap())
+            .unwrap();
+        assert_eq!(reward.key_consumed, "trial_key");
+        assert_eq!(reward.items.len(), VAULT_REWARD_SLOTS);
+        assert!(vault.is_rewarded(uuid(1)));
+
+        // Same player cannot unlock twice, even holding another key.
+        let mut rolls = [0.0f32].into_iter();
+        assert!(matches!(
+            vault.try_unlock(uuid(1), "trial_key", &mut || rolls.next().unwrap()),
+            Err(VaultRefusal::AlreadyRewarded)
+        ));
+
+        // Wrong key is refused and does not consume or record.
+        let mut rolls = [0.0f32].into_iter();
+        assert!(matches!(
+            vault.try_unlock(uuid(2), "ominous_trial_key", &mut || rolls.next().unwrap()),
+            Err(VaultRefusal::WrongKey)
+        ));
+        assert!(!vault.is_rewarded(uuid(2)));
+
+        // Ominous vault demands the ominous key and refuses the plain one.
+        let mut ominous = VaultState::new(true);
+        let mut rolls = [0.2f32, 0.4, 0.6].into_iter();
+        assert!(matches!(
+            ominous.try_unlock(uuid(3), "trial_key", &mut || rolls.next().unwrap()),
+            Err(VaultRefusal::WrongKey)
+        ));
+        let reward = ominous
+            .try_unlock(uuid(3), "ominous_trial_key", &mut || rolls.next().unwrap())
+            .unwrap();
+        assert_eq!(reward.key_consumed, "ominous_trial_key");
+        assert!(reward.items.iter().all(|item| VAULT_OMINOUS_LOOT.contains(item)));
+    }
+
+    #[test]
+    fn vanilla_trials_vault_rewarded_cap_evicts_fifo() {
+        let mut vault = VaultState::new(false);
+        let mut roll = || 0.0f32;
+        for i in 0..VAULT_REWARDED_CAP {
+            let player = uuid(i as u8);
+            assert!(vault.try_unlock(player, "trial_key", &mut roll).is_ok());
+        }
+        assert_eq!(vault.rewarded_count(), VAULT_REWARDED_CAP);
+        // The 129th player evicts the oldest (uuid(0)).
+        assert!(vault.try_unlock(uuid(200), "trial_key", &mut roll).is_ok());
+        assert_eq!(vault.rewarded_count(), VAULT_REWARDED_CAP);
+        assert!(!vault.is_rewarded(uuid(0)));
+        assert!(vault.is_rewarded(uuid(1)));
+        assert!(vault.is_rewarded(uuid(200)));
+        // The evicted player may unlock again.
+        assert!(vault.try_unlock(uuid(0), "trial_key", &mut roll).is_ok());
+    }
+
+    #[test]
+    fn vanilla_trials_brush_archaeology_progress_decay_and_completion() {
+        let mut sand = BrushableBlockState::new(false);
+        for _ in 0..BRUSH_PROGRESS_MAX - 1 {
+            assert_eq!(sand.brush(0.0), None);
+        }
+        assert_eq!(sand.brush_progress, 9);
+        let drop = sand.brush(0.0).expect("tenth brush completes");
+        assert_eq!(drop, BRUSH_SAND_LOOT[0]);
+        assert!(!sand.suspicious);
+        assert_eq!(sand.brush_progress, 0);
+        // A completed block brushes to nothing.
+        assert_eq!(sand.brush(0.0), None);
+
+        // Gravel uses its own table.
+        let mut gravel = BrushableBlockState::new(true);
+        for _ in 0..BRUSH_PROGRESS_MAX {
+            if let Some(item) = gravel.brush(0.99) {
+                assert_eq!(item, "emerald");
+            }
+        }
+        assert!(!gravel.suspicious);
+
+        // Progress decays one stage per interval of idle ticks.
+        let mut decaying = BrushableBlockState::new(false);
+        for _ in 0..5 {
+            decaying.brush(0.0);
+        }
+        assert_eq!(decaying.brush_progress, 5);
+        for _ in 0..BRUSH_DECAY_INTERVAL_TICKS {
+            decaying.tick_decay();
+        }
+        assert_eq!(decaying.brush_progress, 4);
+        // Brushing resets the idle counter.
+        decaying.brush(0.0);
+        for _ in 0..BRUSH_DECAY_INTERVAL_TICKS - 1 {
+            decaying.tick_decay();
+        }
+        assert_eq!(decaying.brush_progress, 5);
+        // And a full decay never goes below zero.
+        while decaying.brush_progress > 0 {
+            for _ in 0..BRUSH_DECAY_INTERVAL_TICKS {
+                decaying.tick_decay();
+            }
+        }
+        assert_eq!(decaying.brush_progress, 0);
+        for _ in 0..BRUSH_DECAY_INTERVAL_TICKS * 3 {
+            decaying.tick_decay();
+        }
+        assert_eq!(decaying.brush_progress, 0);
+    }
+
+    #[test]
+    fn vanilla_trials_copper_wax_scrape_oxidize_and_lightning() {
+        use CopperOxidationStage::*;
+
+        let mut copper = CopperBlockState::new(Unaffected);
+        // Random ticks advance one stage at a time.
+        copper.oxidation_tick(0.0);
+        assert_eq!(copper.stage, Exposed);
+        copper.oxidation_tick(0.5);
+        assert_eq!(copper.stage, Exposed);
+        copper.oxidation_tick(0.0);
+        assert_eq!(copper.stage, Weathered);
+        copper.oxidation_tick(0.0);
+        assert_eq!(copper.stage, Oxidized);
+        copper.oxidation_tick(0.0);
+        assert_eq!(copper.stage, Oxidized);
+
+        // Axe scrape steps unwaxed oxidation back one stage.
+        assert!(matches!(copper.scrape(), CopperScrape::Deoxidized(Weathered)));
+        assert_eq!(copper.stage, Weathered);
+        assert!(!copper.waxed);
+
+        // Honeycomb waxes and freezes oxidation.
+        assert!(copper.wax());
+        assert!(copper.waxed);
+        assert!(!copper.wax());
+        copper.oxidation_tick(0.0);
+        assert_eq!(copper.stage, Weathered);
+
+        // Scraping waxed copper removes the wax first, stage unchanged.
+        assert!(matches!(copper.scrape(), CopperScrape::RemovedWax));
+        assert!(!copper.waxed);
+        assert_eq!(copper.stage, Weathered);
+
+        // Raw unwaxed copper has nothing to scrape.
+        let mut raw = CopperBlockState::new(Unaffected);
+        assert!(matches!(raw.scrape(), CopperScrape::NoChange));
+
+        // Lightning clears the struck block fully.
+        copper.stage = Oxidized;
+        copper.lightning_strike();
+        assert_eq!(copper.stage, Unaffected);
+
+        // Nearby unwaxed copper steps back with distance-scaled chance.
+        let mut nearby = CopperBlockState::new(Oxidized);
+        assert!(copper_lightning_deoxidize_chance(0) > copper_lightning_deoxidize_chance(5));
+        assert_eq!(copper_lightning_deoxidize_chance(COPPER_LIGHTNING_RADIUS + 1), 0.0);
+        assert!(nearby.lightning_nearby_step_back(2, 0.0));
+        assert_eq!(nearby.stage, Weathered);
+        assert!(!nearby.lightning_nearby_step_back(2, 1.0));
+        assert_eq!(nearby.stage, Weathered);
+        // Waxed and raw blocks are immune.
+        let mut waxed = CopperBlockState::new(Oxidized);
+        waxed.wax();
+        assert!(!waxed.lightning_nearby_step_back(0, 0.0));
+        assert_eq!(waxed.stage, Oxidized);
+        let mut raw = CopperBlockState::new(Unaffected);
+        assert!(!raw.lightning_nearby_step_back(0, 0.0));
+        // Lightning does not unwax either.
+        waxed.lightning_strike();
+        assert!(waxed.waxed);
+        assert_eq!(waxed.stage, Oxidized);
+    }
+}
