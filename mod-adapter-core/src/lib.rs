@@ -77,6 +77,13 @@
 //!   FIPS 180-4 SHA-256 with constant-time digest comparison,
 //!   [`mod_sync::ConsentToken`]-gated atomic installs that refuse symlink
 //!   escapes, and [`fallback::BUILTIN_SUPERSEDED_PERF_MODS`] auto-skip.
+//! - [`unified_bundle`]: shrink-to-generic `mc-spine-mod-bundle/1`
+//!   declarative mod bundle — one pure-JSON document declaring a mod's
+//!   portals, progression barriers, biome regions, creature specs, and
+//!   custom payload channels, installed atomically into
+//!   [`unified_bundle::UnifiedModRuntime`] with zero lines of mod-specific
+//!   Rust, plus [`unified_bundle::export_builtin_dimension_bundles`]
+//!   proving the built-in dimension profiles are pure data.
 
 #![deny(unsafe_code)]
 
@@ -92,6 +99,7 @@ pub mod modpack;
 pub mod mod_sync;
 pub mod neoforge_wire;
 pub mod profile;
+pub mod unified_bundle;
 pub mod version_compat;
 pub mod world_extensions;
 
