@@ -36,6 +36,12 @@ MC_SPINE_PORT=25699 cargo run --locked
 
 設定ファイルは任意です。初回起動時にカレントディレクトリへ短い `server.toml` を書き出します（`MC_SPINE_CONFIG` で場所を変更可）。`[server]` の各キーは既存の `MC_SPINE_*` 環境変数に対応し、環境変数が常に優先されます。`[anticheat]` は on/off の 4 項目です: `enabled`（移動・落下・設置チェックの on/off）、`antixray`（埋まったバニラ鉱石＋`#c:ores`/`#forge:ores` 等の Mod 鉱石・チェスト・埋没 BlockEntity NBT を隠す）、`antifullbright`（密閉された地下空洞の光を送らない。クライアントのガンマ/フルブライト自体はサーバーからは止められません）、`check_ops`（`true` で OP も検査対象）。しきい値はプレイヤーの属性・エフェクト・エンチャント・Mod ブロック輸送からサーバー側で毎回自動計算し（`src/anticheat.rs`）、違反は引き戻し・取り消しのみでキックしません。クリエイティブ・スペクテイターは常に対象外で、サバイバル復帰時は短い猶予が付きます。非バニラコマンドは追加せず、既存のバニラ `/reload` で `server.toml` と Mod タグも自然に再読込されます。環境変数 `MC_SPINE_ANTICHEAT=off` でも無効化できます。
 
+## 軽量化 Mod について（プレイヤー・運用者向け）
+
+- `Sodium` / `Embeddium` / `Lithium` / `Starlight` / `FerriteCore` / `ModernFix` / `EntityCulling` / `Distant Horizons` などの軽量化 Mod は別途導入する必要はありません（描画カリング・ライティング・パレット圧縮・並列チャンク処理・遠景 LOD といった同等カテゴリの最適化を、`mc-spine` 独自のクリーンルーム Rust 実装として標準搭載しています）。
+- 既存の Modpack フォルダ（`mods/`）にこれらの軽量化 Mod が含まれていても、起動時に互換衝突や不要な JVM フォールバックを防ぐため **自動でスキップ** され、残りのコンテンツ Mod はそのまま動作します（対象一覧と仕組み: [ux-and-builtin-optimizations.md](specs/client-fork/ux-and-builtin-optimizations.md)）。
+- これらはあくまで自動スキップによる互換性対応であり、上記 Mod 群の公式同梱・提携・コード移植ではありません（詳細は下の「クリーンルーム実装と設計上の先行技術」を参照）。
+
 ## どこから読むか
 
 - 参加する・並列作業の担当境界: [CONTRIBUTING.md](CONTRIBUTING.md) → [開発ガイド](docs/development.md)
