@@ -9,6 +9,11 @@
 //! - Region-isolated Create kinetic, belt transport, mechanical processing, and
 //!   fluid factory adapter driving `mod_offload::region_scheduler::RegionScheduler`
 //!   across arbitrary dynamic dimensions (`dim: i32`).
+//! - [`orbital`]: clean-room altitude-trigger (`Y >= 560`-style) dimension
+//!   transitions for 6-DOF ships — atomic ship + passenger transfers into
+//!   microgravity or low-gravity planetary dimensions with per-dimension
+//!   [`aeronautics::AtmospherePhysics`] and anti-cheat-safe passenger
+//!   `TeleportIntent`s.
 
 #![deny(unsafe_code)]
 
@@ -19,3 +24,4 @@ pub mod contraption_adapter;
 pub mod data_loader;
 pub mod factory;
 pub mod neoforge_wire;
+pub mod orbital;

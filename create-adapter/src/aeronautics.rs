@@ -45,6 +45,100 @@ const INTERNAL_REGION_STEPS: usize = 1_024;
 /// Maximum canonical blockstate string length accepted by the codec.
 const MAX_BLOCKSTATE_LEN: usize = 32_767;
 
+/// Per-dimension environment physics for [`RigidBodySubWorld::step_with_atmosphere`].
+///
+/// Multiplies a caller-supplied base gravitational acceleration by
+/// `gravity_scale` (Overworld `1.0`, microgravity `0.0`, Moon `0.165`, Mars
+/// `0.38`), scales every aerodynamic term through `air_density` (thrust is
+/// never scaled — propellers and rocket engines accelerate in vacuum), and
+/// gates the buoyancy lift term on `enable_buoyancy`. `vacuum_damping` is an
+/// optional artificial-drag station-keeping term (`F = -k * v`) that applies
+/// even at zero air density so a drifting hull in space can settle cleanly;
+/// `0.0` disables it bit-identically.
+///
+/// [`AtmospherePhysics::OVERWORLD`] reproduces the legacy `step(dt, g, 1.0)`
+/// force balance exactly: `1.0 * lift` and a skipped zero damping term keep
+/// the arithmetic unchanged.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AtmospherePhysics {
+    /// Multiplier on the base gravitational acceleration passed to
+    /// [`RigidBodySubWorld::step_with_atmosphere`].
+    pub gravity_scale: f64,
+    /// Air density scaling buoyancy lift, aerodynamic drag, rudder authority,
+    /// and angular damping (`1.0` = sea level, `0.0` = vacuum).
+    pub air_density: f64,
+    /// Whether envelope/levitation blocks produce lift in this dimension.
+    pub enable_buoyancy: bool,
+    /// Optional artificial linear drag (`N per m/s`) applied in any
+    /// atmosphere — the stabilizer that bleeds off drift in vacuum.
+    /// `0.0` disables the term entirely.
+    pub vacuum_damping: f64,
+}
+
+impl AtmospherePhysics {
+    /// The default profile every sub-world carries until a router installs a
+    /// per-dimension environment: identical to the original `step` physics.
+    pub const OVERWORLD: Self = Self {
+        gravity_scale: 1.0,
+        air_density: SEA_LEVEL_AIR_DENSITY,
+        enable_buoyancy: true,
+        vacuum_damping: 0.0,
+    };
+
+    /// Vacuum/microgravity profile: no gravity, no atmosphere, no buoyancy;
+    /// thrusters still accelerate and only `vacuum_damping` can bleed speed.
+    pub const MICROGRAVITY: Self = Self {
+        gravity_scale: 0.0,
+        air_density: 0.0,
+        enable_buoyancy: false,
+        vacuum_damping: 0.0,
+    };
+
+    /// A low-gravity planetary body: proportional gravity, caller-declared
+    /// (possibly zero) air density, buoyancy on only when there is an
+    /// atmosphere to float in.
+    pub const fn low_gravity(gravity_scale: f64, air_density: f64) -> Self {
+        Self {
+            gravity_scale,
+            air_density,
+            enable_buoyancy: air_density > 0.0,
+            vacuum_damping: 0.0,
+        }
+    }
+
+    /// Lunar-style profile (`gravity_scale = 0.165`, vacuum).
+    pub const MOON: Self = Self::low_gravity(0.165, 0.0);
+    /// Mars-style profile (`gravity_scale = 0.38`, thin air for drag).
+    pub const MARS: Self = Self::low_gravity(0.38, 0.06);
+
+    /// Derive physics from a shared
+    /// [`mod_adapter_core::dimension_mod::DimensionEnvProfile`] gravity
+    /// multiplier plus the caller's air-density model for that dimension.
+    /// Environments declaring zero or negative gravity get no buoyancy.
+    pub fn from_env_profile(
+        env: &mod_adapter_core::dimension_mod::DimensionEnvProfile,
+        air_density: f64,
+    ) -> Self {
+        let air_density = if air_density.is_finite() && air_density >= 0.0 {
+            air_density
+        } else {
+            0.0
+        };
+        Self {
+            gravity_scale: env.gravity_multiplier,
+            air_density,
+            enable_buoyancy: env.gravity_multiplier > 0.0 && air_density > 0.0,
+            vacuum_damping: 0.0,
+        }
+    }
+}
+
+impl Default for AtmospherePhysics {
+    fn default() -> Self {
+        Self::OVERWORLD
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum AeronauticsError {
     EmptyAssembly,
@@ -98,6 +192,12 @@ pub struct RigidBodySubWorld {
     factory: CreateFactory,
     propulsion: PropulsionSpec,
     block_mass: f64,
+    /// Per-dimension environment physics consumed by
+    /// [`Self::step_with_atmosphere`]; [`AtmospherePhysics::OVERWORLD`] until a
+    /// dimension router installs the destination's profile. Not part of the
+    /// `AERO` snapshot — `parent_dim` is, so reloads re-derive the profile
+    /// from the dimension they restore into.
+    atmosphere: AtmospherePhysics,
     tick: u64,
     /// `block_id -> min_rpm` gate for propeller mounts (from the addon's
     /// kinetic consumer table; restored from mount data on decode).
@@ -153,6 +253,7 @@ impl RigidBodySubWorld {
             factory: CreateFactory::new(registry.clone()),
             propulsion,
             block_mass,
+            atmosphere: AtmospherePhysics::OVERWORLD,
             tick: 0,
             min_rpms,
             mass: 0.0,
@@ -180,6 +281,34 @@ impl RigidBodySubWorld {
     /// Active propulsion model for this sub-world.
     pub fn propulsion(&self) -> &PropulsionSpec {
         &self.propulsion
+    }
+
+    /// Per-dimension environment physics this sub-world steps under when
+    /// [`Self::step_with_atmosphere`] is used. Defaults to
+    /// [`AtmospherePhysics::OVERWORLD`].
+    pub fn atmosphere(&self) -> AtmospherePhysics {
+        self.atmosphere
+    }
+
+    /// Install the environment profile of the dimension the sub-world
+    /// currently flies in. [`crate::orbital::OrbitalTransitionRouter`] calls
+    /// this on every dimension crossing and once per routed step.
+    pub fn set_atmosphere(&mut self, atmosphere: AtmospherePhysics) {
+        self.atmosphere = atmosphere;
+    }
+
+    /// Move the sub-world into another dimension atomically: `parent_dim` and
+    /// `pos` switch to `new_dim`/`new_pos` while `vel`, `omega`, `quat`,
+    /// mounts, blocks and mass are preserved untouched (horizontal momentum
+    /// and orientation ride through the crossing), then the embedded
+    /// [`CreateFactory`] is rebuilt so every kinetic node re-keys onto the
+    /// new dimension and live propeller RPMs keep solving there.
+    pub fn transfer_to_dimension(&mut self, new_dim: u32, new_pos: [f64; 3]) {
+        self.parent_dim = new_dim;
+        for i in 0..3 {
+            self.pos[i] = sanitize(new_pos[i]);
+        }
+        self.rebuild_factory();
     }
 
     /// Place/replace a local block (canonical blockstate string), updating the
@@ -320,12 +449,65 @@ impl RigidBodySubWorld {
     /// value is sanitized: the integrator can never produce NaN/Inf and
     /// speeds stay bounded by [`MAX_SPEED`]/[`MAX_OMEGA`].
     pub fn step(&mut self, dt: f64, gravity: f64, air_density: f64) {
+        self.step_env(dt, gravity, air_density, 1.0, 0.0);
+    }
+
+    /// Advance one step under [`Self::atmosphere`]'s per-dimension profile:
+    /// effective gravity is `base_gravity * gravity_scale` (microgravity
+    /// `0.0`, Moon `0.165` of `base_gravity`, Mars `0.38`), `air_density`
+    /// scales every aerodynamic term, `enable_buoyancy` gates the lift term,
+    /// and `vacuum_damping` optionally bleeds linear velocity even in space.
+    /// [`AtmospherePhysics::OVERWORLD`] at `base_gravity = 9.81` is
+    /// bit-identical to `step(dt, 9.81, 1.0)`.
+    pub fn step_with_atmosphere(&mut self, dt: f64, base_gravity: f64) {
+        let atmosphere = self.atmosphere;
+        let gravity = if base_gravity.is_finite() {
+            sanitize(base_gravity * atmosphere.gravity_scale)
+        } else {
+            0.0
+        };
+        self.step_env(
+            dt,
+            gravity,
+            atmosphere.air_density,
+            if atmosphere.enable_buoyancy {
+                1.0
+            } else {
+                0.0
+            },
+            atmosphere.vacuum_damping,
+        );
+    }
+
+    /// Shared integrator behind [`Self::step`] and
+    /// [`Self::step_with_atmosphere`]. `buoyancy_scale` multiplies the lift
+    /// term (`1.0` leaves the legacy force balance untouched);
+    /// `vacuum_damping <= 0.0` skips the artificial-drag branch entirely so
+    /// the default path is arithmetic-identical to the original `step`.
+    fn step_env(
+        &mut self,
+        dt: f64,
+        gravity: f64,
+        air_density: f64,
+        buoyancy_scale: f64,
+        vacuum_damping: f64,
+    ) {
         if !dt.is_finite() || dt <= 0.0 {
             return;
         }
         let gravity = if gravity.is_finite() { gravity } else { 0.0 };
         let air_density = if air_density.is_finite() && air_density >= 0.0 {
             air_density
+        } else {
+            0.0
+        };
+        let buoyancy_scale = if buoyancy_scale.is_finite() {
+            buoyancy_scale
+        } else {
+            0.0
+        };
+        let vacuum_damping = if vacuum_damping.is_finite() && vacuum_damping > 0.0 {
+            vacuum_damping
         } else {
             0.0
         };
@@ -363,14 +545,20 @@ impl RigidBodySubWorld {
         let drag = self.propulsion.drag_coeff * air_density * speed;
         let mut accel = [0.0f64; 3];
         for i in 0..3 {
-            let force = sanitize(
+            let mut force = sanitize(
                 thrust_world[i] - drag * self.vel[i]
                     + if i == 1 {
-                        self.buoyancy_force(air_density) - self.mass * gravity
+                        buoyancy_scale * self.buoyancy_force(air_density) - self.mass * gravity
                     } else {
                         0.0
                     },
             );
+            // Optional artificial station-keeping drag (`F = -k * v`); the
+            // branch is skipped outright when disabled so the default path
+            // keeps the legacy arithmetic bit-for-bit.
+            if vacuum_damping > 0.0 {
+                force = sanitize(force - vacuum_damping * self.vel[i]);
+            }
             accel[i] = force / self.mass.max(1e-9);
         }
         for (v, &a) in self.vel.iter_mut().zip(&accel) {
@@ -654,6 +842,7 @@ pub fn decode_aeronautics_snapshot(
         factory: CreateFactory::new(registry.clone()),
         propulsion,
         block_mass,
+        atmosphere: AtmospherePhysics::OVERWORLD,
         tick,
         min_rpms,
         mass,
