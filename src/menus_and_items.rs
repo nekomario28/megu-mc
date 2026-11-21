@@ -1087,144 +1087,204 @@ fn hopper_tick() {
             _ => (1, 0, 0),
         };
         let dst = (hx + dx, hy + dy, hz + dz);
-        if container_kind(block_at(dst.0, dst.1, dst.2)).is_none() {
-            sched_result(hx, hy, hz, false);
-            requeue_hopper(hx, hy, hz);
-            continue;
-        }
-        let mut did = false;
-        // push one item from the hopper's own inventory toward facing container
         unpack_block_loot_if_needed(ow_block((hx, hy, hz)));
-        unpack_block_loot_if_needed(ow_block(dst));
-        if let Some(partner) = chest_partner(dst.0, dst.1, dst.2) {
-            unpack_block_loot_if_needed(ow_block(partner));
-        }
-        {
-            let mut all = chests().lock().unwrap();
-            let own = all.get(&ContainerKey::ow((hx, hy, hz))).and_then(|m| {
-                m.iter()
-                    .find(|(_, v)| v.1 > 0)
-                    .map(|(k, v)| (*k, v.clone()))
-            });
-            if let Some((k, (it, _, _cc))) = own {
-                let smax = item_stack_max(it, &_cc) as u8;
-                // vanilla merges double chests — push spills to the
-                // partner half when the facing half is full
-                let dsts = [dst, chest_partner(dst.0, dst.1, dst.2).unwrap_or(dst)];
-                for dp in dsts {
-                    let dstm = all.entry(ContainerKey::ow(dp)).or_default();
-                    let slot = dstm
-                        .iter()
-                        .find(|(_, v)| v.0 == it && v.2 == _cc && v.1 < smax)
-                        .map(|(s2, _)| *s2)
-                        .or_else(|| (0..27i16).find(|sl| !dstm.contains_key(sl)));
-                    let Some(slot) = slot else { continue }; // full -> try partner
-                    let cur = dstm.get(&slot).map(|v| v.1).unwrap_or(0);
-                    dstm.insert(slot, (it, cur + 1, _cc.clone()));
-                    if let Some(sm) = all.get_mut(&ContainerKey::ow((hx, hy, hz))) {
-                        if let Some(v) = sm.get_mut(&k) {
-                            v.1 -= 1;
-                            if v.1 == 0 {
-                                sm.remove(&k);
-                            }
-                        }
-                    }
-                    did = true;
-                    break;
-                }
-            }
-        }
-        if !did {
-            // pull one item from the chest above into the destination chest
-            let src = (hx, hy + 1, hz);
-            if container_kind(block_at(src.0, src.1, src.2)).is_some() {
-                unpack_block_loot_if_needed(ow_block(src));
-                if let Some(partner) = chest_partner(src.0, src.1, src.2) {
-                    unpack_block_loot_if_needed(ow_block(partner));
-                }
-                let mut all = chests().lock().unwrap();
-                // vanilla merges double chests into one container — a
-                // hopper under either half can pull from both
-                let srcs: [(i32, i32, i32); 2] =
-                    [src, chest_partner(src.0, src.1, src.2).unwrap_or(src)];
-                let item = srcs
-                    .iter()
-                    .filter_map(|sp| {
-                        all.get(&ContainerKey::ow(*sp)).and_then(|ch| {
-                            ch.iter()
-                                .find(|(_, v)| v.1 > 0)
-                                .map(|(k, v)| (*k, v.clone()))
-                                .map(|kv| (*sp, kv))
-                        })
-                    })
-                    .next();
-                if let Some((srcp, (k, (it, c, _xc)))) = item {
-                    let smax = item_stack_max(it, &_xc) as u8;
-                    let dstm = all.entry(ContainerKey::ow(dst)).or_default();
-                    let slot = dstm
-                        .iter()
-                        .find(|(_, v)| v.0 == it && v.2 == _xc && v.1 < smax)
-                        .map(|(s, _)| *s)
-                        .unwrap_or_else(|| {
-                            (0..27i16).find(|sl| !dstm.contains_key(sl)).unwrap_or(0)
-                        });
-                    let nc = dstm.get(&slot).map(|v| v.1).unwrap_or(0) + 1;
-                    if nc <= smax {
-                        dstm.insert(slot, (it, nc, _xc.clone()));
-                        if let Some(srcm) = all.get_mut(&ContainerKey::ow(srcp)) {
-                            if c <= 1 {
-                                srcm.remove(&k);
-                            } else {
-                                srcm.insert(k, (it, c - 1, _xc.clone()));
-                            }
-                        }
-                        did = true;
-                    }
-                }
-            }
-            // absorb drop entities resting on the hopper into the destination chest
-            let absorbed: Vec<(i32, i64, Comps)> = {
-                let dl = drops().lock().unwrap();
-                dl.iter()
-                    .filter(|d| {
-                        (d.x - (hx as f64 + 0.5)).abs() < 0.7
-                            && d.y > hy as f64 + 0.4
-                            && d.y < hy as f64 + 1.6
-                            && (d.z - (hz as f64 + 0.5)).abs() < 0.7
-                    })
-                    .map(|d| (d.eid, d.item, d.comps.clone()))
-                    .collect()
-            };
-            for (deid, item, dcp) in absorbed {
-                {
-                    let mut all = chests().lock().unwrap();
-                    let smax = item_stack_max(item, &dcp) as u8;
-                    let dstm = all.entry(ContainerKey::ow(dst)).or_default();
-                    let slot = dstm
-                        .iter()
-                        .find(|(_, v)| v.0 == item && v.2 == dcp && v.1 < smax)
-                        .map(|(s, _)| *s)
-                        .unwrap_or_else(|| {
-                            (0..27i16).find(|sl| !dstm.contains_key(sl)).unwrap_or(0)
-                        });
-                    let nc = dstm.get(&slot).map(|v| v.1).unwrap_or(0) + 1;
-                    if nc <= smax {
-                        dstm.insert(slot, (item, nc, dcp));
-                    } else {
-                        continue;
-                    }
-                }
-                drops().lock().unwrap().retain(|d| d.eid != deid);
-                let mut p = Vec::new();
-                write_varint(&mut p, 1);
-                write_varint(&mut p, deid as i64);
-                broadcast_seen(deid, |_c| (0x42, p.clone()));
-                did = true;
-            }
+        // Vanilla 1.21.1 `HopperBlockEntity.tryMoveItems` is
+        // `flag = ejectItems(...) | suckInItems(...)` — an *eager* bitwise OR, so
+        // the pull runs even when the push already moved an item and even when
+        // no container sits in front at all. `SleepingHopperEngine`'s
+        // `attempt_transfers` encodes the same shape: push first, then the
+        // container half of `suckInItems`, then the item-entity half.
+        let mut did = hopper_push(hx, hy, hz, dst);
+        if hopper_pull(hx, hy, hz) {
+            did = true;
+        } else if hopper_suck(hx, hy, hz) {
+            did = true;
         }
         sched_result(hx, hy, hz, did);
         requeue_hopper(hx, hy, hz);
     }
+}
+/// The container slot count a hopper transfer may see at `st`: vanilla reads
+/// any `Container` — chests, barrels and shulker boxes are 27 wide, a hopper is
+/// `HOPPER_INVENTORY_SIZE` wide — so hopper-to-hopper chains transfer through
+/// the same path as a hopper pushing into a chest.
+const HOPPER_SLOTS: i16 = HOPPER_INVENTORY_SIZE as i16;
+fn hopper_container_slots(st: u32) -> Option<i16> {
+    if (9225..=9234).contains(&st) {
+        Some(HOPPER_SLOTS)
+    } else {
+        container_kind(st).map(|_| 27)
+    }
+}
+/// Vanilla `ejectItems`: one item from the hopper's first non-empty slot into
+/// the facing container. Runs before any pull and independently of it.
+fn hopper_push(hx: i32, hy: i32, hz: i32, dst: (i32, i32, i32)) -> bool {
+    let Some(dst_slots) = hopper_container_slots(block_at(dst.0, dst.1, dst.2)) else {
+        return false;
+    };
+    unpack_block_loot_if_needed(ow_block(dst));
+    let partner = chest_partner(dst.0, dst.1, dst.2);
+    if let Some(partner) = partner {
+        unpack_block_loot_if_needed(ow_block(partner));
+    }
+    let mut all = chests().lock().unwrap();
+    let own = all.get(&ContainerKey::ow((hx, hy, hz))).and_then(|m| {
+        m.iter()
+            .filter(|(_, v)| v.1 > 0)
+            .map(|(k, v)| (*k, v.clone()))
+            .min_by_key(|(k, _)| *k)
+    });
+    let Some((k, (it, _, _cc))) = own else { return false };
+    let smax = item_stack_max(it, &_cc) as u8;
+    // vanilla merges double chests — push spills to the
+    // partner half when the facing half is full
+    let dsts = [
+        (dst, dst_slots),
+        partner.map(|p| (p, 27)).unwrap_or((dst, dst_slots)),
+    ];
+    for (dp, limit) in dsts {
+        let dstm = all.entry(ContainerKey::ow(dp)).or_default();
+        let slot = dstm
+            .iter()
+            .filter(|(s, v)| **s < limit && v.0 == it && v.2 == _cc && v.1 < smax)
+            .map(|(s2, _)| *s2)
+            .min()
+            .or_else(|| (0..limit).find(|sl| !dstm.contains_key(sl)));
+        let Some(slot) = slot else { continue }; // full -> try partner
+        let cur = dstm.get(&slot).map(|v| v.1).unwrap_or(0);
+        dstm.insert(slot, (it, cur + 1, _cc.clone()));
+        if let Some(sm) = all.get_mut(&ContainerKey::ow((hx, hy, hz))) {
+            if let Some(v) = sm.get_mut(&k) {
+                v.1 -= 1;
+                if v.1 == 0 {
+                    sm.remove(&k);
+                }
+            }
+        }
+        return true;
+    }
+    false
+}
+/// Vanilla `suckInItems`' container half: one item from the first extractable
+/// slot of the container above into the hopper's own five slots — the pulled
+/// item joins the hopper's buffer, it does not skip ahead to the push target.
+fn hopper_pull(hx: i32, hy: i32, hz: i32) -> bool {
+    let src = (hx, hy + 1, hz);
+    let Some(src_slots) = hopper_container_slots(block_at(src.0, src.1, src.2)) else {
+        return false;
+    };
+    unpack_block_loot_if_needed(ow_block(src));
+    let partner = chest_partner(src.0, src.1, src.2);
+    if let Some(partner) = partner {
+        unpack_block_loot_if_needed(ow_block(partner));
+    }
+    let mut all = chests().lock().unwrap();
+    // vanilla merges double chests into one container — a
+    // hopper under either half can pull from both
+    let srcs = [
+        (src, src_slots),
+        partner.map(|p| (p, 27)).unwrap_or((src, src_slots)),
+    ];
+    for (srcp, limit) in srcs {
+        let stacks: std::collections::BTreeMap<i16, Stack> = all
+            .get(&ContainerKey::ow(srcp))
+            .map(|ch| {
+                ch.iter()
+                    .filter(|(s, v)| **s < limit && v.1 > 0)
+                    .map(|(k, v)| (*k, v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (k, (it, c, _xc)) in stacks {
+            let smax = item_stack_max(it, &_xc) as u8;
+            {
+                let own = all.entry(ContainerKey::ow((hx, hy, hz))).or_default();
+                // vanilla `addItem` order: merge onto a matching partial slot
+                // first, else take the first empty of the hopper's five slots
+                let slot = own
+                    .iter()
+                    .filter(|(s, v)| {
+                        **s < HOPPER_SLOTS && v.0 == it && v.2 == _xc && v.1 < smax
+                    })
+                    .map(|(s, _)| *s)
+                    .min()
+                    .or_else(|| (0..HOPPER_SLOTS).find(|sl| !own.contains_key(sl)));
+                let Some(slot) = slot else { continue }; // hopper full -> next slot
+                let cur = own.get(&slot).map(|v| v.1).unwrap_or(0);
+                own.insert(slot, (it, cur + 1, _xc.clone()));
+            }
+            if let Some(srcm) = all.get_mut(&ContainerKey::ow(srcp)) {
+                if c <= 1 {
+                    srcm.remove(&k);
+                } else {
+                    srcm.insert(k, (it, c - 1, _xc.clone()));
+                }
+            }
+            return true;
+        }
+    }
+    false
+}
+/// Vanilla `suckInItems`' entity half: the first dropped item entity resting in
+/// the cell above the hopper loses as much of its stack as the hopper's own
+/// five slots can hold (`Hopper.addItem` semantics — a partial take leaves the
+/// remainder on the entity). One entity per activation, like the engine's
+/// `attempt_suck`.
+fn hopper_suck(hx: i32, hy: i32, hz: i32) -> bool {
+    let mut cell: Vec<(i32, i64, u8, Comps)> = {
+        let dl = drops().lock().unwrap();
+        dl.iter()
+            .filter(|d| {
+                (d.x - (hx as f64 + 0.5)).abs() < 0.7
+                    && d.y > hy as f64 + 0.4
+                    && d.y < hy as f64 + 1.6
+                    && (d.z - (hz as f64 + 0.5)).abs() < 0.7
+            })
+            .map(|d| (d.eid, d.item, d.cnt, d.comps.clone()))
+            .collect()
+    };
+    cell.sort_by_key(|(eid, ..)| *eid);
+    for (deid, item, cnt, dcp) in cell {
+        let smax = item_stack_max(item, &dcp) as u8;
+        let mut remaining = cnt;
+        let moved = {
+            let mut all = chests().lock().unwrap();
+            let own = all.entry(ContainerKey::ow((hx, hy, hz))).or_default();
+            let mut moved = 0u8;
+            while remaining > 0 {
+                let slot = own
+                    .iter()
+                    .filter(|(s, v)| {
+                        **s < HOPPER_SLOTS && v.0 == item && v.2 == dcp && v.1 < smax
+                    })
+                    .map(|(s, _)| *s)
+                    .min()
+                    .or_else(|| (0..HOPPER_SLOTS).find(|sl| !own.contains_key(sl)));
+                let Some(slot) = slot else { break };
+                let cur = own.get(&slot).map(|v| v.1).unwrap_or(0);
+                let take = remaining.min(smax - cur);
+                own.insert(slot, (item, cur + take, dcp.clone()));
+                remaining -= take;
+                moved += take;
+            }
+            moved
+        };
+        if moved == 0 {
+            continue;
+        }
+        if remaining == 0 {
+            drops().lock().unwrap().retain(|d| d.eid != deid);
+            let mut p = Vec::new();
+            write_varint(&mut p, 1);
+            write_varint(&mut p, deid as i64);
+            broadcast_seen(deid, |_c| (0x42, p.clone()));
+        } else if let Some(d) = drops().lock().unwrap().iter_mut().find(|d| d.eid == deid)
+        {
+            d.cnt = remaining;
+        }
+        return true;
+    }
+    false
 }
 fn drop_tick() {
     // Split under `MC_SPINE_TICK_PROFILE=1`. The bucketed merge landed without a
@@ -11411,5 +11471,242 @@ mod p5a_beacon_tests {
         assert_eq!(menu.payment.1, 0);
         drop(active);
         close_live_menu(&c, false, false);
+    }
+}
+
+#[cfg(test)]
+mod p6c_hopper_parity_tests {
+    use super::*;
+
+    const HY: i32 = 120;
+    const HPOS: (i32, i32, i32) = (0, HY, 0);
+
+    struct SavedWorld {
+        hoppers: HashSet<(i32, i32, i32)>,
+        chests: HashMap<ContainerKey, HashMap<i16, Stack>>,
+        drops: Vec<Drop>,
+        forced: HashSet<(i32, i32)>,
+        backoff: HashMap<DimBlockPos, (u64, u32)>,
+        tick: u64,
+        index: u64,
+        hot: HashSet<(i32, i32)>,
+        warm: HashSet<(i32, i32)>,
+    }
+
+    fn save_world() -> SavedWorld {
+        SavedWorld {
+            hoppers: std::mem::take(&mut *hoppers().lock().unwrap()),
+            chests: std::mem::take(&mut *chests().lock().unwrap()),
+            drops: std::mem::take(&mut *drops().lock().unwrap()),
+            forced: std::mem::take(&mut *forceloaded().lock().unwrap()),
+            backoff: std::mem::take(&mut *backoff().lock().unwrap()),
+            tick: TICK.swap(1, Ordering::Relaxed),
+            index: TICK_IDX.swap(0, Ordering::Relaxed),
+            hot: test_region().0,
+            warm: test_region().1,
+        }
+    }
+
+    fn restore_world(saved: SavedWorld) {
+        for y in HY - 1..=HY + 1 {
+            set_block(0, y, 0, 0);
+        }
+        set_block(1, HY, 0, 0);
+        hopper_queue().lock().unwrap().cancel(HPOS);
+        *hoppers().lock().unwrap() = saved.hoppers;
+        *chests().lock().unwrap() = saved.chests;
+        *drops().lock().unwrap() = saved.drops;
+        *forceloaded().lock().unwrap() = saved.forced;
+        *backoff().lock().unwrap() = saved.backoff;
+        TICK.store(saved.tick, Ordering::Relaxed);
+        TICK_IDX.store(saved.index, Ordering::Relaxed);
+        set_test_region(saved.hot, saved.warm);
+    }
+
+    /// One warm chunk so `hopper_tick`'s `is_warm` gate passes, and a clean
+    /// queue slot so `set_block`'s schedule call cannot lose to a leftover.
+    fn begin_hopper_world() {
+        set_test_region(HashSet::from([(0, 0)]), HashSet::from([(0, 0)]));
+        hopper_queue().lock().unwrap().cancel(HPOS);
+    }
+
+    fn put(pos: (i32, i32, i32), slot: i16, stack: Stack) {
+        chests()
+            .lock()
+            .unwrap()
+            .entry(ContainerKey::ow(pos))
+            .or_default()
+            .insert(slot, stack);
+    }
+
+    fn stacks_at(pos: (i32, i32, i32)) -> Vec<(i64, u8)> {
+        let mut v: Vec<(i64, u8)> = chests()
+            .lock()
+            .unwrap()
+            .get(&ContainerKey::ow(pos))
+            .map(|m| m.values().map(|(i, c, _)| (*i, *c)).collect())
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn p6c_parity_hopper_pushes_and_pulls_in_one_activation() {
+        let _guard = world_guard();
+        let saved = save_world();
+        begin_hopper_world();
+        let hy = HY;
+        let chest_st = name_to_state("chest").unwrap_or(2954);
+        let push_item = name_to_item("raw_iron").unwrap_or(1);
+        let pull_item = name_to_item("coal").unwrap_or(2);
+        set_block(0, hy, 0, 9225); // hopper facing down
+        set_block(0, hy - 1, 0, chest_st);
+        set_block(0, hy + 1, 0, chest_st);
+        put(HPOS, 0, (push_item, 1, Vec::new()));
+        put((0, hy + 1, 0), 0, (pull_item, 3, Vec::new()));
+
+        hopper_tick();
+        // Vanilla `ejectItems | suckInItems`: the primed hopper pushed its own
+        // item down AND pulled one from the chest above into its own slots in
+        // the same activation — the pull lands in the hopper, not the output.
+        assert_eq!(stacks_at((0, hy - 1, 0)), vec![(push_item, 1)]);
+        assert_eq!(stacks_at((0, hy + 1, 0)), vec![(pull_item, 2)]);
+        assert_eq!(stacks_at(HPOS), vec![(pull_item, 1)]);
+
+        hopper_tick();
+        // Second activation: the pulled item is the lowest occupied slot, so
+        // it is what gets pushed next while another item is pulled in.
+        assert_eq!(stacks_at((0, hy - 1, 0)), vec![(pull_item, 1), (push_item, 1)]);
+        assert_eq!(stacks_at((0, hy + 1, 0)), vec![(pull_item, 1)]);
+        assert_eq!(stacks_at(HPOS), vec![(pull_item, 1)]);
+        restore_world(saved);
+    }
+
+    #[test]
+    fn p6c_parity_powered_hopper_holds_items_and_pull_needs_no_push_target() {
+        let _guard = world_guard();
+        let saved = save_world();
+        begin_hopper_world();
+        let hy = HY;
+        let chest_st = name_to_state("chest").unwrap_or(2954);
+        let item = name_to_item("raw_iron").unwrap_or(1);
+
+        // Powered (locked) hopper: block updates recompute `enabled`, so the
+        // lock must come from real power — a redstone block beside it.
+        set_block(0, hy, 0, 9225);
+        set_block(0, hy - 1, 0, chest_st);
+        set_block(0, hy + 1, 0, chest_st);
+        set_block(1, hy, 0, name_to_state("redstone_block").unwrap_or(9223));
+        assert_eq!(block_at(0, hy, 0), 9230, "live update powered the hopper");
+        put(HPOS, 0, (item, 1, Vec::new()));
+        put((0, hy + 1, 0), 0, (item, 3, Vec::new()));
+        for _ in 0..4 {
+            hopper_tick();
+        }
+        assert_eq!(stacks_at((0, hy - 1, 0)), vec![]);
+        assert_eq!(stacks_at((0, hy + 1, 0)), vec![(item, 3)]);
+        assert_eq!(stacks_at(HPOS), vec![(item, 1)]);
+
+        // Unpowered hopper facing east into plain air: vanilla still runs
+        // `suckInItems` — a hopper with nothing in front still pulls from the
+        // container above into its own five slots.
+        set_block(1, hy, 0, 0);
+        assert!(block_at(0, hy, 0) < 9230, "hopper unlocks when power leaves");
+        set_block(0, hy, 0, 9229); // facing east, no container there
+        hopper_tick();
+        assert_eq!(stacks_at(HPOS), vec![(item, 2)]);
+        assert_eq!(stacks_at((0, hy + 1, 0)), vec![(item, 2)]);
+        restore_world(saved);
+    }
+
+    #[test]
+    fn p6c_parity_hopper_sucks_drop_stack_into_own_slots() {
+        let _guard = world_guard();
+        let saved = save_world();
+        begin_hopper_world();
+        let hy = HY;
+        let item = name_to_item("raw_iron").unwrap_or(1);
+        set_block(0, hy, 0, 9229); // facing east into air, no container above
+        drops().lock().unwrap().push(Drop {
+            eid: 9001,
+            x: 0.5,
+            y: hy as f64 + 1.0,
+            z: 0.5,
+            item,
+            cnt: 10,
+            comps: Vec::new(),
+            age: 0,
+            target: None,
+            thrower: None,
+        });
+        hopper_tick();
+        // Vanilla `Hopper.addItem`: the entity's whole stack fits the hopper's
+        // five slots, so the entity leaves with nothing — not one item.
+        assert_eq!(stacks_at(HPOS), vec![(item, 10)]);
+        assert!(drops().lock().unwrap().is_empty());
+
+        // A stack that does not fit leaves the remainder on the entity.
+        let slot_items = [1u8, 2, 3, 4];
+        for (i, c) in slot_items.iter().enumerate() {
+            put(HPOS, i as i16, (item, *c, Vec::new()));
+        }
+        drops().lock().unwrap().push(Drop {
+            eid: 9002,
+            x: 0.5,
+            y: hy as f64 + 1.0,
+            z: 0.5,
+            item,
+            cnt: 64,
+            comps: Vec::new(),
+            age: 0,
+            target: None,
+            thrower: None,
+        });
+        hopper_tick();
+        // `addItem` fills the lowest partial first: slot 0 tops to 64 (63
+        // taken), the 64th item lands on slot 1 — all of it fits.
+        assert_eq!(
+            stacks_at(HPOS),
+            vec![(item, 3), (item, 3), (item, 4), (item, 64)]
+        );
+        assert!(drops().lock().unwrap().is_empty());
+        restore_world(saved);
+    }
+
+    #[test]
+    fn p6c_parity_sleeping_engine_eager_pair_and_eight_tick_cooldown() {
+        // The live path and the canonical engine must agree on the vanilla
+        // shape: two items per activation, then eight ticks of cooldown.
+        let mut engine = SleepingHopperEngine::default();
+        let hopper = (DimId::Overworld, 0, 65, 0);
+        let above = (DimId::Overworld, 0, 66, 0);
+        let below = (DimId::Overworld, 0, 64, 0);
+        engine.place_hopper(hopper, HopperFacing::Down);
+        engine.set_container(above, vec![Some((99, 2, Vec::new())), None]);
+        engine.set_container(below, vec![None; 27]);
+        engine.hoppers.get_mut(&hopper).unwrap().slots[0] = Some((42, 1, Vec::new()));
+
+        let stats = engine.tick();
+        assert_eq!(
+            stats.items_transferred, 2,
+            "one push plus one pull in the same activation"
+        );
+        // Ticks 1..=7 move nothing — the cooldown is HOPPER_TRANSFER_COOLDOWN.
+        for tick in 1..HOPPER_TRANSFER_COOLDOWN {
+            let stats = engine.tick();
+            assert_eq!(
+                stats.items_transferred, 0,
+                "cooldown tick {tick} must not transfer"
+            );
+        }
+        let stats = engine.tick();
+        // Push the pulled item down and pull the second item in: another
+        // eager pair.
+        assert_eq!(stats.items_transferred, 2, "activation after the cooldown");
+        for _ in 0..HOPPER_TRANSFER_COOLDOWN - 1 {
+            engine.tick();
+        }
+        // Third activation: the source is empty, so only the push moves.
+        assert_eq!(engine.tick().items_transferred, 1);
     }
 }
