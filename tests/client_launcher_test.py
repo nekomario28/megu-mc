@@ -503,6 +503,64 @@ Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
         self.assertIn("mc_spine_mesh_abi_version", invalid.stderr)
 
 
+    def test_optional_kernel_library_abi_and_packaging(self):
+        kernel = require_native(self, KERNEL_LIB_NAME)
+        mesh = require_native(self, MESH_LIB_NAME)
+        arguments = ("--format", "all", "--loader", "fabric", "--loader-version", "0.16.10",
+                     "--integrated-jar", str(self.integrated), "--kernel-library", str(kernel),
+                     "--mesh-library", str(mesh))
+        first = self.root / "kernel-bundle-one"
+        self.export(first, *arguments)
+        original = {path.relative_to(first): path.read_bytes()
+                    for path in first.rglob("*") if path.is_file()}
+        self.export(first, *arguments)
+        self.assertEqual(original, {path.relative_to(first): path.read_bytes()
+                                    for path in first.rglob("*") if path.is_file()})
+        for name, library in ((KERNEL_LIB_NAME, kernel), (MESH_LIB_NAME, mesh)):
+            self.assertEqual((first / "prism/native" / name).read_bytes(), library.read_bytes())
+        with zipfile.ZipFile(first / "mc-spine-1.21.1.mrpack") as archive:
+            self.assertEqual(archive.namelist(), [
+                "modrinth.index.json",
+                f"overrides/mc-spine/native/{MESH_LIB_NAME}",
+                f"overrides/mc-spine/native/{KERNEL_LIB_NAME}",
+                "overrides/mods/mc-spine-integrated.jar"])
+            index = json.loads(archive.read("modrinth.index.json"))
+            content = archive.read(f"overrides/mc-spine/native/{KERNEL_LIB_NAME}")
+            self.assertEqual(content, kernel.read_bytes())
+            meta = index["mcSpine"]["bundledOverrides"][f"mc-spine/native/{KERNEL_LIB_NAME}"]
+            self.assertEqual(meta["fileSize"], len(content))
+            self.assertEqual(meta["hashes"], {"sha1": hashlib.sha1(content).hexdigest(),
+                                              "sha512": hashlib.sha512(content).hexdigest()})
+            for item in archive.infolist():
+                self.assertEqual(item.date_time, (1980, 1, 1, 0, 0, 0))
+                self.assertEqual((item.external_attr >> 16) & 0o777, 0o644)
+
+    def test_kernel_library_fails_closed(self):
+        fixtures = self.root / "kernel-fixtures"
+        wrong_abi = compile_c_library(fixtures / "abi", KERNEL_LIB_NAME,
+                                      "unsigned mc_spine_kernel_abi_version(void) { return 2; }\n")
+        no_symbol = compile_c_library(fixtures / "symbol", KERNEL_LIB_NAME,
+                                      "unsigned mc_spine_mesh_abi_version(void) { return 1; }\n")
+        junk = fixtures / "junk.so"
+        junk.write_bytes(b"missing ABI")
+        for index, (library, reason) in enumerate((
+                (wrong_abi, "unsupported kernel C ABI version 2, expected 1"),
+                (no_symbol, "mc_spine_kernel_abi_version"),
+                (junk, "mc_spine_kernel_abi_version"),
+                (fixtures / "absent.so", "kernel library is missing"))):
+            with self.subTest(reason=reason):
+                for fmt in ("prism", "mrpack"):
+                    out = self.root / f"invalid-kernel-{index}-{fmt}"
+                    extra = ("--loader", "fabric", "--loader-version", "0.16.10",
+                             "--integrated-jar", str(self.integrated)) if fmt == "mrpack" else ()
+                    result = self.export(out, "--format", fmt, *extra,
+                                         "--kernel-library", str(library), check=False)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(reason, result.stderr)
+                    self.assertFalse(out.exists() and any(out.rglob("*.mrpack")))
+                    self.assertFalse((out / "native").exists())
+
+
 class IntegratedModTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -758,6 +816,86 @@ public final class ConfiguredBridgeHarness {
         info = json.loads((world / "server.json").read_text())
         self.assert_dead(info["pid"])
         self.assertEqual((world / "stopped").read_text(), str(info["pid"]))
+
+    def lifecycle_run(self, loader, event, enabled=True):
+        if not hasattr(type(self), "lifecycle_dir"):
+            fakes = self.root / "lifecycle-src"
+            for name, body in LIFECYCLE_FAKES.items():
+                path = fakes / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(body)
+            classes = self.root / "lifecycle-classes"
+            subprocess.run(["javac", "-J-Djava.io.tmpdir=" + tempfile.gettempdir(),
+                            "-J-XX:-UsePerfData", "--release", "21", "-cp", str(self.jar),
+                            "-d", str(classes), *map(str, sorted(fakes.rglob("*.java")))],
+                           check=True, capture_output=True)
+            type(self).lifecycle_dir = classes
+        game = self.root / f"lifecycle-{loader}-{event}-{enabled}"
+        game.mkdir(exist_ok=True)
+        flags = ["-Dmc.spine.integrated.enabled=true"] if enabled else []
+        return game, subprocess.run(
+            ["java", "-Djava.io.tmpdir=" + tempfile.gettempdir(), "-XX:-UsePerfData", *flags,
+             "-Dmc.spine.integrated.serverBin=" + str(self.mock),
+             "-Dmc.spine.integrated.gameDir=" + str(game),
+             "-Dmc.spine.integrated.world=Lifecycle world",
+             "-cp", os.pathsep.join([str(self.lifecycle_dir), str(self.jar)]),
+             "LifecycleHarness", loader, event], capture_output=True, text=True, timeout=30)
+
+    def test_client_lifecycle_hooks_close_server_for_both_loaders(self):
+        for loader, event, hooks in (("fabric", "stopping", 2), ("fabric", "disconnect", 2),
+                                     ("neoforge", "logout", 2), ("neoforge", "shutdown", 2)):
+            with self.subTest(loader=loader, event=event):
+                game, result = self.lifecycle_run(loader, event)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"HOOKS {hooks}", result.stdout)
+                self.assertIn("STOPPED_BY_HOOK true", result.stdout)
+                world = game / "saves/Lifecycle world"
+                info = json.loads((world / "server.json").read_text())
+                self.assertEqual((world / "stopped").read_text(), str(info["pid"]))
+                self.assert_dead(info["pid"])
+
+    def test_client_lifecycle_hooks_inert_unless_enabled(self):
+        for loader in ("fabric", "neoforge"):
+            with self.subTest(loader=loader):
+                game, result = self.lifecycle_run(loader, "stopping", enabled=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("HOOKS 0", result.stdout)
+                self.assertIn("INERT false", result.stdout)
+                self.assertFalse((game / "saves").exists())
+
+    def test_fabric_hooks_survive_missing_fabric_api(self):
+        game = self.root / "lifecycle-no-fabric-api"
+        game.mkdir(exist_ok=True)
+        classes = self.root / "no-api-classes"
+        source = self.root / "NoApiHarness.java"
+        source.write_text("""import net.mcspine.integrated.FabricIntegratedMod;
+public final class NoApiHarness {
+    public static void main(String[] args) { new FabricIntegratedMod().onInitializeClient(); }
+}
+""")
+        stub = self.root / "no-api-stub/net/fabricmc/api/ClientModInitializer.java"
+        stub.parent.mkdir(parents=True, exist_ok=True)
+        stub.write_text(LIFECYCLE_FAKES["net/fabricmc/api/ClientModInitializer.java"])
+        subprocess.run(["javac", "-J-Djava.io.tmpdir=" + tempfile.gettempdir(),
+                        "-J-XX:-UsePerfData", "--release", "21", "-cp", str(self.jar),
+                        "-d", str(classes), str(stub), str(source)],
+                       check=True, capture_output=True)
+        result = subprocess.run(
+            ["java", "-Djava.io.tmpdir=" + tempfile.gettempdir(), "-XX:-UsePerfData",
+             "-Dmc.spine.integrated.enabled=true",
+             "-Dmc.spine.integrated.serverBin=" + str(self.mock),
+             "-Dmc.spine.integrated.gameDir=" + str(game),
+             "-Dmc.spine.integrated.world=Lifecycle world",
+             "-cp", os.pathsep.join([str(classes), str(self.jar)]), "NoApiHarness"],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Fabric hook CLIENT_STOPPING unavailable", result.stderr)
+        self.assertIn("Fabric hook DISCONNECT unavailable", result.stderr)
+        world = game / "saves/Lifecycle world"
+        info = json.loads((world / "server.json").read_text())
+        self.assertEqual((world / "stopped").read_text(), str(info["pid"]))
+        self.assert_dead(info["pid"])
+
 
     def test_real_protocol_767_and_clean_shutdown(self):
         binary = ROOT / "target/debug/mc-spine"
@@ -1129,6 +1267,391 @@ public final class DirectFrameHarness {
                 self.assertEqual(item.date_time, (1980, 1, 1, 0, 0, 0))
                 self.assertEqual((item.external_attr >> 16) & 0o777, 0o644)
                 self.assertEqual(item.create_system, 3)
+
+
+KERNEL_LIB_NAME = "libmc_spine_kernel.so"
+MESH_LIB_NAME = "libmc_spine_client_mesh.so"
+_NATIVE = {}
+
+
+def native_libraries():
+    """Build the client-kernel/client-port cdylibs once. Returns {name: (path|None, reason)}.
+
+    MC_SPINE_TEST_KERNEL_LIBRARY may name a prebuilt libmc_spine_kernel.so instead of the
+    cargo build. A failed build yields (None, first failure) so tests report it.
+    """
+    if _NATIVE:
+        return _NATIVE
+    override = os.environ.get("MC_SPINE_TEST_KERNEL_LIBRARY")
+    for crate, name in (("client-kernel", KERNEL_LIB_NAME), ("client-port", MESH_LIB_NAME)):
+        if name == KERNEL_LIB_NAME and override:
+            _NATIVE[name] = (Path(override), "")
+            continue
+        result = subprocess.run(
+            ["cargo", "build", "--manifest-path", str(ROOT / crate / "Cargo.toml"), "--release",
+             "-j", "2", "--offline", "--locked"], capture_output=True, text=True, timeout=290)
+        library = ROOT / crate / "target/release" / name
+        if result.returncode == 0 and library.is_file():
+            _NATIVE[name] = (library, "")
+        else:
+            _NATIVE[name] = (None, f"{crate} cargo build failed: {result.stderr.strip()[-400:]}")
+    return _NATIVE
+
+
+def require_native(case, name):
+    library, reason = native_libraries()[name]
+    if library is None:
+        case.skipTest(reason)
+    return library
+
+
+def compile_c_library(directory, name, source):
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "lib.c").write_text(source)
+    subprocess.run(["cc", "-shared", "-fPIC", "-o", str(directory / name),
+                    str(directory / "lib.c")], check=True, capture_output=True)
+    return directory / name
+
+
+class NativeBridgeTest(unittest.TestCase):
+    """Java NativeKernelBridge/NativeMeshBridge against the real C ABI libraries."""
+
+    HARNESS = r'''import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.file.Path;
+import java.util.Arrays;
+import net.mcspine.integrated.NativeBridgeException;
+import net.mcspine.integrated.NativeKernelBridge;
+import net.mcspine.integrated.NativeMeshBridge;
+
+public final class NativeBridgeHarness {
+    static int checks;
+
+    static void check(boolean condition, String message) {
+        if (!condition) {
+            throw new AssertionError(message);
+        }
+        checks++;
+    }
+
+    static ByteBuffer direct(int size) {
+        return ByteBuffer.allocateDirect(size).order(ByteOrder.nativeOrder());
+    }
+
+    static NativeBridgeException expect(Runnable action, String fragment) {
+        try {
+            action.run();
+        } catch (NativeBridgeException error) {
+            check(error.getMessage().contains(fragment), "message '" + error.getMessage() + "' lacks '" + fragment + "'");
+            return error;
+        }
+        throw new AssertionError("expected NativeBridgeException containing " + fragment);
+    }
+
+    static ByteBuffer aabb(double... values) {
+        ByteBuffer buffer = direct(values.length * 8);
+        for (double value : values) {
+            buffer.putDouble(value);
+        }
+        return buffer.flip();
+    }
+
+    static void kernel(Path library) throws Exception {
+        NativeKernelBridge bridge = NativeKernelBridge.open(library);
+        NativeKernelBridge.Palette palette = bridge.newPalette(0);
+        check(palette.get(0) == 0 && palette.nonAir() == 0, "air palette");
+        byte[] uniform = palette.writeWire();
+        palette.set(5, 1);
+        palette.set(4095, 1);
+        check(palette.get(5) == 1 && palette.get(4) == 0, "palette set/get");
+        check(palette.nonAir() == 2, "non air count");
+        byte[] wire = palette.writeWire();
+        check(wire.length > uniform.length && Arrays.equals(wire, palette.writeWire()), "wire output");
+        expect(() -> palette.get(4096), "status 2");
+        expect(() -> palette.set(0, 26684), "status 4");
+        palette.close();
+        palette.close();
+        expect(() -> palette.get(0), "closed");
+        try (NativeKernelBridge.Palette other = bridge.newPalette(1)) {
+            check(other.get(100) == 1 && other.nonAir() == 4096, "single-state palette");
+        }
+
+        ByteBuffer body = aabb(0, 0, 0, 1, 1, 1);
+        ByteBuffer floor = aabb(-1, -1, -1, 2, 0, 2);
+        NativeKernelBridge.Collision hit = bridge.collide(body, aabb(0, -1, 0), false, 0f, floor, 1);
+        check(hit.dx() == 0 && hit.dy() == 0 && hit.dz() == 0, "landing delta " + hit);
+        check((hit.flags() & 2) != 0, "vertical flag " + hit);
+        NativeKernelBridge.Collision free = bridge.collide(body, aabb(0.5, 0, 0.25), true, 0f, null, 0);
+        check(free.dx() == 0.5 && free.dz() == 0.25 && free.flags() == 0, "free movement " + free);
+        check(body.position() == 0 && body.remaining() == 48, "caller buffer position untouched");
+
+        ByteBuffer valid = direct(4).put(new byte[] {10, 0, 0, 0}).flip();
+        check(bridge.nbtValidateNamed(valid) == 0, "valid nbt");
+        ByteBuffer truncated = direct(3).put(new byte[] {10, 0, 0}).flip();
+        check(bridge.nbtValidateNamed(truncated) == 5, "invalid nbt");
+
+        expect(() -> bridge.collide(ByteBuffer.allocate(48), aabb(0, 0, 0), false, 0f, null, 0), "direct ByteBuffer");
+        expect(() -> bridge.nbtValidateNamed(ByteBuffer.wrap(new byte[] {10, 0, 0, 0})), "direct ByteBuffer");
+        ByteBuffer big = direct(128).order(ByteOrder.nativeOrder());
+        ByteBuffer misaligned = big.position(4).slice().order(ByteOrder.nativeOrder());
+        expect(() -> bridge.collide(misaligned, aabb(0, 0, 0), false, 0f, null, 0), "aligned");
+        expect(() -> bridge.collide(aabb(0, 0, 0), aabb(0, 0, 0), false, 0f, null, 0), "too small");
+        expect(() -> bridge.collide(body, aabb(0, 0, 0), false, 0f, null, 1), "shapes");
+
+        NativeKernelBridge.Palette survivor = bridge.newPalette(0);
+        bridge.close();
+        bridge.close();
+        check(!bridge.isOpen(), "closed");
+        expect(() -> bridge.newPalette(0), "closed");
+        expect(() -> survivor.get(0), "closed");
+        survivor.close();
+    }
+
+    static void mesh(Path library) throws Exception {
+        NativeMeshBridge bridge = NativeMeshBridge.open(library);
+        ByteBuffer blocks = direct(4096 * 16);
+        int cell = (1 * 256 + 1 * 16 + 1) * 16;
+        blocks.putInt(cell, 1).put(cell + 12, (byte) 1).put(cell + 13, (byte) 0x3f);
+        ByteBuffer blockLight = direct(2048);
+        ByteBuffer skyLight = direct(2048);
+        check(bridge.meshSection(blocks, blockLight, skyLight, 0, null, 0) == 6, "quad count query");
+        ByteBuffer quads = direct(6 * 84);
+        check(bridge.meshSection(blocks, blockLight, skyLight, 0, quads, 6) == 6, "quads");
+        boolean[] seen = new boolean[6];
+        for (int i = 0; i < 6; i++) {
+            check(quads.getInt(i * 84 + 48) == 1, "quad state");
+            seen[quads.get(i * 84 + 77)] = true;
+        }
+        for (boolean face : seen) {
+            check(face, "all six directions meshed");
+        }
+        NativeBridgeException small = expect(() -> bridge.meshSection(blocks, blockLight, skyLight, 0,
+                direct(5 * 84), 5), "status 2");
+        check(small.status() == 2 && small.getMessage().contains("required 6"), "required count");
+        check(bridge.packVertices(quads, 6, null, 0) == 24, "vertex count query");
+        ByteBuffer vertices = direct(24 * 16);
+        check(bridge.packVertices(quads, 6, vertices, 24) == 24, "vertices");
+        check(vertices.getInt(4) == 1, "vertex state id");
+        expect(() -> bridge.packVertices(quads, 6, direct(16), 1), "status 2");
+        expect(() -> bridge.meshSection(ByteBuffer.allocate(4096 * 16), blockLight, skyLight, 0, null, 0),
+                "direct ByteBuffer");
+        expect(() -> bridge.meshSection(blocks, blockLight, skyLight, 0, null, 3), "output buffer");
+        expect(() -> bridge.meshSection(blocks, direct(16), skyLight, 0, null, 0), "too small");
+        bridge.close();
+        bridge.close();
+        expect(() -> bridge.meshSection(blocks, blockLight, skyLight, 0, null, 0), "closed");
+    }
+
+    static void failClosed(Path directory) {
+        String kernel = "libmc_spine_kernel.so";
+        String mesh = "libmc_spine_client_mesh.so";
+        expect(() -> NativeKernelBridge.open(null), "absolute");
+        expect(() -> NativeKernelBridge.open(Path.of(kernel)), "absolute");
+        expect(() -> NativeKernelBridge.open(directory.resolve("missing/../missing/" + kernel)), "normalized");
+        expect(() -> NativeKernelBridge.open(directory.resolve("missing").resolve(kernel)), "missing");
+        expect(() -> NativeKernelBridge.open(directory.resolve("wrongname/libother.so")), "must be named");
+        expect(() -> NativeKernelBridge.open(directory.resolve("junk").resolve(kernel)), "cannot load");
+        expect(() -> NativeKernelBridge.open(directory.resolve("writable").resolve(kernel)), "writable");
+        expect(() -> NativeKernelBridge.open(directory.resolve("wrongabi").resolve(kernel)), "ABI 2");
+        expect(() -> NativeMeshBridge.open(directory.resolve("wrongabi").resolve(mesh)), "ABI 2");
+        expect(() -> NativeKernelBridge.open(directory.resolve("crosswired").resolve(kernel)), "lacks symbol");
+        expect(() -> NativeMeshBridge.open(directory.resolve("crosswired").resolve(mesh)), "lacks symbol");
+        expect(() -> NativeKernelBridge.open(directory.resolve("partial").resolve(kernel)),
+                "lacks symbol mc_spine_kernel_palette_new_single");
+    }
+
+    public static void main(String[] args) throws Exception {
+        switch (args[0]) {
+            case "kernel" -> kernel(Path.of(args[1]));
+            case "mesh" -> mesh(Path.of(args[1]));
+            case "failclosed" -> failClosed(Path.of(args[1]));
+            default -> throw new IllegalArgumentException("unknown mode " + args[0]);
+        }
+        System.out.println(args[0].toUpperCase() + "_OK checks=" + checks);
+    }
+}
+'''
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory(prefix="mc-spine-native-bridge-")
+        cls.addClassCleanup(cls.temporary.cleanup)
+        cls.root = Path(cls.temporary.name)
+        cls.jar_dir = cls.root / "jar"
+        subprocess.run([sys.executable, str(TOOLS / "build_integrated_mod.py"),
+                        "--out-dir", str(cls.jar_dir)], check=True, capture_output=True)
+        cls.jar = cls.jar_dir / "mc-spine-integrated.jar"
+        harness = cls.root / "NativeBridgeHarness.java"
+        harness.write_text(cls.HARNESS)
+        subprocess.run(["javac", "-J-Djava.io.tmpdir=" + tempfile.gettempdir(),
+                        "-J-XX:-UsePerfData", "--release", "21", "-cp", str(cls.jar),
+                        "-d", str(cls.root), str(harness)], check=True, capture_output=True)
+        fixtures = cls.root / "fixtures"
+        cls.fixtures = fixtures
+        abi = "unsigned %s(void) { return %d; }\n"
+        kernel_abi, mesh_abi = "mc_spine_kernel_abi_version", "mc_spine_mesh_abi_version"
+        for folder in ("missing", "wrongname"):
+            (fixtures / folder).mkdir(parents=True, exist_ok=True)
+        (fixtures / "wrongname/libother.so").write_bytes(b"x")
+        (fixtures / "junk").mkdir(parents=True, exist_ok=True)
+        (fixtures / "junk" / KERNEL_LIB_NAME).write_bytes(b"not an ELF object")
+        writable = compile_c_library(fixtures / "writable", KERNEL_LIB_NAME, abi % (kernel_abi, 1))
+        writable.chmod(0o666)
+        compile_c_library(fixtures / "wrongabi", KERNEL_LIB_NAME, abi % (kernel_abi, 2))
+        compile_c_library(fixtures / "wrongabi", MESH_LIB_NAME, abi % (mesh_abi, 2))
+        compile_c_library(fixtures / "crosswired", KERNEL_LIB_NAME, abi % (mesh_abi, 1))
+        compile_c_library(fixtures / "crosswired", MESH_LIB_NAME, abi % (kernel_abi, 1))
+        compile_c_library(fixtures / "partial", KERNEL_LIB_NAME, abi % (kernel_abi, 1))
+
+    def run_harness(self, *arguments):
+        return subprocess.run(
+            ["java", "-Djava.io.tmpdir=" + tempfile.gettempdir(), "-XX:-UsePerfData",
+             "--enable-native-access=ALL-UNNAMED",
+             "-cp", os.pathsep.join([str(self.root), str(self.jar)]),
+             "NativeBridgeHarness", *arguments],
+            capture_output=True, text=True, timeout=60)
+
+    def test_kernel_palette_collide_nbt_roundtrip(self):
+        result = self.run_harness("kernel", str(require_native(self, KERNEL_LIB_NAME)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("KERNEL_OK", result.stdout)
+
+    def test_mesh_section_and_vertex_packing_roundtrip(self):
+        result = self.run_harness("mesh", str(require_native(self, MESH_LIB_NAME)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("MESH_OK", result.stdout)
+
+    def test_loaders_fail_closed(self):
+        result = self.run_harness("failclosed", str(self.fixtures))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("FAILCLOSED_OK", result.stdout)
+
+    def test_jar_contains_native_bridge_and_no_stubs_and_is_reproducible(self):
+        second = self.root / "jar-second"
+        subprocess.run([sys.executable, str(TOOLS / "build_integrated_mod.py"),
+                        "--out-dir", str(second)], check=True, capture_output=True)
+        self.assertEqual(self.jar.read_bytes(), (second / "mc-spine-integrated.jar").read_bytes())
+        with zipfile.ZipFile(self.jar) as archive:
+            names = set(archive.namelist())
+        for name in ("NativeBridgeException", "NativeKernelBridge", "NativeKernelBridge$Palette",
+                     "NativeKernelBridge$Collision", "NativeLibrary", "NativeMeshBridge"):
+            self.assertIn(f"net/mcspine/integrated/{name}.class", names)
+        self.assertFalse(any(name.startswith(("net/fabricmc/", "net/neoforged/")) for name in names))
+
+
+LIFECYCLE_FAKES = {
+    "net/fabricmc/api/ClientModInitializer.java": """package net.fabricmc.api;
+public interface ClientModInitializer { void onInitializeClient(); }
+""",
+    "net/fabricmc/fabric/api/event/Event.java": """package net.fabricmc.fabric.api.event;
+public class Event<T> {
+    public final java.util.List<T> handlers = new java.util.ArrayList<>();
+    public void register(T handler) { handlers.add(handler); }
+}
+""",
+    "net/fabricmc/fabric/api/client/event/lifecycle/v1/ClientLifecycleEvents.java": """package net.fabricmc.fabric.api.client.event.lifecycle.v1;
+import net.fabricmc.fabric.api.event.Event;
+public final class ClientLifecycleEvents {
+    public static final Event<ClientStopping> CLIENT_STOPPING = new Event<>();
+    @FunctionalInterface public interface ClientStopping { void onClientStopping(Object client); }
+}
+""",
+    "net/fabricmc/fabric/api/client/networking/v1/ClientPlayConnectionEvents.java": """package net.fabricmc.fabric.api.client.networking.v1;
+import net.fabricmc.fabric.api.event.Event;
+public final class ClientPlayConnectionEvents {
+    public static final Event<Disconnect> DISCONNECT = new Event<>();
+    @FunctionalInterface public interface Disconnect { void onPlayDisconnect(Object handler, Object client); }
+}
+""",
+    "net/neoforged/fml/common/Mod.java": """package net.neoforged.fml.common;
+@java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME)
+public @interface Mod { String value(); }
+""",
+    "net/neoforged/bus/api/Event.java": """package net.neoforged.bus.api;
+public abstract class Event { }
+""",
+    "net/neoforged/bus/api/IEventBus.java": """package net.neoforged.bus.api;
+public interface IEventBus { <T extends Event> void addListener(java.util.function.Consumer<T> consumer); }
+""",
+    "net/neoforged/neoforge/common/NeoForge.java": """package net.neoforged.neoforge.common;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.Consumer;
+import net.neoforged.bus.api.Event;
+import net.neoforged.bus.api.IEventBus;
+public class NeoForge {
+    public static final List<Consumer<?>> LISTENERS = new ArrayList<>();
+    public static final IEventBus EVENT_BUS = new IEventBus() {
+        public <T extends Event> void addListener(Consumer<T> consumer) { LISTENERS.add(consumer); }
+    };
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    public static void post(Event event) {
+        for (Consumer listener : LISTENERS) {
+            try { listener.accept(event); } catch (ClassCastException ignored) { }
+        }
+    }
+}
+""",
+    "net/neoforged/neoforge/event/GameShuttingDownEvent.java": """package net.neoforged.neoforge.event;
+public class GameShuttingDownEvent extends net.neoforged.bus.api.Event { }
+""",
+    "net/neoforged/neoforge/client/event/ClientPlayerNetworkEvent.java": """package net.neoforged.neoforge.client.event;
+public abstract class ClientPlayerNetworkEvent extends net.neoforged.bus.api.Event {
+    public static class LoggingOut extends ClientPlayerNetworkEvent { }
+}
+""",
+    "LifecycleHarness.java": """import java.nio.file.Files;
+import java.nio.file.Path;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
+import net.mcspine.integrated.FabricIntegratedMod;
+import net.mcspine.integrated.NeoForgeIntegratedMod;
+import net.neoforged.neoforge.client.event.ClientPlayerNetworkEvent;
+import net.neoforged.neoforge.common.NeoForge;
+import net.neoforged.neoforge.event.GameShuttingDownEvent;
+
+public final class LifecycleHarness {
+    public static void main(String[] args) throws Exception {
+        String loader = args[0];
+        String event = args[1];
+        int hooks;
+        if (loader.equals("fabric")) {
+            new FabricIntegratedMod().onInitializeClient();
+            hooks = ClientLifecycleEvents.CLIENT_STOPPING.handlers.size()
+                    + ClientPlayConnectionEvents.DISCONNECT.handlers.size();
+        } else {
+            new NeoForgeIntegratedMod();
+            hooks = NeoForge.LISTENERS.size();
+        }
+        System.out.println("HOOKS " + hooks);
+        Path info = Path.of(System.getProperty("mc.spine.integrated.gameDir"), "saves",
+                System.getProperty("mc.spine.integrated.world"), "server.json");
+        if (hooks == 0) {
+            System.out.println("INERT " + Files.exists(info));
+            return;
+        }
+        String json = Files.readString(info);
+        long pid = Long.parseLong(json.replaceAll("(?s).*\\"pid\\": ?([0-9]+).*", "$1"));
+        if (!ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false)) {
+            throw new AssertionError("server not running before hook");
+        }
+        switch (event) {
+            case "stopping" -> ClientLifecycleEvents.CLIENT_STOPPING.handlers.forEach(h -> h.onClientStopping(null));
+            case "disconnect" -> ClientPlayConnectionEvents.DISCONNECT.handlers.forEach(h -> h.onPlayDisconnect(null, null));
+            case "logout" -> NeoForge.post(new ClientPlayerNetworkEvent.LoggingOut());
+            case "shutdown" -> NeoForge.post(new GameShuttingDownEvent());
+            default -> throw new IllegalArgumentException(event);
+        }
+        long deadline = System.nanoTime() + 6_000_000_000L;
+        while (ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false) && System.nanoTime() < deadline) {
+            Thread.sleep(20);
+        }
+        System.out.println("STOPPED_BY_HOOK " + !ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false));
+        System.out.flush();
+    }
+}
+""",
+}
 
 
 if __name__ == "__main__":

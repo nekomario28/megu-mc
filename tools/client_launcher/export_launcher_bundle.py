@@ -19,9 +19,11 @@ HERE = Path(__file__).resolve().parent
 ZIP_TIME = (1980, 1, 1, 0, 0, 0)
 MINECRAFT = "1.21.1"
 MESH_ABI = 1
+KERNEL_ABI = 1
 LOADER_UID = {"fabric": "net.fabricmc.fabric-loader", "neoforge": "net.neoforged"}
 LOADER_DEPENDENCY = {"fabric": "fabric-loader", "neoforge": "neoforge"}
 MESH_NAME = "libmc_spine_client_mesh.so"
+KERNEL_NAME = "libmc_spine_kernel.so"
 
 
 def sha(path, algorithm):
@@ -41,20 +43,30 @@ def verify_executable(binary, expected):
         raise ValueError("native client SHA-256 mismatch")
 
 
-def verify_mesh_abi(library):
-    """The current client-port C ABI exposes mc_spine_mesh_abi_version (v1)."""
+def verify_library_abi(library, label, symbol, expected):
+    """Load a C library with ctypes and require symbol() to return the expected ABI."""
     if not library.is_file():
-        raise ValueError("mesh library is missing")
+        raise ValueError(f"{label} library is missing")
     try:
         handle = ctypes.CDLL(str(library))
-        abi = handle.mc_spine_mesh_abi_version
+        abi = getattr(handle, symbol)
         abi.restype = ctypes.c_uint32
         abi.argtypes = []
         found = abi()
     except (OSError, AttributeError) as error:
-        raise ValueError("mesh library is not loadable or lacks mc_spine_mesh_abi_version") from error
-    if found != MESH_ABI:
-        raise ValueError(f"unsupported mesh C ABI version {found}, expected {MESH_ABI}")
+        raise ValueError(f"{label} library is not loadable or lacks {symbol}") from error
+    if found != expected:
+        raise ValueError(f"unsupported {label} C ABI version {found}, expected {expected}")
+
+
+def verify_mesh_abi(library):
+    """The current client-port C ABI exposes mc_spine_mesh_abi_version (v1)."""
+    verify_library_abi(library, "mesh", "mc_spine_mesh_abi_version", MESH_ABI)
+
+
+def verify_kernel_abi(library):
+    """The client-kernel C ABI exposes mc_spine_kernel_abi_version (v1)."""
+    verify_library_abi(library, "kernel", "mc_spine_kernel_abi_version", KERNEL_ABI)
 
 
 def write_text(path, contents):
@@ -74,7 +86,7 @@ def component_list(loader, loader_version):
 
 
 def prism_export(directory, loader, loader_version, name, client_bin, client_sha256,
-                 integrated_jar, mesh_lib):
+                 integrated_jar, native_libs):
     directory.mkdir(parents=True, exist_ok=True)
     # Prism's wrapper command needs a fully resolved executable. Double quotes
     # preserve paths containing spaces in Prism's command-line splitter.
@@ -102,10 +114,10 @@ def prism_export(directory, loader, loader_version, name, client_bin, client_sha
         destination = directory / ".minecraft/mods/mc-spine-integrated.jar"
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(integrated_jar, destination)
-    if mesh_lib:
-        destination = directory / "native" / MESH_NAME
+    for name, library in sorted(native_libs.items()):
+        destination = directory / "native" / name
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(mesh_lib, destination)
+        shutil.copyfile(library, destination)
 
 
 def zip_entry(archive, name, data, mode=0o644):
@@ -116,11 +128,11 @@ def zip_entry(archive, name, data, mode=0o644):
     archive.writestr(info, data, compresslevel=9)
 
 
-def mrpack_export(directory, loader, loader_version, name, version_id, integrated_jar, mesh_lib):
+def mrpack_export(directory, loader, loader_version, name, version_id, integrated_jar, native_libs):
     directory.mkdir(parents=True, exist_ok=True)
     contents = {"overrides/mods/mc-spine-integrated.jar": (integrated_jar.read_bytes(), 0o644)}
-    if mesh_lib:
-        contents[f"overrides/mc-spine/native/{MESH_NAME}"] = (mesh_lib.read_bytes(), 0o644)
+    for lib_name, library in native_libs.items():
+        contents[f"overrides/mc-spine/native/{lib_name}"] = (library.read_bytes(), 0o644)
     # .mrpack files[] describes downloadable URLs. Local overrides are bundled,
     # so checksums are retained in a namespaced extension instead.
     bundled = {}
@@ -166,6 +178,8 @@ def main():
                         help="existing integrated JAR (otherwise build it for loader packs)")
     parser.add_argument("--mesh-library", type=Path,
                         help="optional client-port cdylib (C ABI v1 required)")
+    parser.add_argument("--kernel-library", type=Path,
+                        help="optional client-kernel cdylib (C ABI v1 required)")
     args = parser.parse_args()
     exporting_mrpack = args.format in ("mrpack", "modrinth", "all")
     if bool(args.loader) != bool(args.loader_version):
@@ -183,12 +197,17 @@ def main():
         parser.error("--client-sha256 must be 64 hexadecimal characters")
 
     client_bin = args.client_bin.resolve() if args.client_bin else None
-    mesh_lib = args.mesh_library.resolve() if args.mesh_library else None
+    native_libs = {}
+    for name, option in ((MESH_NAME, args.mesh_library), (KERNEL_NAME, args.kernel_library)):
+        if option:
+            native_libs[name] = option.resolve()
     integrated_jar = args.integrated_jar.resolve() if args.integrated_jar else None
     try:
         verify_executable(client_bin, args.client_sha256)
-        if mesh_lib:
-            verify_mesh_abi(mesh_lib)
+        if MESH_NAME in native_libs:
+            verify_mesh_abi(native_libs[MESH_NAME])
+        if KERNEL_NAME in native_libs:
+            verify_kernel_abi(native_libs[KERNEL_NAME])
         if integrated_jar and not integrated_jar.is_file():
             raise ValueError("--integrated-jar must be an existing JAR")
         if integrated_jar and not args.loader:
@@ -204,11 +223,11 @@ def main():
         if args.format in ("prism", "all"):
             prism_dir = output / "prism" if args.format == "all" else output
             prism_export(prism_dir, args.loader, args.loader_version, args.name,
-                         client_bin, args.client_sha256, integrated_jar, mesh_lib)
+                         client_bin, args.client_sha256, integrated_jar, native_libs)
             print(f"Prism instance: {prism_dir}")
         if exporting_mrpack:
             bundle = mrpack_export(output, args.loader, args.loader_version, args.name,
-                                   args.version_id, integrated_jar, mesh_lib)
+                                   args.version_id, integrated_jar, native_libs)
             print(f"Modrinth bundle: {bundle} (sha256={sha(bundle, 'sha256')})")
 
 

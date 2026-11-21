@@ -19,14 +19,35 @@ JAVA_PACKAGE = HERE / "net/mcspine/integrated"
 ZIP_TIME = (1980, 1, 1, 0, 0, 0)
 MOD_ID = "mc_spine_integrated"
 
-FABRIC_STUB = """package net.fabricmc.api;
+COMPILE_STUBS = {
+    "net/fabricmc/api/ClientModInitializer.java": """package net.fabricmc.api;
 public interface ClientModInitializer { void onInitializeClient(); }
-"""
-NEOFORGE_STUB = """package net.neoforged.fml.common;
+""",
+    "net/neoforged/fml/common/Mod.java": """package net.neoforged.fml.common;
 @java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME)
 @java.lang.annotation.Target(java.lang.annotation.ElementType.TYPE)
 public @interface Mod { String value(); }
-"""
+""",
+    "net/neoforged/bus/api/Event.java": """package net.neoforged.bus.api;
+public abstract class Event { }
+""",
+    "net/neoforged/bus/api/IEventBus.java": """package net.neoforged.bus.api;
+public interface IEventBus {
+    <T extends Event> void addListener(java.util.function.Consumer<T> consumer);
+}
+""",
+    "net/neoforged/neoforge/common/NeoForge.java": """package net.neoforged.neoforge.common;
+public class NeoForge { public static final net.neoforged.bus.api.IEventBus EVENT_BUS = null; }
+""",
+    "net/neoforged/neoforge/event/GameShuttingDownEvent.java": """package net.neoforged.neoforge.event;
+public class GameShuttingDownEvent extends net.neoforged.bus.api.Event { }
+""",
+    "net/neoforged/neoforge/client/event/ClientPlayerNetworkEvent.java": """package net.neoforged.neoforge.client.event;
+public abstract class ClientPlayerNetworkEvent extends net.neoforged.bus.api.Event {
+    public static class LoggingOut extends ClientPlayerNetworkEvent { }
+}
+""",
+}
 
 
 def manifests():
@@ -79,10 +100,7 @@ def build_jar(out_dir):
         stubs = scratch / "stub_sources"
         classes = scratch / "stub_classes"
         output = scratch / "classes"
-        for name, body in (
-            ("net/fabricmc/api/ClientModInitializer.java", FABRIC_STUB),
-            ("net/neoforged/fml/common/Mod.java", NEOFORGE_STUB),
-        ):
+        for name, body in COMPILE_STUBS.items():
             path = stubs / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(body)
