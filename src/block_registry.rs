@@ -10,7 +10,141 @@
 use crate::json::{jarr, jnum, jparse, js, jstr, J};
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+// ---------- version-pack asset paths ----------
+//
+// One block-registry pack exists per Minecraft version: the bundled 1.21.1
+// pack spells the tag on every filename (`blocks_1211.json`), and a future
+// pack directory uses version-neutral names (`blocks.json`). The
+// `MC_SPINE_VERSION_DIR` environment override points at such a directory;
+// when it is unset the bundled `assets/` pack resolves to exactly the paths
+// this module always used. This is the single place the `1211` tag appears.
+
+/// The bundled pack's version tag.
+const VERSION_ASSET_TAG: &str = "1211";
+
+/// Resolved filesystem paths for one version's block-registry asset set.
+/// `resolve()` picks the pack, `from_dir()` maps the filenames inside it.
+pub(crate) struct VersionAssetPaths {
+    /// `blocks*.json`: per-block metadata — names, state-id ranges, properties,
+    /// hardness, harvest tools, drops and stack sizes.
+    pub(crate) blocks: PathBuf,
+    /// `block_states*.json`: per-state flags, collision shape indices and the
+    /// deduplicated shape table.
+    pub(crate) block_states: PathBuf,
+    /// `block_predicates*.bin`: heightmap predicate bits, the double-plant flag
+    /// and the water/source-water pair indexed by state id.
+    pub(crate) block_predicates: PathBuf,
+    /// `block_state_facts*.bin`: the pinned six-bytes-per-state physical-facts
+    /// table (`STATE_FACT_BYTES` columns).
+    pub(crate) block_state_facts: PathBuf,
+    /// `collision_shape_full*.bin`: the independent `isCollisionShapeFullBlock`
+    /// oracle kept for the contract cross-check, not for reads here.
+    /// Resolved for pack completeness; the pinned fact table is the owner.
+    #[allow(dead_code)]
+    pub(crate) collision_shape_full: PathBuf,
+    /// `mineshaft_support*.bin`: support-face bytes; the chain-anchor bit is
+    /// the one fact in it the pinned table does not carry.
+    pub(crate) mineshaft_support: PathBuf,
+    /// `multiface_support*.bin`: `MultifaceBlock.canAttachTo` face masks.
+    pub(crate) multiface_support: PathBuf,
+    /// `structure_state_transforms*.bin`: structure-template transforms,
+    /// resolved for pack completeness; its consumer lives in structure code.
+    #[allow(dead_code)]
+    pub(crate) structure_state_transforms: PathBuf,
+    /// `template_solid*.bin`: solid-template eligibility per state.
+    pub(crate) template_solid: PathBuf,
+}
+
+/// The nine files that make up one pack: (field-neutral-name) pairs are
+/// spelled once so `from_dir` and `default_pack` cannot disagree.
+const VERSION_ASSET_FILES: &[&str] = &[
+    "blocks.json",
+    "block_states.json",
+    "block_predicates.bin",
+    "block_state_facts.bin",
+    "collision_shape_full.bin",
+    "mineshaft_support.bin",
+    "multiface_support.bin",
+    "structure_state_transforms.bin",
+    "template_solid.bin",
+];
+
+impl VersionAssetPaths {
+    /// The pack for this run: the directory `MC_SPINE_VERSION_DIR` names when
+    /// set, else the bundled 1.21.1 `assets/` pack — byte-identical paths to
+    /// what the hardcoded reads used, so the default run cannot observe the
+    /// indirection.
+    pub(crate) fn resolve() -> VersionAssetPaths {
+        match std::env::var_os("MC_SPINE_VERSION_DIR") {
+            Some(dir) if !dir.is_empty() => Self::from_dir(Path::new(&dir)),
+            _ => Self::default_pack(),
+        }
+    }
+
+    /// One pack directory: for each asset the version-neutral filename wins;
+    /// when it is absent the `*_TAG` spelling of the bundled pack is the
+    /// fallback, so an existing `assets/` copy also serves as a version dir.
+    /// When neither exists the neutral path is still reported, so the load
+    /// error names the file the pack should have provided.
+    pub(crate) fn from_dir(dir: &Path) -> VersionAssetPaths {
+        let pick = |neutral: &str| -> PathBuf {
+            let n = dir.join(neutral);
+            if n.is_file() {
+                return n;
+            }
+            let (stem, ext) = neutral
+                .split_once('.')
+                .expect("version asset names carry one extension");
+            let tagged = dir.join(format!("{stem}_{VERSION_ASSET_TAG}.{ext}"));
+            if tagged.is_file() {
+                tagged
+            } else {
+                n
+            }
+        };
+        let mut it = VERSION_ASSET_FILES.iter();
+        let mut next = || pick(it.next().expect("nine pack files"));
+        VersionAssetPaths {
+            blocks: next(),
+            block_states: next(),
+            block_predicates: next(),
+            block_state_facts: next(),
+            collision_shape_full: next(),
+            mineshaft_support: next(),
+            multiface_support: next(),
+            structure_state_transforms: next(),
+            template_solid: next(),
+        }
+    }
+
+    /// The bundled pack: `assets/<name>_TAG.<ext>` for every file.
+    fn default_pack() -> VersionAssetPaths {
+        let dir = Path::new("assets");
+        let mut it = VERSION_ASSET_FILES.iter();
+        let mut next = || {
+            let (stem, ext) = it
+                .next()
+                .expect("nine pack files")
+                .split_once('.')
+                .expect("version asset names carry one extension");
+            dir.join(format!("{stem}_{VERSION_ASSET_TAG}.{ext}"))
+        };
+        VersionAssetPaths {
+            blocks: next(),
+            block_states: next(),
+            block_predicates: next(),
+            block_state_facts: next(),
+            collision_shape_full: next(),
+            mineshaft_support: next(),
+            multiface_support: next(),
+            structure_state_transforms: next(),
+            template_solid: next(),
+        }
+    }
+}
 
 // ---------- block-state JSON helpers ----------
 
@@ -136,6 +270,17 @@ pub(crate) struct BReg {
     /// place. `getRandomElement(tag, random)` indexes into that order, so a set would return
     /// a different member for the same draw.
     tag_order: HashMap<String, Vec<u32>>,
+    /// The pack's `block_state_facts` bytes, indexed by `state_fact`.
+    facts: Box<[u8]>,
+    /// The pack's `block_predicates` bytes, read by `native_predicates`.
+    predicates: Box<[u8]>,
+    /// The pack's `mineshaft_support` bytes: the chain-anchor bit the pinned
+    /// table does not carry.
+    mineshaft: Box<[u8]>,
+    /// The pack's `multiface_support` bytes.
+    multiface: Box<[u8]>,
+    /// The pack's `template_solid` bytes.
+    template_solid: Box<[u8]>,
 }
 
 /// Slots in the `in_tag` name-resolution memo. Tag names at call sites are
@@ -199,8 +344,6 @@ const FL_REPLACEABLE: u16 = 2;
 /// `WorldGenRegion.setBlock` gate for `markPosForPostprocessing`; it lives here because it is a
 /// cached `StatePredicate` on the state, and the oracle derives the three names from
 /// `Blocks.<clinit>` instead of a Rust constant.
-const STATE_FACTS: &[u8] = include_bytes!("../assets/block_state_facts_1211.bin");
-const STATE_FACT_BYTES: usize = 6;
 const FACT_IS_AIR: u8 = 1;
 const FACT_LIQUID: u8 = 1 << 1;
 const FACT_BLOCKS_MOTION: u8 = 1 << 2;
@@ -212,6 +355,11 @@ const FACT_FLUID_EMPTY: u8 = 1 << 7;
 /// Byte 5: `BlockStateBase.hasPostProcess` (`dtb$a.q`). A whole byte per state, not a bit, so a
 /// future column cannot silently alias it.
 const FACT_POSTPROCESS: u8 = 1;
+
+/// Rows of the pinned `block_state_facts` table: `STATE_FACT_BYTES` per state
+/// id, loaded from the version pack alongside the two JSONs it shares the
+/// state-id numbering with.
+const STATE_FACT_BYTES: usize = 6;
 
 /// The pinned `SupportType`: which part of a face has to be covered for it to count as
 /// sturdy. `Full` is vanilla's three-argument `isFaceSturdy`; `Center` is what
@@ -227,11 +375,12 @@ pub(crate) enum Support {
     Rigid,
 }
 
-/// The pinned bytes for `st`. An id outside the table answers every predicate false and
-/// every level zero - "nothing here" - rather than panicking mid-generation.
-fn state_fact(st: u32) -> [u8; STATE_FACT_BYTES] {
+/// The pinned `block_state_facts` bytes for `st`. An id outside the table answers every
+/// predicate false and every level zero - "nothing here" - rather than panicking
+/// mid-generation.
+fn state_fact(facts: &[u8], st: u32) -> [u8; STATE_FACT_BYTES] {
     let at = st as usize * STATE_FACT_BYTES;
-    match STATE_FACTS.get(at..at + STATE_FACT_BYTES) {
+    match facts.get(at..at + STATE_FACT_BYTES) {
         Some(bytes) => [bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]],
         None => [0; STATE_FACT_BYTES],
     }
@@ -239,10 +388,19 @@ fn state_fact(st: u32) -> [u8; STATE_FACT_BYTES] {
 
 impl BReg {
     fn load() -> Option<BReg> {
-        let md = jparse(&std::fs::read("assets/blocks_1211.json").ok()?)?
+        // Every file in the pack shares one state-id numbering, so a missing
+        // table is a broken pack, not a partial one: any read failure declines
+        // the whole registry rather than mixing versions.
+        let paths = VersionAssetPaths::resolve();
+        let md = jparse(&std::fs::read(&paths.blocks).ok()?)?
             .as_arr()?
             .clone();
-        let states = jparse(&std::fs::read("assets/block_states_1211.json").ok()?)?;
+        let states = jparse(&std::fs::read(&paths.block_states).ok()?)?;
+        let facts: Box<[u8]> = std::fs::read(&paths.block_state_facts).ok()?.into();
+        let predicates: Box<[u8]> = std::fs::read(&paths.block_predicates).ok()?.into();
+        let mineshaft: Box<[u8]> = std::fs::read(&paths.mineshaft_support).ok()?.into();
+        let multiface: Box<[u8]> = std::fs::read(&paths.multiface_support).ok()?.into();
+        let template_solid: Box<[u8]> = std::fs::read(&paths.template_solid).ok()?.into();
         let mut shapes = Vec::new();
         for sh in states.get("shapes").and_then(J::as_arr)? {
             let min_a = sh.get("min").and_then(J::as_arr)?;
@@ -293,12 +451,17 @@ impl BReg {
             tag_ids: HashMap::default(),
             tag_cache: std::array::from_fn(|_| AtomicU64::new(0)),
             tag_order: HashMap::new(),
+            facts,
+            predicates,
+            mineshaft,
+            multiface,
+            template_solid,
         };
         // Copy the pinned per-state fact bytes into dense tables once, so the
         // hot predicates below are a single indexed load rather than a slice
         // copy plus shifts on every call.
         for st in 0..state_count {
-            let fact = state_fact(st as u32);
+            let fact = state_fact(&reg.facts, st as u32);
             reg.pred[st] = fact[0];
             reg.light[st] = fact[1];
             reg.postproc[st] = fact[5];
@@ -634,7 +797,7 @@ impl BReg {
     }
 
     pub(crate) fn is_template_solid(&self, state: u32) -> Option<bool> {
-        include_bytes!("../assets/template_solid_1211.bin")
+        self.template_solid
             .get(state as usize)
             .map(|v| *v != 0)
     }
@@ -848,10 +1011,7 @@ impl BReg {
     /// bits, the double-plant flag and the water/source-water pair. The solid-render bit that
     /// table also carries is read from [`BReg::is_solid_render`] instead, from the pinned facts.
     fn native_predicates(&self, st: u32) -> u8 {
-        include_bytes!("../assets/block_predicates_1211.bin")
-            .get(st as usize)
-            .copied()
-            .unwrap_or(0)
+        self.predicates.get(st as usize).copied().unwrap_or(0)
     }
     /// Native FULL support face for the mineshaft floor and chain anchors.
     pub(crate) fn mineshaft_sturdy_face(&self, st: u32, face: u8) -> bool {
@@ -860,7 +1020,7 @@ impl BReg {
     /// The chain anchor also asks whether the block is an instance of the chain class, which is
     /// the one fact `assets/mineshaft_support_1211.bin` records that the pinned table does not.
     pub(crate) fn mineshaft_chain_anchor(&self, st: u32) -> bool {
-        include_bytes!("../assets/mineshaft_support_1211.bin")
+        self.mineshaft
             .get(st as usize)
             .is_some_and(|v| v & 192 == 64)
             && !self.in_tag(st, "minecraft:unstable_bottom_center")
@@ -878,7 +1038,7 @@ impl BReg {
     /// Native MultifaceBlock.canAttachTo on this state, seen in the attachment
     /// direction from the growth cell (the tested support face is opposite).
     pub(crate) fn supports_multiface(&self, st: u32, direction: u8) -> bool {
-        include_bytes!("../assets/multiface_support_1211.bin")
+        self.multiface
             .get(st as usize)
             .is_some_and(|faces| faces & (1 << direction) != 0)
     }
@@ -1537,5 +1697,80 @@ mod tag_tests {
                 "{name} must not match base_stone_overworld"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod version_asset_tests {
+    use super::VersionAssetPaths;
+    use std::path::Path;
+
+    /// With no `MC_SPINE_VERSION_DIR` override the resolver must produce the
+    /// same `assets/*_1211.*` paths the hardcoded reads used — the zero
+    /// behavior change contract for default 1.21.1 runs.
+    #[test]
+    fn default_pack_resolves_the_bundled_1211_paths() {
+        // A set override is an operator choice; this test only proves the
+        // default branch, so it declines rather than fight the environment.
+        if std::env::var_os("MC_SPINE_VERSION_DIR").is_some() {
+            return;
+        }
+        let dir = Path::new("assets");
+        let paths = VersionAssetPaths::resolve();
+        assert_eq!(paths.blocks, dir.join("blocks_1211.json"));
+        assert_eq!(paths.block_states, dir.join("block_states_1211.json"));
+        assert_eq!(paths.block_predicates, dir.join("block_predicates_1211.bin"));
+        assert_eq!(paths.block_state_facts, dir.join("block_state_facts_1211.bin"));
+        assert_eq!(
+            paths.collision_shape_full,
+            dir.join("collision_shape_full_1211.bin")
+        );
+        assert_eq!(
+            paths.mineshaft_support,
+            dir.join("mineshaft_support_1211.bin")
+        );
+        assert_eq!(
+            paths.multiface_support,
+            dir.join("multiface_support_1211.bin")
+        );
+        assert_eq!(
+            paths.structure_state_transforms,
+            dir.join("structure_state_transforms_1211.bin")
+        );
+        assert_eq!(paths.template_solid, dir.join("template_solid_1211.bin"));
+        // The pack the default run reads is the pack the tests ship.
+        for path in [
+            &paths.blocks,
+            &paths.block_states,
+            &paths.block_predicates,
+            &paths.block_state_facts,
+            &paths.mineshaft_support,
+            &paths.multiface_support,
+            &paths.template_solid,
+        ] {
+            assert!(path.is_file(), "bundled pack missing {}", path.display());
+        }
+    }
+
+    /// A custom version dir resolves version-neutral names first, falls back to
+    /// the `_1211` spelling inside the same dir, and still names the neutral
+    /// file when neither exists so the read error points at what is missing.
+    #[test]
+    fn version_dir_prefers_neutral_and_falls_back_to_the_tagged_names() {
+        let dir = std::env::temp_dir().join(format!("mc-spine-vpack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Neutral + tagged both present: the neutral file is the pack's own.
+        std::fs::write(dir.join("blocks.json"), b"[]").unwrap();
+        std::fs::write(dir.join("blocks_1211.json"), b"[]").unwrap();
+        // Only the tagged file present: fallback picks it up unrenamed.
+        std::fs::write(dir.join("block_states_1211.json"), b"{}").unwrap();
+        let paths = VersionAssetPaths::from_dir(&dir);
+        assert_eq!(paths.blocks, dir.join("blocks.json"));
+        assert_eq!(paths.block_states, dir.join("block_states_1211.json"));
+        // Neither spelling: the neutral name is what the error should report.
+        assert_eq!(paths.block_predicates, dir.join("block_predicates.bin"));
+        assert_eq!(paths.template_solid, dir.join("template_solid.bin"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

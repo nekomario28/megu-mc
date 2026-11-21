@@ -23,6 +23,112 @@ const ANVIL_SECTOR: usize = 4096;
 const ANVIL_CHUNK_NBT_BUDGET: usize = 64 << 20;
 const ANVIL_LEVEL_NBT_BUDGET: usize = 256 << 20;
 
+// ---------- DataVersion schema table ----------
+//
+// Vanilla stamps every `level.dat` and chunk record with a `DataVersion`
+// integer that names the release's save schema. The codec writes 1.21.1
+// natively and reads the neighbouring releases whose section layout is
+// identical (1.20.4 through 1.21.5 all store `sections[].Y`,
+// `block_states`/`biomes` palettes and the same packed `data` arrays), so the
+// table below maps each known milestone and classifies everything around it.
+
+/// A Minecraft Java release line the anvil codec can name, keyed by the
+/// `DataVersion` integer vanilla writes for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnvilSchemaVersion {
+    V1_20_4,
+    V1_20_6,
+    V1_21,
+    /// 1.21.1 (`DataVersion` 3955): the codec's native format.
+    V1_21_1,
+    V1_21_3,
+    V1_21_4,
+    V1_21_5,
+    /// A `DataVersion` this table does not list — a snapshot between
+    /// milestones, an older save, or a release newer than the table.
+    Unknown(i32),
+}
+
+impl AnvilSchemaVersion {
+    fn data_version(self) -> i32 {
+        match self {
+            Self::V1_20_4 => 3700,
+            Self::V1_20_6 => 3839,
+            Self::V1_21 => 3953,
+            Self::V1_21_1 => 3955,
+            Self::V1_21_3 => 4082,
+            Self::V1_21_4 => 4189,
+            Self::V1_21_5 => 4325,
+            Self::Unknown(dv) => dv,
+        }
+    }
+
+    /// The `Version.Name` vanilla writes for the milestone; a custom target
+    /// has no release name to claim.
+    fn release_name(self) -> &'static str {
+        match self {
+            Self::V1_20_4 => "1.20.4",
+            Self::V1_20_6 => "1.20.6",
+            Self::V1_21 => "1.21",
+            Self::V1_21_1 => "1.21.1",
+            Self::V1_21_3 => "1.21.3",
+            Self::V1_21_4 => "1.21.4",
+            Self::V1_21_5 => "1.21.5",
+            Self::Unknown(_) => "custom",
+        }
+    }
+
+    fn from_data_version(dv: i32) -> AnvilSchemaVersion {
+        match dv {
+            3700 => Self::V1_20_4,
+            3839 => Self::V1_20_6,
+            3953 => Self::V1_21,
+            3955 => Self::V1_21_1,
+            4082 => Self::V1_21_3,
+            4189 => Self::V1_21_4,
+            4325 => Self::V1_21_5,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
+/// How one observed `DataVersion` relates to what this codec reads and writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnvilVersionSupport {
+    /// `ANVIL_DATA_VERSION` itself: the codec's native 1.21.1 format.
+    Native,
+    /// A known milestone or a snapshot `DataVersion` between milestones: the
+    /// section/palette schema this codec implements has not changed across the
+    /// table, so decode is meaningful.
+    Compatible,
+    /// Older than the table's first milestone (or a missing/corrupt value):
+    /// the save predates the section schema this codec assumes.
+    LegacyUnsupported,
+    /// Newer than the table's last milestone: an unlisted release whose schema
+    /// cannot be assumed.
+    FutureUnknown,
+}
+
+/// Classify an observed chunk or level.dat `DataVersion` against the schema
+/// table. A value that is absent or corrupt decodes as 0 upstream and lands in
+/// `LegacyUnsupported` here — recorded, never silently upgraded to a known one.
+fn classify_anvil_data_version(dv: i32) -> AnvilVersionSupport {
+    match AnvilSchemaVersion::from_data_version(dv) {
+        AnvilSchemaVersion::V1_21_1 => AnvilVersionSupport::Native,
+        AnvilSchemaVersion::Unknown(d)
+            if d <= 0 || d < AnvilSchemaVersion::V1_20_4.data_version() =>
+        {
+            AnvilVersionSupport::LegacyUnsupported
+        }
+        AnvilSchemaVersion::Unknown(d)
+            if d > AnvilSchemaVersion::V1_21_5.data_version() =>
+        {
+            AnvilVersionSupport::FutureUnknown
+        }
+        _ => AnvilVersionSupport::Compatible,
+    }
+}
+
 // ---------- small NBT accessors (AnvilNbt covers all 13 vanilla tags) ----------
 
 fn anvil_str_of(t: &AnvilNbt) -> Option<String> {
@@ -402,6 +508,8 @@ struct AnvilChunk {
     block_entities: Vec<AnvilNbt>,
     /// Palette entries that resolved to no known state — informational only.
     unknown_states: usize,
+    /// Section entries dropped because they carried no `Y` index at all.
+    dropped_sections: usize,
 }
 
 fn anvil_light(sec: &AnvilNbt, key: &str) -> Option<Box<[u8; 2048]>> {
@@ -413,11 +521,19 @@ fn anvil_light(sec: &AnvilNbt, key: &str) -> Option<Box<[u8; 2048]>> {
     }
 }
 
+/// One section entry -> `Some(section)`, or `None` when the entry carries no
+/// section index (`Y` — or the lowercase `y` spelling some 1.21.2+ toolchains
+/// emit) and so cannot be placed. An unplaceable entry is dropped and counted,
+/// not a chunk-wide decode failure; the fields below stay optional exactly as
+/// they are on the wire (`block_states`, `biomes`, both light arrays), and any
+/// real structural error inside them still fails the chunk.
 fn anvil_section_from_nbt(
     sec: &AnvilNbt,
     unknown: &mut usize,
-) -> Result<AnvilSection, String> {
-    let y = anvil_i8(sec, "Y").ok_or("section missing Y")?;
+) -> Result<Option<AnvilSection>, String> {
+    let Some(y) = anvil_i8(sec, "Y").or_else(|| anvil_i8(sec, "y")) else {
+        return Ok(None);
+    };
     let mut blocks = Box::new([0u32; 4096]);
     if let Some(bs) = sec.get("block_states") {
         let palette_tag = bs
@@ -477,13 +593,13 @@ fn anvil_section_from_nbt(
         }
         biomes = Some(cells);
     }
-    Ok(AnvilSection {
+    Ok(Some(AnvilSection {
         y,
         blocks,
         biomes,
         block_light: anvil_light(sec, "BlockLight"),
         sky_light: anvil_light(sec, "SkyLight"),
-    })
+    }))
 }
 
 /// Decode one chunk record's root compound. `fallback` supplies the position
@@ -497,9 +613,13 @@ fn anvil_chunk_from_nbt(
     }
     let mut unknown = 0usize;
     let mut sections = Vec::new();
+    let mut dropped_sections = 0usize;
     if let Some(list) = nbt.get("sections").and_then(AnvilNbt::list) {
         for sec in list {
-            sections.push(anvil_section_from_nbt(sec, &mut unknown)?);
+            match anvil_section_from_nbt(sec, &mut unknown)? {
+                Some(section) => sections.push(section),
+                None => dropped_sections += 1,
+            }
         }
     }
     let mut block_entities = Vec::new();
@@ -518,6 +638,7 @@ fn anvil_chunk_from_nbt(
         sections,
         block_entities,
         unknown_states: unknown,
+        dropped_sections,
     })
 }
 
@@ -903,8 +1024,11 @@ fn anvil_level_dimensions() -> AnvilNbt {
 }
 
 /// Snapshot the live world state into a `Data` compound: identity fields, spawn,
-/// time, difficulty, weather, border, gamemode, and all 51 gamerules.
-fn anvil_level_dat_from_state(level_name: &str) -> AnvilLevelDat {
+/// time, difficulty, weather, border, gamemode, and all 51 gamerules. The
+/// `DataVersion` stamp follows `data_version`, so `Version.Name` reports the
+/// release that version names.
+fn anvil_level_dat_from_state(level_name: &str, data_version: i32) -> AnvilLevelDat {
+    let schema = AnvilSchemaVersion::from_data_version(data_version);
     let spawn = *WORLD_SPAWN.lock().unwrap();
     let now_ms = border_now_ms();
     let border = *world_border().lock().unwrap();
@@ -915,13 +1039,13 @@ fn anvil_level_dat_from_state(level_name: &str) -> AnvilLevelDat {
         data: anvil_obj(&[]),
     };
     let mut put = |key: &str, value: AnvilNbt| level.set(key, value);
-    put("DataVersion", AnvilNbt::Int(ANVIL_DATA_VERSION));
+    put("DataVersion", AnvilNbt::Int(schema.data_version()));
     put("version", AnvilNbt::Int(ANVIL_LEVEL_VERSION));
     put(
         "Version",
         anvil_obj(&[
-            ("Id", AnvilNbt::Int(ANVIL_DATA_VERSION)),
-            ("Name", anvil_s("1.21.1")),
+            ("Id", AnvilNbt::Int(schema.data_version())),
+            ("Name", anvil_s(schema.release_name())),
             ("Series", anvil_s("main")),
             ("Snapshot", AnvilNbt::Byte(0)),
         ]),
@@ -1045,6 +1169,9 @@ struct AnvilImportedChunk {
     /// Palette entries that resolved to no known state — reported, not applied.
     #[cfg_attr(not(test), allow(dead_code))]
     unknown_states: usize,
+    /// Section entries dropped for carrying no `Y` index at all.
+    #[cfg_attr(not(test), allow(dead_code))]
+    dropped_sections: usize,
 }
 
 /// What `import_anvil_world` parsed out of a vanilla world directory.
@@ -1055,6 +1182,14 @@ struct AnvilImportReport {
     region_files: usize,
     /// Region files that read but had chunks which did not decode.
     chunk_errors: Vec<String>,
+    /// Observed chunk `DataVersion` -> decoded chunk count. The multi-version
+    /// intake diagnostic: which releases a directory actually contains.
+    data_version_counts: std::collections::BTreeMap<i32, usize>,
+    /// Chunks whose `DataVersion` classified outside `Native`/`Compatible` —
+    /// corrupt (missing) values land here beside unlisted future releases.
+    unsupported_chunks: usize,
+    /// Section entries dropped for carrying no `Y` index at all.
+    dropped_sections: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1087,6 +1222,17 @@ fn anvil_import_region_dir(
         for (&slot, record) in &region.chunks {
             match anvil_chunk_from_nbt(&record.nbt, slot) {
                 Ok(chunk) => {
+                    *report
+                        .data_version_counts
+                        .entry(chunk.data_version)
+                        .or_insert(0) += 1;
+                    if !matches!(
+                        classify_anvil_data_version(chunk.data_version),
+                        AnvilVersionSupport::Native | AnvilVersionSupport::Compatible
+                    ) {
+                        report.unsupported_chunks += 1;
+                    }
+                    report.dropped_sections += chunk.dropped_sections;
                     report.chunks.push(AnvilImportedChunk {
                         dim,
                         cx: chunk.cx,
@@ -1094,6 +1240,7 @@ fn anvil_import_region_dir(
                         edits: anvil_chunk_edits(&chunk, dim),
                         block_entities: chunk.block_entities.clone(),
                         unknown_states: chunk.unknown_states,
+                        dropped_sections: chunk.dropped_sections,
                     });
                 }
                 Err(e) => report
@@ -1382,11 +1529,38 @@ fn anvil_export_block_entities(
     by_pos.into_values().collect()
 }
 
+/// Export-time knobs: which `DataVersion` the written world claims. Everything
+/// else (section layout, palettes, region-file shape) stays the codec's own —
+/// the option stamps a target version onto the schema this codec writes.
+#[derive(Clone, Copy, Debug)]
+struct AnvilExportOptions {
+    /// The `DataVersion` integer stamped into `level.dat` and every chunk.
+    target_data_version: i32,
+}
+
+impl Default for AnvilExportOptions {
+    fn default() -> AnvilExportOptions {
+        AnvilExportOptions {
+            target_data_version: ANVIL_DATA_VERSION,
+        }
+    }
+}
+
 /// Write a complete vanilla 1.21.1 world directory for the live world state:
 /// `level.dat`, then `region/r.<rx>.<rz>.mca` per dimension that has overlay
 /// chunks (`DIM-1`/`DIM1` only when those dimensions have edits).
 #[allow(dead_code)] // The console export command is a later phase.
 fn export_anvil_world(out_dir: &std::path::Path) -> Result<AnvilExportReport, String> {
+    export_anvil_world_with_options(out_dir, &AnvilExportOptions::default())
+}
+
+/// `export_anvil_world` with an explicit `DataVersion` target, so a future
+/// release can be written by re-stamping rather than by forking the codec.
+#[allow(dead_code)] // The console export command is a later phase.
+fn export_anvil_world_with_options(
+    out_dir: &std::path::Path,
+    options: &AnvilExportOptions,
+) -> Result<AnvilExportReport, String> {
     let mut report = AnvilExportReport::default();
     std::fs::create_dir_all(out_dir)
         .map_err(|e| format!("cannot create {}: {e}", out_dir.display()))?;
@@ -1396,7 +1570,7 @@ fn export_anvil_world(out_dir: &std::path::Path) -> Result<AnvilExportReport, St
         .unwrap_or("world");
     write_level_dat_path(
         &out_dir.join("level.dat"),
-        &anvil_level_dat_from_state(level_name),
+        &anvil_level_dat_from_state(level_name, options.target_data_version),
     )?;
     report.level_written = true;
     let timestamp = (border_now_ms() / 1000).min(u64::from(u32::MAX)) as u32;
@@ -1427,11 +1601,12 @@ fn export_anvil_world(out_dir: &std::path::Path) -> Result<AnvilExportReport, St
             let chunk = AnvilChunk {
                 cx,
                 cz,
-                data_version: ANVIL_DATA_VERSION,
+                data_version: options.target_data_version,
                 status: "minecraft:full".to_string(),
                 sections: anvil_export_sections(dim, cx, cz, &overlay),
                 block_entities: anvil_export_block_entities(dim, cx, cz),
                 unknown_states: 0,
+                dropped_sections: 0,
             };
             region.chunks.insert(
                 (cx, cz),
@@ -2116,5 +2291,176 @@ mod anvil_io_tests {
 
         let _ = std::fs::remove_dir_all(&out);
         let _ = std::fs::remove_dir_all(&out2);
+    }
+
+    #[test]
+    fn anvil_data_version_table_classifies_every_known_milestone() {
+        use AnvilSchemaVersion as V;
+        for (schema, dv, name) in [
+            (V::V1_20_4, 3700, "1.20.4"),
+            (V::V1_20_6, 3839, "1.20.6"),
+            (V::V1_21, 3953, "1.21"),
+            (V::V1_21_1, 3955, "1.21.1"),
+            (V::V1_21_3, 4082, "1.21.3"),
+            (V::V1_21_4, 4189, "1.21.4"),
+            (V::V1_21_5, 4325, "1.21.5"),
+        ] {
+            assert_eq!(schema.data_version(), dv);
+            assert_eq!(schema.release_name(), name);
+            assert_eq!(V::from_data_version(dv), schema);
+        }
+        use AnvilVersionSupport as S;
+        // The codec's native format is exactly 1.21.1.
+        assert_eq!(classify_anvil_data_version(ANVIL_DATA_VERSION), S::Native);
+        // Every other milestone shares this codec's section schema.
+        for dv in [3700, 3839, 3953, 4082, 4189, 4325] {
+            assert_eq!(
+                classify_anvil_data_version(dv),
+                S::Compatible,
+                "milestone {dv}"
+            );
+        }
+        // Snapshot DataVersions between milestones classify the same way.
+        for dv in [3701, 3838, 3954, 4000, 4188, 4190, 4324] {
+            assert_eq!(
+                classify_anvil_data_version(dv),
+                S::Compatible,
+                "snapshot {dv}"
+            );
+        }
+        // Older than the table or a corrupt/absent value: legacy, not native.
+        for dv in [0, -1, 1343, 2566, 3465, 3699] {
+            assert_eq!(
+                classify_anvil_data_version(dv),
+                S::LegacyUnsupported,
+                "legacy {dv}"
+            );
+        }
+        // Newer than the table: an unlisted release, never assumed readable.
+        for dv in [4326, 4400, i32::MAX] {
+            assert_eq!(
+                classify_anvil_data_version(dv),
+                S::FutureUnknown,
+                "future {dv}"
+            );
+        }
+    }
+
+    #[test]
+    fn anvil_chunk_decode_tolerates_optional_fields_and_records_diagnostics() {
+        // A 1.21.4-stamped chunk: one ordinary section, one carrying only the
+        // lowercase `y` spelling, one with no index at all (dropped + counted),
+        // and no DataVersion sibling problems — the field list is optional.
+        let sections = anvil_list(vec![
+            anvil_obj(&[
+                ("Y", AnvilNbt::Byte(0)),
+                (
+                    "block_states",
+                    anvil_obj(&[("palette", anvil_list(vec![anvil_obj(&[(
+                        "Name",
+                        anvil_s("minecraft:stone"),
+                    )])]))]),
+                ),
+            ]),
+            // Lowercase `y`: placed like `Y`; no block_states/biomes at all.
+            anvil_obj(&[("y", AnvilNbt::Byte(-1))]),
+            // No index of either spelling: unplaceable, dropped + counted.
+            anvil_obj(&[("block_states", anvil_obj(&[]))]),
+        ]);
+        let nbt = anvil_obj(&[
+            ("DataVersion", AnvilNbt::Int(4189)),
+            ("xPos", AnvilNbt::Int(0)),
+            ("zPos", AnvilNbt::Int(0)),
+            ("sections", sections),
+        ]);
+        let chunk = anvil_chunk_from_nbt(&nbt, (0, 0)).unwrap();
+        assert_eq!(chunk.data_version, 4189);
+        assert_eq!(classify_anvil_data_version(chunk.data_version), AnvilVersionSupport::Compatible);
+        assert_eq!(chunk.sections.len(), 2);
+        assert_eq!((chunk.sections[0].y, chunk.sections[1].y), (0, -1));
+        assert_eq!(chunk.dropped_sections, 1);
+
+        // A missing/corrupt DataVersion decodes as 0 and classifies as legacy —
+        // recorded, never treated as the native version.
+        let nbt = anvil_obj(&[
+            ("xPos", AnvilNbt::Int(1)),
+            ("zPos", AnvilNbt::Int(1)),
+            ("sections", anvil_list(vec![])),
+        ]);
+        let chunk = anvil_chunk_from_nbt(&nbt, (1, 1)).unwrap();
+        assert_eq!(chunk.data_version, 0);
+        assert_eq!(
+            classify_anvil_data_version(chunk.data_version),
+            AnvilVersionSupport::LegacyUnsupported
+        );
+        // A non-Byte `Y` is absent as far as the index is concerned: dropped.
+        let nbt = anvil_obj(&[
+            ("DataVersion", AnvilNbt::Int(ANVIL_DATA_VERSION)),
+            ("sections", anvil_list(vec![anvil_obj(&[("Y", anvil_s("7"))])])),
+        ]);
+        let chunk = anvil_chunk_from_nbt(&nbt, (0, 0)).unwrap();
+        assert_eq!(chunk.sections.len(), 0);
+        assert_eq!(chunk.dropped_sections, 1);
+        // Structural errors inside a real section still fail the chunk.
+        let nbt = anvil_obj(&[
+            ("DataVersion", AnvilNbt::Int(ANVIL_DATA_VERSION)),
+            (
+                "sections",
+                anvil_list(vec![anvil_obj(&[
+                    ("Y", AnvilNbt::Byte(0)),
+                    ("block_states", anvil_obj(&[])),
+                ])]),
+            ),
+        ]);
+        assert!(anvil_chunk_from_nbt(&nbt, (0, 0)).is_err());
+    }
+
+    #[test]
+    fn anvil_export_with_options_stamps_the_target_data_version() {
+        let _guard = world_guard();
+        let key = (DimId::Overworld, 0i32, 0i32);
+        let _fixture = AnvilWorldFixture::capture(&[]);
+        let stone = name_to_state("stone").expect("stone state");
+        {
+            let mut w = world().lock().unwrap();
+            w.clear();
+            w.insert(key, HashMap::from([(local_idx(1, 70, 2), stone)]));
+        }
+        let out = anvil_tmp_dir("world4189");
+        let report = export_anvil_world_with_options(
+            &out,
+            &AnvilExportOptions {
+                target_data_version: 4189,
+            },
+        )
+        .unwrap();
+        assert!(report.level_written);
+        assert_eq!(report.chunks_written, 1);
+        // level.dat carries the target version in both stamps plus its name.
+        let level = read_level_dat_path(&out.join("level.dat")).unwrap();
+        assert_eq!(level.data_version(), 4189);
+        let version = level.data().get("Version").unwrap();
+        assert_eq!(anvil_i32(version, "Id"), Some(4189));
+        assert_eq!(anvil_str(version, "Name").as_deref(), Some("1.21.4"));
+        // So does every chunk record.
+        let region = read_region_file(&out.join("region").join("r.0.0.mca")).unwrap();
+        let record = region.chunks.get(&(0, 0)).unwrap();
+        assert_eq!(anvil_i32(&record.nbt, "DataVersion"), Some(4189));
+        // Reimport: the foreign version is recorded in the diagnostics, the
+        // blocks still decode, and nothing is counted unsupported.
+        let imported = import_anvil_world(&out).unwrap();
+        assert_eq!(imported.data_version_counts.get(&4189), Some(&1));
+        assert_eq!(imported.unsupported_chunks, 0);
+        assert_eq!(imported.dropped_sections, 0);
+        assert!(imported.chunk_errors.is_empty(), "{:?}", imported.chunk_errors);
+        let chunk = imported
+            .chunks
+            .iter()
+            .find(|c| c.dim == DimId::Overworld)
+            .expect("overworld chunk reimported");
+        assert_eq!(chunk.edits[&local_idx(1, 70, 2)], stone);
+        assert_eq!(chunk.dropped_sections, 0);
+        assert_eq!(chunk.unknown_states, 0);
+        let _ = std::fs::remove_dir_all(&out);
     }
 }

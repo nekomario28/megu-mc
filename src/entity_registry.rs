@@ -222,11 +222,118 @@ pub(crate) fn entity_spec_by_id(id: i64) -> Option<&'static EntitySpec> {
     ENTITY_REGISTRY_1211.get(usize::try_from(id).ok()?)
 }
 
+/// Bare resource name -> row index into `ENTITY_REGISTRY_1211`. Built once from
+/// the static table, so the keys are `&'static` slices of `spec.name` and a
+/// lookup is a single map probe with no allocation.
+fn entity_name_index() -> &'static std::collections::HashMap<&'static str, usize> {
+    static INDEX: std::sync::OnceLock<std::collections::HashMap<&'static str, usize>> =
+        std::sync::OnceLock::new();
+    INDEX.get_or_init(|| {
+        ENTITY_REGISTRY_1211
+            .iter()
+            .enumerate()
+            .map(|(i, spec)| {
+                (
+                    spec.name.strip_prefix("minecraft:").unwrap_or(spec.name),
+                    i,
+                )
+            })
+            .collect()
+    })
+}
+
+/// `minecraft:name` or bare `name` -> the 1.21.1 registry row. Only the
+/// `minecraft:` namespace is stripped, so `other:zombie` does not match.
 pub(crate) fn entity_spec_by_name(name: &str) -> Option<&'static EntitySpec> {
     let name = name.strip_prefix("minecraft:").unwrap_or(name);
-    ENTITY_REGISTRY_1211
-        .iter()
-        .find(|spec| spec.name.strip_prefix("minecraft:") == Some(name))
+    entity_name_index()
+        .get(name)
+        .map(|&i| &ENTITY_REGISTRY_1211[i])
+}
+
+/// Cross-version entity protocol-ID remap, built from a future release's
+/// `minecraft:entity_type` registry listing: `(wire protocol id, resource name)`
+/// pairs. A version that inserts a new type (1.21.4's `minecraft:creaking`)
+/// shifts every later ID — the remap keeps that wire numbering separate from
+/// the canonical 1.21.1 rows instead of leaking it into `EntitySpec.id`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct EntityVersionRemap {
+    /// Dense wire id -> canonical `ENTITY_REGISTRY_1211` index. Wire ids that
+    /// name an entity the canonical table does not have stay `None`.
+    wire_to_index: Vec<Option<usize>>,
+    /// Canonical index -> wire id in the target version, `None` when the
+    /// target registry does not carry that entity at all.
+    index_to_wire: Vec<Option<i64>>,
+    /// Wire entries whose name matched no canonical spec.
+    unmapped: usize,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl EntityVersionRemap {
+    /// Vanilla registry tables are dense from zero; a wire id outside this
+    /// bound is malformed input, not a numbering worth allocating against.
+    const WIRE_ID_LIMIT: i64 = 1 << 16;
+
+    /// Build the remap from `(wire protocol id, resource name)` entries in any
+    /// order. Names resolve through the same normalized lookup as
+    /// `entity_spec_by_name`; unresolvable names keep their wire id but answer
+    /// `None` and count toward `unmapped_count`.
+    pub(crate) fn from_wire_entries(entries: &[(i64, &str)]) -> EntityVersionRemap {
+        let width = entries
+            .iter()
+            .map(|&(id, _)| id)
+            .filter(|&id| (0..Self::WIRE_ID_LIMIT).contains(&id))
+            .max()
+            .map_or(0, |id| id as usize + 1);
+        let mut remap = EntityVersionRemap {
+            wire_to_index: vec![None; width],
+            index_to_wire: vec![None; ENTITY_REGISTRY_1211.len()],
+            unmapped: 0,
+        };
+        for &(wire_id, name) in entries {
+            let Ok(slot) = usize::try_from(wire_id) else {
+                remap.unmapped += 1;
+                continue;
+            };
+            if slot >= width {
+                remap.unmapped += 1;
+                continue;
+            }
+            match entity_spec_by_name(name) {
+                Some(spec) => {
+                    remap.wire_to_index[slot] = Some(spec.id as usize);
+                    remap.index_to_wire[spec.id as usize] = Some(wire_id);
+                }
+                None => remap.unmapped += 1,
+            }
+        }
+        remap
+    }
+
+    /// Wire id in the target version -> the canonical spec, or `None` for an
+    /// entity type the canonical table does not have.
+    pub(crate) fn wire_to_canonical(&self, wire_id: i64) -> Option<&'static EntitySpec> {
+        let &index = self
+            .wire_to_index
+            .get(usize::try_from(wire_id).ok()?)?
+            .as_ref()?;
+        ENTITY_REGISTRY_1211.get(index)
+    }
+
+    /// Canonical 1.21.1 protocol id (`EntitySpec.id`) -> the wire id the target
+    /// version uses, or `None` when the target registry dropped that entity.
+    pub(crate) fn canonical_to_wire(&self, canonical_id: i64) -> Option<i64> {
+        self.index_to_wire
+            .get(usize::try_from(canonical_id).ok()?)
+            .copied()
+            .flatten()
+    }
+
+    /// Wire entries that matched no canonical entity: new types plus any
+    /// malformed or out-of-range ids in the input.
+    pub(crate) fn unmapped_count(&self) -> usize {
+        self.unmapped
+    }
 }
 
 // Invalid IDs use the current entity-collision fallback geometry.
@@ -426,5 +533,85 @@ mod entity_registry_tests {
         for name in ["arrow", "item", "boat", "minecart", "fishing_bobber"] {
             assert_eq!(spec(name).max_health, 0.0);
         }
+    }
+
+    #[test]
+    fn name_lookup_normalizes_the_minecraft_namespace_only() {
+        assert_eq!(entity_spec_by_name("zombie").map(|s| s.id), Some(124));
+        assert_eq!(entity_spec_by_name("minecraft:zombie").map(|s| s.id), Some(124));
+        assert_eq!(entity_spec_by_name("allay").map(|s| s.id), Some(0));
+        assert_eq!(entity_spec_by_name("minecraft:allay").map(|s| s.id), Some(0));
+        // Only the minecraft namespace strips; foreign namespaces must not match.
+        for name in ["other:zombie", "minecraft:", "minecraft:minecraft:zombie", " zombie", "zombie "] {
+            assert!(entity_spec_by_name(name).is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn version_remap_tracks_an_inserted_entity_shifting_later_wire_ids() {
+        // A 1.21.4-shaped wire table: `minecraft:creaking` sorts right after
+        // `minecraft:cow`, so every canonical id from `creeper` (23) on shifts
+        // up by one on the wire.
+        let mut entries: Vec<(i64, &str)> = Vec::new();
+        for spec in ENTITY_REGISTRY_1211.iter() {
+            let shifted = spec.id + i64::from(spec.id >= 23);
+            entries.push((shifted, spec.name));
+            if spec.id == 22 {
+                entries.push((23, "minecraft:creaking"));
+            }
+        }
+        let remap = EntityVersionRemap::from_wire_entries(&entries);
+        // The one new entity has no canonical row; every canonical row remapped.
+        assert_eq!(remap.unmapped_count(), 1);
+        assert!(remap.wire_to_canonical(23).is_none());
+        // Unshifted prefix and shifted tail, both directions exact.
+        assert_eq!(remap.wire_to_canonical(22).unwrap().name, "minecraft:cow");
+        assert_eq!(remap.wire_to_canonical(24).unwrap().name, "minecraft:creeper");
+        assert_eq!(remap.wire_to_canonical(125).unwrap().name, "minecraft:zombie");
+        assert_eq!(remap.canonical_to_wire(22), Some(22));
+        assert_eq!(remap.canonical_to_wire(23), Some(24));
+        assert_eq!(remap.canonical_to_wire(124), Some(125));
+        // Every canonical entity round-trips through the shifted table.
+        for spec in ENTITY_REGISTRY_1211.iter() {
+            let wire = remap.canonical_to_wire(spec.id).expect(spec.name);
+            assert_eq!(remap.wire_to_canonical(wire).unwrap().id, spec.id);
+        }
+        // Past the end of the wire table there is nothing to map.
+        assert!(remap.wire_to_canonical(entries.len() as i64 + 10).is_none());
+        assert!(remap.wire_to_canonical(-1).is_none());
+        assert!(remap.canonical_to_wire(-1).is_none());
+        assert!(remap.canonical_to_wire(130).is_none());
+    }
+
+    #[test]
+    fn version_remap_reports_removals_and_malformed_entries() {
+        // A target registry that dropped `axolotl`: its canonical id maps to
+        // nothing while the survivors still resolve in both directions.
+        let entries: Vec<(i64, &str)> = ENTITY_REGISTRY_1211
+            .iter()
+            .filter(|spec| spec.name != "minecraft:axolotl")
+            .map(|spec| (spec.id, spec.name))
+            .collect();
+        let remap = EntityVersionRemap::from_wire_entries(&entries);
+        assert_eq!(remap.unmapped_count(), 0);
+        assert_eq!(remap.canonical_to_wire(5), None);
+        assert_eq!(remap.canonical_to_wire(6), Some(6));
+        // Bare names resolve like namespaced ones; unknown names and negative
+        // or out-of-range ids are counted, never matched or allocated against.
+        let odd = EntityVersionRemap::from_wire_entries(&[
+            (0, "allay"),
+            (1, "minecraft:axolotl"),
+            (2, "minecraft:creaking"),
+            (-3, "minecraft:zombie"),
+            (i64::MAX, "minecraft:cow"),
+        ]);
+        assert_eq!(odd.unmapped_count(), 3);
+        assert_eq!(odd.wire_to_canonical(0).unwrap().name, "minecraft:allay");
+        assert_eq!(odd.wire_to_canonical(1).unwrap().name, "minecraft:axolotl");
+        assert!(odd.wire_to_canonical(2).is_none());
+        assert!(odd.wire_to_canonical(i64::MAX).is_none());
+        assert_eq!(odd.canonical_to_wire(0), Some(0));
+        assert_eq!(odd.canonical_to_wire(5), Some(1));
+        assert_eq!(odd.canonical_to_wire(124), None);
     }
 }
