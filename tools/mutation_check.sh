@@ -42,7 +42,7 @@ case "${MUTATION_STABILITY:-0}" in
 # `include_bytes!`s fixtures under `assets/`, `tests/` and `evidence/`, so a copy without
 # `evidence/` does not compile (measured: 13 missing-fixture errors). `config_packets.bin` is not a
 # build input, which is why it was missed until 2026-11-16: the wire helper's `local_server`
-# symlinks it into the server's cwd and `src/main.rs::load_config_packets` reads it there, so a copy
+# symlinks it into the server's cwd and `src/play_protocol.rs::load_config_packets` reads it there, so a copy
 # without it runs a server with empty registries and every wire gate then measures different inputs
 # than this tree does. `src/main.rs::load_pack_info` used to read a second cwd file,
 # `resourcepack.zip`; that file was removed as unprovenanced (see THIRD_PARTY.md) and the server
@@ -196,7 +196,7 @@ if ! cut -f2- "$work/selection" > "$work/files"; then
 fi
 for path in "${RUNTIME_INPUTS[@]}"; do
   if [ ! -f "$source_root/$path" ]; then
-    echo "refusing to run: $path is missing from $source_root. src/main.rs reads it from the" >&2
+    echo "refusing to run: $path is missing from $source_root. src/play_protocol.rs reads it from the" >&2
     echo "      working directory, so the wire gates would measure a server without it. Restore" >&2
     echo "      the file instead of copying a tree that does not have it." >&2
     exit 2
@@ -276,7 +276,7 @@ for path in "${RUNTIME_INPUTS[@]}"; do
     echo "FAIL  $snapshot/$path is not byte-identical to $source_root/$path" >&2
     exit 2
   fi
-  echo "  wire input $path $copy_sha (read from the server's cwd by src/main.rs)"
+  echo "  wire input $path $copy_sha (read from the server's cwd by src/play_protocol.rs)"
   unset source_sha copy_sha
 done
 
