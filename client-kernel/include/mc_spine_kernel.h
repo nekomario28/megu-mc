@@ -260,6 +260,23 @@ int32_t mc_spine_kernel_light_update_free(mc_spine_kernel_light_update *update);
 int32_t mc_spine_kernel_registry_open_json(const uint8_t *states_json, size_t states_len,
                                            const uint8_t *blocks_json, size_t blocks_len,
                                            mc_spine_kernel_registry **out);
+/* Opens any Minecraft version's pack from raw buffers: blocks_json is the pack's
+   blocks.json (per-block names and state-id ranges), facts_bin its
+   block_state_facts.bin (six bytes per state, so the state count is
+   facts_len / 6 and must agree with blocks_json exactly), and states_json its
+   optional block_states.json per-state table — NULL to skip it. Without the
+   states table, per-state cross-checks and exact occlusion shapes are
+   unavailable and every occluding state is treated as a full cube. */
+int32_t mc_spine_kernel_registry_open_parts(const uint8_t *blocks_json, size_t blocks_len,
+                                            const uint8_t *states_json, size_t states_len,
+                                            const uint8_t *facts_bin, size_t facts_len,
+                                            mc_spine_kernel_registry **out);
+/* Opens a version pack directory. The version-neutral filenames (blocks.json,
+   block_state_facts.bin, optional block_states.json) win, and the bundled
+   *_1211.* spellings are the fallback. path is a UTF-8 directory path;
+   a missing required file reports NOT_FOUND. */
+int32_t mc_spine_kernel_registry_open_dir(const uint8_t *path, size_t path_len,
+                                          mc_spine_kernel_registry **out);
 int32_t mc_spine_kernel_registry_free(mc_spine_kernel_registry *registry);
 int32_t mc_spine_kernel_registry_state_count(const mc_spine_kernel_registry *registry,
                                              uint32_t *out);

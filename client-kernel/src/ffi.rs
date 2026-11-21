@@ -521,6 +521,49 @@ pub unsafe extern "C" fn mc_spine_kernel_registry_open_json(
     }
 }
 
+/// Opens a registry from the raw buffers of any version pack. `states_json` may
+/// be NULL to skip the optional `block_states.json` table.
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_kernel_registry_open_parts(
+    blocks_json: *const u8,
+    blocks_len: usize,
+    states_json: *const u8,
+    states_len: usize,
+    facts_bin: *const u8,
+    facts_len: usize,
+    out: *mut *mut Registry,
+) -> i32 {
+    unsafe {
+        write_result(out, || {
+            let states = match states_json.is_null() {
+                true => None,
+                false => Some(input_span(states_json, states_len)?),
+            };
+            let registry = Registry::from_parts(
+                input_span(blocks_json, blocks_len)?,
+                states,
+                input_span(facts_bin, facts_len)?,
+            )?;
+            Ok(Box::into_raw(Box::new(registry)))
+        })
+    }
+}
+
+/// Opens a registry from a version pack directory. `path` is a UTF-8 span.
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_kernel_registry_open_dir(
+    path: *const u8,
+    path_len: usize,
+    out: *mut *mut Registry,
+) -> i32 {
+    unsafe {
+        write_result(out, || {
+            let dir = std::path::Path::new(text_input(path, path_len)?);
+            Ok(Box::into_raw(Box::new(Registry::from_version_dir(dir)?)))
+        })
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn mc_spine_kernel_registry_free(registry: *mut Registry) -> i32 {
     unsafe { drop_handle(registry) }
@@ -531,7 +574,11 @@ pub unsafe extern "C" fn mc_spine_kernel_registry_state_count(
     registry: *const Registry,
     out: *mut u32,
 ) -> i32 {
-    unsafe { write_result(out, || Ok(read_handle(registry)?.state_count())) }
+    unsafe {
+        write_result(out, || {
+            u32::try_from(read_handle(registry)?.state_count()).map_err(|_| Error::OutOfRange)
+        })
+    }
 }
 
 #[no_mangle]
@@ -846,6 +893,132 @@ mod tests {
             assert_eq!(
                 input_span(storage.as_ptr(), isize::MAX as usize / 4 + 1),
                 Err(Error::OutOfRange)
+            );
+        }
+    }
+
+    fn read_asset(name: &str) -> Vec<u8> {
+        std::fs::read(format!("{}/../assets/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    }
+
+    #[test]
+    fn registry_open_parts_roundtrips_the_pinned_pack() {
+        let blocks = read_asset("blocks_1211.json");
+        let states = read_asset("block_states_1211.json");
+        let facts = read_asset("block_state_facts_1211.bin");
+        let mut registry: *mut Registry = ptr::null_mut();
+        let mut count = 0u32;
+        unsafe {
+            assert_eq!(
+                mc_spine_kernel_registry_open_parts(
+                    ptr::null(),
+                    0,
+                    states.as_ptr(),
+                    states.len(),
+                    facts.as_ptr(),
+                    facts.len(),
+                    &mut registry
+                ),
+                Error::Null as i32
+            );
+            assert_eq!(
+                mc_spine_kernel_registry_open_parts(
+                    blocks.as_ptr(),
+                    blocks.len(),
+                    states.as_ptr(),
+                    states.len(),
+                    facts.as_ptr(),
+                    facts.len(),
+                    ptr::null_mut()
+                ),
+                Error::Null as i32
+            );
+            // A truncated facts table fails closed before any table is built.
+            assert_eq!(
+                mc_spine_kernel_registry_open_parts(
+                    blocks.as_ptr(),
+                    blocks.len(),
+                    states.as_ptr(),
+                    states.len(),
+                    facts.as_ptr(),
+                    facts.len() - 1,
+                    &mut registry
+                ),
+                Error::InvalidJson as i32
+            );
+            assert!(registry.is_null());
+            // With the optional states table.
+            assert_eq!(
+                mc_spine_kernel_registry_open_parts(
+                    blocks.as_ptr(),
+                    blocks.len(),
+                    states.as_ptr(),
+                    states.len(),
+                    facts.as_ptr(),
+                    facts.len(),
+                    &mut registry
+                ),
+                0
+            );
+            assert_eq!(
+                mc_spine_kernel_registry_state_count(registry, &mut count),
+                0
+            );
+            assert_eq!(count as usize, crate::STATE_COUNT as usize);
+            assert_eq!(mc_spine_kernel_registry_free(registry), 0);
+            // Without it, `states_json` may be NULL and `states_len` is ignored.
+            registry = ptr::null_mut();
+            assert_eq!(
+                mc_spine_kernel_registry_open_parts(
+                    blocks.as_ptr(),
+                    blocks.len(),
+                    ptr::null(),
+                    0,
+                    facts.as_ptr(),
+                    facts.len(),
+                    &mut registry
+                ),
+                0
+            );
+            assert_eq!(
+                mc_spine_kernel_registry_state_count(registry, &mut count),
+                0
+            );
+            assert_eq!(count as usize, crate::STATE_COUNT as usize);
+            assert_eq!(mc_spine_kernel_registry_free(registry), 0);
+        }
+    }
+
+    #[test]
+    fn registry_open_dir_opens_a_pack_and_fails_closed() {
+        let assets = concat!(env!("CARGO_MANIFEST_DIR"), "/../assets");
+        let missing = "definitely/not/a/pack/dir";
+        let mut registry: *mut Registry = ptr::null_mut();
+        let mut count = 0u32;
+        unsafe {
+            assert_eq!(
+                mc_spine_kernel_registry_open_dir(assets.as_ptr(), assets.len(), &mut registry),
+                0
+            );
+            assert_eq!(
+                mc_spine_kernel_registry_state_count(registry, &mut count),
+                0
+            );
+            assert_eq!(count as usize, crate::STATE_COUNT as usize);
+            assert_eq!(mc_spine_kernel_registry_free(registry), 0);
+            registry = ptr::null_mut();
+            assert_eq!(
+                mc_spine_kernel_registry_open_dir(missing.as_ptr(), missing.len(), &mut registry),
+                Error::NotFound as i32
+            );
+            assert!(registry.is_null());
+            assert_eq!(
+                mc_spine_kernel_registry_open_dir([0xff].as_ptr(), 1, &mut registry),
+                Error::InvalidUtf8 as i32
+            );
+            assert_eq!(
+                mc_spine_kernel_registry_open_dir(assets.as_ptr(), assets.len(), ptr::null_mut()),
+                Error::Null as i32
             );
         }
     }

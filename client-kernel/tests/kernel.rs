@@ -601,7 +601,7 @@ fn open_registry() -> Registry {
 #[test]
 fn registry_facts_feed_the_light_engine_and_agree_with_palette_ids() {
     let registry = open_registry();
-    assert_eq!(registry.state_count(), STATE_COUNT);
+    assert_eq!(registry.state_count(), STATE_COUNT as usize);
     let stone = registry.default_state("minecraft:stone").unwrap();
     let glowstone = registry.default_state("minecraft:glowstone").unwrap();
     let to_fact = |state| {
@@ -635,4 +635,38 @@ fn registry_facts_feed_the_light_engine_and_agree_with_palette_ids() {
     // Section air accounting uses the same state-ID table.
     assert_eq!(registry.facts(0).unwrap().is_air, 1);
     assert_eq!(PalettedSection::new_single(0).unwrap().non_air(), 0);
+}
+
+#[test]
+fn version_dir_registry_bounds_sections_to_its_state_count() {
+    // The pinned assets directory is itself a version pack (`*_1211` fallback).
+    let registry = Registry::from_version_dir(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../assets"
+    )))
+    .unwrap();
+    assert_eq!(registry.state_count(), STATE_COUNT as usize);
+    let section = PalettedSection::new_single_in(STATE_COUNT - 1, &registry).unwrap();
+    assert_eq!(section.state_limit(), STATE_COUNT);
+    assert_eq!(section.uniform_state(), Some(STATE_COUNT - 1));
+
+    // A wire container for a pack larger than the pin decodes under its own
+    // bound and still fails closed under the pinned one.
+    let mut bigger = PalettedSection::new_single_bounded(0, STATE_COUNT as usize + 6).unwrap();
+    bigger.set(0, STATE_COUNT).unwrap();
+    let mut wire = Vec::new();
+    bigger.write_block_states_wire(&mut wire);
+    assert!(matches!(
+        PalettedSection::decode_block_states_wire(&wire),
+        Err(Error::InvalidState)
+    ));
+    let (decoded, consumed) =
+        PalettedSection::decode_block_states_wire_bounded(&wire, STATE_COUNT as usize + 6).unwrap();
+    assert_eq!(consumed, wire.len());
+    assert_eq!(decoded.get(0), Ok(STATE_COUNT));
+    assert_eq!(decoded.state_limit(), STATE_COUNT + 6);
+    assert!(matches!(
+        PalettedSection::new_single_bounded(STATE_COUNT, usize::MAX),
+        Err(Error::OutOfRange)
+    ));
 }
