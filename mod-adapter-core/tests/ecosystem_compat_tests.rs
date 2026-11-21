@@ -794,3 +794,20 @@ license="MIT"
         Err(JarScanError::Toml(_))
     ));
 }
+
+#[test]
+fn deeply_nested_toml_arrays_and_tables_fail_closed_without_stack_overflow() {
+    let deep_array = format!("x = {}{}\n", "[".repeat(10_000), "]".repeat(10_000));
+    let array_jar = jar(&[("META-INF/neoforge.mods.toml", deep_array.as_bytes())]);
+    assert!(matches!(
+        scan_mod_jar(&array_jar),
+        Err(JarScanError::Toml(_))
+    ));
+
+    let deep_table = format!("x = {}{}\n", "{a=".repeat(10_000), "}".repeat(10_000));
+    let table_jar = jar(&[("META-INF/neoforge.mods.toml", deep_table.as_bytes())]);
+    assert!(matches!(
+        scan_mod_jar(&table_jar),
+        Err(JarScanError::Toml(_))
+    ));
+}

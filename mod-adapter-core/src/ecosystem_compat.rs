@@ -1249,9 +1249,12 @@ impl TomlValue {
     }
 }
 
+const MAX_TOML_NESTING_DEPTH: usize = 32;
+
 struct TomlParser<'a> {
     src: &'a [u8],
     pos: usize,
+    depth: usize,
     /// Dotted paths of tables explicitly defined via `[a.b]` headers —
     /// re-defining one is a hard error (mirrors the TOML spec).
     explicit_tables: BTreeSet<String>,
@@ -1262,6 +1265,7 @@ impl<'a> TomlParser<'a> {
         Self {
             src,
             pos: 0,
+            depth: 0,
             explicit_tables: BTreeSet::new(),
         }
     }
@@ -1616,6 +1620,18 @@ impl<'a> TomlParser<'a> {
     }
 
     fn parse_array(&mut self) -> Result<TomlValue, String> {
+        if self.depth >= MAX_TOML_NESTING_DEPTH {
+            return Err(self.err(format!(
+                "TOML nesting exceeds maximum depth {MAX_TOML_NESTING_DEPTH}"
+            )));
+        }
+        self.depth += 1;
+        let res = self.parse_array_inner();
+        self.depth -= 1;
+        res
+    }
+
+    fn parse_array_inner(&mut self) -> Result<TomlValue, String> {
         self.expect(b'[')?;
         let mut items = Vec::new();
         loop {
@@ -1642,6 +1658,18 @@ impl<'a> TomlParser<'a> {
     }
 
     fn parse_inline_table(&mut self) -> Result<TomlValue, String> {
+        if self.depth >= MAX_TOML_NESTING_DEPTH {
+            return Err(self.err(format!(
+                "TOML nesting exceeds maximum depth {MAX_TOML_NESTING_DEPTH}"
+            )));
+        }
+        self.depth += 1;
+        let res = self.parse_inline_table_inner();
+        self.depth -= 1;
+        res
+    }
+
+    fn parse_inline_table_inner(&mut self) -> Result<TomlValue, String> {
         self.expect(b'{')?;
         let mut table = BTreeMap::new();
         loop {
