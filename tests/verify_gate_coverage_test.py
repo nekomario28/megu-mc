@@ -28,6 +28,7 @@ EXPECTED_CRATES = (
     "client-port",
     "client-kernel",
     "client-app",
+    "client-ui",
     "mod-offload",
     "mod-adapter-core",
     "create-adapter",

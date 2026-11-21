@@ -116,7 +116,7 @@ bash tools/debt_ratchet.sh || exit 1
 build_manifest=$(mktemp)
 cleanup_verify_artifacts() {
   rm -f "$build_manifest"
-  rm -rf client-port/target client-kernel/target client-app/target mod-offload/target \
+  rm -rf client-port/target client-kernel/target client-app/target client-ui/target mod-offload/target \
       mod-adapter-core/target create-adapter/target proto/target state-store/target \
       server-files/target core/target
   # The companion suite only writes repo-local output when CARGO_TARGET_DIR is
@@ -131,6 +131,7 @@ echo "== standalone crates"
 cargo test --manifest-path client-port/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path client-kernel/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path client-app/Cargo.toml --offline --locked -j 2
+cargo test --manifest-path client-ui/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path mod-offload/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path mod-adapter-core/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path create-adapter/Cargo.toml --offline --locked -j 2
