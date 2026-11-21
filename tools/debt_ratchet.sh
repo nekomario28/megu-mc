@@ -7,10 +7,9 @@
 # file, which is the moment to say in the commit message that the old measurement of anything
 # touching it is void.
 #
-# Why these and not others: a ratchet is only worth having where the count means something. It is
-# not "unwraps" or "hard-coded ranges" - those numbers are large, move for innocent reasons, and
-# would train everyone to raise the limit. A ratchet that gets its limit raised is worse than none,
-# because it looks like a check.
+# Keep large, broad patterns out unless they represent a concrete regression risk. The
+# lock/rwlock unwrap ceiling is intentionally narrow: it catches additional poison
+# propagation paths while existing usages can be addressed incrementally.
 #
 # Run: bash tools/debt_ratchet.sh
 set -uo pipefail
@@ -36,10 +35,22 @@ blind=0
 # alternative was a ratchet that reported "nothing left to fix" on every push.
 count() { grep -ohE "$1" src/*.rs 2>/dev/null | wc -l | tr -d ' '; }
 
-# ratchet <label> <pattern> <limit> <why>
+# Exclude Rust line comments from the poison-lock count. Unlike the generic
+# counter, this one only measures method-call spellings in non-comment lines.
+count_noncomment() {
+  grep -hEv '^[[:space:]]*//' src/*.rs 2>/dev/null | grep -oE "$1" | wc -l | tr -d ' '
+}
+
+# ratchet <label> <pattern> <limit> <why> [noncomment]
 ratchet() {
-  local label="$1" pattern="$2" limit="$3" why="$4" now
-  now=$(count "$pattern")
+  local label="$1" pattern="$2" limit="$3" why="$4" now display
+  if [ "${5:-}" = "noncomment" ]; then
+    now=$(count_noncomment "$pattern")
+    display="$now / $limit"
+  else
+    now=$(count "$pattern")
+    display="$now"
+  fi
   if [ "$now" -eq 0 ] && [ "$limit" -gt 0 ]; then
     echo "BLIND $label: the pattern '$pattern' matches nothing, so this check proves nothing."
     echo "      Either the thing it counts was removed - lower the limit to 0 and say so - or the"
@@ -53,7 +64,7 @@ ratchet() {
   elif [ "$now" -lt "$limit" ]; then
     echo "DOWN  $label: $now, limit $limit - lower the limit to lock the gain in."
   else
-    echo "ok    $label: $now"
+    echo "ok    $label: $display"
   fi
 }
 
@@ -67,6 +78,12 @@ ratchet "wall-clock reads (clock RNG must not return)" 'SystemTime|subsec_nanos'
 # stops meaning anything. The mutation check counts them too, from the other side.
 ratchet "ignored tests (parked gates)" '#\[ignore' 1 \
   "see PLAN.md section 7; a parked gate proves nothing, so the count must not creep up."
+
+# Count only direct Mutex/RwLock guard unwrap calls, excluding comment lines and
+# other unwraps such as thread attachment. The initial ceiling is the live count.
+ratchet "lock/rwlock unwraps (no new poison cascades)" \
+  '\.(lock|read|write)\(\)\.unwrap\(\)' 3663 \
+  "New poison-sensitive lock unwraps must not grow without an explicit review." noncomment
 
 echo
 if [ "$blind" -gt 0 ]; then

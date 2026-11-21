@@ -10,6 +10,7 @@ the next run's build. This test reads tests/verify.sh against the live tree:
   `cleanup_verify_artifacts` (`<dir>/target` on the rm -rf line),
 * every adapter feature declared in the root [features] table is exercised
   (`--features <name>` somewhere in the script), and
+* every tests/*_test.py is invoked or has an explicit documented exemption, and
 * tools/provenance_check.py is invoked live and under --self-test.
 
 Run: python3 tests/verify_gate_coverage_test.py
@@ -41,8 +42,21 @@ EXPECTED_CRATES = (
 ADAPTER_FEATURES = ("fabric-probe", "neoforge-events", "create-offload")
 UNGATED_FEATURES = frozenset({"native-oracle", "java-compat"})
 
+# Standalone tests with prerequisites that the portable verify.sh gate cannot
+# provide. Keep reasons specific so exceptions remain auditable.
+EXEMPT_TEST_FILES = {
+    "lighting_parity_test.py": (
+        "Requires the pinned vanilla 1.21.1 server JAR at a machine-local absolute "
+        "path plus Java 21, which the portable verify.sh runner cannot provide."
+    ),
+}
+
 _FEATURES_TABLE = re.compile(r"(?ms)^\[features\]\s*\n(.*?)(?=^\[|\Z)")
 _FEATURE_KEY = re.compile(r"(?m)^([A-Za-z0-9_-]+)\s*=")
+_PYTHON_TEST_COMMAND = re.compile(
+    r"(?m)^[ \t]*(?:timeout[ \t]+\d+[ \t]+)?python3[ \t]+"
+    r"tests/([A-Za-z0-9_]+_test\.py)(?=[ \t]|$)"
+)
 
 
 def verify_script():
@@ -67,6 +81,23 @@ def cleanup_body(script):
 
 
 class VerifyGateCoverage(unittest.TestCase):
+    def test_every_python_test_is_invoked_or_documented_as_exempt(self):
+        tests = {path.name for path in (ROOT / "tests").glob("*_test.py")}
+        gated = set(_PYTHON_TEST_COMMAND.findall(verify_script()))
+        self.assertFalse(set(EXEMPT_TEST_FILES) - tests,
+                         "EXEMPT_TEST_FILES includes a file that no longer exists")
+        for filename, reason in EXEMPT_TEST_FILES.items():
+            with self.subTest(exempt=filename):
+                self.assertTrue(reason.strip(), f"{filename} needs an exemption reason")
+                self.assertNotIn(filename, gated,
+                                 f"{filename} is gated and should not be exempt")
+        for filename in sorted(tests):
+            with self.subTest(test=filename):
+                self.assertTrue(
+                    filename in gated or filename in EXEMPT_TEST_FILES,
+                    f"tests/{filename} is neither run in verify.sh nor explicitly exempt",
+                )
+
     def test_workspace_crate_set_is_exactly_the_expected_one(self):
         self.assertEqual(root_crates(), sorted(EXPECTED_CRATES))
 

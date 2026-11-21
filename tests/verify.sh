@@ -52,6 +52,7 @@ python3 tests/test_saved_tick_inventory.py
 python3 tests/biome_tree_test.py
 python3 tests/carver_diff_test.py
 python3 tests/sculk_trace_test.py
+python3 tests/sculk_gate_test.py
 python3 tests/carve_agent_build_test.py
 python3 tests/vanilla_java_test.py
 python3 tests/forest_stage_check_test.py
@@ -68,6 +69,7 @@ python3 tests/biome_tie_oracle_test.py
 python3 tests/biome_spawn_oracle_test.py
 python3 tests/weird_sampler_oracle_test.py
 python3 tests/suite_compare_test.py
+python3 tests/fixture_suite_test.py
 python3 tests/chunk_triage_test.py
 python3 tests/port_triage_test.py
 python3 tests/structure_capture_test.py
@@ -82,6 +84,7 @@ python3 tests/neoforge_s4_network_test.py
 python3 tools/mod_compat_audit/test_audit.py
 python3 tests/fabric_shim_test.py
 python3 tests/client_launcher_test.py
+python3 tests/megu_start_test.py
 python3 tests/load_client_test.py
 python3 tools/provenance_check.py
 python3 tools/provenance_check.py --self-test
