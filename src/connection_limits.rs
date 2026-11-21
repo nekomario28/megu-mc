@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, Mutex, OnceLock,
+    Arc, Condvar, Mutex, OnceLock,
 };
 use std::time::{Duration, Instant};
 
@@ -611,6 +611,223 @@ impl PacketCoalescer {
         w.write_all(&self.buf)?;
         self.buf.clear();
         Ok(())
+    }
+}
+
+// ----------------------------------- shared broadcast frames + tx queues
+
+/// One S2C packet framed once and fanned out to every broadcast recipient.
+///
+/// Broadcasting used to pay the framing — and with compression on, a zlib
+/// pass — once per player, so a 50-client broadcast compressed identical
+/// bytes 50 times. The packet body (`varint(packet_id)` + payload) is built
+/// once up front; each wire form is then produced lazily on the first
+/// `frame_for` that asks for it and shared as an `Arc<[u8]>` clone
+/// afterwards, so the fanout encodes once and hands out refcount bumps. The
+/// compressed slot is keyed by its threshold: the server negotiates a single
+/// threshold for every compressed client, and a different request rebuilds
+/// (counting as another encode) rather than retaining both forms.
+#[allow(dead_code)] // wired into the broadcast path by the protocol lane
+pub(crate) struct SharedBroadcastFrame {
+    /// `varint(packet_id)` + payload — what `encode_compressed_frame`
+    /// compresses and `plain_frame` prefixes. Immutable once built.
+    body: Box<[u8]>,
+    /// Lazily built uncompressed frame (`varint(len)` + body).
+    plain: Option<Arc<[u8]>>,
+    /// Lazily built compressed frame and the threshold it was built at.
+    compressed: Option<(usize, Arc<[u8]>)>,
+    /// Wire-form builds so far — the metric the encode-once claim stands on.
+    encode_count: usize,
+}
+
+#[allow(dead_code)]
+impl SharedBroadcastFrame {
+    pub(crate) fn new(packet_id: i64, payload: &[u8]) -> Self {
+        let mut body = Vec::with_capacity(payload.len() + 5);
+        crate::write_varint(&mut body, packet_id);
+        body.extend_from_slice(payload);
+        Self {
+            body: body.into_boxed_slice(),
+            plain: None,
+            compressed: None,
+            encode_count: 0,
+        }
+    }
+
+    /// The wire frame for `compression`, built on the first request and
+    /// shared as the same `Arc` on every later one.
+    pub(crate) fn frame_for(&mut self, compression: Option<usize>) -> Arc<[u8]> {
+        match compression {
+            None => {
+                let body = &self.body;
+                let encode_count = &mut self.encode_count;
+                self.plain
+                    .get_or_insert_with(|| {
+                        *encode_count += 1;
+                        Arc::from(plain_frame(body))
+                    })
+                    .clone()
+            }
+            Some(threshold) => {
+                let rebuild = self
+                    .compressed
+                    .as_ref()
+                    .is_none_or(|(stored, _)| *stored != threshold);
+                if rebuild {
+                    let frame: Arc<[u8]> =
+                        Arc::from(encode_compressed_frame(&self.body, threshold));
+                    self.compressed = Some((threshold, frame));
+                    self.encode_count += 1;
+                }
+                match &self.compressed {
+                    Some((_, frame)) => frame.clone(),
+                    None => unreachable!("the frame was built above"),
+                }
+            }
+        }
+    }
+
+    /// How many wire forms were actually built. A broadcast that served every
+    /// client at one compression mode keeps this at 1.
+    pub(crate) fn encode_count(&self) -> usize {
+        self.encode_count
+    }
+}
+
+/// Why `ClientTxQueue::try_enqueue` refused a frame.
+#[allow(dead_code)] // wired in alongside ClientTxQueue
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TxQueueError {
+    /// The byte budget is full: this client's TCP send buffer is not
+    /// draining. Dropping the slow client costs one player; blocking
+    /// `game_tick` on its socket would stall all of them.
+    BackpressureSlowClient,
+    /// `close` already ran — no new frames are accepted.
+    Closed,
+}
+
+/// A strictly bounded, never-blocking outbound queue for one client.
+///
+/// `game_tick` must never wait on a socket: one client whose TCP send buffer
+/// is full would otherwise hold the whole broadcast loop head-of-line while
+/// every other player waits. Producers `try_enqueue` `Arc<[u8]>` frames —
+/// the same allocations a `SharedBroadcastFrame` hands out, so a broadcast
+/// queueing onto 50 clients is 50 refcount bumps and zero copies — in O(1)
+/// and never block on I/O; over the byte budget the call fails fast with
+/// `TxQueueError::BackpressureSlowClient` so the caller disconnects only the
+/// slow client. A dedicated per-client thread runs `writer_loop`: the
+/// `Condvar` wakes it on the empty→non-empty transition, it drains the batch,
+/// feeds every frame through `PacketCoalescer`, and flushes once per batch.
+/// `close` wakes it one last time so it drains and exits — no leaked thread.
+#[allow(dead_code)] // wired into the per-client writer by the protocol lane
+pub(crate) struct ClientTxQueue {
+    inner: Mutex<TxQueueInner>,
+    /// Signalled on the empty→non-empty transition and by `close`.
+    wake: Condvar,
+    max_queued_bytes: usize,
+}
+
+#[derive(Default)]
+struct TxQueueInner {
+    queue: VecDeque<Arc<[u8]>>,
+    /// Sum of `frame.len()` over `queue` — the bound `try_enqueue` enforces.
+    queued_bytes: usize,
+    closed: bool,
+}
+
+#[allow(dead_code)]
+impl ClientTxQueue {
+    /// The default per-client budget: 4 MiB of outbound frames. Generous
+    /// enough that a healthy client never sees it; small enough that a
+    /// dead socket is cut before it becomes a memory problem.
+    pub(crate) const DEFAULT_MAX_QUEUED_BYTES: usize = 4 * 1024 * 1024;
+
+    pub(crate) fn new(max_queued_bytes: usize) -> Self {
+        Self {
+            inner: Mutex::new(TxQueueInner::default()),
+            wake: Condvar::new(),
+            max_queued_bytes,
+        }
+    }
+
+    /// Queue `frame` for the writer thread without ever blocking. Fails fast
+    /// — rather than stalling the caller — when the byte budget would be
+    /// exceeded or the queue is closed.
+    pub(crate) fn try_enqueue(&self, frame: Arc<[u8]>) -> Result<(), TxQueueError> {
+        let mut inner = lock(&self.inner);
+        if inner.closed {
+            return Err(TxQueueError::Closed);
+        }
+        if inner.queued_bytes.saturating_add(frame.len()) > self.max_queued_bytes {
+            return Err(TxQueueError::BackpressureSlowClient);
+        }
+        // Notify only on the empty→non-empty transition: the writer sleeps
+        // only while the queue is empty, and a non-empty queue is drained by
+        // the batch it is already about to take.
+        let wake_writer = inner.queue.is_empty();
+        inner.queued_bytes += frame.len();
+        inner.queue.push_back(frame);
+        drop(inner);
+        if wake_writer {
+            self.wake.notify_one();
+        }
+        Ok(())
+    }
+
+    /// Move every currently queued frame into `out` in FIFO order and zero
+    /// the byte count. `writer_loop` calls this once per woken batch.
+    pub(crate) fn drain_batch(&self, out: &mut Vec<Arc<[u8]>>) {
+        let mut inner = lock(&self.inner);
+        inner.queued_bytes = 0;
+        out.extend(inner.queue.drain(..));
+    }
+
+    /// Mark the queue closed and wake the writer so `writer_loop` can drain
+    /// what remains and exit. Frames already queued are still written.
+    pub(crate) fn close(&self) {
+        lock(&self.inner).closed = true;
+        self.wake.notify_all();
+    }
+
+    /// Bytes currently queued — the budget `try_enqueue` enforces.
+    pub(crate) fn queued_bytes(&self) -> usize {
+        lock(&self.inner).queued_bytes
+    }
+
+    /// Block until a frame is queued or the queue is closed. `false` means
+    /// closed and drained: the writer exits.
+    fn wait_for_work(&self) -> bool {
+        let mut inner = lock(&self.inner);
+        while inner.queue.is_empty() && !inner.closed {
+            inner = self.wake.wait(inner).unwrap_or_else(|e| e.into_inner());
+        }
+        !(inner.closed && inner.queue.is_empty())
+    }
+
+    /// The dedicated per-client writer loop: sleep on the `Condvar` until a
+    /// batch is ready, push every drained frame through `PacketCoalescer`,
+    /// and flush once per batch — a burst of small packets costs one
+    /// `write_all`, not one per packet. Returns when `close` ran and the
+    /// backlog drained, or early on a write error (the caller then drops the
+    /// client).
+    pub(crate) fn writer_loop(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        let mut coalescer = PacketCoalescer::new();
+        let mut batch = Vec::new();
+        while self.wait_for_work() {
+            self.drain_batch(&mut batch);
+            for frame in batch.drain(..) {
+                coalescer.push_frame(&frame, w)?;
+            }
+            coalescer.flush(w)?;
+        }
+        coalescer.flush(w)
+    }
+}
+
+#[allow(dead_code)]
+impl Default for ClientTxQueue {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_MAX_QUEUED_BYTES)
     }
 }
 
@@ -1880,5 +2097,186 @@ mod tests {
         assert!(w2.writes >= 3, "threshold flushes plus passthrough: {}", w2.writes);
         assert_eq!(w2.bytes, expected2, "auto-flush preserves wire order");
         assert_eq!(bounded.buffered(), 0);
+    }
+
+    #[test]
+    fn bot_net1_broadcast_frame_encodes_once_for_a_50_player_fanout() {
+        // A compressible ~4 KiB payload at the vanilla default threshold.
+        let mut payload = Vec::with_capacity(4 * 1024);
+        for i in 0..2048u32 {
+            payload.extend_from_slice(&[b'a' + (i % 26) as u8, (i >> 8) as u8]);
+        }
+        let mut body = Vec::new();
+        crate::write_varint(&mut body, 0x27);
+        body.extend_from_slice(&payload);
+        let expected = encode_compressed_frame(&body, 256);
+
+        // 50 clients at the negotiated threshold: one compression, then 50
+        // clones of the same allocation.
+        let mut shared = SharedBroadcastFrame::new(0x27, &payload);
+        let frames: Vec<Arc<[u8]>> = (0..50).map(|_| shared.frame_for(Some(256))).collect();
+        assert_eq!(
+            shared.encode_count(),
+            1,
+            "the 50-player broadcast compressed exactly once"
+        );
+        for frame in &frames {
+            assert!(
+                Arc::ptr_eq(frame, &frames[0]),
+                "every client receives the same shared frame"
+            );
+            assert_eq!(
+                &**frame,
+                expected.as_slice(),
+                "identical to encode_compressed_frame byte-for-byte"
+            );
+        }
+
+        // An uncompressed client builds the plain form lazily — a second
+        // encode, shared across subsequent plain requests.
+        let p1 = shared.frame_for(None);
+        let p2 = shared.frame_for(None);
+        assert!(Arc::ptr_eq(&p1, &p2));
+        assert_eq!(shared.encode_count(), 2);
+        let mut expected_plain = Vec::new();
+        crate::write_varint(&mut expected_plain, body.len() as i64);
+        expected_plain.extend_from_slice(&body);
+        assert_eq!(&*p1, expected_plain.as_slice());
+        // The compressed fanout is untouched by serving the plain form.
+        let c = shared.frame_for(Some(256));
+        assert!(Arc::ptr_eq(&c, &frames[0]));
+        assert_eq!(shared.encode_count(), 2);
+
+        // A different threshold re-encodes once, then shares that build.
+        let other = shared.frame_for(Some(64));
+        assert_eq!(shared.encode_count(), 3);
+        assert!(!Arc::ptr_eq(&other, &frames[0]));
+        assert_eq!(
+            &*other,
+            encode_compressed_frame(&body, 64).as_slice(),
+            "rebuilt at the new threshold"
+        );
+        let again = shared.frame_for(Some(64));
+        assert!(Arc::ptr_eq(&other, &again));
+        assert_eq!(shared.encode_count(), 3);
+    }
+
+    #[test]
+    fn bot_net1_tx_queue_writer_coalesces_a_burst_into_one_flush() {
+        use std::io::Write;
+
+        struct Counting {
+            writes: usize,
+            bytes: Vec<u8>,
+        }
+        impl Write for Counting {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                self.bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let queue = Arc::new(ClientTxQueue::default());
+        let mut expected = Vec::new();
+        // Queue the whole burst before the writer starts so it wakes to one
+        // 30-frame batch — the deterministic form of the drain+flush-once
+        // path a mid-tick burst hits.
+        for i in 0..30u8 {
+            let frame: Arc<[u8]> = Arc::from(vec![i; 100 + usize::from(i)]);
+            expected.extend_from_slice(&frame);
+            queue.try_enqueue(frame).unwrap();
+        }
+        assert_eq!(queue.queued_bytes(), expected.len());
+
+        let sink = Arc::new(Mutex::new(Counting {
+            writes: 0,
+            bytes: Vec::new(),
+        }));
+        let writer = {
+            let queue = queue.clone();
+            let sink = sink.clone();
+            std::thread::spawn(move || {
+                let mut out = lock(&sink);
+                queue.writer_loop(&mut *out)
+            })
+        };
+        while queue.queued_bytes() != 0 && !writer.is_finished() {
+            std::thread::yield_now();
+        }
+        // close() wakes the writer to exit cleanly; the join proves the
+        // thread is gone — zero leaked threads.
+        queue.close();
+        writer.join().unwrap().unwrap();
+
+        let out = lock(&sink);
+        assert_eq!(out.writes, 1, "the 30-frame burst is one coalesced write");
+        assert_eq!(out.bytes, expected, "frames leave in exact wire order");
+        assert_eq!(
+            queue.try_enqueue(Arc::from(vec![1u8])),
+            Err(TxQueueError::Closed)
+        );
+    }
+
+    #[test]
+    fn bot_net1_tx_queue_close_wakes_the_writer_on_an_empty_queue() {
+        let queue = Arc::new(ClientTxQueue::new(1024));
+        let writer = {
+            let queue = queue.clone();
+            std::thread::spawn(move || {
+                let mut sink = Vec::new();
+                queue.writer_loop(&mut sink).map(|_| sink)
+            })
+        };
+        queue.close();
+        let sink = writer.join().unwrap().unwrap();
+        assert!(sink.is_empty(), "nothing queued means nothing written");
+    }
+
+    #[test]
+    fn bot_net1_tx_queue_backpressure_fails_fast_without_blocking() {
+        // A stalled client: no writer drains, so the byte budget fills and
+        // the producer — game_tick — must see the refusal immediately rather
+        // than wait on the socket.
+        let queue = ClientTxQueue::new(300);
+        let frame: Arc<[u8]> = Arc::from(vec![7u8; 100]);
+        for _ in 0..3 {
+            queue.try_enqueue(frame.clone()).unwrap();
+        }
+        assert_eq!(queue.queued_bytes(), 300);
+
+        let start = Instant::now();
+        assert_eq!(
+            queue.try_enqueue(Arc::from(vec![9u8; 1])),
+            Err(TxQueueError::BackpressureSlowClient)
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "the slow client never blocks the producer"
+        );
+        // The refusal is accounted, not queued: the budget is unchanged and
+        // even an old frame still over the limit keeps failing.
+        assert_eq!(queue.queued_bytes(), 300);
+        assert_eq!(
+            queue.try_enqueue(frame.clone()),
+            Err(TxQueueError::BackpressureSlowClient)
+        );
+
+        // Once a drain frees budget the producer queues again, in FIFO order.
+        let mut out = Vec::new();
+        queue.drain_batch(&mut out);
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|f| Arc::ptr_eq(f, &frame)));
+        assert_eq!(queue.queued_bytes(), 0);
+        queue.try_enqueue(frame).unwrap();
+
+        queue.close();
+        assert_eq!(
+            queue.try_enqueue(Arc::from(vec![1u8; 1])),
+            Err(TxQueueError::Closed)
+        );
     }
 }
