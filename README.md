@@ -13,6 +13,33 @@ Minecraft Java 1.21.1（protocol 767）向けの実験的なRustサーバーで�
 
 現在の状態・限界・次の順序は [specs/README.md](specs/README.md) と [specs/ROADMAP.md](specs/ROADMAP.md) が正本です。このREADMEには状態表を複製しません。
 
+## 実装されている構成（Alpha）
+
+ルートのサーバーパッケージとは別に、以下の **11 standalone crates** を管理しています。`tests/verify.sh` は各 crate の `cargo test --offline --locked` を実行します。Clippy の警告ゼロは別途リリース対象の各 crate で確認してください。
+
+| crate | 主な役割 |
+|---|---|
+| `core` | クラッシュの指紋・機密情報の伏せ字化 |
+| `proto` | セッション、プロトコル、招待・音声リレー |
+| `state-store` | ワールド保存、Anvil 検査、監査ログ |
+| `server-files` | サーバー初期化、パケットキャッシュ |
+| `mod-offload` | Mod 処理の分離・委譲契約 |
+| `mod-adapter-core` | Mod の静的検査、限定 `.class` VM、互換アダプター |
+| `create-adapter` | Create 系の動力・線路モデル |
+| `client-port` | メッシュ、3D モデルベイク、テクスチャアトラス、Hi-Z |
+| `client-kernel` | クライアント側レジストリ、エンティティ補間 |
+| `client-app` | クライアント CLI、描画パイプライン、フレーム制御、音量制限 |
+| `client-ui` | 純 Rust の UI 状態・レイアウト・描画リスト・ソフトウェア描画 |
+
+現時点で利用できる実装面は次の通りです。
+
+- OP レベル 4 の `/megu policy list|get|set|reset` が、マップの **5 項目**（`minimap_mode`、`allow_cave_map`、`allow_mob_radar`、`player_radar_scope`、`allow_waypoint_teleport`）を制御します。`player_radar_scope=party_only` を選べます。MineAll/CutAll は初期値 `off` の opt-in です。
+- 死亡時の元スロット復帰は opt-in のピックアップ処理とテストが存在します。通常の運用コマンドから有効化する配線は未完成です。
+- `mod-adapter-core` に制限付き `.class` バイトコード検証・実行 VM があります。侵襲的な Java Mod は Tier 3 の境界で判定し、必要な場合のみ `tools/build_mini_jre.py` で手元の JDK から小型の委譲用 JRE を作れます。任意の Mod の動作は保証しません。
+- クライアント側に 3D モデルベイカー、アトラス、Hi-Z、WGSL シェーダー、RenderGraph、純 Rust `client-ui` とヘッドレスのソフトウェアラスタライザがあります。FPS 上限は `10..=2000` または `Unlimited`、`FrameBudgetPacer` はフレームごとの処理量を制御します。音量の上限を制御するリミッターも実装されています。
+- Linux / macOS / Windows を対象とした移植可能な構成です。実ウィンドウを持つ `winit` + `wgpu` バックエンドは Alpha 後の作業、実際の第三者 Modpack による E2E 検証は Wave 3 の対象です。各 OS での実機検証状況は [リリースチェックリスト](docs/release-checklist.md) に従って確認します。
+- Cloudflare Pages Functions に `POST /api/report`（最大 4 KiB、機密文字列を伏せ字化する GitHub Issue リレー）と `GET /api/latest` があります。運用には設定と秘密情報の登録が必要です（[運用ガイド](docs/operator-guide.md)）。
+
 ## Collaborator クイックスタート（3 コマンド）
 
 前提は Rust 1.98.0（[rust-toolchain.toml](rust-toolchain.toml) で固定）、Python 3、Java 21（NeoForge / Fabric 互換テスト用）です。開発ブランチ（`main` / `perf/worldgen-parallel`）にはテスト用の vanilla データが同梱されているため、clone 直後に以下の 3 ステップで開発・検証を開始できます：
@@ -47,9 +74,9 @@ MC_SPINE_PORT=25699 cargo run --locked
 
 ## 軽量化 Mod について（プレイヤー・運用者向け）
 
-- `Sodium` / `Embeddium` / `Lithium` / `Starlight` / `FerriteCore` / `ModernFix` / `EntityCulling` / `Distant Horizons` などの軽量化 Mod は別途導入する必要はありません（描画カリング・ライティング・パレット圧縮・並列チャンク処理・遠景 LOD といった同等カテゴリの最適化を、`mc-spine` 独自のクリーンルーム Rust 実装として標準搭載しています）。
-- 既存の Modpack フォルダ（`mods/`）にこれらの軽量化 Mod が含まれていても、起動時に互換衝突や不要な JVM フォールバックを防ぐため **自動でスキップ** され、残りのコンテンツ Mod はそのまま動作します（対象一覧と仕組み: [ux-and-builtin-optimizations.md](specs/client-fork/ux-and-builtin-optimizations.md)）。
-- これらはあくまで自動スキップによる互換性対応であり、上記 Mod 群の公式同梱・提携・コード移植ではありません（詳細は下の「クリーンルーム実装と設計上の先行技術」を参照）。
+- 描画カリング・ライティング・パレット圧縮・並列チャンク処理・遠景 LOD など、既存の軽量化 Mod と同じ分野の Rust 実装があります。`Sodium` / `Embeddium` / `Lithium` / `Starlight` / `FerriteCore` / `ModernFix` / `EntityCulling` / `Distant Horizons` と機能・性能が同等であることは検証されていません。
+- `mc-spine-mod-check` の事前検査では、組み込みの置換対象として登録された軽量化 Mod の ID をスキップ対象に分類します。それ以外のコンテンツ Mod の動作可否は個別の互換性検査・実行検証に依存します（対象一覧と仕組み: [ux-and-builtin-optimizations.md](specs/client-fork/ux-and-builtin-optimizations.md)）。
+- スキップ対象の分類は事前検査の挙動です。上記 Mod 群の公式同梱・提携・コード移植は行っていません（詳細は下の「クリーンルーム実装と設計上の先行技術」を参照）。
 
 ## どこから読むか
 

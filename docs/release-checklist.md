@@ -27,6 +27,20 @@ The pre-release gate also runs [tests/verify_gate_coverage_test.py](../tests/ver
 offline self-test and against the built server. It checks the `mod-suite`
 feature as well.
 
+The gate invokes `cargo test --offline --locked` for all **11 standalone
+crates**: `core`, `proto`, `state-store`, `server-files`, `mod-offload`,
+`mod-adapter-core`, `create-adapter`, `client-port`, `client-kernel`,
+`client-app`, and `client-ui`. Clippy is a separate release check for the
+same set; `tests/verify.sh` does not run it:
+
+```sh
+for crate in core proto state-store server-files mod-offload mod-adapter-core \
+    create-adapter client-port client-kernel client-app client-ui; do
+    cargo clippy --manifest-path "$crate/Cargo.toml" --offline --locked \
+        --all-targets -- -D warnings || exit 1
+done
+```
+
 ## 2. Clean public export
 
 Produce the Mojang-free export and let `--verify` rehearse it:
@@ -177,3 +191,53 @@ client each:
 - Point operators at [SECURITY_NOTES.md](../SECURITY_NOTES.md) for the
   bind/allowlist posture; in the image the published port, not the bind
   address, decides exposure.
+
+## 8. Phase 2 / 3 / 4 Alpha ship gates
+
+Record results for the **same release-candidate SHA**. These are pending
+checks until run on that SHA; a code path or unit test alone does not satisfy
+a live interoperability gate.
+
+**Phase 2 — documentation and implementation surface**
+
+- [ ] `README.md`, `docs/architecture.md`, `docs/operator-guide.md`, and this
+  checklist agree with the 11 standalone crates and their actual entry points.
+- [ ] Full `tests/verify.sh`, standalone Clippy loop above, provenance check,
+  and `tools/release_bundle.py --self-test` pass on the candidate SHA.
+- [ ] Document the boundaries of the bounded `.class` subset VM, optional
+  mini-JRE/Tier 3 delegation, in-memory OP4 `/megu policy`, optional MineAll/
+  CutAll, and death-slot restore's currently unconnected live toggle.
+- [ ] Document the headless software rasterizer, WGSL/RenderGraph, and
+  `client-ui`; the real `winit` + `wgpu` window backend remains post-Alpha.
+
+**Phase 3 — integration and portability**
+
+- [ ] Build and smoke-test **Linux**, **macOS**, and **Windows** separately;
+  record platform, target triple, compiler, startup and test evidence for each.
+- [ ] On a disposable server, check `/megu policy` level-4 authorization,
+  `list|get|set|reset`, the five map fair-play switches (including
+  `player_radar_scope=party_only`), and opt-in MineAll/CutAll behavior.
+- [ ] Check the client FPS cap (`10..=2000` / `Unlimited`), frame budget,
+  bounded volume, headless 3D model/atlas/Hi-Z/WGSL pipeline, and client UI
+  against the supported entry points.
+- [ ] Run Wave 3 **real third-party modpack E2E** before claiming third-party
+  Mod compatibility. Record which mods needed the optional Tier 3 mini-JRE
+  delegate and which remained unsupported.
+
+**Phase 4 — candidate, distribution and optional crash relay**
+
+- [ ] Complete [`P4-1`](../specs/ROADMAP.md) on the same SHA, including
+  the live/representative M3 evidence, export verification, and release gates.
+  Existing unit and offline results do not establish full M2 parity or
+  equal-work live performance.
+- [ ] Verify the clean public export, playable data regeneration, bundle
+  manifest/checksums, container EULA check, and live client smoke in §§2–6.
+- [ ] For an enabled crash relay, provision the Cloudflare free-tier Pages
+  site, Pages Functions, Workers KV (`CRASH_INDEX` binding), and optional
+  Turnstile. Verify `POST /api/report` and `GET /api/latest` on the deployed
+  Pages project.
+- [ ] Set `GITHUB_REPO` as a non-secret variable and `GITHUB_TOKEN` as a
+  Pages secret with the repository's `issues:write` permission. Set optional
+  `TURNSTILE_SECRET_KEY` only as a Pages secret when Turnstile is enabled.
+  Check that no tokens, secret values, or local `.env` files enter Git,
+  exported sources, or release bundles.

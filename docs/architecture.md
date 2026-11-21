@@ -19,11 +19,38 @@ refer to modules present in this tree.
   validated Server Mod Sync ([`mod_sync`](../mod-adapter-core/src/mod_sync.rs))
   and generic creature behavior primitives
   ([`creature_primitives`](../mod-adapter-core/src/creature_primitives.rs)).
+  [`bytecode_subset_vm`](../mod-adapter-core/src/bytecode_subset_vm.rs) verifies
+  and executes an allowlisted, fuel-bounded `.class` method subset without a
+  JVM; [`ecosystem_compat`](../mod-adapter-core/src/ecosystem_compat.rs),
+  [`mine_cut_all`](../mod-adapter-core/src/mine_cut_all.rs), and
+  [`custom_media`](../mod-adapter-core/src/custom_media.rs) contain bounded
+  compatibility, opt-in bulk-action, and custom-media logic. Invasive Java
+  hooks require separate Tier 3 delegation and validation.
 - **`client-port`** — Vulkan mesh shaders, compute-driven multi-draw
   indirect, and `ClassicLowSpec` for legacy Intel HD/UHD devices with
   16 KiB uniform-buffer batches. The GPU pipeline includes Create-style
   kinetic instances and block-entity instancing for chests, item frames,
   and signs ([`gpu_pipeline`](../client-port/src/gpu_pipeline.rs)).
+  [`model_baker`](../client-port/src/model_baker.rs),
+  [`atlas`](../client-port/src/atlas.rs), and
+  [`hiz_culler`](../client-port/src/hiz_culler.rs) implement model baking,
+  texture packing, and hierarchical occlusion culling.
+- **`client-kernel`** — Client registry and version data; entity snapshot
+  interpolation in [`entity_interp`](../client-kernel/src/entity_interp.rs).
+- **`client-app`** — WGSL shader definitions and validation
+  ([`shaders`](../client-app/src/shaders.rs)), RenderGraph
+  ([`render_graph`](../client-app/src/render_graph.rs)), streaming frame budgets
+  ([`frame_pacer`](../client-app/src/frame_pacer.rs)), and bounded audio/QoL
+  helpers ([`audio_qol`](../client-app/src/audio_qol.rs)). The
+  [software rasterizer](../client-app/src/render.rs) is headless; a real
+  `winit` + `wgpu` window loop is a post-Alpha milestone.
+- **`client-ui`** — Pure-Rust UI draw lists, layout, screen state and a
+  headless RGBA rasterizer ([`src`](../client-ui/src/lib.rs)); GPU-ready
+  draw geometry and WGSL are present without a live window backend.
+- **`core`** — Redacted deterministic crash fingerprints and readable
+  summaries ([`crash_report`](../core/src/crash_report.rs)).
+- **`create-adapter`** — Rail topology and network operations
+  ([`rail_network`](../create-adapter/src/rail_network.rs)).
 - **`proto`** — `FRL1` friend invite relay
   ([`friend_relay`](../proto/src/friend_relay.rs)) and `VCR1` proximity
   voice relay ([`voice_relay`](../proto/src/voice_relay.rs)).
@@ -38,6 +65,21 @@ refer to modules present in this tree.
 - **`server-files`** — `SharedChunkWireCache` with `Arc<[u8]>` packet
   storage, `DirectionalChunkQueue`, and the `SBC1` startup binary cache
   ([`perf_cache`](../server-files/src/perf_cache.rs)).
+- **`mod-offload`** — Rust-side contracts for bounded delegate work. The
+  optional [`mini-JRE builder`](../tools/build_mini_jre.py) requires an
+  operator-installed JDK 21+.
+
+## Operations and reporting
+
+The server exposes level-4 [`/megu policy`](../src/teams_and_commands.rs)
+`list|get|set|reset` for map fair-play and opt-in bulk actions. Five map
+controls include `player_radar_scope=party_only`; current policy state is
+in-memory. [`website/functions/api/report.js`](../website/functions/api/report.js)
+validates and redacts a compact crash/bug/idea report, then relays it to
+GitHub Issues using a secret and KV-backed crash deduplication.
+[`website/functions/api/latest.js`](../website/functions/api/latest.js)
+reads the latest public GitHub release. Neither endpoint proves an
+end-to-end third-party modpack run.
 
 ## Clean-room public export
 

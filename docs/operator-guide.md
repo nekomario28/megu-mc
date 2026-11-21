@@ -165,6 +165,22 @@ The same classifier is available as a Python tool —
 `python3 tools/mod_launcher.py --modpack pack.mrpack --mc-version 1.21.1`
 — which is what the container entrypoint runs (§4).
 
+**Optional bounded Java delegate runtime.** The pure-Rust `.class` subset
+VM handles only verified, allowlisted instructions. For Tier 3/invasive
+Java hooks, an operator may prepare a headless JRE from their own JDK 21+
+using [`build_mini_jre.py`](../tools/build_mini_jre.py):
+
+```sh
+python3 tools/build_mini_jre.py --out ./mini-jre \
+    --profile neoforge-delegate --xms-mib 32 --xmx-mib 256 --dry-run --json
+python3 tools/build_mini_jre.py --out ./mini-jre \
+    --profile neoforge-delegate --xms-mib 32 --xmx-mib 256
+```
+
+`minimal` is the smaller profile. The output path must be new, and the
+tool installs nothing until invoked. A built JRE is a delegate runtime
+component; a real third-party modpack run still requires Wave 3 E2E proof.
+
 ## 3. Running the server
 
 Start it in the server working directory; the world saves to
@@ -199,6 +215,8 @@ Environment knobs the runtime actually reads:
 | `MC_SPINE_LAN_BROADCAST` | off | `1`: multicast "Open to LAN" announcement armed once the game listener owns a port |
 | `MC_SPINE_SAFE_SPAWN` | auto | `1` forces the dry-ground spawn search; it already runs automatically on a never-saved world when the datapack worldgen is active |
 | `MC_SPINE_COMPRESSION_THRESHOLD` | 256 | packet compression threshold; `0`/negative disables |
+| `MC_SPINE_ZLIB_LEVEL` | 1 | compressed packet zlib level, clamped to `1..=9` |
+| `MC_SPINE_STRICT_WORLDGEN` | off | `1`: fail the datapack worldgen load on the first parse failure instead of omitting that entry |
 | `MC_SPINE_IDLE_TIMEOUT_SECS` | 60 | play state: no complete packet for this long drops the client |
 | `MC_SPINE_LOGIN_TIMEOUT_SECS` | 15 | wall-clock budget for handshake + login + configuration |
 | `MC_SPINE_MAX_CONN_PER_IP` | 4 (non-loopback) | concurrent connections per remote IP; `0` = unlimited; when set explicitly it also applies to loopback |
@@ -208,7 +226,7 @@ Environment knobs the runtime actually reads:
 | `MC_SPINE_CONFIG` | `server.toml` | path of the optional config file |
 | `MC_SPINE_ENABLE_QUERY` | off | `1`/`true` enables the GameSpy4 UDP Query responder; `enable-query=true` in `server.properties` also enables it |
 | `MC_SPINE_QUERY_PORT` | game port | UDP Query port; overrides `query.port` in `server.properties` |
-| `MC_SPINE_ANVIL_WORLD_DIR` | unset | load a vanilla-format Anvil world at boot and write it on autosave/shutdown |
+| `MC_SPINE_ANVIL_WORLD_DIR` | unset | load a vanilla-format Anvil world at boot and write it on autosave/shutdown; back up `playerdata/<uuid>.dat` with the world |
 
 **GameSpy4 (GS4) Query.** Enable the opt-in UDP status/rules responder
 with `MC_SPINE_ENABLE_QUERY=1 mc-spine`, or add `enable-query=true` to
@@ -222,6 +240,44 @@ line (TPS band + ms/tick, players, loaded chunks, memory). `status` is
 deliberately console/RCON-only and never enters the player command tree —
 tab completion stays 100% Vanilla. The same commands reach the server
 over RCON when `MC_SPINE_RCON_PORT` + `MC_SPINE_RCON_PASS` are set.
+
+**Level-4 server policies.** Operators can inspect or change the running
+server's opt-in policy with `/megu policy`; settings are in-memory and
+`reset` returns them to defaults:
+
+```text
+/megu policy list
+/megu policy get minimap_mode
+/megu policy set minimap_mode fair_play
+/megu policy set allow_cave_map false
+/megu policy set allow_mob_radar false
+/megu policy set player_radar_scope party_only
+/megu policy set allow_waypoint_teleport false
+/megu policy set mine_all sneak_only
+/megu policy set cut_all sneak_only
+/megu policy reset
+```
+
+The five map controls are `minimap_mode` (`unrestricted` by default,
+`fair_play`, `disabled`), `allow_cave_map`, `allow_mob_radar`,
+`player_radar_scope` (`all` by default, `party_only`, `none`), and
+`allow_waypoint_teleport`. Boolean switches take `true|false`; mine/cut
+modes take `off` (default), `sneak_only`, `while_not_sneaking`, or
+`always`. Additional keys are visible in `list`, including `xp_merge_mode`
+and `max_frame_mib`. Access is checked at level 4 for both parsing and
+execution. The integrated client provides corresponding host-world flags,
+for example:
+
+```sh
+mc-spine-client --fair-play --minimap-mode fair_play \
+    --allow-cave-map false --allow-mob-radar false \
+    --player-radar party_only --allow-waypoint-teleport false
+```
+
+`--fair-play` is opt-in. `--minimap-mode` defaults to `unrestricted`.
+The client forwards host-world choices to its integrated server. Death-slot
+restore currently has tested internal pickup logic but no general operator
+toggle wired into the running server.
 
 **Vanilla world import/export.** `--import-anvil <vanilla_world_dir>`
 reads a vanilla 1.21.1 world (`level.dat` + `region/*.mca` + `DIM-1`/
@@ -311,7 +367,9 @@ For a live vanilla-format world, start the server with
 `MC_SPINE_ANVIL_WORLD_DIR=/path/to/vanilla-world mc-spine`. The Anvil
 import runs after the overlay load and wins on overlapping data; saves
 write back to that directory. Back up an existing world before enabling
-live writes.
+live writes, including its `playerdata/<uuid>.dat` entries. Verify player
+inventory, identity and location restoration on a disposable copy before
+moving a production world.
 
 Exit codes: `0` success, `1` file-level failure (unreadable, corrupt, CRC
 mismatch, malformed JSON, unknown DataVersion), `2` a refused downgrade
@@ -418,6 +476,38 @@ mc-spine-client --gpu-backend classic
 - [../SECURITY_NOTES.md](../SECURITY_NOTES.md) carries the full
   bind/allowlist posture; [../SECURITY.md](../SECURITY.md) is the
   reporting channel.
+
+## 8. Cloudflare Pages report relay (optional)
+
+The static [`website/`](../website) can be deployed to Cloudflare Pages
+with the Pages Functions `POST /api/report` and `GET /api/latest`.
+The reporting endpoint accepts a validated `megu-report/1` JSON payload
+(4 KiB maximum), removes common sensitive strings, and creates or
+deduplicates GitHub Issues. `GET /api/latest` reads the public release.
+
+Four Cloudflare free-tier components used by this setup are **Pages**
+(static site), **Pages Functions** (API execution), **Workers KV**
+(`CRASH_INDEX` dedup state), and **Turnstile** (optional challenge). Free
+tier limits and current eligibility are subject to Cloudflare's terms.
+
+1. Create a Pages project with `website/` as the root and use
+   [`website/wrangler.toml`](../website/wrangler.toml) as the template.
+2. Create a KV namespace `CRASH_INDEX` and set its ID in the Pages
+   project's KV binding. It is required to deduplicate fingerprinted
+   crash/bug reports.
+3. Set the non-secret `GITHUB_REPO=owner/name` variable if needed. Add
+   `GITHUB_TOKEN` as a **Pages secret**, using a fine-grained token with
+   `issues:write` for that repository.
+4. Optionally enable Turnstile and register `TURNSTILE_SECRET_KEY` as a
+   Pages secret. Once enabled, requests without a valid
+   `turnstile_token` are denied.
+
+**Zero-secret rule:** never commit tokens, Turnstile secret values, or
+local `.env` credentials. Use the Pages dashboard or
+`wrangler pages secret put <NAME> --project-name megu-site`.
+Check API responses and GitHub Issue permissions before enabling public
+report submission. The endpoint is a relay, not a full crash telemetry
+service.
 
 See also: [docs/development.md](development.md) for contributor setup and
 test tiers, [docs/architecture-crates.md](architecture-crates.md) for the
