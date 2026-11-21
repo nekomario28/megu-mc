@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 //! `mc-spine-world-migrate`: inspect `STV1` world snapshots and migrate world
-//! data between Minecraft `1.21.1` and `26.3`.
+//! data between Minecraft `1.21.1` and `26.3`, plus the pure-offline operator
+//! subcommands `audit-query` / `rollback` over `AUD1` audit logs and
+//! `pregen-plan` for spiral pregeneration sizing.
 //!
-//! Exit codes: `0` success, `2` a refused downgrade or bad command line, `1`
-//! anything wrong with the files themselves (unreadable, corrupt, CRC
-//! mismatch, malformed JSON).
+//! Exit codes: `0` success, `2` a refused downgrade, a refused over-budget
+//! rollback or bad command line, `1` anything wrong with the files themselves
+//! (unreadable, corrupt, CRC mismatch, malformed JSON).
 
 use mc_spine_core::version::TargetVersion;
 use mc_spine_state_store::{
-    inspect_anvil_world_dir, inspect_snapshot, migrate_anvil_level_dat, migrate_json_document,
-    migrate_snapshot, to_data_json, write_file_atomic, AnvilInspectError, DataValue,
-    MigrationError, SnapshotSummary,
+    decode_snapshot, encode_snapshot, inspect_anvil_world_dir, inspect_snapshot,
+    migrate_anvil_level_dat, migrate_json_document, migrate_snapshot, to_data_json,
+    write_file_atomic, AnvilInspectError, AuditAction, AuditLog, AuditQuery, AuditRecord,
+    DataValue, MigrationError, PregenJob, PregenShape, SnapshotSummary,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -26,6 +29,9 @@ USAGE:
     mc-spine-world-migrate migrate --in <in.stv1> --out <out.stv1> --to <1.21.1|26.3> [--allow-downgrade] [--json]
     mc-spine-world-migrate migrate-json --in <in.json> --out <out.json> --to <1.21.1|26.3> [--allow-downgrade] [--json]
     mc-spine-world-migrate migrate-level --in <in_level.dat> --out <out_level.dat> --to <1.21.1|26.3> [--allow-downgrade] [--backup-old] [--json]
+    mc-spine-world-migrate audit-query --log <audit.aud1> [--actor <name>] [--dim <dim>] [--pos <x,y,z> --radius <r>] [--since-tick <t>] [--limit <n>] [--json]
+    mc-spine-world-migrate rollback --log <audit.aud1> --in <world.stv1> --out <restored.stv1> [--actor <name>] [--dim <dim>] [--pos <x,y,z> --radius <r>] [--since-tick <t>] [--max-blocks <n>] [--json]
+    mc-spine-world-migrate pregen-plan --radius <chunks> [--shape square|circle] [--center <cx,cz>] [--batch-size <n>] [--json]
     mc-spine-world-migrate --help
 
 COMMANDS:
@@ -49,6 +55,23 @@ COMMANDS:
                    gzip level.dat atomically. With --backup-old and an
                    existing --out, the prior file is copied to <out>_old
                    (vanilla's level.dat_old convention) before the swap.
+    audit-query    Query an AUD1 audit log fully offline: every intact
+                   CRC32-framed record is recovered (a torn or corrupt tail
+                   is reported and skipped), then filtered by actor,
+                   dimension, --pos/--radius sphere and --since-tick, and
+                   printed in chronological seq order.
+    rollback       Replay the matching audit-log block mutations against an
+                   STV1 snapshot: every filtered block mutation is undone in
+                   reverse seq order (each position converges to its state
+                   before the earliest matched edit), the result is
+                   re-encoded under the input's exact target version,
+                   verified decodable, and written atomically. Refuses with
+                   exit 2 when the matched block count exceeds --max-blocks;
+                   a refusal never touches --out.
+    pregen-plan    Size a spiral pregen without generating anything: exact
+                   chunk total, ring count, first/last chunk coordinates and
+                   the tick count a --batch-size budget implies, for a
+                   square or circular radius around --center.
 
 OPTIONS:
     --in <path>          Input file.
@@ -61,6 +84,26 @@ OPTIONS:
     --backup-old         migrate-level only: when --out already exists, copy
                          it to <out>_old before writing the migrated file —
                          matching vanilla's level.dat_old convention.
+    --log <path>         audit-query/rollback: the AUD1 audit log to read.
+    --actor <name>       Only records by this actor (player name or a
+                         pseudo-actor like #tnt / #creeper / #fire).
+    --dim <dimension>    Only records in this dimension id.
+    --pos <x,y,z>        Center of the spatial filter; must be given
+                         together with --radius.
+    --radius <r>         audit-query/rollback: Euclidean radius in blocks
+                         around --pos. pregen-plan: spiral radius in chunks
+                         (required; capped at 2000000, past the vanilla
+                         world border's ~1875000 chunks).
+    --since-tick <t>     Only records at tick >= t (inclusive).
+    --limit <n>          audit-query: print at most n matching rows.
+    --max-blocks <n>     rollback: refuse when more than n block mutations
+                         would be rewritten (default 10000, hard cap
+                         100000).
+    --shape <s>          pregen-plan footprint: \"square\" (default) covers
+                         (2r+1)^2 chunks; \"circle\" covers dx^2+dz^2 <= r^2.
+    --center <cx,cz>     pregen-plan spiral center chunk (default 0,0).
+    --batch-size <n>     pregen-plan chunks per tick used for the tick-count
+                         estimate (default 64).
     --json               Print the report as JSON instead of text.
     -h, --help           Show this help.
 
@@ -68,7 +111,8 @@ EXIT CODES:
     0  success
     1  the file could not be used: unreadable, corrupt, CRC mismatch,
        malformed JSON, or a DataVersion this tool does not know
-    2  refused downgrade without --allow-downgrade, or bad command line
+    2  refused downgrade without --allow-downgrade, a rollback whose
+       matched block count exceeds --max-blocks, or bad command line
 ";
 
 /// A fatal-to-this-invocation condition paired with its exit code.
@@ -125,7 +169,38 @@ enum Command {
         backup_old: bool,
         json: bool,
     },
+    AuditQuery {
+        log: PathBuf,
+        query: AuditQuery,
+        limit: Option<usize>,
+        json: bool,
+    },
+    Rollback {
+        log: PathBuf,
+        input: PathBuf,
+        output: PathBuf,
+        query: AuditQuery,
+        max_blocks: u64,
+        json: bool,
+    },
+    PregenPlan {
+        radius: u32,
+        shape: PregenShape,
+        center: (i32, i32),
+        batch_size: usize,
+        json: bool,
+    },
 }
+
+/// `rollback`'s safety bound: the matched-block count it tolerates without an
+/// explicit `--max-blocks`, and the hard cap no invocation may cross.
+const DEFAULT_MAX_BLOCKS: u64 = 10_000;
+const MAX_BLOCKS_CAP: u64 = 100_000;
+/// `pregen-plan`'s default per-tick budget and its radius ceiling. The cap
+/// sits past the vanilla world border (~30M blocks = ~1.875M chunks), so any
+/// real plan fits while a typo cannot spin the ring arithmetic for hours.
+const DEFAULT_BATCH_SIZE: usize = 64;
+const MAX_PREGEN_RADIUS: u32 = 2_000_000;
 
 /// The shared `--in`/`--out`/`--to`/`--allow-downgrade`/`--backup-old`/
 /// `--json` flag set of the three migrate subcommands (`--backup-old` is
@@ -193,6 +268,229 @@ fn parse_migrate_flags(cmd: &str, args: &[String]) -> Result<MigrateFlags, CliEr
 
 fn require<T>(name: &str, value: Option<T>) -> Result<T, CliError> {
     value.ok_or_else(|| usage(format!("missing required option {name}")))
+}
+
+/// `--pos x,y,z` / `--center cx,cz` argument split on commas. A wrong
+/// component count or a non-integer component is a usage error, never a
+/// clamp or a silent drop.
+fn parse_i32_list(flag: &str, value: &str, count: usize) -> Result<Vec<i32>, CliError> {
+    let parts: Vec<&str> = value.split(',').collect();
+    if parts.len() != count {
+        return Err(usage(format!(
+            "{flag} expects {count} comma-separated integers, got {value:?}"
+        )));
+    }
+    parts
+        .iter()
+        .map(|p| {
+            p.trim()
+                .parse::<i32>()
+                .map_err(|_| usage(format!("{flag} expects integers, got {value:?}")))
+        })
+        .collect()
+}
+
+fn parse_pos(flag: &str, value: &str) -> Result<[i32; 3], CliError> {
+    let v = parse_i32_list(flag, value, 3)?;
+    Ok([v[0], v[1], v[2]])
+}
+
+fn parse_center(flag: &str, value: &str) -> Result<(i32, i32), CliError> {
+    let v = parse_i32_list(flag, value, 2)?;
+    Ok((v[0], v[1]))
+}
+
+fn parse_u64(flag: &str, value: &str) -> Result<u64, CliError> {
+    value.parse::<u64>().map_err(|_| {
+        usage(format!(
+            "{flag} expects a non-negative integer, got {value:?}"
+        ))
+    })
+}
+
+/// The shared flag set of `audit-query` and `rollback`: `--log` plus the
+/// `AuditQuery` filters. `--in`/`--out`/`--max-blocks`/`--limit` are also
+/// collected so each command can reject the other's flags with a precise
+/// message instead of a bare "unknown option".
+struct AuditFlags {
+    log: Option<PathBuf>,
+    input: Option<PathBuf>,
+    output: Option<PathBuf>,
+    actor: Option<String>,
+    dim: Option<String>,
+    pos: Option<[i32; 3]>,
+    radius: Option<i32>,
+    since_tick: Option<u64>,
+    limit: Option<u64>,
+    max_blocks: Option<u64>,
+    json: bool,
+}
+
+fn parse_audit_flags(cmd: &str, args: &[String]) -> Result<AuditFlags, CliError> {
+    let mut flags = AuditFlags {
+        log: None,
+        input: None,
+        output: None,
+        actor: None,
+        dim: None,
+        pos: None,
+        radius: None,
+        since_tick: None,
+        limit: None,
+        max_blocks: None,
+        json: false,
+    };
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+            _ => (arg, None),
+        };
+        let mut take_value = |name: &str| -> Result<String, CliError> {
+            match &inline {
+                Some(v) => Ok(v.clone()),
+                None => {
+                    i += 1;
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| usage(format!("{name} needs a value")))
+                }
+            }
+        };
+        match flag {
+            "--log" => flags.log = Some(PathBuf::from(take_value("--log")?)),
+            "--in" => flags.input = Some(PathBuf::from(take_value("--in")?)),
+            "--out" => flags.output = Some(PathBuf::from(take_value("--out")?)),
+            "--actor" => flags.actor = Some(take_value("--actor")?),
+            "--dim" => flags.dim = Some(take_value("--dim")?),
+            "--pos" => flags.pos = Some(parse_pos("--pos", &take_value("--pos")?)?),
+            "--radius" => {
+                let v = take_value("--radius")?;
+                flags.radius = Some(
+                    v.parse::<i32>()
+                        .map_err(|_| usage(format!("--radius expects an integer, got {v:?}")))?,
+                );
+            }
+            "--since-tick" => {
+                flags.since_tick = Some(parse_u64("--since-tick", &take_value("--since-tick")?)?)
+            }
+            "--limit" => flags.limit = Some(parse_u64("--limit", &take_value("--limit")?)?),
+            "--max-blocks" => {
+                flags.max_blocks = Some(parse_u64("--max-blocks", &take_value("--max-blocks")?)?)
+            }
+            "--json" => flags.json = true,
+            other if other.starts_with('-') => {
+                return Err(usage(format!("{cmd}: unknown option {other:?}")))
+            }
+            other => return Err(usage(format!("{cmd}: unexpected argument {other:?}"))),
+        }
+        i += 1;
+    }
+    // --pos and --radius are one spatial filter: giving only half of it is a
+    // bad command line, not an implied infinite or zero radius.
+    match (flags.pos, flags.radius) {
+        (Some(_), None) => return Err(usage(format!("{cmd}: --pos requires --radius"))),
+        (None, Some(_)) => return Err(usage(format!("{cmd}: --radius requires --pos"))),
+        _ => {}
+    }
+    Ok(flags)
+}
+
+fn build_audit_query(flags: &AuditFlags) -> AuditQuery {
+    let mut query = AuditQuery::new();
+    if let Some(actor) = &flags.actor {
+        query = query.actor(actor.clone());
+    }
+    if let Some(dim) = &flags.dim {
+        query = query.dimension(dim.clone());
+    }
+    if let (Some(pos), Some(radius)) = (flags.pos, flags.radius) {
+        query = query.within(pos, radius);
+    }
+    if let Some(tick) = flags.since_tick {
+        query = query.since_tick(tick);
+    }
+    query
+}
+
+fn parse_pregen_flags(args: &[String]) -> Result<Command, CliError> {
+    let mut radius = None;
+    let mut shape = PregenShape::Square;
+    let mut center = (0, 0);
+    let mut batch_size = DEFAULT_BATCH_SIZE;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+            _ => (arg, None),
+        };
+        let mut take_value = |name: &str| -> Result<String, CliError> {
+            match &inline {
+                Some(v) => Ok(v.clone()),
+                None => {
+                    i += 1;
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| usage(format!("{name} needs a value")))
+                }
+            }
+        };
+        match flag {
+            "--radius" => {
+                let v = take_value("--radius")?;
+                let r = parse_u64("--radius", &v)?;
+                radius = Some(u32::try_from(r).map_err(|_| {
+                    usage(format!(
+                        "pregen-plan: --radius {r} exceeds {MAX_PREGEN_RADIUS}"
+                    ))
+                })?);
+            }
+            "--shape" => {
+                let v = take_value("--shape")?;
+                shape = match v.as_str() {
+                    "square" => PregenShape::Square,
+                    "circle" => PregenShape::Circle,
+                    _ => {
+                        return Err(usage(format!(
+                            "pregen-plan: unknown shape {v:?}; expected \"square\" or \"circle\""
+                        )))
+                    }
+                };
+            }
+            "--center" => center = parse_center("--center", &take_value("--center")?)?,
+            "--batch-size" => {
+                let v = take_value("--batch-size")?;
+                let n = parse_u64("--batch-size", &v)?;
+                batch_size = usize::try_from(n).ok().filter(|&n| n >= 1).ok_or_else(|| {
+                    usage(format!(
+                        "pregen-plan: --batch-size must be at least 1, got {v:?}"
+                    ))
+                })?;
+            }
+            "--json" => json = true,
+            other if other.starts_with('-') => {
+                return Err(usage(format!("pregen-plan: unknown option {other:?}")))
+            }
+            other => return Err(usage(format!("pregen-plan: unexpected argument {other:?}"))),
+        }
+        i += 1;
+    }
+    let radius = require("--radius", radius)?;
+    if radius > MAX_PREGEN_RADIUS {
+        return Err(usage(format!(
+            "pregen-plan: --radius {radius} exceeds the {MAX_PREGEN_RADIUS}-chunk cap"
+        )));
+    }
+    Ok(Command::PregenPlan {
+        radius,
+        shape,
+        center,
+        batch_size,
+        json,
+    })
 }
 
 fn parse_args(args: &[String]) -> Result<Command, CliError> {
@@ -285,6 +583,51 @@ fn parse_args(args: &[String]) -> Result<Command, CliError> {
                 }),
             }
         }
+        "audit-query" => {
+            let flags = parse_audit_flags("audit-query", &args[1..])?;
+            for (present, name) in [
+                (flags.input.is_some(), "--in"),
+                (flags.output.is_some(), "--out"),
+                (flags.max_blocks.is_some(), "--max-blocks"),
+            ] {
+                if present {
+                    return Err(usage(format!(
+                        "audit-query: {name} only applies to rollback"
+                    )));
+                }
+            }
+            let query = build_audit_query(&flags);
+            Ok(Command::AuditQuery {
+                log: require("--log", flags.log)?,
+                limit: flags
+                    .limit
+                    .map(|n| usize::try_from(n).unwrap_or(usize::MAX)),
+                query,
+                json: flags.json,
+            })
+        }
+        "rollback" => {
+            let flags = parse_audit_flags("rollback", &args[1..])?;
+            if flags.limit.is_some() {
+                return Err(usage("rollback: --limit only applies to audit-query"));
+            }
+            let max_blocks = flags.max_blocks.unwrap_or(DEFAULT_MAX_BLOCKS);
+            if max_blocks > MAX_BLOCKS_CAP {
+                return Err(usage(format!(
+                    "rollback: --max-blocks {max_blocks} exceeds the hard cap {MAX_BLOCKS_CAP}"
+                )));
+            }
+            let query = build_audit_query(&flags);
+            Ok(Command::Rollback {
+                log: require("--log", flags.log)?,
+                input: require("--in", flags.input)?,
+                output: require("--out", flags.output)?,
+                query,
+                max_blocks,
+                json: flags.json,
+            })
+        }
+        "pregen-plan" => parse_pregen_flags(&args[1..]),
         other => Err(usage(format!("unknown command {other:?}; try --help"))),
     }
 }
@@ -640,6 +983,312 @@ fn cmd_migrate_level(
     Ok(())
 }
 
+// ------------------------------------------------------------- audit ops
+
+fn action_name(action: AuditAction) -> &'static str {
+    match action {
+        AuditAction::BlockPlace => "block_place",
+        AuditAction::BlockBreak => "block_break",
+        AuditAction::Explosion => "explosion",
+        AuditAction::ContainerInsert => "container_insert",
+        AuditAction::ContainerTake => "container_take",
+        AuditAction::EntityKill => "entity_kill",
+    }
+}
+
+/// One audit record as a deterministic JSON object.
+fn record_value(r: &AuditRecord) -> DataValue {
+    map(vec![
+        ("action", DataValue::Str(action_name(r.action).to_string())),
+        ("actor", DataValue::Str(r.actor.clone())),
+        ("dimension", DataValue::Str(r.dimension.clone())),
+        ("item_count", DataValue::Int(i64::from(r.item_count))),
+        (
+            "item_id",
+            r.item_id
+                .as_ref()
+                .map_or(DataValue::Null, |s| DataValue::Str(s.clone())),
+        ),
+        ("new_state", DataValue::Int(i64::from(r.new_state))),
+        ("old_state", DataValue::Int(i64::from(r.old_state))),
+        (
+            "pos",
+            DataValue::List(
+                r.pos
+                    .iter()
+                    .map(|&c| DataValue::Int(i64::from(c)))
+                    .collect(),
+            ),
+        ),
+        ("rolled_back", DataValue::Bool(r.rolled_back)),
+        ("seq", DataValue::Int(r.seq as i64)),
+        ("tick", DataValue::Int(r.tick as i64)),
+    ])
+}
+
+/// One audit record as a greppable `key=value` row.
+fn record_row(r: &AuditRecord) -> String {
+    let mut row = format!(
+        "seq={} tick={} actor={} dim={} action={} pos=({},{},{}) old={} new={}",
+        r.seq,
+        r.tick,
+        r.actor,
+        r.dimension,
+        action_name(r.action),
+        r.pos[0],
+        r.pos[1],
+        r.pos[2],
+        r.old_state,
+        r.new_state,
+    );
+    if let Some(item) = &r.item_id {
+        row.push_str(&format!(" item={item}"));
+        if r.item_count > 0 {
+            row.push_str(&format!(" x{}", r.item_count));
+        }
+    }
+    if r.rolled_back {
+        row.push_str(" rolled_back");
+    }
+    row
+}
+
+/// Recover `path` as an `AUD1` log and warn — on stderr, so stdout stays a
+/// clean record stream — when bytes past the last intact frame were dropped.
+/// Returns the log plus the dropped tail's byte count.
+fn recover_audit_log(path: &Path) -> Result<(AuditLog, usize), CliError> {
+    let (log, truncated) = AuditLog::recover_from_file(path)
+        .map_err(|e| fail(format!("cannot read {}: {e}", path.display())))?;
+    if truncated > 0 {
+        eprintln!(
+            "warning: {}: dropped {truncated} trailing byte(s) after the last intact frame",
+            path.display()
+        );
+    }
+    Ok((log, truncated))
+}
+
+fn cmd_audit_query(
+    log_path: &Path,
+    query: &AuditQuery,
+    limit: Option<usize>,
+    json: bool,
+) -> Result<(), CliError> {
+    let (log, truncated) = recover_audit_log(log_path)?;
+    let mut records = log.query(query);
+    let matched = records.len();
+    if let Some(limit) = limit {
+        records.truncate(limit);
+    }
+    let returned = records.len();
+
+    if json {
+        println!(
+            "{}",
+            to_data_json(&map(vec![
+                ("log", DataValue::Str(log_path.display().to_string())),
+                ("matched", int(matched)),
+                (
+                    "records",
+                    DataValue::List(records.iter().map(|r| record_value(r)).collect()),
+                ),
+                ("returned", int(returned)),
+                (
+                    "schema",
+                    DataValue::Str("mc-spine-audit-query/1".to_string()),
+                ),
+                ("total_records", int(log.len())),
+                ("truncated_tail_bytes", int(truncated)),
+            ]))
+        );
+        return Ok(());
+    }
+
+    if returned < matched {
+        println!(
+            "{}: {} audit record(s), {matched} match the filter (showing {returned})",
+            log_path.display(),
+            log.len()
+        );
+    } else {
+        println!(
+            "{}: {} audit record(s), {matched} match the filter",
+            log_path.display(),
+            log.len()
+        );
+    }
+    for r in records {
+        println!("{}", record_row(r));
+    }
+    Ok(())
+}
+
+fn cmd_rollback(
+    log_path: &Path,
+    input: &Path,
+    output: &Path,
+    query: &AuditQuery,
+    max_blocks: u64,
+    json: bool,
+) -> Result<(), CliError> {
+    let (mut log, truncated) = recover_audit_log(log_path)?;
+    let bytes = read_input(input)?;
+    let (ctx, target) =
+        decode_snapshot(&bytes).map_err(|e| fail(format!("{}: {e}", input.display())))?;
+
+    // Everything below runs in memory first: a refused or failed rollback
+    // leaves --out — and of course --in — exactly as it was.
+    let deltas = log.rollback_blocks(query);
+    if deltas.len() as u64 > max_blocks {
+        return Err(usage(format!(
+            "{}: rollback would rewrite {} block(s), exceeding --max-blocks {max_blocks}; {} left untouched",
+            log_path.display(),
+            deltas.len(),
+            output.display()
+        )));
+    }
+    log.apply_rollback_to_context(&ctx, &deltas);
+    let out = encode_snapshot(&ctx, target);
+    // Verify the artifact before it is written: the restored context must
+    // re-seal as a valid STV1 under the exact target the input carried.
+    let (_, verified) = decode_snapshot(&out)
+        .map_err(|e| fail(format!("rollback output failed verification: {e}")))?;
+    if verified != target {
+        return Err(fail(
+            "rollback output changed the snapshot's target version",
+        ));
+    }
+    write_file_atomic(output, &out)
+        .map_err(|e| fail(format!("cannot write {}: {e}", output.display())))?;
+
+    if json {
+        println!(
+            "{}",
+            to_data_json(&map(vec![
+                ("input_bytes", int(bytes.len())),
+                ("input_file", DataValue::Str(input.display().to_string())),
+                ("log", DataValue::Str(log_path.display().to_string())),
+                ("max_blocks", DataValue::Int(max_blocks as i64)),
+                ("output_bytes", int(out.len())),
+                ("output_file", DataValue::Str(output.display().to_string())),
+                ("rolled_back_blocks", int(deltas.len())),
+                ("schema", DataValue::Str("mc-spine-rollback/1".to_string()),),
+                ("target_version", DataValue::Str(target.id().to_string())),
+                ("total_records", int(log.len())),
+                ("truncated_tail_bytes", int(truncated)),
+            ]))
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{}: {} audit record(s) recovered",
+        log_path.display(),
+        log.len()
+    );
+    println!(
+        "{}: rolled back {} block change(s) (minecraft {target})",
+        input.display(),
+        deltas.len()
+    );
+    println!(
+        "{}: restored snapshot written, {} bytes",
+        output.display(),
+        out.len()
+    );
+    Ok(())
+}
+
+// ------------------------------------------------------------- pregen-plan
+
+fn shape_name(shape: PregenShape) -> &'static str {
+    match shape {
+        PregenShape::Square => "square",
+        PregenShape::Circle => "circle",
+    }
+}
+
+/// The last chunk the spiral emits. Ring `k` is walked clockwise from its
+/// northwest corner and ends on its west edge: `(-k, -k + 1)` for `Square`
+/// (every ring cell is in shape), `(-k, 0)` for `Circle` (`dz = 0` is the
+/// only west-edge offset with `k^2 + dz^2 <= k^2`). Both collapse to the
+/// center at radius 0. Derived rather than walked so `pregen-plan` stays
+/// O(1) in memory at any radius.
+fn last_plan_chunk(center: (i32, i32), radius: u32, shape: PregenShape) -> (i32, i32) {
+    if radius == 0 {
+        return center;
+    }
+    let r = radius as i32;
+    let (dx, dz) = match shape {
+        PregenShape::Square => (-r, -r + 1),
+        PregenShape::Circle => (-r, 0),
+    };
+    (center.0.wrapping_add(dx), center.1.wrapping_add(dz))
+}
+
+fn chunk_value(coord: (i32, i32)) -> DataValue {
+    DataValue::List(vec![
+        DataValue::Int(i64::from(coord.0)),
+        DataValue::Int(i64::from(coord.1)),
+    ])
+}
+
+fn cmd_pregen_plan(
+    radius: u32,
+    shape: PregenShape,
+    center: (i32, i32),
+    batch_size: usize,
+    json: bool,
+) -> Result<(), CliError> {
+    let mut job = PregenJob::new(center.0, center.1, radius, shape);
+    let total = job.progress().total;
+    // The job hands the first spiral cell out itself; both shapes always
+    // cover the center, so the batch is never empty.
+    let first = job.take_batch(1).into_iter().next().unwrap_or(center);
+    let last = last_plan_chunk(center, radius, shape);
+    // Ring 0 is the center plus one ring per radius step; every ring at
+    // k <= radius emits at least the four axis cells, even for `Circle`.
+    let rings = u64::from(radius) + 1;
+    // batch_size >= 1 is enforced by the parser.
+    let ticks = total.div_ceil(batch_size as u64);
+
+    if json {
+        println!(
+            "{}",
+            to_data_json(&map(vec![
+                ("batch_size", int(batch_size)),
+                ("center", chunk_value(center)),
+                ("first_chunk", chunk_value(first)),
+                ("last_chunk", chunk_value(last)),
+                ("radius_chunks", DataValue::Int(i64::from(radius))),
+                ("ring_count", DataValue::Int(rings as i64)),
+                (
+                    "schema",
+                    DataValue::Str("mc-spine-pregen-plan/1".to_string()),
+                ),
+                ("shape", DataValue::Str(shape_name(shape).to_string())),
+                ("ticks", DataValue::Int(ticks as i64)),
+                ("total_chunks", DataValue::Int(total as i64)),
+            ]))
+        );
+        return Ok(());
+    }
+
+    println!(
+        "pregen-plan: {} radius {radius} chunk(s) centered at chunk ({}, {})",
+        shape_name(shape),
+        center.0,
+        center.1
+    );
+    println!("  {total} chunk(s) over {rings} ring(s) (rings 0..={radius})");
+    println!(
+        "  first chunk ({}, {}), last chunk ({}, {})",
+        first.0, first.1, last.0, last.1
+    );
+    println!("  {ticks} tick(s) at {batch_size} chunk(s)/tick");
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = match parse_args(&args) {
@@ -678,6 +1327,27 @@ fn main() -> ExitCode {
             backup_old,
             json,
         } => cmd_migrate_level(&input, &output, to, allow_downgrade, backup_old, json),
+        Command::AuditQuery {
+            log,
+            query,
+            limit,
+            json,
+        } => cmd_audit_query(&log, &query, limit, json),
+        Command::Rollback {
+            log,
+            input,
+            output,
+            query,
+            max_blocks,
+            json,
+        } => cmd_rollback(&log, &input, &output, &query, max_blocks, json),
+        Command::PregenPlan {
+            radius,
+            shape,
+            center,
+            batch_size,
+            json,
+        } => cmd_pregen_plan(radius, shape, center, batch_size, json),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
