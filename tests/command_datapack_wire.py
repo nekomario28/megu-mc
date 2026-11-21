@@ -321,6 +321,10 @@ def command_cases(rcon, client):
 def craft_cases(client, rcon):
     # These are real window=0 creative inventory updates and click transactions.
     # The result slot is calculated by the server's JSON recipe matcher.
+    # Creative-slot packets (0x32) only apply in creative mode; players join in
+    # the server default gamemode, so switch explicitly like a vanilla setup.
+    expect(rcon, f"gamemode creative {client.name}", "gamemode",
+           "craft-cases-gamemode-creative")
     coal, stick, torch = COAL, STICK, TORCH
     client.creative(36, coal, 1)
     client.creative(37, stick, 1)
@@ -407,7 +411,7 @@ def main():
                     check("protocol-767-login", client.pos is not None)
                     # Capture play traffic through the first chunk batch and
                     # initial position. An idle server need not send another.
-                    check("login-commands-packet-0x10-present", 0x10 in client.play_ids,
+                    check("login-commands-packet-0x11-present", 0x11 in client.play_ids,
                           f"observed login play IDs {client.play_ids!r}")
                     player_cases(client, rcon, admin=False)
                     command_cases(rcon, client)

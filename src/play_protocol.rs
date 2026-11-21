@@ -1148,6 +1148,13 @@ fn interest_tick() {
         sync_entity_interest(client, &ents);
     }
     dig_progress_tick(&cls);
+    // Death is a server-tick event (vanilla LivingEntity.die): an idle
+    // victim's own read loop may not wake for seconds, so the tick sweep
+    // drives drop_player_items_on_death — it emits the 0x1f death event and
+    // drops exactly once via death_drop_marks.
+    for c in &cls {
+        drop_player_items_on_death(c);
+    }
 }
 
 /// Server-side mining completion: a pending START_DESTROY_BLOCK whose block
@@ -1480,6 +1487,76 @@ fn velocity_pkt(eid: i32, vx: i16, vy: i16, vz: i16) -> Vec<u8> {
     p.extend_from_slice(&vy.to_be_bytes());
     p.extend_from_slice(&vz.to_be_bytes());
     p
+}
+
+/// Decode the carried stack a container-click packet claims to hold. The tail
+/// after the click mode is `changedSlots` (varint-sized map of slot -> stack)
+/// followed by the carried `ItemStack`. Map entries embed full stacks whose
+/// boundaries need the component-aware decoder, so a non-empty map yields
+/// `None` and callers fall back to a conservative rule.
+fn click_carried_stack(tail: &[u8]) -> Option<Stack> {
+    let mut p = tail;
+    if read_protocol_i32(&mut p)? != 0 {
+        return None;
+    }
+    let mut buf = vec![0u8, 0u8];
+    buf.extend_from_slice(p);
+    slot_read_wire(&buf).map(|(_, st)| st)
+}
+
+/// Hurt Animation (`0x24`): entity id + the hurt direction yaw vanilla computes
+/// in `ServerPlayer.indicateDamage` (`getHurtDir`).
+fn hurt_anim_yaw(eid: i32, yaw: f32) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, eid as i64);
+    p.extend_from_slice(&yaw.to_be_bytes());
+    p
+}
+
+/// Entity Event (`0x1f`): i32 entity id + i8 status. Status 3 is the death
+/// event vanilla broadcasts from `LivingEntity.die`.
+fn entity_event_pkt(eid: i32, status: i8) -> Vec<u8> {
+    let mut p = Vec::new();
+    p.extend_from_slice(&eid.to_be_bytes());
+    p.push(status as u8);
+    p
+}
+
+/// Vanilla `LivingEntity.knockback(0.4, dx, dz)` for a bare-hand player hit,
+/// reduced to the `SetEntityMotion` shorts. `pp`/`vp` are attacker/victim
+/// `(x, y, z, yaw, pitch, on_ground)`. Player knockback resistance is always 0
+/// here, so the strength is the vanilla 0.4 constant.
+fn vanilla_knockback(
+    vp: &(f64, f64, f64, f32, f32, bool),
+    pp: &(f64, f64, f64, f32, f32, bool),
+) -> (i16, i16, i16) {
+    let strength = 0.4f64;
+    let (mut dx, mut dz) = (pp.0 - vp.0, pp.2 - vp.2);
+    if dx * dx + dz * dz < 1e-10 {
+        // Vanilla rerolls a random direction here; a deterministic zero keeps
+        // the packet stable for the degenerate same-position case.
+        dx = 0.0;
+        dz = 0.0;
+    } else {
+        let len = (dx * dx + dz * dz).sqrt();
+        dx /= len;
+        dz /= len;
+    }
+    // Players have no server-side velocity state; a settled on-ground body
+    // carries vanilla's one-tick gravity residue (-0.08 * 0.98 drag).
+    let old_y = if vp.5 { -0.08 * 0.98 } else { 0.0 };
+    let nx = 0.0f64 / 2.0 - dx * strength;
+    let ny = if vp.5 {
+        (old_y / 2.0 + strength).min(0.4)
+    } else {
+        old_y
+    };
+    let nz = 0.0f64 / 2.0 - dz * strength;
+    (
+        (nx.clamp(-3.9, 3.9) * 8000.0) as i16,
+        (ny.clamp(-3.9, 3.9) * 8000.0) as i16,
+        (nz.clamp(-3.9, 3.9) * 8000.0) as i16,
+    )
 }
 
 fn spawn_mob(m: &Mob) -> Vec<u8> {
@@ -3267,6 +3344,14 @@ fn drop_player_items_on_death(player: &Arc<Client>) {
     if !death_drop_marks().lock().unwrap().insert(player.eid) {
         return;
     }
+    // vanilla LivingEntity.die → broadcastEntityEvent(entity, (byte) 3): the
+    // death event goes to the victim and every observer that tracks them,
+    // regardless of keepInventory or gamemode.
+    let death_evt = entity_event_pkt(player.eid, 3);
+    if let Ok(mut w) = player.sock.lock() {
+        let _ = send_packet(&mut w, 0x1f, death_evt.clone());
+    }
+    broadcast_seen_ex(player.eid, player.eid, |_c| (0x1f, death_evt.clone()));
     if GR_KEEP_INVENTORY.load(Ordering::Relaxed) != 0
         || !matches!(*player.gm.lock().unwrap(), 0 | 2)
     {
@@ -5282,7 +5367,7 @@ fn handle(mut s: TcpStream) {
                         if gm != 3 && break_generated_cart(target, gm != 1) {
                             continue;
                         }
-                        let mut found: Option<(i32, String, f32)> = None;
+                        let mut found: Option<(i32, String, f32, f32)> = None;
                         {
                             // LOCK ORDER: snapshot, never hold clients() while
                             // broadcasting or touching per-client locks
@@ -5428,10 +5513,6 @@ fn handle(mut s: TcpStream) {
                                             );
                                         }
                                     }
-                                    if let Ok(mut w) = v.sock.lock() {
-                                        let _ = send_packet(&mut w, 0x24, hurt_anim(v.eid));
-                                        let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, v));
-                                    }
                                     let (pp, vp) = (
                                         {
                                             let p = me.pos.lock().unwrap();
@@ -5442,25 +5523,37 @@ fn handle(mut s: TcpStream) {
                                             *p
                                         },
                                     );
-                                    let (mut kx, mut kz) = (vp.0 - pp.0, vp.2 - pp.2);
-                                    let kl = (kx * kx + kz * kz).sqrt().max(0.01);
-                                    kx /= kl;
-                                    kz /= kl;
-                                    let vel = velocity_pkt(
-                                        v.eid,
-                                        (kx * 3000.0) as i16,
-                                        2500,
-                                        (kz * 3000.0) as i16,
-                                    );
+                                    // vanilla LivingEntity.hurt → indicateDamage:
+                                    // hurtDir = atan2(dz, dx) * 57.2957763671875 - victimYaw
+                                    // where (dx, dz) is attacker minus victim position.
+                                    let hurt_yaw = {
+                                        let dx = pp.0 - vp.0;
+                                        let dz = pp.2 - vp.2;
+                                        (dz.atan2(dx) * 57.2957763671875
+                                            - f64::from(vp.3)) as f32
+                                    };
+                                    let hurt_pkt = hurt_anim_yaw(v.eid, hurt_yaw);
+                                    if let Ok(mut w) = v.sock.lock() {
+                                        let _ = send_packet(&mut w, 0x24, hurt_pkt.clone());
+                                        let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, v));
+                                    }
+                                    // vanilla LivingEntity.knockback(0.4, dx, dz): the
+                                    // strength is scaled by (1 - knockback_resistance),
+                                    // the direction is the normalized attacker-minus-
+                                    // victim offset, and SetEntityMotion clamps each
+                                    // axis to +-3.9 and truncates velocity * 8000.
+                                    let kb = vanilla_knockback(&vp, &pp);
+                                    let vel = velocity_pkt(v.eid, kb.0, kb.1, kb.2);
                                     if let Ok(mut w) = v.sock.lock() {
                                         let _ = send_packet(&mut w, 0x5a, vel.clone());
                                     }
-                                    found = Some((v.eid, v.name.clone(), hh));
+                                    found = Some((v.eid, v.name.clone(), hh, hurt_yaw));
                                 }
                             }
                         }
-                        if let Some((veid, vname, hh)) = found {
-                            broadcast_seen_ex(veid, veid, |_c| (0x24, hurt_anim(veid)));
+                        if let Some((veid, vname, hh, hurt_yaw)) = found {
+                            let hurt_pkt = hurt_anim_yaw(veid, hurt_yaw);
+                            broadcast_seen_ex(veid, veid, |_c| (0x24, hurt_pkt.clone()));
                             if hh <= 0.0 {
                                 let victim = {
                                     clients().lock().unwrap().iter().find(|c| c.eid == veid).cloned()
@@ -6105,6 +6198,7 @@ fn handle(mut s: TcpStream) {
                         let Some(mode) = read_protocol_i32(&mut sl).map(i64::from) else {
                             continue;
                         };
+                        let click_tail = sl;
                         if let Some(active) = live_menu_id(&me) {
                             if wid == active {
                                 with_save_guard(|| live_menu_click(&me, wid, slot, btn as i8, mode));
@@ -6440,6 +6534,15 @@ fn handle(mut s: TcpStream) {
                                 let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p0);
                                 continue;
                             }
+                            // Window 0 (player inventory + 2x2 craft grid). Vanilla's
+                            // post-click broadcast emits only the slots whose content
+                            // changed, in menu order (result, grid, armor, inventory,
+                            // offhand), then the carried stack when it differs from the
+                            // stack the client acknowledged in this click.
+                            let pre_grid = me.craft.lock().unwrap().clone();
+                            let pre_inv = me.inv.lock().unwrap().clone();
+                            let pre_result =
+                                craft_result(&pre_grid).unwrap_or((0, 0, Vec::new()));
                             if slot == -999 {
                                 let cur = {
                                     let c = me.cursor.lock().unwrap();
@@ -6490,39 +6593,12 @@ fn handle(mut s: TcpStream) {
                                             }
                                         }
                                         *cur = (ri, cur.1 + rc, _rc.clone());
-                                        for i in 0..=4i16 {
-                                            let (it, c, _cc) = if i == 0 {
-                                                craft_result(&grid).unwrap_or((0, 0, Vec::new()))
-                                            } else {
-                                                grid.get(&i).cloned().unwrap_or((0, 0, Vec::new()))
-                                            };
-                                            let mut p = vec![0u8];
-                                            write_varint(&mut p, 0);
-                                            p.extend_from_slice(&i.to_be_bytes());
-                                            p.extend_from_slice(&slot_wire(&(it, c, _cc)));
-                                            let _ =
-                                                send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
-                                        }
                                     }
                                 }
                             } else if (1..=4).contains(&slot) {
                                 let mut grid = me.craft.lock().unwrap();
                                 let mut cur = me.cursor.lock().unwrap();
                                 click_slot(&mut grid, &mut cur, slot, btn as i8);
-                                let ns = grid.get(&slot).cloned();
-                                let out = craft_result(&grid).unwrap_or((0, 0, Vec::new()));
-                                drop(grid);
-                                drop(cur);
-                                let mut p = vec![0u8];
-                                write_varint(&mut p, 0);
-                                p.extend_from_slice(&slot.to_be_bytes());
-                                p.extend_from_slice(&slot_wire(&ns.unwrap_or((0, 0, Vec::new()))));
-                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
-                                let mut p0 = vec![0u8];
-                                write_varint(&mut p0, 0);
-                                p0.extend_from_slice(&0i16.to_be_bytes());
-                                p0.extend_from_slice(&slot_wire(&(out.0, out.1, Vec::new())));
-                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p0);
                             } else if (5..=8).contains(&slot) || slot == 45 {
                                 // armor + offhand: vanilla restricts armor
                                 // slots to their matching piece type
@@ -6575,33 +6651,70 @@ fn handle(mut s: TcpStream) {
                                     click_slot(&mut inv, &mut cur, slot, btn as i8);
                                     *me.armor_pts.lock().unwrap() = armor_pts_of(&inv);
                                 }
-                                let ns = inv.get(&slot).cloned();
-                                let cp = cur.clone();
-                                drop(cur);
-                                drop(inv);
-                                let mut p = vec![0u8];
-                                write_varint(&mut p, 0);
-                                p.extend_from_slice(&slot.to_be_bytes());
-                                p.extend_from_slice(&slot_wire(&ns.unwrap_or((0, 0, Vec::new()))));
-                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
-                                let mut pc = vec![0u8];
-                                write_varint(&mut pc, 0);
-                                pc.extend_from_slice(&(-1i16).to_be_bytes());
-                                pc.extend_from_slice(&slot_wire(&cp));
-                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, pc);
                             } else if (9..=44).contains(&slot) {
                                 let mut inv = me.inv.lock().unwrap();
                                 let mut cur = me.cursor.lock().unwrap();
                                 click_slot(&mut inv, &mut cur, slot, btn as i8);
                                 *me.armor_pts.lock().unwrap() = armor_pts_of(&inv);
-                                let ns = inv.get(&slot).cloned();
-                                drop(inv);
-                                drop(cur);
+                            }
+                            let post_grid = me.craft.lock().unwrap().clone();
+                            let post_inv = me.inv.lock().unwrap().clone();
+                            let post_cur = me.cursor.lock().unwrap().clone();
+                            let post_result =
+                                craft_result(&post_grid).unwrap_or((0, 0, Vec::new()));
+                            let carried = click_carried_stack(click_tail);
+                            let mut sock = me.sock.lock().unwrap();
+                            if post_result != pre_result {
                                 let mut p = vec![0u8];
                                 write_varint(&mut p, 0);
-                                p.extend_from_slice(&slot.to_be_bytes());
-                                p.extend_from_slice(&slot_wire(&ns.unwrap_or((0, 0, Vec::new()))));
-                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
+                                p.extend_from_slice(&0i16.to_be_bytes());
+                                p.extend_from_slice(&slot_wire(&post_result));
+                                let _ = send_packet(&mut sock, 0x15, p);
+                            }
+                            for i in 1..=4i16 {
+                                let now = post_grid
+                                    .get(&i)
+                                    .cloned()
+                                    .unwrap_or((0, 0, Vec::new()));
+                                let was = pre_grid
+                                    .get(&i)
+                                    .cloned()
+                                    .unwrap_or((0, 0, Vec::new()));
+                                if now != was {
+                                    let mut p = vec![0u8];
+                                    write_varint(&mut p, 0);
+                                    p.extend_from_slice(&i.to_be_bytes());
+                                    p.extend_from_slice(&slot_wire(&now));
+                                    let _ = send_packet(&mut sock, 0x15, p);
+                                }
+                            }
+                            for i in 5..=45i16 {
+                                let now = post_inv
+                                    .get(&i)
+                                    .cloned()
+                                    .unwrap_or((0, 0, Vec::new()));
+                                let was = pre_inv
+                                    .get(&i)
+                                    .cloned()
+                                    .unwrap_or((0, 0, Vec::new()));
+                                if now != was {
+                                    let mut p = vec![0u8];
+                                    write_varint(&mut p, 0);
+                                    p.extend_from_slice(&i.to_be_bytes());
+                                    p.extend_from_slice(&slot_wire(&now));
+                                    let _ = send_packet(&mut sock, 0x15, p);
+                                }
+                            }
+                            let cursor_differs = match carried {
+                                Some(st) => st != post_cur,
+                                None => post_cur.1 > 0,
+                            };
+                            if cursor_differs {
+                                let mut p = vec![0xFFu8];
+                                write_varint(&mut p, 0);
+                                p.extend_from_slice(&(-1i16).to_be_bytes());
+                                p.extend_from_slice(&slot_wire(&post_cur));
+                                let _ = send_packet(&mut sock, 0x15, p);
                             }
                         } else if mode == 2 {
                             // number-key swap: hovered slot <-> hotbar slot btn (0-8)
