@@ -1051,7 +1051,9 @@ fn environment_time_tick() {
     grow_crops(t, |x, z| region.is_warm(x, z));
     let autosave = server_ticks(AUTOSAVE_GT);
     if AUTOSAVE_ENABLED.load(Ordering::Relaxed) && t % autosave == autosave - 1 {
-        save_world();
+        // The live server hands the snapshot to the save worker; everywhere
+        // else this is the same synchronous save_world it always was.
+        autosave_world();
         gc_backoff();
     }
     {
@@ -1062,25 +1064,32 @@ fn environment_time_tick() {
     }
     if GR_MOB_SPAWNING.load(Ordering::Relaxed) == 1 {
         let cycle = server_ticks(SPAWN_CYCLE_GT);
+        // The smoother's mob budget gates each natural-spawn pass; at full
+        // rate the gate is one float compare on every pass.
+        let mob_scale = current_load_budget().mob_spawn_scale;
         if DIFFICULTY.load(Ordering::Relaxed) != 0
             && t % cycle == cycle / 2
             && (13000..=23000).contains(&wt)
+            && mob_spawn_permitted(0, mob_scale)
         {
             spawn_nightly_hostile(t);
         }
-        if t % nether_spawn_cycle() == 0 {
+        if t % nether_spawn_cycle() == 0 && mob_spawn_permitted(1, mob_scale) {
             spawn_nether_natural(t);
         }
-        if !(13000..=23000).contains(&wt) && t % cycle == cycle / 4 {
+        if !(13000..=23000).contains(&wt)
+            && t % cycle == cycle / 4
+            && mob_spawn_permitted(2, mob_scale)
+        {
             spawn_passive_natural(t);
         }
-        if t % cycle == cycle / 2 + 1 {
+        if t % cycle == cycle / 2 + 1 && mob_spawn_permitted(3, mob_scale) {
             spawn_aquatic_natural(t);
         }
-        if t % cycle == cycle / 4 + 1 {
+        if t % cycle == cycle / 4 + 1 && mob_spawn_permitted(4, mob_scale) {
             spawn_end_natural(t);
         }
-        if t % cycle == cycle - 1 {
+        if t % cycle == cycle - 1 && mob_spawn_permitted(5, mob_scale) {
             spawn_chunkgen_creatures(t);
         }
     }
@@ -3543,6 +3552,10 @@ fn live_mob_tick_dimension(
     let day = !(13000..=23000).contains(&wt);
     let raining = dim == DimId::Overworld && RAINING.load(Ordering::Relaxed) != 0;
     let hostile = DIFFICULTY.load(Ordering::Relaxed) != 0;
+    // Under real overload the smoother shrinks how far from a player a mob
+    // still gets its AI tick; at the baseline range this check never runs.
+    let activation = current_load_budget().entity_activation_range;
+    let activation_sq = (activation as f64) * (activation as f64);
     for (mob_idx, m) in mobs_snap.iter().enumerate() {
         if dead_by_cramming[mob_idx] {
             continue;
@@ -3555,6 +3568,19 @@ fn live_mob_tick_dimension(
             continue;
         }
         if !hot[mob_idx] {
+            continue;
+        }
+        if activation < LoadBudget::FULL.entity_activation_range
+            && !players.iter().any(|p| {
+                p.dim == dim
+                    && {
+                        let dx = p.pos.0 - mp.0;
+                        let dy = p.pos.1 - mp.1;
+                        let dz = p.pos.2 - mp.2;
+                        dx * dx + dy * dy + dz * dz <= activation_sq
+                    }
+            })
+        {
             continue;
         }
         let Some(spec) = entity_spec_by_id(m.etype) else {
@@ -5634,29 +5660,42 @@ fn refresh_hot() {
             (p.2.floor() as i32).div_euclid(16),
         ));
     }
+    // The smoother thins the serviced window under real overload:
+    // `chunk_send_scale` shrinks the warm ring toward the hot core and
+    // `extra_view_trim` takes another ring off the edge. At `FULL` this is
+    // exactly radius 5 + 8 — nothing about the set moves until the stage says
+    // the server is struggling.
+    let budget = current_load_budget();
+    let warm_radius =
+        ((8.0 * budget.chunk_send_scale).round() as i32 - budget.extra_view_trim).max(5);
+    let warm_cells = ((2 * warm_radius + 1) * (2 * warm_radius + 1)) as usize;
+    let skirt = warm_radius - 5;
+    let skirt_cells = ((2 * skirt + 1) * (2 * skirt + 1)) as usize;
     for &center in &centers {
         extend_chunk_square(&mut h, center, 5);
     }
-    // Square dilation distributes over union: radius 5 + skirt 3 = radius 8.
+    // Square dilation distributes over union: hot radius + skirt = warm radius.
     // Dense, overlapping centers can make direct expansion MORE work. Choose
-    // between equivalent unions by their number of insertion attempts (17²/7²).
-    let direct_cost = forced
-        .len()
-        .saturating_mul(49)
-        .saturating_add(centers.len().saturating_mul(289));
+    // between equivalent unions by their number of insertion attempts (17²/7²
+    // at full rate).
+    // Both branches pay the forced ⊕3 ring, so the comparison is just the
+    // differing part: centers expanded whole, or the shared set dilated.
     let mut w;
-    if direct_cost < h.len().saturating_mul(49) {
+    if centers.len().saturating_mul(warm_cells) < h.len().saturating_mul(skirt_cells) {
         w = HashSet::new();
         for center in forced {
             extend_chunk_square(&mut w, center, 3);
         }
         for center in centers {
-            extend_chunk_square(&mut w, center, 8);
+            extend_chunk_square(&mut w, center, warm_radius);
         }
     } else {
         w = h.clone();
-        for &center in &h {
+        for center in forced {
             extend_chunk_square(&mut w, center, 3);
+        }
+        for &center in &h {
+            extend_chunk_square(&mut w, center, skirt);
         }
     }
     let mut r = region().lock().unwrap();
@@ -12726,6 +12765,241 @@ pub(crate) mod loopprof {
     }
 }
 
+// ----------------------------------------------------- live runtime wiring
+//
+// The pieces below are live-server only: `main` installs the background save
+// worker, arms the LAN announcer and feeds the load smoother once the tick
+// loop is running. Every helper degrades to the exact pre-wiring behaviour in
+// tests and tool modes — no worker means the synchronous `save_world` path,
+// stage 0 means `LoadBudget::FULL`, which is byte-for-byte what the tick did
+// before this block existed.
+
+static LIVE_BALANCER: OnceLock<Mutex<AutoLoadBalancer>> = OnceLock::new();
+/// The stage other threads read without taking the balancer's lock. Written
+/// once per tick by `observe_live_tick`, read by every budget consumer.
+static LIVE_BUDGET_STAGE: AtomicU8 = AtomicU8::new(0);
+
+fn live_balancer() -> &'static Mutex<AutoLoadBalancer> {
+    LIVE_BALANCER.get_or_init(|| Mutex::new(AutoLoadBalancer::new()))
+}
+
+/// Feed the smoother one measured tick duration and publish the stage it
+/// settles on. The tick loop is the only caller outside tests.
+fn observe_live_tick(work: Duration) -> LoadBudget {
+    let mut balancer = live_balancer().lock().unwrap();
+    let budget = balancer.observe(work);
+    LIVE_BUDGET_STAGE.store(balancer.stage(), Ordering::Relaxed);
+    budget
+}
+
+/// The work budget currently in force: `LoadBudget::FULL` whenever the rolling
+/// mean tick is healthy, the smoother's tighter stage under real overload.
+fn current_load_budget() -> LoadBudget {
+    LOAD_BUDGETS[(LIVE_BUDGET_STAGE.load(Ordering::Relaxed).min(LOAD_STAGE_MAX)) as usize]
+}
+
+#[cfg(test)]
+fn reset_live_load_balancer() {
+    *live_balancer().lock().unwrap() = AutoLoadBalancer::new();
+    LIVE_BUDGET_STAGE.store(0, Ordering::Relaxed);
+    *MOB_SPAWN_CREDIT.lock().unwrap() = [0.0; 6];
+}
+
+/// `MC_SPINE_MAX_PLAYERS` (default 20) — the same read the status reply uses.
+fn operator_max_players() -> usize {
+    std::env::var("MC_SPINE_MAX_PLAYERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20)
+}
+
+/// One shared read of everything the `status` report needs: the smoother's
+/// rolling tick mean, the online list, the serviced (hot) chunk set and live
+/// process memory. Safe to call from console/RCON while the tick loop runs:
+/// the balancer and the region are each taken only inside their own lock.
+fn operator_health_snapshot() -> OperatorHealthSnapshot {
+    let mspt_ms = live_balancer().lock().unwrap().mspt();
+    let players = client_snapshot();
+    let loaded_chunks = region().lock().unwrap().hot.len();
+    OperatorHealthSnapshot {
+        mspt_ms,
+        tps: tps_of(mspt_ms),
+        players_online: players.len(),
+        players_max: operator_max_players(),
+        player_names: players.iter().map(|c| c.name.clone()).collect(),
+        loaded_chunks,
+        memory_mb: None,
+        native_mods: 0,
+        compat_mods: 0,
+    }
+}
+
+/// One background writer for the live server's saves. Only `main` installs it;
+/// tests and tool modes keep `live_save_worker()` `None` and save synchronously.
+static LIVE_SAVE_WORKER: OnceLock<AsyncSaveWorker> = OnceLock::new();
+
+fn live_save_worker() -> Option<&'static AsyncSaveWorker> {
+    LIVE_SAVE_WORKER.get()
+}
+
+/// `MC_SPINE_BACKUP_MAX_KEEP`: how many `backups/world-*.bak` snapshots stay
+/// after each rotation. `0` (the default, or an unparseable value) disables
+/// the directory entirely.
+fn backup_max_keep() -> usize {
+    std::env::var("MC_SPINE_BACKUP_MAX_KEEP")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+/// `backups/world-NNNNNNNN.bak`, pruned to `backup_max_keep()`, holding the
+/// same protected payloads as the live overlay files. Only written when the
+/// operator asked for them; errors are reported but never block the save.
+fn rotate_save_backups(dir: &std::path::Path, snapshot: &WorldSaveSnapshot) {
+    let keep = backup_max_keep();
+    if keep == 0 {
+        return;
+    }
+    let backup_dir = dir.join("backups");
+    if let Err(error) =
+        rotate_world_backups(&backup_dir, "world", &wrap_world_payload(&snapshot.overworld), keep)
+    {
+        eprintln!("[spine] world backup rotation failed: {error}");
+    }
+    for (dim, payload) in &snapshot.companions {
+        let Some(payload) = payload else { continue };
+        let prefix = dim_overlay_name(*dim)
+            .unwrap_or("world_overlay.bin")
+            .trim_end_matches(".bin");
+        if let Err(error) =
+            rotate_world_backups(&backup_dir, prefix, &wrap_world_payload(payload), keep)
+        {
+            eprintln!("[spine] {prefix} backup rotation failed: {error}");
+        }
+    }
+}
+
+/// Hand the captured snapshot to the save worker. The worker owns a single
+/// pending slot, so the protected overlay (the file a crash recovery reads)
+/// is the job it keeps; companion dimensions are small enough to write inline
+/// while a slow disk still absorbs the main file.
+fn submit_world_snapshot(
+    worker: &AsyncSaveWorker,
+    snapshot: WorldSaveSnapshot,
+    dir: &std::path::Path,
+) -> Result<(), String> {
+    rotate_save_backups(dir, &snapshot);
+    let path = dim_overlay_path(dir, DimId::Overworld);
+    worker.submit(path, wrap_world_payload(&snapshot.overworld).into());
+    let interval = connection_limits::backup_interval();
+    for (dim, payload) in snapshot.companions {
+        let path = dim_overlay_path(dir, dim);
+        match payload {
+            Some(payload) => {
+                write_world_file(&path, &wrap_world_payload(&payload), interval)?;
+            }
+            None => remove_world_save(&path)?,
+        }
+    }
+    Ok(())
+}
+
+/// The autosave: identical to `save_world` until the live worker exists, then
+/// a non-blocking submit. The worker's one-slot queue coalesces slow writes so
+/// a 20 TPS loop never waits on disk.
+fn autosave_world() {
+    let Some(worker) = live_save_worker() else {
+        return save_world();
+    };
+    let dir = world_save_dir();
+    if let Err(error) = save_world_guarded(|snapshot| submit_world_snapshot(worker, snapshot, &dir)) {
+        eprintln!("[spine] WORLD SAVE FAILED: {error}");
+    }
+}
+
+/// Wait until the background writer has finished every snapshot handed to it.
+/// No-op for tests and tool modes, which never queue one.
+fn flush_live_saves() {
+    if let Some(worker) = live_save_worker() {
+        if let Err(error) = worker.flush() {
+            eprintln!("[spine] WORLD SAVE FAILED: {error}");
+        }
+    }
+}
+
+/// The graceful-stop save: synchronously and complete. Any queued snapshot is
+/// written first (the worker may be mid-write), backups rotate, then the final
+/// overlay files land before the process is allowed to exit.
+fn shutdown_world_save() {
+    flush_live_saves();
+    let dir = world_save_dir();
+    if let Err(error) = save_world_guarded(|snapshot| {
+        rotate_save_backups(&dir, &snapshot);
+        snapshot.write(&dir)
+    }) {
+        eprintln!("[spine] WORLD SAVE FAILED: {error}");
+    }
+}
+
+/// Per-natural-spawn-pass fractional credit. `mob_spawn_scale` below 1.0 means
+/// "run this pass on a fraction of its turns"; carrying the remainder in a
+/// credit keeps the long-run rate exactly the scale instead of rounding every
+/// pass off (0.5 would never spawn) or on (0.15 would always spawn).
+static MOB_SPAWN_CREDIT: Mutex<[f64; 6]> = Mutex::new([0.0; 6]);
+
+fn mob_spawn_permitted(slot: usize, scale: f64) -> bool {
+    if scale >= 1.0 {
+        return true;
+    }
+    let mut credit = MOB_SPAWN_CREDIT.lock().unwrap();
+    credit[slot] += scale;
+    if credit[slot] >= 1.0 {
+        credit[slot] -= 1.0;
+        true
+    } else {
+        false
+    }
+}
+
+/// The opt-in "Open to LAN" advertiser. `main` arms it only after the game
+/// listener owns a port; `stop` drops the multicast thread on shutdown.
+static LAN_ANNOUNCER: Mutex<Option<LanAnnouncer>> = Mutex::new(None);
+
+fn start_lan_announcer(port: u16) {
+    if std::env::var("MC_SPINE_LAN_BROADCAST").as_deref() != Ok("1") {
+        return;
+    }
+    let motd = std::env::var("MC_SPINE_MOTD").unwrap_or_else(|_| "mc-spine".into());
+    match LanAnnouncer::start(&motd, port) {
+        Ok(announcer) => {
+            *LAN_ANNOUNCER.lock().unwrap() = Some(announcer);
+            eprintln!("[lan] advertising \"{motd}\" on port {port}");
+        }
+        Err(error) => eprintln!("[lan] multicast announcement unavailable: {error}"),
+    }
+}
+
+fn stop_lan_announcer() {
+    if let Some(announcer) = LAN_ANNOUNCER.lock().unwrap().take() {
+        announcer.stop();
+    }
+}
+
+/// The dry-ground search is opt-in (`MC_SPINE_SAFE_SPAWN=1`) or automatic on a
+/// world that has never been saved when the vanilla datapack generator is
+/// running — a fresh vanilla world can put (0, 0) under an ocean. The flat
+/// generator and wire tests keep their fixed spawn unless the flag says so.
+fn safe_spawn_search_enabled(fresh_world: bool) -> bool {
+    std::env::var("MC_SPINE_SAFE_SPAWN").as_deref() == Ok("1")
+        || (fresh_world && worldgen::enabled())
+}
+
+/// Dry solid ground, two air cells of headroom, away from fluids and contact
+/// damage — `find_safe_world_spawn` over the Overworld.
+fn compute_safe_initial_world_spawn() -> (f64, f64, f64) {
+    find_safe_world_spawn(DimId::Overworld)
+}
+
 fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     // `/tick freeze` skips world ticks unless `/tick step` or `/tick sprint`
     // queued budget; a sprint always runs. The default is unfrozen, so callers
@@ -13814,9 +14088,19 @@ fn main() {
 
     // A corrupt protected save must stop startup rather than silently
     // continuing with a world that failed validation.
+    let fresh_world = !dim_overlay_path(&world_save_dir(), DimId::Overworld).exists();
     if let Err(error) = load_world() {
         eprintln!("[spine] refusing corrupt world save: {error} (original file preserved)");
         std::process::exit(1);
+    }
+    // The initial-spawn decision happens after the save loads so a recorded
+    // `setworldspawn` always wins; only a world with nothing recorded (or an
+    // explicit MC_SPINE_SAFE_SPAWN=1) takes the dry-ground search.
+    if safe_spawn_search_enabled(fresh_world) {
+        let (x, y, z) = compute_safe_initial_world_spawn();
+        let mut spawn = WORLD_SPAWN.lock().unwrap();
+        *spawn = (x, y, z, spawn.3);
+        eprintln!("[spine] safe world spawn at {x:.1} {y:.1} {z:.1}");
     }
     if let Err(error) = landing::initialize() {
         eprintln!("[mod-compatibility] {error}");
@@ -13871,6 +14155,11 @@ fn main() {
             }));
         }
     }
+    // The live autosave worker: periodic saves hand it serialized snapshots so
+    // a slow disk coalesces behind one pending slot instead of stalling the
+    // 20 TPS loop. Only the live server installs it; tests and tool modes keep
+    // the synchronous save path byte-for-byte.
+    let _ = LIVE_SAVE_WORKER.set(AsyncSaveWorker::spawn());
     thread::spawn(|| {
         // The deadline derives from the previous one, not from the sleep
         // duration, so tick work that overruns does not walk the clock later.
@@ -13900,6 +14189,10 @@ fn main() {
             // the working server's own record of G3: the tick body's cost against
             // the 50ms budget, once per 100 ticks
             loopprof::BODY_NS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            // The smoother sees every tick's measured work: full rate while the
+            // rolling mean stays under its warn band, smooth throttling of
+            // background chunk/mob work only under real overload.
+            observe_live_tick(started.elapsed());
             if let Some(r) = stats.record(Instant::now(), started.elapsed()) {
                 eprintln!(
                     "[tick] observed_tps={:.2} avg_work_ms={:.2} max_work_ms={:.2} over_budget={}/{}",
@@ -13918,7 +14211,8 @@ fn main() {
         .expect("signal hook");
         thread::spawn(move || {
             if sigs.forever().next().is_some() {
-                save_world();
+                stop_lan_announcer();
+                shutdown_world_save();
                 disconnect_all_clients("Server closed");
                 thread::sleep(Duration::from_millis(100));
                 #[cfg(feature = "neoforge-events")]
@@ -13946,6 +14240,9 @@ fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(25599);
     let l = TcpListener::bind((bind.as_str(), port)).expect("game listener bind failed");
+    // Vanilla's "Open to LAN" multicast advertisement — opt-in, and only ever
+    // armed on the port the listener actually owns.
+    start_lan_announcer(l.local_addr().map(|a| a.port()).unwrap_or(port));
     eprintln!(
         "mc-spine v0.6 listening {bind}:{port} (offline identities; no Mojang authentication)"
     );

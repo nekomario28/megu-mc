@@ -1485,3 +1485,182 @@ fn live_permission_levels_gate_commands_and_function_return_stops_execution() {
     ban_registry().lock().unwrap().players.clear();
     clients().lock().unwrap().retain(|c| !(8411..=8414).contains(&c.eid));
 }
+
+/// W5: the console/RCON `status` diagnostic. A console source (me = None,
+/// always level 4) gets the plain-language `format_operator_status` report;
+/// a player never does — the non-Vanilla literal is absent from the advertised
+/// command tree at every level and falls through to the unknown-command reply
+/// in dispatch, even for an operator-level player.
+#[test]
+fn w5_console_status_reports_health_and_players_cannot_see_status() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    let _world = world_guard();
+    reset_live_load_balancer();
+
+    let console = command_context(None);
+    let report = run_command_ctx(&console, "/status", &mut None);
+    assert!(report.starts_with("Status: "), "{report}");
+    assert!(report.contains("TPS"), "{report}");
+    assert!(report.contains("ms/tick"), "{report}");
+    assert!(report.contains("Players: "), "{report}");
+    assert!(report.contains("Loaded chunks: "), "{report}");
+    assert!(report.contains("Memory: "), "{report}");
+    for jargon in ["ewma", "mspt", "stage", "budget", "scale", "alpha"] {
+        assert!(
+            !report.to_lowercase().contains(jargon),
+            "internal term {jargon:?} leaked into the operator report: {report}"
+        );
+    }
+
+    // `status` is not a Vanilla literal: it must never reach a player's
+    // advertised command tree, whatever their permission level.
+    for level in [0u8, 2, 3, 4] {
+        assert!(
+            command_tree_at_level(level).child("status").is_none(),
+            "level {level} command tree exposes non-Vanilla status"
+        );
+    }
+
+    let (mut player, _hold) = crate::effect_tests::client_pair();
+    player.name = "w5_status_probe".to_owned();
+    player.eid = 8461;
+    let player = Arc::new(player);
+    clients().lock().unwrap().push(player.clone());
+    let pctx = command_context(Some(player));
+
+    // A level-0 player is stopped by the permission gate.
+    assert!(!run_command_ctx(&pctx, "/status", &mut None).starts_with("Status:"));
+    // Even a level-4 player source is not the console: `status` stays
+    // console/RCON only.
+    ops_registry().lock().unwrap().set("w5_status_probe", 4, false);
+    assert_eq!(
+        run_command_ctx(&pctx, "/status", &mut None),
+        "Unknown command: status"
+    );
+
+    // Restore shared state.
+    ops_registry()
+        .lock()
+        .unwrap()
+        .entries
+        .retain(|e| e.name != "w5_status_probe");
+    clients().lock().unwrap().retain(|c| c.eid != 8461);
+    reset_live_load_balancer();
+}
+
+/// W5: the live smoother. `observe_live_tick` (the call the tick loop makes
+/// once per measured tick) and `current_load_budget` must walk Smooth →
+/// Overloaded → Smooth one stage at a time, staying fully transparent while
+/// ticks are healthy.
+#[test]
+fn w5_live_balancer_walks_smooth_to_overloaded_and_back() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    let _world = world_guard();
+    reset_live_load_balancer();
+
+    // Healthy ticks stay at full rate and report Smooth.
+    for _ in 0..4 {
+        assert_eq!(observe_live_tick(Duration::from_millis(20)), LoadBudget::FULL);
+    }
+    assert_eq!(current_load_budget(), LoadBudget::FULL);
+    assert_eq!(health_label(operator_health_snapshot().mspt_ms), "Smooth");
+
+    // Sustained overload: the rolling mean climbs gradually and the stage
+    // follows it — one step per tick, never a jump — while the shared
+    // budget/snapshot accessors report the same state the tick loop sees.
+    let budget_stage = |b: LoadBudget| {
+        LOAD_BUDGETS.iter().position(|candidate| *candidate == b).unwrap() as u8
+    };
+    let mut stage = 0u8;
+    for _ in 0..20 {
+        let budget = observe_live_tick(Duration::from_millis(90));
+        assert_eq!(current_load_budget(), budget);
+        let next = budget_stage(budget);
+        assert!(next >= stage && next <= stage + 1, "stage jumped {stage} -> {next}");
+        stage = next;
+    }
+    assert_eq!(stage, LOAD_STAGE_MAX, "sustained overload must reach the tightest stage");
+    assert!(current_load_budget().mob_spawn_scale < 1.0);
+    assert_eq!(health_label(operator_health_snapshot().mspt_ms), "Overloaded");
+
+    // Recovery walks the stage back down, again at most one step per tick,
+    // until the budget is fully open and the report reads Smooth.
+    let mut budget = current_load_budget();
+    for _ in 0..60 {
+        budget = observe_live_tick(Duration::from_millis(20));
+        let next = budget_stage(budget);
+        assert!(next <= stage && next + 1 >= stage, "recovery jumped {stage} -> {next}");
+        stage = next;
+    }
+    assert_eq!(budget, LoadBudget::FULL);
+    assert_eq!(current_load_budget(), LoadBudget::FULL);
+    assert_eq!(health_label(operator_health_snapshot().mspt_ms), "Smooth");
+    reset_live_load_balancer();
+}
+
+/// W5: the spawn helper the boot path calls. The search it delegates to walks
+/// past ocean columns, a lava crust and reaches the one dry island — and the
+/// live entry point on the real world always answers a finite, in-bounds
+/// point whose cells are never a contact-damage block.
+#[test]
+fn w5_safe_initial_world_spawn_avoids_ocean_lava_and_returns_dry_ground() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    let _world = world_guard();
+    let reg = breg().expect("block registry");
+    let (stone, grass, water, lava) = (
+        reg.state_of("stone", None),
+        reg.state_of("grass_block", None),
+        reg.state_of("water", None),
+        reg.state_of("lava", None),
+    );
+    // Open ocean everywhere (floor at 40, water to 63): the spiral crosses a
+    // lava crust at (8, 0) before the single dry island at (16, 0).
+    let surface = |x: i32, z: i32| match (x, z) {
+        (8, 0) | (16, 0) => 64,
+        _ => 63,
+    };
+    let block = |x: i32, y: i32, z: i32| -> u32 {
+        match (x, z) {
+            (16, 0) => {
+                if y <= 63 { stone } else if y == 64 { grass } else { 0 }
+            }
+            (8, 0) => {
+                if y <= 63 { stone } else if y == 64 { lava } else { 0 }
+            }
+            _ => {
+                if y <= 40 { stone } else if y <= 63 { water } else { 0 }
+            }
+        }
+    };
+    let (x, feet, z) = safe_spawn_or_fallback(&surface, &block, 62, 250);
+    assert_eq!(
+        (x, feet, z),
+        (16.5, 65.0, 0.5),
+        "the search must skip every ocean column and the lava crust"
+    );
+    let (bx, by, bz) = (x.floor() as i32, feet as i32, z.floor() as i32);
+    assert_eq!(spawn_cell_class(block(bx, by, bz)), SpawnCell::Air);
+    assert_eq!(spawn_cell_class(block(bx, by + 1, bz)), SpawnCell::Air);
+    assert_eq!(spawn_cell_class(block(bx, by - 1, bz)), SpawnCell::Solid);
+
+    // The live call the boot path makes: finite, inside the search bounds, and
+    // none of the body/ground cells is a contact-damage block.
+    let (x, y, z) = compute_safe_initial_world_spawn();
+    assert!(x.is_finite() && y.is_finite() && z.is_finite());
+    let bound = SPAWN_SEARCH_RADIUS as f64 + 0.5;
+    assert!(x.abs() <= bound && z.abs() <= bound, "spawn ({x}, {z}) escaped the search radius");
+    let (bx, by, bz) = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
+    for (dy, what) in [(0i32, "feet"), (1, "headroom"), (-1, "ground")] {
+        assert_ne!(
+            spawn_cell_class(block_at_dim(DimId::Overworld, bx, by + dy, bz)),
+            SpawnCell::Danger,
+            "spawn {what} cell must never be a contact-damage block"
+        );
+    }
+}

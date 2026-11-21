@@ -5459,7 +5459,9 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             }
         }
         "save-all" | "save" => {
-            save_world();
+            // Flush any queued autosave first so an older pending snapshot
+            // cannot be written over this one.
+            shutdown_world_save();
             "Saved the world".into()
         }
         "kick" => {
@@ -5489,10 +5491,21 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             connection_limits::set_idle_timeout(Duration::from_secs(u64::from(minutes) * 60));
             format!("Set idle timeout to {minutes} minutes")
         }
+        // Console/RCON-only diagnostic (Vanilla has no `status` literal, so it
+        // deliberately never enters `command_tree_at_level` — player tab
+        // completion stays 100% Vanilla). The console is the only source that
+        // reaches this arm: it runs at level 4 with `me.is_none()`; a player
+        // who types the word still gets the unknown-command reply.
+        "status" if ctx.me.is_none() => {
+            // RCON carries the reply in its response frame; the stdin console
+            // sees it via the shared `[cmd]` echo below.
+            format_operator_status(&operator_health_snapshot())
+        }
         "stop" => {
-            save_world();
+            shutdown_world_save();
             std::thread::spawn(|| {
                 std::thread::sleep(Duration::from_millis(150)); // flush reply
+                stop_lan_announcer();
                 disconnect_all_clients("Server closed");
                 std::thread::sleep(Duration::from_millis(100));
                 #[cfg(feature = "neoforge-events")]
