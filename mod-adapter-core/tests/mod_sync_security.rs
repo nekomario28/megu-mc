@@ -15,11 +15,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use mod_adapter_core::mod_sync::{
-    decode_sync_manifest, digest_eq, digest_hex, encode_sync_manifest, install_verified_bytes,
-    is_superseded_sync_entry, is_trusted_mod_cdn_host, parse_sha256_hex, plan_mod_sync,
-    sha256, sha256_hex, validate_download_url, validate_jar_file_name, validate_sync_entry,
-    ConsentToken, ModSyncEntry, ModSyncErrorKind, Sha256, SyncManifest, SyncPolicy,
-    MAX_MOD_JAR_BYTES, MAX_SYNC_MODS, MOD_SYNC_CHANNEL, MSY1_MAGIC,
+    compute_manifest_diff, compute_manifest_diff_with_policy, decode_root_hash_probe,
+    decode_sync_manifest, digest_eq, digest_hex, encode_root_hash_probe, encode_sync_manifest,
+    install_verified_bytes, is_superseded_sync_entry, is_trusted_mod_cdn_host, manifest_root_hash,
+    materialize_into_profile, parse_sha256_hex, plan_mod_sync, prune_removed, sha256, sha256_hex,
+    validate_download_url, validate_jar_file_name, validate_sync_entry, ConsentToken,
+    ContentAddressedModCache, ModSyncEntry, ModSyncErrorKind, Sha256, SyncManifest, SyncPolicy,
+    MAX_MOD_JAR_BYTES, MAX_SYNC_MODS, MOD_SYNC_CHANNEL, MSH1_MAGIC, MSY1_MAGIC,
 };
 
 // ---------------------------------------------------------------------------
@@ -76,7 +78,12 @@ fn policy() -> SyncPolicy {
 fn dir_file_names(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(dir)
         .expect("read dir")
-        .map(|e| e.expect("dir entry").file_name().to_string_lossy().into_owned())
+        .map(|e| {
+            e.expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
     names.sort();
     names
@@ -344,7 +351,10 @@ fn wire_encode_refuses_invalid_entries_and_over_cap_manifests() {
             .collect(),
     );
     let body = encode_sync_manifest(&at_cap).unwrap();
-    assert_eq!(decode_sync_manifest(&body).unwrap().entries.len(), MAX_SYNC_MODS);
+    assert_eq!(
+        decode_sync_manifest(&body).unwrap().entries.len(),
+        MAX_SYNC_MODS
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -581,8 +591,8 @@ fn consent_denied_writes_nothing() {
     let mods = dir.join("mods");
     let (e, bytes) = good_entry();
 
-    let err = install_verified_bytes(&mods, &e, &bytes, &ConsentToken::denied(), &policy())
-        .unwrap_err();
+    let err =
+        install_verified_bytes(&mods, &e, &bytes, &ConsentToken::denied(), &policy()).unwrap_err();
     assert_eq!(err.kind(), ModSyncErrorKind::ConsentRequired);
     // Not even the mods/ directory may be created.
     assert!(!mods.exists());
@@ -599,7 +609,11 @@ fn digest_mismatch_writes_nothing_and_leaves_no_temp() {
     let err = install_verified_bytes(&mods, &e, &bytes, &ConsentToken::approved(), &policy())
         .unwrap_err();
     assert_eq!(err.kind(), ModSyncErrorKind::DigestMismatch);
-    assert_eq!(dir_file_names(&mods), Vec::<String>::new(), "no file or temp may remain");
+    assert_eq!(
+        dir_file_names(&mods),
+        Vec::<String>::new(),
+        "no file or temp may remain"
+    );
 }
 
 #[test]
@@ -617,8 +631,8 @@ fn wrong_bytes_and_size_mismatch_write_nothing() {
 
     // Right prefix, wrong length → size mismatch.
     let short = &bytes[..bytes.len() - 1];
-    let err = install_verified_bytes(&mods, &e, short, &ConsentToken::approved(), &policy())
-        .unwrap_err();
+    let err =
+        install_verified_bytes(&mods, &e, short, &ConsentToken::approved(), &policy()).unwrap_err();
     assert_eq!(err.kind(), ModSyncErrorKind::SizeMismatch);
 
     assert_eq!(
@@ -661,7 +675,11 @@ fn tampered_on_disk_file_replans_as_download() {
     install_verified_bytes(&mods, &e, &bytes, &ConsentToken::approved(), &policy()).unwrap();
 
     // Corrupt the installed jar — the plan must demand a re-download.
-    fs::write(mods.join(&e.file_name), jar_bytes(0xEE, e.size_bytes as usize)).unwrap();
+    fs::write(
+        mods.join(&e.file_name),
+        jar_bytes(0xEE, e.size_bytes as usize),
+    )
+    .unwrap();
     let plan = plan_mod_sync(&manifest_of(vec![e.clone()]), &mods, &policy());
     assert!(plan.already_installed_verified.is_empty());
     assert_eq!(plan.to_download, vec![e]);
@@ -704,7 +722,11 @@ fn superseded_perf_mods_auto_skip_by_id_case_and_filename() {
         &bytes,
     );
     for e in [&sodium, &modernfix, &sneaky, &emb] {
-        assert!(is_superseded_sync_entry(e), "{} should be superseded", e.mod_id);
+        assert!(
+            is_superseded_sync_entry(e),
+            "{} should be superseded",
+            e.mod_id
+        );
     }
 
     let (real, _) = good_entry();
@@ -770,7 +792,12 @@ fn plan_partitions_mixed_manifest_fail_closed() {
     );
     let badhash = ModSyncEntry {
         sha256_hex: "not-hex".to_string(),
-        ..entry("badhash", "badhash.jar", "https://cdn.modrinth.com/b.jar", &[1])
+        ..entry(
+            "badhash",
+            "badhash.jar",
+            "https://cdn.modrinth.com/b.jar",
+            &[1],
+        )
     };
     let sodium = entry(
         "sodium",
@@ -862,4 +889,423 @@ fn entry_on_untrusted_host_rejected_even_with_valid_digest() {
     );
     let err = validate_sync_entry(&e, &policy()).unwrap_err();
     assert_eq!(err.kind(), ModSyncErrorKind::UnsafeUrl);
+}
+
+// ---------------------------------------------------------------------------
+// NET-3c: 32-byte manifest identity and validated diff-only plans
+// ---------------------------------------------------------------------------
+
+#[test]
+fn root_hash_is_order_independent_and_content_sensitive() {
+    let (a, _) = good_entry();
+    let b = entry(
+        "create",
+        "create.jar",
+        "https://cdn.modrinth.com/create.jar",
+        b"other",
+    );
+    let first = manifest_of(vec![a.clone(), b.clone()]);
+    let backwards = manifest_of(vec![b.clone(), a.clone()]);
+    assert_eq!(manifest_root_hash(&first), manifest_root_hash(&backwards));
+
+    let mut changed_url = a.clone();
+    changed_url.download_url = "https://edge.forgecdn.net/same.jar".into();
+    assert_eq!(
+        manifest_root_hash(&first),
+        manifest_root_hash(&manifest_of(vec![changed_url, b.clone()]))
+    );
+
+    let mut changed_digest = a.clone();
+    changed_digest.sha256_hex = sha256_hex(b"different");
+    assert_ne!(
+        manifest_root_hash(&first),
+        manifest_root_hash(&manifest_of(vec![changed_digest, b.clone()]))
+    );
+    let mut changed_size = a.clone();
+    changed_size.size_bytes += 1;
+    assert_ne!(
+        manifest_root_hash(&first),
+        manifest_root_hash(&manifest_of(vec![changed_size, b.clone()]))
+    );
+    let mut changed_name = a;
+    changed_name.file_name = "new-name.jar".into();
+    assert_ne!(
+        manifest_root_hash(&first),
+        manifest_root_hash(&manifest_of(vec![changed_name, b]))
+    );
+}
+
+#[test]
+fn msh1_probe_exact_36_bytes_roundtrip_and_fail_closed() {
+    let (a, _) = good_entry();
+    let root = manifest_root_hash(&manifest_of(vec![a]));
+    let packet = encode_root_hash_probe(&root);
+    assert_eq!(packet.len(), 36);
+    assert_eq!(&packet[..4], &MSH1_MAGIC);
+    assert_eq!(decode_root_hash_probe(&packet).unwrap(), root);
+    for invalid in [
+        &packet[..0],
+        &packet[..4],
+        &packet[..35],
+        &[packet.as_slice(), &[0]].concat(),
+    ] {
+        assert_eq!(
+            decode_root_hash_probe(invalid).unwrap_err().kind(),
+            ModSyncErrorKind::MalformedManifest
+        );
+    }
+    let mut bad_magic = packet;
+    bad_magic[0] = b'X';
+    assert_eq!(
+        decode_root_hash_probe(&bad_magic).unwrap_err().kind(),
+        ModSyncErrorKind::MalformedManifest
+    );
+}
+
+#[test]
+fn diff_partitions_add_update_unchanged_remove_and_skips_perf() {
+    let unchanged = entry(
+        "jei",
+        "jei.jar",
+        "https://cdn.modrinth.com/jei.jar",
+        b"unchanged",
+    );
+    let old_update = entry(
+        "create",
+        "old-create.jar",
+        "https://cdn.modrinth.com/create.jar",
+        b"old",
+    );
+    let new_update = entry(
+        "create",
+        "new-create.jar",
+        "https://cdn.modrinth.com/create.jar",
+        b"new",
+    );
+    let old_removed = entry(
+        "retired",
+        "retired.jar",
+        "https://cdn.modrinth.com/retired.jar",
+        b"retired",
+    );
+    let added = entry(
+        "ae2",
+        "ae2.jar",
+        "https://cdn.modrinth.com/ae2.jar",
+        b"added",
+    );
+    let sodium = entry(
+        "sodium",
+        "sodium.jar",
+        "https://cdn.modrinth.com/sodium.jar",
+        b"skip",
+    );
+    let local = vec![unchanged.clone(), old_update.clone(), old_removed];
+    let manifest = manifest_of(vec![
+        new_update.clone(),
+        sodium,
+        unchanged.clone(),
+        added.clone(),
+    ]);
+    let diff = compute_manifest_diff(&local, &manifest).unwrap();
+    assert_eq!(diff.unchanged, vec![unchanged]);
+    assert_eq!(diff.added, vec![added]);
+    assert_eq!(diff.updated, vec![new_update]);
+    assert_eq!(diff.removed, vec!["old-create.jar", "retired.jar"]);
+    assert_eq!(diff.skipped_builtin_perf, vec!["sodium"]);
+    assert_eq!(local[1], old_update);
+}
+
+#[test]
+fn malformed_server_manifest_rejected_before_removal_plan() {
+    let local = vec![entry(
+        "old",
+        "old.jar",
+        "https://cdn.modrinth.com/old.jar",
+        b"old",
+    )];
+    let valid = entry("new", "new.jar", "https://cdn.modrinth.com/new.jar", b"new");
+    let mut hostile = valid.clone();
+    hostile.file_name = "../outside.jar".into();
+    let mut bad_digest = valid.clone();
+    bad_digest.sha256_hex = "not-a-digest".into();
+    let mut bad_host = valid.clone();
+    bad_host.download_url = "https://attacker.example/mod.jar".into();
+    let mut duplicate = valid.clone();
+    duplicate.mod_id = "another-id".into();
+    let mut duplicate_id = valid.clone();
+    duplicate_id.file_name = "another-file.jar".into();
+
+    for bad in [hostile, bad_digest, bad_host, duplicate, duplicate_id] {
+        let manifest = manifest_of(vec![valid.clone(), bad]);
+        assert!(compute_manifest_diff(&local, &manifest).is_err());
+    }
+    let huge = manifest_of(vec![valid; MAX_SYNC_MODS + 1]);
+    assert_eq!(
+        compute_manifest_diff(&local, &huge).unwrap_err().kind(),
+        ModSyncErrorKind::TooManyEntries
+    );
+}
+
+#[test]
+fn diff_accepts_only_explicitly_pinned_mirrors() {
+    let from_mirror = entry(
+        "example",
+        "example.jar",
+        "https://trusted.example/mod.jar",
+        b"blob",
+    );
+    let manifest = manifest_of(vec![from_mirror.clone()]);
+    assert!(compute_manifest_diff(&[], &manifest).is_err());
+    let mirror = SyncPolicy::with_operator_mirrors(&["trusted.example"]).unwrap();
+    assert_eq!(
+        compute_manifest_diff_with_policy(&[], &manifest, &mirror)
+            .unwrap()
+            .added,
+        vec![from_mirror]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// NET-3c: shared content-addressed JAR cache and safe removal
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cache_stores_once_and_materializes_same_digest_into_two_profiles() {
+    let dir = fixture_dir("cache-shared");
+    let cache = ContentAddressedModCache::new(dir.join("cache"));
+    let bytes = jar_bytes(0x17, 4096);
+    let digest = sha256(&bytes);
+    let blob = cache.store_verified_bytes(&digest, &bytes).unwrap();
+    assert_eq!(
+        blob.file_name().unwrap().to_str().unwrap(),
+        format!("{}.jar", digest_hex(&digest))
+    );
+    assert_eq!(cache.store_verified_bytes(&digest, &bytes).unwrap(), blob);
+    assert_eq!(dir_file_names(cache.root()).len(), 1);
+
+    let first = cache
+        .materialize_into_profile(
+            &digest,
+            &dir.join("profile-a/mods"),
+            "first.jar",
+            &ConsentToken::approved(),
+        )
+        .unwrap();
+    let second = materialize_into_profile(
+        cache.root(),
+        &digest,
+        &dir.join("profile-b/mods"),
+        "second.jar",
+        &ConsentToken::approved(),
+    )
+    .unwrap();
+    assert_eq!(fs::read(&first).unwrap(), bytes);
+    assert_eq!(fs::read(&second).unwrap(), bytes);
+    assert_eq!(fs::read(&blob).unwrap(), bytes);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            fs::metadata(&blob).unwrap().ino(),
+            fs::metadata(&first).unwrap().ino()
+        );
+        assert_eq!(
+            fs::metadata(&blob).unwrap().ino(),
+            fs::metadata(&second).unwrap().ino()
+        );
+    }
+}
+
+#[test]
+fn cache_rejects_tampered_bytes_and_never_overwrites_profile() {
+    let dir = fixture_dir("cache-tamper");
+    let cache = ContentAddressedModCache::new(dir.join("cache"));
+    let mods = dir.join("mods");
+    fs::create_dir_all(&mods).unwrap();
+    let bytes = b"verified jar bytes";
+    let digest = sha256(bytes);
+    assert_eq!(
+        cache
+            .store_verified_bytes(&digest, b"wrong")
+            .unwrap_err()
+            .kind(),
+        ModSyncErrorKind::DigestMismatch
+    );
+    let blob = cache.store_verified_bytes(&digest, bytes).unwrap();
+    fs::write(mods.join("existing.jar"), b"leave unchanged").unwrap();
+    assert_eq!(
+        cache
+            .materialize_into_profile(&digest, &mods, "existing.jar", &ConsentToken::denied())
+            .unwrap_err()
+            .kind(),
+        ModSyncErrorKind::ConsentRequired
+    );
+
+    let mut permissions = fs::metadata(&blob).unwrap().permissions();
+    permissions.set_readonly(false);
+    fs::set_permissions(&blob, permissions).unwrap();
+    fs::write(&blob, b"tampered").unwrap();
+    assert_eq!(
+        cache
+            .store_verified_bytes(&digest, bytes)
+            .unwrap_err()
+            .kind(),
+        ModSyncErrorKind::DigestMismatch
+    );
+    assert_eq!(
+        cache
+            .materialize_into_profile(&digest, &mods, "existing.jar", &ConsentToken::approved())
+            .unwrap_err()
+            .kind(),
+        ModSyncErrorKind::DigestMismatch
+    );
+    assert_eq!(
+        fs::read(mods.join("existing.jar")).unwrap(),
+        b"leave unchanged"
+    );
+    assert_eq!(dir_file_names(&mods), vec!["existing.jar"]);
+}
+
+#[test]
+fn long_jar_basename_keeps_staging_name_under_name_max() {
+    let dir = fixture_dir("max-filename");
+    let mods = dir.join("mods");
+    let name = format!("{}.jar", "a".repeat(251));
+    assert_eq!(name.len(), 255);
+    validate_jar_file_name(&name).unwrap();
+    let bytes = jar_bytes(0x27, 512);
+    let digest = sha256(&bytes);
+    let cache = ContentAddressedModCache::new(dir.join("cache"));
+    cache.store_verified_bytes(&digest, &bytes).unwrap();
+    let first = cache
+        .materialize_into_profile(&digest, &mods, &name, &ConsentToken::approved())
+        .unwrap();
+    assert_eq!(fs::read(&first).unwrap(), bytes);
+    let e = entry("long", &name, "https://cdn.modrinth.com/long.jar", &bytes);
+    install_verified_bytes(&mods, &e, &bytes, &ConsentToken::approved(), &policy()).unwrap();
+    assert_eq!(dir_file_names(&mods), vec![name]);
+}
+
+#[test]
+fn prune_removed_requires_consent_and_prevalidates_every_name() {
+    let dir = fixture_dir("prune");
+    let mods = dir.join("mods");
+    fs::create_dir_all(&mods).unwrap();
+    fs::write(mods.join("one.jar"), b"one").unwrap();
+    fs::write(mods.join("two.jar"), b"two").unwrap();
+    fs::write(mods.join("notes.txt"), b"keep").unwrap();
+    let names = vec!["one.jar".into(), "two.jar".into()];
+    assert_eq!(
+        prune_removed(&mods, &names, &ConsentToken::denied())
+            .unwrap_err()
+            .kind(),
+        ModSyncErrorKind::ConsentRequired
+    );
+    let hostile = vec!["one.jar".into(), "../notes.txt".into()];
+    assert_eq!(
+        prune_removed(&mods, &hostile, &ConsentToken::approved())
+            .unwrap_err()
+            .kind(),
+        ModSyncErrorKind::UnsafeFileName
+    );
+    assert!(mods.join("one.jar").exists());
+    assert_eq!(
+        prune_removed(&mods, &names, &ConsentToken::approved()).unwrap(),
+        2
+    );
+    assert_eq!(
+        prune_removed(&mods, &names, &ConsentToken::approved()).unwrap(),
+        0
+    );
+    assert_eq!(dir_file_names(&mods), vec!["notes.txt"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_and_prune_refuse_symlinks_without_touching_outside_files() {
+    use std::os::unix::fs::symlink;
+    let dir = fixture_dir("cache-symlinks");
+    let mods = dir.join("mods");
+    fs::create_dir_all(&mods).unwrap();
+    let outside = dir.join("outside.jar");
+    fs::write(&outside, b"outside").unwrap();
+    symlink(&outside, mods.join("linked.jar")).unwrap();
+    fs::write(mods.join("safe.jar"), b"safe").unwrap();
+    let paths = vec!["safe.jar".into(), "linked.jar".into()];
+    assert_eq!(
+        prune_removed(&mods, &paths, &ConsentToken::approved())
+            .unwrap_err()
+            .kind(),
+        ModSyncErrorKind::SymlinkEscape
+    );
+    assert!(mods.join("safe.jar").exists());
+
+    // A genuine mods directory below a symlinked parent is also unsafe.
+    let alias_parent = dir.join("alias-parent");
+    symlink(&dir, &alias_parent).unwrap();
+    let nested_mods = alias_parent.join("mods");
+    assert_eq!(
+        prune_removed(
+            &nested_mods,
+            &["safe.jar".into()],
+            &ConsentToken::approved()
+        )
+        .unwrap_err()
+        .kind(),
+        ModSyncErrorKind::SymlinkEscape
+    );
+    assert!(mods.join("safe.jar").exists());
+
+    let digest = sha256(b"blob");
+    let cache = ContentAddressedModCache::new(dir.join("cache"));
+    fs::create_dir_all(cache.root()).unwrap();
+    symlink(
+        &outside,
+        cache.root().join(format!("{}.jar", digest_hex(&digest))),
+    )
+    .unwrap();
+    assert_eq!(
+        cache
+            .store_verified_bytes(&digest, b"blob")
+            .unwrap_err()
+            .kind(),
+        ModSyncErrorKind::SymlinkEscape
+    );
+    assert_eq!(
+        cache
+            .materialize_into_profile(&digest, &mods, "new.jar", &ConsentToken::approved())
+            .unwrap_err()
+            .kind(),
+        ModSyncErrorKind::SymlinkEscape
+    );
+    assert_eq!(fs::read(&outside).unwrap(), b"outside");
+
+    fs::remove_file(cache.root().join(format!("{}.jar", digest_hex(&digest)))).unwrap();
+    cache.store_verified_bytes(&digest, b"blob").unwrap();
+    assert_eq!(
+        cache
+            .materialize_into_profile(&digest, &nested_mods, "new.jar", &ConsentToken::approved())
+            .unwrap_err()
+            .kind(),
+        ModSyncErrorKind::SymlinkEscape
+    );
+    assert_eq!(
+        cache
+            .materialize_into_profile(&digest, &mods, "linked.jar", &ConsentToken::approved())
+            .unwrap_err()
+            .kind(),
+        ModSyncErrorKind::SymlinkEscape
+    );
+    assert_eq!(fs::read(&outside).unwrap(), b"outside");
+
+    let linked_dir = dir.join("linked-mods");
+    symlink(&mods, &linked_dir).unwrap();
+    assert_eq!(
+        prune_removed(&linked_dir, &["safe.jar".into()], &ConsentToken::approved())
+            .unwrap_err()
+            .kind(),
+        ModSyncErrorKind::SymlinkEscape
+    );
+    assert!(mods.join("safe.jar").exists());
 }

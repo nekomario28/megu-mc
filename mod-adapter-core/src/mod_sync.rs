@@ -55,11 +55,12 @@
 //! compatibility matching — no third-party code, assets, or data is copied,
 //! linked, bundled, or derived from.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::fallback::BUILTIN_SUPERSEDED_PERF_MODS;
 use crate::modpack::infer_candidate_mod_id;
@@ -71,6 +72,9 @@ pub const MOD_SYNC_CHANNEL: &str = "mc-spine:mod_sync_v1";
 /// the wire version: a future incompatible frame bumps the magic, so old
 /// decoders fail closed on the magic check instead of misparsing.
 pub const MSY1_MAGIC: [u8; 4] = *b"MSY1";
+
+/// Fixed-size root-hash probe for servers and clients with matching manifests.
+pub const MSH1_MAGIC: [u8; 4] = *b"MSH1";
 
 /// Hard cap on manifest entries per sync body — checked before allocation.
 pub const MAX_SYNC_MODS: usize = 512;
@@ -414,6 +418,9 @@ pub struct SyncManifest {
     pub entries: Vec<ModSyncEntry>,
 }
 
+/// Alternative name used by the content-addressed diff sync protocol.
+pub type ModSyncManifest = SyncManifest;
+
 /// Client-side trust policy: the canonical [`TRUSTED_MOD_CDN_HOSTS`]
 /// allowlist plus any operator-pinned HTTPS mirror hostnames.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -566,9 +573,7 @@ fn validate_url_syntax(url: &str) -> Result<String, ModSyncError> {
     }
     // HTTPS only — no http:, file:, ftp:, javascript:, or bare `host/path`.
     if url.len() < 9 || !url.as_bytes()[..8].eq_ignore_ascii_case(b"https://") {
-        return Err(url_err(format!(
-            "URL '{url}' is not an https:// URL"
-        )));
+        return Err(url_err(format!("URL '{url}' is not an https:// URL")));
     }
     let rest = &url[8..];
     let auth_end = rest
@@ -591,9 +596,7 @@ fn validate_url_syntax(url: &str) -> Result<String, ModSyncError> {
     } else if let Some(colon) = authority.rfind(':') {
         let port = &authority[colon + 1..];
         if port != "443" {
-            return Err(url_err(format!(
-                "URL '{url}' uses a non-443 port"
-            )));
+            return Err(url_err(format!("URL '{url}' uses a non-443 port")));
         }
         &authority[..colon]
     } else {
@@ -601,9 +604,7 @@ fn validate_url_syntax(url: &str) -> Result<String, ModSyncError> {
     };
     let host = normalize_host(host)?;
     if is_ip_literal_host(&host) {
-        return Err(url_err(format!(
-            "URL '{url}' uses a raw IP literal host"
-        )));
+        return Err(url_err(format!("URL '{url}' uses a raw IP literal host")));
     }
     if is_local_or_internal_host(&host) {
         return Err(url_err(format!(
@@ -678,9 +679,7 @@ pub fn validate_jar_file_name(name: &str) -> Result<(), ModSyncError> {
         }
     }
     if name.starts_with('.') {
-        return Err(name_err(format!(
-            "file name '{name}' is a hidden dotfile"
-        )));
+        return Err(name_err(format!("file name '{name}' is a hidden dotfile")));
     }
     if name.contains("..") {
         return Err(name_err(format!("file name '{name}' contains '..'")));
@@ -707,17 +706,17 @@ fn validate_entry_structure(entry: &ModSyncEntry) -> Result<(), ModSyncError> {
     {
         return Err(err(
             ModSyncErrorKind::InvalidEntry,
-            format!("mod id {:?} is empty, over-cap, or has an illegal byte", entry.mod_id),
+            format!(
+                "mod id {:?} is empty, over-cap, or has an illegal byte",
+                entry.mod_id
+            ),
         ));
     }
     validate_jar_file_name(&entry.file_name)?;
     if parse_sha256_hex(&entry.sha256_hex).is_none() {
         return Err(err(
             ModSyncErrorKind::InvalidEntry,
-            format!(
-                "entry '{}' sha256 is not a 64-hex digest",
-                entry.file_name
-            ),
+            format!("entry '{}' sha256 is not a 64-hex digest", entry.file_name),
         ));
     }
     if entry.size_bytes == 0 || entry.size_bytes > MAX_MOD_JAR_BYTES {
@@ -873,17 +872,22 @@ pub fn decode_sync_manifest(bytes: &[u8]) -> Result<SyncManifest, ModSyncError> 
             "file_name",
         )?
         .to_owned();
-        let url_len = u16::from_be_bytes([read_u8(bytes, &mut cursor)?, read_u8(bytes, &mut cursor)?])
-            as usize;
+        let url_len =
+            u16::from_be_bytes([read_u8(bytes, &mut cursor)?, read_u8(bytes, &mut cursor)?])
+                as usize;
         let download_url =
             read_capped_str(bytes, &mut cursor, url_len, MAX_SYNC_URL_LEN, "url")?.to_owned();
-        let end = cursor.checked_add(8).ok_or_else(|| malformed("size overflow"))?;
+        let end = cursor
+            .checked_add(8)
+            .ok_or_else(|| malformed("size overflow"))?;
         let size_slice = bytes
             .get(cursor..end)
             .ok_or_else(|| malformed("truncated size"))?;
         let size_bytes = u64::from_be_bytes(size_slice.try_into().expect("8-byte slice"));
         cursor = end;
-        let end = cursor.checked_add(32).ok_or_else(|| malformed("digest overflow"))?;
+        let end = cursor
+            .checked_add(32)
+            .ok_or_else(|| malformed("digest overflow"))?;
         let digest_slice = bytes
             .get(cursor..end)
             .ok_or_else(|| malformed("truncated digest"))?;
@@ -906,6 +910,169 @@ pub fn decode_sync_manifest(bytes: &[u8]) -> Result<SyncManifest, ModSyncError> 
         validate_url_syntax(&entry.download_url)?;
     }
     Ok(SyncManifest { entries })
+}
+
+// ---------------------------------------------------------------------------
+// Content-addressed manifest identity and diff planning (NET-3c)
+// ---------------------------------------------------------------------------
+
+/// SHA-256 over the canonical sorted entries, independent of manifest order
+/// and URL spelling. The input is `u32be count`, followed by each tuple in
+/// `(mod_id, file_name, size_bytes, sha256)` order: length-prefixed UTF-8 id
+/// and filename (`u64be` lengths), `u64be` size, and the lowercase hex digest
+/// (`u64be` length followed by bytes). Length prefixes prevent ambiguity.
+/// A root must only be trusted after the manifest itself has been validated.
+pub fn manifest_root_hash(manifest: &ModSyncManifest) -> [u8; 32] {
+    let mut entries: Vec<_> = manifest
+        .entries
+        .iter()
+        .map(|e| {
+            (
+                &e.mod_id,
+                &e.file_name,
+                e.size_bytes,
+                e.sha256_hex.to_ascii_lowercase(),
+            )
+        })
+        .collect();
+    entries.sort();
+
+    let mut hasher = Sha256::new();
+    hasher.update(&(entries.len() as u32).to_be_bytes());
+    for (id, name, size, digest) in entries {
+        for field in [id.as_bytes(), name.as_bytes()] {
+            hasher.update(&(field.len() as u64).to_be_bytes());
+            hasher.update(field);
+        }
+        hasher.update(&size.to_be_bytes());
+        hasher.update(&(digest.len() as u64).to_be_bytes());
+        hasher.update(digest.as_bytes());
+    }
+    hasher.finalize()
+}
+
+/// Encode the 36-byte `MSH1` fast-path probe.
+pub fn encode_root_hash_probe(root_hash: &[u8; 32]) -> [u8; 36] {
+    let mut probe = [0u8; 36];
+    probe[..4].copy_from_slice(&MSH1_MAGIC);
+    probe[4..].copy_from_slice(root_hash);
+    probe
+}
+
+/// Reject probes of any other version or length, including trailing bytes.
+pub fn decode_root_hash_probe(probe: &[u8]) -> Result<[u8; 32], ModSyncError> {
+    if probe.len() != 36 || probe[..4] != MSH1_MAGIC {
+        return Err(err(
+            ModSyncErrorKind::MalformedManifest,
+            "MSH1 probe must have exact magic and 36 bytes",
+        ));
+    }
+    let mut root = [0u8; 32];
+    root.copy_from_slice(&probe[4..]);
+    Ok(root)
+}
+
+/// Disjoint diff for a validated server manifest against a client's known
+/// entries. `removed` holds old filenames, including renamed updates.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModSyncDiff {
+    pub unchanged: Vec<ModSyncEntry>,
+    pub added: Vec<ModSyncEntry>,
+    pub updated: Vec<ModSyncEntry>,
+    pub removed: Vec<String>,
+    pub skipped_builtin_perf: Vec<String>,
+}
+
+fn checked_manifest_entries<'a>(
+    entries: &'a [ModSyncEntry],
+    policy: Option<&SyncPolicy>,
+) -> Result<BTreeMap<String, &'a ModSyncEntry>, ModSyncError> {
+    if entries.len() > MAX_SYNC_MODS {
+        return Err(err(
+            ModSyncErrorKind::TooManyEntries,
+            "manifest entry count exceeds cap",
+        ));
+    }
+    let mut ids = BTreeMap::new();
+    let mut names = BTreeSet::new();
+    for entry in entries {
+        validate_entry_structure(entry)?;
+        if let Some(policy) = policy {
+            validate_download_url(&entry.download_url, policy)?;
+        }
+        let id = entry.mod_id.to_ascii_lowercase();
+        if !ids.contains_key(&id) && names.insert(entry.file_name.to_ascii_lowercase()) {
+            ids.insert(id, entry);
+        } else {
+            return Err(err(
+                ModSyncErrorKind::InvalidEntry,
+                format!(
+                    "duplicate mod id or filename in manifest: '{}'",
+                    entry.file_name
+                ),
+            ));
+        }
+    }
+    Ok(ids)
+}
+
+/// Validate the entire server manifest before computing any removals.
+/// Canonical CDN policy applies unless the caller supplies pinned mirrors
+/// through [`compute_manifest_diff_with_policy`].
+pub fn compute_manifest_diff(
+    local_entries: &[ModSyncEntry],
+    server_manifest: &ModSyncManifest,
+) -> Result<ModSyncDiff, ModSyncError> {
+    compute_manifest_diff_with_policy(local_entries, server_manifest, &SyncPolicy::canonical())
+}
+
+/// Diff with an explicitly configured CDN/mirror allowlist.
+pub fn compute_manifest_diff_with_policy(
+    local_entries: &[ModSyncEntry],
+    server_manifest: &ModSyncManifest,
+    policy: &SyncPolicy,
+) -> Result<ModSyncDiff, ModSyncError> {
+    // Validation must complete before even considering the local inventory:
+    // corrupt or hostile server input cannot produce a deletion list.
+    let server = checked_manifest_entries(&server_manifest.entries, Some(policy))?;
+    let local = checked_manifest_entries(local_entries, None)?;
+    let server_names: BTreeSet<_> = server_manifest
+        .entries
+        .iter()
+        .map(|e| e.file_name.to_ascii_lowercase())
+        .collect();
+
+    let mut diff = ModSyncDiff::default();
+    for entry in &server_manifest.entries {
+        if is_superseded_sync_entry(entry) {
+            diff.skipped_builtin_perf.push(entry.mod_id.clone());
+            continue;
+        }
+        match local.get(&entry.mod_id.to_ascii_lowercase()) {
+            None => diff.added.push(entry.clone()),
+            Some(old)
+                if old.file_name == entry.file_name
+                    && old.size_bytes == entry.size_bytes
+                    && parse_sha256_hex(&old.sha256_hex) == parse_sha256_hex(&entry.sha256_hex) =>
+            {
+                diff.unchanged.push(entry.clone());
+            }
+            Some(_) => diff.updated.push(entry.clone()),
+        }
+    }
+    for (id, old) in local {
+        if is_superseded_sync_entry(old) {
+            continue;
+        }
+        let retained_name = server_names.contains(&old.file_name.to_ascii_lowercase());
+        let same_name = server
+            .get(&id)
+            .is_some_and(|new| new.file_name.eq_ignore_ascii_case(&old.file_name));
+        if !retained_name && !same_name {
+            diff.removed.push(old.file_name.clone());
+        }
+    }
+    Ok(diff)
 }
 
 // ---------------------------------------------------------------------------
@@ -1003,13 +1170,19 @@ pub fn plan_mod_sync(manifest: &SyncManifest, mods_dir: &Path, policy: &SyncPoli
             Ok(meta) if meta.file_type().is_symlink() => {
                 reject(
                     &mut plan,
-                    format!("existing '{}' is a symlink — refusing to touch it", entry.file_name),
+                    format!(
+                        "existing '{}' is a symlink — refusing to touch it",
+                        entry.file_name
+                    ),
                 );
             }
             Ok(meta) if meta.is_dir() => {
                 reject(
                     &mut plan,
-                    format!("existing '{}' is a directory — cannot overwrite", entry.file_name),
+                    format!(
+                        "existing '{}' is a directory — cannot overwrite",
+                        entry.file_name
+                    ),
                 );
             }
             Ok(_) => match hash_file_capped(&target) {
@@ -1017,7 +1190,8 @@ pub fn plan_mod_sync(manifest: &SyncManifest, mods_dir: &Path, policy: &SyncPoli
                     let expected =
                         parse_sha256_hex(&entry.sha256_hex).expect("structure-checked digest");
                     if len == entry.size_bytes && digest_eq(&digest, &expected) {
-                        plan.already_installed_verified.push(entry.file_name.clone());
+                        plan.already_installed_verified
+                            .push(entry.file_name.clone());
                     } else {
                         plan.to_download.push(entry.clone());
                     }
@@ -1033,6 +1207,347 @@ pub fn plan_mod_sync(manifest: &SyncManifest, mods_dir: &Path, policy: &SyncPoli
     plan
 }
 
+// All staging basenames stay short even when an accepted JAR basename is
+// exactly NAME_MAX bytes. Per-process monotonic ids avoid timestamp entropy.
+static NEXT_STAGE_ID: AtomicU64 = AtomicU64::new(0);
+
+fn stage_path(dir: &Path) -> PathBuf {
+    dir.join(format!(
+        ".msync-{:x}-{:x}.part",
+        std::process::id(),
+        NEXT_STAGE_ID.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+struct StagedPath {
+    path: PathBuf,
+    cleanup: bool,
+}
+
+impl StagedPath {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            cleanup: true,
+        }
+    }
+
+    fn published(&mut self) {
+        self.cleanup = false;
+    }
+}
+
+impl Drop for StagedPath {
+    fn drop(&mut self) {
+        if self.cleanup {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn create_stage(dir: &Path) -> io::Result<(fs::File, StagedPath)> {
+    for _ in 0..32 {
+        let path = stage_path(dir);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((file, StagedPath::new(path))),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "staging filenames exhausted",
+    ))
+}
+
+fn refuse_symlink_or_directory(path: &Path) -> Result<(), ModSyncError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(err(
+            ModSyncErrorKind::SymlinkEscape,
+            format!("symlink refused at '{}'", path.display()),
+        )),
+        Ok(meta) if meta.is_dir() => Err(err(
+            ModSyncErrorKind::InvalidEntry,
+            format!("expected a regular file at '{}'", path.display()),
+        )),
+        Ok(meta) if !meta.is_file() => Err(err(
+            ModSyncErrorKind::InvalidEntry,
+            format!("special file refused at '{}'", path.display()),
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io_err(e)),
+    }
+}
+
+fn refuse_symlink_ancestors(path: &Path) -> Result<(), ModSyncError> {
+    for ancestor in path.ancestors() {
+        match fs::symlink_metadata(ancestor) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(err(
+                    ModSyncErrorKind::SymlinkEscape,
+                    format!(
+                        "symlink directory component refused at '{}'",
+                        ancestor.display()
+                    ),
+                ));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err(e)),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn ensure_real_directory(path: &Path) -> Result<(), ModSyncError> {
+    refuse_symlink_ancestors(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(err(
+            ModSyncErrorKind::SymlinkEscape,
+            format!("symlink directory refused at '{}'", path.display()),
+        )),
+        Ok(meta) if !meta.is_dir() => Err(err(
+            ModSyncErrorKind::InvalidEntry,
+            format!("not a directory: '{}'", path.display()),
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(path).map_err(io_err)?;
+            ensure_real_directory(path)
+        }
+        Err(e) => Err(io_err(e)),
+    }
+}
+
+fn verified_blob(path: &Path, expected: &[u8; 32]) -> Result<(), ModSyncError> {
+    refuse_symlink_or_directory(path)?;
+    let (digest, len) = hash_file_capped(path).map_err(io_err)?;
+    if len == 0 || len > MAX_MOD_JAR_BYTES || !digest_eq(&digest, expected) {
+        return Err(err(
+            ModSyncErrorKind::DigestMismatch,
+            format!(
+                "cached or staged blob '{}' failed SHA-256 verification",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Shared verified JAR store. The digest is the cache key, so different mod
+/// filenames and profiles can reuse the same blob safely.
+#[derive(Clone, Debug)]
+pub struct ContentAddressedModCache {
+    root: PathBuf,
+}
+
+impl ContentAddressedModCache {
+    pub fn new(cache_root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: cache_root.into(),
+        }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Install verified bytes under `<cache_root>/<sha256>.jar` exactly once.
+    /// An exclusive temp write and `hard_link` publish prevent overwriting a
+    /// concurrently inserted blob or a pre-planted symlink.
+    pub fn store_verified_bytes(
+        &self,
+        sha256: &[u8; 32],
+        bytes: &[u8],
+    ) -> Result<PathBuf, ModSyncError> {
+        if bytes.is_empty() || bytes.len() as u64 > MAX_MOD_JAR_BYTES {
+            return Err(err(
+                ModSyncErrorKind::SizeMismatch,
+                "cache blob size is out of bounds",
+            ));
+        }
+        if !digest_eq(&crate::mod_sync::sha256(bytes), sha256) {
+            return Err(err(
+                ModSyncErrorKind::DigestMismatch,
+                "cache input digest mismatch",
+            ));
+        }
+        ensure_real_directory(&self.root)?;
+        let target = self.root.join(format!("{}.jar", digest_hex(sha256)));
+        if fs::symlink_metadata(&target).is_ok() {
+            verified_blob(&target, sha256)?;
+            return Ok(target);
+        }
+
+        let (mut file, stage) = create_stage(&self.root).map_err(io_err)?;
+        file.write_all(bytes).map_err(io_err)?;
+        file.sync_all().map_err(io_err)?;
+        // Hardlinked profile copies inherit read-only cache permissions.
+        // Unix allows unlinking a read-only file from a writable directory.
+        #[cfg(unix)]
+        {
+            let mut permissions = file.metadata().map_err(io_err)?.permissions();
+            permissions.set_readonly(true);
+            file.set_permissions(permissions).map_err(io_err)?;
+        }
+        drop(file);
+        verified_blob(&stage.path, sha256)?;
+        match fs::hard_link(&stage.path, &target) {
+            Ok(()) => Ok(target),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                verified_blob(&target, sha256)?;
+                Ok(target)
+            }
+            Err(e) => Err(io_err(e)),
+        }
+    }
+
+    pub fn materialize_into_profile(
+        &self,
+        sha256: &[u8; 32],
+        profile_mods_dir: &Path,
+        file_name: &str,
+        consent: &ConsentToken,
+    ) -> Result<PathBuf, ModSyncError> {
+        materialize_into_profile(&self.root, sha256, profile_mods_dir, file_name, consent)
+    }
+
+    pub fn prune_removed(
+        &self,
+        profile_mods_dir: &Path,
+        removed_file_names: &[String],
+        consent: &ConsentToken,
+    ) -> Result<usize, ModSyncError> {
+        prune_removed(profile_mods_dir, removed_file_names, consent)
+    }
+}
+
+/// Materialize a verified cached JAR, preferring an atomic hard-link install
+/// and falling back to a staged atomic copy across filesystems.
+pub fn materialize_into_profile(
+    cache_root: &Path,
+    sha256: &[u8; 32],
+    profile_mods_dir: &Path,
+    file_name: &str,
+    consent: &ConsentToken,
+) -> Result<PathBuf, ModSyncError> {
+    if !consent.user_approved {
+        return Err(err(
+            ModSyncErrorKind::ConsentRequired,
+            "mod install requires consent",
+        ));
+    }
+    validate_jar_file_name(file_name)?;
+    ensure_real_directory(cache_root)?;
+    let cached = cache_root.join(format!("{}.jar", digest_hex(sha256)));
+    verified_blob(&cached, sha256)?;
+    ensure_real_directory(profile_mods_dir)?;
+    let target = profile_mods_dir.join(file_name);
+    refuse_symlink_or_directory(&target)?;
+
+    let mut linked = None;
+    let mut fallback = false;
+    for _ in 0..32 {
+        let path = stage_path(profile_mods_dir);
+        match fs::hard_link(&cached, &path) {
+            Ok(()) => {
+                linked = Some(StagedPath::new(path));
+                break;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(_) => {
+                fallback = true;
+                break;
+            }
+        }
+    }
+    let mut stage = if let Some(stage) = linked {
+        stage
+    } else if fallback {
+        // create_new is O_EXCL, so a hostile staging symlink is never opened.
+        let (mut file, stage) = create_stage(profile_mods_dir).map_err(io_err)?;
+        let source = fs::File::open(&cached).map_err(io_err)?;
+        let copied =
+            io::copy(&mut source.take(MAX_MOD_JAR_BYTES + 1), &mut file).map_err(io_err)?;
+        if copied > MAX_MOD_JAR_BYTES {
+            return Err(err(
+                ModSyncErrorKind::SizeMismatch,
+                "cached blob grew beyond the size cap",
+            ));
+        }
+        file.sync_all().map_err(io_err)?;
+        drop(file);
+        stage
+    } else {
+        return Err(io_err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "staging filenames exhausted",
+        )));
+    };
+    verified_blob(&stage.path, sha256)?;
+    refuse_symlink_or_directory(&target)?;
+    fs::rename(&stage.path, &target).map_err(io_err)?;
+    stage.published();
+    if let Err(error) = verified_blob(&target, sha256) {
+        let _ = fs::remove_file(&target);
+        return Err(error);
+    }
+    Ok(target)
+}
+
+/// Delete only approved plain `.jar` basenames from a real profile directory.
+/// Every name and candidate target is checked before the first deletion.
+pub fn prune_removed(
+    profile_mods_dir: &Path,
+    removed_file_names: &[String],
+    consent: &ConsentToken,
+) -> Result<usize, ModSyncError> {
+    if !consent.user_approved {
+        return Err(err(
+            ModSyncErrorKind::ConsentRequired,
+            "mod removal requires consent",
+        ));
+    }
+    for name in removed_file_names {
+        validate_jar_file_name(name)?;
+    }
+    refuse_symlink_ancestors(profile_mods_dir)?;
+    match fs::symlink_metadata(profile_mods_dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(io_err(e)),
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(err(
+                ModSyncErrorKind::SymlinkEscape,
+                "profile mods directory is a symlink",
+            ));
+        }
+        Ok(meta) if !meta.is_dir() => {
+            return Err(err(
+                ModSyncErrorKind::InvalidEntry,
+                "profile mods path is not a directory",
+            ));
+        }
+        Ok(_) => {}
+    }
+    for name in removed_file_names {
+        refuse_symlink_or_directory(&profile_mods_dir.join(name))?;
+    }
+    let mut removed = 0;
+    for name in removed_file_names {
+        match fs::remove_file(profile_mods_dir.join(name)) {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err(e)),
+        }
+    }
+    Ok(removed)
+}
+
 /// Atomically install already-downloaded `bytes` for `entry` into
 /// `mods_dir`, gated on explicit user consent.
 ///
@@ -1045,7 +1560,7 @@ pub fn plan_mod_sync(manifest: &SyncManifest, mods_dir: &Path, policy: &SyncPoli
 ///    `sha256(bytes) ==` the manifest digest, compared in constant time.
 /// 4. Refuse to write through a pre-existing symlink at the target or the
 ///    staging path (both are unlinked inside `mods/` only).
-/// 5. Stage to `.{file_name}.msync-part` inside `mods/` (created
+/// 5. Stage to a bounded, unique `.msync-*.part` inside `mods/` (created
 ///    `O_EXCL`, fsynced), then rename — atomic on POSIX.
 /// 6. Re-hash the installed file; on mismatch the file is removed.
 ///
@@ -1096,7 +1611,7 @@ pub fn install_verified_bytes(
         ));
     }
 
-    fs::create_dir_all(mods_dir).map_err(io_err)?;
+    ensure_real_directory(mods_dir)?;
     let target = mods_dir.join(&entry.file_name);
     if let Ok(meta) = fs::symlink_metadata(&target) {
         if meta.file_type().is_symlink() {
@@ -1110,37 +1625,25 @@ pub fn install_verified_bytes(
         }
     }
 
-    // Stage inside `mods/` so the rename stays on one filesystem. A stale
-    // temp left by a crashed run (or pre-planted by an attacker) is
-    // unlinked first — remove_file never follows a symlink.
-    let tmp = mods_dir.join(format!(".{}.msync-part", entry.file_name));
-    if fs::symlink_metadata(&tmp).is_ok() {
-        fs::remove_file(&tmp).map_err(io_err)?;
-    }
-    let stage = || -> io::Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()
-    };
-    if let Err(e) = stage() {
-        let _ = fs::remove_file(&tmp);
-        return Err(io_err(e));
-    }
-    if let Err(first) = fs::rename(&tmp, &target) {
+    // Stage on the same filesystem under a short, unique O_EXCL basename.
+    // Only the stage created by this call is ever removed on failure.
+    let (mut file, mut stage) = create_stage(mods_dir).map_err(io_err)?;
+    file.write_all(bytes).map_err(io_err)?;
+    file.sync_all().map_err(io_err)?;
+    drop(file);
+    if let Err(first) = fs::rename(&stage.path, &target) {
         // Windows refuses rename-over-existing; remove the target (a
         // symlink swap-in only loses the link itself) and retry once.
         let _ = first;
+        refuse_symlink_or_directory(&target)?;
         if fs::symlink_metadata(&target).is_ok() {
-            let _ = fs::remove_file(&target);
+            fs::remove_file(&target).map_err(io_err)?;
         }
-        if let Err(e) = fs::rename(&tmp, &target) {
-            let _ = fs::remove_file(&tmp);
+        if let Err(e) = fs::rename(&stage.path, &target) {
             return Err(io_err(e));
         }
     }
+    stage.published();
     // Post-install verification: hash what's actually on disk now. A
     // mismatch deletes the planted file rather than leaving corrupt bytes
     // in `mods/`.
