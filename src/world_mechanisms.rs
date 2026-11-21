@@ -2278,7 +2278,25 @@ pub(crate) fn comparator_signal_at_be(dim: DimId, pos: BlockPos) -> Option<u8> {
     let store = world_block_entity_registry()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let be = store.get(&(dim, pos.0, pos.1, pos.2))?;
+    let Some(be) = store.get(&(dim, pos.0, pos.1, pos.2)) else {
+        // Analog-output blocks without a block-entity record read their level
+        // or charge straight from the block state (vanilla
+        // `getAnalogOutputSignal` on Composter/RespawnAnchor/Cauldron).
+        drop(store);
+        let reg = breg()?;
+        let st = block_at_dim(dim, pos.0, pos.1, pos.2);
+        return match reg.name_of(st) {
+            "minecraft:composter" => reg
+                .get_prop(st, "level")
+                .and_then(|value| value.parse().ok())
+                .map(|level| composter_comparator(level)),
+            "minecraft:respawn_anchor" => reg
+                .get_prop(st, "charges")
+                .and_then(|value| value.parse().ok())
+                .map(|charges| respawn_anchor_comparator(charges)),
+            _ => cauldron_state_of(reg, st).map(|state| state.comparator_signal()),
+        };
+    };
     Some(match be {
         VanillaBlockEntity::BrewingStand(stand) => {
             let slots: [Option<BeSlotItem>; 5] = std::array::from_fn(|index| match index {
@@ -2448,6 +2466,9 @@ pub(crate) fn tick_world_block_entities(
     positions.sort_by_key(|(_, x, y, z)| (*x, *y, *z));
     let mut rng = WorldMechanismLcg::new(rand_seed ^ world_tick);
     let mut events = Vec::new();
+    // Crafters whose last applied powered state the redstone pass may since
+    // have changed are re-polled after the store lock is released.
+    let mut crafter_power = Vec::new();
     for (dim, x, y, z) in positions {
         let pos = (x, y, z);
         let Some(entity) = store.get_mut(&(dim, x, y, z)) else { continue };
@@ -2540,6 +2561,9 @@ pub(crate) fn tick_world_block_entities(
                     jukebox.ticks_since_song_started = jukebox.ticks_since_song_started.saturating_add(1);
                 }
             }
+            VanillaBlockEntity::Crafter(crafter) => {
+                crafter_power.push((pos, crafter.triggered));
+            }
             VanillaBlockEntity::Beacon(beacon) if world_tick.is_multiple_of(80) => {
                 let Some(reg) = reg else { continue };
                 beacon.levels = beacon_pyramid_levels(|dx, dy, dz| {
@@ -2582,6 +2606,23 @@ pub(crate) fn tick_world_block_entities(
                 }
             }
             _ => {}
+        }
+    }
+    drop(store);
+    // Crafter powered-state poll: the redstone pass computes the neighbor
+    // signal lazily, so the stored `triggered` flag tracks the last applied
+    // value. A changed signal goes through `interact_world_block_entity`,
+    // which reports the rising-edge `CrafterPulse` exactly once — the vanilla
+    // `neighborChanged` semantics for a crafter.
+    if let (Some(reg), false) = (reg, crafter_power.is_empty()) {
+        let now = live_block_entity_time();
+        for (pos, was_powered) in crafter_power {
+            let powered = live_crafter_powered(reg, (dim, pos.0, pos.1, pos.2), now);
+            if powered == was_powered {
+                continue;
+            }
+            let action = if powered { "powered" } else { "unpowered" };
+            interact_world_block_entity(dim, pos, Some(action), None);
         }
     }
     events
@@ -2920,15 +2961,6 @@ fn eval_random_ticks(
 
 #[cfg_attr(not(test), allow(dead_code))]
 const DEFAULT_RANDOM_TICK_SPEED: u32 = 3;
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn eval_random_ticks_default(
-    sections: &[RandomTickSection],
-    seed: u64,
-    block_name: impl FnMut(BlockPos) -> String,
-) -> Vec<RandomTickSample> {
-    eval_random_ticks(sections, DEFAULT_RANDOM_TICK_SPEED, seed, block_name)
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FireTickInput {
@@ -3494,7 +3526,7 @@ fn vine_random_tick(
 
 /// The P2 random-tick arm: cactus, bamboo, kelp and vines dispatch here,
 /// matching the name-based arms `on_random_tick_dim` already runs. Returns
-/// `true` when the block name was claimed by one of the four handlers.
+/// `true` when the block name was claimed by one of the handlers.
 #[cfg_attr(not(test), allow(dead_code))]
 fn p2_plant_random_tick(
     reg: &crate::block_registry::BReg,
@@ -3504,6 +3536,12 @@ fn p2_plant_random_tick(
     z: i32,
     st: u32,
 ) -> bool {
+    // The block-entity registry is populated lazily: a sampled cell whose
+    // block family carries a [`VanillaBlockEntity`] materializes its default
+    // record, and a registered position whose block left its family is
+    // dropped. Mirrors vanilla `Level.setBlock` create/remove-block-entity,
+    // performed lazily here because placement paths write bare states.
+    wbe_reconcile_at(reg, dim, (x, y, z), st);
     match reg.name_of(st) {
         "minecraft:cactus" => cactus_random_tick(reg, dim, x, y, z, st),
         "minecraft:bamboo" | "minecraft:bamboo_sapling" => {
@@ -3511,9 +3549,228 @@ fn p2_plant_random_tick(
         }
         "minecraft:kelp" => kelp_random_tick(reg, dim, x, y, z, st),
         "minecraft:vine" => vine_random_tick(reg, dim, x, y, z, st),
+        "minecraft:cauldron" | "minecraft:water_cauldron" | "minecraft:lava_cauldron"
+        | "minecraft:powder_snow_cauldron" => {
+            cauldron_random_tick(reg, dim, x, y, z, st)
+        }
+        "minecraft:pointed_dripstone" => dripstone_random_tick(reg, dim, x, y, z, st),
+        "minecraft:composter" => composter_random_tick(reg, dim, x, y, z, st),
+        "minecraft:wet_sponge" => wet_sponge_random_tick(reg, dim, x, y, z, st),
+        "minecraft:turtle_egg" | "minecraft:sniffer_egg" => {
+            egg_random_tick(reg, dim, x, y, z, st);
+        }
         _ => return false,
     }
     true
+}
+
+/// A fresh [`VanillaBlockEntity`] for a block family that needs one, or `None`
+/// for blocks without a world block-entity record.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wbe_default_for(name: &str) -> Option<VanillaBlockEntity> {
+    Some(match name {
+        "minecraft:campfire" | "minecraft:soul_campfire" => {
+            VanillaBlockEntity::Campfire(CampfireBlockEntity::default())
+        }
+        "minecraft:brewing_stand" => {
+            VanillaBlockEntity::BrewingStand(BrewingStand::default())
+        }
+        "minecraft:spawner" => {
+            VanillaBlockEntity::MobSpawner(MobSpawnerBlockEntity::default())
+        }
+        "minecraft:jukebox" => VanillaBlockEntity::Jukebox(JukeboxBlockEntity::default()),
+        "minecraft:lectern" => VanillaBlockEntity::Lectern(LecternBlockEntity::default()),
+        "minecraft:chiseled_bookshelf" => {
+            VanillaBlockEntity::ChiseledBookshelf(ChiseledBookshelfBlockEntity::default())
+        }
+        "minecraft:decorated_pot" => {
+            VanillaBlockEntity::DecoratedPot(DecoratedPotBlockEntity::default())
+        }
+        "minecraft:beacon" => VanillaBlockEntity::Beacon(BeaconBlockEntity::default()),
+        "minecraft:crafter" => VanillaBlockEntity::Crafter(CrafterBlockEntity::default()),
+        _ => return None,
+    })
+}
+
+/// A stable tag for the [`VanillaBlockEntity`] variant, so a stored record
+/// can be compared against the family of the block still occupying its cell.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wbe_family(entity: &VanillaBlockEntity) -> u8 {
+    match entity {
+        VanillaBlockEntity::BrewingStand(_) => 1,
+        VanillaBlockEntity::Crafter(_) => 2,
+        VanillaBlockEntity::Campfire(_) => 3,
+        VanillaBlockEntity::Jukebox(_) => 4,
+        VanillaBlockEntity::MobSpawner(_) => 5,
+        VanillaBlockEntity::Lectern(_) => 6,
+        VanillaBlockEntity::ChiseledBookshelf(_) => 7,
+        VanillaBlockEntity::DecoratedPot(_) => 8,
+        VanillaBlockEntity::Beacon(_) => 9,
+    }
+}
+
+/// `LayeredCauldronBlock.randomTick`: under open sky during rain or snow an
+/// exposed cauldron slowly fills — rain adds water, snow adds powder snow.
+#[cfg_attr(not(test), allow(dead_code))]
+fn cauldron_random_tick(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    st: u32,
+) {
+    if dim != DimId::Overworld
+        || RAINING.load(Ordering::Relaxed) == 0
+        || !random_tick_sky_exposed(dim, x, y, z)
+    {
+        return;
+    }
+    let Some(state) = cauldron_state_of(reg, st) else {
+        return;
+    };
+    let precip = if cold_biome_at(dim, x, y, z) {
+        CauldronPrecip::Snow
+    } else {
+        CauldronPrecip::Rain
+    };
+    let roll = f64::from(world_rng::next_below(1 << 24)) / f64::from(1 << 24);
+    let filled = cauldron_weather_fill(state, precip, roll);
+    if filled == state {
+        return;
+    }
+    if let Some(next) = filled.to_state(reg) {
+        set_block_dim(dim, x, y, z, next);
+        note_block_update_dim(dim, x, y, z, next);
+    }
+}
+
+/// `PointedDripstoneBlock.randomTick`: walk the hanging column down to its
+/// tip; when a cauldron waits below it and a fluid source sits on the
+/// `dripstone_block` cap, occasionally drip one charge into the cauldron.
+#[cfg_attr(not(test), allow(dead_code))]
+fn dripstone_random_tick(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    _st: u32,
+) {
+    // Find the lowest pointed dripstone in this column (the tip) and the
+    // block above the column, which must be `dripstone_block`.
+    let mut top = y;
+    while reg.name_of(block_at_dim(dim, x, top + 1, z)) == "minecraft:pointed_dripstone" {
+        top += 1;
+    }
+    if reg.name_of(block_at_dim(dim, x, top + 1, z)) != "minecraft:dripstone_block" {
+        return;
+    }
+    let fluid = match reg.name_of(block_at_dim(dim, x, top + 2, z)) {
+        "minecraft:water" => CauldronDripFluid::Water,
+        "minecraft:lava" => CauldronDripFluid::Lava,
+        _ => return,
+    };
+    let mut tip = y;
+    while reg.name_of(block_at_dim(dim, x, tip - 1, z)) == "minecraft:pointed_dripstone" {
+        tip -= 1;
+    }
+    let cauldron_y = tip - 1;
+    let cauldron_st = block_at_dim(dim, x, cauldron_y, z);
+    let Some(state) = cauldron_state_of(reg, cauldron_st) else {
+        return;
+    };
+    // Vanilla rolls 45/256 for water and 15/256 for lava per random tick.
+    let threshold = match fluid {
+        CauldronDripFluid::Water => 45,
+        CauldronDripFluid::Lava => 15,
+    };
+    if world_rng::next_below(256) >= threshold {
+        return;
+    }
+    let filled = cauldron_drip_fill(state, fluid);
+    if filled == state {
+        return;
+    }
+    if let Some(next) = filled.to_state(reg) {
+        set_block_dim(dim, x, cauldron_y, z, next);
+        note_block_update_dim(dim, x, cauldron_y, z, next);
+    }
+}
+
+/// `ComposterBlock.tick` (`dhj`): a level-7 composter matures into the
+/// harvest-ready level 8.
+#[cfg_attr(not(test), allow(dead_code))]
+fn composter_random_tick(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    st: u32,
+) {
+    let level: u8 = match reg
+        .get_prop(st, "level")
+        .and_then(|value| value.parse().ok())
+    {
+        Some(level) => level,
+        None => return,
+    };
+    let matured = composter_mature(level);
+    if matured == level {
+        return;
+    }
+    let next = reg.with_prop(st, "level", &matured.to_string());
+    set_block_dim(dim, x, y, z, next);
+    note_block_update_dim(dim, x, y, z, next);
+}
+
+/// `SpongeBlock` in an ultrawarm dimension: a wet sponge dries out. Vanilla
+/// runs this from `onPlace`; the random-tick arm also keeps a wet sponge
+/// carried into the Nether by `/fill`, `/clone` or a saved edit honest.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wet_sponge_random_tick(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    _st: u32,
+) {
+    if !sponge_nether_dries(dim) {
+        return;
+    }
+    let dry = reg.state_of("minecraft:sponge", None);
+    set_block_dim(dim, x, y, z, dry);
+    note_block_update_dim(dim, x, y, z, dry);
+}
+
+/// Lazy registry maintenance for the cell a random tick landed on: create the
+/// default entity when a block-entity family has no record, drop a record
+/// whose block left its family.
+fn wbe_reconcile_at(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    pos: BlockPos,
+    st: u32,
+) {
+    let name = reg.name_of(st);
+    let held = world_block_entity_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(dim, pos.0, pos.1, pos.2))
+        .map(|be| wbe_family(be));
+    match (held, wbe_default_for(name)) {
+        (None, Some(default)) => {
+            register_world_block_entity(dim, pos, default);
+        }
+        (Some(family), default)
+            if default.as_ref().map(|be| wbe_family(be)) != Some(family) =>
+        {
+            remove_world_block_entity(dim, pos);
+        }
+        _ => {}
+    }
 }
 
 // ---- Explosion drop decay + world griefing gates ----
@@ -3730,7 +3987,7 @@ mod world_mechanisms_tests {
             },
         ];
         let run = |seed| {
-            eval_random_ticks_default(&sections, seed, |pos| match pos.0.rem_euclid(6) {
+            eval_random_ticks(&sections, DEFAULT_RANDOM_TICK_SPEED, seed, |pos| match pos.0.rem_euclid(6) {
                 0 => "minecraft:wheat".to_owned(),
                 1 => "minecraft:oak_leaves".to_owned(),
                 2 => "minecraft:fire".to_owned(),
@@ -3755,7 +4012,9 @@ mod world_mechanisms_tests {
                 chunk_z: cz,
             })
         }));
-        let crops = eval_random_ticks_default(&sections, 1234, |_| "minecraft:wheat".to_owned());
+        let crops = eval_random_ticks(&sections, DEFAULT_RANDOM_TICK_SPEED, 1234, |_| {
+            "minecraft:wheat".to_owned()
+        });
         assert!(crops
             .iter()
             .all(|tick| tick.dispatch == RandomTickDispatch::Crop));
@@ -5585,7 +5844,9 @@ mod world_mechanisms_tests {
             assert_eq!(sample.dispatch, Crop);
         }
         assert_eq!(
-            eval_random_ticks_default(&sections, 1, |_| "minecraft:wheat".to_owned()),
+            eval_random_ticks(&sections, DEFAULT_RANDOM_TICK_SPEED, 1, |_| {
+                "minecraft:wheat".to_owned()
+            }),
             eval_random_ticks(
                 &sections,
                 DEFAULT_RANDOM_TICK_SPEED,
@@ -8119,16 +8380,17 @@ pub(crate) fn note_block_power_dim(
         return None;
     }
     let powered = reg.get_prop(st, "powered").as_deref() == Some("true");
-    if powered == has_signal {
+    let (next_powered, rising) = note_block_neighbor_update(powered, has_signal);
+    if next_powered == powered {
         return Some((powered, false));
     }
     let inst = note_block_instrument_at_dim(dim, pos)?;
-    let new_st = reg.with_prop(st, "powered", if has_signal { "true" } else { "false" });
+    let new_st = reg.with_prop(st, "powered", if next_powered { "true" } else { "false" });
     set_block_dim(dim, pos.0, pos.1, pos.2, new_st);
     note_block_update_dim(dim, pos.0, pos.1, pos.2, new_st);
     let above_is_air = reg.is_air(block_at_dim(dim, pos.0, pos.1 + 1, pos.2));
-    let played = has_signal && note_block_trigger(inst, above_is_air);
-    Some((has_signal, played))
+    let played = rising && note_block_trigger(inst, above_is_air);
+    Some((next_powered, played))
 }
 
 /// Vanilla cauldron contents (1.21.1 `dgt`/`dkh`/`dkg`): plain cauldron, and
@@ -9071,5 +9333,114 @@ mod vanilla_blocks_tests {
         assert!(sponge_nether_dries(DimId::Nether));
         assert!(!sponge_nether_dries(DimId::Overworld));
         assert!(!sponge_nether_dries(DimId::End));
+    }
+}
+
+#[cfg(test)]
+mod parity_live_wire_world_tests {
+    use super::*;
+
+    #[test]
+    fn parity_live_wire_world_mechanisms() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let reg = crate::block_registry::breg().unwrap();
+        let (x, y, z) = (34_000, 90, 34_000);
+
+        // Composter: the live random-tick dispatcher (`p2_plant_random_tick`,
+        // called by `on_random_tick_dim` in main.rs) matures a level-7
+        // composter to its harvestable level 8 through composter_random_tick.
+        let composter7 = reg.with_prop(
+            reg.state_of("minecraft:composter", None),
+            "level",
+            "7",
+        );
+        set_block_dim(DimId::Overworld, x, y, z, composter7);
+        assert!(p2_plant_random_tick(reg, DimId::Overworld, x, y, z, composter7));
+        assert_eq!(
+            reg.get_prop(block_at_dim(DimId::Overworld, x, y, z), "level").as_deref(),
+            Some("8"),
+            "level-7 composter matures through the live random tick",
+        );
+
+        // Wet sponge: carried into the Nether it dries through the same arm.
+        let wet = reg.state_of("minecraft:wet_sponge", None);
+        set_block_dim(DimId::Nether, x, y, z, wet);
+        assert!(p2_plant_random_tick(reg, DimId::Nether, x, y, z, wet));
+        assert_eq!(
+            reg.name_of(block_at_dim(DimId::Nether, x, y, z)),
+            "minecraft:sponge",
+            "wet sponge dries in the Nether through the live random tick",
+        );
+
+        // Turtle and sniffer eggs: the dispatcher routes them into the live
+        // incubation path (`egg_random_tick` -> `tick_incubation`).
+        for egg in ["minecraft:turtle_egg", "minecraft:sniffer_egg"] {
+            let st = reg.state_of(egg, None);
+            set_block_dim(DimId::Overworld, x + 4, y, z, st);
+            assert!(
+                p2_plant_random_tick(reg, DimId::Overworld, x + 4, y, z, st),
+                "{egg} must be claimed by the live random-tick dispatch",
+            );
+        }
+
+        // Cauldron and dripstone arms claim their blocks even when the
+        // weather/lava rolls produce no fill this tick.
+        let cauldron = reg.state_of("minecraft:cauldron", None);
+        set_block_dim(DimId::Overworld, x + 8, y, z, cauldron);
+        assert!(p2_plant_random_tick(reg, DimId::Overworld, x + 8, y, z, cauldron));
+        let dripstone = reg.with_prop(
+            reg.state_of("minecraft:pointed_dripstone", None),
+            "thickness",
+            "tip",
+        );
+        set_block_dim(DimId::Overworld, x + 8, y + 2, z, dripstone);
+        assert!(p2_plant_random_tick(reg, DimId::Overworld, x + 8, y + 2, z, dripstone));
+
+        // Comparator analog-output fallback (`getAnalogOutputSignal`): blocks
+        // without a block-entity record read the signal straight off state —
+        // composter level and respawn-anchor charges.
+        let composter3 = reg.with_prop(composter7, "level", "3");
+        set_block_dim(DimId::Overworld, x, y + 4, z, composter3);
+        assert_eq!(
+            comparator_signal_at_be(DimId::Overworld, (x, y + 4, z)),
+            Some(composter_comparator(3)),
+        );
+        let anchor2 = reg.with_prop(
+            reg.state_of("minecraft:respawn_anchor", None),
+            "charges",
+            "2",
+        );
+        set_block_dim(DimId::Nether, x, y + 4, z, anchor2);
+        assert_eq!(
+            comparator_signal_at_be(DimId::Nether, (x, y + 4, z)),
+            Some(respawn_anchor_comparator(2)),
+        );
+
+        // Note block: `note_block_power_dim` — the power-state write the live
+        // wind-charge trigger performs — runs `note_block_neighbor_update`;
+        // only a rising edge plays the note.
+        let note = reg.state_of("minecraft:note_block", None);
+        set_block_dim(DimId::Overworld, x, y + 6, z, note);
+        assert_eq!(
+            note_block_power_dim(DimId::Overworld, (x, y + 6, z), true),
+            Some((true, true)),
+        );
+        assert_eq!(
+            note_block_power_dim(DimId::Overworld, (x, y + 6, z), true),
+            Some((true, false)),
+            "a held-high signal is not a new trigger",
+        );
+
+        // Lazy block-entity reconcile: the dispatcher materializes a jukebox
+        // record the first time a live tick visits its cell, and the
+        // comparator then reads the entity signal instead of state.
+        let jukebox = reg.state_of("minecraft:jukebox", None);
+        set_block_dim(DimId::Overworld, x, y + 8, z, jukebox);
+        p2_plant_random_tick(reg, DimId::Overworld, x, y + 8, z, jukebox);
+        assert!(
+            comparator_signal_at_be(DimId::Overworld, (x, y + 8, z)).is_some(),
+            "the reconciled jukebox record answers comparator queries",
+        );
     }
 }

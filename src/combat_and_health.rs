@@ -835,11 +835,70 @@ fn wind_charge_trigger_blocks(dim: DimId, impact: [f64; 3], radius: f64) -> usiz
                 }
                 if wind_charge_trigger_at(dim, bx + dx, by + dy, bz + dz) {
                     hits += 1;
+                    wind_charge_note_neighbors(dim, bx + dx, by + dy, bz + dz);
                 }
             }
         }
     }
     hits
+}
+
+/// The `neighborUpdate` a triggered block sends to each face: adjacent note
+/// blocks re-evaluate their instrument and the redstone signal, and a rising
+/// edge plays the stored note — the vanilla `NoteBlock.neighborChanged` the
+/// wind-burst toggle provokes. A played note also refreshes every allay in
+/// the vanilla hearing radius.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wind_charge_note_neighbors(dim: DimId, x: i32, y: i32, z: i32) {
+    let Some(reg) = breg() else {
+        return;
+    };
+    let now = live_block_entity_time();
+    let tick = TICK.load(Ordering::Relaxed);
+    for (dx, dy, dz) in [
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    ] {
+        let pos = (x + dx, y + dy, z + dz);
+        if reg.name_of(block_at_dim(dim, pos.0, pos.1, pos.2)) != "minecraft:note_block" {
+            continue;
+        }
+        let Some(instrument) = note_block_refresh_instrument_dim(dim, pos) else {
+            continue;
+        };
+        let has_signal = live_crafter_powered(reg, (dim, pos.0, pos.1, pos.2), now);
+        let Some((_, played)) = note_block_power_dim(dim, pos, has_signal) else {
+            continue;
+        };
+        if !played {
+            continue;
+        }
+        let sound = format!("block.note_block.{}", instrument.state_name());
+        let packet = sound_pkt_named(
+            &sound,
+            f64::from(pos.0) + 0.5,
+            f64::from(pos.1) + 0.5,
+            f64::from(pos.2) + 0.5,
+        );
+        broadcast_chunk_dim(dim, pos.0 >> 4, pos.2 >> 4, |_c| (0x5b, packet.clone()));
+        for mob in mobs().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            if Some(mob.etype) != name_to_etype("allay") {
+                continue;
+            }
+            let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let near = (mx - f64::from(pos.0)).powi(2)
+                + (my - f64::from(pos.1)).powi(2)
+                + (mz - f64::from(pos.2)).powi(2)
+                <= 48.0_f64.powi(2);
+            if mob.dim == dim && near {
+                live_allay_note(mob.eid, pos, tick);
+            }
+        }
+    }
 }
 
 /// Applies a wind-charge burst: launches entities (`hurtEntities`), resets the
@@ -966,6 +1025,61 @@ fn combat2_state_tick() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|eid, _| live.contains(eid));
+    wind_charge_projectile_step();
+}
+
+/// Per-mob age for `wind_charge`/`breeze_wind_charge` projectile entities.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wind_charge_ages() -> &'static Mutex<HashMap<i32, u16>> {
+    static AGES: OnceLock<Mutex<HashMap<i32, u16>>> = OnceLock::new();
+    AGES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Wind-charge projectiles (`wind_charge`, `breeze_wind_charge`) spawned by
+/// `/summon` or a spawn egg live in the mob store: they are entities, not AI
+/// mobs, and the generic velocity pass already moves them. Burst each charge
+/// on the first solid-block contact or after its vanilla 200-tick lifetime.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wind_charge_projectile_step() {
+    let player_charge = name_to_etype("wind_charge");
+    let breeze_charge = name_to_etype("breeze_wind_charge");
+    let Some(reg) = breg() else {
+        return;
+    };
+    let mut bursts = Vec::new();
+    {
+        let mut ages = wind_charge_ages().lock().unwrap_or_else(|e| e.into_inner());
+        let mut seen = HashSet::new();
+        for mob in mobs().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            let kind = if Some(mob.etype) == player_charge {
+                WindChargeKind::Player
+            } else if Some(mob.etype) == breeze_charge {
+                WindChargeKind::Breeze
+            } else {
+                continue;
+            };
+            let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let age = ages.entry(mob.eid).or_insert(0);
+            *age = age.saturating_add(1);
+            let hit_solid = reg.is_solid(block_at_dim(
+                mob.dim,
+                mx.floor() as i32,
+                my.floor() as i32,
+                mz.floor() as i32,
+            ));
+            if hit_solid || *age >= 200 {
+                ages.remove(&mob.eid);
+                *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+                bursts.push((mob.dim, kind, [mx, my, mz]));
+            } else {
+                seen.insert(mob.eid);
+            }
+        }
+        ages.retain(|eid, _| seen.contains(eid));
+    }
+    for (dim, kind, impact) in bursts {
+        wind_charge_burst(dim, kind, impact, -1);
+    }
 }
 
 /// Game ticks the player's shield has been up (vanilla `getTicksUsingItem`);
@@ -2117,7 +2231,28 @@ const MOB_HURT_WINDOW_GT: u64 = 10;
 fn mob_hurt_window_tick() {
     let now_tick = TICK_IDX.load(Ordering::Relaxed);
     let now = Instant::now();
+    let reg = breg();
     for mob in mobs().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        // `LayeredCauldronBlock.entityInside`: a burning entity standing in a
+        // water or powder-snow cauldron is extinguished; water drops a level
+        // (level 1 empties) and powder snow becomes water at the same level.
+        if *mob.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) > 0 {
+            if let Some(reg) = reg {
+                let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+                let (bx, by, bz) = (mx.floor() as i32, my.floor() as i32, mz.floor() as i32);
+                let st = block_at_dim(mob.dim, bx, by, bz);
+                if let Some(state) = cauldron_state_of(reg, st) {
+                    let quenched = cauldron_extinguish(state);
+                    if quenched != state {
+                        if let Some(next) = quenched.to_state(reg) {
+                            set_block_dim(mob.dim, bx, by, bz, next);
+                            note_block_update_dim(mob.dim, bx, by, bz, next);
+                        }
+                        *mob.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+                    }
+                }
+            }
+        }
         let mut hurt_tick = mob.last_hurt_tick.lock().unwrap_or_else(|e| e.into_inner());
         let mut hurt_at = mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner());
         match *hurt_tick {
@@ -5128,5 +5263,117 @@ mod vanilla_combat2_tests {
         assert_eq!(spin_attack_ticks_left(4242), 1);
         TICK_IDX.store(1020, Ordering::Relaxed);
         assert_eq!(spin_attack_ticks_left(4242), 0);
+    }
+
+    #[test]
+    fn parity_live_wire_wind_totem_trident() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let mut lane = LaneGuard::new();
+        let reg = crate::block_registry::breg().unwrap();
+
+        // Wind charge: a charge entity contacting a solid block bursts
+        // through the live `combat2_state_tick` — the same tick `arrow_tick`
+        // runs every arrow pass.
+        let charge_type = name_to_etype("wind_charge").expect("wind_charge etype");
+        let charge = new_live_mob(
+            charge_type,
+            DimId::Overworld,
+            (33_000.5, 81.0, 33_000.5, 0.0, 0.0),
+            1.0,
+            None,
+        );
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(charge.clone());
+        lane.set_block(DimId::Overworld, 33_000, 81, 33_000,
+            reg.state_of("minecraft:stone", None));
+        combat2_state_tick();
+        assert_eq!(*charge.hp.lock().unwrap_or_else(|e| e.into_inner()), 0.0,
+            "solid contact bursts the charge through wind_charge_burst");
+        mobs().lock().unwrap_or_else(|e| e.into_inner())
+            .retain(|m| m.eid != charge.eid);
+
+        // Cauldron extinguish: a burning mob standing in a water cauldron is
+        // quenched and the level drops — `mob_hurt_window_tick` runs this
+        // every live arrow tick before the arrow sweep.
+        let zombie = name_to_etype("zombie").expect("zombie etype");
+        let mob = new_live_mob(
+            zombie,
+            DimId::Overworld,
+            (33_010.5, 81.0, 33_000.5, 0.0, 0.0),
+            20.0,
+            None,
+        );
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob.clone());
+        *mob.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) = 80;
+        let cauldron = reg.with_prop(
+            reg.state_of("minecraft:water_cauldron", None), "level", "2");
+        lane.set_block(DimId::Overworld, 33_010, 81, 33_000, cauldron);
+        mob_hurt_window_tick();
+        assert_eq!(*mob.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()), 0,
+            "water cauldron quenches a burning entity");
+        assert_eq!(
+            reg.get_prop(block_at_dim(DimId::Overworld, 33_010, 81, 33_000), "level").as_deref(),
+            Some("1"),
+            "extinguishing drops one cauldron level",
+        );
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).retain(|m| m.eid != mob.eid);
+
+        // Totem: the live damage path's totem check keeps the holder alive.
+        let (client, _rx) = client_pair();
+        client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(45, (1163, 1, Vec::new()));
+        assert!(try_trigger_totem_of_undying(&client, -1.0, TotemDamageKind::Ordinary));
+        assert_eq!(*client.hp.lock().unwrap_or_else(|e| e.into_inner()), 1.0);
+
+        // Trident: a returning loyalty trident closes on its owner through
+        // `arrow_tick`'s live `trident_returning` pass.
+        let (owner, _r2) = client_pair();
+        {
+            let mut p = owner.pos.lock().unwrap_or_else(|e| e.into_inner());
+            p.0 = 16.0;
+            p.1 = 70.0;
+            p.2 = 10.0;
+        }
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(owner));
+        region().lock().unwrap_or_else(|e| e.into_inner()).hot.insert((1, 0));
+        let mut comps = Vec::new();
+        comp_set(&mut comps, COMP_ENCHANTMENTS, enchantments_data(&[(19, 2)], true));
+        arrows().lock().unwrap_or_else(|e| e.into_inner()).push(Arrow {
+            eid: 99901,
+            owner: 4242,
+            x: 22.0,
+            y: 70.9,
+            z: 10.0,
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+            ttl: 100,
+            dmg: 8.0,
+            fire: 0,
+            punch: 0,
+            kind: 1,
+            loy: 2,
+            ret_item: 9999,
+            ret_comps: comps,
+            pierce: 0,
+            last_hit: -1,
+            stuck: false,
+        });
+        trident_returning().lock().unwrap_or_else(|e| e.into_inner()).insert(99901);
+        let before = {
+            let ar = arrows().lock().unwrap_or_else(|e| e.into_inner());
+            let a = ar.iter().find(|a| a.eid == 99901).unwrap();
+            ((a.x - 16.0).powi(2) + (a.y - 70.9).powi(2)).sqrt()
+        };
+        arrow_tick();
+        let after = {
+            let ar = arrows().lock().unwrap_or_else(|e| e.into_inner());
+            let a = ar.iter().find(|a| a.eid == 99901).unwrap();
+            ((a.x - 16.0).powi(2) + (a.y - 70.9).powi(2)).sqrt()
+        };
+        assert!(after < before, "loyalty trident returns through arrow_tick");
     }
 }

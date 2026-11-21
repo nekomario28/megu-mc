@@ -1873,9 +1873,14 @@ impl MobBehaviorState {
             }
             Self::Ghast(ghast) => {
                 let delta = target.map(|target| mob_behavior_delta(ctx.pos, target.pos));
+                // `generic.follow_range` (100.0) bounds target acquisition;
+                // `GhastAttackGoal` still fires only inside 64 blocks.
+                let tracked = delta.filter(|delta| {
+                    ghast_acquires_target(mob_behavior_dot(*delta, *delta).sqrt())
+                });
                 let can_fire = visible_target.is_some()
                     && delta.is_some_and(|delta| mob_behavior_dot(delta, delta) < 64.0 * 64.0);
-                match ghast.tick(delta, can_fire) {
+                match ghast.tick(tracked, can_fire) {
                     Some(GhastAttack::Warning) => Some(WarningSignal),
                     Some(GhastAttack::Fire(fireball)) => Some(LaunchProjectile {
                         kind: MobProjectileKind::GhastFireball,
@@ -2998,6 +3003,7 @@ enum EquineFeedOutcome {
 
 /// Per-entity equine state: taming, temper, equipment and attributes.
 #[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug)]
 struct EquineState {
     kind: EquineKind,
     tamed: bool,
@@ -3015,6 +3021,10 @@ struct EquineState {
     /// Vanilla age in ticks: negative while a baby (`ageUp` adds toward 0).
     age_ticks: i32,
     in_love: bool,
+    /// Set when this record was claimed by the live breed-stat path: the
+    /// animal spawned as a foal from two in-love parents rather than from
+    /// spawn dice, so `age_ticks` counts the vanilla 24000-tick grow-up.
+    bred_foal: bool,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3036,6 +3046,7 @@ impl EquineState {
             max_health: 30.0,
             age_ticks: 0,
             in_love: false,
+            bred_foal: false,
         }
     }
 
@@ -3294,6 +3305,7 @@ const SHOULDER_MIN_PERCH_TICKS: u32 = 20;
 
 /// Per-entity parrot state.
 #[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug)]
 struct ParrotState {
     tamed: bool,
     owner: Option<[u8; 16]>,
@@ -3308,6 +3320,9 @@ struct ParrotState {
     on_shoulder: bool,
     /// `rideCooldownCounter` equivalent: ticks since the last perch ended.
     shoulder_ticks: u16,
+    /// Ticks spent on the owner's shoulder since the last perch — the
+    /// `timeEntitySatOnShoulder` counter `removeEntitiesOnShoulder` reads.
+    perched_ticks: u32,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3322,6 +3337,7 @@ impl ParrotState {
             leashed: false,
             on_shoulder: false,
             shoulder_ticks: 0,
+            perched_ticks: 0,
         }
     }
 
@@ -3673,6 +3689,114 @@ fn tick_incubation(
         };
     }
     HatchResult::Cracked { stage: state.stage }
+}
+
+// ---- Live egg-block incubation ---------------------------------------------
+//
+// `TurtleEggBlock.randomTick`/`SnifferEggBlock.randomTick`: every random tick
+// on a placed egg advances its incubation record through `tick_incubation`,
+// writes the crack `hatch` stage back to the block state and, on the final
+// stage, spawns the hatchling and consumes one `eggs` count (or the whole
+// block when the last egg hatches). `p2_plant_random_tick` claims these names,
+// so the live `on_random_tick_dim` driver in `main.rs` runs the model for
+// every in-world egg.
+
+/// Per-block incubation progress, keyed like the block-entity registry.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_incubations() -> &'static Mutex<HashMap<(DimId, BlockPos), IncubationState>> {
+    static INCUBATIONS: OnceLock<Mutex<HashMap<(DimId, BlockPos), IncubationState>>> =
+        OnceLock::new();
+    INCUBATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The substrate observation an egg block sits on: sand-family below maps to
+/// `SandNight`, moss to `MossBlock`; anything else is a plain custom tag that
+/// satisfies only `required_env: None` specs.
+#[cfg_attr(not(test), allow(dead_code))]
+fn incubation_env_below(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    pos: BlockPos,
+) -> IncubationEnv {
+    match reg.name_of(block_at_dim(dim, pos.0, pos.1 - 1, pos.2)) {
+        "minecraft:sand" | "minecraft:red_sand" => IncubationEnv::SandNight,
+        "minecraft:moss_block" | "minecraft:moss_carpet" => IncubationEnv::MossBlock,
+        name => IncubationEnv::Custom(name.to_string()),
+    }
+}
+
+/// `randomTick` for `turtle_egg` and `sniffer_egg` blocks. Returns `true`
+/// once the block name is claimed (even when the egg simply accrues credit).
+#[cfg_attr(not(test), allow(dead_code))]
+fn egg_random_tick(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    st: u32,
+) -> bool {
+    let spec = match reg.name_of(st) {
+        "minecraft:turtle_egg" => EggSpec::turtle_egg(),
+        "minecraft:sniffer_egg" => EggSpec::sniffer_egg(),
+        _ => return false,
+    };
+    let env = incubation_env_below(reg, dim, (x, y, z));
+    let day_time = WORLD_TIME.load(Ordering::Relaxed) % 24_000;
+    let is_night = day_time >= 13_000;
+    let outcome = {
+        let mut store = live_incubations().lock().unwrap_or_else(|e| e.into_inner());
+        let state = store
+            .entry((dim, (x, y, z)))
+            .or_insert_with(|| IncubationState::new(spec, None));
+        tick_incubation(state, &env, is_night)
+    };
+    match outcome {
+        HatchResult::Waiting => {}
+        HatchResult::Cracked { stage } => {
+            let cracked = reg.with_prop(st, "hatch", &stage.min(2).to_string());
+            if cracked != st {
+                set_block_dim(dim, x, y, z, cracked);
+                note_block_update_dim(dim, x, y, z, cracked);
+            }
+        }
+        HatchResult::Hatched { entity_id, .. } => {
+            egg_incubation_remove(dim, (x, y, z));
+            let eggs: u8 = reg
+                .get_prop(st, "eggs")
+                .and_then(|count| count.parse().ok())
+                .unwrap_or(1);
+            if eggs > 1 {
+                let remaining = reg.with_prop(
+                    reg.with_prop(st, "eggs", &(eggs - 1).to_string()),
+                    "hatch",
+                    "0",
+                );
+                set_block_dim(dim, x, y, z, remaining);
+                note_block_update_dim(dim, x, y, z, remaining);
+            } else {
+                let air = reg.state_of("minecraft:air", None);
+                set_block_dim(dim, x, y, z, air);
+                note_block_update_dim(dim, x, y, z, air);
+            }
+            live_spawn_named(
+                dim,
+                &entity_id,
+                (x as f64 + 0.5, y as f64, z as f64 + 0.5, 0.0, 0.0),
+            );
+        }
+    }
+    true
+}
+
+/// Drop the incubation record of an egg block that no longer sits at `pos`
+/// (broken, replaced, or pushed). Called by the block-entity reconcile pass.
+#[cfg_attr(not(test), allow(dead_code))]
+fn egg_incubation_remove(dim: DimId, pos: BlockPos) {
+    live_incubations()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(dim, pos));
 }
 
 #[cfg(test)]

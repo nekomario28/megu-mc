@@ -1850,6 +1850,21 @@ enum NativeUtilityState {
     Allay(AllayState),
     Fox(FoxState),
     Camel(CamelState),
+    Equine(EquineState),
+    Parrot(ParrotState),
+}
+
+/// 1.21.1 entity ids for the `AbstractHorse` family — skeleton and zombie
+/// horses share the horse kind's food/temper table in vanilla.
+#[cfg_attr(not(test), allow(dead_code))]
+fn equine_kind_of(etype: i64) -> Option<EquineKind> {
+    Some(match etype {
+        53 | 92 | 125 => EquineKind::Horse,
+        25 => EquineKind::Donkey,
+        71 => EquineKind::Mule,
+        65 | 108 => EquineKind::Llama,
+        _ => return None,
+    })
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2066,18 +2081,49 @@ fn live_fox_collect(mob: &Arc<Mob>, at: [f64; 3]) {
                     + (drop.z - at[2]).powi(2) < 1.5_f64.powi(2)
         })?;
         if !fox.pickup((drop.item, 1, drop.comps.clone())) { return None; }
+        let item = drop.item;
         drop.cnt -= 1;
         let remaining = (drop.cnt > 0).then(|| drop_meta_pkt(drop));
         let eid = drop.eid;
         if remaining.is_none() { ground.retain(|drop| drop.eid != eid); }
-        Some((eid, remaining))
+        Some((eid, remaining, item))
     });
-    if let Some((eid, remaining)) = collected {
+    if let Some((eid, remaining, item)) = collected {
         broadcast_seen(eid, |_c| (0x6f, collect_pkt(eid, mob.eid, 1)));
         if let Some(packet) = remaining {
             broadcast_seen(eid, |_c| (0x58, packet.clone()));
         } else {
             broadcast_seen_destroy(eid);
+        }
+        // A fox that mouths a dropped berry accepts the nearby player's feed —
+        // the stand-in for the vanilla feed/trust bond while breeding is owned
+        // by the generic `love` path. Trust sticks only while the fox holds
+        // the berry it picked up.
+        let berries = ["minecraft:sweet_berries", "minecraft:glow_berries"]
+            .iter()
+            .filter_map(|name| name_to_item(name))
+            .any(|id| id == item);
+        if berries {
+            let feeder = client_snapshot()
+                .iter()
+                .filter(|client| !client.is_spectator())
+                .filter(|client| {
+                    let (dim, px, py, pz, ..) = client_dim_pos(client);
+                    dim == mob.dim
+                        && (px - at[0]).powi(2) + (py - at[1]).powi(2) + (pz - at[2]).powi(2)
+                            <= 8.0_f64.powi(2)
+                })
+                .min_by(|a, b| {
+                    let dist = |client: &&Arc<Client>| {
+                        let (_, px, py, pz, ..) = client_dim_pos(client);
+                        (px - at[0]).powi(2) + (py - at[1]).powi(2) + (pz - at[2]).powi(2)
+                    };
+                    dist(a).total_cmp(&dist(b))
+                })
+                .map(|client| client.uuid);
+            if let Some(uuid) = feeder {
+                live_fox_trust(mob.eid, uuid);
+            }
         }
     }
 }
@@ -2125,6 +2171,477 @@ fn live_camel_dash(eid: i32, tick: u64, yaw: f32) -> Option<[f64; 3]> {
     velocity[1] += impulse[1];
     velocity[2] += impulse[2];
     Some(impulse)
+}
+
+/// `AllayAi` duplication dance: an allay carrying an amethyst shard as its
+/// sample item duplicates once per `duplication_ready_at` while dancing —
+/// that is, within 10 blocks of a jukebox that is mid-song.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_allay_jukebox_step(mob: &Arc<Mob>, at: [f64; 3], tick: u64) {
+    let playing = {
+        let store = world_block_entity_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        store.iter().any(|(&(d, jx, jy, jz), be)| {
+            d == mob.dim
+                && matches!(
+                    be,
+                    VanillaBlockEntity::Jukebox(jukebox)
+                        if jukebox.record_item.is_some()
+                            && jukebox.ticks_since_song_started < 4_000
+                )
+                && (f64::from(jx) + 0.5 - at[0]).powi(2)
+                    + (f64::from(jy) + 0.5 - at[1]).powi(2)
+                    + (f64::from(jz) + 0.5 - at[2]).powi(2)
+                    <= 10.0_f64.powi(2)
+        })
+    };
+    if !playing {
+        return;
+    }
+    let shard = name_to_item("minecraft:amethyst_shard").is_some_and(|id| {
+        live_native_utility_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&mob.eid)
+            .is_some_and(|state| {
+                matches!(
+                    state,
+                    NativeUtilityState::Allay(allay)
+                        if allay.held.as_ref().is_some_and(|held| held.0 == id)
+                )
+            })
+    });
+    live_allay_duplicate(mob.eid, true, true, shard, tick);
+}
+
+/// Village golems retaliate against players the village is hostile to
+/// (`gossip.golem_hostile` — reputation at or below the vanilla -100
+/// threshold) or who provoked any nearby villager (negative gossip, which
+/// accrues only from attacking villagers or the golem). The hit itself runs
+/// the vanilla fling: `iron_golem_fling_velocity` supplies the launch.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_golem_provoke_step(mob: &Arc<Mob>, at: [f64; 3], _tick: u64) {
+    let targets: Vec<(Arc<Client>, [f64; 3])> = client_snapshot()
+        .iter()
+        .filter_map(|client| {
+            if client.is_spectator() {
+                return None;
+            }
+            let (dim, cx, cy, cz, ..) = client_dim_pos(client);
+            let in_reach = dim == mob.dim
+                && (cx - at[0]).powi(2) + (cy - at[1]).powi(2) + (cz - at[2]).powi(2)
+                    <= 4.5_f64.powi(2);
+            in_reach.then(|| (Arc::clone(client), [cx, cy, cz]))
+        })
+        .collect();
+    if targets.is_empty() {
+        return;
+    }
+    let villager_type = name_to_etype("villager");
+    let nearby_villagers: Vec<i32> = mobs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(|other| {
+            if Some(other.etype) != villager_type {
+                return None;
+            }
+            let (mx, my, mz, ..) = *other.pos.lock().unwrap_or_else(|e| e.into_inner());
+            ((mx - at[0]).powi(2) + (my - at[1]).powi(2) + (mz - at[2]).powi(2)
+                <= 16.0_f64.powi(2))
+            .then_some(other.eid)
+        })
+        .collect();
+    if nearby_villagers.is_empty() {
+        return;
+    }
+    {
+        let villagers = live_villagers().lock().unwrap_or_else(|e| e.into_inner());
+        for (client, pos) in targets {
+            let (mut threat, mut attack) = (false, false);
+            for eid in &nearby_villagers {
+                let Some(villager) = villagers.get(eid) else {
+                    continue;
+                };
+                threat = threat
+                    || live_iron_golem_hostile_to_player(mob.eid, &villager.gossip, client.uuid);
+                attack = attack || villager.gossip.reputation(client.uuid) < 0;
+            }
+            if !iron_golem_provoked(threat, attack) {
+                continue;
+            }
+            let fling = iron_golem_fling_velocity(pos, at);
+            live_mob_melee(
+                mob,
+                &client,
+                pos,
+                7.5 + world_rng::next_below(140) as f32 / 10.0,
+                f64::from(fling[1]),
+            );
+            break;
+        }
+    }
+}
+
+/// Per-equine jump-charge percentage while the rider holds the steering jump
+/// bit, mirroring `AbstractHorse.playerJumpPendingScale` (0..100).
+fn equine_jump_charges() -> &'static Mutex<HashMap<i32, i32>> {
+    static CHARGES: OnceLock<Mutex<HashMap<i32, i32>>> = OnceLock::new();
+    CHARGES.get_or_init(Mutex::default)
+}
+
+/// Foal attributes rolled from two in-love parents by `live_equine_breed_roll`,
+/// waiting for the foal's first utility tick to claim them. The spawn itself
+/// is produced by the generic `live_mob_breed` path; this hands the child the
+/// vanilla `setOffspringAttributes` roll instead of fresh spawn dice.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_equine_pending_foals(
+) -> &'static Mutex<Vec<(DimId, [f64; 3], EquineOffspringStats, u64)>> {
+    static FOALS: OnceLock<
+        Mutex<Vec<(DimId, [f64; 3], EquineOffspringStats, u64)>>,
+    > = OnceLock::new();
+    FOALS.get_or_init(Mutex::default)
+}
+
+/// `AbstractHorse` utility tick: the `RunAroundLikeCrazyGoal` tame/buck roll
+/// while a player rides an untamed equine, foal grow-up, and the breed-stat
+/// roll between two in-love parents. Spawn attributes roll once when the
+/// state first materializes.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_equine_utility_step(mob: &Arc<Mob>, kind: EquineKind, at: [f64; 3], tick: u64) {
+    let rider = mounts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .registry
+        .passengers_of(mob.eid)
+        .first()
+        .copied();
+    let rider_uuid = rider.and_then(|eid| {
+        client_snapshot()
+            .iter()
+            .find(|client| client.eid == eid)
+            .map(|client| client.uuid)
+    });
+    let (buck, jump_strength) = {
+        let mut states = live_native_utility_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let state = states.entry(mob.eid).or_insert_with(|| {
+            let roll = || f64::from(world_rng::next_below(10_000)) / 10_000.0;
+            NativeUtilityState::Equine(EquineState::spawned(
+                kind,
+                [roll(), roll(), roll()],
+                [roll(), roll(), roll()],
+                [roll(), roll()],
+            ))
+        });
+        let NativeUtilityState::Equine(equine) = state else {
+            return;
+        };
+        // Foal grow-up: the vanilla 24000-tick `age` counter toward adult.
+        if equine.bred_foal && equine.age_ticks < 0 {
+            equine.age_ticks += 1;
+        }
+        let buck = if equine.tamed || rider.is_none() {
+            None
+        } else {
+            let roll = world_rng::next_below(equine.kind.max_temper().max(1) as u32);
+            match equine.try_equine_tame_tick(roll) {
+                Some(EquineTameOutcome::Tamed) => {
+                    // `tameWithName`: the successful roll also binds the rider.
+                    if let Some(uuid) = rider_uuid {
+                        equine.tame_with_name(uuid);
+                    }
+                    Some(EquineTameOutcome::Tamed)
+                }
+                other => other,
+            }
+        };
+        (buck, equine.tamed.then_some(equine.jump_strength))
+    };
+    live_equine_breed_roll(mob, at, tick);
+    // `AbstractHorse` player-jump input: while a tamed equine carries a rider,
+    // the steering jump bit charges `jumpStrength` and release applies the
+    // scaled upward velocity — the same `ServerboundPlayerInputPacket` bit0
+    // the camel dash reads.
+    if let (Some(_), Some(strength)) = (rider, jump_strength) {
+        let jump_held = mounts()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .steering
+            .get(&mob.eid)
+            .is_some_and(|input| input.jump);
+        let mut charges = equine_jump_charges()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if jump_held {
+            let charge = charges.entry(mob.eid).or_insert(0);
+            *charge = (*charge + 5).min(100);
+        } else if let Some(charge) = charges.remove(&mob.eid) {
+            let (bx, by, bz) = (at[0].floor() as i32, at[1].floor() as i32, at[2].floor() as i32);
+            let grounded = crate::block_registry::breg()
+                .is_some_and(|reg| !reg.is_air(block_at_dim(mob.dim, bx, by - 1, bz)));
+            if grounded {
+                mob.vel.lock().unwrap_or_else(|e| e.into_inner())[1] =
+                    equine_jump_velocity(strength, charge);
+            }
+        }
+    }
+    if matches!(buck, Some(EquineTameOutcome::Bucked { .. })) {
+        if let Some(rider) = rider {
+            // `ejectPassengers` + `makeMad`: the failed roll throws the rider
+            // off at the registry's safe dismount offset.
+            let seat = mounts()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .registry
+                .dismount(rider);
+            if let Some([dx, dy, dz]) = seat {
+                if let Some(client) = client_snapshot()
+                    .iter()
+                    .find(|client| client.eid == rider)
+                    .cloned()
+                {
+                    let mut pos = client.pos.lock().unwrap_or_else(|e| e.into_inner());
+                    pos.0 = dx;
+                    pos.1 = dy;
+                    pos.2 = dz;
+                }
+            }
+        }
+    }
+}
+
+/// `BreedGoal`/`setOffspringAttributes`: while this equine is in love beside
+/// a same-kind mate that is also in love, roll the foal's attributes once and
+/// leave them for the child the generic `live_mob_breed` path produces. A
+/// freshly-seen equine instead claims any pending record at its position —
+/// that is the foal receiving its bred attributes and baby age.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_equine_breed_roll(mob: &Arc<Mob>, at: [f64; 3], tick: u64) {
+    if *mob.love.lock().unwrap_or_else(|e| e.into_inner()) > 0 {
+        let mate_eid = mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|other| {
+                other.eid != mob.eid
+                    && other.etype == mob.etype
+                    && *other.love.lock().unwrap_or_else(|e| e.into_inner()) > 0
+                    && {
+                        let (ox, oy, oz, ..) =
+                            *other.pos.lock().unwrap_or_else(|e| e.into_inner());
+                        (ox - at[0]).powi(2) + (oy - at[1]).powi(2) + (oz - at[2]).powi(2)
+                            <= 4.0
+                    }
+            })
+            .map(|other| other.eid);
+        let Some(mate_eid) = mate_eid else {
+            return;
+        };
+        let stats = {
+            let states = live_native_utility_states()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match (states.get(&mob.eid), states.get(&mate_eid)) {
+                (
+                    Some(NativeUtilityState::Equine(a)),
+                    Some(NativeUtilityState::Equine(b)),
+                ) => {
+                    let rand_unit = f64::from(world_rng::next_below(10_000)) / 10_000.0;
+                    breed_equine_stats(a, b, rand_unit)
+                }
+                _ => return,
+            }
+        };
+        let mut pending = live_equine_pending_foals()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pending.retain(|&(_, _, _, when)| tick.saturating_sub(when) <= 100);
+        // One record per breeding episode per site — a second roll for the
+        // same pair in the same tick would overwrite identical data anyway.
+        if !pending.iter().any(|&(dim, pos, _, when)| {
+            dim == mob.dim
+                && when == tick
+                && (pos[0] - at[0]).abs() < 3.0
+                && (pos[2] - at[2]).abs() < 3.0
+        }) {
+            pending.push((mob.dim, at, stats, tick));
+        }
+    } else {
+        let mut states = live_native_utility_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(NativeUtilityState::Equine(equine)) = states.get_mut(&mob.eid) else {
+            return;
+        };
+        if equine.bred_foal {
+            return;
+        }
+        let claim = {
+            let mut pending = live_equine_pending_foals()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            pending
+                .iter()
+                .position(|&(dim, pos, _, when)| {
+                    dim == mob.dim
+                        && tick.saturating_sub(when) <= 100
+                        && (pos[0] - at[0]).powi(2)
+                            + (pos[1] - at[1]).powi(2)
+                            + (pos[2] - at[2]).powi(2)
+                            <= 4.0
+                })
+                .map(|index| pending.remove(index))
+        };
+        if let Some((_, _, stats, _)) = claim {
+            equine.max_health = stats.max_health as f32;
+            equine.health = equine.health.min(equine.max_health);
+            equine.jump_strength = stats.jump_strength;
+            equine.move_speed = stats.move_speed;
+            equine.age_ticks = -24_000;
+            equine.bred_foal = true;
+        }
+    }
+}
+
+/// `LandOnOwnersShoulderGoal` + `removeEntitiesOnShoulder`: the tame/sit flags
+/// live in `parrot_pets` (the interact path), the shoulder goal mirrors them
+/// here each tick, and a perched parrot is re-seated on its owner — the live
+/// stand-in for shoulder NBT — until a hazard forces the dismount.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_parrot_utility_step(mob: &Arc<Mob>, at: [f64; 3], tick: u64) {
+    let Some(reg) = crate::block_registry::breg() else {
+        return;
+    };
+    let (owner, on_shoulder, perched_ticks) = {
+        let pet = parrot_pets()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&mob.eid)
+            .map(|pet| (pet.owner, pet.sitting));
+        let mut states = live_native_utility_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let state = states.entry(mob.eid).or_insert_with(|| {
+            NativeUtilityState::Parrot(ParrotState::new((mob.eid as u64 % 5) as u8))
+        });
+        let NativeUtilityState::Parrot(parrot) = state else {
+            return;
+        };
+        if let Some((owner, sitting)) = pet {
+            parrot.tamed = owner.is_some();
+            parrot.owner = owner;
+            parrot.sitting_ordered = sitting;
+        }
+        parrot.tick();
+        if parrot.on_shoulder {
+            parrot.perched_ticks = parrot.perched_ticks.saturating_add(1);
+        }
+        (parrot.owner, parrot.on_shoulder, parrot.perched_ticks)
+    };
+    let Some(owner) = owner else {
+        return;
+    };
+    let Some(client) = client_snapshot()
+        .iter()
+        .find(|client| {
+            client.uuid == owner
+                && !client.is_spectator()
+                && *client.dim.lock().unwrap_or_else(|e| e.into_inner()) == mob.dim
+        })
+        .cloned()
+    else {
+        return;
+    };
+    let (_, px, py, pz, ..) = client_dim_pos(&client);
+    let (fbx, fby, fbz) = (px.floor() as i32, py.floor() as i32, pz.floor() as i32);
+    let feet = block_at_dim(mob.dim, fbx, fby, fbz);
+    let in_water = reg.has_water(feet);
+    let in_powder_snow = reg.name_of(feet) == "minecraft:powder_snow";
+    if on_shoulder {
+        let hazards = ShoulderDropConditions {
+            fall_distance: (*client.fall_from.lock().unwrap_or_else(|e| e.into_inner()) - py)
+                .max(0.0) as f32,
+            in_water,
+            player_flying: *client.fall_fly.lock().unwrap_or_else(|e| e.into_inner()),
+            player_sleeping: client
+                .sleeping
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some(),
+            in_powder_snow,
+            player_damaged: *client.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) > 0,
+            // Riptide launches are not modeled in this build.
+            spin_attack: false,
+        };
+        let dropped = {
+            let mut states = live_native_utility_states()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match states.get_mut(&mob.eid) {
+                Some(NativeUtilityState::Parrot(parrot)) => {
+                    parrot.shoulder_dismount(&hazards, perched_ticks)
+                }
+                _ => false,
+            }
+        };
+        if !dropped {
+            // Still perched: keep the entity glued to its owner's shoulder.
+            {
+                let mut pos = mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+                *pos = (px, py + 1.0, pz, pos.3, pos.4);
+            }
+            mob.vel
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .fill(0.0);
+            if tick.is_multiple_of(20) {
+                broadcast_seen(mob.eid, |_| {
+                    (0x70, entity_teleport(mob.eid, px, py + 1.0, pz, 0.0, 0.0, false))
+                });
+            }
+        }
+    } else {
+        let shoulder_slot_free = {
+            let states = live_native_utility_states()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            !states.iter().any(|(&eid, state)| {
+                eid != mob.eid
+                    && matches!(
+                        state,
+                        NativeUtilityState::Parrot(parrot)
+                            if parrot.on_shoulder && parrot.owner == Some(owner)
+                    )
+            })
+        };
+        let ctx = ShoulderPerchContext {
+            player: owner,
+            bounding_boxes_intersect: (px - at[0]).powi(2)
+                + (py - at[1]).powi(2)
+                + (pz - at[2]).powi(2)
+                <= 2.25,
+            player_on_ground: client.pos.lock().unwrap_or_else(|e| e.into_inner()).5,
+            player_mounted: mounts()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .registry
+                .vehicle_of
+                .get(&client.eid)
+                .is_some(),
+            player_in_water: in_water,
+            player_in_powder_snow: in_powder_snow,
+            shoulder_slot_free,
+        };
+        let mut states = live_native_utility_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(NativeUtilityState::Parrot(parrot)) = states.get_mut(&mob.eid) {
+            parrot.try_perch_on_shoulder(&ctx);
+        }
+    }
 }
 
 /// A pumpkin placed on the completed frame consumes all frame blocks and
@@ -2309,10 +2826,25 @@ fn live_utility_mob_tick(tick: u64) {
     let snow_type = name_to_etype("snow_golem");
     let fox_type = name_to_etype("fox");
     let allay_type = name_to_etype("allay");
+    let camel_type = name_to_etype("camel");
+    let golem_type = name_to_etype("iron_golem");
+    let parrot_type = name_to_etype("parrot");
     let relevant: Vec<Arc<Mob>> = mobs()
         .lock().unwrap_or_else(|e| e.into_inner())
         .iter()
-        .filter(|mob| [axolotl_type, snow_type, fox_type, allay_type].contains(&Some(mob.etype)))
+        .filter(|mob| {
+            [
+                axolotl_type,
+                snow_type,
+                fox_type,
+                allay_type,
+                camel_type,
+                golem_type,
+                parrot_type,
+            ]
+            .contains(&Some(mob.etype))
+                || equine_kind_of(mob.etype).is_some()
+        })
         .cloned()
         .collect();
     let alive = tick.is_multiple_of(400).then(|| {
@@ -2327,7 +2859,7 @@ fn live_utility_mob_tick(tick: u64) {
     let Some(reg) = crate::block_registry::breg() else { return };
     for mob in relevant {
         if *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0 { continue; }
-        let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let (x, y, z, yaw, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
         let (bx, by, bz) = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
         if Some(mob.etype) == axolotl_type {
             let rain_exposed = mob.dim == DimId::Overworld
@@ -2359,7 +2891,7 @@ fn live_utility_mob_tick(tick: u64) {
                 && reg.is_air(block_at_dim(mob.dim, bx, by, bz))
                 && reg.is_solid(block_at_dim(mob.dim, bx, by - 1, bz))
                 && cold_biome_at(mob.dim, bx, by, bz)
-                && GR_MOB_GRIEFING.load(Ordering::Relaxed) != 0;
+                && world_griefing_enabled();
             let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
             let state = states.entry(mob.eid).or_insert_with(|| NativeUtilityState::Snow(SnowGolemState::default()));
             let place = if let NativeUtilityState::Snow(_) = state {
@@ -2374,7 +2906,48 @@ fn live_utility_mob_tick(tick: u64) {
         } else if Some(mob.etype) == allay_type {
             if tick.is_multiple_of(10) {
                 live_allay_collect_and_deliver(&mob, [x, y, z], tick);
+                live_allay_jukebox_step(&mob, [x, y, z], tick);
             }
+        } else if Some(mob.etype) == camel_type {
+            // `CamelAi` random sitting: a camel with no riders sits down for a
+            // stretch, then stands again. Sitting camels do not drift.
+            let phase = tick.wrapping_add(mob.eid as u64 * 97) % 2400;
+            let sitting = {
+                let states = live_native_utility_states()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                matches!(
+                    states.get(&mob.eid),
+                    Some(NativeUtilityState::Camel(camel)) if camel.sitting
+                )
+            };
+            if (!sitting && phase == 0) || (sitting && phase == 400) {
+                live_camel_toggle_sitting(mob.eid);
+            }
+            if sitting {
+                *mob.vel.lock().unwrap_or_else(|e| e.into_inner()) = [0.0; 3];
+            } else {
+                // `Camel.saddle` rider jump input fires the dash on its
+                // 55-tick cooldown — the same `ServerboundPlayerInputPacket`
+                // bit0 the steering map stores per vehicle.
+                let dash_input = {
+                    let live = mounts().lock().unwrap_or_else(|e| e.into_inner());
+                    !live.registry.passengers_of(mob.eid).is_empty()
+                        && live
+                            .steering
+                            .get(&mob.eid)
+                            .is_some_and(|input| input.jump)
+                };
+                if dash_input {
+                    live_camel_dash(mob.eid, tick, yaw);
+                }
+            }
+        } else if let Some(kind) = equine_kind_of(mob.etype) {
+            live_equine_utility_step(&mob, kind, [x, y, z], tick);
+        } else if Some(mob.etype) == parrot_type {
+            live_parrot_utility_step(&mob, [x, y, z], tick);
+        } else if Some(mob.etype) == golem_type && tick.is_multiple_of(20) {
+            live_golem_provoke_step(&mob, [x, y, z], tick);
         } else if Some(mob.etype) == fox_type && tick.is_multiple_of(20) {
             let nearby = client_snapshot().iter().filter_map(|client| {
                 let (dim, px, py, pz, ..) = client_dim_pos(client);
@@ -2644,7 +3217,94 @@ fn live_villager_tick(tick: u64) {
             let registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
             let empty = PoiRegistry::default();
             let pois = registries.get(&dim).unwrap_or(&empty);
-            villager.tick(pois, position, world_time);
+            let (activity, _) = villager.tick(pois, position, world_time);
+            if activity == VillagerActivity::Work
+                && villager.profession == VillagerProfession::Farmer
+            {
+                if let Some(site) = villager.job_site {
+                    farmer_composter_work(dim, position, site, tick);
+                }
+            }
+        }
+    }
+}
+
+/// `FarmerVillagerTask.WorkAtComposter`: during work hours a farmer standing
+/// by its claimed composter deposits seeds (the `COMPOSTABLES` chance roll),
+/// lets a level-7 composter mature, and at the ready level 8 pops the bone
+/// meal and spreads it on a neighbouring crop.
+#[cfg_attr(not(test), allow(dead_code))]
+fn farmer_composter_work(dim: DimId, position: BlockPos, site: BlockPos, tick: u64) {
+    if !tick.is_multiple_of(20) || !villager_within(position, site, 2) {
+        return;
+    }
+    let Some(reg) = crate::block_registry::breg() else {
+        return;
+    };
+    let st = block_at_dim(dim, site.0, site.1, site.2);
+    if reg.name_of(st) != "minecraft:composter" {
+        return;
+    }
+    let level: u8 = reg
+        .get_prop(st, "level")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let write = |level: u8| {
+        let next = reg.with_prop(st, "level", &level.to_string());
+        set_block_dim(dim, site.0, site.1, site.2, next);
+        note_block_update_dim(dim, site.0, site.1, site.2, next);
+    };
+    if level < 7 {
+        // Farmers carry seeds: use the wheat-seed row of the compostables
+        // table with the vanilla chance roll.
+        let roll = f64::from(world_rng::next_below(1 << 24)) / f64::from(1 << 24);
+        if let ComposterInsert::Advanced { new_level, .. } =
+            composter_insert(level, "minecraft:wheat_seeds", roll)
+        {
+            write(new_level);
+        }
+    } else if level == 7 {
+        write(composter_mature(level));
+    } else if let Some((rest, _produce)) = composter_harvest(level) {
+        write(rest);
+        farmer_bonemeal_nearby_crop(reg, dim, site);
+    }
+}
+
+/// The farmer spends the harvested bone meal on the first growing crop within
+/// reach of the composter — the vanilla `UseBonemeal` arm of the farming task.
+#[cfg_attr(not(test), allow(dead_code))]
+fn farmer_bonemeal_nearby_crop(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    site: BlockPos,
+) {
+    for dy in -1..=1 {
+        for dx in -2..=2 {
+            for dz in -2..=2 {
+                let pos = (site.0 + dx, site.1 + dy, site.2 + dz);
+                let st = block_at_dim(dim, pos.0, pos.1, pos.2);
+                if !matches!(
+                    reg.name_of(st),
+                    "minecraft:wheat"
+                        | "minecraft:carrots"
+                        | "minecraft:potatoes"
+                        | "minecraft:beetroots"
+                ) {
+                    continue;
+                }
+                let age: u8 = reg
+                    .get_prop(st, "age")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+                if age >= 7 {
+                    continue;
+                }
+                let grown = reg.with_prop(st, "age", &(age + 2).min(7).to_string());
+                set_block_dim(dim, pos.0, pos.1, pos.2, grown);
+                note_block_update_dim(dim, pos.0, pos.1, pos.2, grown);
+                return;
+            }
         }
     }
 }
@@ -5773,5 +6433,226 @@ mod perf1_villager_lod_tests {
         }
         assert_eq!(lod.state, VillagerAiLodState::TradingHallSleep);
         assert_eq!(lod.stats.pathfinds_skipped, 1);
+    }
+}
+
+#[cfg(test)]
+mod parity_live_wire_utility_tests {
+    use super::*;
+
+    fn push_mob(name: &str, pos: (f64, f64, f64, f32, f32), hp: f32) -> Arc<Mob> {
+        let spec = entity_spec_by_name(name).unwrap_or_else(|| panic!("{name} spec"));
+        let mob = new_live_mob(spec.id, DimId::Overworld, pos, hp, None);
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob.clone());
+        mob
+    }
+
+    fn utility_state(eid: i32) -> Option<NativeUtilityState> {
+        live_native_utility_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&eid)
+            .cloned()
+    }
+
+    #[test]
+    fn parity_live_wire_equine_parrot() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let reg = crate::block_registry::breg().unwrap();
+
+        // Horse: `live_utility_mob_tick` — the utility driver `villager_raid_tick`
+        // runs every server tick — materializes the EquineState model.
+        let horse = push_mob("horse", (32_000.5, 81.0, 32_000.5, 0.0, 0.0), 30.0);
+        set_block_dim(
+            DimId::Overworld,
+            32_000,
+            80,
+            32_000,
+            reg.state_of("minecraft:stone", None),
+        );
+        live_utility_mob_tick(1);
+        {
+            let mut states = live_native_utility_states()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let Some(NativeUtilityState::Equine(equine)) = states.get_mut(&horse.eid) else {
+                panic!("equine state must materialize through live_utility_mob_tick");
+            };
+            equine.tamed = true;
+            equine.jump_strength = 0.8;
+        }
+        // Mount a rider and hold the steering jump bit: the charge builds,
+        // and its release applies the vanilla jump-strength-scaled velocity —
+        // `equine_jump_velocity` executed by the live tick.
+        {
+            let mut live = mounts().lock().unwrap_or_else(|e| e.into_inner());
+            live.registry.register_vehicle(
+                horse.eid,
+                VehicleKind::Horse,
+                [32_000.5, 81.0, 32_000.5],
+            );
+            live.registry
+                .mount(horse.eid, 9_777_001)
+                .expect("rider mounts the equine vehicle");
+            live.steering.insert(
+                horse.eid,
+                PlayerInputPacket {
+                    sideways: 0.0,
+                    forward: 0.0,
+                    jump: true,
+                    unmount: false,
+                },
+            );
+        }
+        live_utility_mob_tick(2);
+        assert_eq!(
+            equine_jump_charges()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&horse.eid)
+                .copied(),
+            Some(5),
+            "holding the jump bit charges the equine jump",
+        );
+        {
+            let mut live = mounts().lock().unwrap_or_else(|e| e.into_inner());
+            live.steering.insert(
+                horse.eid,
+                PlayerInputPacket {
+                    sideways: 0.0,
+                    forward: 0.0,
+                    jump: false,
+                    unmount: false,
+                },
+            );
+        }
+        live_utility_mob_tick(3);
+        assert!(
+            horse.vel.lock().unwrap_or_else(|e| e.into_inner())[1] > 0.0,
+            "releasing the charged jump applies equine_jump_velocity upward",
+        );
+        assert_eq!(
+            equine_jump_charges()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&horse.eid)
+                .copied(),
+            None,
+        );
+
+        // Parrot: the same live tick materializes the ParrotState model
+        // (seed taming/cookie/shoulder perch all key off this record).
+        let parrot = push_mob("parrot", (32_004.5, 81.0, 32_000.5, 0.0, 0.0), 6.0);
+        live_utility_mob_tick(4);
+        assert!(
+            matches!(utility_state(parrot.eid), Some(NativeUtilityState::Parrot(_))),
+            "parrot state must materialize through live_utility_mob_tick",
+        );
+    }
+
+    #[test]
+    fn parity_live_wire_golem_allay_axolotl_camel() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let reg = crate::block_registry::breg().unwrap();
+
+        // Axolotl: hydration and the play-dead reflex run inside the live
+        // utility tick against the mob's real hp cell.
+        let axolotl = push_mob("axolotl", (32_020.5, 81.0, 32_000.5, 0.0, 0.0), 14.0);
+        set_block_dim(
+            DimId::Overworld,
+            32_020,
+            81,
+            32_000,
+            reg.state_of("minecraft:water", None),
+        );
+        live_utility_mob_tick(11);
+        assert!(
+            matches!(utility_state(axolotl.eid), Some(NativeUtilityState::Axolotl(_))),
+            "axolotl state must materialize through live_utility_mob_tick",
+        );
+        *axolotl.hp.lock().unwrap_or_else(|e| e.into_inner()) = 5.0;
+        live_utility_mob_tick(12);
+        match utility_state(axolotl.eid) {
+            Some(NativeUtilityState::Axolotl(state)) => assert!(
+                state.playing_dead_ticks > 0,
+                "dropping below half health while hydrated plays dead",
+            ),
+            _ => panic!("axolotl state vanished"),
+        }
+        live_utility_mob_tick(25);
+        assert_eq!(
+            *axolotl.hp.lock().unwrap_or_else(|e| e.into_inner()),
+            6.0,
+            "play-dead regeneration heals through the live tick",
+        );
+
+        // Allay: a shard-carrying allay within 10 blocks of a mid-song
+        // jukebox duplicates through `live_allay_jukebox_step` in the tick.
+        let allay = push_mob("allay", (32_030.5, 81.0, 32_000.5, 0.0, 0.0), 20.0);
+        let shard = name_to_item("minecraft:amethyst_shard").expect("amethyst shard id");
+        live_native_utility_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                allay.eid,
+                NativeUtilityState::Allay(AllayState {
+                    held: Some((shard, 1, Vec::new())),
+                    ..Default::default()
+                }),
+            );
+        register_world_block_entity(
+            DimId::Overworld,
+            (32_031, 81, 32_000),
+            VanillaBlockEntity::Jukebox(JukeboxBlockEntity {
+                record_item: Some("minecraft:music_disc_cat".into()),
+                ..Default::default()
+            }),
+        );
+        let mobs_before = mobs().lock().unwrap_or_else(|e| e.into_inner()).len();
+        live_utility_mob_tick(10);
+        assert!(
+            mobs().lock().unwrap_or_else(|e| e.into_inner()).len() > mobs_before,
+            "a dancing shard-carrier allay duplicates through the live tick",
+        );
+
+        // Iron golem: iron-ingot repair runs the live item-interaction entry.
+        let golem = push_mob("iron_golem", (32_040.5, 81.0, 32_000.5, 0.0, 0.0), 50.0);
+        assert!(live_iron_golem_repair(golem.eid, true));
+        assert_eq!(*golem.hp.lock().unwrap_or_else(|e| e.into_inner()), 75.0);
+
+        // Camel: the rider's steering jump bit fires the dash on its cooldown
+        // through the same tick branch that reads PlayerInputPacket.
+        let camel = push_mob("camel", (32_050.5, 81.0, 32_000.5, 0.0, 0.0), 32.0);
+        {
+            let mut live = mounts().lock().unwrap_or_else(|e| e.into_inner());
+            live.registry.register_vehicle(
+                camel.eid,
+                VehicleKind::Camel,
+                [32_050.5, 81.0, 32_000.5],
+            );
+            live.registry
+                .mount(camel.eid, 9_777_002)
+                .expect("rider mounts the camel");
+            live.steering.insert(
+                camel.eid,
+                PlayerInputPacket {
+                    sideways: 0.0,
+                    forward: 0.0,
+                    jump: true,
+                    unmount: false,
+                },
+            );
+        }
+        let mut dashed = false;
+        for tick in 100u64..2_600 {
+            live_utility_mob_tick(tick);
+            if *camel.vel.lock().unwrap_or_else(|e| e.into_inner()) != [0.0; 3] {
+                dashed = true;
+                break;
+            }
+        }
+        assert!(dashed, "steering jump must fire live_camel_dash while unsat");
     }
 }
