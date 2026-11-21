@@ -2837,6 +2837,844 @@ impl ProjectileDespawnPolicy {
     }
 }
 
+// ---------- Vanilla equines: temper, mount-bucking taming, gear & jump bar ----------
+//
+// `AbstractHorse` (horse/donkey/mule), `Llama`, `AbstractChestedHorse` and
+// `RunAroundLikeCrazyGoal` mechanics for 1.21.1: the temper-driven tame/buck
+// roll while ridden, the `handleEating` food table, the saddle/chest/armor
+// equip gates, the `onPlayerJump` charge scale, and `createOffspringAttribute`
+// breeding. Llamas override `getMaxTemper` (30) and accept only `LLAMA_FOOD`
+// (wheat, hay block); the other kinds share `HORSE_FOOD`.
+
+/// The four tamable `AbstractHorse` descendants this lane models.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EquineKind {
+    Horse,
+    Donkey,
+    Mule,
+    Llama,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl EquineKind {
+    /// `getMaxTemper`: 100 for every `AbstractHorse` descendant except the
+    /// llama, which caps temper at 30.
+    fn max_temper(self) -> i32 {
+        match self {
+            Self::Llama => 30,
+            _ => 100,
+        }
+    }
+
+    /// `AbstractChestedHorse`: donkeys, mules and llamas take a chest; horses
+    /// take body armor instead.
+    fn can_chest(self) -> bool {
+        matches!(self, Self::Donkey | Self::Mule | Self::Llama)
+    }
+
+    /// `Horse.mobInteract`/`isEquippableInSlot(BODY)`: only horses wear the
+    /// four armor tiers.
+    fn can_wear_armor(self) -> bool {
+        matches!(self, Self::Horse)
+    }
+
+    /// `HORSE_FOOD` membership (`ItemTags`): wheat, sugar, hay block, apple,
+    /// carrot, golden carrot, golden apple, enchanted golden apple. `carrot`
+    /// has no `handleEating` branch, so it is food by tag but does nothing.
+    fn is_horse_food(item: &str) -> bool {
+        matches!(
+            mob_behavior_id(item),
+            "wheat"
+                | "sugar"
+                | "hay_block"
+                | "apple"
+                | "carrot"
+                | "golden_carrot"
+                | "golden_apple"
+                | "enchanted_golden_apple"
+        )
+    }
+
+    /// `LLAMA_FOOD` membership: wheat and hay block only.
+    fn is_llama_food(item: &str) -> bool {
+        matches!(mob_behavior_id(item), "wheat" | "hay_block")
+    }
+
+    /// Whether the item enters the `fedFood` path for this kind.
+    fn is_food(self, item: &str) -> bool {
+        match self {
+            Self::Llama => Self::is_llama_food(item),
+            _ => Self::is_horse_food(item),
+        }
+    }
+
+    /// One row of the vanilla `handleEating` table: heal amount, `ageUp`
+    /// ticks, temper delta, and whether the item can trigger love on a tamed
+    /// adult (`setInLove` for golden foods / llama hay).
+    fn food_effect(self, item: &str) -> Option<EquineFoodEffect> {
+        let fx = |heal: f32, age_up_ticks: i32, temper: i32, love_food: bool| {
+            Some(EquineFoodEffect {
+                heal,
+                age_up_ticks,
+                temper,
+                love_food,
+            })
+        };
+        match (self, mob_behavior_id(item)) {
+            // `Llama.handleEating` over `LLAMA_FOOD`.
+            (Self::Llama, "wheat") => fx(2.0, 10, 3, false),
+            (Self::Llama, "hay_block") => fx(10.0, 90, 6, true),
+            // Llamas reject every other item before the horse table applies.
+            (Self::Llama, _) => None,
+            // `AbstractHorse.handleEating` over `HORSE_FOOD`; `carrot` is in
+            // the tag but has no branch and falls through to PASS.
+            (_, "wheat") => fx(2.0, 20, 3, false),
+            (_, "sugar") => fx(1.0, 30, 3, false),
+            (_, "hay_block") => fx(20.0, 180, 0, false),
+            (_, "apple") => fx(3.0, 60, 3, false),
+            (_, "golden_carrot") => fx(4.0, 60, 5, true),
+            (_, "golden_apple" | "enchanted_golden_apple") => fx(10.0, 240, 10, true),
+            _ => None,
+        }
+    }
+}
+
+/// One `handleEating` row as defined above.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+struct EquineFoodEffect {
+    heal: f32,
+    age_up_ticks: i32,
+    temper: i32,
+    love_food: bool,
+}
+
+/// `generateJumpStrength`: `0.4 + 0.2 * (r1 + r2 + r3)` over three unit rolls.
+#[cfg_attr(not(test), allow(dead_code))]
+fn equine_generate_jump_strength(rolls: [f64; 3]) -> f64 {
+    0.4 + 0.2 * rolls.iter().sum::<f64>()
+}
+
+/// `generateSpeed`: `(0.45 + 0.3 * (r1 + r2 + r3)) * 0.25`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn equine_generate_move_speed(rolls: [f64; 3]) -> f64 {
+    (0.45 + 0.3 * rolls.iter().sum::<f64>()) * 0.25
+}
+
+/// Vanilla spawn attribute ranges the breeding formula clamps into.
+#[cfg_attr(not(test), allow(dead_code))]
+const EQUINE_JUMP_STRENGTH_RANGE: (f64, f64) = (0.4, 1.0);
+#[cfg_attr(not(test), allow(dead_code))]
+const EQUINE_MOVE_SPEED_RANGE: (f64, f64) = (0.1125, 0.3375);
+/// `generateMaxHealth`: `15 + rand(8) + rand(9)` bounds the bred health roll.
+#[cfg_attr(not(test), allow(dead_code))]
+const EQUINE_MAX_HEALTH_RANGE: (f64, f64) = (15.0, 30.0);
+
+/// Result of one mount-bucking tame check (`RunAroundLikeCrazyGoal.tick`).
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EquineTameOutcome {
+    /// `nextInt(maxTemper) < temper`: the horse tames to its rider.
+    Tamed,
+    /// The roll failed: temper rises by 5 (clamped) and the rider is thrown.
+    Bucked { new_temper: i32 },
+}
+
+/// Result of `EquineState::feed`, mirroring `handleEating`/`fedFood`.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum EquineFeedOutcome {
+    /// Not this kind's food, or a full-health tamed adult with nothing to
+    /// gain — vanilla returns PASS and the item is not consumed.
+    Pass,
+    /// Item consumed: heal/age-up/love/temper applied as vanilla does.
+    Consumed {
+        healed: f32,
+        temper_gain: i32,
+        fell_in_love: bool,
+    },
+}
+
+/// Per-entity equine state: taming, temper, equipment and attributes.
+#[cfg_attr(not(test), allow(dead_code))]
+struct EquineState {
+    kind: EquineKind,
+    tamed: bool,
+    owner: Option<[u8; 16]>,
+    /// Vanilla `temper`; `modify_temper` clamps to `0..=kind.max_temper()`.
+    temper: i32,
+    saddled: bool,
+    chested: bool,
+    /// Horse body armor: 0 none, 1 leather, 2 iron, 3 gold, 4 diamond.
+    armor_tier: u8,
+    jump_strength: f64,
+    move_speed: f64,
+    health: f32,
+    max_health: f32,
+    /// Vanilla age in ticks: negative while a baby (`ageUp` adds toward 0).
+    age_ticks: i32,
+    in_love: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl EquineState {
+    /// Base-attribute defaults (`JUMP_STRENGTH` 0.7, `MOVEMENT_SPEED` 0.225)
+    /// before spawn rolls; `spawned` applies the rolled ranges instead.
+    fn new(kind: EquineKind) -> Self {
+        Self {
+            kind,
+            tamed: false,
+            owner: None,
+            temper: 0,
+            saddled: false,
+            chested: false,
+            armor_tier: 0,
+            jump_strength: 0.7,
+            move_speed: 0.225,
+            health: 30.0,
+            max_health: 30.0,
+            age_ticks: 0,
+            in_love: false,
+        }
+    }
+
+    /// A fresh spawn: attributes rolled via `generateJumpStrength`/
+    /// `generateSpeed` from six unit rolls, health from the vanilla
+    /// `generateMaxHealth` range midpoint.
+    fn spawned(
+        kind: EquineKind,
+        jump_rolls: [f64; 3],
+        speed_rolls: [f64; 3],
+        health_rolls: [f64; 2],
+    ) -> Self {
+        let mut state = Self::new(kind);
+        state.jump_strength = equine_generate_jump_strength(jump_rolls);
+        state.move_speed = equine_generate_move_speed(speed_rolls);
+        // `generateMaxHealth`: `15 + nextInt(8) + nextInt(9)` as unit rolls
+        // approximates the integer draws over [15, 30).
+        state.max_health = (15.0 + 7.0 * health_rolls[0] + 8.0 * health_rolls[1]) as f32;
+        state.health = state.max_health;
+        state
+    }
+
+    fn is_baby(&self) -> bool {
+        self.age_ticks < 0
+    }
+
+    /// `modifyTemper`: clamp `temper + delta` into `0..=getMaxTemper()`.
+    fn modify_temper(&mut self, delta: i32) -> i32 {
+        self.temper = (self.temper + delta).clamp(0, self.kind.max_temper());
+        self.temper
+    }
+
+    /// `AbstractHorse.tameWithName`: ownership and the tame flag together —
+    /// name-tag taming and the successful `RunAroundLikeCrazyGoal` roll both
+    /// land here. Returns whether the animal was untamed before.
+    fn tame_with_name(&mut self, player: [u8; 16]) -> bool {
+        let was_tamed = self.tamed;
+        self.tamed = true;
+        self.owner = Some(player);
+        !was_tamed
+    }
+
+    /// One `RunAroundLikeCrazyGoal.tick` roll while an untamed equine is
+    /// ridden by a player: vanilla draws `nextInt(getMaxTemper())` and tames
+    /// when it lands below `temper`; otherwise `modifyTemper(5)` and the
+    /// rider is bucked off (`ejectPassengers` + `makeMad` + event 6).
+    ///
+    /// `roll` is that draw; for the common 100-temper kinds it is a 0..=99
+    /// value. Llamas draw `nextInt(30)`, so callers should pass 0..=29 there.
+    /// Returns `None` once tamed — the goal only runs while `!isTamed`.
+    fn try_equine_tame_tick(&mut self, roll: u32) -> Option<EquineTameOutcome> {
+        if self.tamed {
+            return None;
+        }
+        if roll < self.temper.max(0) as u32 {
+            self.tamed = true;
+            return Some(EquineTameOutcome::Tamed);
+        }
+        let new_temper = self.modify_temper(5);
+        Some(EquineTameOutcome::Bucked { new_temper })
+    }
+
+    /// `fedFood`/`handleEating`: apply the kind's food table. Temper only
+    /// rises when the item was actually used (heal/age-up/love) or the animal
+    /// is still untamed, and never past `getMaxTemper()` — so a full-health
+    /// tamed adult refuses plain foods exactly like vanilla. The `is_food`
+    /// tag check runs first, mirroring `mobInteract`'s `isFood` gate.
+    fn feed(&mut self, item: &str) -> EquineFeedOutcome {
+        if !self.kind.is_food(item) {
+            return EquineFeedOutcome::Pass;
+        }
+        let Some(fx) = self.kind.food_effect(item) else {
+            return EquineFeedOutcome::Pass;
+        };
+        let mut used = false;
+        let mut healed = 0.0;
+        if self.health < self.max_health && fx.heal > 0.0 {
+            let before = self.health;
+            self.health = (self.health + fx.heal).min(self.max_health);
+            healed = self.health - before;
+            used = true;
+        }
+        if self.is_baby() && fx.age_up_ticks > 0 {
+            self.age_ticks = self.age_ticks.saturating_add(fx.age_up_ticks);
+            used = true;
+        }
+        let mut fell_in_love = false;
+        if fx.love_food && self.tamed && !self.is_baby() && !self.in_love {
+            self.in_love = true;
+            fell_in_love = true;
+            used = true;
+        }
+        let mut temper_gain = 0;
+        if fx.temper > 0 && (used || !self.tamed) && self.temper < self.kind.max_temper() {
+            let before = self.temper;
+            self.modify_temper(fx.temper);
+            temper_gain = self.temper - before;
+            used = true;
+        }
+        if used {
+            EquineFeedOutcome::Consumed {
+                healed,
+                temper_gain,
+                fell_in_love,
+            }
+        } else {
+            EquineFeedOutcome::Pass
+        }
+    }
+
+    /// `isSaddleable` + `equipSaddle`: tamed adult without a saddle already.
+    fn equip_saddle(&mut self) -> bool {
+        if !(self.tamed && !self.is_baby() && !self.saddled) {
+            return false;
+        }
+        self.saddled = true;
+        true
+    }
+
+    /// `AbstractChestedHorse.equipChest`: tamed adult of a chested kind only.
+    fn equip_chest(&mut self) -> bool {
+        if !(self.kind.can_chest() && self.tamed && !self.is_baby() && !self.chested) {
+            return false;
+        }
+        self.chested = true;
+        true
+    }
+
+    /// Horse body armor (`isEquippableInSlot(BODY)` + `equipBodyArmor`):
+    /// tiers 1..=4 on a tamed adult horse; vanilla refuses to swap a worn
+    /// piece, so equipping requires `armor_tier == 0`.
+    fn equip_armor(&mut self, tier: u8) -> bool {
+        if !(self.kind.can_wear_armor()
+            && (1..=4).contains(&tier)
+            && self.tamed
+            && !self.is_baby()
+            && self.armor_tier == 0)
+        {
+            return false;
+        }
+        self.armor_tier = tier;
+        true
+    }
+
+    /// `canJump`: only a saddled mount answers the jump bar.
+    fn can_jump(&self) -> bool {
+        self.saddled
+    }
+}
+
+/// `AbstractHorse.onPlayerJump` charge → `playerJumpPendingScale`: negatives
+/// clamp to 0, >=90 is full power, below that it ramps 0.4..0.8 linearly —
+/// `0.4 + 0.4 * charge / 90` — the exact vanilla formula.
+#[cfg_attr(not(test), allow(dead_code))]
+fn equine_jump_scale(charge_0_to_100: i32) -> f64 {
+    let charge = charge_0_to_100.max(0);
+    if charge >= 90 {
+        1.0
+    } else {
+        0.4 + 0.4 * charge as f64 / 90.0
+    }
+}
+
+/// `LivingEntity.getJumpPower(scale)` vertical term on ordinary ground
+/// (block jump factor 1.0, no jump-boost effect): `jump_strength * scale`.
+/// Callers apply `getBlockJumpFactor`/`getJumpBoostPower` corrections for
+/// special blocks or effects — see `wm_horse_jump_velocity`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn equine_jump_velocity(jump_strength: f64, charge_0_to_100: i32) -> f64 {
+    jump_strength * equine_jump_scale(charge_0_to_100)
+}
+
+/// `AbstractHorse.createOffspringAttribute`: clamp both parents into the
+/// attribute range, average them, then perturb by `spread * draw` where
+/// `spread` is the parent gap plus 30% of the range on each side, and `draw`
+/// is vanilla's `(r1+r2+r3)/3 - 0.5`. `rand_unit` supplies that draw as one
+/// [0,1) value (`draw = rand_unit - 0.5`); out-of-range results reflect once
+/// back inside, exactly like vanilla.
+#[cfg_attr(not(test), allow(dead_code))]
+fn equine_offspring_attribute(
+    parent_a: f64,
+    parent_b: f64,
+    min: f64,
+    max: f64,
+    rand_unit: f64,
+) -> f64 {
+    let a = parent_a.clamp(min, max);
+    let b = parent_b.clamp(min, max);
+    let pad = 0.15 * (max - min);
+    let spread = (a - b).abs() + pad * 2.0;
+    let average = (a + b) / 2.0;
+    let result = average + spread * (rand_unit - 0.5);
+    if result > max {
+        max - (result - max)
+    } else if result < min {
+        min + (min - result)
+    } else {
+        result
+    }
+}
+
+/// The attributes `setOffspringAttributes` rolls for a foal.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EquineOffspringStats {
+    max_health: f64,
+    jump_strength: f64,
+    move_speed: f64,
+}
+
+/// `breed_equine_stats`: average both parents plus the vanilla random third
+/// draw per attribute. One `rand_unit` in [0,1) drives all three rolls —
+/// vanilla draws independently, so callers wanting per-attribute draws can
+/// call `equine_offspring_attribute` directly.
+#[cfg_attr(not(test), allow(dead_code))]
+fn breed_equine_stats(a: &EquineState, b: &EquineState, rand_unit: f64) -> EquineOffspringStats {
+    EquineOffspringStats {
+        max_health: equine_offspring_attribute(
+            a.max_health as f64,
+            b.max_health as f64,
+            EQUINE_MAX_HEALTH_RANGE.0,
+            EQUINE_MAX_HEALTH_RANGE.1,
+            rand_unit,
+        ),
+        jump_strength: equine_offspring_attribute(
+            a.jump_strength,
+            b.jump_strength,
+            EQUINE_JUMP_STRENGTH_RANGE.0,
+            EQUINE_JUMP_STRENGTH_RANGE.1,
+            rand_unit,
+        ),
+        move_speed: equine_offspring_attribute(
+            a.move_speed,
+            b.move_speed,
+            EQUINE_MOVE_SPEED_RANGE.0,
+            EQUINE_MOVE_SPEED_RANGE.1,
+            rand_unit,
+        ),
+    }
+}
+
+// ---------- Vanilla parrot: food, cookie poison, sit order & shoulder perch ----------
+//
+// `Parrot.mobInteract`, `PARROT_FOOD`/`PARROT_POISONOUS_FOOD`,
+// `LandOnOwnersShoulderGoal`, `ShoulderRidingEntity` and the player-side
+// `setEntityOnShoulder`/`removeEntitiesOnShoulder` rules for 1.21.1.
+
+/// Ticks a freshly-dropped parrot waits before it can perch again —
+/// `ShoulderRidingEntity.canSitOnShoulder` requires `rideCooldownCounter > 100`.
+#[cfg_attr(not(test), allow(dead_code))]
+const PERCH_COOLDOWN_TICKS: u16 = 100;
+/// `removeEntitiesOnShoulder` refuses to drop a parrot that has perched for
+/// fewer than 20 ticks (`timeEntitySatOnShoulder + 20 < gameTime`).
+#[cfg_attr(not(test), allow(dead_code))]
+const SHOULDER_MIN_PERCH_TICKS: u32 = 20;
+
+/// Per-entity parrot state.
+#[cfg_attr(not(test), allow(dead_code))]
+struct ParrotState {
+    tamed: bool,
+    owner: Option<[u8; 16]>,
+    /// `Parrot.Variant` id (cosmetic; 0..=4 vanilla variants plus the rare 5th).
+    variant: u8,
+    /// `isOrderedToSit`: right-click toggles it for the owning player.
+    sitting_ordered: bool,
+    /// `isFlying`: grounded parrots only attempt the shoulder goal.
+    flying: bool,
+    leashed: bool,
+    /// Currently consumed into the owner's shoulder NBT slot.
+    on_shoulder: bool,
+    /// `rideCooldownCounter` equivalent: ticks since the last perch ended.
+    shoulder_ticks: u16,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl ParrotState {
+    fn new(variant: u8) -> Self {
+        Self {
+            tamed: false,
+            owner: None,
+            variant,
+            sitting_ordered: false,
+            flying: false,
+            leashed: false,
+            on_shoulder: false,
+            shoulder_ticks: 0,
+        }
+    }
+
+    /// `ShoulderRidingEntity.tick`: the re-perch cooldown only counts while
+    /// the parrot exists as a world entity (not while perched as NBT).
+    fn tick(&mut self) {
+        if !self.on_shoulder {
+            self.shoulder_ticks = self.shoulder_ticks.saturating_add(1);
+        }
+    }
+
+    /// `PARROT_FOOD` membership: the six seed/pod items vanilla parrots eat.
+    fn is_parrot_food(item: &str) -> bool {
+        matches!(
+            mob_behavior_id(item),
+            "wheat_seeds"
+                | "melon_seeds"
+                | "pumpkin_seeds"
+                | "beetroot_seeds"
+                | "torchflower_seeds"
+                | "pitcher_pod"
+        )
+    }
+
+    /// `PARROT_POISONOUS_FOOD` membership: cookies only.
+    fn is_parrot_poisonous_food(item: &str) -> bool {
+        mob_behavior_id(item) == "cookie"
+    }
+
+    /// `Parrot.mobInteract` in vanilla order: untamed + parrot food eats and
+    /// rolls `nextInt(10) == 0` to tame; any non-poisonous item on a tamed,
+    /// owned, grounded parrot toggles the sit order; poisonous food (cookie)
+    /// is consumed, applies poison and deals `Float.MAX_VALUE` damage —
+    /// fatal for the parrot.
+    fn mob_interact(
+        &mut self,
+        player: [u8; 16],
+        item: &str,
+        tame_roll_0_9: u32,
+    ) -> ParrotInteract {
+        let id = mob_behavior_id(item);
+        if !self.tamed && Self::is_parrot_food(id) {
+            let tamed_now = tame_roll_0_9 == 0;
+            if tamed_now {
+                self.tamed = true;
+                self.owner = Some(player);
+            }
+            return ParrotInteract::Ate { tamed_now };
+        }
+        if !Self::is_parrot_poisonous_food(id) {
+            if !self.flying && self.tamed && self.owner == Some(player) {
+                self.sitting_ordered = !self.sitting_ordered;
+                return ParrotInteract::Sat {
+                    sitting: self.sitting_ordered,
+                };
+            }
+            return ParrotInteract::Pass;
+        }
+        ParrotInteract::Poisoned
+    }
+
+    /// `LandOnOwnersShoulderGoal.tick` + `Player.setEntityOnShoulder`: the
+    /// parrot must be tamed by this player, not sit-ordered, grounded,
+    /// unleashed, past the 100-tick cooldown, touching the player's box, and
+    /// the player must be on the ground, unmounted, dry and out of powder
+    /// snow with a free shoulder slot. On success the entity is consumed
+    /// into the player's shoulder NBT (`on_shoulder = true`).
+    fn try_perch_on_shoulder(&mut self, ctx: &ShoulderPerchContext) -> bool {
+        let player_ready = ctx.player_on_ground
+            && !ctx.player_mounted
+            && !ctx.player_in_water
+            && !ctx.player_in_powder_snow;
+        if self.on_shoulder
+            || !self.tamed
+            || self.owner != Some(ctx.player)
+            || self.sitting_ordered
+            || self.flying
+            || self.leashed
+            || !ctx.bounding_boxes_intersect
+            || self.shoulder_ticks <= PERCH_COOLDOWN_TICKS
+            || !player_ready
+            || !ctx.shoulder_slot_free
+        {
+            return false;
+        }
+        self.on_shoulder = true;
+        true
+    }
+
+    /// `Player.removeEntitiesOnShoulder` triggers: the owning player's fall
+    /// distance over 0.5, water, elytra flight, sleep, powder snow, taking
+    /// damage, or a riptide spin attack all drop shoulder entities — but only
+    /// after the parrot has perched for more than 20 ticks. On a forced
+    /// dismount the entity respawns in the world and the 100-tick re-perch
+    /// cooldown restarts.
+    fn shoulder_dismount(
+        &mut self,
+        hazards: &ShoulderDropConditions,
+        ticks_on_shoulder: u32,
+    ) -> bool {
+        if !self.on_shoulder || ticks_on_shoulder <= SHOULDER_MIN_PERCH_TICKS {
+            return false;
+        }
+        if !(hazards.fall_distance > 0.5
+            || hazards.in_water
+            || hazards.player_flying
+            || hazards.player_sleeping
+            || hazards.in_powder_snow
+            || hazards.player_damaged
+            || hazards.spin_attack)
+        {
+            return false;
+        }
+        self.on_shoulder = false;
+        self.shoulder_ticks = 0;
+        true
+    }
+}
+
+/// Result of `ParrotState::mob_interact`.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParrotInteract {
+    /// Nothing consumed; the caller may fall through to other interact logic.
+    Pass,
+    /// Parrot food consumed; `tamed_now` reports the `nextInt(10) == 0` roll.
+    Ate { tamed_now: bool },
+    /// Cookie consumed: fatal poison + `Float.MAX_VALUE` damage (vanilla).
+    Poisoned,
+    /// Sit order toggled for the owning player.
+    Sat { sitting: bool },
+}
+
+/// Player-side facts `try_perch_on_shoulder` reads.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+struct ShoulderPerchContext {
+    player: [u8; 16],
+    bounding_boxes_intersect: bool,
+    player_on_ground: bool,
+    player_mounted: bool,
+    player_in_water: bool,
+    player_in_powder_snow: bool,
+    shoulder_slot_free: bool,
+}
+
+/// Player-side hazards that force `removeEntitiesOnShoulder`.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default)]
+struct ShoulderDropConditions {
+    fall_distance: f32,
+    in_water: bool,
+    player_flying: bool,
+    player_sleeping: bool,
+    in_powder_snow: bool,
+    player_damaged: bool,
+    spin_attack: bool,
+}
+
+// ---------- Generic environmental egg incubator ----------
+//
+// Data-driven `Block.tick`/`randomTick` hatching for turtle eggs, sniffer
+// eggs and any modded fire/water/thunder egg: the spec declares the required
+// environment, the per-stage tick cost and the hatch payload; `tick_incubation`
+// advances deterministically and reports cracks and the final hatch. Zero
+// hardcoded mod names — mods describe themselves through `Custom` tags.
+
+/// Incubation credit per tick while sitting on a moss-family substrate —
+/// the vanilla sniffer egg's 2x boost (12000 vs 24000 ticks), generalized.
+#[cfg_attr(not(test), allow(dead_code))]
+const MOSS_HATCH_CREDIT: u32 = 2;
+/// Incubation credit per tick on a sand substrate during the night window —
+/// models the turtle egg's always-crack night ticks vs the rare day chance.
+#[cfg_attr(not(test), allow(dead_code))]
+const NIGHT_HATCH_CREDIT: u32 = 8;
+/// Stage boundaries before hatch: vanilla eggs show two crack textures then
+/// hatch on the third qualifying tick (`HATCH` 0 -> 1 -> 2 -> hatch).
+#[cfg_attr(not(test), allow(dead_code))]
+const EGG_CRACK_STAGES: u8 = 3;
+/// Vanilla `SnifferEggBlock`: 24000 ticks (20 min) on ordinary blocks,
+/// halved to 12000 (10 min) on moss — modeled as 8000/stage at 1x credit.
+#[cfg_attr(not(test), allow(dead_code))]
+const SNIFFER_EGG_TICKS_PER_STAGE: u32 = 8_000;
+/// Turtle-egg day-rate stage cost; the night credit makes the night window
+/// dominant, matching vanilla's ~95% night-window hatching.
+#[cfg_attr(not(test), allow(dead_code))]
+const TURTLE_EGG_TICKS_PER_STAGE: u32 = 9_600;
+
+/// Environment observations an `EggSpec` can require or an egg can sit in.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum IncubationEnv {
+    /// Sand-family substrate; incubation accelerates while `is_night` holds
+    /// (the turtle egg's night window).
+    SandNight,
+    /// Moss-family substrate; doubles incubation credit (sniffer egg).
+    MossBlock,
+    /// Modded: the egg sits in or adjacent to fire/lava.
+    OnFire,
+    /// Modded: the egg is submerged.
+    SubmergedWater,
+    /// Modded: a thunderstorm is active.
+    Thunderstorm,
+    /// Any other mod-defined environment tag, matched by exact string.
+    Custom(String),
+}
+
+/// Declarative hatch recipe for one egg block.
+#[cfg_attr(not(test), allow(dead_code))]
+struct EggSpec {
+    /// Stable spec id, conventionally the egg block id.
+    id: String,
+    /// Environment that must hold for any progress; `None` incubates in any
+    /// environment (the sniffer egg hatches on every solid block).
+    required_env: Option<IncubationEnv>,
+    /// Base ticks credited per stage at 1x rate.
+    ticks_per_stage: u32,
+    /// Stage boundaries crossed before hatching.
+    stages: u8,
+    /// Entity id emitted on hatch.
+    spawns_entity: String,
+    /// Whether the hatched entity inherits the planter's owner id.
+    inherit_owner: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl EggSpec {
+    /// Vanilla `TurtleEggBlock`: sand substrate only, hatches a turtle; the
+    /// night window accelerates via `NIGHT_HATCH_CREDIT`.
+    fn turtle_egg() -> Self {
+        Self {
+            id: "minecraft:turtle_egg".into(),
+            required_env: Some(IncubationEnv::SandNight),
+            ticks_per_stage: TURTLE_EGG_TICKS_PER_STAGE,
+            stages: EGG_CRACK_STAGES,
+            spawns_entity: "minecraft:turtle".into(),
+            inherit_owner: false,
+        }
+    }
+
+    /// Vanilla `SnifferEggBlock`: hatches on any block — 24000 ticks normally,
+    /// halved on moss blocks through `MOSS_HATCH_CREDIT`.
+    fn sniffer_egg() -> Self {
+        Self {
+            id: "minecraft:sniffer_egg".into(),
+            required_env: None,
+            ticks_per_stage: SNIFFER_EGG_TICKS_PER_STAGE,
+            stages: EGG_CRACK_STAGES,
+            spawns_entity: "minecraft:sniffer".into(),
+            inherit_owner: false,
+        }
+    }
+}
+
+/// Live incubation progress for one placed egg.
+#[cfg_attr(not(test), allow(dead_code))]
+struct IncubationState {
+    spec: EggSpec,
+    /// Completed stage boundaries, `0..spec.stages`.
+    stage: u8,
+    /// Accumulated credit inside the current stage.
+    ticks_in_stage: u32,
+    /// Planter id, emitted on hatch only when `spec.inherit_owner`.
+    owner: Option<[u8; 16]>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl IncubationState {
+    fn new(spec: EggSpec, owner: Option<[u8; 16]>) -> Self {
+        Self {
+            spec,
+            stage: 0,
+            ticks_in_stage: 0,
+            owner,
+        }
+    }
+
+    fn stage(&self) -> u8 {
+        self.stage
+    }
+
+    fn hatched(&self) -> bool {
+        self.stage >= self.spec.stages
+    }
+}
+
+/// What one `tick_incubation` call produced.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HatchResult {
+    /// The required environment did not hold, the stage is unfinished, or the
+    /// egg already hatched.
+    Waiting,
+    /// One crack stage completed this tick.
+    Cracked { stage: u8 },
+    /// All stages done: the egg hatches `spec.spawns_entity`.
+    Hatched {
+        entity_id: String,
+        owner: Option<[u8; 16]>,
+    },
+}
+
+/// Advance one placed egg by one game tick. Progress accrues only while
+/// `current_env` satisfies `spec.required_env` (`None` accepts everything,
+/// `Custom` tags compare by string). Credit modifiers are environmental:
+/// moss-family substrates double the rate and sand substrates multiply it
+/// during the night window — the vanilla sniffer/turtle rules generalized
+/// to every spec. Emits `HatchResult::Hatched` exactly once, when `stage`
+/// reaches `spec.stages`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn tick_incubation(
+    state: &mut IncubationState,
+    current_env: &IncubationEnv,
+    is_night: bool,
+) -> HatchResult {
+    if state.hatched() {
+        return HatchResult::Waiting;
+    }
+    let env_ok = match &state.spec.required_env {
+        None => true,
+        Some(required) => required == current_env,
+    };
+    if !env_ok {
+        return HatchResult::Waiting;
+    }
+    let mut credit = 1u32;
+    if *current_env == IncubationEnv::MossBlock {
+        credit *= MOSS_HATCH_CREDIT;
+    }
+    if *current_env == IncubationEnv::SandNight && is_night {
+        credit *= NIGHT_HATCH_CREDIT;
+    }
+    state.ticks_in_stage = state.ticks_in_stage.saturating_add(credit);
+    let stage_len = state.spec.ticks_per_stage.max(1);
+    if state.ticks_in_stage < stage_len {
+        return HatchResult::Waiting;
+    }
+    state.ticks_in_stage -= stage_len;
+    state.stage += 1;
+    if state.stage >= state.spec.stages {
+        let owner = if state.spec.inherit_owner {
+            state.owner
+        } else {
+            None
+        };
+        return HatchResult::Hatched {
+            entity_id: state.spec.spawns_entity.clone(),
+            owner,
+        };
+    }
+    HatchResult::Cracked { stage: state.stage }
+}
+
 #[cfg(test)]
 mod mob_behaviors_tests {
     use super::*;
@@ -5255,5 +6093,888 @@ mod p6a_parity_tests {
             in_ground: true,
             ..flying(ProjectileFamily::Trident)
         }));
+    }
+}
+
+#[cfg(test)]
+mod vanilla_horse_tests {
+    use super::*;
+
+    fn player(seed: u8) -> [u8; 16] {
+        let mut id = [0u8; 16];
+        id[0] = seed;
+        id[15] = seed;
+        id
+    }
+
+    fn adult_tamed(kind: EquineKind) -> EquineState {
+        let mut state = EquineState::new(kind);
+        state.tamed = true;
+        state.owner = Some(player(1));
+        state
+    }
+
+    fn run_until_hatch(
+        state: &mut IncubationState,
+        env: &IncubationEnv,
+        is_night: bool,
+        max_ticks: u32,
+    ) -> (u32, HatchResult) {
+        for tick in 1..=max_ticks {
+            let result = tick_incubation(state, env, is_night);
+            if let HatchResult::Hatched { .. } = result {
+                return (tick, result);
+            }
+        }
+        (max_ticks, tick_incubation(state, env, is_night))
+    }
+
+    // ---- Taming & temper -------------------------------------------------
+
+    #[test]
+    fn vanilla_horse_tame_roll_bucks_until_temper() {
+        let mut horse = EquineState::new(EquineKind::Horse);
+        assert_eq!(horse.temper, 0);
+        // Temper 0 can never roll a tame: every ride bucks and +5 temper.
+        // Roll 99 always fails the `roll < temper` check at these tempers.
+        for expected in [5, 10, 15] {
+            assert_eq!(
+                horse.try_equine_tame_tick(99),
+                Some(EquineTameOutcome::Bucked {
+                    new_temper: expected
+                })
+            );
+            assert_eq!(horse.temper, expected);
+            assert!(!horse.tamed);
+        }
+        // At temper 15 a roll below 15 tames; a roll equal to or above bucks.
+        assert_eq!(
+            horse.try_equine_tame_tick(14),
+            Some(EquineTameOutcome::Tamed)
+        );
+        assert!(horse.tamed);
+        // Once tamed the goal no longer runs.
+        assert_eq!(horse.try_equine_tame_tick(0), None);
+    }
+
+    #[test]
+    fn vanilla_horse_tame_roll_strict_less_than_temper() {
+        let mut horse = EquineState::new(EquineKind::Horse);
+        horse.temper = 50;
+        // roll == temper is NOT a tame (vanilla `nextInt < temper` is strict).
+        assert_eq!(
+            horse.try_equine_tame_tick(50),
+            Some(EquineTameOutcome::Bucked { new_temper: 55 })
+        );
+        assert!(!horse.tamed);
+        // roll == temper - 1 tames.
+        horse.temper = 50;
+        assert_eq!(
+            horse.try_equine_tame_tick(49),
+            Some(EquineTameOutcome::Tamed)
+        );
+    }
+
+    #[test]
+    fn vanilla_horse_temper_clamps_at_max_and_llama_caps_at_30() {
+        let mut horse = EquineState::new(EquineKind::Horse);
+        horse.temper = 98;
+        assert_eq!(
+            horse.try_equine_tame_tick(200),
+            Some(EquineTameOutcome::Bucked { new_temper: 100 })
+        );
+        // Another buck stays pinned at 100.
+        assert_eq!(
+            horse.try_equine_tame_tick(200),
+            Some(EquineTameOutcome::Bucked { new_temper: 100 })
+        );
+
+        let mut llama = EquineState::new(EquineKind::Llama);
+        llama.temper = 29;
+        // Llama `getMaxTemper` is 30: +5 clamps to 30, not 100.
+        assert_eq!(
+            llama.try_equine_tame_tick(200),
+            Some(EquineTameOutcome::Bucked { new_temper: 30 })
+        );
+        assert_eq!(llama.temper, 30);
+        // And a llama draw is nextInt(30): roll 29 < 30 tames at full temper.
+        assert_eq!(
+            llama.try_equine_tame_tick(29),
+            Some(EquineTameOutcome::Tamed)
+        );
+    }
+
+    #[test]
+    fn vanilla_horse_tame_with_name_sets_owner() {
+        let mut horse = EquineState::new(EquineKind::Donkey);
+        assert!(horse.tame_with_name(player(7)));
+        assert!(horse.tamed);
+        assert_eq!(horse.owner, Some(player(7)));
+        // Already tamed: tameWithName still applies but reports no change.
+        assert!(!horse.tame_with_name(player(9)));
+        assert_eq!(horse.owner, Some(player(9)));
+    }
+
+    // ---- Feeding / temper gains -------------------------------------------
+
+    fn feq(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn vanilla_horse_feeding_untamed_gains_temper_and_heals() {
+        let mut horse = EquineState::new(EquineKind::Horse);
+        horse.health = 28.0;
+        horse.max_health = 30.0;
+        // Untamed full-table foods always gain temper even at full health.
+        assert_eq!(
+            horse.feed("wheat"),
+            EquineFeedOutcome::Consumed {
+                healed: 2.0,
+                temper_gain: 3,
+                fell_in_love: false,
+            }
+        );
+        assert_eq!(horse.health, 30.0);
+        assert_eq!(horse.temper, 3);
+        // hay_block heals 20 but grants no temper.
+        horse.health = 5.0;
+        assert_eq!(
+            horse.feed("hay_block"),
+            EquineFeedOutcome::Consumed {
+                healed: 20.0,
+                temper_gain: 0,
+                fell_in_love: false,
+            }
+        );
+        assert_eq!(horse.health, 25.0);
+        assert_eq!(horse.temper, 3);
+    }
+
+    #[test]
+    fn vanilla_horse_feeding_tamed_adult_requires_use_for_temper() {
+        let mut horse = adult_tamed(EquineKind::Horse);
+        horse.health = 30.0;
+        // Full-health tamed adult: wheat has nothing to do -> PASS, no temper.
+        assert_eq!(horse.feed("wheat"), EquineFeedOutcome::Pass);
+        assert_eq!(horse.temper, 0);
+        // Hurt tamed adult: heal applies, temper follows because item was used.
+        horse.health = 28.0;
+        assert_eq!(
+            horse.feed("sugar"),
+            EquineFeedOutcome::Consumed {
+                healed: 1.0,
+                temper_gain: 3,
+                fell_in_love: false,
+            }
+        );
+        assert_eq!(horse.temper, 3);
+        // Heal is capped at max_health: hay_block on 25/30 restores only 5.
+        horse.health = 25.0;
+        assert_eq!(
+            horse.feed("hay_block"),
+            EquineFeedOutcome::Consumed {
+                healed: 5.0,
+                temper_gain: 0,
+                fell_in_love: false,
+            }
+        );
+        assert_eq!(horse.health, 30.0);
+    }
+
+    #[test]
+    fn vanilla_horse_golden_foods_trigger_love_on_tamed_adult() {
+        let mut horse = adult_tamed(EquineKind::Horse);
+        horse.health = 30.0;
+        // golden_carrot: love food -> setInLove even at full health, +5 temper.
+        assert_eq!(
+            horse.feed("golden_carrot"),
+            EquineFeedOutcome::Consumed {
+                healed: 0.0,
+                temper_gain: 5,
+                fell_in_love: true,
+            }
+        );
+        assert!(horse.in_love);
+        assert_eq!(horse.temper, 5);
+        // Already in love: no second love, but temper still applies (item used? no —
+        // vanilla: used=false when love gate fails and health full -> PASS).
+        let mut horse2 = adult_tamed(EquineKind::Horse);
+        horse2.in_love = true;
+        horse2.health = 30.0;
+        assert_eq!(horse2.feed("golden_apple"), EquineFeedOutcome::Pass);
+        assert_eq!(horse2.temper, 0);
+        // enchanted_golden_apple shares the golden_apple row (heal 10, temper 10).
+        let mut horse3 = adult_tamed(EquineKind::Horse);
+        horse3.health = 20.0;
+        assert_eq!(
+            horse3.feed("enchanted_golden_apple"),
+            EquineFeedOutcome::Consumed {
+                healed: 10.0,
+                temper_gain: 10,
+                fell_in_love: true,
+            }
+        );
+    }
+
+    #[test]
+    fn vanilla_horse_carrot_is_tag_food_but_does_nothing() {
+        let mut horse = EquineState::new(EquineKind::Horse);
+        assert!(EquineKind::Horse.is_food("carrot"));
+        assert_eq!(horse.feed("carrot"), EquineFeedOutcome::Pass);
+        assert_eq!(horse.temper, 0);
+        // Non-food items pass for every kind.
+        assert_eq!(horse.feed("diamond"), EquineFeedOutcome::Pass);
+    }
+
+    #[test]
+    fn vanilla_horse_baby_age_up_and_llama_food_table() {
+        let mut horse = EquineState::new(EquineKind::Horse);
+        horse.age_ticks = -100;
+        horse.health = 30.0;
+        // Baby at full health: ageUp still consumes the item.
+        assert_eq!(
+            horse.feed("wheat"),
+            EquineFeedOutcome::Consumed {
+                healed: 0.0,
+                temper_gain: 3,
+                fell_in_love: false,
+            }
+        );
+        assert_eq!(horse.age_ticks, -80);
+
+        // Llama food table: wheat + hay only.
+        let mut llama = EquineState::new(EquineKind::Llama);
+        llama.health = 10.0;
+        assert_eq!(
+            llama.feed("wheat"),
+            EquineFeedOutcome::Consumed {
+                healed: 2.0,
+                temper_gain: 3,
+                fell_in_love: false,
+            }
+        );
+        // Apple is HORSE_FOOD but not LLAMA_FOOD.
+        assert_eq!(llama.feed("apple"), EquineFeedOutcome::Pass);
+        // Llama hay_block: heal 10, temper +6, love food.
+        llama.tamed = true;
+        llama.owner = Some(player(3));
+        llama.health = 10.0;
+        assert_eq!(
+            llama.feed("hay_block"),
+            EquineFeedOutcome::Consumed {
+                healed: 10.0,
+                temper_gain: 6,
+                fell_in_love: true,
+            }
+        );
+        assert!(llama.in_love);
+        assert_eq!(llama.temper, 9);
+    }
+
+    // ---- Saddle / chest / armor --------------------------------------------
+
+    #[test]
+    fn vanilla_horse_saddle_requires_tamed_adult() {
+        let mut horse = EquineState::new(EquineKind::Horse);
+        assert!(!horse.equip_saddle());
+        horse.tame_with_name(player(1));
+        horse.age_ticks = -50; // baby cannot wear a saddle
+        assert!(!horse.equip_saddle());
+        horse.age_ticks = 0;
+        assert!(horse.equip_saddle());
+        assert!(horse.saddled);
+        assert!(horse.can_jump());
+        // No double-saddling.
+        assert!(!horse.equip_saddle());
+    }
+
+    #[test]
+    fn vanilla_horse_chest_rules_per_kind() {
+        // Horse never chests.
+        let mut horse = adult_tamed(EquineKind::Horse);
+        assert!(!horse.equip_chest());
+        // Donkey/Mule/Llama chest when tamed adult.
+        for kind in [EquineKind::Donkey, EquineKind::Mule, EquineKind::Llama] {
+            let mut state = adult_tamed(kind);
+            assert!(state.equip_chest(), "{kind:?} should accept a chest");
+            assert!(state.chested);
+            assert!(!state.equip_chest(), "{kind:?} double-chest refused");
+        }
+        // Untamed mule refuses.
+        let mut mule = EquineState::new(EquineKind::Mule);
+        assert!(!mule.equip_chest());
+    }
+
+    #[test]
+    fn vanilla_horse_armor_tiers_horse_only_no_swap() {
+        let mut horse = adult_tamed(EquineKind::Horse);
+        assert!(horse.equip_armor(1)); // leather
+        assert_eq!(horse.armor_tier, 1);
+        // Vanilla refuses to swap a worn piece.
+        assert!(!horse.equip_armor(4));
+        assert_eq!(horse.armor_tier, 1);
+
+        let mut horse2 = adult_tamed(EquineKind::Horse);
+        assert!(horse2.equip_armor(4)); // diamond
+        assert_eq!(horse2.armor_tier, 4);
+        // Tier 0 and out-of-range tiers rejected.
+        assert!(!horse2.equip_armor(0));
+        assert!(!horse2.equip_armor(5));
+
+        // Donkeys/mules/llamas cannot wear horse armor.
+        for kind in [EquineKind::Donkey, EquineKind::Mule, EquineKind::Llama] {
+            let mut state = adult_tamed(kind);
+            assert!(!state.equip_armor(1), "{kind:?} cannot wear armor");
+        }
+        // Untamed horse refuses.
+        let mut wild = EquineState::new(EquineKind::Horse);
+        assert!(!wild.equip_armor(2));
+    }
+
+    // ---- Jump bar ------------------------------------------------------------
+
+    #[test]
+    fn vanilla_horse_jump_scale_exact_boundaries() {
+        // AbstractHorse.onPlayerJump: charge<0 -> 0; >=90 -> 1.0; else
+        // 0.4 + 0.4*charge/90. Exact values at the required charges.
+        assert_eq!(equine_jump_scale(0), 0.4);
+        assert!(feq(equine_jump_scale(45), 0.6));
+        assert!(feq(equine_jump_scale(45), 0.4 + 0.4 * 45.0 / 90.0));
+        assert_eq!(equine_jump_scale(90), 1.0);
+        assert_eq!(equine_jump_scale(100), 1.0);
+        assert_eq!(equine_jump_scale(-30), 0.4);
+        assert_eq!(equine_jump_scale(89), 0.4 + 0.4 * 89.0 / 90.0);
+        assert_eq!(equine_jump_scale(1), 0.4 + 0.4 / 90.0);
+    }
+
+    #[test]
+    fn vanilla_horse_jump_velocity_applies_strength() {
+        // getJumpPower on normal ground: jump_strength * scale.
+        assert!(feq(equine_jump_velocity(0.7, 0), 0.28));
+        assert!(feq(equine_jump_velocity(0.7, 45), 0.42));
+        assert_eq!(equine_jump_velocity(0.7, 90), 0.7);
+        assert_eq!(equine_jump_velocity(0.7, 100), 0.7);
+        assert!(feq(equine_jump_velocity(1.0, 45), 0.6));
+        // Full charge is exactly jump_strength (scale 1.0 is exact).
+        assert_eq!(equine_jump_velocity(0.9, 90), 0.9);
+        // Spawn-roll attribute ranges stay inside vanilla bounds.
+        let fast = EquineState::spawned(
+            EquineKind::Horse,
+            [1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [1.0, 1.0],
+        );
+        assert!(feq(fast.jump_strength, 1.0));
+        assert!(feq(fast.move_speed, 0.3375));
+        let slow = EquineState::spawned(
+            EquineKind::Horse,
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0],
+        );
+        assert!(feq(slow.jump_strength, 0.4));
+        assert!(feq(slow.move_speed, 0.1125));
+    }
+
+    // ---- Breeding ------------------------------------------------------------
+
+    #[test]
+    fn vanilla_horse_breeding_averages_parents_plus_third_draw() {
+        // createOffspringAttribute: clamp, average, spread*(draw-0.5), reflect.
+        // parents 0.5/0.7 in [0.4,1.0], rand_unit=0.5 -> draw 0 -> pure average.
+        assert!(feq(
+            equine_offspring_attribute(0.5, 0.7, 0.4, 1.0, 0.5),
+            0.6
+        ));
+        // rand_unit=1.0 -> draw +0.5 -> avg + spread*0.5.
+        // spread = |0.5-0.7| + 0.15*0.6*2 = 0.2 + 0.18 = 0.38 -> 0.6+0.19=0.79.
+        assert!(feq(
+            equine_offspring_attribute(0.5, 0.7, 0.4, 1.0, 1.0),
+            0.79
+        ));
+        // rand_unit=0.0 -> draw -0.5 -> 0.6-0.19=0.41.
+        assert!(feq(
+            equine_offspring_attribute(0.5, 0.7, 0.4, 1.0, 0.0),
+            0.41
+        ));
+        // Identical parents still get the range pad spread.
+        // avg 0.7, spread = 0 + 0.18 = 0.18 -> rand 1.0 -> 0.7+0.09=0.79.
+        assert!(feq(
+            equine_offspring_attribute(0.7, 0.7, 0.4, 1.0, 1.0),
+            0.79
+        ));
+        // Out-of-range parents clamp first; result reflects back inside.
+        // a=2.0 clamps to 1.0, b=0.0 clamps to 0.4, avg=0.7,
+        // spread=|1.0-0.4|+0.18=0.78, rand=0 -> 0.7-0.39=0.31 < 0.4 ->
+        // reflect: 0.4 + (0.4-0.31) = 0.49.
+        assert!(feq(
+            equine_offspring_attribute(2.0, 0.0, 0.4, 1.0, 0.0),
+            0.49
+        ));
+    }
+
+    #[test]
+    fn vanilla_horse_breed_equine_stats_stays_in_ranges() {
+        let a = EquineState::spawned(
+            EquineKind::Horse,
+            [0.0, 1.0, 0.5],
+            [0.5, 0.5, 0.5],
+            [0.5, 0.5],
+        );
+        let b = EquineState::spawned(
+            EquineKind::Horse,
+            [1.0, 0.0, 0.5],
+            [0.0, 1.0, 0.5],
+            [0.0, 1.0],
+        );
+        for draw in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let child = breed_equine_stats(&a, &b, draw);
+            assert!(
+                (0.4..=1.0).contains(&child.jump_strength),
+                "jump {child:?}"
+            );
+            assert!(
+                (0.1125..=0.3375).contains(&child.move_speed),
+                "speed {child:?}"
+            );
+            assert!((15.0..=30.0).contains(&child.max_health), "hp {child:?}");
+        }
+        // Midpoint draw averages the parents' means.
+        let child = breed_equine_stats(&a, &b, 0.5);
+        // a.jump = 0.4+0.2*1.5=0.7, b.jump = 0.4+0.2*1.5=0.7 -> child 0.7.
+        assert!(feq(child.jump_strength, 0.7));
+    }
+
+    // ---- Parrot --------------------------------------------------------------
+
+    #[test]
+    fn vanilla_parrot_cookie_is_fatal_poison() {
+        let mut wild = ParrotState::new(0);
+        assert_eq!(wild.variant, 0);
+        // Cookie on an untamed parrot: still the poisonous-food branch.
+        assert_eq!(wild.mob_interact(player(1), "cookie", 0), ParrotInteract::Poisoned);
+        assert!(!wild.tamed);
+        // Cookie on a tamed parrot: same fatal outcome.
+        let mut tame = ParrotState::new(0);
+        tame.tamed = true;
+        tame.owner = Some(player(2));
+        assert_eq!(tame.mob_interact(player(2), "cookie", 0), ParrotInteract::Poisoned);
+        // Poison applies before any tame/ownership logic — item names map through
+        // mob_behavior_id, so a namespaced id works too.
+        let mut tame2 = ParrotState::new(0);
+        tame2.tamed = true;
+        tame2.owner = Some(player(2));
+        assert_eq!(
+            tame2.mob_interact(player(2), "minecraft:cookie", 0),
+            ParrotInteract::Poisoned
+        );
+    }
+
+    #[test]
+    fn vanilla_parrot_seed_taming_roll_and_sit_toggle() {
+        let mut parrot = ParrotState::new(0);
+        // nextInt(10)==0 tames on the spot.
+        assert_eq!(
+            parrot.mob_interact(player(4), "wheat_seeds", 0),
+            ParrotInteract::Ate { tamed_now: true }
+        );
+        assert!(parrot.tamed);
+        assert_eq!(parrot.owner, Some(player(4)));
+
+        // A non-zero roll eats but stays wild.
+        let mut wild = ParrotState::new(1);
+        assert_eq!(
+            wild.mob_interact(player(4), "melon_seeds", 7),
+            ParrotInteract::Ate { tamed_now: false }
+        );
+        assert!(!wild.tamed);
+        assert_eq!(wild.owner, None);
+
+        // Tamed + owned + grounded: any non-poisonous item toggles sit.
+        let mut tame = ParrotState::new(2);
+        tame.tamed = true;
+        tame.owner = Some(player(4));
+        assert_eq!(
+            tame.mob_interact(player(4), "wheat_seeds", 0),
+            ParrotInteract::Sat { sitting: true }
+        );
+        assert!(tame.sitting_ordered);
+        assert_eq!(
+            tame.mob_interact(player(4), "stick", 0),
+            ParrotInteract::Sat { sitting: false }
+        );
+        assert!(!tame.sitting_ordered);
+        // A different player cannot toggle the sit order.
+        assert_eq!(
+            tame.mob_interact(player(9), "stick", 0),
+            ParrotInteract::Pass
+        );
+        // Flying parrots ignore the sit toggle.
+        let mut flyer = ParrotState::new(2);
+        flyer.tamed = true;
+        flyer.owner = Some(player(4));
+        flyer.flying = true;
+        assert_eq!(
+            flyer.mob_interact(player(4), "stick", 0),
+            ParrotInteract::Pass
+        );
+        assert!(!flyer.sitting_ordered);
+    }
+
+    #[test]
+    fn vanilla_parrot_shoulder_perch_gates() {
+        let mut parrot = ParrotState::new(0);
+        parrot.tamed = true;
+        parrot.owner = Some(player(5));
+        for _ in 0..PERCH_COOLDOWN_TICKS + 1 {
+            parrot.tick();
+        }
+        let ready = ShoulderPerchContext {
+            player: player(5),
+            bounding_boxes_intersect: true,
+            player_on_ground: true,
+            player_mounted: false,
+            player_in_water: false,
+            player_in_powder_snow: false,
+            shoulder_slot_free: true,
+        };
+        assert!(parrot.try_perch_on_shoulder(&ready));
+        assert!(parrot.on_shoulder);
+        // Already perched parrots do not re-perch.
+        assert!(!parrot.try_perch_on_shoulder(&ready));
+    }
+
+    #[test]
+    fn vanilla_parrot_shoulder_perch_rejects_each_gate() {
+        let base = ShoulderPerchContext {
+            player: player(5),
+            bounding_boxes_intersect: true,
+            player_on_ground: true,
+            player_mounted: false,
+            player_in_water: false,
+            player_in_powder_snow: false,
+            shoulder_slot_free: true,
+        };
+        let fresh = |parrot: &mut ParrotState| {
+            parrot.tamed = true;
+            parrot.owner = Some(player(5));
+            for _ in 0..PERCH_COOLDOWN_TICKS + 1 {
+                parrot.tick();
+            }
+        };
+        // Wrong owner.
+        let mut p = ParrotState::new(0);
+        fresh(&mut p);
+        let mut ctx = base;
+        ctx.player = player(6);
+        assert!(!p.try_perch_on_shoulder(&ctx));
+        // Not intersecting.
+        let mut p = ParrotState::new(0);
+        fresh(&mut p);
+        let mut ctx = base;
+        ctx.bounding_boxes_intersect = false;
+        assert!(!p.try_perch_on_shoulder(&ctx));
+        // Cooldown not elapsed.
+        let mut p = ParrotState::new(0);
+        p.tamed = true;
+        p.owner = Some(player(5));
+        for _ in 0..PERCH_COOLDOWN_TICKS {
+            p.tick();
+        }
+        assert!(!p.try_perch_on_shoulder(&base));
+        // Sit-ordered parrot refuses to perch.
+        let mut p = ParrotState::new(0);
+        fresh(&mut p);
+        p.sitting_ordered = true;
+        assert!(!p.try_perch_on_shoulder(&base));
+        // Flying / leashed refuse.
+        let mut p = ParrotState::new(0);
+        fresh(&mut p);
+        p.flying = true;
+        assert!(!p.try_perch_on_shoulder(&base));
+        let mut p = ParrotState::new(0);
+        fresh(&mut p);
+        p.leashed = true;
+        assert!(!p.try_perch_on_shoulder(&base));
+        // Player-side gates: airborne, mounted, wet, powder snow, slot taken.
+        let gates: [fn(&mut ShoulderPerchContext); 5] = [
+            |c| c.player_on_ground = false,
+            |c| c.player_mounted = true,
+            |c| c.player_in_water = true,
+            |c| c.player_in_powder_snow = true,
+            |c| c.shoulder_slot_free = false,
+        ];
+        for mutate in gates {
+            let mut p = ParrotState::new(0);
+            fresh(&mut p);
+            let mut ctx = base;
+            mutate(&mut ctx);
+            assert!(!p.try_perch_on_shoulder(&ctx));
+        }
+    }
+
+    #[test]
+    fn vanilla_parrot_shoulder_dismount_on_fall_water_damage() {
+        let mut parrot = ParrotState::new(0);
+        parrot.tamed = true;
+        parrot.owner = Some(player(5));
+        parrot.on_shoulder = true;
+        let safe = ShoulderDropConditions::default();
+        // No hazard -> stays.
+        assert!(!parrot.shoulder_dismount(&safe, 100));
+        // Vanilla 20-tick minimum: even a real hazard cannot drop it sooner.
+        assert!(!parrot.shoulder_dismount(
+            &ShoulderDropConditions {
+                fall_distance: 3.0,
+                ..safe
+            },
+            20
+        ));
+        // Fall distance > 0.5 after the minimum -> dismount + cooldown reset.
+        assert!(parrot.shoulder_dismount(
+            &ShoulderDropConditions {
+                fall_distance: 0.6,
+                ..safe
+            },
+            21
+        ));
+        assert!(!parrot.on_shoulder);
+        assert_eq!(parrot.shoulder_ticks, 0);
+
+        // Water entry dismounts too.
+        parrot.on_shoulder = true;
+        assert!(parrot.shoulder_dismount(
+            &ShoulderDropConditions {
+                in_water: true,
+                ..safe
+            },
+            30
+        ));
+        // Player damage dismounts.
+        parrot.on_shoulder = true;
+        assert!(parrot.shoulder_dismount(
+            &ShoulderDropConditions {
+                player_damaged: true,
+                ..safe
+            },
+            30
+        ));
+        // Elytra flight, sleep, powder snow, riptide all dismount.
+        for hazard in [
+            ShoulderDropConditions {
+                player_flying: true,
+                ..safe
+            },
+            ShoulderDropConditions {
+                player_sleeping: true,
+                ..safe
+            },
+            ShoulderDropConditions {
+                in_powder_snow: true,
+                ..safe
+            },
+            ShoulderDropConditions {
+                spin_attack: true,
+                ..safe
+            },
+        ] {
+            parrot.on_shoulder = true;
+            assert!(parrot.shoulder_dismount(&hazard, 30));
+            parrot.on_shoulder = true;
+        }
+    }
+
+    // ---- EnvIncubator ---------------------------------------------------------
+
+    #[test]
+    fn vanilla_horse_turtle_egg_sand_night_accelerates() {
+        let mut day = IncubationState::new(EggSpec::turtle_egg(), None);
+        let (day_ticks, day_result) =
+            run_until_hatch(&mut day, &IncubationEnv::SandNight, false, 60_000);
+        assert_eq!(
+            day_result,
+            HatchResult::Hatched {
+                entity_id: "minecraft:turtle".into(),
+                owner: None,
+            }
+        );
+        assert_eq!(day.stage(), EGG_CRACK_STAGES);
+        // Deterministic totals: 3 x 9600 day ticks vs 3 x 1200 night ticks.
+        assert_eq!(day_ticks, 28_800);
+
+        let mut night = IncubationState::new(EggSpec::turtle_egg(), None);
+        let (night_ticks, night_result) =
+            run_until_hatch(&mut night, &IncubationEnv::SandNight, true, 60_000);
+        assert!(matches!(night_result, HatchResult::Hatched { .. }));
+        assert_eq!(night_ticks, 3_600);
+        // Night credit 8x -> strictly fewer ticks than the day rate.
+        assert!(night_ticks < day_ticks);
+
+        // Wrong substrate never progresses.
+        let mut stuck = IncubationState::new(EggSpec::turtle_egg(), None);
+        for _ in 0..10_000 {
+            assert_eq!(
+                tick_incubation(&mut stuck, &IncubationEnv::OnFire, true),
+                HatchResult::Waiting
+            );
+        }
+        assert_eq!(stuck.stage(), 0);
+    }
+
+    #[test]
+    fn vanilla_horse_sniffer_egg_moss_block_2x_speedup() {
+        let mut plain = IncubationState::new(EggSpec::sniffer_egg(), None);
+        let (plain_ticks, plain_result) =
+            run_until_hatch(&mut plain, &IncubationEnv::Custom("dirt".into()), false, 30_000);
+        assert_eq!(
+            plain_result,
+            HatchResult::Hatched {
+                entity_id: "minecraft:sniffer".into(),
+                owner: None,
+            }
+        );
+        // Vanilla: 24000 ticks on ordinary blocks.
+        assert_eq!(plain_ticks, 24_000);
+
+        let mut moss = IncubationState::new(EggSpec::sniffer_egg(), None);
+        let (moss_ticks, moss_result) =
+            run_until_hatch(&mut moss, &IncubationEnv::MossBlock, false, 30_000);
+        assert!(matches!(moss_result, HatchResult::Hatched { .. }));
+        // Vanilla: 12000 ticks on moss — exactly half.
+        assert_eq!(moss_ticks, 12_000);
+        assert_eq!(plain_ticks, moss_ticks * 2);
+
+        // Cracks land at the right stage boundaries.
+        let mut fresh = IncubationState::new(EggSpec::sniffer_egg(), None);
+        let mut saw = Vec::new();
+        for _ in 0..24_000 {
+            match tick_incubation(&mut fresh, &IncubationEnv::Custom("stone".into()), false) {
+                HatchResult::Cracked { stage } => saw.push(stage),
+                HatchResult::Hatched { .. } => break,
+                HatchResult::Waiting => {}
+            }
+        }
+        assert_eq!(saw, vec![1, 2]);
+    }
+
+    #[test]
+    fn vanilla_horse_generic_fire_water_thunder_eggs() {
+        // A modded fire egg: no mod name hardcoded, just the env contract.
+        let fire_spec = EggSpec {
+            id: "mymod:ember_egg".into(),
+            required_env: Some(IncubationEnv::OnFire),
+            ticks_per_stage: 100,
+            stages: 3,
+            spawns_entity: "mymod:ember_imp".into(),
+            inherit_owner: true,
+        };
+        let mut fire = IncubationState::new(fire_spec, Some(player(11)));
+        assert_eq!(fire.spec.id, "mymod:ember_egg");
+        let (ticks, result) = run_until_hatch(&mut fire, &IncubationEnv::OnFire, false, 1_000);
+        assert_eq!(ticks, 300);
+        assert_eq!(
+            result,
+            HatchResult::Hatched {
+                entity_id: "mymod:ember_imp".into(),
+                owner: Some(player(11)),
+            }
+        );
+        // Owner inheritance off -> owner dropped even when planter known.
+        let no_inherit = EggSpec {
+            id: "mymod:plain_egg".into(),
+            required_env: Some(IncubationEnv::OnFire),
+            ticks_per_stage: 1,
+            stages: 1,
+            spawns_entity: "mymod:plain".into(),
+            inherit_owner: false,
+        };
+        let mut plain = IncubationState::new(no_inherit, Some(player(11)));
+        assert_eq!(
+            tick_incubation(&mut plain, &IncubationEnv::OnFire, false),
+            HatchResult::Hatched {
+                entity_id: "mymod:plain".into(),
+                owner: None,
+            }
+        );
+        // A fire egg in water does not progress.
+        let mut blocked = IncubationState::new(
+            EggSpec {
+                id: "mymod:ember_egg2".into(),
+                required_env: Some(IncubationEnv::OnFire),
+                ticks_per_stage: 100,
+                stages: 3,
+                spawns_entity: "mymod:ember_imp".into(),
+                inherit_owner: false,
+            },
+            None,
+        );
+        for _ in 0..500 {
+            assert_eq!(
+                tick_incubation(&mut blocked, &IncubationEnv::SubmergedWater, false),
+                HatchResult::Waiting
+            );
+        }
+        assert_eq!(blocked.stage(), 0);
+
+        // Thunderstorm egg.
+        let mut storm = IncubationState::new(
+            EggSpec {
+                id: "mymod:storm_egg".into(),
+                required_env: Some(IncubationEnv::Thunderstorm),
+                ticks_per_stage: 50,
+                stages: 2,
+                spawns_entity: "mymod:storm_hawk".into(),
+                inherit_owner: false,
+            },
+            None,
+        );
+        let (storm_ticks, storm_result) =
+            run_until_hatch(&mut storm, &IncubationEnv::Thunderstorm, false, 500);
+        assert_eq!(storm_ticks, 100);
+        assert!(matches!(storm_result, HatchResult::Hatched { .. }));
+        // Same egg in a Custom env does not satisfy the requirement.
+        let mut storm2 = IncubationState::new(
+            EggSpec {
+                id: "mymod:storm_egg".into(),
+                required_env: Some(IncubationEnv::Thunderstorm),
+                ticks_per_stage: 50,
+                stages: 2,
+                spawns_entity: "mymod:storm_hawk".into(),
+                inherit_owner: false,
+            },
+            None,
+        );
+        for _ in 0..200 {
+            assert_eq!(
+                tick_incubation(&mut storm2, &IncubationEnv::Custom("mymod:storm".into()), false),
+                HatchResult::Waiting
+            );
+        }
+
+        // Custom env egg with owner inheritance.
+        let mut custom = IncubationState::new(
+            EggSpec {
+                id: "mymod:rime_egg".into(),
+                required_env: Some(IncubationEnv::Custom("mymod:frost".into())),
+                ticks_per_stage: 1,
+                stages: 1,
+                spawns_entity: "mymod:rime_wisp".into(),
+                inherit_owner: true,
+            },
+            Some(player(12)),
+        );
+        assert_eq!(
+            tick_incubation(&mut custom, &IncubationEnv::Custom("mymod:frost".into()), false),
+            HatchResult::Hatched {
+                entity_id: "mymod:rime_wisp".into(),
+                owner: Some(player(12)),
+            }
+        );
+        // Post-hatch ticks report Waiting forever.
+        assert_eq!(
+            tick_incubation(&mut custom, &IncubationEnv::Custom("mymod:frost".into()), false),
+            HatchResult::Waiting
+        );
     }
 }
