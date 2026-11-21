@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
-//! Sodium/Distant-Horizons style section visibility: a six-bit face mask plus
+//! Section visibility masks and emission proofs: a six-bit face mask plus
 //! cheap "emits nothing" proofs that let sealed and uniform-air sections skip
 //! the greedy mesher entirely.
 

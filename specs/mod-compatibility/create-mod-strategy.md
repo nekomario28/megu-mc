@@ -187,4 +187,4 @@ flowchart TD
 現在並行実行中の以下 2 トラックが `main` へ統合され次第、**Phase C1** へ直結できる：
 
 1. **Track 2（動的ディメンション `DimId` / `DimensionRegistry`）**: 任意次元の `0x07` Registry Data 動的追加と Save v2 名前ベース永続化パターンが確立され、そのまま C1 の多状態カスタムブロック永続化・`RegionKey(dim, rx, rz)` へ接続できる。
-2. **Track 1（Wave B: Sodium S1–S5 + Horizon LOD + Spec/Gate）**: サーバー/クライアント双方のベースライン性能計測が最新化され、C5 比較ベンチマークの基準線が確定する。
+2. **Track 1（Wave B: グラフオクルージョンカリング S1–S5 + 粗 LOD + Spec/Gate）**: サーバー/クライアント双方のベースライン性能計測が最新化され、C5 比較ベンチマークの基準線が確定する。

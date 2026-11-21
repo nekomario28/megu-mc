@@ -69,3 +69,35 @@
 2. **コード一致とテスト値表の置換**: `THIRD_PARTY.md` §8・§10 の通り書き換えおよび 1.21.1 jar 生成ベクタへの置換完了。
 3. **自作ファイルの確定**:
    - `datapacks/{modtest,rectest,spinetest,tagtest,testpack}` および `evidence/foundation/audit-snapshots` はオーナー自作（first-party）と確認済み。
+
+## 5. クリーンルーム実装と先行技術（Prior Art）の整理 / Clean-room implementation & prior art
+
+### (a) 最適化サブシステムの来歴 / Provenance of the optimization subsystems
+
+本リポジトリの最適化サブシステムはすべて、標準的なコンピュータグラフィックス／システム系アルゴリズムに基づく **100% クリーンルームのオリジナル Rust 実装**です:
+
+| サブシステム | アルゴリズム | 実装箇所 |
+|---|---|---|
+| セクション可視性 | 6×6 視界グラフ到達性＋方向単調 BFS の**グラフオクルージョンカリング**、6 平面フラスタムカリング | `client-port/src/visibility.rs` / `culler.rs` / `cull.rs` |
+| 面振り分け | **方向別フェースバケッティング**（7方向バケットのバックフェースカリング） | `client-port/src/mesh.rs` |
+| 描画バッチ | **マルチドローレンダリージョン**（8×4×8 セクション共有頂点/インデックスアリーナ） | `client-port/src/region.rs` |
+| 遠景 | **階層的 LOD**（粗カラムサマリ） | `client-port/src/lod.rs` / `client-app/src/lod.rs` |
+| 生成並列化 | **依存 DAG 並列スケジューリング**（`populate_parallel`、checkerboard feature バッチ） | `src/feature.rs` / `src/worldgen.rs` |
+| 照明 | **インクリメンタルライティング**（`IncrementalLighting` / `LiveLightEngine`） | `src/lighting.rs` / `src/main.rs` |
+| チャンク格納 | **パレット化ストレージ**（0-bit uniform / 4–8-bit indirect / 15-bit direct） | `src/paletted.rs` |
+
+これらのアルゴリズム概念はグラフィックス／システム分野の標準的な手法であり、特定の第三者 Mod のソースを読まずに、vanilla 1.21.1 の観測可能な契約と独自設計から実装しています。
+
+### (b) 非互換ソースの排除 / Exclusion of incompatible sources
+
+**PolyForm Shield**（例: Sodium 0.6+）、**All Rights Reserved / ARR**（例: OptiFine）、その他いかなる第三者 Mod からも、**ソースコード・シェーダー・アセットを一切コピー・移植していません**。PolyForm Shield 1.0.0 は source-available かつ非 OSI で GPL/LGPL/AGPL 系と互換ではなく、ARR はそもそも利用許諾を与えないため、これらの実装を読んで挙動を複製することも禁止しています。挙動の一致は vanilla の観測可能な意味論と wire/parity テストでのみ確立します。
+
+### (c) 互換境界 / Compatibility boundary
+
+| 区分 | ライセンス例 | 扱い |
+|---|---|---|
+| **互換（参照・帰属つき利用可）** | `MIT` / `Apache-2.0` / `BSD` / `ISC` / `Zlib` / `0BSD` / `MPL-2.0` / `LGPL-2.1` / `LGPL-3.0-or-later` | すべて `LGPL-3.0-or-later` / `GPL-3.0-or-later` / `AGPL-3.0-or-later` の 3 者と互換。帰属は [THIRD_PARTY.md](THIRD_PARTY.md) / [NOTICE](NOTICE) に記載 |
+| **概念参照のみ（コード不可）** | 第三者の `GPL-3.0-only` / `AGPL-3.0-only` | ファーストパーティファイルへ直接コピーしない（そのファイルがトリプルライセンスの双方向性を失うため）。必要なら専用モジュール／オプショナルクレートへ分離 |
+| **常時除外（参照自体を禁止）** | `PolyForm Shield`（Sodium 0.6+ 等）、`ARR`（OptiFine 等） | ソースを読まない・コピーしない・移植しない |
+
+なお、歴史的経緯で `specs/client-fork/sodium-culling-architecture.md` というファイル名が残っていますが、これは既存リンク維持のためだけの名前であり、記述されているパイプラインは上記 (a) のクリーンルーム設計です。

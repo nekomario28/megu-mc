@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
-//! Sodium-style section visibility graph. For every ordered pair of section
+//! Section visibility graph for graph occlusion culling. For every ordered
+//! pair of section
 //! faces `(enter, exit)` the graph records whether a path of open cells joins
 //! the two boundary planes: a traversal that enters a section through `enter`
 //! only needs to keep walking toward the faces `visible_from(enter)` reports.

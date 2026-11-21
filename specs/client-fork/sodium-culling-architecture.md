@@ -1,4 +1,12 @@
-# CF-5 — Sodium + Distant-Horizons + culling: the three-layer architecture
+# CF-5 — Graph occlusion culling + coarse LOD: the three-layer architecture
+
+> Filename note: this file keeps its historical name
+> (`sodium-culling-architecture.md`) only so existing markdown links stay
+> valid. Every implementation described here is a clean-room original Rust
+> design built on standard computer-graphics algorithms (visibility-graph
+> reachability, frustum culling, directional face bucketing, multi-draw batch
+> submission, hierarchical LOD); no third-party mod source code, shaders or
+> assets were consulted, copied or ported.
 
 This document fixes the ownership boundary for chunk visibility work in the
 client fork. Three layers exist and must not be merged:
@@ -22,7 +30,7 @@ boundary violation, not an optimization.
 
 ## Layer 1 — Server: packet production and tracking culling
 
-The server side already implements the "Sodium server" half: a bounded,
+The server side already implements the paced, cache-backed half: a bounded,
 ack-paced, look-prioritized chunk sender in front of a shared, validated
 chunk-packet cache.
 
@@ -71,7 +79,7 @@ Stages S1–S6 below are the target pipeline. **Status is marked per stage**;
 into `client-app`, "design" means specified here but not yet implemented.
 Nothing in this section changes the wire contract with the server.
 
-### S1 — 6×6 Visibility Graph (kernel)
+### S1 — 6×6 Visibility Graph (kernel + app)
 
 `FaceVisibility` in [client-port/src/visibility.rs](../../client-port/src/visibility.rs)
 implements the per-section reachability graph: a packed 36-bit matrix where
@@ -93,10 +101,10 @@ The cross-section graph walk that consumes these masks is S2; the
 `SectionVis` boundary-face proofs in [cull.rs](../../client-port/src/cull.rs)
 remain the cheaper per-node predicate where full reachability is not needed.
 
-### S2 — Frustum × direction-monotonic BFS `GraphCuller` (kernel)
+### S2 — Frustum × direction-monotonic BFS `GraphCuller` (kernel + app)
 
 `GraphCuller` in [client-port/src/culler.rs](../../client-port/src/culler.rs)
-implements the Sodium-style occlusion walk: a breadth-first search from the
+implements the graph occlusion-culling walk: a breadth-first search from the
 camera's section over per-section `SectionGraph { through, renderable }`
 masks — the same 36-bit `entry * 6 + exit` reachability shape as S1's
 `FaceVisibility`. Two monotonicity rules bound the walk: a node never exits
@@ -110,12 +118,10 @@ propagates. Unit tests cover a synthetic 8×4×8 terrain + cave fixture
 (≥60% cull), corridor connectivity gating, off-frustum non-traversal,
 multi-entry dedup, and a camera inside sealed geometry.
 
-`client-app` does not call `GraphCuller` yet; wiring it in front of the
-renderer (replacing the full per-section scan in
-[client-app/src/render.rs](../../client-app/src/render.rs)) is part of the
-in-progress app-side integration.
+`client-app` calls `GraphCuller` in front of the renderer in
+[client-app/src/render.rs](../../client-app/src/render.rs) (`ab06605`).
 
-### S3 — 7-direction bucketed backface culling (kernel)
+### S3 — 7-direction bucketed backface culling (kernel + app)
 
 Inside `mesh_section`/`mesh_column`, face emission is decided per direction
 slice — six `Direction` sweeps for unit cubes (`mesh_cubes_fast`, slices
@@ -144,7 +150,7 @@ contiguous per-bucket ranges. The C ABI exposes this as
 query counts; `DirectionBuckets` reports offsets/counts). The "7-direction"
 invariant is unchanged: culling happens before greedy merging, never after.
 
-### S4 — `RenderRegion` 8×4×8 MultiDraw (kernel)
+### S4 — `RenderRegion` 8×4×8 MultiDraw (kernel + app)
 
 [client-port/src/region.rs](../../client-port/src/region.rs) implements the
 region layer inside the kernel: an `8×4×8` slab of sections
@@ -158,9 +164,11 @@ folds every non-empty slot into one `MultiDrawCommand` per
 `(region, box_facing_mask bucket)` pair — the `DrawElementsCommand`
 parameter block matches `glDrawElementsInstancedBaseVertexBaseInstance` —
 replacing per-section draw calls with a single multi-draw submission per
-bucket. `client-app` does not consume `RenderRegions` yet; adopting it is
-part of the in-progress app-side integration and must keep the
-`PackedVertex`/`Quad` contracts unchanged.
+bucket. `client-app` owns a `RenderRegions` store in
+[client-app/src/world.rs](../../client-app/src/world.rs) and batches
+survivors by region in
+[client-app/src/render.rs](../../client-app/src/render.rs) (`ab06605`),
+keeping the `PackedVertex`/`Quad` contracts unchanged.
 
 Existing substrate this builds on:
 
@@ -177,7 +185,7 @@ Existing substrate this builds on:
   already consumes `(coord, &[PackedVertex])` pairs — the region boundary is
   where per-section iteration becomes per-region batching.
 
-### S5 — Incremental translucent sort (kernel scheduler; app wiring partial)
+### S5 — Incremental translucent sort (kernel scheduler + app)
 
 Translucent correctness requires back-to-front order, but re-sorting the
 whole world per frame is the classic churn point. The kernel now provides
@@ -197,15 +205,14 @@ two schedulers in [client-port/src/cache.rs](../../client-port/src/cache.rs):
   whose order actually changed are reported. Dirty sections are skipped —
   their rebuild replaces the order anyway.
 
-App side: `client-app`'s `WorldState::rebuild_dirty_bounded` still calls
-`rebuild_dirty` + the per-section `sort_translucent` FFI
-([client-app/src/world.rs](../../client-app/src/world.rs)); switching it to
-`rebuild_dirty_ordered`/`resort_translucent` is part of the in-progress
-Wave B1/B2 wiring.
+App side: `client-app`'s dirty-queue drain calls
+`rebuild_dirty_ordered(limit, camera, planes)` and the threshold-gated
+`resort_translucent(camera)` in
+[client-app/src/world.rs](../../client-app/src/world.rs) (`ab06605`).
 
-### S6 — Horizon LOD (kernel; app integration pending)
+### S6 — Coarse terrain LOD (kernel + app)
 
-Distant-Horizons-style coarse column summaries for terrain beyond the active
+Coarse distant-terrain column summaries for terrain beyond the active
 mesh distance, generated from the same `SectionView` data the mesher uses —
 no second decode path:
 
@@ -220,10 +227,11 @@ no second decode path:
   the same 24-section Overworld fixture the mesh bench uses —
   [client-port/src/bin/lod_bench.rs](../../client-port/src/bin/lod_bench.rs).
 
-`client-app` does not consume `LodSummary` yet; wiring coarse cells into the
-renderer (replacing per-section meshes beyond the mesh radius) is the
-remaining app-side step and must reuse `LodCell.state_id/tint/top_y/light`
-verbatim — no re-interpretation of block facts.
+`client-app` consumes coarse LOD cells through `LodManager` in
+[client-app/src/lod.rs](../../client-app/src/lod.rs) (`32a59e4`), which
+selects `active_lod_columns` beyond the mesh radius and reuses
+`LodCell.state_id/tint/top_y/light` verbatim — no re-interpretation of
+block facts.
 
 ## Data flow
 

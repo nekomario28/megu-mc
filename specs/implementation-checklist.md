@@ -1,7 +1,7 @@
 # 実装・検証チェックリスト（`perf/worldgen-parallel`）
 
 作成: 2026-11-06。基点: `48dfe73b4e1db64d5ce295f0e533d30780a8fc37`。
-更新: 2026-11-21（同期基準: `a970d82`）。状態: **部分実装・限定検証済み。上位P0〜P4の完了は別判定**。Wave 5（B4 昇格・Save v2・protocol 767・execute・gamerules・block entities・fluids・M3 計測）と Wave B（CF-5 culling カーネル・`ChunkPacketCache`・broadcast culling・perf gate 拡張）を下記「Wave 5 同期受入」「Wave B 同期受入」に反映済み。
+更新: 2026-11-21（同期基準: `fe9ef04`）。状態: **部分実装・限定検証済み。上位P0〜P4の完了は別判定**。Wave 5（B4 昇格・Save v2・protocol 767・execute・gamerules・block entities・fluids・M3 計測）、Wave B（CF-5 culling カーネル・`ChunkPacketCache`・broadcast culling・perf gate 拡張）、および Wave 6（CF-5 `client-app` 配線・P1-3 `LiveLightEngine`・Phase P0 決定性修正・P1–P3 エンジン群・Lane U1–U3・mod 橋渡し）を下記「Wave 5 同期受入」「Wave B 同期受入」「Wave 6 同期受入」に反映済み。
 作成時点の履歴と、下記の現行棚卸しを混同しない。
 
 この文書は**作業順、担当する既存owner、完了ゲートを一覧化する実行台帳**。
@@ -48,6 +48,21 @@
 | `tests/culling_perf_gate.py` 拡張と live gate | self-test に S1 `FaceVisibility`・S2 `GraphCuller`・S3 `DirectionBuckets`・S4 `RenderRegion` slab 再利用・S6 `LodSummary`・Layer 1 `ChunkPacketCache` の Python ミラーを追加。`--self-test` PASS、`--runs 20` PASS（19 metrics、全 quad/vertex カウント pin 一致・全 timing ceiling 内） | live モードは `mesh_bench`/`lod_bench` の出力のみ検査；S2/S4 の新カーネル専用ベンチ予算は今後の登録対象 |
 | `client_fork_e2e.py` | `--self-test` PASS（offline、wrapper parser/tamper/redaction のみ） | フル E2E（ビルド＋Prism/mrpack export＋実サーバー往復）は未実施。release artifact 3種（`libmc_spine_client_mesh.so`/`libmc_spine_kernel.so`/`mc-spine-client`）は未ビルド |
 | 仕様同期 | `specs/client-fork/sodium-culling-architecture.md` を HEAD `a970d82` の Layer 1/Layer 3 実装状態へ更新、`specs/ROADMAP.md` に Wave B 行を追加 | ドキュメントのみ；動作変更なし |
+
+## Wave 6 同期受入（2026-11-21、HEAD `fe9ef04`）
+
+以下は `git log` と checkout 内ソース、および `evidence/` の記録のみを根拠にした実行記録。**「エンジン＋codec＋単体テストが `main` に存在する」ことと「本番 `src/main.rs` live 経路への実配線・wire 検証済み」は厳密に区別する。** 上位 P0〜P4 の完了判定や `P4-1` 同一 SHA gate に代わるものではない。
+
+| 同期項目 | 完了根拠（commit / 実行結果） | 残す境界 |
+|---|---|---|
+| CF-5 `client-app` 配線（Wave B1/B2 完了） | `ab06605`（S1–S5 パイプラインを `client-app/src/world.rs`/`render.rs`/`sim.rs` に配線: `GraphCuller` BFS、`RenderRegions` バッチ、`bucket_draw_mask`、`rebuild_dirty_ordered`/`resort_translucent`）、`32a59e4`（粗 LOD ABI 完了＋`client-app/src/lod.rs` `LodManager`） | S2/S4 専用ベンチ予算の perf gate 登録とフル `client_fork_e2e.py` E2E（ビルド＋Prism/mrpack export＋実サーバー往復）は未実施 |
+| P1-3 永続 live light エンジン | `906eb2a`：`src/main.rs` の `LiveLightEngine` が次元ごとに `IncrementalLighting` を永続化。`WARM=1` live CPU は 16.670 s → **5.110 s（first warm）/ 3.290 s（second warm）**、記録済み pre-change 中央値 16.82 s、Vanilla 参照 4.23 s（[`m3-warm-worldgen.md`](../evidence/perf/m3-warm-worldgen.md)） | after 値は **host contention 下の逐次実行**で、interleaved binary A/B ではない。Vanilla 値は**再計測ではなく過去記録**。equal-work live throughput・G3 50 ms tick budget は未検証 |
+| Phase P0 worldgen 決定性修正 | `ea14165`：並列 carve `aq_sched` parity（`ChunkCols::carve_sched` で build-end flag を保持・carve 入口で復元）、final-column `a2a_flat_corner_memo`、`m3_p1b_single_flight` bounds 更新、`tick_tests` saver starvation 修正 | 個別修正の広い回帰は `P4-1` 同一 SHA 再収集対象 |
+| Phase P1–P3 エンジン群（`main` 到達） | `d17c771`：`src/server_config.rs`（`server.properties` 層）＋`src/server_ops.rs`（ops/ban/whitelist/stdin console）。`dcbbbea`：`src/anvil_io.rs`（Vanilla 1.21.1 Anvil import/export）。`4d4a13f`：`src/workstations_and_mounts.rs`（Stonecutter/Grindstone/Loom/Cartography＋mounts/equipment、protocol 767 codec）。`8811a89`：`src/teams_and_commands.rs`（`/team` `0x60`、`/tick` `0x71`/`0x72`、`/locate`、`/random`、`/return`、`.mcfunction` マクロ）。`96edcd3`：`src/recipes_and_stats.rs`（recipe book、statistics、tab list codec） | **エンジン＋codec＋単体テストは `main` に存在するが、P2/P3 コマンド・workstation・protocol packet の本番 live 配線（W1/W2/W3）は進行中 — マージされるまで live-wired 済みとは扱わない** |
+| Lane U1 信頼性 | `57b4273`：`src/server_reliability.rs`（online-mode crypto/auth、Velocity forwarding、crash isolation、async autosave） | 同上：エンジン＋単体テスト済み、live wire 統合は進行中 |
+| Lane U2 UX | `fe9ef04`：`src/operator_ux.rs`（safe spawn、status ping、LAN、console status、load smoothing） | 同上 |
+| Lane U3 ＋ mod 橋渡し | `db66a9b`：36 個の `BUILTIN_SUPERSEDED_PERF_MODS`（`mod-adapter-core/src/fallback.rs`）＋ `ClientSettings`（`client-app/src/settings.rs`、`import_vanilla_options_txt`/`to_toml`）。`772c47c`：`src/aeronautics_and_dim_bridge.rs`（create-offload 経由の Aeronautics/dimension-mod runtime bridge） | **`ClientSettings` の本番 live 配線（C1）は進行中 — live-wired 済みとは扱わない** |
+| その他の `main` 到達分 | `b22123e`/`4630269`（Create 戦略 spec・culling docs 同期）、`7a2877b`（`create-adapter` crate Phase C1-a）、`c255fa9`（contraption Save v2＋NeoForge registry sync codec）、`41770fa`/`3270c6f`/`1b7c7d8`/`e0fe8a3`（`mod-adapter-core` 抽出・multi-mod bench・4-tier classifier・`mc-spine:lod_v1` channel）、`c5c7788`/`9118323`/`db0b6a6`/`6c77b97`（dynamic dim・dimension-mod support・Aeronautics 6-DOF・create-offload bridge）、`7710277`/`344c6c5`（`server.toml`/anticheat・anti-xray occlusion）、`2011eb0`/`3f48042`/`ccc553d`（random ticks/gamerules・villager/raid/spawning・redstone sensor/bed-sleep/protocol 767 parity の live 配線） | mod-adapter 系の本番フック残件は従来どおり [shim-plan.md](mod-compatibility/shim-plan.md) で追跡 |
 
 ## 現行の棚卸し（2026-11-13、上位項目の一括完了ではない）
 
@@ -117,7 +132,7 @@
   - [x] **M3 P5 & Layer A4 (`d4fa504`, `0c88980`, `30d0346`, `d06032e`)**: 配信パレット書込 -89%、sky spill -52〜63%、floor cache -88%、`EntitySpatialGrid` 単一マップ化、512-entry `MapChunkCache`、`tools/pgo_build.sh`（PGO `full j=8` `2.971s -> 2.656s`、-10.6%、全 dump SHA-256 ビット完全一致）。
   - [x] **Wave 3/4 評価と起動修正**: Issue `#41` palette churn（`01badc1`）および Issue `#42` region storage（`eec10bf`）はそれぞれ評価結果 NO-GO。`WARM=1` 初期81-chunk login timeoutは `6e4e534` + `80617f3` で修正し、`WARM=1 bash tools/load_compare.sh 20 0` が `LOAD ok packets=3265 chunks_moved=90`。当該測定では mc-spine 17.510s CPU / 357.7 MiB / 3 threads、Vanilla 4.610s CPU / 1138.1 MiB / 66 threads。これは記録された負荷の結果で、P4-1全gateの代替ではない。
   - [x] **Wave 5 M3 CPU／アロケーション削減 (`a82df1a`, `cfffac7`)**: [M3 計測](../evidence/perf/m3-warm-worldgen.md) に記録。オフライン full 8-worker CPU `8.748 → 4.821 s`、4×4 アロケーション `10,762,088 → 565,305`（−94.7%）、full/no-feature/terrain の全 dump SHA-256 と cross-seed/dimension のブロック・heightmap が byte 一致。`cfffac7` の octave-noise cache は five-round A/B で full 1-worker CPU −1.00%／8-worker +0.57% の小さく混在した差にとどまり **end-to-end 利得なし**。
-  - [ ] **M3 残り出口（未完了）**: `WARM=1` live CPU は candidate 中央値 16.82 s（baseline 20.56 s）対 Vanilla 4.23 s で依然上回る。live driver の chunk 配信数が異なるため equal-work 比較は未実施、G3 50 ms tick budget も未検証。統合候補 SHA での back-to-back は `P4-1` に委譲。
+  - [ ] **M3 残り出口（未完了）**: `WARM=1` live CPU は P1-3 永続 `LiveLightEngine`（`906eb2a`）で 16.670 s → **5.110 s（first warm）/ 3.290 s（second warm）** に改善（記録済み pre-change 中央値 16.82 s、baseline 20.56 s、Vanilla 参照 4.23 s）。ただし after 値は host contention 下の**逐次実行**で interleaved A/B ではなく、Vanilla 値は過去記録のまま。live driver の chunk 配信数が異なるため equal-work 比較は未実施、G3 50 ms tick budget も未検証。統合候補 SHA での back-to-back は `P4-1` に委譲。
 
 ### R5 — Mod 互換層（NeoForge 1.21.1 S0〜S3+）
 
@@ -142,7 +157,7 @@
 - [x] **CF-2（Client Port描画・増分lighting・Greedy Meshing）**: `client-port/` Greedy Mesher + AO + fluid surfaces + 24-section column meshing + packed 16-byte vertex VBO + translucent sorting と Protocol 767 wire bridge（`0018bac`, `d384fb8`, `8f7a520`）。`768 -> 3` quad reduction（256.00x）、5,208.55 µs/column。増分lighting `src/lighting.rs` directional slab/stair face occlusion・settled emitter-removal parityは15/15 live Vanilla snapshots byte-exact（`6598fe6`, `906ec67`; `tests/lighting_parity_test.py` PASS）。
 - [x] **CF-3（`mods/` 投入型 Rust Integrated Server 第 1 段 JAR パッケージ完了 `8199d14`）**: [build_integrated_mod.py](../tools/client_launcher/build_integrated_mod.py) で Fabric/NeoForge 両対応 `mc-spine-integrated.jar` ＋ `IntegratedServerBridge` ループバック起動・監視・クリーン終了を実装（`client_launcher_test.py` 18/18 PASS。残件：実ゲーム Client Mod ライフサイクル・Direct `ByteBuffer` FFI 接続）。
 - [x] **CF-4（Launcher bundle exporter — `e46f6b0`）**: Prism Launcher / Modrinth `.mrpack` / Official Launcher bundle exporter と SHA-256 integrity gate（`tools/client_launcher/export_launcher_bundle.py`, `tests/client_launcher_test.py` 25/25 PASS）。
-- [ ] **CF-5（Sodium + Horizon 可視化アーキテクチャ — カーネル完了・app 配線未完了）**: [sodium-culling-architecture.md](client-fork/sodium-culling-architecture.md) の 3 層契約に基づき、Layer 1（server）に `ChunkPacketCache` 共有 `0x27` フレーム＋`broadcast_near` Vanilla 半径/次元 culling（`a970d82`、`container_wire.py` live PASS）、Layer 3 の `client-port` カーネルに S1 `FaceVisibility`・S2 `GraphCuller`・S3 `DirectionBuckets`・S4 `RenderRegion`・S5 `rebuild_dirty_ordered`/`resort_translucent`・S6 `LodSummary`（`4be29f7`, `20fb3fa`, `f7bed23`、53 unit tests PASS、`culling_perf_gate.py` self-test＋live `--runs 20` PASS）を実装済み。**残件**: `client-app` への配線（Wave B1/B2 — `GraphCuller`/`RenderRegion`/`LodSummary`/新スケジューラ採用）、S2/S4 専用ベンチ予算の perf gate 登録、フル `client_fork_e2e.py` E2E。
+- [ ] **CF-5（グラフオクルージョンカリング＋粗 LOD 可視化アーキテクチャ — カーネル＋app 配線完了・E2E 未完了）**: [sodium-culling-architecture.md](client-fork/sodium-culling-architecture.md) の 3 層契約に基づき、Layer 1（server）に `ChunkPacketCache` 共有 `0x27` フレーム＋`broadcast_near` Vanilla 半径/次元 culling（`a970d82`、`container_wire.py` live PASS）、Layer 3 の `client-port` カーネルに S1 `FaceVisibility`・S2 `GraphCuller`・S3 `DirectionBuckets`・S4 `RenderRegion`・S5 `rebuild_dirty_ordered`/`resort_translucent`・S6 `LodSummary`（`4be29f7`, `20fb3fa`, `f7bed23`、53 unit tests PASS、`culling_perf_gate.py` self-test＋live `--runs 20` PASS）を実装し、`client-app` への配線（Wave B1/B2 — `GraphCuller`/`RenderRegion`/`LodManager`/新スケジューラ採用）も `ab06605`・`32a59e4` で完了。**残件**: S2/S4 専用ベンチ予算の perf gate 登録、フル `client_fork_e2e.py` E2E（release artifact 3 種のビルド＋実サーバー往復）。
 
 ### R7 — ゲームプレイ完全性（M2→M4：`GP-0`〜`GP-7`）
 
@@ -164,7 +179,7 @@
 
 ## 次の着手
 
-[ROADMAPの直近の状態と出口](ROADMAP.md#直近の実行順2026-11-21-wave-b-同期)を参照する。Wave 3/4・Wave 5 の完了済みレーンと Wave B（CF-5 culling カーネル＋Layer 1 フレームキャッシュ）の同期済み範囲を反映済み。次の統合出口は `client-app` への CF-5 カーネル配線（Wave B1/B2）、`WARM=1` live CPU（Vanilla 4.23 s 対比）、P1 template/Fossil 残件の追跡と `P4-1` 同一SHA Release Gate。
+[ROADMAPの直近の状態と出口](ROADMAP.md)を参照する。Wave 3/4・Wave 5 の完了済みレーンと Wave B（CF-5 culling カーネル＋Layer 1 フレームキャッシュ＋`client-app` 配線）・Wave 6（P1–P3 エンジン群・Lane U1–U3）の同期済み範囲を反映済み。次の統合出口は P2/P3 コマンド・workstation・protocol packet の本番 live 配線（W1/W2/W3）、`ClientSettings` live 配線（C1）、`WARM=1` live CPU の equal-work 再計測（Vanilla 4.23 s 対比、現行 5.110/3.290 s は逐次実行の参考値）、P1 template/Fossil 残件の追跡と `P4-1` 同一SHA Release Gate。
 下記の作成時点の「未実行」を、現在の未実装一覧や最新gate結果に読み替えない。
 
 ## 履歴: 作成時点の作業実績（2026-11-06〜07）

@@ -497,7 +497,7 @@ pub struct McSpineLodCell {
     pub pad: u8,
 }
 
-/// Summarize a chunk column into coarse LOD cells for distant-horizon
+/// Summarize a chunk column into coarse LOD cells for distant-terrain
 /// rendering. `resolution` is `LOD_COARSE` (4) or `LOD_FINE` (16); `count`
 /// receives `resolution * resolution`, the number of cells written in
 /// x-fastest, z-major order. Uses the v1 buffer, count and status conventions:

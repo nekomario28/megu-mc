@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
-//! Distant-Horizons style coarse summaries for chunk columns past the active
+//! Coarse LOD summaries for chunk columns past the active
 //! mesh distance: per-column top height, block and tint at a 4x4 or 16x16 grid.
 
 use crate::section::{Block, SectionView, EDGE, FACE_CELLS, FLUID_TINTED, TINTED};

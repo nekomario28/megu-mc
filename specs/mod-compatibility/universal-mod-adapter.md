@@ -52,7 +52,7 @@ Create 固有の知識を一切持たず、任意の `namespace:path` の Mod �
 4. **汎用 NeoForge Configuration Registry Sync ワイヤ**（`mod-adapter-core/src/neoforge_wire.rs`）
    - 任意の `BlockRegistry` に対して `neoforge:frozen_registry_sync_start` / `neoforge:frozen_registry` / `neoforge:frozen_registry_sync_completed` フレームを生成し、無改造 NeoForge 1.21.1 クライアントと状態 ID を完全同期。
 5. **汎用サーバー＆クライアント基盤最適化（全 Mod 自動恩恵）**
-   - `ChunkPacketCache`（共有 `0x27` + 遅延圧縮）、`broadcast_near` 距離/次元カリング、動的 `DimId` / `DimensionRegistry`、Lithium `BReg`、C2ME/Noisium 並列ワールド生成、Sodium S1–S5 + Horizon LOD。
+   - `ChunkPacketCache`（共有 `0x27` + 遅延圧縮）、`broadcast_near` 距離/次元カリング、動的 `DimId` / `DimensionRegistry`、動的ブロックレジストリ `BReg`、依存 DAG 並列ワールド生成、グラフオクルージョンカリング S1–S5 + 粗 LOD。
 
 ### 層 2: 別枠・特別最適化（フラッグシップネイティブアダプタ）
 

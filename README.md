@@ -52,3 +52,15 @@ MC_SPINE_PORT=25699 cargo run --locked
 コード本体は **`GPL-3.0-or-later`**（[LICENSE](LICENSE)、[NOTICE](NOTICE)、[LICENSING.md](LICENSING.md)）で配布されています。また、寄稿コードおよびファーストパーティコードは `LGPL-3.0-or-later`（[COPYING.LESSER](COPYING.LESSER)）、`GPL-3.0-or-later`（[LICENSE](LICENSE)）、および `AGPL-3.0-or-later`（[COPYING.AGPL](COPYING.AGPL)）のトリプルライセンスで提供されるものとし、将来 `LGPL-3.0-or-later`・`GPL-3.0-or-later`・`AGPL-3.0-or-later` のいずれの間でも自由に行き来できる柔軟性と、C2ME (`MIT`)・Lithium (`LGPL-3.0`)・NeoForge (`LGPL-2.1`) との完全な互換性を確保しています。Fabric / NeoForge 互換レイヤ経由で動的ロードされる独立した外部 Mod JAR には本体のコピーレフトは波及しません。
 
 貢献の条件は、寄稿コードの `LGPL-3.0-or-later` / `GPL-3.0-or-later` / `AGPL-3.0-or-later` トリプルライセンス提供、DCO の `Signed-off-by`（`git commit -s`）、Mojang 逆コンパイルコードや第三者 JAR を混入させないことです。詳細は [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
+
+## クリーンルーム実装と設計上の先行技術（Prior Art）
+
+本リポジトリの最適化サブシステムはすべて、標準的なコンピュータグラフィックス／システム系アルゴリズムに基づく **100% クリーンルームのオリジナル Rust 実装**です。該当するサブシステム:
+
+- **フラスタムカリング＋グラフオクルージョンカリング**（セクション視界グラフと方向単調 BFS — `client-port/src/cull.rs` / `visibility.rs` / `culler.rs`）
+- **方向別フェースバケッティング**（7方向バケットのバックフェースカリング — `client-port/src/mesh.rs`）
+- **マルチドローレンダリージョン**（8×4×8 セクション共有アリーナ — `client-port/src/region.rs`）
+- **階層的 LOD**（粗カラムサマリ — `client-port/src/lod.rs`）
+- **依存 DAG 並列スケジューリング**（`populate_parallel`）、**インクリメンタルライティング**（`src/lighting.rs`）、**パレット化ストレージ**（`src/paletted.rs`）
+
+**PolyForm Shield**（例: Sodium 0.6+）や **All Rights Reserved**（例: OptiFine）、その他いかなる第三者 Mod からも、**ソースコード・シェーダー・アセットを一切コピー・移植していません**。`MIT` / `Apache-2.0` / `BSD` / `MPL-2.0` / `LGPL-3.0-or-later` 系のコードとはライセンス互換ですが、PolyForm Shield や ARR のコードは GPL/LGPL/AGPL 系と互換でないため、参照・コピー・移植の対象から常時除外しています。歴史的経緯で `specs/client-fork/sodium-culling-architecture.md` というファイル名が残っていますが、リンク維持のための名前であり、中身は上記のクリーンルーム設計です。詳細な境界は [LICENSING.md](LICENSING.md) を参照してください。
