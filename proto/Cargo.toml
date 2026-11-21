@@ -1,0 +1,12 @@
+[package]
+name = "mc-spine-proto"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later"
+description = "Standalone canonical protocol IR, versioned protocol tables and the protocol-767 codec for mc-spine"
+
+# Zero external dependencies by contract: this crate is the clean-room protocol
+# core both the server (`src/play_protocol.rs`) and the client
+# (`client-app/src/protocol.rs`) can share, so it must build on pure `std`.
+[dependencies]

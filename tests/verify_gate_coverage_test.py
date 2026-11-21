@@ -30,6 +30,7 @@ EXPECTED_CRATES = (
     "mod-offload",
     "mod-adapter-core",
     "create-adapter",
+    "proto",
 )
 # Root Cargo.toml features the adapter lane must gate. `native-oracle` and
 # `java-compat` are exempt: the first is a CI-only fixture switch, the second is
