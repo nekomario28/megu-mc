@@ -512,6 +512,7 @@ mod entity_push_tests {
             portal_at: Mutex::new(None),
             held: Mutex::new(0),
             effs: Mutex::new(Vec::new()),
+            lod_v1_enabled: AtomicBool::new(false),
         });
         (client, peer)
     }

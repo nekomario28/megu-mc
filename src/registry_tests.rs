@@ -3638,3 +3638,340 @@ fn dynamic_dim_save_roundtrip_survives_slot_reordering() {
     pos_store().lock().unwrap().clear();
     worldgen::reset_dimension_registry();
 }
+
+// ---- Wave B3: dynamic-dimension cache/broadcast isolation + lod_v1 wire ----
+
+/// One varint straight off a socket; `None` on close or read timeout.
+fn lod_test_varint(stream: &mut TcpStream) -> Option<i64> {
+    let mut value = 0i64;
+    for shift in 0..5 {
+        let mut byte = [0u8; 1];
+        std::io::Read::read_exact(stream, &mut byte).ok()?;
+        value |= i64::from(byte[0] & 0x7f) << (7 * shift);
+        if byte[0] & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Every frame that arrived on this socket, as `(packet id, payload)`.
+fn lod_test_frames(stream: &mut TcpStream) -> Vec<(i64, Vec<u8>)> {
+    let mut out = Vec::new();
+    while let Some(len) = lod_test_varint(stream) {
+        let mut body = vec![0u8; usize::try_from(len).ok().unwrap_or(0)];
+        if std::io::Read::read_exact(stream, &mut body).is_err() {
+            break;
+        }
+        let mut sl = &body[..];
+        let Some(pid) = read_varint(&mut sl) else {
+            break;
+        };
+        out.push((pid, sl.to_vec()));
+    }
+    out
+}
+
+/// The `(channel, data)` split of an S2C `0x19` custom-payload body.
+fn lod_test_channel(body: &[u8]) -> (&str, &[u8]) {
+    let mut sl = body;
+    let len = read_protocol_i32(&mut sl).expect("channel length") as usize;
+    let (channel, data) = sl.split_at(len);
+    (std::str::from_utf8(channel).expect("channel utf8"), data)
+}
+
+/// A C2S `0x12` body for `channel` carrying `data`.
+fn lod_test_payload(channel: &str, data: &[u8]) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_str(&mut p, channel);
+    p.extend_from_slice(data);
+    p
+}
+
+/// A `REQ1` request frame: magic, resolution, `cx`/`cz` little-endian.
+fn lod_test_req1(resolution: u8, cx: i32, cz: i32) -> Vec<u8> {
+    let mut d = b"REQ1".to_vec();
+    d.push(resolution);
+    d.extend_from_slice(&cx.to_le_bytes());
+    d.extend_from_slice(&cz.to_le_bytes());
+    d
+}
+
+#[test]
+fn dynamic_dim_chunk_packet_cache_isolates_dimensions() {
+    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
+    worldgen::reset_dimension_registry();
+    let sources = dynamic_dim_entries(&[
+        ("data/lodc/dimension_type/t.json", DYNAMIC_DIM_TYPE),
+        (
+            "data/lodc/dimension/lod_dim.json",
+            r#"{"type": "lodc:t", "generator": {"type": "minecraft:debug"}}"#,
+        ),
+    ]);
+    worldgen::register_datapack_dimensions(&sources, |_| Some(1)).unwrap();
+    let custom = DimId::parse_dimension_id("lodc:lod_dim").expect("custom dimension resolves");
+    assert!(custom.index() >= 3);
+
+    let dims = [DimId::Overworld, DimId::Nether, DimId::End, custom];
+    let mut cache = connection_limits::ChunkPacketCache::new();
+    for (i, &dim) in dims.iter().enumerate() {
+        cache.insert(7, (dim, 0, 0), 100, Vec::new(), vec![0xa0 + i as u8]);
+    }
+    // The same (cx, cz) in four dimensions: four distinct frames, and a hit
+    // returns the same shared Arc a rebuild would produce.
+    let mut frames = Vec::new();
+    for &dim in &dims {
+        let (first, _) = cache.frame(7, (dim, 0, 0), 100, None).expect("cached frame");
+        let (second, _) = cache.frame(7, (dim, 0, 0), 100, None).expect("second read hits");
+        assert!(Arc::ptr_eq(&first, &second), "a cache hit shares one Arc");
+        frames.push(first);
+    }
+    for (i, a) in frames.iter().enumerate() {
+        for b in &frames[i + 1..] {
+            assert_ne!(a, b, "dimensions never share a chunk frame");
+        }
+    }
+    // A revision miss invalidates only the dimension asked with it.
+    assert!(cache.frame(7, (DimId::Overworld, 0, 0), 101, None).is_none());
+    for &dim in &dims[1..] {
+        assert!(
+            cache.frame(7, (dim, 0, 0), 100, None).is_some(),
+            "a revision miss in one dimension never touches the others"
+        );
+    }
+    // The designed wholesale invalidation moves the generation, not one slot.
+    for &dim in &dims {
+        assert!(cache.frame(8, (dim, 0, 0), 100, None).is_none());
+    }
+    worldgen::reset_dimension_registry();
+}
+
+#[test]
+fn dynamic_dim_broadcast_near_isolates_custom_dimensions() {
+    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
+    worldgen::reset_dimension_registry();
+    let sources = dynamic_dim_entries(&[
+        ("data/lodb/dimension_type/t.json", DYNAMIC_DIM_TYPE),
+        (
+            "data/lodb/dimension/lod_dim.json",
+            r#"{"type": "lodb:t", "generator": {"type": "minecraft:debug"}}"#,
+        ),
+    ]);
+    worldgen::register_datapack_dimensions(&sources, |_| Some(1)).unwrap();
+    let custom = DimId::parse_dimension_id("lodb:lod_dim").expect("custom dimension resolves");
+    assert!(custom.index() >= 3);
+
+    // Two clients at the identical (x, z) in different dimensions.
+    let mk_client = |eid: i32, dim: DimId| {
+        let (mut c, r) = effect_tests::client_pair();
+        c.eid = eid;
+        *c.dim.lock().unwrap() = dim;
+        *c.pos.lock().unwrap() = (0.0, 70.0, 0.0, 0.0, 0.0, true);
+        r.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        (Arc::new(c), r)
+    };
+    let (over_client, mut over_r) = mk_client(71, DimId::Overworld);
+    let (custom_client, mut custom_r) = mk_client(72, custom);
+    let audience = [over_client, custom_client];
+
+    // A normal (not long-distance) particle reaches 32 blocks; both clients
+    // stand at the origin, so only the dimension match decides delivery.
+    broadcast_near_in(DimId::Overworld, &audience, 0.0, 70.0, 0.0, -1, |_| {
+        (0x29, vec![0u8])
+    });
+    let over_frames = lod_test_frames(&mut over_r);
+    assert!(
+        over_frames.iter().any(|(pid, _)| *pid == 0x29),
+        "the overworld client receives its dimension's broadcast"
+    );
+    assert!(
+        lod_test_frames(&mut custom_r).is_empty(),
+        "a custom-dimension client at the same (x, z) hears nothing"
+    );
+
+    broadcast_near_in(custom, &audience, 0.0, 70.0, 0.0, -1, |_| (0x29, vec![0u8]));
+    assert!(
+        lod_test_frames(&mut over_r).is_empty(),
+        "the overworld client never hears the custom dimension"
+    );
+    let custom_frames = lod_test_frames(&mut custom_r);
+    assert!(
+        custom_frames.iter().any(|(pid, _)| *pid == 0x29),
+        "the custom-dimension client receives its own broadcast"
+    );
+    worldgen::reset_dimension_registry();
+}
+
+#[test]
+fn lod_v1_wire_matches_client_app_codec_and_vanilla_unaffected() {
+    // -- codec layout, byte for byte against client-app/src/lod.rs --
+    let cells: Vec<LodCellV1> = (0..16u32)
+        .map(|i| LodCellV1 {
+            state_id: 100 + i,
+            tint: 0x7cbd6b,
+            top_y: 64 + i as i16,
+            light: 0xf0,
+        })
+        .collect();
+    let frame = encode_lod_v1(-3, 8, LOD_RES_COARSE, &cells).unwrap();
+    assert_eq!(frame.len(), LOD_V1_HEADER + 16 * LOD_V1_CELL_BYTES);
+    assert_eq!(&frame[..4], b"LOD1");
+    assert_eq!(frame[4], 1, "version byte");
+    assert_eq!(frame[5], 4, "resolution byte");
+    assert_eq!(u16::from_le_bytes([frame[6], frame[7]]), 16, "cell count");
+    assert_eq!(i32::from_le_bytes(frame[8..12].try_into().unwrap()), -3);
+    assert_eq!(i32::from_le_bytes(frame[12..16].try_into().unwrap()), 8);
+    assert_eq!(&frame[16..20], &100u32.to_le_bytes(), "cell 0 state_id");
+    assert_eq!(&frame[20..24], &0x7cbd6bu32.to_le_bytes(), "cell 0 tint");
+    assert_eq!(&frame[24..26], &64i16.to_le_bytes(), "cell 0 top_y");
+    assert_eq!(frame[26], 0xf0, "cell 0 light");
+    let decoded = decode_lod_v1_frame(&frame).unwrap();
+    assert_eq!((decoded.cx, decoded.cz, decoded.resolution), (-3, 8, 4));
+    assert_eq!(decoded.cells, cells);
+    // The client decoder's rejections: any truncation, trailing bytes, wrong
+    // magic/version/resolution, and a cell count off the resolution square.
+    for cut in 0..frame.len() {
+        assert!(decode_lod_v1_frame(&frame[..cut]).is_none(), "truncated at {cut}");
+    }
+    assert!(decode_lod_v1_frame(&[frame.as_slice(), &[0]].concat()).is_none());
+    let mut bad = frame.clone();
+    bad[0] = b'X';
+    assert!(decode_lod_v1_frame(&bad).is_none(), "bad magic");
+    let mut bad = frame.clone();
+    bad[4] = 2;
+    assert!(decode_lod_v1_frame(&bad).is_none(), "bad version");
+    let mut bad = frame.clone();
+    bad[5] = 8;
+    assert!(decode_lod_v1_frame(&bad).is_none(), "bad resolution");
+    let mut bad = frame.clone();
+    bad[6] = 15;
+    assert!(decode_lod_v1_frame(&bad).is_none(), "count off the square");
+    assert!(encode_lod_v1(0, 0, 8, &cells).is_none());
+    assert!(encode_lod_v1(0, 0, LOD_RES_COARSE, &cells[..15]).is_none());
+
+    // -- in-process loopback: socket-paired clients through the 0x12 handler --
+    // A vanilla client never registers: even a forged REQ1 yields nothing.
+    let (vanilla, mut vanilla_r) = effect_tests::client_pair();
+    vanilla_r
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    custom_payload_c2s(&vanilla, &lod_test_payload(LOD_V1_CHANNEL, &lod_test_req1(16, 0, 0)));
+    assert!(!vanilla.lod_v1_enabled.load(Ordering::Relaxed));
+    custom_payload_c2s(&vanilla, &lod_test_payload("minecraft:register", b"some:other"));
+    assert!(!vanilla.lod_v1_enabled.load(Ordering::Relaxed));
+    assert!(
+        lod_test_frames(&mut vanilla_r).is_empty(),
+        "a vanilla client receives zero lod_v1 packets"
+    );
+
+    // Opt-in: registering the channel flips the flag and earns the S2C
+    // `minecraft:register` echo naming `mc-spine:lod_v1`.
+    let (lod, mut lod_r) = effect_tests::client_pair();
+    lod_r.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    custom_payload_c2s(
+        &lod,
+        &lod_test_payload("minecraft:register", b"other:chan\x00mc-spine:lod_v1\x00more:x"),
+    );
+    assert!(lod.lod_v1_enabled.load(Ordering::Relaxed));
+    let acks = lod_test_frames(&mut lod_r);
+    assert_eq!(acks.len(), 1, "exactly one register ack");
+    assert_eq!(acks[0].0, 0x19);
+    let (channel, data) = lod_test_channel(&acks[0].1);
+    assert_eq!(channel, "minecraft:register");
+    assert_eq!(data, b"mc-spine:lod_v1");
+
+    // A fine REQ1 for (0, 0) answers with a 2832-byte LOD1 frame of non-air
+    // surface cells; the coarse request answers 192 bytes.
+    custom_payload_c2s(&lod, &lod_test_payload(LOD_V1_CHANNEL, &lod_test_req1(16, 0, 0)));
+    let frames = lod_test_frames(&mut lod_r);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].0, 0x19);
+    let (channel, data) = lod_test_channel(&frames[0].1);
+    assert_eq!(channel, LOD_V1_CHANNEL);
+    assert_eq!(data.len(), 16 + 256 * 11, "fine frame is header + 256 cells");
+    let fine = decode_lod_v1_frame(data).expect("server frame decodes");
+    assert_eq!((fine.cx, fine.cz, fine.resolution), (0, 0, 16));
+    assert!(
+        fine.cells.iter().all(|c| c.top_y > i16::MIN && c.state_id != 0),
+        "every fine cell is a real non-air surface block"
+    );
+
+    custom_payload_c2s(&lod, &lod_test_payload(LOD_V1_CHANNEL, &lod_test_req1(4, 0, 0)));
+    let frames = lod_test_frames(&mut lod_r);
+    assert_eq!(frames.len(), 1);
+    let (channel, data) = lod_test_channel(&frames[0].1);
+    assert_eq!(channel, LOD_V1_CHANNEL);
+    assert_eq!(data.len(), 16 + 16 * 11, "coarse frame is header + 16 cells");
+    let coarse = decode_lod_v1_frame(data).expect("server frame decodes");
+    assert_eq!((coarse.cx, coarse.cz, coarse.resolution), (0, 0, 4));
+    assert!(
+        coarse.cells.iter().all(|c| c.top_y > i16::MIN && c.state_id != 0),
+        "every coarse cell is a real non-air surface block"
+    );
+
+    // Out-of-range, bad-resolution and malformed requests are dropped without
+    // a packet and without disconnecting the client.
+    for req in [
+        lod_test_req1(16, LOD_V1_MAX_RANGE_CHUNKS + 1, 0),
+        lod_test_req1(16, 0, -LOD_V1_MAX_RANGE_CHUNKS - 1),
+        lod_test_req1(8, 0, 0),
+        b"BAD!".to_vec(),
+    ] {
+        custom_payload_c2s(&lod, &lod_test_payload(LOD_V1_CHANNEL, &req));
+    }
+    assert!(
+        lod_test_frames(&mut lod_r).is_empty(),
+        "unsafe or malformed requests are silently ignored"
+    );
+    // The socket is still usable: a valid request still answers.
+    custom_payload_c2s(&lod, &lod_test_payload(LOD_V1_CHANNEL, &lod_test_req1(4, 0, 0)));
+    assert_eq!(lod_test_frames(&mut lod_r).len(), 1);
+
+    // Unregister flips the flag off and the channel goes silent again.
+    custom_payload_c2s(&lod, &lod_test_payload("minecraft:unregister", b"mc-spine:lod_v1"));
+    assert!(!lod.lod_v1_enabled.load(Ordering::Relaxed));
+    custom_payload_c2s(&lod, &lod_test_payload(LOD_V1_CHANNEL, &lod_test_req1(4, 0, 0)));
+    assert!(lod_test_frames(&mut lod_r).is_empty());
+
+    // -- the column encoder answers for the Overworld and a custom dimension --
+    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
+    worldgen::reset_dimension_registry();
+    let sources = dynamic_dim_entries(&[
+        ("data/lodw/dimension_type/t.json", DYNAMIC_DIM_TYPE),
+        (
+            "data/lodw/dimension/lod_dim.json",
+            r#"{"type": "lodw:t", "generator": {"type": "minecraft:flat",
+                "settings": {"biome": "minecraft:plains", "layers": [
+                    {"block": "minecraft:bedrock", "height": 1},
+                    {"block": "minecraft:stone", "height": 10}]}}}"#,
+        ),
+    ]);
+    worldgen::register_datapack_dimensions(&sources, |_| Some(1)).unwrap();
+    let custom = DimId::parse_dimension_id("lodw:lod_dim").expect("custom dimension resolves");
+    for (dim, want_resolution) in [
+        (DimId::Overworld, LOD_RES_FINE),
+        (DimId::Overworld, LOD_RES_COARSE),
+        (custom, LOD_RES_FINE),
+        (custom, LOD_RES_COARSE),
+    ] {
+        let frame = encode_lod_v1_column(dim, 0, 0, want_resolution).expect("column frame");
+        let decoded = decode_lod_v1_frame(&frame).expect("round trip");
+        assert_eq!((decoded.cx, decoded.cz, decoded.resolution), (0, 0, want_resolution));
+        assert!(
+            decoded.cells.iter().all(|c| c.top_y > i16::MIN && c.state_id != 0),
+            "dimension {:?} column reports non-air surface cells",
+            dim.raw()
+        );
+    }
+    // The flat dimension's top is its layer stack, not the Overworld's hills:
+    // bedrock + 10 stone over min_y -32 puts the first air at -21.
+    let flat = decode_lod_v1_frame(
+        &encode_lod_v1_column(custom, 0, 0, LOD_RES_FINE).expect("flat column"),
+    )
+    .unwrap();
+    assert!(
+        flat.cells.iter().all(|c| c.top_y == -22),
+        "flat dimension tops sit at the layer stack top"
+    );
+    worldgen::reset_dimension_registry();
+}

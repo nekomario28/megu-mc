@@ -58,6 +58,7 @@ include!("commands_execute.rs");
 include!("menus_and_items.rs");
 include!("combat_and_health.rs");
 include!("play_protocol.rs");
+include!("lod_protocol.rs");
 
 // ---------- clients (multiplayer visibility) ----------
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};

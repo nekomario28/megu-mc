@@ -552,6 +552,10 @@ struct Client {
     portal_at: Mutex<Option<Instant>>,
     held: Mutex<i16>,
     effs: Mutex<Vec<Eff>>,
+    // The `mc-spine:lod_v1` opt-in from the client's `minecraft:register`
+    // payload. Vanilla clients never set it and must never receive a `lod_v1`
+    // packet, so the flag is checked before every channel write.
+    lod_v1_enabled: AtomicBool,
 }
 
 impl Client {
@@ -4081,6 +4085,7 @@ fn handle(mut s: TcpStream) {
         effs: Mutex::new(saved_player.as_ref().map_or_else(Vec::new, |save| {
             save.effects.iter().map(|&(id, amp, left)| Eff { id, amp, left }).collect()
         })),
+        lod_v1_enabled: AtomicBool::new(false),
     });
     let mut retry_chunks = chunk_delivery.has_pending();
     me.enter_play_wire(compression, chunk_delivery);
@@ -5495,8 +5500,7 @@ fn handle(mut s: TcpStream) {
                     broadcast(me.eid, |_c| (0x6c, pl.clone()));
                 }
             }
-            #[cfg(feature = "neoforge-events")]
-            0x12 => neoforge_payload(&me, &b),
+            0x12 => custom_payload_c2s(&me, &b),
             0x16 => {
                 // use_entity: attack mobs
                 let mut sl = &b[..];
