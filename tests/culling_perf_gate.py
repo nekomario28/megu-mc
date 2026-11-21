@@ -13,11 +13,12 @@ Two modes:
                 chunk-packet/frame-cache invariants. No cargo, no network,
                 no server binary; deterministic and fast.
 
-  (default)     Live gate: builds client-port's release `lod_bench` and
-                `mesh_bench` when absent, runs them, and asserts both the
-                exact quad/vertex counts (zero output regression) and per-
-                metric timing ceilings (zero perf regression vs the pinned
-                budgets below). `--runs N` controls bench iterations.
+  (default)     Live gate: builds client-port's release `lod_bench`,
+                `mesh_bench` and `cull_region_bench` when absent, runs them,
+                and asserts both the exact quad/vertex/cull/draw counts
+                (zero output regression) and per-metric timing ceilings
+                (zero perf regression vs the pinned budgets below).
+                `--runs N` controls bench iterations.
 
 Usage:
     python3 tests/culling_perf_gate.py --self-test
@@ -1485,6 +1486,79 @@ def self_test():
     check(len(fine_summary.cells_view()) == LOD_FINE * LOD_FINE,
           "lodsummary-fine-size")
 
+    # --- cull_region_bench fixture mirrors (S2 + S4 pinned counts) ---
+    # Same scene rules, frustum and workload as
+    # client-port/src/bin/cull_region_bench.rs; these checks pin the exact
+    # deterministic counts the live gate asserts against the real binary.
+    def bench_is_cave(x, y, z):
+        return ((y == 2 and 7 <= z <= 8 and 2 <= x <= 13)
+                or (y == 2 and 7 <= x <= 8 and 2 <= z <= 13)
+                or (7 <= x <= 8 and 3 <= y <= 4 and 7 <= z <= 8)
+                or (4 <= x <= 7 and 1 <= y <= 2 and 9 <= z <= 12))
+
+    def bench_is_sealed_room(x, y, z):
+        return ((11 <= x <= 12 and 0 <= y <= 1 and 3 <= z <= 4)
+                or (2 <= x <= 3 and 0 <= y <= 1 and 12 <= z <= 13))
+
+    surface_blocks = [stone] * (SECTION_CELLS // 2) + [AIR] * (SECTION_CELLS // 2)
+    surface_graph = SectionGraph(face_visibility_compute(surface_blocks), True)
+    scene = {}
+    for x in range(16):
+        for y in range(8):
+            for z in range(16):
+                if bench_is_sealed_room(x, y, z):
+                    graph = SG_AIR
+                elif bench_is_cave(x, y, z):
+                    graph = SectionGraph(THROUGH_ALL, True)
+                elif y > 4:
+                    graph = SG_AIR
+                elif y == 4:
+                    graph = surface_graph
+                else:
+                    graph = SG_SOLID
+                scene[(x, y, z)] = graph
+    bench_planes = [[-1.0, 0.0, 0.0, 216.0], [0.0, 0.0, -1.0, 184.0],
+                    [1.0, 0.0, 0.0, 4096.0], [0.0, 1.0, 0.0, 4096.0],
+                    [0.0, 0.0, 1.0, 4096.0], [0.0, -1.0, 0.0, 4096.0]]
+    bench_visible, bench_culled = graph_culler_search(scene, (7, 6, 7), bench_planes)
+    bench_renderable = sum(1 for g in scene.values() if g.renderable)
+    check(bench_renderable == PINNED_COUNTS["s2_renderable"],
+          f"bench-s2-renderable-{bench_renderable}")
+    check(len(bench_visible) == PINNED_COUNTS["s2_visible"],
+          f"bench-s2-visible-{len(bench_visible)}")
+    check(bench_culled == PINNED_COUNTS["s2_culled"],
+          f"bench-s2-culled-{bench_culled}")
+    check(len(bench_visible) + bench_culled == bench_renderable,
+          "bench-s2-visible-plus-culled")
+
+    s4_coords = [(x, y, z) for x in range(12) for y in range(4) for z in range(12)]
+    bench_regions = RenderRegions()
+    for c in s4_coords:
+        bench_regions.upload(
+            c, PINNED_COUNTS["s4_sparse_quads"] if (c[0] + c[1] + c[2]) % 3 == 0
+            else PINNED_COUNTS["s4_solid_quads"])
+    bench_evict = [c for c in s4_coords if (c[0] + 2 * c[2] + c[1]) % 7 == 0]
+    check(len(bench_evict) == PINNED_COUNTS["s4_evicted"],
+          f"bench-s4-evicted-{len(bench_evict)}")
+    for c in bench_evict:
+        check(bench_regions.remove(c), f"bench-s4-remove-{c}")
+    check(len(s4_coords) - len(bench_evict) == PINNED_COUNTS["s4_loaded"],
+          "bench-s4-loaded")
+    bench_commands = bench_regions.build_multidraw([96.0, 96.0, 96.0])
+    check(len(bench_commands) == PINNED_COUNTS["s4_commands"],
+          f"bench-s4-commands-{len(bench_commands)}")
+    bench_draws = sum(len(c["draws"]) for c in bench_commands)
+    check(bench_draws == PINNED_COUNTS["s4_draws"], f"bench-s4-draws-{bench_draws}")
+    bench_vertex_words = sum(r.stats()["vertex_words"]
+                             for r in bench_regions.regions.values())
+    bench_index_words = sum(r.stats()["index_words"]
+                            for r in bench_regions.regions.values())
+    check(bench_vertex_words == PINNED_COUNTS["s4_vertex_words"]
+          and bench_index_words == PINNED_COUNTS["s4_index_words"],
+          f"bench-s4-arenas-{bench_vertex_words}-{bench_index_words}")
+    check(bench_vertex_words * 16 + bench_index_words * 4
+          == PINNED_COUNTS["s4_arena_bytes"], "bench-s4-arena-bytes")
+
     # --- Layer 1 ChunkPacketCache (connection_limits.rs) ---
     pcache = ChunkPacketCache()
     key = ("overworld", 4, -7)
@@ -1560,6 +1634,9 @@ CEILINGS_US = {
     "lod_sealed_scan_us": 1000.0,
     "lod_unsealed_us": 1500.0,
     "lod_overworld_us": 1500.0,
+    "s2_search_us": 2500.0,
+    "s4_upload_us": 40000.0,
+    "s4_multidraw_us": 250.0,
 }
 
 PINNED_COUNTS = {
@@ -1570,6 +1647,18 @@ PINNED_COUNTS = {
     "lod_unsealed_quads": 98,
     "lod_overworld_quads": 1872,
     "lod_max_top_y": 133,
+    "s2_renderable": 1264,
+    "s2_visible": 363,
+    "s2_culled": 901,
+    "s4_solid_quads": 6,
+    "s4_sparse_quads": 666,
+    "s4_evicted": 81,
+    "s4_commands": 16,
+    "s4_draws": 495,
+    "s4_loaded": 495,
+    "s4_vertex_words": 520704,
+    "s4_index_words": 781056,
+    "s4_arena_bytes": 11455488,
 }
 
 
@@ -1592,13 +1681,15 @@ def parse_us(pattern, text, name):
 def live_gate(runs, build):
     mesh_bench = BENCH_DIR / "mesh_bench"
     lod_bench = BENCH_DIR / "lod_bench"
-    if not (mesh_bench.is_file() and lod_bench.is_file()):
+    cull_region_bench = BENCH_DIR / "cull_region_bench"
+    binaries = (mesh_bench, lod_bench, cull_region_bench)
+    if not all(binary.is_file() for binary in binaries):
         if not build:
             raise RuntimeError("client-port release benches missing; run without --no-build")
         print("[culling-gate] building client-port release benches", flush=True)
         subprocess.run(["cargo", "build", "--release", "--offline", "--locked", "--bins"],
                        cwd=CLIENT_PORT, check=True, timeout=3600)
-    check(mesh_bench.is_file() and lod_bench.is_file(), "bench-binaries-missing")
+    check(all(binary.is_file() for binary in binaries), "bench-binaries-missing")
 
     results = {}
     failures = []
@@ -1680,6 +1771,46 @@ def live_gate(runs, build):
     record("lod_overworld_quads", int(over.group(2)), None,
            PINNED_COUNTS["lod_overworld_quads"])
     record("lod_overworld_us", float(over.group(1)), CEILINGS_US["lod_overworld_us"], None)
+
+    # --- cull_region_bench (S2 GraphCuller + S4 RenderRegion) ---
+    out = run_bench(cull_region_bench, runs)
+    s2_scene = re.search(r"S2 scene: (\d+) renderable of (\d+) sections", out)
+    check(s2_scene is not None, "cull_region_bench-s2-scene-line")
+    record("s2_renderable", int(s2_scene.group(1)), None,
+           PINNED_COUNTS["s2_renderable"])
+    s2 = re.search(r"s2 search: (\d+) visible, (\d+) culled, ([\d.]+) us/iter", out)
+    check(s2 is not None, "cull_region_bench-s2-line")
+    record("s2_visible", int(s2.group(1)), None, PINNED_COUNTS["s2_visible"])
+    record("s2_culled", int(s2.group(2)), None, PINNED_COUNTS["s2_culled"])
+    record("s2_search_us", float(s2.group(3)), CEILINGS_US["s2_search_us"], None)
+
+    s4_workload = re.search(r"S4 workload: (\d+) sections across (\d+) regions, "
+                            r"(\d+) evicted/iter \((\d+) solid \+ (\d+) sparse "
+                            r"fixture quads\)", out)
+    check(s4_workload is not None, "cull_region_bench-s4-workload-line")
+    record("s4_evicted", int(s4_workload.group(3)), None, PINNED_COUNTS["s4_evicted"])
+    record("s4_solid_quads", int(s4_workload.group(4)), None,
+           PINNED_COUNTS["s4_solid_quads"])
+    record("s4_sparse_quads", int(s4_workload.group(5)), None,
+           PINNED_COUNTS["s4_sparse_quads"])
+    record("s4_upload_us",
+           parse_us(r"s4 upload\+evict: ([\d.]+) us/iter", out, "cull_region_bench"),
+           CEILINGS_US["s4_upload_us"], None)
+    s4 = re.search(r"s4 multidraw: ([\d.]+) us/iter, (\d+) commands, (\d+) draws", out)
+    check(s4 is not None, "cull_region_bench-s4-line")
+    record("s4_multidraw_us", float(s4.group(1)), CEILINGS_US["s4_multidraw_us"], None)
+    record("s4_commands", int(s4.group(2)), None, PINNED_COUNTS["s4_commands"])
+    record("s4_draws", int(s4.group(3)), None, PINNED_COUNTS["s4_draws"])
+    arenas = re.search(r"s4 arenas: (\d+) vertex words \+ (\d+) index words "
+                       r"\((\d+) bytes active over (\d+) loaded sections\)", out)
+    check(arenas is not None, "cull_region_bench-s4-arenas-line")
+    record("s4_vertex_words", int(arenas.group(1)), None,
+           PINNED_COUNTS["s4_vertex_words"])
+    record("s4_index_words", int(arenas.group(2)), None,
+           PINNED_COUNTS["s4_index_words"])
+    record("s4_arena_bytes", int(arenas.group(3)), None,
+           PINNED_COUNTS["s4_arena_bytes"])
+    record("s4_loaded", int(arenas.group(4)), None, PINNED_COUNTS["s4_loaded"])
 
     if failures:
         for failure in failures:
