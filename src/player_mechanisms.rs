@@ -1,6 +1,12 @@
 // R7 GP-5: player mechanisms for Java Edition 1.21.1.
 // Included at the crate root by main.rs.
 
+// Lane P5e: name-keyed item registry facts (#217) and the typed block entity
+// models (#216) share this file's flat crate-root scope, the same way
+// commands_core.rs includes datapack.rs.
+include!("item_registry.rs");
+include!("block_entity.rs");
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn count_enchanting_bookshelves(
     (x, y, z): (i32, i32, i32),
@@ -905,12 +911,10 @@ fn mining_speed_with_modifiers(
         speed *= 1.0 + 0.2 * (amplifier.max(0) as f32 + 1.0);
     }
     if let Some(amplifier) = mining_fatigue_amplifier {
-        let multiplier = if amplifier >= 3 {
-            0.00081
-        } else {
-            0.3_f32.powi(amplifier.max(0) + 1)
-        };
-        speed *= multiplier;
+        // `LivingEntity`'s switch table hardcodes each level; amplifier 2 is
+        // 0.0027, not 0.3^3.
+        const FATIGUE: [f32; 4] = [0.3, 0.09, 0.0027, 0.00081];
+        speed *= FATIGUE[amplifier.clamp(0, 3) as usize];
     }
     if in_water_without_aqua_affinity {
         speed *= 0.2;
@@ -934,53 +938,178 @@ fn instant_mining_break(speed: f32, block_hardness: f32) -> bool {
     block_hardness <= 0.0 || mining_damage_per_tick(speed, block_hardness) >= 1.0
 }
 
+/// Every input vanilla 1.21.1 `Player.getDestroySpeed` consults, pre-resolved
+/// so the evaluator stays pure: the held item's `minecraft:tool` component
+/// answers the base speed, then Efficiency, the dig-speed effect, Mining
+/// Fatigue, the water penalty and the airborne penalty apply in that order.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default)]
+struct MiningSpeedContext<'a> {
+    /// Held item name, e.g. "diamond_pickaxe"; anything without a tool
+    /// component (including ""/"air", the bare hand) mines at speed 1.
+    held_item: &'a str,
+    /// Block being mined, e.g. "cobweb".
+    block: &'a str,
+    /// The block's `mineable/<kind>` tag in the encoding `BReg::tool_kind_of`
+    /// uses: shovel = 1, pickaxe = 2, axe = 3, hoe = 4, anything else = none.
+    preferred_tool: i8,
+    efficiency_level: i32,
+    /// Haste amplifier, `None` when the effect is absent.
+    haste_amplifier: Option<i32>,
+    /// Conduit Power amplifier, `None` when the effect is absent.
+    conduit_power_amplifier: Option<i32>,
+    /// Mining Fatigue amplifier, `None` when the effect is absent.
+    mining_fatigue_amplifier: Option<i32>,
+    /// `isEyeInFluid(FluidTags.WATER)`.
+    submerged_in_water: bool,
+    has_aqua_affinity: bool,
+    /// `onGround()` - being airborne divides the speed by five.
+    on_ground: bool,
+}
+
+/// The `minecraft:tool` component half of `ItemStack.getDestroySpeed`: the held
+/// item's speed against `block`. `preferred_tool` is the block's
+/// `mineable/<kind>` tag as `BReg::tool_kind_of` encodes it - shovel 1,
+/// pickaxe 2, axe 3, hoe 4, anything else no preferred tool.
+#[cfg_attr(not(test), allow(dead_code))]
+fn mining_tool_speed(item: &str, block: &str, preferred_tool: i8) -> f32 {
+    let item = item.strip_prefix("minecraft:").unwrap_or(item);
+    let block = block.strip_prefix("minecraft:").unwrap_or(block);
+    if item == "shears" {
+        // ShearsItem's Tool component: cobweb and leaves 15, wool 5,
+        // vine and glow lichen 2, everything else the default 1.
+        return if block == "cobweb" || block.ends_with("_leaves") {
+            15.0
+        } else if block.ends_with("_wool") {
+            5.0
+        } else if matches!(block, "vine" | "glow_lichen") {
+            2.0
+        } else {
+            1.0
+        };
+    }
+    let Some((tier, kind)) = tool_parts(item) else {
+        return 1.0;
+    };
+    if kind == "sword" {
+        // SwordItem's Tool component: cobweb 15; the 1.21.1 instant break is
+        // BambooBlock.calcBlockBreakingDelta answering 1 for any sword;
+        // sword_efficient 1.5; everything else the default 1.
+        return if block == "cobweb" {
+            15.0
+        } else if matches!(block, "bamboo" | "bamboo_sapling") {
+            f32::MAX
+        } else if sword_efficient(block) {
+            1.5
+        } else {
+            1.0
+        };
+    }
+    let mines = match kind {
+        "shovel" => 1,
+        "pickaxe" => 2,
+        "axe" => 3,
+        "hoe" => 4,
+        _ => return 1.0,
+    };
+    if preferred_tool != mines {
+        return 1.0;
+    }
+    match tier {
+        "wooden" => 2.0,
+        "stone" => 4.0,
+        "iron" => 6.0,
+        "diamond" => 8.0,
+        "netherite" => 9.0,
+        "golden" => 12.0,
+        _ => 1.0,
+    }
+}
+
+/// The 1.21.1 `sword_efficient` block tag: all leaves, vine, glow lichen,
+/// pumpkins, melon, cocoa, big dripleaf, and both chorus blocks.
+#[cfg_attr(not(test), allow(dead_code))]
+fn sword_efficient(block: &str) -> bool {
+    block.ends_with("_leaves")
+        || matches!(
+            block,
+            "vine"
+                | "glow_lichen"
+                | "pumpkin"
+                | "carved_pumpkin"
+                | "jack_o_lantern"
+                | "melon"
+                | "cocoa"
+                | "big_dripleaf"
+                | "big_dripleaf_stem"
+                | "chorus_plant"
+                | "chorus_flower"
+        )
+}
+
+/// Vanilla 1.21.1 `Player.getDestroySpeed` (`digSpeed` in yarn): the tool
+/// component speed, Efficiency only when the tool already beats bare hands,
+/// `MobEffectUtil.getDigSpeedAmplification` (the stronger of Haste and Conduit
+/// Power), the Mining Fatigue switch table, the /5 water penalty without Aqua
+/// Affinity, and the /5 airborne penalty.
+#[cfg_attr(not(test), allow(dead_code))]
+fn vanilla_destroy_speed(ctx: &MiningSpeedContext) -> f32 {
+    let mut speed = mining_tool_speed(ctx.held_item, ctx.block, ctx.preferred_tool);
+    if speed > 1.0 && ctx.efficiency_level > 0 {
+        speed += (ctx.efficiency_level * ctx.efficiency_level + 1) as f32;
+    }
+    if let Some(amplifier) = ctx.haste_amplifier.max(ctx.conduit_power_amplifier) {
+        speed *= 1.0 + (amplifier.max(0) + 1) as f32 * 0.2;
+    }
+    if let Some(amplifier) = ctx.mining_fatigue_amplifier {
+        // `LivingEntity.getDigSpeed`'s switch table, verbatim.
+        const FATIGUE: [f32; 4] = [0.3, 0.09, 0.0027, 0.00081];
+        speed *= FATIGUE[amplifier.clamp(0, 3) as usize];
+    }
+    if ctx.submerged_in_water && !ctx.has_aqua_affinity {
+        speed /= 5.0;
+    }
+    if !ctx.on_ground {
+        speed /= 5.0;
+    }
+    speed
+}
+
+/// How many ticks `getDestroyProgress` accumulation takes to break the block:
+/// `damage_per_tick = speed / hardness / (can_harvest ? 30 : 100)` and the
+/// block drops once the running sum reaches 1. `0` means instant (zero
+/// hardness, or `damage_per_tick >= 1` on the first check); `u32::MAX` means
+/// never - a negative hardness block like bedrock keeps returning zero
+/// progress, and so does mining with no effective speed.
+#[cfg_attr(not(test), allow(dead_code))]
+fn vanilla_mining_ticks(hardness: f32, can_harvest: bool, speed: f32) -> u32 {
+    if hardness == 0.0 {
+        return 0;
+    }
+    if hardness < 0.0 || speed <= 0.0 {
+        return u32::MAX;
+    }
+    let damage_per_tick = speed / hardness / if can_harvest { 30.0 } else { 100.0 };
+    if damage_per_tick >= 1.0 {
+        return 0;
+    }
+    (1.0 / damage_per_tick).ceil() as u32
+}
+
+/// The block state's `mineable/<kind>` tag through the loaded 1.21.1 registry,
+/// in `mining_tool_speed`'s encoding; -1 when the registry is not loaded or
+/// the block has no preferred tool.
+#[cfg_attr(not(test), allow(dead_code))]
+fn preferred_mining_tool(state: u32) -> i8 {
+    breg().map_or(-1, |reg| reg.tool_kind_of(state))
+}
+
+/// `max_damage` by item name; the canonical table is `max_durability_by_name`
+/// in `item_registry.rs` so every caller shares one name-keyed source (#217:
+/// crossbow is 465, golden armour is x7, not x15).
 #[cfg_attr(not(test), allow(dead_code))]
 fn item_max_durability(item: &str) -> Option<u32> {
-    if let Some((tier, kind)) = tool_parts(item) {
-        return Some(match (tier, kind) {
-            ("wooden", _) => 59,
-            ("stone", _) => 131,
-            ("iron", _) => 250,
-            ("golden", _) => 32,
-            ("diamond", _) => 1_561,
-            ("netherite", _) => 2_031,
-            _ => return None,
-        });
-    }
-    if let Some((material, piece)) = armor_parts(item) {
-        let multiplier = match material {
-            "leather" => 5,
-            "chainmail" | "iron" | "golden" => 15,
-            "diamond" => 33,
-            "netherite" => 37,
-            "turtle" => return Some(275),
-            _ => return None,
-        };
-        let base = match piece {
-            "helmet" => 11,
-            "chestplate" => 16,
-            "leggings" => 15,
-            "boots" => 13,
-            _ => return None,
-        };
-        return Some(multiplier * base);
-    }
-    Some(match item {
-        "bow" => 384,
-        "crossbow" => 326,
-        "trident" => 250,
-        "elytra" => 432,
-        "shield" => 336,
-        "flint_and_steel" => 64,
-        "shears" => 238,
-        "brush" => 64,
-        "mace" => 500,
-        "wolf_armor" => 64,
-        "fishing_rod" => 64,
-        "carrot_on_a_stick" => 25,
-        "warped_fungus_on_a_stick" => 100,
-        _ => return None,
-    })
+    max_durability_by_name(item).map(u32::from)
 }
 
 #[cfg(test)]
@@ -1181,7 +1310,7 @@ mod player_mechanisms_combat_mining_durability_tests {
         assert_eq!(item_max_durability("turtle_helmet"), Some(275));
         for (item, durability) in [
             ("bow", 384),
-            ("crossbow", 326),
+            ("crossbow", 465),
             ("trident", 250),
             ("elytra", 432),
             ("shield", 336),
@@ -3805,5 +3934,184 @@ mod p2_parity_player_tests {
         add_player_xp_points(&mut xp, rewards.experience).unwrap();
         assert_eq!(xp.total_experience, 100);
         assert!(xp.level > 0 || xp.progress > 0.0);
+    }
+}
+
+#[cfg(test)]
+mod p5e_parity_mining_tests {
+    use super::*;
+
+    fn ctx<'a>(item: &'a str, block: &'a str, preferred_tool: i8) -> MiningSpeedContext<'a> {
+        MiningSpeedContext {
+            held_item: item,
+            block,
+            preferred_tool,
+            efficiency_level: 0,
+            haste_amplifier: None,
+            conduit_power_amplifier: None,
+            mining_fatigue_amplifier: None,
+            submerged_in_water: false,
+            has_aqua_affinity: false,
+            on_ground: true,
+        }
+    }
+
+    #[test]
+    fn p5e_parity_tool_speed_matches_tier_when_the_tool_is_preferred() {
+        // mineable/<kind>: shovel=1, pickaxe=2, axe=3, hoe=4, none=-1.
+        for (tier, speed) in [
+            ("wooden", 2.0_f32),
+            ("stone", 4.0),
+            ("iron", 6.0),
+            ("diamond", 8.0),
+            ("netherite", 9.0),
+            ("golden", 12.0),
+        ] {
+            assert_eq!(
+                mining_tool_speed(&format!("{tier}_pickaxe"), "stone", 2),
+                speed,
+                "{tier}_pickaxe on mineable/pickaxe"
+            );
+            // A pickaxe against a shovel block mines at bare-hand speed.
+            assert_eq!(mining_tool_speed(&format!("{tier}_pickaxe"), "dirt", 1), 1.0);
+            // Swords never get the tier speed.
+            assert_eq!(mining_tool_speed(&format!("{tier}_sword"), "stone", 2), 1.0);
+        }
+        // Bare hand and non-tools are always 1.
+        assert_eq!(mining_tool_speed("", "stone", 2), 1.0);
+        assert_eq!(mining_tool_speed("apple", "stone", 2), 1.0);
+        // A matching item on a block with no preferred tool is still 1.
+        assert_eq!(mining_tool_speed("diamond_pickaxe", "glass", -1), 1.0);
+        // The registry-side resolver answers the same encoding or -1.
+        assert!((-1..=4).contains(&preferred_mining_tool(1)));
+    }
+
+    #[test]
+    fn p5e_parity_shears_and_sword_have_their_component_speeds() {
+        // Shears: cobweb/leaves 15, wool 5, vine & glow lichen 2, else 1.
+        assert_eq!(mining_tool_speed("shears", "cobweb", -1), 15.0);
+        assert_eq!(mining_tool_speed("shears", "oak_leaves", 4), 15.0);
+        assert_eq!(mining_tool_speed("shears", "red_wool", -1), 5.0);
+        assert_eq!(mining_tool_speed("shears", "vine", 3), 2.0);
+        assert_eq!(mining_tool_speed("shears", "glow_lichen", 3), 2.0);
+        assert_eq!(mining_tool_speed("shears", "stone", 2), 1.0);
+        // Sword: cobweb 15, instantly-mined bamboo maximal, sword_efficient 1.5.
+        assert_eq!(mining_tool_speed("diamond_sword", "cobweb", -1), 15.0);
+        assert!(mining_tool_speed("wooden_sword", "bamboo", 3) > 1.0e30);
+        assert!(mining_tool_speed("netherite_sword", "bamboo_sapling", -1) > 1.0e30);
+        assert_eq!(mining_tool_speed("iron_sword", "oak_leaves", 4), 1.5);
+        assert_eq!(mining_tool_speed("iron_sword", "pumpkin", 3), 1.5);
+        assert_eq!(mining_tool_speed("iron_sword", "chorus_plant", 3), 1.5);
+        assert_eq!(mining_tool_speed("iron_sword", "stone", 2), 1.0);
+    }
+
+    #[test]
+    fn p5e_parity_efficiency_only_applies_above_speed_one() {
+        // Diamond pickaxe + Efficiency V: 8 + 26 = 34.
+        let mut c = ctx("diamond_pickaxe", "stone", 2);
+        c.efficiency_level = 5;
+        assert_eq!(vanilla_destroy_speed(&c), 34.0);
+        // Efficiency never applies to a bare hand or a wrong tool (speed 1).
+        let mut wrong = ctx("diamond_pickaxe", "dirt", 1);
+        wrong.efficiency_level = 5;
+        assert_eq!(vanilla_destroy_speed(&wrong), 1.0);
+        let mut hand = ctx("", "stone", 2);
+        hand.efficiency_level = 5;
+        assert_eq!(vanilla_destroy_speed(&hand), 1.0);
+        // But it does apply to a 1.5 sword-efficient match.
+        let mut sword = ctx("iron_sword", "oak_leaves", 4);
+        sword.efficiency_level = 2;
+        assert_eq!(vanilla_destroy_speed(&sword), 1.5 + 5.0);
+    }
+
+    #[test]
+    fn p5e_parity_haste_conduit_and_the_fatigue_switch_table() {
+        // Diamond pickaxe + Efficiency V + Haste II: 34 * 1.4 = 47.6.
+        let mut c = ctx("diamond_pickaxe", "stone", 2);
+        c.efficiency_level = 5;
+        c.haste_amplifier = Some(1);
+        assert!((vanilla_destroy_speed(&c) - 47.6).abs() < 0.001);
+        // Conduit Power I (amp 0) alone: 34 * 1.2 = 40.8.
+        c.haste_amplifier = None;
+        c.conduit_power_amplifier = Some(0);
+        assert!((vanilla_destroy_speed(&c) - 40.8).abs() < 0.001);
+        // The stronger of the two wins: Haste 0 vs Conduit 2 -> x1.6.
+        c.haste_amplifier = Some(0);
+        c.conduit_power_amplifier = Some(2);
+        assert!((vanilla_destroy_speed(&c) - 54.4).abs() < 0.001);
+        // Mining Fatigue I-IV is the hardcoded LivingEntity switch table.
+        for (amplifier, factor) in [(0, 0.3), (1, 0.09), (2, 0.0027), (3, 0.00081)] {
+            let mut tired = ctx("diamond_pickaxe", "stone", 2);
+            tired.efficiency_level = 5;
+            tired.mining_fatigue_amplifier = Some(amplifier);
+            assert_eq!(
+                vanilla_destroy_speed(&tired),
+                34.0 * factor as f32,
+                "fatigue amplifier {amplifier}"
+            );
+        }
+        // Amplifier above III clamps to the last switch arm, like vanilla's default.
+        let mut over = ctx("diamond_pickaxe", "stone", 2);
+        over.efficiency_level = 5;
+        over.mining_fatigue_amplifier = Some(7);
+        assert!((vanilla_destroy_speed(&over) - 34.0 * 0.00081).abs() < 1e-6);
+    }
+
+    #[test]
+    fn p5e_parity_water_and_airborne_penalties() {
+        let base = ctx("diamond_pickaxe", "stone", 2);
+        assert_eq!(vanilla_destroy_speed(&base), 8.0);
+        // Underwater without Aqua Affinity: x0.2.
+        let mut wet = base;
+        wet.submerged_in_water = true;
+        assert_eq!(vanilla_destroy_speed(&wet), 1.6);
+        // Aqua Affinity cancels the water penalty completely.
+        wet.has_aqua_affinity = true;
+        assert_eq!(vanilla_destroy_speed(&wet), 8.0);
+        // Airborne (jumping / flying / falling): x0.2 even on dry land.
+        let mut air = base;
+        air.on_ground = false;
+        assert_eq!(vanilla_destroy_speed(&air), 1.6);
+        // Wet and airborne stack to x0.04, in vanilla order.
+        air.submerged_in_water = true;
+        assert_eq!(vanilla_destroy_speed(&air), 0.32);
+        air.has_aqua_affinity = true;
+        assert_eq!(vanilla_destroy_speed(&air), 1.6);
+    }
+
+    #[test]
+    fn p5e_parity_mining_ticks_harvest_and_instant_thresholds() {
+        // Stone (1.5) with a correct tool at diamond speed (8): 8/1.5/30 -> 6 ticks.
+        assert_eq!(vanilla_mining_ticks(1.5, true, 8.0), 6);
+        // The same tool without drops pays the /100 rate: 8/1.5/100 -> 19 ticks.
+        assert_eq!(vanilla_mining_ticks(1.5, false, 8.0), 19);
+        // Zero-hardness blocks break instantly, as does any fast enough tool.
+        assert_eq!(vanilla_mining_ticks(0.0, true, 1.0), 0);
+        assert_eq!(vanilla_mining_ticks(0.0, false, 1.0), 0);
+        assert_eq!(vanilla_mining_ticks(1.0, true, 30.0), 0);
+        // Just under the threshold needs a second tick of progress.
+        assert_eq!(vanilla_mining_ticks(1.0, true, 29.9), 2);
+        // Bedrock (-1) is unbreakable; so is zero effective speed.
+        assert_eq!(vanilla_mining_ticks(-1.0, true, 34.0), u32::MAX);
+        assert_eq!(vanilla_mining_ticks(50.0, true, 0.0), u32::MAX);
+        // Obsidian with a diamond pickaxe: 8/50/30 -> ceil(187.5) = 188 ticks.
+        assert_eq!(vanilla_mining_ticks(50.0, true, 8.0), 188);
+        // Sword instantly mines bamboo through the tool rule.
+        let bamboo = ctx("wooden_sword", "bamboo", 3);
+        assert_eq!(vanilla_mining_ticks(1.0, false, vanilla_destroy_speed(&bamboo)), 0);
+    }
+
+    #[test]
+    fn p5e_parity_legacy_modifier_path_matches_the_fatigue_table() {
+        // The pre-existing helper had to learn the same switch table; a
+        // fatigue-II run must produce 0.0027, not the old 0.3^3 = 0.027.
+        assert_eq!(
+            mining_speed_with_modifiers(6.0, false, 0, None, Some(2), false, true),
+            6.0 * 0.0027
+        );
+        assert_eq!(
+            mining_speed_with_modifiers(6.0, false, 0, None, Some(3), false, true),
+            6.0 * 0.00081
+        );
     }
 }
