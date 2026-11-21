@@ -1142,9 +1142,19 @@ fn cache_rejects_tampered_bytes_and_never_overwrites_profile() {
         ModSyncErrorKind::ConsentRequired
     );
 
-    let mut permissions = fs::metadata(&blob).unwrap().permissions();
-    permissions.set_readonly(false);
-    fs::set_permissions(&blob, permissions).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&blob).unwrap().permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&blob, permissions).unwrap();
+    }
+    #[cfg(not(unix))]
+    {
+        let mut permissions = fs::metadata(&blob).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&blob, permissions).unwrap();
+    }
     fs::write(&blob, b"tampered").unwrap();
     assert_eq!(
         cache

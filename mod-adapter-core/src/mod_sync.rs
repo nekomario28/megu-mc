@@ -577,7 +577,7 @@ fn validate_url_syntax(url: &str) -> Result<String, ModSyncError> {
     }
     let rest = &url[8..];
     let auth_end = rest
-        .find(|c| matches!(c, '/' | '?' | '#'))
+        .find(['/', '?', '#'])
         .unwrap_or(rest.len());
     let authority = &rest[..auth_end];
     if authority.is_empty() {

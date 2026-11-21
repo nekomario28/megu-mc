@@ -73,7 +73,7 @@ pub const CAVE_LAYER_Y: f64 = 60.0;
 /// Map-mod fair-play configuration shared by dedicated servers and client
 /// friend-hosts. The *same* config drives the client-side control codes and
 /// the server-side radar enforcement, so both hosts behave identically.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct MapFairPlayConfig {
     /// Master switch. `false` = no restrictions (a `§r§e§s§e§t§x§a§e§r§o`
     /// reset code is broadcast so previously applied restrictions clear).
@@ -90,18 +90,6 @@ pub struct MapFairPlayConfig {
     /// `0` means "unassigned" — no level-id payload is emitted. Derive one
     /// with [`derive_world_level_id`].
     pub world_level_id: i32,
-}
-
-impl Default for MapFairPlayConfig {
-    fn default() -> Self {
-        Self {
-            fair_play: false,
-            allow_cave_map: false,
-            allow_entity_radar: false,
-            allow_waypoint_teleport: false,
-            world_level_id: 0,
-        }
-    }
 }
 
 /// Error produced by [`MapFairPlayConfig::from_kv_pairs`] and

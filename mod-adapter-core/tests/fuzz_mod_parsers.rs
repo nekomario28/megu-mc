@@ -20,7 +20,7 @@
 //! the offending input is hex-dumped for reproduction, and the panic is
 //! re-thrown so the test still fails.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
@@ -594,7 +594,7 @@ fn scratch_dir(tag: &str) -> PathBuf {
     dir
 }
 
-fn scratch_path(dir: &PathBuf, file_name: &str) -> PathBuf {
+fn scratch_path(dir: &Path, file_name: &str) -> PathBuf {
     dir.join(file_name)
 }
 
@@ -875,7 +875,7 @@ fn modpack_bombs() -> Vec<Vec<u8>> {
     ]);
     let over_stream = deflate_repeat_bomb(b'B', 17 * 1024 * 1024);
     let over_budget = zip_build(&[
-        ("modrinth.index.json", 8, over_stream.as_slice(), 17 * 1024 * 1024u32, crc32(&vec![b'B'; 64])),
+        ("modrinth.index.json", 8, over_stream.as_slice(), 17 * 1024 * 1024u32, crc32(&[b'B'; 64])),
     ]);
     vec![inside_budget, over_budget]
 }

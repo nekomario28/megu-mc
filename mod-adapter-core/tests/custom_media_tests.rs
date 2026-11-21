@@ -360,9 +360,9 @@ fn mdia_encode_reassemble_out_of_order() {
 
     // Feed strictly out of order: last, first, middle.
     let mut re = MediaChunkReassembler::with_expected_sha256(digest);
-    assert_eq!(re.push(&frames[2]).unwrap(), false);
-    assert_eq!(re.push(&frames[0]).unwrap(), false);
-    assert_eq!(re.push(&frames[1]).unwrap(), true, "final chunk completes");
+    assert!(!re.push(&frames[2]).unwrap());
+    assert!(!re.push(&frames[0]).unwrap());
+    assert!(re.push(&frames[1]).unwrap(), "final chunk completes");
     assert!(re.is_complete());
     assert_eq!(re.assembled_bytes().expect("assembled"), bytes.as_slice());
 }

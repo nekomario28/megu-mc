@@ -390,7 +390,7 @@ impl BossEncounterState {
         for part in &self.parts {
             let (min, max) = self.part_aabb(part);
             if let Some(t) = ray_aabb(origin, dir, min, max, max_distance) {
-                if best.map_or(true, |(_, bt)| t < bt) {
+                if best.is_none_or(|(_, bt)| t < bt) {
                     best = Some((part, t));
                 }
             }
@@ -649,7 +649,7 @@ pub fn encode_chunk_gen_request(req: &ChunkGenDelegateRequest) -> Result<Vec<u8>
     if req.dim.len() > MAX_DELEGATE_DIM_LEN {
         return Err("oversized delegate dimension id");
     }
-    if req.height == 0 || req.height % 16 != 0 || req.height / 16 > MAX_DELEGATE_SECTIONS {
+    if req.height == 0 || !req.height.is_multiple_of(16) || req.height / 16 > MAX_DELEGATE_SECTIONS {
         return Err("delegate height out of section bounds");
     }
     let mut body = Vec::with_capacity(24 + req.dim.len());

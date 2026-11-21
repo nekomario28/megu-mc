@@ -821,7 +821,7 @@ fn same_block_id(a: &str, b: &str) -> bool {
 
 fn last_tag_segment(tag: &str) -> &str {
     normalize_tag(tag)
-        .rsplit(|ch| ch == '/' || ch == ':')
+        .rsplit(['/', ':'])
         .next()
         .unwrap_or("")
 }

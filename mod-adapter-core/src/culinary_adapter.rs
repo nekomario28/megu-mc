@@ -681,13 +681,11 @@ fn classify_member(name: &str) -> Option<(&str, DataKind, &str)> {
         .or_else(|| rest.strip_prefix("loot_modifier/"))
     {
         (DataKind::LootModifier, r)
-    } else if let Some(r) = rest
-        .strip_prefix("food/")
-        .or_else(|| rest.strip_prefix("foods/"))
-    {
-        (DataKind::FoodSpec, r)
     } else {
-        return None;
+        let r = rest
+            .strip_prefix("food/")
+            .or_else(|| rest.strip_prefix("foods/"))?;
+        (DataKind::FoodSpec, r)
     };
     let rel = sub.strip_suffix(".json")?;
     if rel.is_empty() {

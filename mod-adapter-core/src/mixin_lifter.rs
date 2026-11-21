@@ -426,7 +426,7 @@ fn lookup_target(target_class: &str, target_method: &str) -> Option<&'static Sta
     let method = target_method.trim();
     STANDARD_TARGETS
         .iter()
-        .find(|t| t.classes.contains(&class.as_str()) && t.methods.iter().any(|m| *m == method))
+        .find(|t| t.classes.contains(&class.as_str()) && t.methods.contains(&method))
 }
 
 /// Lift one site to a standard event binding, or fail closed with the exact

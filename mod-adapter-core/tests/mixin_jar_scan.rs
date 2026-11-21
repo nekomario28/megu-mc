@@ -600,12 +600,49 @@ fn intermediary_targets_string_form_lifts() {
 fn unliftable_mixins_fail_closed() {
     let target_le = cls("net/minecraft/world/entity/LivingEntity");
     let mixin_targets = mixin(vec![("value", EV::Arr(vec![target_le]))]);
-    let mut methods = Vec::new();
-    methods.push(meth(
-        "bad$redirect",
-        vec![ann(
-            "Lorg/spongepowered/asm/mixin/injection/Redirect;",
-            vec![
+    let methods = vec![
+        meth(
+            "bad$redirect",
+            vec![ann(
+                "Lorg/spongepowered/asm/mixin/injection/Redirect;",
+                vec![
+                    ("method", s("hurt")),
+                    (
+                        "at",
+                        EV::Ann(Box::new(ann(
+                            AT,
+                            vec![
+                                ("value", s("INVOKE")),
+                                ("target", s("Lnet/minecraft/x;->y()V")),
+                            ],
+                            true,
+                        ))),
+                    ),
+                ],
+                true,
+            )],
+        ),
+        meth(
+            "bad$overwrite",
+            vec![ann("Lorg/spongepowered/asm/mixin/Overwrite;", vec![], true)],
+        ),
+        meth(
+            "bad$locals",
+            vec![inject(vec![
+                ("method", s("hurt")),
+                ("at", at("HEAD")),
+                (
+                    "locals",
+                    EV::Enum(
+                        "Lorg/spongepowered/asm/mixin/injection/callback/LocalCapture;".into(),
+                        "CAPTURE_FAILHARD".into(),
+                    ),
+                ),
+            ])],
+        ),
+        meth(
+            "bad$invokePoint",
+            vec![inject(vec![
                 ("method", s("hurt")),
                 (
                     "at",
@@ -618,53 +655,17 @@ fn unliftable_mixins_fail_closed() {
                         true,
                     ))),
                 ),
-            ],
-            true,
-        )],
-    ));
-    methods.push(meth(
-        "bad$overwrite",
-        vec![ann("Lorg/spongepowered/asm/mixin/Overwrite;", vec![], true)],
-    ));
-    methods.push(meth(
-        "bad$locals",
-        vec![inject(vec![
-            ("method", s("hurt")),
-            ("at", at("HEAD")),
-            (
-                "locals",
-                EV::Enum(
-                    "Lorg/spongepowered/asm/mixin/injection/callback/LocalCapture;".into(),
-                    "CAPTURE_FAILHARD".into(),
-                ),
-            ),
-        ])],
-    ));
-    methods.push(meth(
-        "bad$invokePoint",
-        vec![inject(vec![
-            ("method", s("hurt")),
-            (
-                "at",
-                EV::Ann(Box::new(ann(
-                    AT,
-                    vec![
-                        ("value", s("INVOKE")),
-                        ("target", s("Lnet/minecraft/x;->y()V")),
-                    ],
-                    true,
-                ))),
-            ),
-        ])],
-    ));
-    methods.push(meth(
-        "bad$shadow",
-        vec![ann(
-            "Lorg/spongepowered/asm/mixin/Shadow;",
-            vec![("method", s("hurt")), ("at", at("HEAD"))],
-            true,
-        )],
-    ));
+            ])],
+        ),
+        meth(
+            "bad$shadow",
+            vec![ann(
+                "Lorg/spongepowered/asm/mixin/Shadow;",
+                vec![("method", s("hurt")), ("at", at("HEAD"))],
+                true,
+            )],
+        ),
+    ];
     // A @Mixin targeting Valkyrien Skies 2-style physics internals.
     let physics = build_class(
         "com/badmod/mixin/VSPhysicsMixin",
