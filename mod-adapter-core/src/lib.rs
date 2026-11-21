@@ -79,6 +79,14 @@
 //!   item-conservation invariant, and a
 //!   [`world_extensions::BiomeRegionBlender`] TerraBlender-style weighted
 //!   Voronoi multi-region biome composer.
+//! - [`bytecode_subset_vm`]: pure-`std` bounded `.class` bytecode subset
+//!   evaluator — zero-JVM execution of safe mod event/logic methods with
+//!   a fail-closed static verifier (opcode allowlist, instruction-boundary
+//!   branch checks, operand-stack dataflow proof, and an allowlist-only
+//!   [`bytecode_subset_vm::HostCallKind`] bridge that rejects reflection,
+//!   `Runtime`/`ProcessBuilder`, JNDI, IO, and networking before a single
+//!   instruction runs) plus a strict fuel cap so no mod loop can hang a
+//!   server tick.
 //! - [`mod_sync`]: hardened server→client mod sync protocol — the `MSY1`
 //!   `CustomPacketPayload` body on channel `mc-spine:mod_sync_v1`, an
 //!   HTTPS-only trusted-CDN allowlist with SSRF/IP-literal/credentials
@@ -97,6 +105,7 @@
 #![deny(unsafe_code)]
 
 pub mod blockstates;
+pub mod bytecode_subset_vm;
 pub mod class_mixin_scanner;
 pub mod creature_primitives;
 pub mod culinary_adapter;
