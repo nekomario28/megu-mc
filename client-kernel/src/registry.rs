@@ -4,6 +4,7 @@ use crate::{
     light::face_occlusion_from_octants,
     Error, STATE_COUNT,
 };
+use mc_spine_core::id::ResourceLocation;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -431,6 +432,15 @@ impl Registry {
         self.by_name.get(name).copied().ok_or(Error::NotFound)
     }
 
+    /// The default state of a validated [`ResourceLocation`], or `None` when
+    /// the pack does not define the block. `id` is already proven to parse by
+    /// the `mc-spine-core` identifier rules, so the only failure mode left is
+    /// a name absent from this registry — reported as `None`, never silently
+    /// repaired.
+    pub fn lookup_resource(&self, id: &ResourceLocation) -> Option<u32> {
+        self.by_name.get(id.as_str()).copied()
+    }
+
     pub fn facts(&self, state: u32) -> Result<BlockFacts, Error> {
         self.facts
             .get(state as usize)
@@ -611,6 +621,41 @@ mod tests {
         }"#
         .as_bytes()
         .to_vec()
+    }
+
+    #[test]
+    fn lookup_resource_resolves_validated_ids_and_fails_closed() {
+        let registry = open();
+        let stone = registry.default_state("minecraft:stone").unwrap();
+        // An explicit namespace resolves like `default_state`.
+        assert_eq!(
+            registry.lookup_resource(&ResourceLocation::parse("minecraft:stone").unwrap()),
+            Some(stone)
+        );
+        // An unqualified id defaults to `minecraft:` exactly as vanilla.
+        assert_eq!(
+            registry.lookup_resource(&ResourceLocation::parse("stone").unwrap()),
+            Some(stone)
+        );
+        // A well-formed name absent from the pack reports `None`.
+        assert_eq!(
+            registry.lookup_resource(&ResourceLocation::parse("custom_mod:unobtainium").unwrap()),
+            None
+        );
+        // The validated type keeps malformed spellings out entirely.
+        assert!(ResourceLocation::parse("a:b:c").is_err());
+        assert!(ResourceLocation::parse("minecraft:../escape").is_err());
+    }
+
+    #[test]
+    fn target_version_pins_the_kernel_protocol() {
+        assert_eq!(crate::TARGET_VERSION, crate::TargetVersion::V1_21_1);
+        assert_eq!(crate::TARGET_VERSION.protocol() as u32, crate::PROTOCOL);
+        let meta = crate::version_meta();
+        assert_eq!(
+            (meta.id, meta.protocol, meta.data_version),
+            ("1.21.1", 767, 3955)
+        );
     }
 
     #[test]

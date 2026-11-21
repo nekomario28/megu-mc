@@ -3,8 +3,20 @@
 use crate::mesh::{DirectionBuckets, DIRECTION_BUCKETS};
 use crate::{Layer, Quad, EDGE, LAVA, QUAD_FALLING, QUAD_TINTED, WATER};
 
-pub(crate) const MAX_COLUMN_SECTIONS: usize = 32;
+/// Input bound for column meshing and LOD calls, mirrored by
+/// `MC_SPINE_MESH_MAX_COLUMN_SECTIONS` in the C header. Sized for tall Mod
+/// dimensions well past the vanilla 24-section window (e.g. a 96-section
+/// custom dimension at Y -512..1024): 128 sections is 2,048 blocks.
+pub(crate) const MAX_COLUMN_SECTIONS: usize = 128;
 const Y_SCALE: f32 = 1024.0;
+
+/// Column-local Y the packed vertex format can still encode: bits 10..29 of
+/// `PackedVertex::position` hold `Y * Y_SCALE` (20 bits), so `y` must stay
+/// below `PACK_Y_LIMIT` — the first 64 sections of a column. Columns up to
+/// `MAX_COLUMN_SECTIONS` mesh, cull and summarize fine; quads at or above
+/// this height are simply not representable in this vertex format and
+/// [`is_packable`] says so.
+const PACK_Y_LIMIT: f32 = 1024.0;
 
 /// Four native-endian u32 words, with the GPU bit layout defined in the C header.
 #[repr(C)]
@@ -56,11 +68,10 @@ fn extents(quad: &Quad) -> [f32; 2] {
 
 #[inline(always)]
 pub(crate) fn is_packable(quad: &Quad) -> bool {
-    let max_y = (MAX_COLUMN_SECTIONS * EDGE) as f32;
     let edge_f = EDGE as f32;
     for &[x, y, z] in &quad.positions {
         if !whole_range(x, 0.0, edge_f)
-            || !(0.0..=max_y).contains(&y)
+            || !(0.0..PACK_Y_LIMIT).contains(&y)
             || !whole_range(z, 0.0, edge_f)
         {
             return false;

@@ -220,6 +220,51 @@ fn column_skips_air_and_packs_the_maximum_height_endpoint() {
             ABI_OK
         );
         assert_eq!(count, 6);
+        // The top face of a 128-section column sits at Y=2048 — meshed
+        // exactly, but above the 1024-block ceiling of the 20-bit Y*1024
+        // vertex field, so packing fails closed instead of truncating.
+        assert_eq!(quads[1].positions.map(|p| p[1]), [2048.0; 4]);
+        assert_eq!(
+            mc_spine_client_mesh_pack_vertices(
+                quads.as_ptr(),
+                quads.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &mut count
+            ),
+            ABI_INVALID_ARGUMENT
+        );
+        assert_eq!(count, 0);
+    }
+
+    // The same column with its solid top at section 31 keeps the endpoint
+    // below the vertex ceiling and packs bit-exactly.
+    let low: [_; 32] = std::array::from_fn(|i| {
+        if i == 31 {
+            MeshColumnSection {
+                flags: 0,
+                blocks: solid.blocks.as_ptr(),
+                block_light: solid.block_light.as_ptr(),
+                sky_light: solid.sky_light.as_ptr(),
+            }
+        } else {
+            MeshColumnSection {
+                flags: ABI_COLUMN_UNIFORM_AIR,
+                blocks: ptr::null(),
+                block_light: air.block_light.as_ptr(),
+                sky_light: air.sky_light.as_ptr(),
+            }
+        }
+    });
+    input.sections = low.as_ptr();
+    input.section_count = low.len();
+    // SAFETY: all non-null buffers are live, sized as supplied and disjoint.
+    unsafe {
+        assert_eq!(
+            mc_spine_client_mesh_column(&input, quads.as_mut_ptr(), quads.len(), &mut count),
+            ABI_OK
+        );
+        assert_eq!(count, 6);
         assert_eq!(quads[1].positions.map(|p| p[1]), [512.0; 4]);
 
         assert_eq!(

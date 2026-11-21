@@ -114,7 +114,8 @@ int32_t mc_spine_mesh_section(const mc_spine_mesh_input *input,
                              mc_spine_mesh_quad *output, size_t capacity, size_t *count);
 
 enum {
-    MC_SPINE_MESH_MAX_COLUMN_SECTIONS = 32,
+    MC_SPINE_MESH_MAX_COLUMN_SECTIONS = 128, /* tall Mod dimensions past
+      the vanilla 24-section window, e.g. 96 sections at Y -512..1024 */
     MC_SPINE_MESH_COLUMN_UNIFORM_AIR = 1,
     MC_SPINE_MESH_COLUMN_SEALED_SOLID = 2,
 };
@@ -155,6 +156,9 @@ int32_t mc_spine_client_mesh_column(const mc_spine_mesh_column_input *input,
    start from the least significant bit. Input corner order is preserved.
    position:   X 0..4, Z 5..9, Y*1024 rounded 10..29, zero 30..31.
    state_id:   full block registry ID, also the source state for fluids.
+   The 20-bit Y*1024 field caps column-local Y below 1024 blocks (the first 64
+   sections); taller columns mesh fully, but quads above the ceiling cannot be
+   packed and callers must split them before a vertex-format upload.
    attributes: direction 0..2, corner AO 3..4, block light 5..8, sky light
                9..12, layer 13..14, fluid kind 15..16, diagonal 17,
                quad flags 18..19, U width 20..24, V height 25..29,

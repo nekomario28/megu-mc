@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::cull::box_facing_mask;
-use crate::packed::{pack_quad, PackedVertex};
+use crate::packed::{is_packable, pack_quad, PackedVertex};
 use crate::{Quad, SectionCoord, EDGE};
 
 /// Sections per region along X and Z, and the Y height respectively.
@@ -188,11 +188,17 @@ impl RenderRegion {
 
     /// Writes `quads` into the shared arenas, releasing any previous slab for
     /// the section first so a same-size rebuild lands back on its old range.
-    /// Returns false when `coord` lies outside the region.
+    /// Returns false when `coord` lies outside the region or any quad is not
+    /// representable in the packed vertex format (see `is_packable` — e.g.
+    /// column-local Y at or above the 1,024-block ceiling of a >64-section
+    /// column); on failure the slot and arenas are left untouched.
     pub fn upload(&mut self, coord: SectionCoord, quads: &[Quad]) -> bool {
         let Some(index) = self.local(coord) else {
             return false;
         };
+        if quads.iter().any(|quad| !is_packable(quad)) {
+            return false;
+        }
         let mut vertices = Vec::with_capacity(quads.len() * 4);
         let mut indices = Vec::with_capacity(quads.len() * 6);
         for (q, quad) in quads.iter().enumerate() {
@@ -313,12 +319,20 @@ impl RenderRegions {
     }
 
     /// Uploads `quads` for `coord`, creating the containing region on first
-    /// use. Re-uploading reuses the released slab when it still fits.
-    pub fn upload(&mut self, coord: SectionCoord, quads: &[Quad]) {
-        self.regions
-            .entry(Self::origin_of(coord))
-            .or_insert_with(|| RenderRegion::new(Self::origin_of(coord)))
-            .upload(coord, quads);
+    /// use. Re-uploading reuses the released slab when it still fits. Returns
+    /// false when a quad cannot be packed (see [`RenderRegion::upload`]); on
+    /// failure no slot or region is created.
+    pub fn upload(&mut self, coord: SectionCoord, quads: &[Quad]) -> bool {
+        let origin = Self::origin_of(coord);
+        let region = self
+            .regions
+            .entry(origin)
+            .or_insert_with(|| RenderRegion::new(origin));
+        let uploaded = region.upload(coord, quads);
+        if region.occupied == 0 {
+            self.regions.remove(&origin);
+        }
+        uploaded
     }
 
     /// Unloads `coord` and drops the region once its last slot is released.
@@ -358,9 +372,9 @@ mod tests {
         Quad {
             positions: [
                 [x, 0.0, 0.0],
+                [x, 0.0, 1.0],
+                [x + 1.0, 0.0, 1.0],
                 [x + 1.0, 0.0, 0.0],
-                [x + 1.0, 1.0, 0.0],
-                [x, 1.0, 0.0],
             ],
             state_id: 1,
             tint: 0,

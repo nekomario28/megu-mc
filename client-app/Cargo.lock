@@ -22,6 +22,9 @@ version = "0.1.0"
 [[package]]
 name = "mc-spine-kernel"
 version = "0.1.0"
+dependencies = [
+ "mc-spine-core",
+]
 
 [[package]]
 name = "mc-spine-proto"

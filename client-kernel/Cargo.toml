@@ -8,3 +8,12 @@ publish = false
 
 [lib]
 crate-type = ["rlib", "cdylib"]
+
+# Zero external dependencies by contract: this crate is the protocol-767
+# kernel both the client (`client-app`) and C FFI consumers share, so it must
+# build on pure `std`. `mc-spine-core` is the in-repo leaf crate (also
+# zero-dependency) that owns the canonical 1.21.1/26.3 `TargetVersion`/
+# `VersionMeta` constants and the validated `ResourceLocation` this crate
+# exposes — still no crates.io dependencies.
+[dependencies]
+mc_spine_core = { package = "mc-spine-core", path = "../core" }

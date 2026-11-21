@@ -2312,3 +2312,249 @@ mod lod_ffi {
         }
     }
 }
+
+// 26.3-era registries carry block-state ids past the 1.21.1 count (26,684)
+// and past u16::MAX. `Block::state_id`, `Quad::state_id`,
+// `PackedVertex::state_id` and `LodCell::state_id` are u32 end to end, so
+// ids like 30_000, 50_000, 70_000 and u32::MAX survive meshing, culling,
+// packing and LOD summarization without truncation.
+#[test]
+fn high_state_ids_mesh_pack_and_summarize_without_truncation() {
+    use crate::packed::{is_packable, pack_quad};
+
+    // Past the vanilla count, past u16::MAX, and at the u32 limit.
+    let ids = [30_000, 50_000, 70_000, u32::MAX];
+    let mut section = air();
+    for (x, &id) in ids.iter().enumerate() {
+        section.set(x * 4, 8, 8, Block::opaque_cube(id), DARK);
+    }
+    let quads = mesh_section(&section.view());
+    for &id in &ids {
+        let quad = face(&quads, Direction::Up, id);
+        assert_eq!(quad.state_id, id);
+        assert!(is_packable(quad));
+        assert!(pack_quad(quad).iter().all(|v| v.state_id == id));
+    }
+    assert!(quads.iter().all(|q| ids.contains(&q.state_id)));
+
+    // LOD cells keep the exact id at the top of each column.
+    let mut out = [LodCell::EMPTY; LOD_FINE * LOD_FINE];
+    summarize_column(&[section.view()], LOD_FINE, &mut out);
+    for (x, &id) in ids.iter().enumerate() {
+        let cell = out[8 * EDGE + x * 4];
+        assert_eq!((cell.state_id, cell.top_y), (id, 8));
+    }
+}
+
+#[test]
+fn same_state_cull_compares_the_full_u32_state_id() {
+    // 70_000 is 0x1_1170: only the low 16 bits collide with 4_464 (0x1170).
+    // A u16 comparison would cull a face that must be emitted.
+    let glass = |state_id| Block {
+        state_id,
+        flags: TRANSLUCENT | SAME_STATE_CULL,
+        ..Block::AIR
+    };
+    let mut pair = air();
+    pair.set(0, 8, 8, glass(70_000), DAY);
+    pair.set(1, 8, 8, glass(70_000), DAY);
+    let quads = mesh_section(&pair.view());
+    // Identical ids share the x = 1 plane and cull it entirely.
+    assert!(!quads
+        .iter()
+        .any(|q| q.positions.iter().all(|p| p[0] == 1.0)));
+
+    pair.set(1, 8, 8, glass(4_464), DAY);
+    let quads = mesh_section(&pair.view());
+    let shared = |direction, id| {
+        quads.iter().any(|q| {
+            q.direction == direction
+                && q.state_id == id
+                && q.positions.iter().all(|p| p[0] == 1.0)
+        })
+    };
+    // Ids equal in their low 16 bits but different in u32 must both emit.
+    assert!(shared(Direction::East, 70_000));
+    assert!(shared(Direction::West, 4_464));
+}
+
+#[test]
+fn packed_vertex_y_ceiling_is_1024_blocks() {
+    use crate::packed::is_packable;
+
+    let solid = Section::filled(STONE, DAY);
+    let quads = mesh_section(&solid.view());
+    let top = *quads
+        .iter()
+        .find(|q| q.direction == Direction::Up)
+        .unwrap();
+    // Shifting a planar face up keeps it packable just under the 20-bit
+    // Y * 1024 field limit, and unrepresentable at it: a quad that cannot
+    // round-trip must be rejected, not truncated into the zero bits.
+    let mut just_under = top;
+    just_under
+        .positions
+        .iter_mut()
+        .for_each(|p| p[1] = 1023.9375);
+    assert!(is_packable(&just_under));
+    let mut at_ceiling = just_under;
+    at_ceiling
+        .positions
+        .iter_mut()
+        .for_each(|p| p[1] = 1024.0);
+    assert!(!is_packable(&at_ceiling));
+
+    // Regions fail closed on an unpackable upload instead of silently
+    // dropping vertices into the arenas.
+    let mut regions = RenderRegions::default();
+    assert!(!regions.upload(SectionCoord(0, 0, 0), &[at_ceiling]));
+    assert!(regions.region(SectionCoord(0, 0, 0)).is_none());
+    assert!(regions.upload(SectionCoord(0, 0, 0), &[just_under]));
+    let slab = regions
+        .region(SectionCoord(0, 0, 0))
+        .unwrap()
+        .slab(SectionCoord(0, 0, 0))
+        .unwrap();
+    assert_eq!((slab.vertices, slab.indices), (4, 6));
+}
+
+// 80 sections at sec_y = -32..48 is 1,280 blocks: past the vanilla 24-section
+// window and past the old 32-section column bound, spanning both negative and
+// positive section Y through a signed coordinate space.
+#[test]
+fn tall_column_meshes_summarizes_and_traverses_across_negative_sec_y() {
+    use crate::column::{mesh_column, ColumnSection};
+    use crate::packed::is_packable;
+
+    const SECTIONS: usize = 80;
+    const MIN_SEC_Y: i32 = -32;
+
+    // A two-slab stone floor, open air, and a high-id marker capping the
+    // column: enough shape for every consumer to prove its path.
+    let mut sections: Vec<Section> = (0..SECTIONS).map(|_| air()).collect();
+    sections[0] = Section::filled(STONE, DAY);
+    sections[1] = Section::filled(STONE, DAY);
+    let marker = Block::opaque_cube(70_000);
+    sections[SECTIONS - 1].set(8, 15, 8, marker, Light::new(3, 15));
+    let coord = |i: usize| SectionCoord(0, MIN_SEC_Y + i as i32, 0);
+    let views: Vec<_> = sections.iter().map(Section::view).collect();
+
+    // FaceVisibility is section-local: sealed slabs connect nothing, air and
+    // the mostly-empty marker section connect every face pair.
+    let graphs: Vec<(SectionCoord, SectionGraph)> = sections
+        .iter()
+        .enumerate()
+        .map(|(i, section)| {
+            (
+                coord(i),
+                SectionGraph {
+                    through: FaceVisibility::compute(&section.blocks).bits(),
+                    renderable: SectionVis::scan(&section.view()).emits_any(),
+                },
+            )
+        })
+        .collect();
+    assert_eq!(graphs[0].1, SectionGraph::SOLID);
+    assert_eq!(graphs[1].1, SectionGraph::SOLID);
+    for &(_, graph) in &graphs[2..SECTIONS - 1] {
+        assert_eq!(graph.through, THROUGH_ALL);
+        assert!(!graph.renderable);
+    }
+    assert_eq!(graphs[SECTIONS - 1].1.through, THROUGH_ALL);
+    assert!(graphs[SECTIONS - 1].1.renderable);
+
+    // The culler walks signed section coordinates: a camera inside the air
+    // band propagates up across the sec_y -1..0 boundary and down into the
+    // top stone slab, which occludes everything below it.
+    let result = GraphCuller::new(SectionCoord(0, 0, 0), &[]).search(graphs.iter().copied());
+    let mut visible: Vec<i32> = result.visible.iter().map(|coord| coord.1).collect();
+    visible.sort_unstable();
+    assert_eq!(visible, [MIN_SEC_Y + 1, MIN_SEC_Y + SECTIONS as i32 - 1]);
+    assert_eq!(result.culled, 1); // only the buried slab at MIN_SEC_Y
+    // A camera sealed in the floor sees only its own slab.
+    let buried = GraphCuller::new(SectionCoord(0, MIN_SEC_Y, 0), &[]).search(graphs.iter().copied());
+    assert_eq!(buried.visible, [SectionCoord(0, MIN_SEC_Y, 0)]);
+    assert_eq!(buried.culled, 2);
+
+    // Region partitioning floors negative coords: sec_y -1 lives in the
+    // (-4..0) slab, -32 anchors its own slab.
+    assert_eq!(
+        RenderRegions::origin_of(SectionCoord(0, -1, 0)),
+        [0, -4, 0]
+    );
+    assert_eq!(
+        RenderRegions::origin_of(SectionCoord(0, MIN_SEC_Y, 0)),
+        [0, MIN_SEC_Y, 0]
+    );
+
+    // Mesh each section through the cache and upload at its signed coord;
+    // section-local quads always fit the packed format, negative Y included.
+    let mut cache = MeshCache::default();
+    for (i, section) in sections.iter().enumerate() {
+        assert!(cache.insert(coord(i), section.clone()));
+    }
+    assert_eq!(cache.pending(), SECTIONS);
+    cache.rebuild_dirty(usize::MAX);
+    let mut regions = RenderRegions::default();
+    for i in 0..SECTIONS {
+        assert!(regions.upload(coord(i), cache.mesh(coord(i)).unwrap()));
+    }
+    for sy in MIN_SEC_Y..MIN_SEC_Y + SECTIONS as i32 {
+        assert!(regions.region(SectionCoord(0, sy, 0)).is_some(), "sec_y {sy}");
+    }
+    // A camera under the floor sees one multi-draw command per renderable
+    // region: the stone slab pair at sec_y -32 and the marker slab at 44.
+    let commands = regions.build_multidraw([8.0, (MIN_SEC_Y * 16 - 8) as f32, 8.0]);
+    assert_eq!(
+        commands.iter().map(|c| c.region).collect::<Vec<_>>(),
+        [[0, MIN_SEC_Y, 0], [0, MIN_SEC_Y + 76, 0]]
+    );
+    assert_eq!(commands[0].draws.len(), 2);
+    assert_eq!(commands[1].draws.len(), 1);
+    assert!(commands.iter().all(|c| c.facing == Direction::Down.bit()));
+
+    // The column mesher walks all 80 descriptors bottom to top and keeps
+    // column-local Y exact: the marker cap emits at 1,280 blocks, which is
+    // precisely why a vertex upload must refuse it.
+    let column: Vec<_> = views
+        .iter()
+        .map(|&view| ColumnSection {
+            view,
+            uniform_air: false,
+            sealed: false,
+        })
+        .collect();
+    let quads = mesh_column(&column, [None; 4]);
+    let cap = face(&quads, Direction::Up, 70_000);
+    assert_eq!(cap.positions.map(|p| p[1]), [1280.0; 4]);
+    assert!(!is_packable(cap));
+    // The sealed plane between the two stone slabs never emits.
+    assert!(quads.iter().all(|q| {
+        !(matches!(q.direction, Direction::Up | Direction::Down)
+            && q.positions.iter().all(|p| p[1] == 16.0))
+    }));
+    assert!(quads.iter().any(|q| {
+        q.direction == Direction::Up && q.positions.iter().all(|p| p[1] == 32.0)
+    }));
+    assert!(quads.iter().any(|q| {
+        q.direction == Direction::Down && q.positions.iter().all(|p| p[1] == 0.0)
+    }));
+
+    // LOD over the same 80 views: height is the full 1,280 blocks, top_y
+    // reaches 1,279 (still far below the i16 field), and the marker keeps
+    // its exact u32 id.
+    let mut summary = LodSummary::new(LOD_FINE);
+    let cells = summary.update(&views).to_vec();
+    assert_eq!(summary.height(), SECTIONS * EDGE);
+    let top = cells[8 * EDGE + 8];
+    assert_eq!((top.top_y, top.state_id, top.light), (1279, 70_000, 0xf3));
+    for (i, cell) in cells.iter().enumerate() {
+        if i != 8 * EDGE + 8 {
+            assert_eq!(
+                (cell.top_y, cell.state_id),
+                (31, STONE.state_id),
+                "column cell {i}"
+            );
+        }
+    }
+}
