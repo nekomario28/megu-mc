@@ -3390,4 +3390,353 @@ mod mob_behaviors_tests {
         assert_eq!(warden.hp, 0.0);
         assert_eq!(warden.tick(observed), None);
     }
+
+    #[test]
+    fn witch_drinking_prioritizes_water_fire_health_and_distance_at_chance_boundaries() {
+        use WitchPotion::*;
+        let all_needs = WitchNeeds {
+            underwater: true,
+            in_fire_or_lava: true,
+            hurt: true,
+            chase_distance: Some(12.0),
+        };
+        for (active, expected) in [
+            (&[][..], WaterBreathing),
+            (&[WaterBreathing][..], FireResistance),
+            (&[WaterBreathing, FireResistance][..], Healing),
+            (&[WaterBreathing, FireResistance, Healing][..], Swiftness),
+        ] {
+            let mut witch = WitchBehavior::default();
+            assert_eq!(
+                witch.tick_drinking(all_needs, active, &mut zero),
+                Some(WitchAction::StartDrinking(expected))
+            );
+        }
+        let mut witch = WitchBehavior::default();
+        assert_eq!(
+            witch.tick_drinking(
+                all_needs,
+                &[WaterBreathing, FireResistance, Healing, Swiftness],
+                &mut no_draw
+            ),
+            None
+        );
+
+        // A failed roll falls through to the next unmet need; a passed roll keeps
+        // the higher-priority potion.
+        let mut witch = WitchBehavior::default();
+        assert_eq!(
+            witch.tick_drinking(all_needs, &[], &mut rolls([15, 14])),
+            Some(WitchAction::StartDrinking(FireResistance))
+        );
+        let mut witch = WitchBehavior::default();
+        assert_eq!(
+            witch.tick_drinking(all_needs, &[], &mut rolls([14, 99, 99, 99])),
+            Some(WitchAction::StartDrinking(WaterBreathing))
+        );
+
+        // 11.0 is not farther than 11 blocks, 11.01 is.
+        let near = WitchNeeds {
+            chase_distance: Some(11.0),
+            ..WitchNeeds::default()
+        };
+        let far = WitchNeeds {
+            chase_distance: Some(11.01),
+            ..WitchNeeds::default()
+        };
+        assert_eq!(
+            WitchBehavior::default().tick_drinking(near, &[], &mut no_draw),
+            None
+        );
+        assert_eq!(
+            WitchBehavior::default().tick_drinking(far, &[], &mut zero),
+            Some(WitchAction::StartDrinking(Swiftness))
+        );
+
+        // Each chance is exclusive at its upper bound.
+        let water = WitchNeeds {
+            underwater: true,
+            ..WitchNeeds::default()
+        };
+        let hurt = WitchNeeds {
+            hurt: true,
+            ..WitchNeeds::default()
+        };
+        assert_eq!(
+            WitchBehavior::default().tick_drinking(water, &[], &mut rolls([14])),
+            Some(WitchAction::StartDrinking(WaterBreathing))
+        );
+        assert_eq!(
+            WitchBehavior::default().tick_drinking(water, &[], &mut rolls([15])),
+            None
+        );
+        assert_eq!(
+            WitchBehavior::default().tick_drinking(hurt, &[], &mut rolls([4])),
+            Some(WitchAction::StartDrinking(Healing))
+        );
+        assert_eq!(
+            WitchBehavior::default().tick_drinking(hurt, &[], &mut rolls([5])),
+            None
+        );
+        assert_eq!(
+            WitchBehavior::default().tick_drinking(far, &[], &mut rolls([49])),
+            Some(WitchAction::StartDrinking(Swiftness))
+        );
+        assert_eq!(
+            WitchBehavior::default().tick_drinking(far, &[], &mut rolls([50])),
+            None
+        );
+    }
+
+    #[test]
+    fn witch_dispatch_heals_four_at_half_health_and_only_while_still_hurt() {
+        use MobBehaviorEffect::*;
+        let world = || MobBehaviorWorldTick::Witch {
+            eid: 42,
+            active_effects: &[],
+            target_effects: &[],
+            throw_ready: true,
+        };
+
+        let mut state = MobBehaviorState::for_etype(118).unwrap();
+        let mut ctx = dispatch_ctx();
+        ctx.hp = 5.0; // exactly a quarter of max health, well below the half-health gate
+        ctx.rng_u64 = 3; // first draw is 3 % 100 < 5, so Healing is chosen
+        assert!(state.step_with_world(&ctx, world()).is_empty());
+        for _ in 0..31 {
+            assert!(state.step_with_world(&ctx, world()).is_empty());
+        }
+        assert_eq!(state.step_with_world(&ctx, world()), [HealSelf(4.0)]);
+
+        // Reaching full health while drinking cancels the heal itself.
+        let mut state = MobBehaviorState::for_etype(118).unwrap();
+        let mut ctx = dispatch_ctx();
+        ctx.hp = 5.0;
+        ctx.rng_u64 = 3;
+        assert!(state.step_with_world(&ctx, world()).is_empty());
+        ctx.hp = ctx.max_hp;
+        for _ in 0..31 {
+            assert!(state.step_with_world(&ctx, world()).is_empty());
+        }
+        assert!(state.step_with_world(&ctx, world()).is_empty());
+    }
+
+    #[test]
+    fn witch_splash_falls_back_to_harming_when_every_stronger_option_is_blocked() {
+        use WitchPotion::*;
+        let witch = WitchBehavior::default();
+        let splash = |distance, hp, effects, draw| {
+            witch.splash(
+                WitchTarget {
+                    entity: 1,
+                    horizontal_distance: distance,
+                    hp,
+                    effects,
+                },
+                &mut rolls(draw),
+            )
+        };
+        assert_eq!(
+            splash(7.99, 7.99, &[Slowness, Poison, Weakness], [0]),
+            Some(WitchAction::Splash {
+                target: 1,
+                potion: Harming
+            })
+        );
+        assert_eq!(
+            splash(100.0, 100.0, &[Slowness, Poison, Weakness], [3]),
+            Some(WitchAction::Splash {
+                target: 1,
+                potion: Harming
+            })
+        );
+        assert_eq!(
+            splash(3.0, 7.0, &[], [0]),
+            Some(WitchAction::Splash {
+                target: 1,
+                potion: Weakness
+            })
+        );
+        assert_eq!(
+            splash(3.0, 7.0, &[], [3]),
+            Some(WitchAction::Splash {
+                target: 1,
+                potion: Harming
+            })
+        );
+    }
+
+    #[test]
+    fn creeper_swell_holds_only_inside_the_cancel_band_and_charging_doubles_power() {
+        let mut creeper = CreeperBehavior::new();
+        assert_eq!(creeper.fuse, -1);
+        assert_eq!(creeper.tick(Some(3.0)), None);
+        assert_eq!(creeper.fuse, 0);
+        for _ in 0..3 {
+            assert_eq!(creeper.tick(Some(7.0)), None);
+        }
+        assert_eq!(creeper.fuse, 0);
+        assert_eq!(creeper.tick(Some(7.0001)), None);
+        assert_eq!(creeper.fuse, -1);
+        assert_eq!(creeper.tick(None), None);
+        assert_eq!(creeper.fuse, -1);
+
+        creeper.ignite(true);
+        assert_eq!(creeper.fuse, 0);
+        for _ in 0..10 {
+            assert_eq!(creeper.tick(None), None);
+        }
+        assert_eq!(creeper.fuse, 10);
+        creeper.ignite(true);
+        assert_eq!(creeper.fuse, 10);
+        creeper.ignite(false);
+        assert_eq!(creeper.fuse, -1);
+        creeper.ignite(true);
+        assert_eq!(creeper.fuse, 0);
+        for _ in 0..29 {
+            assert_eq!(creeper.tick(None), None);
+        }
+        assert_eq!(creeper.tick(None), Some(3.0));
+
+        for (charged, power) in [(false, 3.0), (true, 6.0)] {
+            let mut creeper = CreeperBehavior {
+                charged,
+                ..CreeperBehavior::new()
+            };
+            creeper.ignite(true);
+            for _ in 0..29 {
+                assert_eq!(creeper.tick(None), None);
+            }
+            assert_eq!(creeper.tick(None), Some(power));
+        }
+    }
+
+    #[test]
+    fn enderman_stare_cone_and_range_are_strict_at_their_boundaries() {
+        let player = [0.0, 1.6, 0.0];
+        let look = [1.0, 0.0, 0.0];
+        assert!(enderman_stared_at(player, look, [64.0, 1.6, 0.0], "air", true));
+        assert!(!enderman_stared_at(
+            player,
+            look,
+            [64.0001, 1.6, 0.0],
+            "air",
+            true
+        ));
+        // At ten blocks the cone is cos > 1 - 0.025 / 10 = 0.9975.
+        let target = [10.0, 1.6, 0.0];
+        assert!(enderman_stared_at(
+            player,
+            [1.0, 0.0, 0.069],
+            target,
+            "air",
+            true
+        ));
+        assert!(!enderman_stared_at(
+            player,
+            [1.0, 0.0, 0.071],
+            target,
+            "air",
+            true
+        ));
+        assert!(!enderman_stared_at(player, [0.0; 3], target, "air", true));
+        assert!(!enderman_stared_at(player, look, player, "air", true));
+    }
+
+    #[test]
+    fn enderman_escape_rejects_world_edge_and_below_minimum_ground() {
+        // The chosen y is origin + 63 - 32 = 95; feet at 96 leave no headroom in
+        // a world ending at 96, so the destination is rejected.
+        let escape = enderman_escape(
+            EndermanHazard::Water,
+            [0.0, 64.0, 0.0],
+            -64..96,
+            |[_, y, _]| EndermanTeleportBlock {
+                blocks_motion: y == 95,
+                liquid: false,
+            },
+            |_| true,
+            &mut |bound| if bound == 64 { 63 } else { 1 << 23 },
+        );
+        assert_eq!(escape.destination, None);
+
+        // With the chosen y at 32, ground at 30 is below min_ground 31 and never
+        // considered.
+        let escape = enderman_escape(
+            EndermanHazard::Rain,
+            [0.0, 64.0, 0.0],
+            0..320,
+            |[_, y, _]| EndermanTeleportBlock {
+                blocks_motion: y == 30,
+                liquid: false,
+            },
+            |_| true,
+            &mut |bound| if bound == 64 { 0 } else { 1 << 23 },
+        );
+        assert_eq!(escape.destination, None);
+        assert!(!escape.reject_damage);
+    }
+
+    #[test]
+    fn pet_taming_skips_draws_when_ineligible_and_assist_follows_an_untamed_owner() {
+        let owner = [1; 16];
+        let visitor = [2; 16];
+        let mut wolf = PetBehavior::new(PetKind::Wolf);
+        assert_eq!(
+            wolf.try_tame(owner, "bone", &mut highest),
+            PetTameResult::Consumed
+        );
+        assert_eq!(
+            wolf.try_tame(owner, "bone", &mut zero),
+            PetTameResult::Tamed
+        );
+        assert_eq!(
+            wolf.try_tame(visitor, "bone", &mut no_draw),
+            PetTameResult::Pass
+        );
+        assert!(wolf.sitting);
+        assert_eq!(wolf.wolf_assist_target(owner, Some(11), None), None);
+        assert_eq!(wolf.toggle_sitting(owner), Some(false));
+        assert_eq!(wolf.wolf_assist_target(owner, Some(11), None), Some(11));
+        assert!(!wolf.dye_collar(owner, 16));
+        assert!(!wolf.dye_collar(owner, 14));
+        assert!(wolf.dye_collar(owner, 15));
+
+        let mut cat = PetBehavior::new(PetKind::Cat);
+        assert_eq!(
+            cat.try_tame(owner, "cooked_salmon", &mut no_draw),
+            PetTameResult::Pass
+        );
+        assert_eq!(
+            cat.try_tame(owner, "salmon", &mut zero),
+            PetTameResult::Tamed
+        );
+        assert_eq!(
+            cat.try_tame(visitor, "cod", &mut no_draw),
+            PetTameResult::Pass
+        );
+        assert_eq!(cat.toggle_sitting(visitor), None);
+        assert_eq!(cat.toggle_sitting(owner), Some(false));
+    }
+
+    #[test]
+    fn iron_golem_aggregates_aggro_and_knockup_including_coincident_positions() {
+        assert!(iron_golem_provoked(true, true));
+        assert!(iron_golem_provoked(true, false));
+        assert!(iron_golem_provoked(false, true));
+        assert!(!iron_golem_provoked(false, false));
+
+        assert_eq!(
+            iron_golem_fling_velocity([0.0; 3], [0.0; 3]),
+            [0.0, 0.4, 0.0]
+        );
+        assert_eq!(
+            iron_golem_fling_velocity([0.0, 50.0, 0.0], [0.0; 3]),
+            [0.0, 0.4, 0.0]
+        );
+        let fling = iron_golem_fling_velocity([3.0, 10.0, 4.0], [0.0, 10.0, 0.0]);
+        assert!((fling[0] - 0.24).abs() < 1e-12);
+        assert_eq!(fling[1], 0.4);
+        assert!((fling[2] - 0.32).abs() < 1e-12);
+    }
 }

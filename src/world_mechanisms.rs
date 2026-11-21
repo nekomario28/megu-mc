@@ -4215,4 +4215,307 @@ mod world_mechanisms_tests {
         }
         assert_eq!(world, [0, 0, 20, 30, 50, 60]);
     }
+
+    #[test]
+    fn crop_growth_probability_boundaries_across_ages_light_and_species() {
+        use CropKind::*;
+        let wet = [[Some(7); 3]; 3];
+        let base = |kind, age, light, farmland, random_value| CropTickInput {
+            kind,
+            age,
+            light,
+            farmland_below: farmland,
+            farmland_3x3: wet,
+            same_crop_north_south: false,
+            same_crop_east_west: false,
+            random_value,
+        };
+
+        assert_eq!(eval_crop_random_tick(base(Wheat, 0, 9, true, 0)), Some(1));
+        assert_eq!(eval_crop_random_tick(base(Wheat, 0, 8, true, 0)), None);
+        assert_eq!(eval_crop_random_tick(base(Wheat, 0, 9, false, 0)), None);
+
+        // A fully wet 3x3 has speed 10, giving a bound of floor(25 / 10) + 1 = 3:
+        // only every third raw value grows the crop.
+        assert_eq!(eval_crop_random_tick(base(Wheat, 3, 15, true, 0)), Some(4));
+        for roll in [1, 2, 4, 5] {
+            assert_eq!(eval_crop_random_tick(base(Wheat, 3, 15, true, roll)), None);
+        }
+        assert_eq!(eval_crop_random_tick(base(Wheat, 3, 15, true, 3)), Some(4));
+        // Same crop on both axes halves the speed to 5, giving a bound of six.
+        assert_eq!(
+            eval_crop_random_tick(CropTickInput {
+                same_crop_north_south: true,
+                same_crop_east_west: true,
+                ..base(Wheat, 3, 15, true, 0)
+            }),
+            Some(4)
+        );
+        for roll in [1, 5] {
+            assert_eq!(
+                eval_crop_random_tick(CropTickInput {
+                    same_crop_north_south: true,
+                    same_crop_east_west: true,
+                    ..base(Wheat, 3, 15, true, roll)
+                }),
+                None
+            );
+        }
+        assert_eq!(
+            eval_crop_random_tick(CropTickInput {
+                same_crop_north_south: true,
+                same_crop_east_west: true,
+                ..base(Wheat, 3, 15, true, 6)
+            }),
+            Some(4)
+        );
+
+        for (kind, max_age) in [
+            (Wheat, 7),
+            (Carrots, 7),
+            (Potatoes, 7),
+            (Beetroots, 3),
+            (NetherWart, 3),
+            (Cocoa, 2),
+            (SweetBerryBush, 3),
+            (MelonStem, 7),
+            (PumpkinStem, 7),
+        ] {
+            assert_eq!(
+                eval_crop_random_tick(base(kind, max_age, 15, true, 0)),
+                None,
+                "{kind:?}"
+            );
+        }
+
+        // Species that do not need farmland ignore light and use their own modulo.
+        assert_eq!(eval_crop_random_tick(base(NetherWart, 2, 0, false, 9)), None);
+        assert_eq!(
+            eval_crop_random_tick(base(NetherWart, 2, 0, false, 10)),
+            Some(3)
+        );
+        assert_eq!(eval_crop_random_tick(base(Cocoa, 1, 0, false, 4)), None);
+        assert_eq!(eval_crop_random_tick(base(Cocoa, 1, 0, false, 5)), Some(2));
+        assert_eq!(
+            eval_crop_random_tick(base(SweetBerryBush, 0, 0, false, 20)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn random_tick_speed_and_dispatch_cover_every_registered_name_and_offset() {
+        use RandomTickDispatch::*;
+        let sections = [RandomTickSection {
+            chunk_x: -2,
+            section_y: 4,
+            chunk_z: 3,
+        }];
+        assert!(eval_random_ticks(&sections, 0, 1, |_| "minecraft:wheat".to_owned()).is_empty());
+        let samples = eval_random_ticks(&sections, 5, 1, |_| "minecraft:wheat".to_owned());
+        assert_eq!(samples.len(), 5);
+        for sample in &samples {
+            assert!((-32..-16).contains(&sample.pos.0));
+            assert!((64..80).contains(&sample.pos.1));
+            assert!((48..64).contains(&sample.pos.2));
+            assert_eq!(sample.dispatch, Crop);
+        }
+        assert_eq!(
+            eval_random_ticks_default(&sections, 1, |_| "minecraft:wheat".to_owned()),
+            eval_random_ticks(
+                &sections,
+                DEFAULT_RANDOM_TICK_SPEED,
+                1,
+                |_| "minecraft:wheat".to_owned()
+            )
+        );
+
+        for (name, expected) in [
+            ("minecraft:wheat", Crop),
+            ("minecraft:carrots", Crop),
+            ("minecraft:potatoes", Crop),
+            ("minecraft:beetroots", Crop),
+            ("minecraft:nether_wart", Crop),
+            ("minecraft:melon_stem", Crop),
+            ("minecraft:pumpkin_stem", Crop),
+            ("minecraft:sweet_berry_bush", Crop),
+            ("minecraft:cocoa", Crop),
+            ("minecraft:fire", Fire),
+            ("minecraft:soul_fire", Fire),
+            ("minecraft:oak_leaves", Leaves),
+            ("minecraft:dark_oak_leaves", Leaves),
+            ("minecraft:snow", Snow),
+            ("minecraft:ice", Ice),
+            ("minecraft:stone", Other),
+        ] {
+            let sampled = eval_random_ticks(&sections, 1, 7, |_| name.to_owned());
+            assert_eq!(sampled.len(), 1);
+            assert_eq!(sampled[0].dispatch, expected, "{name}");
+        }
+
+        // Across seeds the section-local x offset covers all sixteen columns.
+        let mut seen = [false; 16];
+        for seed in 0..64 {
+            for sample in eval_random_ticks(&sections, 3, seed, |_| "minecraft:stone".to_owned()) {
+                seen[(sample.pos.0 - sections[0].chunk_x * 16) as usize] = true;
+            }
+        }
+        assert!(seen.iter().all(|covered| *covered), "x offsets: {seen:?}");
+    }
+
+    #[test]
+    fn fire_age_burnout_rain_and_soul_fire_boundaries() {
+        let base = FireTickInput {
+            age: 15,
+            rain_exposed: false,
+            soul_fire: false,
+            flammable_neighbors: [false; 6],
+            spread_rolls: [0; 6],
+            age_roll: 2,
+            burnout_roll: 1,
+        };
+        assert_eq!(eval_fire_tick(base).age, Some(15));
+        assert_eq!(eval_fire_tick(FireTickInput { age: 14, ..base }).age, Some(15));
+        assert_eq!(
+            eval_fire_tick(FireTickInput {
+                age: 14,
+                age_roll: 1,
+                ..base
+            })
+            .age,
+            Some(14)
+        );
+        assert_eq!(
+            eval_fire_tick(FireTickInput {
+                age: 14,
+                age_roll: 0,
+                ..base
+            })
+            .age,
+            Some(14)
+        );
+        assert_eq!(
+            eval_fire_tick(FireTickInput {
+                age: 255,
+                age_roll: 2,
+                ..base
+            })
+            .age,
+            Some(15)
+        );
+
+        let spread = eval_fire_tick(FireTickInput {
+            flammable_neighbors: [true, true, false, false, false, false],
+            spread_rolls: [0, 1, 0, 0, 0, 0],
+            ..base
+        });
+        assert_eq!(spread.spread, [true, false, false, false, false, false]);
+        assert!(eval_fire_tick(FireTickInput { burnout_roll: 0, ..base }).burned_out);
+        assert!(!eval_fire_tick(FireTickInput { burnout_roll: 1, ..base }).burned_out);
+        assert!(
+            !eval_fire_tick(FireTickInput {
+                burnout_roll: 4,
+                flammable_neighbors: [true, false, false, false, false, false],
+                ..base
+            })
+            .burned_out
+        );
+
+        let rain = eval_fire_tick(FireTickInput {
+            rain_exposed: true,
+            flammable_neighbors: [true; 6],
+            ..base
+        });
+        assert!(rain.extinguished);
+        assert_eq!(rain.age, None);
+        assert_eq!(rain.spread, [false; 6]);
+        let soul = eval_fire_tick(FireTickInput {
+            rain_exposed: true,
+            soul_fire: true,
+            age: 7,
+            burnout_roll: 0,
+            flammable_neighbors: [true; 6],
+            ..base
+        });
+        assert_eq!(
+            soul,
+            FireTickResult {
+                extinguished: false,
+                age: Some(7),
+                spread: [false; 6],
+                burned_out: false,
+            }
+        );
+    }
+
+    #[test]
+    fn leaf_decay_boundary_is_exactly_seven_and_drop_every_twentieth_roll() {
+        for distance in [6, 7, 8, 255] {
+            let result = eval_leaf_decay(LeafDecayInput {
+                persistent: false,
+                distance,
+                random_roll: 0,
+            });
+            assert_eq!(result.decay, distance >= 7);
+            assert_eq!(result.drop_item, distance >= 7);
+        }
+        assert!(
+            !eval_leaf_decay(LeafDecayInput {
+                persistent: true,
+                distance: 7,
+                random_roll: 0
+            })
+            .decay
+        );
+        for roll in [0, 19, 20, 39, 40] {
+            let result = eval_leaf_decay(LeafDecayInput {
+                persistent: false,
+                distance: 7,
+                random_roll: roll,
+            });
+            assert_eq!(result.drop_item, roll % 20 == 0, "roll {roll}");
+        }
+    }
+
+    #[test]
+    fn snow_and_ice_boundaries_for_light_roll_support_and_source_water() {
+        use SnowIceTickResult::*;
+        let base = SnowIceTickInput {
+            cold_biome: true,
+            sky_exposed: true,
+            light: 9,
+            support_is_full_solid: false,
+            water_source: true,
+            random_roll: 0,
+        };
+        for roll in [0, 15, 16, 31, 32] {
+            let accumulate =
+                eval_snow_accumulation(SnowIceTickInput { random_roll: roll, ..base });
+            assert_eq!(accumulate == AccumulateSnow, roll % 16 == 0, "roll {roll}");
+        }
+        assert_eq!(
+            eval_snow_accumulation(SnowIceTickInput { light: 10, ..base }),
+            NoChange
+        );
+        assert_eq!(
+            eval_snow_accumulation(SnowIceTickInput {
+                support_is_full_solid: true,
+                ..base
+            }),
+            NoChange
+        );
+        assert_eq!(eval_ice_freeze_melt(SnowIceTickInput { light: 10, ..base }, true), NoChange);
+        assert_eq!(eval_ice_freeze_melt(SnowIceTickInput { light: 11, ..base }, true), MeltIce);
+        // Freezing does not consult light; melting does not consult water source.
+        assert_eq!(
+            eval_ice_freeze_melt(SnowIceTickInput { light: 15, ..base }, false),
+            FreezeWater
+        );
+        for changed in [
+            SnowIceTickInput { cold_biome: false, ..base },
+            SnowIceTickInput { sky_exposed: false, ..base },
+            SnowIceTickInput { water_source: false, ..base },
+        ] {
+            assert_eq!(eval_ice_freeze_melt(changed, false), NoChange);
+        }
+    }
 }

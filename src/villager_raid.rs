@@ -2748,4 +2748,131 @@ mod villager_raid_tests {
         assert_eq!(raid.tick(&pois, 1), Some(RaidEvent::Loss));
         assert_eq!(raid.state, RaidState::Loss);
     }
+
+    #[test]
+    fn hero_discount_is_session_scoped_and_reopening_never_stacks_it() {
+        let (pois, mut villager) = village();
+        villager.offers.push(offer());
+        villager.gossip.cure(PLAYER);
+
+        // Hero V (amplifier 4): floor(20 * 0.55) = 11 plus the fixed reputation
+        // adjustment floor(125 * 0.05) = 6. The opening price is 20 - 17 = 3.
+        assert!(villager.start_trading(&pois, PLAYER, Some(4)));
+        assert_eq!(villager.offers[0].special_price_diff, -17);
+        assert_eq!(villager.offers[0].cost_a_count(&items()), 3);
+        assert!(!villager.start_trading(&pois, PLAYER, Some(4)));
+        assert_eq!(villager.offers[0].special_price_diff, -17);
+
+        let mut menu = MerchantMenu {
+            payments: [stack(WHEAT, 3), stack(BOOK, 2)],
+            ..MerchantMenu::default()
+        };
+        let outcome = villager
+            .trade(PLAYER, &mut menu, &items())
+            .expect("the discounted opening price is payable");
+        assert_eq!((outcome.consumed_a, outcome.consumed_b), (3, 2));
+        assert_eq!(villager.offers[0].special_price_diff, -17);
+
+        villager.stop_trading();
+        assert_eq!(villager.offers[0].special_price_diff, 0);
+        assert_eq!(villager.offers[0].cost_a_count(&items()), 20);
+        assert!(villager.start_trading(&pois, PLAYER, Some(4)));
+        assert_eq!(villager.offers[0].special_price_diff, -17);
+
+        // A new session with a weaker effect replaces the old discount instead of
+        // adding to it.
+        villager.stop_trading();
+        assert!(villager.start_trading(&pois, PLAYER, Some(0)));
+        assert_eq!(villager.offers[0].special_price_diff, -12);
+
+        // Even an out-of-range amplifier can never push the price below one.
+        villager.stop_trading();
+        villager.offers[0].cost_a.count = 2;
+        assert!(villager.start_trading(&pois, PLAYER, Some(u8::MAX)));
+        assert_eq!(villager.offers[0].cost_a_count(&items()), 1);
+    }
+
+    #[test]
+    fn max_omen_amplifier_adds_exactly_one_bonus_wave_and_caps_the_hero_level() {
+        let (pois, _) = village();
+        let no_bonus = BadOmen::from_ominous_bottle(0);
+        assert_eq!(no_bonus.level, 1);
+        let raid = start_raid(&pois, RaidDifficulty::Easy, no_bonus.enter_village().bad_omen_level);
+        assert_eq!(raid.total_waves, raid.regular_waves);
+
+        for amplifier in [4, 5, u8::MAX] {
+            let bad_omen = BadOmen::from_ominous_bottle(amplifier);
+            assert_eq!(bad_omen.level, 5);
+            assert_eq!(bad_omen.duration_ticks, BAD_OMEN_TICKS);
+            let mut raid = start_raid(
+                &pois,
+                RaidDifficulty::Easy,
+                bad_omen.enter_village().bad_omen_level,
+            );
+            assert_eq!(raid.omen_level, 5);
+            assert_eq!(raid.total_waves, raid.regular_waves + 1);
+
+            for number in 1..=raid.total_waves {
+                raid.countdown = 1;
+                let Some(RaidEvent::SpawnWave(wave)) = raid.tick(&pois, 1) else {
+                    panic!("expected wave {number}");
+                };
+                assert_eq!(wave.number, number);
+                let row = usize::from(number.min(raid.regular_waves) - 1);
+                assert_eq!(wave.counts, RAID_BASE_WAVES[row]);
+                for (id, _) in wave.raiders() {
+                    assert!(raid.record_defeat(id, Some(PLAYER)));
+                }
+            }
+            assert_eq!(
+                raid.tick(&pois, 1),
+                Some(RaidEvent::Victory {
+                    participants: vec![PLAYER],
+                    effect: HeroOfTheVillage {
+                        level: 5,
+                        duration_ticks: 48_000,
+                    },
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn gossip_decay_removes_a_player_only_when_every_value_crosses_the_threshold() {
+        let mut gossip = VillagerGossip::default();
+        gossip.add(PLAYER, GossipType::MinorPositive, 1);
+        assert!(!gossip.by_player.contains_key(&PLAYER));
+        gossip.add(PLAYER, GossipType::MinorPositive, 2);
+        assert_eq!(
+            gossip.by_player[&PLAYER][GossipType::MinorPositive as usize],
+            2
+        );
+        gossip.decay(0);
+        assert_eq!(
+            gossip.by_player[&PLAYER][GossipType::MinorPositive as usize],
+            2
+        );
+        gossip.decay(1);
+        assert!(!gossip.by_player.contains_key(&PLAYER));
+
+        gossip.add(PLAYER, GossipType::MinorPositive, 3);
+        gossip.decay(1);
+        assert_eq!(
+            gossip.by_player[&PLAYER][GossipType::MinorPositive as usize],
+            2
+        );
+        gossip.decay(1);
+        assert!(!gossip.by_player.contains_key(&PLAYER));
+
+        // Major Positive gossip never decays, so it keeps the entry alive while
+        // every decaying type is removed by the clamped 25-day decay.
+        gossip.add(PLAYER, GossipType::MajorPositive, 20);
+        gossip.add(PLAYER, GossipType::MajorNegative, 100);
+        gossip.add(PLAYER, GossipType::MinorNegative, 200);
+        gossip.add(PLAYER, GossipType::Trading, 25);
+        gossip.decay(u64::MAX);
+        assert_eq!(gossip.by_player[&PLAYER], [0, 0, 0, 20, 0]);
+        assert_eq!(gossip.reputation(PLAYER), 100);
+        assert!(!gossip.golem_hostile(PLAYER));
+    }
 }
