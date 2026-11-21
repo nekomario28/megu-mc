@@ -139,8 +139,8 @@ impl EntitySpatialGrid {
     fn build_mobs_and_clients(mobs_snap: &[Arc<Mob>], cls_snap: &[Arc<Client>]) -> Self {
         let mut entities = Vec::with_capacity(mobs_snap.len() + cls_snap.len());
         for (idx, m) in mobs_snap.iter().enumerate() {
-            let (x, y, z, _, _) = *m.pos.lock().unwrap();
-            let alive = *m.hp.lock().unwrap() > 0.0;
+            let (x, y, z, _, _) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let alive = *m.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0;
             let (w, h) = mob_dimensions(m.etype);
             let aabb = EntityAabb::from_dimensions(x, y, z, w, h);
             entities.push(SpatialEntity {
@@ -159,11 +159,11 @@ impl EntitySpatialGrid {
             });
         }
         for (idx, c) in cls_snap.iter().enumerate() {
-            let (x, y, z, _, _, _) = *c.pos.lock().unwrap();
-            let alive = *c.hp.lock().unwrap() > 0.0;
+            let (x, y, z, _, _, _) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let alive = *c.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0;
             let spectator = c.is_spectator();
-            let sneaking = *c.sneaking.lock().unwrap();
-            let fall_fly = *c.fall_fly.lock().unwrap();
+            let sneaking = *c.sneaking.lock().unwrap_or_else(|e| e.into_inner());
+            let fall_fly = *c.fall_fly.lock().unwrap_or_else(|e| e.into_inner());
             let aabb = player_bounding_box(x, y, z, sneaking, fall_fly);
             entities.push(SpatialEntity {
                 idx,

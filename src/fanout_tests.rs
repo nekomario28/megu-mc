@@ -37,9 +37,9 @@ fn the_broadcast_helpers_still_select_the_same_clients() {
     let (peer, mut r_peer) = client_with(2);
     let (far, mut r_far) = client_with(3);
     // Both peers have seen entity 77; only `peer` is streaming chunk (4,5).
-    peer.seen.lock().unwrap().insert(77);
-    far.seen.lock().unwrap().insert(77);
-    peer.chunks.lock().unwrap().insert((4, 5));
+    peer.seen.lock().unwrap_or_else(|e| e.into_inner()).insert(77);
+    far.seen.lock().unwrap_or_else(|e| e.into_inner()).insert(77);
+    peer.chunks.lock().unwrap_or_else(|e| e.into_inner()).insert((4, 5));
     // The audience is handed to the helpers explicitly, so no other test can
     // write into these sockets: the "nobody else may receive it" assertions used
     // to depend on every concurrent broadcast holding the world guard, which the

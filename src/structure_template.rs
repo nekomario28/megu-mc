@@ -1939,21 +1939,21 @@ mod tests {
         crate::materialize_generation_payloads(staged);
         let redstone = crate::name_to_item("minecraft:redstone").unwrap() as i64;
         assert_eq!(
-            crate::chests().lock().unwrap().get(&crate::ContainerKey::ow((2, 70, 2))).cloned(),
+            crate::chests().lock().unwrap_or_else(|e| e.into_inner()).get(&crate::ContainerKey::ow((2, 70, 2))).cloned(),
             Some([(0i16, (redstone, 3u8, Vec::new()))].into_iter().collect()),
             "the live store holds what the template staged"
         );
         // Save and reload: the contents must come back, not just the block.
         let mut buffer = Vec::new();
         crate::save_world_into(&mut buffer);
-        crate::chests().lock().unwrap().clear();
+        crate::chests().lock().unwrap_or_else(|e| e.into_inner()).clear();
         crate::load_world_from(&buffer).unwrap();
         assert_eq!(
-            crate::chests().lock().unwrap().get(&crate::ContainerKey::ow((2, 70, 2))).cloned(),
+            crate::chests().lock().unwrap_or_else(|e| e.into_inner()).get(&crate::ContainerKey::ow((2, 70, 2))).cloned(),
             Some([(0i16, (redstone, 3u8, Vec::new()))].into_iter().collect()),
             "a saved container comes back with its contents"
         );
-        crate::chests().lock().unwrap().remove(&crate::ContainerKey::ow((2, 70, 2)));
+        crate::chests().lock().unwrap_or_else(|e| e.into_inner()).remove(&crate::ContainerKey::ow((2, 70, 2)));
     }
 
     /// The window a player opens reads the same store the handoff writes, so the packet
@@ -1965,14 +1965,14 @@ mod tests {
         let reg = crate::block_registry::breg().unwrap();
         let redstone = crate::name_to_item("minecraft:redstone").unwrap();
         let pos = crate::ContainerKey::ow((2, 70, 2));
-        crate::chests().lock().unwrap().insert(
+        crate::chests().lock().unwrap_or_else(|e| e.into_inner()).insert(
             pos,
             [(0i16, (redstone, 3u8, Vec::new()))].into_iter().collect(),
         );
         let (client, mut receiver) = client_pair();
-        let inv = client.inv.lock().unwrap().clone();
+        let inv = client.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
         crate::open_chest_window(
-            &mut client.sock.lock().unwrap(),
+            &mut client.sock.lock().unwrap_or_else(|e| e.into_inner()),
             pos,
             None,
             &inv,
@@ -2007,9 +2007,9 @@ mod tests {
         assert_eq!(varint(), 0, "the staged stack carries no components");
 
         // The same window over an empty store: the packet follows the store, not a copy.
-        crate::chests().lock().unwrap().remove(&pos);
+        crate::chests().lock().unwrap_or_else(|e| e.into_inner()).remove(&pos);
         crate::open_chest_window(
-            &mut client.sock.lock().unwrap(),
+            &mut client.sock.lock().unwrap_or_else(|e| e.into_inner()),
             pos,
             None,
             &inv,
@@ -2137,7 +2137,7 @@ mod tests {
         assert_eq!(
             crate::signs()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .get(&(crate::worldgen::DimId::Overworld, cell.0, cell.1, cell.2, 1))
                 .cloned(),
             Some(["Hi".to_string(), String::new(), String::new(), String::new()]),
@@ -2145,7 +2145,7 @@ mod tests {
         );
         crate::signs()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .remove(&(crate::worldgen::DimId::Overworld, cell.0, cell.1, cell.2, 1));
     }
 
@@ -2215,7 +2215,7 @@ mod tests {
         let ore = crate::name_to_item("minecraft:iron_ore").unwrap();
         let coal = crate::name_to_item("minecraft:coal").unwrap();
         {
-            let store = crate::furnaces().lock().unwrap();
+            let store = crate::furnaces().lock().unwrap_or_else(|e| e.into_inner());
             let f = store.get(&crate::ow_block(cell)).expect("the furnace store holds the placed furnace");
             assert_eq!(f.input, (ore, 2, Vec::new()), "slot 0 is the input");
             assert_eq!(f.fuel, (coal, 5, Vec::new()), "slot 1 is the fuel");
@@ -2223,10 +2223,10 @@ mod tests {
             assert!(f.dirty, "a placed furnace needs a resync");
         }
         assert!(
-            crate::chests().lock().unwrap().get(&crate::ContainerKey::ow(cell)).is_none(),
+            crate::chests().lock().unwrap_or_else(|e| e.into_inner()).get(&crate::ContainerKey::ow(cell)).is_none(),
             "a furnace must not be staged into the chest store"
         );
-        crate::furnaces().lock().unwrap().remove(&crate::ow_block(cell));
+        crate::furnaces().lock().unwrap_or_else(|e| e.into_inner()).remove(&crate::ow_block(cell));
     }
 
     /// A container the port has no store for is refused rather than staged where nothing
@@ -3564,20 +3564,20 @@ mod tests {
         }
         crate::materialize_generation_payloads(g.take_staged_payloads());
         assert!(
-            !crate::chests().lock().unwrap().contains_key(&crate::ContainerKey::ow((4, 70, 4))),
+            !crate::chests().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&crate::ContainerKey::ow((4, 70, 4))),
             "placed loot chest remains unexpanded until first open/unpack"
         );
         assert!(crate::unpack_block_loot_if_needed(crate::ow_block((4, 70, 4))));
         let expected_loot = crate::roll_cart_loot(424242);
         assert_eq!(
-            crate::chests().lock().unwrap().get(&crate::ContainerKey::ow((4, 70, 4))).cloned(),
+            crate::chests().lock().unwrap_or_else(|e| e.into_inner()).get(&crate::ContainerKey::ow((4, 70, 4))).cloned(),
             Some(expected_loot)
         );
-        assert!(crate::furnaces().lock().unwrap().contains_key(&crate::ow_block((5, 70, 4))));
-        crate::chests().lock().unwrap().remove(&crate::ContainerKey::ow((4, 70, 4)));
-        crate::pending_block_loot().lock().unwrap().remove(&crate::ow_block((4, 70, 4)));
-        crate::pending_block_loot().lock().unwrap().remove(&crate::ow_block((7, 70, 4)));
-        crate::furnaces().lock().unwrap().remove(&crate::ow_block((5, 70, 4)));
+        assert!(crate::furnaces().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&crate::ow_block((5, 70, 4))));
+        crate::chests().lock().unwrap_or_else(|e| e.into_inner()).remove(&crate::ContainerKey::ow((4, 70, 4)));
+        crate::pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()).remove(&crate::ow_block((4, 70, 4)));
+        crate::pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()).remove(&crate::ow_block((7, 70, 4)));
+        crate::furnaces().lock().unwrap_or_else(|e| e.into_inner()).remove(&crate::ow_block((5, 70, 4)));
     }
 
     #[test]

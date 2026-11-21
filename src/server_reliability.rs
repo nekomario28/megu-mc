@@ -760,13 +760,13 @@ fn online_auth_slot() -> &'static Mutex<Option<Arc<dyn OnlineAuth>>> {
 /// this; the login path reads through `online_auth_provider`.
 #[allow(dead_code)]
 pub(crate) fn set_online_auth_provider(provider: Option<Arc<dyn OnlineAuth>>) {
-    *online_auth_slot().lock().unwrap() = provider;
+    *online_auth_slot().lock().unwrap_or_else(|e| e.into_inner()) = provider;
 }
 
 /// The installed provider, or `None` when online mode must fail closed.
 #[allow(dead_code)]
 pub(crate) fn online_auth_provider() -> Option<Arc<dyn OnlineAuth>> {
-    online_auth_slot().lock().unwrap().clone()
+    online_auth_slot().lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 // ================= async background autosave =================
@@ -864,7 +864,7 @@ impl AsyncSaveWorker {
         let (lock, cv) = &**state;
         loop {
             let job = {
-                let mut g = lock.lock().unwrap();
+                let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
                 loop {
                     if !g.paused || g.closing {
                         if let Some(job) = g.pending.take() {
@@ -878,7 +878,7 @@ impl AsyncSaveWorker {
                 }
             };
             let result = write_bytes_atomic(&job.path, &job.bytes);
-            let mut g = lock.lock().unwrap();
+            let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
             g.writes += 1;
             g.last_done = job.seq;
             if let Err(error) = result {
@@ -896,7 +896,7 @@ impl AsyncSaveWorker {
     pub(crate) fn submit(&self, path: impl Into<std::path::PathBuf>, bytes: std::sync::Arc<[u8]>) -> u64 {
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         let (lock, cv) = &*self.state;
-        lock.lock().unwrap().pending = Some(SaveJob {
+        lock.lock().unwrap_or_else(|e| e.into_inner()).pending = Some(SaveJob {
             path: path.into(),
             bytes,
             seq,
@@ -915,7 +915,7 @@ impl AsyncSaveWorker {
     pub(crate) fn flush(&self) -> std::io::Result<()> {
         let target = self.submitted_seq();
         let (lock, cv) = &*self.state;
-        let mut g = lock.lock().unwrap();
+        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
         while g.last_done < target {
             g = cv.wait(g).unwrap();
         }
@@ -927,7 +927,7 @@ impl AsyncSaveWorker {
 
     /// Completed writes, for tests and operator telemetry.
     pub(crate) fn writes_completed(&self) -> u64 {
-        self.state.0.lock().unwrap().writes
+        self.state.0.lock().unwrap_or_else(|e| e.into_inner()).writes
     }
 
     /// Pause/resume draining. Used by tests to force coalescing deterministically;
@@ -935,7 +935,7 @@ impl AsyncSaveWorker {
     #[cfg(test)]
     pub(crate) fn set_paused(&self, paused: bool) {
         let (lock, cv) = &*self.state;
-        lock.lock().unwrap().paused = paused;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).paused = paused;
         cv.notify_all();
     }
 }
@@ -943,7 +943,7 @@ impl AsyncSaveWorker {
 impl std::ops::Drop for AsyncSaveWorker {
     fn drop(&mut self) {
         let (lock, cv) = &*self.state;
-        lock.lock().unwrap().closing = true;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).closing = true;
         cv.notify_all();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -1578,7 +1578,7 @@ impl TickFaultQuarantine {
     pub(crate) fn is_quarantined(&self, target: &QuarantineTarget) -> bool {
         self.records
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(target)
             .is_some_and(|r| r.quarantined)
     }
@@ -1587,7 +1587,7 @@ impl TickFaultQuarantine {
     pub(crate) fn diagnostic(&self, target: &QuarantineTarget) -> Option<String> {
         self.records
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(target)
             .map(|r| r.diagnostic.clone())
     }
@@ -1596,7 +1596,7 @@ impl TickFaultQuarantine {
     pub(crate) fn quarantined(&self) -> Vec<QuarantineTarget> {
         self.records
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter(|(_, r)| r.quarantined)
             .map(|(t, _)| t.clone())
@@ -1616,7 +1616,7 @@ impl TickFaultQuarantine {
                 target.describe()
             ));
         }
-        let mut records = self.records.lock().unwrap();
+        let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
         if records.get(target).is_some_and(|r| r.quarantined) {
             records.remove(target);
             return Ok(true);
@@ -1630,7 +1630,7 @@ impl TickFaultQuarantine {
         ops_data_path_checked(path, "quarantine evidence")?;
         let mut out = String::from(QUARANTINE_FILE_HEADER);
         out.push('\n');
-        for (target, record) in self.records.lock().unwrap().iter() {
+        for (target, record) in self.records.lock().unwrap_or_else(|e| e.into_inner()).iter() {
             if !record.quarantined {
                 continue;
             }
@@ -1658,7 +1658,7 @@ impl TickFaultQuarantine {
         let quarantine = TickFaultQuarantine::new(max_consecutive_faults);
         for line in text.lines() {
             if let Some((target, faults, diagnostic)) = parse_quarantine_line(line) {
-                quarantine.records.lock().unwrap().insert(
+                quarantine.records.lock().unwrap_or_else(|e| e.into_inner()).insert(
                     target,
                     QuarantineRecord {
                         consecutive_faults: faults,
@@ -1795,7 +1795,7 @@ pub(crate) fn run_quarantined_tick(
     f: impl FnOnce() + std::panic::UnwindSafe,
 ) -> TickFaultOutcome {
     {
-        let records = quarantine.records.lock().unwrap();
+        let records = quarantine.records.lock().unwrap_or_else(|e| e.into_inner());
         if records.get(&target).is_some_and(|r| r.quarantined) {
             return TickFaultOutcome::SkippedQuarantined;
         }
@@ -1805,14 +1805,14 @@ pub(crate) fn run_quarantined_tick(
         Err(payload) => Some(panic_payload_message(&payload)),
     };
     let Some(message) = panic else {
-        let mut records = quarantine.records.lock().unwrap();
+        let mut records = quarantine.records.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(record) = records.get_mut(&target) {
             record.consecutive_faults = 0;
         }
         return TickFaultOutcome::Ticked;
     };
     let message = quarantine_sanitize(&message);
-    let mut records = quarantine.records.lock().unwrap();
+    let mut records = quarantine.records.lock().unwrap_or_else(|e| e.into_inner());
     let record = records
         .entry(target.clone())
         .or_insert_with(|| QuarantineRecord {

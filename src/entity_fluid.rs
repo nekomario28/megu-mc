@@ -828,7 +828,7 @@ fn mob_fluid_travel_tick(
 ) -> Option<FluidTravelOutcome> {
     let (w, h) = mob_dimensions(m.etype);
     let pos = [mp.0, mp.1, mp.2];
-    let mut vel = *m.vel.lock().unwrap();
+    let mut vel = *m.vel.lock().unwrap_or_else(|e| e.into_inner());
     let water = mob_water_state_vel(m.etype, pos, vel);
     let (kind, state) = if water.in_fluid {
         (EntityFluidKind::Water, water)
@@ -838,7 +838,7 @@ fn mob_fluid_travel_tick(
             (EntityFluidKind::Lava, lava)
         } else {
             if vel != [0.0; 3] {
-                *m.vel.lock().unwrap() = [0.0; 3];
+                *m.vel.lock().unwrap_or_else(|e| e.into_inner()) = [0.0; 3];
             }
             return None;
         }
@@ -872,7 +872,7 @@ fn mob_fluid_travel_tick(
     mp.0 += out.moved[0];
     mp.1 += out.moved[1];
     mp.2 += out.moved[2];
-    *m.vel.lock().unwrap() = out.vel;
+    *m.vel.lock().unwrap_or_else(|e| e.into_inner()) = out.vel;
     Some(out)
 }
 
@@ -889,9 +889,9 @@ mod entity_fluid_tests {
     impl FluidTestWorldSnapshot {
         fn take() -> Self {
             Self {
-                world: std::mem::take(&mut *world().lock().unwrap()),
-                mobs: std::mem::take(&mut *mobs().lock().unwrap()),
-                region: std::mem::take(&mut *region().lock().unwrap()),
+                world: std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner())),
+                mobs: std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner())),
+                region: std::mem::take(&mut *region().lock().unwrap_or_else(|e| e.into_inner())),
             }
         }
     }
@@ -1416,7 +1416,7 @@ mod entity_fluid_tests {
         });
         set_block(6, 60, 0, 80); // 1-deep water over stone at y=59
         {
-            let mut mp = cow_water.pos.lock().unwrap();
+            let mut mp = cow_water.pos.lock().unwrap_or_else(|e| e.into_inner());
             mob_snap_y(&cow_water, &mut mp);
             assert!(
                 (mp.1 - 60.0).abs() < 1e-6,
@@ -1424,7 +1424,7 @@ mod entity_fluid_tests {
             );
         }
         assert_eq!(
-            *cow_water.hp.lock().unwrap(),
+            *cow_water.hp.lock().unwrap_or_else(|e| e.into_inner()),
             10.0,
             "landing in water must reset fall distance and deal 0 fall damage"
         );
@@ -1447,11 +1447,11 @@ mod entity_fluid_tests {
             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
         });
         {
-            let mut mp = cow_dry.pos.lock().unwrap();
+            let mut mp = cow_dry.pos.lock().unwrap_or_else(|e| e.into_inner());
             mob_snap_y(&cow_dry, &mut mp);
             assert!((mp.1 - 60.0).abs() < 1e-6);
         }
-        assert_eq!(*cow_dry.hp.lock().unwrap(), 5.0, "8-block dry fall deals 5 dmg");
+        assert_eq!(*cow_dry.hp.lock().unwrap_or_else(|e| e.into_inner()), 5.0, "8-block dry fall deals 5 dmg");
 
         // Mob water current push + drowning + lava burn in mob_tick.
         // Build a 1x1 channel along +X from x=-2..=2 at y=60 over stone y=59.
@@ -1531,8 +1531,8 @@ mod entity_fluid_tests {
             sleeping: Mutex::new(None),
             inv_state_id: AtomicI32::new(0),
         });
-        let old_clients = std::mem::take(&mut *clients().lock().unwrap());
-        clients().lock().unwrap().push(dummy_client);
+        let old_clients = std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner()));
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(dummy_client);
         let old_tick = TICK.load(Ordering::Relaxed);
         let old_world_time = WORLD_TIME.load(Ordering::Relaxed);
         TICK.store(server_ticks(10), Ordering::Relaxed);
@@ -1626,7 +1626,7 @@ mod entity_fluid_tests {
             love: Mutex::new(0),
             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
         });
-        mobs().lock().unwrap().extend([
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).extend([
             chicken.clone(),
             pig_lava.clone(),
             blaze_lava.clone(),
@@ -1639,31 +1639,31 @@ mod entity_fluid_tests {
 
         WORLD_TIME.store(old_world_time, Ordering::Relaxed);
         TICK.store(old_tick, Ordering::Relaxed);
-        *clients().lock().unwrap() = old_clients;
+        *clients().lock().unwrap_or_else(|e| e.into_inner()) = old_clients;
 
-        assert_eq!(*chicken.air.lock().unwrap(), 9, "chicken air must drain in water");
+        assert_eq!(*chicken.air.lock().unwrap_or_else(|e| e.into_inner()), 9, "chicken air must drain in water");
         assert!(
-            chicken.pos.lock().unwrap().0 > 0.5,
+            chicken.pos.lock().unwrap_or_else(|e| e.into_inner()).0 > 0.5,
             "chicken must be pushed +X by water current: {:?}",
-            *chicken.pos.lock().unwrap()
+            *chicken.pos.lock().unwrap_or_else(|e| e.into_inner())
         );
         assert_eq!(
-            *pig_lava.hp.lock().unwrap(),
+            *pig_lava.hp.lock().unwrap_or_else(|e| e.into_inner()),
             6.0,
             "pig in flowing lava must take 4.0 damage on 10-tick boundary"
         );
         assert_eq!(
-            *blaze_lava.hp.lock().unwrap(),
+            *blaze_lava.hp.lock().unwrap_or_else(|e| e.into_inner()),
             20.0,
             "fire-immune blaze must take 0 lava damage"
         );
         assert_eq!(
-            *zombie_water.fire_ticks.lock().unwrap(),
+            *zombie_water.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()),
             0,
             "zombie daylight burn counter must clear in water"
         );
         assert_eq!(
-            *creeper_water.fuse.lock().unwrap(),
+            *creeper_water.fuse.lock().unwrap_or_else(|e| e.into_inner()),
             8,
             "creeper fuse must NOT be cleared by water contact (7 -> 8, not 0 -> 1)"
         );

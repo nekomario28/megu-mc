@@ -657,7 +657,7 @@ fn a_fork_runs_the_command_once_per_source_and_counts_them() {
     let seen_by_command = seen.clone();
     dispatcher
         .register(ArgumentBuilder::literal("run").executes(move |context| {
-            seen_by_command.lock().unwrap().push(*context.source());
+            seen_by_command.lock().unwrap_or_else(|e| e.into_inner()).push(*context.source());
             Ok(*context.source())
         }))
         .unwrap();
@@ -668,7 +668,7 @@ fn a_fork_runs_the_command_once_per_source_and_counts_them() {
         .unwrap();
 
     assert_eq!(dispatcher.execute("split run", 0).unwrap(), 3);
-    assert_eq!(*seen.lock().unwrap(), vec![9, 10, 11]);
+    assert_eq!(*seen.lock().unwrap_or_else(|e| e.into_inner()), vec![9, 10, 11]);
 }
 
 #[test]
@@ -749,7 +749,7 @@ fn a_result_consumer_is_told_about_every_successful_run() {
     dispatcher.set_consumer(std::sync::Arc::new(move |context, success, result| {
         log_for_consumer
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .push((*context.source(), success, result));
     }));
     dispatcher
@@ -763,12 +763,12 @@ fn a_result_consumer_is_told_about_every_successful_run() {
 
     assert_eq!(dispatcher.execute("split run", 0).unwrap(), 3);
     assert_eq!(
-        *log.lock().unwrap(),
+        *log.lock().unwrap_or_else(|e| e.into_inner()),
         vec![(9, true, 9), (10, true, 10), (11, true, 11)]
     );
 
     // A failure is reported as such, and in non-forked mode still propagates.
-    log.lock().unwrap().clear();
+    log.lock().unwrap_or_else(|e| e.into_inner()).clear();
     dispatcher
         .register(
             ArgumentBuilder::literal("crash")
@@ -776,7 +776,7 @@ fn a_result_consumer_is_told_about_every_successful_run() {
         )
         .unwrap();
     assert!(dispatcher.execute("crash", 4).is_err());
-    assert_eq!(*log.lock().unwrap(), vec![(4, false, 0)]);
+    assert_eq!(*log.lock().unwrap_or_else(|e| e.into_inner()), vec![(4, false, 0)]);
 }
 
 #[test]
@@ -1072,7 +1072,7 @@ fn the_context_hands_back_typed_arguments_by_name() {
                 ArgumentBuilder::argument("x", Box::new(IntegerArgumentType::integer())).then(
                     ArgumentBuilder::argument("who", Box::new(StringArgumentType::word())).executes(
                         move |context| {
-                        *captured_by_command.lock().unwrap() = Some(format!(
+                        *captured_by_command.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!(
                             "{}:{}",
                             IntegerArgumentType::get_integer(context, "x").expect("x was parsed"),
                             StringArgumentType::get_string(context, "who").expect("who was parsed")
@@ -1086,7 +1086,7 @@ fn the_context_hands_back_typed_arguments_by_name() {
         .unwrap();
 
     assert_eq!(dispatcher.execute("tp 5 alpha", allowed()).unwrap(), 1);
-    assert_eq!(captured.lock().unwrap().as_deref(), Some("5:alpha"));
+    assert_eq!(captured.lock().unwrap_or_else(|e| e.into_inner()).as_deref(), Some("5:alpha"));
 
     // The two `getArgument` failure cases keep Java's messages.
     let parse = dispatcher.parse("tp 5 alpha", allowed());
@@ -2363,10 +2363,10 @@ fn execute_pipeline_forks_and_carries_each_entity_position_and_rotation() {
         let (mut player, peer) = crate::effect_tests::client_pair();
         player.name = name.into();
         player.eid += index as i32;
-        *player.pos.lock().unwrap() = (x, 80.0, 30.5, yaw, 0.0, true);
+        *player.pos.lock().unwrap_or_else(|e| e.into_inner()) = (x, 80.0, 30.5, yaw, 0.0, true);
         crate::clients()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .push(std::sync::Arc::new(player));
         peers.push(peer);
     }
@@ -2409,11 +2409,11 @@ fn execute_pipeline_forks_and_carries_each_entity_position_and_rotation() {
         "executed 2 command(s)"
     );
     assert_eq!(
-        crate::scoreboard().lock().unwrap().get("Last", "exec"),
+        crate::scoreboard().lock().unwrap_or_else(|e| e.into_inner()).get("Last", "exec"),
         Some(7)
     );
 
-    crate::pearls().lock().unwrap().push(crate::Pearl {
+    crate::pearls().lock().unwrap_or_else(|e| e.into_inner()).push(crate::Pearl {
         eid: 9000,
         owner: 4242,
         x: 0.5,
@@ -2457,7 +2457,7 @@ fn execute_pipeline_runs_in_selected_dimension_and_evaluates_world_conditions() 
         "executed 1 command(s)"
     );
     assert_eq!(crate::block_at(12, 83, 12), 1);
-    crate::forceloaded().lock().unwrap().insert((2, 2));
+    crate::forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((2, 2));
     assert_eq!(
         execute_console("/execute positioned 32.5 90 32.5 if loaded ~ ~ ~ if biome ~ ~ ~ plains run setblock ~ ~ ~ stone"),
         "executed 1 command(s)"
@@ -2466,7 +2466,7 @@ fn execute_pipeline_runs_in_selected_dimension_and_evaluates_world_conditions() 
         execute_console("/execute positioned 32.5 0 32.5 positioned over world_surface if block ~ ~-1 ~ stone if blocks 32 90 32 32 90 32 ~ ~-1 ~ all"),
         "Test passed"
     );
-    crate::predicates().lock().unwrap().insert(
+    crate::predicates().lock().unwrap_or_else(|e| e.into_inner()).insert(
         "test:always".into(),
         r#"{"condition":"minecraft:time_check","period":1,"value":0}"#.into(),
     );
@@ -2520,7 +2520,7 @@ fn execute_pipeline_runs_nested_commands_and_stores_result_and_success_separatel
         "Unknown command: missing_command"
     );
     assert_eq!(
-        crate::scoreboard().lock().unwrap().get("unknown", "exec"),
+        crate::scoreboard().lock().unwrap_or_else(|e| e.into_inner()).get("unknown", "exec"),
         Some(0)
     );
     assert_eq!(
@@ -2528,7 +2528,7 @@ fn execute_pipeline_runs_nested_commands_and_stores_result_and_success_separatel
         "Test failed"
     );
     assert_eq!(
-        crate::scoreboard().lock().unwrap().get("untouched", "exec"),
+        crate::scoreboard().lock().unwrap_or_else(|e| e.into_inner()).get("untouched", "exec"),
         None
     );
     assert_eq!(
@@ -2563,7 +2563,7 @@ fn execute_pipeline_summons_and_stores_in_live_entity_and_block_data() {
     crate::set_block(pos.0, pos.1, pos.2, crate::name_to_state("chest").unwrap());
     let item = crate::name_to_item("stone").unwrap();
     let components = vec![(crate::COMP_CUSTOM_DATA, vec![10, 0])];
-    crate::chests().lock().unwrap().insert(
+    crate::chests().lock().unwrap_or_else(|e| e.into_inner()).insert(
         crate::ContainerKey::ow(pos),
         [(0, (item, 1, components.clone()))].into(),
     );
@@ -2578,7 +2578,7 @@ fn execute_pipeline_summons_and_stores_in_live_entity_and_block_data() {
         "Test passed"
     );
     assert_eq!(
-        crate::chests().lock().unwrap()[&crate::ContainerKey::ow(pos)][&0],
+        crate::chests().lock().unwrap_or_else(|e| e.into_inner())[&crate::ContainerKey::ow(pos)][&0],
         (item, 8, components)
     );
 }

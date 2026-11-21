@@ -58,8 +58,8 @@ fn entity_angles_spawn_matches_native_constructors() {
     };
     for case in entity_angle_cases() {
         let (yaw, pitch) = rotations(&case);
-        *client.pos.lock().unwrap() = (1.0, 64.0, -2.0, yaw, pitch, false);
-        *mob.pos.lock().unwrap() = (1.0, 64.0, -2.0, yaw, pitch);
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (1.0, 64.0, -2.0, yaw, pitch, false);
+        *mob.pos.lock().unwrap_or_else(|e| e.into_inner()) = (1.0, 64.0, -2.0, yaw, pitch);
         let want = expected_bytes(&case, "spawn");
         for packet in [
             spawn_player(&client),

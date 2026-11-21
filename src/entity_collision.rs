@@ -367,7 +367,7 @@ mod entity_collision_tests {
     impl TestWorldSnapshot {
         fn take() -> Self {
             Self {
-                world: std::mem::take(&mut *world().lock().unwrap()),
+                world: std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner())),
             }
         }
     }
@@ -680,18 +680,18 @@ mod entity_collision_tests {
         // Creeper (0.6x1.7) steps onto slab [1..2] (x=1.5, y=64.5) in 4 steps of +0.25.
         let creeper = make_mob(9001, 23, 0.5, 64.0, 0.5);
         for _ in 0..4 {
-            let mut mp = creeper.pos.lock().unwrap();
+            let mut mp = creeper.pos.lock().unwrap_or_else(|e| e.into_inner());
             mob_collide_move(&creeper, &mut mp, 0.25, 0.0);
         }
-        let cp = *creeper.pos.lock().unwrap();
+        let cp = *creeper.pos.lock().unwrap_or_else(|e| e.into_inner());
         assert!((cp.0 - 1.5).abs() < 1e-6 && (cp.1 - 64.5).abs() < 1e-6, "creeper must step onto slab (1.5, 64.5), got {cp:?}");
 
         // Continue moving east off the slab into oak_fence at x=3..4: fence stops creeper before x=3.0.
         for _ in 0..16 {
-            let mut mp = creeper.pos.lock().unwrap();
+            let mut mp = creeper.pos.lock().unwrap_or_else(|e| e.into_inner());
             mob_collide_move(&creeper, &mut mp, 0.25, 0.0);
         }
-        let cp_fence = *creeper.pos.lock().unwrap();
+        let cp_fence = *creeper.pos.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             cp_fence.0 <= 3.08 && (cp_fence.1 - 64.0).abs() < 1e-6,
             "creeper (half_w=0.3) must stop flush at 1.5-block fence post (x_min=3.375): {cp_fence:?}"
@@ -700,7 +700,7 @@ mod entity_collision_tests {
         // Sheep (0.9x1.3) resting on slab at 64.5 stays at 64.5 across mob_snap_y (no false snap to 65.0).
         let sheep = make_mob(9002, 87, 1.5, 64.5, 0.5);
         {
-            let mut mp = sheep.pos.lock().unwrap();
+            let mut mp = sheep.pos.lock().unwrap_or_else(|e| e.into_inner());
             mob_snap_y(&sheep, &mut mp);
             assert!((mp.1 - 64.5).abs() < 1e-6, "sheep on slab must stay at 64.5: {mp:?}");
         }
@@ -708,10 +708,10 @@ mod entity_collision_tests {
         // Cow (0.9x1.4) blocked by 1.0-tall stone wall at (1, 64, 2).
         let cow = make_mob(9003, 22, 0.3, 64.0, 2.5);
         for _ in 0..6 {
-            let mut mp = cow.pos.lock().unwrap();
+            let mut mp = cow.pos.lock().unwrap_or_else(|e| e.into_inner());
             mob_collide_move(&cow, &mut mp, 0.28, 0.0);
         }
-        let cow_pos = *cow.pos.lock().unwrap();
+        let cow_pos = *cow.pos.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             cow_pos.0 <= 0.56,
             "cow (half_w=0.45) must stop before 1.0-block wall at x=1.0: {cow_pos:?}"

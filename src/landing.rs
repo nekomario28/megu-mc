@@ -113,7 +113,7 @@ fn commit(trample: Trample) -> Result<bool, String> {
 /// Adult cow dimensions are pinned from 1.21.1 bsx static initializer, offsets 948..968.
 /// Other mobs are not advertised as supported until their dimensions and landing are validated.
 pub fn cow_land(mob: &Arc<Mob>, position: (i32, i32, i32), distance: f32) -> bool {
-    if mob.etype != 22 || *mob.hp.lock().unwrap() <= 0.0 {
+    if mob.etype != 22 || *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0 {
         return false;
     }
     let dim = DimId::Overworld;
@@ -152,18 +152,18 @@ pub fn cow_land(mob: &Arc<Mob>, position: (i32, i32, i32), distance: f32) -> boo
 }
 
 pub fn player_move(me: &Arc<Client>, previous_ground: bool) {
-    let (x, y, z, _, _, ground) = *me.pos.lock().unwrap();
+    let (x, y, z, _, _, ground) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
     if !x.is_finite() || !y.is_finite() || !z.is_finite() {
         return;
     }
-    let dim = *me.dim.lock().unwrap();
+    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
     let water = name_to_state("water").unwrap_or(u32::MAX);
     // Block containing a point in the player's current dimension.
     let block_containing = |px: f64, py: f64, pz: f64| {
         block_at_dim(dim, px.floor() as i32, py.floor() as i32, pz.floor() as i32)
     };
-    let gliding = *me.fall_fly.lock().unwrap();
-    let mut peak = me.fall_from.lock().unwrap();
+    let gliding = *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner());
+    let mut peak = me.fall_from.lock().unwrap_or_else(|e| e.into_inner());
     if !ground && y > *peak {
         *peak = y;
     }
@@ -185,12 +185,12 @@ pub fn player_move(me: &Arc<Client>, previous_ground: bool) {
     let wet = block_containing(x, y - 0.5, z) == water || block_containing(x, y, z) == water;
     let height = if gliding {
         0.6
-    } else if *me.sneaking.lock().unwrap() {
+    } else if *me.sneaking.lock().unwrap_or_else(|e| e.into_inner()) {
         1.5
     } else {
         1.8
     };
-    if (4286..=4293).contains(&state) && !wet && *me.hp.lock().unwrap() > 0.0 {
+    if (4286..=4293).contains(&state) && !wet && *me.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0 {
         let random = (crate::world_rng::next_u64() >> 40) as f32 / 16777216.0;
         if eligible(distance as f32, random, true, true, true, 0.6, height) {
             match commit(Trample {
@@ -204,7 +204,7 @@ pub fn player_move(me: &Arc<Client>, previous_ground: bool) {
                 Err(error) => {
                     // Fail closed. Never apply an unreviewed vanilla fallback after callback failure.
                     eprintln!("[mod-compatibility] landing failed: {error}");
-                    let _ = me.sock.lock().unwrap().shutdown(std::net::Shutdown::Both);
+                    let _ = me.sock.lock().unwrap_or_else(|e| e.into_inner()).shutdown(std::net::Shutdown::Both);
                     return;
                 }
             }
@@ -213,22 +213,22 @@ pub fn player_move(me: &Arc<Client>, previous_ground: bool) {
     // Cancellation changes farmland conversion only; the existing damage path still runs.
     if distance > 3.0
         && !wet
-        && *me.gm.lock().unwrap() != 1
+        && *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1
         && GR_FALL_DAMAGE.load(Ordering::Relaxed) != 0
     {
-        let mut hp = me.hp.lock().unwrap();
+        let mut hp = me.hp.lock().unwrap_or_else(|e| e.into_inner());
         let damage = (distance - 3.0).ceil() as f32;
         *hp = (*hp - damage * (1.0 - 0.04 * enchant_epf(me, 1) as f32)).max(0.0);
         if *hp <= 0.0 {
             drop(hp);
             totem_check(me);
-            hp = me.hp.lock().unwrap();
+            hp = me.hp.lock().unwrap_or_else(|e| e.into_inner());
         }
         let current = *hp;
         drop(hp);
-        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x24, hurt_anim(me.eid));
+        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x24, hurt_anim(me.eid));
         let _ = send_packet(
-            &mut me.sock.lock().unwrap(),
+            &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
             0x5d,
             health_pkt_c(current, me),
         );
@@ -254,7 +254,7 @@ mod tests {
         // This is the only test here that writes to the shared world, so it must
         // hold the world fixture lock or it corrupts another test's world mid-run.
         // It also has to put the cell back afterwards.
-        let _world_guard = super::super::WORLD_TEST_LOCK.lock().unwrap();
+        let _world_guard = super::super::WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let p = (811, 71, 811);
         let original = block_at(p.0, p.1, p.2);
         super::super::set_block(p.0, p.1, p.2, 4286);
@@ -267,7 +267,7 @@ mod tests {
     }
     #[test]
     fn commit_trample_is_dimension_scoped() {
-        let _world_guard = super::super::WORLD_TEST_LOCK.lock().unwrap();
+        let _world_guard = super::super::WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let p = (812, 71, 812);
         let orig_ow = block_at_dim(DimId::Overworld, p.0, p.1, p.2);
         let orig_ne = block_at_dim(DimId::Nether, p.0, p.1, p.2);

@@ -25,23 +25,23 @@ fn state() -> &'static Mutex<u64> {
 /// Seed the stream. Called once at startup with the world seed, so two servers on the
 /// same seed and the same inputs make the same rolls.
 pub(crate) fn seed(s: u64) {
-    let mut st = state().lock().unwrap();
+    let mut st = state().lock().unwrap_or_else(|e| e.into_inner());
     // A zero state is a fixed point of xorshift, so it must never be reached.
     *st = if s == 0 { DEFAULT_SEED } else { s };
 }
 
 /// The current state, for saving.
 pub(crate) fn saved_state() -> u64 {
-    *state().lock().unwrap()
+    *state().lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Restore a saved state.
 pub(crate) fn restore(s: u64) {
-    *state().lock().unwrap() = if s == 0 { DEFAULT_SEED } else { s };
+    *state().lock().unwrap_or_else(|e| e.into_inner()) = if s == 0 { DEFAULT_SEED } else { s };
 }
 
 pub(crate) fn next_u64() -> u64 {
-    let mut st = state().lock().unwrap();
+    let mut st = state().lock().unwrap_or_else(|e| e.into_inner());
     let mut x = *st;
     x ^= x >> 12;
     x ^= x << 25;

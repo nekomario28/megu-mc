@@ -531,8 +531,8 @@ fn chunk_gen_and_natural_spawning_cover_passive_aquatic_and_end() {
     let _guard = crate::world_guard();
     let mob_spawning = crate::GR_MOB_SPAWNING.swap(1, Ordering::Relaxed);
     let difficulty = crate::DIFFICULTY.swap(1, Ordering::Relaxed);
-    let saved_visited = std::mem::take(&mut *crate::spawned_creature_chunks().lock().unwrap());
-    let saved_mobs = std::mem::take(&mut *crate::mobs().lock().unwrap());
+    let saved_visited = std::mem::take(&mut *crate::spawned_creature_chunks().lock().unwrap_or_else(|e| e.into_inner()));
+    let saved_mobs = std::mem::take(&mut *crate::mobs().lock().unwrap_or_else(|e| e.into_inner()));
     let mut cells: Vec<(crate::DimBlockPos, u32)> = Vec::new();
     let mut place = |dim: DimId, x: i32, y: i32, z: i32, state: u32| {
         cells.push(((dim, x, y, z), crate::block_at_dim(dim, x, y, z)));
@@ -547,7 +547,7 @@ fn chunk_gen_and_natural_spawning_cover_passive_aquatic_and_end() {
         );
         assert!(crate::spawned_creature_chunks()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .contains(&(DimId::Overworld, 41, -17)));
 
         // A forced pass on plains actually inserts live creature mobs: a
@@ -566,7 +566,7 @@ fn chunk_gen_and_natural_spawning_cover_passive_aquatic_and_end() {
                 place(DimId::Overworld, x, 252, z, air);
             }
         }
-        let before = crate::mobs().lock().unwrap().len();
+        let before = crate::mobs().lock().unwrap_or_else(|e| e.into_inner()).len();
         assert!(crate::live_chunkgen_run(
             DimId::Overworld,
             43,
@@ -574,7 +574,7 @@ fn chunk_gen_and_natural_spawning_cover_passive_aquatic_and_end() {
             Some(0.9),
         ));
         assert!(
-            crate::mobs().lock().unwrap().len() > before,
+            crate::mobs().lock().unwrap_or_else(|e| e.into_inner()).len() > before,
             "a high-probability creature pass should insert mobs"
         );
 
@@ -592,7 +592,7 @@ fn chunk_gen_and_natural_spawning_cover_passive_aquatic_and_end() {
             "a lit grass site should accept a daytime animal"
         );
         let sheep = crate::entity_spec_by_name("sheep").unwrap().id;
-        assert!(crate::mobs().lock().unwrap().iter().any(|mob| {
+        assert!(crate::mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|mob| {
             mob.dim == DimId::Overworld && mob.etype == sheep
         }));
         assert!(
@@ -625,7 +625,7 @@ fn chunk_gen_and_natural_spawning_cover_passive_aquatic_and_end() {
             usize::MAX,
             "squid"
         ));
-        assert!(crate::mobs().lock().unwrap().iter().any(|mob| {
+        assert!(crate::mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|mob| {
             mob.dim == DimId::Overworld
                 && mob.etype == crate::entity_spec_by_name("squid").unwrap().id
         }));
@@ -638,7 +638,7 @@ fn chunk_gen_and_natural_spawning_cover_passive_aquatic_and_end() {
         place(DimId::End, ex, ey, ez, air);
         place(DimId::End, ex, ey + 1, ez, air);
         assert!(crate::live_end_spawn_attempt(ex, ey, ez, 7, usize::MAX));
-        assert!(crate::mobs().lock().unwrap().iter().any(|mob| {
+        assert!(crate::mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|mob| {
             mob.dim == DimId::End
                 && mob.etype == crate::entity_spec_by_name("enderman").unwrap().id
         }));
@@ -685,8 +685,8 @@ fn chunk_gen_and_natural_spawning_cover_passive_aquatic_and_end() {
     }
     crate::GR_MOB_SPAWNING.store(mob_spawning, Ordering::Relaxed);
     crate::DIFFICULTY.store(difficulty, Ordering::Relaxed);
-    *crate::spawned_creature_chunks().lock().unwrap() = saved_visited;
-    *crate::mobs().lock().unwrap() = saved_mobs;
+    *crate::spawned_creature_chunks().lock().unwrap_or_else(|e| e.into_inner()) = saved_visited;
+    *crate::mobs().lock().unwrap_or_else(|e| e.into_inner()) = saved_mobs;
     if let Err(payload) = result {
         std::panic::resume_unwind(payload);
     }

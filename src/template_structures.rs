@@ -1773,11 +1773,11 @@ static GLOBAL_FLUID_TICKER: std::sync::Mutex<Option<FluidTicker>> = std::sync::M
 /// Register the process-wide fluid ticker (`main.rs`, and the structure tests that run the
 /// pass without one).
 pub(crate) fn register_fluid_ticker(ticker: FluidTicker) {
-    *GLOBAL_FLUID_TICKER.lock().unwrap() = Some(ticker);
+    *GLOBAL_FLUID_TICKER.lock().unwrap_or_else(|e| e.into_inner()) = Some(ticker);
 }
 
 fn global_fluid_ticker() -> Option<FluidTicker> {
-    *GLOBAL_FLUID_TICKER.lock().unwrap()
+    *GLOBAL_FLUID_TICKER.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// `FluidState.getType().tick(level, pos, state)` reads and writes through the same world
@@ -4584,7 +4584,7 @@ mod template_structures_tests {
         register_fluid_ticker(spread_south);
         let changed = postprocess_shape_marks(&mut world, reg, &[(0, -30, -1)]);
         // The housekeeping ticker back: a later test must not inherit this stand-in.
-        *GLOBAL_FLUID_TICKER.lock().unwrap() = None;
+        *GLOBAL_FLUID_TICKER.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
         assert_eq!(changed, 0, "a liquid block is skipped by the shape branch");
         let south = world.get(0, -30, 0);

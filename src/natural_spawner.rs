@@ -639,8 +639,8 @@ fn natural_spawn_light_sources(clients: &[Arc<Client>], dim: DimId, cx: i32, cz:
     let mut nearby = GenSources::new();
     for client in clients {
         // Chunk streaming takes these locks in this order.
-        let sources = client.gen_sources.lock().unwrap();
-        if *client.dim.lock().unwrap() != dim {
+        let sources = client.gen_sources.lock().unwrap_or_else(|e| e.into_inner());
+        if *client.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
             continue;
         }
         for dx in -1..=1 {
@@ -739,7 +739,7 @@ fn nightly_spawn_obstructed(bounds: EntityAabb) -> bool {
     let cart_type = entity_spec_by_name("chest_minecart").expect("registered chest minecart");
     generated_content()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .carts
         .iter()
         .filter_map(|cart| cart.pos().ok())
@@ -820,7 +820,7 @@ fn try_nightly_monster_at(
     // Block edits and spawn insertion share the world-write guard.
     with_save_guard(|| {
         let NaturalSpawnPos { x, y, z } = pos;
-        if !has_room_for_nightly_monster(&mobs().lock().unwrap(), cap) {
+        if !has_room_for_nightly_monster(&mobs().lock().unwrap_or_else(|e| e.into_inner()), cap) {
             return NightlySpawnAttempt::AtCap;
         }
         // These four types use Monster.checkMonsterSpawnRules. The tick has
@@ -842,12 +842,12 @@ fn try_nightly_monster_at(
         if nightly_spawn_obstructed(bounds) {
             return NightlySpawnAttempt::Rejected;
         }
-        let mut current_mobs = mobs().lock().unwrap();
+        let mut current_mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
         if !has_room_for_nightly_monster(&current_mobs, cap) {
             return NightlySpawnAttempt::AtCap;
         }
         if current_mobs.iter().filter(|mob| mob.dim == DimId::Overworld).any(|mob| {
-            let (x, y, z, ..) = *mob.pos.lock().unwrap();
+            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
             let (width, height) = entity_dimensions_1211(mob.etype);
             bounds.intersects(EntityAabb::from_dimensions(x, y, z, width, height))
         }) {
@@ -888,11 +888,11 @@ fn spawn_nightly_hostile(tick: u64) {
             if client.is_spectator() {
                 return None;
             }
-            let dim = client.dim.lock().unwrap();
+            let dim = client.dim.lock().unwrap_or_else(|e| e.into_inner());
             if *dim != DimId::Overworld {
                 return None;
             }
-            let (x, y, z, ..) = *client.pos.lock().unwrap();
+            let (x, y, z, ..) = *client.pos.lock().unwrap_or_else(|e| e.into_inner());
             Some((x, y, z))
         })
         .collect();
@@ -909,7 +909,7 @@ fn spawn_nightly_hostile(tick: u64) {
         extend_chunk_square(&mut spawn_chunks, center, NATURAL_SPAWN_CHUNK_RADIUS);
     }
     let cap = MobCategory::Monster.global_cap(spawn_chunks.len() as u32) as usize;
-    if !has_room_for_nightly_monster(&mobs().lock().unwrap(), cap) {
+    if !has_room_for_nightly_monster(&mobs().lock().unwrap_or_else(|e| e.into_inner()), cap) {
         return;
     }
 
@@ -931,7 +931,7 @@ fn spawn_nightly_hostile(tick: u64) {
         y: by,
         z: bz,
     };
-    let (sx, sy, sz, _) = *WORLD_SPAWN.lock().unwrap();
+    let (sx, sy, sz, _) = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
     let spawn_point_sq = |x: f64, y: f64, z: f64| {
         (sx.floor() + 0.5 - x).powi(2)
             + (sy.floor() + 0.5 - y).powi(2)
@@ -977,7 +977,7 @@ fn spawn_nightly_hostile(tick: u64) {
                 }
             };
             let (min_x, min_z, max_x, max_z) =
-                world_border().lock().unwrap().bounds(border_now_ms());
+                world_border().lock().unwrap_or_else(|e| e.into_inner()).bounds(border_now_ms());
             // Vanilla tests membership of the selected SpawnerData object in
             // the current position's list, including after crossing a biome edge.
             if !(min_x..max_x).contains(&f64::from(pos.x))
@@ -1764,8 +1764,8 @@ fn spawn_nether_natural(tick: u64) {
     let mut chunks = HashMap::<_, Vec<_>>::new();
     let mut loaded = HashSet::new();
     for client in &clients {
-        let held = client.chunks.lock().unwrap();
-        if *client.dim.lock().unwrap() == NETHER_SPAWN_DIM {
+        let held = client.chunks.lock().unwrap_or_else(|e| e.into_inner());
+        if *client.dim.lock().unwrap_or_else(|e| e.into_inner()) == NETHER_SPAWN_DIM {
             loaded.extend(held.iter().copied());
         }
     }
@@ -1780,7 +1780,7 @@ fn spawn_nether_natural(tick: u64) {
     let mut caps = NaturalSpawnState::new(chunks.len() as u32, true);
     let mut census = Vec::new();
     {
-        let current = mobs().lock().unwrap();
+        let current = mobs().lock().unwrap_or_else(|e| e.into_inner());
         if current.len() >= MOB_CAP {
             return;
         }
@@ -1793,10 +1793,10 @@ fn spawn_nether_natural(tick: u64) {
                 EntityMobCategory::Creature => MobCategory::Creature,
                 _ => continue,
             };
-            if *mob.hp.lock().unwrap() <= 0.0 {
+            if *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0 {
                 continue;
             }
-            let (x, y, z, ..) = *mob.pos.lock().unwrap();
+            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
             let pos = NaturalSpawnPos {
                 x: x.floor() as i32,
                 y: y.floor() as i32,
@@ -1849,9 +1849,9 @@ fn spawn_nether_natural(tick: u64) {
     });
     static RULES: OnceLock<NetherSpawnRules> = OnceLock::new();
     let rules = RULES.get_or_init(NetherSpawnRules::vanilla);
-    let (min_x, min_z, max_x, max_z) = world_border().lock().unwrap().bounds(border_now_ms());
+    let (min_x, min_z, max_x, max_z) = world_border().lock().unwrap_or_else(|e| e.into_inner()).bounds(border_now_ms());
     // DerivedLevelData uses the same shared spawn position in the Nether.
-    let (sx, sy, sz, _) = *WORLD_SPAWN.lock().unwrap();
+    let (sx, sy, sz, _) = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
     let mut fortresses = HashMap::new();
     let inside = |bb: &[i32; 6], pos: NaturalSpawnPos| {
         (bb[0]..=bb[3]).contains(&pos.x)
@@ -1958,13 +1958,13 @@ fn spawn_nether_natural(tick: u64) {
                     {
                         return false;
                     }
-                    let mut current = mobs().lock().unwrap();
+                    let mut current = mobs().lock().unwrap_or_else(|e| e.into_inner());
                     if current.len() >= MOB_CAP
                         || current.iter().any(|other| {
                             if other.dim != NETHER_SPAWN_DIM {
                                 return false;
                             }
-                            let (x, y, z, ..) = *other.pos.lock().unwrap();
+                            let (x, y, z, ..) = *other.pos.lock().unwrap_or_else(|e| e.into_inner());
                             let (w, h) = entity_dimensions_1211(other.etype);
                             bounds.intersects(EntityAabb::from_dimensions(x, y, z, w, h))
                         })

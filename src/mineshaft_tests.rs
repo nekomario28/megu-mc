@@ -549,7 +549,7 @@ fn queued_generation_payloads_never_take_the_save_lock_on_a_cell_read() {
         g.stage_payloads((512, 512), &mut p);
     });
     crate::worldgen::block_state(0, 64, 0, |_, _, _| {}); // warm before the timeout assertion
-    let save = crate::SAVE_LOCK.lock().unwrap();
+    let save = crate::SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
         crate::wg2_block(0, 64, 0);
@@ -565,7 +565,7 @@ fn queued_generation_payloads_never_take_the_save_lock_on_a_cell_read() {
     assert!(
         crate::generated_content()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .spawners
             .is_empty(),
         "a block read prematurely materialized payloads"
@@ -573,13 +573,13 @@ fn queued_generation_payloads_never_take_the_save_lock_on_a_cell_read() {
     crate::materialize_pending_generation();
     assert!(crate::generated_content()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .spawners
         .contains_key(&(7, 20, 7)));
     let p = (8, 20, 7);
     crate::world()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .entry((crate::worldgen::DimId::Overworld, 0, 0))
         .or_default()
         .insert(crate::local_idx(p.0, p.1, p.2), 0);
@@ -590,7 +590,7 @@ fn queued_generation_payloads_never_take_the_save_lock_on_a_cell_read() {
     assert!(
         !crate::generated_content()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .spawners
             .contains_key(&p),
         "handoff overwrote a user air edit"
@@ -660,7 +660,7 @@ fn generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once() {
         .unwrap()
         .unwrap();
         crate::load_world_from(&payload).unwrap();
-        let before = crate::generated_content().lock().unwrap().clone();
+        let before = crate::generated_content().lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!(before.carts.len(), 1);
         assert_eq!(
             before.carts[0].data, saved.content.carts[0].data,
@@ -697,7 +697,7 @@ fn generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once() {
                 "restart/recomputed source emitted a second payload"
             );
         });
-        assert_eq!(*crate::generated_content().lock().unwrap(), before);
+        assert_eq!(*crate::generated_content().lock().unwrap_or_else(|e| e.into_inner()), before);
         let p = *before.spawners.keys().next().unwrap();
         let entities = crate::generated_spawner_chunk_entities(p.0 >> 4, p.2 >> 4);
         assert_eq!(entities.len(), 1);
@@ -720,10 +720,10 @@ fn generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once() {
         crate::set_block(p.0, p.1, p.2, 0);
         assert!(crate::generated_content()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .spawners
             .is_empty());
-        crate::generated_content().lock().unwrap().carts.clear();
+        crate::generated_content().lock().unwrap_or_else(|e| e.into_inner()).carts.clear();
         crate::worldgen::with_gen(|g| {
             stage_native_case(g, chest);
             stage_native_case(g, spider);
@@ -745,14 +745,14 @@ fn generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once() {
     let mut pending_save = Vec::new();
     crate::save_world_into(&mut pending_save);
     assert_eq!(
-        crate::generated_content().lock().unwrap().carts.len(),
+        crate::generated_content().lock().unwrap_or_else(|e| e.into_inner()).carts.len(),
         1,
         "save dropped an unmaterialized payload"
     );
     crate::worldgen::with_gen(|g| stage_native_case(g, spider));
     crate::materialize_pending_generation();
     {
-        let mut content = crate::generated_content().lock().unwrap();
+        let mut content = crate::generated_content().lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(content.carts.len(), 1);
         assert_eq!(content.spawners.len(), 1);
         if let crate::nbt::Tag::Compound(tag) = content.spawners.values_mut().next().unwrap() {
@@ -763,17 +763,17 @@ fn generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once() {
         }
     }
     // Exercise the real interest/tracker dispatch, not just a packet constructor.
-    let cart = crate::generated_content().lock().unwrap().carts[0].clone();
+    let cart = crate::generated_content().lock().unwrap_or_else(|e| e.into_inner()).carts[0].clone();
     let (client, mut receiver) = crate::effect_tests::client_pair();
     let [x, y, z] = cart.pos().unwrap();
-    *client.pos.lock().unwrap() = (x, y, z, 0., 0., true);
-    client.chunks.lock().unwrap().insert((
+    *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (x, y, z, 0., 0., true);
+    client.chunks.lock().unwrap_or_else(|e| e.into_inner()).insert((
         (x.floor() as i32).div_euclid(16),
         (z.floor() as i32).div_euclid(16),
     ));
     crate::clients()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .push(std::sync::Arc::new(client));
     crate::interest_tick();
     use std::io::Read;
@@ -792,7 +792,7 @@ fn generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once() {
     let mut wire = &frame[..];
     assert_eq!(crate::read_varint(&mut wire).unwrap(), 1);
     assert_eq!(wire, crate::spawn_generated_cart(&cart));
-    crate::clients().lock().unwrap().clear();
+    crate::clients().lock().unwrap_or_else(|e| e.into_inner()).clear();
     let mut payload = Vec::new();
     crate::save_world_into(&mut payload);
     let mut again = Vec::new();

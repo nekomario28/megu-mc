@@ -1483,8 +1483,8 @@ fn light_scene_fingerprint() -> (usize, usize, u32, u32, Vec<u8>) {
         .iter()
         .map(|sec| sec.iter().fold(0u8, |acc, b| acc ^ b))
         .collect();
-    let chunks = world().lock().unwrap().len();
-    let floors = sky_floors_cache().lock().unwrap().len();
+    let chunks = world().lock().unwrap_or_else(|e| e.into_inner()).len();
+    let floors = sky_floors_cache().lock().unwrap_or_else(|e| e.into_inner()).len();
     let marker = block_at(1, 250, 1);
     let tunnel = block_at(4, 7, 2);
     (chunks, floors, marker, tunnel, light)
@@ -1623,7 +1623,7 @@ fn a_panicking_scene_fixture_leaves_nothing_to_restore() {
         "marker={} tunnel={} chunks={}",
         block_at(1, 250, 1),
         block_at(4, 7, 2),
-        world().lock().unwrap().len()
+        world().lock().unwrap_or_else(|e| e.into_inner()).len()
     ));
     panic!("the fixture panicked after writing to the shared scene");
 }
@@ -3488,7 +3488,7 @@ const DYNAMIC_DIM_TYPE: &str = r##"{
 fn dynamic_dim_datapack_registers_flat_dimension() {
     let _world_guard = world_guard();
     let _gen_guard = crate::worldgen::lock_gen_for_tests();
-    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
+    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     worldgen::reset_dimension_registry();
     let sources = dynamic_dim_entries(&[
         ("data/custom/dimension_type/my_type.json", DYNAMIC_DIM_TYPE),
@@ -3530,7 +3530,7 @@ fn dynamic_dim_datapack_registers_flat_dimension() {
 fn dynamic_dim_slots_are_sorted_and_stable_by_canonical_name() {
     let _world_guard = world_guard();
     let _gen_guard = crate::worldgen::lock_gen_for_tests();
-    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
+    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     worldgen::reset_dimension_registry();
     let sources = dynamic_dim_entries(&[
         ("data/zz/dimension_type/t.json", DYNAMIC_DIM_TYPE),
@@ -3552,7 +3552,7 @@ fn dynamic_dim_slots_are_sorted_and_stable_by_canonical_name() {
 fn dynamic_dim_invalid_geometry_is_rejected() {
     let _world_guard = world_guard();
     let _gen_guard = crate::worldgen::lock_gen_for_tests();
-    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
+    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     worldgen::reset_dimension_registry();
     for (min_y, height) in [(-33, 192), (-32, 190), (0, 0)] {
         let ty = DYNAMIC_DIM_TYPE
@@ -3573,7 +3573,7 @@ fn dynamic_dim_invalid_geometry_is_rejected() {
 fn dynamic_dim_noise_generator_uses_custom_window() {
     let _world_guard = world_guard();
     let _gen_guard = crate::worldgen::lock_gen_for_tests();
-    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
+    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     worldgen::reset_dimension_registry();
     let sources = dynamic_dim_entries(&[
         ("data/nz/dimension_type/t.json", DYNAMIC_DIM_TYPE),
@@ -3597,7 +3597,7 @@ fn dynamic_dim_noise_generator_uses_custom_window() {
 fn dynamic_dim_join_game_names_all_dimensions() {
     let _world_guard = world_guard();
     let _gen_guard = crate::worldgen::lock_gen_for_tests();
-    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
+    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     worldgen::reset_dimension_registry();
     let sources = dynamic_dim_entries(&[
         ("data/custom/dimension_type/my_type.json", DYNAMIC_DIM_TYPE),
@@ -3623,7 +3623,7 @@ fn dynamic_dim_join_game_names_all_dimensions() {
 fn dynamic_dim_execute_in_resolves_custom_name() {
     let _world_guard = world_guard();
     let _gen_guard = crate::worldgen::lock_gen_for_tests();
-    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
+    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     worldgen::reset_dimension_registry();
     let sources = dynamic_dim_entries(&[
         ("data/custom/dimension_type/my_type.json", DYNAMIC_DIM_TYPE),
@@ -3643,7 +3643,7 @@ fn dynamic_dim_execute_in_resolves_custom_name() {
 fn dynamic_dim_save_roundtrip_survives_slot_reordering() {
     let _world_guard = world_guard();
     let _gen_guard = crate::worldgen::lock_gen_for_tests();
-    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
+    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     worldgen::reset_dimension_registry();
     let sources = dynamic_dim_entries(&[
         ("data/zz/dimension_type/t.json", DYNAMIC_DIM_TYPE),
@@ -3657,13 +3657,13 @@ fn dynamic_dim_save_roundtrip_survives_slot_reordering() {
     assert_eq!(first_a.index(), 3);
     assert_eq!(first_z.index(), 4);
     // An edit and a logout position in the higher-slotted dimension.
-    world().lock().unwrap().insert(
+    world().lock().unwrap_or_else(|e| e.into_inner()).insert(
         (first_z, 2, -3),
         HashMap::from([(local_idx(2, -16, 3), 17u32)]),
     );
     pos_store()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .insert("Tester".to_string(), (first_z, 8.0, 64.0, -24.0, 0.0, 0.0));
     let mut bytes = Vec::new();
     save_world_into(&mut bytes);
@@ -3672,8 +3672,8 @@ fn dynamic_dim_save_roundtrip_survives_slot_reordering() {
         "a custom-dimension save carries the named DXT1 footer"
     );
     // Restart: the registry rebuilds in a different slot order.
-    world().lock().unwrap().clear();
-    pos_store().lock().unwrap().clear();
+    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    pos_store().lock().unwrap_or_else(|e| e.into_inner()).clear();
     worldgen::reset_dimension_registry();
     let reversed = dynamic_dim_entries(&[
         ("data/aa/dimension_type/t.json", DYNAMIC_DIM_TYPE),
@@ -3692,18 +3692,18 @@ fn dynamic_dim_save_roundtrip_survives_slot_reordering() {
     assert!(
         world()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&(second_z, 2, -3))
             .is_some_and(|edits| edits.get(&local_idx(2, -16, 3)) == Some(&17)),
         "the chunk edit resolves to zz:z_dim's new slot"
     );
     assert_eq!(
-        pos_store().lock().unwrap().get("Tester").map(|p| p.0),
+        pos_store().lock().unwrap_or_else(|e| e.into_inner()).get("Tester").map(|p| p.0),
         Some(second_z),
         "the logout dimension resolves by name"
     );
-    world().lock().unwrap().clear();
-    pos_store().lock().unwrap().clear();
+    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    pos_store().lock().unwrap_or_else(|e| e.into_inner()).clear();
     worldgen::reset_dimension_registry();
 }
 
@@ -3769,7 +3769,7 @@ fn lod_test_req1(resolution: u8, cx: i32, cz: i32) -> Vec<u8> {
 fn dynamic_dim_chunk_packet_cache_isolates_dimensions() {
     let _world_guard = world_guard();
     let _gen_guard = crate::worldgen::lock_gen_for_tests();
-    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
+    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     worldgen::reset_dimension_registry();
     let sources = dynamic_dim_entries(&[
         ("data/lodc/dimension_type/t.json", DYNAMIC_DIM_TYPE),
@@ -3820,7 +3820,7 @@ fn dynamic_dim_chunk_packet_cache_isolates_dimensions() {
 fn dynamic_dim_broadcast_near_isolates_custom_dimensions() {
     let _world_guard = world_guard();
     let _gen_guard = crate::worldgen::lock_gen_for_tests();
-    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
+    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     worldgen::reset_dimension_registry();
     let sources = dynamic_dim_entries(&[
         ("data/lodb/dimension_type/t.json", DYNAMIC_DIM_TYPE),
@@ -3837,8 +3837,8 @@ fn dynamic_dim_broadcast_near_isolates_custom_dimensions() {
     let mk_client = |eid: i32, dim: DimId| {
         let (mut c, r) = effect_tests::client_pair();
         c.eid = eid;
-        *c.dim.lock().unwrap() = dim;
-        *c.pos.lock().unwrap() = (0.0, 70.0, 0.0, 0.0, 0.0, true);
+        *c.dim.lock().unwrap_or_else(|e| e.into_inner()) = dim;
+        *c.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.0, 70.0, 0.0, 0.0, 0.0, true);
         r.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
         (Arc::new(c), r)
     };
@@ -4008,7 +4008,7 @@ fn lod_v1_wire_matches_client_app_codec_and_vanilla_unaffected() {
     // -- the column encoder answers for the Overworld and a custom dimension --
     let _world_guard = world_guard();
     let _gen_guard = crate::worldgen::lock_gen_for_tests();
-    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap();
+    let _guard = DYNAMIC_DIM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     worldgen::reset_dimension_registry();
     let sources = dynamic_dim_entries(&[
         ("data/lodw/dimension_type/t.json", DYNAMIC_DIM_TYPE),

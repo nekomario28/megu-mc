@@ -548,7 +548,7 @@ extern "system" fn set_block(
         (1..=2).contains(&state)
     };
     if SERVER.get() == Some(&true) {
-        let active = *ACTIVE.lock().unwrap();
+        let active = *ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(active) = active {
             if active.position == (x, y, z) && state == 10 {
                 let dim = super::DimId::ALL
@@ -601,7 +601,7 @@ extern "system" fn get_block(mut env: JNIEnv, _class: JClass, x: jint, y: jint, 
         return -1;
     }
     let active_dim = if SERVER.get() == Some(&true) {
-        let active = *ACTIVE.lock().unwrap();
+        let active = *ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
         match active {
             Some(a) if a.position == (x, y, z) => Some(
                 super::DimId::ALL
@@ -879,7 +879,7 @@ pub fn serve(
 fn serve_trample(env: &mut JNIEnv, hooks: &JClass, request: Request) -> bool {
     let input = request.trample;
     COMMITTED.store(false, super::Ordering::Relaxed);
-    *ACTIVE.lock().unwrap() = Some(input);
+    *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(input);
     let (x, y, z) = input.position;
     let outcome = env.with_local_frame(16, |env| {
         env.call_static_method(
@@ -895,7 +895,7 @@ fn serve_trample(env: &mut JNIEnv, hooks: &JClass, request: Request) -> bool {
         )?;
         Ok::<(), jni::errors::Error>(())
     });
-    *ACTIVE.lock().unwrap() = None;
+    *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = None;
     let result = outcome
         .map(|()| COMMITTED.load(super::Ordering::Relaxed))
         .map_err(|error| java_error(env, error));
@@ -986,7 +986,7 @@ impl NeoForgeRuntime {
     }
 
     pub(crate) fn cleanup_staged_mods(&self) {
-        self.staged.lock().unwrap().take();
+        self.staged.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 
     pub(crate) fn event(&self, event: S1Event<String>) -> Result<S1EventOutcome, String> {

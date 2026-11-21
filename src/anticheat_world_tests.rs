@@ -166,21 +166,21 @@ fn buried_valuables_never_reach_the_wire_and_visible_ones_do() {
     let update = || {
         pending_blocks()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&key)
             .and_then(|m| m.get(&li).copied())
     };
-    std::mem::take(&mut *pending_blocks().lock().unwrap());
+    std::mem::take(&mut *pending_blocks().lock().unwrap_or_else(|e| e.into_inner()));
     set_block_dim(DimId::Nether, x + 1, y, z, 0);
     assert_eq!(
         update(),
         Some(debris),
         "mining the neighbour reveals the debris"
     );
-    std::mem::take(&mut *pending_blocks().lock().unwrap());
+    std::mem::take(&mut *pending_blocks().lock().unwrap_or_else(|e| e.into_inner()));
     set_block_dim(DimId::Nether, x + 1, y, z, rack);
     assert_eq!(update(), Some(rack), "filling it hides the debris again");
-    std::mem::take(&mut *pending_blocks().lock().unwrap());
+    std::mem::take(&mut *pending_blocks().lock().unwrap_or_else(|e| e.into_inner()));
     for (a, b, c) in SIDES.iter().copied().chain([(0, 0, 0), (2, 0, 0)]) {
         let (px, py, pz) = (x + a, y + b, z + c);
         set_block_dim(
@@ -191,7 +191,7 @@ fn buried_valuables_never_reach_the_wire_and_visible_ones_do() {
             base_state_dim(DimId::Nether, px, py, pz),
         );
     }
-    std::mem::take(&mut *pending_blocks().lock().unwrap());
+    std::mem::take(&mut *pending_blocks().lock().unwrap_or_else(|e| e.into_inner()));
 }
 
 /// Every state of a hidden block is hidden, and see-through blocks expose a face.
@@ -374,12 +374,12 @@ fn sealed_pocket_light_is_hidden_until_the_pocket_is_opened() {
         .find(|&(x, y, z)| reg.opacity_of(block_at_dim(dim, x, y, z)) == 15)
         .expect("a pocket has a wall");
     let before = block_at_dim(dim, wx, wy, wz);
-    light_reveals().lock().unwrap().clear();
+    light_reveals().lock().unwrap_or_else(|e| e.into_inner()).clear();
     set_block(wx, wy, wz, 0);
     assert!(
         light_reveals()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&dim)
             .is_some_and(|v| v.contains(&Position::new(wx, wy, wz))),
         "opening the pocket queues a light re-send"
@@ -396,7 +396,7 @@ fn sealed_pocket_light_is_hidden_until_the_pocket_is_opened() {
         "opened pocket keeps its light"
     );
     set_block(wx, wy, wz, before);
-    light_reveals().lock().unwrap().clear();
+    light_reveals().lock().unwrap_or_else(|e| e.into_inner()).clear();
     ac_test_set_anti_fullbright(None);
     println!("antifullbright: {hidden_total} of {lit_total} lit light bytes cleared before the first pocket");
 }
@@ -493,7 +493,7 @@ fn conventional_c_and_forge_ore_tags_auto_register_for_antixray() {
 
     // Clean up test state and directory.
     {
-        let mut extra = hidden_extra().lock().unwrap();
+        let mut extra = hidden_extra().lock().unwrap_or_else(|e| e.into_inner());
         extra.remove(&gold);
         extra.remove(&iron);
     }
@@ -821,9 +821,9 @@ fn underground_occlusion_reveals_on_descent_and_hysteresis() {
 
     // A client on the surface: the lane evaluates occluded, nothing is resent.
     let (client, mut receiver) = crate::effect_tests::client_pair();
-    *client.pos.lock().unwrap() = (8.0, 70.0, 8.0, 0.0, 0.0, true);
-    client.chunks.lock().unwrap().insert((0, 0));
-    client.chunks.lock().unwrap().insert((3, 0));
+    *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (8.0, 70.0, 8.0, 0.0, 0.0, true);
+    client.chunks.lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
+    client.chunks.lock().unwrap_or_else(|e| e.into_inner()).insert((3, 0));
     assert!(update_underground_lane(&client));
     assert!(!client.underground_revealed.load(Ordering::Relaxed));
     assert!(
@@ -833,7 +833,7 @@ fn underground_occlusion_reveals_on_descent_and_hysteresis() {
 
     // Descend below Y=48 inside the same column: the lane flips to revealed and
     // every held chunk is re-sent real, nearest first.
-    client.pos.lock().unwrap().1 = 30.0;
+    client.pos.lock().unwrap_or_else(|e| e.into_inner()).1 = 30.0;
     assert!(!update_underground_lane(&client));
     assert!(client.underground_revealed.load(Ordering::Relaxed));
     let mut gen: GenSources = HashMap::new();
@@ -854,11 +854,11 @@ fn underground_occlusion_reveals_on_descent_and_hysteresis() {
 
     // Inside the hysteresis band the lane does not flap: back up to Y=55 stays
     // revealed, and only the clear-surface threshold re-occludes.
-    client.pos.lock().unwrap().1 = 55.0;
+    client.pos.lock().unwrap_or_else(|e| e.into_inner()).1 = 55.0;
     assert!(!update_underground_lane(&client));
     assert!(client.underground_revealed.load(Ordering::Relaxed));
     let surface = height_at_dim(DimId::Overworld, 8, 8);
-    client.pos.lock().unwrap().1 = ((surface + 4).max(61)) as f64;
+    client.pos.lock().unwrap_or_else(|e| e.into_inner()).1 = ((surface + 4).max(61)) as f64;
     assert!(update_underground_lane(&client));
     assert!(!client.underground_revealed.load(Ordering::Relaxed));
     let f1 = recv_wire_frame(&mut receiver).expect("re-occluded first frame");

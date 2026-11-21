@@ -80,7 +80,7 @@ fn register_hidden_block_names(names: impl IntoIterator<Item = impl AsRef<str>>)
     }
     let mut added = 0usize;
     {
-        let mut extra = hidden_extra().lock().unwrap();
+        let mut extra = hidden_extra().lock().unwrap_or_else(|e| e.into_inner());
         for st in state_ids {
             if extra.insert(st) {
                 added += 1;

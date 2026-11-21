@@ -329,7 +329,7 @@ impl ModOffloadBridge {
         }
         let mut added = 0usize;
         {
-            let mut extra = hidden_extra().lock().unwrap();
+            let mut extra = hidden_extra().lock().unwrap_or_else(|e| e.into_inner());
             if let Some(reg) = breg() {
                 for st in 0..reg.state_count() as u32 {
                     if names.contains(reg.name_of(st)) && extra.insert(st) {
@@ -769,7 +769,7 @@ mod mod_offload_bridge_tests {
     static MOB_LOCK: Mutex<()> = Mutex::new(());
 
     fn fresh_bridge() {
-        *mod_offload_bridge().lock().unwrap() = ModOffloadBridge::new();
+        *mod_offload_bridge().lock().unwrap_or_else(|e| e.into_inner()) = ModOffloadBridge::new();
     }
 
     /// Synthetic `Client` (same fixture style as `entity_fluid`'s tests) — a
@@ -847,7 +847,7 @@ mod mod_offload_bridge_tests {
     /// exceeds it, so a missing grant would flag on the first move.
     #[test]
     fn mod_offload_belt_and_contraption_carry_prevents_ac_rubberband() {
-        let _serial = MOB_LOCK.lock().unwrap();
+        let _serial = MOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_bridge();
         let dim = DimId::from_raw(9);
         let belt_eid = 977_001;
@@ -863,7 +863,7 @@ mod mod_offload_bridge_tests {
         // A 3-block bearing arm at (100,64,100), one rider at the arm tip, and a
         // belt rider carried at 1.2 blocks/tick — over twice the walk allowance.
         {
-            let mut b = mod_offload_bridge().lock().unwrap();
+            let mut b = mod_offload_bridge().lock().unwrap_or_else(|e| e.into_inner());
             b.enable_create();
             let shaft = b
                 .create_registry()
@@ -912,7 +912,7 @@ mod mod_offload_bridge_tests {
             );
             belt_pos = belt_to;
 
-            let lift_anchor = mod_offload_bridge().lock().unwrap().contraption_riders
+            let lift_anchor = mod_offload_bridge().lock().unwrap_or_else(|e| e.into_inner()).contraption_riders
                 [&lift_eid]
                 .anchor;
             let v = ac_check_move(
@@ -953,9 +953,9 @@ mod mod_offload_bridge_tests {
 
     #[test]
     fn mod_offload_config_wire_roundtrips_create_and_universal_profiles() {
-        let _serial = MOB_LOCK.lock().unwrap();
+        let _serial = MOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         {
-            let mut b = mod_offload_bridge().lock().unwrap();
+            let mut b = mod_offload_bridge().lock().unwrap_or_else(|e| e.into_inner());
             *b = ModOffloadBridge::new();
             b.enable_create();
             b.load_profiles(mod_profile::builtin_reference_profiles())
@@ -969,7 +969,7 @@ mod mod_offload_bridge_tests {
         let (registry, entries) = mod_wire::decode_config_registry_data_0x07(body).unwrap();
         assert_eq!(registry, "minecraft:block");
         let expected_names: Vec<String> = {
-            let b = mod_offload_bridge().lock().unwrap();
+            let b = mod_offload_bridge().lock().unwrap_or_else(|e| e.into_inner());
             let mut names: Vec<String> = b
                 .create_registry()
                 .unwrap()
@@ -1002,7 +1002,7 @@ mod mod_offload_bridge_tests {
             )
         }
         let registries: Vec<(usize, Vec<(u32, String)>)> = {
-            let b = mod_offload_bridge().lock().unwrap();
+            let b = mod_offload_bridge().lock().unwrap_or_else(|e| e.into_inner());
             vec![
                 states_of(b.create_registry().unwrap()),
                 states_of(b.universal.as_ref().unwrap().registry()),
@@ -1044,7 +1044,7 @@ mod mod_offload_bridge_tests {
         // the bridge's tracked custom-state set, vanilla names resolve through
         // `breg()`, and unknown names skip cleanly.
         {
-            let mut b = mod_offload_bridge().lock().unwrap();
+            let mut b = mod_offload_bridge().lock().unwrap_or_else(|e| e.into_inner());
             // A loaded profile block matching `#c:ores` tracks its custom states.
             let custom = ModOffloadProfile::from_json(
                 br#"{"mod_id":"testmod","blocks":[{"id":"testmod:quartz_ore","role":"decorative"}]}"#,
@@ -1064,7 +1064,7 @@ mod mod_offload_bridge_tests {
             assert!(!quartz_states.is_empty());
             assert!(quartz_states.iter().all(|st| b.mod_state_ids.contains(st)));
             assert!(b.mod_state_ids_for_block("create:zinc_ore").is_empty());
-            let extra = hidden_extra().lock().unwrap();
+            let extra = hidden_extra().lock().unwrap_or_else(|e| e.into_inner());
             for st in &quartz_states {
                 assert!(extra.contains(st));
             }
@@ -1081,18 +1081,18 @@ mod mod_offload_bridge_tests {
 
     #[test]
     fn mod_offload_empty_bridge_emits_zero_vanilla_packets() {
-        let _serial = MOB_LOCK.lock().unwrap();
+        let _serial = MOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_bridge();
         assert!(mod_offload_config_payloads().is_empty());
-        assert!(!mod_offload_bridge().lock().unwrap().has_work());
+        assert!(!mod_offload_bridge().lock().unwrap_or_else(|e| e.into_inner()).has_work());
         mod_offload_tick();
-        let b = mod_offload_bridge().lock().unwrap();
+        let b = mod_offload_bridge().lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(b.ticks_stepped, 0, "empty bridge must be a no-op, not ticked");
     }
 
     #[test]
     fn mod_offload_save_load_roundtrips_contraption_state() {
-        let _serial = MOB_LOCK.lock().unwrap();
+        let _serial = MOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut src = ModOffloadBridge::new();
         src.enable_create();
         let wheel_x = src

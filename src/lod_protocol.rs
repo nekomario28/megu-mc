@@ -265,7 +265,7 @@ fn lod_v1_register(client: &Client, payload: &[u8]) {
     let mut out = Vec::with_capacity(LOD_V1_CHANNEL.len() + 8);
     write_str(&mut out, "minecraft:register");
     out.extend_from_slice(LOD_V1_CHANNEL.as_bytes());
-    let _ = send_packet(&mut client.sock.lock().unwrap(), 0x19, out);
+    let _ = send_packet(&mut client.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x19, out);
 }
 
 /// A `minecraft:unregister` naming the channel flips the opt-in flag off.
@@ -292,21 +292,21 @@ fn lod_v1_request(client: &Client, payload: &[u8]) {
     }
     let cx = i32::from_le_bytes(payload[5..9].try_into().expect("request cx"));
     let cz = i32::from_le_bytes(payload[9..13].try_into().expect("request cz"));
-    let (px, _, pz, ..) = *client.pos.lock().unwrap();
+    let (px, _, pz, ..) = *client.pos.lock().unwrap_or_else(|e| e.into_inner());
     let near = (i64::from(cx) - i64::from(px.floor() as i32 >> 4))
         .abs()
         .max((i64::from(cz) - i64::from(pz.floor() as i32 >> 4)).abs());
     if near > i64::from(LOD_V1_MAX_RANGE_CHUNKS) {
         return;
     }
-    let dim = *client.dim.lock().unwrap();
+    let dim = *client.dim.lock().unwrap_or_else(|e| e.into_inner());
     let Some(frame) = encode_lod_v1_column(dim, cx, cz, resolution) else {
         return;
     };
     let mut out = Vec::with_capacity(frame.len() + LOD_V1_CHANNEL.len() + 8);
     write_str(&mut out, LOD_V1_CHANNEL);
     out.extend_from_slice(&frame);
-    let _ = send_packet(&mut client.sock.lock().unwrap(), 0x19, out);
+    let _ = send_packet(&mut client.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x19, out);
 }
 
 /// C2S `0x12` (Custom Payload) dispatch. `minecraft:register`,

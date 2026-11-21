@@ -4,24 +4,24 @@ use super::*;
 // code path rather than a reimplementation of it.
 fn merge_outcome(items: Vec<Drop>) -> Vec<(i32, i64, u8)> {
     let _world_guard = world_guard();
-    let old_drops = std::mem::take(&mut *drops().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_drops = std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let old_tick = TICK.swap(1, Ordering::Relaxed);
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
     let (old_hot, old_warm) = test_region();
-    forceloaded().lock().unwrap().insert((0, 0));
-    *drops().lock().unwrap() = items;
+    forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
+    *drops().lock().unwrap_or_else(|e| e.into_inner()) = items;
     // One tick isolates the merge. More ticks would advance ages and merge again,
     // which is a separate concern covered by the entity-life gate.
     game_tick(|_, tick| tick());
     let mut outcome: Vec<(i32, i64, u8)> = drops()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .iter()
         .map(|d| (d.eid, d.item, d.cnt))
         .collect();
-    *drops().lock().unwrap() = old_drops;
-    *forceloaded().lock().unwrap() = old_forced;
+    *drops().lock().unwrap_or_else(|e| e.into_inner()) = old_drops;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     TICK.store(old_tick, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
     set_test_region(old_hot, old_warm);
