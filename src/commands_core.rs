@@ -1347,19 +1347,19 @@ impl DatapackContent {
             .unwrap_or_default();
         // Recipes consult item tags while holding their own locks. Counts also
         // reads block tags under the recipe lock. Publish in that lock order.
-        let mut recipes = json_recipes().lock().unwrap();
-        let mut smelts = json_smelts().lock().unwrap();
-        let mut blocks = block_tags().lock().unwrap();
-        let mut items = item_tags().lock().unwrap();
-        let mut loot = loot_tables().lock().unwrap();
-        let mut loot_raw = raw_loot_tables().lock().unwrap();
-        let mut mob_loot = mob_loot_tables().lock().unwrap();
-        let mut mods = item_mods().lock().unwrap();
-        let mut advs = advancements().lock().unwrap();
-        let mut conditions = predicates().lock().unwrap();
-        let mut ids = recipe_ids().lock().unwrap();
-        let mut registry = datapack_registry().lock().unwrap();
-        let mut active = packs().lock().unwrap();
+        let mut recipes = json_recipes().lock().unwrap_or_else(|e| e.into_inner());
+        let mut smelts = json_smelts().lock().unwrap_or_else(|e| e.into_inner());
+        let mut blocks = block_tags().lock().unwrap_or_else(|e| e.into_inner());
+        let mut items = item_tags().lock().unwrap_or_else(|e| e.into_inner());
+        let mut loot = loot_tables().lock().unwrap_or_else(|e| e.into_inner());
+        let mut loot_raw = raw_loot_tables().lock().unwrap_or_else(|e| e.into_inner());
+        let mut mob_loot = mob_loot_tables().lock().unwrap_or_else(|e| e.into_inner());
+        let mut mods = item_mods().lock().unwrap_or_else(|e| e.into_inner());
+        let mut advs = advancements().lock().unwrap_or_else(|e| e.into_inner());
+        let mut conditions = predicates().lock().unwrap_or_else(|e| e.into_inner());
+        let mut ids = recipe_ids().lock().unwrap_or_else(|e| e.into_inner());
+        let mut registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
+        let mut active = packs().lock().unwrap_or_else(|e| e.into_inner());
         *recipes = self.recipes;
         *ids = self.recipe_ids;
         *smelts = self.smelts;
@@ -1980,7 +1980,7 @@ fn reload_datapacks(
         .try_lock()
         .map_err(|_| "Datapack reload already in progress")?;
     let mut sources = datapack_sources(base);
-    let mut disabled = disabled_datapacks().lock().unwrap().clone();
+    let mut disabled = disabled_datapacks().lock().unwrap_or_else(|e| e.into_inner()).clone();
     if let Some((name, enable, _)) = &change {
         if !sources.iter().any(|(candidate, _, _)| candidate == name) {
             return Err(format!("Unknown datapack '{name}'"));
@@ -2002,7 +2002,7 @@ fn reload_datapacks(
             .map(|(name, _, _)| name.as_str())
             .filter(|name| !disabled.contains(*name))
             .collect();
-        let mut order = datapack_order().lock().unwrap();
+        let mut order = datapack_order().lock().unwrap_or_else(|e| e.into_inner());
         order.retain(|name| enabled.contains(name.as_str()));
         for (name, _, _) in &sources {
             if enabled.contains(name.as_str()) && !order.iter().any(|o| o == name) {
@@ -2111,7 +2111,7 @@ fn reload_datapacks(
         .flat_map(|pack| pack.load.iter().cloned())
         .collect();
     {
-        let mut disabled_packs = disabled_datapacks().lock().unwrap();
+        let mut disabled_packs = disabled_datapacks().lock().unwrap_or_else(|e| e.into_inner());
         content.publish();
         *disabled_packs = disabled;
     }
@@ -2132,12 +2132,12 @@ fn run_datapack_command(args: &[&str]) -> String {
     let names: Vec<String> = match args {
         ["list"] | ["list", "enabled"] => packs()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .map(|p| p.name.clone())
             .collect(),
         ["list", "available"] => {
-            let disabled = disabled_datapacks().lock().unwrap();
+            let disabled = disabled_datapacks().lock().unwrap_or_else(|e| e.into_inner());
             datapack_sources(base)
                 .into_iter()
                 .filter_map(|(name, _, _)| disabled.contains(&name).then_some(name))
@@ -2263,7 +2263,7 @@ fn lookup_function(name: &str) -> Option<Vec<String>> {
     };
     packs()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .iter()
         .find_map(|p| p.functions.get(&name).cloned())
 }
@@ -2385,7 +2385,7 @@ fn run_experience_command(args: &[&str], source: Option<&Arc<Client>>) -> String
         let [player] = targets.as_slice() else {
             return "Expected one player".into();
         };
-        let sessions = player_mechanism_sessions().lock().unwrap();
+        let sessions = player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner());
         let Some(session) = sessions.get(&player.eid) else {
             return "Player experience is unavailable".into();
         };
@@ -2511,7 +2511,7 @@ fn command_gamerules() -> &'static Mutex<HashMap<&'static str, i32>> {
 // Resolve core command targets through the same Brigadier snapshot as /execute.
 fn resolve_selector(sel: &str, ctx: Option<&Arc<Client>>) -> Vec<String> {
     let (x, y, z) = ctx.map(|c| {
-        let p = *c.pos.lock().unwrap();
+        let p = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
         (p.0, p.1, p.2)
     }).unwrap_or((0.5, 16.0, 0.5));
     let source = ExecuteSource::new(&CmdCtx { me: ctx.cloned(), x, y, z });
@@ -2557,7 +2557,7 @@ fn spawn_yaw(token: Option<&str>, source: Option<&Arc<Client>>) -> Option<f32> {
         return Some(0.0);
     };
     let angle = if let Some(relative) = token.strip_prefix('~') {
-        let yaw = source.map_or(0.0, |player| player.pos.lock().unwrap().3);
+        let yaw = source.map_or(0.0, |player| player.pos.lock().unwrap_or_else(|e| e.into_inner()).3);
         yaw + if relative.is_empty() {
             0.0
         } else {
@@ -2607,7 +2607,7 @@ fn border_now_ms() -> u64 {
 }
 
 fn run_world_border_command(ctx: &CmdCtx, args: &[&str]) -> String {
-    let mut border = world_border().lock().unwrap();
+    let mut border = world_border().lock().unwrap_or_else(|e| e.into_inner());
     let result = WorldBorderCommand::parse(args, ctx.x, ctx.z)
         .and_then(|cmd| cmd.execute(&mut border, None, border_now_ms()));
     let feedback = match result {
@@ -2833,7 +2833,7 @@ fn scoreboard_holders(holder: &str, source: Option<&Arc<Client>>) -> Vec<String>
 
 fn run_scoreboard_command(args: &[&str], source: Option<&Arc<Client>>) -> String {
     let ["players", _, holder, ..] = args else {
-        return apply_scoreboard_command(&mut scoreboard().lock().unwrap(), args)
+        return apply_scoreboard_command(&mut scoreboard().lock().unwrap_or_else(|e| e.into_inner()), args)
             .unwrap_or_else(|err| err);
     };
     let holders = scoreboard_holders(holder, source);
@@ -2850,7 +2850,7 @@ fn run_scoreboard_command(args: &[&str], source: Option<&Arc<Client>>) -> String
         return "No score holders found".into();
     }
     let mut replies = Vec::new();
-    let mut board = scoreboard().lock().unwrap();
+    let mut board = scoreboard().lock().unwrap_or_else(|e| e.into_inner());
     for holder in &holders {
         args[2] = holder;
         for from in &sources {
@@ -2877,7 +2877,7 @@ fn run_trigger_command(args: &[&str], source: Option<&Arc<Client>>) -> String {
         }
         _ => return "Usage: /trigger <objective> [add|set <amount>]".into(),
     };
-    let mut board = scoreboard().lock().unwrap();
+    let mut board = scoreboard().lock().unwrap_or_else(|e| e.into_inner());
     let delta = if set {
         amount.wrapping_sub(board.get(&player.name, objective).unwrap_or(0))
     } else {
@@ -3278,7 +3278,7 @@ fn loot_table_json(id: &str) -> Option<String> {
     } else {
         format!("minecraft:{id}")
     };
-    raw_loot_tables().lock().unwrap().get(&id).cloned()
+    raw_loot_tables().lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned()
 }
 fn mob_loot_tables() -> &'static Mutex<HashMap<i64, Vec<LootPool>>> {
     static R: OnceLock<Mutex<HashMap<i64, Vec<LootPool>>>> = OnceLock::new();
@@ -3320,7 +3320,7 @@ fn advancement_time_ms() -> i64 {
 fn send_advancement_delta(tracker: &mut AdvancementTracker, c: &Client, reset: bool) {
     if let Some(delta) = tracker.take_delta(&c.name, reset) {
         let (id, body) = delta.into_packet();
-        let mut socket = c.sock.lock().unwrap();
+        let mut socket = c.sock.lock().unwrap_or_else(|e| e.into_inner());
         if send_packet(&mut socket, id, body).is_err() {
             let _ = socket.shutdown(std::net::Shutdown::Both);
         }
@@ -3328,7 +3328,7 @@ fn send_advancement_delta(tracker: &mut AdvancementTracker, c: &Client, reset: b
 }
 
 fn restore_player_advancements(tracker: &mut AdvancementTracker, name: &str) {
-    if let Some(earned) = adv_done().lock().unwrap().get(name) {
+    if let Some(earned) = adv_done().lock().unwrap_or_else(|e| e.into_inner()).get(name) {
         let now = advancement_time_ms();
         for id in earned {
             // A legacy save records only completed IDs. Preserve precise criteria
@@ -3352,7 +3352,7 @@ fn run_advancement_command(args: &[&str], source: Option<&Arc<Client>>) -> Strin
     if targets.is_empty() {
         return "No player found".into();
     }
-    let mut tracker = player_advancements().lock().unwrap();
+    let mut tracker = player_advancements().lock().unwrap_or_else(|e| e.into_inner());
     if *action == "query" {
         return run_advancement_query(&tracker, &targets, scope);
     }
@@ -3365,7 +3365,7 @@ fn run_advancement_command(args: &[&str], source: Option<&Arc<Client>>) -> Strin
         let datapack_ids = match scope {
             ["everything"] => advancements()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .keys()
                 .filter(|id| tracker.definition(id).is_none())
                 .cloned()
@@ -3377,7 +3377,7 @@ fn run_advancement_command(args: &[&str], source: Option<&Arc<Client>>) -> Strin
                     format!("minecraft:{id}")
                 };
                 if tracker.definition(&id).is_none()
-                    && advancements().lock().unwrap().contains_key(&id)
+                    && advancements().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&id)
                 {
                     vec![id]
                 } else {
@@ -3387,7 +3387,7 @@ fn run_advancement_command(args: &[&str], source: Option<&Arc<Client>>) -> Strin
             _ => Vec::new(),
         };
         {
-            let mut done = adv_done().lock().unwrap();
+            let mut done = adv_done().lock().unwrap_or_else(|e| e.into_inner());
             let earned = done.entry(c.name.clone()).or_default();
             if reply.is_ok() {
                 let progress = tracker.progress.get(&c.name);
@@ -3485,7 +3485,7 @@ fn bossbar_pkt(id: &str, action: u8, bar: Option<&Bossbar>) -> Vec<u8> {
 }
 fn run_bossbar_command(args: &[&str], source: Option<&Arc<Client>>) -> String {
     const USAGE: &str = "usage: /bossbar add|remove|set|list|get";
-    let mut bars = bossbars().lock().unwrap();
+    let mut bars = bossbars().lock().unwrap_or_else(|e| e.into_inner());
     if args == ["list"] {
         let mut ids: Vec<_> = bars.keys().cloned().collect();
         ids.sort();
@@ -3523,7 +3523,7 @@ fn run_bossbar_command(args: &[&str], source: Option<&Arc<Client>>) -> String {
     let online = client_snapshot();
     let send = |player: &Client, action, bar: Option<&Bossbar>| {
         let _ = send_packet(
-            &mut player.sock.lock().unwrap(),
+            &mut player.sock.lock().unwrap_or_else(|e| e.into_inner()),
             0x0a,
             bossbar_pkt(&id, action, bar),
         );
@@ -3671,9 +3671,9 @@ fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
     let __t = tickprof::enabled().then(std::time::Instant::now);
     let mut grants: Vec<String> = Vec::new();
     {
-        let advs = advancements().lock().unwrap();
+        let advs = advancements().lock().unwrap_or_else(|e| e.into_inner());
         let revision = content_revision();
-        let mut index = INDEX.lock().unwrap();
+        let mut index = INDEX.lock().unwrap_or_else(|e| e.into_inner());
         if index.as_ref().is_none_or(|(cached, _)| *cached != revision) {
             let mut by_event = AdvancementEventIndex::new();
             for (id, advancement) in advs.iter() {
@@ -3691,7 +3691,7 @@ fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
         };
         if adv_done()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(pname)
             .map(|g| g.len() >= advs.len() && advs.keys().all(|id| g.contains(id)))
             .unwrap_or(false)
@@ -3701,12 +3701,12 @@ fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
             }
             return;
         }
-        let mut prog = adv_prog().lock().unwrap();
+        let mut prog = adv_prog().lock().unwrap_or_else(|e| e.into_inner());
         let pp = prog.entry(pname.to_string()).or_default();
         // Only the advancements that can fire on this event: their criteria are the
         // only ones this call can complete. The completion test still walks *all* of an
         // advancement's criteria, so a partially satisfied one is judged as before.
-        let done = adv_done().lock().unwrap();
+        let done = adv_done().lock().unwrap_or_else(|e| e.into_inner());
         let granted = done.get(pname);
         // (advancement id -> the criteria this event satisfied), so an advancement
         // reached by several criteria is only walked once.
@@ -3744,10 +3744,10 @@ fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
     }
     for id in grants {
         {
-            let mut tracker = player_advancements().lock().unwrap();
+            let mut tracker = player_advancements().lock().unwrap_or_else(|e| e.into_inner());
             let inserted = adv_done()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .entry(pname.to_string())
                 .or_default()
                 .insert(id.clone());
@@ -3762,7 +3762,7 @@ fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
         }
         let t = advancements()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&id)
             .map(|a| a.title.clone())
             .unwrap_or(id.clone());
@@ -3901,7 +3901,7 @@ fn run_block_modification(ctx: &CmdCtx, cmd: &str, args: &[&str]) -> Result<Stri
                 // /fill destroy honors doTileDrops the way vanilla's
                 // dropResources check does.
                 if dim == DimId::Overworld && GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0 {
-                    let mut drops = drops().lock().unwrap();
+                    let mut drops = drops().lock().unwrap_or_else(|e| e.into_inner());
                     let remaining = DROP_CAP.saturating_sub(drops.len());
                     drops.extend(
                         block_drops(previous)
@@ -3942,7 +3942,7 @@ fn setblock_attach_nbt(dim: DimId, x: i32, y: i32, z: i32, tag: ExecTag) {
             if !slots.is_empty() {
                 chests()
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .insert(ContainerKey::Block((dim, x, y, z)), slots);
             }
         }
@@ -4084,7 +4084,7 @@ fn clear_scheduled_functions(scheduled: &mut Vec<(String, u64)>, function: Optio
 fn run_command(me: Option<&Arc<Client>>, msg: &str, s: &mut Option<&Client>) {
     let ctx = match me {
         Some(c) => {
-            let p = *c.pos.lock().unwrap();
+            let p = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
             CmdCtx {
                 me: Some(c.clone()),
                 x: p.0,
@@ -4242,7 +4242,7 @@ fn player_permission_level(name: &str) -> u8 {
     if allow_unsafe_player_admin() {
         return 4;
     }
-    let level = ops_registry().lock().unwrap().op_level_of(name);
+    let level = ops_registry().lock().unwrap_or_else(|e| e.into_inner()).op_level_of(name);
     if level > 0 {
         return level;
     }
@@ -4250,7 +4250,7 @@ fn player_permission_level(name: &str) -> u8 {
     // a name present only there is still a level-4 operator.
     if OPERATORS
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .contains(&name.to_ascii_lowercase())
     {
         return 4;
@@ -4272,7 +4272,7 @@ fn set_difficulty(difficulty: u8) {
     DIFFICULTY.store(difficulty, Ordering::Relaxed);
     if difficulty == 0 {
         let gone: Vec<i32> = {
-            let mut mobs = mobs().lock().unwrap();
+            let mut mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
             let gone: Vec<i32> = mobs
                 .iter()
                 .filter(|mob| {
@@ -4335,7 +4335,7 @@ fn read_operators(path: &std::path::Path) -> std::io::Result<Operators> {
 fn load_operators(path: &std::path::Path) -> std::io::Result<()> {
     // `OpsRegistry::load` accepts both the Vanilla object schema and the legacy
     // flat name array, so it is the single parse both views are fed from.
-    let mut operators = OPERATORS.lock().unwrap();
+    let mut operators = OPERATORS.lock().unwrap_or_else(|e| e.into_inner());
     match OpsRegistry::load(path) {
         Ok(registry) => {
             *operators = registry
@@ -4343,12 +4343,12 @@ fn load_operators(path: &std::path::Path) -> std::io::Result<()> {
                 .iter()
                 .map(|e| e.name.to_ascii_lowercase())
                 .collect();
-            *ops_registry().lock().unwrap() = registry;
+            *ops_registry().lock().unwrap_or_else(|e| e.into_inner()) = registry;
             Ok(())
         }
         Err(error) => {
             operators.clear();
-            ops_registry().lock().unwrap().entries.clear();
+            ops_registry().lock().unwrap_or_else(|e| e.into_inner()).entries.clear();
             Err(error)
         }
     }
@@ -4356,7 +4356,7 @@ fn load_operators(path: &std::path::Path) -> std::io::Result<()> {
 
 fn set_operator(path: &std::path::Path, name: &str, enable: bool) -> std::io::Result<bool> {
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-    let mut operators = OPERATORS.lock().unwrap();
+    let mut operators = OPERATORS.lock().unwrap_or_else(|e| e.into_inner());
     let mut proposed = operators.clone();
     let name = name.to_ascii_lowercase();
     let changed = if enable {
@@ -4389,7 +4389,7 @@ fn set_operator(path: &std::path::Path, name: &str, enable: bool) -> std::io::Re
     }
     *operators = proposed;
     {
-        let mut registry = ops_registry().lock().unwrap();
+        let mut registry = ops_registry().lock().unwrap_or_else(|e| e.into_inner());
         if enable {
             registry.set(&name, 4, false);
         } else {
@@ -4744,7 +4744,7 @@ fn send_commands_at_level(socket: &mut TcpStream, level: u8) -> std::io::Result<
 }
 
 fn update_client_commands(client: &Client) {
-    let mut socket = client.sock.lock().unwrap();
+    let mut socket = client.sock.lock().unwrap_or_else(|e| e.into_inner());
     let _ = send_commands_at_level(&mut socket, player_permission_level(&client.name));
 }
 
@@ -4784,20 +4784,20 @@ fn reply_to_command_suggestion(client: &Client, body: &[u8]) {
     if level >= 2 {
         completions.operators = ops_registry()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .names()
             .iter()
             .map(|name| name.to_string())
             .collect();
         completions.enabled_packs = packs()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .map(|p| p.name.clone())
             .collect();
         completions.disabled_packs = disabled_datapacks()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .cloned()
             .collect();
@@ -4805,7 +4805,7 @@ fn reply_to_command_suggestion(client: &Client, body: &[u8]) {
     let response = command_suggestion_response(&request, level, &completions);
     if let Ok(payload) = brigadier_wire::command_suggestions_response_payload(&response) {
         let _ = send_packet(
-            &mut client.sock.lock().unwrap(),
+            &mut client.sock.lock().unwrap_or_else(|e| e.into_inner()),
             i64::from(brigadier_wire::CLIENTBOUND_COMMAND_SUGGESTIONS),
             payload,
         );
@@ -4953,13 +4953,13 @@ fn spreadplayers_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) 
         return USAGE.into();
     }
     let cls = client_snapshot();
-    let mob_snap = mobs().lock().unwrap().clone();
+    let mob_snap = mobs().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let mut targets: Vec<SpreadTarget> = Vec::new();
     for token in &args[idx..] {
         for eid in resolve_selector(token, me) {
             if let Ok(pid) = eid.parse::<i32>() {
                 if let Some(c) = cls.iter().find(|c| c.eid == pid) {
-                    if *c.dim.lock().unwrap() == dim {
+                    if *c.dim.lock().unwrap_or_else(|e| e.into_inner()) == dim {
                         targets.push(SpreadTarget::Player(c.clone()));
                     }
                 }
@@ -5098,24 +5098,24 @@ fn spreadplayers_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) 
         for &mi in &pile.members {
             match &targets[mi] {
                 SpreadTarget::Player(c) => {
-                    if *c.dim.lock().unwrap() != dim {
+                    if *c.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
                         continue;
                     }
                     let (yaw, pitch) = {
-                        let p = c.pos.lock().unwrap();
+                        let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
                         (p.3, p.4)
                     };
-                    teleport_in_dimension(c, &mut c.sock.lock().unwrap(), (px, y, pz, yaw, pitch));
+                    teleport_in_dimension(c, &mut c.sock.lock().unwrap_or_else(|e| e.into_inner()), (px, y, pz, yaw, pitch));
                 }
                 SpreadTarget::Mob(m) => {
                     {
-                        let mut p = m.pos.lock().unwrap();
+                        let mut p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
                         p.0 = px;
                         p.1 = y;
                         p.2 = pz;
                     }
                     let (yaw, pitch) = {
-                        let p = m.pos.lock().unwrap();
+                        let p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
                         (p.3, p.4)
                     };
                     let tp = entity_teleport(m.eid, px, y, pz, yaw, pitch, true);
@@ -5250,10 +5250,10 @@ fn particle_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> St
     let range2 = range * range;
     let cls = client_snapshot();
     let in_range = |c: &Arc<Client>| {
-        if *c.dim.lock().unwrap() != dim {
+        if *c.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
             return false;
         }
-        let p = *c.pos.lock().unwrap();
+        let p = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
         let ddx = p.0 - px;
         let ddy = p.1 - py;
         let ddz = p.2 - pz;
@@ -5403,7 +5403,7 @@ fn playsound_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> S
     let audible = 16.0 * volume;
     let mut sent = 0usize;
     for c in &targets {
-        let p = *c.pos.lock().unwrap();
+        let p = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
         let (dx, dy, dz) = (p.0 - px, p.1 - py, p.2 - pz);
         let dist = (dx * dx + dy * dy + dz * dz).sqrt();
         let (sx, sy, sz, vol) = if volume > 0.0 && dist <= audible {
@@ -5460,12 +5460,12 @@ impl TpMover {
     fn position(&self) -> (f64, f64, f64, f32, f32) {
         match self {
             Self::Player(client) => {
-                let p = client.pos.lock().unwrap();
+                let p = client.pos.lock().unwrap_or_else(|e| e.into_inner());
                 (p.0, p.1, p.2, p.3, p.4)
             }
-            Self::Mob(mob) => *mob.pos.lock().unwrap(),
+            Self::Mob(mob) => *mob.pos.lock().unwrap_or_else(|e| e.into_inner()),
             Self::Actor(actor) => {
-                let p = actor.pos.lock().unwrap();
+                let p = actor.pos.lock().unwrap_or_else(|e| e.into_inner());
                 (p.0, p.1, p.2, 0.0, 0.0)
             }
         }
@@ -5474,15 +5474,15 @@ impl TpMover {
     fn teleport(&self, dim: DimId, x: f64, y: f64, z: f64, yaw: f32, pitch: f32) -> bool {
         match self {
             Self::Player(client) => {
-                if *client.dim.lock().unwrap() != dim {
+                if *client.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
                     // A cross-dimension /tp is a real respawn, not a coordinate
                     // patch: the client needs 0x47 and a whole new window.
-                    let view = *client.view.lock().unwrap();
+                    let view = *client.view.lock().unwrap_or_else(|e| e.into_inner());
                     switch_client_dimension(client, dim, (x, y, z, yaw, pitch), view);
                 } else {
                     teleport_in_dimension(
                         client,
-                        &mut client.sock.lock().unwrap(),
+                        &mut client.sock.lock().unwrap_or_else(|e| e.into_inner()),
                         (x, y, z, yaw, pitch),
                     );
                 }
@@ -5492,13 +5492,13 @@ impl TpMover {
                 if mob.dim != dim {
                     return false;
                 }
-                *mob.pos.lock().unwrap() = (x, y, z, yaw, pitch);
+                *mob.pos.lock().unwrap_or_else(|e| e.into_inner()) = (x, y, z, yaw, pitch);
                 let tp = entity_teleport(mob.eid, x, y, z, yaw, pitch, true);
                 broadcast_seen(mob.eid, |_c| (0x70, tp.clone()));
                 true
             }
             Self::Actor(actor) => {
-                *actor.pos.lock().unwrap() = (x, y, z);
+                *actor.pos.lock().unwrap_or_else(|e| e.into_inner()) = (x, y, z);
                 true
             }
         }
@@ -5584,8 +5584,8 @@ fn tp_single_entity(
 /// A teleport destination for a single entity token that is neither a live
 /// selector match nor a player — the fake actors used by parity fixtures.
 fn tp_actor_destination(token: &str) -> Option<([f64; 3], DimId)> {
-    actors().lock().unwrap().get(token).map(|actor| {
-        let p = *actor.pos.lock().unwrap();
+    actors().lock().unwrap_or_else(|e| e.into_inner()).get(token).map(|actor| {
+        let p = *actor.pos.lock().unwrap_or_else(|e| e.into_inner());
         ([p.0, p.1, p.2], DimId::Overworld)
     })
 }
@@ -5621,7 +5621,7 @@ fn run_teleport_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -
                 Err(e) => return e,
             };
             if selected.is_empty() {
-                if let Some(actor) = actors().lock().unwrap().get(*token).cloned() {
+                if let Some(actor) = actors().lock().unwrap_or_else(|e| e.into_inner()).get(*token).cloned() {
                     movers.push(TpMover::Actor(actor));
                 }
             }
@@ -5748,7 +5748,7 @@ fn loot_table_pools(id: &str) -> Option<Vec<LootPool>> {
     } else {
         format!("minecraft:{id}")
     };
-    loot_tables().lock().unwrap().get(&id).map(|pools| {
+    loot_tables().lock().unwrap_or_else(|e| e.into_inner()).get(&id).map(|pools| {
         pools
             .iter()
             .map(|pl| LootPool {
@@ -5794,7 +5794,7 @@ fn loot_slot_of(spec: &str, held: i16) -> Option<i16> {
 /// partial stack first, then hotbar (36-44) before the main inventory (9-35).
 fn loot_give_stack(client: &Arc<Client>, stack: &Stack) {
     let (item, cnt, comps) = stack;
-    let mut inv = client.inv.lock().unwrap();
+    let mut inv = client.inv.lock().unwrap_or_else(|e| e.into_inner());
     let slot: i16 = (36..=44i16)
         .chain(9..=35)
         .find(|sl| {
@@ -5857,7 +5857,7 @@ fn loot_roll_source(
             if entity.starts_with('@') {
                 match tp_single_entity(ctx, entity) {
                     Ok(ExecuteEntity::Mob(mob)) => {
-                        let burning = *mob.fire_ticks.lock().unwrap() > 0;
+                        let burning = *mob.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) > 0;
                         Ok(mob_loot(mob.etype, burning))
                     }
                     Ok(_) => Err("Entity has no loot table".into()),
@@ -5989,7 +5989,7 @@ fn run_loot_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> St
                 Err(e) => return e,
             };
             let key = ContainerKey::Block((dim, bx, by, bz));
-            let mut chests = chests().lock().unwrap();
+            let mut chests = chests().lock().unwrap_or_else(|e| e.into_inner());
             let slots = chests.entry(key).or_default();
             let mut n = 0usize;
             for st in &items {
@@ -6046,7 +6046,7 @@ fn run_loot_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> St
                     };
                     let limit = count.unwrap_or(1).min(items.len());
                     let mut n = 0usize;
-                    let mut chests = chests().lock().unwrap();
+                    let mut chests = chests().lock().unwrap_or_else(|e| e.into_inner());
                     let slots = chests.entry(ContainerKey::Block((dim, bx, by, bz))).or_default();
                     for (i, st) in items.iter().take(limit).enumerate() {
                         let s = slot + i as i16;
@@ -6088,11 +6088,11 @@ fn run_loot_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> St
                                     None => slot_spec.to_owned(),
                                 }
                             };
-                            let Some(slot) = loot_slot_of(&spec, *c.held.lock().unwrap()) else { continue };
+                            let Some(slot) = loot_slot_of(&spec, *c.held.lock().unwrap_or_else(|e| e.into_inner())) else { continue };
                             {
-                                let mut inv = c.inv.lock().unwrap();
+                                let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
                                 inv.insert(slot, st.clone());
-                                *c.armor_pts.lock().unwrap() = armor_pts_of(&inv);
+                                *c.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&inv);
                             }
                             let mut p = vec![0u8];
                             write_varint(&mut p, 0);
@@ -6126,7 +6126,7 @@ fn run_loot_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> St
             };
             let n = items.len();
             for (item, cnt, ic) in items {
-                drops().lock().unwrap().push(Drop {
+                drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
                     eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                     x: lx,
                     y: ly,
@@ -6168,7 +6168,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
     if !command_allowed_at_level(cmd, level) && !command_allowed_for_player(cmd, &args) {
         let reply = "You do not have permission to run that command";
         if let Some(client) = s {
-            let _ = send_packet(&mut client.sock.lock().unwrap(), 0x6c, system_chat(reply));
+            let _ = send_packet(&mut client.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x6c, system_chat(reply));
         }
         return reply.into();
     }
@@ -6188,7 +6188,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         };
         if !reply.is_empty() {
             if let Some(client) = s {
-                let _ = send_packet(&mut client.sock.lock().unwrap(), 0x6c, system_chat(&reply));
+                let _ = send_packet(&mut client.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x6c, system_chat(&reply));
             }
         }
         return reply;
@@ -6280,19 +6280,19 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             } else if args.len() >= 3 { (ctx.me.as_ref().map(|c| c.name.clone()).unwrap_or_default(), &args[0..]) }
               else { (args.first().copied().unwrap_or("").to_string(), &args[0..0]) };
             let t: Option<Arc<Client>> = if nm.is_empty() { ctx.me.clone() }
-                else { clients().lock().unwrap().iter().find(|c| c.name == nm).cloned() };
+                else { clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.name == nm).cloned() };
             match t {
                 None => format!("unknown player '{nm}'"),
                 Some(c) => {
                     let (x, y, z) = if xyz.len() >= 3 {
                         (coord(xyz[0], ctx.x), coord(xyz[1], ctx.y), coord(xyz[2], ctx.z))
-                    } else { let p = c.pos.lock().unwrap(); (p.0, p.1, p.2) };
+                    } else { let p = c.pos.lock().unwrap_or_else(|e| e.into_inner()); (p.0, p.1, p.2) };
                     let Some(yaw) = spawn_yaw(xyz.get(3).copied(), me) else {
                         return "Invalid spawn angle".into();
                     };
                     let dim = cmd_dim(ctx);
-                    let mut spawn_dim = c.spawn_dim.lock().unwrap();
-                    *c.spawn_pt.lock().unwrap() = Some((x, y, z, yaw));
+                    let mut spawn_dim = c.spawn_dim.lock().unwrap_or_else(|e| e.into_inner());
+                    *c.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) = Some((x, y, z, yaw));
                     *spawn_dim = dim;
                     format!("Set spawn point to {x}, {y}, {z} facing {yaw} for {}", c.name)
                 }
@@ -6312,10 +6312,10 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 return "Invalid spawn angle".into();
             };
             let spawn = (x, y, z, yaw);
-            *WORLD_SPAWN.lock().unwrap() = spawn;
+            *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = spawn;
             fanout_in(
                 &client_snapshot(),
-                |player| *player.dim.lock().unwrap() == DimId::Overworld,
+                |player| *player.dim.lock().unwrap_or_else(|e| e.into_inner()) == DimId::Overworld,
                 |_| (0x56, spawn_position_packet(spawn)),
             );
             format!("Set the world spawn point to {x}, {y}, {z} facing {yaw}")
@@ -6389,10 +6389,10 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             let sender = me.map(|client| client.name.as_str()).unwrap_or("Server");
             let text = words.join(" ");
             let target_message = system_chat(&format!("{sender} whispers to you: {text}"));
-            let _ = send_packet(&mut target.sock.lock().unwrap(), 0x6c, target_message);
+            let _ = send_packet(&mut target.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x6c, target_message);
             let reply = format!("You whisper to {}: {}", target.name, text);
             if let Some(client) = *s {
-                let _ = send_packet(&mut client.sock.lock().unwrap(), 0x6c, system_chat(&reply));
+                let _ = send_packet(&mut client.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x6c, system_chat(&reply));
             }
             return String::new();
         }
@@ -6400,46 +6400,46 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             let mut killed = 0;
             let targets = match args.first() {
                 Some(sel) if sel.starts_with('@') => resolve_selector(sel, me),
-                Some(nm) => clients().lock().unwrap().iter()
+                Some(nm) => clients().lock().unwrap_or_else(|e| e.into_inner()).iter()
                     .find(|c| c.name == *nm).map(|c| vec![c.eid.to_string()])
                     .unwrap_or_default(),
                 _ => me.map(|c| vec![c.eid.to_string()]).unwrap_or_default(),
             };
             for t in targets {
                 if let Some(eid) = t.strip_prefix("m:").and_then(|e| e.parse::<i32>().ok()) {
-                    let info = mobs().lock().unwrap().iter()
+                    let info = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter()
                         .find(|m| m.eid == eid)
-                        .map(|m| (m.etype, *m.pos.lock().unwrap()));
+                        .map(|m| (m.etype, *m.pos.lock().unwrap_or_else(|e| e.into_inner())));
                     if let Some((et, (mx, my, mz, ..))) = info { kill_mob(eid, et, mx, my, mz); }
                     killed += 1;
                 } else if let Some(eid) = t.strip_prefix("d:").and_then(|e| e.parse::<i32>().ok()) {
-                    drops().lock().unwrap().retain(|d| d.eid != eid);
+                    drops().lock().unwrap_or_else(|e| e.into_inner()).retain(|d| d.eid != eid);
                     broadcast_seen_destroy(eid);
                     killed += 1;
                 } else if let Some(eid) = t.strip_prefix("t:").and_then(|e| e.parse::<i32>().ok()) {
-                    primed().lock().unwrap().retain(|t2| t2.eid != eid);
+                    primed().lock().unwrap_or_else(|e| e.into_inner()).retain(|t2| t2.eid != eid);
                     broadcast_seen_destroy(eid);
                     killed += 1;
                 } else if let Some(eid) = t.strip_prefix("a:").and_then(|e| e.parse::<i32>().ok()) {
-                    arrows().lock().unwrap().retain(|x| x.eid != eid);
+                    arrows().lock().unwrap_or_else(|e| e.into_inner()).retain(|x| x.eid != eid);
                     broadcast_seen_destroy(eid);
                     killed += 1;
                 } else if let Some(eid) = t.strip_prefix("p:").and_then(|e| e.parse::<i32>().ok()) {
-                    pearls().lock().unwrap().retain(|x| x.eid != eid);
+                    pearls().lock().unwrap_or_else(|e| e.into_inner()).retain(|x| x.eid != eid);
                     broadcast_seen_destroy(eid);
                     killed += 1;
                 } else if let Some(eid) = t.strip_prefix("b:").and_then(|e| e.parse::<i32>().ok()) {
-                    bobbers().lock().unwrap().retain(|x| x.eid != eid);
+                    bobbers().lock().unwrap_or_else(|e| e.into_inner()).retain(|x| x.eid != eid);
                     broadcast_seen_destroy(eid);
                     killed += 1;
                 } else if let Some(eid) = t.strip_prefix("x:").and_then(|e| e.parse::<i32>().ok()) {
-                    xps().lock().unwrap().retain(|x| x.eid != eid);
+                    xps().lock().unwrap_or_else(|e| e.into_inner()).retain(|x| x.eid != eid);
                     broadcast_seen_destroy(eid);
                     killed += 1;
                 } else if let Ok(eid) = t.parse::<i32>() {
                     let cls: Vec<Arc<Client>> = client_snapshot();
                     if let Some(c) = cls.iter().find(|c| c.eid == eid) {
-                        *c.hp.lock().unwrap() = 0.0;
+                        *c.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
                         if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x5d, health_pkt_c(0.0, c)); }
                         killed += 1;
                     }
@@ -6455,17 +6455,17 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 _ => return "usage: /gamemode survival|creative|adventure|spectator [player]".into() };
             // optional second arg: another player (or actor record)
             let target: Option<Arc<Client>> = if args.len() >= 2 {
-                if actors().lock().unwrap().contains_key(args[1]) {
+                if actors().lock().unwrap_or_else(|e| e.into_inner()).contains_key(args[1]) {
                     return format!("Set gamemode of {} to {}", args[1], args[0])
                 }
-                match clients().lock().unwrap().iter().find(|c| c.name == args[1]).cloned() {
+                match clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.name == args[1]).cloned() {
                     Some(c) => Some(c),
                     None => return format!("unknown player '{}'", args[1]),
                 }
             } else { me.cloned() };
             match target {
                 Some(c) => {
-                    *c.gm.lock().unwrap() = v as u8;
+                    *c.gm.lock().unwrap_or_else(|e| e.into_inner()) = v as u8;
                     let mut g = vec![3u8]; g.extend_from_slice(&v.to_be_bytes());
                     let mut ab = vec![flags]; ab.extend_from_slice(&0.05f32.to_be_bytes()); ab.extend_from_slice(&0.1f32.to_be_bytes());
                     if let Ok(mut w) = c.sock.lock() {
@@ -6501,7 +6501,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             } else {
                 "Kicked by an operator.".to_owned()
             };
-            let mut socket = target.sock.lock().unwrap();
+            let mut socket = target.sock.lock().unwrap_or_else(|e| e.into_inner());
             play_disconnect(&mut socket, &reason);
             let _ = socket.shutdown(std::net::Shutdown::Both);
             format!("Kicked {}: {}", target.name, reason)
@@ -6543,7 +6543,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             let targets = match args.first() {
                 Some(sel) if sel.starts_with('@') => resolve_selector(sel, me),
                 Some(n) if name_to_item(n).is_none() => {
-                    clients().lock().unwrap().iter().find(|c| c.name == *n)
+                    clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.name == *n)
                         .map(|c| vec![c.eid.to_string()]).unwrap_or_default()
                 }
                 _ => me.map(|c| vec![c.eid.to_string()]).unwrap_or_default(),
@@ -6569,7 +6569,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             let cls: Vec<Arc<Client>> = client_snapshot();
             for t in &targets {
                 if let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) {
-                    let mut inv = c.inv.lock().unwrap();
+                    let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
                     let keys: Vec<i16> = inv.iter()
                         .filter(|(_, (it, _, _))| want.map(|w| w == *it).unwrap_or(true))
                         .map(|(&k, _)| k).collect();
@@ -6610,7 +6610,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             let sub = args.first().copied().unwrap_or("");
             let sel = args.get(1).copied().unwrap_or("@s");
             let targets = if sel.starts_with('@') { resolve_selector(sel, me) }
-                else { clients().lock().unwrap().iter().find(|c| c.name == sel)
+                else { clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.name == sel)
                     .map(|c| vec![c.eid.to_string()]).unwrap_or_default() };
             // hold a snapshot of client Arcs, not the clients() mutex —
             // broadcast_seen re-locks clients() internally.
@@ -6630,19 +6630,19 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                         if let Some(c) = cls_snap.iter().find(|c| c.eid.to_string() == *t) {
                             match eid2 {
                                 // instant effects apply once, not stored
-                                5 => { let mut h = c.hp.lock().unwrap();
+                                5 => { let mut h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
                                     *h = (*h + 4.0 * (amp + 1) as f32).min(20.0);
                                     if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x5d, health_pkt_c(*h, c)); } }
-                                6 => { let mut h = c.hp.lock().unwrap();
+                                6 => { let mut h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
                                     *h = (*h - 6.0 * (amp + 1) as f32).max(0.0);
-                                    if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); }
+                                    if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap_or_else(|e| e.into_inner()); }
                                     if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x5d, health_pkt_c(*h, c)); } }
-                                22 => { let mut f = c.food.lock().unwrap();
+                                22 => { let mut f = c.food.lock().unwrap_or_else(|e| e.into_inner());
                                     *f = (*f + amp + 1).min(20); drop(f);
-                                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x5d, health_pkt_c(*c.hp.lock().unwrap(), c)); } }
+                                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x5d, health_pkt_c(*c.hp.lock().unwrap_or_else(|e| e.into_inner()), c)); } }
                                 _ => {
                                     let ticks = secs * TICKS_PER_SECOND as i32; // server ticks
-                                    { let mut ef = c.effs.lock().unwrap();
+                                    { let mut ef = c.effs.lock().unwrap_or_else(|e| e.into_inner());
                                       ef.retain(|e| e.id != eid2);
                                       ef.push(Eff { id: eid2, amp, left: ticks }); }
                                     fx.push(((*c).clone(), entity_effect_pkt(c.eid, eid2, amp, ticks)));
@@ -6663,7 +6663,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     };
                     for t in &targets {
                         if let Some(c) = cls_snap.iter().find(|c| c.eid.to_string() == *t) {
-                            let gone: Vec<i32> = { let mut ef = c.effs.lock().unwrap();
+                            let gone: Vec<i32> = { let mut ef = c.effs.lock().unwrap_or_else(|e| e.into_inner());
                                 let g: Vec<i32> = ef.iter().filter(|e| want.map(|w| w == e.id).unwrap_or(true)).map(|e| e.id).collect();
                                 ef.retain(|e| want.map(|w| w != e.id).unwrap_or(false)); g };
                             for id in gone { rx.push(((*c).clone(), remove_effect_pkt(c.eid, id))); }
@@ -6743,7 +6743,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     (0x28, p.clone())
                 });
                 if dim == DimId::Overworld && GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0 {
-                    let mut drops = drops().lock().unwrap();
+                    let mut drops = drops().lock().unwrap_or_else(|e| e.into_inner());
                     let remaining = DROP_CAP.saturating_sub(drops.len());
                     drops.extend(
                         block_drops(old)
@@ -6786,7 +6786,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             let dim = cmd_dim(ctx);
             if etype == 106 && dim == DimId::Overworld {
                 let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                primed().lock().unwrap().push(Primed { eid, x, y, z, left: server_ticks(TNT_FUSE_GT) as i32 });
+                primed().lock().unwrap_or_else(|e| e.into_inner()).push(Primed { eid, x, y, z, left: server_ticks(TNT_FUSE_GT) as i32 });
             } else if !insert_live_mob(etype, dim, (x, y, z, 0.0, 0.0), default_mob_hp(args[0]), None) {
                 return "mob cap reached".into();
             }
@@ -6801,7 +6801,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 (me.map(|c| vec![c.eid.to_string()]).unwrap_or_default(), args.first().copied().unwrap_or(""))
             } else {
                 let name = args.first().copied().unwrap_or("");
-                let t = { clients().lock().unwrap().iter().find(|c| c.name == name).map(|c| c.eid.to_string()) };
+                let t = { clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.name == name).map(|c| c.eid.to_string()) };
                 (t.into_iter().collect(), args.get(1).copied().unwrap_or(""))
             };
             {
@@ -6817,7 +6817,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     let cnt = args.iter().rev().find_map(|a| a.parse::<u8>().ok()).unwrap_or(1);
                     gave_names.push(c.name.clone());
                     let st: Stack = (item, cnt, comps.clone());
-                    let mut inv = c.inv.lock().unwrap();
+                    let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
                     // vanilla fills hotbar (36-44) before main inv (9-35), and
                     // merges into a matching partial stack first
                     let slot: i16 = (36..=44i16).chain(9..=35)
@@ -6847,7 +6847,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 (resolve_selector(args[0], me), args.get(1).copied().unwrap_or(""))
             } else {
                 let name = args.first().copied().unwrap_or("");
-                let t = { clients().lock().unwrap().iter().find(|c| c.name == name).map(|c| c.eid.to_string()) };
+                let t = { clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.name == name).map(|c| c.eid.to_string()) };
                 (t.into_iter().collect(), args.get(1).copied().unwrap_or(""))
             };
             let Some(eid) = enchant_id(en_name) else {
@@ -6870,8 +6870,8 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 let cls: Vec<Arc<Client>> = client_snapshot();
                 for t in &targets {
                     let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) else { continue };
-                    let slot = 36 + *c.held.lock().unwrap();
-                    let mut inv = c.inv.lock().unwrap();
+                    let slot = 36 + *c.held.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
                     let Some(st) = inv.get_mut(&slot) else { continue };
                     if !enchant_applicable(st.0, eid) { continue }
                     let cur = enchantments_get(&st.2);
@@ -6910,14 +6910,14 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     // carpet-actor held-item fast path: replace entity
                     // <actor> weapon.mainhand with <item> [count]
                     if args.get(1) == Some(&"entity") && args.len() >= 6
-                        && !clients().lock().unwrap().iter().any(|c| c.name == args[2])
-                        && actors().lock().unwrap().contains_key(args[2]) {
-                        let a = actors().lock().unwrap();
+                        && !clients().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|c| c.name == args[2])
+                        && actors().lock().unwrap_or_else(|e| e.into_inner()).contains_key(args[2]) {
+                        let a = actors().lock().unwrap_or_else(|e| e.into_inner());
                         let a = a.get(args[2]).unwrap();
                         let it = name_to_item(args.get(5).copied().unwrap_or("")
                             .split('[').next().unwrap_or("")).unwrap_or(0);
                         let cnt = args.get(6).and_then(|v| v.parse::<u8>().ok()).unwrap_or(1);
-                        *a.held.lock().unwrap() = (it, cnt, parse_item_comps(args[5]));
+                        *a.held.lock().unwrap_or_else(|e| e.into_inner()) = (it, cnt, parse_item_comps(args[5]));
                         return "ok".into();
                     }
                     if args.get(1) == Some(&"entity") && args.len() >= 6 {
@@ -6934,11 +6934,11 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                             let cls: Vec<Arc<Client>> = client_snapshot();
                             for t in &tgts {
                                 let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) else { continue };
-                                let Some(slot) = slot_of(slot_sp, *c.held.lock().unwrap()) else { continue };
+                                let Some(slot) = slot_of(slot_sp, *c.held.lock().unwrap_or_else(|e| e.into_inner())) else { continue };
                                 {
-                                    let mut inv = c.inv.lock().unwrap();
+                                    let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
                                     inv.insert(slot, (item, cnt, comps.clone()));
-                                    *c.armor_pts.lock().unwrap() = armor_pts_of(&inv);
+                                    *c.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&inv);
                                 }
                                 {   // resync the touched slot (held fast path + generic)
                                     let mut p = vec![0u8]; write_varint(&mut p, 0);
@@ -6960,13 +6960,13 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                         let cnt = args.get(8).and_then(|v| v.parse::<u8>().ok()).unwrap_or(1);
                         let key = (bx, by, bz);
                         if is_furnace_at(bx, by, bz) && slot <= 2 {
-                            let mut fs = furnaces().lock().unwrap();
+                            let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
                             let f = fs.entry(ow_block(key)).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
                             let cell = match slot { 0 => &mut f.input, 1 => &mut f.fuel, _ => &mut f.output };
                             *cell = (item, cnt, comps); f.dirty = true;
                         } else {
                             unpack_block_loot_if_needed(ow_block(key));
-                            let mut ch = chests().lock().unwrap();
+                            let mut ch = chests().lock().unwrap_or_else(|e| e.into_inner());
                             let m = ch.entry(ContainerKey::ow(key)).or_default();
                             if item == 0 { m.remove(&slot); } else { m.insert(slot, (item, cnt, comps)); }
                         }
@@ -6977,15 +6977,15 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     if args.get(1) == Some(&"entity") && args.len() >= 5 {
                         let tgts = resolve_selector(args[2], me);
                         let (slot_sp, mod_id) = (args[3], args[4]);
-                        let fns = item_mods().lock().unwrap().get(mod_id).cloned();
+                        let fns = item_mods().lock().unwrap_or_else(|e| e.into_inner()).get(mod_id).cloned();
                         let Some(fns) = fns else { return format!("Unknown item modifier: {}", mod_id) };
                         let mut done = 0;
                         {
                             let cls: Vec<Arc<Client>> = client_snapshot();
                             for t in &tgts {
                                 let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) else { continue };
-                                let Some(slot) = slot_of(slot_sp, *c.held.lock().unwrap()) else { continue };
-                                let mut inv = c.inv.lock().unwrap();
+                                let Some(slot) = slot_of(slot_sp, *c.held.lock().unwrap_or_else(|e| e.into_inner())) else { continue };
+                                let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
                                 if let Some(st) = inv.get_mut(&slot) { apply_loot_funcs(st, &fns); done += 1; }
                                 let ns = inv.get(&slot).cloned().unwrap_or((0, 0, Vec::new()));
                                 drop(inv);
@@ -6999,11 +6999,11 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     } else if args.get(1) == Some(&"block") && args.len() >= 7 {
                         let (bx, by, bz) = (coord(args[2], ctx.x) as i32, coord(args[3], ctx.y) as i32, coord(args[4], ctx.z) as i32);
                         let mod_id = args[6];
-                        let fns = item_mods().lock().unwrap().get(mod_id).cloned();
+                        let fns = item_mods().lock().unwrap_or_else(|e| e.into_inner()).get(mod_id).cloned();
                         let Some(fns) = fns else { return format!("Unknown item modifier: {}", mod_id) };
                         let cslot: i16 = args[5].trim_start_matches("container.").parse().unwrap_or(-1);
                         unpack_block_loot_if_needed(ow_block((bx, by, bz)));
-                        let mut ch = chests().lock().unwrap();
+                        let mut ch = chests().lock().unwrap_or_else(|e| e.into_inner());
                         let ok = ch.get_mut(&ContainerKey::ow((bx, by, bz))).and_then(|m| m.get_mut(&cslot))
                             .map(|st| { apply_loot_funcs(st, &fns); }).is_some();
                         (if ok { "Modified item".to_string() } else { "No item in slot".to_string() }).to_string()
@@ -7063,7 +7063,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 p.extend_from_slice(&a.to_be_bytes()); p.extend_from_slice(&b.to_be_bytes()); p.extend_from_slice(&c.to_be_bytes());
                 let mut n = 0;
                 for e in &targets {
-                    let found = clients().lock().unwrap().iter().find(|c2| c2.eid.to_string() == *e).cloned();
+                    let found = clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c2| c2.eid.to_string() == *e).cloned();
                     if let Some(c2) = found {
                         if let Ok(mut w) = c2.sock.lock() { let _ = send_packet(&mut w, 0x66, p.clone()); n += 1; }
                     }
@@ -7077,7 +7077,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             let payload = chat_nbt(&txt);
             let mut n = 0;
             for e in &targets {
-                let found = clients().lock().unwrap().iter().find(|c2| c2.eid.to_string() == *e).cloned();
+                let found = clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c2| c2.eid.to_string() == *e).cloned();
                     if let Some(c2) = found {
                     if let Ok(mut w) = c2.sock.lock() { let _ = send_packet(&mut w, pkt_id, payload.clone()); n += 1; }
                 }
@@ -7107,7 +7107,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     "get" => { out += &format!("{} = {}; ", e, attr_of(&key, aname)); }
                     "set" => {
                         let v: f64 = args.get(4).and_then(|x| x.parse().ok()).unwrap_or(0.0);
-                        attrs().lock().unwrap().entry(key.clone()).or_default()
+                        attrs().lock().unwrap_or_else(|e| e.into_inner()).entry(key.clone()).or_default()
                             .insert(aname.trim_start_matches("minecraft:").to_string(), v);
                         let eid: i32 = e.parse().unwrap_or(0);
                         let mut m = HashMap::new();
@@ -7128,7 +7128,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             let payload = json_component_nbt(&args[1..].join(" "));
             let mut n = 0;
             for e in &targets {
-                let found = clients().lock().unwrap().iter().find(|c| c.eid.to_string() == *e).cloned();
+                let found = clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.eid.to_string() == *e).cloned();
                 if let Some(c) = found {
                     let mut p = payload.clone(); p.push(0);
                     if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x6c, p); n += 1; }
@@ -7142,7 +7142,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             let snd = args.get(2).copied().unwrap_or("");
             let mut n = 0;
             for e in &targets {
-                let found = clients().lock().unwrap().iter().find(|c| c.eid.to_string() == *e).cloned();
+                let found = clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.eid.to_string() == *e).cloned();
                 if let Some(c) = found {
                     let mut p = Vec::new();
                     if snd.is_empty() { p.push(0u8); }
@@ -7164,7 +7164,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             // forceload add|remove <x1> <z1> [x2 z2] | query — keeps chunks ticking with no players online
             match args.first().copied().unwrap_or("") {
                 "remove" if args.get(1) == Some(&"all") => {
-                    let mut forced = forceloaded().lock().unwrap();
+                    let mut forced = forceloaded().lock().unwrap_or_else(|e| e.into_inner());
                     let removed = forced.len();
                     forced.clear();
                     format!("Removed {} forceloaded chunk(s)", removed)
@@ -7175,7 +7175,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     let (x2, z2) = if args.len() >= 5 { (coord(args[3], ctx.x) as i32, coord(args[4], ctx.z) as i32) } else { (x1, z1) };
                     let (cx1, cx2) = (x1.div_euclid(16).min(x2.div_euclid(16)), x1.div_euclid(16).max(x2.div_euclid(16)));
                     let (cz1, cz2) = (z1.div_euclid(16).min(z2.div_euclid(16)), z1.div_euclid(16).max(z2.div_euclid(16)));
-                    let mut f = forceloaded().lock().unwrap();
+                    let mut f = forceloaded().lock().unwrap_or_else(|e| e.into_inner());
                     let mut n = 0;
                     for cx in cx1..=cx2 { for cz in cz1..=cz2 {
                         if add { n += f.insert((cx, cz)) as usize } else { n += f.remove(&(cx, cz)) as usize }
@@ -7185,19 +7185,19 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 "query" if args.len() >= 3 => {
                     let (x, z) = (coord(args[1], ctx.x) as i32, coord(args[2], ctx.z) as i32);
                     let chunk = (x.div_euclid(16), z.div_euclid(16));
-                    if forceloaded().lock().unwrap().contains(&chunk) {
+                    if forceloaded().lock().unwrap_or_else(|e| e.into_inner()).contains(&chunk) {
                         format!("Chunk {}, {} is force loaded", chunk.0, chunk.1)
                     } else {
                         format!("Chunk {}, {} is not force loaded", chunk.0, chunk.1)
                     }
                 }
-                "query" => format!("{} forceloaded chunk(s)", forceloaded().lock().unwrap().len()),
+                "query" => format!("{} forceloaded chunk(s)", forceloaded().lock().unwrap_or_else(|e| e.into_inner()).len()),
                 _ => "usage: /forceload add|remove x z [x2 z2] | query".into(),
             }
         }
         "gamerule" => {
             let Some(name) = args.first() else {
-                let rules = command_gamerules().lock().unwrap();
+                let rules = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
                 return COMMAND_GAMERULE_DEFAULTS.iter().map(|&(name, is_bool, _)| {
                     let value = gamerule_atomic_value(name).unwrap_or(rules[name]);
                     let value = if is_bool { (value != 0).to_string() } else { value.to_string() };
@@ -7209,7 +7209,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 return format!("unknown gamerule '{name}'");
             };
             if args.len() > 2 { return format!("usage: /gamerule {name} [value]"); }
-            let mut rules = command_gamerules().lock().unwrap();
+            let mut rules = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
             let value = if let Some(raw) = args.get(1) {
                 let value = if is_bool {
                     match *raw { "true" => 1, "false" => 0,
@@ -7234,9 +7234,9 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             let sub = args.get(1).copied().unwrap_or("");
             let tg = args.get(2).copied().unwrap_or("");
             let tgts = if sel.starts_with('@') { resolve_selector(sel, me) }
-                else { clients().lock().unwrap().iter().find(|c| c.name == sel)
+                else { clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.name == sel)
                     .map(|c| vec![c.eid.to_string()]).unwrap_or_default() };
-            let tm = tags().lock().unwrap();
+            let tm = tags().lock().unwrap_or_else(|e| e.into_inner());
             match sub {
                 "add" | "remove" if !tg.is_empty() => {
                     let mut tm = tm; let mut n = 0;
@@ -7244,7 +7244,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                         let key = if let Some(e) = t.strip_prefix("m:") { format!("e:{}", e) }
                             else if t.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
                                 && t.contains(':') { t.clone() }
-                            else { clients().lock().unwrap().iter().find(|c| c.eid.to_string() == *t)
+                            else { clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.eid.to_string() == *t)
                                 .map(|c| format!("p:{}", c.name)).unwrap_or_default() };
                         if key.is_empty() { continue }
                         match sub { "add" => { tm.entry(key).or_default().insert(tg.to_string()); },
@@ -7260,7 +7260,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     let mut lines: Vec<String> = Vec::new();
                     for t in &tgts {
                         let key = if let Some(e) = t.strip_prefix("m:") { format!("e:{}", e) }
-                            else { clients().lock().unwrap().iter().find(|c| c.eid.to_string() == *t)
+                            else { clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.eid.to_string() == *t)
                                 .map(|c| format!("p:{}", c.name)).unwrap_or_default() };
                         if key.is_empty() { continue }
                         let who = key.strip_prefix("p:").unwrap_or(t).to_string();
@@ -7280,7 +7280,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             let sel = args.first().copied().unwrap_or("");
             let amt = args.get(1).and_then(|a| a.parse::<f32>().ok()).unwrap_or(0.0);
             let tgts = if sel.starts_with('@') { resolve_selector(sel, me) }
-                else { clients().lock().unwrap().iter().find(|c| c.name == sel)
+                else { clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.name == sel)
                     .map(|c| vec![c.eid.to_string()]).unwrap_or_default() };
             let mut n = 0;
             let cls_snap: Vec<Arc<Client>> = client_snapshot();
@@ -7289,9 +7289,9 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 if let Some(e) = t.strip_prefix("m:").and_then(|e| e.parse::<i32>().ok()) {
                     mob_hits.push((e, amt));
                 } else if let Some(c) = cls_snap.iter().find(|c| c.eid.to_string() == *t) {
-                    if *c.gm.lock().unwrap() == 1 { continue }
-                    let mut h = c.hp.lock().unwrap();
-                    *h = (*h - hurt_absorb(c, dmg_after(c, amt, 0))).max(0.0); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); }
+                    if *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 { continue }
+                    let mut h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
+                    *h = (*h - hurt_absorb(c, dmg_after(c, amt, 0))).max(0.0); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap_or_else(|e| e.into_inner()); }
                     let hh = *h; drop(h);
                     damage_armor(c, amt);
                     if let Ok(mut w) = c.sock.lock() {
@@ -7302,16 +7302,16 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 }
             }
             for (eid, amt) in mob_hits {
-                let dead = { let ms = mobs().lock().unwrap();
+                let dead = { let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
                     ms.iter().find(|m| m.eid == eid).map(|m| {
-                        let mut h = m.hp.lock().unwrap(); *h -= amt; *h <= 0.0
+                        let mut h = m.hp.lock().unwrap_or_else(|e| e.into_inner()); *h -= amt; *h <= 0.0
                     }).unwrap_or(false) };
-                let mob = mobs().lock().unwrap().iter().find(|m| m.eid == eid).cloned();
+                let mob = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|m| m.eid == eid).cloned();
                 if let Some(m) = mob {
-                    *m.hurt_at.lock().unwrap() = Instant::now();
+                    *m.hurt_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
                     broadcast_seen(eid, |_c| (0x24, hurt_anim(eid)));
                     if dead {
-                        let (mx, my, mz) = { let p = m.pos.lock().unwrap(); (p.0, p.1, p.2) };
+                        let (mx, my, mz) = { let p = m.pos.lock().unwrap_or_else(|e| e.into_inner()); (p.0, p.1, p.2) };
                         let et = m.etype;
                         kill_mob(eid, et, mx, my, mz);
                     }
@@ -7324,11 +7324,11 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             // schedule function <fn> <time>[t|s|d] — t=game ticks(20/s), s=seconds
             if args.first().copied() == Some("clear") {
                 if args.len() == 1 {
-                    let mut scheduled = sched_fns().lock().unwrap();
+                    let mut scheduled = sched_fns().lock().unwrap_or_else(|e| e.into_inner());
                     let removed = clear_scheduled_functions(&mut scheduled, None);
                     format!("Removed {} scheduled function(s)", removed)
                 } else if args.len() == 2 {
-                    let mut scheduled = sched_fns().lock().unwrap();
+                    let mut scheduled = sched_fns().lock().unwrap_or_else(|e| e.into_inner());
                     let removed = clear_scheduled_functions(&mut scheduled, Some(args[1]));
                     format!("Removed {} scheduled function(s)", removed)
                 } else {
@@ -7346,7 +7346,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     "replace" => true,
                     _ => return "usage: /schedule function <fn> <time>[t|s|d] [append|replace]".into(),
                 };
-                let mut scheduled = sched_fns().lock().unwrap();
+                let mut scheduled = sched_fns().lock().unwrap_or_else(|e| e.into_inner());
                 schedule_function(&mut scheduled, f, t2 + off.max(1), !replace);
                 format!("Scheduled function '{}' in {} ticks", f, { off.max(1) })
             } else { "usage: /schedule clear [<function>] | function <fn> <time>[t|s|d] [append|replace]".into() }
@@ -7354,13 +7354,13 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         "counts" => {
             // debug: live entity/store census (non-vanilla, fixture aid)
             format!("mobs={} drops={} xps={} arrows={} bobbers={} pearls={} primed={} chests={} furnaces={} signs={}",
-                mobs().lock().unwrap().len(), drops().lock().unwrap().len(),
-                xps().lock().unwrap().len(), arrows().lock().unwrap().len(),
-                bobbers().lock().unwrap().len(), pearls().lock().unwrap().len(),
-                primed().lock().unwrap().len(), chests().lock().unwrap().len(),
-                furnaces().lock().unwrap().len(), signs().lock().unwrap().len())
-                + &format!(" recipes={} tags={}", json_recipes().lock().unwrap().len(),
-                    block_tags().lock().unwrap().len())
+                mobs().lock().unwrap_or_else(|e| e.into_inner()).len(), drops().lock().unwrap_or_else(|e| e.into_inner()).len(),
+                xps().lock().unwrap_or_else(|e| e.into_inner()).len(), arrows().lock().unwrap_or_else(|e| e.into_inner()).len(),
+                bobbers().lock().unwrap_or_else(|e| e.into_inner()).len(), pearls().lock().unwrap_or_else(|e| e.into_inner()).len(),
+                primed().lock().unwrap_or_else(|e| e.into_inner()).len(), chests().lock().unwrap_or_else(|e| e.into_inner()).len(),
+                furnaces().lock().unwrap_or_else(|e| e.into_inner()).len(), signs().lock().unwrap_or_else(|e| e.into_inner()).len())
+                + &format!(" recipes={} tags={}", json_recipes().lock().unwrap_or_else(|e| e.into_inner()).len(),
+                    block_tags().lock().unwrap_or_else(|e| e.into_inner()).len())
         }
                 "player" => {
             // carpet-actor subset: spawn / look at / attack|use continuous / stop / kill
@@ -7368,7 +7368,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             let sub = args.get(1).copied().unwrap_or("");
             match sub {
                 "spawn" => {
-                    let mut acts = actors().lock().unwrap();
+                    let mut acts = actors().lock().unwrap_or_else(|e| e.into_inner());
                     if acts.len() < 64 && !acts.contains_key(&name) {
                         acts.insert(name.clone(), Arc::new(Actor {
                             name: name.clone(), eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
@@ -7379,21 +7379,21 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     } else { format!("{} already spawned", name) }
                 }
                 "look" => {
-                    if let Some(a) = actors().lock().unwrap().get(&name) {
-                        *a.look.lock().unwrap() = Some((coord(args.get(3).copied().unwrap_or("~"), ctx.x) as i32,
+                    if let Some(a) = actors().lock().unwrap_or_else(|e| e.into_inner()).get(&name) {
+                        *a.look.lock().unwrap_or_else(|e| e.into_inner()) = Some((coord(args.get(3).copied().unwrap_or("~"), ctx.x) as i32,
                             coord(args.get(4).copied().unwrap_or("~"), ctx.y) as i32,
                             coord(args.get(5).copied().unwrap_or("~"), ctx.z) as i32));
                         format!("{} looking", name)
                     } else { format!("no actor {}", name) }
                 }
                 "attack" | "use" => {
-                    if let Some(a) = actors().lock().unwrap().get(&name) {
-                        *a.action.lock().unwrap() = if sub == "attack" { "attack" } else { "use" };
+                    if let Some(a) = actors().lock().unwrap_or_else(|e| e.into_inner()).get(&name) {
+                        *a.action.lock().unwrap_or_else(|e| e.into_inner()) = if sub == "attack" { "attack" } else { "use" };
                         format!("{} -> {}", name, sub)
                     } else { format!("no actor {}", name) }
                 }
-                "stop" => { if let Some(a) = actors().lock().unwrap().get(&name) { *a.action.lock().unwrap() = ""; } format!("{} stopped", name) }
-                "kill" => { actors().lock().unwrap().remove(&name); format!("Killed {}", name) }
+                "stop" => { if let Some(a) = actors().lock().unwrap_or_else(|e| e.into_inner()).get(&name) { *a.action.lock().unwrap_or_else(|e| e.into_inner()) = ""; } format!("{} stopped", name) }
+                "kill" => { actors().lock().unwrap_or_else(|e| e.into_inner()).remove(&name); format!("Killed {}", name) }
                 _ => format!("player: unknown subcommand {}", sub),
             }
         }
@@ -7405,7 +7405,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         "profile" => run_profile_command(level, &args),
         "transfer" => run_transfer_command(ctx, level, &args),
         "list" => {
-            let c = clients().lock().unwrap();
+            let c = clients().lock().unwrap_or_else(|e| e.into_inner());
             let names: Vec<String> = c.iter().map(|x| x.name.clone()).collect();
             format!("{} players: {}", names.len(), names.join(", "))
         }
@@ -7428,7 +7428,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             if GR_SEND_COMMAND_FEEDBACK.load(Ordering::Relaxed) != 0
                 || command_reply_is_error(&reply)
             {
-                let _ = send_packet(&mut client.sock.lock().unwrap(), 0x6c, system_chat(&reply));
+                let _ = send_packet(&mut client.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x6c, system_chat(&reply));
             }
         } else {
             eprintln!("[cmd] {}", reply);
@@ -7439,7 +7439,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
 
 /// Disconnect one online player the way `/kick` does.
 fn kick_client(client: &Arc<Client>, text: &str) {
-    let mut socket = client.sock.lock().unwrap();
+    let mut socket = client.sock.lock().unwrap_or_else(|e| e.into_inner());
     play_disconnect(&mut socket, text);
     let _ = socket.shutdown(std::net::Shutdown::Both);
 }
@@ -7469,24 +7469,24 @@ fn run_server_ops_command(ctx: &CmdCtx, cmd: &str, args: &[&str]) -> String {
     static OPS_FILES_LOADED: AtomicBool = AtomicBool::new(false);
     if !OPS_FILES_LOADED.swap(true, Ordering::Relaxed) {
         match BanRegistry::load(dir) {
-            Ok(bans) => *ban_registry().lock().unwrap() = bans,
+            Ok(bans) => *ban_registry().lock().unwrap_or_else(|e| e.into_inner()) = bans,
             Err(error) => eprintln!("[spine] could not load ban lists: {error}"),
         }
         match WhitelistRegistry::load(&dir.join(WHITELIST_FILE)) {
-            Ok(list) => *whitelist_registry().lock().unwrap() = list,
+            Ok(list) => *whitelist_registry().lock().unwrap_or_else(|e| e.into_inner()) = list,
             Err(error) => eprintln!("[spine] could not load {WHITELIST_FILE}: {error}"),
         }
     }
     let (reply, kicks) = {
-        let mut bans = ban_registry().lock().unwrap();
-        let mut whitelist = whitelist_registry().lock().unwrap();
+        let mut bans = ban_registry().lock().unwrap_or_else(|e| e.into_inner());
+        let mut whitelist = whitelist_registry().lock().unwrap_or_else(|e| e.into_inner());
         exec_server_ops_command(&input, &mut bans, &mut whitelist, dir, &source, &now)
     };
     let ip_ban_reason = |client: &Arc<Client>| -> Option<String> {
-        let ip = client.sock.lock().unwrap().peer_addr().ok()?.ip().to_string();
+        let ip = client.sock.lock().unwrap_or_else(|e| e.into_inner()).peer_addr().ok()?.ip().to_string();
         ban_registry()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .ip_ban(&ip)
             .map(|ban| {
                 format!(
@@ -7502,7 +7502,7 @@ fn run_server_ops_command(ctx: &CmdCtx, cmd: &str, args: &[&str]) -> String {
         {
             let text = ban_registry()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .player_ban(&client.name)
                 .map(|ban| {
                     format!("You are banned from this server.\nReason: {}", ban.reason)
@@ -7515,10 +7515,10 @@ fn run_server_ops_command(ctx: &CmdCtx, cmd: &str, args: &[&str]) -> String {
             }
         }
     }
-    if whitelist_registry().lock().unwrap().enabled {
+    if whitelist_registry().lock().unwrap_or_else(|e| e.into_inner()).enabled {
         for client in client_snapshot() {
-            let admitted = whitelist_registry().lock().unwrap().contains(&client.name)
-                || ops_registry().lock().unwrap().is_op(&client.name);
+            let admitted = whitelist_registry().lock().unwrap_or_else(|e| e.into_inner()).contains(&client.name)
+                || ops_registry().lock().unwrap_or_else(|e| e.into_inner()).is_op(&client.name);
             if !admitted {
                 kick_client(&client, "You are not white-listed on this server!");
             }
@@ -7538,7 +7538,7 @@ fn run_recipe_command(ctx: &CmdCtx, args: &[&str]) -> String {
         "take" => RecipeCommandVerb::Take,
         _ => return "usage: /recipe <give|take> <targets> <recipe|*>".into(),
     };
-    let universe: Vec<String> = recipe_ids().lock().unwrap().iter().cloned().collect();
+    let universe: Vec<String> = recipe_ids().lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
     if recipe != "*" && !universe.iter().any(|id| id == recipe) {
         return format!("Unknown recipe '{recipe}'");
     }
@@ -7546,7 +7546,7 @@ fn run_recipe_command(ctx: &CmdCtx, args: &[&str]) -> String {
     if targets.is_empty() {
         return "No player found".into();
     }
-    let mut books = recipe_books().lock().unwrap();
+    let mut books = recipe_books().lock().unwrap_or_else(|e| e.into_inner());
     let mut total_changed = 0usize;
     let mut players_changed = 0usize;
     for client in &targets {
@@ -7560,7 +7560,7 @@ fn run_recipe_command(ctx: &CmdCtx, args: &[&str]) -> String {
             players_changed += 1;
             total_changed += outcome.changed.len();
             for payload in outcome.packets {
-                let _ = send_packet(&mut client.sock.lock().unwrap(), 0x41, payload);
+                let _ = send_packet(&mut client.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x41, payload);
             }
         }
     }
@@ -7670,7 +7670,7 @@ mod p5f_parity_tests {
         let (mut client, receiver) = crate::effect_tests::client_pair();
         client.eid = eid;
         client.name = name.into();
-        *client.pos.lock().unwrap() = (x, y, z, 0.0, 0.0, true);
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (x, y, z, 0.0, 0.0, true);
         (Arc::new(client), receiver)
     }
 
@@ -7783,10 +7783,10 @@ mod p5f_parity_tests {
         assert!(p5f_run(&ctx, "/setblock 31 80 30 minecraft:gold_block keep").starts_with("Set block"));
         assert_eq!(block_at_dim(DimId::Overworld, 31, 80, 30), gold);
         // destroy drops the old block then replaces it.
-        let drops_before = drops().lock().unwrap().len();
+        let drops_before = drops().lock().unwrap_or_else(|e| e.into_inner()).len();
         assert!(p5f_run(&ctx, "/setblock 30 80 30 minecraft:gold_block destroy").starts_with("Set block"));
         assert_eq!(block_at_dim(DimId::Overworld, pos.0, pos.1, pos.2), gold);
-        let gained = drops().lock().unwrap().len() - drops_before;
+        let gained = drops().lock().unwrap_or_else(|e| e.into_inner()).len() - drops_before;
         assert!(gained >= 1, "destroy should have dropped the old block");
         // replace is the default.
         assert!(p5f_run(&ctx, "/setblock 31 80 30 minecraft:stone").starts_with("Set block"));
@@ -7799,7 +7799,7 @@ mod p5f_parity_tests {
         assert!(reply.starts_with("Set block"), "{reply}");
         let slots = chests()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&ContainerKey::Block((DimId::Overworld, 32, 80, 30)))
             .cloned()
             .unwrap_or_default();
@@ -7813,7 +7813,7 @@ mod p5f_parity_tests {
         assert!(reply.starts_with("Set block"), "{reply}");
         let slots = chests()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&ContainerKey::Block((DimId::Overworld, 33, 80, 30)))
             .cloned()
             .unwrap_or_default();
@@ -7946,33 +7946,33 @@ mod p5f_parity_tests {
         let _world = world_guard();
         let (a, _ra) = p5f_client(9101, "p5f-a", 0.5, 16.0, 0.5);
         let (b, _rb) = p5f_client(9102, "p5f-b", 100.5, 70.0, -50.5);
-        clients().lock().unwrap().extend([a.clone(), b.clone()]);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).extend([a.clone(), b.clone()]);
         let ctx = p5f_ctx(None);
 
         // coords + explicit rotation
         assert_eq!(p5f_run(&ctx, "/tp p5f-a 10 64 -20 90 -45"), "Teleported 1 target(s)");
-        let p = *a.pos.lock().unwrap();
+        let p = *a.pos.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!((p.0, p.1, p.2), (10.0, 64.0, -20.0));
         assert_eq!((p.3, p.4), (90.0, -45.0));
         // no rotation keeps the current one
         assert_eq!(p5f_run(&ctx, "/tp p5f-a 1 65 2"), "Teleported 1 target(s)");
-        let p = *a.pos.lock().unwrap();
+        let p = *a.pos.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!((p.0, p.1, p.2), (1.0, 65.0, 2.0));
         assert_eq!((p.3, p.4), (90.0, -45.0));
         // relative rotation ~ wraps like vanilla
         assert_eq!(p5f_run(&ctx, "/tp p5f-a 1 65 2 ~90 ~"), "Teleported 1 target(s)");
-        let p = *a.pos.lock().unwrap();
+        let p = *a.pos.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!((p.3, p.4), (-180.0, -45.0));
 
         // facing a point: aimed from the subject's feet at the new position
         assert_eq!(p5f_run(&ctx, "/tp p5f-a 0 64 0 facing 0 64 10"), "Teleported 1 target(s)");
-        let p = *a.pos.lock().unwrap();
+        let p = *a.pos.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!((p.3, p.4), (0.0, 0.0));
         assert_eq!(p5f_run(&ctx, "/tp p5f-a 0 64 0 facing 10 64 0"), "Teleported 1 target(s)");
-        let p = *a.pos.lock().unwrap();
+        let p = *a.pos.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!((p.3, p.4), (-90.0, 0.0));
         assert_eq!(p5f_run(&ctx, "/tp p5f-a 0 64 0 facing 0 60 0"), "Teleported 1 target(s)");
-        let p = *a.pos.lock().unwrap();
+        let p = *a.pos.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!((p.3, p.4), (0.0, 90.0));
 
         // facing entity feet vs eyes: the eyes anchor adds the eye height.
@@ -7980,25 +7980,25 @@ mod p5f_parity_tests {
         let (expect_yaw, expect_pitch) =
             tp_look_angles([0.0, 64.0, 0.0], [bx, by, bz]);
         assert_eq!(p5f_run(&ctx, "/tp p5f-a 0 64 0 facing entity p5f-b feet"), "Teleported 1 target(s)");
-        let p = *a.pos.lock().unwrap();
+        let p = *a.pos.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!((p.3, p.4), (expect_yaw, expect_pitch));
         let (expect_yaw, expect_pitch) =
             tp_look_angles([0.0, 64.0, 0.0], [bx, by + 1.62, bz]);
         assert_eq!(p5f_run(&ctx, "/tp p5f-a 0 64 0 facing entity p5f-b eyes"), "Teleported 1 target(s)");
-        let p = *a.pos.lock().unwrap();
+        let p = *a.pos.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!((p.3, p.4), (expect_yaw, expect_pitch));
 
         // entity destination adopts the destination's position AND rotation
-        *b.pos.lock().unwrap() = (5.0, 65.0, 7.0, 45.0, -30.0, true);
+        *b.pos.lock().unwrap_or_else(|e| e.into_inner()) = (5.0, 65.0, 7.0, 45.0, -30.0, true);
         assert_eq!(p5f_run(&ctx, "/tp p5f-a p5f-b"), "Teleported 1 target(s)");
-        let p = *a.pos.lock().unwrap();
+        let p = *a.pos.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!((p.0, p.1, p.2, p.3, p.4), (5.0, 65.0, 7.0, 45.0, -30.0));
         // selector subjects and selector destination
         assert_eq!(
             p5f_run(&ctx, "/tp @a[name=p5f-a] @a[name=p5f-b]"),
             "Teleported 1 target(s)"
         );
-        let p = *a.pos.lock().unwrap();
+        let p = *a.pos.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!((p.0, p.1, p.2), (5.0, 65.0, 7.0));
 
         // mobs move and broadcast the entity-teleport packet path
@@ -8009,22 +8009,22 @@ mod p5f_parity_tests {
             20.0,
             None,
         ));
-        let zeid = mobs().lock().unwrap().last().unwrap().eid;
+        let zeid = mobs().lock().unwrap_or_else(|e| e.into_inner()).last().unwrap().eid;
         assert_eq!(p5f_run(&ctx, "/tp @e[type=zombie] p5f-b"), "Teleported 1 target(s)");
         let zombie = mobs()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .find(|m| m.eid == zeid)
             .cloned()
             .unwrap();
-        let zp = *zombie.pos.lock().unwrap();
+        let zp = *zombie.pos.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!((zp.0, zp.1, zp.2), (5.0, 65.0, 7.0));
         assert_eq!((zp.3, zp.4), (45.0, -30.0));
 
         // fake actors keep working as subjects
         {
-            let mut actors = actors().lock().unwrap();
+            let mut actors = actors().lock().unwrap_or_else(|e| e.into_inner());
             actors.insert(
                 "p5f-actor".to_owned(),
                 Arc::new(Actor {
@@ -8040,10 +8040,10 @@ mod p5f_parity_tests {
         }
         assert_eq!(p5f_run(&ctx, "/tp p5f-actor 8 70 9"), "Teleported 1 target(s)");
         assert_eq!(
-            *actors().lock().unwrap().get("p5f-actor").unwrap().pos.lock().unwrap(),
+            *actors().lock().unwrap_or_else(|e| e.into_inner()).get("p5f-actor").unwrap().pos.lock().unwrap_or_else(|e| e.into_inner()),
             (8.0, 70.0, 9.0)
         );
-        actors().lock().unwrap().remove("p5f-actor");
+        actors().lock().unwrap_or_else(|e| e.into_inner()).remove("p5f-actor");
 
         // failure modes
         assert!(insert_live_mob(
@@ -8053,7 +8053,7 @@ mod p5f_parity_tests {
             20.0,
             None,
         ));
-        let zeid2 = mobs().lock().unwrap().last().unwrap().eid;
+        let zeid2 = mobs().lock().unwrap_or_else(|e| e.into_inner()).last().unwrap().eid;
         assert_eq!(
             p5f_run(&ctx, "/tp @e[type=zombie] @e[type=zombie]"),
             "Only one entity is allowed"
@@ -8063,10 +8063,10 @@ mod p5f_parity_tests {
         assert!(p5f_run(&ctx, "/tp p5f-a 0 64 0 facing entity p5f-b eyes junk").starts_with("usage:"));
         assert!(p5f_run(&ctx, "/tp p5f-a 0 64 0 facing 0 0").starts_with("usage:"));
 
-        mobs().lock().unwrap().retain(|m| m.eid != zeid && m.eid != zeid2);
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).retain(|m| m.eid != zeid && m.eid != zeid2);
         clients()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .retain(|c| c.eid != a.eid && c.eid != b.eid);
     }
 
@@ -8079,35 +8079,35 @@ mod p5f_parity_tests {
         let emerald = name_to_item("emerald").unwrap();
         loot_tables()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert("p5f:fixed".to_owned(), p5f_loot_table(diamond));
 
         // spawn + loot table source
-        let before = drops().lock().unwrap().len();
+        let before = drops().lock().unwrap_or_else(|e| e.into_inner()).len();
         assert_eq!(
             p5f_run(&ctx, "/loot spawn 5 64 5 loot p5f:fixed"),
             "Dropped 1 item stack(s)"
         );
-        let drop = drops().lock().unwrap().pop().unwrap();
+        let drop = drops().lock().unwrap_or_else(|e| e.into_inner()).pop().unwrap();
         assert_eq!((drop.item, drop.cnt), (diamond, 1));
-        assert_eq!(drops().lock().unwrap().len(), before);
+        assert_eq!(drops().lock().unwrap_or_else(|e| e.into_inner()).len(), before);
 
         // spawn + fish source (table + position + tool)
         assert_eq!(
             p5f_run(&ctx, "/loot spawn 5 64 5 fish p5f:fixed 0 64 0 minecraft:fishing_rod"),
             "Dropped 1 item stack(s)"
         );
-        let drop = drops().lock().unwrap().pop().unwrap();
+        let drop = drops().lock().unwrap_or_else(|e| e.into_inner()).pop().unwrap();
         assert_eq!((drop.item, drop.cnt), (diamond, 1));
-        assert_eq!(drops().lock().unwrap().len(), before);
+        assert_eq!(drops().lock().unwrap_or_else(|e| e.into_inner()).len(), before);
 
         // spawn + kill by entity type name: the cow fallback drops its pair.
-        let before = drops().lock().unwrap().len();
+        let before = drops().lock().unwrap_or_else(|e| e.into_inner()).len();
         let reply = p5f_run(&ctx, "/loot spawn 5 64 5 kill minecraft:cow");
         assert!(reply.starts_with("Dropped"), "{reply}");
-        let gained = drops().lock().unwrap().len() - before;
+        let gained = drops().lock().unwrap_or_else(|e| e.into_inner()).len() - before;
         assert!(gained >= 1, "cow kill source should drop something");
-        drops().lock().unwrap().truncate(before);
+        drops().lock().unwrap_or_else(|e| e.into_inner()).truncate(before);
 
         // kill via a live entity selector
         assert!(insert_live_mob(
@@ -8117,12 +8117,12 @@ mod p5f_parity_tests {
             10.0,
             None,
         ));
-        let peid = mobs().lock().unwrap().last().unwrap().eid;
-        let before = drops().lock().unwrap().len();
+        let peid = mobs().lock().unwrap_or_else(|e| e.into_inner()).last().unwrap().eid;
+        let before = drops().lock().unwrap_or_else(|e| e.into_inner()).len();
         let reply = p5f_run(&ctx, "/loot spawn 5 64 5 kill @e[type=pig]");
         assert!(reply.starts_with("Dropped"), "{reply}");
-        assert!(drops().lock().unwrap().len() > before);
-        drops().lock().unwrap().truncate(before);
+        assert!(drops().lock().unwrap_or_else(|e| e.into_inner()).len() > before);
+        drops().lock().unwrap_or_else(|e| e.into_inner()).truncate(before);
         assert_eq!(
             p5f_run(&ctx, "/loot spawn 5 64 5 kill @e[type=zombie]"),
             "No entity was found"
@@ -8130,7 +8130,7 @@ mod p5f_parity_tests {
 
         // give source into a player inventory
         let (c, _rc) = p5f_client(9201, "p5f-loot", 0.5, 16.0, 0.5);
-        clients().lock().unwrap().push(c.clone());
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(c.clone());
         assert_eq!(
             p5f_run(&ctx, "/loot give p5f-loot loot p5f:fixed"),
             "Gave 1 item stack(s)"
@@ -8138,28 +8138,28 @@ mod p5f_parity_tests {
         assert!(c
             .inv
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .any(|(it, cnt, _)| *it == diamond && *cnt == 1));
 
         // replace entity <slot> writes the first rolled stack
         loot_tables()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert("p5f:emerald".to_owned(), p5f_loot_table(emerald));
         assert_eq!(
             p5f_run(&ctx, "/loot replace entity p5f-loot weapon.mainhand loot p5f:emerald"),
             "Replaced 1 slot(s)"
         );
-        let held = 36 + *c.held.lock().unwrap();
+        let held = 36 + *c.held.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
-            c.inv.lock().unwrap().get(&held).map(|s| (s.0, s.1)),
+            c.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&held).map(|s| (s.0, s.1)),
             Some((emerald, 1))
         );
-        clients().lock().unwrap().retain(|cl| cl.eid != c.eid);
-        mobs().lock().unwrap().retain(|m| m.eid != peid);
-        loot_tables().lock().unwrap().remove("p5f:fixed");
-        loot_tables().lock().unwrap().remove("p5f:emerald");
+        clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|cl| cl.eid != c.eid);
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).retain(|m| m.eid != peid);
+        loot_tables().lock().unwrap_or_else(|e| e.into_inner()).remove("p5f:fixed");
+        loot_tables().lock().unwrap_or_else(|e| e.into_inner()).remove("p5f:emerald");
 
         // unknown table / entity fail closed
         assert_eq!(
@@ -8183,7 +8183,7 @@ mod p5f_parity_tests {
         let diamond = name_to_item("diamond").unwrap();
         loot_tables()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert("p5f:chest".to_owned(), p5f_loot_table(diamond));
 
         // insert requires a real container block
@@ -8198,7 +8198,7 @@ mod p5f_parity_tests {
         );
         let slots = chests()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&ContainerKey::Block((DimId::Overworld, 40, 80, 40)))
             .cloned()
             .unwrap_or_default();
@@ -8211,7 +8211,7 @@ mod p5f_parity_tests {
         );
         let slots = chests()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&ContainerKey::Block((DimId::Overworld, 40, 80, 40)))
             .cloned()
             .unwrap_or_default();
@@ -8219,22 +8219,22 @@ mod p5f_parity_tests {
 
         // mine rolls the block's drop table
         assert!(p5f_run(&ctx, "/setblock 41 80 40 minecraft:diamond_ore").starts_with("Set block"));
-        let before = drops().lock().unwrap().len();
+        let before = drops().lock().unwrap_or_else(|e| e.into_inner()).len();
         let reply = p5f_run(&ctx, "/loot spawn 42 80 40 mine 41 80 40");
         assert!(reply.starts_with("Dropped"), "{reply}");
-        let gained: Vec<Drop> = drops().lock().unwrap().split_off(before);
+        let gained: Vec<Drop> = drops().lock().unwrap_or_else(|e| e.into_inner()).split_off(before);
         assert!(!gained.is_empty(), "mining diamond_ore should drop");
 
         // spawn + mine with an explicit tool token parses too
         let reply = p5f_run(&ctx, "/loot spawn 42 80 40 mine 41 80 40 minecraft:diamond_pickaxe");
         assert!(reply.starts_with("Dropped"), "{reply}");
-        drops().lock().unwrap().truncate(before);
+        drops().lock().unwrap_or_else(|e| e.into_inner()).truncate(before);
         assert_eq!(
             p5f_run(&ctx, "/loot spawn 42 80 40 mine 41 80 40 minecraft:not_a_tool"),
             "Unknown item 'minecraft:not_a_tool'"
         );
 
-        loot_tables().lock().unwrap().remove("p5f:chest");
+        loot_tables().lock().unwrap_or_else(|e| e.into_inner()).remove("p5f:chest");
     }
 
     // Bonus — `execute store result` now sees 1 vs 0 for /forceload query.
@@ -8242,7 +8242,7 @@ mod p5f_parity_tests {
     fn p5f_parity_forceload_query_execute_store_result() {
         let _world = world_guard();
         let ctx = p5f_ctx(None);
-        let previous = std::mem::replace(&mut *forceloaded().lock().unwrap(), HashSet::new());
+        let previous = std::mem::replace(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()), HashSet::new());
         assert_eq!(
             p5f_run(&ctx, "/scoreboard objectives add p5f dummy"),
             "Added objective p5f"
@@ -8252,14 +8252,14 @@ mod p5f_parity_tests {
             p5f_run(&ctx, "/execute store result score holder p5f run forceload query 7 9"),
             "Stored 0 in p5f for holder"
         );
-        assert_eq!(scoreboard().lock().unwrap().get("holder", "p5f"), Some(0));
+        assert_eq!(scoreboard().lock().unwrap_or_else(|e| e.into_inner()).get("holder", "p5f"), Some(0));
         // force-loaded -> 1
         assert!(p5f_run(&ctx, "/forceload add 7 9").contains("force"));
         assert_eq!(
             p5f_run(&ctx, "/execute store result score holder p5f run forceload query 7 9"),
             "Stored 1 in p5f for holder"
         );
-        assert_eq!(scoreboard().lock().unwrap().get("holder", "p5f"), Some(1));
+        assert_eq!(scoreboard().lock().unwrap_or_else(|e| e.into_inner()).get("holder", "p5f"), Some(1));
         // direct mapping sanity for the bare-count query as well
         assert_eq!(
             execute_legacy_result("forceload", "Chunk 7, 9 is force loaded"),
@@ -8274,7 +8274,7 @@ mod p5f_parity_tests {
             Some(3)
         );
         p5f_run(&ctx, "/forceload remove all");
-        scoreboard().lock().unwrap().remove_objective("p5f");
-        *forceloaded().lock().unwrap() = previous;
+        scoreboard().lock().unwrap_or_else(|e| e.into_inner()).remove_objective("p5f");
+        *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = previous;
     }
 }

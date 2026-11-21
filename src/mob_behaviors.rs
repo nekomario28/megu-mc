@@ -4525,7 +4525,7 @@ mod p2_parity_mob_tests {
     struct StoredRules(Vec<(&'static str, i32)>);
     impl StoredRules {
         fn take(names: &[&'static str]) -> Self {
-            let map = command_gamerules().lock().unwrap();
+            let map = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
             StoredRules(
                 names
                     .iter()
@@ -4534,12 +4534,12 @@ mod p2_parity_mob_tests {
             )
         }
         fn set(&self, name: &'static str, value: i32) {
-            command_gamerules().lock().unwrap().insert(name, value);
+            command_gamerules().lock().unwrap_or_else(|e| e.into_inner()).insert(name, value);
         }
     }
     impl std::ops::Drop for StoredRules {
         fn drop(&mut self) {
-            let mut map = command_gamerules().lock().unwrap();
+            let mut map = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
             for (name, value) in self.0.drain(..) {
                 map.insert(name, value);
             }

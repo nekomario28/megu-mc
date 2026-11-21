@@ -587,11 +587,11 @@ fn damage_stack(st: &mut Stack, random: f32) -> bool {
     false
 }
 fn damage_held(me: &Arc<Client>) -> bool {
-    let slot = 36 + *me.held.lock().unwrap();
+    let slot = 36 + *me.held.lock().unwrap_or_else(|e| e.into_inner());
     damage_inv_slot(me, slot)
 }
 fn damage_inv_slot(me: &Client, slot: i16) -> bool {
-    let mut inv = me.inv.lock().unwrap();
+    let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
     let Some(st) = inv.get_mut(&slot) else {
         return false;
     };
@@ -607,12 +607,12 @@ fn damage_inv_slot(me: &Client, slot: i16) -> bool {
 // resend the held slot to the owner after damage/break so the client
 // model stays honest
 fn held_slot_resync(me: &Client) {
-    let hs = *me.held.lock().unwrap();
+    let hs = *me.held.lock().unwrap_or_else(|e| e.into_inner());
     let slot = 36 + hs;
     let st = me
         .inv
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(&slot)
         .cloned()
         .unwrap_or((0, 0, Vec::new()));
@@ -929,7 +929,7 @@ fn merge_drops(dp: &mut [Drop]) -> Vec<i32> {
 }
 
 fn furnace_tick() {
-    let mut fs = furnaces().lock().unwrap();
+    let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
     if fs.is_empty() {
         return;
     }
@@ -1007,10 +1007,10 @@ fn furnace_tick() {
     }
     let cs: Vec<Arc<Client>> = client_snapshot();
     for c in cs {
-        let fp = *c.open_furnace.lock().unwrap();
+        let fp = *c.open_furnace.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((dim, x, y, z)) = fp {
             if dirty_pos.contains(&(dim, x, y, z)) {
-                let inv = c.inv.lock().unwrap().clone();
+                let inv = c.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let slots = furnace_slot_snapshot_dim(dim, (x, y, z));
                 if let Ok(mut w) = c.sock.lock() {
                     furnace_push_items_snap(&mut w, &inv, &slots);
@@ -1056,7 +1056,7 @@ fn hopper_tick() {
     // that need work rather than every hopper that exists. Every exit re-queues
     // except removal from the registry.
     let due = {
-        let mut q = hopper_queue().lock().unwrap();
+        let mut q = hopper_queue().lock().unwrap_or_else(|e| e.into_inner());
         q.due()
     };
     if due.is_empty() {
@@ -1070,7 +1070,7 @@ fn hopper_tick() {
         }
         let st = block_at(hx, hy, hz);
         if !(9225..=9234).contains(&st) {
-            hoppers().lock().unwrap().remove(&(hx, hy, hz));
+            hoppers().lock().unwrap_or_else(|e| e.into_inner()).remove(&(hx, hy, hz));
             continue;
         }
         if st >= 9230 {
@@ -1127,7 +1127,7 @@ fn hopper_push(hx: i32, hy: i32, hz: i32, dst: (i32, i32, i32)) -> bool {
     if let Some(partner) = partner {
         unpack_block_loot_if_needed(ow_block(partner));
     }
-    let mut all = chests().lock().unwrap();
+    let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
     let own = all.get(&ContainerKey::ow((hx, hy, hz))).and_then(|m| {
         m.iter()
             .filter(|(_, v)| v.1 > 0)
@@ -1178,7 +1178,7 @@ fn hopper_pull(hx: i32, hy: i32, hz: i32) -> bool {
     if let Some(partner) = partner {
         unpack_block_loot_if_needed(ow_block(partner));
     }
-    let mut all = chests().lock().unwrap();
+    let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
     // vanilla merges double chests into one container — a
     // hopper under either half can pull from both
     let srcs = [
@@ -1232,7 +1232,7 @@ fn hopper_pull(hx: i32, hy: i32, hz: i32) -> bool {
 /// `attempt_suck`.
 fn hopper_suck(hx: i32, hy: i32, hz: i32) -> bool {
     let mut cell: Vec<(i32, i64, u8, Comps)> = {
-        let dl = drops().lock().unwrap();
+        let dl = drops().lock().unwrap_or_else(|e| e.into_inner());
         dl.iter()
             .filter(|d| {
                 (d.x - (hx as f64 + 0.5)).abs() < 0.7
@@ -1248,7 +1248,7 @@ fn hopper_suck(hx: i32, hy: i32, hz: i32) -> bool {
         let smax = item_stack_max(item, &dcp) as u8;
         let mut remaining = cnt;
         let moved = {
-            let mut all = chests().lock().unwrap();
+            let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
             let own = all.entry(ContainerKey::ow((hx, hy, hz))).or_default();
             let mut moved = 0u8;
             while remaining > 0 {
@@ -1273,12 +1273,12 @@ fn hopper_suck(hx: i32, hy: i32, hz: i32) -> bool {
             continue;
         }
         if remaining == 0 {
-            drops().lock().unwrap().retain(|d| d.eid != deid);
+            drops().lock().unwrap_or_else(|e| e.into_inner()).retain(|d| d.eid != deid);
             let mut p = Vec::new();
             write_varint(&mut p, 1);
             write_varint(&mut p, deid as i64);
             broadcast_seen(deid, |_c| (0x42, p.clone()));
-        } else if let Some(d) = drops().lock().unwrap().iter_mut().find(|d| d.eid == deid)
+        } else if let Some(d) = drops().lock().unwrap_or_else(|e| e.into_inner()).iter_mut().find(|d| d.eid == deid)
         {
             d.cnt = remaining;
         }
@@ -1298,14 +1298,14 @@ fn drop_tick() {
     {
         let ds: Vec<(i32, f64, f64, Option<[u8; 16]>, EntityAabb)> = drops()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .map(|d| (d.eid, d.x, d.z, d.target, d.bounding_box()))
             .collect();
         let cls: Vec<Arc<Client>> = client_snapshot();
         let touches: Vec<(bool, bool, EntityAabb)> = cls
             .iter()
-            .map(|c| (c.is_spectator(), *c.hp.lock().unwrap() > 0.0, c.touch_aabb()))
+            .map(|c| (c.is_spectator(), *c.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0, c.touch_aabb()))
             .collect();
         for (d_eid, dx, dz, d_target, d_aabb) in ds.iter() {
             if !region.is_hot(*dx as i32, *dz as i32) {
@@ -1333,12 +1333,12 @@ fn drop_tick() {
     {
         let mut collected: Vec<(i32, i32, i16)> = vec![];
         {
-            let xs = xps().lock().unwrap();
+            let xs = xps().lock().unwrap_or_else(|e| e.into_inner());
             let cls: Vec<Arc<Client>> = client_snapshot();
             for x in xs.iter() {
                 for c in cls.iter() {
                     let (px, py, pz, ..) = {
-                        let p = c.pos.lock().unwrap();
+                        let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
                         *p
                     };
                     if (px - x.x).powi(2) + (py - x.y).powi(2) + (pz - x.z).powi(2) < 2.56 {
@@ -1349,13 +1349,13 @@ fn drop_tick() {
             }
         }
         for (xeid, ceid, val) in collected {
-            xps().lock().unwrap().retain(|x| x.eid != xeid);
+            xps().lock().unwrap_or_else(|e| e.into_inner()).retain(|x| x.eid != xeid);
             let cls: Vec<Arc<Client>> = client_snapshot();
             if let Some(c) = cls.iter().find(|c| c.eid == ceid) {
                 // mending: xp first repairs damaged mending gear (2 dur per xp)
                 let mut val = val as i64;
                 {
-                    let mut inv = c.inv.lock().unwrap();
+                    let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
                     let cands: Vec<i16> = inv
                         .iter()
                         .filter(|(_, (it, _, cc))| {
@@ -1391,13 +1391,13 @@ fn drop_tick() {
         let selected = *c.held.lock().unwrap();
         let creative = *c.gm.lock().unwrap() == 1;
         let spectator = c.is_spectator();
-        let alive = *c.hp.lock().unwrap() > 0.0;
+        let alive = *c.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0;
         let player_aabb = c.touch_aabb();
         let (accepted, original, changed, remaining) = {
             // Same inventory -> drops lock order as actor_tick. Read the live
             // entity, not a stack snapshot another collector may have consumed.
-            let mut inv = c.inv.lock().unwrap();
-            let mut ds = drops().lock().unwrap();
+            let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
+            let mut ds = drops().lock().unwrap_or_else(|e| e.into_inner());
             let Some(d) = ds.iter_mut().find(|d| d.eid == deid) else {
                 continue;
             };
@@ -1455,7 +1455,7 @@ fn drop_tick() {
     {
         // despawn drops after 300s (vanilla); a hard cap bounds the flood
         // inside any one despawn window — oldest lose first.
-        let mut dp = drops().lock().unwrap();
+        let mut dp = drops().lock().unwrap_or_else(|e| e.into_inner());
         let life = server_ticks(DROP_LIFE_GT) as i32;
         for d in dp.iter_mut() {
             if region.is_hot(d.x as i32, d.z as i32) {
@@ -1509,7 +1509,7 @@ fn is_furnace_at(x: i32, y: i32, z: i32) -> bool {
     (4295..=4302).contains(&block_at(x, y, z))
 }
 fn furnace_slots(pos: (i32, i32, i32)) -> HashMap<i16, Stack> {
-    let fs = furnaces().lock().unwrap();
+    let fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
     fs.get(&ow_block(pos))
         .map(|f| {
             let mut m = HashMap::new();
@@ -1538,7 +1538,7 @@ fn content_revision() -> u64 {
 /// `content_revision()` in the key. The result never carries components, which is
 /// why the cache can hold a plain pair rather than a whole stack.
 fn smelt_out(item: i64) -> Option<(i64, u8)> {
-    for (ig, o, c, _) in json_smelts().lock().unwrap().iter() {
+    for (ig, o, c, _) in json_smelts().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         if ingr_match(ig, item, 0) {
             return Some((*o, *c));
         }
@@ -1568,7 +1568,7 @@ fn smelt_result(item: i64) -> Option<i64> {
     None
 }
 fn smelt_xp(item: i64) -> f32 {
-    for (ig, _, _, xp) in json_smelts().lock().unwrap().iter() {
+    for (ig, _, _, xp) in json_smelts().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         if ingr_match(ig, item, 0) {
             return *xp;
         }
@@ -1611,7 +1611,7 @@ fn furnace_xp_pop(f: &mut Furnace, px: f64, py: f64, pz: f64) {
         };
     f.xp = 0.0;
     if whole > 0 {
-        xps().lock().unwrap().push(Xp {
+        xps().lock().unwrap_or_else(|e| e.into_inner()).push(Xp {
             eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
             x: px,
             y: py + 1.0,
@@ -1651,7 +1651,7 @@ fn roll_loot_container_slots(
     if loot_table == "minecraft:chests/abandoned_mineshaft" {
         roll_cart_loot(seed)
     } else {
-        let pools = loot_tables().lock().unwrap().get(loot_table).map(|p| {
+        let pools = loot_tables().lock().unwrap_or_else(|e| e.into_inner()).get(loot_table).map(|p| {
             p.iter()
                 .map(|pl| LootPool {
                     rolls: pl.rolls,
@@ -1708,7 +1708,7 @@ fn unpack_block_loot_if_needed(pos: DimBlockPos) -> bool {
         // container positions, and the block-id guard leaves matching entries
         // alone.
         {
-            let mut store = live_block_entities().lock().unwrap();
+            let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
             if let Some(&(id, _)) = store.entries.get(&pos) {
                 let current = breg()
                     .and_then(|reg| reg.block_id_of(block_at_dim(pos.0, pos.1, pos.2, pos.3)));
@@ -1717,7 +1717,7 @@ fn unpack_block_loot_if_needed(pos: DimBlockPos) -> bool {
                 }
             }
         }
-        let pending = pending_block_loot().lock().unwrap().remove(&pos);
+        let pending = pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()).remove(&pos);
         let Some(entry) = pending else {
             return false;
         };
@@ -1731,7 +1731,7 @@ fn unpack_block_loot_if_needed(pos: DimBlockPos) -> bool {
     })
 }
 fn window_has_pending_loot(window: (ContainerKey, Option<ContainerKey>)) -> bool {
-    let map = pending_block_loot().lock().unwrap();
+    let map = pending_block_loot().lock().unwrap_or_else(|e| e.into_inner());
     [Some(window.0), window.1]
         .into_iter()
         .flatten()
@@ -1765,7 +1765,7 @@ fn loot_json_tag_items(tag: &str, depth: usize) -> Vec<&'static str> {
     // namespace ("minecraft:planks"); accept either spelling.
     let members = {
         let tags = item_tags();
-        let tags = tags.lock().unwrap();
+        let tags = tags.lock().unwrap_or_else(|e| e.into_inner());
         tags.get(tag)
             .or_else(|| {
                 tag.strip_prefix("minecraft:")
@@ -1935,7 +1935,7 @@ fn container_exists(key: ContainerKey) -> bool {
         }
         ContainerKey::Cart(uuid) => generated_content()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .carts
             .iter()
             .any(|c| c.uuid().ok() == Some(uuid)),
@@ -2009,10 +2009,10 @@ fn broadcast_block_update(audience: &[Arc<Client>], pos: BlockPos, state: u32) {
     fanout_in(
         audience,
         |c| {
-            if c.chunks.lock().unwrap().contains(&chunk) {
+            if c.chunks.lock().unwrap_or_else(|e| e.into_inner()).contains(&chunk) {
                 return true;
             }
-            let at = *c.pos.lock().unwrap();
+            let at = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
             let (dx, dy, dz) = (
                 at.0 - f64::from(pos.0),
                 at.1 - f64::from(pos.1),
@@ -2068,7 +2068,7 @@ fn broadcast_block_event(audience: &[Arc<Client>], pos: BlockPos, action: u8, pa
     fanout_in(
         audience,
         |c| {
-            let at = *c.pos.lock().unwrap();
+            let at = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
             let (dx, dy, dz) = (
                 at.0 - f64::from(pos.0),
                 at.1 - f64::from(pos.1),
@@ -2447,11 +2447,11 @@ fn client_window_halves(
 fn client_open_window_and_anchor(
     c: &Client,
 ) -> Option<((ContainerKey, Option<ContainerKey>), Option<BlockPos>)> {
-    let open = (*c.open_chest.lock().unwrap())?;
+    let open = (*c.open_chest.lock().unwrap_or_else(|e| e.into_inner()))?;
     let anchor = c
         .chest_sync
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .filter(|s| s.window == open)
         .and_then(|s| s.anchor);
@@ -2466,7 +2466,7 @@ fn is_blocked_chest_by_block(pos: BlockPos) -> bool {
 /// `ChestBlock.isCatSittingOnChest` (`dhb.b(Ldcx;Ljd;)Z`): true when a sitting `Cat`
 /// (`etype == 15`, dimensions `0.6 x 0.7`) intersects `AABB(x, y+1, z, x+1, y+2, z+1)`.
 fn is_cat_sitting_on_chest(pos: BlockPos) -> bool {
-    let sitting = sitting_cats().lock().unwrap();
+    let sitting = sitting_cats().lock().unwrap_or_else(|e| e.into_inner());
     if sitting.is_empty() {
         return false;
     }
@@ -2476,12 +2476,12 @@ fn is_cat_sitting_on_chest(pos: BlockPos) -> bool {
         f64::from(pos.1 + 2),
         f64::from(pos.2 + 1),
     ];
-    let ms = mobs().lock().unwrap();
+    let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
     ms.iter().any(|m| {
-        if m.etype != 15 || !sitting.contains(&m.eid) || *m.hp.lock().unwrap() <= 0.0 {
+        if m.etype != 15 || !sitting.contains(&m.eid) || *m.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0 {
             return false;
         }
-        let (mx, my, mz, ..) = *m.pos.lock().unwrap();
+        let (mx, my, mz, ..) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
         aabb_overlaps(
             (min, max),
             ([mx - 0.3, my, mz - 0.3], [mx + 0.3, my + 0.7, mz + 0.3]),
@@ -2502,9 +2502,9 @@ fn chest_window_blocked(window: (ContainerKey, Option<ContainerKey>)) -> bool {
         .any(is_chest_blocked_at)
 }
 fn client_eye_pos(c: &Client) -> (f64, f64, f64) {
-    let (px, py, pz, ..) = *c.pos.lock().unwrap();
+    let (px, py, pz, ..) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
     // 1.21.1 `Player` pose eye heights (`cmx.<clinit>`): standing 1.62f, crouching 1.27f.
-    let eye_h = if *c.sneaking.lock().unwrap() {
+    let eye_h = if *c.sneaking.lock().unwrap_or_else(|e| e.into_inner()) {
         1.27
     } else {
         1.62
@@ -2523,7 +2523,7 @@ fn can_interact_with_block(c: &Client, pos: BlockPos, extra: f64) -> bool {
     // `double d = this.blockInteractionRange() + distance;`
     // `return new AABB(pos).distanceToSqr(this.getEyePosition()) < d * d;`
     // `Attributes.BLOCK_INTERACTION_RANGE` = 4.5, creative modifier `+0.5` -> 5.0.
-    let base = if *c.gm.lock().unwrap() == 1 {
+    let base = if *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
         5.0
     } else {
         4.5
@@ -2572,7 +2572,7 @@ fn chest_still_valid(
         (ContainerKey::Cart(uuid), _) => {
             let cart_pos = generated_content()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .carts
                 .iter()
                 .find(|cart| cart.uuid().ok() == Some(uuid))
@@ -2581,7 +2581,7 @@ fn chest_still_valid(
                 return false;
             };
             // `Attributes.ENTITY_INTERACTION_RANGE` = 3.0, creative modifier `+2.0` -> 5.0.
-            let base = if *c.gm.lock().unwrap() == 1 {
+            let base = if *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
                 5.0
             } else {
                 3.0
@@ -2597,7 +2597,7 @@ fn chest_window_slots(window: (ContainerKey, Option<ContainerKey>)) -> Vec<Stack
     let first = window.0;
     let rows = if window.1.is_some() { 54usize } else { 27usize };
     let mut out = vec![(0, 0, Vec::new()); rows];
-    let all = chests().lock().unwrap();
+    let all = chests().lock().unwrap_or_else(|e| e.into_inner());
     let ch = all.get(&first).cloned().unwrap_or_default();
     for i in 0..27i16 {
         if let Some(st) = ch.get(&i) {
@@ -2629,23 +2629,23 @@ fn chest_viewer_tick_on(audience: &[Arc<Client>]) {
         return;
     }
     for c in audience {
-        let open = *c.open_chest.lock().unwrap();
+        let open = *c.open_chest.lock().unwrap_or_else(|e| e.into_inner());
         let Some(win) = open else {
-            *c.chest_sync.lock().unwrap() = None;
+            *c.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
             continue;
         };
         let anchor = c
             .chest_sync
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .filter(|s| s.window == win)
             .and_then(|s| s.anchor);
         if !chest_still_valid(c, win, anchor) {
             let halves = client_window_halves(win, anchor);
             let before = chest_opener_snapshot(audience, &halves);
-            *c.open_chest.lock().unwrap() = None;
-            *c.chest_sync.lock().unwrap() = None;
+            *c.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *c.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
             if let Ok(mut w) = c.sock.lock() {
                 let _ = send_packet(&mut w, 0x12, vec![1u8]);
             }
@@ -2654,7 +2654,7 @@ fn chest_viewer_tick_on(audience: &[Arc<Client>]) {
         }
         let current = chest_window_slots(win);
         let updates: Vec<(i16, i32, Stack)> = {
-            let mut sync_guard = c.chest_sync.lock().unwrap();
+            let mut sync_guard = c.chest_sync.lock().unwrap_or_else(|e| e.into_inner());
             let sync = sync_guard.get_or_insert_with(|| ChestSyncState {
                 window: win,
                 anchor,
@@ -5172,7 +5172,7 @@ fn apply_live_beacon_update(
     if let Some((dim, x, y, z)) = menu.anchor {
         let Some(reg) = breg() else { return false };
         let state = block_at_dim(dim, x, y, z);
-        let mut store = live_block_entities().lock().unwrap();
+        let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
         let Some(LiveBlockEntity::Beacon(beacon)) =
             store.at(reg, (dim, x, y, z), state)
         else {
@@ -6836,14 +6836,14 @@ impl LiveBlockEntityStore {
         self.scanned_at = sequence;
         let mut changed = chunk_versions()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter_map(|(&key, &version)| {
                 (self.chunk_versions.insert(key, version) != Some(version)).then_some(key)
             })
             .collect::<HashSet<_>>();
         let placements = {
-            let edits = world().lock().unwrap();
+            let edits = world().lock().unwrap_or_else(|e| e.into_inner());
             if first_scan {
                 changed.extend(edits.keys().copied());
             }
@@ -6882,7 +6882,7 @@ fn live_block_entity_snapshot(key @ (dim, x, y, z): DimBlockPos) -> Option<(u32,
         let reg = breg()?;
         let state = block_at_dim(dim, x, y, z);
         let id = live_block_entity_id(reg.name_of(state))?;
-        let mut store = live_block_entities().lock().unwrap();
+        let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
         let Tag::Compound(mut fields) = store.at(reg, key, state)?.to_nbt() else {
             unreachable!("block entity payload must be a compound");
         };
@@ -6911,7 +6911,7 @@ fn restore_live_block_entity(key @ (dim, x, y, z): DimBlockPos, tag: &Tag) -> bo
         let entity = LiveBlockEntity::load(reg, state, id, tag);
         live_block_entities()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .entries
             .insert(key, (block, entity));
         true
@@ -7020,7 +7020,7 @@ fn live_block_entity_time() -> i64 {
 fn live_block_entity_loot(table: &ResourceLocation, seed: i64) -> Vec<BlockEntityItem> {
     loot_tables()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(&table.to_string())
         .map(|pools| {
             roll_loot_seeded(pools, seed)
@@ -7059,7 +7059,7 @@ fn live_vault_state(reg: &BReg, state: u32, vault: &Vault) -> u32 {
 fn live_entity_hit(c: &Client, (x, y, z): BlockPos) -> Option<(RsDir, [f64; 3])> {
     let (eye_x, eye_y, eye_z) = client_eye_pos(c);
     let eye = [eye_x - x as f64, eye_y - y as f64, eye_z - z as f64];
-    let (_, _, _, yaw, pitch, _) = *c.pos.lock().unwrap();
+    let (_, _, _, yaw, pitch, _) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
     let (yaw_sin, yaw_cos) = f64::from(yaw).to_radians().sin_cos();
     let (pitch_sin, pitch_cos) = f64::from(pitch).to_radians().sin_cos();
     let ray = [-yaw_sin * pitch_cos, -pitch_sin, yaw_cos * pitch_cos];
@@ -7114,11 +7114,11 @@ fn use_live_block_entity(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u
             open_live_menu(c, Some(key), LiveMenu::Lectern);
             return true;
         }
-        let creative = *c.gm.lock().unwrap() == 1;
-        let held_index = *c.held.lock().unwrap();
+        let creative = *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
+        let held_index = *c.held.lock().unwrap_or_else(|e| e.into_inner());
         let selected = 36 + held_index;
         let hit = || live_entity_hit(c, (x, y, z));
-        let mut inv = c.inv.lock().unwrap();
+        let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
         let stack = inv.get(&selected).cloned().unwrap_or_default();
         let mut held = BlockEntityItem::from_stack(&stack);
         let held_before = held.as_ref().map_or(0, BlockEntityItem::count);
@@ -7128,7 +7128,7 @@ fn use_live_block_entity(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u
         let mut event = None;
         let mut inventory_changed = false;
         let used = {
-            let mut store = live_block_entities().lock().unwrap();
+            let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
             let Some(entity) = store.at(reg, key, state) else {
                 return false;
             };
@@ -7272,8 +7272,8 @@ fn use_live_block_entity(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u
             inventory_changed = true;
         }
         if inventory_changed {
-            let cursor = c.cursor.lock().unwrap();
-            let mut sock = c.sock.lock().unwrap();
+            let cursor = c.cursor.lock().unwrap_or_else(|e| e.into_inner());
+            let mut sock = c.sock.lock().unwrap_or_else(|e| e.into_inner());
             send_live_contents(&mut sock, 0, 0, &[], &inv, 0..46, &cursor);
         }
         drop(inv);
@@ -7303,10 +7303,10 @@ fn live_block_entity_event((dim, x, y, z): DimBlockPos, event: i32, data: i32) {
 fn live_beacon_pulse((dim, x, y, z): DimBlockPos, pulse: BeaconPulse, players: &[Arc<Client>]) {
     let range = f64::from(pulse.range);
     for player in players {
-        if *player.dim.lock().unwrap() != dim || player.is_spectator() {
+        if *player.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim || player.is_spectator() {
             continue;
         }
-        let (px, py, pz, ..) = *player.pos.lock().unwrap();
+        let (px, py, pz, ..) = *player.pos.lock().unwrap_or_else(|e| e.into_inner());
         if !(x as f64 - range..x as f64 + 1.0 + range).contains(&px)
             || !(z as f64 - range..z as f64 + 1.0 + range).contains(&pz)
             || !(y as f64 - range..(dim.min_y() + dim.height()) as f64 + range).contains(&py)
@@ -7319,7 +7319,7 @@ fn live_beacon_pulse((dim, x, y, z): DimBlockPos, pulse: BeaconPulse, players: &
             let amp = i32::from(amp);
             let left = server_ticks(pulse.duration as u64) as i32;
             {
-                let mut effects = player.effs.lock().unwrap();
+                let mut effects = player.effs.lock().unwrap_or_else(|e| e.into_inner());
                 if effects
                     .iter()
                     .any(|e| e.id == id && (e.amp > amp || e.amp == amp && e.left >= left))
@@ -7330,7 +7330,7 @@ fn live_beacon_pulse((dim, x, y, z): DimBlockPos, pulse: BeaconPulse, players: &
                 effects.push(Eff { id, amp, left });
             }
             let packet = entity_effect_pkt(player.eid, id, amp, pulse.duration);
-            let _ = send_packet(&mut player.sock.lock().unwrap(), 0x76, packet.clone());
+            let _ = send_packet(&mut player.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x76, packet.clone());
             broadcast_seen_ex(player.eid, player.eid, |_| (0x76, packet.clone()));
         }
     }
@@ -7344,13 +7344,13 @@ fn nearby_block_entity_players(
     players
         .iter()
         .filter_map(|player| {
-            if *player.dim.lock().unwrap() != dim
+            if *player.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim
                 || player.is_spectator()
-                || *player.hp.lock().unwrap() <= 0.0
+                || *player.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0
             {
                 return None;
             }
-            let (px, py, pz, ..) = *player.pos.lock().unwrap();
+            let (px, py, pz, ..) = *player.pos.lock().unwrap_or_else(|e| e.into_inner());
             let distance = (px - x as f64 - 0.5).powi(2)
                 + (py - y as f64 - 0.5).powi(2)
                 + (pz - z as f64 - 0.5).powi(2);
@@ -7386,7 +7386,7 @@ fn live_crafter_recipe(
 }
 
 fn live_crafter_powered(reg: &'static BReg, (dim, x, y, z): DimBlockPos, now: i64) -> bool {
-    let mut dimensions = live_redstone().lock().unwrap();
+    let mut dimensions = live_redstone().lock().unwrap_or_else(|e| e.into_inner());
     let mut empty = LiveRedstoneState::default();
     let mut world = LiveRedstoneWorld {
         dim,
@@ -7487,11 +7487,11 @@ fn tick_live_trial_spawner(
     let range = block_entity_number(config, "spawn_range")
         .filter(|value| (1..=128).contains(value))
         .unwrap_or(4);
-    let mut mobs = mobs().lock().unwrap();
+    let mut mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
     for uuid in spawner.current_mobs.clone() {
         if !mobs
             .iter()
-            .any(|mob| mob.dim == dim && mob.uuid == uuid && *mob.hp.lock().unwrap() > 0.0)
+            .any(|mob| mob.dim == dim && mob.uuid == uuid && *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0)
         {
             spawner.remove_mob(now, interval, uuid);
         }
@@ -7538,7 +7538,7 @@ fn tick_live_block_entities(players: &[Arc<Client>]) {
     with_save_guard(|| {
         let game_time = live_block_entity_time();
         let updates = {
-            let mut store = live_block_entities().lock().unwrap();
+            let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
             store.discover(reg);
             let mut updates = Vec::new();
             for (&key @ (dim, x, y, z), (_, entity)) in &mut store.entries {
@@ -7655,7 +7655,7 @@ fn tick_live_block_entities(players: &[Arc<Client>]) {
                     let Some(connection) = live_menu_connection(player) else {
                         continue;
                     };
-                    let mut active = connection.active.lock().unwrap();
+                    let mut active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(session) = active.as_mut().filter(|session| {
                         matches!(session.menu, LiveMenu::Crafter) && session.anchor == Some(key)
                     }) {
@@ -7972,8 +7972,8 @@ fn open_chest_for_client(
         unpack_window_loot_if_needed(window);
     }
     let initial = chest_window_slots(window);
-    *me.open_chest.lock().unwrap() = Some(window);
-    *me.chest_sync.lock().unwrap() = Some(ChestSyncState {
+    *me.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = Some(window);
+    *me.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = Some(ChestSyncState {
         window,
         anchor,
         state_id: 0,
@@ -8228,16 +8228,16 @@ fn quick_move_chest(
 // drag-paint one slot: place `per` items of the cursor stack into the
 // resolved window slot (merging if compatible), then resync
 fn paint_slot(me: &Client, wsl: i16, per: u8, cur: &mut Stack) {
-    let chest_pos = *me.open_chest.lock().unwrap();
-    let furnace_pos = *me.open_furnace.lock().unwrap();
+    let chest_pos = *me.open_chest.lock().unwrap_or_else(|e| e.into_inner());
+    let furnace_pos = *me.open_furnace.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((cp, cp2)) = chest_pos {
         if !window_live_for(me, (cp, cp2)) {
             invalidate_client_chest_window(&client_snapshot(), me, (cp, cp2));
             return;
         }
         let rows = if cp2.is_some() { 54i16 } else { 27i16 };
-        let mut all = chests().lock().unwrap();
-        let mut inv = me.inv.lock().unwrap();
+        let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
         if wsl < 0 || wsl >= rows + 36 {
             return;
         }
@@ -8264,7 +8264,7 @@ fn paint_slot(me: &Client, wsl: i16, per: u8, cur: &mut Stack) {
         // vanilla doesn't allow painting into furnace input/fuel/output;
         // only inventory slots 3..38 (key = wsl+6)
         if (3..39).contains(&wsl) {
-            let mut inv = me.inv.lock().unwrap();
+            let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
             let k = wsl + 6;
             let st = inv.entry(k).or_insert((0, 0, Vec::new()));
             if (st.1 == 0 || (st.0 == cur.0 && st.2 == cur.2))
@@ -8282,7 +8282,7 @@ fn paint_slot(me: &Client, wsl: i16, per: u8, cur: &mut Stack) {
     } else {
         // inventory window: paintable slots are 9-44 (inv keys) + craft 1-4
         if (9..=44).contains(&wsl) {
-            let mut inv = me.inv.lock().unwrap();
+            let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
             let st = inv.entry(wsl).or_insert((0, 0, Vec::new()));
             if (st.1 == 0 || (st.0 == cur.0 && st.2 == cur.2))
                 && (st.1 as i64 + per as i64) <= item_stack_max(cur.0, &cur.2)
@@ -8296,7 +8296,7 @@ fn paint_slot(me: &Client, wsl: i16, per: u8, cur: &mut Stack) {
                 resync_slot(me, 0, wsl, st);
             }
         } else if (1..=4).contains(&wsl) {
-            let mut grid = me.craft.lock().unwrap();
+            let mut grid = me.craft.lock().unwrap_or_else(|e| e.into_inner());
             let st = grid.entry(wsl).or_insert((0, 0, Vec::new()));
             if (st.1 == 0 || (st.0 == cur.0 && st.2 == cur.2))
                 && (st.1 as i64 + per as i64) <= item_stack_max(cur.0, &cur.2)
@@ -8322,7 +8322,7 @@ fn send_chest_slot(me: &Client, wslot: i16, st: &Stack) {
         (0, 0, Vec::new())
     };
     let state_id = {
-        let mut sync_guard = me.chest_sync.lock().unwrap();
+        let mut sync_guard = me.chest_sync.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(sync) = sync_guard.as_mut() {
             sync.state_id = (sync.state_id + 1) & 0x7fff;
             if wslot >= 0 {
@@ -8441,7 +8441,7 @@ fn open_furnace_window(s: &mut TcpStream, inv: &HashMap<i16, Stack>, slots: &[St
     furnace_push_items_snap(s, inv, slots);
 }
 fn furnace_slot_snapshot_dim(dim: DimId, pos: (i32, i32, i32)) -> [Stack; 3] {
-    let fs = furnaces().lock().unwrap();
+    let fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
     let f = fs.get(&(dim, pos.0, pos.1, pos.2));
     [
         f.map(|f| f.input.clone()).unwrap_or((0, 0, Vec::new())),
@@ -8478,7 +8478,7 @@ fn ingr_match(ig: &Ingr, item: i64, depth: usize) -> bool {
             }
             let members = item_tags()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .get(t)
                 .cloned()
                 .unwrap_or_default();
@@ -8496,7 +8496,7 @@ fn json_craft_match(g: &HashMap<i16, Stack>, dim: i16) -> Option<Stack> {
     // vanilla translation: the pattern's bounding box may sit at any
     // offset inside the grid; cells outside it must be air
     let at = |x: i16, y: i16| g.get(&(y * dim + x + 1)).map(|e| e.0).unwrap_or(0);
-    for r in json_recipes().lock().unwrap().iter() {
+    for r in json_recipes().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         if !r.shaped {
             // shapeless: multiset of ingredients == multiset of grid items
             let mut items: Vec<i64> = (1..=(dim * dim))
@@ -8875,7 +8875,7 @@ fn live_menu_connection(c: &Client) -> Option<Arc<LiveMenuConnection>> {
     // can update XP, which briefly reacquires the registry.
     player_mechanism_sessions()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(&c.eid)
         .map(|session| Arc::clone(&session.menus))
 }
@@ -8884,7 +8884,7 @@ fn live_menu_id(c: &Client) -> Option<u8> {
     live_menu_connection(c)?
         .active
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .map(|menu| menu.id)
 }
@@ -8947,13 +8947,13 @@ fn live_offers_payload(window: u8, merchant: &Villager) -> Vec<u8> {
 }
 
 fn open_live_merchant(c: &Client, mob: &Mob) {
-    if c.is_spectator() || *c.dim.lock().unwrap() != DimId::Overworld {
+    if c.is_spectator() || *c.dim.lock().unwrap_or_else(|e| e.into_inner()) != DimId::Overworld {
         return;
     }
     let Some(connection) = live_menu_connection(c) else {
         return;
     };
-    if matches!(connection.active.lock().unwrap().as_ref().map(|s| &s.menu),
+    if matches!(connection.active.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|s| &s.menu),
                 Some(LiveMenu::Merchant(id, _)) if *id == mob.eid)
     {
         return;
@@ -8961,14 +8961,14 @@ fn open_live_merchant(c: &Client, mob: &Mob) {
     // Bind a nearby workstation before the table opens: claiming it assigns
     // the site profession and its real trade rows. Only a villager with no
     // workstation nearby keeps the historical farmer fallback.
-    let dim = *c.dim.lock().unwrap();
+    let dim = *c.dim.lock().unwrap_or_else(|e| e.into_inner());
     {
-        let mut villagers = live_villagers().lock().unwrap();
+        let mut villagers = live_villagers().lock().unwrap_or_else(|e| e.into_inner());
         let villager = villagers
             .entry(mob.eid)
             .or_insert_with(|| Villager::new(mob.uuid, VillagerProfession::None));
         if villager.job_site.is_none() || villager.offers.is_empty() {
-            let (x, y, z, ..) = *mob.pos.lock().unwrap();
+            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
             live_villager_bind_pois(
                 dim,
                 (x.floor() as i32, y.floor() as i32, z.floor() as i32),
@@ -8980,8 +8980,8 @@ fn open_live_merchant(c: &Client, mob: &Mob) {
         }
     }
     let opened = {
-        let mut villagers = live_villagers().lock().unwrap();
-        let registries = live_pois().lock().unwrap();
+        let mut villagers = live_villagers().lock().unwrap_or_else(|e| e.into_inner());
+        let registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
         let empty = PoiRegistry::default();
         let pois = registries.get(&dim).unwrap_or(&empty);
         villagers
@@ -9026,12 +9026,12 @@ fn open_live_block_menu(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u3
             if matches!(menu, LiveMenu::Brewing) {
                 live_brewing_stands()
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .entry(key)
                     .or_default();
             }
             if matches!(menu, LiveMenu::Crafter) {
-                live_block_entities().lock().unwrap().at(reg, key, state);
+                live_block_entities().lock().unwrap_or_else(|e| e.into_inner()).at(reg, key, state);
             }
             open_live_menu(c, Some(key), menu);
         });
@@ -9047,13 +9047,13 @@ fn open_live_menu(c: &Client, anchor: Option<DimBlockPos>, menu: LiveMenu) {
     if let Some((window, old_anchor)) = client_open_window_and_anchor(c) {
         let audience = client_snapshot();
         let before = chest_opener_snapshot(&audience, &client_window_halves(window, old_anchor));
-        *c.open_chest.lock().unwrap() = None;
-        *c.chest_sync.lock().unwrap() = None;
+        *c.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *c.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
         sync_chest_openers(&audience, &before);
     }
-    *c.open_furnace.lock().unwrap() = None;
-    if std::mem::take(&mut *c.open_table.lock().unwrap()) {
-        let grid = std::mem::take(&mut *c.craft9.lock().unwrap());
+    *c.open_furnace.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    if std::mem::take(&mut *c.open_table.lock().unwrap_or_else(|e| e.into_inner())) {
+        let grid = std::mem::take(&mut *c.craft9.lock().unwrap_or_else(|e| e.into_inner()));
         return_live_inputs(c, grid.into_values());
     }
 
@@ -9070,7 +9070,7 @@ fn open_live_menu(c: &Client, anchor: Option<DimBlockPos>, menu: LiveMenu) {
             break current;
         }
     };
-    let mut active = connection.active.lock().unwrap();
+    let mut active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
     let session = active.insert(LiveMenuSession {
         id,
         state_id: 0,
@@ -9083,7 +9083,7 @@ fn open_live_menu(c: &Client, anchor: Option<DimBlockPos>, menu: LiveMenu) {
     write_varint(&mut packet, i64::from(id));
     write_varint(&mut packet, kind);
     packet.extend_from_slice(&chat_nbt(title));
-    let _ = send_packet(&mut c.sock.lock().unwrap(), 0x33, packet);
+    let _ = send_packet(&mut c.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x33, packet);
     sync_live_menu(c, session, true);
 }
 
@@ -9294,7 +9294,7 @@ fn live_map_state(stack: &Stack) -> Option<MapState> {
     Some(
         live_map_states()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&map_id)
             .copied()
             .unwrap_or(MapState {
@@ -9310,7 +9310,7 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
     let mut offers = None;
     let slots = match &mut session.menu {
         LiveMenu::Anvil(menu) => {
-            let result = menu.result(anvil_hover_name(&menu.left), *c.gm.lock().unwrap() == 1);
+            let result = menu.result(anvil_hover_name(&menu.left), *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1);
             properties.extend(anvil_window_properties(
                 result.as_ref().map_or(0, |r| r.level_cost),
             ));
@@ -9325,7 +9325,7 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
             vec![menu.item.clone(), menu.lapis.clone()]
         }
         LiveMenu::Brewing => {
-            let stands = live_brewing_stands().lock().unwrap();
+            let stands = live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner());
             let Some(entry) = stands.get(&session.anchor.unwrap()) else {
                 return;
             };
@@ -9333,7 +9333,7 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
             entry.menu.slots.to_vec()
         }
         LiveMenu::Crafter => {
-            let store = live_block_entities().lock().unwrap();
+            let store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
             let Some((_, LiveBlockEntity::Crafter(crafter, _))) =
                 store.entries.get(&session.anchor.unwrap())
             else {
@@ -9366,7 +9366,7 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
             let (Some(reg), state) = (breg(), block_at_dim(dim, x, y, z)) else {
                 return;
             };
-            let mut store = live_block_entities().lock().unwrap();
+            let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
             let Some(LiveBlockEntity::Lectern(lectern, _)) = store.at(reg, (dim, x, y, z), state)
             else {
                 return;
@@ -9390,7 +9390,7 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
             ]
         }
         LiveMenu::Merchant(id, menu) => {
-            let merchants = live_villagers().lock().unwrap();
+            let merchants = live_villagers().lock().unwrap_or_else(|e| e.into_inner());
             let Some(villager) = merchants.get(id) else {
                 return;
             };
@@ -9458,7 +9458,7 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
             let (Some(reg), state) = (breg(), block_at_dim(dim, x, y, z)) else {
                 return;
             };
-            let mut store = live_block_entities().lock().unwrap();
+            let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
             let Some(LiveBlockEntity::Beacon(beacon)) =
                 store.at(reg, (dim, x, y, z), state)
             else {
@@ -9483,9 +9483,9 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
         }
     };
     session.state_id = (session.state_id + 1) & 0x7fff;
-    let inventory = c.inv.lock().unwrap();
-    let cursor = c.cursor.lock().unwrap();
-    let mut sock = c.sock.lock().unwrap();
+    let inventory = c.inv.lock().unwrap_or_else(|e| e.into_inner());
+    let cursor = c.cursor.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sock = c.sock.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(payload) = offers {
         let _ = send_packet(&mut sock, 0x2d, payload);
     }
@@ -9511,7 +9511,7 @@ fn drop_live_stack((x, y, z): (f64, f64, f64), stack: Stack) {
     if stack.1 == 0 {
         return;
     }
-    drops().lock().unwrap().push(Drop {
+    drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
         eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
         x,
         y,
@@ -9526,9 +9526,9 @@ fn drop_live_stack((x, y, z): (f64, f64, f64), stack: Stack) {
 }
 
 fn return_live_inputs(c: &Client, stacks: impl IntoIterator<Item = Stack>) {
-    let (x, y, z, ..) = *c.pos.lock().unwrap();
-    let selected = *c.held.lock().unwrap();
-    let mut inventory = c.inv.lock().unwrap();
+    let (x, y, z, ..) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+    let selected = *c.held.lock().unwrap_or_else(|e| e.into_inner());
+    let mut inventory = c.inv.lock().unwrap_or_else(|e| e.into_inner());
     for mut stack in stacks {
         pickup_into_inventory(&mut inventory, selected, false, &mut stack);
         drop_live_stack((x, y + 1.3, z), stack);
@@ -9543,7 +9543,7 @@ fn close_live_menu_id(c: &Client, id: Option<u8>, send_close: bool, sync: bool) 
     let Some(connection) = live_menu_connection(c) else {
         return;
     };
-    let mut active = connection.active.lock().unwrap();
+    let mut active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
     if id.is_some_and(|id| active.as_ref().is_none_or(|s| s.id != id)) {
         return;
     }
@@ -9551,13 +9551,13 @@ fn close_live_menu_id(c: &Client, id: Option<u8>, send_close: bool, sync: bool) 
         return;
     };
     if let LiveMenu::Merchant(id, _) = session.menu {
-        if let Some(villager) = live_villagers().lock().unwrap().get_mut(&id) {
+        if let Some(villager) = live_villagers().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&id) {
             if villager.trading_player == Some(c.uuid) {
                 villager.stop_trading();
             }
         }
     }
-    let cursor = std::mem::take(&mut *c.cursor.lock().unwrap());
+    let cursor = std::mem::take(&mut *c.cursor.lock().unwrap_or_else(|e| e.into_inner()));
     return_live_inputs(
         c,
         session
@@ -9568,8 +9568,8 @@ fn close_live_menu_id(c: &Client, id: Option<u8>, send_close: bool, sync: bool) 
             .chain([cursor]),
     );
     if sync {
-        let inventory = c.inv.lock().unwrap();
-        let mut sock = c.sock.lock().unwrap();
+        let inventory = c.inv.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sock = c.sock.lock().unwrap_or_else(|e| e.into_inner());
         if send_close {
             let _ = send_packet(&mut sock, 0x12, vec![session.id]);
         }
@@ -9591,7 +9591,7 @@ fn refresh_live_enchanting(connection: &LiveMenuConnection, session: &mut LiveMe
                 )
             },
         );
-        menu.refresh_offers(*connection.enchantment_seed.lock().unwrap(), shelves);
+        menu.refresh_offers(*connection.enchantment_seed.lock().unwrap_or_else(|e| e.into_inner()), shelves);
     }
 }
 
@@ -9599,7 +9599,7 @@ fn live_anvil_rename(c: &Client, text: &str) {
     let Some(connection) = live_menu_connection(c) else {
         return;
     };
-    let mut active = connection.active.lock().unwrap();
+    let mut active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(session) = active.as_mut() {
         if let LiveMenu::Anvil(menu) = &mut session.menu {
             if menu.rename(text) {
@@ -9613,7 +9613,7 @@ fn live_enchant_button(c: &Client, window: i32, button: i32) {
     let Some(connection) = live_menu_connection(c) else {
         return;
     };
-    let mut active = connection.active.lock().unwrap();
+    let mut active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
     let Some(session) = active.as_mut().filter(|s| i32::from(s.id) == window) else {
         return;
     };
@@ -9646,8 +9646,8 @@ fn live_enchant_button(c: &Client, window: i32, button: i32) {
         return;
     }
     if let LiveMenu::Enchanting(menu) = &mut session.menu {
-        let creative = *c.gm.lock().unwrap() == 1;
-        let mut seed = connection.enchantment_seed.lock().unwrap();
+        let creative = *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
+        let mut seed = connection.enchantment_seed.lock().unwrap_or_else(|e| e.into_inner());
         let mut rng = generation_math::Lcg::new(i64::from(*seed) as u64);
         let _ = send_player_xp(c, |xp| {
             menu.click_button(button, xp, &mut seed, creative, &mut rng);
@@ -9661,11 +9661,11 @@ fn live_enchant_button(c: &Client, window: i32, button: i32) {
 fn live_lectern_button(c: &Client, key @ (dim, x, y, z): DimBlockPos, button: i32) {
     let Some(reg) = breg() else { return };
     let state = block_at_dim(dim, x, y, z);
-    let mut store = live_block_entities().lock().unwrap();
+    let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
     let Some(LiveBlockEntity::Lectern(lectern, pulse_end)) = store.at(reg, key, state) else {
         return;
     };
-    if button == 3 && matches!(*c.gm.lock().unwrap(), 0 | 1) {
+    if button == 3 && matches!(*c.gm.lock().unwrap_or_else(|e| e.into_inner()), 0 | 1) {
         if let Some(book) = lectern.book.as_ref().and_then(BlockEntityItem::to_stack) {
             lectern.take_book();
             *pulse_end = None;
@@ -9697,14 +9697,14 @@ fn live_select_trade(c: &Client, index: i32) {
     let Some(connection) = live_menu_connection(c) else {
         return;
     };
-    let mut active = connection.active.lock().unwrap();
+    let mut active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(session) = active.as_mut() {
         if let LiveMenu::Merchant(id, menu) = &mut session.menu {
-            if let Some(villager) = live_villagers().lock().unwrap().get(id) {
+            if let Some(villager) = live_villagers().lock().unwrap_or_else(|e| e.into_inner()).get(id) {
                 menu.select_trade(
                     index,
                     &villager.offers,
-                    &mut c.inv.lock().unwrap(),
+                    &mut c.inv.lock().unwrap_or_else(|e| e.into_inner()),
                     &MerchantItems(&merchant_item_prototype),
                 );
             }
@@ -9766,7 +9766,7 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
     let Some(connection) = live_menu_connection(c) else {
         return;
     };
-    let mut active = connection.active.lock().unwrap();
+    let mut active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
     let Some(session) = active.as_mut().filter(|s| s.id == window) else {
         return;
     };
@@ -9805,8 +9805,8 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
         | LiveMenu::Cartography(_) => slots - 1,
         _ => -1,
     };
-    let mut inventory = c.inv.lock().unwrap();
-    let mut cursor = c.cursor.lock().unwrap();
+    let mut inventory = c.inv.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cursor = c.cursor.lock().unwrap_or_else(|e| e.into_inner());
     let mut offer_changed = false;
     let mut wear_anvil = false;
     let mut brewing_changed = false;
@@ -9815,7 +9815,7 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
 
     if slot == output_slot && slot >= 0 {
         let mut quick_move_inventory = None;
-        let selected = *c.held.lock().unwrap();
+        let selected = *c.held.lock().unwrap_or_else(|e| e.into_inner());
         let mut receive = |result: &Stack| {
             if mode == 1 {
                 let mut trial = inventory.clone();
@@ -9835,7 +9835,7 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
         let result = match &mut session.menu {
             LiveMenu::Anvil(menu) => {
                 let name = anvil_hover_name(&menu.left).to_owned();
-                let creative = *c.gm.lock().unwrap() == 1;
+                let creative = *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
                 let mut output = None;
                 let _ = send_player_xp(c, |xp| {
                     if let Some(result) = menu.take_result(&name, xp, creative, receive, || {
@@ -9903,7 +9903,7 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
                 })
             }
             LiveMenu::Merchant(id, menu) => {
-                let mut villagers = live_villagers().lock().unwrap();
+                let mut villagers = live_villagers().lock().unwrap_or_else(|e| e.into_inner());
                 let items = MerchantItems(&merchant_item_prototype);
                 let result = villagers.get_mut(id).and_then(|villager| {
                     let index = menu.active_offer(&villager.offers, &items)?;
@@ -9931,24 +9931,24 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
                 let _ = send_player_xp(c, |xp| add_player_xp_points(xp, grind_xp as i32));
             }
             if let Some(state) = carto_state {
-                live_map_states().lock().unwrap().insert(state.map_id, state);
+                live_map_states().lock().unwrap_or_else(|e| e.into_inner()).insert(state.map_id, state);
             }
         }
     } else if (0..slots).contains(&slot) {
         if let LiveMenu::Brewing = session.menu {
-            let mut stands = live_brewing_stands().lock().unwrap();
+            let mut stands = live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = stands.get_mut(&session.anchor.unwrap()) {
                 brewing_changed = if mode == 0 {
                     entry.menu.click_slot(slot, button, &mut cursor)
                 } else {
                     let stack = &mut entry.menu.slots[slot as usize];
                     let before = stack.1;
-                    pickup_into_inventory(&mut inventory, *c.held.lock().unwrap(), false, stack);
+                    pickup_into_inventory(&mut inventory, *c.held.lock().unwrap_or_else(|e| e.into_inner()), false, stack);
                     before != stack.1
                 };
             }
         } else if matches!(session.menu, LiveMenu::Crafter) {
-            let mut store = live_block_entities().lock().unwrap();
+            let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
             if let Some((_, LiveBlockEntity::Crafter(crafter, _))) =
                 store.entries.get_mut(&session.anchor.unwrap())
             {
@@ -9973,7 +9973,7 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
                     } else {
                         pickup_into_inventory(
                             &mut inventory,
-                            *c.held.lock().unwrap(),
+                            *c.held.lock().unwrap_or_else(|e| e.into_inner()),
                             false,
                             &mut target,
                         );
@@ -9994,7 +9994,7 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
             if mode == 0 {
                 click_live_input(target, &mut cursor, button, limit);
             } else {
-                pickup_into_inventory(&mut inventory, *c.held.lock().unwrap(), false, target);
+                pickup_into_inventory(&mut inventory, *c.held.lock().unwrap_or_else(|e| e.into_inner()), false, target);
             }
             drop(inputs);
             if let (LiveMenu::Stonecutter(menu), Some(before)) =
@@ -10015,7 +10015,7 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
             click_slot(&mut inventory, &mut cursor, inv_slot, button);
         } else if let Some(mut source) = inventory.remove(&inv_slot) {
             if let LiveMenu::Brewing = session.menu {
-                let mut stands = live_brewing_stands().lock().unwrap();
+                let mut stands = live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(entry) = stands.get_mut(&session.anchor.unwrap()) {
                     // Only merge or use an empty slot during shift-click.
                     for target in [4, 3, 0, 1, 2] {
@@ -10028,7 +10028,7 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
                     }
                 }
             } else if matches!(session.menu, LiveMenu::Crafter) {
-                let mut store = live_block_entities().lock().unwrap();
+                let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
                 if let Some((_, LiveBlockEntity::Crafter(crafter, _))) =
                     store.entries.get_mut(&session.anchor.unwrap())
                 {
@@ -10068,7 +10068,7 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
             }
         }
     } else if slot == -999 && mode == 0 && cursor.1 != 0 {
-        let (x, y, z, ..) = *c.pos.lock().unwrap();
+        let (x, y, z, ..) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
         let count = if button == 0 { cursor.1 } else { 1 };
         drop_live_stack((x, y + 1.3, z), (cursor.0, count, cursor.2.clone()));
         consume_menu_stack(&mut cursor, count);
@@ -10097,7 +10097,7 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
                 let Some(connection) = live_menu_connection(&viewer) else {
                     continue;
                 };
-                let mut active = connection.active.lock().unwrap();
+                let mut active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(session) = active
                     .as_mut()
                     .filter(|s| matches!(s.menu, LiveMenu::Brewing) && s.anchor == Some(key))
@@ -10108,8 +10108,8 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
         }
     }
     if offer_changed {
-        let (x, y, z, ..) = *c.pos.lock().unwrap();
-        xps().lock().unwrap().push(Xp {
+        let (x, y, z, ..) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+        xps().lock().unwrap_or_else(|e| e.into_inner()).push(Xp {
             eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
             x,
             y: y + 1.0,
@@ -10139,17 +10139,17 @@ fn wear_live_anvil(dim: DimId, x: i32, y: i32, z: i32) {
 }
 
 fn live_menu_valid(c: &Client, session: &LiveMenuSession) -> bool {
-    let dim = *c.dim.lock().unwrap();
-    let (px, py, pz, ..) = *c.pos.lock().unwrap();
+    let dim = *c.dim.lock().unwrap_or_else(|e| e.into_inner());
+    let (px, py, pz, ..) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
     let close_to =
         |x: f64, y: f64, z: f64| (px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2) <= 64.0;
     if let LiveMenu::Merchant(eid, _) = session.menu {
         return dim == DimId::Overworld
-            && mobs().lock().unwrap().iter().any(|mob| {
+            && mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|mob| {
                 if mob.eid != eid {
                     return false;
                 }
-                let (x, y, z, ..) = *mob.pos.lock().unwrap();
+                let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
                 close_to(x, y, z)
             });
     }
@@ -10189,7 +10189,7 @@ fn live_menu_tick() {
         let Some(connection) = live_menu_connection(&c) else {
             continue;
         };
-        let active = connection.active.lock().unwrap();
+        let active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
         if active.as_ref().is_some_and(|s| !live_menu_valid(&c, s)) {
             // Hold the session through validation. The close then checks the
             // same ID, since the connection can open a new menu between them.
@@ -10201,13 +10201,13 @@ fn live_menu_tick() {
     if TICK_IDX
         .load(Ordering::Relaxed)
         .is_multiple_of(server_ticks(20))
-        && !live_villagers().lock().unwrap().is_empty()
+        && !live_villagers().lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     {
-        let mobs = mobs().lock().unwrap();
+        let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
         let alive: HashSet<_> = mobs.iter().map(|mob| mob.eid).collect();
         live_villagers()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .retain(|id, _| alive.contains(id));
     }
 }
@@ -10368,7 +10368,7 @@ fn update_brewing_bottles(key @ (dim, x, y, z): DimBlockPos) {
     let Some(reg) = breg() else { return };
     let bottles = live_brewing_stands()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(&key)
         .map(|entry| std::array::from_fn::<_, 3, _>(|i| entry.menu.slots[i].1 != 0));
     let Some(bottles) = bottles else { return };
@@ -10391,7 +10391,7 @@ fn update_brewing_bottles(key @ (dim, x, y, z): DimBlockPos) {
 }
 
 fn remove_live_brewing_stand(key @ (dim, x, y, z): DimBlockPos) {
-    if let Some(entry) = live_brewing_stands().lock().unwrap().remove(&key) {
+    if let Some(entry) = live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner()).remove(&key) {
         // Item entities currently live in the Overworld simulation.
         if dim == DimId::Overworld {
             for stack in entry.menu.slots {
@@ -10407,7 +10407,7 @@ fn remove_live_brewing_stand(key @ (dim, x, y, z): DimBlockPos) {
 fn live_brewing_tick() {
     with_save_guard(|| {
         let mut updates = HashMap::new();
-        for (&key, entry) in live_brewing_stands().lock().unwrap().iter_mut() {
+        for (&key, entry) in live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
             let (mut slots_changed, mut properties_changed, mut eject) = (false, false, false);
             for _ in 0..GAME_TICKS_PER_TICK {
                 let (slots, properties, bottle) = entry.tick();
@@ -10445,7 +10445,7 @@ fn live_brewing_tick() {
             let Some(connection) = live_menu_connection(&client) else {
                 continue;
             };
-            let mut active = connection.active.lock().unwrap();
+            let mut active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
             let Some(session) = active.as_mut() else {
                 continue;
             };
@@ -10456,7 +10456,7 @@ fn live_brewing_tick() {
                 if *slots {
                     sync_live_menu(&client, session, false);
                 } else {
-                    let mut sock = client.sock.lock().unwrap();
+                    let mut sock = client.sock.lock().unwrap_or_else(|e| e.into_inner());
                     for property in properties {
                         let _ = send_packet(&mut sock, 0x14, property.encode(session.id).to_vec());
                     }
@@ -10639,14 +10639,14 @@ fn json_smelts() -> &'static Mutex<Vec<SmeltRecipe>> {
 // usable item is activated in the air (bow draw, crossbow load, throws,
 // food, shield). seq is acked here; callers must not ack again.
 fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat_release: bool) {
-    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
+    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
     {
-        let inv = me.inv.lock().unwrap();
+        let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
         let main = inv.get(&(36 + held_slot)).map(|v| v.0).unwrap_or(0);
         if main == 931 {
             // fishing rod: cast or reel
             drop(inv);
-            let mut fb = bobbers().lock().unwrap();
+            let mut fb = bobbers().lock().unwrap_or_else(|e| e.into_inner());
             if let Some(ix) = fb.iter().position(|b| b.owner == me.eid) {
                 let b = fb.remove(ix);
                 broadcast_seen_destroy(b.eid);
@@ -10655,7 +10655,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                     // datapack gameplay/fishing table wins; fallback raw fish
                     let table: Option<Vec<LootPool>> = loot_tables()
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .get("minecraft:gameplay/fishing")
                         .map(|p| {
                             p.iter()
@@ -10687,17 +10687,17 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                             1,
                             Vec::new(),
                         ));
-                    let mut inv = me.inv.lock().unwrap();
+                    let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                     let slot = (9..=44).find(|sl| !inv.contains_key(sl)).unwrap_or(9);
                     inv.insert(slot, (fish, fcnt, fcomps.clone()));
                     let mut p = vec![4u8];
                     write_varint(&mut p, 0);
                     p.extend_from_slice(&slot.to_be_bytes());
                     p.extend_from_slice(&slot_wire(&(fish, fcnt, fcomps)));
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
                 }
             } else {
-                let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap();
+                let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
                 let yr = (yaw as f64).to_radians();
                 let pr = (pitch as f64).to_radians();
                 let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
@@ -10720,10 +10720,10 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
         }
         if main == 993 {
             // ender pearl: throw (vanilla 20t cooldown)
-            if me.pearl_cd.lock().unwrap().elapsed() < Duration::from_secs(1) {
+            if me.pearl_cd.lock().unwrap_or_else(|e| e.into_inner()).elapsed() < Duration::from_secs(1) {
                 return;
             }
-            *me.pearl_cd.lock().unwrap() = Instant::now();
+            *me.pearl_cd.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
             {
                 let mut cp = Vec::new();
                 write_varint(&mut cp, 993); // itemID
@@ -10733,7 +10733,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                 }
             }
             drop(inv);
-            let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap();
+            let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
             let yr = (yaw as f64).to_radians();
             let pr = (pitch as f64).to_radians();
             let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
@@ -10748,10 +10748,10 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                 dz: yr.cos() * pr.cos() * 2.0,
                 ttl: server_ticks(PEARL_TTL_GT) as i32,
             };
-            pearls().lock().unwrap().push(pe);
+            pearls().lock().unwrap_or_else(|e| e.into_inner()).push(pe);
             // spawn streams via interest_tick
-            if *me.gm.lock().unwrap() != 1 {
-                let mut inv = me.inv.lock().unwrap();
+            if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
+                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                 let hs = 36 + held_slot;
                 if let Some((it, c, _cc)) = inv.get(&hs).cloned() {
                     if it == 993 {
@@ -10770,7 +10770,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
         if main == 912 || main == 927 {
             // snowball/egg: throw (egg may hatch a chicken)
             drop(inv);
-            let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap();
+            let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
             let yr = (yaw as f64).to_radians();
             let pr = (pitch as f64).to_radians();
             let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
@@ -10786,10 +10786,10 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                 ttl: server_ticks(SNOWBALL_TTL_GT) as i32,
                 egg: main == 927,
             };
-            snowballs().lock().unwrap().push(sb);
+            snowballs().lock().unwrap_or_else(|e| e.into_inner()).push(sb);
             // spawn streams via interest_tick
-            if *me.gm.lock().unwrap() != 1 {
-                let mut inv2 = me.inv.lock().unwrap();
+            if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
+                let mut inv2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                 let hs = 36 + held_slot;
                 if let Some((it, c, _cc)) = inv2.get(&hs).cloned() {
                     if it == 912 || it == 927 {
@@ -10806,7 +10806,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
             return;
         }
         if main == 1162 || (_h == Some(1) && inv.get(&45).map(|v| v.0).unwrap_or(0) == 1162) {
-            *me.blocking.lock().unwrap() = true;
+            *me.blocking.lock().unwrap_or_else(|e| e.into_inner()) = true;
             return;
         }
         let asl = armor_slot_for(main);
@@ -10814,8 +10814,8 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
             // vanilla: right-click equips armor into its slot (swaps)
             drop(inv);
             let hs = 36 + held_slot;
-            let creative = *me.gm.lock().unwrap() == 1;
-            let mut inv2 = me.inv.lock().unwrap();
+            let creative = *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
+            let mut inv2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
             if armor_removal_blocked(asl, inv2.get(&asl), creative) {
                 drop(inv2);
                 held_slot_resync(me);
@@ -10845,7 +10845,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                 let st = me
                     .inv
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .get(&asl)
                     .cloned()
                     .unwrap_or((0, 0, Vec::new()));
@@ -10863,23 +10863,23 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
             // milk_bucket: clears all effects, leaves a bucket
             if !eat_release {
                 // vanilla: milk is a 32-tick drink like food
-                *me.eat_start.lock().unwrap() = Some(Instant::now());
+                *me.eat_start.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
                 return;
             }
             drop(inv);
             let gone: Vec<i32> = {
-                let mut ef = me.effs.lock().unwrap();
+                let mut ef = me.effs.lock().unwrap_or_else(|e| e.into_inner());
                 let g: Vec<i32> = ef.iter().map(|e| e.id).collect();
                 ef.clear();
                 g
             };
             for id in &gone {
                 let pk = remove_effect_pkt(me.eid, *id);
-                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x43, pk.clone());
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x43, pk.clone());
                 broadcast_seen(me.eid, |_c| (0x43, pk.clone()));
             }
-            if *me.gm.lock().unwrap() != 1 {
-                let mut iv = me.inv.lock().unwrap();
+            if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
+                let mut iv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                 let hs = 36 + held_slot;
                 iv.insert(hs, (name_to_item("bucket").unwrap_or(0), 1, Vec::new()));
             }
@@ -10887,14 +10887,14 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
             return;
         }
         if main == 801 || main == 1192 || main == name_to_item("trident").unwrap_or(-9) {
-            *me.bow_draw.lock().unwrap() = Some(Instant::now());
+            *me.bow_draw.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
             return;
         }
     }
-    if *me.gm.lock().unwrap() != 1 {
+    if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
         // prefer held slot; fall back to first food item in inventory
         let (slot, it) = {
-            let inv = me.inv.lock().unwrap();
+            let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
             let hs = 36 + held_slot;
             match inv.get(&hs) {
                 Some((it, _, _)) if food_value(*it) > 0 => (hs, *it),
@@ -10906,20 +10906,20 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
             }
         };
         let fv = food_value(it);
-        let cur_food = *me.food.lock().unwrap();
+        let cur_food = *me.food.lock().unwrap_or_else(|e| e.into_inner());
         let edible = fv > 0 && (cur_food < 20 || always_edible(it));
         if edible && !eat_release {
             // vanilla: eating holds use for 32 ticks; nothing consumed yet
-            *me.eat_start.lock().unwrap() = Some(Instant::now());
+            *me.eat_start.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         }
         if edible && eat_release {
-            let mut f = me.food.lock().unwrap();
-            let mut st = me.sat.lock().unwrap();
+            let mut f = me.food.lock().unwrap_or_else(|e| e.into_inner());
+            let mut st = me.sat.lock().unwrap_or_else(|e| e.into_inner());
             (*f, *st) = FoodData::values_after_eating(*f, *st, fv, sat_value(it));
             drop(st);
             drop(f);
             let ncnt = {
-                let mut inv = me.inv.lock().unwrap();
+                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                 let (nc, cc2) = inv
                     .get(&slot)
                     .map(|e| (e.1.saturating_sub(1), e.2.clone()))
@@ -10940,14 +10940,14 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                 write_varint(&mut p, 0);
                 write_varint(&mut p, 0);
             }
-            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
-            let hh = *me.hp.lock().unwrap();
-            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x5d, health_pkt_c(hh, me));
+            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
+            let hh = *me.hp.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x5d, health_pkt_c(hh, me));
             // vanilla food side-effects (golden apple, pufferfish, ...)
             for &(ch, eid2, amp, ticks) in food_effects(it) {
                 if (world_rng::next_u64() % 100) < ch {
                     {
-                        let mut ef = me.effs.lock().unwrap();
+                        let mut ef = me.effs.lock().unwrap_or_else(|e| e.into_inner());
                         ef.retain(|e| e.id != eid2);
                         ef.push(Eff {
                             id: eid2,
@@ -10956,31 +10956,31 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                         });
                     }
                     if eid2 == 21 {
-                        *me.absorb.lock().unwrap() = (amp + 1) as f32 * 4.0;
+                        *me.absorb.lock().unwrap_or_else(|e| e.into_inner()) = (amp + 1) as f32 * 4.0;
                     }
                     let pk = entity_effect_pkt(me.eid, eid2, amp, ticks);
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x76, pk.clone());
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x76, pk.clone());
                     broadcast_seen(me.eid, |_c| (0x76, pk.clone()));
                 }
             }
             // honey bottle clears poison only
             if it == name_to_item("honey_bottle").unwrap_or(-9) {
                 let had = {
-                    let mut ef = me.effs.lock().unwrap();
+                    let mut ef = me.effs.lock().unwrap_or_else(|e| e.into_inner());
                     let h = ef.iter().any(|e| e.id == 18);
                     ef.retain(|e| e.id != 18);
                     h
                 };
                 if had {
                     let pk = remove_effect_pkt(me.eid, 18);
-                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x43, pk.clone());
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x43, pk.clone());
                     broadcast_seen(me.eid, |_c| (0x43, pk.clone()));
                 }
             }
             // chorus fruit: random teleport within +-8 blocks
             if it == name_to_item("chorus_fruit").unwrap_or(-9) {
                 let (px, py, pz, ..) = {
-                    let p = me.pos.lock().unwrap();
+                    let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                     *p
                 };
                 for _ in 0..16 {
@@ -10988,10 +10988,10 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                     let nz = pz + ((world_rng::next_u64() % 1600) as f64 / 100.0) - 8.0;
                     let ny = surface_y(nx.round() as i32, nz.round() as i32);
                     if (ny - py).abs() < 8.0 {
-                        let (_, _, _, yaw, pitch, _) = *me.pos.lock().unwrap();
+                        let (_, _, _, yaw, pitch, _) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
                         teleport_in_dimension(
                             me,
-                            &mut me.sock.lock().unwrap(),
+                            &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
                             (nx, ny, nz, yaw, pitch),
                         );
                         break;
@@ -11111,10 +11111,10 @@ mod p5a_beacon_tests {
     impl BeaconWorld {
         fn new() -> Self {
             Self {
-                store: std::mem::take(&mut *live_block_entities().lock().unwrap()),
+                store: std::mem::take(&mut *live_block_entities().lock().unwrap_or_else(|e| e.into_inner())),
                 cells: Vec::new(),
-                sessions: std::mem::take(&mut *player_mechanism_sessions().lock().unwrap()),
-                players: std::mem::take(&mut *clients().lock().unwrap()),
+                sessions: std::mem::take(&mut *player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner())),
+                players: std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner())),
             }
         }
 
@@ -11133,15 +11133,15 @@ mod p5a_beacon_tests {
             for &((dim, x, y, z), state) in self.cells.iter().rev() {
                 set_block_dim(dim, x, y, z, state);
             }
-            *live_block_entities().lock().unwrap() = std::mem::take(&mut self.store);
-            *player_mechanism_sessions().lock().unwrap() = std::mem::take(&mut self.sessions);
-            *clients().lock().unwrap() = std::mem::take(&mut self.players);
+            *live_block_entities().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.store);
+            *player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.sessions);
+            *clients().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.players);
         }
     }
 
     fn attach(c: &Client) {
         c.enter_play_wire(None, Default::default());
-        player_mechanism_sessions().lock().unwrap().insert(
+        player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner()).insert(
             c.eid,
             PlayerMechanismSession {
                 xp_bar: (0, 0.0),
@@ -11184,7 +11184,7 @@ mod p5a_beacon_tests {
     }
 
     fn beacon_of(key: DimBlockPos) -> (Option<BeaconEffect>, Option<BeaconEffect>, i32) {
-        let store = live_block_entities().lock().unwrap();
+        let store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
         let Some((_, LiveBlockEntity::Beacon(beacon))) = store.entries.get(&key) else {
             panic!("beacon entity missing at {key:?}");
         };
@@ -11312,7 +11312,7 @@ mod p5a_beacon_tests {
         // Seed a level-4 pyramid with a running Speed effect.
         {
             let reg = breg().unwrap();
-            let mut store = live_block_entities().lock().unwrap();
+            let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
             let Some(LiveBlockEntity::Beacon(beacon)) =
                 store.at(reg, key, block_at_dim(dim, x, y, z))
             else {
@@ -11323,7 +11323,7 @@ mod p5a_beacon_tests {
         }
         let (mut c, mut rx) = client_pair();
         c.eid = 5252;
-        *c.pos.lock().unwrap() = (
+        *c.pos.lock().unwrap_or_else(|e| e.into_inner()) = (
             f64::from(x) + 0.5,
             f64::from(y) + 1.0,
             f64::from(z) + 0.5,
@@ -11362,7 +11362,7 @@ mod p5a_beacon_tests {
             "level 4, primary speed(1), no secondary"
         );
         let conn = live_menu_connection(&c).unwrap();
-        let mut active = conn.active.lock().unwrap();
+        let mut active = conn.active.lock().unwrap_or_else(|e| e.into_inner());
         let session = active.as_mut().unwrap();
         assert!(live_menu_valid(&c, session));
         let LiveMenu::Beacon(menu) = &mut session.menu else {
@@ -11390,7 +11390,7 @@ mod p5a_beacon_tests {
         world.place(key2, "beacon");
         {
             let reg = breg().unwrap();
-            let mut store = live_block_entities().lock().unwrap();
+            let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
             let Some(LiveBlockEntity::Beacon(beacon)) =
                 store.at(reg, (dim2, x2, y2, z2), block_at_dim(dim2, x2, y2, z2))
             else {
@@ -11422,7 +11422,7 @@ mod p5a_beacon_tests {
         let state = world.place(key, "beacon");
         let (mut c, mut rx) = client_pair();
         c.eid = 5253;
-        *c.pos.lock().unwrap() = (
+        *c.pos.lock().unwrap_or_else(|e| e.into_inner()) = (
             f64::from(x) + 0.5,
             f64::from(y) + 1.0,
             f64::from(z) + 0.5,
@@ -11436,35 +11436,35 @@ mod p5a_beacon_tests {
         let window = live_menu_id(&c).unwrap();
         // Cursor with 3 iron ingots: a click pays exactly one into slot 0.
         let iron = name_to_item("iron_ingot").unwrap();
-        *c.cursor.lock().unwrap() = (iron, 3, Vec::new());
+        *c.cursor.lock().unwrap_or_else(|e| e.into_inner()) = (iron, 3, Vec::new());
         live_menu_click(&c, window, 0, 0, 0);
         {
             let conn = live_menu_connection(&c).unwrap();
-            let active = conn.active.lock().unwrap();
+            let active = conn.active.lock().unwrap_or_else(|e| e.into_inner());
             let LiveMenu::Beacon(menu) = &active.as_ref().unwrap().menu else {
                 panic!("beacon menu expected");
             };
             assert_eq!(menu.payment, (iron, 1, Vec::new()));
         }
-        assert_eq!(c.cursor.lock().unwrap().1, 2);
+        assert_eq!(c.cursor.lock().unwrap_or_else(|e| e.into_inner()).1, 2);
         // A sword on the cursor cannot displace the payment or enter the slot.
         let sword = name_to_item("iron_sword").unwrap();
-        *c.cursor.lock().unwrap() = (sword, 1, Vec::new());
+        *c.cursor.lock().unwrap_or_else(|e| e.into_inner()) = (sword, 1, Vec::new());
         live_menu_click(&c, window, 0, 0, 0);
         {
             let conn = live_menu_connection(&c).unwrap();
-            let active = conn.active.lock().unwrap();
+            let active = conn.active.lock().unwrap_or_else(|e| e.into_inner());
             let LiveMenu::Beacon(menu) = &active.as_ref().unwrap().menu else {
                 panic!("beacon menu expected");
             };
             assert_eq!(menu.payment, (iron, 1, Vec::new()));
         }
-        assert_eq!(*c.cursor.lock().unwrap(), (sword, 1, Vec::new()));
+        assert_eq!(*c.cursor.lock().unwrap_or_else(|e| e.into_inner()), (sword, 1, Vec::new()));
         // With an empty cursor the payment comes back out of slot 0.
-        *c.cursor.lock().unwrap() = Stack::default();
+        *c.cursor.lock().unwrap_or_else(|e| e.into_inner()) = Stack::default();
         live_menu_click(&c, window, 0, 0, 0);
         let conn = live_menu_connection(&c).unwrap();
-        let active = conn.active.lock().unwrap();
+        let active = conn.active.lock().unwrap_or_else(|e| e.into_inner());
         let LiveMenu::Beacon(menu) = &active.as_ref().unwrap().menu else {
             panic!("beacon menu expected");
         };
@@ -11495,11 +11495,11 @@ mod p6c_hopper_parity_tests {
 
     fn save_world() -> SavedWorld {
         SavedWorld {
-            hoppers: std::mem::take(&mut *hoppers().lock().unwrap()),
-            chests: std::mem::take(&mut *chests().lock().unwrap()),
-            drops: std::mem::take(&mut *drops().lock().unwrap()),
-            forced: std::mem::take(&mut *forceloaded().lock().unwrap()),
-            backoff: std::mem::take(&mut *backoff().lock().unwrap()),
+            hoppers: std::mem::take(&mut *hoppers().lock().unwrap_or_else(|e| e.into_inner())),
+            chests: std::mem::take(&mut *chests().lock().unwrap_or_else(|e| e.into_inner())),
+            drops: std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner())),
+            forced: std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner())),
+            backoff: std::mem::take(&mut *backoff().lock().unwrap_or_else(|e| e.into_inner())),
             tick: TICK.swap(1, Ordering::Relaxed),
             index: TICK_IDX.swap(0, Ordering::Relaxed),
             hot: test_region().0,
@@ -11512,12 +11512,12 @@ mod p6c_hopper_parity_tests {
             set_block(0, y, 0, 0);
         }
         set_block(1, HY, 0, 0);
-        hopper_queue().lock().unwrap().cancel(HPOS);
-        *hoppers().lock().unwrap() = saved.hoppers;
-        *chests().lock().unwrap() = saved.chests;
-        *drops().lock().unwrap() = saved.drops;
-        *forceloaded().lock().unwrap() = saved.forced;
-        *backoff().lock().unwrap() = saved.backoff;
+        hopper_queue().lock().unwrap_or_else(|e| e.into_inner()).cancel(HPOS);
+        *hoppers().lock().unwrap_or_else(|e| e.into_inner()) = saved.hoppers;
+        *chests().lock().unwrap_or_else(|e| e.into_inner()) = saved.chests;
+        *drops().lock().unwrap_or_else(|e| e.into_inner()) = saved.drops;
+        *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = saved.forced;
+        *backoff().lock().unwrap_or_else(|e| e.into_inner()) = saved.backoff;
         TICK.store(saved.tick, Ordering::Relaxed);
         TICK_IDX.store(saved.index, Ordering::Relaxed);
         set_test_region(saved.hot, saved.warm);
@@ -11527,13 +11527,13 @@ mod p6c_hopper_parity_tests {
     /// queue slot so `set_block`'s schedule call cannot lose to a leftover.
     fn begin_hopper_world() {
         set_test_region(HashSet::from([(0, 0)]), HashSet::from([(0, 0)]));
-        hopper_queue().lock().unwrap().cancel(HPOS);
+        hopper_queue().lock().unwrap_or_else(|e| e.into_inner()).cancel(HPOS);
     }
 
     fn put(pos: (i32, i32, i32), slot: i16, stack: Stack) {
         chests()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .entry(ContainerKey::ow(pos))
             .or_default()
             .insert(slot, stack);
@@ -11542,7 +11542,7 @@ mod p6c_hopper_parity_tests {
     fn stacks_at(pos: (i32, i32, i32)) -> Vec<(i64, u8)> {
         let mut v: Vec<(i64, u8)> = chests()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&ContainerKey::ow(pos))
             .map(|m| m.values().map(|(i, c, _)| (*i, *c)).collect())
             .unwrap_or_default();
@@ -11627,7 +11627,7 @@ mod p6c_hopper_parity_tests {
         let hy = HY;
         let item = name_to_item("raw_iron").unwrap_or(1);
         set_block(0, hy, 0, 9229); // facing east into air, no container above
-        drops().lock().unwrap().push(Drop {
+        drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
             eid: 9001,
             x: 0.5,
             y: hy as f64 + 1.0,
@@ -11643,14 +11643,14 @@ mod p6c_hopper_parity_tests {
         // Vanilla `Hopper.addItem`: the entity's whole stack fits the hopper's
         // five slots, so the entity leaves with nothing — not one item.
         assert_eq!(stacks_at(HPOS), vec![(item, 10)]);
-        assert!(drops().lock().unwrap().is_empty());
+        assert!(drops().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
 
         // A stack that does not fit leaves the remainder on the entity.
         let slot_items = [1u8, 2, 3, 4];
         for (i, c) in slot_items.iter().enumerate() {
             put(HPOS, i as i16, (item, *c, Vec::new()));
         }
-        drops().lock().unwrap().push(Drop {
+        drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
             eid: 9002,
             x: 0.5,
             y: hy as f64 + 1.0,
@@ -11669,7 +11669,7 @@ mod p6c_hopper_parity_tests {
             stacks_at(HPOS),
             vec![(item, 3), (item, 3), (item, 4), (item, 64)]
         );
-        assert!(drops().lock().unwrap().is_empty());
+        assert!(drops().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
         restore_world(saved);
     }
 

@@ -2232,9 +2232,9 @@ fn apply_advancement_rewards(client: &Arc<Client>, rewards: &AdvancementRewards)
         let _ = send_player_xp(client, |xp| add_player_xp_points(xp, rewards.experience));
     }
     if !rewards.recipes.is_empty() {
-        let universe: Vec<String> = recipe_ids().lock().unwrap().iter().cloned().collect();
+        let universe: Vec<String> = recipe_ids().lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
         let packets = {
-            let mut books = recipe_books().lock().unwrap();
+            let mut books = recipe_books().lock().unwrap_or_else(|e| e.into_inner());
             let book = books
                 .entry(client.uuid)
                 .or_insert_with(PlayerRecipeBook::new);
@@ -2254,11 +2254,11 @@ fn apply_advancement_rewards(client: &Arc<Client>, rewards: &AdvancementRewards)
         }
     }
     if !rewards.loot.is_empty() {
-        let (x, y, z, ..) = *client.pos.lock().unwrap();
+        let (x, y, z, ..) = *client.pos.lock().unwrap_or_else(|e| e.into_inner());
         for table in &rewards.loot {
             let pools: Vec<LootPool> = loot_tables()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .get(table)
                 .map(|pools| {
                     pools
@@ -2282,7 +2282,7 @@ fn apply_advancement_rewards(client: &Arc<Client>, rewards: &AdvancementRewards)
                 })
                 .unwrap_or_default();
             for (item, count, comps) in roll_loot_seeded(&pools, world_rng::next_u64() as i64) {
-                drops().lock().unwrap().push(Drop {
+                drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
                     eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                     x,
                     y,
@@ -3754,7 +3754,7 @@ mod p2_parity_player_tests {
     struct StoredRules(Vec<(&'static str, i32)>);
     impl StoredRules {
         fn take(names: &[&'static str]) -> Self {
-            let map = command_gamerules().lock().unwrap();
+            let map = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
             StoredRules(
                 names
                     .iter()
@@ -3763,12 +3763,12 @@ mod p2_parity_player_tests {
             )
         }
         fn set(&self, name: &'static str, value: i32) {
-            command_gamerules().lock().unwrap().insert(name, value);
+            command_gamerules().lock().unwrap_or_else(|e| e.into_inner()).insert(name, value);
         }
     }
     impl std::ops::Drop for StoredRules {
         fn drop(&mut self) {
-            let mut map = command_gamerules().lock().unwrap();
+            let mut map = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
             for (name, value) in self.0.drain(..) {
                 map.insert(name, value);
             }

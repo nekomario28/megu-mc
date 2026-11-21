@@ -14,7 +14,7 @@ thread_local! {
 fn cmd_dim(ctx: &CmdCtx) -> DimId {
     EXEC_DIM
         .with(|d| d.get())
-        .or_else(|| ctx.me.as_ref().map(|c| *c.dim.lock().unwrap()))
+        .or_else(|| ctx.me.as_ref().map(|c| *c.dim.lock().unwrap_or_else(|e| e.into_inner())))
         .unwrap_or(DimId::Overworld)
 }
 
@@ -149,7 +149,7 @@ impl ExecuteEntity {
 
     fn dimension(&self) -> DimId {
         match self {
-            Self::Player(player) => *player.dim.lock().unwrap(),
+            Self::Player(player) => *player.dim.lock().unwrap_or_else(|e| e.into_inner()),
             Self::Mob(mob) => mob.dim,
             Self::Other { dimension, .. } => *dimension,
         }
@@ -158,10 +158,10 @@ impl ExecuteEntity {
     fn location(&self) -> ([f64; 3], [f64; 2]) {
         let (x, y, z, yaw, pitch) = match self {
             Self::Player(player) => {
-                let (x, y, z, yaw, pitch, _) = *player.pos.lock().unwrap();
+                let (x, y, z, yaw, pitch, _) = *player.pos.lock().unwrap_or_else(|e| e.into_inner());
                 (x, y, z, yaw, pitch)
             }
-            Self::Mob(mob) => *mob.pos.lock().unwrap(),
+            Self::Mob(mob) => *mob.pos.lock().unwrap_or_else(|e| e.into_inner()),
             Self::Other { pos, .. } => return (*pos, [0.0; 2]),
         };
         ([x, y, z], [f64::from(yaw), f64::from(pitch)])
@@ -170,8 +170,8 @@ impl ExecuteEntity {
     fn eye_height(&self) -> f64 {
         f64::from(match self {
             Self::Player(player) => {
-                let sneaking = *player.sneaking.lock().unwrap();
-                let flying = *player.fall_fly.lock().unwrap();
+                let sneaking = *player.sneaking.lock().unwrap_or_else(|e| e.into_inner());
+                let flying = *player.fall_fly.lock().unwrap_or_else(|e| e.into_inner());
                 player_eye_height(sneaking, flying)
             }
             Self::Mob(mob) => entity_eye_height_1211(mob.etype),
@@ -183,8 +183,8 @@ impl ExecuteEntity {
 
     fn health(&self) -> Option<f32> {
         match self {
-            Self::Player(player) => Some(*player.hp.lock().unwrap()),
-            Self::Mob(mob) => Some(*mob.hp.lock().unwrap()),
+            Self::Player(player) => Some(*player.hp.lock().unwrap_or_else(|e| e.into_inner())),
+            Self::Mob(mob) => Some(*mob.hp.lock().unwrap_or_else(|e| e.into_inner())),
             Self::Other { .. } => None,
         }
     }
@@ -229,7 +229,7 @@ impl ExecuteEntity {
             (Self::Other { owner, .. }, ExecuteRelation::Origin) => *owner,
             (Self::Mob(mob), ExecuteRelation::Owner) => {
                 let owner = {
-                    let states = live_mob_states().lock().unwrap();
+                    let states = live_mob_states().lock().unwrap_or_else(|e| e.into_inner());
                     match states.get(&mob.eid)?.behavior.as_ref()? {
                         MobBehaviorState::Wolf(pet) | MobBehaviorState::Cat(pet) => pet.owner?,
                         _ => return None,
@@ -241,7 +241,7 @@ impl ExecuteEntity {
                     .map(|player| player.eid)
             }
             (Self::Mob(mob), ExecuteRelation::Target) => {
-                let states = live_mob_states().lock().unwrap();
+                let states = live_mob_states().lock().unwrap_or_else(|e| e.into_inner());
                 match states.get(&mob.eid)?.behavior.as_ref()? {
                     MobBehaviorState::Warden(warden) => warden.target,
                     _ => None,
@@ -261,7 +261,7 @@ fn execute_entities() -> Vec<ExecuteEntity> {
     entities.extend(
         mobs()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .cloned()
             .map(ExecuteEntity::Mob),
@@ -271,7 +271,7 @@ fn execute_entities() -> Vec<ExecuteEntity> {
             entities.extend(
                 $registry()
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .iter()
                     .map(|e| ExecuteEntity::Other {
                         id: e.eid,
@@ -292,7 +292,7 @@ fn execute_entities() -> Vec<ExecuteEntity> {
     entities.extend(
         live_mob_projectiles()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .map(|projectile| ExecuteEntity::Other {
                 id: projectile.eid,
@@ -417,7 +417,7 @@ impl ExecuteSource {
             entities.push(entity.clone());
         }
 
-        let tag_snapshot = tags().lock().unwrap().clone();
+        let tag_snapshot = tags().lock().unwrap_or_else(|e| e.into_inner()).clone();
         let entity_tags: Vec<Vec<&str>> = entities
             .iter()
             .map(|entity| {
@@ -439,7 +439,7 @@ impl ExecuteSource {
             .flatten()
             .collect();
         let score_snapshot: Vec<HashMap<&str, i32>> = {
-            let board = scoreboard().lock().unwrap();
+            let board = scoreboard().lock().unwrap_or_else(|e| e.into_inner());
             entities
                 .iter()
                 .map(|entity| {
@@ -487,7 +487,7 @@ impl ExecuteSource {
                 let (name, level, gamemode) = match entity {
                     ExecuteEntity::Player(player) => {
                         use brigadier::SelectorGameMode::*;
-                        let mode = match *player.gm.lock().unwrap() {
+                        let mode = match *player.gm.lock().unwrap_or_else(|e| e.into_inner()) {
                             1 => Creative,
                             2 => Adventure,
                             3 => Spectator,
@@ -498,7 +498,7 @@ impl ExecuteSource {
                             Some(
                                 player_mechanism_sessions()
                                     .lock()
-                                    .unwrap()
+                                    .unwrap_or_else(|e| e.into_inner())
                                     .get(&player.eid)
                                     .map_or(0, |session| session.xp_bar.0),
                             ),
@@ -575,7 +575,7 @@ impl ExecuteSource {
                 .collect());
         }
         if target == "*" {
-            let board = scoreboard().lock().unwrap();
+            let board = scoreboard().lock().unwrap_or_else(|e| e.into_inner());
             let mut holders: Vec<_> = board
                 .scores
                 .get(objective)
@@ -693,7 +693,7 @@ impl ExecuteSource {
                 {
                     return Err("Invalid summon position".into());
                 }
-                let mut live = mobs().lock().unwrap();
+                let mut live = mobs().lock().unwrap_or_else(|e| e.into_inner());
                 if live.len() >= MOB_CAP {
                     return Err("mob cap reached".into());
                 }
@@ -749,15 +749,15 @@ fn execute_chunk_loaded(dim: DimId, x: i32, z: i32) -> bool {
     // Everything below is keyed by the queried dimension, so a Nether or End chunk
     // reports loaded on the same evidence an Overworld chunk does.
     region_guard().is_warm(x, z)
-        || forceloaded().lock().unwrap().contains(&chunk)
+        || forceloaded().lock().unwrap_or_else(|e| e.into_inner()).contains(&chunk)
         || world()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&(dim, chunk.0, chunk.1))
             .is_some_and(|cells| !cells.is_empty())
         || band_for(dim, chunk.0, chunk.1).is_some()
         || {
-            let store = section_store().lock().unwrap();
+            let store = section_store().lock().unwrap_or_else(|e| e.into_inner());
             store.generation == current_gen_seq()
                 && store
                     .map
@@ -766,12 +766,12 @@ fn execute_chunk_loaded(dim: DimId, x: i32, z: i32) -> bool {
         }
         || worldgen::with_gen_dim(dim, |g| g.pop_done.contains(&chunk)).unwrap_or(false)
         || client_snapshot().iter().any(|client| {
-            *client.dim.lock().unwrap() == dim && client.chunks.lock().unwrap().contains(&chunk)
+            *client.dim.lock().unwrap_or_else(|e| e.into_inner()) == dim && client.chunks.lock().unwrap_or_else(|e| e.into_inner()).contains(&chunk)
         })
 }
 
 fn execute_predicate(id: &str, source: &ExecuteSource) -> Option<bool> {
-    let body = predicates().lock().unwrap().get(id).cloned()?;
+    let body = predicates().lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned()?;
     Some(pred_eval(&body, source, 0))
 }
 
@@ -830,7 +830,7 @@ fn execute_condition(
             } else {
                 None
             };
-            let board = scoreboard().lock().unwrap();
+            let board = scoreboard().lock().unwrap_or_else(|e| e.into_inner());
             let get = |holder: Option<String>, objective: &str| board.get(&holder?, objective);
             let value = get(holder, objective);
             let matched = match test {
@@ -1387,7 +1387,7 @@ fn execute_storage() -> &'static LockedMap<String, ExecTag> {
 
 fn execute_block_data(dim: DimId, (x, y, z): BlockPos) -> Option<ExecTag> {
     if dim == DimId::Overworld {
-        let generated = generated_content().lock().unwrap();
+        let generated = generated_content().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(tag) = generated.spawners.get(&(x, y, z)) {
             let mut tag = tag.clone();
             if let ExecTag::Compound(fields) = &mut tag {
@@ -1399,7 +1399,7 @@ fn execute_block_data(dim: DimId, (x, y, z): BlockPos) -> Option<ExecTag> {
         }
     }
     let key = (dim, x, y, z);
-    if let Some(furnace) = furnaces().lock().unwrap().get(&key) {
+    if let Some(furnace) = furnaces().lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         let slots = HashMap::from([
             (0, furnace.input.clone()),
             (1, furnace.fuel.clone()),
@@ -1417,7 +1417,7 @@ fn execute_block_data(dim: DimId, (x, y, z): BlockPos) -> Option<ExecTag> {
             ),
         ]));
     }
-    if let Some(slots) = chests().lock().unwrap().get(&ContainerKey::Block(key)) {
+    if let Some(slots) = chests().lock().unwrap_or_else(|e| e.into_inner()).get(&ContainerKey::Block(key)) {
         return Some(execute_nbt_compound([(
             "Items",
             stacks_to_items_nbt(slots),
@@ -1457,7 +1457,7 @@ fn execute_block_data(dim: DimId, (x, y, z): BlockPos) -> Option<ExecTag> {
 /// `front_text`/`back_text`/`is_waxed` carries, so `if data`/`store` see what a client
 /// would. Lines are JSON-string components, matching `sign_side_nbt`.
 fn execute_sign_block_data(dim: DimId, (x, y, z): BlockPos) -> ExecTag {
-    let store = signs().lock().unwrap();
+    let store = signs().lock().unwrap_or_else(|e| e.into_inner());
     let side = |front: u8| {
         let lines = store.get(&(dim, x, y, z, front)).cloned().unwrap_or_default();
         execute_nbt_compound([
@@ -1516,18 +1516,18 @@ fn execute_entity_data(entity: &ExecuteEntity) -> ExecTag {
         ExecuteEntity::Player(player) => {
             values.push((
                 "Inventory",
-                stacks_to_items_nbt(&player.inv.lock().unwrap()),
+                stacks_to_items_nbt(&player.inv.lock().unwrap_or_else(|e| e.into_inner())),
             ));
         }
         ExecuteEntity::Mob(mob) => {
             values.push((
                 "Air",
-                ExecTag::Short((*mob.air.lock().unwrap() * GAME_TICKS_PER_TICK as i32) as i16),
+                ExecTag::Short((*mob.air.lock().unwrap_or_else(|e| e.into_inner()) * GAME_TICKS_PER_TICK as i32) as i16),
             ));
             values.push((
                 "Fire",
                 ExecTag::Short(
-                    (*mob.fire_ticks.lock().unwrap() * GAME_TICKS_PER_TICK as i32) as i16,
+                    (*mob.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) * GAME_TICKS_PER_TICK as i32) as i16,
                 ),
             ));
         }
@@ -1538,7 +1538,7 @@ fn execute_entity_data(entity: &ExecuteEntity) -> ExecTag {
         } => {
             if let Some(item) = drops()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .iter()
                 .find(|item| item.eid == *id)
                 .and_then(|item| stack_to_nbt(0, &(item.item, item.cnt, item.comps.clone())))
@@ -1570,16 +1570,16 @@ fn execute_read_data(
             let selected = source.select(target)?;
             match selected.as_slice() {
                 [entity] => Some(execute_entity_data(entity)),
-                [] => actors().lock().unwrap().get(target).map(|actor| {
+                [] => actors().lock().unwrap_or_else(|e| e.into_inner()).get(target).map(|actor| {
                     execute_nbt_compound([(
                         "Inventory",
-                        stacks_to_items_nbt(&actor.inv.lock().unwrap()),
+                        stacks_to_items_nbt(&actor.inv.lock().unwrap_or_else(|e| e.into_inner())),
                     )])
                 }),
                 _ => return Err("Expected a single data entity".into()),
             }
         }
-        ExecuteDataTarget::Storage(id) => execute_storage().lock().unwrap().get(id).cloned(),
+        ExecuteDataTarget::Storage(id) => execute_storage().lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned(),
     })
 }
 
@@ -1608,13 +1608,13 @@ impl BoundExecuteStore {
                 }
                 scoreboard()
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .require_writable(objective)
                     .map_err(scoreboard_command_error)?;
                 BoundExecuteTarget::Score(holders, objective.clone())
             }
             ExecuteStoreTarget::Bossbar { id, field } => {
-                if !bossbars().lock().unwrap().contains_key(id) {
+                if !bossbars().lock().unwrap_or_else(|e| e.into_inner()).contains_key(id) {
                     return Err(format!("Unknown bossbar '{id}'"));
                 }
                 BoundExecuteTarget::Bossbar(id.clone(), *field)
@@ -1680,7 +1680,7 @@ impl BoundExecuteStore {
         };
         match &self.target {
             BoundExecuteTarget::Score(holders, objective) => {
-                let mut board = scoreboard().lock().unwrap();
+                let mut board = scoreboard().lock().unwrap_or_else(|e| e.into_inner());
                 let available = board
                     .scores
                     .get(objective)
@@ -1702,7 +1702,7 @@ impl BoundExecuteStore {
                 }
             }
             BoundExecuteTarget::Bossbar(id, field) => {
-                let mut bars = bossbars().lock().unwrap();
+                let mut bars = bossbars().lock().unwrap_or_else(|e| e.into_inner());
                 let bar = bars
                     .get_mut(id)
                     .ok_or_else(|| format!("Unknown bossbar '{id}'"))?;
@@ -1715,11 +1715,11 @@ impl BoundExecuteStore {
                     .iter()
                     .filter(|player| bar.shown_to(player))
                 {
-                    let _ = send_packet(&mut player.sock.lock().unwrap(), 0x0a, packet.clone());
+                    let _ = send_packet(&mut player.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x0a, packet.clone());
                 }
             }
             BoundExecuteTarget::Storage(id, path, ty, scale) => {
-                let mut storage = execute_storage().lock().unwrap();
+                let mut storage = execute_storage().lock().unwrap_or_else(|e| e.into_inner());
                 let mut data = storage
                     .get(id)
                     .cloned()
@@ -1775,21 +1775,21 @@ fn execute_write_mob_data(mob: &Mob, path: &ExecuteNbtPath, value: &ExecTag) -> 
         [Key(key)] => match key.to_utf8().map_err(|_| unsupported())?.as_str() {
             "Health" => {
                 let max = entity_spec_by_id(mob.etype).map_or(f32::MAX, |spec| spec.max_health);
-                *mob.hp.lock().unwrap() = (number as f32).clamp(0.0, max);
+                *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) = (number as f32).clamp(0.0, max);
                 Ok(())
             }
             "Air" => {
-                *mob.air.lock().unwrap() = number as i16 as i32 / GAME_TICKS_PER_TICK as i32;
+                *mob.air.lock().unwrap_or_else(|e| e.into_inner()) = number as i16 as i32 / GAME_TICKS_PER_TICK as i32;
                 Ok(())
             }
             "Fire" => {
-                *mob.fire_ticks.lock().unwrap() = number as i16 as i32 / GAME_TICKS_PER_TICK as i32;
+                *mob.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) = number as i16 as i32 / GAME_TICKS_PER_TICK as i32;
                 Ok(())
             }
             _ => Err(unsupported()),
         },
         [Key(key), Index(index)] => {
-            let mut pos = mob.pos.lock().unwrap();
+            let mut pos = mob.pos.lock().unwrap_or_else(|e| e.into_inner());
             match (
                 key.to_utf8().map_err(|_| unsupported())?.as_str(),
                 *index,
@@ -1830,7 +1830,7 @@ fn execute_write_block_data(
             return Err(unsupported());
         }
         if dim == DimId::Overworld {
-            let mut generated = generated_content().lock().unwrap();
+            let mut generated = generated_content().lock().unwrap_or_else(|e| e.into_inner());
             if let Some(data) = generated.spawners.get_mut(&pos) {
                 let mut updated = data.clone();
                 if !path.set(&mut updated, value) {
@@ -1841,7 +1841,7 @@ fn execute_write_block_data(
             }
         }
         let (x, y, z) = pos;
-        if let Some(furnace) = furnaces().lock().unwrap().get_mut(&(dim, x, y, z)) {
+        if let Some(furnace) = furnaces().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&(dim, x, y, z)) {
             match (key.as_str(), path.0.len()) {
                 ("BurnTime", 1) | ("CookTime", 1) => {
                     let ticks = execute_nbt_number(value).ok_or_else(unsupported)? as i16;
@@ -1869,7 +1869,7 @@ fn execute_write_block_data(
             return Ok(());
         }
         if key == "Items" {
-            let mut containers = chests().lock().unwrap();
+            let mut containers = chests().lock().unwrap_or_else(|e| e.into_inner());
             if let Some(slots) = containers.get_mut(&ContainerKey::Block((dim, x, y, z))) {
                 return execute_write_items(slots, path, value);
             }
@@ -2200,7 +2200,7 @@ fn execute_run(
         ("scoreboard", ["players", _, _, ..]) => return execute_run_scoreboard(source, &parts, s),
         ("tag", [target, action @ ("add" | "remove"), tag]) => {
             let entities = source.select(target)?;
-            let mut tags = tags().lock().unwrap();
+            let mut tags = tags().lock().unwrap_or_else(|e| e.into_inner());
             let count = entities
                 .iter()
                 .filter(|entity| {
@@ -2220,7 +2220,7 @@ fn execute_run(
         }
         ("kill", [] | ["@s"]) => {
             if let Some(ExecuteEntity::Mob(mob)) = &source.entity {
-                let (x, y, z, ..) = *mob.pos.lock().unwrap();
+                let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
                 kill_mob(mob.eid, mob.etype, x, y, z);
                 return Ok(1);
             }
@@ -2316,7 +2316,7 @@ fn execute_run_scoreboard(
     if holders.is_empty() || sources.is_empty() {
         return Err("No score holders found".into());
     }
-    let mut board = scoreboard().lock().unwrap();
+    let mut board = scoreboard().lock().unwrap_or_else(|e| e.into_inner());
     let mut result = 0i32;
     let mut replies = Vec::new();
     let mut resolved = args.to_vec();
@@ -2340,7 +2340,7 @@ fn execute_run_scoreboard(
     drop(board);
     if let Some(client) = s {
         let _ = send_packet(
-            &mut client.sock.lock().unwrap(),
+            &mut client.sock.lock().unwrap_or_else(|e| e.into_inner()),
             0x6c,
             system_chat(&replies.join("; ")),
         );
@@ -2450,7 +2450,7 @@ fn block_tag_has(tag: &str, st: u32, depth: usize) -> bool {
     }
     let members = block_tags()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(tag)
         .cloned()
         .unwrap_or_default();
@@ -2594,7 +2594,7 @@ mod execute_dimension_tests {
         lines[0] = "Hello".to_owned();
         signs()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert((DimId::Nether, 56, 80, 40, 1), lines);
         assert_eq!(
             execute_console(

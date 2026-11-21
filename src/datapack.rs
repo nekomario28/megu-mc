@@ -196,7 +196,7 @@ fn tag_expand_into(
 /// Fully expanded member list of one tag id (`ns:name` without `#`).
 #[allow(dead_code)] // expansion API — consumed by tag lookups and later lanes
 fn datapack_tag_members(category: &str, id: &str) -> Vec<String> {
-    let registry = datapack_registry().lock().unwrap();
+    let registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
     let mut out = Vec::new();
     if let Some(map) = registry.tags.get(category) {
         tag_expand_into(map, id, &mut HashSet::new(), &mut HashSet::new(), &mut out);
@@ -225,7 +225,7 @@ fn tag_contains_rec(
 
 /// `#ref`-aware membership test used by `/fillbiome ... replace #tag`.
 fn datapack_tag_contains(category: &str, id: &str, member: &str) -> bool {
-    let registry = datapack_registry().lock().unwrap();
+    let registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
     registry
         .tags
         .get(category)
@@ -235,7 +235,7 @@ fn datapack_tag_contains(category: &str, id: &str, member: &str) -> bool {
 /// `true` when a `#tag` id is registered under the `biome` or `worldgen/biome`
 /// tag category (both spellings appear in 1.21.1 datapacks).
 fn biome_tag_known(tag: &str) -> bool {
-    let registry = datapack_registry().lock().unwrap();
+    let registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
     ["biome", "worldgen/biome"]
         .iter()
         .any(|cat| registry.tags.get(*cat).is_some_and(|map| map.contains_key(tag)))
@@ -494,7 +494,7 @@ fn biome_overrides() -> &'static Mutex<HashMap<DimId, HashMap<(i32, i32, i32), S
 fn effective_biome_name(dim: DimId, qx: i32, qy: i32, qz: i32) -> Option<String> {
     if let Some(name) = biome_overrides()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(&dim)
         .and_then(|m| m.get(&(qx, qy, qz)))
     {
@@ -2021,7 +2021,7 @@ fn loot_eff_weight(node: &LootEntryNode, luck: f32) -> i32 {
 fn loot_smelt_result(item: &str) -> Option<String> {
     let bare = item.strip_prefix("minecraft:").unwrap_or(item);
     let item_id = name_to_item(bare)?;
-    json_smelts().lock().unwrap().iter().find_map(|(ingr, out, _, _)| {
+    json_smelts().lock().unwrap_or_else(|e| e.into_inner()).iter().find_map(|(ingr, out, _, _)| {
         let hit = match ingr {
             Ingr::Item(id) => *id == item_id,
             Ingr::Tag(tag) => loot_item_in_tag(tag, item),
@@ -2573,7 +2573,7 @@ impl DynamicDataRegistries {
 #[cfg_attr(not(test), allow(dead_code))]
 fn load_dynamic_registries(base: &std::path::Path) -> DynamicDataRegistries {
     let mut regs = DynamicDataRegistries::default();
-    let disabled = disabled_datapacks().lock().unwrap().clone();
+    let disabled = disabled_datapacks().lock().unwrap_or_else(|e| e.into_inner()).clone();
     for (name, path, zip) in datapack_sources(base) {
         if disabled.contains(&name) {
             continue;
@@ -2643,7 +2643,7 @@ fn dynamic_registries() -> &'static Mutex<DynamicDataRegistries> {
 #[allow(dead_code)]
 fn refresh_dynamic_registries() {
     let regs = load_dynamic_registries(std::path::Path::new(DATAPACK_DIRECTORY));
-    *dynamic_registries().lock().unwrap() = regs;
+    *dynamic_registries().lock().unwrap_or_else(|e| e.into_inner()) = regs;
 }
 
 // ------------------------------------------------------------ p3_parity ---
@@ -2754,7 +2754,7 @@ mod p3_datapack_tests {
         reload_datapacks(root, None, false).expect("synthetic pack loads");
 
         {
-            let registry = datapack_registry().lock().unwrap();
+            let registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
             for category in [
                 "block",
                 "item",
@@ -2801,8 +2801,8 @@ mod p3_datapack_tests {
         assert!(!datapack_tag_contains("item", "test:nested", "minecraft:emerald"));
         assert!(datapack_tag_contains("item", "test:cycle_a", "minecraft:dirt"));
         // Builtins still seed the legacy block/item maps.
-        assert!(block_tags().lock().unwrap().contains_key("minecraft:logs"));
-        assert!(block_tags().lock().unwrap().contains_key("test:probe"));
+        assert!(block_tags().lock().unwrap_or_else(|e| e.into_inner()).contains_key("minecraft:logs"));
+        assert!(block_tags().lock().unwrap_or_else(|e| e.into_inner()).contains_key("test:probe"));
     }
 
     #[test]
@@ -2849,7 +2849,7 @@ mod p3_datapack_tests {
         );
         reload_datapacks(Path::new("datapacks"), None, false).expect("loads");
 
-        let registry = datapack_registry().lock().unwrap();
+        let registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(registry.stonecutting.len(), 2);
         let (first, second) = (&registry.stonecutting[0], &registry.stonecutting[1]);
         assert!(
@@ -2899,7 +2899,7 @@ mod p3_datapack_tests {
         }
         // cwd is the repo root here: the real datapacks/ tree loads.
         reload_datapacks(Path::new("datapacks"), None, false).expect("vanilla loads");
-        let registry = datapack_registry().lock().unwrap();
+        let registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
         let block = registry.tags.get("block").expect("block category");
         assert!(
             block.len() >= 184,

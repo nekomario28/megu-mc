@@ -167,8 +167,8 @@ fn apply_item_attribute_modifiers(
 /// main hand, off hand, and the four armor slots. Stacks are cloned so no
 /// inventory lock is held while the modifiers are evaluated.
 fn equipped_pairs(c: &Client) -> Vec<(ItemAttrSlotGroup, Stack)> {
-    let inv = c.inv.lock().unwrap();
-    let held_slot = *c.held.lock().unwrap();
+    let inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
+    let held_slot = *c.held.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = Vec::with_capacity(6);
     if let Some(st) = inv.get(&(36 + held_slot)) {
         out.push((ItemAttrSlotGroup::MainHand, st.clone()));
@@ -233,7 +233,7 @@ fn refresh_equip_attrs(c: &Client) {
             m.insert(id, (add, mb, mt));
         }
     }
-    equip_attrs().lock().unwrap().insert(c.name.clone(), m);
+    equip_attrs().lock().unwrap_or_else(|e| e.into_inner()).insert(c.name.clone(), m);
 }
 
 /// Vanilla `Player.currentItemAttackStrengthDelay` source: the effective
@@ -245,7 +245,7 @@ fn refresh_equip_attrs(c: &Client) {
 fn melee_attack_speed(me: &Client, item: i64) -> f64 {
     let base = attrs()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(&format!("p:{}", me.name))
         .and_then(|m| m.get("generic.attack_speed"))
         .copied()
@@ -291,7 +291,7 @@ fn attack_tickers() -> &'static Mutex<HashMap<i32, AttackTicker>> {
 /// swing paths outside this file.
 #[allow(dead_code)]
 fn reset_attack_ticker(eid: i32) {
-    let mut map = attack_tickers().lock().unwrap();
+    let mut map = attack_tickers().lock().unwrap_or_else(|e| e.into_inner());
     let tick = TICK_IDX.load(Ordering::Relaxed);
     map.entry(eid)
         .and_modify(|st| {
@@ -311,7 +311,7 @@ fn reset_attack_ticker(eid: i32) {
 // TICK_IDX so `/tick freeze` and tick lag freeze the recharge instead of
 // drifting on wall-clock time.
 fn melee_charge(me: &Arc<Client>, item: i64) -> f32 {
-    let speed_eff = me.effs.lock().unwrap().iter().fold(1.0_f32, |speed, effect| {
+    let speed_eff = me.effs.lock().unwrap_or_else(|e| e.into_inner()).iter().fold(1.0_f32, |speed, effect| {
         match effect.id {
             2 | 3 => speed * effects::effect_attribute_modifier(
                 effect.id + 1, effect.amp, effects::EffectAttribute::AttackSpeed,
@@ -322,11 +322,11 @@ fn melee_charge(me: &Arc<Client>, item: i64) -> f32 {
     let speed = melee_attack_speed(me, item) * f64::from(speed_eff.max(0.001));
     let delay_ticks = 20.0 / speed.max(0.001);
     let now_tick = TICK_IDX.load(Ordering::Relaxed);
-    let held_slot = *me.held.lock().unwrap();
-    let mut lm = me.last_melee.lock().unwrap();
+    let held_slot = *me.held.lock().unwrap_or_else(|e| e.into_inner());
+    let mut lm = me.last_melee.lock().unwrap_or_else(|e| e.into_inner());
     let wall_ticks =
         u64::try_from(lm.elapsed().as_millis() / u128::from(TICK_MS)).unwrap_or(u64::MAX);
-    let mut map = attack_tickers().lock().unwrap();
+    let mut map = attack_tickers().lock().unwrap_or_else(|e| e.into_inner());
     let elapsed = match map.get(&me.eid) {
         // Ticker is live and the wall stamp is untouched: game ticks only.
         Some(st) if st.wall == Some(*lm) => {
@@ -542,7 +542,7 @@ fn mob_fire_ticks() -> &'static Mutex<HashMap<i32, u32>> {
 /// Vanilla `Entity.setRemainingFireTicks`: store a fresh burn without touching
 /// `Mob.fuse` or `Mob.fire_ticks` bookkeeping owned elsewhere.
 fn ignite_mob(eid: i32, ticks: u32) {
-    mob_fire_ticks().lock().unwrap().insert(eid, ticks);
+    mob_fire_ticks().lock().unwrap_or_else(|e| e.into_inner()).insert(eid, ticks);
 }
 /// Vanilla `Player.attack`'s `target.igniteForSeconds(4 * fireAspectLevel)`:
 /// Fire Aspect I burns 80 game ticks (4s), Fire Aspect II 160 (8s).
@@ -557,21 +557,21 @@ fn ignite_mob_fire_aspect(eid: i32, level: i64) {
 fn mob_fire_ticks_of(eid: i32) -> u32 {
     mob_fire_ticks()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(&eid)
         .copied()
         .unwrap_or(0)
 }
 /// Vanilla water/rain extinguish (`Entity.isInWaterOrRain`): clears the burn.
 fn extinguish_mob_fire(eid: i32) {
-    mob_fire_ticks().lock().unwrap().remove(&eid);
+    mob_fire_ticks().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
 }
 /// One server tick of burning on the map store: decrements cleanly, pays
 /// `1.0` HP every `MOB_BURN_TICK_GT` game ticks, never damages a fire-immune
 /// mob, and goes out in water or rain. Returns the fire damage for the tick.
 #[cfg_attr(not(test), allow(dead_code))]
 fn tick_mob_fire(eid: i32, tick: u64, fire_immune: bool, wet: bool) -> bool {
-    let mut map = mob_fire_ticks().lock().unwrap();
+    let mut map = mob_fire_ticks().lock().unwrap_or_else(|e| e.into_inner());
     if wet {
         map.remove(&eid);
         return false;
@@ -610,8 +610,8 @@ fn sweeping_movement_ok(horizontal_speed: f64, speed_cap: f64) -> bool {
 // vanilla: blocking with a shield pays floor(blocked)+1 durability
 fn damage_shield(me: &Arc<Client>, blocked: f32) {
     let sh = name_to_item("shield").unwrap_or(-9);
-    let slots = [45i16, 36 + *me.held.lock().unwrap()];
-    let mut inv = me.inv.lock().unwrap();
+    let slots = [45i16, 36 + *me.held.lock().unwrap_or_else(|e| e.into_inner())];
+    let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
     for slot in slots {
         let Some(st) = inv.get_mut(&slot) else {
             continue;
@@ -645,7 +645,7 @@ fn damage_armor(me: &Arc<Client>, raw_dmg: f32) {
     let per = (raw_dmg / 4.0).floor().max(1.0) as i64;
     let mut broke = false;
     {
-        let mut inv = me.inv.lock().unwrap();
+        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
         for slot in [5i16, 6, 7, 8] {
             let Some(st) = inv.get_mut(&slot) else {
                 continue;
@@ -673,11 +673,11 @@ fn damage_armor(me: &Arc<Client>, raw_dmg: f32) {
                 comp_set_varint(&mut st.2, COMP_DAMAGE, dmg);
             }
         }
-        *me.armor_pts.lock().unwrap() = armor_pts_of(&inv);
+        *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&inv);
     }
     if broke {
         let (x, y, z, ..) = {
-            let p = me.pos.lock().unwrap();
+            let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
             *p
         };
         let snd = sound_pkt_named("entity.item.break", x, y + 1.0, z);
@@ -688,7 +688,7 @@ fn damage_armor(me: &Arc<Client>, raw_dmg: f32) {
         let st = me
             .inv
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&slot)
             .cloned()
             .unwrap_or((0, 0, Vec::new()));
@@ -761,10 +761,10 @@ fn mob_xp(etype: i64) -> i16 {
 fn kill_mob(deid: i32, etype: i64, mx: f64, my: f64, mz: f64) {
     extinguish_mob_fire(deid);
     let Some((mob, state)) = remove_live_mob(deid) else { return };
-    let burning = *mob.fire_ticks.lock().unwrap() > 0;
+    let burning = *mob.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) > 0;
     live_mob_death(&mob, state, [mx, my, mz]);
     broadcast_seen_destroy(deid);
-    let was_sheared = sheared().lock().unwrap().remove(&deid);
+    let was_sheared = sheared().lock().unwrap_or_else(|e| e.into_inner()).remove(&deid);
     for (item, cnt, comps) in mob_loot(etype, burning)
         .into_iter()
         .filter(|st| !(was_sheared && st.0 == 202))
@@ -782,10 +782,10 @@ fn kill_mob(deid: i32, etype: i64, mx: f64, my: f64, mz: f64) {
             target: None,
             thrower: None,
         };
-        drops().lock().unwrap().push(d);
+        drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
     }
     let xeid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-    xps().lock().unwrap().push(Xp {
+    xps().lock().unwrap_or_else(|e| e.into_inner()).push(Xp {
         eid: xeid,
         x: mx,
         y: my,
@@ -803,12 +803,12 @@ fn mob_env_die(deid: i32, etype: i64, mx: f64, my: f64, mz: f64, burning: bool) 
     let Some((mob, state)) = remove_live_mob(deid) else { return };
     live_mob_death(&mob, state, [mx, my, mz]);
     broadcast_seen_destroy(deid);
-    sheared().lock().unwrap().remove(&deid);
+    sheared().lock().unwrap_or_else(|e| e.into_inner()).remove(&deid);
     for (item, cnt, comps) in mob_loot(etype, burning)
         .into_iter()
         .filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1)
     {
-        drops().lock().unwrap().push(Drop {
+        drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
             eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
             x: mx,
             y: my,
@@ -890,7 +890,7 @@ fn cooked_drop(item: i64) -> Option<i64> {
     None
 }
 fn mob_loot(etype: i64, burning: bool) -> Vec<Stack> {
-    if let Some(pools) = mob_loot_tables().lock().unwrap().get(&etype).map(|p| {
+    if let Some(pools) = mob_loot_tables().lock().unwrap_or_else(|e| e.into_inner()).get(&etype).map(|p| {
         p.iter()
             .map(|pl| LootPool {
                 rolls: pl.rolls,
@@ -1052,7 +1052,7 @@ fn armor_dmg_factor(c: &Client, raw: f32) -> f64 {
         })
         .copied()
         .collect();
-    let armor = f64::from(*c.armor_pts.lock().unwrap())
+    let armor = f64::from(*c.armor_pts.lock().unwrap_or_else(|e| e.into_inner()))
         + apply_item_attribute_modifiers(0.0, &hand_pairs, ATTR_ARMOR);
     let f = 2.0 + armor_toughness_of(&pairs) / 4.0;
     let v = armor - f64::from(raw) / f;
@@ -1065,7 +1065,7 @@ fn armor_dmg_factor(c: &Client, raw: f32) -> f64 {
 // 1 fall (feather_falling 3x), 2 explosion (blast 2x), 3 projectile
 // (proj 2x), 4 fire (fire_prot 2x)
 fn enchant_epf(c: &Client, kind: u8) -> i64 {
-    let inv = c.inv.lock().unwrap();
+    let inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
     let mut epf = 0i64;
     for slot in [5i16, 6, 7, 8] {
         if let Some((_, _, comps)) = inv.get(&slot) {
@@ -1089,11 +1089,11 @@ fn dmg_after(c: &Client, raw: f32, kind: u8) -> f32 {
 // offhand), consume it — vanilla sets hp to 1, fires entity_status 35,
 // plays the totem animation+sound, grants absorption/regen/fire_resist
 fn totem_check(c: &Client) {
-    if *c.hp.lock().unwrap() > 0.0 || *c.gm.lock().unwrap() == 1 {
+    if *c.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0 || *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
         return;
     }
-    let mut inv = c.inv.lock().unwrap();
-    let held_k = 36i16 + (*c.held.lock().unwrap());
+    let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
+    let held_k = 36i16 + (*c.held.lock().unwrap_or_else(|e| e.into_inner()));
     for k in [45i16, held_k] {
         if inv.get(&k).map(|v| v.0) == Some(1163) {
             let st = inv.get(&k).unwrap().clone();
@@ -1104,23 +1104,23 @@ fn totem_check(c: &Client) {
             }
             let now = inv.get(&k).cloned().unwrap_or((0, 0, Vec::new()));
             drop(inv);
-            *c.hp.lock().unwrap() = 1.0;
+            *c.hp.lock().unwrap_or_else(|e| e.into_inner()) = 1.0;
             resync_slot(c, 0, k, &now);
             // entity_status 35 = totem use; i32 entity id + i8 status
             let mut st_pkt = Vec::new();
             st_pkt.extend_from_slice(&c.eid.to_be_bytes());
             st_pkt.push(35);
-            let _ = send_packet(&mut c.sock.lock().unwrap(), 0x1f, st_pkt.clone());
+            let _ = send_packet(&mut c.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x1f, st_pkt.clone());
             broadcast_seen(c.eid, |_c| (0x1f, st_pkt.clone()));
             let (px, py, pz, ..) = {
-                let p = c.pos.lock().unwrap();
+                let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
                 *p
             };
             let snd = sound_pkt_named("item.totem.use", px, py, pz);
             broadcast_seen(c.eid, |_c| (0x68, snd.clone()));
             // Death protection replaces existing effects with the vanilla grant set.
-            grant_totem_effects(c, &mut c.effs.lock().unwrap());
-            let _ = send_packet(&mut c.sock.lock().unwrap(), 0x5d, health_pkt_c(1.0, c));
+            grant_totem_effects(c, &mut c.effs.lock().unwrap_or_else(|e| e.into_inner()));
+            let _ = send_packet(&mut c.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x5d, health_pkt_c(1.0, c));
             return;
         }
     }
@@ -1154,7 +1154,7 @@ fn grant_totem_effects(c: &Client, ef: &mut Vec<Eff>) {
         broadcast_seen(c.eid, |_| (0x43, packet.clone()));
     }
     totem_effects(ef);
-    *c.absorb.lock().unwrap() = 8.0;
+    *c.absorb.lock().unwrap_or_else(|e| e.into_inner()) = 8.0;
     for e in ef.iter() {
         // The wire uses game ticks even while the simulation stores server ticks.
         let packet = entity_effect_pkt(c.eid, e.id, e.amp, e.left);
@@ -1394,9 +1394,9 @@ const MOB_HURT_WINDOW_GT: u64 = 10;
 fn mob_hurt_window_tick() {
     let now_tick = TICK_IDX.load(Ordering::Relaxed);
     let now = Instant::now();
-    for mob in mobs().lock().unwrap().iter() {
-        let mut hurt_tick = mob.last_hurt_tick.lock().unwrap();
-        let mut hurt_at = mob.hurt_at.lock().unwrap();
+    for mob in mobs().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        let mut hurt_tick = mob.last_hurt_tick.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hurt_at = mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner());
         match *hurt_tick {
             Some(t) if now_tick.saturating_sub(t) < MOB_HURT_WINDOW_GT => {
                 *hurt_at = now + Duration::from_secs(3600);
@@ -1422,7 +1422,7 @@ fn arrow_tick() {
     let mut hits: Vec<(i32, f32)> = vec![]; // (victim eid, arrow dmg)
     let mut mob_dead: Vec<(i32, i64, f64, f64, f64)> = vec![];
     {
-        let mut ar = arrows().lock().unwrap();
+        let mut ar = arrows().lock().unwrap_or_else(|e| e.into_inner());
         let region = region_guard();
         for a in ar.iter_mut() {
             let eid = a.eid;
@@ -1440,18 +1440,18 @@ fn arrow_tick() {
                 let grab = {
                     clients()
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .iter()
-                        .filter(|c| *c.gm.lock().unwrap() != 1)
+                        .filter(|c| *c.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1)
                         .find(|c| {
-                            let p = c.pos.lock().unwrap();
+                            let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
                             let (dx, dy, dz) = (p.0 - ax, (p.1 + 0.9) - ay, p.2 - az);
                             dx * dx + dy * dy + dz * dz < 1.3
                         })
                         .cloned()
                 };
                 if let Some(c) = grab {
-                    let mut inv = c.inv.lock().unwrap();
+                    let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
                     let slot: i16 = (9..=44i16)
                         .find(|sl| {
                             inv.get(sl)
@@ -1467,7 +1467,7 @@ fn arrow_tick() {
                     let st =
                         c.inv
                             .lock()
-                            .unwrap()
+                            .unwrap_or_else(|e| e.into_inner())
                             .get(&slot)
                             .cloned()
                             .unwrap_or((802, 1, Vec::new()));
@@ -1517,12 +1517,12 @@ fn arrow_tick() {
             if a.owner >= 0 {
                 // Player-shot arrow: intersect the whole segment with mobs and
                 // other players. The owner and last pierced target are skipped.
-                let ml = mobs().lock().unwrap();
+                let ml = mobs().lock().unwrap_or_else(|e| e.into_inner());
                 'outer: for m in ml.iter() {
                     if m.eid == a.last_hit || m.dim != DimId::Overworld {
                         continue;
                     }
-                    let (mx, my, mz, ..) = *m.pos.lock().unwrap();
+                    let (mx, my, mz, ..) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
                     if projectile_segment_hits(
                         segment_start,
                         segment_end,
@@ -1536,21 +1536,21 @@ fn arrow_tick() {
                             dead.push(eid);
                             break;
                         }
-                        *m.hurt_at.lock().unwrap() = Instant::now();
-                        *m.last_hurt_tick.lock().unwrap() =
+                        *m.hurt_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+                        *m.last_hurt_tick.lock().unwrap_or_else(|e| e.into_inner()) =
                             Some(TICK_IDX.load(Ordering::Relaxed));
-                        let mut h = m.hp.lock().unwrap();
+                        let mut h = m.hp.lock().unwrap_or_else(|e| e.into_inner());
                         *h -= a.dmg;
                         let dh = *h;
                         drop(h);
                         if a.fire > 0 && !mob_fire_immune(m.etype) {
-                            *m.fire_ticks.lock().unwrap() = a.fire;
+                            *m.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) = a.fire;
                             ignite_mob(m.eid, a.fire.max(0) as u32);
                         }
                         if a.punch > 0 && a.kind == 0 {
                             let vl = (a.dx * a.dx + a.dz * a.dz).sqrt().max(0.01);
                             let kb = 0.3 * a.punch as f64;
-                            let mut p = m.pos.lock().unwrap();
+                            let mut p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
                             p.0 += a.dx / vl * kb;
                             p.2 += a.dz / vl * kb;
                             drop(p);
@@ -1559,11 +1559,11 @@ fn arrow_tick() {
                                     0x70,
                                     entity_teleport(
                                         m.eid,
-                                        m.pos.lock().unwrap().0,
-                                        m.pos.lock().unwrap().1,
-                                        m.pos.lock().unwrap().2,
-                                        m.pos.lock().unwrap().3,
-                                        m.pos.lock().unwrap().4,
+                                        m.pos.lock().unwrap_or_else(|e| e.into_inner()).0,
+                                        m.pos.lock().unwrap_or_else(|e| e.into_inner()).1,
+                                        m.pos.lock().unwrap_or_else(|e| e.into_inner()).2,
+                                        m.pos.lock().unwrap_or_else(|e| e.into_inner()).3,
+                                        m.pos.lock().unwrap_or_else(|e| e.into_inner()).4,
                                         true,
                                     ),
                                 )
@@ -1574,14 +1574,14 @@ fn arrow_tick() {
                         // (punch slot carries the level for kind==1)
                         if a.kind == 1 && a.punch > 0 && THUNDERING.load(Ordering::Relaxed) > 0 {
                             {
-                                let mut h2 = m.hp.lock().unwrap();
+                                let mut h2 = m.hp.lock().unwrap_or_else(|e| e.into_inner());
                                 *h2 -= 5.0;
                             }
-                            *m.fuse.lock().unwrap() = server_ticks(CREEPER_FUSE_GT) as i32; // ignite ~5s
+                            *m.fuse.lock().unwrap_or_else(|e| e.into_inner()) = server_ticks(CREEPER_FUSE_GT) as i32; // ignite ~5s
                             let be = NEXT_EID.fetch_add(1, Ordering::SeqCst);
                             bolts()
                                 .lock()
-                                .unwrap()
+                                .unwrap_or_else(|e| e.into_inner())
                                 .push((be, server_ticks(BOLT_LIFE_GT) as i32));
                             broadcast(-1, |_c| (0x01, spawn_typed_pkt(be, 64, mx, my, mz)));
                             let ts = sound_pkt_named("entity.lightning_bolt.thunder", mx, my, mz);
@@ -1591,7 +1591,7 @@ fn arrow_tick() {
                             mob_dead.push((m.eid, m.etype, mx, my, mz));
                             let on = clients()
                                 .lock()
-                                .unwrap()
+                                .unwrap_or_else(|e| e.into_inner())
                                 .iter()
                                 .find(|c| c.eid == a.owner)
                                 .map(|c| c.name.clone());
@@ -1616,7 +1616,7 @@ fn arrow_tick() {
                             continue;
                         }
                         let (px, py, pz, ..) = {
-                            let p = c.pos.lock().unwrap();
+                            let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
                             *p
                         };
                         if c.eid == a.last_hit {
@@ -1645,7 +1645,7 @@ fn arrow_tick() {
                 let cls: Vec<Arc<Client>> = client_snapshot();
                 for c in cls.iter() {
                     let (px, py, pz, ..) = {
-                        let p = c.pos.lock().unwrap();
+                        let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
                         *p
                     };
                     if projectile_segment_hits(
@@ -1684,18 +1684,18 @@ fn arrow_tick() {
             let (tx, ty, tz) = if loy > 0 {
                 clients()
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .iter()
                     .find(|c| c.eid == ow)
                     .map(|c| {
-                        let p = c.pos.lock().unwrap();
+                        let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
                         (p.0, p.1, p.2)
                     })
                     .unwrap_or((lx, ly, lz))
             } else {
                 (lx, ly, lz)
             };
-            drops().lock().unwrap().push(Drop {
+            drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
                 eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                 x: tx,
                 y: ty,
@@ -1718,11 +1718,11 @@ fn arrow_tick() {
     for (veid, admg) in hits {
         let cls: Vec<Arc<Client>> = client_snapshot();
         if let Some(c) = cls.iter().find(|c| c.eid == veid) {
-            if *c.gm.lock().unwrap() == 1 {
+            if *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
                 continue;
             }
-            let blocked_ar = *c.blocking.lock().unwrap()
-                && c.shield_cd.lock().unwrap().elapsed() > Duration::from_secs(5);
+            let blocked_ar = *c.blocking.lock().unwrap_or_else(|e| e.into_inner())
+                && c.shield_cd.lock().unwrap_or_else(|e| e.into_inner()).elapsed() > Duration::from_secs(5);
             // a rejected hit must not cost shield durability (vanilla returns before that)
             let Some((ad, _)) = damage_after_invulnerability(c, if blocked_ar { 0.0 } else { admg })
             else {
@@ -1731,7 +1731,7 @@ fn arrow_tick() {
             if blocked_ar {
                 damage_shield(c, admg);
             }
-            let mut h = c.hp.lock().unwrap();
+            let mut h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
             *h = (*h
                 - if ad > 0.0 {
                     hurt_absorb(c, dmg_after(c, ad, 0))
@@ -1742,7 +1742,7 @@ fn arrow_tick() {
             if *h <= 0.0 {
                 drop(h);
                 totem_check(c);
-                h = c.hp.lock().unwrap();
+                h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
             }
             let hh = *h;
             drop(h);
@@ -1777,7 +1777,7 @@ fn explode_at(ex: f64, ey: f64, ez: f64, power: f64) {
                         let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
                         let jitter =
                             ((tx.wrapping_mul(31) ^ tz.wrapping_mul(17) ^ ty) & 0x3ff) as u64;
-                        primed().lock().unwrap().push(Primed {
+                        primed().lock().unwrap_or_else(|e| e.into_inner()).push(Primed {
                             eid,
                             x: tx as f64 + 0.5,
                             y: ty as f64,
@@ -1796,21 +1796,21 @@ fn explode_at(ex: f64, ey: f64, ez: f64, power: f64) {
     let cs: Vec<Arc<Client>> = client_snapshot();
     for cl in cs {
         let (px, py, pz, ..) = {
-            let p = cl.pos.lock().unwrap();
+            let p = cl.pos.lock().unwrap_or_else(|e| e.into_inner());
             *p
         };
         let dd = ((px - ex).powi(2) + (py - ey).powi(2) + (pz - ez).powi(2)).sqrt();
-        if dd < power * 1.5 && *cl.gm.lock().unwrap() != 1 {
+        if dd < power * 1.5 && *cl.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
             let raw = ((power * 1.5 - dd) * 3.0) as f32;
             let Some((accepted, _)) = damage_after_invulnerability(&cl, raw) else {
                 continue;
             };
-            let mut h = cl.hp.lock().unwrap();
+            let mut h = cl.hp.lock().unwrap_or_else(|e| e.into_inner());
             *h = (*h - hurt_absorb(&cl, dmg_after(&cl, accepted, 2))).max(0.0);
             if *h <= 0.0 {
                 drop(h);
                 totem_check(&cl);
-                h = cl.hp.lock().unwrap();
+                h = cl.hp.lock().unwrap_or_else(|e| e.into_inner());
             }
             let hh = *h;
             drop(h);
@@ -1826,7 +1826,7 @@ fn explode_at(ex: f64, ey: f64, ez: f64, power: f64) {
 fn primed_tick() {
     let mut boom: Vec<Primed> = Vec::new();
     {
-        let mut pl = primed().lock().unwrap();
+        let mut pl = primed().lock().unwrap_or_else(|e| e.into_inner());
         let region = region_guard();
         let mut i = 0;
         while i < pl.len() {
@@ -1852,7 +1852,7 @@ fn live_mob_hit_allowed(mob: &Mob, source: i32, hit: BossHit) -> bool {
     if !matches!(mob.etype, 31 | 88 | 116 | 119) {
         return true;
     }
-    let mut states = live_mob_states().lock().unwrap();
+    let mut states = live_mob_states().lock().unwrap_or_else(|e| e.into_inner());
     let state = states
         .entry(mob.eid)
         .or_insert_with(|| LiveMobState::new(mob.etype));
@@ -1881,12 +1881,12 @@ fn live_mob_damage_player(
     protection_kind: Option<u8>,
     knockback_y: Option<f64>,
 ) -> bool {
-    if !matches!(*player.gm.lock().unwrap(), 0 | 2) || *player.hp.lock().unwrap() <= 0.0 {
+    if !matches!(*player.gm.lock().unwrap_or_else(|e| e.into_inner()), 0 | 2) || *player.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0 {
         return false;
     }
     if protection_kind == Some(0)
-        && *player.blocking.lock().unwrap()
-        && player.shield_cd.lock().unwrap().elapsed() > Duration::from_secs(5)
+        && *player.blocking.lock().unwrap_or_else(|e| e.into_inner())
+        && player.shield_cd.lock().unwrap_or_else(|e| e.into_inner()).elapsed() > Duration::from_secs(5)
     {
         damage_shield(player, damage);
         return false;
@@ -1899,19 +1899,19 @@ fn live_mob_damage_player(
     };
     let damage_taken = protection_kind.map_or(accepted, |kind| dmg_after(player, accepted, kind));
     {
-        let mut hp = player.hp.lock().unwrap();
+        let mut hp = player.hp.lock().unwrap_or_else(|e| e.into_inner());
         *hp = (*hp - hurt_absorb(player, damage_taken)).max(0.0);
     }
     totem_check(player);
     if protection_kind.is_some() {
         damage_armor(player, damage);
     }
-    let health = *player.hp.lock().unwrap();
+    let health = *player.hp.lock().unwrap_or_else(|e| e.into_inner());
     // Vanilla LivingEntity.knockback scales the horizontal push by
     // (1 - knockback_resistance); the vertical component is unaffected.
     let kb_res = knockback_resist_of(player);
     let velocity = knockback_y.map(|up| {
-        let (x, _, z, ..) = *player.pos.lock().unwrap();
+        let (x, _, z, ..) = *player.pos.lock().unwrap_or_else(|e| e.into_inner());
         let [dx, _, dz] = mob_behavior_unit([x - origin[0], 0.0, z - origin[2]]);
         velocity_pkt(
             player.eid,
@@ -1939,19 +1939,19 @@ fn live_mob_melee(mob: &Mob, player: &Arc<Client>, pos: [f64; 3], amount: f32, u
         return;
     }
     let thorns = {
-        let inv = player.inv.lock().unwrap();
+        let inv = player.inv.lock().unwrap_or_else(|e| e.into_inner());
         (5i16..=8)
             .filter_map(|slot| inv.get(&slot))
             .map(|stack| enchant_level(&stack.2, 38))
             .sum::<i64>()
     };
     if thorns > 0 && world_rng::next_u64() % 100 < (thorns * 15) as u64 {
-        *mob.hp.lock().unwrap() -= (1 + world_rng::next_u64() % 4) as f32;
-        *mob.hurt_at.lock().unwrap() = Instant::now();
-        *mob.last_hurt_tick.lock().unwrap() = Some(TICK_IDX.load(Ordering::Relaxed));
+        *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) -= (1 + world_rng::next_u64() % 4) as f32;
+        *mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        *mob.last_hurt_tick.lock().unwrap_or_else(|e| e.into_inner()) = Some(TICK_IDX.load(Ordering::Relaxed));
         broadcast_seen(mob.eid, |_| (0x24, hurt_anim(mob.eid)));
     }
-    if *player.hp.lock().unwrap() <= 0.0
+    if *player.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0
         && GR_SHOW_DEATH_MESSAGES.load(Ordering::Relaxed) != 0
     {
         let name = entity_spec_by_id(mob.etype).map_or("mob", |spec| {
@@ -2022,11 +2022,11 @@ fn live_witch_effect_id(potion: WitchPotion) -> i32 {
 }
 
 fn live_mob_player_effect(client: &Client, id: i32, ticks: u16) {
-    if !matches!(*client.gm.lock().unwrap(), 0 | 2) || *client.hp.lock().unwrap() <= 0.0 {
+    if !matches!(*client.gm.lock().unwrap_or_else(|e| e.into_inner()), 0 | 2) || *client.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0 {
         return;
     }
     let ticks = server_ticks(u64::from(ticks)) as i32;
-    let mut effects = client.effs.lock().unwrap();
+    let mut effects = client.effs.lock().unwrap_or_else(|e| e.into_inner());
     if effects
         .iter()
         .any(|effect| effect.id == id && effect.left >= ticks)
@@ -2049,7 +2049,7 @@ fn live_mob_player_effect(client: &Client, id: i32, ticks: u16) {
 
 fn live_mob_death(mob: &Arc<Mob>, state: Option<LiveMobState>, pos: [f64; 3]) {
     let state = state.unwrap_or_else(|| LiveMobState::new(mob.etype));
-    sitting_cats().lock().unwrap().remove(&mob.eid);
+    sitting_cats().lock().unwrap_or_else(|e| e.into_inner()).remove(&mob.eid);
     if let Some(behavior) = state.behavior {
         apply_live_mob_effects(mob, mob.dim, pos, behavior.on_death(), &[]);
     }
@@ -2149,10 +2149,10 @@ fn broadcast_player_attack_damage(victim: i32, attacker: i32, dim: DimId) {
     fanout_in(
         &client_snapshot(),
         |client| {
-            if client.player_attack_damage_id.is_none() || *client.dim.lock().unwrap() != dim {
+            if client.player_attack_damage_id.is_none() || *client.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
                 return false;
             }
-            client.eid == victim || client.seen.lock().unwrap().contains(&victim)
+            client.eid == victim || client.seen.lock().unwrap_or_else(|e| e.into_inner()).contains(&victim)
         },
         |client| {
             let mut body = Vec::new();
@@ -2193,13 +2193,13 @@ fn player_movement_exhaustion(c: &Client, (x, y, z): (f64, f64, f64)) -> f32 {
     // Once per client per tick, before the health lock is taken downstream:
     // keep the equipment attribute view attr_of reports current.
     refresh_equip_attrs(c);
-    let (last_x, _, last_z) = std::mem::replace(&mut *c.lastp.lock().unwrap(), (x, y, z));
+    let (last_x, _, last_z) = std::mem::replace(&mut *c.lastp.lock().unwrap_or_else(|e| e.into_inner()), (x, y, z));
     let distance = (x - last_x).hypot(z - last_z);
     let movement = if distance >= 10.0 {
         0.0
-    } else if *c.sprinting.lock().unwrap() {
+    } else if *c.sprinting.lock().unwrap_or_else(|e| e.into_inner()) {
         distance as f32 * 0.1
-    } else if *c.sneaking.lock().unwrap() {
+    } else if *c.sneaking.lock().unwrap_or_else(|e| e.into_inner()) {
         distance as f32 * 0.005
     } else {
         0.0
@@ -2207,7 +2207,7 @@ fn player_movement_exhaustion(c: &Client, (x, y, z): (f64, f64, f64)) -> f32 {
     let hunger = c
         .effs
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .iter()
         .find(|effect| effect.id == HUNGER_EFFECT)
         .map_or(0.0, |effect| 0.005 * (effect.amp as f32 + 1.0));
@@ -2222,14 +2222,14 @@ fn tick_player_food(c: &Client, hp: &mut f32, max_hp: f32, exhaustion: f32, t: u
         _ => HungerDifficulty::Normal,
     };
     let natural_regeneration = GR_NATURAL_REGEN.load(Ordering::Relaxed) != 0;
-    let mut sessions = player_mechanism_sessions().lock().unwrap();
+    let mut sessions = player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner());
     let Some(session) = sessions.get_mut(&c.eid) else {
         return false;
     };
     let (mut food, mut sat, mut acc) = (
-        c.food.lock().unwrap(),
-        c.sat.lock().unwrap(),
-        c.walk_acc.lock().unwrap(),
+        c.food.lock().unwrap_or_else(|e| e.into_inner()),
+        c.sat.lock().unwrap_or_else(|e| e.into_inner()),
+        c.walk_acc.lock().unwrap_or_else(|e| e.into_inner()),
     );
     let before = (*hp, *food, *sat);
     let mut data = FoodData {
@@ -2267,7 +2267,7 @@ fn tick_player_food(c: &Client, hp: &mut f32, max_hp: f32, exhaustion: f32, t: u
 }
 
 fn reset_player_food(c: &Client) {
-    let effects = std::mem::take(&mut *c.effs.lock().unwrap());
+    let effects = std::mem::take(&mut *c.effs.lock().unwrap_or_else(|e| e.into_inner()));
     for effect in effects {
         let packet = remove_effect_pkt(c.eid, effect.id);
         if let Ok(mut sock) = c.sock.lock() {
@@ -2275,24 +2275,24 @@ fn reset_player_food(c: &Client) {
         }
         broadcast_seen(c.eid, |_| (0x43, packet.clone()));
     }
-    *c.absorb.lock().unwrap() = 0.0;
-    *c.air.lock().unwrap() = server_ticks(AIR_SUPPLY_GT) as i32;
-    *c.invulnerable.lock().unwrap() = 0;
-    *c.last_hurt.lock().unwrap() = 0.0;
-    *c.blocking.lock().unwrap() = false;
-    *c.sprinting.lock().unwrap() = false;
-    *c.sneaking.lock().unwrap() = false;
-    *c.fall_fly.lock().unwrap() = false;
-    let mut sessions = player_mechanism_sessions().lock().unwrap();
+    *c.absorb.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+    *c.air.lock().unwrap_or_else(|e| e.into_inner()) = server_ticks(AIR_SUPPLY_GT) as i32;
+    *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+    *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+    *c.blocking.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    *c.sprinting.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    *c.sneaking.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    *c.fall_fly.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    let mut sessions = player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(session) = sessions.get_mut(&c.eid) {
         session.food_timer = 0;
     }
-    attack_tickers().lock().unwrap().remove(&c.eid);
-    equip_attrs().lock().unwrap().remove(&c.name);
+    attack_tickers().lock().unwrap_or_else(|e| e.into_inner()).remove(&c.eid);
+    equip_attrs().lock().unwrap_or_else(|e| e.into_inner()).remove(&c.name);
     let data = FoodData::default();
-    *c.food.lock().unwrap() = data.food_level;
-    *c.sat.lock().unwrap() = data.saturation;
-    *c.walk_acc.lock().unwrap() = 0.0;
+    *c.food.lock().unwrap_or_else(|e| e.into_inner()) = data.food_level;
+    *c.sat.lock().unwrap_or_else(|e| e.into_inner()) = data.saturation;
+    *c.walk_acc.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
 }
 
 fn add_player_xp_points(xp: &mut PlayerXpState, points: i32) -> Result<(), ExperienceSetError> {
@@ -2306,9 +2306,9 @@ fn add_player_xp_points(xp: &mut PlayerXpState, points: i32) -> Result<(), Exper
 }
 
 fn take_dropped_experience(c: &Client) -> i64 {
-    let mut total = c.xp.lock().unwrap();
+    let mut total = c.xp.lock().unwrap_or_else(|e| e.into_inner());
     let previous_total = std::mem::take(&mut *total);
-    let mut sessions = player_mechanism_sessions().lock().unwrap();
+    let mut sessions = player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner());
     let Some(session) = sessions.get_mut(&c.eid) else {
         return previous_total.clamp(0, 100);
     };
@@ -2326,8 +2326,8 @@ fn send_player_xp(
     update: impl FnOnce(&mut PlayerXpState) -> Result<(), ExperienceSetError>,
 ) -> Result<(), ExperienceSetError> {
     // Serialize changes and their packets for this player, including concurrent orb pickups.
-    let mut total = c.xp.lock().unwrap();
-    let mut sessions = player_mechanism_sessions().lock().unwrap();
+    let mut total = c.xp.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sessions = player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner());
     let Some(session) = sessions.get_mut(&c.eid) else {
         return Ok(());
     };
@@ -2350,7 +2350,7 @@ fn send_player_xp(
 }
 
 fn health_pkt_c(hp: f32, c: &Client) -> Vec<u8> {
-    health_pkt(hp, *c.food.lock().unwrap(), *c.sat.lock().unwrap())
+    health_pkt(hp, *c.food.lock().unwrap_or_else(|e| e.into_inner()), *c.sat.lock().unwrap_or_else(|e| e.into_inner()))
 }
 // vanilla food side-effects: (chance%%, effect id, amplifier, ticks@4/s)
 fn food_effects(item: i64) -> &'static [(u64, i32, i32, i32)] {
@@ -2394,8 +2394,8 @@ fn food_effects(item: i64) -> &'static [(u64, i32, i32, i32)] {
 /// this starts a new hurt window. Vanilla sends Damage Event on that new window.
 /// A rejected hit leaves health, armour and the shield alone.
 fn damage_after_invulnerability(c: &Client, amount: f32) -> Option<(f32, bool)> {
-    let mut invulnerable = c.invulnerable.lock().unwrap();
-    let mut last_hurt = c.last_hurt.lock().unwrap();
+    let mut invulnerable = c.invulnerable.lock().unwrap_or_else(|e| e.into_inner());
+    let mut last_hurt = c.last_hurt.lock().unwrap_or_else(|e| e.into_inner());
     if *invulnerable > 10 {
         if amount <= *last_hurt {
             return None;
@@ -2410,7 +2410,7 @@ fn damage_after_invulnerability(c: &Client, amount: f32) -> Option<(f32, bool)> 
 }
 
 fn hurt_absorb(c: &Client, dmg: f32) -> f32 {
-    let mut a = c.absorb.lock().unwrap();
+    let mut a = c.absorb.lock().unwrap_or_else(|e| e.into_inner());
     if *a <= 0.0 {
         return dmg;
     }
@@ -2491,7 +2491,7 @@ fn attr_key_name(id: i64) -> Option<&'static str> {
 fn attr_of(key: &str, name: &str) -> f64 {
     let base = attrs()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(key)
         .and_then(|m| m.get(name))
         .copied()
@@ -2502,7 +2502,7 @@ fn attr_of(key: &str, name: &str) -> f64 {
     if let (Some(id), Some(pname)) = (attr_key_id(name), key.strip_prefix("p:")) {
         if let Some((add, mb, mt)) = equip_attrs()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(pname)
             .and_then(|m| m.get(&(id as i32)))
             .copied()
@@ -2532,7 +2532,7 @@ fn attrs_pkt(eid: i32, m: &HashMap<String, f64>) -> Vec<u8> {
 fn send_attrs(c: &Arc<Client>) {
     let m = attrs()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(&format!("p:{}", c.name))
         .cloned()
         .unwrap_or_default();
@@ -2565,9 +2565,9 @@ mod p1_combat_tests {
     impl std::ops::Drop for CombatGuard {
         fn drop(&mut self) {
             TICK_IDX.store(self.time, Ordering::Relaxed);
-            attack_tickers().lock().unwrap().remove(&4242);
-            equip_attrs().lock().unwrap().remove("totem-test");
-            mobs().lock().unwrap().retain(|m| m.eid != 4242);
+            attack_tickers().lock().unwrap_or_else(|e| e.into_inner()).remove(&4242);
+            equip_attrs().lock().unwrap_or_else(|e| e.into_inner()).remove("totem-test");
+            mobs().lock().unwrap_or_else(|e| e.into_inner()).retain(|m| m.eid != 4242);
         }
     }
 
@@ -2618,7 +2618,7 @@ mod p1_combat_tests {
         let (client, _rx) = client_pair();
         let client = Arc::new(client);
         let sword = name_to_item("diamond_sword").unwrap();
-        client.inv.lock().unwrap().insert(36, (sword, 1, Vec::new()));
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(36, (sword, 1, Vec::new()));
         TICK_IDX.store(100, Ordering::Relaxed);
         // Never attacked: full charge (vanilla attackStrengthTicker starts ready).
         assert_eq!(melee_charge(&client, sword), 1.0);
@@ -2640,7 +2640,7 @@ mod p1_combat_tests {
         let (client, _rx) = client_pair();
         let client = Arc::new(client);
         let sword = name_to_item("diamond_sword").unwrap();
-        client.inv.lock().unwrap().insert(36, (sword, 1, Vec::new()));
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(36, (sword, 1, Vec::new()));
         TICK_IDX.store(100, Ordering::Relaxed);
         assert_eq!(melee_charge(&client, sword), 1.0);
         // Wall time passes but TICK_IDX stands still (as under /tick freeze):
@@ -2656,14 +2656,14 @@ mod p1_combat_tests {
         let (client, _rx) = client_pair();
         let client = Arc::new(client);
         let sword = name_to_item("diamond_sword").unwrap();
-        client.inv.lock().unwrap().insert(36, (sword, 1, Vec::new()));
-        client.inv.lock().unwrap().insert(37, (sword, 1, Vec::new()));
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(36, (sword, 1, Vec::new()));
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(37, (sword, 1, Vec::new()));
         TICK_IDX.store(100, Ordering::Relaxed);
         assert_eq!(melee_charge(&client, sword), 1.0);
         TICK_IDX.store(112, Ordering::Relaxed);
         // 12 ticks of charge (0.76) on the old item, then vanilla
         // resetAttackStrengthTicker on the switch: the new item starts at 0.
-        *client.held.lock().unwrap() = 1;
+        *client.held.lock().unwrap_or_else(|e| e.into_inner()) = 1;
         let c = f64::from(melee_charge(&client, sword));
         assert!((c - 0.5 / 12.5).abs() < 1e-6, "{c}");
     }
@@ -2672,45 +2672,45 @@ mod p1_combat_tests {
     fn p1_combat_mob_hurt_window_runs_on_ticks() {
         let _g = CombatGuard::new();
         let mob = test_mob(4242);
-        mobs().lock().unwrap().push(mob.clone());
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob.clone());
         TICK_IDX.store(100, Ordering::Relaxed);
         // The melee gate writes only the wall stamp; the tick pass adopts it.
-        *mob.hurt_at.lock().unwrap() = Instant::now();
+        *mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
         mob_hurt_window_tick();
-        assert_eq!(*mob.last_hurt_tick.lock().unwrap(), Some(100));
+        assert_eq!(*mob.last_hurt_tick.lock().unwrap_or_else(|e| e.into_inner()), Some(100));
         assert!(
-            mob.hurt_at.lock().unwrap().elapsed() < Duration::from_millis(500),
+            mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner()).elapsed() < Duration::from_millis(500),
             "window must be shut ten ticks"
         );
         // Frozen ticks: even after the wall window would have lapsed, the gate
         // stays shut.
         std::thread::sleep(Duration::from_millis(600));
-        assert!(mob.hurt_at.lock().unwrap().elapsed() < Duration::from_millis(500));
+        assert!(mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner()).elapsed() < Duration::from_millis(500));
         // Ten game ticks later the window ends and the wall stamp is backed out
         // to the hurt instant (elapsed >= the 500ms gate).
         TICK_IDX.store(110, Ordering::Relaxed);
         mob_hurt_window_tick();
-        assert!(mob.hurt_at.lock().unwrap().elapsed() >= Duration::from_millis(500));
+        assert!(mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner()).elapsed() >= Duration::from_millis(500));
     }
 
     #[test]
     fn p1_combat_mob_hurt_window_stamped_paths_hold() {
         let _g = CombatGuard::new();
         let mob = test_mob(4242);
-        mobs().lock().unwrap().push(mob.clone());
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob.clone());
         TICK_IDX.store(100, Ordering::Relaxed);
-        *mob.last_hurt_tick.lock().unwrap() = Some(100);
-        *mob.hurt_at.lock().unwrap() = Instant::now();
+        *mob.last_hurt_tick.lock().unwrap_or_else(|e| e.into_inner()) = Some(100);
+        *mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
         mob_hurt_window_tick();
         TICK_IDX.store(109, Ordering::Relaxed);
         mob_hurt_window_tick();
         assert!(
-            mob.hurt_at.lock().unwrap().elapsed() < Duration::from_millis(500),
+            mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner()).elapsed() < Duration::from_millis(500),
             "still inside the 10-tick window at tick 109"
         );
         TICK_IDX.store(110, Ordering::Relaxed);
         mob_hurt_window_tick();
-        assert!(mob.hurt_at.lock().unwrap().elapsed() >= Duration::from_millis(500));
+        assert!(mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner()).elapsed() >= Duration::from_millis(500));
     }
 
     #[test]
@@ -2792,7 +2792,7 @@ mod p1_combat_tests {
         let client = Arc::new(client);
         let sword = name_to_item("diamond_sword").unwrap();
         // +3 attack damage and a slower attack speed (1.2 < 1.6 table speed).
-        client.inv.lock().unwrap().insert(
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(
             36,
             attr_stack(&[
                 attr_mod(ATTR_ATTACK_DAMAGE, 3.0, ItemAttrOp::AddValue, ItemAttrSlotGroup::MainHand),
@@ -2821,7 +2821,7 @@ mod p1_combat_tests {
         let (client, _rx) = client_pair();
         let client = Arc::new(client);
         assert_eq!(knockback_resist_of(&client), 0.0);
-        client.inv.lock().unwrap().insert(
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(
             45,
             attr_stack(&[attr_mod(
                 ATTR_KNOCKBACK_RESISTANCE,
@@ -2839,7 +2839,7 @@ mod p1_combat_tests {
         let (client, _rx) = client_pair();
         let client = Arc::new(client);
         assert_eq!(max_hp_of(&client.name), 20.0);
-        client.inv.lock().unwrap().insert(
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(
             5,
             (
                 name_to_item("iron_helmet").unwrap(),
@@ -2882,7 +2882,7 @@ mod p5a_parity_tests {
     impl std::ops::Drop for FireGuard {
         fn drop(&mut self) {
             TICK_IDX.store(self.time, Ordering::Relaxed);
-            mob_fire_ticks().lock().unwrap().clear();
+            mob_fire_ticks().lock().unwrap_or_else(|e| e.into_inner()).clear();
         }
     }
 
@@ -2911,7 +2911,7 @@ mod p5a_parity_tests {
     fn p5a_parity_fire_aspect_never_touches_creeper_fuse() {
         let _g = FireGuard::new();
         let creeper = mob(4243, name_to_etype("creeper").unwrap());
-        *creeper.fuse.lock().unwrap() = 7;
+        *creeper.fuse.lock().unwrap_or_else(|e| e.into_inner()) = 7;
         ignite_mob_fire_aspect(creeper.eid, 1);
         assert_eq!(
             mob_fire_ticks_of(creeper.eid),
@@ -2928,8 +2928,8 @@ mod p5a_parity_tests {
             server_ticks(160) as u32,
             "Fire Aspect II is 8s"
         );
-        assert_eq!(*creeper.fuse.lock().unwrap(), 7, "fuse untouched");
-        assert_eq!(*creeper.fire_ticks.lock().unwrap(), 0, "sunlight field untouched");
+        assert_eq!(*creeper.fuse.lock().unwrap_or_else(|e| e.into_inner()), 7, "fuse untouched");
+        assert_eq!(*creeper.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()), 0, "sunlight field untouched");
         ignite_mob_fire_aspect(creeper.eid, 0);
         assert_eq!(
             mob_fire_ticks_of(creeper.eid),
@@ -2970,7 +2970,7 @@ mod p5a_parity_tests {
         ignite_mob(eid, 1);
         assert!(!tick_mob_fire(eid, burn_interval * 4 + 1, false, false));
         assert_eq!(mob_fire_ticks_of(eid), 0);
-        assert!(mob_fire_ticks().lock().unwrap().get(&eid).is_none());
+        assert!(mob_fire_ticks().lock().unwrap_or_else(|e| e.into_inner()).get(&eid).is_none());
     }
 
     // #78 — the immune list keeps covering the vanilla fireImmune family.
