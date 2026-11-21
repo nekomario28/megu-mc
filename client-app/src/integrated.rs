@@ -86,14 +86,29 @@ pub fn validate_world_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Enqueue the platform server-binary names inside `dir`: `mc-spine`
+/// everywhere, plus `mc-spine.exe` — the name the Windows toolchain
+/// actually emits — tried first there.
+#[cfg(windows)]
+fn push_server_bin_candidates(candidates: &mut Vec<PathBuf>, dir: &Path) {
+    candidates.push(dir.join("mc-spine.exe"));
+    candidates.push(dir.join("mc-spine"));
+}
+
+#[cfg(not(windows))]
+fn push_server_bin_candidates(candidates: &mut Vec<PathBuf>, dir: &Path) {
+    candidates.push(dir.join("mc-spine"));
+}
+
 fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
-/// Resolve the `mc-spine` server binary. Order: `--server-bin`,
-/// `MC_SPINE_SERVER_BIN`, a `mc-spine` sibling of this executable, then
-/// `target/{debug,release}/mc-spine` relative to the working directory and to
-/// ancestors of the working directory and this executable.
+/// Resolve the `mc-spine` server binary (`mc-spine.exe` on Windows).
+/// Order: `--server-bin`, `MC_SPINE_SERVER_BIN`, a `mc-spine` sibling of
+/// this executable, then `target/{debug,release}/mc-spine` relative to
+/// the working directory and to ancestors of the working directory and
+/// this executable.
 pub fn resolve_server_bin(explicit: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(path) = explicit {
         let path = path.to_path_buf();
@@ -121,9 +136,7 @@ pub fn resolve_server_bin(explicit: Option<&Path>) -> Result<PathBuf, String> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(exe) = env::current_exe() {
         if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("mc-spine"));
-            #[cfg(windows)]
-            candidates.push(dir.join("mc-spine.exe"));
+            push_server_bin_candidates(&mut candidates, dir);
         }
     }
     let mut bases: Vec<PathBuf> = vec![env::current_dir().unwrap_or_else(|_| PathBuf::from("."))];
@@ -131,9 +144,10 @@ pub fn resolve_server_bin(explicit: Option<&Path>) -> Result<PathBuf, String> {
         bases.extend(exe.ancestors().skip(1).take(6).map(Path::to_path_buf));
     }
     for base in bases {
-        candidates.push(base.join("target/debug/mc-spine"));
-        candidates.push(base.join("target/release/mc-spine"));
-        candidates.push(base.join("mc-spine"));
+        for profile in ["debug", "release"] {
+            push_server_bin_candidates(&mut candidates, &base.join("target").join(profile));
+        }
+        push_server_bin_candidates(&mut candidates, &base);
     }
     for candidate in candidates {
         if is_executable_file(&candidate) {

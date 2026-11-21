@@ -87,6 +87,11 @@ class BuildError(Exception):
     """Environment or jlink failure; exits 1."""
 
 
+def platform_tool_name(base):
+    """`<base>.exe` on Windows (`os.name == 'nt'`), `<base>` elsewhere."""
+    return f"{base}.exe" if os.name == "nt" else base
+
+
 def validate_out_dir(raw):
     """Resolve `--out`, rejecting `..`, NUL/control chars and symlink escapes."""
     if not raw or not raw.strip():
@@ -110,13 +115,25 @@ def resolve_jlink(explicit):
     """Return the validated jlink path, or None when discovery fails."""
     if explicit is not None:
         candidate = Path(explicit)
+        # Accept `...\bin\jlink` as well as `...\bin\jlink.exe` on Windows.
+        if os.name == "nt" and not candidate.is_file():
+            with_suffix = candidate.with_name(candidate.name + ".exe")
+            if with_suffix.is_file():
+                candidate = with_suffix
         if not candidate.is_file():
             raise UsageError(f"--jlink does not name a file: {explicit}")
         if not os.access(candidate, os.X_OK):
             raise UsageError(f"--jlink is not executable: {explicit}")
         return Path(os.path.realpath(candidate))
-    found = shutil.which("jlink")
-    return Path(found).resolve() if found else None
+    # On Windows the JDK ships `jlink.exe`; `which` also resolves it via
+    # PATHEXT, but probe the literal name first so a missing PATHEXT
+    # entry cannot hide an installed JDK.
+    names = ["jlink.exe", "jlink"] if os.name == "nt" else ["jlink"]
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return Path(found).resolve()
+    return None
 
 
 def detect_compress(jlink_bin):
@@ -174,8 +191,8 @@ def delegate_flags(xms_mib, xmx_mib, gc_mode="serial"):
 
 
 def build_delegate_jvm_argv(jre_dir, xms_mib, xmx_mib, gc_mode="serial"):
-    """Full worker argv: <jre>/bin/java plus the lean headless flag list."""
-    java_bin = Path(jre_dir) / "bin" / ("java.exe" if os.name == "nt" else "java")
+    """Full worker argv: <jre>/bin/java[.exe] plus the lean headless flags."""
+    java_bin = Path(jre_dir) / "bin" / platform_tool_name("java")
     return [str(java_bin)] + delegate_flags(xms_mib, xmx_mib, gc_mode)
 
 
@@ -286,7 +303,8 @@ def plan(profile, out_dir, xms_mib, xmx_mib, jlink_bin, gc_mode="serial"):
             "compress": compress,
         },
         "jlink_argv": build_jlink_argv(
-            jlink_bin if jlink_bin else "jlink", modules, staging_dir, compress
+            jlink_bin if jlink_bin else platform_tool_name("jlink"),
+            modules, staging_dir, compress
         ),
         "xms_mib": xms_mib,
         "xmx_mib": xmx_mib,

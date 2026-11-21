@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tempfile
 import urllib.error
@@ -271,22 +272,88 @@ def unload_ollama(parsed, model):
     post_json(url, {"model": model, "prompt": "", "stream": False, "keep_alive": 0})
 
 
-def ram_tier():
+def _linux_total_ram_bytes():
+    """`MemTotal` from /proc/meminfo in bytes; None when unreadable."""
     try:
         with open("/proc/meminfo", encoding="ascii") as info:
             for line in info:
                 if line.startswith("MemTotal:"):
-                    gigabytes = int(line.split()[1]) * 1024 / 1_000_000_000
-                    if gigabytes < 8:
-                        return "too_low_ram"
-                    if gigabytes < 16:
-                        return "small_2b_4b"
-                    if gigabytes < 32:
-                        return "medium_8b_12b"
-                    return "large_ok"
+                    return int(line.split()[1]) * 1024
     except (OSError, ValueError, IndexError):
         pass
-    return "unknown"
+    return None
+
+
+def _darwin_total_ram_bytes():
+    """`hw.memsize` via `sysctl -n` in bytes; None on any failure."""
+    try:
+        proc = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        return int(proc.stdout.strip())
+    except ValueError:
+        return None
+
+
+def _windows_total_ram_bytes():
+    """`ullTotalPhys` via Win32 `GlobalMemoryStatusEx` (ctypes, stdlib)."""
+    import ctypes
+
+    class MemoryStatusEx(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong),
+            ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    status = MemoryStatusEx()
+    status.dwLength = ctypes.sizeof(MemoryStatusEx)
+    # Returns BOOL: nonzero on success.
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return None
+    return int(status.ullTotalPhys)
+
+
+def total_ram_bytes():
+    """Best-effort physical RAM in bytes; None when no probe succeeds."""
+    if sys.platform == "darwin":
+        return _darwin_total_ram_bytes()
+    if sys.platform == "win32":
+        try:
+            return _windows_total_ram_bytes()
+        except (OSError, AttributeError, ValueError):
+            return None
+    return _linux_total_ram_bytes()
+
+
+def ram_tier():
+    total = total_ram_bytes()
+    if total is None:
+        return "unknown"
+    gigabytes = total / 1_000_000_000
+    if gigabytes < 8:
+        return "too_low_ram"
+    if gigabytes < 16:
+        return "small_2b_4b"
+    if gigabytes < 32:
+        return "medium_8b_12b"
+    return "large_ok"
 
 
 def write_pack(path, translations, lang):

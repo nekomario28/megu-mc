@@ -571,17 +571,59 @@ pub fn decode_frame(frame: &[u8]) -> Result<FriendPacket, ProtoError> {
     }
 }
 
-/// OS entropy for invite-code generation: `/dev/urandom` first (the source
-/// the rest of this codebase uses for secrets), with a portable mixer —
-/// pid, heap ASLR and monotonic-clock jitter folded through a splitmix64
-/// finalizer — for platforms where the device file does not exist.
+/// Win32 CSPRNG for invite-code seeds: `BCryptGenRandom` with
+/// `BCRYPT_USE_SYSTEM_PREFERRED_RNG` — the OS CNG generator, the same
+/// entropy source `rand`/`getrandom` consumers use on Windows. `false`
+/// on any API failure so the caller falls back to the portable mixer.
+#[cfg(windows)]
+fn windows_csprng(buf: &mut [u8]) -> bool {
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+
+    #[link(name = "bcrypt")]
+    extern "system" {
+        fn BCryptGenRandom(
+            hAlgorithm: *mut std::ffi::c_void,
+            pbBuffer: *mut u8,
+            cbBuffer: u32,
+            dwFlags: u32,
+        ) -> i32;
+    }
+
+    let Ok(len) = u32::try_from(buf.len()) else {
+        return false;
+    };
+    // NTSTATUS: STATUS_SUCCESS == 0. `hAlgorithm` must be NULL when
+    // BCRYPT_USE_SYSTEM_PREFERRED_RNG selects the system generator.
+    unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            len,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        ) == 0
+    }
+}
+
+/// OS entropy for invite-code generation: the platform CSPRNG —
+/// `/dev/urandom` on Unix, `BCryptGenRandom` on Windows — with a portable
+/// mixer (pid, heap ASLR and monotonic-clock jitter folded through a
+/// splitmix64 finalizer) for platforms where neither is available.
 fn draw_seed() -> u64 {
     let mut buf = [0u8; 8];
-    if std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .is_ok()
+    #[cfg(unix)]
     {
-        return u64::from_ne_bytes(buf);
+        if std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut buf))
+            .is_ok()
+        {
+            return u64::from_ne_bytes(buf);
+        }
+    }
+    #[cfg(windows)]
+    {
+        if windows_csprng(&mut buf) {
+            return u64::from_ne_bytes(buf);
+        }
     }
     let marker = Box::new(0u8);
     let mut x = (u64::from(std::process::id()) << 32)
@@ -716,7 +758,7 @@ pub struct FriendRelayRouter {
 }
 
 impl FriendRelayRouter {
-    /// A router seeded from OS entropy (`/dev/urandom`).
+    /// A router seeded from OS entropy (the platform CSPRNG).
     pub fn new(config: FriendRelayConfig) -> Self {
         Self::with_seed(config, draw_seed())
     }

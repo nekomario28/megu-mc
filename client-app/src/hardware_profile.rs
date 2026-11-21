@@ -5,15 +5,20 @@
 //! without touching the machine the tests run on:
 //!
 //! * Pure parsers — [`parse_meminfo_total_kib`], [`parse_cache_size_kib`],
-//!   [`parse_pci_id`], and [`classify_gpu`] turn `/proc` + `/sys` text into
+//!   [`parse_pci_id`], [`parse_sysctl_memsize_mib`],
+//!   [`parse_sysctl_l3_cache_kib`], [`classify_macos_cpu_brand`], and
+//!   [`classify_gpu`] turn `/proc` + `/sys` + `sysctl` text into
 //!   typed values. They never read files themselves.
 //! * [`probe_host_hardware`] — a read-only host probe that feeds those
 //!   parsers from `/proc/meminfo`,
 //!   `/sys/devices/system/cpu/cpu0/cache/index*/{level,size}`, and
-//!   `/sys/class/drm/card*/device/{vendor,device}`. On non-Linux hosts the
-//!   probe degrades gracefully (`total_ram_mib`/`l3_cache_kib` become `0`,
-//!   `gpu_class` becomes [`GpuVendorClass::NoneSoftware`], or
-//!   [`GpuVendorClass::AppleSilicon`] on macOS).
+//!   `/sys/class/drm/card*/device/{vendor,device}` on Linux, from
+//!   `sysctl -n hw.memsize` / `hw.l3cachesize` /
+//!   `machdep.cpu.brand_string` on macOS, and from the Win32
+//!   `GlobalMemoryStatusEx` kernel32 call on Windows. On hosts with no
+//!   probe the fields degrade gracefully (`total_ram_mib`/
+//!   `l3_cache_kib` become `0`, `gpu_class` becomes
+//!   [`GpuVendorClass::NoneSoftware`]).
 //!
 //! [`recommend_tuning`] maps a [`HostHardwareProfile`] onto a
 //! [`HardwareTuningPlan`]: GPU backend preference, meshing worker threads,
@@ -199,6 +204,46 @@ pub fn parse_pci_id(text: &str) -> Option<u16> {
     u16::from_str_radix(hex, 16).ok()
 }
 
+/// Parse `sysctl -n hw.memsize` output — a byte count in decimal — into
+/// MiB. `None` on empty or unparseable input; sub-MiB values floor to `0`.
+pub fn parse_sysctl_memsize_mib(text: &str) -> Option<u32> {
+    let bytes: u64 = text.trim().parse().ok()?;
+    Some((bytes / (1024 * 1024)).min(u64::from(u32::MAX)) as u32)
+}
+
+/// Parse `sysctl -n hw.l3cachesize` output — a byte count in decimal —
+/// into KiB. `None` on empty or unparseable input.
+pub fn parse_sysctl_l3_cache_kib(text: &str) -> Option<u32> {
+    let bytes: u64 = text.trim().parse().ok()?;
+    Some((bytes / 1024).min(u64::from(u32::MAX)) as u32)
+}
+
+/// Classify a macOS `machdep.cpu.brand_string` value. Apple Silicon parts
+/// report `Apple M<n>[ Pro|Max|Ultra]` and share one unified-memory GPU,
+/// so they map to [`GpuVendorClass::AppleSilicon`]. Every other brand —
+/// Intel Core parts, empty or garbled output — maps to
+/// [`GpuVendorClass::Unknown`]: a Mac always has a GPU, the CPU brand
+/// string just cannot name an Intel one's vendor, and `Unknown`
+/// negotiates `Auto` rather than claiming the software rasterizer.
+pub fn classify_macos_cpu_brand(brand: &str) -> GpuVendorClass {
+    let mut words = brand.split_whitespace();
+    let apple = words
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("apple"));
+    let silicon = words.next().is_some_and(|model| {
+        model
+            .strip_prefix('M')
+            .or_else(|| model.strip_prefix('m'))
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|c| c.is_ascii_digit())
+    });
+    if apple && silicon {
+        GpuVendorClass::AppleSilicon
+    } else {
+        GpuVendorClass::Unknown
+    }
+}
+
 /// Map a PCI vendor (+ optional device) id pair onto a [`GpuVendorClass`].
 /// `vendor_id == None` means no GPU was found at all →
 /// [`GpuVendorClass::NoneSoftware`]; an unrecognized vendor →
@@ -262,9 +307,10 @@ fn gpu_class_rank(class: GpuVendorClass) -> u8 {
 // ---------------------------------------------------------------------------
 
 /// Probe the host for CPU/RAM/GPU facts. Read-only: opens a handful of
-/// `/proc` and `/sys` files, never writes, never shells out, never
-/// panics on missing data — every absent source degrades to `0` /
-/// `NoneSoftware` defaults.
+/// `/proc` and `/sys` files on Linux, runs `sysctl -n` on macOS and calls
+/// the Win32 `GlobalMemoryStatusEx` kernel32 export on Windows — never
+/// writes, never panics on missing data; every absent source degrades to
+/// `0` / `NoneSoftware` defaults.
 pub fn probe_host_hardware() -> HostHardwareProfile {
     let logical_cpus = std::thread::available_parallelism()
         .map(|n| u16::try_from(n.get()).unwrap_or(u16::MAX))
@@ -296,6 +342,7 @@ pub fn probe_host_hardware() -> HostHardwareProfile {
 }
 
 /// `MemTotal` from `/proc/meminfo`, in MiB (`0` when unavailable).
+#[cfg(target_os = "linux")]
 fn probe_total_ram_mib() -> u32 {
     std::fs::read_to_string("/proc/meminfo")
         .ok()
@@ -304,8 +351,82 @@ fn probe_total_ram_mib() -> u32 {
         .unwrap_or(0)
 }
 
+/// `hw.memsize` from `sysctl -n`, in MiB (`0` when sysctl fails).
+#[cfg(target_os = "macos")]
+fn probe_total_ram_mib() -> u32 {
+    sysctl_value("hw.memsize")
+        .and_then(|text| parse_sysctl_memsize_mib(&text))
+        .unwrap_or(0)
+}
+
+/// `ullTotalPhys` from Win32 `GlobalMemoryStatusEx`, in MiB (`0` when the
+/// kernel32 call fails). Minimal `extern "system"` FFI — zero crates.
+#[cfg(windows)]
+fn probe_total_ram_mib() -> u32 {
+    /// `MEMORYSTATUSEX`: the Win32 physical-RAM snapshot.
+    #[repr(C)]
+    struct MemoryStatusEx {
+        dw_length: u32,
+        dw_memory_load: u32,
+        ull_total_phys: u64,
+        ull_avail_phys: u64,
+        ull_total_page_file: u64,
+        ull_avail_page_file: u64,
+        ull_total_virtual: u64,
+        ull_avail_virtual: u64,
+        ull_avail_extended_virtual: u64,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalMemoryStatusEx(lpBuffer: *mut MemoryStatusEx) -> i32;
+    }
+
+    let mut status = MemoryStatusEx {
+        dw_length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        dw_memory_load: 0,
+        ull_total_phys: 0,
+        ull_avail_phys: 0,
+        ull_total_page_file: 0,
+        ull_avail_page_file: 0,
+        ull_total_virtual: 0,
+        ull_avail_virtual: 0,
+        ull_avail_extended_virtual: 0,
+    };
+    // Returns BOOL: nonzero on success.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+        return 0;
+    }
+    (status.ull_total_phys / (1024 * 1024)).min(u64::from(u32::MAX)) as u32
+}
+
+/// No RAM probe exists on this platform; report `0` (unknown).
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn probe_total_ram_mib() -> u32 {
+    0
+}
+
+/// `sysctl -n <name>` on macOS: stdout on success, `None` on any failure.
+/// One short-lived child process per call; stderr is silenced so a
+/// missing key cannot spam the client's log.
+#[cfg(target_os = "macos")]
+fn sysctl_value(name: &str) -> Option<String> {
+    let output = std::process::Command::new("sysctl")
+        .arg("-n")
+        .arg(name)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
 /// Total L3 cache in KiB across `cpu0`'s `index*/level == 3` sysfs nodes
 /// (`0` when sysfs is absent — non-Linux hosts, containers).
+#[cfg(target_os = "linux")]
 fn probe_l3_cache_kib() -> u32 {
     let cache_dir = std::path::Path::new("/sys/devices/system/cpu/cpu0/cache");
     let mut total_kib: u64 = 0;
@@ -335,10 +456,24 @@ fn probe_l3_cache_kib() -> u32 {
     total_kib.min(u64::from(u32::MAX)) as u32
 }
 
+/// `hw.l3cachesize` from `sysctl -n`, in KiB (`0` when sysctl fails).
+#[cfg(target_os = "macos")]
+fn probe_l3_cache_kib() -> u32 {
+    sysctl_value("hw.l3cachesize")
+        .and_then(|text| parse_sysctl_l3_cache_kib(&text))
+        .unwrap_or(0)
+}
+
+/// L3 cache size is not probed on this platform (`0` = unknown).
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn probe_l3_cache_kib() -> u32 {
+    0
+}
+
 /// Walk `/sys/class/drm/card*` for the strongest GPU. Returns the class
 /// plus the driver-reported dedicated VRAM total in MiB (amdgpu's
 /// `mem_info_vram_total`; `0` when no driver reports it). Absent sysfs →
-/// `NoneSoftware` (`AppleSilicon` on macOS).
+/// `NoneSoftware`, refined on macOS by the `sysctl` CPU-brand probe.
 fn probe_gpu() -> (GpuVendorClass, u32) {
     let mut class = GpuVendorClass::NoneSoftware;
     let mut vram_mib = 0u32;
@@ -371,10 +506,20 @@ fn probe_gpu() -> (GpuVendorClass, u32) {
             }
         }
     }
+    // macOS exposes no `/sys/class/drm`: classify the GPU from the CPU
+    // brand string instead — `Apple M<n>` parts share one unified-memory
+    // GPU, everything else is an unclassifiable-but-real Intel GPU.
+    // When sysctl itself is unavailable keep the historical Apple
+    // Silicon assumption (virtually every shipping Mac is one).
     #[cfg(target_os = "macos")]
     if matches!(class, GpuVendorClass::NoneSoftware) {
-        class = GpuVendorClass::AppleSilicon;
+        class = sysctl_value("machdep.cpu.brand_string")
+            .map(|brand| classify_macos_cpu_brand(&brand))
+            .unwrap_or(GpuVendorClass::AppleSilicon);
     }
+    // Any platform without DRM sysfs (Windows, the BSDs, ...) keeps
+    // `NoneSoftware` — the safe classic-low-spec fallback — rather than
+    // guessing a GPU class the probe never verified.
     (class, vram_mib)
 }
 

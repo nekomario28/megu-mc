@@ -11,8 +11,9 @@ use std::path::PathBuf;
 
 use mc_spine_client::cli::parse_args;
 use mc_spine_client::hardware_profile::{
-    classify_gpu, classify_intel_device, parse_cache_size_kib, parse_meminfo_total_kib,
-    parse_pci_id, probe_host_hardware, recommend_tuning, GpuVendorClass, HostHardwareProfile,
+    classify_gpu, classify_intel_device, classify_macos_cpu_brand, parse_cache_size_kib,
+    parse_meminfo_total_kib, parse_pci_id, parse_sysctl_l3_cache_kib, parse_sysctl_memsize_mib,
+    probe_host_hardware, recommend_tuning, GpuVendorClass, HostHardwareProfile,
     LocalLlmRecommendation,
 };
 use mc_spine_client::render::RenderConfig;
@@ -143,6 +144,75 @@ fn pci_id_parser_and_gpu_classification() {
         GpuVendorClass::Unknown
     );
     assert_eq!(classify_gpu(None, None), GpuVendorClass::NoneSoftware);
+}
+
+#[test]
+fn sysctl_parsers_handle_macos_byte_counts() {
+    // `sysctl -n hw.memsize` prints physical RAM in bytes, decimal.
+    assert_eq!(parse_sysctl_memsize_mib("17179869184\n"), Some(16384));
+    assert_eq!(parse_sysctl_memsize_mib("  8589934592  "), Some(8192));
+    assert_eq!(parse_sysctl_memsize_mib("34359738368"), Some(32768));
+    // Sub-MiB values floor to 0; junk and empty input are None.
+    assert_eq!(parse_sysctl_memsize_mib("512"), Some(0));
+    assert_eq!(parse_sysctl_memsize_mib(""), None);
+    assert_eq!(parse_sysctl_memsize_mib("not-a-number"), None);
+    assert_eq!(parse_sysctl_memsize_mib("16 GiB"), None);
+
+    // `sysctl -n hw.l3cachesize` prints bytes too -> KiB.
+    assert_eq!(parse_sysctl_l3_cache_kib("16777216\n"), Some(16384));
+    assert_eq!(parse_sysctl_l3_cache_kib("9437184"), Some(9216));
+    assert_eq!(parse_sysctl_l3_cache_kib(""), None);
+    assert_eq!(parse_sysctl_l3_cache_kib("abc"), None);
+}
+
+#[test]
+fn macos_cpu_brand_classification_detects_apple_silicon() {
+    // Every shipping Apple Silicon part reports `Apple M<n>[ suffix]`.
+    for brand in [
+        "Apple M1",
+        "Apple M1 Pro",
+        "Apple M1 Max",
+        "Apple M1 Ultra",
+        "Apple M2",
+        "Apple M2 Pro",
+        "Apple M2 Max",
+        "Apple M3",
+        "Apple M3 Pro",
+        "Apple M3 Max",
+        "Apple M4",
+        "Apple M4 Pro",
+        "Apple M4 Max",
+    ] {
+        assert_eq!(
+            classify_macos_cpu_brand(brand),
+            GpuVendorClass::AppleSilicon,
+            "{brand}"
+        );
+    }
+    // Case and whitespace tolerance.
+    assert_eq!(
+        classify_macos_cpu_brand("  apple   m4  "),
+        GpuVendorClass::AppleSilicon
+    );
+    // Intel Macs and unparseable output degrade to Unknown — a real GPU
+    // exists, the CPU brand simply cannot name its vendor — never
+    // AppleSilicon and never NoneSoftware.
+    for brand in [
+        "Intel(R) Core(TM) i9-9980HK CPU @ 2.40GHz",
+        "Intel(R) Xeon(R) CPU E5-1650 v4 @ 3.60GHz",
+        "",
+        "   ",
+        "not a cpu",
+        "Apple",
+        "Apple M",
+        "M1",
+    ] {
+        assert_eq!(
+            classify_macos_cpu_brand(brand),
+            GpuVendorClass::Unknown,
+            "{brand:?}"
+        );
+    }
 }
 
 #[test]

@@ -754,6 +754,57 @@ fn nightly_spawn_obstructed(bounds: EntityAabb) -> bool {
         })
 }
 
+/// Fill `buf` with OS CSPRNG bytes for entity UUIDs: `/dev/urandom` on
+/// Unix, the Win32 `BCryptGenRandom` system-preferred RNG on Windows.
+#[cfg(unix)]
+fn fill_entity_uuid_entropy(buf: &mut [u8; 16]) -> std::io::Result<()> {
+    let mut f = std::fs::File::open("/dev/urandom")?;
+    std::io::Read::read_exact(&mut f, buf)
+}
+
+/// Win32 CSPRNG: `BCryptGenRandom` with `BCRYPT_USE_SYSTEM_PREFERRED_RNG`
+/// — the OS CNG generator, zero external crates.
+#[cfg(windows)]
+fn fill_entity_uuid_entropy(buf: &mut [u8; 16]) -> std::io::Result<()> {
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+
+    #[link(name = "bcrypt")]
+    extern "system" {
+        fn BCryptGenRandom(
+            hAlgorithm: *mut std::ffi::c_void,
+            pbBuffer: *mut u8,
+            cbBuffer: u32,
+            dwFlags: u32,
+        ) -> i32;
+    }
+
+    // NTSTATUS: STATUS_SUCCESS == 0; `hAlgorithm` must be NULL when
+    // BCRYPT_USE_SYSTEM_PREFERRED_RNG selects the system generator.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "BCryptGenRandom failed (NTSTATUS {status:#010x})"
+        )))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn fill_entity_uuid_entropy(_buf: &mut [u8; 16]) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no OS entropy source on this platform",
+    ))
+}
+
 enum NightlySpawnAttempt {
     Rejected,
     Spawned,
@@ -803,9 +854,7 @@ fn try_nightly_monster_at(
             return NightlySpawnAttempt::Rejected;
         }
         let mut uuid = [0; 16];
-        std::fs::File::open("/dev/urandom")
-            .and_then(|mut f| f.read_exact(&mut uuid))
-            .expect("entity UUID entropy");
+        fill_entity_uuid_entropy(&mut uuid).expect("entity UUID entropy");
         uuid[6] = (uuid[6] & 15) | 64;
         uuid[8] = (uuid[8] & 63) | 128;
         push_natural_hostile(&mut current_mobs, Arc::new(Mob {
