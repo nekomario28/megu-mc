@@ -374,6 +374,25 @@ pub enum C2SPacket {
         jump: bool,
         unmount: bool,
     },
+    /// `play/serverbound/player_input` in its 1.21.2+ form: vanilla replaced
+    /// the two f32 impulses with an `Input` record serialized as a single
+    /// byte of flags (`0x01` forward, `0x02` backward, `0x04` left, `0x08`
+    /// right, `0x10` jump, `0x20` shift, `0x40` sprint). A codec produces
+    /// this variant when [`VersionCapabilities::player_input_flags`] is set.
+    /// The float [`C2SPacket::PlayerInput`] still encodes under that
+    /// capability by quantizing each impulse to its sign (sprint has no
+    /// float-form source); this variant encodes under the float form as the
+    /// vanilla ±1.0 magnitudes with `shift` mapped to `unmount` and `sprint`
+    /// dropped — the two wire shapes cannot express each other's full range.
+    PlayerInputFlags {
+        forward: bool,
+        backward: bool,
+        left: bool,
+        right: bool,
+        jump: bool,
+        shift: bool,
+        sprint: bool,
+    },
 }
 
 /// Version-agnostic codec contract: encode/decode the canonical IR against
@@ -383,7 +402,10 @@ pub enum C2SPacket {
 /// `VarInt(id)` + payload — as produced by `send_packet`. Decoders require the
 /// declared length to match the buffer exactly and the payload to be consumed
 /// completely: any surplus or shortfall fails closed.
-pub trait ProtocolCodec {
+///
+/// `Send + Sync` so a [`crate::router::VersionRouter`]-selected codec can be
+/// handed to a connection thread.
+pub trait ProtocolCodec: Send + Sync {
     /// Structured facts about the version this codec speaks.
     fn capabilities(&self) -> &VersionCapabilities;
     /// The id table ids resolve through.
@@ -399,7 +421,58 @@ pub trait ProtocolCodec {
 
 // ---------------------------------------------------------------------------
 // Shared body encoders/decoders (payload only; ids live in the table)
+//
+// These free functions are the whole wire engine: `CodecV767` and
+// `crate::router::TableDrivenCodec` are both thin shells over them, so packet
+// bodies are written exactly once. Ids and menu/component registries resolve
+// through the `ProtocolTable` argument; wire-shape deltas resolve through the
+// `VersionCapabilities` argument — never a raw protocol number.
 // ---------------------------------------------------------------------------
+
+/// The 1.21.2+ `Input` record's flag byte layout (vanilla's
+/// `Input.STREAM_CODEC` packs the seven booleans into one byte; bit 7 is
+/// reserved).
+const INPUT_FORWARD: u8 = 0x01;
+const INPUT_BACKWARD: u8 = 0x02;
+const INPUT_LEFT: u8 = 0x04;
+const INPUT_RIGHT: u8 = 0x08;
+const INPUT_JUMP: u8 = 0x10;
+const INPUT_SHIFT: u8 = 0x20;
+const INPUT_SPRINT: u8 = 0x40;
+
+/// Quantize the pre-1.21.2 float impulses into the `Input` flag byte. The
+/// signs follow `KeyboardInput`: a positive sideways impulse is the left key,
+/// a positive forward impulse is forward. Non-finite inputs encode as 0 —
+/// the same "don't propagate NaN" stance the decoders take.
+fn input_flags_byte(sideways: f32, forward: f32, jump: bool, unmount: bool) -> u8 {
+    let mut bits = 0u8;
+    if forward > 0.0 {
+        bits |= INPUT_FORWARD;
+    }
+    if forward < 0.0 {
+        bits |= INPUT_BACKWARD;
+    }
+    if sideways > 0.0 {
+        bits |= INPUT_LEFT;
+    }
+    if sideways < 0.0 {
+        bits |= INPUT_RIGHT;
+    }
+    if jump {
+        bits |= INPUT_JUMP;
+    }
+    if unmount {
+        bits |= INPUT_SHIFT;
+    }
+    bits
+}
+
+/// The `Input` record's impulse magnitudes when downgraded to the pre-1.21.2
+/// float form: each boolean pair becomes ±1.0, the values `KeyboardInput`
+/// itself produced.
+fn input_flags_impulse(positive: bool, negative: bool) -> f32 {
+    f32::from(i8::from(positive) - i8::from(negative))
+}
 
 fn write_item_stack(w: &mut WireWriter, stack: &ItemStack) {
     w.write_varint(i32::from(stack.count));
@@ -423,7 +496,12 @@ fn write_item_stack(w: &mut WireWriter, stack: &ItemStack) {
 /// understands — the same accepted-type table `slot_read_wire`/`wm_stack_decode`
 /// enforce. Unknown types fail the whole stack rather than desynchronizing the
 /// entry list.
-fn read_item_stack(r: &mut WireReader<'_>) -> Result<ItemStack, ProtoError> {
+///
+/// The *type* of each component resolves through `table`'s
+/// `minecraft:data_component_type` registry, so a renumbered 1.21.4 table
+/// decodes the same names under different ids; a name the codec has no shape
+/// for fails closed.
+fn read_item_stack(r: &mut WireReader<'_>, table: &ProtocolTable) -> Result<ItemStack, ProtoError> {
     let count = r.read_varint()?;
     if count < 0 || count > 127 {
         return Err(ProtoError::InvalidDiscriminant {
@@ -452,8 +530,14 @@ fn read_item_stack(r: &mut WireReader<'_>) -> Result<ItemStack, ProtoError> {
                 what: "component type",
             });
         }
+        let type_name = table
+            .registry_name("minecraft:data_component_type", type_id as u32)
+            .ok_or(ProtoError::InvalidDiscriminant {
+                value: i64::from(type_id),
+                what: "component type",
+            })?;
         let start = r.position();
-        skip_component_value(r, type_id as u32)?;
+        skip_component_value(r, type_id as u32, type_name)?;
         added.push(RawComponent {
             type_id: type_id as u32,
             data: r.buffer()[start..r.position()].to_vec(),
@@ -480,26 +564,35 @@ fn read_item_stack(r: &mut WireReader<'_>) -> Result<ItemStack, ProtoError> {
 
 /// Skip one component *value* for the shapes the canonical codec understands:
 /// the exact accepted set of `slot_read_wire` (protocol 767). Values use the
-/// vanilla `DataComponentType` stream encodings.
-fn skip_component_value(r: &mut WireReader<'_>, type_id: u32) -> Result<(), ProtoError> {
-    match type_id {
+/// vanilla `DataComponentType` stream encodings. Keyed by resource name so
+/// any version's renumbered registry decodes the same shapes; an
+/// unrecognized name fails closed on its numeric id.
+fn skip_component_value(
+    r: &mut WireReader<'_>,
+    type_id: u32,
+    type_name: &str,
+) -> Result<(), ProtoError> {
+    match type_name {
         // max_stack_size / max_damage / damage / repair_cost: VarInt.
-        1 | 2 | 3 | 16 => {
+        "minecraft:max_stack_size"
+        | "minecraft:max_damage"
+        | "minecraft:damage"
+        | "minecraft:repair_cost" => {
             r.read_varint()?;
         }
         // unbreakable: strict bool byte.
-        4 => {
+        "minecraft:unbreakable" => {
             r.read_bool()?;
         }
         // custom_name / item_name: anonymous NBT holding a string component.
-        5 | 6 => {
+        "minecraft:custom_name" | "minecraft:item_name" => {
             let span = r.read_anonymous_nbt()?;
             // The codec stores *components as NBT*; the span is validated but
             // not interpreted.
             let _ = span;
         }
         // lore: VarInt count of anonymous-NBT components.
-        7 => {
+        "minecraft:lore" => {
             let n = r.read_count(MAX_COMPONENTS)?;
             for _ in 0..n {
                 r.read_anonymous_nbt()?;
@@ -507,7 +600,7 @@ fn skip_component_value(r: &mut WireReader<'_>, type_id: u32) -> Result<(), Prot
         }
         // enchantments / stored_enchantments: VarInt count of
         // {VarInt enchantment, VarInt level} plus a show-in-tooltip bool.
-        9 | 23 => {
+        "minecraft:enchantments" | "minecraft:stored_enchantments" => {
             let n = r.read_count(256)?;
             for _ in 0..n {
                 r.read_varint()?;
@@ -517,7 +610,7 @@ fn skip_component_value(r: &mut WireReader<'_>, type_id: u32) -> Result<(), Prot
         }
         // potion_contents: optional VarInt potion, optional i32 custom color,
         // VarInt count of {VarInt effect, MobEffectInstance details}.
-        31 => {
+        "minecraft:potion_contents" => {
             if r.read_bool()? {
                 r.read_varint()?;
             }
@@ -533,7 +626,7 @@ fn skip_component_value(r: &mut WireReader<'_>, type_id: u32) -> Result<(), Prot
         // trim: two registry holders (VarInt id each; a `0` holder would mean
         // "by name" which this codec's accepted set rejects like mc-spine) and
         // a show-in-tooltip bool.
-        35 => {
+        "minecraft:trim" => {
             let material = r.read_varint()?;
             let pattern = r.read_varint()?;
             if material == 0 || pattern == 0 {
@@ -662,127 +755,468 @@ impl CodecV767 {
 
     /// Decode one clientbound frame as `phase` without changing codec state.
     pub fn decode_s2c_in(&self, phase: PacketPhase, frame: &[u8]) -> Result<S2CPacket, ProtoError> {
-        let (id, body) = read_frame(frame)?;
-        let name = self
-            .table
-            .packet_name(phase, PacketDir::Clientbound, id as u32)
-            .ok_or(ProtoError::UnknownPacketId {
-                id,
-                context: "s2c packet",
-            })?;
-        let mut r = WireReader::new(body);
-        let packet = self.read_s2c(phase, name, &mut r)?;
-        r.finish()?;
-        Ok(packet)
+        decode_s2c_in(&self.table, phase, frame)
     }
 
     /// Decode one serverbound frame as `phase` without changing codec state.
     pub fn decode_c2s_in(&self, phase: PacketPhase, frame: &[u8]) -> Result<C2SPacket, ProtoError> {
-        let (id, body) = read_frame(frame)?;
-        let name = self
-            .table
-            .packet_name(phase, PacketDir::Serverbound, id as u32)
-            .ok_or(ProtoError::UnknownPacketId {
-                id,
-                context: "c2s packet",
-            })?;
-        let mut r = WireReader::new(body);
-        let packet = self.read_c2s(phase, name, &mut r)?;
-        r.finish()?;
-        Ok(packet)
+        decode_c2s_in(&self.table, &self.capabilities, phase, frame)
     }
+}
 
-    /// Emit `body` under the wire `name` registered in `(phase, dir)`;
-    /// unknown names (a table lacking the packet) fail closed.
-    fn framed(
-        &self,
-        phase: PacketPhase,
-        dir: PacketDir,
-        name: &'static str,
-        body: &[u8],
-        out: &mut Vec<u8>,
-    ) -> Result<(), ProtoError> {
-        let id = self
-            .table
-            .packet_id(phase, dir, name)
-            .ok_or(ProtoError::UnknownPacketId {
-                id: -1,
-                context: "table lookup for packet name",
-            })?;
-        write_frame(out, id as i32, body);
-        Ok(())
-    }
+/// Decode one clientbound frame as `phase` against `table` — the shared
+/// engine behind `CodecV767::decode_s2c_in` and `TableDrivenCodec`.
+pub(crate) fn decode_s2c_in(
+    table: &ProtocolTable,
+    phase: PacketPhase,
+    frame: &[u8],
+) -> Result<S2CPacket, ProtoError> {
+    let (id, body) = read_frame(frame)?;
+    let name = table
+        .packet_name(phase, PacketDir::Clientbound, id as u32)
+        .ok_or(ProtoError::UnknownPacketId {
+            id,
+            context: "s2c packet",
+        })?;
+    let mut r = WireReader::new(body);
+    let packet = read_s2c(table, phase, name, &mut r)?;
+    r.finish()?;
+    Ok(packet)
+}
 
-    fn encode_s2c_body(
-        &self,
-        packet: &S2CPacket,
-    ) -> Result<(PacketPhase, &'static str, Vec<u8>), ProtoError> {
-        let mut w = WireWriter::new();
-        let (phase, name) = match packet {
-            S2CPacket::LoginDisconnect { reason } => {
-                w.raw(reason);
-                (PacketPhase::Login, "login_disconnect")
-            }
-            S2CPacket::EncryptionRequest {
-                server_id,
-                public_key,
-                verify_token,
-                should_authenticate,
-            } => {
-                w.write_string(server_id);
-                w.write_bytes(public_key);
-                w.write_bytes(verify_token);
-                w.write_bool(*should_authenticate);
-                (PacketPhase::Login, "encryption_request")
-            }
-            S2CPacket::LoginSuccess {
-                uuid,
-                username,
-                properties,
-            } => {
-                w.write_uuid(uuid);
-                w.write_string(username);
-                w.write_varint(properties.len() as i32);
-                for p in properties {
-                    w.write_string(&p.name);
-                    w.write_string(&p.value);
-                    w.write_bool(p.signature.is_some());
-                    if let Some(sig) = &p.signature {
-                        w.write_string(sig);
-                    }
+/// Decode one serverbound frame as `phase` against `table`, switching
+/// wire-shape deltas on `caps`.
+pub(crate) fn decode_c2s_in(
+    table: &ProtocolTable,
+    caps: &VersionCapabilities,
+    phase: PacketPhase,
+    frame: &[u8],
+) -> Result<C2SPacket, ProtoError> {
+    let (id, body) = read_frame(frame)?;
+    let name = table
+        .packet_name(phase, PacketDir::Serverbound, id as u32)
+        .ok_or(ProtoError::UnknownPacketId {
+            id,
+            context: "c2s packet",
+        })?;
+    let mut r = WireReader::new(body);
+    let packet = read_c2s(caps, phase, name, &mut r)?;
+    r.finish()?;
+    Ok(packet)
+}
+
+/// Emit `body` under the wire `name` registered in `(phase, dir)`;
+/// unknown names (a table lacking the packet) fail closed.
+pub(crate) fn framed(
+    table: &ProtocolTable,
+    phase: PacketPhase,
+    dir: PacketDir,
+    name: &'static str,
+    body: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), ProtoError> {
+    let id = table
+        .packet_id(phase, dir, name)
+        .ok_or(ProtoError::UnknownPacketId {
+            id: -1,
+            context: "table lookup for packet name",
+        })?;
+    write_frame(out, id as i32, body);
+    Ok(())
+}
+
+pub(crate) fn encode_s2c_body(
+    table: &ProtocolTable,
+    packet: &S2CPacket,
+) -> Result<(PacketPhase, &'static str, Vec<u8>), ProtoError> {
+    let mut w = WireWriter::new();
+    let (phase, name) = match packet {
+        S2CPacket::LoginDisconnect { reason } => {
+            w.raw(reason);
+            (PacketPhase::Login, "login_disconnect")
+        }
+        S2CPacket::EncryptionRequest {
+            server_id,
+            public_key,
+            verify_token,
+            should_authenticate,
+        } => {
+            w.write_string(server_id);
+            w.write_bytes(public_key);
+            w.write_bytes(verify_token);
+            w.write_bool(*should_authenticate);
+            (PacketPhase::Login, "encryption_request")
+        }
+        S2CPacket::LoginSuccess {
+            uuid,
+            username,
+            properties,
+        } => {
+            w.write_uuid(uuid);
+            w.write_string(username);
+            w.write_varint(properties.len() as i32);
+            for p in properties {
+                w.write_string(&p.name);
+                w.write_string(&p.value);
+                w.write_bool(p.signature.is_some());
+                if let Some(sig) = &p.signature {
+                    w.write_string(sig);
                 }
-                (PacketPhase::Login, "login_success")
             }
-            S2CPacket::SetCompression { threshold } => {
-                w.write_varint(*threshold);
-                (PacketPhase::Login, "set_compression")
-            }
-            S2CPacket::ConfigKeepAlive { id } => {
-                w.write_i64(*id);
-                (PacketPhase::Configuration, "keep_alive")
-            }
-            S2CPacket::ConfigRegistryData {
-                registry_id,
-                entries,
-            } => {
-                w.write_string(registry_id);
-                w.write_varint(entries.len() as i32);
-                for e in entries {
-                    w.write_string(&e.entry_id);
-                    w.write_bool(e.data.is_some());
-                    if let Some(data) = &e.data {
-                        w.raw(data);
-                    }
+            (PacketPhase::Login, "login_success")
+        }
+        S2CPacket::SetCompression { threshold } => {
+            w.write_varint(*threshold);
+            (PacketPhase::Login, "set_compression")
+        }
+        S2CPacket::ConfigKeepAlive { id } => {
+            w.write_i64(*id);
+            (PacketPhase::Configuration, "keep_alive")
+        }
+        S2CPacket::ConfigRegistryData {
+            registry_id,
+            entries,
+        } => {
+            w.write_string(registry_id);
+            w.write_varint(entries.len() as i32);
+            for e in entries {
+                w.write_string(&e.entry_id);
+                w.write_bool(e.data.is_some());
+                if let Some(data) = &e.data {
+                    w.raw(data);
                 }
-                (PacketPhase::Configuration, "registry_data")
             }
-            S2CPacket::ConfigFinishConfiguration => {
-                (PacketPhase::Configuration, "finish_configuration")
+            (PacketPhase::Configuration, "registry_data")
+        }
+        S2CPacket::ConfigFinishConfiguration => {
+            (PacketPhase::Configuration, "finish_configuration")
+        }
+        S2CPacket::KeepAlive { id } => {
+            w.write_i64(*id);
+            (PacketPhase::Play, "keep_alive")
+        }
+        S2CPacket::LightUpdateMask {
+            chunk_x,
+            chunk_z,
+            sky_mask,
+            block_mask,
+            empty_sky_mask,
+            empty_block_mask,
+            sky_light,
+            block_light,
+        } => {
+            w.write_varint(*chunk_x);
+            w.write_varint(*chunk_z);
+            w.write_bitset(sky_mask);
+            w.write_bitset(block_mask);
+            w.write_bitset(empty_sky_mask);
+            w.write_bitset(empty_block_mask);
+            w.write_varint(sky_light.len() as i32);
+            for array in sky_light {
+                w.write_bytes(array);
             }
-            S2CPacket::KeepAlive { id } => {
-                w.write_i64(*id);
-                (PacketPhase::Play, "keep_alive")
+            w.write_varint(block_light.len() as i32);
+            for array in block_light {
+                w.write_bytes(array);
             }
+            (PacketPhase::Play, "light_update")
+        }
+        S2CPacket::OpenScreen {
+            container_id,
+            menu,
+            title,
+        } => {
+            w.write_varint(*container_id);
+            // Menu id resolves through the registry, not a constant: a
+            // different version's table remaps this packet automatically.
+            let menu_id = table
+                .registry_id("minecraft:menu", menu.resource_name())
+                .ok_or(ProtoError::Malformed(
+                    "menu kind missing from the menu registry",
+                ))?;
+            w.write_varint(menu_id as i32);
+            w.raw(title);
+            (PacketPhase::Play, "open_screen")
+        }
+        S2CPacket::SetEquipment { entity_id, slots } => {
+            if slots.is_empty() {
+                // The wire form cannot express zero entries (the continue
+                // bit lives on each slot byte), so refuse to emit one.
+                return Err(ProtoError::Malformed("empty equipment list"));
+            }
+            w.write_varint(*entity_id);
+            for (i, entry) in slots.iter().enumerate() {
+                let more = u8::from(i + 1 < slots.len()) << 7;
+                w.write_u8(entry.slot | more);
+                write_item_stack(&mut w, &entry.item);
+            }
+            (PacketPhase::Play, "set_equipment")
+        }
+        S2CPacket::SetPassengers {
+            vehicle,
+            passengers,
+        } => {
+            w.write_varint(*vehicle);
+            w.write_varint(passengers.len() as i32);
+            for &p in passengers {
+                w.write_varint(p);
+            }
+            (PacketPhase::Play, "set_passengers")
+        }
+        S2CPacket::SetPlayerTeam { name, operation } => {
+            w.write_string(name);
+            match operation {
+                TeamOperation::Create { info, members } => {
+                    w.write_u8(0);
+                    write_team_info(&mut w, info);
+                    write_string_list(&mut w, members);
+                }
+                TeamOperation::Remove => {
+                    w.write_u8(1);
+                }
+                TeamOperation::UpdateInfo { info } => {
+                    w.write_u8(2);
+                    write_team_info(&mut w, info);
+                }
+                TeamOperation::AddMembers { members } => {
+                    w.write_u8(3);
+                    write_string_list(&mut w, members);
+                }
+                TeamOperation::RemoveMembers { members } => {
+                    w.write_u8(4);
+                    write_string_list(&mut w, members);
+                }
+            }
+            (PacketPhase::Play, "set_player_team")
+        }
+        S2CPacket::TabList { header, footer } => {
+            w.raw(header);
+            w.raw(footer);
+            (PacketPhase::Play, "tab_list")
+        }
+        S2CPacket::TickingState {
+            tick_rate,
+            is_frozen,
+        } => {
+            w.write_f32(*tick_rate);
+            w.write_bool(*is_frozen);
+            (PacketPhase::Play, "ticking_state")
+        }
+        S2CPacket::TickingStep { steps } => {
+            w.write_varint(*steps);
+            (PacketPhase::Play, "ticking_step")
+        }
+    };
+    Ok((phase, name, w.into_vec()))
+}
+
+pub(crate) fn encode_c2s_body(
+    caps: &VersionCapabilities,
+    packet: &C2SPacket,
+) -> Result<(PacketPhase, &'static str, Vec<u8>), ProtoError> {
+    let mut w = WireWriter::new();
+    let (phase, name) = match packet {
+        C2SPacket::Handshake {
+            protocol_version,
+            server_address,
+            server_port,
+            next_state,
+        } => {
+            w.write_varint(*protocol_version);
+            w.write_string(server_address);
+            w.write_u16(*server_port);
+            w.write_varint(*next_state);
+            (PacketPhase::Handshake, "handshake")
+        }
+        C2SPacket::LoginStart { name, uuid } => {
+            w.write_string(name);
+            w.write_uuid(uuid);
+            (PacketPhase::Login, "login_start")
+        }
+        C2SPacket::EncryptionResponse {
+            shared_secret,
+            verify_token,
+        } => {
+            w.write_bytes(shared_secret);
+            w.write_bytes(verify_token);
+            (PacketPhase::Login, "encryption_response")
+        }
+        C2SPacket::LoginAcknowledged => (PacketPhase::Login, "login_acknowledged"),
+        C2SPacket::ConfigKeepAlive { id } => {
+            w.write_i64(*id);
+            (PacketPhase::Configuration, "keep_alive")
+        }
+        C2SPacket::ConfigFinishConfiguration => {
+            (PacketPhase::Configuration, "finish_configuration")
+        }
+        C2SPacket::MoveVehicle { x, y, z, yaw, pitch } => {
+            w.write_f64(*x);
+            w.write_f64(*y);
+            w.write_f64(*z);
+            w.write_f32(*yaw);
+            w.write_f32(*pitch);
+            (PacketPhase::Play, "move_vehicle")
+        }
+        C2SPacket::PaddleBoat { left, right } => {
+            w.write_bool(*left);
+            w.write_bool(*right);
+            (PacketPhase::Play, "paddle_boat")
+        }
+        C2SPacket::KeepAlive { id } => {
+            w.write_i64(*id);
+            (PacketPhase::Play, "keep_alive")
+        }
+        C2SPacket::PlayerInput {
+            sideways,
+            forward,
+            jump,
+            unmount,
+        } => {
+            if caps.player_input_flags {
+                w.write_u8(input_flags_byte(*sideways, *forward, *jump, *unmount));
+            } else {
+                w.write_f32(*sideways);
+                w.write_f32(*forward);
+                w.write_u8(u8::from(*jump) | (u8::from(*unmount) << 1));
+            }
+            (PacketPhase::Play, "player_input")
+        }
+        C2SPacket::PlayerInputFlags {
+            forward,
+            backward,
+            left,
+            right,
+            jump,
+            shift,
+            sprint,
+        } => {
+            if caps.player_input_flags {
+                let mut bits = 0u8;
+                if *forward {
+                    bits |= INPUT_FORWARD;
+                }
+                if *backward {
+                    bits |= INPUT_BACKWARD;
+                }
+                if *left {
+                    bits |= INPUT_LEFT;
+                }
+                if *right {
+                    bits |= INPUT_RIGHT;
+                }
+                if *jump {
+                    bits |= INPUT_JUMP;
+                }
+                if *shift {
+                    bits |= INPUT_SHIFT;
+                }
+                if *sprint {
+                    bits |= INPUT_SPRINT;
+                }
+                w.write_u8(bits);
+            } else {
+                // Downgrade to the float form: impulses become the vanilla
+                // ±1.0 magnitudes, `shift` maps to the old `unmount` bit,
+                // `sprint` has no 767 wire slot.
+                w.write_f32(input_flags_impulse(*left, *right));
+                w.write_f32(input_flags_impulse(*forward, *backward));
+                w.write_u8(u8::from(*jump) | (u8::from(*shift) << 1));
+            }
+            (PacketPhase::Play, "player_input")
+        }
+    };
+    Ok((phase, name, w.into_vec()))
+}
+
+/// Dispatch on the resolved wire name — decoders never see numeric ids.
+/// `phase` disambiguates wire names shared across phases (`keep_alive`,
+/// `finish_configuration`).
+fn read_s2c(
+    table: &ProtocolTable,
+    phase: PacketPhase,
+    name: &str,
+    r: &mut WireReader<'_>,
+) -> Result<S2CPacket, ProtoError> {
+    Ok(match name {
+        "login_disconnect" => S2CPacket::LoginDisconnect {
+            reason: r.read_anonymous_nbt()?.to_vec(),
+        },
+        "encryption_request" => S2CPacket::EncryptionRequest {
+            server_id: r.read_string(MAX_STRING_CHARS)?,
+            public_key: r.read_bytes(1 << 16)?.to_vec(),
+            verify_token: r.read_bytes(1 << 16)?.to_vec(),
+            should_authenticate: r.read_bool()?,
+        },
+        "login_success" => S2CPacket::LoginSuccess {
+            uuid: r.read_uuid()?,
+            username: r.read_string(16)?,
+            properties: {
+                let n = r.read_count(1024)?;
+                let mut props = Vec::with_capacity(n.min(64));
+                for _ in 0..n {
+                    let name = r.read_string(MAX_NAME_CHARS)?;
+                    let value = r.read_string(MAX_NAME_CHARS)?;
+                    let signature = if r.read_bool()? {
+                        Some(r.read_string(MAX_NAME_CHARS)?)
+                    } else {
+                        None
+                    };
+                    props.push(LoginProperty {
+                        name,
+                        value,
+                        signature,
+                    });
+                }
+                props
+            },
+        },
+        "set_compression" => S2CPacket::SetCompression {
+            threshold: r.read_varint()?,
+        },
+        "keep_alive" => {
+            let id = r.read_i64()?;
+            if phase == PacketPhase::Configuration {
+                S2CPacket::ConfigKeepAlive { id }
+            } else {
+                S2CPacket::KeepAlive { id }
+            }
+        }
+        "registry_data" => S2CPacket::ConfigRegistryData {
+            registry_id: r.read_string(MAX_NAME_CHARS)?,
+            entries: {
+                let n = r.read_count(MAX_REGISTRY_ENTRIES)?;
+                let mut entries = Vec::with_capacity(n.min(4096));
+                for _ in 0..n {
+                    let entry_id = r.read_string(MAX_NAME_CHARS)?;
+                    let data = if r.read_bool()? {
+                        Some(r.read_anonymous_nbt()?.to_vec())
+                    } else {
+                        None
+                    };
+                    entries.push(RegistryDataEntry { entry_id, data });
+                }
+                entries
+            },
+        },
+        "finish_configuration" => S2CPacket::ConfigFinishConfiguration,
+        "light_update" => {
+            let chunk_x = r.read_varint()?;
+            let chunk_z = r.read_varint()?;
+            let sky_mask = r.read_bitset(1024)?;
+            let block_mask = r.read_bitset(1024)?;
+            let empty_sky_mask = r.read_bitset(1024)?;
+            let empty_block_mask = r.read_bitset(1024)?;
+            let read_arrays = |r: &mut WireReader<'_>| -> Result<Vec<Vec<u8>>, ProtoError> {
+                let n = r.read_count(1024)?;
+                let mut arrays = Vec::with_capacity(n.min(64));
+                for _ in 0..n {
+                    let array = r.read_bytes(1 << 20)?;
+                    arrays.push(array.to_vec());
+                }
+                Ok(arrays)
+            };
+            let sky_light = read_arrays(r)?;
+            let block_light = read_arrays(r)?;
             S2CPacket::LightUpdateMask {
                 chunk_x,
                 chunk_z,
@@ -792,461 +1226,196 @@ impl CodecV767 {
                 empty_block_mask,
                 sky_light,
                 block_light,
-            } => {
-                w.write_varint(*chunk_x);
-                w.write_varint(*chunk_z);
-                w.write_bitset(sky_mask);
-                w.write_bitset(block_mask);
-                w.write_bitset(empty_sky_mask);
-                w.write_bitset(empty_block_mask);
-                w.write_varint(sky_light.len() as i32);
-                for array in sky_light {
-                    w.write_bytes(array);
-                }
-                w.write_varint(block_light.len() as i32);
-                for array in block_light {
-                    w.write_bytes(array);
-                }
-                (PacketPhase::Play, "light_update")
             }
+        }
+        "open_screen" => {
+            let container_id = r.read_varint()?;
+            let menu_id = r.read_varint()?;
+            if menu_id < 0 {
+                return Err(ProtoError::InvalidDiscriminant {
+                    value: i64::from(menu_id),
+                    what: "menu id",
+                });
+            }
+            let menu_name = table
+                .registry_name("minecraft:menu", menu_id as u32)
+                .ok_or(ProtoError::InvalidDiscriminant {
+                    value: i64::from(menu_id),
+                    what: "menu id",
+                })?;
+            let menu = MenuKind::from_resource_name(menu_name).ok_or(
+                ProtoError::InvalidDiscriminant {
+                    value: i64::from(menu_id),
+                    what: "menu kind",
+                },
+            )?;
+            let title = r.read_anonymous_nbt()?.to_vec();
             S2CPacket::OpenScreen {
                 container_id,
                 menu,
                 title,
-            } => {
-                w.write_varint(*container_id);
-                // Menu id resolves through the registry, not a constant: a
-                // different version's table remaps this packet automatically.
-                let menu_id = self
-                    .table
-                    .registry_id("minecraft:menu", menu.resource_name())
-                    .ok_or(ProtoError::Malformed(
-                        "menu kind missing from the menu registry",
-                    ))?;
-                w.write_varint(menu_id as i32);
-                w.raw(title);
-                (PacketPhase::Play, "open_screen")
             }
-            S2CPacket::SetEquipment { entity_id, slots } => {
-                if slots.is_empty() {
-                    // The wire form cannot express zero entries (the continue
-                    // bit lives on each slot byte), so refuse to emit one.
-                    return Err(ProtoError::Malformed("empty equipment list"));
+        }
+        "set_equipment" => {
+            let entity_id = r.read_varint()?;
+            let mut slots = Vec::new();
+            loop {
+                let byte = r.read_u8()?;
+                let slot = byte & 0x7f;
+                if slot > 5 {
+                    return Err(ProtoError::InvalidDiscriminant {
+                        value: i64::from(slot),
+                        what: "equipment slot",
+                    });
                 }
-                w.write_varint(*entity_id);
-                for (i, entry) in slots.iter().enumerate() {
-                    let more = u8::from(i + 1 < slots.len()) << 7;
-                    w.write_u8(entry.slot | more);
-                    write_item_stack(&mut w, &entry.item);
+                let item = read_item_stack(r, table)?;
+                slots.push(EquipmentSlot { slot, item });
+                if byte & 0x80 == 0 {
+                    break;
                 }
-                (PacketPhase::Play, "set_equipment")
             }
-            S2CPacket::SetPassengers {
-                vehicle,
-                passengers,
-            } => {
-                w.write_varint(*vehicle);
-                w.write_varint(passengers.len() as i32);
-                for &p in passengers {
-                    w.write_varint(p);
+            S2CPacket::SetEquipment { entity_id, slots }
+        }
+        "set_passengers" => {
+            let vehicle = r.read_varint()?;
+            let passengers = {
+                let n = r.read_count(MAX_PASSENGERS)?;
+                let mut list = Vec::with_capacity(n.min(256));
+                for _ in 0..n {
+                    list.push(r.read_varint()?);
                 }
-                (PacketPhase::Play, "set_passengers")
-            }
-            S2CPacket::SetPlayerTeam { name, operation } => {
-                w.write_string(name);
-                match operation {
-                    TeamOperation::Create { info, members } => {
-                        w.write_u8(0);
-                        write_team_info(&mut w, info);
-                        write_string_list(&mut w, members);
-                    }
-                    TeamOperation::Remove => {
-                        w.write_u8(1);
-                    }
-                    TeamOperation::UpdateInfo { info } => {
-                        w.write_u8(2);
-                        write_team_info(&mut w, info);
-                    }
-                    TeamOperation::AddMembers { members } => {
-                        w.write_u8(3);
-                        write_string_list(&mut w, members);
-                    }
-                    TeamOperation::RemoveMembers { members } => {
-                        w.write_u8(4);
-                        write_string_list(&mut w, members);
-                    }
+                list
+            };
+            S2CPacket::SetPassengers { vehicle, passengers }
+        }
+        "set_player_team" => {
+            let name = r.read_string(MAX_NAME_CHARS)?;
+            let mode = r.read_u8()?;
+            let operation = match mode {
+                0 => TeamOperation::Create {
+                    info: read_team_info(r)?,
+                    members: read_string_list(r, MAX_TEAM_MEMBERS)?,
+                },
+                1 => TeamOperation::Remove,
+                2 => TeamOperation::UpdateInfo {
+                    info: read_team_info(r)?,
+                },
+                3 => TeamOperation::AddMembers {
+                    members: read_string_list(r, MAX_TEAM_MEMBERS)?,
+                },
+                4 => TeamOperation::RemoveMembers {
+                    members: read_string_list(r, MAX_TEAM_MEMBERS)?,
+                },
+                other => {
+                    return Err(ProtoError::InvalidDiscriminant {
+                        value: i64::from(other),
+                        what: "team mode",
+                    })
                 }
-                (PacketPhase::Play, "set_player_team")
+            };
+            S2CPacket::SetPlayerTeam { name, operation }
+        }
+        "tab_list" => S2CPacket::TabList {
+            header: r.read_anonymous_nbt()?.to_vec(),
+            footer: r.read_anonymous_nbt()?.to_vec(),
+        },
+        "ticking_state" => S2CPacket::TickingState {
+            tick_rate: r.read_f32()?,
+            is_frozen: r.read_bool_lenient()?,
+        },
+        "ticking_step" => {
+            let steps = r.read_varint()?;
+            if steps < 0 {
+                return Err(ProtoError::InvalidDiscriminant {
+                    value: i64::from(steps),
+                    what: "ticking step count",
+                });
             }
-            S2CPacket::TabList { header, footer } => {
-                w.raw(header);
-                w.raw(footer);
-                (PacketPhase::Play, "tab_list")
-            }
-            S2CPacket::TickingState {
-                tick_rate,
-                is_frozen,
-            } => {
-                w.write_f32(*tick_rate);
-                w.write_bool(*is_frozen);
-                (PacketPhase::Play, "ticking_state")
-            }
-            S2CPacket::TickingStep { steps } => {
-                w.write_varint(*steps);
-                (PacketPhase::Play, "ticking_step")
-            }
-        };
-        Ok((phase, name, w.into_vec()))
-    }
+            S2CPacket::TickingStep { steps }
+        }
+        _ => {
+            return Err(ProtoError::UnknownPacketId {
+                id: -1,
+                context: "s2c packet outside the canonical IR",
+            })
+        }
+    })
+}
 
-    fn encode_c2s_body(
-        &self,
-        packet: &C2SPacket,
-    ) -> Result<(PacketPhase, &'static str, Vec<u8>), ProtoError> {
-        let mut w = WireWriter::new();
-        let (phase, name) = match packet {
+fn read_c2s(
+    caps: &VersionCapabilities,
+    phase: PacketPhase,
+    name: &str,
+    r: &mut WireReader<'_>,
+) -> Result<C2SPacket, ProtoError> {
+    Ok(match name {
+        "handshake" => {
+            let protocol_version = r.read_varint()?;
+            let server_address = r.read_string(255)?;
+            let server_port = r.read_u16()?;
+            let next_state = r.read_varint()?;
+            if !matches!(next_state, 1 | 2) {
+                return Err(ProtoError::InvalidDiscriminant {
+                    value: i64::from(next_state),
+                    what: "handshake next state",
+                });
+            }
             C2SPacket::Handshake {
                 protocol_version,
                 server_address,
                 server_port,
                 next_state,
-            } => {
-                w.write_varint(*protocol_version);
-                w.write_string(server_address);
-                w.write_u16(*server_port);
-                w.write_varint(*next_state);
-                (PacketPhase::Handshake, "handshake")
             }
-            C2SPacket::LoginStart { name, uuid } => {
-                w.write_string(name);
-                w.write_uuid(uuid);
-                (PacketPhase::Login, "login_start")
+        }
+        "login_start" => C2SPacket::LoginStart {
+            name: r.read_string(16)?,
+            uuid: r.read_uuid()?,
+        },
+        "encryption_response" => C2SPacket::EncryptionResponse {
+            shared_secret: r.read_bytes(1 << 16)?.to_vec(),
+            verify_token: r.read_bytes(1 << 16)?.to_vec(),
+        },
+        "login_acknowledged" => C2SPacket::LoginAcknowledged,
+        "keep_alive" => {
+            let id = r.read_i64()?;
+            if phase == PacketPhase::Configuration {
+                C2SPacket::ConfigKeepAlive { id }
+            } else {
+                C2SPacket::KeepAlive { id }
             }
-            C2SPacket::EncryptionResponse {
-                shared_secret,
-                verify_token,
-            } => {
-                w.write_bytes(shared_secret);
-                w.write_bytes(verify_token);
-                (PacketPhase::Login, "encryption_response")
+        }
+        "finish_configuration" => C2SPacket::ConfigFinishConfiguration,
+        "move_vehicle" => {
+            let x = r.read_f64()?;
+            let y = r.read_f64()?;
+            let z = r.read_f64()?;
+            let yaw = r.read_f32()?;
+            let pitch = r.read_f32()?;
+            if ![x, y, z].iter().all(|v| v.is_finite())
+                || !yaw.is_finite()
+                || !pitch.is_finite()
+            {
+                return Err(ProtoError::Malformed("non-finite vehicle coordinates"));
             }
-            C2SPacket::LoginAcknowledged => (PacketPhase::Login, "login_acknowledged"),
-            C2SPacket::ConfigKeepAlive { id } => {
-                w.write_i64(*id);
-                (PacketPhase::Configuration, "keep_alive")
-            }
-            C2SPacket::ConfigFinishConfiguration => {
-                (PacketPhase::Configuration, "finish_configuration")
-            }
-            C2SPacket::MoveVehicle { x, y, z, yaw, pitch } => {
-                w.write_f64(*x);
-                w.write_f64(*y);
-                w.write_f64(*z);
-                w.write_f32(*yaw);
-                w.write_f32(*pitch);
-                (PacketPhase::Play, "move_vehicle")
-            }
-            C2SPacket::PaddleBoat { left, right } => {
-                w.write_bool(*left);
-                w.write_bool(*right);
-                (PacketPhase::Play, "paddle_boat")
-            }
-            C2SPacket::KeepAlive { id } => {
-                w.write_i64(*id);
-                (PacketPhase::Play, "keep_alive")
-            }
-            C2SPacket::PlayerInput {
-                sideways,
-                forward,
-                jump,
-                unmount,
-            } => {
-                w.write_f32(*sideways);
-                w.write_f32(*forward);
-                w.write_u8(u8::from(*jump) | (u8::from(*unmount) << 1));
-                (PacketPhase::Play, "player_input")
-            }
-        };
-        Ok((phase, name, w.into_vec()))
-    }
-
-    /// Dispatch on the resolved wire name — decoders never see numeric ids.
-    /// `phase` disambiguates wire names shared across phases (`keep_alive`,
-    /// `finish_configuration`).
-    fn read_s2c(
-        &self,
-        phase: PacketPhase,
-        name: &str,
-        r: &mut WireReader<'_>,
-    ) -> Result<S2CPacket, ProtoError> {
-        Ok(match name {
-            "login_disconnect" => S2CPacket::LoginDisconnect {
-                reason: r.read_anonymous_nbt()?.to_vec(),
-            },
-            "encryption_request" => S2CPacket::EncryptionRequest {
-                server_id: r.read_string(MAX_STRING_CHARS)?,
-                public_key: r.read_bytes(1 << 16)?.to_vec(),
-                verify_token: r.read_bytes(1 << 16)?.to_vec(),
-                should_authenticate: r.read_bool()?,
-            },
-            "login_success" => S2CPacket::LoginSuccess {
-                uuid: r.read_uuid()?,
-                username: r.read_string(16)?,
-                properties: {
-                    let n = r.read_count(1024)?;
-                    let mut props = Vec::with_capacity(n.min(64));
-                    for _ in 0..n {
-                        let name = r.read_string(MAX_NAME_CHARS)?;
-                        let value = r.read_string(MAX_NAME_CHARS)?;
-                        let signature = if r.read_bool()? {
-                            Some(r.read_string(MAX_NAME_CHARS)?)
-                        } else {
-                            None
-                        };
-                        props.push(LoginProperty {
-                            name,
-                            value,
-                            signature,
-                        });
-                    }
-                    props
-                },
-            },
-            "set_compression" => S2CPacket::SetCompression {
-                threshold: r.read_varint()?,
-            },
-            "keep_alive" => {
-                let id = r.read_i64()?;
-                if phase == PacketPhase::Configuration {
-                    S2CPacket::ConfigKeepAlive { id }
-                } else {
-                    S2CPacket::KeepAlive { id }
+            C2SPacket::MoveVehicle { x, y, z, yaw, pitch }
+        }
+        "paddle_boat" => C2SPacket::PaddleBoat {
+            left: r.read_bool_lenient()?,
+            right: r.read_bool_lenient()?,
+        },
+        "player_input" => {
+            if caps.player_input_flags {
+                let bits = r.read_u8()?;
+                C2SPacket::PlayerInputFlags {
+                    forward: bits & INPUT_FORWARD != 0,
+                    backward: bits & INPUT_BACKWARD != 0,
+                    left: bits & INPUT_LEFT != 0,
+                    right: bits & INPUT_RIGHT != 0,
+                    jump: bits & INPUT_JUMP != 0,
+                    shift: bits & INPUT_SHIFT != 0,
+                    sprint: bits & INPUT_SPRINT != 0,
                 }
-            }
-            "registry_data" => S2CPacket::ConfigRegistryData {
-                registry_id: r.read_string(MAX_NAME_CHARS)?,
-                entries: {
-                    let n = r.read_count(MAX_REGISTRY_ENTRIES)?;
-                    let mut entries = Vec::with_capacity(n.min(4096));
-                    for _ in 0..n {
-                        let entry_id = r.read_string(MAX_NAME_CHARS)?;
-                        let data = if r.read_bool()? {
-                            Some(r.read_anonymous_nbt()?.to_vec())
-                        } else {
-                            None
-                        };
-                        entries.push(RegistryDataEntry { entry_id, data });
-                    }
-                    entries
-                },
-            },
-            "finish_configuration" => S2CPacket::ConfigFinishConfiguration,
-            "light_update" => {
-                let chunk_x = r.read_varint()?;
-                let chunk_z = r.read_varint()?;
-                let sky_mask = r.read_bitset(1024)?;
-                let block_mask = r.read_bitset(1024)?;
-                let empty_sky_mask = r.read_bitset(1024)?;
-                let empty_block_mask = r.read_bitset(1024)?;
-                let read_arrays = |r: &mut WireReader<'_>| -> Result<Vec<Vec<u8>>, ProtoError> {
-                    let n = r.read_count(1024)?;
-                    let mut arrays = Vec::with_capacity(n.min(64));
-                    for _ in 0..n {
-                        let array = r.read_bytes(1 << 20)?;
-                        arrays.push(array.to_vec());
-                    }
-                    Ok(arrays)
-                };
-                let sky_light = read_arrays(r)?;
-                let block_light = read_arrays(r)?;
-                S2CPacket::LightUpdateMask {
-                    chunk_x,
-                    chunk_z,
-                    sky_mask,
-                    block_mask,
-                    empty_sky_mask,
-                    empty_block_mask,
-                    sky_light,
-                    block_light,
-                }
-            }
-            "open_screen" => {
-                let container_id = r.read_varint()?;
-                let menu_id = r.read_varint()?;
-                if menu_id < 0 {
-                    return Err(ProtoError::InvalidDiscriminant {
-                        value: i64::from(menu_id),
-                        what: "menu id",
-                    });
-                }
-                let menu_name = self
-                    .table
-                    .registry_name("minecraft:menu", menu_id as u32)
-                    .ok_or(ProtoError::InvalidDiscriminant {
-                        value: i64::from(menu_id),
-                        what: "menu id",
-                    })?;
-                let menu = MenuKind::from_resource_name(menu_name).ok_or(
-                    ProtoError::InvalidDiscriminant {
-                        value: i64::from(menu_id),
-                        what: "menu kind",
-                    },
-                )?;
-                let title = r.read_anonymous_nbt()?.to_vec();
-                S2CPacket::OpenScreen {
-                    container_id,
-                    menu,
-                    title,
-                }
-            }
-            "set_equipment" => {
-                let entity_id = r.read_varint()?;
-                let mut slots = Vec::new();
-                loop {
-                    let byte = r.read_u8()?;
-                    let slot = byte & 0x7f;
-                    if slot > 5 {
-                        return Err(ProtoError::InvalidDiscriminant {
-                            value: i64::from(slot),
-                            what: "equipment slot",
-                        });
-                    }
-                    let item = read_item_stack(r)?;
-                    slots.push(EquipmentSlot { slot, item });
-                    if byte & 0x80 == 0 {
-                        break;
-                    }
-                }
-                S2CPacket::SetEquipment { entity_id, slots }
-            }
-            "set_passengers" => {
-                let vehicle = r.read_varint()?;
-                let passengers = {
-                    let n = r.read_count(MAX_PASSENGERS)?;
-                    let mut list = Vec::with_capacity(n.min(256));
-                    for _ in 0..n {
-                        list.push(r.read_varint()?);
-                    }
-                    list
-                };
-                S2CPacket::SetPassengers { vehicle, passengers }
-            }
-            "set_player_team" => {
-                let name = r.read_string(MAX_NAME_CHARS)?;
-                let mode = r.read_u8()?;
-                let operation = match mode {
-                    0 => TeamOperation::Create {
-                        info: read_team_info(r)?,
-                        members: read_string_list(r, MAX_TEAM_MEMBERS)?,
-                    },
-                    1 => TeamOperation::Remove,
-                    2 => TeamOperation::UpdateInfo {
-                        info: read_team_info(r)?,
-                    },
-                    3 => TeamOperation::AddMembers {
-                        members: read_string_list(r, MAX_TEAM_MEMBERS)?,
-                    },
-                    4 => TeamOperation::RemoveMembers {
-                        members: read_string_list(r, MAX_TEAM_MEMBERS)?,
-                    },
-                    other => {
-                        return Err(ProtoError::InvalidDiscriminant {
-                            value: i64::from(other),
-                            what: "team mode",
-                        })
-                    }
-                };
-                S2CPacket::SetPlayerTeam { name, operation }
-            }
-            "tab_list" => S2CPacket::TabList {
-                header: r.read_anonymous_nbt()?.to_vec(),
-                footer: r.read_anonymous_nbt()?.to_vec(),
-            },
-            "ticking_state" => S2CPacket::TickingState {
-                tick_rate: r.read_f32()?,
-                is_frozen: r.read_bool_lenient()?,
-            },
-            "ticking_step" => {
-                let steps = r.read_varint()?;
-                if steps < 0 {
-                    return Err(ProtoError::InvalidDiscriminant {
-                        value: i64::from(steps),
-                        what: "ticking step count",
-                    });
-                }
-                S2CPacket::TickingStep { steps }
-            }
-            _ => {
-                return Err(ProtoError::UnknownPacketId {
-                    id: -1,
-                    context: "s2c packet outside the canonical IR",
-                })
-            }
-        })
-    }
-
-    fn read_c2s(
-        &self,
-        phase: PacketPhase,
-        name: &str,
-        r: &mut WireReader<'_>,
-    ) -> Result<C2SPacket, ProtoError> {
-        Ok(match name {
-            "handshake" => {
-                let protocol_version = r.read_varint()?;
-                let server_address = r.read_string(255)?;
-                let server_port = r.read_u16()?;
-                let next_state = r.read_varint()?;
-                if !matches!(next_state, 1 | 2) {
-                    return Err(ProtoError::InvalidDiscriminant {
-                        value: i64::from(next_state),
-                        what: "handshake next state",
-                    });
-                }
-                C2SPacket::Handshake {
-                    protocol_version,
-                    server_address,
-                    server_port,
-                    next_state,
-                }
-            }
-            "login_start" => C2SPacket::LoginStart {
-                name: r.read_string(16)?,
-                uuid: r.read_uuid()?,
-            },
-            "encryption_response" => C2SPacket::EncryptionResponse {
-                shared_secret: r.read_bytes(1 << 16)?.to_vec(),
-                verify_token: r.read_bytes(1 << 16)?.to_vec(),
-            },
-            "login_acknowledged" => C2SPacket::LoginAcknowledged,
-            "keep_alive" => {
-                let id = r.read_i64()?;
-                if phase == PacketPhase::Configuration {
-                    C2SPacket::ConfigKeepAlive { id }
-                } else {
-                    C2SPacket::KeepAlive { id }
-                }
-            }
-            "finish_configuration" => C2SPacket::ConfigFinishConfiguration,
-            "move_vehicle" => {
-                let x = r.read_f64()?;
-                let y = r.read_f64()?;
-                let z = r.read_f64()?;
-                let yaw = r.read_f32()?;
-                let pitch = r.read_f32()?;
-                if ![x, y, z].iter().all(|v| v.is_finite())
-                    || !yaw.is_finite()
-                    || !pitch.is_finite()
-                {
-                    return Err(ProtoError::Malformed("non-finite vehicle coordinates"));
-                }
-                C2SPacket::MoveVehicle { x, y, z, yaw, pitch }
-            }
-            "paddle_boat" => C2SPacket::PaddleBoat {
-                left: r.read_bool_lenient()?,
-                right: r.read_bool_lenient()?,
-            },
-            "player_input" => {
+            } else {
                 let sideways = r.read_f32()?;
                 let forward = r.read_f32()?;
                 let flags = r.read_u8()?;
@@ -1260,14 +1429,14 @@ impl CodecV767 {
                     unmount: flags & 0x02 != 0,
                 }
             }
-            _ => {
-                return Err(ProtoError::UnknownPacketId {
-                    id: -1,
-                    context: "c2s packet outside the canonical IR",
-                })
-            }
-        })
-    }
+        }
+        _ => {
+            return Err(ProtoError::UnknownPacketId {
+                id: -1,
+                context: "c2s packet outside the canonical IR",
+            })
+        }
+    })
 }
 
 impl ProtocolCodec for CodecV767 {
@@ -1282,8 +1451,8 @@ impl ProtocolCodec for CodecV767 {
     fn encode_s2c(&self, packet: &S2CPacket, out: &mut Vec<u8>) -> Result<(), ProtoError> {
         // A keep_alive in configuration and play share a field shape but are
         // different packets — the IR variant names the phase explicitly.
-        let (phase, name, body) = self.encode_s2c_body(packet)?;
-        self.framed(phase, PacketDir::Clientbound, name, &body, out)
+        let (phase, name, body) = encode_s2c_body(&self.table, packet)?;
+        framed(&self.table, phase, PacketDir::Clientbound, name, &body, out)
     }
 
     fn decode_s2c(&self, frame: &[u8]) -> Result<S2CPacket, ProtoError> {
@@ -1291,8 +1460,8 @@ impl ProtocolCodec for CodecV767 {
     }
 
     fn encode_c2s(&self, packet: &C2SPacket, out: &mut Vec<u8>) -> Result<(), ProtoError> {
-        let (phase, name, body) = self.encode_c2s_body(packet)?;
-        self.framed(phase, PacketDir::Serverbound, name, &body, out)
+        let (phase, name, body) = encode_c2s_body(&self.capabilities, packet)?;
+        framed(&self.table, phase, PacketDir::Serverbound, name, &body, out)
     }
 
     fn decode_c2s(&self, frame: &[u8]) -> Result<C2SPacket, ProtoError> {

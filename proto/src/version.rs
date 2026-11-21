@@ -40,7 +40,7 @@ impl ProtocolVersion {
     }
 
     /// The numeric protocol version used in handshakes and the `server_list_ping`.
-    pub fn number(self) -> i32 {
+    pub const fn number(self) -> i32 {
         match self {
             Self::V1_21_1 => Self::V1_21_1_NUMBER,
             Self::V1_21_3 => Self::V1_21_3_NUMBER,
@@ -151,6 +151,10 @@ pub struct VersionCapabilities {
     /// Whether item components include `consumable`/`use_remainder`
     /// (1.21.2+ replaced the old `food` payload with these types).
     pub consumable_component: bool,
+    /// Whether serverbound `player_input` is the 1.21.2+ `Input` record — a
+    /// single byte of direction/jump/shift/sprint flags — instead of the
+    /// 1.21.1 `f32 sideways, f32 forward, u8 jump/unmount flags` form.
+    pub player_input_flags: bool,
 }
 
 impl VersionCapabilities {
@@ -176,6 +180,7 @@ const CAP_1_21_1: VersionCapabilities = VersionCapabilities {
     split_particle_status: false,
     relative_movement_flags: false,
     consumable_component: false,
+    player_input_flags: false,
 };
 
 const CAP_1_21_3: VersionCapabilities = VersionCapabilities {
@@ -189,6 +194,7 @@ const CAP_1_21_3: VersionCapabilities = VersionCapabilities {
     split_particle_status: true,
     relative_movement_flags: true,
     consumable_component: true,
+    player_input_flags: true,
 };
 
 const CAP_1_21_4: VersionCapabilities = VersionCapabilities {
@@ -202,6 +208,7 @@ const CAP_1_21_4: VersionCapabilities = VersionCapabilities {
     split_particle_status: true,
     relative_movement_flags: true,
     consumable_component: true,
+    player_input_flags: true,
 };
 
 const CAP_1_21_5: VersionCapabilities = VersionCapabilities {
@@ -215,6 +222,7 @@ const CAP_1_21_5: VersionCapabilities = VersionCapabilities {
     split_particle_status: true,
     relative_movement_flags: true,
     consumable_component: true,
+    player_input_flags: true,
 };
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "mc-spine-client-mesh",
  "mc-spine-kernel",
+ "mc-spine-proto",
 ]
 
 [[package]]
@@ -16,4 +17,8 @@ version = "0.1.0"
 
 [[package]]
 name = "mc-spine-kernel"
+version = "0.1.0"
+
+[[package]]
+name = "mc-spine-proto"
 version = "0.1.0"

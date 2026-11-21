@@ -29,9 +29,15 @@
 //! * [`codec`] — the canonical packet IR ([`codec::S2CPacket`],
 //!   [`codec::C2SPacket`]), the [`codec::ProtocolCodec`] trait and
 //!   [`codec::CodecV767`], the protocol-767 implementation.
+//! * [`router`] — the multi-version glue: [`router::TableDrivenCodec`] (a
+//!   codec over any `VersionCapabilities` + `ProtocolTable` pair, e.g. a
+//!   loaded 1.21.4 pack), [`router::SessionRemapper`] (per-connection
+//!   registry-id translation) and [`router::VersionRouter`] (codec selection
+//!   by handshake protocol number).
 
 pub mod codec;
 mod data_v767;
+pub mod router;
 pub mod table;
 pub mod version;
 pub mod wire;
@@ -40,6 +46,7 @@ pub use codec::{
     C2SPacket, CodecV767, EquipmentSlot, ItemStack, LoginProperty, MenuKind,
     ProtocolCodec, RawComponent, RegistryDataEntry, S2CPacket, TeamInfo, TeamOperation,
 };
+pub use router::{SessionRemapSummary, SessionRemapper, TableDrivenCodec, VersionRouter};
 pub use table::{IdRemapper, PacketDir, PacketPhase, ProtocolTable, Registry, RemapReport};
 pub use version::{
     BlockStateJsonFormat, ProtocolVersion, RecipeSyncMode, VersionCapabilities,

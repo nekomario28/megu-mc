@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 mc_spine_kernel = { package = "mc-spine-kernel", path = "../client-kernel" }
 mc_spine_client_mesh = { package = "mc-spine-client-mesh", path = "../client-port" }
+mc_spine_proto = { package = "mc-spine-proto", path = "../proto" }
 
 [profile.release]
 opt-level = 3

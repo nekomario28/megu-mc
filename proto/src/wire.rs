@@ -63,6 +63,13 @@ pub enum ProtoError {
     /// A registry/table received a name or id it already holds under a
     /// different spelling, or a JSON object repeated a key.
     DuplicateEntry(&'static str),
+    /// A handshake asked for a protocol version no registered codec speaks.
+    UnsupportedVersion {
+        /// The protocol number the peer requested.
+        requested: i32,
+        /// Protocol numbers with a registered codec, ascending.
+        supported: Vec<i32>,
+    },
 }
 
 impl fmt::Display for ProtoError {
@@ -96,6 +103,16 @@ impl fmt::Display for ProtoError {
             Self::Malformed(what) => write!(f, "malformed structure: {what}"),
             Self::VersionPack(what) => write!(f, "invalid version pack: {what}"),
             Self::DuplicateEntry(what) => write!(f, "duplicate entry: {what}"),
+            Self::UnsupportedVersion {
+                requested,
+                supported,
+            } => {
+                write!(f, "unsupported protocol version {requested} (supported:")?;
+                for v in supported {
+                    write!(f, " {v}")?;
+                }
+                write!(f, ")")
+            }
         }
     }
 }
@@ -545,6 +562,13 @@ impl WireWriter {
         Self {
             buf: Vec::with_capacity(capacity),
         }
+    }
+
+    /// Wrap an existing buffer, appending after its current contents. Pair
+    /// with [`WireWriter::into_vec`] to write into a caller-owned `Vec`
+    /// without copying.
+    pub fn from_vec(buf: Vec<u8>) -> Self {
+        Self { buf }
     }
 
     pub fn as_slice(&self) -> &[u8] {

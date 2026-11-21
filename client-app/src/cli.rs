@@ -13,7 +13,7 @@ use crate::settings::{
 
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MINECRAFT_VERSION: &str = "1.21.1";
-pub const PROTOCOL_VERSION: u32 = 767;
+pub const PROTOCOL_VERSION: u32 = mc_spine_proto::ProtocolVersion::V1_21_1.number() as u32;
 
 const TOKEN_FLAGS: &[&str] = &[
     "--accessToken",

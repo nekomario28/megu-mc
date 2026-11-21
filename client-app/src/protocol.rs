@@ -7,7 +7,9 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-pub const PROTOCOL_767: i32 = 767;
+/// Protocol 767 / Minecraft 1.21.1 — the single canonical version constant,
+/// sourced from `mc-spine-proto` rather than a local literal.
+pub const PROTOCOL_767: i32 = mc_spine_proto::ProtocolVersion::V1_21_1.number();
 pub const MAX_PACKET_SIZE: usize = 16 * 1024 * 1024;
 const MAX_NBT_DEPTH: usize = 64;
 const MAX_NBT_ARRAY: usize = 1_048_576;
@@ -86,34 +88,23 @@ impl<'a> WireReader<'a> {
         Ok(f64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
 
+    /// Delegated to `mc_spine_proto`'s canonical reader — identical bounds
+    /// (final byte `& 0xf0` rejected, five bytes max); the `String` error
+    /// surface this module's callers use is kept.
     pub fn read_varint(&mut self) -> Result<i32, String> {
-        let mut value = 0u32;
-        for i in 0..5 {
-            let byte = self.read_u8()?;
-            if i == 4 && byte > 0x0f {
-                return Err("varint overflow".to_string());
-            }
-            value |= u32::from(byte & 0x7f) << (7 * i);
-            if byte & 0x80 == 0 {
-                return Ok(value as i32);
-            }
-        }
-        Err("varint exceeds 5 bytes".to_string())
+        let mut r = mc_spine_proto::WireReader::new(self.rest());
+        let value = r.read_varint().map_err(|e| e.to_string())?;
+        self.pos += r.position();
+        Ok(value)
     }
 
+    /// Delegated to `mc_spine_proto`'s canonical reader — identical bounds
+    /// (final byte `& 0xfe` rejected, ten bytes max).
     pub fn read_varlong(&mut self) -> Result<i64, String> {
-        let mut value = 0u64;
-        for i in 0..10 {
-            let byte = self.read_u8()?;
-            if i == 9 && byte > 0x01 {
-                return Err("varlong overflow".to_string());
-            }
-            value |= u64::from(byte & 0x7f) << (7 * i);
-            if byte & 0x80 == 0 {
-                return Ok(value as i64);
-            }
-        }
-        Err("varlong exceeds 10 bytes".to_string())
+        let mut r = mc_spine_proto::WireReader::new(self.rest());
+        let value = r.read_varlong().map_err(|e| e.to_string())?;
+        self.pos += r.position();
+        Ok(value)
     }
 
     pub fn read_string(&mut self, max_bytes: usize) -> Result<String, String> {
@@ -284,28 +275,18 @@ impl NbtValue {
     }
 }
 
+/// Delegated to `mc_spine_proto`'s canonical `WireWriter` — `from_vec`
+/// appends in place, so no copy of the caller's buffer is made.
 pub fn write_varint(buf: &mut Vec<u8>, value: i32) {
-    let mut v = value as u32;
-    loop {
-        if v & !0x7f == 0 {
-            buf.push(v as u8);
-            return;
-        }
-        buf.push(((v & 0x7f) as u8) | 0x80);
-        v >>= 7;
-    }
+    let mut w = mc_spine_proto::WireWriter::from_vec(std::mem::take(buf));
+    w.write_varint(value);
+    *buf = w.into_vec();
 }
 
 pub fn write_varlong(buf: &mut Vec<u8>, value: i64) {
-    let mut v = value as u64;
-    loop {
-        if v & !0x7f == 0 {
-            buf.push(v as u8);
-            return;
-        }
-        buf.push(((v & 0x7f) as u8) | 0x80);
-        v >>= 7;
-    }
+    let mut w = mc_spine_proto::WireWriter::from_vec(std::mem::take(buf));
+    w.write_varlong(value);
+    *buf = w.into_vec();
 }
 
 pub fn write_string(buf: &mut Vec<u8>, s: &str) {
@@ -313,18 +294,16 @@ pub fn write_string(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(s.as_bytes());
 }
 
+/// `x:26 | z:26 | y:12` packing, delegated to `mc_spine_proto::BlockPos`.
 pub fn pack_position(pos: [i32; 3]) -> i64 {
     let [x, y, z] = pos;
-    ((i64::from(x) & 0x3ff_ffff) << 38)
-        | ((i64::from(z) & 0x3ff_ffff) << 12)
-        | (i64::from(y) & 0xfff)
+    mc_spine_proto::BlockPos::new(x, y, z).pack()
 }
 
+/// Inverse of [`pack_position`], sign-extending each field.
 pub fn unpack_position(packed: i64) -> [i32; 3] {
-    let x = (packed >> 38) as i32;
-    let z = ((packed << 26) >> 38) as i32;
-    let y = ((packed << 52) >> 52) as i32;
-    [x, y, z]
+    let p = mc_spine_proto::BlockPos::unpack(packed);
+    [p.x, p.y, p.z]
 }
 
 pub fn bitset_get(words: &[u64], index: usize) -> bool {
@@ -1199,6 +1178,11 @@ pub struct ProtocolClient {
     dimension_types_by_name: HashMap<String, (i32, i32, bool)>,
     pub dimension: DimensionMeta,
     pub biome_count: usize,
+    /// The protocol version this client offered in its handshake — always
+    /// `V1_21_1` (767) today, exposed as the canonical
+    /// `mc_spine_proto::ProtocolVersion` so a future negotiated version
+    /// flows through one type instead of a raw number.
+    pub protocol_version: mc_spine_proto::ProtocolVersion,
     pub packets_rx: u64,
     pub packets_tx: u64,
 }
@@ -1227,13 +1211,14 @@ impl ProtocolClient {
             dimension_types_by_name: HashMap::new(),
             dimension: DimensionMeta::default(),
             biome_count: 64,
+            protocol_version: mc_spine_proto::ProtocolVersion::V1_21_1,
             packets_rx: 0,
             packets_tx: 0,
         };
 
         // 1. Handshake (0x00, next_state = 2 Login)
         let mut hs = Vec::new();
-        write_varint(&mut hs, PROTOCOL_767);
+        write_varint(&mut hs, client.protocol_version.number());
         write_string(&mut hs, host);
         hs.extend_from_slice(&port.to_be_bytes());
         write_varint(&mut hs, 2);
