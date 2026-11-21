@@ -532,7 +532,7 @@ fn live_mod_suite_boot() {
         suite.load_progression_json(std::path::Path::new(path));
     }
     suite.active = true;
-    *live_mod_suite().lock().unwrap() = suite;
+    *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = suite;
 }
 
 /// Per-tick AppleSkin QoL sync, wired from `game_tick` next to the vanilla
@@ -549,8 +549,8 @@ fn live_mod_appleskin_sync(client: &Client) {
         if !suite.active {
             return;
         }
-        let exhaustion = *client.walk_acc.lock().unwrap() as f32;
-        let saturation = *client.sat.lock().unwrap();
+        let exhaustion = *client.walk_acc.lock().unwrap_or_else(|e| e.into_inner()) as f32;
+        let saturation = *client.sat.lock().unwrap_or_else(|e| e.into_inner());
         let tracker = suite
             .appleskin
             .entry(client.eid)
@@ -582,7 +582,7 @@ fn live_mod_tick() {
     if live_mod_suite().lock().map(|suite| !suite.active).unwrap_or(true) {
         return;
     }
-    let players = clients().lock().unwrap().clone();
+    let players = clients().lock().unwrap_or_else(|e| e.into_inner()).clone();
     for client in &players {
         live_mod_appleskin_sync(client);
     }
@@ -648,7 +648,7 @@ fn live_check_progression_barrier(
 /// into before checking the barrier engine.
 #[cfg(feature = "mod-suite")]
 fn live_player_advancement_set(player: &str) -> BTreeSet<String> {
-    let tracker = player_advancements().lock().unwrap();
+    let tracker = player_advancements().lock().unwrap_or_else(|e| e.into_inner());
     tracker
         .definitions
         .iter()
@@ -704,7 +704,7 @@ fn live_progression_denies_break(me: &Client, dim: DimId, x: i32, y: i32, z: i32
             }
         }
     }
-    let creative = matches!(*me.gm.lock().unwrap(), 1 | 3);
+    let creative = matches!(*me.gm.lock().unwrap_or_else(|e| e.into_inner()), 1 | 3);
     match live_check_progression_barrier(&dim_id, &biome, &advancements, creative) {
         LiveProgressionVerdict::Locked {
             block_break_blocked: true,
@@ -916,7 +916,7 @@ mod wire_mods_tests {
     static WIRE_LOCK: Mutex<()> = Mutex::new(());
 
     fn fresh_suite() {
-        *live_mod_suite().lock().unwrap() = LiveModSuite::new();
+        *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = LiveModSuite::new();
     }
 
     // ---------- JVM .class file builder (same shape as mixin_jar_scan) ----------
@@ -1526,7 +1526,7 @@ mod wire_mods_tests {
 
     #[test]
     fn wire_mods_boot_scan_supersedes_loads_culinary_and_classifies() {
-        let _serial = WIRE_LOCK.lock().unwrap();
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
         let dir = lmb_temp_dir("scan");
         std::fs::write(dir.join("sodium-0.6.13.jar"), lmb_test_jar(&[("x.bin", b"x")])).unwrap();
@@ -1593,7 +1593,7 @@ mod wire_mods_tests {
 
     #[test]
     fn wire_mods_classify_data_only_and_unverified_bytecode() {
-        let _serial = WIRE_LOCK.lock().unwrap();
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // No `.class` members at all -> pure data jar -> Tier 1.
         let data_jar = lmb_test_jar(&[("data/x/recipes/a.json", br#"{"type":"x:y"}"#)]);
         let (tier, _, classes, sites, _) = live_mod_classify("datamod", &data_jar);
@@ -1618,9 +1618,9 @@ mod wire_mods_tests {
 
     #[test]
     fn wire_mods_appleskin_emits_767_custom_payload_with_delta_suppression() {
-        let _serial = WIRE_LOCK.lock().unwrap();
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
-        live_mod_suite().lock().unwrap().active = true;
+        live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()).active = true;
         let (me, mut peer) = lmb_client("wire_appleskin", 977_101);
 
         // First observation emits both channels once each on the verified
@@ -1642,12 +1642,12 @@ mod wire_mods_tests {
         assert_eq!(sat_sent, 5.0);
 
         // Sub-epsilon drift is suppressed; a >=0.01 move emits once.
-        *me.sat.lock().unwrap() = 5.005;
+        *me.sat.lock().unwrap_or_else(|e| e.into_inner()) = 5.005;
         live_mod_appleskin_sync(&me);
         assert!(lmb_silent(&mut peer), "sub-epsilon drift must stay silent");
 
-        *me.sat.lock().unwrap() = 4.5;
-        *me.walk_acc.lock().unwrap() = 0.25;
+        *me.sat.lock().unwrap_or_else(|e| e.into_inner()) = 4.5;
+        *me.walk_acc.lock().unwrap_or_else(|e| e.into_inner()) = 0.25;
         live_mod_appleskin_sync(&me);
         let mut channels = Vec::new();
         for _ in 0..2 {
@@ -1671,7 +1671,7 @@ mod wire_mods_tests {
         // An inactive suite emits nothing even with changed values.
         fresh_suite();
         let (me2, mut peer2) = lmb_client("wire_appleskin_off", 977_102);
-        *me2.sat.lock().unwrap() = 1.0;
+        *me2.sat.lock().unwrap_or_else(|e| e.into_inner()) = 1.0;
         live_mod_appleskin_sync(&me2);
         assert!(lmb_silent(&mut peer2), "inactive suite must emit nothing");
     }
@@ -1696,9 +1696,9 @@ mod wire_mods_tests {
 
     #[test]
     fn wire_mods_progression_barrier_locks_and_allows() {
-        let _serial = WIRE_LOCK.lock().unwrap();
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
-        live_mod_suite().lock().unwrap().barriers =
+        live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()).barriers =
             ProgressionBarrierEngine::new(vec![lmb_gate_rule()]);
 
         // Missing the gate advancement -> Locked with the full payload.
@@ -1761,10 +1761,10 @@ mod wire_mods_tests {
 
     #[test]
     fn wire_mods_progression_denies_break_and_resyncs() {
-        let _serial = WIRE_LOCK.lock().unwrap();
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
         {
-            let mut suite = live_mod_suite().lock().unwrap();
+            let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
             suite.barriers = ProgressionBarrierEngine::new(vec![lmb_gate_rule()]);
         }
         let (me, mut peer) = lmb_client("wire_gate", 977_103);
@@ -1788,7 +1788,7 @@ mod wire_mods_tests {
 
     #[test]
     fn wire_mods_progression_json_parses_rules() {
-        let _serial = WIRE_LOCK.lock().unwrap();
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let json = br#"{"rules":[{
             "id":"gate:a","dimension":"twilightforest:twilight_forest",
             "biomes":["twilightforest:naga_courtyard"],
@@ -1820,7 +1820,7 @@ mod wire_mods_tests {
 
     #[test]
     fn wire_mods_msy1_manifest_served_on_join() {
-        let _serial = WIRE_LOCK.lock().unwrap();
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
         let dir = lmb_temp_dir("sync");
         let manifest_path = dir.join("manifest.json");
@@ -1832,7 +1832,7 @@ mod wire_mods_tests {
         );
         std::fs::write(&manifest_path, json).unwrap();
         {
-            let mut suite = live_mod_suite().lock().unwrap();
+            let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
             suite.arm_mod_sync_json(&manifest_path);
             assert!(suite.mod_sync_body.is_some(), "valid manifest must arm");
         }
@@ -1864,7 +1864,7 @@ mod wire_mods_tests {
 
     #[test]
     fn wire_mods_msy1_arm_rejects_bad_manifest() {
-        let _serial = WIRE_LOCK.lock().unwrap();
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
         let dir = lmb_temp_dir("syncbad");
         // http:// (not https) on a trusted host still fails the URL check.
@@ -1878,7 +1878,7 @@ mod wire_mods_tests {
         )
         .unwrap();
         {
-            let mut suite = live_mod_suite().lock().unwrap();
+            let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
             suite.arm_mod_sync_json(&bad);
             assert!(suite.mod_sync_body.is_none(), "untrusted scheme must not arm");
         }
@@ -1886,7 +1886,7 @@ mod wire_mods_tests {
         let worse = dir.join("worse.json");
         std::fs::write(&worse, b"{").unwrap();
         {
-            let mut suite = live_mod_suite().lock().unwrap();
+            let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
             suite.arm_mod_sync_json(&worse);
             assert!(suite.mod_sync_body.is_none());
         }
@@ -1905,7 +1905,7 @@ mod wire_mods_tests {
 
     #[test]
     fn wire_mods_inject_sites_lift_and_redirects_fail_closed() {
-        let _serial = WIRE_LOCK.lock().unwrap();
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let jar = lmb_inject_jar("com/safemod", "net/minecraft/world/entity/LivingEntity", "hurt");
         let report = scan_jar_mixins_with_options(&jar, JarScanOptions::default()).unwrap();
         assert_eq!(report.sites.len(), 1);
