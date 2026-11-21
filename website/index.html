@@ -4,9 +4,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Megu — Same seed, same world, written in Rust</title>
+  <title>Megu — Lightweight Minecraft &amp; Modpack Engine</title>
   <meta name="description"
-        content="Megu (codename mc-spine) is an experimental Minecraft: Java Edition 1.21.1 &amp; 26.3 server and client engine written in Rust with tiered NeoForge/Fabric mod support.">
+        content="Megu (codename mc-spine) is an experimental lightweight Minecraft: Java Edition 1.21.1 &amp; 26.3 server and client engine with tiered NeoForge/Fabric mod support.">
   <link rel="stylesheet" href="style.css">
   <script src="site-config.js"></script>
   <script src="app.js" defer></script>
@@ -46,12 +46,12 @@
 
         <h1 class="hero-title">
           <span data-cfg="projectName">Megu</span>
-          <span class="hero-sub" data-i18n="hero_headline">Same seed, same world — written from scratch in Rust.</span>
+          <span class="hero-sub" data-i18n="hero_headline">Lightweight Minecraft &amp; Modpacks, without the bloat.</span>
         </h1>
 
         <p class="lead" data-i18n="hero_lead">
-          A clean-room Minecraft: Java Edition engine for 1.21.1 and 26.3.
-          Differential-tested against vanilla worldgen and protocol, with native Rust engines for major mods and safe fallback to NeoForge when Java is still required.
+          A fast, low-memory Minecraft: Java Edition engine for 1.21.1 and 26.3.
+          Run vanilla worlds and NeoForge/Fabric modpacks smoothly on modest servers and older PCs — without stacking optimization mods or fighting Java GC pauses.
         </p>
 
         <div class="hero-actions">
@@ -120,7 +120,7 @@
 
     <section id="how">
       <div class="wrap">
-        <h2 data-i18n="how_title">A different foundation, the same world.</h2>
+        <h2 data-i18n="how_title">How it stays lightweight</h2>
         <div class="pillars">
           <article class="pillar">
             <h3 data-i18n="p1_title">Your own server.jar</h3>
@@ -262,20 +262,20 @@ cargo run --locked</code></pre>
       nav_how: "設計",
       nav_quickstart: "起動手順",
       nav_scope: "対応状況",
-      hero_headline: "同じ種、変わらぬ世界、Rustで組む。",
-      hero_lead: "Java Edition 1.21.1・26.3 に向けたクリーンルーム Rust 実装の Minecraft 互換エンジン。地形生成とプロトコルをバニラと突き合わせ、主要 Mod はネイティブで動かし、未対応 Mod は本家 NeoForge へ委譲します。",
+      hero_headline: "いつもの Minecraft を、そのまま超軽量に。",
+      hero_lead: "バニラのワールドも Modpack も、低スペック PC や小さなサーバーで軽快に動かすための Minecraft 互換エンジン。軽量化 Mod を何個も重ねたり、Java の重い GC 停止に悩まされる必要はありません。",
       cta_start: "起動手順へ",
       cta_check: "Modpackを診断",
       cta_github: "GitHub を見る",
       checker_title: "手元の Modpack をその場で診断。",
       checker_note: "このタブ内で完結 — ファイルは一切送信されません。",
-      checker_desc: "Modrinth の .mrpack や CurseForge の .zip を落とすだけで、自動スキップされる軽量化 Mod・Rust ネイティブ動作・要検査 JAR を即座に表示します。",
+      checker_desc: "Modrinth の .mrpack や CurseForge の .zip を落とすだけで、自動スキップされる軽量化 Mod・ネイティブ動作・要検査 JAR を即座に表示します。",
       checker_target: "対象バージョン",
       checker_sample: "サンプルパックを試す",
       checker_drop: ".mrpack / CurseForge .zip / manifest .json をドロップ",
       checker_hint: "またはクリックしてファイルを選択",
       checker_raw: "JSON レポートとテキスト要約",
-      how_title: "器を替えて、世界を残す。",
+      how_title: "軽さの理由と仕組み",
       p1_title: "手元の公式 server.jar から生成",
       p1_body: "Mojang のバイナリやアセットは一切同梱しません。初回セットアップ時に手元の公式 Minecraft ファイルからローカル生成します。",
       p2_title: "Modpack をそのまま投入",
