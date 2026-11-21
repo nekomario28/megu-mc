@@ -2613,6 +2613,22 @@ fn scoreboard_entry_available(board: &ScoreboardEngine, owner: &str, objective: 
 }
 
 fn apply_scoreboard_command(board: &mut ScoreboardEngine, args: &[&str]) -> Result<String, String> {
+    // Vanilla accepts every tracked criteria name at parse time. The engine
+    // models `health` natively; the remaining tracked aliases (xp, level,
+    // food, air, armor) map onto the writable `dummy` criterion so the
+    // objective is recognized instead of rejected.
+    let mut rewritten_args;
+    let args = match args {
+        ["objectives", "add", _, criteria, ..]
+            if ScoreboardCriteria::parse(criteria).is_none()
+                && matches!(*criteria, "xp" | "level" | "food" | "air" | "armor") =>
+        {
+            rewritten_args = args.to_vec();
+            rewritten_args[3] = "dummy";
+            &rewritten_args[..]
+        }
+        _ => args,
+    };
     let entries = match args {
         ["players", "operation", owner, objective, _, source, source_objective] => {
             &[(*owner, *objective), (*source, *source_objective)][..]
@@ -2640,7 +2656,57 @@ fn apply_scoreboard_command(board: &mut ScoreboardEngine, args: &[&str]) -> Resu
             return Err("Too many scores for objective".into());
         }
     }
-    let reply = execute_scoreboard_command(board, args)?;
+    let reply = match args {
+        ["objectives", "modify", name, "displayname", text @ ..] if !text.is_empty() => {
+            let Some(objective) = board.objectives.get_mut(*name) else {
+                return Err(format!("Unknown objective: {name}"));
+            };
+            objective.display_name = text.join(" ");
+            format!("Changed display name of objective {name}")
+        }
+        ["objectives", "modify", name, "rendertype", kind] => {
+            let render_type = match *kind {
+                "integer" => ScoreboardRenderType::Integer,
+                "hearts" => ScoreboardRenderType::Hearts,
+                _ => return Err(format!("Unknown render type: {kind}")),
+            };
+            let Some(objective) = board.objectives.get_mut(*name) else {
+                return Err(format!("Unknown objective: {name}"));
+            };
+            objective.render_type = render_type;
+            format!("Changed render type of objective {name}")
+        }
+        ["players", "list"] => {
+            let mut holders: Vec<String> = board
+                .scores
+                .values()
+                .flat_map(|scores| scores.keys().cloned())
+                .collect();
+            holders.sort_unstable();
+            holders.dedup();
+            format!("{} score holders: {}", holders.len(), holders.join(", "))
+        }
+        ["players", "list", holder] => {
+            let mut entries: Vec<(&str, i32)> = board
+                .scores
+                .iter()
+                .filter_map(|(objective, scores)| {
+                    scores.get(*holder).map(|score| (objective.as_str(), score.value))
+                })
+                .collect();
+            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            format!(
+                "{} scores for {holder}: {}",
+                entries.len(),
+                entries
+                    .iter()
+                    .map(|(objective, value)| format!("[{value}] {objective}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+        _ => execute_scoreboard_command(board, args)?,
+    };
     for &(owner, objective) in entries {
         broadcast_score(board, owner, objective);
     }
@@ -2655,6 +2721,13 @@ fn apply_scoreboard_command(board: &mut ScoreboardEngine, args: &[&str]) -> Resu
         ["objectives", "setdisplay", slot, ..] => {
             let slot = ScoreboardDisplaySlot::parse(slot).unwrap();
             encode_scoreboard_display(slot, board.display(slot))
+        }
+        ["objectives", "modify", name, ..] => {
+            // mode 2: display name + render type changed in place.
+            encode_scoreboard_objective(ScoreboardObjectivePacket::Update(
+                board.objective(name).unwrap(),
+                None,
+            ))
         }
         ["players", "reset", owner, objective @ ..] => {
             encode_scoreboard_reset(owner, objective.first().copied())
@@ -3388,8 +3461,11 @@ fn run_bossbar_command(args: &[&str], source: Option<&Arc<Client>>) -> String {
                 .map(|p| p.name.as_str())
                 .collect();
             names.sort_unstable();
+            // The count leads the sentence so `execute_legacy_result` returns
+            // it exactly — `/execute store result` sees the vanilla
+            // player-count result rather than a bare success flag.
             return format!(
-                "Bossbar {id} has {} player(s): {}",
+                "{} player(s) on bossbar {id}: {}",
                 names.len(),
                 names.join(", ")
             );
@@ -3803,6 +3879,21 @@ fn run_neoforge_command(
     Ok(reply.join("\n"))
 }
 
+/// Vanilla `TimeArgument`: a non-negative number with an optional `t`/`s`/`d`
+/// suffix (1s = 20t, 1d = 24000t; a bare number is already ticks). Returns
+/// `None` on anything the vanilla parser would reject — a malformed number,
+/// a negative value, or a non-finite result.
+fn time_argument_ticks(time: &str) -> Option<i64> {
+    let (num, mult) = time
+        .strip_suffix('t')
+        .map(|n| (n, 1.0f64))
+        .or_else(|| time.strip_suffix('s').map(|n| (n, TICKS_PER_SECOND as f64)))
+        .or_else(|| time.strip_suffix('d').map(|n| (n, 24_000.0)))
+        .unwrap_or((time, 1.0));
+    let value = num.parse::<f64>().ok()?;
+    (value.is_finite() && value >= 0.0).then(|| (value * mult) as i64)
+}
+
 fn schedule_delay_ticks(time: &str) -> u64 {
     let (num, mult) = time
         .strip_suffix('t')
@@ -3871,26 +3962,86 @@ fn command_allowed_for_player(cmd: &str, args: &[&str]) -> bool {
         || (cmd == "time" && matches!(args.first().copied(), Some("query" | "get")))
 }
 fn command_usage(name: &str) -> String {
+    // Exact usage for every literal `native_command_dispatcher` registers.
+    // Anything missing here is not a command the server knows, so /help
+    // reports it as unknown rather than pretending a usage line exists.
     let usage = match name.trim_start_matches('/') {
-        "setblock" => "/setblock <x> <y> <z> <block> [replace|destroy|keep]",
+        "advancement" => "/advancement grant|revoke <target> everything|from|through|until|only <id> [<criterion>]",
+        "attribute" => "/attribute <target> <attribute> base|modifier ...",
+        "ban" => "/ban <player> [<reason>]",
+        "ban-ip" => "/ban-ip <target> [<reason>]",
+        "banlist" => "/banlist [ips|players]",
+        "bossbar" => "/bossbar add <id> <name> | remove <id> | list | set <id> name|color|style|value|max|visible|players [<targets>] | get <id> max|players|value|visible",
+        "clear" => "/clear [<target>] [<item>] [<count>]",
+        "clone" => "/clone <from> <to> <destination> [replace|masked|filtered <block>] [force|move|normal]",
+        "counts" => "no arguments; debug entity/store census",
+        "damage" => "/damage <target> <amount> [<type>] [at <pos>|by <entity>]",
+        "data" => "/data get|remove block <x> <y> <z> Items | get entity <target> <path>",
+        "datapack" => "/datapack list [enabled|available] | enable <name> | disable <name>",
+        "defaultgamemode" => "/defaultgamemode <survival|creative|adventure|spectator>",
+        "deop" => "/deop <player>",
+        "difficulty" => "/difficulty [peaceful|easy|normal|hard]",
+        "effect" => "/effect give <target> <effect> [<seconds>] [<amplifier>] [<hideParticles>] | clear [<target>] [<effect>]",
+        "enchant" => "/enchant <target> <enchantment> [<level>]",
+        "execute" => "/execute <subcommand> ... run <command>",
+        "experience" | "xp" => "/experience add|set <player> <amount> [points|levels] | query <player> points|levels",
         "fill" => "/fill <from> <to> <block> [replace|destroy|keep|hollow|outline]",
         "fillbiome" => "/fillbiome <from> <to> <biome> [replace <filter>]",
-        "place" => "/place feature|template <id> [<pos>]",
-        "ride" => "/ride <target> mount <vehicle> | /ride <target> dismount",
-        "spectate" => "/spectate [<target>] [<player>]",
+        "forceload" => "/forceload add|remove <x> <z> [<x2> <z2>] | remove all | query [<x> <z>]",
+        "function" => "/function <name> [<arguments>]",
         "gamemode" => "/gamemode <survival|creative|adventure|spectator> [player]",
-        "defaultgamemode" => "/defaultgamemode <survival|creative|adventure|spectator>",
+        "gamerule" => "/gamerule <rule> [<value>]",
+        "give" => "/give <player> <item> [<count>]",
+        "help" => "/help [<command>]",
+        "item" => "/item modify|replace <target> <slot> ...",
+        "kick" => "/kick <player> [<reason>]",
+        "kill" => "/kill [<targets>]",
+        "list" => "no arguments; list online players",
+        "locate" => "/locate structure|biome|poi <id>",
+        "loot" => "/loot spawn|give|insert|replace <target> <source>",
+        "me" => "/me <action>",
+        "msg" | "tell" | "w" => "/msg <player> <message>",
+        "op" => "/op <player>",
+        "pardon" => "/pardon <player>",
+        "pardon-ip" => "/pardon-ip <target>",
+        "particle" => "/particle <particle> [<x> <y> <z> [<dx> <dy> <dz> [<speed> [<count> [<mode> [<viewers>]]]]]]",
+        "place" => "/place feature|template <id> [<pos>]",
+        "player" => "/player <name> spawn|look|attack|use|stop|kill",
+        "playsound" => "/playsound <sound> [<source>] [<target>] [<pos>] [<volume>] [<pitch>] [<minVolume>]",
+        "random" => "/random value|roll <range> [<sequence>] | reset <sequence> [*]",
+        "recipe" => "/recipe give|take <target> <recipe|*>",
+        "reload" => "no arguments; reload datapacks",
+        "return" => "/return [<value>] | fail",
+        "ride" => "/ride <target> mount <vehicle> | /ride <target> dismount",
         "save-on" | "save-off" => "no arguments",
         "save-all" | "save" => "no arguments; force a world save",
-        "spawnpoint" => "/spawnpoint [player] [x y z] [angle]",
+        "say" => "/say <message>",
+        "schedule" => "/schedule function <id> <time>[t|s|d] [append|replace] | /schedule clear [<id>]",
+        "scoreboard" => "/scoreboard objectives add|remove|list|setdisplay|modify | players set|add|remove|reset|get|list|enable|operation",
+        "seed" => "no arguments; print the world seed",
+        "setblock" => "/setblock <x> <y> <z> <block> [replace|destroy|keep]",
+        "setidletimeout" => "/setidletimeout <minutes>",
         "setworldspawn" => "/setworldspawn [x y z] [angle]",
-        "forceload" => "/forceload add|remove <x> <z> [<x2> <z2>] | remove all | query [<x> <z>]",
-        "bossbar" => "/bossbar add|remove|set|list|get ...",
-        "time" => "/time set <day|noon|night|ticks> | query <day|daytime|gametime>",
-        "difficulty" => "/difficulty [peaceful|easy|normal|hard]",
-        "help" => "/help [command]",
-        "list" => "no arguments; list online players",
-        _ => return format!("No detailed help available for /{}", name.trim_start_matches('/')),
+        "spawnpoint" => "/spawnpoint [player] [x y z] [angle]",
+        "spectate" => "/spectate [<target>] [<player>]",
+        "spreadplayers" => "/spreadplayers <x> <z> <spreadDistance> <maxRange> [under <maxHeight>] <respectTeams> <targets>",
+        "stop" => "no arguments; stop the server",
+        "stopsound" => "/stopsound [<target>] [<source>] [<sound>]",
+        "summon" => "/summon <entity> [<x> <y> <z>] [<nbt>]",
+        "tag" => "/tag <target> add|remove <tag> | list",
+        "team" => "/team list [<team>] | add|remove|empty <team> | join <team> [<members>] | leave <members> | modify <team> <option> [<value>]",
+        "teammsg" | "tm" => "/teammsg <message>",
+        "teleport" | "tp" => "/teleport [<target>] <destination|x> [<y> <z>] [<rotation>]",
+        "tellraw" => "/tellraw <target> <json message>",
+        "tick" => "/tick query|rate|freeze|unfreeze|step|sprint ...",
+        "time" => "/time add <time>[t|s|d] | set <day|noon|night|midnight|ticks> | query <day|daytime|gametime>",
+        "title" => "/title <target> title|subtitle|actionbar|times|clear|reset ...",
+        "trigger" => "/trigger <objective> [add|set <value>]",
+        "weather" => "/weather clear|rain|thunder [<duration>]",
+        "whitelist" => "/whitelist on|off|list|add|remove|reload [<player>]",
+        "worldborder" => "/worldborder center|add|set|damage|get|warning|buffer ...",
+        "?" => "/? [<command>]",
+        _ => return "Unknown command or insufficient permissions".into(),
     };
     if usage.starts_with('/') {
         format!("Usage: {usage}")
@@ -4234,6 +4385,13 @@ fn native_command_dispatcher(
     if level < 2 {
         return dispatcher;
     }
+    // `/?` is the help alias the issue tracker asks for. It keeps the default
+    // level-2 gate (the pinned `help_reports_specific_usage_and_alias_is_read_only`
+    // contract), so only operators see it advertised.
+    register_at_level(
+        "?",
+        literal("?").executes(|_| Ok(0)).then(completion_argument("command", word(), None)),
+    );
     for name in ["counts", "reload", "save", "save-all", "save-on", "save-off", "seed", "stop"] {
         register_at_level(name, done(name));
     }
@@ -4503,9 +4661,9 @@ fn reply_to_command_suggestion(client: &Client, body: &[u8]) {
 // per scoreboard team when respectTeams holds, otherwise one per entity),
 // the piles relax under the world RNG until every pair sits at least
 // spreadDistance apart inside the center +/- maxRange square, and each pile
-// then snaps to the safe surface. Scoreboard teams are not wired yet (the
-// same gap entity_push documents), so the grouping key always misses and
-// every target is its own pile — the deterministic fallback.
+// then snaps to the safe surface. Team lookup goes through `p3b_team_of` —
+// players key by name and mobs by their string UUID, matching the member
+// keys `/team join` stores.
 const SPREAD_MAX_ITERATIONS: usize = 10_000;
 
 fn spreadplayers_f64() -> f64 {
@@ -4537,10 +4695,14 @@ enum SpreadTarget {
     Mob(Arc<Mob>),
 }
 
-fn spreadplayers_team(_target: &SpreadTarget) -> Option<String> {
-    // No scoreboard-team storage exists yet; when it lands, members sharing
-    // this key collapse into one pile under respectTeams.
-    None
+fn spreadplayers_team(target: &SpreadTarget) -> Option<String> {
+    // Vanilla Entity.getTeam: players look up their name, every other entity
+    // its string UUID — the same keys TeamRegistry.member_team holds.
+    let member = match target {
+        SpreadTarget::Player(client) => client.name.clone(),
+        SpreadTarget::Mob(mob) => uuid_text(&mob.uuid),
+    };
+    p3b_team_of(&member)
 }
 
 fn spreadplayers_hazardous(reg: &block_registry::BReg, st: u32) -> bool {
@@ -4662,7 +4824,7 @@ fn spreadplayers_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) 
     }
 
     // Piles: respectTeams collapses members sharing a team key into one pile;
-    // with no team storage every key misses, so each target stays alone.
+    // members without a team stay alone in their own pile.
     struct Pile {
         x: f64,
         z: f64,
@@ -5170,11 +5332,11 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         "execute" => run_execute(ctx, &args, s),
         "time" => {
             if args.first() == Some(&"add") {
-                if let Some(ticks) = args.get(1).and_then(|n| n.parse::<i64>().ok()).filter(|t| *t >= 0) {
+                if let Some(ticks) = args.get(1).and_then(|n| time_argument_ticks(n)) {
                     let current = WORLD_TIME.load(Ordering::Relaxed);
                     let updated = add_world_time(current, ticks);
                     WORLD_TIME.store(updated, Ordering::Relaxed);
-                    format!("Added {} ticks to the time", ticks)
+                    format!("Set the time to {}", updated)
                 } else {
                     "usage: /time add <ticks>".into()
                 }
@@ -5225,8 +5387,21 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             DEFAULT_GAME_MODE.store(value, Ordering::Relaxed);
             format!("The default game mode is now {mode}")
         }
-        "help" if !args.is_empty() => command_usage(args[0]),
-        "help" => {
+        "help" | "?" if !args.is_empty() => {
+            // /help <command>: exact usage for commands the caller may run,
+            // Vanilla's "Unknown command or insufficient permissions" otherwise.
+            let name = args[0]
+                .trim_start_matches('/')
+                .rsplit(':')
+                .next()
+                .unwrap_or("");
+            if name.is_empty() || !command_allowed_at_level(name, level) {
+                "Unknown command or insufficient permissions".into()
+            } else {
+                command_usage(name)
+            }
+        }
+        "help" | "?" => {
             let names = command_tree_at_level(level).children().into_iter()
                 .map(|node| node.name().to_owned()).collect::<Vec<_>>();
             format!("commands: {}", names.join(" "))
@@ -6274,6 +6449,9 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 }
             } else if args.first().copied() == Some("function") && (args.len() == 3 || args.len() == 4) {
                 let f = args[1];
+                if time_argument_ticks(args[2]).is_none() {
+                    return "usage: /schedule function <fn> <time>[t|s|d] [append|replace]".into();
+                }
                 let off = schedule_delay_ticks(args[2]);
                 let t2 = TICK.load(Ordering::Relaxed);
                 let replace = match args.get(3).copied().unwrap_or("replace") {

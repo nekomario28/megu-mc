@@ -3272,3 +3272,539 @@ mod p3_parity_tests {
         assert_eq!(place_dispatches().lock().unwrap().len(), before + 1);
     }
 }
+
+#[cfg(test)]
+mod p5d_parity_tests {
+    // Lane P5d — issues #159, #163, #166, #168, #171, #172, #177, #224.
+    use super::*;
+    use std::net::TcpStream;
+
+    fn p5d_ctx(me: Option<Arc<Client>>) -> CmdCtx {
+        CmdCtx {
+            me,
+            x: 0.5,
+            y: 16.0,
+            z: 0.5,
+        }
+    }
+
+    fn p5d_run(ctx: &CmdCtx, msg: &str) -> String {
+        run_command_ctx(ctx, msg, &mut None)
+    }
+
+    fn p5d_client(eid: i32, uuid_byte: u8, name: &str) -> (Arc<Client>, TcpStream) {
+        let (mut client, receiver) = crate::effect_tests::client_pair();
+        client.eid = eid;
+        client.uuid = [uuid_byte; 16];
+        client.name = name.into();
+        (Arc::new(client), receiver)
+    }
+
+    // #168 — /time add accepts the vanilla TimeArgument suffixes and keeps the
+    // live day-time store coherent with set/query.
+    #[test]
+    fn p5d_parity_time_add_accepts_t_s_d_suffixes() {
+        assert_eq!(time_argument_ticks("7"), Some(7));
+        assert_eq!(time_argument_ticks("7t"), Some(7));
+        assert_eq!(time_argument_ticks("2s"), Some(40));
+        assert_eq!(time_argument_ticks("1d"), Some(24_000));
+        assert_eq!(time_argument_ticks("0.5s"), Some(10));
+        assert_eq!(time_argument_ticks("0"), Some(0));
+        assert_eq!(time_argument_ticks("-1"), None);
+        assert_eq!(time_argument_ticks("bogus"), None);
+        assert_eq!(time_argument_ticks("1x"), None);
+        assert_eq!(time_argument_ticks("NaN"), None);
+
+        let _world = world_guard();
+        let ctx = p5d_ctx(None);
+        let before = WORLD_TIME.load(Ordering::Relaxed);
+        let reply = p5d_run(&ctx, "/time add 1d");
+        assert_eq!(WORLD_TIME.load(Ordering::Relaxed), before + 24_000);
+        assert_eq!(reply, format!("Set the time to {}", before + 24_000));
+        assert_eq!(
+            p5d_run(&ctx, "/time add 2s"),
+            format!("Set the time to {}", before + 24_040)
+        );
+        assert_eq!(p5d_run(&ctx, "/time add -1"), "usage: /time add <ticks>");
+        assert_eq!(p5d_run(&ctx, "/time add bogus"), "usage: /time add <ticks>");
+        assert_eq!(WORLD_TIME.load(Ordering::Relaxed), before + 24_040);
+        assert_eq!(
+            p5d_run(&ctx, "/time query daytime"),
+            format!("The time is {}", (before + 24_040) % 24_000)
+        );
+        WORLD_TIME.store(before, Ordering::Relaxed);
+    }
+
+    // #166 — /schedule function honours t/s/d times plus append/replace, and
+    // /schedule clear reports the removed entry count.
+    #[test]
+    fn p5d_parity_schedule_function_times_and_clear() {
+        let _world = world_guard();
+        let ctx = p5d_ctx(None);
+        let saved = std::mem::take(&mut *sched_fns().lock().unwrap());
+        let now = TICK.load(Ordering::Relaxed);
+
+        assert_eq!(
+            p5d_run(&ctx, "/schedule function p5d:alpha 1s"),
+            "Scheduled function 'p5d:alpha' in 20 ticks"
+        );
+        assert_eq!(
+            p5d_run(&ctx, "/schedule function p5d:beta 2d append"),
+            "Scheduled function 'p5d:beta' in 48000 ticks"
+        );
+        // append keeps the existing entry for the same id.
+        assert_eq!(
+            p5d_run(&ctx, "/schedule function p5d:alpha 5t append"),
+            "Scheduled function 'p5d:alpha' in 5 ticks"
+        );
+        {
+            let scheduled = sched_fns().lock().unwrap();
+            let alpha: Vec<u64> = scheduled
+                .iter()
+                .filter(|(name, _)| name == "p5d:alpha")
+                .map(|(_, due)| *due)
+                .collect();
+            assert_eq!(alpha, vec![now + 20, now + 5], "{scheduled:?}");
+            assert_eq!(scheduled.len(), 3);
+        }
+        // replace (the default) collapses to a single entry.
+        assert_eq!(
+            p5d_run(&ctx, "/schedule function p5d:alpha 3t"),
+            "Scheduled function 'p5d:alpha' in 3 ticks"
+        );
+        assert_eq!(
+            p5d_run(&ctx, "/schedule function p5d:alpha 3t replace"),
+            "Scheduled function 'p5d:alpha' in 3 ticks"
+        );
+        {
+            let scheduled = sched_fns().lock().unwrap();
+            let alpha: Vec<u64> = scheduled
+                .iter()
+                .filter(|(name, _)| name == "p5d:alpha")
+                .map(|(_, due)| *due)
+                .collect();
+            assert_eq!(alpha, vec![now + 3], "{scheduled:?}");
+        }
+        // clear <id> removes every pending entry and reports the count.
+        assert_eq!(p5d_run(&ctx, "/schedule clear p5d:alpha"), "Removed 1 scheduled function(s)");
+        assert_eq!(p5d_run(&ctx, "/schedule clear p5d:alpha"), "Removed 0 scheduled function(s)");
+        assert_eq!(p5d_run(&ctx, "/schedule clear"), "Removed 1 scheduled function(s)");
+        assert!(sched_fns().lock().unwrap().is_empty());
+        // malformed time and unknown mode are rejected like vanilla parse errors.
+        assert_eq!(
+            p5d_run(&ctx, "/schedule function p5d:x nope"),
+            "usage: /schedule function <fn> <time>[t|s|d] [append|replace]"
+        );
+        assert_eq!(
+            p5d_run(&ctx, "/schedule function p5d:x 1t sideways"),
+            "usage: /schedule function <fn> <time>[t|s|d] [append|replace]"
+        );
+        *sched_fns().lock().unwrap() = saved;
+    }
+
+    // #163 — /help lists the caller-visible commands, /help <command> prints
+    // exact usage or the vanilla unknown/unpermitted error, and /? aliases it.
+    #[test]
+    fn p5d_parity_help_lists_usage_and_question_alias() {
+        let _world = world_guard();
+        let console = p5d_ctx(None);
+
+        let listed = p5d_run(&console, "/help");
+        assert!(listed.starts_with("commands: "), "{listed}");
+        for name in ["help", "time", "spreadplayers", "scoreboard", "bossbar"] {
+            assert!(listed.split_whitespace().any(|c| c == name), "{name} missing from {listed}");
+        }
+        assert_eq!(
+            p5d_run(&console, "/help time"),
+            "Usage: /time add <time>[t|s|d] | set <day|noon|night|midnight|ticks> | query <day|daytime|gametime>"
+        );
+        assert_eq!(
+            p5d_run(&console, "/help spreadplayers"),
+            "Usage: /spreadplayers <x> <z> <spreadDistance> <maxRange> [under <maxHeight>] <respectTeams> <targets>"
+        );
+        assert_eq!(
+            p5d_run(&console, "/help nosuchthing"),
+            "Unknown command or insufficient permissions"
+        );
+        assert_eq!(
+            p5d_run(&console, "/help /time"),
+            p5d_run(&console, "/help time"),
+            "leading slash accepted"
+        );
+
+        // /? behaves identically for operators and the console.
+        assert_eq!(p5d_run(&console, "/?"), listed);
+        assert_eq!(p5d_run(&console, "/? time"), p5d_run(&console, "/help time"));
+        assert_eq!(p5d_run(&console, "/? nosuchthing"), "Unknown command or insufficient permissions");
+        assert_eq!(command_usage("?"), "Usage: /? [<command>]");
+        // The pinned contract: ? is an operator alias, not a level-0 command.
+        assert!(command_allowed_at_level("?", 2));
+        assert!(!command_allowed_at_level("?", 0));
+        assert!(!command_allowed_for_player("?", &[]));
+
+        // A level-0 player gets /help filtered to level-0 commands, exact usage
+        // for permitted commands, and the vanilla error for unpermitted ones.
+        let (player, _recv) = p5d_client(60001, 0x51, "p5d_visitor");
+        let player_ctx = p5d_ctx(Some(player));
+        let player_help = p5d_run(&player_ctx, "/help");
+        assert!(player_help.split_whitespace().any(|c| c == "help"), "{player_help}");
+        assert!(!player_help.split_whitespace().any(|c| c == "op"), "{player_help}");
+        assert_eq!(p5d_run(&player_ctx, "/help list"), "Usage: /list no arguments; list online players");
+        assert_eq!(
+            p5d_run(&player_ctx, "/help op"),
+            "Unknown command or insufficient permissions"
+        );
+        // `?` is gated at level 2, so a visitor cannot run the alias at all.
+        assert_eq!(
+            p5d_run(&player_ctx, "/?"),
+            "You do not have permission to run that command"
+        );
+    }
+
+    // #171 — /forceload query maps block coords >> 4 to the chunk and
+    // /forceload remove all clears the set while reporting the count.
+    #[test]
+    fn p5d_parity_forceload_query_chunk_and_remove_all() {
+        let _world = world_guard();
+        let previous = std::mem::replace(&mut *forceloaded().lock().unwrap(), HashSet::new());
+        let ctx = p5d_ctx(None);
+
+        let added = p5d_run(&ctx, "/forceload add 32 48");
+        assert!(added.contains("1 chunks"), "{added}");
+        assert!(forceloaded().lock().unwrap().contains(&(2, 3)));
+        // every block inside the chunk reports forced; the neighbour does not.
+        assert_eq!(p5d_run(&ctx, "/forceload query 32 48"), "Chunk 2, 3 is force loaded");
+        assert_eq!(p5d_run(&ctx, "/forceload query 47 63"), "Chunk 2, 3 is force loaded");
+        assert_eq!(p5d_run(&ctx, "/forceload query 16 48"), "Chunk 1, 3 is not force loaded");
+        assert_eq!(p5d_run(&ctx, "/forceload query -1 -1"), "Chunk -1, -1 is not force loaded");
+        let removed = p5d_run(&ctx, "/forceload remove all");
+        assert_eq!(removed, "Removed 1 forceloaded chunk(s)");
+        assert!(forceloaded().lock().unwrap().is_empty());
+        assert_eq!(p5d_run(&ctx, "/forceload query"), "0 forceloaded chunk(s)");
+
+        *forceloaded().lock().unwrap() = previous;
+    }
+
+    // #172 — /setworldspawn and /spawnpoint take the optional yaw and persist
+    // it beside the coordinates.
+    #[test]
+    fn p5d_parity_spawn_commands_store_angle() {
+        let _world = world_guard();
+        let ctx = p5d_ctx(None);
+        let previous = *WORLD_SPAWN.lock().unwrap();
+
+        assert_eq!(spawn_yaw(Some("270.5"), None), Some(-89.5));
+        assert_eq!(spawn_yaw(None, None), Some(0.0));
+        assert_eq!(spawn_yaw(Some("NaN"), None), None);
+
+        let reply = p5d_run(&ctx, "/setworldspawn 10 70 20 135");
+        assert_eq!(reply, "Set the world spawn point to 10, 70, 20 facing 135");
+        assert_eq!(*WORLD_SPAWN.lock().unwrap(), (10.0, 70.0, 20.0, 135.0));
+        // no angle defaults to 0.0
+        p5d_run(&ctx, "/setworldspawn 1 2 3");
+        assert_eq!(*WORLD_SPAWN.lock().unwrap(), (1.0, 2.0, 3.0, 0.0));
+        assert_eq!(p5d_run(&ctx, "/setworldspawn 1 2 3 nope"), "Invalid spawn angle");
+
+        let (player, _recv) = p5d_client(60002, 0x52, "p5d_spawn");
+        clients().lock().unwrap().push(player.clone());
+        let reply = p5d_run(&ctx, "/spawnpoint p5d_spawn 5 65 15 -90");
+        assert_eq!(reply, "Set spawn point to 5, 65, 15 facing -90 for p5d_spawn");
+        assert_eq!(*player.spawn_pt.lock().unwrap(), Some((5.0, 65.0, 15.0, -90.0)));
+        // executor spawnpoint without pos uses the live position and yaw 0.
+        ops_registry().lock().unwrap().set("p5d_spawn", 4, false);
+        *player.pos.lock().unwrap() = (7.5, 64.0, -3.5, 0.0, 0.0, true);
+        let player_ctx = p5d_ctx(Some(player.clone()));
+        assert_eq!(
+            p5d_run(&player_ctx, "/spawnpoint"),
+            "Set spawn point to 7.5, 64, -3.5 facing 0 for p5d_spawn"
+        );
+        assert_eq!(*player.spawn_pt.lock().unwrap(), Some((7.5, 64.0, -3.5, 0.0)));
+        ops_registry()
+            .lock()
+            .unwrap()
+            .entries
+            .retain(|e| e.name != "p5d_spawn");
+
+        clients().lock().unwrap().retain(|c| c.eid != 60002);
+        *WORLD_SPAWN.lock().unwrap() = previous;
+    }
+
+    // #177 — /bossbar set players assigns the viewer list (empty clears it)
+    // and /bossbar get reports exact integer results.
+    #[test]
+    fn p5d_parity_bossbar_players_and_exact_get_results() {
+        let _world = world_guard();
+        let saved = std::mem::take(&mut *bossbars().lock().unwrap());
+        let (a, _ra) = p5d_client(60011, 0x61, "p5d_a");
+        let (b, _rb) = p5d_client(60012, 0x62, "p5d_b");
+        clients().lock().unwrap().push(a.clone());
+        clients().lock().unwrap().push(b.clone());
+
+        assert_eq!(
+            run_bossbar_command(&["add", "bar", "Title"], None),
+            "Created bossbar minecraft:bar"
+        );
+        // get max/value/visible decode to their exact vanilla results.
+        for (args, expect) in [
+            (vec!["get", "bar", "max"], 100),
+            (vec!["get", "bar", "value"], 0),
+            (vec!["get", "bar", "visible"], 1),
+        ] {
+            let reply = run_bossbar_command(&args, None);
+            assert_eq!(
+                execute_legacy_result("bossbar", &reply),
+                Some(expect),
+                "{args:?} -> {reply}"
+            );
+        }
+        run_bossbar_command(&["set", "bar", "max", "50"], None);
+        run_bossbar_command(&["set", "bar", "value", "30"], None);
+        run_bossbar_command(&["set", "bar", "visible", "false"], None);
+        for (args, expect) in [
+            (vec!["get", "bar", "max"], 50),
+            (vec!["get", "bar", "value"], 30),
+            (vec!["get", "bar", "visible"], 0),
+        ] {
+            let reply = run_bossbar_command(&args, None);
+            assert_eq!(execute_legacy_result("bossbar", &reply), Some(expect), "{reply}");
+        }
+
+        // set players assigns the viewer list; get players reports the count.
+        assert_eq!(
+            run_bossbar_command(&["set", "bar", "players", "p5d_a"], None),
+            "Updated bossbar minecraft:bar"
+        );
+        let reply = run_bossbar_command(&["get", "bar", "players"], None);
+        assert!(reply.starts_with("1 player(s) on bossbar minecraft:bar"), "{reply}");
+        assert_eq!(execute_legacy_result("bossbar", &reply), Some(1));
+        run_bossbar_command(&["set", "bar", "players", "@a"], None);
+        let reply = run_bossbar_command(&["get", "bar", "players"], None);
+        assert!(reply.starts_with("2 player(s)"), "{reply}");
+        assert_eq!(execute_legacy_result("bossbar", &reply), Some(2));
+        // an empty argument list clears the viewers entirely.
+        run_bossbar_command(&["set", "bar", "players"], None);
+        let reply = run_bossbar_command(&["get", "bar", "players"], None);
+        assert!(reply.starts_with("0 player(s)"), "{reply}");
+        assert_eq!(execute_legacy_result("bossbar", &reply), Some(0));
+        // a selector that matches nobody is the vanilla failure.
+        assert_eq!(
+            run_bossbar_command(&["set", "bar", "players", "nobody_here"], None),
+            "No players found"
+        );
+        assert_eq!(
+            run_bossbar_command(&["get", "none", "max"], None),
+            "Unknown bossbar 'minecraft:none'"
+        );
+
+        clients().lock().unwrap().retain(|c| c.eid != 60011 && c.eid != 60012);
+        *bossbars().lock().unwrap() = saved;
+    }
+
+    // #224 — objectives modify displayname/rendertype, players list forms, and
+    // the full vanilla criteria alias set.
+    #[test]
+    fn p5d_parity_scoreboard_modify_list_and_criteria_aliases() {
+        let _world = world_guard();
+        let mut board = ScoreboardEngine::default();
+
+        // every vanilla criteria alias is accepted, bogus names still fail.
+        for criteria in [
+            "dummy", "trigger", "health", "deathCount", "playerKillCount",
+            "totalKillCount", "xp", "level", "food", "air", "armor",
+        ] {
+            let name = format!("obj_{criteria}");
+            let reply = apply_scoreboard_command(&mut board, &["objectives", "add", &name, criteria]);
+            assert!(reply.is_ok(), "{criteria}: {reply:?}");
+        }
+        assert_eq!(
+            apply_scoreboard_command(&mut board, &["objectives", "add", "bad", "notacriterion"]),
+            Err("Unknown scoreboard criterion: notacriterion".into())
+        );
+        // the stat aliases map onto a usable objective (writable dummy form).
+        assert_eq!(
+            apply_scoreboard_command(&mut board, &["players", "set", "s1", "obj_xp", "9"]),
+            Ok("s1 has 9 in obj_xp".into())
+        );
+
+        // objectives modify displayname + rendertype.
+        assert_eq!(
+            apply_scoreboard_command(
+                &mut board,
+                &["objectives", "modify", "obj_xp", "displayname", "XP", "Bar"]
+            ),
+            Ok("Changed display name of objective obj_xp".into())
+        );
+        assert_eq!(board.objective("obj_xp").unwrap().display_name, "XP Bar");
+        assert_eq!(
+            apply_scoreboard_command(
+                &mut board,
+                &["objectives", "modify", "obj_xp", "rendertype", "hearts"]
+            ),
+            Ok("Changed render type of objective obj_xp".into())
+        );
+        assert_eq!(
+            board.objective("obj_xp").unwrap().render_type,
+            ScoreboardRenderType::Hearts
+        );
+        assert_eq!(
+            apply_scoreboard_command(
+                &mut board,
+                &["objectives", "modify", "obj_xp", "rendertype", "integer"]
+            ),
+            Ok("Changed render type of objective obj_xp".into())
+        );
+        assert_eq!(
+            board.objective("obj_xp").unwrap().render_type,
+            ScoreboardRenderType::Integer
+        );
+        assert_eq!(
+            apply_scoreboard_command(
+                &mut board,
+                &["objectives", "modify", "missing", "rendertype", "hearts"]
+            ),
+            Err("Unknown objective: missing".into())
+        );
+        assert_eq!(
+            apply_scoreboard_command(
+                &mut board,
+                &["objectives", "modify", "obj_xp", "rendertype", "fancy"]
+            ),
+            Err("Unknown render type: fancy".into())
+        );
+
+        // players list: all tracked holders, then per-holder breakdown.
+        apply_scoreboard_command(&mut board, &["players", "set", "s2", "obj_xp", "4"]).unwrap();
+        apply_scoreboard_command(&mut board, &["players", "set", "s1", "obj_air", "2"]).unwrap();
+        assert_eq!(
+            apply_scoreboard_command(&mut board, &["players", "list"]),
+            Ok("2 score holders: s1, s2".into())
+        );
+        assert_eq!(
+            apply_scoreboard_command(&mut board, &["players", "list", "s1"]),
+            Ok("2 scores for s1: [2] obj_air, [9] obj_xp".into())
+        );
+        assert_eq!(
+            apply_scoreboard_command(&mut board, &["players", "list", "ghost"]),
+            Ok("0 scores for ghost: ".into())
+        );
+        // counts decode exactly for /execute store result.
+        assert_eq!(
+            execute_legacy_result("scoreboard", "2 score holders: s1, s2"),
+            Some(2)
+        );
+        assert_eq!(
+            execute_legacy_result("scoreboard", "2 scores for s1: [2] obj_air, [9] obj_xp"),
+            Some(2)
+        );
+    }
+
+    // #159 — /spreadplayers validates its numeric window, parses respectTeams,
+    // groups teammates into one pile, and is registered at permission level 2.
+    #[test]
+    fn p5d_parity_spreadplayers_validation_and_team_piles() {
+        crate::test_support::require_vanilla_data();
+        let _world = world_guard();
+        let ctx = p5d_ctx(None);
+
+        // level-2 registration, like every other cheat literal.
+        assert!(!command_allowed_at_level("spreadplayers", 1));
+        assert!(command_allowed_at_level("spreadplayers", 2));
+        // argument validation precedes any target or world lookup.
+        assert_eq!(
+            p5d_run(&ctx, "/spreadplayers 0 0 -1 10 false @a"),
+            "Distance is too small."
+        );
+        assert_eq!(
+            p5d_run(&ctx, "/spreadplayers 0 0 9 9 false @a"),
+            "Max range is too small."
+        );
+        assert_eq!(
+            p5d_run(&ctx, "/spreadplayers 0 0 1 10 maybe @a"),
+            "'maybe' is not true or false"
+        );
+        assert!(p5d_run(&ctx, "/spreadplayers 0 0 1 10 true").starts_with("usage:"));
+        assert_eq!(
+            p5d_run(&ctx, "/spreadplayers 0 0 1 10 under 4000 true @a"),
+            "Invalid max height"
+        );
+
+        // a guaranteed safe surface: stone floor at y=240 over the spread area.
+        let dim = DimId::Overworld;
+        for x in -11..=11 {
+            for z in -11..=11 {
+                place_block_dim(dim, x, 240, z, 1);
+            }
+        }
+        let (a, _ra) = p5d_client(60021, 0x6a, "p5d_alpha");
+        let (b, _rb) = p5d_client(60022, 0x6b, "p5d_beta");
+        let (c, _rc) = p5d_client(60023, 0x6c, "p5d_solo");
+        clients().lock().unwrap().push(a.clone());
+        clients().lock().unwrap().push(b.clone());
+        clients().lock().unwrap().push(c.clone());
+
+        // team members share one pile; unteamed players keep their own.
+        {
+            let mut registry = teams().lock().unwrap();
+            registry.add("p5d_team", None).unwrap();
+            registry.join("p5d_team", "p5d_alpha").unwrap();
+            registry.join("p5d_team", "p5d_beta").unwrap();
+        }
+        assert_eq!(
+            spreadplayers_team(&SpreadTarget::Player(a.clone())),
+            Some("p5d_team".to_string())
+        );
+        assert_eq!(spreadplayers_team(&SpreadTarget::Player(c.clone())), None);
+
+        let reply = p5d_run(&ctx, "/spreadplayers 0 0 4 10 true @a");
+        assert!(
+            reply.starts_with("Successfully spread 2 teams around 0, 0"),
+            "{reply}"
+        );
+        {
+            let (pa, pb) = (*a.pos.lock().unwrap(), *b.pos.lock().unwrap());
+            assert_eq!((pa.0, pa.1, pa.2), (pb.0, pb.1, pb.2), "teammates share a pile");
+            assert_eq!(pa.1, 241.0, "feet y sits on the floor");
+        }
+        // respectTeams=false gives every entity its own pile.
+        let reply = p5d_run(&ctx, "/spreadplayers 0 0 4 10 false @a");
+        assert!(
+            reply.starts_with("Successfully spread 3 entities around 0, 0"),
+            "{reply}"
+        );
+
+        // mob lookup uses the string UUID key just like /team join stores it.
+        assert!(insert_live_mob(
+            name_to_etype("zombie").unwrap(),
+            DimId::Overworld,
+            (1.5, 241.0, 1.5, 0.0, 0.0),
+            20.0,
+            None,
+        ));
+        let mob = mobs().lock().unwrap().last().unwrap().clone();
+        let mob_key = uuid_text(&mob.uuid);
+        {
+            let mut registry = teams().lock().unwrap();
+            registry.join("p5d_team", &mob_key).unwrap();
+        }
+        assert_eq!(
+            spreadplayers_team(&SpreadTarget::Mob(mob.clone())),
+            Some("p5d_team".to_string())
+        );
+
+        // teardown: team, clients, mob and the floor.
+        {
+            let mut registry = teams().lock().unwrap();
+            let _ = registry.remove("p5d_team");
+        }
+        clients()
+            .lock()
+            .unwrap()
+            .retain(|p| !matches!(p.eid, 60021 | 60022 | 60023));
+        mobs().lock().unwrap().retain(|m| m.eid != mob.eid);
+        for x in -11..=11 {
+            for z in -11..=11 {
+                place_block_dim(dim, x, 240, z, 0);
+            }
+        }
+    }
+}
