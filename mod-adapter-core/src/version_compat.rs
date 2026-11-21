@@ -22,8 +22,16 @@
 //! Everything parses fail-closed: a malformed or empty range string yields a
 //! [`VersionRangeError`] and never panics, so a corrupt mod manifest degrades
 //! to a clean "incompatible" diagnostic instead of a startup crash.
+//!
+//! The `1.21.1` and `26.3` rows of the `pack_format` / `DataVersion` lookup
+//! table source their numbers from [`mc_spine_core::version::TargetVersion`],
+//! the single source of truth the whole crate DAG shares; historical rows
+//! (`1.20.4`-`1.21.5`, `1.21.0`) stay local since `mc-spine-core` only pins
+//! the two current targets.
 
 use std::fmt;
+
+use mc_spine_core::version::TargetVersion;
 
 /// A Minecraft release version triple (`major.minor.patch`).
 ///
@@ -76,6 +84,46 @@ impl McVersion {
 impl fmt::Display for McVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// Error from `TryFrom<McVersion>` for [`TargetVersion`]: the version is not
+/// one of the two canonical targets (`1.21.1`, `26.3`).
+///
+/// Other table rows (`1.20.4`-`1.21.5`, `1.21.0`) are real versions the range
+/// engine understands but they sit outside the `mc-spine-core` target set —
+/// they fail here instead of silently collapsing onto the nearest target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NoTargetVersion(pub McVersion);
+
+impl fmt::Display for NoTargetVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} is not a canonical mc-spine target version", self.0)
+    }
+}
+
+impl std::error::Error for NoTargetVersion {}
+
+impl From<TargetVersion> for McVersion {
+    fn from(target: TargetVersion) -> Self {
+        match target {
+            TargetVersion::V1_21_1 => Self::V1_21_1,
+            TargetVersion::V26_3 => Self::V26_3,
+        }
+    }
+}
+
+impl TryFrom<McVersion> for TargetVersion {
+    type Error = NoTargetVersion;
+
+    fn try_from(version: McVersion) -> Result<Self, Self::Error> {
+        if version == McVersion::V1_21_1 {
+            Ok(Self::V1_21_1)
+        } else if version == McVersion::V26_3 {
+            Ok(Self::V26_3)
+        } else {
+            Err(NoTargetVersion(version))
+        }
     }
 }
 
@@ -510,21 +558,26 @@ pub fn data_pack_format_for(v: McVersion) -> Option<u32> {
         McVersion::V1_20_4 => 26,
         McVersion::V1_20_6 => 41,
         McVersion::V1_21_0 => 48,
-        McVersion::V1_21_1 => 48,
+        McVersion::V1_21_1 => TargetVersion::V1_21_1.data_pack_format().0,
         McVersion::V1_21_3 => 57,
         McVersion::V1_21_4 => 61,
         McVersion::V1_21_5 => 71,
-        McVersion::V26_3 => 121,
+        McVersion::V26_3 => TargetVersion::V26_3.data_pack_format().0,
         _ => return None,
     })
 }
 
 /// `(major, minor)` data pack format tuple for `v` — the shape `pack.mcmeta`
-/// `min_format`/`max_format` use on the 26.x line. Scalar-`pack_format`
-/// versions report `(format, 0)`: `1.21.1` -> `(48, 0)`, `26.3` ->
-/// `(121, 0)`. `None` for versions outside the table.
+/// `min_format`/`max_format` use on the 26.x line. The two canonical targets
+/// report the tuple `mc-spine-core` pins: `1.21.1` -> `(48, 0)`, `26.3` ->
+/// `(121, 0)`. Other scalar-`pack_format` versions report `(format, 0)`.
+/// `None` for versions outside the table.
 pub fn data_pack_format_tuple_for(v: McVersion) -> Option<(u32, u32)> {
-    data_pack_format_for(v).map(|major| (major, 0))
+    match v {
+        McVersion::V1_21_1 => Some(TargetVersion::V1_21_1.data_pack_format()),
+        McVersion::V26_3 => Some(TargetVersion::V26_3.data_pack_format()),
+        _ => data_pack_format_for(v).map(|major| (major, 0)),
+    }
 }
 
 /// Mojang `DataVersion` for `v` (the number stored in world/player saves),
@@ -534,11 +587,11 @@ pub fn data_version_for(v: McVersion) -> Option<i32> {
         McVersion::V1_20_4 => 3700,
         McVersion::V1_20_6 => 3839,
         McVersion::V1_21_0 => 3953,
-        McVersion::V1_21_1 => 3955,
+        McVersion::V1_21_1 => TargetVersion::V1_21_1.data_version(),
         McVersion::V1_21_3 => 4082,
         McVersion::V1_21_4 => 4189,
         McVersion::V1_21_5 => 4325,
-        McVersion::V26_3 => 5023,
+        McVersion::V26_3 => TargetVersion::V26_3.data_version(),
         _ => return None,
     })
 }
@@ -986,5 +1039,59 @@ mod tests {
             VersionCompatVerdict::InvalidRange { .. } => {}
             other => panic!("expected InvalidRange for blank range, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn target_rows_come_from_mc_spine_core_meta() {
+        // The two canonical target rows of the pack-format / DataVersion
+        // table must equal `TargetVersion::meta()` exactly — this is what
+        // makes the core crate the single source of truth.
+        for target in TargetVersion::ALL {
+            let meta = target.meta();
+            let v = McVersion::from(target);
+            assert_eq!(McVersion::parse(meta.id), Some(v));
+            assert_eq!(data_pack_format_for(v), Some(meta.data_pack_format.0));
+            assert_eq!(data_pack_format_tuple_for(v), Some(meta.data_pack_format));
+            assert_eq!(data_version_for(v), Some(meta.data_version));
+        }
+    }
+
+    #[test]
+    fn target_version_mc_version_roundtrip_is_total_over_all() {
+        // `TargetVersion -> McVersion -> TargetVersion` must be the identity
+        // for every entry in the canonical target set.
+        for target in TargetVersion::ALL {
+            let v = McVersion::from(target);
+            assert_eq!(TargetVersion::try_from(v), Ok(target));
+        }
+        assert_eq!(McVersion::from(TargetVersion::V1_21_1), McVersion::V1_21_1);
+        assert_eq!(McVersion::from(TargetVersion::V26_3), McVersion::V26_3);
+    }
+
+    #[test]
+    fn non_target_mc_versions_fail_try_from_cleanly() {
+        for v in [
+            McVersion::V1_20_4,
+            McVersion::V1_20_6,
+            McVersion::V1_21_0,
+            McVersion::V1_21_3,
+            McVersion::V1_21_4,
+            McVersion::V1_21_5,
+            v(1, 21, 2),
+            v(26, 3, 1),
+        ] {
+            assert_eq!(
+                TargetVersion::try_from(v),
+                Err(NoTargetVersion(v)),
+                "{v} must not map to a canonical target"
+            );
+        }
+        // The error carries the offending version and formats usefully.
+        let err = NoTargetVersion(v(9, 9, 9));
+        assert_eq!(err.0, v(9, 9, 9));
+        assert_eq!(
+            err.to_string(),
+            "9.9.9 is not a canonical mc-spine target version"
+        );
     }
 }

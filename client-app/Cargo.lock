@@ -16,9 +16,16 @@ name = "mc-spine-client-mesh"
 version = "0.1.0"
 
 [[package]]
+name = "mc-spine-core"
+version = "0.1.0"
+
+[[package]]
 name = "mc-spine-kernel"
 version = "0.1.0"
 
 [[package]]
 name = "mc-spine-proto"
 version = "0.1.0"
+dependencies = [
+ "mc-spine-core",
+]

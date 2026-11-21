@@ -55,6 +55,7 @@ pub use resolver::{resolve as resolve_server_address, ResolveError};
 pub use router::{SessionRemapSummary, SessionRemapper, TableDrivenCodec, VersionRouter};
 pub use table::{IdRemapper, PacketDir, PacketPhase, ProtocolTable, Registry, RemapReport};
 pub use version::{
-    BlockStateJsonFormat, ProtocolVersion, RecipeSyncMode, VersionCapabilities,
+    BlockStateJsonFormat, NoTargetVersion, ProtocolVersion, RecipeSyncMode,
+    VersionCapabilities,
 };
 pub use wire::{BitSet, BlockPos, ProtoError, WireReader, WireWriter};

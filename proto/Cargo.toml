@@ -9,4 +9,8 @@ description = "Standalone canonical protocol IR, versioned protocol tables and t
 # Zero external dependencies by contract: this crate is the clean-room protocol
 # core both the server (`src/play_protocol.rs`) and the client
 # (`client-app/src/protocol.rs`) can share, so it must build on pure `std`.
+# `mc-spine-core` is the in-repo leaf crate (also zero-dependency) that owns the
+# canonical 1.21.1/26.3 `TargetVersion`/`VersionMeta` constants this crate
+# derives its version tables from — still no crates.io dependencies.
 [dependencies]
+mc_spine_core = { package = "mc-spine-core", path = "../core" }

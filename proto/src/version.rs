@@ -4,8 +4,16 @@
 //! Downstream code branches on [`VersionCapabilities`] instead of scattering
 //! `protocol == 767`-style checks (the pattern `src/play_protocol.rs` already
 //! uses for its `protocol_1_21_3`/`protocol_1_21_4` forks).
+//!
+//! The two primary targets (`1.21.1` and `26.3`) source every constant —
+//! protocol number, release id, `DataVersion`, pack formats — from
+//! [`mc_spine_core::version::TargetVersion`], the single source of truth the
+//! whole crate DAG shares; the historical `1.21.3`/`1.21.4`/`1.21.5` rows stay
+//! local since `mc-spine-core` only pins the two current targets.
 
 use std::fmt;
+
+use mc_spine_core::version::TargetVersion;
 
 /// A negotiated Java-protocol version number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -25,11 +33,11 @@ pub enum ProtocolVersion {
 }
 
 impl ProtocolVersion {
-    pub const V1_21_1_NUMBER: i32 = 767;
+    pub const V1_21_1_NUMBER: i32 = TargetVersion::V1_21_1.protocol();
     pub const V1_21_3_NUMBER: i32 = 768;
     pub const V1_21_4_NUMBER: i32 = 769;
     pub const V1_21_5_NUMBER: i32 = 770;
-    pub const V26_3_NUMBER: i32 = 777;
+    pub const V26_3_NUMBER: i32 = TargetVersion::V26_3.protocol();
 
     /// Map a wire/handshake number to the enum, keeping unknown numbers.
     pub fn from_number(number: i32) -> Self {
@@ -58,11 +66,11 @@ impl ProtocolVersion {
     /// The canonical Minecraft release name, when this is a known release.
     pub fn mc_version(self) -> Option<&'static str> {
         match self {
-            Self::V1_21_1 => Some("1.21.1"),
+            Self::V1_21_1 => Some(TargetVersion::V1_21_1.id()),
             Self::V1_21_3 => Some("1.21.3"),
             Self::V1_21_4 => Some("1.21.4"),
             Self::V1_21_5 => Some("1.21.5"),
-            Self::V26_3 => Some("26.3"),
+            Self::V26_3 => Some(TargetVersion::V26_3.id()),
             Self::Custom(_) => None,
         }
     }
@@ -93,6 +101,45 @@ impl fmt::Display for ProtocolVersion {
         match self.mc_version() {
             Some(name) => write!(f, "{name} (protocol {})", self.number()),
             None => write!(f, "protocol {}", self.number()),
+        }
+    }
+}
+
+/// Error from `TryFrom<ProtocolVersion>` for [`TargetVersion`]: the protocol
+/// version is not one of the two canonical targets (`1.21.1`, `26.3`).
+///
+/// `V1_21_3`/`V1_21_4`/`V1_21_5` are real protocols mc-spine ships tables for
+/// but they sit outside the `mc-spine-core` target set, and `Custom` is by
+/// definition unidentified — all three cases fail here instead of silently
+/// collapsing onto the nearest target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NoTargetVersion(pub ProtocolVersion);
+
+impl fmt::Display for NoTargetVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} is not a canonical mc-spine target version", self.0)
+    }
+}
+
+impl std::error::Error for NoTargetVersion {}
+
+impl From<TargetVersion> for ProtocolVersion {
+    fn from(target: TargetVersion) -> Self {
+        match target {
+            TargetVersion::V1_21_1 => Self::V1_21_1,
+            TargetVersion::V26_3 => Self::V26_3,
+        }
+    }
+}
+
+impl TryFrom<ProtocolVersion> for TargetVersion {
+    type Error = NoTargetVersion;
+
+    fn try_from(version: ProtocolVersion) -> Result<Self, Self::Error> {
+        match version {
+            ProtocolVersion::V1_21_1 => Ok(Self::V1_21_1),
+            ProtocolVersion::V26_3 => Ok(Self::V26_3),
+            other => Err(NoTargetVersion(other)),
         }
     }
 }
@@ -203,11 +250,11 @@ impl VersionCapabilities {
 
 const CAP_1_21_1: VersionCapabilities = VersionCapabilities {
     protocol_version: ProtocolVersion::V1_21_1_NUMBER,
-    mc_version: "1.21.1",
-    data_version: 3955,
-    pack_format: 48,
-    data_pack_format_tuple: (48, 0),
-    resource_pack_format_tuple: (34, 0),
+    mc_version: TargetVersion::V1_21_1.id(),
+    data_version: TargetVersion::V1_21_1.data_version() as u32,
+    pack_format: TargetVersion::V1_21_1.data_pack_format().0,
+    data_pack_format_tuple: TargetVersion::V1_21_1.data_pack_format(),
+    resource_pack_format_tuple: TargetVersion::V1_21_1.resource_pack_format(),
     recipe_sync_mode: RecipeSyncMode::FullOnJoin,
     block_state_json_format: BlockStateJsonFormat::NameString,
     multi_word_light_mask: true,
@@ -275,11 +322,11 @@ const CAP_1_21_5: VersionCapabilities = VersionCapabilities {
 /// (`recipe_book_add`/`recipe_book_remove`/`recipe_book_settings`).
 const CAP_26_3: VersionCapabilities = VersionCapabilities {
     protocol_version: ProtocolVersion::V26_3_NUMBER,
-    mc_version: "26.3",
-    data_version: 5023,
-    pack_format: 121,
-    data_pack_format_tuple: (121, 0),
-    resource_pack_format_tuple: (97, 1),
+    mc_version: TargetVersion::V26_3.id(),
+    data_version: TargetVersion::V26_3.data_version() as u32,
+    pack_format: TargetVersion::V26_3.data_pack_format().0,
+    data_pack_format_tuple: TargetVersion::V26_3.data_pack_format(),
+    resource_pack_format_tuple: TargetVersion::V26_3.resource_pack_format(),
     recipe_sync_mode: RecipeSyncMode::RecipeBookDisplays,
     block_state_json_format: BlockStateJsonFormat::DualNameOrId,
     multi_word_light_mask: true,
@@ -361,5 +408,63 @@ mod tests {
         let c = ProtocolVersion::V1_21_1.capabilities();
         assert_eq!(c.data_pack_format_tuple, (48, 0));
         assert_eq!(c.resource_pack_format_tuple, (34, 0));
+    }
+
+    #[test]
+    fn primary_target_capabilities_come_from_mc_spine_core() {
+        // Every field `mc-spine-core` pins must equal `TargetVersion::meta()`
+        // exactly — this is what makes the core crate the single source of
+        // truth for the two-target constants.
+        for (proto, target) in [
+            (ProtocolVersion::V1_21_1, TargetVersion::V1_21_1),
+            (ProtocolVersion::V26_3, TargetVersion::V26_3),
+        ] {
+            let meta = target.meta();
+            let c = proto.capabilities();
+            assert_eq!(c.protocol_version, meta.protocol);
+            assert_eq!(c.mc_version, meta.id);
+            assert_eq!(proto.mc_version(), Some(meta.id));
+            assert_eq!(proto.number(), meta.protocol);
+            assert_eq!(c.data_version, meta.data_version as u32);
+            assert_eq!(c.pack_format, meta.data_pack_format.0);
+            assert_eq!(c.data_pack_format_tuple, meta.data_pack_format);
+            assert_eq!(c.resource_pack_format_tuple, meta.resource_pack_format);
+        }
+    }
+
+    #[test]
+    fn target_version_protocol_version_roundtrip_is_total_over_all() {
+        // `TargetVersion -> ProtocolVersion -> TargetVersion` must be the
+        // identity for every entry in the canonical target set.
+        for target in TargetVersion::ALL {
+            let proto = ProtocolVersion::from(target);
+            assert_eq!(proto.number(), target.protocol());
+            assert_eq!(proto.mc_version(), Some(target.id()));
+            assert_eq!(TargetVersion::try_from(proto), Ok(target));
+        }
+    }
+
+    #[test]
+    fn non_target_protocols_fail_try_from_cleanly() {
+        for proto in [
+            ProtocolVersion::V1_21_3,
+            ProtocolVersion::V1_21_4,
+            ProtocolVersion::V1_21_5,
+            ProtocolVersion::Custom(766),
+            ProtocolVersion::Custom(0),
+        ] {
+            assert_eq!(
+                TargetVersion::try_from(proto),
+                Err(NoTargetVersion(proto)),
+                "{proto} must not map to a canonical target"
+            );
+        }
+        // The error carries the offending version and formats usefully.
+        let err = NoTargetVersion(ProtocolVersion::Custom(999));
+        assert_eq!(err.0, ProtocolVersion::Custom(999));
+        assert_eq!(
+            err.to_string(),
+            "protocol 999 is not a canonical mc-spine target version"
+        );
     }
 }
