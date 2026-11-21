@@ -84,6 +84,13 @@ python3 tests/fabric_shim_test.py
 python3 tests/client_launcher_test.py
 python3 tests/load_client_test.py
 python3 tools/provenance_check.py
+python3 tools/provenance_check.py --self-test
+python3 tests/mod_fallback_test.py
+python3 tests/culling_perf_gate.py --self-test
+python3 tests/client_fork_e2e.py --self-test
+python3 tests/perf_bench_test.py
+python3 tests/pgo_build_test.py
+python3 tests/verify_gate_coverage_test.py
 
 echo "== module layering"
 python3 tests/layers_gate_test.py
@@ -97,7 +104,8 @@ bash tools/debt_ratchet.sh || exit 1
 build_manifest=$(mktemp)
 cleanup_verify_artifacts() {
   rm -f "$build_manifest"
-  rm -rf client-port/target client-kernel/target client-app/target mod-offload/target
+  rm -rf client-port/target client-kernel/target client-app/target mod-offload/target \
+      mod-adapter-core/target create-adapter/target
 }
 trap cleanup_verify_artifacts EXIT
 
@@ -106,6 +114,8 @@ cargo test --manifest-path client-port/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path client-kernel/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path client-app/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path mod-offload/Cargo.toml --offline --locked -j 2
+cargo test --manifest-path mod-adapter-core/Cargo.toml --offline --locked -j 2
+cargo test --manifest-path create-adapter/Cargo.toml --offline --locked -j 2
 
 echo "== tests, serial"
 cargo test --offline --locked -j 2 -- --test-threads=1
@@ -156,6 +166,8 @@ timeout 180 python3 tests/client_vanilla_parity.py
 echo "== adapter checks"
 cargo check --offline --locked -j 2 --features fabric-probe
 cargo check --offline --locked -j 2 --features neoforge-events
+cargo check --offline --locked -j 2 --features create-offload
+cargo test --offline --locked -j 2 --features create-offload -- --test-threads=1 aeronautics_and_dim_bridge_tests
 
 # Last, because it is the slowest: prove the gates can still fail. A suite that is green over a gate
 # that cannot fail reports safety it does not have, and this is the only check that would notice.

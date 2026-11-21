@@ -20,10 +20,16 @@ without it.
 is untracked *and* ignored, so a future release commit cannot pick it up by accident. It is a
 separate flag because the default must pass on this branch's tree as it is.
 
+The license scan is the other half of provenance: every workspace manifest must declare a
+`license =` field, and that declaration must not name a GPL-incompatible identifier
+(PolyForm/BUSL/SSPL/ARR-style terms or a prose "all rights reserved"/"proprietary" claim), so a
+crate that cannot be distributed inside this tree fails the gate instead of shipping quietly.
+
 Exit status: 0 clean, 1 findings, 2 the check could not run (no git, unreadable asset).
 """
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -61,6 +67,24 @@ STRICT_PUBLIC = (
     "tests/data/vanilla_vectors_1211.tsv",
     "config_packets.bin",
 )
+# Every workspace manifest whose [package] table must declare a distributable license. The list
+# is explicit rather than globbed so a manifest deleted with its crate is a finding, not a pass.
+LICENSE_MANIFESTS = (
+    "Cargo.toml",
+    "client-port/Cargo.toml",
+    "client-kernel/Cargo.toml",
+    "client-app/Cargo.toml",
+    "mod-offload/Cargo.toml",
+    "mod-adapter-core/Cargo.toml",
+    "create-adapter/Cargo.toml",
+)
+# License terms a crate in this GPL-family tree cannot be distributed under. Identifiers are
+# matched per '-'-separated token segment so SPDX spellings ("BUSL-1.1", "PolyForm-Shield-1.0.0",
+# "LicenseRef-ARR") all resolve, and the phrases catch the prose stand-ins that carry no grant.
+LICENSE_BLOCKED_SEGMENTS = frozenset({"polyform", "busl", "sspl", "arr", "proprietary"})
+LICENSE_BLOCKED_PHRASES = ("all rights reserved", "proprietary")
+_PACKAGE_TABLE = re.compile(r"(?ms)^\[package\]\s*\n(.*?)(?=^\[|\Z)")
+_LICENSE_FIELD = re.compile(r"(?m)^\s*license\s*=\s*[\"']([^\"']*)[\"']")
 
 
 class Unrunnable(Exception):
@@ -153,6 +177,42 @@ def check_state_asset(root, *, allow_missing=False):
     return failures
 
 
+def manifest_license(text):
+    """The `[package]` table's `license = "..."` value, or None when the field is absent."""
+    package = _PACKAGE_TABLE.search(text)
+    if package is None:
+        return None
+    field = _LICENSE_FIELD.search(package.group(1))
+    return field.group(1) if field else None
+
+
+def check_licenses(root):
+    failures = []
+    for relative in LICENSE_MANIFESTS:
+        path = root / relative
+        try:
+            declared = manifest_license(path.read_text())
+        except OSError:
+            failures.append(f"{relative} is missing; every workspace crate declares a license")
+            continue
+        if not declared or not declared.strip():
+            failures.append(f"{relative} declares no license = field")
+            continue
+        normalized = re.sub(r"[-_+/:]", " ", declared.lower())
+        phrase = next((p for p in LICENSE_BLOCKED_PHRASES if p in normalized), None)
+        if phrase is not None:
+            failures.append(f"{relative} declares the incompatible license "
+                            f"{declared!r} ({phrase})")
+            continue
+        segments = [segment for token in re.split(r"[\s()]+", normalized)
+                    for segment in token.split() if segment]
+        blocked = [segment for segment in segments if segment in LICENSE_BLOCKED_SEGMENTS]
+        if blocked:
+            failures.append(f"{relative} declares the incompatible license "
+                            f"{declared!r} ({blocked[0]})")
+    return failures
+
+
 def check_strict_public(root):
     failures = []
     index = tracked(root)
@@ -173,6 +233,7 @@ def check(root, strict_public=False):
     failures += check_state_asset(root, allow_missing=(
         strict_public or (STATE_ASSET not in index and ignored(root, STATE_ASSET))
     ))
+    failures += check_licenses(root)
     if strict_public:
         failures += check_strict_public(root)
     return failures, notices
@@ -205,6 +266,13 @@ def selftest_case(asset, name, *, index=(), write=(), strict_public=False, missi
                                          "/config_packets.bin\n")
         (root / STATE_ASSET).write_bytes(asset)
         (root / "src/main.rs").write_text("fn main() {}\n")
+        # A clean license baseline in every case; a `write` entry can then break one manifest.
+        for index_, manifest in enumerate(LICENSE_MANIFESTS):
+            target = root / manifest
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(f'[package]\nname = "selftest-{index_}"\nversion = "0.0.0"\n'
+                              'license = "LGPL-3.0-or-later OR GPL-3.0-or-later '
+                              'OR AGPL-3.0-or-later"\n')
         for path, text in write:
             target = root / path
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -265,6 +333,38 @@ def selftest(root):
              index=["tests/data/biome_probe_1211.tsv"], strict_public=True, expect=True),
         case("strict-public rejects a tracked datapack",
              index=["datapacks/vanilla/pack.mcmeta"], strict_public=True, expect=True),
+        # License hygiene: the GPL-family expressions pass, the incompatible identifiers and a
+        # missing declaration all fail closed.
+        case("MIT OR Apache-2.0 is an accepted expression",
+             write=[("mod-offload/Cargo.toml",
+                     '[package]\nname = "m"\nlicense = "MIT OR Apache-2.0"\n')],
+             expect=False),
+        case("a PolyForm license fails",
+             write=[("mod-offload/Cargo.toml",
+                     '[package]\nname = "m"\nlicense = "PolyForm-Shield-1.0.0"\n')],
+             expect=True),
+        case("BUSL and SSPL licenses fail",
+             write=[("client-port/Cargo.toml",
+                     '[package]\nname = "p"\nlicense = "BUSL-1.1"\n'),
+                    ("client-kernel/Cargo.toml",
+                     '[package]\nname = "k"\nlicense = "SSPL-1.0"\n')],
+             expect=True),
+        case("an ARR license fails",
+             write=[("create-adapter/Cargo.toml",
+                     '[package]\nname = "c"\nlicense = "ARR"\n')],
+             expect=True),
+        case("an all-rights-reserved claim fails",
+             write=[("client-app/Cargo.toml",
+                     '[package]\nname = "a"\nlicense = "LicenseRef-All-Rights-Reserved"\n')],
+             expect=True),
+        case("a proprietary license fails",
+             write=[("client-app/Cargo.toml",
+                     '[package]\nname = "a"\nlicense = "Proprietary"\n')],
+             expect=True),
+        case("a manifest without a license field fails",
+             write=[("mod-adapter-core/Cargo.toml",
+                     '[package]\nname = "a"\nversion = "0.1.0"\n')],
+             expect=True),
     ]
     # The reference scan is what makes "reading one again" a failure, so the case that plants a
     # reference must actually have been planted.
