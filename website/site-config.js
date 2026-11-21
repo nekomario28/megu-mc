@@ -14,15 +14,17 @@
 
   var SITE_CONFIG = {
     // Display name of the project (hero, nav, footer, <title>).
-    projectName: "mc-spine",
+    projectName: "Megu",
 
     // Prefix every CLI binary shares: `<cliPrefix>-init`,
     // `<cliPrefix>-mod-check`, `<cliPrefix>-world-migrate`,
     // `<cliPrefix>-client`, and the bare `<cliPrefix>` server binary.
+    // Kept at "mc-spine" while binaries/packages remain on the development
+    // codename (provisional brand preview only).
     cliPrefix: "mc-spine",
 
     // Short line under the project name in the nav/hero.
-    tagline: "A Rust-native Minecraft server & client runtime",
+    tagline: "A Minecraft-compatible engine written in Rust (codename: mc-spine)",
 
     // Badge shown next to the project name.
     statusBadge: "Experimental Alpha",
@@ -45,7 +47,7 @@
     // Optional custom domain once the brand name is final, e.g.
     // "megu.megumin.tech". Leave "" while undecided: the footer deploy note
     // stays hidden until a domain is set.
-    customDomain: "",
+    customDomain: "megu.megumin.tech",
 
     // Default classification sets for the browser pre-flight checker,
     // mirroring the `mc-spine-mod-check` CLI defaults
