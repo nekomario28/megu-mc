@@ -31,6 +31,21 @@ _spec = importlib.util.spec_from_file_location("perf_bench", ROOT / "tools" / "p
 pb = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(pb)
 
+# 64-chunk seed-0 Overworld digests of current main 28e5977, proven
+# bit-identical across Wave 5 a82df1a/cfffac7 and Wave 7A cb26645/92a9749.
+PINNED_SHA_DEFAULT = {
+    "full": "368ab50dc931faec43469cd4fd9620f56c1f8c0931f0708c3bfd9e9b3e8297b7",
+    "nofeat": "16dd14904130aa56a887cb4fb7e18b2492784cb147a08325cdc46df64f91b766",
+    "terrain": "c7fa585e8ec40df5825325c6d39fc6f6d17d5c01e3e80f2f4e4b3bae9b50c3e0",
+}
+
+# Superseded defaults that must no longer be pinned.
+STALE_SHA_DEFAULT = (
+    "670fdfe3472812afeeba823a30e08f472ea8eb69965d6ba0c54b30a2e9949def",
+    "57101c434d49edf21f7efdd4207beca8cae34ff74cbf4ffdc009b680cb5d5a48",
+    "bb499dfb6c53128734a23f8722534a5f1882e7acbb53a9885a604ce74352beff",
+)
+
 # Copied verbatim from the m3_report() format in src/worldgen.rs (with plausible
 # numbers from evidence/foundation/performance/README.md).
 M3_STDERR = """[m3] terrain_store_bound=512 jobs=5
@@ -246,6 +261,76 @@ class PerfBenchTest(unittest.TestCase):
     # ------------------------------------------------------------------
     # Fail-closed digest verification and the profile pass.
     # ------------------------------------------------------------------
+
+    def test_default_expected_sha_pins_current_main(self):
+        # 64-chunk seed-0 Overworld digests from main 28e5977 (bit-identical
+        # across Wave 5 a82df1a/cfffac7 and Wave 7A cb26645/92a9749).
+        self.assertEqual(pb.EXPECTED_SHA_DEFAULT, PINNED_SHA_DEFAULT)
+        self.assertEqual(set(pb.EXPECTED_SHA_DEFAULT), set(pb.ARMS))
+        for arm, digest in pb.EXPECTED_SHA_DEFAULT.items():
+            self.assertRegex(digest, r"^[0-9a-f]{64}$", arm)
+        self.assertEqual(len(set(pb.EXPECTED_SHA_DEFAULT.values())), len(pb.ARMS))
+        for stale in STALE_SHA_DEFAULT:
+            self.assertNotIn(stale, pb.EXPECTED_SHA_DEFAULT.values())
+
+        for spec in ("default", "DEFAULT", " default ", ""):
+            expected, applicable = pb.parse_expected_sha(spec, 8)
+            self.assertEqual(expected, PINNED_SHA_DEFAULT)
+            self.assertTrue(applicable)
+        expected, applicable = pb.parse_expected_sha("default", 4)
+        self.assertEqual(expected, PINNED_SHA_DEFAULT)
+        self.assertFalse(applicable)
+        # callers get a copy; the module constant cannot be mutated through it
+        expected["full"] = "0" * 64
+        self.assertEqual(pb.EXPECTED_SHA_DEFAULT["full"], PINNED_SHA_DEFAULT["full"])
+
+    def test_default_expected_sha_end_to_end(self):
+        fake = self.fake_binary("fake.py", "BASE")
+        # N=8: the pinned digests are applied (and the fake's bytes do not match)
+        out_json = self.root / "default8.json"
+        code, _, err = self.invoke(
+            ["--binary", fake, "--tmpdir", str(self.dumps), "--arms", "terrain",
+             "--jobs", "1", "--rounds", "1", "--json", str(out_json)],
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("sha256 mismatch for arm=terrain", err)
+        self.assertIn("expected " + PINNED_SHA_DEFAULT["terrain"], err)
+        self.assertFalse(out_json.exists())
+
+        # --no-verify-sha: run succeeds, config records no verification
+        code, _, _ = self.invoke(
+            self.base_argv(fake, "--arms", "full", "--jobs", "1", "--rounds", "1", "--json", str(out_json)),
+        )
+        self.assertEqual(code, 0)
+        doc = json.loads(out_json.read_text())
+        self.assertFalse(doc["config"]["verify_sha"])
+        self.assertEqual(doc["config"]["expected_sha"], {})
+
+        # N != 8: recorded digests are skipped with a note, not failed
+        out4 = self.root / "default4.json"
+        code, _, err = self.invoke(
+            ["--binary", fake, "--tmpdir", str(self.dumps), "--arms", "full",
+             "--jobs", "1", "--rounds", "1", "--dump-n", "4", "--json", str(out4)],
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("skipping sha check at N=4", err)
+        doc = json.loads(out4.read_text())
+        self.assertFalse(doc["config"]["verify_sha"])
+        self.assertEqual(doc["samples"][0]["dump_bytes"], 64 * 4 * 4)
+
+        # the pinned map, passed explicitly, is what config records when verifying
+        good = hashlib.sha256(dump_bytes("full")).hexdigest()
+        pinned = dict(PINNED_SHA_DEFAULT, full=good)
+        ok_json = self.root / "pinned.json"
+        code, _, _ = self.invoke(
+            ["--binary", fake, "--tmpdir", str(self.dumps), "--arms", "full",
+             "--jobs", "1", "--rounds", "1", "--expected-sha", json.dumps(pinned),
+             "--json", str(ok_json)],
+        )
+        self.assertEqual(code, 0)
+        doc = json.loads(ok_json.read_text())
+        self.assertTrue(doc["config"]["verify_sha"])
+        self.assertEqual(doc["config"]["expected_sha"], pinned)
 
     def test_sha256_mismatch_is_fail_closed(self):
         fake = self.fake_binary("fake.py", "BASE")

@@ -63,11 +63,13 @@ ARM_ENV: Dict[str, Dict[str, str]] = {
     "terrain": {"MC_SPINE_NOFEAT": "1", "MC_SPINE_NOCARVE": "1"},
 }
 
-# sha256 of the 25,165,824-byte seed-0 N=8 block dump (see the README).
+# sha256 of the 25,165,824-byte seed-0 N=8 Overworld block dump (see the
+# README), as produced by current main 28e5977 (bit-identical across Wave 5
+# a82df1a / cfffac7 and Wave 7A cb26645 / 92a9749).
 EXPECTED_SHA_DEFAULT: Dict[str, str] = {
-    "full": "670fdfe3472812afeeba823a30e08f472ea8eb69965d6ba0c54b30a2e9949def",
-    "nofeat": "57101c434d49edf21f7efdd4207beca8cae34ff74cbf4ffdc009b680cb5d5a48",
-    "terrain": "bb499dfb6c53128734a23f8722534a5f1882e7acbb53a9885a604ce74352beff",
+    "full": "368ab50dc931faec43469cd4fd9620f56c1f8c0931f0708c3bfd9e9b3e8297b7",
+    "nofeat": "16dd14904130aa56a887cb4fb7e18b2492784cb147a08325cdc46df64f91b766",
+    "terrain": "c7fa585e8ec40df5825325c6d39fc6f6d17d5c01e3e80f2f4e4b3bae9b50c3e0",
 }
 
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{64}$")
