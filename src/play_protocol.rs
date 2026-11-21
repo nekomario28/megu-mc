@@ -1821,6 +1821,12 @@ fn finish_block_break(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, old:
             return;
         }
     }
+    // Live progression gates (mod-suite): a sealed dimension/biome rule
+    // denies the break before any world mutation and resyncs the cell so the
+    // client sees the block reappear, matching the recheck above.
+    if live_progression_denies_break(me, dim, x, y, z) {
+        return;
+    }
     #[cfg(feature = "neoforge-events")]
     if java_compat::NEOFORGE.get().is_some() {
         let result = neoforge_event(me, java_compat::S1Event::BlockBreak {
@@ -5703,6 +5709,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     write_varint(&mut hp, saved_player.as_ref().map_or(20, |save| save.food) as i64);
     hp.extend_from_slice(&saved_player.as_ref().map_or(5.0, |save| save.saturation).to_be_bytes());
     let _ = send_packet(&mut s, 0x5d, hp);
+    // Live mod suite: the armed `mc-spine:mod_sync_v1` (MSY1) manifest rides
+    // the play-phase 0x19 custom payload. No-op unless an operator manifest
+    // validated at boot (default builds send nothing new).
+    live_mod_sync_on_join(&mut s);
     if let Some(rp) = resource_pack_pkt() {
         let _ = send_packet(&mut s, 0x46, rp);
     }

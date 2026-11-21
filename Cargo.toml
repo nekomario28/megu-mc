@@ -38,11 +38,24 @@ neoforge-events = ["java-compat"]
 # `include!`d behind this cfg). All three crates are path-local with zero
 # crates-io dependencies, so default builds keep an unchanged dependency graph.
 create-offload = ["dep:mod-adapter-core", "dep:create-adapter"]
+# Opt-in live root integration bridge (`src/live_mod_bridge.rs`, `include!`d
+# unconditionally; every symbol inside is `#[cfg]`-gated so default builds keep
+# an unchanged dependency graph). All four crates are path-local, already in
+# `Cargo.lock`, and already copied by `tools/mutation_check.sh`'s INPUTS — this
+# feature adds dependency *edges* only, never new crates.
+mod-suite = [
+    "dep:mod-adapter-core",
+    "dep:create-adapter",
+    "dep:mod-offload",
+    "dep:mc-spine-core",
+]
 
 [dependencies]
 flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 jni = { version = "0.21.1", features = ["invocation"], optional = true }
 mod-adapter-core = { path = "mod-adapter-core", optional = true }
 create-adapter = { path = "create-adapter", optional = true }
+mc-spine-core = { path = "core", optional = true }
+mod-offload = { path = "mod-offload", optional = true }
 signal-hook = "0.4.4"
 ureq = { version = "3.4.2", features = ["rustls"] }

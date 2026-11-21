@@ -70,6 +70,7 @@ include!("recipes_and_stats.rs");
 include!("mod_offload_bridge.rs");
 #[cfg(feature = "create-offload")]
 include!("aeronautics_and_dim_bridge.rs");
+include!("live_mod_bridge.rs");
 
 // ---------- clients (multiplayer visibility) ----------
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -13174,6 +13175,7 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     run("chest_viewers", chest_viewer_tick);
     #[cfg(feature = "create-offload")]
     run("mod_offload", mod_offload_tick);
+    run("live_mods", live_mod_tick);
 }
 
 fn main() {
@@ -13188,6 +13190,10 @@ fn main() {
         ac_install(AcConfig::from_doc(&doc, |name| std::env::var(name).ok()));
         refresh_hidden_tags_from_datapacks(std::path::Path::new(DATAPACK_DIRECTORY));
     }
+    // Live mod suite (mod-suite feature): scans MC_SPINE_MODS_DIR and arms the
+    // operator mod-sync/progression files. Inert unless the feature is built
+    // in *and* one of its env vars names a file or directory.
+    live_mod_suite_boot();
     // Terrain evaluates `add(final_density, beardifier)` (see `worldgen`), and the
     // structure pipeline owns the starts that feed it. `worldgen` sits below `feature`
     // in `tools/layers_check.sh`, so the edge is a registered function pointer rather

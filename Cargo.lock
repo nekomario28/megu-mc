@@ -219,7 +219,9 @@ dependencies = [
  "create-adapter",
  "flate2",
  "jni",
+ "mc-spine-core",
  "mod-adapter-core",
+ "mod-offload",
  "signal-hook",
  "ureq",
 ]
