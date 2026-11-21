@@ -367,3 +367,810 @@ fn mining_efficiency_and_durability_use_shared_mechanics() {
     assert!(!damage_stack(&mut protected, 0.0));
     assert_eq!(comp_varint(&protected.2, COMP_DAMAGE), None);
 }
+
+mod block_entity_helpers {
+    use super::*;
+    use crate::nbt::{read_named, write_named, NbtString, Tag};
+
+    fn compound(fields: impl IntoIterator<Item = (&'static str, Tag)>) -> Tag {
+        Tag::Compound(
+            fields
+                .into_iter()
+                .map(|(k, v)| (NbtString::text(k), v))
+                .collect(),
+        )
+    }
+
+    fn string(value: &str) -> Tag {
+        Tag::String(NbtString::text(value))
+    }
+
+    fn item_nbt(id: &str, count: i32) -> Tag {
+        compound([("id", string(id)), ("count", Tag::Int(count))])
+    }
+
+    fn item(id: &str, count: u8) -> BlockEntityItem {
+        BlockEntityItem::new(id, count).unwrap()
+    }
+
+    fn saved(tag: &Tag) -> Tag {
+        let name = NbtString::text("");
+        let bytes = write_named(&name, tag).unwrap();
+        let (decoded_name, decoded) = read_named(&bytes).unwrap();
+        assert_eq!(decoded_name, name);
+        assert_eq!(&decoded, tag);
+        decoded
+    }
+
+    #[test]
+    fn beacon_scans_complete_layers_and_refreshes_effects_every_80_ticks() {
+        let fixture = compound([
+            ("Levels", Tag::Int(4)),
+            ("primary_effect", string("minecraft:speed")),
+            ("secondary_effect", string("minecraft:regeneration")),
+            ("Lock", string("key")),
+        ]);
+        let mut beacon = Beacon::from_nbt(&fixture);
+        assert_eq!(saved(&beacon.to_nbt()), fixture);
+        assert!(beacon
+            .tick(79, true, |_, _, _| panic!("early scan"))
+            .is_none());
+        assert!(beacon
+            .tick(80, false, |_, _, _| panic!("beam blocked"))
+            .is_none());
+        let pulse = beacon
+            .tick(80, true, |x, y, z| (x, y, z) != (3, -3, 3))
+            .unwrap();
+        assert_eq!(beacon.levels(), 2);
+        assert_eq!(
+            (
+                pulse.range,
+                pulse.duration,
+                pulse.primary,
+                pulse.amplifier,
+                pulse.secondary
+            ),
+            (30, 260, BeaconEffect::Speed, 0, None)
+        );
+
+        let mut invalid = Some(item("coal", 1));
+        assert!(!beacon.confirm(Some(BeaconEffect::Haste), None, &mut invalid));
+        assert_eq!(invalid, Some(item("coal", 1)));
+        let mut payment = Some(item("iron_ingot", 2));
+        assert!(beacon.confirm(
+            Some(BeaconEffect::Haste),
+            Some(BeaconEffect::Haste),
+            &mut payment
+        ));
+        assert_eq!(payment, Some(item("iron_ingot", 1)));
+        let pulse = beacon.tick(160, true, |_, _, _| true).unwrap();
+        assert_eq!(
+            (
+                pulse.range,
+                pulse.duration,
+                pulse.primary,
+                pulse.amplifier,
+                pulse.secondary
+            ),
+            (50, 340, BeaconEffect::Haste, 1, None)
+        );
+        beacon.confirm(
+            Some(BeaconEffect::Strength),
+            Some(BeaconEffect::Regeneration),
+            &mut payment,
+        );
+        assert_eq!(payment, None);
+        assert_eq!(
+            beacon.tick(240, true, |_, _, _| true).unwrap().secondary,
+            Some(BeaconEffect::Regeneration)
+        );
+        assert!(beacon.tick(320, true, |_, _, _| false).is_none());
+        assert_eq!(beacon.levels(), 0);
+    }
+
+    fn slot_nbt(slot: i8, id: &str, count: i32) -> Tag {
+        compound([
+            ("Slot", Tag::Byte(slot)),
+            ("id", string(id)),
+            ("count", Tag::Int(count)),
+        ])
+    }
+
+    #[test]
+    fn campfire_resumes_four_slots_and_cools_twice_as_fast_as_it_cooks() {
+        let fixture = compound([
+            (
+                "Items",
+                Tag::List(
+                    10,
+                    vec![
+                        slot_nbt(0, "minecraft:beef", 1),
+                        slot_nbt(1, "minecraft:potato", 1),
+                        slot_nbt(2, "minecraft:cod", 1),
+                        slot_nbt(3, "minecraft:porkchop", 1),
+                    ],
+                ),
+            ),
+            ("CookingTimes", Tag::IntArray(vec![3, 3, 0, 4])),
+            ("CookingTotalTimes", Tag::IntArray(vec![3, 4, 2, 5])),
+        ]);
+        let mut fire = Campfire::from_nbt(&fixture);
+        assert_eq!(saved(&fire.to_nbt()), fixture);
+
+        let mut held = Some(item("salmon", 2));
+        assert_eq!(
+            fire.place(&mut held, |_| panic!("all slots occupied")),
+            None
+        );
+        assert!(fire.tick(false, |_| panic!("unlit"), |_| true).is_empty());
+        assert_eq!(fire.cooking_times, [1, 1, 0, 2]);
+        assert_eq!(Campfire::from_nbt(&saved(&fire.to_nbt())), fire);
+
+        let cook = |ingredient: &BlockEntityItem| {
+            (ingredient.id.path() == "beef").then(|| item("cooked_beef", 1))
+        };
+        assert!(fire.tick(true, cook, |_| true).is_empty());
+        assert_eq!(
+            fire.tick(true, cook, |_| true),
+            [item("cooked_beef", 1), item("cod", 1)]
+        );
+        assert_eq!(
+            fire.slots,
+            [
+                None,
+                Some(item("potato", 1)),
+                None,
+                Some(item("porkchop", 1))
+            ]
+        );
+        assert_eq!(fire.place(&mut held, |_| None), None);
+        assert_eq!(fire.place(&mut held, |_| Some(7)), Some(0));
+        assert_eq!(held.as_ref().map(BlockEntityItem::count), Some(1));
+        assert_eq!(fire.cooking_times[0], 0);
+        assert_eq!(fire.cooking_total_times[0], 7);
+        assert_eq!(
+            fire.tick(true, cook, |output| output.id.path() != "porkchop"),
+            [item("potato", 1)]
+        );
+        assert_eq!(fire.slots[3], Some(item("porkchop", 1)));
+        assert_eq!(fire.tick(true, cook, |_| true), [item("porkchop", 1)]);
+    }
+
+    #[test]
+    fn lectern_preserves_book_components_and_signals_only_real_page_turns() {
+        let book = compound([
+            ("id", string("minecraft:written_book")),
+            ("count", Tag::Int(1)),
+            (
+                "components",
+                compound([(
+                    "minecraft:written_book_content",
+                    compound([
+                        ("title", compound([("raw", string("レシピ"))])),
+                        ("author", string("Alex")),
+                        ("resolved", Tag::Byte(1)),
+                        (
+                            "pages",
+                            Tag::List(
+                                10,
+                                vec![
+                                    compound([("raw", string("First"))]),
+                                    compound([
+                                        ("raw", string("Second")),
+                                        ("filtered", string("Filtered")),
+                                    ]),
+                                    compound([("raw", string("Third"))]),
+                                ],
+                            ),
+                        ),
+                    ]),
+                )]),
+            ),
+        ]);
+        let fixture = compound([("Book", book.clone()), ("Page", Tag::Int(1))]);
+        let mut lectern = Lectern::from_nbt(&fixture);
+        assert_eq!(saved(&lectern.to_nbt()), fixture);
+        assert_eq!(lectern.page_count(), 3);
+        assert_eq!(lectern.page(), 1);
+        assert_eq!(lectern.comparator_signal(), 8);
+        assert!(!lectern.set_page(1));
+        assert!(lectern.set_page(i32::MAX));
+        assert_eq!((lectern.page(), lectern.comparator_signal()), (2, 15));
+        assert!(!lectern.set_page(3));
+        assert!(lectern.set_page(-99));
+        assert_eq!((lectern.page(), lectern.comparator_signal()), (0, 1));
+
+        let mut held = Some(item("writable_book", 2));
+        assert!(!lectern.place(&mut held));
+        assert_eq!(lectern.take_book().unwrap().to_nbt(), book);
+        assert_eq!(lectern.comparator_signal(), 0);
+        assert_eq!(lectern.to_nbt(), compound([]));
+        assert!(lectern.place(&mut held));
+        assert_eq!(held, Some(item("writable_book", 1)));
+        assert_eq!(lectern.page_count(), 0);
+        assert_eq!((lectern.page(), lectern.comparator_signal()), (0, 15));
+        assert!(lectern.set_page(1));
+        assert_eq!(lectern.page(), -1);
+        assert_eq!(Lectern::from_nbt(&saved(&lectern.to_nbt())).page(), -1);
+        lectern.take_book();
+        assert!(!lectern.place(&mut Some(item("book", 1))));
+    }
+
+    #[test]
+    fn chiseled_bookshelf_tracks_the_last_successful_insert_or_removal() {
+        let fixture = compound([
+            (
+                "Items",
+                Tag::List(10, vec![slot_nbt(5, "minecraft:enchanted_book", 1)]),
+            ),
+            ("last_interacted_slot", Tag::Int(5)),
+        ]);
+        assert_eq!(ChiseledBookshelf::default().comparator_signal(), 0);
+        let mut shelf = ChiseledBookshelf::from_nbt(&fixture);
+        assert_eq!(saved(&shelf.to_nbt()), fixture);
+        assert_eq!(shelf.comparator_signal(), 6);
+
+        let mut held = Some(item("book", 2));
+        assert!(!shelf.insert_book(6, &mut held));
+        assert!(!shelf.insert_book(5, &mut held));
+        assert_eq!(held, Some(item("book", 2)));
+        assert!(!shelf.insert_book(0, &mut Some(item("paper", 1))));
+        assert_eq!(shelf.remove_book(0), None);
+        assert_eq!(shelf.comparator_signal(), 6);
+        assert!(shelf.insert_book(1, &mut held));
+        assert_eq!(shelf.comparator_signal(), 2);
+        assert_eq!(held, Some(item("book", 1)));
+        assert_eq!(shelf.remove_book(5), Some(item("enchanted_book", 1)));
+        assert_eq!(shelf.comparator_signal(), 6);
+        assert_eq!(shelf.remove_book(1), Some(item("book", 1)));
+        assert!(shelf.slots.iter().all(Option::is_none));
+        assert_eq!(shelf.comparator_signal(), 2);
+        assert_eq!(ChiseledBookshelf::from_nbt(&saved(&shelf.to_nbt())), shelf);
+    }
+
+    #[test]
+    fn decorated_pot_preserves_side_order_and_merges_only_matching_stacks() {
+        let fixture = compound([
+            (
+                "sherds",
+                Tag::List(
+                    8,
+                    vec![
+                        string("minecraft:angler_pottery_sherd"),
+                        string("minecraft:brick"),
+                        string("minecraft:archer_pottery_sherd"),
+                        string("minecraft:arms_up_pottery_sherd"),
+                    ],
+                ),
+            ),
+            ("item", item_nbt("minecraft:diamond", 31)),
+        ]);
+        let mut pot = DecoratedPot::from_nbt(&fixture);
+        assert_eq!(saved(&pot.to_nbt()), fixture);
+        assert_eq!(
+            pot.sherds[0].as_ref().unwrap().path(),
+            "angler_pottery_sherd"
+        );
+        assert!(pot.sherds[1].is_none());
+        assert_eq!(
+            pot.sherds[3].as_ref().unwrap().path(),
+            "arms_up_pottery_sherd"
+        );
+        assert_eq!(pot.comparator_signal(64), 7);
+        let mut held = Some(item("diamond", 2));
+        assert!(pot.insert(&mut held, 64));
+        assert_eq!(held, Some(item("diamond", 1)));
+        assert_eq!(pot.item, Some(item("diamond", 32)));
+        assert_eq!(pot.comparator_signal(64), 8);
+        assert!(!pot.insert(&mut held, 32));
+        assert!(!pot.insert(&mut Some(item("emerald", 1)), 64));
+
+        let mut renamed = item("diamond", 1);
+        renamed
+            .components
+            .insert(NbtString::text("minecraft:custom_name"), string("Gem"));
+        assert!(!pot.insert(&mut Some(renamed), 64));
+        assert_eq!(DecoratedPot::from_nbt(&saved(&pot.to_nbt())), pot);
+        assert_eq!(DecoratedPot::default().to_nbt(), compound([]));
+
+        let contingent = compound([
+            (
+                "LootTable",
+                string("minecraft:chests/trial_chambers/corridor"),
+            ),
+            ("LootTableSeed", Tag::Long(-5)),
+        ]);
+        let mut pot = DecoratedPot::from_nbt(&contingent);
+        assert_eq!(saved(&pot.to_nbt()), contingent);
+        assert!(!pot.insert(&mut held, 64));
+        assert_eq!(held, Some(item("diamond", 1)));
+    }
+
+    #[test]
+    fn crafter_prioritizes_empty_slots_and_consumes_only_on_a_successful_recipe() {
+        let fixture = compound([
+            (
+                "Items",
+                Tag::List(
+                    10,
+                    vec![
+                        slot_nbt(0, "minecraft:milk_bucket", 2),
+                        slot_nbt(2, "minecraft:egg", 2),
+                        slot_nbt(8, "minecraft:wheat", 1),
+                    ],
+                ),
+            ),
+            ("disabled_slots", Tag::IntArray(vec![1, 3, 4, 5, 6])),
+            ("crafting_ticks_remaining", Tag::Int(2)),
+            ("triggered", Tag::Int(1)),
+        ]);
+        let mut crafter = Crafter::from_nbt(&fixture);
+        assert_eq!(saved(&crafter.to_nbt()), fixture);
+        assert_eq!(crafter.comparator_signal(), 8);
+        assert!(!crafter.set_slot_disabled(0, true));
+        assert!(!crafter.set_slot_disabled(9, true));
+        assert!(!crafter.tick());
+        assert!(crafter.tick());
+        assert!(!crafter.tick());
+        assert_eq!(crafter.set_powered(true), None);
+        assert_eq!(crafter.set_powered(false), None);
+        assert_eq!(crafter.set_powered(true), Some(4));
+
+        let mut held = Some(item("egg", 2));
+        assert_eq!(crafter.insert(&mut held, 16), Some(7));
+        assert_eq!(crafter.insert(&mut held, 16), Some(7));
+        assert_eq!(held, None);
+        assert_eq!(crafter.comparator_signal(), 9);
+
+        let before = crafter.to_nbt();
+        assert_eq!(crafter.craft(|_| None), None);
+        assert_eq!(crafter.to_nbt(), before);
+        let result = crafter.craft(|slots| {
+            assert_eq!(slots[0], Some(item("milk_bucket", 2)));
+            assert_eq!(slots[7], Some(item("egg", 2)));
+            Some((item("cake", 1), vec![item("bucket", 1)]))
+        });
+        assert_eq!(result, Some((item("cake", 1), vec![item("bucket", 1)])));
+        assert_eq!(crafter.slots()[0], Some(item("milk_bucket", 1)));
+        assert_eq!(crafter.slots()[2], Some(item("egg", 1)));
+        assert_eq!(crafter.slots()[7], Some(item("egg", 1)));
+        assert_eq!(crafter.slots()[8], None);
+        assert_eq!(crafter.crafting_ticks_remaining, 6);
+        assert_eq!(Crafter::from_nbt(&saved(&crafter.to_nbt())), crafter);
+        for _ in 0..5 {
+            assert!(!crafter.tick());
+        }
+        assert!(crafter.tick());
+        assert!(crafter.set_slot(1, Some(item("sugar", 1))));
+        assert_eq!(crafter.slots()[1], Some(item("sugar", 1)));
+        assert!(crafter.set_slot(1, None));
+        assert_eq!(crafter.comparator_signal(), 7);
+    }
+
+    #[test]
+    fn crafter_can_use_the_existing_recipe_matcher_after_reload() {
+        let mut crafter = Crafter::default();
+        assert!(crafter.set_slot(1, Some(item("coal", 2))));
+        assert!(crafter.set_slot(4, Some(item("stick", 1))));
+        let mut crafter = Crafter::from_nbt(&saved(&crafter.to_nbt()));
+        let output = crafter.craft(|slots| {
+            let grid = slots
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| {
+                    let item = item.as_ref()?;
+                    let id = name_to_item(&item.id.to_string())?;
+                    Some((index as i16 + 1, (id, item.count(), vec![])))
+                })
+                .collect();
+            let (id, count, _) = craft3_result(&grid)?;
+            Some((item(item_to_name(id)?, count), vec![]))
+        });
+        assert_eq!(output, Some((item("torch", 4), vec![])));
+        assert_eq!(crafter.slots()[1], Some(item("coal", 1)));
+        assert_eq!(crafter.slots()[4], None);
+    }
+
+    #[test]
+    fn jukebox_resumes_at_saved_tick_and_keeps_disc_after_song_ends() {
+        let fixture = compound([
+            ("RecordItem", item_nbt("minecraft:music_disc_13", 1)),
+            ("ticks_since_song_started", Tag::Long(3_579)),
+        ]);
+        let resolve = |disc: &BlockEntityItem| {
+            (disc.id.path() == "music_disc_13").then_some(JukeboxSong {
+                length_in_ticks: 3_560,
+                comparator_output: 1,
+            })
+        };
+        let mut jukebox = Jukebox::from_nbt(&fixture, resolve);
+        assert_eq!(saved(&jukebox.to_nbt()), fixture);
+        assert_eq!(jukebox.playing_ticks(), Some(3_579));
+        assert_eq!(jukebox.tick(), None);
+        assert_eq!(jukebox.tick(), Some(JukeboxTick::Stopped));
+        assert_eq!(jukebox.tick(), None);
+        assert_eq!(jukebox.playing_ticks(), None);
+        assert_eq!(jukebox.comparator_signal(resolve), 1);
+        assert_eq!(
+            saved(&jukebox.to_nbt()),
+            compound([("RecordItem", item_nbt("minecraft:music_disc_13", 1))])
+        );
+
+        let mut disc = Some(item("music_disc_13", 2));
+        assert!(!jukebox.insert(&mut disc, resolve));
+        assert_eq!(jukebox.eject(), Some(item("music_disc_13", 1)));
+        assert!(!jukebox.insert(&mut Some(item("stone", 1)), resolve));
+        assert!(jukebox.insert(&mut disc, resolve));
+        assert_eq!(disc, Some(item("music_disc_13", 1)));
+        assert_eq!(jukebox.playing_ticks(), Some(0));
+        assert_eq!(jukebox.tick(), Some(JukeboxTick::MusicNote));
+        for _ in 1..20 {
+            assert_eq!(jukebox.tick(), None);
+        }
+        assert_eq!(jukebox.tick(), Some(JukeboxTick::MusicNote));
+        assert_eq!(jukebox.eject(), Some(item("music_disc_13", 1)));
+        assert_eq!(jukebox.comparator_signal(resolve), 0);
+
+        let mut custom = item("stone", 1);
+        custom.components.insert(
+            NbtString::text("minecraft:jukebox_playable"),
+            compound([("song", string("example:unregistered"))]),
+        );
+        let mut held = Some(custom.clone());
+        assert!(jukebox.insert(&mut held, resolve));
+        assert_eq!(held, None);
+        assert_eq!(jukebox.playing_ticks(), None);
+        assert_eq!(
+            Jukebox::from_nbt(&saved(&jukebox.to_nbt()), resolve).eject(),
+            Some(custom)
+        );
+    }
+
+    #[test]
+    fn banner_saves_registry_patterns_and_washes_the_last_layer_first() {
+        let cross = compound([
+            ("pattern", string("minecraft:cross")),
+            ("color", string("red")),
+        ]);
+        let fixture = compound([
+            (
+                "patterns",
+                Tag::List(
+                    10,
+                    vec![
+                        cross.clone(),
+                        compound([
+                            ("pattern", string("example:sun")),
+                            ("color", string("light_blue")),
+                        ]),
+                    ],
+                ),
+            ),
+            ("CustomName", string("\"Harbor\"")),
+        ]);
+        let mut banner = Banner::from_nbt(&fixture);
+        assert_eq!(saved(&banner.to_nbt()), fixture);
+        let removed = banner.remove_last_pattern().unwrap();
+        assert_eq!(removed.pattern.to_string(), "example:sun");
+        assert_eq!(removed.color, BannerColor::LightBlue);
+        assert_eq!(
+            banner.to_nbt().get("patterns"),
+            Some(&Tag::List(10, vec![cross]))
+        );
+        assert_eq!(
+            banner.remove_last_pattern().unwrap().color,
+            BannerColor::Red
+        );
+        assert_eq!(banner.remove_last_pattern(), None);
+        assert_eq!(
+            banner.to_nbt(),
+            compound([("CustomName", string("\"Harbor\""))])
+        );
+    }
+
+    #[test]
+    fn skull_preserves_sound_and_signed_profile_properties() {
+        let fixture = compound([
+            ("note_block_sound", string("example:head_chime")),
+            ("custom_name", string("\"A head\"")),
+            (
+                "profile",
+                compound([
+                    ("name", string("Alex")),
+                    ("id", Tag::IntArray(vec![1, -2, 3, -4])),
+                    (
+                        "properties",
+                        Tag::List(
+                            10,
+                            vec![compound([
+                                ("name", string("textures")),
+                                ("value", string("texture")),
+                                ("signature", string("signed")),
+                            ])],
+                        ),
+                    ),
+                ]),
+            ),
+        ]);
+        let mut skull = Skull::from_nbt(&fixture);
+        assert_eq!(saved(&skull.to_nbt()), fixture);
+        let profile = skull.profile.as_ref().unwrap();
+        assert!(!profile.needs_resolution());
+        assert_eq!(
+            profile.id,
+            Some(0x0000_0001_ffff_fffe_0000_0003_ffff_fffc_u128.to_be_bytes())
+        );
+        assert_eq!(
+            skull.note_block_sound.take().unwrap().to_string(),
+            "example:head_chime"
+        );
+        assert!(skull.to_nbt().get("note_block_sound").is_none());
+
+        let named = Skull::from_nbt(&compound([("profile", string("Alex"))]));
+        assert!(named.profile.as_ref().unwrap().needs_resolution());
+        assert_eq!(
+            named.to_nbt(),
+            compound([("profile", compound([("name", string("Alex"))]))])
+        );
+        let unsigned = Skull::from_nbt(&compound([(
+            "profile",
+            compound([
+                ("name", string("Alex")),
+                (
+                    "properties",
+                    compound([("textures", Tag::List(8, vec![string("texture")]))]),
+                ),
+            ]),
+        )]));
+        let profile = unsigned.profile.as_ref().unwrap();
+        assert!(!profile.needs_resolution());
+        assert_eq!(
+            profile.properties,
+            [ProfileProperty {
+                name: "textures".into(),
+                value: "texture".into(),
+                signature: None
+            }]
+        );
+        assert_eq!(Skull::from_nbt(&saved(&unsigned.to_nbt())), unsigned);
+    }
+
+    #[test]
+    fn brushing_rolls_once_and_completes_after_ten_rate_limited_strokes() {
+        let fixture = compound([
+            ("LootTable", string("minecraft:archaeology/desert_well")),
+            ("LootTableSeed", Tag::Long(-73)),
+        ]);
+        let mut brushable = Brushable::from_nbt(&fixture);
+        assert_eq!(saved(&brushable.to_nbt()), fixture);
+        let artifact = item("arms_up_pottery_sherd", 1);
+        assert_eq!(
+            brushable.brush(100, Face::West, |table| {
+                assert_eq!(table.id.to_string(), "minecraft:archaeology/desert_well");
+                assert_eq!(table.seed, -73);
+                Some(artifact.clone())
+            }),
+            BrushResult::Progress { dusted: 1 }
+        );
+        let saved_item = compound([("item", artifact.to_nbt())]);
+        assert_eq!(saved(&brushable.to_nbt()), saved_item);
+        assert_eq!(
+            Brushable::from_nbt(&saved_item).item,
+            Some(artifact.clone())
+        );
+        assert_eq!(
+            brushable.update_nbt().get("hit_direction"),
+            Some(&Tag::Int(4))
+        );
+        assert_eq!(
+            Brushable::from_nbt(&brushable.update_nbt()).hit_direction,
+            Some(Face::West)
+        );
+        let no_roll = |_: &BlockLootTable| panic!("Loot table may roll only once");
+        assert_eq!(
+            brushable.brush(109, Face::East, no_roll),
+            BrushResult::CoolingDown
+        );
+        for stroke in 2..=9 {
+            let result = brushable.brush(90 + i64::from(stroke) * 10, Face::East, no_roll);
+            let dusted = if stroke == 2 {
+                1
+            } else if stroke < 6 {
+                2
+            } else {
+                3
+            };
+            assert_eq!(result, BrushResult::Progress { dusted });
+        }
+        assert_eq!(
+            brushable.brush(190, Face::East, no_roll),
+            BrushResult::Completed {
+                loot: Some(artifact),
+                direction: Face::West
+            }
+        );
+        assert_eq!(brushable.to_nbt(), compound([]));
+        assert_eq!(
+            brushable.brush(200, Face::East, no_roll),
+            BrushResult::CoolingDown
+        );
+    }
+
+    #[test]
+    fn brushable_decay_refreshes_on_contact_and_clears_the_original_hit_face() {
+        let mut brushable = Brushable::default();
+        for now in [0, 10, 20] {
+            brushable.brush(now, Face::North, |_| None);
+        }
+        assert_eq!(brushable.dusted(), 2);
+        assert_eq!(
+            brushable.brush(29, Face::East, |_| None),
+            BrushResult::CoolingDown
+        );
+        assert_eq!(brushable.tick(68), None);
+        assert_eq!(brushable.tick(69), Some(1));
+        assert_eq!(brushable.tick(72), None);
+        assert_eq!(brushable.tick(73), Some(0));
+        assert_eq!(brushable.hit_direction, None);
+        assert_eq!(
+            brushable.brush(74, Face::South, |_| None),
+            BrushResult::Progress { dusted: 1 }
+        );
+        assert_eq!(brushable.hit_direction, Some(Face::South));
+    }
+
+    fn uuid_list(values: &[[i32; 4]]) -> Tag {
+        Tag::List(
+            11,
+            values.iter().map(|id| Tag::IntArray(id.to_vec())).collect(),
+        )
+    }
+
+    #[test]
+    fn trial_spawner_preserves_encounter_nbt_and_advances_spawn_and_reward_counters() {
+        let player = 0x0000_0001_0000_0002_0000_0003_0000_0004_u128.to_be_bytes();
+        let first = 0x0000_0004_0000_0003_0000_0002_0000_0001_u128.to_be_bytes();
+        let second = 5_u128.to_be_bytes();
+        let fixture = compound([
+            ("normal_config", compound([("spawn_range", Tag::Int(5))])),
+            (
+                "ominous_config",
+                compound([("ticks_between_spawn", Tag::Int(10))]),
+            ),
+            (
+                "spawn_data",
+                compound([("entity", compound([("id", string("minecraft:breeze"))]))]),
+            ),
+            (
+                "ejecting_loot_table",
+                string("minecraft:spawners/trial_chamber/key"),
+            ),
+            ("registered_players", uuid_list(&[[1, 2, 3, 4]])),
+            ("current_mobs", uuid_list(&[[4, 3, 2, 1]])),
+            ("cooldown_ends_at", Tag::Long(60)),
+            ("next_mob_spawns_at", Tag::Long(125)),
+            ("total_mobs_spawned", Tag::Int(1)),
+            ("target_cooldown_length", Tag::Int(150)),
+            ("required_player_range", Tag::Int(9)),
+        ]);
+        let mut spawner = TrialSpawner::from_nbt(&fixture);
+        assert_eq!(saved(&spawner.to_nbt()), fixture);
+        assert_eq!(spawner.required_player_range, 9);
+        assert!(!spawner.record_spawn(124, 30, second));
+        assert!(!spawner.record_spawn(125, 30, first));
+        assert!(spawner.record_spawn(125, 30, second));
+        assert_eq!(spawner.current_mobs, [first, second]);
+        assert_eq!(spawner.next_mob_spawns_at, 155);
+        assert_eq!(spawner.total_mobs_spawned, 2);
+        assert!(!spawner.begin_rewards(135));
+        assert!(spawner.remove_mob(135, 30, first));
+        assert!(!spawner.remove_mob(136, 30, first));
+        assert_eq!(spawner.next_mob_spawns_at, 165);
+        assert!(spawner.remove_mob(140, 30, second));
+        assert!(spawner.begin_rewards(140));
+        assert_eq!(spawner.cooldown_ends_at, 290);
+        assert_eq!(spawner.next_mob_spawns_at, 0);
+        assert_eq!(spawner.total_mobs_spawned, 0);
+        assert_eq!(spawner.registered_players, [player]);
+        assert_eq!(TrialSpawner::from_nbt(&saved(&spawner.to_nbt())), spawner);
+        assert_eq!(
+            TrialSpawner::from_nbt(&compound([])),
+            TrialSpawner::default()
+        );
+    }
+
+    #[test]
+    fn vault_charges_a_matching_key_once_and_resumes_reward_ejection_after_save() {
+        let player = 0x0000_0001_0000_0002_0000_0003_0000_0004_u128.to_be_bytes();
+        let previous = 0x0000_0004_0000_0003_0000_0002_0000_0001_u128.to_be_bytes();
+        let nearby = 5_u128.to_be_bytes();
+        let fixture = compound([
+            (
+                "config",
+                compound([
+                    ("loot_table", string("example:treasure")),
+                    ("activation_range", Tag::Double(5.0_f64.to_bits())),
+                    ("deactivation_range", Tag::Double(6.0_f64.to_bits())),
+                    ("key_item", item_nbt("minecraft:ominous_trial_key", 2)),
+                    ("override_loot_table_to_display", string("example:preview")),
+                ]),
+            ),
+            (
+                "shared_data",
+                compound([
+                    ("display_item", item_nbt("minecraft:emerald", 5)),
+                    ("connected_players", uuid_list(&[[1, 2, 3, 4]])),
+                    ("connected_particles_range", Tag::Double(5.0_f64.to_bits())),
+                ]),
+            ),
+            (
+                "server_data",
+                compound([
+                    ("rewarded_players", uuid_list(&[[4, 3, 2, 1]])),
+                    ("state_updating_resumes_at", Tag::Long(100)),
+                ]),
+            ),
+        ]);
+        let mut vault = Vault::from_nbt(&fixture, VaultPhase::Active);
+        assert_eq!(saved(&vault.to_nbt()), fixture);
+        let mut key = Some(item("ominous_trial_key", 3));
+        let mut too_few = Some(item("ominous_trial_key", 1));
+        assert!(!vault.try_unlock(90, player, &mut too_few, |_| panic!("need two keys")));
+        assert!(!vault.try_unlock(90, previous, &mut key, |_| panic!("already rewarded")));
+        assert!(!vault.try_unlock(90, player, &mut key, |_| vec![]));
+        assert_eq!(key, Some(item("ominous_trial_key", 3)));
+        assert!(vault.try_unlock(90, player, &mut key, |table| {
+            assert_eq!(table.to_string(), "example:treasure");
+            vec![item("diamond_block", 1), item("emerald", 4)]
+        }));
+        assert_eq!(key, Some(item("ominous_trial_key", 1)));
+        assert_eq!(vault.phase, VaultPhase::Unlocking);
+        assert_eq!(vault.total_ejections_needed, 2);
+        assert_eq!(vault.display_item, Some(item("emerald", 4)));
+        let mut vault = Vault::from_nbt(&saved(&vault.to_nbt()), VaultPhase::Unlocking);
+        assert_eq!(vault.rewarded_players, [previous, player]);
+        assert_eq!(
+            vault.items_to_eject,
+            [item("diamond_block", 1), item("emerald", 4)]
+        );
+        assert_eq!(vault.state_updating_resumes_at, 104);
+        assert_eq!(vault.total_ejections_needed, 2);
+        assert_eq!(vault.tick(103, |_| panic!("unlocking")), None);
+        assert_eq!(vault.tick(104, |_| panic!("starts ejection")), None);
+        assert_eq!(vault.phase, VaultPhase::Ejecting);
+        assert_eq!(vault.tick(123, |_| panic!("ejection interval")), None);
+        assert_eq!(
+            vault.tick(124, |_| panic!("eject first")),
+            Some(item("emerald", 4))
+        );
+        assert_eq!(vault.display_item, Some(item("diamond_block", 1)));
+        assert_eq!(
+            vault.tick(144, |_| panic!("eject second")),
+            Some(item("diamond_block", 1))
+        );
+        assert_eq!(vault.display_item, None);
+        assert_eq!(
+            vault.tick(164, |range| {
+                assert_eq!(range, 6.0);
+                vec![player, previous]
+            }),
+            None
+        );
+        assert_eq!(vault.phase, VaultPhase::Inactive);
+        assert_eq!(vault.total_ejections_needed, 0);
+        assert_eq!(
+            vault.tick(184, |range| {
+                assert_eq!(range, 5.0);
+                vec![nearby, player, nearby]
+            }),
+            None
+        );
+        assert_eq!(vault.connected_players, [nearby]);
+        assert_eq!(vault.phase, VaultPhase::Active);
+        assert_eq!(vault.connected_particles_range, 5.0);
+        assert_eq!(
+            Vault::from_nbt(&saved(&vault.to_nbt()), VaultPhase::Active),
+            vault
+        );
+    }
+}

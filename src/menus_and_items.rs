@@ -4198,6 +4198,1822 @@ fn items_nbt_to_stacks(tag: &crate::nbt::Tag) -> Result<HashMap<i16, Stack>, &'s
     Ok(out)
 }
 
+// Block-entity NBT payloads and transitions for the runtime integration.
+// The integration supplies world inputs and owns blockstate, ticks, and packets.
+// The state types have test callers until they are connected to the world.
+use crate::brigadier_wire::ResourceLocation;
+use crate::nbt::Tag;
+
+type BlockEntityNbtFields = BTreeMap<NbtString, Tag>;
+
+fn block_entity_compound(fields: impl IntoIterator<Item = (&'static str, Tag)>) -> Tag {
+    Tag::Compound(
+        fields
+            .into_iter()
+            .map(|(key, tag)| (NbtString::text(key), tag))
+            .collect(),
+    )
+}
+
+fn block_entity_put(fields: &mut BlockEntityNbtFields, key: &str, tag: Tag) {
+    fields.insert(NbtString::text(key), tag);
+}
+
+fn block_entity_string(value: &str) -> Tag {
+    Tag::String(NbtString::text(value))
+}
+
+fn block_entity_str_field(tag: &Tag, key: &str) -> Option<String> {
+    tag.get(key)?.string()?.to_utf8().ok()
+}
+
+fn block_entity_resource(tag: &Tag, key: &str) -> Option<ResourceLocation> {
+    ResourceLocation::parse(&block_entity_str_field(tag, key)?).ok()
+}
+
+fn block_entity_number(tag: &Tag, key: &str) -> Option<i64> {
+    tag.get(key).and_then(nbt_int_val)
+}
+
+fn block_entity_int(tag: &Tag, key: &str) -> i32 {
+    block_entity_number(tag, key)
+        .and_then(|n| i32::try_from(n).ok())
+        .unwrap_or_default()
+}
+
+fn block_entity_list(kind: u8, values: Vec<Tag>) -> Tag {
+    Tag::List(if values.is_empty() { 0 } else { kind }, values)
+}
+
+fn block_entity_entries<'a>(tag: &'a Tag, key: &str) -> &'a [Tag] {
+    tag.get(key).and_then(Tag::list).unwrap_or_default()
+}
+
+fn block_entity_int_array<'a>(tag: &'a Tag, key: &str) -> &'a [i32] {
+    match tag.get(key) {
+        Some(Tag::IntArray(values)) => values,
+        _ => &[],
+    }
+}
+
+fn block_entity_compound_field(tag: &Tag, key: &str) -> Option<Tag> {
+    tag.get(key)
+        .filter(|value| matches!(value, Tag::Compound(_)))
+        .cloned()
+}
+
+/// Keep the item component patch as NBT so book contents, custom songs, and other
+/// components survive persistence independently of the protocol inventory codec.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BlockEntityItem {
+    pub(crate) id: ResourceLocation,
+    count: u8,
+    pub(crate) components: BlockEntityNbtFields,
+}
+
+impl BlockEntityItem {
+    pub(crate) fn new(id: &str, count: u8) -> Option<Self> {
+        let id = ResourceLocation::parse(id).ok()?;
+        if id.path() == "air" && id.namespace() == "minecraft" {
+            return None;
+        }
+        (1..=99).contains(&count).then_some(Self {
+            id,
+            count,
+            components: BlockEntityNbtFields::new(),
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn count(&self) -> u8 {
+        self.count
+    }
+
+    fn vanilla(&self, names: &[&str]) -> bool {
+        self.id.namespace() == "minecraft" && names.contains(&self.id.path())
+    }
+
+    fn same_item(&self, other: &Self) -> bool {
+        self.id == other.id && self.components == other.components
+    }
+
+    fn take(source: &mut Option<Self>, count: u8) -> Option<Self> {
+        let item = source.as_mut()?;
+        let count = count.min(item.count);
+        if count == item.count {
+            return source.take();
+        }
+        let mut split = item.clone();
+        split.count = count;
+        item.count -= count;
+        Some(split)
+    }
+
+    pub(crate) fn from_nbt(tag: &Tag) -> Option<Self> {
+        let count = u8::try_from(block_entity_number(tag, "count").unwrap_or(1)).ok()?;
+        let mut item = Self::new(&block_entity_str_field(tag, "id")?, count)?;
+        if let Some(Tag::Compound(components)) = tag.get("components") {
+            item.components = components.clone();
+        }
+        Some(item)
+    }
+
+    pub(crate) fn to_nbt(&self) -> Tag {
+        Tag::Compound(self.nbt_fields())
+    }
+
+    fn nbt_fields(&self) -> BlockEntityNbtFields {
+        let mut fields = BlockEntityNbtFields::new();
+        block_entity_put(&mut fields, "id", block_entity_string(&self.id.to_string()));
+        block_entity_put(&mut fields, "count", Tag::Int(i32::from(self.count)));
+        if !self.components.is_empty() {
+            block_entity_put(
+                &mut fields,
+                "components",
+                Tag::Compound(self.components.clone()),
+            );
+        }
+        fields
+    }
+}
+
+fn block_entity_item_field(tag: &Tag, key: &str) -> Option<BlockEntityItem> {
+    tag.get(key).and_then(BlockEntityItem::from_nbt)
+}
+
+fn block_entity_put_item(
+    fields: &mut BlockEntityNbtFields,
+    key: &str,
+    item: Option<&BlockEntityItem>,
+) {
+    if let Some(item) = item {
+        block_entity_put(fields, key, item.to_nbt());
+    }
+}
+
+fn block_entity_read_slots<const N: usize>(tag: &Tag) -> [Option<BlockEntityItem>; N] {
+    let mut slots = std::array::from_fn(|_| None);
+    for entry in block_entity_entries(tag, "Items") {
+        if let Some(slot) = block_entity_number(entry, "Slot")
+            .and_then(|n| usize::try_from(n).ok())
+            .and_then(|n| slots.get_mut(n))
+        {
+            *slot = BlockEntityItem::from_nbt(entry);
+        }
+    }
+    slots
+}
+
+fn block_entity_write_slots(slots: &[Option<BlockEntityItem>]) -> Tag {
+    let values = slots
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, item)| {
+            let mut fields = item.as_ref()?.nbt_fields();
+            block_entity_put(&mut fields, "Slot", Tag::Byte(slot as i8));
+            Some(Tag::Compound(fields))
+        })
+        .collect();
+    block_entity_list(10, values)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BeaconEffect {
+    Speed,
+    Haste,
+    Resistance,
+    JumpBoost,
+    Strength,
+    Regeneration,
+}
+
+impl BeaconEffect {
+    const IDS: [(Self, &'static str); 6] = [
+        (Self::Speed, "speed"),
+        (Self::Haste, "haste"),
+        (Self::Resistance, "resistance"),
+        (Self::JumpBoost, "jump_boost"),
+        (Self::Strength, "strength"),
+        (Self::Regeneration, "regeneration"),
+    ];
+
+    fn read(tag: &Tag, key: &str) -> Option<Self> {
+        let id = block_entity_resource(tag, key)?;
+        if id.namespace() != "minecraft" {
+            return None;
+        }
+        Self::IDS
+            .iter()
+            .find(|(_, name)| *name == id.path())
+            .map(|(effect, _)| *effect)
+    }
+
+    fn write(self) -> Tag {
+        block_entity_string(&format!("minecraft:{}", Self::IDS[self as usize].1))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BeaconPulse {
+    pub(crate) range: i32,
+    pub(crate) duration: i32,
+    pub(crate) primary: BeaconEffect,
+    pub(crate) amplifier: u8,
+    pub(crate) secondary: Option<BeaconEffect>,
+}
+
+#[derive(Debug, Default, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Beacon {
+    levels: i32,
+    pub(crate) primary: Option<BeaconEffect>,
+    pub(crate) secondary: Option<BeaconEffect>,
+    pub(crate) custom_name: Option<String>,
+    pub(crate) lock: Option<String>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Beacon {
+    pub(crate) fn levels(&self) -> i32 {
+        self.levels
+    }
+
+    pub(crate) fn from_nbt(tag: &Tag) -> Self {
+        Self {
+            // Preserve the saved tier snapshot until the next available world scan.
+            levels: block_entity_int(tag, "Levels").clamp(0, 4),
+            primary: BeaconEffect::read(tag, "primary_effect"),
+            secondary: BeaconEffect::read(tag, "secondary_effect"),
+            custom_name: block_entity_str_field(tag, "CustomName"),
+            lock: block_entity_str_field(tag, "Lock"),
+        }
+    }
+
+    pub(crate) fn to_nbt(&self) -> Tag {
+        let mut fields = BlockEntityNbtFields::new();
+        block_entity_put(&mut fields, "Levels", Tag::Int(self.levels));
+        for (key, effect) in [
+            ("primary_effect", self.primary),
+            ("secondary_effect", self.secondary),
+        ] {
+            if let Some(effect) = effect {
+                block_entity_put(&mut fields, key, effect.write());
+            }
+        }
+        for (key, value) in [("CustomName", &self.custom_name), ("Lock", &self.lock)] {
+            if let Some(value) = value {
+                block_entity_put(&mut fields, key, block_entity_string(value));
+            }
+        }
+        Tag::Compound(fields)
+    }
+
+    /// The menu's payment slot accepts these five items. The effect enum matches the
+    /// server's allowlist; the client's tier restrictions are applied in its UI.
+    pub(crate) fn confirm(
+        &mut self,
+        primary: Option<BeaconEffect>,
+        secondary: Option<BeaconEffect>,
+        payment: &mut Option<BlockEntityItem>,
+    ) -> bool {
+        if !payment.as_ref().is_some_and(|item| {
+            item.vanilla(&[
+                "netherite_ingot",
+                "emerald",
+                "diamond",
+                "gold_ingot",
+                "iron_ingot",
+            ])
+        }) {
+            return false;
+        }
+        BlockEntityItem::take(payment, 1);
+        self.primary = primary;
+        self.secondary = secondary;
+        true
+    }
+
+    /// The caller supplies the beam result and checks blocks relative to the beacon.
+    pub(crate) fn tick(
+        &mut self,
+        now: i64,
+        beam_clear: bool,
+        mut base_block: impl FnMut(i32, i32, i32) -> bool,
+    ) -> Option<BeaconPulse> {
+        if now % 80 != 0 || !beam_clear {
+            return None;
+        }
+        self.levels = 0;
+        for depth in 1..=4 {
+            let complete =
+                (-depth..=depth).all(|x| (-depth..=depth).all(|z| base_block(x, -depth, z)));
+            if !complete {
+                break;
+            }
+            self.levels = depth;
+        }
+        if self.levels == 0 {
+            return None;
+        }
+        let primary = self.primary?;
+        let secondary = self.secondary.filter(|_| self.levels == 4);
+        Some(BeaconPulse {
+            range: self.levels * 10 + 10,
+            duration: (9 + self.levels * 2) * 20,
+            primary,
+            amplifier: u8::from(secondary == Some(primary)),
+            secondary: secondary.filter(|&effect| effect != primary),
+        })
+    }
+}
+
+#[derive(Debug, Default, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Campfire {
+    pub(crate) slots: [Option<BlockEntityItem>; 4],
+    pub(crate) cooking_times: [i32; 4],
+    pub(crate) cooking_total_times: [i32; 4],
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Campfire {
+    pub(crate) fn from_nbt(tag: &Tag) -> Self {
+        fn times(tag: &Tag, key: &str) -> [i32; 4] {
+            let mut ticks = [0; 4];
+            for (tick, &saved) in ticks.iter_mut().zip(block_entity_int_array(tag, key)) {
+                *tick = saved.max(0);
+            }
+            ticks
+        }
+        Self {
+            slots: block_entity_read_slots(tag),
+            cooking_times: times(tag, "CookingTimes"),
+            cooking_total_times: times(tag, "CookingTotalTimes"),
+        }
+    }
+
+    pub(crate) fn to_nbt(&self) -> Tag {
+        block_entity_compound([
+            ("Items", block_entity_write_slots(&self.slots)),
+            ("CookingTimes", Tag::IntArray(self.cooking_times.to_vec())),
+            (
+                "CookingTotalTimes",
+                Tag::IntArray(self.cooking_total_times.to_vec()),
+            ),
+        ])
+    }
+
+    pub(crate) fn place(
+        &mut self,
+        held: &mut Option<BlockEntityItem>,
+        recipe_time: impl FnOnce(&BlockEntityItem) -> Option<i32>,
+    ) -> Option<usize> {
+        let slot = self.slots.iter().position(Option::is_none)?;
+        let total = recipe_time(held.as_ref()?)?;
+        self.cooking_times[slot] = 0;
+        self.cooking_total_times[slot] = total.max(0);
+        self.slots[slot] = BlockEntityItem::take(held, 1);
+        Some(slot)
+    }
+
+    /// Return cooked stacks in slot order. If a recipe disappeared after placement,
+    /// the original item is returned. The caller can reject feature-disabled outputs.
+    pub(crate) fn tick(
+        &mut self,
+        lit: bool,
+        mut cook: impl FnMut(&BlockEntityItem) -> Option<BlockEntityItem>,
+        mut enabled: impl FnMut(&BlockEntityItem) -> bool,
+    ) -> Vec<BlockEntityItem> {
+        let mut drops = Vec::new();
+        for ((slot, time), &total) in self
+            .slots
+            .iter_mut()
+            .zip(&mut self.cooking_times)
+            .zip(&self.cooking_total_times)
+        {
+            if !lit {
+                if *time > 0 {
+                    *time = (*time - 2).clamp(0, total.max(0));
+                }
+            } else if let Some(item) = slot.as_ref() {
+                *time = time.saturating_add(1);
+                if *time >= total {
+                    let cooked = cook(item);
+                    if enabled(cooked.as_ref().unwrap_or(item)) {
+                        drops.extend(cooked.or_else(|| slot.take()));
+                        *slot = None;
+                    }
+                }
+            }
+        }
+        drops
+    }
+}
+
+#[derive(Debug, Default, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Lectern {
+    book: Option<BlockEntityItem>,
+    page: i32,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Lectern {
+    pub(crate) fn from_nbt(tag: &Tag) -> Self {
+        let mut lectern = Self {
+            book: block_entity_item_field(tag, "Book"),
+            page: 0,
+        };
+        lectern.set_page(block_entity_int(tag, "Page"));
+        lectern
+    }
+
+    pub(crate) fn to_nbt(&self) -> Tag {
+        match &self.book {
+            Some(book) => {
+                block_entity_compound([("Book", book.to_nbt()), ("Page", Tag::Int(self.page))])
+            }
+            None => block_entity_compound([]),
+        }
+    }
+
+    pub(crate) fn place(&mut self, held: &mut Option<BlockEntityItem>) -> bool {
+        if self.book.is_some()
+            || !held
+                .as_ref()
+                .is_some_and(|item| item.vanilla(&["writable_book", "written_book"]))
+        {
+            return false;
+        }
+        self.book = BlockEntityItem::take(held, 1);
+        self.page = 0;
+        true
+    }
+
+    pub(crate) fn take_book(&mut self) -> Option<BlockEntityItem> {
+        self.page = 0;
+        self.book.take()
+    }
+
+    pub(crate) fn page(&self) -> i32 {
+        self.page
+    }
+
+    pub(crate) fn page_count(&self) -> i32 {
+        let pages = self
+            .book
+            .as_ref()
+            .and_then(|book| {
+                [
+                    "minecraft:written_book_content",
+                    "minecraft:writable_book_content",
+                ]
+                .iter()
+                .find_map(|key| book.components.get(&NbtString::text(key)))
+            })
+            .and_then(|content| content.get("pages"))
+            .and_then(Tag::list);
+        pages.map_or(0, |pages| pages.len() as i32)
+    }
+
+    /// True requests the two-tick page-turn pulse from the block. Vanilla's clamp
+    /// returns -1 for a book with no pages, including when the saved book is empty.
+    pub(crate) fn set_page(&mut self, page: i32) -> bool {
+        let page = page.max(0).min(self.page_count() - 1);
+        let changed = page != self.page;
+        self.page = page;
+        changed
+    }
+
+    pub(crate) fn comparator_signal(&self) -> i32 {
+        if self.book.is_none() {
+            return 0;
+        }
+        let pages = self.page_count();
+        let fraction = if pages > 1 {
+            self.page as f32 / (pages - 1) as f32
+        } else {
+            1.0
+        };
+        let valid_book = self
+            .book
+            .as_ref()
+            .is_some_and(|book| book.vanilla(&["writable_book", "written_book"]));
+        (fraction * 14.0).floor() as i32 + i32::from(valid_book)
+    }
+}
+
+#[derive(Debug, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct ChiseledBookshelf {
+    pub(crate) slots: [Option<BlockEntityItem>; 6],
+    last_interacted_slot: Option<usize>,
+}
+
+impl Default for ChiseledBookshelf {
+    fn default() -> Self {
+        Self {
+            slots: Default::default(),
+            last_interacted_slot: None,
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl ChiseledBookshelf {
+    pub(crate) fn from_nbt(tag: &Tag) -> Self {
+        let slot = block_entity_int(tag, "last_interacted_slot");
+        Self {
+            slots: block_entity_read_slots(tag),
+            last_interacted_slot: (0..6).contains(&slot).then_some(slot as usize),
+        }
+    }
+
+    pub(crate) fn to_nbt(&self) -> Tag {
+        block_entity_compound([
+            ("Items", block_entity_write_slots(&self.slots)),
+            (
+                "last_interacted_slot",
+                Tag::Int(self.last_interacted_slot.map_or(-1, |slot| slot as i32)),
+            ),
+        ])
+    }
+
+    pub(crate) fn insert_book(&mut self, index: usize, held: &mut Option<BlockEntityItem>) -> bool {
+        let Some(slot @ None) = self.slots.get_mut(index) else {
+            return false;
+        };
+        if !held.as_ref().is_some_and(|item| {
+            item.vanilla(&[
+                "book",
+                "written_book",
+                "enchanted_book",
+                "writable_book",
+                "knowledge_book",
+            ])
+        }) {
+            return false;
+        }
+        *slot = BlockEntityItem::take(held, 1);
+        self.last_interacted_slot = Some(index);
+        true
+    }
+
+    pub(crate) fn remove_book(&mut self, index: usize) -> Option<BlockEntityItem> {
+        let book = self.slots.get_mut(index)?.take()?;
+        self.last_interacted_slot = Some(index);
+        Some(book)
+    }
+
+    pub(crate) fn comparator_signal(&self) -> u8 {
+        self.last_interacted_slot.map_or(0, |slot| slot as u8 + 1)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BlockLootTable {
+    pub(crate) id: ResourceLocation,
+    pub(crate) seed: i64,
+}
+
+impl BlockLootTable {
+    fn from_nbt(tag: &Tag) -> Option<Self> {
+        Some(Self {
+            id: block_entity_resource(tag, "LootTable")?,
+            seed: block_entity_number(tag, "LootTableSeed").unwrap_or_default(),
+        })
+    }
+
+    fn write(&self, fields: &mut BlockEntityNbtFields) {
+        block_entity_put(
+            fields,
+            "LootTable",
+            block_entity_string(&self.id.to_string()),
+        );
+        if self.seed != 0 {
+            block_entity_put(fields, "LootTableSeed", Tag::Long(self.seed));
+        }
+    }
+}
+
+#[derive(Debug, Default, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct DecoratedPot {
+    // Back, left, right, front, in the order used by the PotDecorations codec.
+    pub(crate) sherds: [Option<ResourceLocation>; 4],
+    pub(crate) item: Option<BlockEntityItem>,
+    pub(crate) loot_table: Option<BlockLootTable>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl DecoratedPot {
+    pub(crate) fn from_nbt(tag: &Tag) -> Self {
+        let mut pot = Self {
+            loot_table: BlockLootTable::from_nbt(tag),
+            ..Self::default()
+        };
+        if pot.loot_table.is_none() {
+            pot.item = block_entity_item_field(tag, "item");
+        }
+        let sherds = block_entity_entries(tag, "sherds");
+        if sherds.len() <= 4 {
+            let decorations: Option<Vec<_>> = sherds
+                .iter()
+                .map(|tag| ResourceLocation::parse(&tag.string()?.to_utf8().ok()?).ok())
+                .collect();
+            if let Some(decorations) = decorations {
+                for (slot, id) in pot.sherds.iter_mut().zip(decorations) {
+                    *slot = (id.namespace() != "minecraft" || id.path() != "brick").then_some(id);
+                }
+            }
+        }
+        pot
+    }
+
+    pub(crate) fn to_nbt(&self) -> Tag {
+        let mut fields = BlockEntityNbtFields::new();
+        if self.sherds.iter().any(Option::is_some) {
+            block_entity_put(
+                &mut fields,
+                "sherds",
+                block_entity_list(
+                    8,
+                    self.sherds
+                        .iter()
+                        .map(|side| {
+                            block_entity_string(
+                                &side
+                                    .as_ref()
+                                    .map_or_else(|| "minecraft:brick".into(), ToString::to_string),
+                            )
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(loot) = &self.loot_table {
+            loot.write(&mut fields);
+        } else {
+            block_entity_put_item(&mut fields, "item", self.item.as_ref());
+        }
+        Tag::Compound(fields)
+    }
+
+    /// Insert one item. The caller supplies the registry's effective stack limit.
+    pub(crate) fn insert(&mut self, held: &mut Option<BlockEntityItem>, stack_limit: u8) -> bool {
+        let Some(source) = held.as_ref() else {
+            return false;
+        };
+        if self.loot_table.is_some()
+            || stack_limit == 0
+            || self
+                .item
+                .as_ref()
+                .is_some_and(|item| !item.same_item(source) || item.count >= stack_limit.min(99))
+        {
+            return false;
+        }
+        let Some(added) = BlockEntityItem::take(held, 1) else {
+            return false;
+        };
+        if let Some(item) = &mut self.item {
+            item.count += 1;
+        } else {
+            self.item = Some(added);
+        }
+        true
+    }
+
+    pub(crate) fn comparator_signal(&self, stack_limit: u8) -> u8 {
+        let Some(item) = &self.item else {
+            return 0;
+        };
+        ((f32::from(item.count) / f32::from(stack_limit.clamp(1, 99))).min(1.0) * 14.0).floor()
+            as u8
+            + 1
+    }
+}
+
+#[derive(Debug, Default, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Crafter {
+    slots: [Option<BlockEntityItem>; 9],
+    disabled: [bool; 9],
+    pub(crate) crafting_ticks_remaining: i32,
+    pub(crate) triggered: bool,
+    pub(crate) loot_table: Option<BlockLootTable>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Crafter {
+    pub(crate) fn from_nbt(tag: &Tag) -> Self {
+        let loot_table = BlockLootTable::from_nbt(tag);
+        let mut crafter = Self {
+            slots: if loot_table.is_none() {
+                block_entity_read_slots(tag)
+            } else {
+                Default::default()
+            },
+            crafting_ticks_remaining: block_entity_int(tag, "crafting_ticks_remaining").max(0),
+            triggered: block_entity_int(tag, "triggered") == 1,
+            loot_table,
+            ..Self::default()
+        };
+        for &slot in block_entity_int_array(tag, "disabled_slots") {
+            if let Ok(slot) = usize::try_from(slot) {
+                crafter.set_slot_disabled(slot, true);
+            }
+        }
+        crafter
+    }
+
+    pub(crate) fn to_nbt(&self) -> Tag {
+        let mut fields = BlockEntityNbtFields::new();
+        block_entity_put(
+            &mut fields,
+            "crafting_ticks_remaining",
+            Tag::Int(self.crafting_ticks_remaining),
+        );
+        block_entity_put(
+            &mut fields,
+            "triggered",
+            Tag::Int(i32::from(self.triggered)),
+        );
+        let disabled = self
+            .disabled
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, &disabled)| disabled.then_some(slot as i32))
+            .collect();
+        block_entity_put(&mut fields, "disabled_slots", Tag::IntArray(disabled));
+        if let Some(loot) = &self.loot_table {
+            loot.write(&mut fields);
+        } else {
+            block_entity_put(&mut fields, "Items", block_entity_write_slots(&self.slots));
+        }
+        Tag::Compound(fields)
+    }
+
+    pub(crate) fn slots(&self) -> &[Option<BlockEntityItem>; 9] {
+        &self.slots
+    }
+
+    pub(crate) fn set_slot_disabled(&mut self, index: usize, disabled: bool) -> bool {
+        if !matches!(self.slots.get(index), Some(None)) {
+            return false;
+        }
+        self.disabled[index] = disabled;
+        true
+    }
+
+    pub(crate) fn set_slot(&mut self, index: usize, item: Option<BlockEntityItem>) -> bool {
+        let Some(slot) = self.slots.get_mut(index) else {
+            return false;
+        };
+        if self.loot_table.is_some() {
+            return false;
+        }
+        self.disabled[index] = false;
+        *slot = item;
+        true
+    }
+
+    /// Automation prefers empty enabled slots, then spreads matching stacks by count.
+    pub(crate) fn insert(
+        &mut self,
+        held: &mut Option<BlockEntityItem>,
+        stack_limit: u8,
+    ) -> Option<usize> {
+        if self.loot_table.is_some() || stack_limit == 0 {
+            return None;
+        }
+        let source = held.as_ref()?;
+        let index = self
+            .slots
+            .iter()
+            .zip(self.disabled)
+            .enumerate()
+            .filter_map(|(index, (slot, disabled))| {
+                if disabled {
+                    return None;
+                }
+                let count = match slot {
+                    None => 0,
+                    Some(item) if item.same_item(source) && item.count < stack_limit.min(99) => {
+                        item.count
+                    }
+                    _ => return None,
+                };
+                Some((count, index))
+            })
+            .min()?
+            .1;
+        let added = BlockEntityItem::take(held, 1)?;
+        if let Some(item) = &mut self.slots[index] {
+            item.count += 1;
+        } else {
+            self.slots[index] = Some(added);
+        }
+        Some(index)
+    }
+
+    pub(crate) fn comparator_signal(&self) -> u8 {
+        self.slots
+            .iter()
+            .zip(self.disabled)
+            .filter(|(item, disabled)| *disabled || item.is_some())
+            .count() as u8
+    }
+
+    /// A rising redstone edge schedules one block tick four ticks later.
+    pub(crate) fn set_powered(&mut self, powered: bool) -> Option<i32> {
+        let previous = std::mem::replace(&mut self.triggered, powered);
+        (powered && !previous).then_some(4)
+    }
+
+    /// Execute the scheduled craft. The caller routes the result and crafting
+    /// remainders to the facing inventory or ejects them.
+    pub(crate) fn craft(
+        &mut self,
+        recipe: impl FnOnce(
+            &[Option<BlockEntityItem>; 9],
+        ) -> Option<(BlockEntityItem, Vec<BlockEntityItem>)>,
+    ) -> Option<(BlockEntityItem, Vec<BlockEntityItem>)> {
+        if self.loot_table.is_some() || self.slots.iter().all(Option::is_none) {
+            return None;
+        }
+        let result = recipe(&self.slots)?;
+        for slot in &mut self.slots {
+            BlockEntityItem::take(slot, 1);
+        }
+        self.crafting_ticks_remaining = 6;
+        Some(result)
+    }
+
+    /// True when the block should clear its crafting animation.
+    pub(crate) fn tick(&mut self) -> bool {
+        if self.crafting_ticks_remaining <= 0 {
+            return false;
+        }
+        self.crafting_ticks_remaining -= 1;
+        self.crafting_ticks_remaining == 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct JukeboxSong {
+    pub(crate) length_in_ticks: i32,
+    pub(crate) comparator_output: u8,
+}
+
+impl JukeboxSong {
+    fn playback_end(self) -> i64 {
+        i64::from(self.length_in_ticks.max(0)) + 20
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JukeboxTick {
+    MusicNote,
+    Stopped,
+}
+
+#[derive(Debug, Default, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Jukebox {
+    record: Option<BlockEntityItem>,
+    playback: Option<(i64, JukeboxSong)>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Jukebox {
+    pub(crate) fn from_nbt(
+        tag: &Tag,
+        song: impl FnOnce(&BlockEntityItem) -> Option<JukeboxSong>,
+    ) -> Self {
+        let record = block_entity_item_field(tag, "RecordItem");
+        let playback = match (record.as_ref(), tag.get("ticks_since_song_started")) {
+            (Some(item), Some(Tag::Long(ticks))) => song(item)
+                .filter(|song| *ticks >= 0 && *ticks < song.playback_end())
+                .map(|song| (*ticks, song)),
+            _ => None,
+        };
+        Self { record, playback }
+    }
+
+    pub(crate) fn to_nbt(&self) -> Tag {
+        let mut fields = BlockEntityNbtFields::new();
+        block_entity_put_item(&mut fields, "RecordItem", self.record.as_ref());
+        if let Some((ticks, _)) = self.playback {
+            block_entity_put(&mut fields, "ticks_since_song_started", Tag::Long(ticks));
+        }
+        Tag::Compound(fields)
+    }
+
+    /// Resolve established record songs through the registry. An unresolved
+    /// jukebox_playable component still permits insertion without playback.
+    pub(crate) fn insert(
+        &mut self,
+        held: &mut Option<BlockEntityItem>,
+        song: impl FnOnce(&BlockEntityItem) -> Option<JukeboxSong>,
+    ) -> bool {
+        let Some(item) = held.as_ref().filter(|_| self.record.is_none()) else {
+            return false;
+        };
+        let song = song(item);
+        if song.is_none()
+            && !item
+                .components
+                .contains_key(&NbtString::text("minecraft:jukebox_playable"))
+        {
+            return false;
+        }
+        self.record = BlockEntityItem::take(held, 1);
+        self.playback = song.map(|song| (0, song));
+        true
+    }
+
+    pub(crate) fn eject(&mut self) -> Option<BlockEntityItem> {
+        self.playback = None;
+        self.record.take()
+    }
+
+    pub(crate) fn comparator_signal(
+        &self,
+        song: impl FnOnce(&BlockEntityItem) -> Option<JukeboxSong>,
+    ) -> u8 {
+        self.record
+            .as_ref()
+            .and_then(song)
+            .map_or(0, |song| song.comparator_output.min(15))
+    }
+
+    pub(crate) fn playing_ticks(&self) -> Option<i64> {
+        self.playback.map(|(ticks, _)| ticks)
+    }
+
+    pub(crate) fn tick(&mut self) -> Option<JukeboxTick> {
+        let (ticks, song) = self.playback.as_mut()?;
+        if *ticks >= song.playback_end() {
+            self.playback = None;
+            return Some(JukeboxTick::Stopped);
+        }
+        let note = *ticks % 20 == 0;
+        *ticks += 1;
+        note.then_some(JukeboxTick::MusicNote)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BannerColor {
+    White,
+    Orange,
+    Magenta,
+    LightBlue,
+    Yellow,
+    Lime,
+    Pink,
+    Gray,
+    LightGray,
+    Cyan,
+    Purple,
+    Blue,
+    Brown,
+    Green,
+    Red,
+    Black,
+}
+
+impl BannerColor {
+    const IDS: [(Self, &'static str); 16] = [
+        (Self::White, "white"),
+        (Self::Orange, "orange"),
+        (Self::Magenta, "magenta"),
+        (Self::LightBlue, "light_blue"),
+        (Self::Yellow, "yellow"),
+        (Self::Lime, "lime"),
+        (Self::Pink, "pink"),
+        (Self::Gray, "gray"),
+        (Self::LightGray, "light_gray"),
+        (Self::Cyan, "cyan"),
+        (Self::Purple, "purple"),
+        (Self::Blue, "blue"),
+        (Self::Brown, "brown"),
+        (Self::Green, "green"),
+        (Self::Red, "red"),
+        (Self::Black, "black"),
+    ];
+
+    fn from_nbt(tag: &Tag) -> Option<Self> {
+        let color = block_entity_str_field(tag, "color")?;
+        Self::IDS
+            .iter()
+            .find(|(_, name)| *name == color)
+            .map(|(value, _)| *value)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BannerPattern {
+    pub(crate) pattern: ResourceLocation,
+    pub(crate) color: BannerColor,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Banner {
+    pub(crate) patterns: Vec<BannerPattern>,
+    pub(crate) custom_name: Option<String>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Banner {
+    pub(crate) fn from_nbt(tag: &Tag) -> Self {
+        let patterns = block_entity_entries(tag, "patterns")
+            .iter()
+            .filter_map(|layer| {
+                Some(BannerPattern {
+                    pattern: block_entity_resource(layer, "pattern")?,
+                    color: BannerColor::from_nbt(layer)?,
+                })
+            })
+            .collect();
+        Self {
+            patterns,
+            custom_name: block_entity_str_field(tag, "CustomName"),
+        }
+    }
+
+    pub(crate) fn to_nbt(&self) -> Tag {
+        let mut fields = BlockEntityNbtFields::new();
+        if !self.patterns.is_empty() {
+            let patterns = self
+                .patterns
+                .iter()
+                .map(|layer| {
+                    block_entity_compound([
+                        ("pattern", block_entity_string(&layer.pattern.to_string())),
+                        (
+                            "color",
+                            block_entity_string(BannerColor::IDS[layer.color as usize].1),
+                        ),
+                    ])
+                })
+                .collect();
+            block_entity_put(&mut fields, "patterns", block_entity_list(10, patterns));
+        }
+        if let Some(name) = &self.custom_name {
+            block_entity_put(&mut fields, "CustomName", block_entity_string(name));
+        }
+        Tag::Compound(fields)
+    }
+
+    /// Washing removes the last layer.
+    pub(crate) fn remove_last_pattern(&mut self) -> Option<BannerPattern> {
+        self.patterns.pop()
+    }
+}
+
+type BlockEntityUuid = [u8; 16];
+
+fn block_entity_uuid(tag: &Tag) -> Option<BlockEntityUuid> {
+    let Tag::IntArray(parts) = tag else {
+        return None;
+    };
+    let parts: &[i32; 4] = parts.as_slice().try_into().ok()?;
+    let mut uuid = [0; 16];
+    for (bytes, word) in uuid.chunks_exact_mut(4).zip(parts) {
+        bytes.copy_from_slice(&word.to_be_bytes());
+    }
+    Some(uuid)
+}
+
+fn block_entity_uuid_nbt(uuid: &BlockEntityUuid) -> Tag {
+    Tag::IntArray(
+        uuid.chunks_exact(4)
+            .map(|bytes| i32::from_be_bytes(bytes.try_into().expect("four bytes per UUID word")))
+            .collect(),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProfileProperty {
+    pub(crate) name: String,
+    pub(crate) value: String,
+    pub(crate) signature: Option<String>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SkullProfile {
+    pub(crate) name: Option<String>,
+    pub(crate) id: Option<BlockEntityUuid>,
+    pub(crate) properties: Vec<ProfileProperty>,
+}
+
+impl SkullProfile {
+    fn from_nbt(tag: &Tag) -> Option<Self> {
+        if let Some(name) = tag.string() {
+            return Some(Self {
+                name: Some(name.to_utf8().ok()?),
+                ..Self::default()
+            });
+        }
+        let Tag::Compound(_) = tag else {
+            return None;
+        };
+        let mut properties = Vec::new();
+        match tag.get("properties") {
+            Some(Tag::Compound(groups)) => {
+                for (name, values) in groups {
+                    let name = name.to_utf8().ok()?;
+                    for value in values.list()? {
+                        properties.push(ProfileProperty {
+                            name: name.clone(),
+                            value: value.string()?.to_utf8().ok()?,
+                            signature: None,
+                        });
+                    }
+                }
+            }
+            Some(Tag::List(_, values)) => {
+                for value in values {
+                    properties.push(ProfileProperty {
+                        name: block_entity_str_field(value, "name")?,
+                        value: block_entity_str_field(value, "value")?,
+                        signature: block_entity_str_field(value, "signature"),
+                    });
+                }
+            }
+            Some(_) => return None,
+            None => {}
+        }
+        Some(Self {
+            name: block_entity_str_field(tag, "name"),
+            id: tag.get("id").and_then(block_entity_uuid),
+            properties,
+        })
+    }
+
+    fn to_nbt(&self) -> Tag {
+        let mut fields = BlockEntityNbtFields::new();
+        if let Some(name) = &self.name {
+            block_entity_put(&mut fields, "name", block_entity_string(name));
+        }
+        if let Some(id) = self.id {
+            block_entity_put(&mut fields, "id", block_entity_uuid_nbt(&id));
+        }
+        if !self.properties.is_empty() {
+            let properties = self
+                .properties
+                .iter()
+                .map(|property| {
+                    let mut fields = BlockEntityNbtFields::new();
+                    block_entity_put(&mut fields, "name", block_entity_string(&property.name));
+                    block_entity_put(&mut fields, "value", block_entity_string(&property.value));
+                    if let Some(signature) = &property.signature {
+                        block_entity_put(&mut fields, "signature", block_entity_string(signature));
+                    }
+                    Tag::Compound(fields)
+                })
+                .collect();
+            block_entity_put(&mut fields, "properties", block_entity_list(10, properties));
+        }
+        Tag::Compound(fields)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn needs_resolution(&self) -> bool {
+        self.properties.is_empty() && self.name.is_some() != self.id.is_some()
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Skull {
+    pub(crate) note_block_sound: Option<ResourceLocation>,
+    pub(crate) profile: Option<SkullProfile>,
+    pub(crate) custom_name: Option<String>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Skull {
+    pub(crate) fn from_nbt(tag: &Tag) -> Self {
+        Self {
+            note_block_sound: block_entity_resource(tag, "note_block_sound"),
+            profile: tag.get("profile").and_then(SkullProfile::from_nbt),
+            custom_name: block_entity_str_field(tag, "custom_name"),
+        }
+    }
+
+    pub(crate) fn to_nbt(&self) -> Tag {
+        let mut fields = BlockEntityNbtFields::new();
+        if let Some(sound) = &self.note_block_sound {
+            block_entity_put(
+                &mut fields,
+                "note_block_sound",
+                block_entity_string(&sound.to_string()),
+            );
+        }
+        if let Some(profile) = &self.profile {
+            block_entity_put(&mut fields, "profile", profile.to_nbt());
+        }
+        if let Some(name) = &self.custom_name {
+            block_entity_put(&mut fields, "custom_name", block_entity_string(name));
+        }
+        Tag::Compound(fields)
+    }
+}
+
+#[derive(Debug, Default, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Brushable {
+    pub(crate) item: Option<BlockEntityItem>,
+    pub(crate) loot_table: Option<BlockLootTable>,
+    pub(crate) hit_direction: Option<Face>,
+    brushes: u8,
+    next_brush_at: i64,
+    decay_at: i64,
+    completed: bool,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum BrushResult {
+    CoolingDown,
+    Progress {
+        dusted: u8,
+    },
+    Completed {
+        loot: Option<BlockEntityItem>,
+        direction: Face,
+    },
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Brushable {
+    // Direction ordinal order in the vanilla client update tag.
+    const DIRECTIONS: [Face; 6] = [
+        Face::Down,
+        Face::Up,
+        Face::North,
+        Face::South,
+        Face::West,
+        Face::East,
+    ];
+
+    pub(crate) fn from_nbt(tag: &Tag) -> Self {
+        let loot_table = BlockLootTable::from_nbt(tag);
+        let item = if loot_table.is_none() {
+            block_entity_item_field(tag, "item")
+        } else {
+            None
+        };
+        let hit_direction = block_entity_number(tag, "hit_direction")
+            .and_then(|value| usize::try_from(value).ok())
+            .and_then(|index| Self::DIRECTIONS.get(index))
+            .copied();
+        Self {
+            item,
+            loot_table,
+            hit_direction,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn to_nbt(&self) -> Tag {
+        let mut fields = BlockEntityNbtFields::new();
+        if let Some(loot) = &self.loot_table {
+            loot.write(&mut fields);
+        } else {
+            block_entity_put_item(&mut fields, "item", self.item.as_ref());
+        }
+        Tag::Compound(fields)
+    }
+
+    pub(crate) fn update_nbt(&self) -> Tag {
+        let mut fields = BlockEntityNbtFields::new();
+        if let Some(index) = Self::DIRECTIONS
+            .iter()
+            .position(|&face| Some(face) == self.hit_direction)
+        {
+            block_entity_put(&mut fields, "hit_direction", Tag::Int(index as i32));
+        }
+        block_entity_put_item(&mut fields, "item", self.item.as_ref());
+        Tag::Compound(fields)
+    }
+
+    pub(crate) fn brush(
+        &mut self,
+        now: i64,
+        face: Face,
+        roll: impl FnOnce(&BlockLootTable) -> Option<BlockEntityItem>,
+    ) -> BrushResult {
+        if self.completed {
+            return BrushResult::CoolingDown;
+        }
+        let direction = *self.hit_direction.get_or_insert(face);
+        self.decay_at = now.saturating_add(40);
+        if now < self.next_brush_at {
+            return BrushResult::CoolingDown;
+        }
+        self.next_brush_at = now.saturating_add(10);
+        if let Some(table) = self.loot_table.take() {
+            self.item = roll(&table);
+        }
+        self.brushes += 1;
+        if self.brushes == 10 {
+            self.completed = true;
+            BrushResult::Completed {
+                loot: self.item.take(),
+                direction,
+            }
+        } else {
+            BrushResult::Progress {
+                dusted: self.dusted(),
+            }
+        }
+    }
+
+    pub(crate) fn dusted(&self) -> u8 {
+        match self.brushes {
+            0 => 0,
+            1..=2 => 1,
+            3..=5 => 2,
+            _ => 3,
+        }
+    }
+
+    /// Returns a blockstate update when the visible dust level changes.
+    pub(crate) fn tick(&mut self, now: i64) -> Option<u8> {
+        if self.completed || (self.brushes != 0 && now < self.decay_at) {
+            return None;
+        }
+        let before = self.dusted();
+        self.brushes = self.brushes.saturating_sub(2);
+        self.decay_at = now.saturating_add(4);
+        if self.brushes == 0 {
+            self.hit_direction = None;
+            self.decay_at = 0;
+            self.next_brush_at = 0;
+        }
+        let after = self.dusted();
+        (after != before).then_some(after)
+    }
+}
+
+fn block_entity_read_uuids(tag: &Tag, key: &str) -> Vec<BlockEntityUuid> {
+    let mut seen = std::collections::HashSet::new();
+    block_entity_entries(tag, key)
+        .iter()
+        .filter_map(block_entity_uuid)
+        .filter(|id| seen.insert(*id))
+        .collect()
+}
+
+fn block_entity_put_uuids(fields: &mut BlockEntityNbtFields, key: &str, uuids: &[BlockEntityUuid]) {
+    if !uuids.is_empty() {
+        block_entity_put(
+            fields,
+            key,
+            block_entity_list(11, uuids.iter().map(block_entity_uuid_nbt).collect()),
+        );
+    }
+}
+
+#[derive(Debug, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct TrialSpawner {
+    // The normal/ominous configs and SpawnData have their own codecs. Keep their
+    // nested settings intact while exposing the counters needed for game ticks.
+    pub(crate) normal_config: Option<Tag>,
+    pub(crate) ominous_config: Option<Tag>,
+    pub(crate) spawn_data: Option<Tag>,
+    pub(crate) ejecting_loot_table: Option<ResourceLocation>,
+    pub(crate) registered_players: Vec<BlockEntityUuid>,
+    pub(crate) current_mobs: Vec<BlockEntityUuid>,
+    pub(crate) cooldown_ends_at: i64,
+    pub(crate) next_mob_spawns_at: i64,
+    pub(crate) total_mobs_spawned: i32,
+    pub(crate) target_cooldown_length: i32,
+    pub(crate) required_player_range: i32,
+}
+
+impl Default for TrialSpawner {
+    fn default() -> Self {
+        Self {
+            normal_config: None,
+            ominous_config: None,
+            spawn_data: None,
+            ejecting_loot_table: None,
+            registered_players: Vec::new(),
+            current_mobs: Vec::new(),
+            cooldown_ends_at: 0,
+            next_mob_spawns_at: 0,
+            total_mobs_spawned: 0,
+            target_cooldown_length: 36_000,
+            required_player_range: 14,
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl TrialSpawner {
+    pub(crate) fn from_nbt(tag: &Tag) -> Self {
+        let defaults = Self::default();
+        Self {
+            normal_config: block_entity_compound_field(tag, "normal_config"),
+            ominous_config: block_entity_compound_field(tag, "ominous_config"),
+            spawn_data: block_entity_compound_field(tag, "spawn_data"),
+            ejecting_loot_table: block_entity_resource(tag, "ejecting_loot_table"),
+            registered_players: block_entity_read_uuids(tag, "registered_players"),
+            current_mobs: block_entity_read_uuids(tag, "current_mobs"),
+            cooldown_ends_at: block_entity_number(tag, "cooldown_ends_at").unwrap_or_default(),
+            next_mob_spawns_at: block_entity_number(tag, "next_mob_spawns_at").unwrap_or_default(),
+            total_mobs_spawned: block_entity_int(tag, "total_mobs_spawned").max(0),
+            target_cooldown_length: tag
+                .get("target_cooldown_length")
+                .and_then(Tag::int)
+                .filter(|&value| value >= 0)
+                .unwrap_or(defaults.target_cooldown_length),
+            required_player_range: tag
+                .get("required_player_range")
+                .and_then(Tag::int)
+                .filter(|value| (1..=128).contains(value))
+                .unwrap_or(defaults.required_player_range),
+        }
+    }
+
+    pub(crate) fn to_nbt(&self) -> Tag {
+        let defaults = Self::default();
+        let mut fields = BlockEntityNbtFields::new();
+        for (key, value) in [
+            ("normal_config", &self.normal_config),
+            ("ominous_config", &self.ominous_config),
+            ("spawn_data", &self.spawn_data),
+        ] {
+            if let Some(value) = value {
+                block_entity_put(&mut fields, key, value.clone());
+            }
+        }
+        if let Some(table) = &self.ejecting_loot_table {
+            block_entity_put(
+                &mut fields,
+                "ejecting_loot_table",
+                block_entity_string(&table.to_string()),
+            );
+        }
+        block_entity_put_uuids(&mut fields, "registered_players", &self.registered_players);
+        block_entity_put_uuids(&mut fields, "current_mobs", &self.current_mobs);
+        for (key, value) in [
+            ("cooldown_ends_at", self.cooldown_ends_at),
+            ("next_mob_spawns_at", self.next_mob_spawns_at),
+        ] {
+            if value != 0 {
+                block_entity_put(&mut fields, key, Tag::Long(value));
+            }
+        }
+        for (key, value, default) in [
+            ("total_mobs_spawned", self.total_mobs_spawned, 0),
+            (
+                "target_cooldown_length",
+                self.target_cooldown_length,
+                defaults.target_cooldown_length,
+            ),
+            (
+                "required_player_range",
+                self.required_player_range,
+                defaults.required_player_range,
+            ),
+        ] {
+            if value != default {
+                block_entity_put(&mut fields, key, Tag::Int(value));
+            }
+        }
+        Tag::Compound(fields)
+    }
+
+    /// Record a successful world spawn while the caller's active encounter has capacity.
+    pub(crate) fn record_spawn(&mut self, now: i64, interval: i32, mob: BlockEntityUuid) -> bool {
+        if now < self.next_mob_spawns_at || self.current_mobs.contains(&mob) {
+            return false;
+        }
+        self.current_mobs.push(mob);
+        self.total_mobs_spawned = self.total_mobs_spawned.saturating_add(1);
+        self.next_mob_spawns_at = now.saturating_add(i64::from(interval.max(0)));
+        true
+    }
+
+    pub(crate) fn remove_mob(&mut self, now: i64, interval: i32, mob: BlockEntityUuid) -> bool {
+        let Some(index) = self.current_mobs.iter().position(|&id| id == mob) else {
+            return false;
+        };
+        self.current_mobs.swap_remove(index);
+        self.next_mob_spawns_at = now.saturating_add(i64::from(interval.max(0)));
+        true
+    }
+
+    /// The caller determines whether the encounter's spawn quota has been reached.
+    pub(crate) fn begin_rewards(&mut self, now: i64) -> bool {
+        if !self.current_mobs.is_empty() {
+            return false;
+        }
+        self.cooldown_ends_at = now.saturating_add(i64::from(self.target_cooldown_length));
+        self.total_mobs_spawned = 0;
+        self.next_mob_spawns_at = 0;
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum VaultPhase {
+    #[default]
+    Inactive,
+    Active,
+    Unlocking,
+    Ejecting,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct VaultConfig {
+    pub(crate) loot_table: ResourceLocation,
+    pub(crate) activation_range: f64,
+    pub(crate) deactivation_range: f64,
+    pub(crate) key_item: Option<BlockEntityItem>,
+    pub(crate) override_loot_table_to_display: Option<ResourceLocation>,
+}
+
+fn block_entity_double_field(tag: &Tag, key: &str) -> Option<f64> {
+    match tag.get(key)? {
+        Tag::Double(bits) => Some(f64::from_bits(*bits)),
+        Tag::Float(bits) => Some(f64::from(f32::from_bits(*bits))),
+        value => nbt_int_val(value).map(|n| n as f64),
+    }
+    .filter(|value| value.is_finite())
+}
+
+impl Default for VaultConfig {
+    fn default() -> Self {
+        Self {
+            loot_table: ResourceLocation::new("minecraft", "chests/trial_chambers/reward")
+                .expect("valid built-in resource"),
+            activation_range: 4.0,
+            deactivation_range: 4.5,
+            key_item: BlockEntityItem::new("minecraft:trial_key", 1),
+            override_loot_table_to_display: None,
+        }
+    }
+}
+
+impl VaultConfig {
+    fn from_nbt(tag: &Tag) -> Self {
+        let defaults = Self::default();
+        let activation_range =
+            block_entity_double_field(tag, "activation_range").unwrap_or(defaults.activation_range);
+        let deactivation_range = block_entity_double_field(tag, "deactivation_range")
+            .unwrap_or(defaults.deactivation_range);
+        if activation_range > deactivation_range {
+            return defaults;
+        }
+        Self {
+            loot_table: block_entity_resource(tag, "loot_table").unwrap_or(defaults.loot_table),
+            activation_range,
+            deactivation_range,
+            key_item: block_entity_item_field(tag, "key_item"),
+            override_loot_table_to_display: block_entity_resource(
+                tag,
+                "override_loot_table_to_display",
+            ),
+        }
+    }
+
+    fn to_nbt(&self) -> Tag {
+        let defaults = Self::default();
+        let mut fields = BlockEntityNbtFields::new();
+        if self.loot_table != defaults.loot_table {
+            block_entity_put(
+                &mut fields,
+                "loot_table",
+                block_entity_string(&self.loot_table.to_string()),
+            );
+        }
+        for (key, value, default) in [
+            (
+                "activation_range",
+                self.activation_range,
+                defaults.activation_range,
+            ),
+            (
+                "deactivation_range",
+                self.deactivation_range,
+                defaults.deactivation_range,
+            ),
+        ] {
+            if value != default {
+                block_entity_put(&mut fields, key, Tag::Double(value.to_bits()));
+            }
+        }
+        block_entity_put_item(&mut fields, "key_item", self.key_item.as_ref());
+        if let Some(table) = &self.override_loot_table_to_display {
+            block_entity_put(
+                &mut fields,
+                "override_loot_table_to_display",
+                block_entity_string(&table.to_string()),
+            );
+        }
+        Tag::Compound(fields)
+    }
+}
+
+#[derive(Debug, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Vault {
+    // The phase belongs to the blockstate and is supplied when loading the payload.
+    pub(crate) phase: VaultPhase,
+    pub(crate) config: VaultConfig,
+    pub(crate) rewarded_players: Vec<BlockEntityUuid>,
+    pub(crate) connected_players: Vec<BlockEntityUuid>,
+    pub(crate) display_item: Option<BlockEntityItem>,
+    pub(crate) connected_particles_range: f64,
+    pub(crate) state_updating_resumes_at: i64,
+    pub(crate) items_to_eject: Vec<BlockEntityItem>,
+    pub(crate) total_ejections_needed: i32,
+}
+
+impl Default for Vault {
+    fn default() -> Self {
+        Self {
+            phase: VaultPhase::Inactive,
+            config: VaultConfig::default(),
+            rewarded_players: Vec::new(),
+            connected_players: Vec::new(),
+            display_item: None,
+            connected_particles_range: 4.5,
+            state_updating_resumes_at: 0,
+            items_to_eject: Vec::new(),
+            total_ejections_needed: 0,
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Vault {
+    pub(crate) fn from_nbt(tag: &Tag, phase: VaultPhase) -> Self {
+        let empty = Tag::End;
+        let server = tag.get("server_data").unwrap_or(&empty);
+        let shared = tag.get("shared_data").unwrap_or(&empty);
+        Self {
+            phase,
+            config: tag
+                .get("config")
+                .filter(|tag| matches!(tag, Tag::Compound(_)))
+                .map(VaultConfig::from_nbt)
+                .unwrap_or_default(),
+            rewarded_players: block_entity_read_uuids(server, "rewarded_players"),
+            connected_players: block_entity_read_uuids(shared, "connected_players"),
+            display_item: block_entity_item_field(shared, "display_item"),
+            connected_particles_range: block_entity_double_field(
+                shared,
+                "connected_particles_range",
+            )
+            .unwrap_or(4.5),
+            state_updating_resumes_at: block_entity_number(server, "state_updating_resumes_at")
+                .unwrap_or_default(),
+            items_to_eject: block_entity_entries(server, "items_to_eject")
+                .iter()
+                .filter_map(BlockEntityItem::from_nbt)
+                .collect(),
+            total_ejections_needed: block_entity_int(server, "total_ejections_needed"),
+        }
+    }
+
+    pub(crate) fn to_nbt(&self) -> Tag {
+        let mut server = BlockEntityNbtFields::new();
+        block_entity_put_uuids(&mut server, "rewarded_players", &self.rewarded_players);
+        if self.state_updating_resumes_at != 0 {
+            block_entity_put(
+                &mut server,
+                "state_updating_resumes_at",
+                Tag::Long(self.state_updating_resumes_at),
+            );
+        }
+        if !self.items_to_eject.is_empty() {
+            block_entity_put(
+                &mut server,
+                "items_to_eject",
+                block_entity_list(
+                    10,
+                    self.items_to_eject
+                        .iter()
+                        .map(BlockEntityItem::to_nbt)
+                        .collect(),
+                ),
+            );
+        }
+        if self.total_ejections_needed != 0 {
+            block_entity_put(
+                &mut server,
+                "total_ejections_needed",
+                Tag::Int(self.total_ejections_needed),
+            );
+        }
+
+        let mut shared = BlockEntityNbtFields::new();
+        block_entity_put_uuids(&mut shared, "connected_players", &self.connected_players);
+        block_entity_put_item(&mut shared, "display_item", self.display_item.as_ref());
+        if self.connected_particles_range != 4.5 {
+            block_entity_put(
+                &mut shared,
+                "connected_particles_range",
+                Tag::Double(self.connected_particles_range.to_bits()),
+            );
+        }
+        block_entity_compound([
+            ("config", self.config.to_nbt()),
+            ("server_data", Tag::Compound(server)),
+            ("shared_data", Tag::Compound(shared)),
+        ])
+    }
+
+    pub(crate) fn try_unlock(
+        &mut self,
+        now: i64,
+        player: BlockEntityUuid,
+        held: &mut Option<BlockEntityItem>,
+        roll: impl FnOnce(&ResourceLocation) -> Vec<BlockEntityItem>,
+    ) -> bool {
+        let Some(key) = self.config.key_item.as_ref() else {
+            return false;
+        };
+        if self.phase != VaultPhase::Active
+            || (self.config.loot_table.namespace() == "minecraft"
+                && self.config.loot_table.path() == "empty")
+            || self.rewarded_players.contains(&player)
+            || !held
+                .as_ref()
+                .is_some_and(|held| held.same_item(key) && held.count >= key.count)
+        {
+            return false;
+        }
+        let items = roll(&self.config.loot_table);
+        if items.is_empty() {
+            return false;
+        }
+        BlockEntityItem::take(held, key.count);
+        self.display_item = items.last().cloned();
+        self.total_ejections_needed = items.len() as i32;
+        self.items_to_eject = items;
+        self.rewarded_players.push(player);
+        if self.rewarded_players.len() > 128 {
+            self.rewarded_players.remove(0);
+        }
+        self.connected_players
+            .retain(|&connected| connected != player);
+        self.phase = VaultPhase::Unlocking;
+        self.state_updating_resumes_at = now.saturating_add(14);
+        true
+    }
+
+    /// The caller detects nearby players within the requested radius and handles
+    /// the display preview and world effects on a phase change.
+    pub(crate) fn tick(
+        &mut self,
+        now: i64,
+        nearby: impl FnOnce(f64) -> Vec<BlockEntityUuid>,
+    ) -> Option<BlockEntityItem> {
+        if now < self.state_updating_resumes_at {
+            return None;
+        }
+        self.state_updating_resumes_at = now.saturating_add(20);
+        match self.phase {
+            VaultPhase::Unlocking => self.phase = VaultPhase::Ejecting,
+            VaultPhase::Ejecting if !self.items_to_eject.is_empty() => {
+                let item = self.items_to_eject.pop();
+                self.display_item = self.items_to_eject.last().cloned();
+                return item;
+            }
+            _ => {
+                let range = if self.phase == VaultPhase::Inactive {
+                    self.config.activation_range
+                } else {
+                    self.config.deactivation_range
+                };
+                self.total_ejections_needed = 0;
+                let mut seen = std::collections::HashSet::new();
+                self.connected_players = nearby(range)
+                    .into_iter()
+                    .filter(|id| !self.rewarded_players.contains(id) && seen.insert(*id))
+                    .collect();
+                self.phase = if self.connected_players.is_empty() {
+                    self.display_item = None;
+                    VaultPhase::Inactive
+                } else {
+                    VaultPhase::Active
+                };
+            }
+        }
+        None
+    }
+}
+
 // ---------- item -> blockstate (1.21.1 ids) ----------
 fn item_to_state(item: i64) -> Option<u32> {
     Some(match item {
