@@ -34,6 +34,13 @@
 //!   `org.spongepowered.asm.mixin` annotation) from real mod JAR bytecode
 //!   with zero JVM invocation, feeding [`mixin_lifter::MixinSite`]s
 //!   directly into [`mixin_lifter::lift_mixin_sites`].
+//! - [`culinary_adapter`]: clean-room, fully generic Farmer's Delight
+//!   culinary engine — auto-discovers any `*:cooking` / `*:fermenting` /
+//!   `*:cutting` recipe, item/block tag, `*:add_item` / `*:add_table` loot
+//!   modifier, and food spec inside **any** culinary mod or addon JAR
+//!   (zero hardcoded namespaces), resolves nested tags, executes
+//!   deterministic chance rolls, and drives a sleeping-timer cooking pot
+//!   that consumes zero CPU ticks while unheated, unmatched, or full.
 //! - [`version_compat`]: multi-version Minecraft compatibility engine —
 //!   dependency-free Maven interval (NeoForge/Forge) and SemVer (Fabric)
 //!   version-range parsing, the `pack_format`/`DataVersion` lookup table, and
@@ -51,6 +58,7 @@
 
 pub mod blockstates;
 pub mod class_mixin_scanner;
+pub mod culinary_adapter;
 pub mod data_loader;
 pub mod dimension_mod;
 pub mod fallback;
