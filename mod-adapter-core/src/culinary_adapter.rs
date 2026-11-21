@@ -39,9 +39,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use mc_spine_core::perf_kit::{FingerprintBuilder, FingerprintStats};
 use mc_spine_core::random::Xoroshiro128pp;
 
 use crate::data_loader::{parse_json, DataLoadError, JsonValue};
+use crate::mod_tick_runtime::ModTickRuntime;
 use crate::modpack;
 
 /// Cumulative decompressed-byte budget for one JAR scan, shared with the
@@ -1330,5 +1332,305 @@ impl CulinaryRegistry {
             });
         }
         out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pot cluster — perf_kit-backed O(due) tick driver
+// ---------------------------------------------------------------------------
+
+/// Outbound state-sync snapshot for one pot — the last-write-wins delta
+/// [`CookingPotCluster`] accumulates between flushes. Callers drain it via
+/// [`CookingPotCluster::drain_sync_deltas`] once per sync window instead of
+/// shipping every intermediate mutation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PotSyncSnapshot {
+    /// Current output slot contents.
+    pub output: Option<SlotStack>,
+    /// Banked progress toward the armed recipe.
+    pub progress_ticks: u32,
+    /// Armed completion tick; `None` while the pot sleeps.
+    pub next_completion_tick: Option<u64>,
+    /// Whether a heat source is under the pot.
+    pub heated: bool,
+}
+
+impl PotSyncSnapshot {
+    fn of(pot: &CookingPotState) -> Self {
+        Self {
+            output: pot.output.clone(),
+            progress_ticks: pot.progress_ticks,
+            next_completion_tick: pot.next_completion_tick,
+            heated: pot.heated,
+        }
+    }
+}
+
+/// Per-tick summary returned by [`CookingPotCluster::tick`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ClusterTickReport {
+    /// Machines pulled off the wake backlog this tick.
+    pub processed: usize,
+    /// `(pot_id, result)` completions emitted this tick, in backlog order.
+    pub results: Vec<(u64, CookResult)>,
+}
+
+/// Cluster of [`CookingPotState`] machines driven by
+/// [`crate::mod_tick_runtime::ModTickRuntime`]: pots sleep in O(1), wake
+/// exactly on `next_completion_tick`, burst completions slice through a
+/// per-tick budget, and outbound state deltas coalesce last-write-wins.
+///
+/// Every mutator re-fingerprints the pot: a mutation that changes nothing
+/// (a full-pot insert, an unchanged heat flag) skips both the recipe
+/// re-match and the schedule update, and — crucially — never disturbs an
+/// already-armed `next_completion_tick`, since [`CookingPotState::refresh`]
+/// would otherwise re-arm relative to the new `now`.
+pub struct CookingPotCluster {
+    pots: BTreeMap<u64, CookingPotState>,
+    runtime: ModTickRuntime<u64, PotSyncSnapshot>,
+}
+
+impl Default for CookingPotCluster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CookingPotCluster {
+    /// Empty cluster.
+    pub fn new() -> Self {
+        Self {
+            pots: BTreeMap::new(),
+            runtime: ModTickRuntime::new(),
+        }
+    }
+
+    /// Pots in the cluster.
+    pub fn len(&self) -> usize {
+        self.pots.len()
+    }
+
+    /// `true` when empty.
+    pub fn is_empty(&self) -> bool {
+        self.pots.is_empty()
+    }
+
+    /// Read a pot's state.
+    pub fn pot(&self, id: u64) -> Option<&CookingPotState> {
+        self.pots.get(&id)
+    }
+
+    /// Add a fresh sleeping pot. `false` when `id` is already registered —
+    /// the existing pot is left untouched.
+    pub fn add_pot(&mut self, id: u64) -> bool {
+        if self.pots.contains_key(&id) {
+            return false;
+        }
+        self.pots.insert(id, CookingPotState::new());
+        let pot = &self.pots[&id];
+        self.runtime.commit(id, pot_fingerprint(pot), None);
+        true
+    }
+
+    /// Remove a pot and every trace of it from the runtime (gate, wake
+    /// schedule, backlog, pending delta). `false` when absent.
+    pub fn remove_pot(&mut self, id: u64) -> bool {
+        if self.pots.remove(&id).is_none() {
+            return false;
+        }
+        self.runtime.remove(&id);
+        true
+    }
+
+    /// Shared post-mutation path: fingerprint the pot, skip the refresh
+    /// when nothing effectively changed, otherwise re-match the recipe,
+    /// commit the new fingerprint + wake, and accumulate a sync delta.
+    /// Returns `true` when the pot was actually re-evaluated.
+    fn observe_pot(&mut self, id: u64, registry: &CulinaryRegistry, now: u64) -> bool {
+        let Some(pot) = self.pots.get_mut(&id) else {
+            return false;
+        };
+        if !self.runtime.is_dirty(&id, pot_fingerprint(pot)) {
+            return false;
+        }
+        pot.refresh(registry, now);
+        let fp = pot_fingerprint(pot);
+        let wake = pot.next_completion_tick;
+        let snapshot = PotSyncSnapshot::of(pot);
+        self.runtime.commit(id, fp, wake);
+        self.runtime.record_delta(id, snapshot);
+        true
+    }
+
+    /// Insert `(item, count)` into `id`'s first free slot and re-observe.
+    /// Returns [`CookingPotState::insert_input`]'s result (`false` when
+    /// full — and the no-op is fingerprint-skipped, not re-matched).
+    pub fn insert_input(
+        &mut self,
+        id: u64,
+        item: &str,
+        count: u16,
+        registry: &CulinaryRegistry,
+        now: u64,
+    ) -> bool {
+        let Some(pot) = self.pots.get_mut(&id) else {
+            return false;
+        };
+        let inserted = pot.insert_input(item, count);
+        self.observe_pot(id, registry, now);
+        inserted
+    }
+
+    /// Replace the container slot (`minecraft:bowl`, …) and re-observe.
+    pub fn set_container(
+        &mut self,
+        id: u64,
+        container: Option<SlotStack>,
+        registry: &CulinaryRegistry,
+        now: u64,
+    ) {
+        if let Some(pot) = self.pots.get_mut(&id) {
+            pot.container = container;
+            self.observe_pot(id, registry, now);
+        }
+    }
+
+    /// Set the heated flag directly and re-observe.
+    pub fn set_heated(&mut self, id: u64, heated: bool, registry: &CulinaryRegistry, now: u64) {
+        if let Some(pot) = self.pots.get_mut(&id) {
+            pot.heated = heated;
+            self.observe_pot(id, registry, now);
+        }
+    }
+
+    /// Recompute `heated` from the blocks below via [`is_heated`], then
+    /// re-observe. Convenience for callers tracking the world instead of
+    /// the flag.
+    pub fn set_heat_source(
+        &mut self,
+        id: u64,
+        block_below: &str,
+        block_two_below: Option<&str>,
+        tags: &TagIndex,
+        registry: &CulinaryRegistry,
+        now: u64,
+    ) {
+        self.set_heated(
+            id,
+            is_heated(block_below, block_two_below, tags),
+            registry,
+            now,
+        );
+    }
+
+    /// Take the output slot's contents and re-observe. Returns what was
+    /// in the slot.
+    pub fn take_output(
+        &mut self,
+        id: u64,
+        registry: &CulinaryRegistry,
+        now: u64,
+    ) -> Option<SlotStack> {
+        let pot = self.pots.get_mut(&id)?;
+        let taken = pot.output.take();
+        self.observe_pot(id, registry, now);
+        taken
+    }
+
+    /// Advance the cluster to `now`. Pots whose wake tick arrived move
+    /// from the wheel onto the budget queue, and at most `max_process` of
+    /// them are advanced this tick — burst completions beyond the budget
+    /// stay queued for the next tick, but each still reports its own
+    /// scheduled `completed_tick`, so results are identical regardless of
+    /// how the burst sliced.
+    pub fn tick(
+        &mut self,
+        now: u64,
+        registry: &CulinaryRegistry,
+        max_process: usize,
+    ) -> ClusterTickReport {
+        let mut due = Vec::new();
+        let drain = self
+            .runtime
+            .tick(now, max_process, u64::MAX, |_| 1, &mut due);
+        let mut results = Vec::new();
+        for id in due {
+            let Some(pot) = self.pots.get_mut(&id) else {
+                continue;
+            };
+            if let Some(result) = pot.advance_to(now, registry) {
+                results.push((id, result));
+            }
+            let fp = pot_fingerprint(pot);
+            let wake = pot.next_completion_tick;
+            let snapshot = PotSyncSnapshot::of(pot);
+            self.runtime.commit(id, fp, wake);
+            self.runtime.record_delta(id, snapshot);
+        }
+        ClusterTickReport {
+            processed: drain.items,
+            results,
+        }
+    }
+
+    /// Append every coalesced outbound snapshot to `out` in sorted pot-id
+    /// order, emptying the batch — one delta per touched pot no matter how
+    /// many mutations or completions happened since the last flush.
+    pub fn drain_sync_deltas(&mut self, out: &mut Vec<(u64, PotSyncSnapshot)>) {
+        self.runtime.drain_deltas_into(out);
+    }
+
+    /// Fingerprint-gate counters: `skips` proves idle mutations skipped
+    /// the recipe re-match, `updates` counts committed state changes.
+    pub fn gate_stats(&self) -> FingerprintStats {
+        self.runtime.gate_stats()
+    }
+
+    /// Pots armed on the wake wheel.
+    pub fn scheduled_len(&self) -> usize {
+        self.runtime.scheduled_len()
+    }
+
+    /// Due-but-unprocessed pots waiting out a burst budget.
+    pub fn backlog_len(&self) -> usize {
+        self.runtime.backlog_len()
+    }
+
+    /// Pots with an unflushed sync delta.
+    pub fn pending_delta_len(&self) -> usize {
+        self.runtime.pending_delta_len()
+    }
+
+    /// `id`'s armed wake tick, if any.
+    pub fn wake_of(&self, id: u64) -> Option<u64> {
+        self.runtime.wake_of(&id)
+    }
+}
+
+/// Fingerprint of the pot's schedule-relevant state: input slots, output,
+/// container, heat, banked progress, and armed recipe. `next_completion_tick`
+/// is deliberately excluded — it is derived from these fields plus `now`,
+/// so including it would make every commit distinct and defeat the gate.
+fn pot_fingerprint(pot: &CookingPotState) -> u64 {
+    let mut f = FingerprintBuilder::new();
+    f.write_bool(pot.heated)
+        .write_u64(u64::from(pot.progress_ticks))
+        .write_u64(pot.active_recipe.map(|i| i as u64 + 1).unwrap_or(0));
+    for slot in &pot.inputs {
+        write_slot_fp(&mut f, slot);
+    }
+    write_slot_fp(&mut f, &pot.container);
+    write_slot_fp(&mut f, &pot.output);
+    f.finish()
+}
+
+fn write_slot_fp(f: &mut FingerprintBuilder, slot: &Option<SlotStack>) {
+    match slot {
+        None => {
+            f.write_u8(0);
+        }
+        Some((id, count)) => {
+            f.write_u8(1).write_str(id).write_u16(*count);
+        }
     }
 }

@@ -25,9 +25,20 @@
 //! * [`crash_report`] — [`crash_report::CrashContext`]: deterministic
 //!   `MEGU-E-XXXXXXXX` fingerprints and privacy-redacted bilingual blame
 //!   reports for operator-facing crash triage.
+//! * [`perf_kit`] — universal zero-overhead performance primitives: a
+//!   [`perf_kit::DirtyFingerprintGate`] for O(1) idle skipping,
+//!   [`perf_kit::BoundedScratchVec`] reusable scratch storage with bounded
+//!   retention, a [`perf_kit::TickBudgetQueue`] for smooth per-tick burst
+//!   slicing, an [`perf_kit::EventWakeWheel`] exact-tick wake scheduler, a
+//!   [`perf_kit::CoalescedDeltaBatch`] last-write-wins delta collapser, and
+//!   an [`perf_kit::AdaptiveLoadGovernor`] hysteresis budget scale — all
+//!   generic so any vanilla or modded subsystem can plug in.
+
+#![deny(unsafe_code)]
 
 pub mod crash_report;
 pub mod id;
 pub mod math;
+pub mod perf_kit;
 pub mod random;
 pub mod version;

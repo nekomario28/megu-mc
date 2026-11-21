@@ -7,6 +7,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
+use mc_spine_core::perf_kit::{
+    BoundedScratchVec, CoalescedDeltaBatch, DirtyFingerprintGate, FingerprintBuilder,
+    FingerprintStats,
+};
 use mod_offload::fluid_network::FluidError;
 use mod_offload::kinetic_graph::{KineticNode, NetworkStatus, Solution};
 use mod_offload::recipe_processor::{Drive, Recipe, RecipeError, Stack};
@@ -17,6 +21,11 @@ use mod_offload::region_scheduler::{
 use mod_offload::sleeping_transport::TransportError;
 
 use crate::blockstates::{CreateBlockRegistry, CreateBlockRole};
+
+/// Capacity (elements) the reconcile scratch vecs retain across calls —
+/// past this, [`BoundedScratchVec::clear_bounded`] shrinks them back so a
+/// one-off huge region doesn't inflate idle RSS.
+const RECONCILE_SCRATCH_RETAIN: usize = 4096;
 
 /// World-space block coordinate with arbitrary dynamic dimension ID (`0=Overworld`,
 /// `1=Nether`, `2=End`, `3+=custom`).
@@ -166,13 +175,34 @@ pub struct CreateFactory {
     next_node_id: u32,
     kinetics: HashMap<DimBlockPos, PlacedKinetic>,
     kinetic_edges: BTreeMap<(DimBlockPos, DimBlockPos), f64>,
-    last_published: HashMap<DimBlockPos, Solution>,
+    /// Per-node publish gate: the committed fingerprint of each block
+    /// entity's last-exported [`Solution`], replacing a full `Solution`
+    /// map with 64-bit entries. A re-solved state whose fingerprint
+    /// matches is skipped in O(1) — no UpdateTag is emitted.
+    update_gate: DirtyFingerprintGate<DimBlockPos>,
+    /// Last-write-wins UpdateTag accumulator for the per-tick sync flush;
+    /// a node re-solved several times inside one window emits one delta.
+    update_batch: CoalescedDeltaBatch<DimBlockPos, KineticUpdateTag>,
     processors_by_pos: HashMap<DimBlockPos, u32>,
-    export_scratch: Vec<u8>,
+    /// Regions whose batch queue may hold unexported records. Only work
+    /// processed by `advance_to` (or an external `queue_delta`) pushes
+    /// records, so a region absent from this set provably exports nothing
+    /// and its `export_into` call is skipped in O(1).
+    pending_exports: BTreeSet<RegionKey>,
+    /// `export_into` calls skipped because the batch was provably empty.
+    idle_export_skips: u64,
+    /// Shared export window — one buffer for every region, every tick.
+    export_scratch: BoundedScratchVec<u8>,
+    /// Reusable region-node snapshot for [`Self::reconcile_stress_and_diffs`].
+    reconcile_nodes: BoundedScratchVec<(DimBlockPos, PlacedKinetic)>,
+    /// Reusable nominal-RPM snapshot for the same reconcile pass.
+    reconcile_rpms: BoundedScratchVec<(PlacedKinetic, f64)>,
 }
 
 impl CreateFactory {
     pub fn new(registry: CreateBlockRegistry) -> Self {
+        let mut export_scratch = BoundedScratchVec::new();
+        export_scratch.resize(MAX_BATCH_BYTES, 0);
         Self {
             registry,
             scheduler: RegionScheduler::default(),
@@ -180,9 +210,14 @@ impl CreateFactory {
             next_node_id: 1,
             kinetics: HashMap::new(),
             kinetic_edges: BTreeMap::new(),
-            last_published: HashMap::new(),
+            update_gate: DirtyFingerprintGate::new(),
+            update_batch: CoalescedDeltaBatch::new(),
             processors_by_pos: HashMap::new(),
-            export_scratch: vec![0u8; MAX_BATCH_BYTES],
+            pending_exports: BTreeSet::new(),
+            idle_export_skips: 0,
+            export_scratch,
+            reconcile_nodes: BoundedScratchVec::new(),
+            reconcile_rpms: BoundedScratchVec::new(),
         }
     }
 
@@ -209,11 +244,43 @@ impl CreateFactory {
     }
 
     pub fn scheduler_mut(&mut self) -> &mut RegionScheduler {
+        // Direct region access can push batch records (`queue_delta`) or
+        // reschedule work through paths the factory cannot see. Mark every
+        // active region as possibly-pending so the next `step_tick`
+        // re-checks them instead of skipping a queue that silently filled.
+        self.pending_exports
+            .extend(self.active_regions.iter().copied());
         &mut self.scheduler
     }
 
     pub fn kinetic_node_count(&self) -> usize {
         self.kinetics.len()
+    }
+
+    /// Skip/update counters for the UpdateTag publish gate: `skips` counts
+    /// re-solved states identical to the last publish (no tag emitted),
+    /// `updates` counts committed state changes.
+    pub fn update_gate_stats(&self) -> FingerprintStats {
+        self.update_gate.stats()
+    }
+
+    /// UpdateTags coalesced since the last
+    /// [`drain_update_batch_into`](Self::drain_update_batch_into) flush.
+    pub fn pending_update_deltas(&self) -> usize {
+        self.update_batch.len()
+    }
+
+    /// Append every coalesced UpdateTag delta to `out` in sorted
+    /// `DimBlockPos` order, emptying the batch — one tag per touched block
+    /// entity no matter how many times it re-solved inside the window.
+    pub fn drain_update_batch_into(&mut self, out: &mut Vec<(DimBlockPos, KineticUpdateTag)>) {
+        self.update_batch.drain_sorted_into(out);
+    }
+
+    /// `export_into` calls skipped because the region's batch queue was
+    /// provably empty — the measurable "idle regions cost O(1)" counter.
+    pub fn idle_export_skips(&self) -> u64 {
+        self.idle_export_skips
     }
 
     pub fn kinetic_solution(&self, pos: DimBlockPos) -> Option<Solution> {
@@ -288,7 +355,8 @@ impl CreateFactory {
         let Some(removed) = self.kinetics.remove(&pos) else {
             return Vec::new();
         };
-        self.last_published.remove(&pos);
+        self.update_gate.remove(&pos);
+        self.update_batch.remove(&pos);
         self.kinetic_edges.retain(|&(a, b), _| a != pos && b != pos);
         let region_key = pos.region_key();
         if let Some(region) = self.scheduler.region_mut_if_present(region_key) {
@@ -458,9 +526,32 @@ impl CreateFactory {
         for &key in &self.active_regions {
             let region = self.scheduler.region_mut(key);
             let report = region.advance_to(tick, budget)?;
-            let batch = region
-                .export_into(&mut self.export_scratch, MAX_BATCH_RECORDS)
-                .expect("scratch buffer matches MAX_BATCH_BYTES");
+            // `advance_to` pushes one batch record per processed work unit
+            // and `output_blocked` only fires when the queue was full, so
+            // `processed == 0` with no pending residue means the export
+            // queue is provably empty: `export_into` would return an empty
+            // `BatchReport` anyway, and skipping it is byte-identical.
+            let may_hold_records = report.processed > 0
+                || report.output_blocked
+                || self.pending_exports.contains(&key);
+            let batch = if may_hold_records {
+                let batch = region
+                    .export_into(&mut self.export_scratch, MAX_BATCH_RECORDS)
+                    .expect("scratch buffer matches MAX_BATCH_BYTES");
+                if batch.records > 0 {
+                    self.pending_exports.insert(key);
+                } else {
+                    self.pending_exports.remove(&key);
+                }
+                batch
+            } else {
+                self.idle_export_skips += 1;
+                BatchReport {
+                    bytes: 0,
+                    records: 0,
+                    sequence: None,
+                }
+            };
             if report.processed > 0 || batch.records > 0 {
                 outputs.push(RegionStepOutput {
                     region: key,
@@ -590,18 +681,26 @@ impl CreateFactory {
     /// return UpdateTag diffs for every node in `region_key` whose solved state
     /// changed.
     fn reconcile_stress_and_diffs(&mut self, region_key: RegionKey) -> Vec<KineticUpdateTag> {
-        let mut region_nodes: Vec<(DimBlockPos, PlacedKinetic)> = self
-            .kinetics
-            .iter()
-            .filter(|(p, _)| p.region_key() == region_key)
-            .map(|(&p, &k)| (p, k))
-            .collect();
+        // `mem::take` the scratch vecs so the collection borrows don't
+        // overlap the `self` field borrows below; both go back at the end
+        // with their capacity intact for the next reconcile.
+        let mut region_nodes = std::mem::take(&mut self.reconcile_nodes);
+        region_nodes.clear_bounded(RECONCILE_SCRATCH_RETAIN);
+        region_nodes.extend(
+            self.kinetics
+                .iter()
+                .filter(|(p, _)| p.region_key() == region_key)
+                .map(|(&p, &k)| (p, k)),
+        );
         region_nodes.sort_by_key(|(p, _)| *p);
+
+        let mut nominal_rpms = std::mem::take(&mut self.reconcile_rpms);
+        nominal_rpms.clear_bounded(RECONCILE_SCRATCH_RETAIN);
 
         if let Some(region) = self.scheduler.region_mut_if_present(region_key) {
             // Pass 1: clear consumer loads so KineticGraph computes exact
             // kinematic RPMs even when a component was previously overstressed.
-            for &(_, placed) in &region_nodes {
+            for &(_, placed) in region_nodes.iter() {
                 if !matches!(placed.role, CreateBlockRole::Generator { .. }) {
                     let _ = region
                         .kinetic
@@ -609,20 +708,17 @@ impl CreateFactory {
                 }
             }
             // Snapshot nominal kinematic RPMs before applying RPM-scaled loads.
-            let nominal_rpms: Vec<(PlacedKinetic, f64)> = region_nodes
-                .iter()
-                .map(|&(_, placed)| {
-                    let rpm = region
-                        .kinetic
-                        .solution(placed.id)
-                        .map(|s| s.speed.abs())
-                        .unwrap_or(0.0);
-                    (placed, rpm)
-                })
-                .collect();
+            nominal_rpms.extend(region_nodes.iter().map(|&(_, placed)| {
+                let rpm = region
+                    .kinetic
+                    .solution(placed.id)
+                    .map(|s| s.speed.abs())
+                    .unwrap_or(0.0);
+                (placed, rpm)
+            }));
             // Pass 2: apply exact `stress_impact * |nominal_rpm|` to consumers
             // so Running vs Overstressed is deterministic and oscillation-free.
-            for (placed, rpm) in nominal_rpms {
+            for &(placed, rpm) in nominal_rpms.iter() {
                 if !matches!(placed.role, CreateBlockRole::Generator { .. }) {
                     let _ = region
                         .kinetic
@@ -632,7 +728,7 @@ impl CreateFactory {
         }
 
         let mut diffs = Vec::new();
-        for (pos, placed) in region_nodes {
+        for &(pos, placed) in region_nodes.iter() {
             let Some(sol) = self
                 .scheduler
                 .region(region_key)
@@ -662,18 +758,31 @@ impl CreateFactory {
                     .set_processor_drive(machine_id, drive);
             }
 
-            let changed = self.last_published.get(&pos) != Some(&sol);
+            // Fingerprint gate: a re-solved state identical to the last
+            // publish is skipped in O(1); a changed one commits and emits.
+            // `NaN != NaN` under `PartialEq`, so a NaN solution always
+            // diffs in the reference semantics — invalidate instead of
+            // committing to keep that exactly.
+            let changed = if sol.capacity.is_nan() || sol.load.is_nan() || sol.speed.is_nan() {
+                self.update_gate.invalidate(&pos);
+                true
+            } else {
+                self.update_gate.observe(pos, solution_fingerprint(&sol))
+            };
             if changed {
-                self.last_published.insert(pos, sol);
-                diffs.push(KineticUpdateTag {
+                let tag = KineticUpdateTag {
                     pos,
                     speed_rpm: sol.speed,
                     stress_capacity: sol.capacity,
                     stress_load: sol.load,
                     overstressed: sol.status == NetworkStatus::Overstressed,
-                });
+                };
+                self.update_batch.record(pos, tag);
+                diffs.push(tag);
             }
         }
+        self.reconcile_nodes = region_nodes;
+        self.reconcile_rpms = nominal_rpms;
         diffs
     }
 }
@@ -714,6 +823,39 @@ fn kinetic_node_input(placed: PlacedKinetic, rpm_scale: f64) -> KineticNode {
             driven_speed: None,
         },
     }
+}
+
+/// 64-bit fingerprint of a solved kinetic state — component id, stress
+/// numbers, speed, and status discriminant.
+///
+/// The encoding mirrors `Solution`'s `PartialEq` so the gate's skip set is
+/// exactly the reference `!=` set (modulo the negligible 64-bit collision
+/// bound): `0.0` and `-0.0` fold to the same bytes because `==` says
+/// they're equal, and every NaN maps to one canonical value because NaN
+/// never reaches the gate — callers invalidate instead of committing.
+fn solution_fingerprint(sol: &Solution) -> u64 {
+    fn push_f64(f: &mut FingerprintBuilder, v: f64) {
+        if v == 0.0 {
+            // `-0.0 == 0.0` under `PartialEq`, so both fold to one slot.
+            f.write_u64(0);
+        } else if v.is_nan() {
+            f.write_u64(u64::MAX);
+        } else {
+            f.write_u64(v.to_bits());
+        }
+    }
+    let mut f = FingerprintBuilder::new();
+    f.write_u64(u64::from(sol.component));
+    push_f64(&mut f, sol.capacity);
+    push_f64(&mut f, sol.load);
+    push_f64(&mut f, sol.speed);
+    f.write_u8(match sol.status {
+        NetworkStatus::Unpowered => 0,
+        NetworkStatus::Running => 1,
+        NetworkStatus::Overstressed => 2,
+        NetworkStatus::Conflict => 3,
+    });
+    f.finish()
 }
 
 fn canonical_pair(a: DimBlockPos, b: DimBlockPos) -> (DimBlockPos, DimBlockPos) {

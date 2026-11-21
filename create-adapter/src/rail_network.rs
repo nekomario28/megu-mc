@@ -32,9 +32,16 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
+use mc_spine_core::perf_kit::{
+    BoundedScratchVec, DirtyFingerprintGate, FingerprintBuilder, FingerprintStats,
+};
 use mod_adapter_core::neoforge_wire::{
     read_mc_string, read_varint, write_mc_string, write_varint,
 };
+
+/// Train-id scratch capacity retained between ticks; a burst past this
+/// shrinks back via [`BoundedScratchVec::clear_bounded`].
+const MAX_TRAIN_SCRATCH_RETAIN: usize = 4096;
 
 /// Deterministic binary snapshot magic (`"RAIL"`).
 pub const RAIL_MAGIC: [u8; 4] = *b"RAIL";
@@ -825,7 +832,7 @@ pub enum TransitEvent {
 
 /// The whole live rail network: spline graph, signal blocks and signals,
 /// stations, and articulated trains.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct RailNetwork {
     pub graph: TrackGraph,
     pub blocks: BTreeMap<BlockId, SignalBlock>,
@@ -837,6 +844,34 @@ pub struct RailNetwork {
     pub trains: BTreeMap<TrainId, ArticulatedTrain>,
     pub tick: u64,
     next_block: u64,
+    /// Per-train occupancy fingerprints: a train whose covered-block set
+    /// is unchanged since the last epoch-skippable commit skips the
+    /// `O(blocks)` refresh sweep. Cache only — never persisted or compared.
+    occupancy_gate: DirtyFingerprintGate<TrainId>,
+    /// Epoch bumped on every write to block occupancy/reservation fields
+    /// or to the graph topology coverage derives from; committed into each
+    /// train's fingerprint so a skip is only allowed while the write set
+    /// the refresh would produce is provably already in place.
+    occupancy_epoch: u64,
+    /// Reusable train-id snapshot for the tick loop — one allocation
+    /// serves every tick instead of a fresh `Vec` each call.
+    id_scratch: BoundedScratchVec<TrainId>,
+}
+
+/// Occupancy fingerprints, epoch, and scratch are tick-loop caches: they
+/// accelerate refresh decisions but hold no semantic state, so equality —
+/// including snapshot round-trips — compares the network itself only.
+impl PartialEq for RailNetwork {
+    fn eq(&self, other: &Self) -> bool {
+        self.graph == other.graph
+            && self.blocks == other.blocks
+            && self.edge_block == other.edge_block
+            && self.signals == other.signals
+            && self.stations == other.stations
+            && self.trains == other.trains
+            && self.tick == other.tick
+            && self.next_block == other.next_block
+    }
 }
 
 impl RailNetwork {
@@ -844,8 +879,29 @@ impl RailNetwork {
         Self::default()
     }
 
+    /// Bump the occupancy epoch: every committed refresh fingerprint is
+    /// invalidated, so the next refresh decision re-runs the sweep instead
+    /// of skipping on stale coverage.
+    fn bump_occupancy_epoch(&mut self) {
+        self.occupancy_epoch += 1;
+    }
+
+    /// Invalidate every cached occupancy fingerprint. Call after mutating
+    /// `self.graph` directly (edge/block topology outside this API) — the
+    /// covered-block derivation may have shifted under committed states.
+    pub fn invalidate_occupancy_cache(&mut self) {
+        self.bump_occupancy_epoch();
+    }
+
+    /// Skip/update counters for the occupancy refresh gate: `skips` is the
+    /// measurable proof parked trains re-evaluate in O(1).
+    pub fn occupancy_gate_stats(&self) -> FingerprintStats {
+        self.occupancy_gate.stats()
+    }
+
     /// See [`TrackGraph::add_node`].
     pub fn add_node(&mut self, dim: DimId, pos: [f64; 3]) -> NodeId {
+        self.bump_occupancy_epoch();
         self.graph.add_node(dim, pos)
     }
 
@@ -857,6 +913,7 @@ impl RailNetwork {
         gauge: TrackGauge,
         control: [[f64; 3]; 4],
     ) -> Result<EdgeId, RailError> {
+        self.bump_occupancy_epoch();
         self.graph.add_edge(from, to, gauge, control)
     }
 
@@ -868,12 +925,14 @@ impl RailNetwork {
         gauge: TrackGauge,
         segments: Vec<[[f64; 3]; 4]>,
     ) -> Result<EdgeId, RailError> {
+        self.bump_occupancy_epoch();
         self.graph.add_segmented_edge(from, to, gauge, segments)
     }
 
     /// Partition `edges` into a new signal section. An edge already in
     /// another block is moved into the new one.
     pub fn add_block(&mut self, edges: &[EdgeId]) -> Result<BlockId, RailError> {
+        self.bump_occupancy_epoch();
         for e in edges {
             if !self.graph.edges.contains_key(e) {
                 return Err(RailError::EdgeNotFound(*e));
@@ -904,6 +963,7 @@ impl RailNetwork {
 
     /// Mount a `kind` signal guarding entry into `edge`'s block.
     pub fn add_signal(&mut self, edge: EdgeId, kind: SignalKind) -> Result<(), RailError> {
+        self.bump_occupancy_epoch();
         if !self.graph.edges.contains_key(&edge) {
             return Err(RailError::EdgeNotFound(edge));
         }
@@ -913,6 +973,7 @@ impl RailNetwork {
 
     /// Register a named station stop on `edge` at arc distance `s`.
     pub fn add_station(&mut self, name: &str, edge: EdgeId, s: f64) -> Result<(), RailError> {
+        self.bump_occupancy_epoch();
         let len = self
             .graph
             .edges
@@ -960,13 +1021,15 @@ impl RailNetwork {
             .unwrap_or_default();
         let id = train.id;
         self.trains.insert(id, train);
-        refresh_occupancy(self, id);
+        refresh_occupancy_gated(self, id);
         Ok(())
     }
 
     /// Remove a train and release every block it occupied or reserved.
     pub fn remove_train(&mut self, id: TrainId) {
+        self.bump_occupancy_epoch();
         self.trains.remove(&id);
+        self.occupancy_gate.remove(&id);
         for b in self.blocks.values_mut() {
             if b.occupied_by == Some(id) {
                 b.occupied_by = None;
@@ -1036,6 +1099,7 @@ impl RailNetwork {
     /// that train (no-op otherwise — a reservation by another train is
     /// never stolen).
     pub fn reserve_block_for(&mut self, edge: EdgeId, train: TrainId) {
+        self.bump_occupancy_epoch();
         let Some(&bid) = self.edge_block.get(&edge) else {
             return;
         };
@@ -1111,8 +1175,14 @@ pub fn tick_rail_network(
     loaded_chunks: &BTreeSet<ChunkKey>,
 ) -> Vec<TransitEvent> {
     let mut events = Vec::new();
-    let ids: Vec<TrainId> = net.trains.keys().copied().collect();
-    for id in ids {
+    // `mem::take` the shared id snapshot so the collection borrow doesn't
+    // overlap `&mut net` below; it goes back with its capacity intact, so
+    // steady-state ticks allocate nothing for the snapshot.
+    let mut ids = std::mem::take(&mut net.id_scratch);
+    ids.clear_bounded(MAX_TRAIN_SCRATCH_RETAIN);
+    ids.extend(net.trains.keys().copied());
+    for i in 0..ids.len() {
+        let id = ids[i];
         if !net.trains.contains_key(&id) {
             continue;
         }
@@ -1142,10 +1212,11 @@ pub fn tick_rail_network(
                 }
             }
         }
-        refresh_occupancy(net, id);
+        refresh_occupancy_gated(net, id);
         update_render_mode(net, id, loaded_chunks, &mut events);
     }
     net.tick += 1;
+    net.id_scratch = ids;
     events
 }
 
@@ -1159,8 +1230,53 @@ fn release_reservations(net: &mut RailNetwork, train: TrainId) {
     }
 }
 
+/// Fingerprint of everything [`refresh_occupancy`] reads to decide which
+/// blocks `train` covers: head edge, arc position, body length, and the
+/// traversed-edge history. The network's occupancy `epoch` is folded in so
+/// any write to block fields or coverage-defining topology since the
+/// commit invalidates the fingerprint.
+fn occupancy_fingerprint(t: &ArticulatedTrain, epoch: u64) -> u64 {
+    let mut f = FingerprintBuilder::new();
+    f.write_u64(t.pos_edge.get())
+        .write_u64(t.pos_s.to_bits())
+        .write_u64(epoch)
+        .write_u64(t.carriages.len() as u64);
+    for c in &t.carriages {
+        f.write_u64(c.length.to_bits());
+    }
+    for e in &t.history {
+        f.write_u64(e.get());
+    }
+    f.finish()
+}
+
+/// [`refresh_occupancy`] behind the fingerprint gate: a train whose
+/// coverage-defining state and the block-field epoch are both unchanged
+/// since its last commit would only rewrite the same values, so the sweep
+/// is skipped in O(1). Any real change — the train moved, another refresh
+/// or mutation touched the fields — invalidates the fingerprint and the
+/// refresh runs exactly as before.
+fn refresh_occupancy_gated(net: &mut RailNetwork, train: TrainId) {
+    let Some(t) = net.trains.get(&train) else {
+        return;
+    };
+    let candidate = occupancy_fingerprint(t, net.occupancy_epoch);
+    if net.occupancy_gate.should_skip(&train, candidate) {
+        return;
+    }
+    refresh_occupancy(net, train);
+    // Commit at the *post-refresh* epoch: if this run wrote fields it
+    // bumped the epoch itself, and the commit must reflect that newer
+    // write-set for next tick's skip decision.
+    let epoch = net.occupancy_epoch;
+    let fp = occupancy_fingerprint(&net.trains[&train], epoch);
+    net.occupancy_gate.commit(train, fp);
+}
+
 /// Recompute which blocks `train` physically occupies (any edge under its
-/// full body length) and clear occupancy it left behind.
+/// full body length) and clear occupancy it left behind. A write that
+/// actually changes a block field bumps the occupancy epoch, invalidating
+/// every committed refresh fingerprint.
 fn refresh_occupancy(net: &mut RailNetwork, train: TrainId) {
     let Some(t) = net.trains.get(&train) else {
         return;
@@ -1179,15 +1295,24 @@ fn refresh_occupancy(net: &mut RailNetwork, train: TrainId) {
         }
         need -= net.graph.edges.get(e).map(|e| e.length()).unwrap_or(0.0);
     }
+    let mut wrote = false;
     for (bid, b) in net.blocks.iter_mut() {
         if covered.contains(bid) {
-            b.occupied_by = Some(train);
+            if b.occupied_by != Some(train) {
+                b.occupied_by = Some(train);
+                wrote = true;
+            }
             if b.reserved_by == Some(train) {
                 b.reserved_by = None;
+                wrote = true;
             }
         } else if b.occupied_by == Some(train) {
             b.occupied_by = None;
+            wrote = true;
         }
+    }
+    if wrote {
+        net.bump_occupancy_epoch();
     }
 }
 

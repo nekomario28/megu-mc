@@ -123,6 +123,10 @@
 //!   [`unified_bundle::UnifiedModRuntime`] with zero lines of mod-specific
 //!   Rust, plus [`unified_bundle::export_builtin_dimension_bundles`]
 //!   proving the built-in dimension profiles are pure data.
+//! - [`mod_tick_runtime`]: generic modded block-entity tick runtime on
+//!   `mc_spine_core::perf_kit` — O(1) dirty-fingerprint idle skips,
+//!   exact-tick wake scheduling, per-tick-budget burst slicing, and
+//!   last-write-wins coalesced outbound deltas for any machine family.
 
 #![deny(unsafe_code)]
 
@@ -142,6 +146,7 @@ pub mod mixin_lifter;
 pub mod mine_cut_all;
 pub mod modpack;
 pub mod mod_sync;
+pub mod mod_tick_runtime;
 pub mod neoforge_wire;
 pub mod profile;
 pub mod unified_bundle;
