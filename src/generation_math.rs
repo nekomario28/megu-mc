@@ -437,7 +437,7 @@ impl Xor {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub(crate) struct Split {
     pub(crate) lo: u64,
     pub(crate) hi: u64,
@@ -634,6 +634,7 @@ const GRAD: [[f64; 3]; 16] = [
     [0.0, -1.0, -1.0],
 ];
 
+#[inline(always)]
 fn wrap(x: f64) -> f64 {
     const RO: f64 = 33_554_432.0;
     const HALF: f64 = f64::from_bits(0x416F_FFFF_FFFF_FFFF);
@@ -643,6 +644,7 @@ fn wrap(x: f64) -> f64 {
         x - (x / RO + 0.5).floor() * RO
     }
 }
+#[inline(always)]
 fn smooth(t: f64) -> f64 {
     t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 }
@@ -707,9 +709,11 @@ impl Perlin {
         }
         Perlin { p, xo, yo, zo }
     }
+    #[inline(always)]
     fn perm(&self, x: i32) -> i32 {
         self.p[(x & 0xFF) as usize] as i32
     }
+    #[inline(always)]
     fn grad_dot(hash: i32, x: f64, y: f64, z: f64) -> f64 {
         let g = &GRAD[(hash & 15) as usize];
         g[0] * x + g[1] * y + g[2] * z
@@ -782,27 +786,67 @@ impl Perlin {
     #[target_feature(enable = "avx2")]
     unsafe fn get_4_avx2(&self, x: [f64; 4], y: [f64; 4], z: [f64; 4]) -> [f64; 4] {
         use std::arch::x86_64::*;
-        // Coordinate preparation: exactly `get`'s wrap/floor/fraction per lane.
+        let x_same = x[0].to_bits() == x[1].to_bits()
+            && x[0].to_bits() == x[2].to_bits()
+            && x[0].to_bits() == x[3].to_bits();
+        let y_same = y[0].to_bits() == y[1].to_bits()
+            && y[0].to_bits() == y[2].to_bits()
+            && y[0].to_bits() == y[3].to_bits();
+        let z_same = z[0].to_bits() == z[1].to_bits()
+            && z[0].to_bits() == z[2].to_bits()
+            && z[0].to_bits() == z[3].to_bits();
         let mut ix = [0i32; 4];
         let mut iy = [0i32; 4];
         let mut iz = [0i32; 4];
         let mut rx = [0.0f64; 4];
         let mut ry = [0.0f64; 4];
         let mut rz = [0.0f64; 4];
-        for k in 0..4 {
-            let wx = wrap(x[k]) + self.xo;
-            let wy = wrap(y[k]) + self.yo;
-            let wz = wrap(z[k]) + self.zo;
-            ix[k] = wx.floor() as i32;
-            iy[k] = wy.floor() as i32;
-            iz[k] = wz.floor() as i32;
-            rx[k] = wx - ix[k] as f64;
-            ry[k] = wy - iy[k] as f64;
-            rz[k] = wz - iz[k] as f64;
+        if x_same {
+            let wx = wrap(x[0]) + self.xo;
+            let fx = wx.floor() as i32;
+            ix = [fx; 4];
+            rx = [wx - fx as f64; 4];
+        } else {
+            for k in 0..4 {
+                let wx = wrap(x[k]) + self.xo;
+                ix[k] = wx.floor() as i32;
+                rx[k] = wx - ix[k] as f64;
+            }
+        }
+        if y_same {
+            let wy = wrap(y[0]) + self.yo;
+            let fy = wy.floor() as i32;
+            iy = [fy; 4];
+            ry = [wy - fy as f64; 4];
+        } else {
+            for k in 0..4 {
+                let wy = wrap(y[k]) + self.yo;
+                iy[k] = wy.floor() as i32;
+                ry[k] = wy - iy[k] as f64;
+            }
+        }
+        if z_same {
+            let wz = wrap(z[0]) + self.zo;
+            let fz = wz.floor() as i32;
+            iz = [fz; 4];
+            rz = [wz - fz as f64; 4];
+        } else {
+            for k in 0..4 {
+                let wz = wrap(z[k]) + self.zo;
+                iz[k] = wz.floor() as i32;
+                rz[k] = wz - iz[k] as f64;
+            }
         }
         // The eight gradient dots per lane, in `sample_lerp`'s order and with the
         // scalar grad_dot operation order `((g0*x) + (g1*y)) + (g2*z)`.
-        let mut d = [[0.0f64; 8]; 4];
+        let mut d0 = [0.0f64; 4];
+        let mut d1 = [0.0f64; 4];
+        let mut d2 = [0.0f64; 4];
+        let mut d3 = [0.0f64; 4];
+        let mut d4 = [0.0f64; 4];
+        let mut d5 = [0.0f64; 4];
+        let mut d6 = [0.0f64; 4];
+        let mut d7 = [0.0f64; 4];
         for k in 0..4 {
             let (px, py, pz) = (ix[k], iy[k], iz[k]);
             let (dx, dy, dz) = (rx[k], ry[k], rz[k]);
@@ -812,21 +856,23 @@ impl Perlin {
             let xy01 = self.perm(x0 + py + 1);
             let xy10 = self.perm(x1 + py);
             let xy11 = self.perm(x1 + py + 1);
-            d[k] = [
-                Self::grad_dot(self.perm(xy00 + pz), dx, dy, dz),
-                Self::grad_dot(self.perm(xy10 + pz), dx - 1.0, dy, dz),
-                Self::grad_dot(self.perm(xy01 + pz), dx, dy - 1.0, dz),
-                Self::grad_dot(self.perm(xy11 + pz), dx - 1.0, dy - 1.0, dz),
-                Self::grad_dot(self.perm(xy00 + pz + 1), dx, dy, dz - 1.0),
-                Self::grad_dot(self.perm(xy10 + pz + 1), dx - 1.0, dy, dz - 1.0),
-                Self::grad_dot(self.perm(xy01 + pz + 1), dx, dy - 1.0, dz - 1.0),
-                Self::grad_dot(self.perm(xy11 + pz + 1), dx - 1.0, dy - 1.0, dz - 1.0),
-            ];
+            d0[k] = Self::grad_dot(self.perm(xy00 + pz), dx, dy, dz);
+            d1[k] = Self::grad_dot(self.perm(xy10 + pz), dx - 1.0, dy, dz);
+            d2[k] = Self::grad_dot(self.perm(xy01 + pz), dx, dy - 1.0, dz);
+            d3[k] = Self::grad_dot(self.perm(xy11 + pz), dx - 1.0, dy - 1.0, dz);
+            d4[k] = Self::grad_dot(self.perm(xy00 + pz + 1), dx, dy, dz - 1.0);
+            d5[k] = Self::grad_dot(self.perm(xy10 + pz + 1), dx - 1.0, dy, dz - 1.0);
+            d6[k] = Self::grad_dot(self.perm(xy01 + pz + 1), dx, dy - 1.0, dz - 1.0);
+            d7[k] = Self::grad_dot(self.perm(xy11 + pz + 1), dx - 1.0, dy - 1.0, dz - 1.0);
         }
-        // Lift each of the eight gradient results and the three fractions into lanes.
-        let dvec = |j: usize| _mm256_setr_pd(d[0][j], d[1][j], d[2][j], d[3][j]);
-        let (v0, v1, v2, v3) = (dvec(0), dvec(1), dvec(2), dvec(3));
-        let (v4, v5, v6, v7) = (dvec(4), dvec(5), dvec(6), dvec(7));
+        let v0 = _mm256_loadu_pd(d0.as_ptr());
+        let v1 = _mm256_loadu_pd(d1.as_ptr());
+        let v2 = _mm256_loadu_pd(d2.as_ptr());
+        let v3 = _mm256_loadu_pd(d3.as_ptr());
+        let v4 = _mm256_loadu_pd(d4.as_ptr());
+        let v5 = _mm256_loadu_pd(d5.as_ptr());
+        let v6 = _mm256_loadu_pd(d6.as_ptr());
+        let v7 = _mm256_loadu_pd(d7.as_ptr());
         // smooth(t) = t*t*t*(t*(t*6-15)+10), same op order as scalar `smooth`.
         let smoothv = |t: __m256d| -> __m256d {
             let t2 = _mm256_mul_pd(t, t);
@@ -837,9 +883,21 @@ impl Perlin {
             let e = _mm256_add_pd(c, _mm256_set1_pd(10.0));
             _mm256_mul_pd(t3, e)
         };
-        let a = smoothv(_mm256_setr_pd(rx[0], rx[1], rx[2], rx[3]));
-        let b = smoothv(_mm256_setr_pd(ry[0], ry[1], ry[2], ry[3]));
-        let c = smoothv(_mm256_setr_pd(rz[0], rz[1], rz[2], rz[3]));
+        let a = if x_same {
+            _mm256_set1_pd(smooth(rx[0]))
+        } else {
+            smoothv(_mm256_loadu_pd(rx.as_ptr()))
+        };
+        let b = if y_same {
+            _mm256_set1_pd(smooth(ry[0]))
+        } else {
+            smoothv(_mm256_loadu_pd(ry.as_ptr()))
+        };
+        let c = if z_same {
+            _mm256_set1_pd(smooth(rz[0]))
+        } else {
+            smoothv(_mm256_loadu_pd(rz.as_ptr()))
+        };
         // lerp3's seven stages, in the exact order of the scalar helper.
         let l0 = _mm256_add_pd(v0, _mm256_mul_pd(a, _mm256_sub_pd(v1, v0)));
         let l1 = _mm256_add_pd(v2, _mm256_mul_pd(a, _mm256_sub_pd(v3, v2)));
@@ -883,55 +941,117 @@ impl Perlin {
     #[target_feature(enable = "avx512f,avx512dq")]
     unsafe fn get_8_avx512(&self, x: [f64; 8], y: [f64; 8], z: [f64; 8]) -> [f64; 8] {
         use std::arch::x86_64::*;
-        // Coordinate preparation: exactly `get`'s wrap/floor/fraction per lane.
+        let x0b = x[0].to_bits();
+        let x_same = x[1..].iter().all(|v| v.to_bits() == x0b);
+        let y0b = y[0].to_bits();
+        let y_same = y[1..].iter().all(|v| v.to_bits() == y0b);
+        let z0b = z[0].to_bits();
+        let z_same = z[1..].iter().all(|v| v.to_bits() == z0b);
         let mut ix = [0i32; 8];
         let mut iy = [0i32; 8];
         let mut iz = [0i32; 8];
         let mut rx = [0.0f64; 8];
         let mut ry = [0.0f64; 8];
         let mut rz = [0.0f64; 8];
-        for k in 0..8 {
-            let wx = wrap(x[k]) + self.xo;
-            let wy = wrap(y[k]) + self.yo;
-            let wz = wrap(z[k]) + self.zo;
-            ix[k] = wx.floor() as i32;
-            iy[k] = wy.floor() as i32;
-            iz[k] = wz.floor() as i32;
-            rx[k] = wx - ix[k] as f64;
-            ry[k] = wy - iy[k] as f64;
-            rz[k] = wz - iz[k] as f64;
+        if x_same {
+            let wx = wrap(x[0]) + self.xo;
+            let fx = wx.floor() as i32;
+            ix = [fx; 8];
+            rx = [wx - fx as f64; 8];
+        } else {
+            for k in 0..8 {
+                let wx = wrap(x[k]) + self.xo;
+                ix[k] = wx.floor() as i32;
+                rx[k] = wx - ix[k] as f64;
+            }
+        }
+        if y_same {
+            let wy = wrap(y[0]) + self.yo;
+            let fy = wy.floor() as i32;
+            iy = [fy; 8];
+            ry = [wy - fy as f64; 8];
+        } else {
+            for k in 0..8 {
+                let wy = wrap(y[k]) + self.yo;
+                iy[k] = wy.floor() as i32;
+                ry[k] = wy - iy[k] as f64;
+            }
+        }
+        if z_same {
+            let wz = wrap(z[0]) + self.zo;
+            let fz = wz.floor() as i32;
+            iz = [fz; 8];
+            rz = [wz - fz as f64; 8];
+        } else {
+            for k in 0..8 {
+                let wz = wrap(z[k]) + self.zo;
+                iz[k] = wz.floor() as i32;
+                rz[k] = wz - iz[k] as f64;
+            }
         }
         // The eight gradient dots per lane, in `sample_lerp`'s order and with the
         // scalar grad_dot operation order `((g0*x) + (g1*y)) + (g2*z)`.
-        let mut d = [[0.0f64; 8]; 8];
-        for k in 0..8 {
-            let (px, py, pz) = (ix[k], iy[k], iz[k]);
-            let (dx, dy, dz) = (rx[k], ry[k], rz[k]);
-            let x0 = self.perm(px);
-            let x1 = self.perm(px + 1);
-            let xy00 = self.perm(x0 + py);
-            let xy01 = self.perm(x0 + py + 1);
-            let xy10 = self.perm(x1 + py);
-            let xy11 = self.perm(x1 + py + 1);
-            d[k] = [
-                Self::grad_dot(self.perm(xy00 + pz), dx, dy, dz),
-                Self::grad_dot(self.perm(xy10 + pz), dx - 1.0, dy, dz),
-                Self::grad_dot(self.perm(xy01 + pz), dx, dy - 1.0, dz),
-                Self::grad_dot(self.perm(xy11 + pz), dx - 1.0, dy - 1.0, dz),
-                Self::grad_dot(self.perm(xy00 + pz + 1), dx, dy, dz - 1.0),
-                Self::grad_dot(self.perm(xy10 + pz + 1), dx - 1.0, dy, dz - 1.0),
-                Self::grad_dot(self.perm(xy01 + pz + 1), dx, dy - 1.0, dz - 1.0),
-                Self::grad_dot(self.perm(xy11 + pz + 1), dx - 1.0, dy - 1.0, dz - 1.0),
-            ];
+        let mut d0 = [0.0f64; 8];
+        let mut d1 = [0.0f64; 8];
+        let mut d2 = [0.0f64; 8];
+        let mut d3 = [0.0f64; 8];
+        let mut d4 = [0.0f64; 8];
+        let mut d5 = [0.0f64; 8];
+        let mut d6 = [0.0f64; 8];
+        let mut d7 = [0.0f64; 8];
+        if x_same && z_same {
+            let x0 = self.perm(ix[0]);
+            let x1 = self.perm(ix[0] + 1);
+            let pz = iz[0];
+            let dx = rx[0];
+            let dx1 = dx - 1.0;
+            let dz = rz[0];
+            let dz1 = dz - 1.0;
+            for k in 0..8 {
+                let py = iy[k];
+                let dy = ry[k];
+                let dy1 = dy - 1.0;
+                let xy00 = self.perm(x0 + py);
+                let xy01 = self.perm(x0 + py + 1);
+                let xy10 = self.perm(x1 + py);
+                let xy11 = self.perm(x1 + py + 1);
+                d0[k] = Self::grad_dot(self.perm(xy00 + pz), dx, dy, dz);
+                d1[k] = Self::grad_dot(self.perm(xy10 + pz), dx1, dy, dz);
+                d2[k] = Self::grad_dot(self.perm(xy01 + pz), dx, dy1, dz);
+                d3[k] = Self::grad_dot(self.perm(xy11 + pz), dx1, dy1, dz);
+                d4[k] = Self::grad_dot(self.perm(xy00 + pz + 1), dx, dy, dz1);
+                d5[k] = Self::grad_dot(self.perm(xy10 + pz + 1), dx1, dy, dz1);
+                d6[k] = Self::grad_dot(self.perm(xy01 + pz + 1), dx, dy1, dz1);
+                d7[k] = Self::grad_dot(self.perm(xy11 + pz + 1), dx1, dy1, dz1);
+            }
+        } else {
+            for k in 0..8 {
+                let (px, py, pz) = (ix[k], iy[k], iz[k]);
+                let (dx, dy, dz) = (rx[k], ry[k], rz[k]);
+                let x0 = self.perm(px);
+                let x1 = self.perm(px + 1);
+                let xy00 = self.perm(x0 + py);
+                let xy01 = self.perm(x0 + py + 1);
+                let xy10 = self.perm(x1 + py);
+                let xy11 = self.perm(x1 + py + 1);
+                d0[k] = Self::grad_dot(self.perm(xy00 + pz), dx, dy, dz);
+                d1[k] = Self::grad_dot(self.perm(xy10 + pz), dx - 1.0, dy, dz);
+                d2[k] = Self::grad_dot(self.perm(xy01 + pz), dx, dy - 1.0, dz);
+                d3[k] = Self::grad_dot(self.perm(xy11 + pz), dx - 1.0, dy - 1.0, dz);
+                d4[k] = Self::grad_dot(self.perm(xy00 + pz + 1), dx, dy, dz - 1.0);
+                d5[k] = Self::grad_dot(self.perm(xy10 + pz + 1), dx - 1.0, dy, dz - 1.0);
+                d6[k] = Self::grad_dot(self.perm(xy01 + pz + 1), dx, dy - 1.0, dz - 1.0);
+                d7[k] = Self::grad_dot(self.perm(xy11 + pz + 1), dx - 1.0, dy - 1.0, dz - 1.0);
+            }
         }
-        // Lift each of the eight gradient results and the three fractions into lanes.
-        let dvec = |j: usize| {
-            _mm512_setr_pd(
-                d[0][j], d[1][j], d[2][j], d[3][j], d[4][j], d[5][j], d[6][j], d[7][j],
-            )
-        };
-        let (v0, v1, v2, v3) = (dvec(0), dvec(1), dvec(2), dvec(3));
-        let (v4, v5, v6, v7) = (dvec(4), dvec(5), dvec(6), dvec(7));
+        let v0 = _mm512_loadu_pd(d0.as_ptr());
+        let v1 = _mm512_loadu_pd(d1.as_ptr());
+        let v2 = _mm512_loadu_pd(d2.as_ptr());
+        let v3 = _mm512_loadu_pd(d3.as_ptr());
+        let v4 = _mm512_loadu_pd(d4.as_ptr());
+        let v5 = _mm512_loadu_pd(d5.as_ptr());
+        let v6 = _mm512_loadu_pd(d6.as_ptr());
+        let v7 = _mm512_loadu_pd(d7.as_ptr());
         // smooth(t) = t*t*t*(t*(t*6-15)+10), same op order as scalar `smooth`.
         let smoothv = |t: __m512d| -> __m512d {
             let t2 = _mm512_mul_pd(t, t);
@@ -942,15 +1062,21 @@ impl Perlin {
             let e = _mm512_add_pd(c, _mm512_set1_pd(10.0));
             _mm512_mul_pd(t3, e)
         };
-        let a = smoothv(_mm512_setr_pd(
-            rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7],
-        ));
-        let b = smoothv(_mm512_setr_pd(
-            ry[0], ry[1], ry[2], ry[3], ry[4], ry[5], ry[6], ry[7],
-        ));
-        let c = smoothv(_mm512_setr_pd(
-            rz[0], rz[1], rz[2], rz[3], rz[4], rz[5], rz[6], rz[7],
-        ));
+        let a = if x_same {
+            _mm512_set1_pd(smooth(rx[0]))
+        } else {
+            smoothv(_mm512_loadu_pd(rx.as_ptr()))
+        };
+        let b = if y_same {
+            _mm512_set1_pd(smooth(ry[0]))
+        } else {
+            smoothv(_mm512_loadu_pd(ry.as_ptr()))
+        };
+        let c = if z_same {
+            _mm512_set1_pd(smooth(rz[0]))
+        } else {
+            smoothv(_mm512_loadu_pd(rz.as_ptr()))
+        };
         // lerp3's seven stages, in the exact order of the scalar helper.
         let l0 = _mm512_add_pd(v0, _mm512_mul_pd(a, _mm512_sub_pd(v1, v0)));
         let l1 = _mm512_add_pd(v2, _mm512_mul_pd(a, _mm512_sub_pd(v3, v2)));
@@ -1037,20 +1163,8 @@ pub(crate) struct Normal {
     native: Option<NativeNormal>,
 }
 impl Normal {
-    pub(crate) fn get(&self, x: f64, y: f64, z: f64) -> f64 {
-        let key = (self.cache_id, x.to_bits(), y.to_bits(), z.to_bits());
-        let idx = nhash(key);
-        if let Some(v) = NCACHE.with(|c| {
-            let slot = c.borrow()[idx];
-            if slot.0 == key {
-                Some(slot.1)
-            } else {
-                None
-            }
-        }) {
-            return v;
-        }
-        let v = match &self.native {
+    pub(crate) fn get_uncached(&self, x: f64, y: f64, z: f64) -> f64 {
+        match &self.native {
             Some(native) => {
                 let mut first = 0.0;
                 for (o, weight) in self.layers[..native.split]
@@ -1059,8 +1173,6 @@ impl Normal {
                 {
                     first += o.a * o.n.get(x * o.f, y * o.f, z * o.f) * weight;
                 }
-                // Java multiplies the coordinate by INPUT_FACTOR before the
-                // second PerlinNoise applies its per-octave frequency scaling.
                 let ix = x * INPUT_FACTOR;
                 let iy = y * INPUT_FACTOR;
                 let iz = z * INPUT_FACTOR;
@@ -1080,7 +1192,23 @@ impl Normal {
                 }
                 v
             }
-        };
+        }
+    }
+
+    pub(crate) fn get(&self, x: f64, y: f64, z: f64) -> f64 {
+        let key = (self.cache_id, x.to_bits(), y.to_bits(), z.to_bits());
+        let idx = nhash(key);
+        if let Some(v) = NCACHE.with(|c| {
+            let slot = c.borrow()[idx];
+            if slot.0 == key {
+                Some(slot.1)
+            } else {
+                None
+            }
+        }) {
+            return v;
+        }
+        let v = self.get_uncached(x, y, z);
         NCACHE.with(|c| {
             c.borrow_mut()[idx] = (key, v);
         });
@@ -1137,7 +1265,7 @@ impl Normal {
     /// `Normal::get`'s body without the NCACHE, evaluated for four lanes at once.
     /// Each octave's four Perlin samples are one [`Perlin::get_4`] call; the scalar
     /// per-lane multiply and accumulate order is preserved exactly.
-    fn eval_x4_uncached(&self, x: [f64; 4], y: [f64; 4], z: [f64; 4]) -> [f64; 4] {
+    pub(crate) fn eval_x4_uncached(&self, x: [f64; 4], y: [f64; 4], z: [f64; 4]) -> [f64; 4] {
         match &self.native {
             Some(native) => {
                 let mut first = [0.0f64; 4];
@@ -1239,7 +1367,7 @@ impl Normal {
     /// `Normal::get`'s body without the NCACHE, evaluated for eight lanes at once. Each
     /// octave's eight Perlin samples are one [`Perlin::get_8`] call; the scalar per-lane
     /// multiply and accumulate order is preserved exactly.
-    fn eval_x8_uncached(&self, x: [f64; 8], y: [f64; 8], z: [f64; 8]) -> [f64; 8] {
+    pub(crate) fn eval_x8_uncached(&self, x: [f64; 8], y: [f64; 8], z: [f64; 8]) -> [f64; 8] {
         match &self.native {
             Some(native) => {
                 let mut first = [0.0f64; 8];
@@ -1842,9 +1970,138 @@ impl BlendedNoise {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512dq")]
+    unsafe fn sample_8_avx512(
+        layers: &[Perlin],
+        x: f64,
+        y: f64,
+        z: f64,
+        smear: f64,
+        mut freq: f64,
+    ) -> ([f64; 8], [f64; 8], f64) {
+        use std::arch::x86_64::*;
+        let mut freqs = [0.0f64; 8];
+        let mut rx = [0.0f64; 8];
+        let mut ory = [0.0f64; 8];
+        let mut rz = [0.0f64; 8];
+        let mut d0 = [0.0f64; 8];
+        let mut d1 = [0.0f64; 8];
+        let mut d2 = [0.0f64; 8];
+        let mut d3 = [0.0f64; 8];
+        let mut d4 = [0.0f64; 8];
+        let mut d5 = [0.0f64; 8];
+        let mut d6 = [0.0f64; 8];
+        let mut d7 = [0.0f64; 8];
+        for k in 0..8 {
+            let layer = &layers[k];
+            let f = freq;
+            freqs[k] = f;
+            freq /= 2.0;
+            let sx = x * f;
+            let oy = y * f;
+            let sz = z * f;
+            let fudge_y_scale = smear * f;
+            let wx = wrap(sx) + layer.xo;
+            let wy = wrap(oy) + layer.yo;
+            let wz = wrap(sz) + layer.zo;
+            let px = wx.floor() as i32;
+            let py = wy.floor() as i32;
+            let pz = wz.floor() as i32;
+            let dx = wx - px as f64;
+            let ry = wy - py as f64;
+            let dz = wz - pz as f64;
+            rx[k] = dx;
+            ory[k] = ry;
+            rz[k] = dz;
+            let lim = if oy >= 0.0 && oy < ry { oy } else { ry };
+            let fudge = (lim / fudge_y_scale + 1.0e-7).floor() * fudge_y_scale;
+            let dy = ry - fudge;
+            let dx1 = dx - 1.0;
+            let dy1 = dy - 1.0;
+            let dz1 = dz - 1.0;
+            let x0 = layer.perm(px);
+            let x1 = layer.perm(px + 1);
+            let xy00 = layer.perm(x0 + py);
+            let xy01 = layer.perm(x0 + py + 1);
+            let xy10 = layer.perm(x1 + py);
+            let xy11 = layer.perm(x1 + py + 1);
+            d0[k] = Perlin::grad_dot(layer.perm(xy00 + pz), dx, dy, dz);
+            d1[k] = Perlin::grad_dot(layer.perm(xy10 + pz), dx1, dy, dz);
+            d2[k] = Perlin::grad_dot(layer.perm(xy01 + pz), dx, dy1, dz);
+            d3[k] = Perlin::grad_dot(layer.perm(xy11 + pz), dx1, dy1, dz);
+            d4[k] = Perlin::grad_dot(layer.perm(xy00 + pz + 1), dx, dy, dz1);
+            d5[k] = Perlin::grad_dot(layer.perm(xy10 + pz + 1), dx1, dy, dz1);
+            d6[k] = Perlin::grad_dot(layer.perm(xy01 + pz + 1), dx, dy1, dz1);
+            d7[k] = Perlin::grad_dot(layer.perm(xy11 + pz + 1), dx1, dy1, dz1);
+        }
+        let v0 = _mm512_loadu_pd(d0.as_ptr());
+        let v1 = _mm512_loadu_pd(d1.as_ptr());
+        let v2 = _mm512_loadu_pd(d2.as_ptr());
+        let v3 = _mm512_loadu_pd(d3.as_ptr());
+        let v4 = _mm512_loadu_pd(d4.as_ptr());
+        let v5 = _mm512_loadu_pd(d5.as_ptr());
+        let v6 = _mm512_loadu_pd(d6.as_ptr());
+        let v7 = _mm512_loadu_pd(d7.as_ptr());
+        let smoothv = |t: __m512d| -> __m512d {
+            let t2 = _mm512_mul_pd(t, t);
+            let t3 = _mm512_mul_pd(t2, t);
+            let a = _mm512_mul_pd(t, _mm512_set1_pd(6.0));
+            let b = _mm512_sub_pd(a, _mm512_set1_pd(15.0));
+            let c = _mm512_mul_pd(t, b);
+            let e = _mm512_add_pd(c, _mm512_set1_pd(10.0));
+            _mm512_mul_pd(t3, e)
+        };
+        let a = smoothv(_mm512_loadu_pd(rx.as_ptr()));
+        let b = smoothv(_mm512_loadu_pd(ory.as_ptr()));
+        let c = smoothv(_mm512_loadu_pd(rz.as_ptr()));
+        let l0 = _mm512_add_pd(v0, _mm512_mul_pd(a, _mm512_sub_pd(v1, v0)));
+        let l1 = _mm512_add_pd(v2, _mm512_mul_pd(a, _mm512_sub_pd(v3, v2)));
+        let l2 = _mm512_add_pd(v4, _mm512_mul_pd(a, _mm512_sub_pd(v5, v4)));
+        let l3 = _mm512_add_pd(v6, _mm512_mul_pd(a, _mm512_sub_pd(v7, v6)));
+        let m0 = _mm512_add_pd(l0, _mm512_mul_pd(b, _mm512_sub_pd(l1, l0)));
+        let m1 = _mm512_add_pd(l2, _mm512_mul_pd(b, _mm512_sub_pd(l3, l2)));
+        let r = _mm512_add_pd(m0, _mm512_mul_pd(c, _mm512_sub_pd(m1, m0)));
+        let out = std::mem::transmute::<__m512d, [f64; 8]>(r);
+        (out, freqs, freq)
+    }
+
     fn sample(layers: &[Perlin], x: f64, y: f64, z: f64, smear: f64) -> f64 {
         let mut value = 0.0;
         let mut frequency = 1.0;
+        #[cfg(target_arch = "x86_64")]
+        {
+            static AVX512: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if layers.len() >= 8
+                && *AVX512.get_or_init(|| {
+                    std::arch::is_x86_feature_detected!("avx512f")
+                        && std::arch::is_x86_feature_detected!("avx512dq")
+                })
+            {
+                let mut i = 0usize;
+                while i + 8 <= layers.len() {
+                    // SAFETY: AVX-512F+DQ detected at runtime above.
+                    let (vals, freqs, next_freq) = unsafe {
+                        Self::sample_8_avx512(&layers[i..i + 8], x, y, z, smear, frequency)
+                    };
+                    for k in 0..8 {
+                        value += vals[k] / freqs[k];
+                    }
+                    frequency = next_freq;
+                    i += 8;
+                }
+                for layer in &layers[i..] {
+                    value += layer.get_smeared(
+                        x * frequency,
+                        y * frequency,
+                        z * frequency,
+                        smear * frequency,
+                    ) / frequency;
+                    frequency /= 2.0;
+                }
+                return value;
+            }
+        }
         for layer in layers {
             value += layer.get_smeared(
                 x * frequency,

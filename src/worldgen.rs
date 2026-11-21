@@ -713,8 +713,11 @@ enum Cond {
     },
     VGrad {
         legacy_seed: u64,
+        #[allow(dead_code)]
         lo_w: u64,
+        #[allow(dead_code)]
         hi_w: u64,
+        sp: Split,
         t: YA,
         f: YA,
     },
@@ -874,7 +877,7 @@ struct SC {
     fluid: i32,
     est_min: i32,
     biome: Option<((i32, i32, i32), u16)>,
-    nt: HashMap<usize, bool>, // per-column memo for 2d noise_threshold
+    nt: Vec<u8>, // per-column memo for 2d noise_threshold (0=unset, 1=false, 2=true)
     memo: HashMap<(usize, i32, i32, i32), f64>,
 }
 impl SC {
@@ -892,9 +895,13 @@ impl SC {
             fluid: i32::MIN,
             est_min: i32::MAX,
             biome: None,
-            nt: HashMap::new(),
+            nt: Vec::new(),
             memo: HashMap::new(),
         }
+    }
+    #[inline]
+    fn clear_nt(&mut self) {
+        self.nt.fill(0);
     }
 }
 
@@ -924,6 +931,246 @@ struct VeinCfg {
     iron_ore: u32,
     iron_raw: u32,
     iron_fill: u32,
+}
+
+#[derive(Clone, Copy)]
+enum InterpKind {
+    General(usize),
+    YNoise {
+        y_grad: Option<(f64, f64, f64, f64, f64, f64, f64)>,
+        ni: usize,
+        xzs: f64,
+        ys: f64,
+        mul: Option<(f64, bool)>,
+        add: Option<(f64, bool)>,
+    },
+}
+
+fn classify_interp_inner(dfs: &[DF], inner: usize) -> InterpKind {
+    let strip_cache = |mut id: usize| -> usize {
+        while let Some(DF::Cache(a)) = dfs.get(id) {
+            id = *a;
+        }
+        id
+    };
+    let const_val = |id: usize| -> Option<f64> {
+        match dfs.get(strip_cache(id))? {
+            DF::C(v) => Some(*v),
+            DF::Zero => Some(0.0),
+            _ => None,
+        }
+    };
+    let match_affine_noise = |id: usize| -> Option<(usize, f64, f64, Option<(f64, bool)>, Option<(f64, bool)>)> {
+        let mut cur = strip_cache(id);
+        let mut add = None;
+        if let DF::Add(a, b) = dfs.get(cur)? {
+            if let Some(c) = const_val(*a) {
+                add = Some((c, true));
+                cur = strip_cache(*b);
+            } else if let Some(c) = const_val(*b) {
+                add = Some((c, false));
+                cur = strip_cache(*a);
+            }
+        }
+        let mut mul = None;
+        if let DF::Mul(a, b) = dfs.get(cur)? {
+            if let Some(c) = const_val(*a) {
+                mul = Some((c, true));
+                cur = strip_cache(*b);
+            } else if let Some(c) = const_val(*b) {
+                mul = Some((c, false));
+                cur = strip_cache(*a);
+            }
+        }
+        if let DF::Noise {
+            ni,
+            sx,
+            sy,
+            sz,
+            xzs,
+            ys,
+        } = dfs.get(cur)?
+        {
+            if const_val(*sx) == Some(0.0)
+                && const_val(*sy) == Some(0.0)
+                && const_val(*sz) == Some(0.0)
+            {
+                return Some((*ni, *xzs, *ys, mul, add));
+            }
+        }
+        None
+    };
+    let root = strip_cache(inner);
+    if let Some((ni, xzs, ys, mul, add)) = match_affine_noise(root) {
+        return InterpKind::YNoise {
+            y_grad: None,
+            ni,
+            xzs,
+            ys,
+            mul,
+            add,
+        };
+    }
+    if let Some(DF::RangeChoice { i, mi, ma, wr, wo }) = dfs.get(root) {
+        if let (Some(DF::Grad { fc, fv, tc, tv }), Some(out_val)) =
+            (dfs.get(strip_cache(*i)), const_val(*wo))
+        {
+            if let Some((ni, xzs, ys, mul, add)) = match_affine_noise(*wr) {
+                return InterpKind::YNoise {
+                    y_grad: Some((*fc, *fv, *tc, *tv, *mi, *ma, out_val)),
+                    ni,
+                    xzs,
+                    ys,
+                    mul,
+                    add,
+                };
+            }
+        }
+    }
+    InterpKind::General(inner)
+}
+
+fn detect_upper_bound_interp(dfs: &[DF], final_density: usize) -> Option<usize> {
+    let base = match dfs.get(final_density)? {
+        DF::Add(a, b) if matches!(dfs.get(*b), Some(DF::Beardifier)) => *a,
+        _ => return None,
+    };
+    let check_squeeze = |id: usize| -> Option<usize> {
+        let mut cur = id;
+        while let Some(DF::Cache(inner)) = dfs.get(cur) {
+            cur = *inner;
+        }
+        let sq_arg = match dfs.get(cur)? {
+            DF::Squeeze(a) => *a,
+            _ => return None,
+        };
+        let mut inner = sq_arg;
+        while let Some(DF::Cache(a)) = dfs.get(inner) {
+            inner = *a;
+        }
+        let (a, b) = match dfs.get(inner)? {
+            DF::Mul(a, b) => (*a, *b),
+            _ => return None,
+        };
+        let is_pos_c =
+            |n: usize| matches!(dfs.get(n), Some(DF::C(v)) if *v > 0.0 && v.is_finite());
+        let interp_id = if is_pos_c(a) {
+            b
+        } else if is_pos_c(b) {
+            a
+        } else {
+            return None;
+        };
+        if matches!(dfs.get(interp_id), Some(DF::Interp(_))) {
+            Some(interp_id)
+        } else {
+            None
+        }
+    };
+    if let Some(id) = check_squeeze(base) {
+        return Some(id);
+    }
+    if let DF::Min(a, b) = dfs.get(base)? {
+        if let Some(id) = check_squeeze(*a) {
+            return Some(id);
+        }
+        if let Some(id) = check_squeeze(*b) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn beard_max_y(beard: Option<&BeardChunkData>) -> i32 {
+    let Some(b) = beard else {
+        return i32::MIN;
+    };
+    if b.is_empty() {
+        return i32::MIN;
+    }
+    let mut hi = i32::MIN;
+    for r in &b.rigids {
+        let top = r.max[1].max(r.min[1] + r.ground_level_delta) + 12;
+        if top > hi {
+            hi = top;
+        }
+    }
+    for j in &b.junctions {
+        let top = j.source_ground_y + 12;
+        if top > hi {
+            hi = top;
+        }
+    }
+    hi
+}
+
+#[derive(Clone, Copy)]
+enum DeepStep {
+    Block(u32),
+    VGrad {
+        ta: i32,
+        fa: i32,
+        legacy_seed: u64,
+        sp: Split,
+        st: u32,
+    },
+}
+
+fn compile_deep_fast(
+    rules: &[Rule],
+    conds: &[Cond],
+    root: usize,
+    min_y: i32,
+    height: i32,
+) -> Option<Vec<DeepStep>> {
+    let top = min_y + height - 1;
+    let mut steps = Vec::new();
+    fn visit(
+        rid: usize,
+        rules: &[Rule],
+        conds: &[Cond],
+        min_y: i32,
+        top: i32,
+        out: &mut Vec<DeepStep>,
+    ) -> bool {
+        match rules.get(rid) {
+            Some(Rule::Block(st)) => {
+                out.push(DeepStep::Block(*st));
+                true
+            }
+            Some(Rule::Seq(seq)) => seq.iter().all(|&sub| visit(sub, rules, conds, min_y, top, out)),
+            Some(Rule::Cond(ci, ri)) => match conds.get(*ci) {
+                Some(Cond::False | Cond::Prelim) => true,
+                Some(Cond::VGrad {
+                    legacy_seed,
+                    sp,
+                    t,
+                    f,
+                    ..
+                }) => {
+                    if let Some(Rule::Block(st)) = rules.get(*ri) {
+                        out.push(DeepStep::VGrad {
+                            ta: t.get(min_y, top),
+                            fa: f.get(min_y, top),
+                            legacy_seed: *legacy_seed,
+                            sp: *sp,
+                            st: *st,
+                        });
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+    if visit(root, rules, conds, min_y, top, &mut steps) {
+        Some(steps)
+    } else {
+        None
+    }
 }
 
 /// The immutable half of the generator: everything read from the datapack and the
@@ -959,6 +1206,7 @@ pub struct GenData {
     btree: Option<BT>,
     leaf_ps: Vec<[[i32; 2]; 7]>,
     biome_names: Vec<String>,
+    biome_ids: Vec<i64>,
     biome_weather: Vec<BiomeWeather>,
     pub sea: i32,
     /// The **generator** window from `worldgen/noise_settings/<preset>.json`'s `noise`
@@ -984,6 +1232,7 @@ pub struct GenData {
     cond_ids: HashMap<String, usize>,
     bleaf: HashMap<String, u16>,
     surface_rule: Option<usize>,
+    deep_fast: Option<Vec<DeepStep>>,
     prelim_df: Option<usize>,
     surf_ni: Option<usize>,
     sec_ni: Option<usize>,
@@ -1000,10 +1249,60 @@ pub struct GenData {
     world_seed: u64,
     /// Interpolated nodes and their inputs, in the corner-grid evaluation order.
     interp_nodes: Vec<(usize, usize)>,
+    density_interp_nodes: Vec<(usize, InterpKind)>,
+    vein_interp_nodes: Vec<(usize, InterpKind)>,
+    upper_bound_interp: Option<usize>,
+    fallback_share: std::sync::Arc<TerrainShare>,
     /// `final_density` compiled once into a flat post-order program (see
     /// `DfProg`). `None` keeps the interpreted evaluator (`MC_SPINE_DF_INTERP`).
     dfprog: Option<Box<DfProg>>,
 }
+struct AqCell12 {
+    valid: bool,
+    cx: i32,
+    cz: i32,
+    sx: i32,
+    sy: i32,
+    sz: i32,
+    slot: usize,
+    px: [i32; 12],
+    py: [i32; 12],
+    pz: [i32; 12],
+    idx: [usize; 12],
+}
+
+impl AqCell12 {
+    fn empty() -> Self {
+        Self {
+            valid: false,
+            cx: 0,
+            cz: 0,
+            sx: 0,
+            sy: 0,
+            sz: 0,
+            slot: 0,
+            px: [0; 12],
+            py: [0; 12],
+            pz: [0; 12],
+            idx: [0; 12],
+        }
+    }
+}
+
+struct BaseColLazy {
+    xz: (i32, i32),
+    cc: ChunkCols,
+    memos: Box<[FlatCornerMemo; 4]>,
+    ub_filled: Vec<bool>,
+    other_filled: Vec<bool>,
+    corners: [(usize, usize, i32, i32); 4],
+    n_corners: usize,
+    xi: usize,
+    zi: usize,
+    fx_zero: bool,
+    fz_zero: bool,
+}
+
 pub struct Gen {
     /// The immutable inputs. `Deref` keeps every existing field name working;
     /// `DerefMut` exists only for construction (see below).
@@ -1017,6 +1316,7 @@ pub struct Gen {
     aq_chunk: [Option<AqChunkCache>; AQ_CHUNK_SLOTS],
     aq_chunk_use: [u64; AQ_CHUNK_SLOTS],
     aq_chunk_tick: u64,
+    aq_cell12: AqCell12,
     prelim_c: HashMap<(i32, i32), i32>,
     /// per chunk: the distinct biomes of its section palettes, i.e. what vanilla's
     /// `applyBiomeDecoration` unions over the 3x3 before deciding which features run
@@ -1028,6 +1328,16 @@ pub struct Gen {
     // Paletted biome IDs by quart position for surface rules.
     bioq: HashMap<(i32, i32, i32), u16>,
     bioq_ord: std::collections::VecDeque<(i32, i32, i32)>,
+    // Cached `biome_quart(qx, qy, qz, None)` answers (pure when `last` is None).
+    bioq_none: HashMap<(i32, i32, i32), u16>,
+    bioq_none_ord: std::collections::VecDeque<(i32, i32, i32)>,
+    // Lazy single-column base heightmap cache `(x, z) -> (surf, wtop_or_i32_min)` plus
+    // reusable scratch buffers so `top_ws`/`top_oc` during beardifier resolution never
+    // have to compute a full 25-column × 49-level chunk grid for a single column query.
+    base_hm_c: HashMap<(i32, i32), (i32, i32)>,
+    base_hm_cc: Option<Box<ChunkCols>>,
+    base_hm_memos: Option<Box<[FlatCornerMemo; 4]>>,
+    base_col_lazy: Option<Box<BaseColLazy>>,
     col_c: HashMap<(i32, i32), std::sync::Arc<ChunkCols>>,
     col_ord: std::collections::VecDeque<(i32, i32)>,
     /// The parallel terrain round this generator belongs to, if any: selects that round's
@@ -1561,6 +1871,7 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> FlightLeader<'_, K, V> {
                 }
             }
         }
+        self.published = true;
     }
 }
 
@@ -1604,6 +1915,7 @@ pub(crate) struct TerrainShare {
     bases: FlightCache<TerrainKey, Option<std::sync::Arc<ChunkCols>>>,
     beards: FlightCache<TerrainKey, Option<std::sync::Arc<BeardChunkData>>>,
     cols: FlightCache<TerrainKey, Option<std::sync::Arc<ChunkCols>>>,
+    base_surf: Mutex<HashMap<(u64, u8, i32, i32), i32>>,
 }
 
 /// `(world_seed, preset, cx, cz, flags)` with the flags that change a column's bytes: the
@@ -1625,12 +1937,17 @@ fn share_nofeat() -> bool {
     *NOFEAT.get_or_init(|| env_flag!("MC_SPINE_NOFEAT"))
 }
 
+const BASE_CACHE_CAP: usize = 512;
+const BEARD_CACHE_CAP: usize = 1024;
+const COL_CACHE_CAP: usize = 512;
+
 impl TerrainShare {
     fn new() -> Self {
         TerrainShare {
-            bases: FlightCache::new(Some(64)),
-            beards: FlightCache::new(Some(128)),
-            cols: FlightCache::new(Some(128)),
+            bases: FlightCache::new(Some(BASE_CACHE_CAP)),
+            beards: FlightCache::new(Some(BEARD_CACHE_CAP)),
+            cols: FlightCache::new(Some(COL_CACHE_CAP)),
+            base_surf: Mutex::new(HashMap::new()),
         }
     }
 
@@ -2117,7 +2434,16 @@ pub(crate) struct CarveStage {
 /// `AQ_TRACE="<cx>,<cz>"` prints the aquifer's decision terms for that chunk.
 /// Warm cost is one `OnceLock` atomic load; callers hoist it out of the hot path
 /// so each `aq_state` call pays it once rather than at every return branch.
+fn aq_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("AQ_TRACE").is_some() || std::env::var_os("AQ_POS").is_some())
+}
+
 fn aq_trace_at(x: i32, z: i32) -> bool {
+    if !aq_trace_enabled() {
+        return false;
+    }
     use std::sync::OnceLock;
     static SPEC: OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
     let spec = SPEC.get_or_init(|| {
@@ -2362,6 +2688,7 @@ impl Gen {
                 btree: None,
                 leaf_ps: Vec::new(),
                 biome_names: Vec::new(),
+                biome_ids: Vec::new(),
                 biome_weather: Vec::new(),
                 sea: 63,
                 min_y: -64,
@@ -2377,6 +2704,7 @@ impl Gen {
                 cond_ids: HashMap::new(),
                 bleaf: HashMap::new(),
                 surface_rule: None,
+                deep_fast: None,
                 prelim_df: None,
                 surf_ni: None,
                 sec_ni: None,
@@ -2391,11 +2719,16 @@ impl Gen {
                 is_2d: Vec::new(),
                 world_seed: seed,
                 interp_nodes: Vec::new(),
+                density_interp_nodes: Vec::new(),
+                vein_interp_nodes: Vec::new(),
+                upper_bound_interp: None,
+                fallback_share: std::sync::Arc::new(TerrainShare::new()),
                 dfprog: None,
             }),
             aq_chunk: std::array::from_fn(|_| None),
             aq_chunk_use: [0; AQ_CHUNK_SLOTS],
             aq_chunk_tick: 0,
+            aq_cell12: AqCell12::empty(),
             prelim_c: HashMap::new(),
             chunk_biomes: HashMap::new(),
             chunk_biomes_ord: std::collections::VecDeque::new(),
@@ -2404,6 +2737,12 @@ impl Gen {
             clim_ord: std::collections::VecDeque::new(),
             bioq: HashMap::new(),
             bioq_ord: std::collections::VecDeque::new(),
+            bioq_none: HashMap::new(),
+            bioq_none_ord: std::collections::VecDeque::new(),
+            base_hm_c: HashMap::new(),
+            base_hm_cc: None,
+            base_hm_memos: None,
+            base_col_lazy: None,
             col_c: HashMap::new(),
             col_ord: std::collections::VecDeque::new(),
             starts_round: None,
@@ -2667,6 +3006,7 @@ impl Gen {
         // temperature coordinate. Bind the settings to the same leaf identities.
         let biome_files = Self::dp_files("biome");
         for name in g.biome_names.clone() {
+            g.biome_ids.push(biome_id(&name));
             let Some(weather) = biome_files
                 .get(&name)
                 .and_then(|b| jparse(b))
@@ -2709,6 +3049,9 @@ impl Gen {
                 if g.surface_rule.is_none() {
                     Self::load_trace("noise_settings surface_rule/material_rule did not resolve");
                     return None;
+                }
+                if let Some(root) = g.surface_rule {
+                    g.deep_fast = compile_deep_fast(&g.rules, &g.conds, root, g.min_y, g.height);
                 }
             }
         }
@@ -2756,6 +3099,8 @@ impl Gen {
         }
         // Compile `final_density` once, now that the id table is final.
         g.is_2d = compute_is_2d(&g.dfs);
+        let density_ids = g.interp_ids_from(&[g.final_density]);
+        let density_set: HashSet<usize> = density_ids.iter().copied().collect();
         g.interp_nodes = g
             .interp_ids()
             .into_iter()
@@ -2764,6 +3109,19 @@ impl Gen {
                 _ => None,
             })
             .collect();
+        let mut density_interp_nodes = Vec::new();
+        let mut vein_interp_nodes = Vec::new();
+        for &(id, inner) in &g.interp_nodes {
+            let kind = classify_interp_inner(&g.dfs, inner);
+            if density_set.contains(&id) {
+                density_interp_nodes.push((id, kind));
+            } else {
+                vein_interp_nodes.push((id, kind));
+            }
+        }
+        g.density_interp_nodes = density_interp_nodes;
+        g.vein_interp_nodes = vein_interp_nodes;
+        g.upper_bound_interp = detect_upper_bound_interp(&g.dfs, g.final_density);
         g.dfprog = DfProg::compile(&g);
         // Diagnostic counters sized to this generator's node table (WG_COUNT only).
         if std::env::var_os("WG_COUNT").is_some() {
@@ -3001,13 +3359,18 @@ impl Gen {
                 // Guava Longs.fromBytes (vanilla StringHash.fromString) is
                 // big-endian; `Split::of_str` already reads it that way.
                 let h = md5(j.get("random_name")?.str().as_bytes());
+                let lo_w = u64::from_be_bytes(h[0..8].try_into().unwrap());
+                let hi_w = u64::from_be_bytes(h[8..16].try_into().unwrap());
+                let mut xr = Xor::raw(lo_w ^ self.factory.lo, hi_w ^ self.factory.hi);
+                let sp = xr.splitter();
                 Cond::VGrad {
                     legacy_seed: legacy_named_factory_seed(
                         self.world_seed,
                         j.get("random_name")?.str(),
                     ),
-                    lo_w: u64::from_be_bytes(h[0..8].try_into().unwrap()),
-                    hi_w: u64::from_be_bytes(h[8..16].try_into().unwrap()),
+                    lo_w,
+                    hi_w,
+                    sp,
                     t: ya("true_at_and_below")?,
                     f: ya("false_at_and_above")?,
                 }
@@ -3491,16 +3854,12 @@ impl Gen {
         df_kids(&self.dfs[id], out);
     }
 
-    /// `interpolated` nodes reachable from final_density.
-    fn interp_ids(&self) -> Vec<usize> {
+    /// `interpolated` nodes reachable from `roots`.
+    fn interp_ids_from(&self, roots: &[usize]) -> Vec<usize> {
         let mut seen = vec![false; self.dfs.len()];
         let mut out = Vec::new();
         let mut kids = Vec::new();
-        let mut roots = vec![self.final_density];
-        if let Some(v) = self.vein {
-            roots.extend([v.toggle, v.ridged, v.gap]);
-        }
-        let mut stack = roots;
+        let mut stack = roots.to_vec();
         while let Some(id) = stack.pop() {
             if seen[id] {
                 continue;
@@ -3518,6 +3877,15 @@ impl Gen {
             }
         }
         out
+    }
+
+    /// `interpolated` nodes reachable from final_density and veins.
+    fn interp_ids(&self) -> Vec<usize> {
+        let mut roots = vec![self.final_density];
+        if let Some(v) = self.vein {
+            roots.extend([v.toggle, v.ridged, v.gap]);
+        }
+        self.interp_ids_from(&roots)
     }
 
     fn eval_spline_c(
@@ -5893,7 +6261,7 @@ impl Gen {
         };
         self.prelim_c.insert(k, v);
         self.prelim_ord.push_back(k);
-        if self.prelim_ord.len() > 8192 {
+        if self.prelim_ord.len() > 32768 {
             let old = self.prelim_ord.pop_front().unwrap();
             self.prelim_c.remove(&old);
         }
@@ -5941,8 +6309,10 @@ impl Gen {
             }
             Cond::NoiseTh { ni, is3d, lo, hi } => {
                 if !is3d {
-                    if let Some(&b) = c.nt.get(&cid) {
-                        return b;
+                    if let Some(&v) = c.nt.get(cid) {
+                        if v != 0 {
+                            return v == 2;
+                        }
                     }
                 }
                 let v = if is3d {
@@ -5952,16 +6322,19 @@ impl Gen {
                 };
                 let ok = v >= lo && v <= hi;
                 if !is3d {
-                    c.nt.insert(cid, ok);
+                    if c.nt.len() <= cid {
+                        c.nt.resize(self.conds.len(), 0);
+                    }
+                    c.nt[cid] = if ok { 2 } else { 1 };
                 }
                 ok
             }
             Cond::VGrad {
                 legacy_seed,
-                lo_w,
-                hi_w,
+                sp,
                 t,
                 f,
+                ..
             } => {
                 let top = self.min_y + self.height - 1;
                 let ta = t.get(self.min_y, top);
@@ -5972,14 +6345,11 @@ impl Gen {
                 if c.y >= fa {
                     return false;
                 }
-                let mut xr = Xor::raw(lo_w ^ self.factory.lo, hi_w ^ self.factory.hi);
-                let sp = xr.splitter();
-                let mut r = sp.pos(c.x, c.y, c.z);
                 let m = (c.y as f32 - ta as f32) / (fa as f32 - ta as f32) * (0.0 - 1.0) + 1.0;
                 if self.legacy_random_source {
                     Lcg::new(legacy_seed ^ hash_block_pos(c.x, c.y, c.z) as u64).next_f32() < m
                 } else {
-                    r.next_f32() < m
+                    sp.pos(c.x, c.y, c.z).next_f32() < m
                 }
             }
             Cond::YAbove { a, mult, sd } => {
@@ -6142,6 +6512,8 @@ pub(crate) struct SurfaceMats {
 /// materials exactly once across threads.
 struct SurfMatsCell {
     cell: std::sync::OnceLock<SurfaceMats>,
+    base_surf: [std::sync::atomic::AtomicI16; 256],
+    base_wtop: [std::sync::atomic::AtomicI16; 256],
     cx: i32,
     cz: i32,
 }
@@ -6150,6 +6522,8 @@ impl SurfMatsCell {
     fn new(cx: i32, cz: i32) -> Self {
         Self {
             cell: std::sync::OnceLock::new(),
+            base_surf: std::array::from_fn(|_| std::sync::atomic::AtomicI16::new(i16::MIN)),
+            base_wtop: std::array::from_fn(|_| std::sync::atomic::AtomicI16::new(i16::MIN)),
             cx,
             cz,
         }
@@ -7274,6 +7648,7 @@ impl Gen {
             aq_chunk: std::array::from_fn(|_| None),
             aq_chunk_use: [0; AQ_CHUNK_SLOTS],
             aq_chunk_tick: 0,
+            aq_cell12: AqCell12::empty(),
             prelim_c: HashMap::new(),
             chunk_biomes: HashMap::new(),
             chunk_biomes_ord: std::collections::VecDeque::new(),
@@ -7282,6 +7657,12 @@ impl Gen {
             clim_ord: std::collections::VecDeque::new(),
             bioq: HashMap::new(),
             bioq_ord: std::collections::VecDeque::new(),
+            bioq_none: HashMap::new(),
+            bioq_none_ord: std::collections::VecDeque::new(),
+            base_hm_c: HashMap::new(),
+            base_hm_cc: None,
+            base_hm_memos: None,
+            base_col_lazy: None,
             col_c: HashMap::new(),
             col_ord: std::collections::VecDeque::new(),
             starts_round: None,
@@ -7334,7 +7715,7 @@ impl Gen {
                 continue;
             }
             self.col_ord.push_back((cx, cz));
-            if self.col_ord.len() > 128 {
+            if self.col_ord.len() > COL_CACHE_CAP {
                 let old = self.col_ord.pop_front().unwrap();
                 self.col_c.remove(&old);
             }
@@ -7374,6 +7755,46 @@ impl Gen {
         self.beard_resolver
     }
 
+    fn aq_section_all_air(&mut self, cx: i32, sy: i32, cz: i32) -> bool {
+        if self.aq.is_none() {
+            return sy >= self.sea && sy >= -54;
+        }
+        if sy < self.sea || sy < -53 {
+            return false;
+        }
+        let slot = self.aq_chunk_slot(cx, cz);
+        let min_gx = lxz(cx * 16 - 5);
+        let max_gx = lxz(cx * 16 + 15 - 5) + 1;
+        let min_gz = lxz(cz * 16 - 5);
+        let max_gz = lxz(cz * 16 + 15 - 5) + 1;
+        let min_gy = ly12(sy + 1) - 1;
+        let max_gy = ly12(sy + 16) + 1;
+        if !(self.aq_cache(slot).contains(min_gx, min_gy, min_gz)
+            && self.aq_cache(slot).contains(max_gx, max_gy, max_gz))
+        {
+            return false;
+        }
+        let mut common: Option<(i32, u8)> = None;
+        for gy in min_gy..=max_gy {
+            for gz in min_gz..=max_gz {
+                for gx in min_gx..=max_gx {
+                    let idx = self.aq_cache(slot).idx(gx, gy, gz);
+                    let _ = self.aq_cell_rpos(slot, idx, gx, gy, gz);
+                    let lvl = self.aq_cell_level(slot, idx, false);
+                    if sy < lvl.0 {
+                        return false;
+                    }
+                    match common {
+                        None => common = Some(lvl),
+                        Some(prev) if prev == lvl => {}
+                        Some(_) => return false,
+                    }
+                }
+            }
+        }
+        common.is_some()
+    }
+
     /// Base (feature-free) rows for one section: the terrain half of `block_state_at`,
     /// with the columns already fetched.
     fn base_section_rows(
@@ -7389,6 +7810,24 @@ impl Gen {
         // caller marked (`m3_set_worker`), not by looking at the generator.
         m3_inc_split(M3_OWNER_SECTIONS, M3_WORKER_SECTIONS);
         let t0 = m3_start();
+        let ly_top = self.min_y + self.height;
+        if sy + 15 < self.min_y || sy >= ly_top {
+            m3_elapsed(M3_FILL_NS, M3_FILL_N, t0);
+            return Vec::new();
+        }
+        if !aq_trace_enabled() && sy >= self.min_y && sy + 16 <= ly_top {
+            let max_surf = cc
+                .surf
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or((self.min_y - 1) as i16) as i32;
+            if sy > max_surf && self.aq_section_all_air(cx, sy, cz) {
+                self.aq_sched = false;
+                m3_elapsed(M3_FILL_NS, M3_FILL_N, t0);
+                return Vec::new();
+            }
+        }
         let mut marks: Vec<(u8, i32, i32, i32)> = Vec::new();
         // M3 P4 / A2-c: the section's densities are asked for eight columns at a time
         // (`Gen::block_density_x8`, falling back to two `x4` calls where the 8-lane arm
@@ -7396,35 +7835,30 @@ impl Gen {
         // `ly`, `lz`, `lx`. Only the density call is batched, and the values are the
         // individual `block_density` values bit for bit, so the order the aquifer, the
         // material rules and the deep rules see is the order they saw before.
-        let ly_top = self.min_y + self.height;
         for ly in 0..16i32 {
             let y = sy + ly;
+            if y < self.min_y || y >= ly_top {
+                continue;
+            }
             for lz in 0..16i32 {
                 let z = cz * 16 + lz;
-                // A cell outside the generator's window is air and asks no density
-                // (`terrain_cell_marked`'s first rule).
-                let in_window = y >= self.min_y && y < ly_top;
                 let mut lx = 0i32;
                 while lx < 16 {
                     let x = cx * 16 + lx;
-                    let d = if in_window {
-                        Some(self.block_density_x8(cc, x, y, z))
-                    } else {
-                        None
-                    };
+                    let d = self.block_density_x8(cc, x, y, z);
                     for k in 0..DF8 {
-                        let (state, marked) = match d {
-                            Some(d) => self.terrain_cell_density(cc, x + k as i32, y, z, d[k]),
-                            None => (0, 0),
-                        };
+                        let (state, marked) =
+                            self.terrain_cell_density(cc, x + k as i32, y, z, d[k]);
                         let lx = lx + k as i32;
                         arr[((ly << 8) | (lz << 4) | lx) as usize] = state;
                         // One entry per writer: vanilla preserves duplicates, and a cell the
                         // fill marked and the surface then rewrote with another fluid is
                         // visited twice by `postProcessGeneration`.
-                        for bit in [MARK_FILL, MARK_SURFACE] {
-                            if marked & bit != 0 {
-                                marks.push((bit, x + k as i32, y, z));
+                        if marked != 0 {
+                            for bit in [MARK_FILL, MARK_SURFACE] {
+                                if marked & bit != 0 {
+                                    marks.push((bit, x + k as i32, y, z));
+                                }
                             }
                         }
                     }
@@ -7657,7 +8091,7 @@ impl Gen {
             return Some(v.clone());
         }
         self.beard_ord.push_back((cx, cz));
-        if self.beard_ord.len() > 128 {
+        if self.beard_ord.len() > BEARD_CACHE_CAP {
             if let Some(old) = self.beard_ord.pop_front() {
                 self.beard_c.remove(&old);
             }
@@ -7692,9 +8126,16 @@ impl Gen {
         Some(std::sync::Arc::new(data))
     }
 
-    /// This generator's round-scoped terrain share, if it belongs to a round that opened one.
+    /// This generator's round-scoped terrain share, or the per-world fallback share when no
+    /// explicit round is open (and `WG_COUNT` is off).
     fn round_share(&self) -> Option<std::sync::Arc<TerrainShare>> {
-        self.starts_round.and_then(terrain_share)
+        if let Some(round) = self.starts_round {
+            terrain_share(round)
+        } else if !wg_count() {
+            Some(self.data.fallback_share.clone())
+        } else {
+            None
+        }
     }
 
     /// The share key for one chunk. Two things beyond the chunk's identity change what a
@@ -7750,7 +8191,7 @@ impl Gen {
         // final columns need the structure data this build could not ask for.
         if self.beard_depth == 0 {
             self.col_ord.push_back((cx, cz));
-            if self.col_ord.len() > 128 {
+            if self.col_ord.len() > COL_CACHE_CAP {
                 let old = self.col_ord.pop_front().unwrap();
                 self.col_c.remove(&old);
             }
@@ -7795,7 +8236,7 @@ impl Gen {
             None => self.build_cols(cx, cz, false).map(std::sync::Arc::new),
         }?;
         self.base_ord.push_back((cx, cz));
-        if self.base_ord.len() > 64 {
+        if self.base_ord.len() > BASE_CACHE_CAP {
             if let Some(old) = self.base_ord.pop_front() {
                 self.base_c.remove(&old);
             }
@@ -7814,8 +8255,232 @@ impl Gen {
         if y < self.min_y || y >= self.min_y + self.height {
             return None;
         }
-        let cc = self.base_cols(x >> 4, z >> 4)?;
+        let cx = x >> 4;
+        let cz = z >> 4;
+        if let Some(cc) = self.base_c.get(&(cx, cz)).cloned() {
+            let d = self.block_density(&cc, x, y, z);
+            if d > 0.0 {
+                return Some(self.def_st);
+            }
+            return Some(self.aq_state(x, y, z, d).unwrap_or(self.def_st));
+        }
+        if let Some(st) = self.base_column_state_lazy(x, y, z) {
+            return Some(st);
+        }
+        let cc = self.base_cols(cx, cz)?;
         let d = self.block_density(&cc, x, y, z);
+        if d > 0.0 {
+            return Some(self.def_st);
+        }
+        Some(self.aq_state(x, y, z, d).unwrap_or(self.def_st))
+    }
+
+    fn base_column_state_lazy(&mut self, x: i32, y: i32, z: i32) -> Option<u32> {
+        if wg_count() || self.dfprog.is_none() || self.noise_cell_w <= 0 || self.noise_cell_h <= 0
+        {
+            return None;
+        }
+        let ub_slot = self.upper_bound_interp?;
+        let ub_inner = match self.dfs[ub_slot] {
+            DF::Interp(inner) => inner,
+            _ => return None,
+        };
+        let cell_w = self.noise_cell_w;
+        let cell_h = self.noise_cell_h;
+        let min_y = self.min_y;
+        let nx = (16 / cell_w + 1) as usize;
+        let ny = ((self.height / cell_h) + 1) as usize;
+        if nx < 2 || ny < 2 {
+            return None;
+        }
+        let dfs_len = self.dfs.len();
+        let grid_len = nx * nx * ny;
+        let mut lazy = self.base_col_lazy.take().unwrap_or_else(|| {
+            let mut grids: Vec<Option<Box<[f64]>>> = (0..dfs_len).map(|_| None).collect();
+            for &(iid, _) in &self.density_interp_nodes {
+                grids[iid] = Some(vec![0.0; grid_len].into_boxed_slice());
+            }
+            Box::new(BaseColLazy {
+                xz: (i32::MAX, i32::MAX),
+                cc: ChunkCols {
+                    grids,
+                    surf: [0i16; 256],
+                    ny,
+                    cell_w,
+                    cell_h,
+                    min_y,
+                    mats: SurfMatsCell::new(0, 0),
+                    rd: [0i16; 256],
+                    wtop: [0i16; 256],
+                    beard: None,
+                },
+                memos: Box::new(std::array::from_fn(|_| FlatCornerMemo::new(dfs_len))),
+                ub_filled: vec![false; ny],
+                other_filled: vec![false; ny],
+                corners: [(0, 0, 0, 0); 4],
+                n_corners: 0,
+                xi: 0,
+                zi: 0,
+                fx_zero: false,
+                fz_zero: false,
+            })
+        });
+
+        if lazy.xz != (x, z) {
+            let cx = x >> 4;
+            let cz = z >> 4;
+            let lx = x & 15;
+            let lz = z & 15;
+            let xi = ((lx / cell_w) as usize).min(nx - 2);
+            let zi = ((lz / cell_w) as usize).min(nx - 2);
+            let fx_zero = lx == (xi as i32) * cell_w;
+            let fz_zero = lz == (zi as i32) * cell_w;
+            let mut n_corners = 0usize;
+            let z_end = if fz_zero { 0 } else { 1 };
+            let x_end = if fx_zero { 0 } else { 1 };
+            for dzi in 0..=z_end {
+                let bz = cz * 16 + ((zi + dzi) as i32) * cell_w;
+                for dxi in 0..=x_end {
+                    let bx = cx * 16 + ((xi + dxi) as i32) * cell_w;
+                    lazy.corners[n_corners] = (dxi, dzi, bx, bz);
+                    n_corners += 1;
+                }
+            }
+            lazy.xz = (x, z);
+            lazy.xi = xi;
+            lazy.zi = zi;
+            lazy.fx_zero = fx_zero;
+            lazy.fz_zero = fz_zero;
+            lazy.n_corners = n_corners;
+            lazy.ub_filled.fill(false);
+            lazy.other_filled.fill(false);
+            for memo in lazy.memos.iter_mut().take(n_corners) {
+                memo.next_2d();
+            }
+        }
+
+        let yi = (((y - min_y) as f64 / f64::from(cell_h))
+            .floor()
+            .min((ny - 2) as f64)) as usize;
+        let xi = lazy.xi;
+        let zi = lazy.zi;
+        let fx_zero = lazy.fx_zero;
+        let fz_zero = lazy.fz_zero;
+        let n_corners = lazy.n_corners;
+
+        let write_corner = |cells: &mut [f64], dxi: usize, dzi: usize, lvl: usize, v: f64| {
+            let set = |cells: &mut [f64], cxi: usize, czi: usize| {
+                cells[(czi * nx + cxi) * ny + lvl] = v;
+            };
+            set(cells, xi + dxi, zi + dzi);
+            if fx_zero {
+                set(cells, xi + 1, zi + dzi);
+            }
+            if fz_zero {
+                set(cells, xi + dxi, zi + 1);
+                if fx_zero {
+                    set(cells, xi + 1, zi + 1);
+                }
+            }
+        };
+
+        // Ensure `ub_slot` is evaluated at `yi` and `yi + 1`.
+        for lvl in [yi, yi + 1] {
+            if !lazy.ub_filled[lvl] {
+                lazy.ub_filled[lvl] = true;
+                let by = min_y + (lvl as i32) * cell_h;
+                let ub_cells = lazy.cc.grids[ub_slot].as_mut().unwrap();
+                for c in 0..n_corners {
+                    let (dxi, dzi, bx, bz) = lazy.corners[c];
+                    lazy.memos[c].next_3d();
+                    let v = self.eval_flat(ub_inner, bx, by, bz, &mut lazy.memos[c]);
+                    write_corner(ub_cells, dxi, dzi, lvl, v);
+                }
+            }
+        }
+
+        // Check if all active corners of `ub_slot` at [yi, yi+1] are <= 0.0.
+        let mut any_pos = false;
+        {
+            let ub_cells = lazy.cc.grids[ub_slot].as_deref().unwrap();
+            for c in 0..n_corners {
+                let (dxi, dzi, _, _) = lazy.corners[c];
+                let base = ((zi + dzi) * nx + (xi + dxi)) * ny + yi;
+                if ub_cells[base] > 0.0 || ub_cells[base + 1] > 0.0 {
+                    any_pos = true;
+                    break;
+                }
+            }
+        }
+
+        if !any_pos {
+            if let Some(aq_res) = self.aq_state_if_nonpos_independent(x, y, z) {
+                self.base_col_lazy = Some(lazy);
+                return Some(aq_res.unwrap_or(self.def_st));
+            }
+        }
+
+        // Need exact `block_density`: fill any remaining density interp grids at [yi, yi+1].
+        for lvl in [yi, yi + 1] {
+            if !lazy.other_filled[lvl] {
+                lazy.other_filled[lvl] = true;
+                let by_lvl = min_y + (lvl as i32) * cell_h;
+                for &(iid, kind) in &self.density_interp_nodes {
+                    if iid == ub_slot {
+                        continue;
+                    }
+                    let cells = lazy.cc.grids[iid].as_mut().unwrap();
+                    match kind {
+                        InterpKind::YNoise {
+                            y_grad,
+                            ni,
+                            xzs,
+                            ys,
+                            mul,
+                            add,
+                        } => {
+                            let out = y_grad.and_then(|(fc, fv, tc, tv, mi, ma, ov)| {
+                                let t = ((by_lvl as f64) - fc) / (tc - fc);
+                                let gv = fv + t.clamp(0.0, 1.0) * (tv - fv);
+                                if gv >= mi && gv < ma { None } else { Some(ov) }
+                            });
+                            for c in 0..n_corners {
+                                let (dxi, dzi, bx, bz) = lazy.corners[c];
+                                let v = match out {
+                                    Some(ov) => ov,
+                                    None => {
+                                        let mut nv = self.noises[ni].get_uncached(
+                                            bx as f64 * xzs,
+                                            by_lvl as f64 * ys,
+                                            bz as f64 * xzs,
+                                        );
+                                        if let Some((mc, left)) = mul {
+                                            nv = if left { mc * nv } else { nv * mc };
+                                        }
+                                        if let Some((ac, left)) = add {
+                                            nv = if left { ac + nv } else { nv + ac };
+                                        }
+                                        nv
+                                    }
+                                };
+                                write_corner(cells, dxi, dzi, lvl, v);
+                            }
+                        }
+                        InterpKind::General(inner) => {
+                            for c in 0..n_corners {
+                                let (dxi, dzi, bx, bz) = lazy.corners[c];
+                                lazy.memos[c].next_3d();
+                                let v = self.eval_flat(inner, bx, by_lvl, bz, &mut lazy.memos[c]);
+                                write_corner(cells, dxi, dzi, lvl, v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let d = self.block_density(&lazy.cc, x, y, z);
+        self.base_col_lazy = Some(lazy);
         if d > 0.0 {
             return Some(self.def_st);
         }
@@ -7840,18 +8505,191 @@ impl Gen {
             .unwrap_or_else(|| FlatCornerMemo::new(self.dfs.len()))
     }
 
+    fn fill_ynoise_grid(
+        &self,
+        cells: &mut [f64],
+        cx: i32,
+        cz: i32,
+        nx: usize,
+        ny: usize,
+        kind: InterpKind,
+    ) {
+        let InterpKind::YNoise {
+            y_grad,
+            ni,
+            xzs,
+            ys,
+            mul,
+            add,
+        } = kind
+        else {
+            return;
+        };
+        let noise = &self.noises[ni];
+        let mut active_yi: Vec<usize> = Vec::with_capacity(ny);
+        let mut active_y: Vec<f64> = Vec::with_capacity(ny);
+        let mut out_val = 0.0;
+        let has_range = y_grad.is_some();
+        if let Some((fc, fv, tc, tv, mi, ma, ov)) = y_grad {
+            out_val = ov;
+            let inv = tc - fc;
+            for yi in 0..ny {
+                let by = self.min_y + (yi as i32) * self.noise_cell_h;
+                let t = ((by as f64) - fc) / inv;
+                let v = fv + t.clamp(0.0, 1.0) * (tv - fv);
+                if v >= mi && v < ma {
+                    active_yi.push(yi);
+                    active_y.push((by as f64) * ys);
+                }
+            }
+        } else {
+            for yi in 0..ny {
+                let by = self.min_y + (yi as i32) * self.noise_cell_h;
+                active_yi.push(yi);
+                active_y.push((by as f64) * ys);
+            }
+        }
+        if has_range && active_yi.len() < ny {
+            cells.fill(out_val);
+        }
+        if active_yi.is_empty() {
+            return;
+        }
+        let apply = |mut v: f64| -> f64 {
+            if let Some((c, left)) = mul {
+                v = if left { c * v } else { v * c };
+            }
+            if let Some((c, left)) = add {
+                v = if left { c + v } else { v + c };
+            }
+            v
+        };
+        let n_act = active_yi.len();
+        for zi in 0..nx {
+            let bz = (cz * 16 + (zi as i32) * self.noise_cell_w) as f64 * xzs;
+            let vz8 = [bz; 8];
+            let vz4 = [bz; 4];
+            for xi in 0..nx {
+                let bx = (cx * 16 + (xi as i32) * self.noise_cell_w) as f64 * xzs;
+                let vx8 = [bx; 8];
+                let vx4 = [bx; 4];
+                let col_base = (zi * nx + xi) * ny;
+                let mut i = 0usize;
+                while i + 8 <= n_act {
+                    let vy8 = [
+                        active_y[i],
+                        active_y[i + 1],
+                        active_y[i + 2],
+                        active_y[i + 3],
+                        active_y[i + 4],
+                        active_y[i + 5],
+                        active_y[i + 6],
+                        active_y[i + 7],
+                    ];
+                    let nv = noise.eval_x8_uncached(vx8, vy8, vz8);
+                    for k in 0..8 {
+                        cells[col_base + active_yi[i + k]] = apply(nv[k]);
+                    }
+                    i += 8;
+                }
+                while i + 4 <= n_act {
+                    let vy4 = [
+                        active_y[i],
+                        active_y[i + 1],
+                        active_y[i + 2],
+                        active_y[i + 3],
+                    ];
+                    let nv = noise.eval_x4_uncached(vx4, vy4, vz4);
+                    for k in 0..4 {
+                        cells[col_base + active_yi[i + k]] = apply(nv[k]);
+                    }
+                    i += 4;
+                }
+                while i < n_act {
+                    let nv = noise.get_uncached(bx, active_y[i], bz);
+                    cells[col_base + active_yi[i]] = apply(nv);
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    fn upper_bound_start_y(
+        &self,
+        cc: &ChunkCols,
+        lx_start: usize,
+        lx_end_excl: usize,
+        lz: usize,
+        beard_top: i32,
+        top: i32,
+    ) -> i32 {
+        let Some(slot) = self.upper_bound_interp else {
+            return top;
+        };
+        let Some(cells) = cc.grids.get(slot).and_then(|g| g.as_deref()) else {
+            return top;
+        };
+        let cell_w = cc.cell_w as usize;
+        let cell_h = cc.cell_h;
+        let nx = 16 / cell_w + 1;
+        let ny = cc.ny;
+        if ny < 2 {
+            return top;
+        }
+        let xi_lo = (lx_start / cell_w).min(nx - 2);
+        let xi_hi = ((lx_end_excl - 1) / cell_w).min(nx - 2);
+        let zi = (lz / cell_w).min(nx - 2);
+        let mut yi = ny - 2;
+        loop {
+            let cell_lo_y = cc.min_y + (yi as i32) * cell_h;
+            if cell_lo_y <= beard_top {
+                return (cell_lo_y + cell_h - 1).min(top);
+            }
+            let mut any_pos = false;
+            'corners: for dz in 0..=1 {
+                let z_base = (zi + dz) * nx;
+                for xi in xi_lo..=(xi_hi + 1) {
+                    let base = (z_base + xi) * ny + yi;
+                    if cells[base] > 0.0 || cells[base + 1] > 0.0 {
+                        any_pos = true;
+                        break 'corners;
+                    }
+                }
+            }
+            if any_pos {
+                return (cell_lo_y + cell_h - 1).min(top);
+            }
+            if yi == 0 {
+                return cc.min_y - 1;
+            }
+            yi -= 1;
+        }
+    }
+
     fn build_cols_body(&mut self, cx: i32, cz: i32, final_columns: bool) -> Option<ChunkCols> {
         let g = self;
         let ny = ((g.height / g.noise_cell_h) + 1) as usize;
         let nx = (16 / g.noise_cell_w + 1) as usize;
+        // Resolve the chunk's beardifier before `surf`, `wtop` and `mats`: vanilla's
+        // `fillFromNoise` evaluates `final_density` with `Beardifier` active and only
+        // then calls `SurfaceSystem.buildSurface`. `preliminarySurfaceLevel` is the
+        // unsmoothed estimate and is not affected; a nested heightmap query during
+        // resolution runs with `beard_depth > 0`, gets `None` here, and is therefore
+        // excluded from `col_c` (see the cache rule at the end of this function).
+        let beard = if final_columns && !wg_count() {
+            g.resolve_beard(cx, cz)
+        } else {
+            None
+        };
         // One corner grid per `interpolated` node on the final_density path. The
         // grid holds the node's input; the enclosing operators are evaluated per
         // block in block_density(). Interpolating final_density itself would
         // interpolate squeeze(), which is cubic and not vanilla.
-        let mut grids: Vec<Option<Box<[f64]>>> = (0..g.dfs.len()).map(|_| None).collect();
+        let mut grids: Vec<Option<Box<[f64]>>>;
         // `WG_COUNT` counts visits through `eval_c`, so keep the original HashMap path
         // when diagnostics are on; the flat path has no per-visit counter to update.
         if wg_count() {
+            grids = (0..g.dfs.len()).map(|_| None).collect();
             let mut memo: HashMap<(usize, i32, i32, i32), f64> = HashMap::new();
             for &(iid, inner) in &g.interp_nodes {
                 let mut cells = vec![0.0f64; nx * nx * ny];
@@ -7868,41 +8706,103 @@ impl Gen {
                 grids[iid] = Some(cells.into_boxed_slice());
             }
         } else {
-            // Flip the loops so both the 2D and the 3D memo are shared: `val_2d` across
-            // all `ny` levels, and both memos across every interpolated node at the
-            // same corner. Zero HashMap allocations, one generation bump per (x,z) and
-            // one per (x,y,z).
-            let mut flat = g.take_corner_memo();
-            for &(iid, _) in &g.interp_nodes {
-                grids[iid] = Some(vec![0.0; nx * nx * ny].into_boxed_slice());
-            }
-            for zi in 0..nx {
-                for xi in 0..nx {
-                    flat.next_2d();
-                    let bx = cx * 16 + (xi as i32) * g.noise_cell_w;
-                    let bz = cz * 16 + (zi as i32) * g.noise_cell_w;
-                    for yi in 0..ny {
-                        flat.next_3d();
-                        let by = g.min_y + (yi as i32) * g.noise_cell_h;
-                        for &(iid, inner) in &g.interp_nodes {
-                            grids[iid].as_mut().unwrap()[(zi * nx + xi) * ny + yi] =
-                                g.eval_flat(inner, bx, by, bz, &mut flat);
+            let mut reused = g
+                .base_c
+                .get(&(cx, cz))
+                .or_else(|| g.col_c.get(&(cx, cz)))
+                .map(|c| c.grids.clone())
+                .or_else(|| {
+                    let share = g.round_share()?;
+                    let key = g.terrain_share_key(cx, cz);
+                    share
+                        .bases
+                        .peek(&key)
+                        .flatten()
+                        .or_else(|| share.cols.peek(&key).flatten())
+                        .map(|c| c.grids.clone())
+                });
+            let have_density = reused.is_some();
+            grids = reused
+                .take()
+                .unwrap_or_else(|| (0..g.dfs.len()).map(|_| None).collect());
+            if !have_density {
+                let mut general: Vec<(usize, usize)> = Vec::new();
+                for &(iid, kind) in &g.density_interp_nodes {
+                    match kind {
+                        InterpKind::General(inner) => {
+                            grids[iid] = Some(vec![0.0; nx * nx * ny].into_boxed_slice());
+                            general.push((iid, inner));
+                        }
+                        InterpKind::YNoise { .. } => {
+                            let mut cells = vec![0.0; nx * nx * ny].into_boxed_slice();
+                            g.fill_ynoise_grid(&mut cells, cx, cz, nx, ny, kind);
+                            grids[iid] = Some(cells);
                         }
                     }
                 }
+                if !general.is_empty() {
+                    let mut flat = g.take_corner_memo();
+                    for zi in 0..nx {
+                        for xi in 0..nx {
+                            flat.next_2d();
+                            let bx = cx * 16 + (xi as i32) * g.noise_cell_w;
+                            let bz = cz * 16 + (zi as i32) * g.noise_cell_w;
+                            for yi in 0..ny {
+                                flat.next_3d();
+                                let by = g.min_y + (yi as i32) * g.noise_cell_h;
+                                for &(iid, inner) in &general {
+                                    grids[iid].as_mut().unwrap()[(zi * nx + xi) * ny + yi] =
+                                        g.eval_flat(inner, bx, by, bz, &mut flat);
+                                }
+                            }
+                        }
+                    }
+                    g.corner_memo = Some(flat);
+                }
             }
-            g.corner_memo = Some(flat);
+            if final_columns && !g.vein_interp_nodes.is_empty() {
+                let mut general_vein: Vec<(usize, usize)> = Vec::new();
+                for &(iid, kind) in &g.vein_interp_nodes {
+                    if grids[iid].is_some() {
+                        continue;
+                    }
+                    match kind {
+                        InterpKind::General(inner) => {
+                            grids[iid] = Some(vec![0.0; nx * nx * ny].into_boxed_slice());
+                            general_vein.push((iid, inner));
+                        }
+                        InterpKind::YNoise { .. } => {
+                            let mut cells = vec![0.0; nx * nx * ny].into_boxed_slice();
+                            g.fill_ynoise_grid(&mut cells, cx, cz, nx, ny, kind);
+                            grids[iid] = Some(cells);
+                        }
+                    }
+                }
+                if !general_vein.is_empty() {
+                    let mut flat = g.take_corner_memo();
+                    for zi in 0..nx {
+                        for xi in 0..nx {
+                            flat.next_2d();
+                            let bx = cx * 16 + (xi as i32) * g.noise_cell_w;
+                            let bz = cz * 16 + (zi as i32) * g.noise_cell_w;
+                            for yi in 0..ny {
+                                flat.next_3d();
+                                let by = g.min_y + (yi as i32) * g.noise_cell_h;
+                                for &(iid, inner) in &general_vein {
+                                    grids[iid].as_mut().unwrap()[(zi * nx + xi) * ny + yi] =
+                                        g.eval_flat(inner, bx, by, bz, &mut flat);
+                                }
+                            }
+                        }
+                    }
+                    g.corner_memo = Some(flat);
+                }
+            }
         }
-        // Resolve the chunk's beardifier before `surf`, `wtop` and `mats`: vanilla's
-        // `fillFromNoise` evaluates `final_density` with `Beardifier` active and only
-        // then calls `SurfaceSystem.buildSurface`. `preliminarySurfaceLevel` is the
-        // unsmoothed estimate and is not affected; a nested heightmap query during
-        // resolution runs with `beard_depth > 0`, gets `None` here, and is therefore
-        // excluded from `col_c` (see the cache rule at the end of this function).
-        let beard = if final_columns {
+        let beard = if final_columns && wg_count() {
             g.resolve_beard(cx, cz)
         } else {
-            None
+            beard
         };
         let mut cc = ChunkCols {
             grids,
@@ -7923,6 +8823,7 @@ impl Gen {
             return Some(cc);
         }
         let top = g.min_y + g.height - 1;
+        let beard_top = beard_max_y(cc.beard.as_deref());
         // M3 P4 / A2-c: eight columns of one `z` row per pass. Each lane keeps its own answer
         // - the first `y` from the top whose density is positive - so the searches share the
         // pass and the step down, and the lanes that have already found their surface are
@@ -7936,7 +8837,7 @@ impl Gen {
                 let wx = cx * 16 + xb as i32;
                 let mut sy = [g.min_y - 1; DF8];
                 let mut live = DF8;
-                let mut yy = top;
+                let mut yy = g.upper_bound_start_y(&cc, xb, xb + DF8, zi, beard_top, top);
                 while yy >= g.min_y && live > 0 {
                     let d = g.block_density_x8(&cc, wx, yy, wz);
                     for (k, lane) in d.iter().enumerate() {
@@ -7995,6 +8896,18 @@ impl Gen {
         let mut rd = [0i16; 256];
         if let Some(root) = g.surface_rule {
             let mut c = SC::new();
+            c.nt.resize(g.conds.len(), 0);
+            let is_nether = g.preset == NoisePreset::Nether;
+            let (h00, h10, h01, h11) = if is_nether {
+                (0.0, 0.0, 0.0, 0.0)
+            } else {
+                (
+                    g.prelim_est(cx * 16, cz * 16) as f64,
+                    g.prelim_est(cx * 16 + 16, cz * 16) as f64,
+                    g.prelim_est(cx * 16, cz * 16 + 16) as f64,
+                    g.prelim_est(cx * 16 + 16, cz * 16 + 16) as f64,
+                )
+            };
             // Batch the densities in row order; the columns are still walked one
             // at a time, in the order they were walked before, so the aquifer, the surface
             // predicates and the per-column caches see exactly the sequence they saw.
@@ -8002,48 +8915,72 @@ impl Gen {
             // A2-a: one reusable buffer for the 256 per-column surface-cell scans; the
             // previous `collect()` allocated a fresh Vec for every column.
             let mut cells: Vec<SurfaceCell> = Vec::new();
+            let mut rds = [0i32; DF8];
+            let mut est_mins = [0i32; DF8];
+            let mut scan_tops = [0i32; DF8];
             for lz in 0..16usize {
                 let z = cz * 16 + lz as i32;
+                let fz = lz as f64 / 16.0;
                 let mut xb = 0usize;
                 while xb < 16 {
-                    let mut span = 0i32;
-                    for k in 0..DF8 {
-                        let lx = xb + k;
-                        let scan_top = (cc.surf[lz * 16 + lx] as i32).max(g.sea);
-                        span = span.max(scan_top - g.min_y + 1);
-                    }
-                    let span = span.max(0) as usize;
-                    dbuf.clear();
-                    let gx = cx * 16 + xb as i32;
-                    dbuf.extend((0..span).map(|yi| {
-                        let y = g.min_y + yi as i32;
-                        g.block_density_x8(cc, gx, y, z)
-                    }));
+                    let mut min_lo = i32::MAX;
+                    let mut max_top = i32::MIN;
                     for k in 0..DF8 {
                         let lx = xb + k;
                         let x = cx * 16 + lx as i32;
-                        let surf_y = cc.surf[lz * 16 + lx] as i32;
-                        let scan_top = surf_y.max(g.sea);
-                        c.x = x;
-                        c.z = z;
-                        c.run_depth = g.run_depth(x, z);
-                        c.sec_ok = false;
-                        c.steep = None;
-                        c.nt.clear();
-                        rd[lz * 16 + lx] = c.run_depth as i16;
-                        // Nether surface rules decorate every cave floor/ceiling;
-                        // they have no above_preliminary_surface guard.
-                        let est_min = if g.preset == NoisePreset::Nether {
+                        let rdv = g.run_depth(x, z);
+                        rds[k] = rdv;
+                        rd[lz * 16 + lx] = rdv as i16;
+                        let scan_top = (cc.surf[lz * 16 + lx] as i32).max(g.sea);
+                        scan_tops[k] = scan_top;
+                        let est_min = if is_nether {
                             g.min_y
                         } else {
-                            g.prelim_min(x, z)
+                            let est = lerp2(lx as f64 / 16.0, fz, h00, h10, h01, h11).floor() as i32;
+                            est.wrapping_add(rdv).wrapping_sub(8)
                         };
-                        c.est_min = est_min;
-                        cells.clear();
-                        cells.extend((g.min_y..=scan_top).map(|y| {
-                            g.surface_cell_density(dbuf[(y - g.min_y) as usize][k], x, y, z)
+                        est_mins[k] = est_min;
+                        if scan_top >= est_min {
+                            let lo = est_min.max(g.min_y);
+                            if lo < min_lo {
+                                min_lo = lo;
+                            }
+                            if scan_top > max_top {
+                                max_top = scan_top;
+                            }
+                        }
+                    }
+                    dbuf.clear();
+                    if min_lo <= max_top {
+                        let gx = cx * 16 + xb as i32;
+                        let span = (max_top - min_lo + 1) as usize;
+                        dbuf.extend((0..span).map(|yi| {
+                            let y = min_lo + yi as i32;
+                            g.block_density_x8(cc, gx, y, z)
                         }));
-                        let column = g.scan_surface_column(root, &mut c, est_min, &cells, &cc.wtop);
+                    }
+                    for k in 0..DF8 {
+                        let lx = xb + k;
+                        let x = cx * 16 + lx as i32;
+                        let scan_top = scan_tops[k];
+                        let est_min = est_mins[k];
+                        if scan_top < est_min {
+                            continue;
+                        }
+                        c.x = x;
+                        c.z = z;
+                        c.run_depth = rds[k];
+                        c.sec_ok = false;
+                        c.steep = None;
+                        c.clear_nt();
+                        c.est_min = est_min;
+                        let lo = est_min.max(g.min_y);
+                        cells.clear();
+                        cells.extend((lo..=scan_top).map(|y| {
+                            g.surface_cell_density(dbuf[(y - min_lo) as usize][k], x, y, z)
+                        }));
+                        let column =
+                            g.scan_surface_column_lazy(cc, root, &mut c, est_min, lo, &cells, &cc.wtop);
                         mats[lz * 16 + lx] = column;
                     }
                     xb += DF8;
@@ -8068,9 +9005,91 @@ impl Gen {
         classify_surface_cell(d, aq, air, fluid)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn scan_surface_column_lazy(
+        &mut self,
+        cc: &ChunkCols,
+        root: usize,
+        c: &mut SC,
+        est_min: i32,
+        lo: i32,
+        cells_above: &[SurfaceCell],
+        heightmap: &[i16; 256],
+    ) -> Option<SurfMat> {
+        let min_y = self.min_y;
+        let scan_top = lo + cells_above.len() as i32 - 1;
+        if scan_top < est_min {
+            return None;
+        }
+        let mut vals = vec![u16::MAX; (scan_top - est_min + 1) as usize];
+        let mut min = i32::MAX;
+        let mut sda = 0i32;
+        let mut fluid = i32::MIN;
+        for y in (est_min..=scan_top).rev() {
+            let cell = if y >= lo {
+                cells_above[(y - lo) as usize]
+            } else {
+                let d = self.block_density(cc, c.x, y, c.z);
+                self.surface_cell_density(d, c.x, y, c.z)
+            };
+            match cell {
+                SurfaceCell::Air => {
+                    sda = 0;
+                    fluid = i32::MIN;
+                }
+                SurfaceCell::Fluid => {
+                    if fluid == i32::MIN {
+                        fluid = y + 1;
+                    }
+                }
+                SurfaceCell::Solid => {
+                    if min >= y {
+                        min = min_y;
+                        let mut found = false;
+                        if y > lo {
+                            for sy in (lo..y).rev() {
+                                if cells_above[(sy - lo) as usize] != SurfaceCell::Solid {
+                                    min = sy + 1;
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !found {
+                            let below_top = y.min(lo);
+                            for sy in (min_y..below_top).rev() {
+                                let d = self.block_density(cc, c.x, sy, c.z);
+                                if d <= 0.0
+                                    && self.surface_cell_density(d, c.x, sy, c.z)
+                                        != SurfaceCell::Solid
+                                {
+                                    min = sy + 1;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    sda += 1;
+                    c.y = y;
+                    c.sda = sda;
+                    c.sdb = y - min + 1;
+                    c.fluid = fluid;
+                    if let Some(st) = self.eval_rule(root, c, heightmap) {
+                        vals[(y - est_min) as usize] = st.min(u16::MAX as u32 - 1) as u16;
+                    }
+                }
+            }
+        }
+        Some(SurfMat {
+            lo: est_min as i16,
+            vals: vals.into_boxed_slice(),
+        })
+    }
+
     /// The top-down surface scan, separated from terrain sampling so a synthetic
     /// column can be compared with the actual `SurfaceSystem.buildSurface`.
     /// `cells` is indexed by `y - min_y`; the scan starts at its top cell.
+    #[cfg(test)]
     fn scan_surface_column(
         &mut self,
         root: usize,
@@ -8227,6 +9246,46 @@ impl Gen {
     ///
     /// COPPER is y 0..50 with copper_ore / raw_copper_block / granite, IRON is
     /// y -60..-8 with deepslate_iron_ore / raw_iron_block / tuff.
+    #[inline]
+    fn eval_vein_df(&self, id: usize, cc: &ChunkCols, x: i32, y: i32, z: i32) -> Option<f64> {
+        match &self.dfs[id] {
+            DF::C(v) => Some(*v),
+            DF::Zero => Some(0.0),
+            DF::Interp(_) => cc
+                .grids
+                .get(id)
+                .and_then(|g| g.as_deref())
+                .map(|cells| trilinear(cells, cc, x, y, z)),
+            DF::Cache(a) | DF::BlendD(a) => self.eval_vein_df(*a, cc, x, y, z),
+            DF::Abs(a) => Some(self.eval_vein_df(*a, cc, x, y, z)?.abs()),
+            DF::Add(a, b) => {
+                Some(self.eval_vein_df(*a, cc, x, y, z)? + self.eval_vein_df(*b, cc, x, y, z)?)
+            }
+            DF::Max(a, b) => Some(df_max(
+                self.eval_vein_df(*a, cc, x, y, z)?,
+                self.eval_vein_df(*b, cc, x, y, z)?,
+            )),
+            DF::Noise {
+                ni,
+                sx,
+                sy,
+                sz,
+                xzs,
+                ys,
+            } => {
+                if matches!(self.dfs[*sx], DF::Zero)
+                    && matches!(self.dfs[*sy], DF::Zero)
+                    && matches!(self.dfs[*sz], DF::Zero)
+                {
+                    Some(self.noises[*ni].get(x as f64 * xzs, y as f64 * ys, z as f64 * xzs))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn vein_override(&mut self, cc: &ChunkCols, x: i32, y: i32, z: i32, st: u32) -> u32 {
         let v = match self.vein {
             Some(v) => v,
@@ -8264,6 +9323,60 @@ impl Gen {
         // before the sampler makes its first positional draw.
         if !dbg && !wg_count() && !((-60..=-8).contains(&y) || (0..=50).contains(&y)) {
             return st;
+        }
+        if !dbg && !wg_count() {
+            if let Some(t) = self.eval_vein_df(v.toggle, cc, x, y, z) {
+                let (min_y, max_y, ore, raw, fill) = if t > 0.0 {
+                    (0i32, 50i32, v.copper_ore, v.copper_raw, v.copper_fill)
+                } else {
+                    (-60i32, -8i32, v.iron_ore, v.iron_raw, v.iron_fill)
+                };
+                let (up, down) = (max_y - y, y - min_y);
+                if up < 0 || down < 0 {
+                    return st;
+                }
+                let at = t.abs();
+                let roundoff = map(up.min(down) as f64, 0.0, 20.0, -0.2, 0.0);
+                if at + roundoff < 0.4 {
+                    return st;
+                }
+                let mut r = match self.ore_split.as_ref() {
+                    Some(f) => f.pos(x, y, z),
+                    None => self.factory.pos(x, y, z),
+                };
+                if r.next_f32() > 0.7 {
+                    return st;
+                }
+                let ridged = match self.eval_vein_df(v.ridged, cc, x, y, z) {
+                    Some(rv) => rv,
+                    None => {
+                        let mut memo = std::mem::take(&mut self.memo);
+                        let rv = self.eval_c(v.ridged, x, y, z, &mut memo, Some(cc));
+                        self.memo = memo;
+                        rv
+                    }
+                };
+                if ridged >= 0.0 {
+                    return st;
+                }
+                let richness = map(at, 0.4, 0.6, 0.1, 0.3);
+                let r2 = r.next_f32();
+                let gv = match self.eval_vein_df(v.gap, cc, x, y, z) {
+                    Some(g) => g,
+                    None => {
+                        let mut memo = std::mem::take(&mut self.memo);
+                        let g = self.eval_c(v.gap, x, y, z, &mut memo, Some(cc));
+                        self.memo = memo;
+                        g
+                    }
+                };
+                let r3 = r.next_f32();
+                return if (r2 as f64) < richness && gv > -0.3 {
+                    if r3 < 0.02 { raw } else { ore }
+                } else {
+                    fill
+                };
+            }
         }
         let mut memo = std::mem::take(&mut self.memo);
         let t = self.eval_c(v.toggle, x, y, z, &mut memo, Some(cc));
@@ -8470,20 +9583,37 @@ impl Gen {
     /// `block_density` at one column equals that lane's `block_density_x8` value bit for
     /// bit, so the answer is the same cell the full column build would have filed.
     fn single_col_surf(&self, cc: &ChunkCols, x: i32, z: i32) -> i32 {
-        let mut yy = self.min_y + self.height - 1;
+        let lx = (x & 15) as usize;
+        let lz = (z & 15) as usize;
+        let idx = lz * 16 + lx;
+        let cached = cc.mats.base_surf[idx].load(std::sync::atomic::Ordering::Relaxed);
+        if cached != i16::MIN {
+            return cached as i32;
+        }
+        let top = self.min_y + self.height - 1;
+        let beard_top = beard_max_y(cc.beard.as_deref());
+        let mut yy = self.upper_bound_start_y(cc, lx, lx + 1, lz, beard_top, top);
         while yy >= self.min_y {
             if self.block_density(cc, x, yy, z) > 0.0 {
+                cc.mats.base_surf[idx].store(yy as i16, std::sync::atomic::Ordering::Relaxed);
                 return yy;
             }
             yy -= 1;
         }
-        self.min_y - 1
+        let res = self.min_y - 1;
+        cc.mats.base_surf[idx].store(res as i16, std::sync::atomic::Ordering::Relaxed);
+        res
     }
 
     /// The matching single-column water-surface scan: a solid top below sea level probes
     /// the aquifer downward for the default fluid, exactly as `build_cols_body` does for
     /// every column of a final chunk.
-    fn single_col_wtop(&mut self, x: i32, z: i32, surf: i32) -> i32 {
+    fn single_col_wtop(&mut self, cc: &ChunkCols, x: i32, z: i32, surf: i32) -> i32 {
+        let idx = ((z & 15) as usize) * 16 + (x & 15) as usize;
+        let cached = cc.mats.base_wtop[idx].load(std::sync::atomic::Ordering::Relaxed);
+        if cached != i16::MIN {
+            return cached as i32;
+        }
         let mut wt = surf;
         if surf < self.sea {
             let mut yy = self.sea;
@@ -8495,6 +9625,289 @@ impl Gen {
                 yy -= 1;
             }
         }
+        cc.mats.base_wtop[idx].store(wt as i16, std::sync::atomic::Ordering::Relaxed);
+        wt
+    }
+
+    /// Lazy single-column base surface scan for `top_ws`/`top_oc` while `beard_depth > 0`.
+    /// Evaluates only the 1..4 horizontal corners needed for `(x, z)` top-down, skipping
+    /// empty sky cells and stopping at the first positive density cell without building
+    /// a full 25-column chunk grid.
+    fn compute_base_col_surf_lazy(&mut self, x: i32, z: i32) -> Option<i32> {
+        if wg_count() || self.dfprog.is_none() || self.noise_cell_w <= 0 || self.noise_cell_h <= 0
+        {
+            return None;
+        }
+        let ub_slot = self.upper_bound_interp?;
+        let ub_inner = match self.dfs[ub_slot] {
+            DF::Interp(inner) => inner,
+            _ => return None,
+        };
+        let cx = x >> 4;
+        let cz = z >> 4;
+        let lx = x & 15;
+        let lz = z & 15;
+        let cell_w = self.noise_cell_w;
+        let cell_h = self.noise_cell_h;
+        let min_y = self.min_y;
+        let top = min_y + self.height - 1;
+        let nx = (16 / cell_w + 1) as usize;
+        let ny = ((self.height / cell_h) + 1) as usize;
+        if nx < 2 || ny < 2 {
+            return None;
+        }
+        let xi = ((lx / cell_w) as usize).min(nx - 2);
+        let zi = ((lz / cell_w) as usize).min(nx - 2);
+        let fx_zero = lx == (xi as i32) * cell_w;
+        let fz_zero = lz == (zi as i32) * cell_w;
+
+        let mut corners = [(0usize, 0usize, 0i32, 0i32); 4];
+        let mut n_corners = 0usize;
+        let z_end = if fz_zero { 0 } else { 1 };
+        let x_end = if fx_zero { 0 } else { 1 };
+        for dzi in 0..=z_end {
+            let bz = cz * 16 + ((zi + dzi) as i32) * cell_w;
+            for dxi in 0..=x_end {
+                let bx = cx * 16 + ((xi + dxi) as i32) * cell_w;
+                corners[n_corners] = (dxi, dzi, bx, bz);
+                n_corners += 1;
+            }
+        }
+
+        let dfs_len = self.dfs.len();
+        let grid_len = nx * nx * ny;
+        let mut scratch_cc = self.base_hm_cc.take().unwrap_or_else(|| {
+            let mut grids: Vec<Option<Box<[f64]>>> = (0..dfs_len).map(|_| None).collect();
+            for &(iid, _) in &self.density_interp_nodes {
+                grids[iid] = Some(vec![0.0; grid_len].into_boxed_slice());
+            }
+            Box::new(ChunkCols {
+                grids,
+                surf: [0i16; 256],
+                ny,
+                cell_w,
+                cell_h,
+                min_y,
+                mats: SurfMatsCell::new(cx, cz),
+                rd: [0i16; 256],
+                wtop: [0i16; 256],
+                beard: None,
+            })
+        });
+        let mut memos = self.base_hm_memos.take().unwrap_or_else(|| {
+            Box::new(std::array::from_fn(|_| FlatCornerMemo::new(dfs_len)))
+        });
+        for memo in memos.iter_mut().take(n_corners) {
+            memo.next_2d();
+        }
+
+        let write_corner = |cells: &mut [f64], dxi: usize, dzi: usize, yi: usize, v: f64| {
+            let set = |cells: &mut [f64], cxi: usize, czi: usize| {
+                cells[(czi * nx + cxi) * ny + yi] = v;
+            };
+            set(cells, xi + dxi, zi + dzi);
+            if fx_zero {
+                set(cells, xi + 1, zi + dzi);
+            }
+            if fz_zero {
+                set(cells, xi + dxi, zi + 1);
+                if fx_zero {
+                    set(cells, xi + 1, zi + 1);
+                }
+            }
+        };
+
+        // Evaluate top vertical grid level `ny - 1` for `ub_slot`.
+        let by_top = min_y + ((ny - 1) as i32) * cell_h;
+        let mut prev_pos = false;
+        {
+            let ub_cells = scratch_cc.grids[ub_slot].as_mut().unwrap();
+            for c in 0..n_corners {
+                let (dxi, dzi, bx, bz) = corners[c];
+                memos[c].next_3d();
+                let v = self.eval_flat(ub_inner, bx, by_top, bz, &mut memos[c]);
+                write_corner(ub_cells, dxi, dzi, ny - 1, v);
+                if v > 0.0 {
+                    prev_pos = true;
+                }
+            }
+        }
+
+        let mut other_filled_stack = [false; 128];
+        let mut other_filled_heap;
+        let other_filled: &mut [bool] = if ny <= 128 {
+            &mut other_filled_stack[..ny]
+        } else {
+            other_filled_heap = vec![false; ny];
+            &mut other_filled_heap
+        };
+
+        let mut found = min_y - 1;
+        for yi in (0..ny - 1).rev() {
+            let by = min_y + (yi as i32) * cell_h;
+            let mut cur_pos = false;
+            {
+                let ub_cells = scratch_cc.grids[ub_slot].as_mut().unwrap();
+                for c in 0..n_corners {
+                    let (dxi, dzi, bx, bz) = corners[c];
+                    memos[c].next_3d();
+                    let v = self.eval_flat(ub_inner, bx, by, bz, &mut memos[c]);
+                    write_corner(ub_cells, dxi, dzi, yi, v);
+                    if v > 0.0 {
+                        cur_pos = true;
+                    }
+                }
+            }
+            if prev_pos || cur_pos {
+                for lvl in [yi + 1, yi] {
+                    if !other_filled[lvl] {
+                        other_filled[lvl] = true;
+                        let by_lvl = min_y + (lvl as i32) * cell_h;
+                        for &(iid, kind) in &self.density_interp_nodes {
+                            if iid == ub_slot {
+                                continue;
+                            }
+                            let cells = scratch_cc.grids[iid].as_mut().unwrap();
+                            match kind {
+                                InterpKind::YNoise {
+                                    y_grad,
+                                    ni,
+                                    xzs,
+                                    ys,
+                                    mul,
+                                    add,
+                                } => {
+                                    let out = y_grad.and_then(|(fc, fv, tc, tv, mi, ma, ov)| {
+                                        let t = ((by_lvl as f64) - fc) / (tc - fc);
+                                        let gv = fv + t.clamp(0.0, 1.0) * (tv - fv);
+                                        if gv >= mi && gv < ma { None } else { Some(ov) }
+                                    });
+                                    for c in 0..n_corners {
+                                        let (dxi, dzi, bx, bz) = corners[c];
+                                        let v = match out {
+                                            Some(ov) => ov,
+                                            None => {
+                                                let mut nv = self.noises[ni].get_uncached(
+                                                    bx as f64 * xzs,
+                                                    by_lvl as f64 * ys,
+                                                    bz as f64 * xzs,
+                                                );
+                                                if let Some((mc, left)) = mul {
+                                                    nv = if left { mc * nv } else { nv * mc };
+                                                }
+                                                if let Some((ac, left)) = add {
+                                                    nv = if left { ac + nv } else { nv + ac };
+                                                }
+                                                nv
+                                            }
+                                        };
+                                        write_corner(cells, dxi, dzi, lvl, v);
+                                    }
+                                }
+                                InterpKind::General(inner) => {
+                                    for c in 0..n_corners {
+                                        let (dxi, dzi, bx, bz) = corners[c];
+                                        memos[c].next_3d();
+                                        let v = self.eval_flat(inner, bx, by_lvl, bz, &mut memos[c]);
+                                        write_corner(cells, dxi, dzi, lvl, v);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let y_hi = (min_y + (yi as i32 + 1) * cell_h - 1).min(top);
+                let y_lo = min_y + (yi as i32) * cell_h;
+                let mut yy = y_hi;
+                while yy >= y_lo {
+                    if self.block_density(&scratch_cc, x, yy, z) > 0.0 {
+                        found = yy;
+                        break;
+                    }
+                    yy -= 1;
+                }
+                if found != min_y - 1 {
+                    break;
+                }
+            }
+            prev_pos = cur_pos;
+        }
+
+        self.base_hm_cc = Some(scratch_cc);
+        self.base_hm_memos = Some(memos);
+        Some(found)
+    }
+
+    fn base_col_surf_cached(&mut self, x: i32, z: i32) -> i32 {
+        if let Some(&(surf, _)) = self.base_hm_c.get(&(x, z)) {
+            return surf;
+        }
+        let cx = x >> 4;
+        let cz = z >> 4;
+        if let Some(cc) = self.base_c.get(&(cx, cz)).cloned() {
+            return self.single_col_surf(&cc, x, z);
+        }
+        let share_key = (self.world_seed, self.preset.dim().index() as u8, x, z);
+        if let Some(share) = self.round_share() {
+            if let Some(&surf) = share
+                .base_surf
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&share_key)
+            {
+                if self.base_hm_c.len() >= 16384 {
+                    self.base_hm_c.clear();
+                }
+                self.base_hm_c.insert((x, z), (surf, i32::MIN));
+                return surf;
+            }
+        }
+        let surf = match self.compute_base_col_surf_lazy(x, z) {
+            Some(s) => s,
+            None => match self.base_cols(cx, cz) {
+                Some(cc) => self.single_col_surf(&cc, x, z),
+                None => self.min_y - 1,
+            },
+        };
+        if self.base_hm_c.len() >= 16384 {
+            self.base_hm_c.clear();
+        }
+        self.base_hm_c.insert((x, z), (surf, i32::MIN));
+        if let Some(share) = self.round_share() {
+            let mut m = share.base_surf.lock().unwrap_or_else(|e| e.into_inner());
+            if m.len() >= 32768 {
+                m.clear();
+            }
+            m.insert(share_key, surf);
+        }
+        surf
+    }
+
+    fn base_col_wtop_cached(&mut self, x: i32, z: i32) -> i32 {
+        if let Some(&(_, wtop)) = self.base_hm_c.get(&(x, z)) {
+            if wtop != i32::MIN {
+                return wtop;
+            }
+        }
+        let cx = x >> 4;
+        let cz = z >> 4;
+        if let Some(cc) = self.base_c.get(&(cx, cz)).cloned() {
+            let surf = self.single_col_surf(&cc, x, z);
+            return self.single_col_wtop(&cc, x, z, surf);
+        }
+        let surf = self.base_col_surf_cached(x, z);
+        let mut wt = surf;
+        if surf < self.sea {
+            let mut yy = self.sea;
+            while yy > surf {
+                if self.aq_state(x, yy, z, -1.0) == Some(self.def_fl) {
+                    wt = yy;
+                    break;
+                }
+                yy -= 1;
+            }
+        }
+        self.base_hm_c.insert((x, z), (surf, wt));
         wt
     }
 
@@ -8518,13 +9931,7 @@ impl Gen {
                 m3_inc_split(M3_COLS_HIT_OWNER, M3_COLS_HIT_WORKER);
                 return c.wtop((x & 15) as usize, (z & 15) as usize) + 1;
             }
-            return match self.base_cols(cx, cz) {
-                Some(cc) => {
-                    let surf = self.single_col_surf(&cc, x, z);
-                    self.single_col_wtop(x, z, surf) + 1
-                }
-                None => self.min_y,
-            };
+            return self.base_col_wtop_cached(x, z) + 1;
         }
         match self.cols(cx, cz) {
             Some(c) => c.wtop((x & 15) as usize, (z & 15) as usize) + 1,
@@ -8541,10 +9948,7 @@ impl Gen {
                 m3_inc_split(M3_COLS_HIT_OWNER, M3_COLS_HIT_WORKER);
                 return c.surface((x & 15) as usize, (z & 15) as usize) + 1;
             }
-            return match self.base_cols(cx, cz) {
-                Some(cc) => self.single_col_surf(&cc, x, z) + 1,
-                None => self.min_y,
-            };
+            return self.base_col_surf_cached(x, z) + 1;
         }
         match self.cols(cx, cz) {
             Some(c) => c.surface((x & 15) as usize, (z & 15) as usize) + 1,
@@ -8743,7 +10147,8 @@ impl Gen {
             return v.clone();
         }
         let mut seen: Vec<String> = vec![];
-        let mut set = std::collections::HashSet::new();
+        let mut seen_mask = 0u128;
+        let mut seen_extra: HashSet<u16> = HashSet::new();
         let (qx0, qz0) = (cx * 4, cz * 4);
         // The quart y index is the *block* y divided by four, so the sweep has to start at
         // `min_y / 4` (-16 in the overworld), not at 0. Starting at 0 covered y = 0..383 and
@@ -8757,9 +10162,20 @@ impl Gen {
             for lx in 0..4 {
                 for lz in 0..4 {
                     if let Some((_, leaf)) = self.biome_quart(qx0 + lx, qy, qz0 + lz, None) {
-                        if let Some(name) = self.biome_name_of_leaf(leaf) {
-                            if set.insert(name.clone()) {
-                                seen.push(name);
+                        let is_new = if leaf < 128 {
+                            let bit = 1u128 << leaf;
+                            if seen_mask & bit == 0 {
+                                seen_mask |= bit;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            seen_extra.insert(leaf)
+                        };
+                        if is_new {
+                            if let Some(name) = self.biome_names.get(leaf as usize) {
+                                seen.push(name.clone());
                             }
                         }
                     }
@@ -9451,7 +10867,47 @@ impl Gen {
     /// The material rule below the surface window. Running the rule is the most expensive
     /// terrain work the feature pass does, and the same cell is read again by the send pass
     /// (`wg2_block`) immediately after, so the result is memoized here rather than recomputed.
+    #[inline]
+    fn deep_state_fast(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        let steps = self.deep_fast.as_deref()?;
+        if flat_bedrock() && y >= self.min_y && y < self.min_y + 5 {
+            return Some(self.bedrock_st);
+        }
+        for step in steps {
+            match *step {
+                DeepStep::Block(st) => return Some(st),
+                DeepStep::VGrad {
+                    ta,
+                    fa,
+                    legacy_seed,
+                    sp,
+                    st,
+                } => {
+                    if y <= ta {
+                        return Some(st);
+                    }
+                    if y < fa {
+                        let m =
+                            (y as f32 - ta as f32) / (fa as f32 - ta as f32) * (0.0 - 1.0) + 1.0;
+                        let hit = if self.legacy_random_source {
+                            Lcg::new(legacy_seed ^ hash_block_pos(x, y, z) as u64).next_f32() < m
+                        } else {
+                            sp.pos(x, y, z).next_f32() < m
+                        };
+                        if hit {
+                            return Some(st);
+                        }
+                    }
+                }
+            }
+        }
+        Some(self.def_st)
+    }
+
     pub(crate) fn deep_state_cached(&mut self, x: i32, y: i32, z: i32, cc: &ChunkCols) -> u32 {
+        if let Some(v) = self.deep_state_fast(x, y, z) {
+            return v;
+        }
         // M3 P1a M3: the deep rule is the most expensive terrain work a feature read does,
         // and its memo lives on whichever generator ran the terrain pass. A cold memo here is
         // the concrete form of "the feature layer reads terrain the terrain pass used to warm".
@@ -9516,6 +10972,9 @@ impl Gen {
     }
 
     pub(crate) fn deep_state_i(&mut self, x: i32, y: i32, z: i32, cc: &ChunkCols) -> u32 {
+        if let Some(v) = self.deep_state_fast(x, y, z) {
+            return v;
+        }
         // Opt-in flat floor: the vanilla bedrock band is y in [min_y, min_y+4].
         if flat_bedrock() && y >= self.min_y && y < self.min_y + 5 {
             return self.bedrock_st;
@@ -9603,7 +11062,7 @@ fn ly12(v: i32) -> i32 {
 /// Chunk-local aquifer grids kept on a generator. A terrain fill walks one chunk
 /// densely while carvers/features probe its neighbours, so a small ring avoids both
 /// a single-slot thrash and a global hash lookup on every cell.
-const AQ_CHUNK_SLOTS: usize = 4;
+const AQ_CHUNK_SLOTS: usize = 16;
 
 /// The whole 12-cell neighbourhood of every block in a chunk fits in a flat grid:
 /// `sx = lxz(x-5)` is `cx-1..=cx` and `sz = lxz(z-5)` is `cz-1..=cz`, so the sampled
@@ -9659,6 +11118,31 @@ impl AqChunkCache {
         }
     }
 
+    fn reset(&mut self, cx: i32, cz: i32, min_y: i32, height: i32) {
+        let min_gx = lxz(cx * 16 - 5);
+        let max_gx = lxz(cx * 16 + 15 - 5) + 1;
+        let min_gz = lxz(cz * 16 - 5);
+        let max_gz = lxz(cz * 16 + 15 - 5) + 1;
+        let min_gy = ly12(min_y + 1) - 1;
+        let max_gy = ly12(min_y + height) + 1;
+        let nx = (max_gx - min_gx + 1) as usize;
+        let ny = (max_gy - min_gy + 1) as usize;
+        let nz = (max_gz - min_gz + 1) as usize;
+        let n = nx * ny * nz;
+        self.cx = cx;
+        self.cz = cz;
+        self.min_gx = min_gx;
+        self.min_gy = min_gy;
+        self.min_gz = min_gz;
+        self.nx = nx;
+        self.ny = ny;
+        self.nz = nz;
+        self.rpos.clear();
+        self.rpos.resize(n, None);
+        self.levels.clear();
+        self.levels.resize(n, None);
+    }
+
     #[inline]
     fn contains(&self, gx: i32, gy: i32, gz: i32) -> bool {
         gx >= self.min_gx
@@ -9706,6 +11190,9 @@ impl Gen {
     /// `AQ_POS="x,y,z"` prints the 12 sample positions for that query block,
     /// for diffing against `tools/vanilla-probe/AquiferPos.java`.
     fn aq_pos_trace(&mut self, x: i32, y: i32, z: i32) {
+        if !aq_trace_enabled() {
+            return;
+        }
         use std::sync::OnceLock;
         static SPEC: OnceLock<Option<String>> = OnceLock::new();
         let Some(spec) = SPEC.get_or_init(|| std::env::var("AQ_POS").ok()) else {
@@ -9769,7 +11256,14 @@ impl Gen {
                 victim = i;
             }
         }
-        self.aq_chunk[victim] = Some(AqChunkCache::new(cx, cz, self.data.min_y, self.data.height));
+        if self.aq_cell12.valid && self.aq_cell12.slot == victim {
+            self.aq_cell12.valid = false;
+        }
+        let (min_y, height) = (self.data.min_y, self.data.height);
+        match &mut self.aq_chunk[victim] {
+            Some(existing) => existing.reset(cx, cz, min_y, height),
+            slot_opt => *slot_opt = Some(AqChunkCache::new(cx, cz, min_y, height)),
+        }
         self.aq_chunk_use[victim] = tick;
         victim
     }
@@ -9827,22 +11321,30 @@ impl Gen {
     /// same selection directly instead.
     fn aq_near3(&mut self, x: i32, y: i32, z: i32) -> Option<(AqNear, usize)> {
         let (sx, sy, sz) = (lxz(x - 5), ly12(y + 1), lxz(z - 5));
-        let slot = self.aq_chunk_slot(x.div_euclid(16), z.div_euclid(16));
-        if !(self.aq_cache(slot).contains(sx, sy - 1, sz)
-            && self.aq_cache(slot).contains(sx + 1, sy + 1, sz + 1))
+        let (cx, cz) = (x.div_euclid(16), z.div_euclid(16));
+        if self.aq_cell12.valid
+            && self.aq_cell12.sx == sx
+            && self.aq_cell12.sy == sy
+            && self.aq_cell12.sz == sz
+            && self.aq_cell12.cx == cx
+            && self.aq_cell12.cz == cz
         {
-            return None;
-        }
-        let mut near: AqNear = [((0, 0, 0), i64::MAX, 0); 3];
-        for dx in 0..=1 {
-            for dy in -1..=1 {
-                for dz in 0..=1 {
-                    let (gx, gy, gz) = (sx + dx, sy + dy, sz + dz);
-                    let idx = self.aq_cache(slot).idx(gx, gy, gz);
-                    let (px, py, pz) = self.aq_cell_rpos(slot, idx, gx, gy, gz);
-                    let (ex, ey, ez) = (px - x, py - y, pz - z);
-                    let h = ex as i64 * ex as i64 + ey as i64 * ey as i64 + ez as i64 * ez as i64;
-                    let p = ((px, py, pz), h, idx);
+            let slot = self.aq_cell12.slot;
+            let tick = self.aq_chunk_tick.wrapping_add(1);
+            self.aq_chunk_tick = tick;
+            self.aq_chunk_use[slot] = tick;
+            let mut near: AqNear = [((0, 0, 0), i64::MAX, 0); 3];
+            let px = &self.aq_cell12.px;
+            let py = &self.aq_cell12.py;
+            let pz = &self.aq_cell12.pz;
+            let idxs = &self.aq_cell12.idx;
+            for i in 0..12 {
+                let ex = px[i] - x;
+                let ey = py[i] - y;
+                let ez = pz[i] - z;
+                let h = (ex * ex + ey * ey + ez * ez) as i64;
+                if near[2].1 >= h {
+                    let p = ((px[i], py[i], pz[i]), h, idxs[i]);
                     if near[0].1 >= h {
                         near[2] = near[1];
                         near[1] = near[0];
@@ -9850,12 +11352,67 @@ impl Gen {
                     } else if near[1].1 >= h {
                         near[2] = near[1];
                         near[1] = p;
-                    } else if near[2].1 >= h {
+                    } else {
                         near[2] = p;
                     }
                 }
             }
+            return Some((near, slot));
         }
+        let slot = self.aq_chunk_slot(cx, cz);
+        if !(self.aq_cache(slot).contains(sx, sy - 1, sz)
+            && self.aq_cache(slot).contains(sx + 1, sy + 1, sz + 1))
+        {
+            return None;
+        }
+        let mut near: AqNear = [((0, 0, 0), i64::MAX, 0); 3];
+        let mut cpx = [0i32; 12];
+        let mut cpy = [0i32; 12];
+        let mut cpz = [0i32; 12];
+        let mut cidx = [0usize; 12];
+        let mut n = 0usize;
+        for dx in 0..=1 {
+            for dy in -1..=1 {
+                for dz in 0..=1 {
+                    let (gx, gy, gz) = (sx + dx, sy + dy, sz + dz);
+                    let idx = self.aq_cache(slot).idx(gx, gy, gz);
+                    let (px, py, pz) = self.aq_cell_rpos(slot, idx, gx, gy, gz);
+                    cpx[n] = px;
+                    cpy[n] = py;
+                    cpz[n] = pz;
+                    cidx[n] = idx;
+                    n += 1;
+                    let (ex, ey, ez) = (px - x, py - y, pz - z);
+                    let h = ex as i64 * ex as i64 + ey as i64 * ey as i64 + ez as i64 * ez as i64;
+                    if near[2].1 >= h {
+                        let p = ((px, py, pz), h, idx);
+                        if near[0].1 >= h {
+                            near[2] = near[1];
+                            near[1] = near[0];
+                            near[0] = p;
+                        } else if near[1].1 >= h {
+                            near[2] = near[1];
+                            near[1] = p;
+                        } else {
+                            near[2] = p;
+                        }
+                    }
+                }
+            }
+        }
+        self.aq_cell12 = AqCell12 {
+            valid: true,
+            cx,
+            cz,
+            sx,
+            sy,
+            sz,
+            slot,
+            px: cpx,
+            py: cpy,
+            pz: cpz,
+            idx: cidx,
+        };
         Some((near, slot))
     }
     /// Uncached selection for the out-of-window fallback: same 12 cells, same `>=`
@@ -9918,6 +11475,38 @@ impl Gen {
         let kind = self.aq_fluid_kind(rx, ry, rz, def, p);
         (p, kind)
     }
+    #[inline]
+    fn eval_aq_df(&mut self, id: usize, x: i32, y: i32, z: i32) -> f64 {
+        if !wg_count() {
+            match &self.dfs[id] {
+                DF::C(v) => return *v,
+                DF::Zero => return 0.0,
+                DF::Noise {
+                    ni,
+                    sx,
+                    sy,
+                    sz,
+                    xzs,
+                    ys,
+                } if matches!(self.dfs[*sx], DF::Zero)
+                    && matches!(self.dfs[*sy], DF::Zero)
+                    && matches!(self.dfs[*sz], DF::Zero) =>
+                {
+                    return self.noises[*ni].get(x as f64 * xzs, y as f64 * ys, z as f64 * xzs);
+                }
+                _ => {
+                    let mut flat = self.take_corner_memo();
+                    flat.next_2d();
+                    flat.next_3d();
+                    let v = self.eval_flat(id, x, y, z, &mut flat);
+                    self.corner_memo = Some(flat);
+                    return v;
+                }
+            }
+        }
+        self.eval(id, x, y, z, &mut HashMap::new())
+    }
+
     fn aq_fluid_y(
         &mut self,
         x: i32,
@@ -9927,14 +11516,24 @@ impl Gen {
         min_est: i32,
         map_y: bool,
     ) -> i32 {
-        let mut memo = HashMap::new();
         // OverworldBiomeBuilder.isDeepDark: erosion < -0.225F && depth > 0.9F.
         // NoiseRouter.h()/i() are erosion/depth accessors (the fields are named
         // continents/erosion/depth); keep the promoted f32 literals.
         let deep = match self.climate {
             Some(c) => {
-                self.eval(c[3], x, y, z, &mut memo) < -0.225f32 as f64
-                    && self.eval(c[4], x, y, z, &mut memo) > 0.9f32 as f64
+                if wg_count() {
+                    let mut memo = HashMap::new();
+                    self.eval(c[3], x, y, z, &mut memo) < -0.225f32 as f64
+                        && self.eval(c[4], x, y, z, &mut memo) > 0.9f32 as f64
+                } else {
+                    let mut flat = self.take_corner_memo();
+                    flat.next_2d();
+                    flat.next_3d();
+                    let is_deep = self.eval_flat(c[3], x, y, z, &mut flat) < -0.225f32 as f64
+                        && self.eval_flat(c[4], x, y, z, &mut flat) > 0.9f32 as f64;
+                    self.corner_memo = Some(flat);
+                    is_deep
+                }
             }
             None => false,
         };
@@ -9947,9 +11546,8 @@ impl Gen {
             } else {
                 0.0
             };
-            let g = self
-                .eval(self.aq.as_ref().unwrap().flood, x, y, z, &mut memo)
-                .clamp(-1.0, 1.0);
+            let flood_id = self.aq.as_ref().unwrap().flood;
+            let g = self.eval_aq_df(flood_id, x, y, z).clamp(-1.0, 1.0);
             (
                 g - lmap(f, 1.0, 0.0, -0.8, 0.4),
                 g - lmap(f, 1.0, 0.0, -0.3, 0.8),
@@ -9965,23 +11563,18 @@ impl Gen {
     }
     fn aq_noise_level(&mut self, x: i32, y: i32, z: i32, min_est: i32) -> i32 {
         let (gx, gy, gz) = (x.div_euclid(16), y.div_euclid(40), z.div_euclid(16));
-        let s = self.eval(
-            self.aq.as_ref().unwrap().spread,
-            gx,
-            gy,
-            gz,
-            &mut HashMap::new(),
-        ) * 10.0;
+        let spread_id = self.aq.as_ref().unwrap().spread;
+        let s = self.eval_aq_df(spread_id, gx, gy, gz) * 10.0;
         min_est.min(((s / 3.0).floor() as i32) * 3 + gy * 40 + 20)
     }
     fn aq_fluid_kind(&mut self, x: i32, y: i32, z: i32, def: (i32, u8), level: i32) -> u8 {
         if level <= -10 && level != AQ_MIN && def.1 != 2 {
-            let s = self.eval(
-                self.aq.as_ref().unwrap().lava,
+            let lava_id = self.aq.as_ref().unwrap().lava;
+            let s = self.eval_aq_df(
+                lava_id,
                 x.div_euclid(64),
                 y.div_euclid(40),
                 z.div_euclid(64),
-                &mut HashMap::new(),
             );
             if s.abs() > 0.3 {
                 return 2;
@@ -10030,13 +11623,8 @@ impl Gen {
             match *barrier {
                 Some(v) => v,
                 None => {
-                    let v = self.eval(
-                        self.aq.as_ref().unwrap().barrier,
-                        x,
-                        y,
-                        z,
-                        &mut HashMap::new(),
-                    );
+                    let barrier_id = self.aq.as_ref().unwrap().barrier;
+                    let v = self.eval_aq_df(barrier_id, x, y, z);
                     *barrier = Some(v);
                     v
                 }
@@ -10233,6 +11821,73 @@ impl Gen {
     /// a fluid": a fluid inside a blend is a fluid vanilla does not mark.
     pub(crate) fn aq_schedule_fluid_update(&self) -> bool {
         self.aq_sched
+    }
+
+    /// Fast aquifer probe when the caller already proved `density <= 0.0`.
+    /// Returns `Some(res)` when `aq_state(x, y, z, d)` returns `res` identically for every
+    /// `d <= 0.0`, avoiding unnecessary `noodle` density evaluation. Returns `None` when
+    /// a non-zero aquifer barrier blend could depend on the exact magnitude of `d`.
+    fn aq_state_if_nonpos_independent(&mut self, x: i32, y: i32, z: i32) -> Option<Option<u32>> {
+        if aq_trace_enabled() {
+            return None;
+        }
+        if self.aq.is_none() {
+            m3_inc(M3_AQUIFER_CELLS);
+            self.aq_sched = false;
+            return Some(Some(if y < -54 {
+                1
+            } else if y < self.sea {
+                self.def_fl
+            } else {
+                0
+            }));
+        }
+        let (water, lava) = {
+            let a = self.aq.as_ref().unwrap();
+            (a.water, a.lava_st)
+        };
+        let def = self.aq_pick(y);
+        if Gen::lvl_block(def.0, def.1, y) == 2 {
+            m3_inc(M3_AQUIFER_CELLS);
+            self.aq_sched = false;
+            return Some(Some(lava));
+        }
+        let (near, slot) = match self.aq_near3(x, y, z) {
+            Some((near, slot)) => (near, Some(slot)),
+            None => (self.aq_near3_uncached(x, y, z), None),
+        };
+        let m3_read = m3_on() && m3_in_feature_read();
+        let (d0, d1) = (near[0].1, near[1].1);
+        let l2 = self.aq_near_level(&near, 0, slot, m3_read);
+        let blk = Gen::lvl_block(l2.0, l2.1, y);
+        let sim12 = 1.0 - (d1 - d0).abs() as f64 / 25.0;
+        if sim12 <= 0.0 {
+            m3_inc(M3_AQUIFER_CELLS);
+            self.aq_sched = sim12 >= AQ_FLOWING_UPDATE_SIMULARITY;
+            return Some(Some(match blk {
+                1 => water,
+                2 => lava,
+                _ => 0,
+            }));
+        }
+        let pb = self.aq_pick(y - 1);
+        if blk == 1 && Gen::lvl_block(pb.0, pb.1, y - 1) == 2 {
+            m3_inc(M3_AQUIFER_CELLS);
+            self.aq_sched = true;
+            return Some(Some(water));
+        }
+        let l3 = self.aq_near_level(&near, 1, slot, m3_read);
+        let l4 = self.aq_near_level(&near, 2, slot, m3_read);
+        if l2 == l3 && l2 == l4 {
+            m3_inc(M3_AQUIFER_CELLS);
+            self.aq_sched = true;
+            return Some(Some(match blk {
+                1 => water,
+                2 => lava,
+                _ => 0,
+            }));
+        }
+        None
     }
 
     pub(crate) fn aq_state(&mut self, x: i32, y: i32, z: i32, density: f64) -> Option<u32> {
@@ -10447,9 +12102,24 @@ fn biome_id(name: &str) -> i64 {
 }
 
 #[derive(Debug, Clone)]
-enum BT {
+struct BTNode {
+    bounds: [[i32; 2]; 7],
+    /// When `child_len == 0`, this is a leaf with biome id `child_start as u16`.
+    /// Otherwise children live contiguously at `nodes[child_start .. child_start + child_len]`.
+    child_start: u32,
+    child_len: u16,
+    /// Precomputed squared distance for dimension 6 when `t[6] == 0` (always true in `target7`).
+    off6_sq: i64,
+}
+
+#[derive(Debug, Clone)]
+struct BT {
+    nodes: Vec<BTNode>,
+}
+
+enum RawBT {
     Leaf([[i32; 2]; 7], u16),
-    Sub([[i32; 2]; 7], Vec<BT>),
+    Sub([[i32; 2]; 7], Vec<RawBT>),
 }
 
 fn bt_params(j: &J) -> [[i32; 2]; 7] {
@@ -10463,12 +12133,12 @@ fn bt_params(j: &J) -> [[i32; 2]; 7] {
     p
 }
 
-fn bt_parse(
+fn bt_parse_raw(
     j: &J,
     names: &mut Vec<String>,
     ids: &mut HashMap<String, u16>,
     leaf_ps: &mut Vec<[[i32; 2]; 7]>,
-) -> Option<BT> {
+) -> Option<RawBT> {
     let ps = bt_params(j);
     match j.get("_type").map(J::str) {
         Some("leaf") => {
@@ -10483,56 +12153,153 @@ fn bt_parse(
                     i
                 }
             };
-            Some(BT::Leaf(ps, id))
+            Some(RawBT::Leaf(ps, id))
         }
         Some("branch") => {
             let ch = j
                 .get("subTree")
                 .and_then(J::as_arr)?
                 .iter()
-                .filter_map(|c| bt_parse(c, names, ids, leaf_ps))
+                .filter_map(|c| bt_parse_raw(c, names, ids, leaf_ps))
                 .collect();
-            Some(BT::Sub(ps, ch))
+            Some(RawBT::Sub(ps, ch))
         }
         _ => None,
     }
 }
 
-fn ps_dist(ps: &[[i32; 2]; 7], t: &[i64; 7]) -> i64 {
-    let mut d = 0i64;
-    for i in 0..7 {
-        let (mn, mx) = (ps[i][0] as i64, ps[i][1] as i64);
-        let dd = if t[i] < mn {
-            mn - t[i]
-        } else if t[i] > mx {
-            t[i] - mx
+fn bt_parse(
+    j: &J,
+    names: &mut Vec<String>,
+    ids: &mut HashMap<String, u16>,
+    leaf_ps: &mut Vec<[[i32; 2]; 7]>,
+) -> Option<BT> {
+    let root = bt_parse_raw(j, names, ids, leaf_ps)?;
+    let mut nodes = Vec::new();
+    fn off6(ps: &[[i32; 2]; 7]) -> i64 {
+        let (mn, mx) = (ps[6][0] as i64, ps[6][1] as i64);
+        let dd = if 0 < mn {
+            mn
+        } else if 0 > mx {
+            -mx
         } else {
             0
         };
-        d += dd * dd;
+        dd * dd
     }
-    d
+    fn flatten(node: &RawBT, out: &mut Vec<BTNode>) -> usize {
+        let idx = out.len();
+        match node {
+            RawBT::Leaf(ps, id) => {
+                out.push(BTNode {
+                    bounds: *ps,
+                    child_start: u32::from(*id),
+                    child_len: 0,
+                    off6_sq: off6(ps),
+                });
+            }
+            RawBT::Sub(ps, children) => {
+                out.push(BTNode {
+                    bounds: *ps,
+                    child_start: 0,
+                    child_len: children.len() as u16,
+                    off6_sq: off6(ps),
+                });
+                let start = out.len() as u32;
+                out[idx].child_start = start;
+                // Reserve all direct children contiguously so a branch scans one flat slice.
+                for ch in children {
+                    match ch {
+                        RawBT::Leaf(cps, id) => out.push(BTNode {
+                            bounds: *cps,
+                            child_start: u32::from(*id),
+                            child_len: 0,
+                            off6_sq: off6(cps),
+                        }),
+                        RawBT::Sub(cps, grand) => out.push(BTNode {
+                            bounds: *cps,
+                            child_start: 0,
+                            child_len: grand.len() as u16,
+                            off6_sq: off6(cps),
+                        }),
+                    }
+                }
+                for (i, ch) in children.iter().enumerate() {
+                    if let RawBT::Sub(_, grand) = ch {
+                        fill_children(start as usize + i, grand, out);
+                    }
+                }
+            }
+        }
+        idx
+    }
+    fn fill_children(parent_idx: usize, children: &[RawBT], out: &mut Vec<BTNode>) {
+        let start = out.len() as u32;
+        out[parent_idx].child_start = start;
+        for ch in children {
+            match ch {
+                RawBT::Leaf(cps, id) => out.push(BTNode {
+                    bounds: *cps,
+                    child_start: u32::from(*id),
+                    child_len: 0,
+                    off6_sq: off6(cps),
+                }),
+                RawBT::Sub(cps, grand) => out.push(BTNode {
+                    bounds: *cps,
+                    child_start: 0,
+                    child_len: grand.len() as u16,
+                    off6_sq: off6(cps),
+                }),
+            }
+        }
+        for (i, ch) in children.iter().enumerate() {
+            if let RawBT::Sub(_, grand) = ch {
+                fill_children(start as usize + i, grand, out);
+            }
+        }
+    }
+    flatten(&root, &mut nodes);
+    Some(BT { nodes })
+}
+
+#[inline(always)]
+fn dim_dist_sq(bounds: [i32; 2], v: i64) -> i64 {
+    let d1 = bounds[0] as i64 - v;
+    let d2 = v - bounds[1] as i64;
+    let d = d1.max(d2).max(0);
+    d * d
+}
+
+#[inline(always)]
+fn ps_dist(ps: &[[i32; 2]; 7], t: &[i64; 7]) -> i64 {
+    dim_dist_sq(ps[0], t[0])
+        + dim_dist_sq(ps[1], t[1])
+        + dim_dist_sq(ps[2], t[2])
+        + dim_dist_sq(ps[3], t[3])
+        + dim_dist_sq(ps[4], t[4])
+        + dim_dist_sq(ps[5], t[5])
+        + dim_dist_sq(ps[6], t[6])
+}
+
+impl BTNode {
+    #[inline(always)]
+    fn dist(&self, t: &[i64; 7]) -> i64 {
+        let d6 = if t[6] == 0 {
+            self.off6_sq
+        } else {
+            dim_dist_sq(self.bounds[6], t[6])
+        };
+        dim_dist_sq(self.bounds[0], t[0])
+            + dim_dist_sq(self.bounds[1], t[1])
+            + dim_dist_sq(self.bounds[2], t[2])
+            + dim_dist_sq(self.bounds[3], t[3])
+            + dim_dist_sq(self.bounds[4], t[4])
+            + dim_dist_sq(self.bounds[5], t[5])
+            + d6
+    }
 }
 
 impl BT {
-    fn dist(&self, t: &[i64; 7]) -> i64 {
-        let ps = match self {
-            BT::Leaf(p, _) | BT::Sub(p, _) => p,
-        };
-        let mut d = 0i64;
-        for i in 0..7 {
-            let (mn, mx) = (ps[i][0] as i64, ps[i][1] as i64);
-            let dd = if t[i] < mn {
-                mn - t[i]
-            } else if t[i] > mx {
-                t[i] - mx
-            } else {
-                0
-            };
-            d += dd * dd;
-        }
-        d
-    }
     /// `SearchTree.TreeNode.getResultingNode`. `best` is the incumbent (distance, leaf): the
     /// previous result when the caller has one, else `(i64::MAX, _)`. A branch scans its
     /// children **in array order**, descends into a child only when the child's box is
@@ -10542,25 +12309,49 @@ impl BT {
     /// changed (sorting the children by distance reaches a different leaf on ties, and also
     /// prunes differently).
     fn search(&self, t: &[i64; 7], best: &mut (i64, u16)) -> Option<&[[i32; 2]; 7]> {
-        match self {
-            BT::Leaf(bounds, id) => {
-                let d = self.dist(t);
-                if d < best.0 {
-                    *best = (d, *id);
-                    return Some(bounds);
-                }
-                None
+        if self.nodes.is_empty() || best.0 == 0 {
+            return None;
+        }
+        self.search_node(0, t, best)
+    }
+
+    fn search_node(
+        &self,
+        idx: usize,
+        t: &[i64; 7],
+        best: &mut (i64, u16),
+    ) -> Option<&[[i32; 2]; 7]> {
+        let node = &self.nodes[idx];
+        if node.child_len == 0 {
+            let d = node.dist(t);
+            if d < best.0 {
+                *best = (d, node.child_start as u16);
+                return Some(&node.bounds);
             }
-            BT::Sub(_, children) => {
-                let mut selected = None;
-                for child in children {
-                    if best.0 > child.dist(t) {
-                        selected = child.search(t, best).or(selected);
+            return None;
+        }
+        let start = node.child_start as usize;
+        let end = start + node.child_len as usize;
+        let mut selected = None;
+        for ci in start..end {
+            let child = &self.nodes[ci];
+            let d = child.dist(t);
+            if d < best.0 {
+                if child.child_len == 0 {
+                    *best = (d, child.child_start as u16);
+                    selected = Some(&child.bounds);
+                    if d == 0 {
+                        return selected;
+                    }
+                } else {
+                    selected = self.search_node(ci, t, best).or(selected);
+                    if best.0 == 0 {
+                        return selected;
                     }
                 }
-                selected
             }
         }
+        selected
     }
 }
 
@@ -10574,19 +12365,34 @@ impl Gen {
         }
         let cl = self.climate?;
         let (bx, bz) = (qx << 2, qz << 2);
-        let mut memo = HashMap::new();
         let mut t = [0i64; 5];
-        for (i, &id) in [cl[0], cl[1], cl[2], cl[3], cl[5]].iter().enumerate() {
-            t[i] = (self.eval(id, bx, 0, bz, &mut memo) * 10000.0) as i64;
+        let off;
+        if wg_count() {
+            let mut memo = HashMap::new();
+            for (i, &id) in [cl[0], cl[1], cl[2], cl[3], cl[5]].iter().enumerate() {
+                t[i] = (self.eval(id, bx, 0, bz, &mut memo) * 10000.0) as i64;
+            }
+            // depth offset term (y-independent part of depth) when splittable
+            off = match self.depth_split {
+                Some((_, _, _, _, oid)) => self.eval(oid, bx, 0, bz, &mut memo),
+                None => 0.0,
+            };
+        } else {
+            let mut flat = self.take_corner_memo();
+            flat.next_2d();
+            flat.next_3d();
+            for (i, &id) in [cl[0], cl[1], cl[2], cl[3], cl[5]].iter().enumerate() {
+                t[i] = (self.eval_flat(id, bx, 0, bz, &mut flat) * 10000.0) as i64;
+            }
+            off = match self.depth_split {
+                Some((_, _, _, _, oid)) => self.eval_flat(oid, bx, 0, bz, &mut flat),
+                None => 0.0,
+            };
+            self.corner_memo = Some(flat);
         }
-        // depth offset term (y-independent part of depth) when splittable
-        let off = match self.depth_split {
-            Some((_, _, _, _, oid)) => self.eval(oid, bx, 0, bz, &mut memo),
-            None => 0.0,
-        };
         self.clim_c.insert((qx, qz), (t, off));
         self.clim_ord.push_back((qx, qz));
-        if self.clim_ord.len() > 4096 {
+        if self.clim_ord.len() > 16384 {
             let old = self.clim_ord.pop_front().unwrap();
             self.clim_c.remove(&old);
         }
@@ -10688,7 +12494,12 @@ impl Gen {
                     4
                 }
             };
-            return Some((biome_id(self.biome_names.get(leaf)?), leaf as u16));
+            return Some((*self.biome_ids.get(leaf)?, leaf as u16));
+        }
+        if last.is_none() {
+            if let Some(&leaf) = self.bioq_none.get(&(qx, qy, qz)) {
+                return Some((*self.biome_ids.get(leaf as usize)?, leaf));
+            }
         }
         let t = self.target7(qx, qy, qz)?;
         // vanilla seeds the search with the previous result
@@ -10699,8 +12510,17 @@ impl Gen {
             }
         }
         self.btree.as_ref()?.search(&t, &mut best);
-        let name = self.biome_names.get(best.1 as usize)?;
-        Some((biome_id(name), best.1))
+        if last.is_none() {
+            self.bioq_none.insert((qx, qy, qz), best.1);
+            self.bioq_none_ord.push_back((qx, qy, qz));
+            if self.bioq_none_ord.len() > 65536 {
+                if let Some(old) = self.bioq_none_ord.pop_front() {
+                    self.bioq_none.remove(&old);
+                }
+            }
+        }
+        let id = *self.biome_ids.get(best.1 as usize)?;
+        Some((id, best.1))
     }
 }
 
