@@ -2352,6 +2352,9 @@ fn save_world_into(f: &mut Vec<u8>) {
         }
     }
     append_dxt_footer(f, &dxt);
+    // WBE1 tucks beneath WBD1: a registry with nothing in it emits not one
+    // byte, so an untouched world keeps the exact pre-record tail.
+    append_wbe_footer(f);
     // WBD1 rides alongside VER1 beneath the seed trailer and, like every other
     // additive footer, is emitted only when it would say something a default
     // save does not already imply.
@@ -3869,6 +3872,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     if let Some(border) = world_border_save {
         apply_saved_world_border(&border);
     }
+    let (payload, wbe_entries) = read_wbe_footer(payload)?;
     let (payload, dxt) = read_dxt_footer(payload)?;
     let (payload, mut mob_dimensions) = read_mob_dimensions_footer(payload)?;
     let (payload, mut brewing) = read_brewing_footer(payload)?;
@@ -5114,6 +5118,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     *saved_players().lock().unwrap_or_else(|e| e.into_inner()) = state.players;
     *saved_raids().lock().unwrap_or_else(|e| e.into_inner()) = state.raids;
     *live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner()) = brewing;
+    restore_wbe_entries(wbe_entries);
     restore_saved_block_entities(block_entities);
     eprintln!(
         "[spine] loaded {} dirty chunks",
@@ -5258,6 +5263,323 @@ fn read_brewing_footer(
         return Err("trailing bytes in brewing footer");
     }
     Ok((&payload[..start], stands))
+}
+
+// ---------- W-BE mechanism registry footer ----------
+//
+// The world-mechanisms registry (`world_block_entity_registry`) owns the nine
+// live block-entity families — brewing stand, crafter, campfire, jukebox,
+// spawner, lectern, chiseled bookshelf, decorated pot and beacon — keyed by
+// dimension and block. Written as a WBE1 footer only when the registry holds
+// something, so a world without mechanism entities keeps the exact pre-record
+// byte layout (and `the_tick_preserves_the_saved_world_payload_byte_for_byte`
+// sees not one extra byte). Framed `[body][body size u64][WBE1]` like the
+// other save-state footers; each entry is `[dim key u16+utf8][x][y][z][kind u8]
+// [payload len u32][payload]`, where the payload is named NBT for the eight
+// `to_nbt` families and a compact binary record for the component-aware live
+// brewing stand.
+const WBE_MAGIC: &[u8; 4] = b"WBE1";
+
+/// Kind tags in `VanillaBlockEntity` declaration order.
+fn wbe_entity_tag(entity: &VanillaBlockEntity) -> u8 {
+    match entity {
+        VanillaBlockEntity::BrewingStand(_) => 0,
+        VanillaBlockEntity::Crafter(_) => 1,
+        VanillaBlockEntity::Campfire(_) => 2,
+        VanillaBlockEntity::Jukebox(_) => 3,
+        VanillaBlockEntity::MobSpawner(_) => 4,
+        VanillaBlockEntity::Lectern(_) => 5,
+        VanillaBlockEntity::ChiseledBookshelf(_) => 6,
+        VanillaBlockEntity::DecoratedPot(_) => 7,
+        VanillaBlockEntity::Beacon(_) => 8,
+    }
+}
+
+// Declaration-order tables for the brewing stand's fieldless enums: encode is
+// the `as u8` discriminant, decode indexes back into the same table.
+const WBE_POTION_KINDS: [PotionKind; 46] = [
+    PotionKind::Water,
+    PotionKind::Mundane,
+    PotionKind::Thick,
+    PotionKind::Awkward,
+    PotionKind::NightVision,
+    PotionKind::LongNightVision,
+    PotionKind::Invisibility,
+    PotionKind::LongInvisibility,
+    PotionKind::Leaping,
+    PotionKind::LongLeaping,
+    PotionKind::StrongLeaping,
+    PotionKind::FireResistance,
+    PotionKind::LongFireResistance,
+    PotionKind::Swiftness,
+    PotionKind::LongSwiftness,
+    PotionKind::StrongSwiftness,
+    PotionKind::Slowness,
+    PotionKind::LongSlowness,
+    PotionKind::StrongSlowness,
+    PotionKind::TurtleMaster,
+    PotionKind::LongTurtleMaster,
+    PotionKind::StrongTurtleMaster,
+    PotionKind::WaterBreathing,
+    PotionKind::LongWaterBreathing,
+    PotionKind::Healing,
+    PotionKind::StrongHealing,
+    PotionKind::Harming,
+    PotionKind::StrongHarming,
+    PotionKind::Poison,
+    PotionKind::LongPoison,
+    PotionKind::StrongPoison,
+    PotionKind::Regeneration,
+    PotionKind::LongRegeneration,
+    PotionKind::StrongRegeneration,
+    PotionKind::Strength,
+    PotionKind::LongStrength,
+    PotionKind::StrongStrength,
+    PotionKind::Weakness,
+    PotionKind::LongWeakness,
+    PotionKind::Luck,
+    PotionKind::SlowFalling,
+    PotionKind::LongSlowFalling,
+    PotionKind::WindCharged,
+    PotionKind::Oozing,
+    PotionKind::Infested,
+    PotionKind::Weaving,
+];
+const WBE_POTION_FORMS: [PotionForm; 3] = [
+    PotionForm::Drinkable,
+    PotionForm::Splash,
+    PotionForm::Lingering,
+];
+const WBE_INGREDIENTS: [BrewingIngredient; 22] = [
+    BrewingIngredient::NetherWart,
+    BrewingIngredient::FermentedSpiderEye,
+    BrewingIngredient::GoldenCarrot,
+    BrewingIngredient::RabbitFoot,
+    BrewingIngredient::MagmaCream,
+    BrewingIngredient::Sugar,
+    BrewingIngredient::TurtleHelmet,
+    BrewingIngredient::Pufferfish,
+    BrewingIngredient::GlisteringMelonSlice,
+    BrewingIngredient::SpiderEye,
+    BrewingIngredient::GhastTear,
+    BrewingIngredient::BlazePowder,
+    BrewingIngredient::PhantomMembrane,
+    BrewingIngredient::BreezeRod,
+    BrewingIngredient::SlimeBlock,
+    BrewingIngredient::Stone,
+    BrewingIngredient::Cobweb,
+    BrewingIngredient::Redstone,
+    BrewingIngredient::GlowstoneDust,
+    BrewingIngredient::Gunpowder,
+    BrewingIngredient::DragonBreath,
+    BrewingIngredient::GlassBottle,
+];
+
+/// The live brewing stand's binary payload: `[blaze_powder u8][fuel u8]
+/// [brew_time u16][ingredient item u8 = 0xFF none][ingredient count u8 when set]
+/// [active_ingredient u8 = 0xFF none]` then three bottles, each `[kind u8 =
+/// 0xFF none][form u8 when set]`.
+fn wbe_write_brewing(stand: &BrewingStand, out: &mut Vec<u8>) {
+    out.push(stand.blaze_powder);
+    out.push(stand.fuel);
+    out.extend_from_slice(&stand.brew_time.to_be_bytes());
+    match stand.ingredient {
+        Some((item, count)) => {
+            out.push(item as u8);
+            out.push(count);
+        }
+        None => out.push(0xFF),
+    }
+    out.push(stand.active_ingredient.map_or(0xFF, |item| item as u8));
+    for bottle in &stand.bottles {
+        match bottle {
+            Some(potion) => {
+                out.push(potion.kind as u8);
+                out.push(potion.form as u8);
+            }
+            None => out.push(0xFF),
+        }
+    }
+}
+
+fn wbe_read_brewing(payload: &[u8]) -> Option<BrewingStand> {
+    let mut input = SaveInput(payload);
+    let blaze_powder = input.byte().ok()?;
+    let fuel = input.byte().ok()?;
+    let brew_time = u16::from_be_bytes(input.take().ok()?);
+    let ingredient = match input.byte().ok()? {
+        0xFF => None,
+        item => Some((
+            WBE_INGREDIENTS.get(usize::from(item)).copied()?,
+            input.byte().ok()?,
+        )),
+    };
+    let active_ingredient = match input.byte().ok()? {
+        0xFF => None,
+        item => Some(WBE_INGREDIENTS.get(usize::from(item)).copied()?),
+    };
+    let mut bottles = [None, None, None];
+    for bottle in &mut bottles {
+        match input.byte().ok()? {
+            0xFF => {}
+            kind => {
+                let kind = WBE_POTION_KINDS.get(usize::from(kind)).copied()?;
+                let form = WBE_POTION_FORMS.get(usize::from(input.byte().ok()?)).copied()?;
+                *bottle = Some(BrewingPotion { kind, form });
+            }
+        }
+    }
+    if !input.0.is_empty() {
+        return None;
+    }
+    Some(BrewingStand {
+        bottles,
+        ingredient,
+        blaze_powder,
+        fuel,
+        brew_time,
+        active_ingredient,
+    })
+}
+
+/// One registry entry's opaque payload: named NBT for the eight `to_nbt`
+/// families, the binary record above for the live brewing stand.
+fn wbe_entity_payload(entity: &VanillaBlockEntity) -> Option<Vec<u8>> {
+    let tag = match entity {
+        VanillaBlockEntity::BrewingStand(stand) => {
+            let mut payload = Vec::new();
+            wbe_write_brewing(stand, &mut payload);
+            return Some(payload);
+        }
+        VanillaBlockEntity::Crafter(be) => be.to_nbt(),
+        VanillaBlockEntity::Campfire(be) => be.to_nbt(),
+        VanillaBlockEntity::Jukebox(be) => be.to_nbt(),
+        VanillaBlockEntity::MobSpawner(be) => be.to_nbt(),
+        VanillaBlockEntity::Lectern(be) => be.to_nbt(),
+        VanillaBlockEntity::ChiseledBookshelf(be) => be.to_nbt(),
+        VanillaBlockEntity::DecoratedPot(be) => be.to_nbt(),
+        VanillaBlockEntity::Beacon(be) => be.to_nbt(),
+    };
+    crate::nbt::write_named(&crate::nbt::NbtString::text(""), &tag).ok()
+}
+
+fn wbe_entity_from_payload(
+    kind: u8,
+    payload: &[u8],
+) -> Result<VanillaBlockEntity, &'static str> {
+    if kind == 0 {
+        return wbe_read_brewing(payload)
+            .map(VanillaBlockEntity::BrewingStand)
+            .ok_or("invalid W-BE brewing stand record");
+    }
+    let (name, tag) = crate::nbt::read_named(payload)?;
+    if !name.0.is_empty() || !matches!(tag, crate::nbt::Tag::Compound(_)) {
+        return Err("W-BE record must be an unnamed compound");
+    }
+    match kind {
+        1 => CrafterBlockEntity::from_nbt(&tag).map(VanillaBlockEntity::Crafter),
+        2 => CampfireBlockEntity::from_nbt(&tag).map(VanillaBlockEntity::Campfire),
+        3 => JukeboxBlockEntity::from_nbt(&tag).map(VanillaBlockEntity::Jukebox),
+        4 => MobSpawnerBlockEntity::from_nbt(&tag).map(VanillaBlockEntity::MobSpawner),
+        5 => LecternBlockEntity::from_nbt(&tag).map(VanillaBlockEntity::Lectern),
+        6 => ChiseledBookshelfBlockEntity::from_nbt(&tag)
+            .map(VanillaBlockEntity::ChiseledBookshelf),
+        7 => DecoratedPotBlockEntity::from_nbt(&tag).map(VanillaBlockEntity::DecoratedPot),
+        8 => BeaconBlockEntity::from_nbt(&tag).map(VanillaBlockEntity::Beacon),
+        _ => return Err("unknown W-BE entity kind"),
+    }
+    .ok_or("invalid W-BE entity payload")
+}
+
+fn append_wbe_footer(out: &mut Vec<u8>) {
+    let mut entries: Vec<((DimId, i32, i32, i32), u8, Vec<u8>)> = Vec::new();
+    {
+        let registry = world_block_entity_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (&key, entity) in registry.iter() {
+            if key.0.dimension_id().is_empty() {
+                continue;
+            }
+            let Some(payload) = wbe_entity_payload(entity) else {
+                continue;
+            };
+            entries.push((key, wbe_entity_tag(entity), payload));
+        }
+    }
+    if entries.is_empty() {
+        return;
+    }
+    entries.sort_by_key(|(key, kind, _)| (dim_key(key.0), key.1, key.2, key.3, *kind));
+    let start = out.len();
+    out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for ((dim, x, y, z), kind, payload) in entries {
+        let key = dim_key(dim);
+        out.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        out.extend_from_slice(key.as_bytes());
+        save_numbers!(out, x, y, z);
+        out.push(kind);
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(&payload);
+    }
+    out.extend_from_slice(&((out.len() - start) as u64).to_be_bytes());
+    out.extend_from_slice(WBE_MAGIC);
+}
+
+fn read_wbe_footer(
+    payload: &[u8],
+) -> Result<(&[u8], Vec<(DimBlockPos, VanillaBlockEntity)>), &'static str> {
+    let (payload, body) = split_save_footer(payload, WBE_MAGIC)?;
+    let Some(body) = body else {
+        return Ok((payload, Vec::new()));
+    };
+    let mut input = SaveInput(body);
+    let count = u32::from_be_bytes(input.take()?) as usize;
+    // One entry is at least 2 + 12 + 1 + 4 bytes; a larger count is corrupt.
+    if count > input.0.len() / 19 {
+        return Err("invalid W-BE entity count");
+    }
+    let mut entries = Vec::with_capacity(count);
+    let mut positions = HashSet::new();
+    for _ in 0..count {
+        let key_len = usize::from(u16::from_be_bytes(input.take()?));
+        let key = std::str::from_utf8(input.bytes(key_len)?)
+            .map_err(|_| "invalid W-BE dimension key")?
+            .to_owned();
+        let (x, y, z) = (
+            i32::from_be_bytes(input.take()?),
+            i32::from_be_bytes(input.take()?),
+            i32::from_be_bytes(input.take()?),
+        );
+        let kind = input.byte()?;
+        let len = u32::from_be_bytes(input.take()?) as usize;
+        let entity = wbe_entity_from_payload(kind, input.bytes(len)?)?;
+        // A dimension a dropped datapack took with it keeps nothing here, the
+        // same convention DXT1 records follow.
+        let Some(dim) = dxt_dim(&key) else {
+            continue;
+        };
+        if !positions.insert((dim, x, y, z)) {
+            return Err("duplicate W-BE entity position");
+        }
+        entries.push(((dim, x, y, z), entity));
+    }
+    if !input.0.is_empty() {
+        return Err("trailing bytes in W-BE footer");
+    }
+    Ok((payload, entries))
+}
+
+/// Install WBE1 records as the live mechanism registry: the save is
+/// authoritative, so whatever was registered is replaced wholesale.
+fn restore_wbe_entries(entries: Vec<(DimBlockPos, VanillaBlockEntity)>) {
+    let mut registry = world_block_entity_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    registry.clear();
+    for (key, entity) in entries {
+        registry.insert(key, entity);
+    }
 }
 
 // Live block-entity snapshots (#216): beacon, campfire, lectern, chiseled
@@ -5867,9 +6189,26 @@ fn live_chunk_tickets() -> &'static LockedMap<DimChunkKey, u64> {
     LIVE_CHUNK_TICKETS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// One mob drained out of the live stores for a parked chunk: the mob itself
+/// plus every eid-keyed side record, so `rehydrate_evicted_chunk` puts a tamed
+/// pet's owner, sitting flag, collar color and behavior back exactly as the
+/// unload left them.
+#[allow(dead_code)]
+struct ParkedMob {
+    mob: Arc<Mob>,
+    live_state: Option<LiveMobState>,
+    sitting_cat: bool,
+    villager: Option<Villager>,
+    sheared: bool,
+    tags: Option<HashSet<String>>,
+    attrs: Option<HashMap<String, f64>>,
+    selector_attrs: Option<HashMap<String, f64>>,
+}
+
 /// Everything `park_evicted_chunk` drains out of the live stores for one
 /// chunk, kept as the stores' own record types so a re-hydrate puts every
-/// block, container and block entity back exactly as the unload left it.
+/// block, container, block entity and parked entity back exactly as the unload
+/// left it.
 #[derive(Default)]
 #[allow(dead_code)]
 struct EvictedChunkArchive {
@@ -5882,6 +6221,8 @@ struct EvictedChunkArchive {
     anvil_records: Vec<(DimBlockPos, AnvilNbt)>,
     crops: Vec<(DimBlockPos, u8)>,
     pending_loot: Vec<(DimBlockPos, PendingBlockLoot)>,
+    mobs: Vec<ParkedMob>,
+    drops: Vec<Drop>,
 }
 
 #[allow(dead_code)]
@@ -5897,7 +6238,9 @@ impl EvictedChunkArchive {
             && self.live_entities.is_empty()
             && self.anvil_records.is_empty()
             && self.crops.is_empty()
-            && self.pending_loot.is_empty())
+            && self.pending_loot.is_empty()
+            && self.mobs.is_empty()
+            && self.drops.is_empty())
     }
 
     /// The block-entity-shaped records the drain carried: one entry per store
@@ -6283,37 +6626,94 @@ fn park_evicted_chunk(dim: DimId, cx: i32, cz: i32) -> EvictedChunkArchive {
     archive
 }
 
-/// Drop the non-player entities a chunk held: mobs keyed by dimension, plus
+/// Drain the non-player entities a chunk held: mobs keyed by dimension, plus
 /// item drops, which this store keeps dimension-agnostic and which are
 /// therefore reclaimed only with the Overworld chunk their position falls in.
 /// Connected players are never in either store — `clients()` is a separate
-/// list the unloader never touches.
+/// list the unloader never touches. The drained records come back to the
+/// caller so a park keeps them instead of losing them outright; each mob's
+/// eid-keyed side records (behavior state, sitting flag, villager data,
+/// shearing, tags, attributes) travel with it.
 #[allow(dead_code)]
-fn reclaim_chunk_entities(dim: DimId, cx: i32, cz: i32) -> usize {
-    let mut reclaimed = 0;
+fn drain_chunk_entities(dim: DimId, cx: i32, cz: i32) -> (usize, Vec<ParkedMob>, Vec<Drop>) {
+    let mut parked_mobs = Vec::new();
     {
         let mut ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
-        let before = ms.len();
-        ms.retain(|mob| {
-            if mob.dim != dim {
-                return true;
+        let mut i = 0;
+        while i < ms.len() {
+            let in_chunk = ms[i].dim == dim && {
+                let (x, _, z, _, _) = *ms[i].pos.lock().unwrap_or_else(|e| e.into_inner());
+                (x.floor() as i32).div_euclid(16) == cx
+                    && (z.floor() as i32).div_euclid(16) == cz
+            };
+            if in_chunk {
+                parked_mobs.push(ms.remove(i));
+            } else {
+                i += 1;
             }
-            let (x, _, z, _, _) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
-            (x.floor() as i32).div_euclid(16) != cx
-                || (z.floor() as i32).div_euclid(16) != cz
-        });
-        reclaimed += before - ms.len();
+        }
     }
+    // One store lock per statement: a `MutexGuard` temporary inside a struct
+    // literal lives to the end of the whole expression, which would hold every
+    // store at once — and re-locking `attrs()` there deadlocks.
+    let parked_mobs: Vec<ParkedMob> = parked_mobs
+        .into_iter()
+        .map(|mob| {
+            let eid = mob.eid;
+            let live_state = live_mob_states()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&eid);
+            let sitting_cat = sitting_cats()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&eid);
+            let villager = live_villagers()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&eid);
+            let sheared = sheared()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&eid);
+            let tags = tags()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&format!("e:{eid}"));
+            let (attrs_map, selector_attrs) = {
+                let mut attrs = attrs().lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    attrs.remove(&format!("e:{eid}")),
+                    attrs.remove(&format!("e:m:{eid}")),
+                )
+            };
+            ParkedMob {
+                mob,
+                live_state,
+                sitting_cat,
+                villager,
+                sheared,
+                tags,
+                attrs: attrs_map,
+                selector_attrs,
+            }
+        })
+        .collect();
+    let mut parked_drops = Vec::new();
     if dim == DimId::Overworld {
         let mut ds = drops().lock().unwrap_or_else(|e| e.into_inner());
-        let before = ds.len();
-        ds.retain(|item_drop| {
-            (item_drop.x.floor() as i32).div_euclid(16) != cx
-                || (item_drop.z.floor() as i32).div_euclid(16) != cz
-        });
-        reclaimed += before - ds.len();
+        let mut i = 0;
+        while i < ds.len() {
+            let in_chunk = (ds[i].x.floor() as i32).div_euclid(16) == cx
+                && (ds[i].z.floor() as i32).div_euclid(16) == cz;
+            if in_chunk {
+                parked_drops.push(ds.remove(i));
+            } else {
+                i += 1;
+            }
+        }
     }
-    reclaimed
+    (parked_mobs.len() + parked_drops.len(), parked_mobs, parked_drops)
 }
 
 /// Evict one unticketed chunk: flush its dirty overlay and block entities to
@@ -6352,8 +6752,15 @@ fn unload_unticketed_chunk_overlays(
             // The flush preserved the edits; the dropped archive is only the
             // drain record, so count the cells the flush wrote.
             debug_assert_eq!(summary.blocks_flushed, dropped.edits.len());
+            // A disk flush carries only blocks and block entities, so the
+            // drained entities are reclaimed outright.
+            summary.entities_unloaded = drain_chunk_entities(dim, cx, cz).0;
         } else {
-            let archive = park_evicted_chunk(dim, cx, cz);
+            let mut archive = park_evicted_chunk(dim, cx, cz);
+            let (entities, mobs, item_drops) = drain_chunk_entities(dim, cx, cz);
+            archive.mobs = mobs;
+            archive.drops = item_drops;
+            summary.entities_unloaded = entities;
             summary.block_entities_unloaded = archive.block_entity_records();
             summary.blocks_flushed = archive.edits.len();
             if archive.has_records() {
@@ -6365,7 +6772,6 @@ fn unload_unticketed_chunk_overlays(
                     .insert((cx, cz), archive);
             }
         }
-        summary.entities_unloaded = reclaim_chunk_entities(dim, cx, cz);
         live_chunk_tickets()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -6524,6 +6930,56 @@ fn rehydrate_evicted_chunk(dim: DimId, cx: i32, cz: i32) -> bool {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(pos, loot);
         }
+        for parked in archive.mobs {
+            let eid = parked.mob.eid;
+            if let Some(state) = parked.live_state {
+                live_mob_states()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(eid, state);
+            }
+            if parked.sitting_cat {
+                sitting_cats()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(eid);
+            }
+            if let Some(villager) = parked.villager {
+                live_villagers()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(eid, villager);
+            }
+            if parked.sheared {
+                sheared()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(eid);
+            }
+            if let Some(tag_set) = parked.tags {
+                tags()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(format!("e:{eid}"), tag_set);
+            }
+            {
+                let mut attrs = attrs().lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(values) = parked.attrs {
+                    attrs.insert(format!("e:{eid}"), values);
+                }
+                if let Some(values) = parked.selector_attrs {
+                    attrs.insert(format!("e:m:{eid}"), values);
+                }
+            }
+            mobs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(parked.mob);
+        }
+        drops()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(archive.drops);
     });
     true
 }
@@ -6776,5 +7232,353 @@ mod p8b4_issue105_tests {
             .insert((50, 50));
         assert!(unload_unticketed_chunk_overlays(DimId::Overworld, 50, 50, None).is_err());
         assert_eq!(p8b4_overlay_len((DimId::Overworld, 50, 50)), 1);
+    }
+}
+
+#[cfg(test)]
+mod fix_save_tests {
+    use super::*;
+
+    /// Insert a tamed pet into the live stores the way `insert_live_mob` +
+    /// `PetBehavior::try_tame` leave them, returning its eid.
+    fn fix_save_pet(etype: i64, x: f64, z: f64, owner: [u8; 16], item: &str, collar: u8) -> i32 {
+        assert!(insert_live_mob(
+            etype,
+            DimId::Overworld,
+            (x, 70.0, z, 0.0, 0.0),
+            8.0,
+            None
+        ));
+        let eid = {
+            let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
+            mobs.last().unwrap().eid
+        };
+        {
+            let mut states = live_mob_states().lock().unwrap_or_else(|e| e.into_inner());
+            let pet = match &mut states.get_mut(&eid).unwrap().behavior {
+                Some(MobBehaviorState::Wolf(p)) | Some(MobBehaviorState::Cat(p)) => p,
+                _ => unreachable!("pet behavior for etype {etype}"),
+            };
+            assert_eq!(pet.try_tame(owner, item, &mut |_| 0), PetTameResult::Tamed);
+            assert!(pet.dye_collar(owner, collar));
+            assert!(pet.sitting);
+        }
+        // `try_tame` bumps the behavior record's hp to the tamed max; mirror it
+        // into the mob's live hp the way the taming interaction does.
+        let max_hp = {
+            let states = live_mob_states().lock().unwrap_or_else(|e| e.into_inner());
+            match &states[&eid].behavior {
+                Some(MobBehaviorState::Wolf(p)) | Some(MobBehaviorState::Cat(p)) => p.hp,
+                _ => unreachable!(),
+            }
+        };
+        let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
+        let mob = mobs.iter().find(|m| m.eid == eid).unwrap();
+        *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) = max_hp;
+        eid
+    }
+
+    /// The live record of `eid`'s pet behavior: `(owner, sitting, collar, pet
+    /// hp, mob hp, is_wolf)`.
+    fn fix_save_pet_record(eid: i32) -> (Option<[u8; 16]>, bool, u8, f32, f32, bool) {
+        let states = live_mob_states().lock().unwrap_or_else(|e| e.into_inner());
+        let (pet, is_wolf) = match &states[&eid].behavior {
+            Some(MobBehaviorState::Wolf(p)) => (p, true),
+            Some(MobBehaviorState::Cat(p)) => (p, false),
+            _ => unreachable!(),
+        };
+        let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
+        let mob = mobs.iter().find(|m| m.eid == eid).unwrap();
+        let mob_hp = saved_value(&mob.hp);
+        (pet.owner, pet.sitting, pet.collar_color, pet.hp, mob_hp, is_wolf)
+    }
+
+    #[test]
+    fn fix_save_tamed_wolf_and_cat_roundtrip_save_v2() {
+        if test_support::isolated_world_test() {
+            return;
+        }
+        let _guard = world_guard();
+        let owner = [0x5Au8; 16];
+        let wolf = fix_save_pet(122, 50.5, 50.5, owner, "bone", 11);
+        let cat = fix_save_pet(15, 51.5, 51.5, owner, "cod", 3);
+        assert_eq!(fix_save_pet_record(wolf), (Some(owner), true, 11, 40.0, 40.0, true));
+        assert_eq!(fix_save_pet_record(cat), (Some(owner), true, 3, 10.0, 10.0, false));
+
+        let mut payload = Vec::new();
+        save_world_into(&mut payload);
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        live_mob_states().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        load_world_from(&payload).unwrap();
+
+        // eids are reissued on load: find the restored pets by entity type.
+        let restored = mobs().lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(restored.len(), 2);
+        let wolf_eid = restored.iter().find(|m| m.etype == 122).unwrap().eid;
+        let cat_eid = restored.iter().find(|m| m.etype == 15).unwrap().eid;
+        assert_eq!(
+            fix_save_pet_record(wolf_eid),
+            (Some(owner), true, 11, 40.0, 40.0, true),
+            "tamed wolf survives save/load"
+        );
+        assert_eq!(
+            fix_save_pet_record(cat_eid),
+            (Some(owner), true, 3, 10.0, 10.0, false),
+            "tamed cat survives save/load"
+        );
+    }
+
+    #[test]
+    fn fix_save_tamed_pets_survive_chunk_eviction_and_rehydrate() {
+        if test_support::isolated_world_test() {
+            return;
+        }
+        let _guard = world_guard();
+        let owner = [0x7Eu8; 16];
+        // Chunk (40, 40): block coords 640..655.
+        let wolf = fix_save_pet(122, 644.5, 644.5, owner, "bone", 11);
+        let cat = fix_save_pet(15, 645.5, 645.5, owner, "cod", 9);
+
+        let summary = sweep_unticketed_regions(
+            &HashSet::new(),
+            &HashSet::new(),
+            LiveChunkUnloadPolicy {
+                max_unticketed_chunks: 64,
+                grace_ticks: 0,
+            },
+            1,
+            None,
+        )
+        .unwrap();
+        assert_eq!(summary.chunks_unloaded, 1, "the pets' chunk evicts");
+        assert_eq!(summary.entities_unloaded, 2);
+        assert!(mobs().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        assert!(live_mob_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
+
+        assert!(
+            reload_unticketed_chunk_overlay(DimId::Overworld, 40, 40, None).unwrap(),
+            "the parked archive re-hydrates"
+        );
+        // The same records return under the same eids: an archive parks the
+        // mob itself, not a fresh spawn.
+        assert_eq!(mobs().lock().unwrap_or_else(|e| e.into_inner()).len(), 2);
+        assert_eq!(
+            fix_save_pet_record(wolf),
+            (Some(owner), true, 11, 40.0, 40.0, true),
+            "tamed wolf survives eviction"
+        );
+        assert_eq!(
+            fix_save_pet_record(cat),
+            (Some(owner), true, 9, 10.0, 10.0, false),
+            "tamed cat survives eviction"
+        );
+    }
+
+    #[test]
+    fn fix_save_wbe_footer_omitted_when_registry_empty() {
+        if test_support::isolated_world_test() {
+            return;
+        }
+        let _guard = world_guard();
+        world_block_entity_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        let mut out = Vec::new();
+        append_wbe_footer(&mut out);
+        assert!(out.is_empty(), "empty W-BE registry emits zero bytes");
+        // The full save payload carries no WBE1 marker either.
+        let mut payload = Vec::new();
+        save_world_into(&mut payload);
+        assert!(
+            !payload.windows(4).any(|w| w == WBE_MAGIC),
+            "no WBE1 footer in an untouched save"
+        );
+        // And the footer reader accepts its absence without touching bytes.
+        let (rest, entries) = read_wbe_footer(&payload).unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(rest.len(), payload.len());
+    }
+
+    #[test]
+    fn fix_save_wbe_footer_codec_roundtrip_and_rejects_corruption() {
+        if test_support::isolated_world_test() {
+            return;
+        }
+        let _guard = world_guard();
+        {
+            let mut registry = world_block_entity_registry()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            registry.insert(
+                (DimId::Overworld, 10, 64, 10),
+                VanillaBlockEntity::Campfire(CampfireBlockEntity {
+                    slots: [
+                        Some(("minecraft:beef".to_string(), 40, 600)),
+                        Some(("minecraft:cod".to_string(), 120, 600)),
+                        None,
+                        None,
+                    ],
+                }),
+            );
+            registry.insert(
+                (DimId::Nether, -8, 70, 33),
+                VanillaBlockEntity::Jukebox(JukeboxBlockEntity {
+                    record_item: Some("minecraft:music_disc_cat".to_string()),
+                    ticks_since_song_started: 1234,
+                }),
+            );
+            registry.insert(
+                (DimId::End, 100, 49, -7),
+                VanillaBlockEntity::Lectern(LecternBlockEntity {
+                    book_item: Some("minecraft:writable_book".to_string()),
+                    page: 3,
+                    total_pages: 20,
+                }),
+            );
+        }
+        let mut out = Vec::new();
+        append_wbe_footer(&mut out);
+        assert!(out.ends_with(WBE_MAGIC));
+        let (rest, entries) = read_wbe_footer(&out).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(entries.len(), 3);
+        let campfire = entries
+            .iter()
+            .find(|(pos, _)| *pos == (DimId::Overworld, 10, 64, 10))
+            .map(|(_, e)| e);
+        let Some(VanillaBlockEntity::Campfire(campfire)) = campfire else {
+            panic!("campfire missing");
+        };
+        assert_eq!(campfire.slots[0], Some(("minecraft:beef".to_string(), 40, 600)));
+        assert_eq!(campfire.slots[1], Some(("minecraft:cod".to_string(), 120, 600)));
+        assert_eq!(campfire.slots[2], None);
+        let Some(VanillaBlockEntity::Jukebox(jukebox)) = entries
+            .iter()
+            .find(|(pos, _)| *pos == (DimId::Nether, -8, 70, 33))
+            .map(|(_, e)| e)
+        else {
+            panic!("jukebox missing");
+        };
+        assert_eq!(jukebox.record_item.as_deref(), Some("minecraft:music_disc_cat"));
+        assert_eq!(jukebox.ticks_since_song_started, 1234);
+        let Some(VanillaBlockEntity::Lectern(lectern)) = entries
+            .iter()
+            .find(|(pos, _)| *pos == (DimId::End, 100, 49, -7))
+            .map(|(_, e)| e)
+        else {
+            panic!("lectern missing");
+        };
+        assert_eq!(lectern.book_item.as_deref(), Some("minecraft:writable_book"));
+        assert_eq!(lectern.page, 3);
+        assert_eq!(lectern.total_pages, 20);
+
+        // Malformed records fail closed, never panic. The footer is
+        // trailer-framed, so "truncated" means a body shorter than its
+        // declared length or a severed trailer — both reject cleanly.
+        let len_pos = out.len() - 12;
+        let body_len =
+            u64::from_be_bytes(out[len_pos..len_pos + 8].try_into().unwrap()) as usize;
+        let body_start = out.len() - 12 - body_len;
+        // An inflated declared length overruns the payload.
+        let mut corrupt = out.clone();
+        corrupt[len_pos..len_pos + 8]
+            .copy_from_slice(&(body_len as u64 + 4096).to_be_bytes());
+        assert!(read_wbe_footer(&corrupt).is_err(), "overrun body length");
+        // An unknown kind tag is rejected. The first entry's kind byte sits
+        // after 4B count + 2B key len + key + 12B position.
+        let key_len =
+            u16::from_be_bytes(out[body_start + 4..body_start + 6].try_into().unwrap())
+                as usize;
+        let mut corrupt = out.clone();
+        corrupt[body_start + 4 + 2 + key_len + 12] = 0xEE;
+        assert!(read_wbe_footer(&corrupt).is_err(), "unknown kind tag");
+        // A body cut mid-entry, re-framed with an honest length, cannot parse.
+        let cut_body = &out[body_start..body_start + body_len - 2];
+        let mut reframed = out[..body_start].to_vec();
+        reframed.extend_from_slice(cut_body);
+        reframed.extend_from_slice(&(cut_body.len() as u64).to_be_bytes());
+        reframed.extend_from_slice(WBE_MAGIC);
+        assert!(read_wbe_footer(&reframed).is_err(), "mid-entry truncation");
+        // A garbage byte left after the last record inside the declared body
+        // is rejected as trailing junk.
+        let mut padded = out[..body_start + body_len].to_vec();
+        padded.push(0xFF);
+        padded.extend_from_slice(&((body_len + 1) as u64).to_be_bytes());
+        padded.extend_from_slice(WBE_MAGIC);
+        assert!(read_wbe_footer(&padded).is_err(), "trailing bytes in body");
+    }
+
+    #[test]
+    fn fix_save_wbe_registry_survives_save_v2_roundtrip() {
+        if test_support::isolated_world_test() {
+            return;
+        }
+        let _guard = world_guard();
+        {
+            let mut registry = world_block_entity_registry()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            registry.insert(
+                (DimId::Overworld, 10, 64, 10),
+                VanillaBlockEntity::Campfire(CampfireBlockEntity {
+                    slots: [Some(("minecraft:porkchop".to_string(), 5, 600)), None, None, None],
+                }),
+            );
+            registry.insert(
+                (DimId::Nether, -8, 70, 33),
+                VanillaBlockEntity::Jukebox(JukeboxBlockEntity {
+                    record_item: Some("minecraft:music_disc_blocks".to_string()),
+                    ticks_since_song_started: 77,
+                }),
+            );
+            registry.insert(
+                (DimId::Overworld, 11, 64, 10),
+                VanillaBlockEntity::Lectern(LecternBlockEntity {
+                    book_item: Some("minecraft:written_book".to_string()),
+                    page: 1,
+                    total_pages: 9,
+                }),
+            );
+        }
+        let mut payload = Vec::new();
+        save_world_into(&mut payload);
+        assert!(
+            payload.windows(4).any(|w| w == WBE_MAGIC),
+            "a non-empty W-BE registry writes the footer"
+        );
+        world_block_entity_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        load_world_from(&payload).unwrap();
+        let registry = world_block_entity_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(registry.len(), 3);
+        let Some(VanillaBlockEntity::Campfire(campfire)) =
+            registry.get(&(DimId::Overworld, 10, 64, 10))
+        else {
+            panic!("campfire missing after load");
+        };
+        assert_eq!(campfire.slots[0], Some(("minecraft:porkchop".to_string(), 5, 600)));
+        let Some(VanillaBlockEntity::Jukebox(jukebox)) =
+            registry.get(&(DimId::Nether, -8, 70, 33))
+        else {
+            panic!("jukebox missing after load");
+        };
+        assert_eq!(jukebox.record_item.as_deref(), Some("minecraft:music_disc_blocks"));
+        assert_eq!(jukebox.ticks_since_song_started, 77);
+        let Some(VanillaBlockEntity::Lectern(lectern)) =
+            registry.get(&(DimId::Overworld, 11, 64, 10))
+        else {
+            panic!("lectern missing after load");
+        };
+        assert_eq!(lectern.book_item.as_deref(), Some("minecraft:written_book"));
+        assert_eq!(lectern.page, 1);
+        assert_eq!(lectern.total_pages, 9);
     }
 }

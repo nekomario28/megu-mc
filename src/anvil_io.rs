@@ -1695,6 +1695,8 @@ struct AnvilLoadSummary {
     unsupported_chunks: usize,
     /// Section entries dropped for carrying no `Y` index at all.
     dropped_sections: usize,
+    /// `playerdata/*.dat` records restored into `saved_players`.
+    players_loaded: usize,
 }
 
 /// What `live_anvil_save_dir` wrote.
@@ -1707,6 +1709,8 @@ struct AnvilSaveSummary {
     backup_rotated: bool,
     region_files: usize,
     chunks_written: usize,
+    /// `playerdata/<uuid>.dat` files written under the world directory.
+    players_written: usize,
 }
 
 /// Does `dir` hold anything shaped like an Anvil world — a `level.dat` or at
@@ -1781,10 +1785,485 @@ fn write_level_dat_rotating(
     }
 }
 
+// ---------- playerdata/<uuid>.dat (vanilla per-player NBT) ----------
+//
+// Vanilla keeps one gzipped NBT file per player under
+// `<world>/playerdata/<dashed-uuid>.dat`. These records round-trip a
+// `PlayerSave` verbatim: `Dimension` + `Pos`/`Rotation`, `Health`,
+// `AbsorptionAmount`, `foodLevel`/`foodSaturationLevel`/`foodExhaustionLevel`,
+// `XpLevel`/`XpP`/`XpTotal`, `playerGameType`, `SelectedItemSlot`,
+// `Inventory`/`EnderItems`, `ActiveEffects`, and the `Spawn*` fields, with a
+// private `SpawnKind` extension byte so bed/anchor targets survive too.
+// `PlayerSave` inventory keys are window-0 slot ids; vanilla `Slot` keys are
+// 0..=8 hotbar, 9..=35 main, 100..=103 feet..head and -106 offhand.
+
+/// A window-0 slot `PlayerSave` carries -> the `Slot` key vanilla writes.
+fn playerdata_slot_to_vanilla(slot: i16) -> Option<i16> {
+    match slot {
+        36..=44 => Some(slot - 36),
+        9..=35 => Some(slot),
+        5..=8 => Some(108 - slot),
+        45 => Some(-106),
+        _ => None,
+    }
+}
+
+/// A `Slot` key read back from NBT -> the window-0 slot `PlayerSave` uses.
+fn playerdata_slot_from_vanilla(slot: i16) -> Option<i16> {
+    match slot {
+        0..=8 => Some(slot + 36),
+        9..=35 => Some(slot),
+        100..=103 => Some(108 - slot),
+        -106 => Some(45),
+        _ => None,
+    }
+}
+
+fn playerdata_slots_to_vanilla(slots: &HashMap<i16, Stack>) -> HashMap<i16, Stack> {
+    slots
+        .iter()
+        .filter_map(|(&slot, stack)| {
+            playerdata_slot_to_vanilla(slot).map(|key| (key, stack.clone()))
+        })
+        .collect()
+}
+
+fn playerdata_slots_from_vanilla(slots: HashMap<i16, Stack>) -> HashMap<i16, Stack> {
+    slots
+        .into_iter()
+        .filter_map(|(slot, stack)| {
+            playerdata_slot_from_vanilla(slot).map(|key| (key, stack))
+        })
+        .collect()
+}
+
+/// The lowercase dashed `<8-4-4-4-12>.dat` name vanilla gives a player file.
+fn playerdata_file_name(uuid: &[u8; 16]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut name = String::with_capacity(40);
+    for (index, byte) in uuid.iter().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            name.push('-');
+        }
+        name.push(HEX[usize::from(byte >> 4)] as char);
+        name.push(HEX[usize::from(byte & 0xF)] as char);
+    }
+    name.push_str(".dat");
+    name
+}
+
+/// The 16 bytes a `<8-4-4-4-12>` file stem stands for: strict — exactly 36
+/// chars, hyphens only in the four canonical slots, hex elsewhere — so a `..`
+/// or otherwise odd name never resolves to a path the loader would touch.
+fn playerdata_uuid_of(stem: &str) -> Option<[u8; 16]> {
+    let b = stem.as_bytes();
+    if b.len() != 36 {
+        return None;
+    }
+    let mut uuid = [0u8; 16];
+    let mut nibble = true;
+    let mut out = 0usize;
+    for (index, &c) in b.iter().enumerate() {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            if c != b'-' {
+                return None;
+            }
+            continue;
+        }
+        let digit = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            b'A'..=b'F' => c - b'A' + 10,
+            _ => return None,
+        };
+        if nibble {
+            uuid[out] = digit << 4;
+        } else {
+            uuid[out] |= digit;
+            out += 1;
+        }
+        nibble = !nibble;
+    }
+    Some(uuid)
+}
+
+/// `Tag::Float`/`Tag::Double` hold raw bits; this is the same coercion the
+/// `anvil_f*` key accessors apply, for list elements.
+fn playerdata_f64(t: &AnvilNbt) -> Option<f64> {
+    match t {
+        AnvilNbt::Double(v) => Some(f64::from_bits(*v)),
+        AnvilNbt::Float(v) => Some(f64::from(f32::from_bits(*v))),
+        _ => None,
+    }
+}
+
+/// The compound one `PlayerSave` serializes to — the vanilla schema, with the
+/// private `SpawnKind` byte carrying the bed/anchor kind the classic `Spawn*`
+/// fields cannot express.
+fn playerdata_nbt_of(save: &PlayerSave) -> AnvilNbt {
+    let (dim, x, y, z, yaw, pitch) = save.position;
+    let fields: Vec<(&str, AnvilNbt)> = vec![
+        ("DataVersion", AnvilNbt::Int(ANVIL_DATA_VERSION)),
+        ("Dimension", anvil_s(&dim_key(dim))),
+        (
+            "Pos",
+            anvil_list(vec![
+                AnvilNbt::Double(x.to_bits()),
+                AnvilNbt::Double(y.to_bits()),
+                AnvilNbt::Double(z.to_bits()),
+            ]),
+        ),
+        (
+            "Rotation",
+            anvil_list(vec![
+                AnvilNbt::Float(yaw.to_bits()),
+                AnvilNbt::Float(pitch.to_bits()),
+            ]),
+        ),
+        ("Health", AnvilNbt::Float(save.health.to_bits())),
+        (
+            "AbsorptionAmount",
+            AnvilNbt::Float(save.absorption.to_bits()),
+        ),
+        ("foodLevel", AnvilNbt::Int(save.food)),
+        (
+            "foodSaturationLevel",
+            AnvilNbt::Float(save.saturation.to_bits()),
+        ),
+        (
+            "foodExhaustionLevel",
+            AnvilNbt::Float((save.exhaustion as f32).to_bits()),
+        ),
+        ("foodTickTimer", AnvilNbt::Int(0)),
+        ("XpLevel", AnvilNbt::Int(save.xp_level)),
+        ("XpP", AnvilNbt::Float(save.xp_progress.to_bits())),
+        (
+            "XpTotal",
+            AnvilNbt::Int(save.xp_total.clamp(0, i64::from(i32::MAX)) as i32),
+        ),
+        ("playerGameType", AnvilNbt::Int(i32::from(save.gamemode))),
+        ("previousPlayerGameType", AnvilNbt::Int(-1)),
+        ("SelectedItemSlot", AnvilNbt::Int(i32::from(save.held))),
+        (
+            "Inventory",
+            stacks_to_items_nbt(&playerdata_slots_to_vanilla(&save.inventory)),
+        ),
+        (
+            "EnderItems",
+            stacks_to_items_nbt(&save.ender_chest),
+        ),
+    ];
+    let mut root = anvil_obj(&fields);
+    let effects: Vec<AnvilNbt> = save
+        .effects
+        .iter()
+        .map(|&(id, amp, left)| {
+            anvil_obj(&[
+                ("Id", AnvilNbt::Byte(id.clamp(0, 255) as i8)),
+                ("Amplifier", AnvilNbt::Byte(amp.clamp(0, 127) as i8)),
+                ("Duration", AnvilNbt::Int(left)),
+                ("Ambient", AnvilNbt::Byte(0)),
+                ("ShowParticles", AnvilNbt::Byte(1)),
+                ("ShowIcon", AnvilNbt::Byte(1)),
+            ])
+        })
+        .collect();
+    if let AnvilNbt::Compound(map) = &mut root {
+        map.insert(
+            crate::nbt::NbtString::text("ActiveEffects"),
+            anvil_list(effects),
+        );
+        if let Some(point) = save.respawn {
+            map.insert(
+                crate::nbt::NbtString::text("SpawnDimension"),
+                anvil_s(&dim_key(point.dim)),
+            );
+            map.insert(crate::nbt::NbtString::text("SpawnX"), AnvilNbt::Int(point.position.0 as i32));
+            map.insert(crate::nbt::NbtString::text("SpawnY"), AnvilNbt::Int(point.position.1 as i32));
+            map.insert(crate::nbt::NbtString::text("SpawnZ"), AnvilNbt::Int(point.position.2 as i32));
+            map.insert(
+                crate::nbt::NbtString::text("SpawnAngle"),
+                AnvilNbt::Float(point.angle.to_bits()),
+            );
+            map.insert(
+                crate::nbt::NbtString::text("SpawnForced"),
+                AnvilNbt::Byte(i8::from(point.forced)),
+            );
+            map.insert(
+                crate::nbt::NbtString::text("SpawnKind"),
+                AnvilNbt::Byte(match point.kind {
+                    SpawnTargetKind::Legacy => 0,
+                    SpawnTargetKind::Bed => 1,
+                    SpawnTargetKind::Anchor => 2,
+                }),
+            );
+        }
+    }
+    root
+}
+
+fn uuid_to_int_array(uuid: &[u8; 16]) -> Vec<i32> {
+    (0..4)
+        .map(|i| {
+            i32::from_be_bytes([uuid[4 * i], uuid[4 * i + 1], uuid[4 * i + 2], uuid[4 * i + 3]])
+        })
+        .collect()
+}
+
+fn uuid_from_int_array(values: &[i32]) -> Option<[u8; 16]> {
+    if values.len() != 4 {
+        return None;
+    }
+    let mut uuid = [0u8; 16];
+    for (i, v) in values.iter().enumerate() {
+        uuid[4 * i..4 * i + 4].copy_from_slice(&v.to_be_bytes());
+    }
+    Some(uuid)
+}
+
+/// Read one player file's NBT back into a `PlayerSave`. Required fields that
+/// are missing or misshapen abort the file; vanilla extras the record does not
+// model are ignored.
+fn playerdata_from_nbt(tag: &AnvilNbt) -> Result<PlayerSave, String> {
+    let AnvilNbt::Compound(_) = tag else {
+        return Err("playerdata root is not a compound".to_string());
+    };
+    let dimension = anvil_str(tag, "Dimension").unwrap_or_else(|| "minecraft:overworld".to_string());
+    let dim = DimId::parse_dimension_id(&dimension)
+        .ok_or_else(|| format!("playerdata dimension {dimension} is unregistered"))?;
+    let pos = tag
+        .get("Pos")
+        .and_then(AnvilNbt::list)
+        .filter(|p| p.len() == 3)
+        .and_then(|p| {
+            Some([
+                playerdata_f64(&p[0])?,
+                playerdata_f64(&p[1])?,
+                playerdata_f64(&p[2])?,
+            ])
+        })
+        .ok_or("playerdata has no Pos list")?;
+    let rotation = tag
+        .get("Rotation")
+        .and_then(AnvilNbt::list)
+        .filter(|r| r.len() == 2)
+        .and_then(|r| {
+            Some([
+                playerdata_f64(&r[0])? as f32,
+                playerdata_f64(&r[1])? as f32,
+            ])
+        })
+        .ok_or("playerdata has no Rotation list")?;
+    let inventory = tag
+        .get("Inventory")
+        .map(items_nbt_to_stacks)
+        .transpose()
+        .map_err(|e| format!("playerdata Inventory: {e}"))?
+        .map(playerdata_slots_from_vanilla)
+        .unwrap_or_default();
+    let ender_chest = tag
+        .get("EnderItems")
+        .map(items_nbt_to_stacks)
+        .transpose()
+        .map_err(|e| format!("playerdata EnderItems: {e}"))?
+        .unwrap_or_default();
+    let held = anvil_i32(tag, "SelectedItemSlot")
+        .unwrap_or(0)
+        .clamp(0, 8) as i16;
+    let gamemode = anvil_i32(tag, "playerGameType")
+        .unwrap_or(0)
+        .clamp(0, 3) as u8;
+    let mut effects = Vec::new();
+    if let Some(list) = tag.get("ActiveEffects").and_then(AnvilNbt::list) {
+        if list.len() > 64 {
+            return Err("playerdata has too many ActiveEffects".to_string());
+        }
+        for effect in list {
+            let id = nbt_int_val(effect.get("Id").unwrap_or(&AnvilNbt::Int(-1)))
+                .unwrap_or(-1) as i32;
+            if id < 0 {
+                continue;
+            }
+            effects.push((
+                id,
+                nbt_int_val(effect.get("Amplifier").unwrap_or(&AnvilNbt::Byte(0)))
+                    .unwrap_or(0) as i32,
+                nbt_int_val(effect.get("Duration").unwrap_or(&AnvilNbt::Int(0)))
+                    .unwrap_or(0) as i32,
+            ));
+        }
+    }
+    let respawn = match (
+        anvil_i32(tag, "SpawnX"),
+        anvil_i32(tag, "SpawnY"),
+        anvil_i32(tag, "SpawnZ"),
+        anvil_str(tag, "SpawnDimension"),
+    ) {
+        (Some(x), Some(y), Some(z), Some(dim_key_str)) => {
+            let Some(sdim) = DimId::parse_dimension_id(&dim_key_str) else {
+                return Err(format!("playerdata respawn dimension {dim_key_str} is unregistered"));
+            };
+            Some(SpawnTarget {
+                kind: match anvil_i8(tag, "SpawnKind").unwrap_or(0) {
+                    1 => SpawnTargetKind::Bed,
+                    2 => SpawnTargetKind::Anchor,
+                    _ => SpawnTargetKind::Legacy,
+                },
+                dim: sdim,
+                position: (f64::from(x), f64::from(y), f64::from(z)),
+                angle: anvil_f32(tag, "SpawnAngle").unwrap_or(0.0),
+                forced: anvil_i8(tag, "SpawnForced").unwrap_or(0) != 0,
+            })
+        }
+        _ => None,
+    };
+    Ok(PlayerSave {
+        position: (dim, pos[0], pos[1], pos[2], rotation[0], rotation[1]),
+        inventory,
+        ender_chest,
+        held,
+        health: anvil_f32(tag, "Health").unwrap_or(20.0),
+        absorption: anvil_f32(tag, "AbsorptionAmount").unwrap_or(0.0),
+        food: anvil_i32(tag, "foodLevel").unwrap_or(20),
+        saturation: anvil_f32(tag, "foodSaturationLevel").unwrap_or(5.0),
+        exhaustion: f64::from(anvil_f32(tag, "foodExhaustionLevel").unwrap_or(0.0)),
+        xp_level: anvil_i32(tag, "XpLevel").unwrap_or(0),
+        xp_progress: anvil_f32(tag, "XpP").unwrap_or(0.0),
+        xp_total: anvil_i64(tag, "XpTotal").unwrap_or(0),
+        gamemode,
+        effects,
+        respawn,
+    })
+}
+
+/// The gzip wrapper every `playerdata/*.dat` carries; same encode level.dat
+/// uses.
+fn playerdata_to_bytes(uuid: &[u8; 16], save: &PlayerSave) -> Result<Vec<u8>, String> {
+    let mut root = playerdata_nbt_of(save);
+    if let AnvilNbt::Compound(map) = &mut root {
+        map.insert(
+            crate::nbt::NbtString::text("UUID"),
+            AnvilNbt::IntArray(uuid_to_int_array(uuid)),
+        );
+    }
+    let nbt = crate::nbt::write_named(&crate::nbt::NbtString(Vec::new()), &root)
+        .map_err(|e| format!("cannot encode playerdata: {e}"))?;
+    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    e.write_all(&nbt)
+        .and_then(|_| e.finish())
+        .map_err(|e| format!("cannot gzip playerdata: {e}"))
+}
+
+/// One `.dat`'s decoded record plus the `UUID` int array it stamped, for the
+/// file-name cross-check the loader does.
+fn playerdata_from_bytes(bytes: &[u8]) -> Result<(Option<[u8; 16]>, PlayerSave), String> {
+    let (_, root) = crate::nbt::read_gzip(bytes, ANVIL_LEVEL_NBT_BUDGET)
+        .map_err(|e| format!("invalid playerdata NBT: {e}"))?;
+    let recorded = match root.get("UUID") {
+        Some(AnvilNbt::IntArray(values)) => uuid_from_int_array(values),
+        _ => None,
+    };
+    Ok((recorded, playerdata_from_nbt(&root)?))
+}
+
+/// Write one player's `.dat`: staged temp + fsync + atomic rename, the same
+/// discipline `write_level_dat_rotating`/`anvil_atomic_write` give `level.dat`.
+fn write_playerdata_dat(
+    world_dir: &std::path::Path,
+    uuid: &[u8; 16],
+    save: &PlayerSave,
+) -> Result<(), String> {
+    let dir = world_dir.join("playerdata");
+    if dir.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(format!("{} is a symlink; refusing to write playerdata into it", dir.display()));
+    }
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    anvil_atomic_write(
+        &dir.join(playerdata_file_name(uuid)),
+        &playerdata_to_bytes(uuid, save)?,
+    )
+}
+
+/// Every live `saved_players` record flushed to `playerdata/`. Files left from
+/// players who no longer exist stay on disk, as vanilla keeps them.
+fn write_all_playerdata_dat(world_dir: &std::path::Path) -> Result<usize, String> {
+    let players: Vec<([u8; 16], PlayerSave)> = saved_players()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(uuid, save)| (*uuid, save.clone()))
+        .collect();
+    for (uuid, save) in &players {
+        write_playerdata_dat(world_dir, uuid, save)?;
+    }
+    Ok(players.len())
+}
+
+/// Load every `playerdata/*.dat` into `saved_players`. Symlinked or
+/// non-file entries and odd names are skipped with a diagnostic; a corrupt
+/// gzip/NBT or structurally invalid record fails the load outright — a
+/// half-restored player is worse than no load at all.
+fn load_all_playerdata_dat(world_dir: &std::path::Path) -> Result<usize, String> {
+    let dir = world_dir.join("playerdata");
+    if dir.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(format!("{} is a symlink; refusing to load playerdata from it", dir.display()));
+    }
+    if !dir.is_dir() {
+        return Ok(0);
+    }
+    let mut loaded = 0;
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)
+        .map_err(|e| format!("cannot list {}: {e}", dir.display()))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("cannot stat {}: {e}", entry.path().display()))?;
+        if file_type.is_symlink() {
+            eprintln!(
+                "[spine] {} is a symlink; skipping it",
+                entry.path().display()
+            );
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".dat") else {
+            continue;
+        };
+        let Some(uuid) = playerdata_uuid_of(stem) else {
+            eprintln!("[spine] skipping malformed playerdata name {name}");
+            continue;
+        };
+        let bytes = std::fs::read(entry.path())
+            .map_err(|e| format!("cannot read {}: {e}", entry.path().display()))?;
+        let (recorded, save) = playerdata_from_bytes(&bytes).map_err(|e| format!("{name}: {e}"))?;
+        if recorded.is_some_and(|recorded| recorded != uuid) {
+            eprintln!("[spine] {name}: NBT UUID does not match file name; keeping the file name");
+        }
+        saved_players()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(uuid, save);
+        loaded += 1;
+    }
+    Ok(loaded)
+}
+
 /// Open `dir` as the live world: an Anvil directory with data is imported and
 /// applied exactly as `import_anvil_world` + `apply_anvil_import` do; an empty
 /// or missing directory is created and stamped with a fresh `level.dat` so the
-/// world is valid before the first autosave ever runs.
+/// world is valid before the first autosave ever runs. Its `playerdata/*.dat`
+/// records are then folded into `saved_players` — a corrupt file fails the
+/// load closed rather than silently dropping a player.
 #[allow(dead_code)]
 fn live_anvil_load_dir(dir: &std::path::Path) -> Result<AnvilLoadSummary, String> {
     if !anvil_dir_has_data(dir) {
@@ -1804,7 +2283,7 @@ fn live_anvil_load_dir(dir: &std::path::Path) -> Result<AnvilLoadSummary, String
         });
     }
     let report = import_anvil_world(dir)?;
-    let summary = AnvilLoadSummary {
+    let mut summary = AnvilLoadSummary {
         initialized: false,
         level_loaded: report.level.is_some(),
         region_files: report.region_files,
@@ -1812,8 +2291,10 @@ fn live_anvil_load_dir(dir: &std::path::Path) -> Result<AnvilLoadSummary, String
         chunk_errors: report.chunk_errors.clone(),
         unsupported_chunks: report.unsupported_chunks,
         dropped_sections: report.dropped_sections,
+        players_loaded: 0,
     };
     apply_anvil_import(&report);
+    summary.players_loaded = load_all_playerdata_dat(dir)?;
     Ok(summary)
 }
 
@@ -1892,6 +2373,7 @@ fn live_anvil_save_dir(dir: &std::path::Path) -> Result<AnvilSaveSummary, String
         write_region_file(&region_path, &region)?;
         summary.region_files += 1;
     }
+    summary.players_written = write_all_playerdata_dat(dir)?;
     Ok(summary)
 }
 
@@ -3467,4 +3949,165 @@ mod anvil_io_tests {
         assert_eq!(overlay_block_dim(DimId::Overworld, 17, 65, 1), Some(dirt));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn fix_save_playerdata_anvil_roundtrip_restores_every_field() {
+        if test_support::isolated_world_test() {
+            return;
+        }
+        let _guard = world_guard();
+        test_support::require_vanilla_data();
+        let dir = anvil_tmp_dir("playerdata");
+        let uuid = [0xABu8; 16];
+        let sword = name_to_item("minecraft:iron_sword").expect("iron_sword item");
+        let apple = name_to_item("minecraft:apple").expect("apple item");
+        let mut inventory = HashMap::new();
+        inventory.insert(36i16, (sword, 1u8, Vec::new()));
+        inventory.insert(10i16, (apple, 7u8, Vec::new()));
+        let save = PlayerSave {
+            position: (DimId::Nether, 128.5, 70.25, -256.5, 90.0, -10.0),
+            inventory,
+            ender_chest: HashMap::from([(0i16, (sword, 2u8, Vec::new()))]),
+            held: 0,
+            health: 13.5,
+            absorption: 4.0,
+            food: 14,
+            saturation: 2.5,
+            exhaustion: 1.25,
+            xp_level: 7,
+            xp_progress: 0.4,
+            xp_total: 77,
+            gamemode: 0,
+            effects: vec![(1, 0, 400)],
+            respawn: Some(SpawnTarget {
+                kind: SpawnTargetKind::Bed,
+                dim: DimId::Overworld,
+                position: (10.0, 64.0, 10.0),
+                angle: 45.0,
+                forced: true,
+            }),
+        };
+        saved_players()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(uuid, save.clone());
+
+        let written = live_anvil_save_dir(&dir).unwrap();
+        assert_eq!(written.players_written, 1);
+        let file = dir.join("playerdata").join(playerdata_file_name(&uuid));
+        assert_eq!(
+            playerdata_file_name(&uuid),
+            "abababab-abab-abab-abab-abababababab.dat"
+        );
+        assert!(file.is_file(), "playerdata/<uuid>.dat exists");
+        assert!(!file.with_extension("tmp").exists());
+
+        // Fresh state: the reload must restore every field from disk alone.
+        saved_players()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        let loaded = live_anvil_load_dir(&dir).unwrap();
+        assert_eq!(loaded.players_loaded, 1);
+        let restored = saved_players()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&uuid)
+            .cloned()
+            .expect("player restored");
+        assert_eq!(restored.position.0, DimId::Nether);
+        assert_eq!(restored.position.1, 128.5);
+        assert_eq!(restored.position.2, 70.25);
+        assert_eq!(restored.position.3, -256.5);
+        assert_eq!(restored.position.4, 90.0);
+        assert_eq!(restored.position.5, -10.0);
+        assert_eq!(restored.gamemode, 0, "survival gamemode");
+        assert_eq!(restored.health, 13.5);
+        assert_eq!(restored.absorption, 4.0);
+        assert_eq!(restored.food, 14);
+        assert_eq!(restored.saturation, 2.5);
+        assert_eq!(restored.exhaustion, 1.25);
+        assert_eq!(restored.xp_level, 7);
+        assert_eq!(restored.xp_progress, 0.4);
+        assert_eq!(restored.xp_total, 77);
+        assert_eq!(restored.held, 0);
+        assert_eq!(restored.inventory.get(&36), Some(&(sword, 1, Vec::new())),
+            "sword in slot 36");
+        assert_eq!(restored.inventory.get(&10), Some(&(apple, 7, Vec::new())));
+        assert_eq!(restored.ender_chest.get(&0), Some(&(sword, 2, Vec::new())));
+        assert_eq!(restored.effects, vec![(1, 0, 400)], "speed effect");
+        let Some(respawn) = restored.respawn else {
+            panic!("respawn target restored");
+        };
+        assert_eq!(respawn.kind, SpawnTargetKind::Bed);
+        assert_eq!(respawn.dim, DimId::Overworld);
+        assert_eq!(respawn.position, (10.0, 64.0, 10.0));
+        assert_eq!(respawn.angle, 45.0);
+        assert!(respawn.forced);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fix_save_playerdata_rejects_corrupt_symlinked_and_traversal_entries() {
+        if test_support::isolated_world_test() {
+            return;
+        }
+        let _guard = world_guard();
+        let dir = anvil_tmp_dir("playerdata-bad");
+        let playerdata = dir.join("playerdata");
+        std::fs::create_dir_all(&playerdata).unwrap();
+        // Corrupt gzip in a well-named file fails the load closed.
+        std::fs::write(
+            playerdata.join("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.dat"),
+            b"not gzip at all",
+        )
+        .unwrap();
+        // A traversal-shaped name is skipped outright.
+        std::fs::write(playerdata.join("..%2f..%2fetc%2fpasswd.dat"), b"x").unwrap();
+        assert!(load_all_playerdata_dat(&dir).is_err(), "corrupt .dat fails closed");
+        assert!(saved_players()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
+        // Remove the corrupt file; the malformed name stays and is skipped.
+        std::fs::remove_file(
+            playerdata.join("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.dat"),
+        )
+        .unwrap();
+        // A malformed uuid name is skipped rather than misfiled.
+        std::fs::write(playerdata.join("not-a-uuid.dat"), b"x").unwrap();
+        assert_eq!(load_all_playerdata_dat(&dir).unwrap(), 0);
+        // A symlinked .dat is skipped rather than followed.
+        #[cfg(unix)]
+        {
+            let outside = dir.join("outside.dat");
+            let save = PlayerSave {
+                position: (DimId::Overworld, 0.0, 64.0, 0.0, 0.0, 0.0),
+                inventory: HashMap::new(),
+                ender_chest: HashMap::new(),
+                held: 0,
+                health: 20.0,
+                absorption: 0.0,
+                food: 20,
+                saturation: 5.0,
+                exhaustion: 0.0,
+                xp_level: 0,
+                xp_progress: 0.0,
+                xp_total: 0,
+                gamemode: 0,
+                effects: Vec::new(),
+                respawn: None,
+            };
+            std::fs::write(&outside, playerdata_to_bytes(&[9; 16], &save).unwrap())
+                .unwrap();
+            std::os::unix::fs::symlink(
+                &outside,
+                playerdata.join("99999999-9999-9999-9999-999999999999.dat"),
+            )
+            .unwrap();
+            assert_eq!(load_all_playerdata_dat(&dir).unwrap(), 0);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }
