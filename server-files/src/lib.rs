@@ -18,7 +18,9 @@
 //!   registries share. Malformed input is an error, never a partial document.
 //! * [`properties`] — a lossless Java `.properties` document (comments and
 //!   entry order survive a parse/store round trip) and the typed
-//!   [`properties::ServerProperties`] view with Vanilla defaults.
+//!   [`properties::ServerProperties`] view with Vanilla defaults, including
+//!   the strictly opt-in fair-play map policy
+//!   ([`properties::ServerFairPlayPolicy`]).
 //! * [`eula`] — [`eula::check_eula`] (`Accepted`/`NotAccepted`/`Missing`) and
 //!   [`eula::write_default_eula`], which always writes `eula=false`.
 //! * [`lists`] — `ops.json` (Vanilla levels 0..=4 plus the legacy flat name
@@ -82,5 +84,8 @@ pub use perf_cache::{
     DirectionalChunkQueue, SharedChunkWireCache, StartupBinaryCache, StartupInputFile,
     StartupInputFingerprint, CACHE_SCHEMA_VERSION, STARTUP_CACHE_MAGIC,
 };
-pub use properties::{MalformedEscape, PropertiesFile, ServerProperties, PROPERTIES_FILE};
+pub use properties::{
+    can_see_player_on_radar, players_are_party_or_allies, MalformedEscape, MinimapMode,
+    PlayerRadarScope, PropertiesFile, ServerFairPlayPolicy, ServerProperties, PROPERTIES_FILE,
+};
 pub use usercache::{UserCache, UserCacheEntry, DEFAULT_CAPACITY, USERCACHE_FILE};

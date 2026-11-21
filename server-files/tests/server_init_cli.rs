@@ -9,8 +9,9 @@ use mc_spine_core::version::TargetVersion;
 use mc_spine_server_files::json::{self, Json};
 use mc_spine_server_files::{
     offline_uuid, AdmissionDecision, ClaimChunkKey, ClaimOwner, ClaimsWorld, EulaStatus,
-    ServerDirectory, SubClaimId, BANNED_IPS_FILE, BANNED_PLAYERS_FILE, CLAIMS_FILE, EULA_FILE,
-    OPS_FILE, PARTIES_FILE, PROPERTIES_FILE, USERCACHE_FILE, WHITELIST_FILE,
+    MinimapMode, PlayerRadarScope, ServerDirectory, ServerFairPlayPolicy, SubClaimId,
+    BANNED_IPS_FILE, BANNED_PLAYERS_FILE, CLAIMS_FILE, EULA_FILE, OPS_FILE, PARTIES_FILE,
+    PROPERTIES_FILE, USERCACHE_FILE, WHITELIST_FILE,
 };
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -739,4 +740,166 @@ fn claims_listing_reads_player_claims_and_parties() {
         std::fs::read(dir.join(CLAIMS_FILE)).unwrap(),
         b"{ definitely not json"
     );
+}
+
+// ------------------------------------------------------------- fair play
+
+/// The five strictly opt-in `server.properties` keys the `--minimap-mode` /
+/// `--player-radar` / `--allow-*` init flags write.
+const FAIR_PLAY_KEYS: [&str; 5] = [
+    "minimap-mode",
+    "allow-cave-map",
+    "allow-mob-radar",
+    "player-radar-scope",
+    "allow-waypoint-teleport",
+];
+
+#[test]
+fn init_fair_play_flags_are_strictly_opt_in() {
+    let scratch = TestDir::new("init-fp-optin");
+    let dir = scratch.path("srv");
+
+    let out = run(&["init", "--dir", dir.to_str().unwrap()]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+
+    // Without the flags the file carries none of the five keys — minimaps
+    // stay fully unrestricted by contract.
+    let props = std::fs::read_to_string(dir.join(PROPERTIES_FILE)).unwrap();
+    for key in FAIR_PLAY_KEYS {
+        assert!(!props.contains(key), "{key} must not be written:\n{props}");
+    }
+    // And the loaded policy is the permissive default.
+    let sd = ServerDirectory::load_or_init(&dir, TargetVersion::V26_3).unwrap();
+    assert_eq!(sd.properties.fair_play_policy(), ServerFairPlayPolicy::default());
+    assert_eq!(
+        sd.properties.fair_play_policy().minimap_mode,
+        MinimapMode::Unrestricted
+    );
+    assert_eq!(
+        sd.properties.fair_play_policy().player_radar_scope,
+        PlayerRadarScope::All
+    );
+}
+
+#[test]
+fn init_fair_play_flags_persist_and_pass_doctor() {
+    let scratch = TestDir::new("init-fp");
+    let dir = scratch.path("srv");
+
+    let out = run(&[
+        "init",
+        "--dir",
+        dir.to_str().unwrap(),
+        "--minimap-mode",
+        "fair_play",
+        "--player-radar",
+        "party_only",
+        "--allow-cave-map",
+        "false",
+        "--allow-mob-radar",
+        "false",
+        "--json",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let doc = json_stdout(&out);
+    let applied = get(&doc, "applied");
+    for (key, value) in [
+        ("minimap-mode", "fair_play"),
+        ("player-radar-scope", "party_only"),
+        ("allow-cave-map", "false"),
+        ("allow-mob-radar", "false"),
+    ] {
+        assert_eq!(str_field(applied, key), value, "{applied:?}");
+    }
+
+    // Each flag landed as exactly its own key; the unpassed waypoint flag
+    // stayed absent.
+    let props = std::fs::read_to_string(dir.join(PROPERTIES_FILE)).unwrap();
+    for line in [
+        "minimap-mode=fair_play",
+        "player-radar-scope=party_only",
+        "allow-cave-map=false",
+        "allow-mob-radar=false",
+    ] {
+        assert!(props.contains(line), "{line} missing:\n{props}");
+    }
+    assert!(!props.contains("allow-waypoint-teleport"), "{props}");
+
+    // A reload reads the typed policy; the absent waypoint key defaults
+    // permissive.
+    let sd = ServerDirectory::load_or_init(&dir, TargetVersion::V26_3).unwrap();
+    let policy = sd.properties.fair_play_policy();
+    assert_eq!(policy.minimap_mode, MinimapMode::FairPlay);
+    assert!(!policy.allow_cave_map);
+    assert!(!policy.allow_mob_radar);
+    assert_eq!(policy.player_radar_scope, PlayerRadarScope::PartyOnly);
+    assert!(policy.allow_waypoint_teleport);
+
+    // doctor still passes once the EULA is accepted.
+    scratch.write("srv/eula.txt", b"eula=true\n");
+    let out = run(&["doctor", "--dir", dir.to_str().unwrap()]);
+    assert_eq!(code(&out), 0, "{}", stdout(&out));
+
+    // A flag-less re-init keeps the operator's fair-play keys byte-identical.
+    let before = std::fs::read(dir.join(PROPERTIES_FILE)).unwrap();
+    let out = run(&["init", "--dir", dir.to_str().unwrap()]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(std::fs::read(dir.join(PROPERTIES_FILE)).unwrap(), before);
+}
+
+#[test]
+fn init_fair_play_partial_flags_write_only_their_keys() {
+    let scratch = TestDir::new("init-fp-partial");
+    let dir = scratch.path("srv");
+
+    // "minimap ON + show party members only" — the friend-server opt-in.
+    let out = run(&[
+        "init",
+        "--dir",
+        dir.to_str().unwrap(),
+        "--minimap-mode",
+        "unrestricted",
+        "--player-radar",
+        "party_only",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let props = std::fs::read_to_string(dir.join(PROPERTIES_FILE)).unwrap();
+    assert!(props.contains("minimap-mode=unrestricted"), "{props}");
+    assert!(props.contains("player-radar-scope=party_only"), "{props}");
+    for key in ["allow-cave-map", "allow-mob-radar", "allow-waypoint-teleport"] {
+        assert!(!props.contains(key), "{key} must not be written:\n{props}");
+    }
+}
+
+#[test]
+fn init_rejects_invalid_fair_play_values() {
+    let scratch = TestDir::new("init-fp-bad");
+    let d = scratch.path("srv").to_str().unwrap().to_string();
+    for args in [
+        &["init", "--dir", &d, "--minimap-mode", "bogus"][..],
+        &["init", "--dir", &d, "--minimap-mode", "fair-play"][..], // dash, not _
+        &["init", "--dir", &d, "--player-radar", "bogus"][..],
+        &["init", "--dir", &d, "--player-radar", "party-only"][..],
+        &["init", "--dir", &d, "--allow-cave-map", "maybe"][..],
+        &["init", "--dir", &d, "--allow-mob-radar", "1"][..],
+        &["init", "--dir", &d, "--allow-waypoint-teleport", "yes"][..],
+        &["init", "--dir", &d, "--minimap-mode"][..], // missing value
+        &["init", "--dir", &d, "--player-radar"][..],
+        &["init", "--dir", &d, "--allow-cave-map"][..],
+    ] {
+        let out = run(args);
+        assert_eq!(
+            code(&out),
+            2,
+            "{args:?} -> out={} err={}",
+            stdout(&out),
+            stderr(&out)
+        );
+    }
+
+    // The failure names the flag, and nothing was materialized on disk for
+    // the rejected invocations.
+    let out = run(&["init", "--dir", &d, "--minimap-mode", "bogus"]);
+    assert!(stderr(&out).contains("--minimap-mode"), "{}", stderr(&out));
+    assert!(!scratch.path("srv").join(PROPERTIES_FILE).exists());
 }

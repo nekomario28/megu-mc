@@ -395,6 +395,179 @@ fn prop_i64(doc: &PropertiesFile, key: &str, default: i64) -> i64 {
         .unwrap_or(default)
 }
 
+// -------------------------------------------------------- fair-play policy
+
+/// `minimap-mode`: how much minimap/world-map mods may do on this server.
+///
+/// Default-permissive by contract — a file that omits the key reads as
+/// [`MinimapMode::Unrestricted`], so no map feature is ever locked unless an
+/// operator opts in. An unrecognized value fails *closed* to
+/// [`MinimapMode::Disabled`] rather than silently permitting everything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MinimapMode {
+    /// Map mods run with every feature enabled (the default).
+    Unrestricted,
+    /// Maps run, gated by the server's `allow-*` restriction keys.
+    FairPlay,
+    /// No minimap/world-map features at all.
+    Disabled,
+}
+
+impl Default for MinimapMode {
+    fn default() -> Self {
+        Self::Unrestricted
+    }
+}
+
+impl MinimapMode {
+    /// The `server.properties` spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unrestricted => "unrestricted",
+            Self::FairPlay => "fair_play",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    /// The exact [`Self::as_str`] spellings (ASCII-case-insensitive,
+    /// surrounding whitespace tolerated); anything else is `None` — an
+    /// unrecognized restriction is never silently accepted.
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "unrestricted" => Self::Unrestricted,
+            "fair_play" => Self::FairPlay,
+            "disabled" => Self::Disabled,
+            _ => return None,
+        })
+    }
+}
+
+/// `player-radar-scope`: who may appear on a player's map radar.
+///
+/// Like [`MinimapMode`], absent reads as the permissive default
+/// [`PlayerRadarScope::All`] and an unrecognized value fails closed to
+/// [`PlayerRadarScope::None`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlayerRadarScope {
+    /// Every player is visible on every radar (the default).
+    All,
+    /// Self, operators, and party members / allied parties only.
+    PartyOnly,
+    /// Self and operators only — nobody else appears on the radar.
+    None,
+}
+
+impl Default for PlayerRadarScope {
+    fn default() -> Self {
+        Self::All
+    }
+}
+
+impl PlayerRadarScope {
+    /// The `server.properties` spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::PartyOnly => "party_only",
+            Self::None => "none",
+        }
+    }
+
+    /// The exact [`Self::as_str`] spellings (ASCII-case-insensitive,
+    /// surrounding whitespace tolerated); anything else is `None`.
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "all" => Self::All,
+            "party_only" => Self::PartyOnly,
+            "none" => Self::None,
+            _ => return None,
+        })
+    }
+}
+
+/// The granular map fair-play policy read from `server.properties`.
+///
+/// Every switch is strictly opt-in: [`Default`] is the fully permissive
+/// policy — unrestricted mode, cave map and mob radar allowed, every player
+/// on the radar, waypoint teleports allowed — so a file that omits the keys
+/// (including every file written before they existed) changes nothing for
+/// players. An operator can opt into just `"minimap ON + party-only radar"`
+/// or lock every feature down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServerFairPlayPolicy {
+    /// `minimap-mode` (default [`MinimapMode::Unrestricted`]).
+    pub minimap_mode: MinimapMode,
+    /// `allow-cave-map` (default `true`): cave-map rendering may run.
+    pub allow_cave_map: bool,
+    /// `allow-mob-radar` (default `true`): entity/mob radar may run.
+    pub allow_mob_radar: bool,
+    /// `player-radar-scope` (default [`PlayerRadarScope::All`]).
+    pub player_radar_scope: PlayerRadarScope,
+    /// `allow-waypoint-teleport` (default `true`): world-map waypoint
+    /// teleports may run.
+    pub allow_waypoint_teleport: bool,
+}
+
+impl Default for ServerFairPlayPolicy {
+    /// The fully permissive policy — every map feature allowed, every
+    /// player on the radar. Non-negotiable: nothing here may ever default
+    /// to a restriction.
+    fn default() -> Self {
+        Self {
+            minimap_mode: MinimapMode::Unrestricted,
+            allow_cave_map: true,
+            allow_mob_radar: true,
+            player_radar_scope: PlayerRadarScope::All,
+            allow_waypoint_teleport: true,
+        }
+    }
+}
+
+/// Radar visibility under `policy`: whether `viewer_uuid`'s map may show
+/// `target_uuid`. `are_party_or_allies` carries the claims engine's
+/// party/ally verdict for the pair — see [`players_are_party_or_allies`] —
+/// and `viewer_is_op` the operator bypass. A player always sees themself,
+/// and operators always see everyone, in every scope.
+/// [`MinimapMode::Disabled`] is a map-feature concern, not a radar filter,
+/// so it plays no part here.
+pub fn can_see_player_on_radar(
+    policy: &ServerFairPlayPolicy,
+    viewer_uuid: &str,
+    target_uuid: &str,
+    are_party_or_allies: bool,
+    viewer_is_op: bool,
+) -> bool {
+    if viewer_uuid == target_uuid || viewer_is_op {
+        return true;
+    }
+    match policy.player_radar_scope {
+        PlayerRadarScope::All => true,
+        PlayerRadarScope::PartyOnly => are_party_or_allies,
+        PlayerRadarScope::None => false,
+    }
+}
+
+/// The `are_party_or_allies` input [`can_see_player_on_radar`] expects,
+/// computed from the claims engine's public party data: the two players are
+/// in the same party, or either one's party declared the other's an ally —
+/// the symmetric alliance rule [`crate::claims::ClaimsWorld`] applies to
+/// claim access.
+pub fn players_are_party_or_allies(
+    world: &crate::claims::ClaimsWorld,
+    viewer_uuid: &str,
+    target_uuid: &str,
+) -> bool {
+    let (Some(viewer), Some(target)) = (
+        world.party_of(viewer_uuid),
+        world.party_of(target_uuid),
+    ) else {
+        return false;
+    };
+    viewer.id == target.id
+        || viewer.allies.contains(&target.id)
+        || target.allies.contains(&viewer.id)
+}
+
 /// Typed `server.properties`: every accessor returns the file's value or the
 /// Vanilla default, and the matching setter writes it back into the document.
 /// Unknown keys are untouched — [`Self::doc`] exposes them.
@@ -567,6 +740,85 @@ impl ServerProperties {
         self.doc
             .set("network-compression-threshold", &threshold.to_string());
     }
+
+    /// `enable-query`: the opt-in GS4 UDP query responder; Vanilla default
+    /// `false`.
+    pub fn enable_query(&self) -> bool {
+        prop_bool(&self.doc, "enable-query", false)
+    }
+    pub fn set_enable_query(&mut self, enabled: bool) {
+        self.doc
+            .set("enable-query", if enabled { "true" } else { "false" });
+    }
+
+    /// `query.port`: the GS4 responder's UDP port; Vanilla's default is the
+    /// game port itself, so this follows [`Self::server_port`].
+    pub fn query_port(&self) -> u16 {
+        prop_u16(&self.doc, "query.port", self.server_port())
+    }
+    pub fn set_query_port(&mut self, port: u16) {
+        self.doc.set("query.port", &port.to_string());
+    }
+
+    /// `enforce-secure-profile`: require Mojang-signed chat profiles.
+    /// Default `false` — an absent key must not flip chat enforcement on for
+    /// a server that never asked for it.
+    pub fn enforce_secure_profile(&self) -> bool {
+        prop_bool(&self.doc, "enforce-secure-profile", false)
+    }
+    pub fn set_enforce_secure_profile(&mut self, enabled: bool) {
+        self.doc.set(
+            "enforce-secure-profile",
+            if enabled { "true" } else { "false" },
+        );
+    }
+
+    /// The whole fair-play policy: every key defaults permissive when
+    /// absent, and an unrecognized `minimap-mode`/`player-radar-scope`
+    /// fails closed to that enum's most restrictive variant rather than
+    /// silently permitting everything.
+    pub fn fair_play_policy(&self) -> ServerFairPlayPolicy {
+        ServerFairPlayPolicy {
+            minimap_mode: self
+                .doc
+                .get("minimap-mode")
+                .map(|v| MinimapMode::parse(v).unwrap_or(MinimapMode::Disabled))
+                .unwrap_or_default(),
+            allow_cave_map: prop_bool(&self.doc, "allow-cave-map", true),
+            allow_mob_radar: prop_bool(&self.doc, "allow-mob-radar", true),
+            player_radar_scope: self
+                .doc
+                .get("player-radar-scope")
+                .map(|v| PlayerRadarScope::parse(v).unwrap_or(PlayerRadarScope::None))
+                .unwrap_or_default(),
+            allow_waypoint_teleport: prop_bool(&self.doc, "allow-waypoint-teleport", true),
+        }
+    }
+
+    /// Write all five fair-play keys at once. Callers that only want some
+    /// keys set them individually through [`Self::doc_mut`] so unrequested
+    /// keys stay absent — `init`'s opt-in flags rely on that.
+    pub fn set_fair_play_policy(&mut self, policy: &ServerFairPlayPolicy) {
+        self.doc.set("minimap-mode", policy.minimap_mode.as_str());
+        self.doc.set(
+            "allow-cave-map",
+            if policy.allow_cave_map { "true" } else { "false" },
+        );
+        self.doc.set(
+            "allow-mob-radar",
+            if policy.allow_mob_radar { "true" } else { "false" },
+        );
+        self.doc
+            .set("player-radar-scope", policy.player_radar_scope.as_str());
+        self.doc.set(
+            "allow-waypoint-teleport",
+            if policy.allow_waypoint_teleport {
+                "true"
+            } else {
+                "false"
+            },
+        );
+    }
 }
 
 /// Every field except `rcon.password`, which always prints `[REDACTED]` — a
@@ -594,6 +846,10 @@ impl fmt::Debug for ServerProperties {
                 "network_compression_threshold",
                 &self.network_compression_threshold(),
             )
+            .field("enable_query", &self.enable_query())
+            .field("query_port", &self.query_port())
+            .field("enforce_secure_profile", &self.enforce_secure_profile())
+            .field("fair_play_policy", &self.fair_play_policy())
             .finish()
     }
 }
@@ -726,5 +982,219 @@ mod tests {
         assert!(text.contains("max-players=8"), "{text}");
         assert_eq!(ServerProperties::load_from(&path).unwrap().max_players(), 8);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------- fair-play coverage
+
+    const UUID_1: &str = "00000000-0000-0000-0000-000000000001";
+    const UUID_2: &str = "00000000-0000-0000-0000-000000000002";
+    const UUID_3: &str = "00000000-0000-0000-0000-000000000003";
+    const UUID_4: &str = "00000000-0000-0000-0000-000000000004";
+
+    #[test]
+    fn fair_play_defaults_are_fully_permissive() {
+        let props = ServerProperties::new();
+        let policy = props.fair_play_policy();
+        assert_eq!(policy, ServerFairPlayPolicy::default());
+        assert_eq!(policy.minimap_mode, MinimapMode::Unrestricted);
+        assert!(policy.allow_cave_map);
+        assert!(policy.allow_mob_radar);
+        assert_eq!(policy.player_radar_scope, PlayerRadarScope::All);
+        assert!(policy.allow_waypoint_teleport);
+        // Scope `all`: everyone sees everyone — uuid, party and op inputs
+        // never gate anything.
+        for (viewer, target, allies, op) in [
+            (UUID_1, UUID_2, false, false),
+            (UUID_1, UUID_2, true, true),
+            (UUID_1, UUID_1, false, false),
+        ] {
+            assert!(
+                can_see_player_on_radar(&policy, viewer, target, allies, op),
+                "viewer={viewer} target={target} allies={allies} op={op}"
+            );
+        }
+        // The query/secure-profile accessors default off as well.
+        assert!(!props.enable_query());
+        assert!(!props.enforce_secure_profile());
+        assert_eq!(props.query_port(), props.server_port());
+    }
+
+    #[test]
+    fn fair_play_policy_roundtrips_through_the_document() {
+        let mut props = ServerProperties::new();
+        props.set_fair_play_policy(&ServerFairPlayPolicy {
+            minimap_mode: MinimapMode::FairPlay,
+            allow_cave_map: false,
+            allow_mob_radar: false,
+            player_radar_scope: PlayerRadarScope::PartyOnly,
+            allow_waypoint_teleport: false,
+        });
+        let text = props.doc().render();
+        for line in [
+            "minimap-mode=fair_play",
+            "allow-cave-map=false",
+            "allow-mob-radar=false",
+            "player-radar-scope=party_only",
+            "allow-waypoint-teleport=false",
+        ] {
+            assert!(text.contains(line), "{line} missing:\n{text}");
+        }
+        let back = ServerProperties::parse(&text).unwrap().fair_play_policy();
+        assert_eq!(back.minimap_mode, MinimapMode::FairPlay);
+        assert!(!back.allow_cave_map);
+        assert!(!back.allow_mob_radar);
+        assert_eq!(back.player_radar_scope, PlayerRadarScope::PartyOnly);
+        assert!(!back.allow_waypoint_teleport);
+    }
+
+    #[test]
+    fn radar_scope_gates_visibility_but_self_and_ops_pass() {
+        let policy = ServerFairPlayPolicy {
+            minimap_mode: MinimapMode::FairPlay,
+            allow_cave_map: false,
+            allow_mob_radar: false,
+            player_radar_scope: PlayerRadarScope::PartyOnly,
+            allow_waypoint_teleport: false,
+        };
+        let (me, ally, stranger) = (UUID_1, UUID_2, UUID_3);
+        assert!(can_see_player_on_radar(&policy, me, ally, true, false));
+        assert!(!can_see_player_on_radar(&policy, me, stranger, false, false));
+        assert!(can_see_player_on_radar(&policy, me, stranger, false, true)); // op
+        assert!(can_see_player_on_radar(&policy, me, me, false, false)); // self
+
+        let none = ServerFairPlayPolicy {
+            player_radar_scope: PlayerRadarScope::None,
+            ..policy
+        };
+        assert!(can_see_player_on_radar(&none, me, me, false, false));
+        assert!(can_see_player_on_radar(&none, me, stranger, false, true));
+        assert!(!can_see_player_on_radar(&none, me, ally, true, false));
+        assert!(!can_see_player_on_radar(&none, me, stranger, false, false));
+    }
+
+    #[test]
+    fn radar_party_check_uses_claims_parties_and_allies() {
+        use crate::claims::ClaimsWorld;
+        let mut world = ClaimsWorld::new();
+        let (owner, member, ally, stranger) = (UUID_1, UUID_2, UUID_3, UUID_4);
+        let raiders = world.create_party(owner, "Raiders").unwrap();
+        world.invite_player(owner, member).unwrap();
+        world.accept_invite(member, None).unwrap();
+        let friends = world.create_party(ally, "Friends").unwrap();
+        world.add_ally(ally, &raiders).unwrap();
+        assert_eq!(friends, "party-2");
+
+        // Same party -> party; declared alliance counts in both directions;
+        // a stranger (and a party-less player) gets nothing.
+        assert!(players_are_party_or_allies(&world, owner, member));
+        assert!(players_are_party_or_allies(&world, member, owner));
+        assert!(players_are_party_or_allies(&world, owner, ally));
+        assert!(players_are_party_or_allies(&world, ally, member));
+        assert!(!players_are_party_or_allies(&world, owner, stranger));
+        assert!(!players_are_party_or_allies(&world, stranger, member));
+        assert!(!players_are_party_or_allies(&world, stranger, UUID_4));
+
+        // And the wired-up predicate: party_only scope + the claims verdict.
+        let policy = ServerFairPlayPolicy {
+            minimap_mode: MinimapMode::FairPlay,
+            allow_cave_map: false,
+            allow_mob_radar: false,
+            player_radar_scope: PlayerRadarScope::PartyOnly,
+            allow_waypoint_teleport: false,
+        };
+        let see = |viewer: &str, target: &str, op: bool| {
+            can_see_player_on_radar(
+                &policy,
+                viewer,
+                target,
+                players_are_party_or_allies(&world, viewer, target),
+                op,
+            )
+        };
+        assert!(see(member, owner, false));
+        assert!(see(member, ally, false));
+        assert!(!see(member, stranger, false));
+        assert!(see(member, stranger, true));
+    }
+
+    #[test]
+    fn fair_play_unrecognized_values_fail_closed() {
+        // `parse` accepts exactly the file spellings (case/whitespace free).
+        assert_eq!(
+            MinimapMode::parse("unrestricted"),
+            Some(MinimapMode::Unrestricted)
+        );
+        assert_eq!(MinimapMode::parse("FAIR_PLAY"), Some(MinimapMode::FairPlay));
+        assert_eq!(
+            MinimapMode::parse(" disabled \t"),
+            Some(MinimapMode::Disabled)
+        );
+        for bad in ["", "yes", "on", "fair-play", "fairplay"] {
+            assert_eq!(MinimapMode::parse(bad), None, "{bad}");
+        }
+        assert_eq!(PlayerRadarScope::parse("all"), Some(PlayerRadarScope::All));
+        assert_eq!(
+            PlayerRadarScope::parse(" Party_Only"),
+            Some(PlayerRadarScope::PartyOnly)
+        );
+        for bad in ["", "everyone", "party-only", "off"] {
+            assert_eq!(PlayerRadarScope::parse(bad), None, "{bad}");
+        }
+
+        // A key the operator typo'd fails closed to the restrictive end of
+        // its enum — never silently back to the permissive default — while
+        // untouched keys keep their permissive defaults.
+        let props = ServerProperties::parse(
+            "minimap-mode=fair-play\nplayer-radar-scope=party-only\nallow-cave-map=maybe\n",
+        )
+        .unwrap();
+        let policy = props.fair_play_policy();
+        assert_eq!(policy.minimap_mode, MinimapMode::Disabled);
+        assert_eq!(policy.player_radar_scope, PlayerRadarScope::None);
+        assert!(!policy.allow_cave_map); // unparseable bool reads as false
+        assert!(policy.allow_mob_radar);
+        assert!(policy.allow_waypoint_teleport);
+    }
+
+    #[test]
+    fn query_and_secure_profile_accessors() {
+        let mut props = ServerProperties::parse("server-port=25570\n").unwrap();
+        assert!(!props.enable_query());
+        assert!(!props.enforce_secure_profile());
+        assert_eq!(props.query_port(), 25570); // defaults to the game port
+        props.set_enable_query(true);
+        props.set_query_port(25577);
+        props.set_enforce_secure_profile(true);
+        let back = ServerProperties::parse(&props.doc().render()).unwrap();
+        assert!(back.enable_query());
+        assert!(back.enforce_secure_profile());
+        assert_eq!(back.query_port(), 25577);
+    }
+
+    #[test]
+    fn untouched_fair_play_keys_preserve_byte_identical_roundtrip() {
+        // Reading the policy writes nothing.
+        let original = "#server\nmotd=hi\nminimap-mode=fair_play\n";
+        let props = ServerProperties::parse(original).unwrap();
+        assert_eq!(
+            props.fair_play_policy().minimap_mode,
+            MinimapMode::FairPlay
+        );
+        assert_eq!(props.doc().render(), original);
+
+        // Absent keys stay absent through an unrelated edit.
+        let mut props = ServerProperties::parse("motd=hi\n").unwrap();
+        props.set_motd("bye");
+        let rendered = props.doc().render();
+        assert_eq!(rendered, "motd=bye\n");
+        for key in [
+            "minimap-mode",
+            "allow-cave-map",
+            "allow-mob-radar",
+            "player-radar-scope",
+            "allow-waypoint-teleport",
+        ] {
+            assert!(!rendered.contains(key), "{rendered}");
+        }
     }
 }

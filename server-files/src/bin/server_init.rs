@@ -18,9 +18,10 @@ use mc_spine_core::version::TargetVersion;
 use mc_spine_server_files::json::Json;
 use mc_spine_server_files::{
     check_eula, valid_player_name, BannedIps, BannedPlayers, ClaimChunkKey, ClaimOwner,
-    ClaimsWorld, ChunkClaim, EulaStatus, OpsList, Party, ServerDirectory, ServerProperties,
-    SubClaimId, UserCache, Whitelist, BANNED_IPS_FILE, BANNED_PLAYERS_FILE, EULA_FILE, EULA_LINK,
-    OPS_FILE, PROPERTIES_FILE, USERCACHE_FILE, WHITELIST_FILE,
+    ClaimsWorld, ChunkClaim, EulaStatus, MinimapMode, OpsList, Party, PlayerRadarScope,
+    ServerDirectory, ServerProperties, SubClaimId, UserCache, Whitelist, BANNED_IPS_FILE,
+    BANNED_PLAYERS_FILE, EULA_FILE, EULA_LINK, OPS_FILE, PROPERTIES_FILE, USERCACHE_FILE,
+    WHITELIST_FILE,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -31,7 +32,12 @@ mc-spine-init — bootstrap and administer a Vanilla-compatible server directory
 USAGE:
     mc-spine-init init --dir <dir> [--mc-version 1.21.1|26.3] [--port <u16>]
                        [--motd <text>] [--online-mode true|false]
-                       [--max-players <u32>] [--json]
+                       [--max-players <u32>]
+                       [--minimap-mode unrestricted|fair_play|disabled]
+                       [--player-radar all|party_only|none]
+                       [--allow-cave-map true|false]
+                       [--allow-mob-radar true|false]
+                       [--allow-waypoint-teleport true|false] [--json]
     mc-spine-init doctor --dir <dir> [--mc-version 1.21.1|26.3] [--json]
     mc-spine-init op --dir <dir> <player> [--level 1..4] [--bypass-limit] [--json]
     mc-spine-init deop --dir <dir> <player> [--json]
@@ -52,6 +58,12 @@ COMMANDS:
                 banned-players.json / banned-ips.json / usercache.json.
                 Existing files are never clobbered; only the explicitly passed
                 flags are applied on top of an existing server.properties.
+                The map fair-play keys are strictly opt-in: each of
+                --minimap-mode / --player-radar / --allow-cave-map /
+                --allow-mob-radar / --allow-waypoint-teleport writes only its
+                own server.properties key, so omitting them all leaves
+                minimaps fully unrestricted. An unrecognized enum or
+                boolean value is rejected with exit 2.
     doctor      Read-only pre-flight check: eula.txt acceptance,
                 server.properties (rcon.password always redacted), the admin
                 JSON lists and usercache.json. Exits 0 when the directory is
@@ -82,6 +94,14 @@ OPTIONS:
     --dir <dir>          The server working directory (required).
     --mc-version <v>     Pinned target: \"1.21.1\" or \"26.3\"
                          (default: 26.3, the latest vanilla).
+    --minimap-mode <m>   unrestricted|fair_play|disabled — opt-in init only;
+                         writes minimap-mode (absent = unrestricted).
+    --player-radar <s>   all|party_only|none — opt-in init only; writes
+                         player-radar-scope (absent = all).
+    --allow-cave-map <b>         true|false — opt-in init only (absent = true).
+    --allow-mob-radar <b>        true|false — opt-in init only (absent = true).
+    --allow-waypoint-teleport <b>
+                         true|false — opt-in init only (absent = true).
     --json               Print the report as JSON instead of text.
     -h, --help           Show this help.
 
@@ -156,6 +176,18 @@ enum ClaimsAction {
     },
 }
 
+/// The opt-in fair-play keys `init` may write; every `None` leaves its key
+/// absent from `server.properties` entirely, so a flag-less init keeps the
+/// fully permissive default policy.
+#[derive(Default)]
+struct FairPlayInit {
+    minimap_mode: Option<MinimapMode>,
+    player_radar_scope: Option<PlayerRadarScope>,
+    allow_cave_map: Option<bool>,
+    allow_mob_radar: Option<bool>,
+    allow_waypoint_teleport: Option<bool>,
+}
+
 enum Command {
     Help,
     Init {
@@ -165,6 +197,7 @@ enum Command {
         motd: Option<String>,
         online_mode: Option<bool>,
         max_players: Option<u32>,
+        fair_play: FairPlayInit,
         json: bool,
     },
     Doctor {
@@ -370,6 +403,7 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
             let mut motd = None;
             let mut online_mode = None;
             let mut max_players = None;
+            let mut fair_play = FairPlayInit::default();
             let common = parse_args("init", rest, |flag, _inline, source| {
                 match flag {
                     "--port" => {
@@ -389,6 +423,42 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
                             usage(format!("--max-players expects a non-negative integer, got {v:?}"))
                         })?);
                     }
+                    "--minimap-mode" => {
+                        let v = source.value("--minimap-mode")?;
+                        fair_play.minimap_mode =
+                            Some(MinimapMode::parse(&v).ok_or_else(|| {
+                                usage(format!(
+                                    "--minimap-mode expects unrestricted|fair_play|disabled, got {v:?}"
+                                ))
+                            })?);
+                    }
+                    "--player-radar" => {
+                        let v = source.value("--player-radar")?;
+                        fair_play.player_radar_scope =
+                            Some(PlayerRadarScope::parse(&v).ok_or_else(|| {
+                                usage(format!(
+                                    "--player-radar expects all|party_only|none, got {v:?}"
+                                ))
+                            })?);
+                    }
+                    "--allow-cave-map" => {
+                        fair_play.allow_cave_map = Some(parse_bool(
+                            "--allow-cave-map",
+                            &source.value("--allow-cave-map")?,
+                        )?)
+                    }
+                    "--allow-mob-radar" => {
+                        fair_play.allow_mob_radar = Some(parse_bool(
+                            "--allow-mob-radar",
+                            &source.value("--allow-mob-radar")?,
+                        )?)
+                    }
+                    "--allow-waypoint-teleport" => {
+                        fair_play.allow_waypoint_teleport = Some(parse_bool(
+                            "--allow-waypoint-teleport",
+                            &source.value("--allow-waypoint-teleport")?,
+                        )?)
+                    }
                     _ => return Ok(false),
                 }
                 Ok(true)
@@ -406,6 +476,7 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
                 motd,
                 online_mode,
                 max_players,
+                fair_play,
                 json: common.json,
             })
         }
@@ -704,6 +775,7 @@ fn cmd_init(
     motd: Option<&str>,
     online_mode: Option<bool>,
     max_players: Option<u32>,
+    fair_play: &FairPlayInit,
     json: bool,
 ) -> Result<(), CliError> {
     let existed = preexisting(dir);
@@ -735,6 +807,29 @@ fn cmd_init(
     if let Some(max) = max_players {
         sd.properties.set_max_players(i64::from(max));
         applied.push(("max-players", max.to_string()));
+    }
+    // Fair-play keys are strictly opt-in: each passed flag writes exactly
+    // its own key, and a flag-less init writes none of them.
+    if let Some(mode) = fair_play.minimap_mode {
+        sd.properties.doc_mut().set("minimap-mode", mode.as_str());
+        applied.push(("minimap-mode", mode.as_str().to_owned()));
+    }
+    if let Some(scope) = fair_play.player_radar_scope {
+        sd.properties
+            .doc_mut()
+            .set("player-radar-scope", scope.as_str());
+        applied.push(("player-radar-scope", scope.as_str().to_owned()));
+    }
+    for (value, key) in [
+        (fair_play.allow_cave_map, "allow-cave-map"),
+        (fair_play.allow_mob_radar, "allow-mob-radar"),
+        (fair_play.allow_waypoint_teleport, "allow-waypoint-teleport"),
+    ] {
+        if let Some(value) = value {
+            let spelled = if value { "true" } else { "false" };
+            sd.properties.doc_mut().set(key, spelled);
+            applied.push((key, spelled.to_owned()));
+        }
     }
 
     // Write only what was missing or what a flag actually addressed; every
@@ -1586,9 +1681,19 @@ fn main() -> ExitCode {
             motd,
             online_mode,
             max_players,
+            fair_play,
             json,
-        } => cmd_init(&dir, target, port, motd.as_deref(), online_mode, max_players, json)
-            .map(|()| 0u8),
+        } => cmd_init(
+            &dir,
+            target,
+            port,
+            motd.as_deref(),
+            online_mode,
+            max_players,
+            &fair_play,
+            json,
+        )
+        .map(|()| 0u8),
         Command::Doctor { dir, target, json } => cmd_doctor(&dir, target, json),
         Command::Op {
             dir,
