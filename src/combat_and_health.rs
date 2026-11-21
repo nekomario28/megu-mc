@@ -359,12 +359,14 @@ fn melee_charge(me: &Arc<Client>, item: i64) -> f32 {
     refresh_equip_attrs(me);
     charge
 }
+// `#minecraft:undead` (1.21.1): every member Smite's +2.5/level bonus applies to.
 fn enchantment_targets_undead(etype: i64) -> bool {
     entity_spec_by_id(etype).is_some_and(|entity| {
         matches!(
             entity.name.strip_prefix("minecraft:"),
             Some(
-                "drowned"
+                "bogged"
+                    | "drowned"
                     | "husk"
                     | "phantom"
                     | "skeleton"
@@ -381,6 +383,7 @@ fn enchantment_targets_undead(etype: i64) -> bool {
         )
     })
 }
+// `#minecraft:arthropod` (1.21.1): Bane of Arthropods' damage/slowdown family.
 fn enchantment_targets_arthropod(etype: i64) -> bool {
     entity_spec_by_id(etype).is_some_and(|entity| {
         matches!(
@@ -389,6 +392,100 @@ fn enchantment_targets_arthropod(etype: i64) -> bool {
         )
     })
 }
+// `#minecraft:sensitive_to_impaling` (1.21.1) — the whole aquatic family. The
+// tag name differs from the issue's `#minecraft:aquatic` shorthand; the
+// membership is the same 12 rows vanilla lists.
+#[cfg_attr(not(test), allow(dead_code))]
+fn enchantment_targets_aquatic(etype: i64) -> bool {
+    entity_spec_by_id(etype).is_some_and(|entity| {
+        matches!(
+            entity.name.strip_prefix("minecraft:"),
+            Some(
+                "axolotl"
+                    | "cod"
+                    | "dolphin"
+                    | "elder_guardian"
+                    | "glow_squid"
+                    | "guardian"
+                    | "pufferfish"
+                    | "salmon"
+                    | "squid"
+                    | "tadpole"
+                    | "tropical_fish"
+                    | "turtle"
+            )
+        )
+    })
+}
+/// `EnchantmentHelper.getDamageBonus` for the typed families (1.21.1): each
+/// pays a flat +2.5 per level against its tag and nothing otherwise.
+/// Smite=34 undead, Bane of Arthropods=1 arthropods, Impaling=15 aquatic.
+#[cfg_attr(not(test), allow(dead_code))]
+fn typed_damage_bonus(enchant: i64, level: i64, etype: i64) -> f32 {
+    let applies = match enchant {
+        34 => enchantment_targets_undead(etype),
+        1 => enchantment_targets_arthropod(etype),
+        15 => enchantment_targets_aquatic(etype),
+        _ => false,
+    };
+    if applies {
+        2.5 * level as f32
+    } else {
+        0.0
+    }
+}
+/// Bane of Arthropods' post-hit rider (vanilla `DamageEnchantment.doPostAttack`):
+/// Slowness IV (amplifier 3) for a random `20 + nextInt(10 * level)` ticks,
+/// i.e. the inclusive window `20..=(20 + 10 * level)`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn bane_slowness_iv(level: i64) -> Option<(i32, i32, i32)> {
+    (level >= 1).then(|| (3, 20, 20 + 10 * level as i32))
+}
+/// Facts `Player.attack` (1.21.1) evaluates for its critical-hit flag, captured
+/// at swing time so the packet handler stays stateless.
+#[derive(Clone, Copy, Debug, Default)]
+struct CritContext {
+    attack_charge: f32,
+    fall_distance: f32,
+    on_ground: bool,
+    on_climbable: bool,
+    in_water: bool,
+    has_blindness: bool,
+    is_passenger: bool,
+    is_sprinting: bool,
+    /// Elytra flight is not part of the vanilla predicate, but this server
+    /// already bars airborne elytra crits; kept so live behaviour is preserved.
+    fall_flying: bool,
+    /// Vanilla requires `entity instanceof LivingEntity` — boats, item frames
+    /// and other non-living entities never take a critical hit. (Armor stands
+    /// *are* LivingEntity in vanilla and therefore can be.)
+    target_is_living: bool,
+}
+
+/// `instanceof LivingEntity` for the crit predicate: living registry rows are
+/// the ones with health — boats, item frames, minecarts and projectiles carry
+/// none. Armor stands are LivingEntity in vanilla and read true here.
+#[cfg_attr(not(test), allow(dead_code))]
+fn entity_is_living(etype: i64) -> bool {
+    entity_spec_by_id(etype).is_some_and(|spec| spec.max_health > 0.0)
+}
+
+/// Vanilla 1.21.1 `Player.attack` crit predicate: a charged falling blow that
+/// is not grounded, climbing, wet, blinded, riding, or sprinting, against a
+/// living target. Sprint-hits pay knockback instead of the 1.5x.
+fn is_vanilla_critical_hit(ctx: &CritContext) -> bool {
+    ctx.attack_charge > 0.9
+        && ctx.fall_distance > 0.0
+        && !ctx.on_ground
+        && !ctx.on_climbable
+        && !ctx.in_water
+        && !ctx.has_blindness
+        && !ctx.is_passenger
+        && !ctx.is_sprinting
+        && !ctx.fall_flying
+        && ctx.target_is_living
+}
+
 fn melee_critical_allowed(
     charge: f32,
     grounded: bool,
@@ -399,14 +496,29 @@ fn melee_critical_allowed(
     climbing: bool,
     blind: bool,
 ) -> bool {
-    charge > 0.9
-        && !grounded
-        && falling
-        && !fall_flying
-        && !sprinting
-        && !in_water
-        && !climbing
-        && !blind
+    is_vanilla_critical_hit(&CritContext {
+        attack_charge: charge,
+        fall_distance: if falling { 1.0 } else { 0.0 },
+        on_ground: grounded,
+        on_climbable: climbing,
+        in_water,
+        has_blindness: blind,
+        is_passenger: false,
+        is_sprinting: sprinting,
+        fall_flying,
+        target_is_living: true,
+    })
+}
+
+/// Vanilla `Player.attack` damage order (1.21.1): the attribute base is scaled
+/// by `0.2 + 0.8 * charge^2`, the critical multiplier applies to that scaled
+/// base only, and the enchantment bonus (`getDamageBonus`, scaled by a bare
+/// `charge`) is added afterwards — a crit never multiplies Smite/Bane/Sharpness.
+#[cfg_attr(not(test), allow(dead_code))]
+fn melee_hit_damage(base: f32, enchant_bonus: f32, charge: f32, critical: bool) -> f32 {
+    let scaled_base = base * (0.2 + 0.8 * charge * charge);
+    let scaled_bonus = enchant_bonus * charge;
+    scaled_base * if critical { 1.5 } else { 1.0 } + scaled_bonus
 }
 fn fire_aspect_duration_ticks(level: i64) -> i32 {
     server_ticks(80 * level.max(0) as u64) as i32
@@ -416,6 +528,83 @@ fn fire_tick_update(remaining: i32, tick: u64, fire_immune: bool) -> (i32, bool)
         && tick.is_multiple_of(server_ticks(MOB_BURN_TICK_GT))
         && !fire_immune;
     (remaining.saturating_sub(1).max(0), damage)
+}
+
+// ---------- per-mob fire ticks (issue #78) ----------
+// `Entity.remainingFireTicks` keyed by entity id, held here rather than on the
+// mob record so weapon ignition can never alias the creeper fuse countdown or
+// the sunlight-burn refresh the environment tick owns. Values are server
+// ticks, matching `fire_aspect_duration_ticks`/`fire_tick_update`.
+static MOB_FIRE_TICKS: OnceLock<Mutex<HashMap<i32, u32>>> = OnceLock::new();
+fn mob_fire_ticks() -> &'static Mutex<HashMap<i32, u32>> {
+    MOB_FIRE_TICKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// Vanilla `Entity.setRemainingFireTicks`: store a fresh burn without touching
+/// `Mob.fuse` or `Mob.fire_ticks` bookkeeping owned elsewhere.
+fn ignite_mob(eid: i32, ticks: u32) {
+    mob_fire_ticks().lock().unwrap().insert(eid, ticks);
+}
+/// Vanilla `Player.attack`'s `target.igniteForSeconds(4 * fireAspectLevel)`:
+/// Fire Aspect I burns 80 game ticks (4s), Fire Aspect II 160 (8s).
+#[cfg_attr(not(test), allow(dead_code))]
+fn ignite_mob_fire_aspect(eid: i32, level: i64) {
+    if level > 0 {
+        ignite_mob(eid, fire_aspect_duration_ticks(level).max(0) as u32);
+    }
+}
+/// The mob's remaining weapon/environmental burn, in server ticks.
+#[cfg_attr(not(test), allow(dead_code))]
+fn mob_fire_ticks_of(eid: i32) -> u32 {
+    mob_fire_ticks()
+        .lock()
+        .unwrap()
+        .get(&eid)
+        .copied()
+        .unwrap_or(0)
+}
+/// Vanilla water/rain extinguish (`Entity.isInWaterOrRain`): clears the burn.
+fn extinguish_mob_fire(eid: i32) {
+    mob_fire_ticks().lock().unwrap().remove(&eid);
+}
+/// One server tick of burning on the map store: decrements cleanly, pays
+/// `1.0` HP every `MOB_BURN_TICK_GT` game ticks, never damages a fire-immune
+/// mob, and goes out in water or rain. Returns the fire damage for the tick.
+#[cfg_attr(not(test), allow(dead_code))]
+fn tick_mob_fire(eid: i32, tick: u64, fire_immune: bool, wet: bool) -> bool {
+    let mut map = mob_fire_ticks().lock().unwrap();
+    if wet {
+        map.remove(&eid);
+        return false;
+    }
+    let Some(entry) = map.get_mut(&eid) else {
+        return false;
+    };
+    let (remaining, damage) = fire_tick_update(*entry as i32, tick, fire_immune);
+    if remaining > 0 {
+        *entry = remaining as u32;
+    } else {
+        map.remove(&eid);
+    }
+    damage
+}
+
+// ---------- sword sweeping (issue #80) ----------
+/// Vanilla `Player.attack`'s sweep knockback strength (`knockback(0.4F, ...)`).
+#[cfg_attr(not(test), allow(dead_code))]
+const SWEEP_KNOCKBACK: f64 = 0.4;
+/// The vanilla gate around `sweepingAttack`: any sword (Sweeping Edge not
+/// required), `attackStrengthScale > 0.9`, no crit, not sprinting, on ground.
+/// The horizontal-speed cap (`walkDist - walkDistO < getSpeed()`) is checked
+/// separately by `sweeping_movement_ok` since it needs live movement data.
+#[cfg_attr(not(test), allow(dead_code))]
+fn sweeping_attack_gate(charge: f32, on_ground: bool, sprinting: bool, critical: bool) -> bool {
+    charge > 0.9 && on_ground && !sprinting && !critical
+}
+/// Vanilla `Player.attack`: a sweep is refused while the attacker is moving
+/// faster than their own movement speed (e.g. sprint-jumping through the hit).
+#[cfg_attr(not(test), allow(dead_code))]
+fn sweeping_movement_ok(horizontal_speed: f64, speed_cap: f64) -> bool {
+    horizontal_speed < speed_cap
 }
 
 // vanilla: blocking with a shield pays floor(blocked)+1 durability
@@ -570,6 +759,7 @@ fn mob_xp(etype: i64) -> i16 {
 // vanilla /kill applies void damage — the same loot+xp+cleanup path as
 // combat death, not a silent retain
 fn kill_mob(deid: i32, etype: i64, mx: f64, my: f64, mz: f64) {
+    extinguish_mob_fire(deid);
     let Some((mob, state)) = remove_live_mob(deid) else { return };
     let burning = *mob.fire_ticks.lock().unwrap() > 0;
     live_mob_death(&mob, state, [mx, my, mz]);
@@ -607,6 +797,7 @@ fn kill_mob(deid: i32, etype: i64, mx: f64, my: f64, mz: f64) {
 }
 
 fn mob_env_die(deid: i32, etype: i64, mx: f64, my: f64, mz: f64, burning: bool) {
+    extinguish_mob_fire(deid);
     // environmental death (suffocation/drowning/fall): drops but no XP —
     // vanilla only drops XP when recently hurt by a player
     let Some((mob, state)) = remove_live_mob(deid) else { return };
@@ -1354,6 +1545,7 @@ fn arrow_tick() {
                         drop(h);
                         if a.fire > 0 && !mob_fire_immune(m.etype) {
                             *m.fire_ticks.lock().unwrap() = a.fire;
+                            ignite_mob(m.eid, a.fire.max(0) as u32);
                         }
                         if a.punch > 0 && a.kind == 0 {
                             let vl = (a.dx * a.dx + a.dz * a.dz).sqrt().max(0.01);
@@ -2668,5 +2860,381 @@ mod p1_combat_tests {
         );
         refresh_equip_attrs(&client);
         assert_eq!(max_hp_of(&client.name), 24.0);
+    }
+}
+
+#[cfg(test)]
+mod p5a_parity_tests {
+    use super::*;
+
+    /// Restores the fire map and tick clock around a test so eids and tick
+    /// counts cannot collide between cases.
+    struct FireGuard {
+        time: u64,
+    }
+    impl FireGuard {
+        fn new() -> Self {
+            Self {
+                time: TICK_IDX.swap(0, Ordering::Relaxed),
+            }
+        }
+    }
+    impl std::ops::Drop for FireGuard {
+        fn drop(&mut self) {
+            TICK_IDX.store(self.time, Ordering::Relaxed);
+            mob_fire_ticks().lock().unwrap().clear();
+        }
+    }
+
+    fn mob(eid: i32, etype: i64) -> Mob {
+        Mob {
+            dim: DimId::Overworld,
+            eid,
+            uuid: [eid as u8; 16],
+            etype,
+            pos: Mutex::new((0.0, 64.0, 0.0, 0.0, 0.0)),
+            hp: Mutex::new(20.0),
+            last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            last_hurt_tick: Mutex::new(None),
+            fuse: Mutex::new(0),
+            fire_ticks: Mutex::new(0),
+            love: Mutex::new(0),
+            air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+            vel: Mutex::new([0.0; 3]),
+        }
+    }
+
+    // #78 — Fire Aspect's burn lands on the dedicated map store, never on the
+    // creeper's fuse countdown or the sunlight-burn field.
+    #[test]
+    fn p5a_parity_fire_aspect_never_touches_creeper_fuse() {
+        let _g = FireGuard::new();
+        let creeper = mob(4243, name_to_etype("creeper").unwrap());
+        *creeper.fuse.lock().unwrap() = 7;
+        ignite_mob_fire_aspect(creeper.eid, 1);
+        assert_eq!(
+            mob_fire_ticks_of(creeper.eid),
+            fire_aspect_duration_ticks(1) as u32
+        );
+        assert_eq!(
+            mob_fire_ticks_of(creeper.eid),
+            server_ticks(80) as u32,
+            "Fire Aspect I is 4s"
+        );
+        ignite_mob_fire_aspect(creeper.eid, 2);
+        assert_eq!(
+            mob_fire_ticks_of(creeper.eid),
+            server_ticks(160) as u32,
+            "Fire Aspect II is 8s"
+        );
+        assert_eq!(*creeper.fuse.lock().unwrap(), 7, "fuse untouched");
+        assert_eq!(*creeper.fire_ticks.lock().unwrap(), 0, "sunlight field untouched");
+        ignite_mob_fire_aspect(creeper.eid, 0);
+        assert_eq!(
+            mob_fire_ticks_of(creeper.eid),
+            server_ticks(160) as u32,
+            "no Fire Aspect keeps the running burn"
+        );
+    }
+
+    // #78 — burn damage pays 1hp every 20 game ticks, skips the fire-immune
+    // family, decrements to zero, and water/rain extinguishes.
+    #[test]
+    fn p5a_parity_mob_fire_ticks_decrement_damage_and_extinguish() {
+        let _g = FireGuard::new();
+        let eid = 4244;
+        ignite_mob(eid, server_ticks(80) as u32);
+        let burn_interval = server_ticks(MOB_BURN_TICK_GT);
+        for tick in 1..burn_interval {
+            assert!(!tick_mob_fire(eid, tick, false, false), "tick {tick}");
+        }
+        assert_eq!(mob_fire_ticks_of(eid), server_ticks(80) as u32 - 19);
+        assert!(tick_mob_fire(eid, burn_interval, false, false));
+        assert_eq!(mob_fire_ticks_of(eid), server_ticks(80) as u32 - 20);
+
+        // Fire-immune mobs (blaze, ghast, magma_cube, strider, wither,
+        // wither_skeleton, zombified_piglin, warden, ender_dragon...) still
+        // burn down on the clock but take no damage.
+        ignite_mob(eid, server_ticks(80) as u32);
+        assert!(!tick_mob_fire(eid, burn_interval * 2, true, false));
+        assert_eq!(mob_fire_ticks_of(eid), server_ticks(80) as u32 - 1);
+
+        // Water (or rain) clears the whole burn before the next decrement.
+        assert!(mob_fire_ticks_of(eid) > 0);
+        assert!(!tick_mob_fire(eid, burn_interval * 3, false, true));
+        assert_eq!(mob_fire_ticks_of(eid), 0);
+        extinguish_mob_fire(eid);
+
+        // The burn decrements cleanly to zero and the entry is dropped.
+        ignite_mob(eid, 1);
+        assert!(!tick_mob_fire(eid, burn_interval * 4 + 1, false, false));
+        assert_eq!(mob_fire_ticks_of(eid), 0);
+        assert!(mob_fire_ticks().lock().unwrap().get(&eid).is_none());
+    }
+
+    // #78 — the immune list keeps covering the vanilla fireImmune family.
+    #[test]
+    fn p5a_parity_fire_immune_family_matches_vanilla() {
+        for name in [
+            "blaze", "ghast", "magma_cube", "strider", "wither", "wither_skeleton",
+            "zombified_piglin", "warden", "ender_dragon", "shulker", "vex", "zoglin",
+        ] {
+            assert!(
+                mob_fire_immune(name_to_etype(name).unwrap()),
+                "{name} must be fire immune"
+            );
+        }
+        for name in ["creeper", "zombie", "skeleton", "cow", "spider"] {
+            assert!(
+                !mob_fire_immune(name_to_etype(name).unwrap()),
+                "{name} burns"
+            );
+        }
+    }
+
+    // #79 — every gate of the vanilla crit predicate, and a clean falling blow.
+    #[test]
+    fn p5a_parity_vanilla_critical_hit_all_gates() {
+        let clean = CritContext {
+            attack_charge: 1.0,
+            fall_distance: 0.5,
+            target_is_living: true,
+            ..Default::default()
+        };
+        assert!(is_vanilla_critical_hit(&clean));
+        assert!(!is_vanilla_critical_hit(&CritContext {
+            attack_charge: 0.9,
+            ..clean
+        }));
+        assert!(!is_vanilla_critical_hit(&CritContext {
+            fall_distance: 0.0,
+            ..clean
+        }));
+        assert!(!is_vanilla_critical_hit(&CritContext {
+            on_ground: true,
+            ..clean
+        }));
+        assert!(!is_vanilla_critical_hit(&CritContext {
+            on_climbable: true,
+            ..clean
+        }));
+        assert!(!is_vanilla_critical_hit(&CritContext {
+            in_water: true,
+            ..clean
+        }));
+        assert!(!is_vanilla_critical_hit(&CritContext {
+            has_blindness: true,
+            ..clean
+        }));
+        assert!(!is_vanilla_critical_hit(&CritContext {
+            is_passenger: true,
+            ..clean
+        }));
+        assert!(!is_vanilla_critical_hit(&CritContext {
+            is_sprinting: true,
+            ..clean
+        }));
+        assert!(!is_vanilla_critical_hit(&CritContext {
+            target_is_living: false,
+            ..clean
+        }));
+        assert!(!is_vanilla_critical_hit(&CritContext {
+            fall_flying: true,
+            ..clean
+        }));
+        // Vanilla's `instanceof LivingEntity` gate: boats, item frames,
+        // minecarts and other non-living targets can never be crit; armor
+        // stands are LivingEntity in vanilla and *can*.
+        for name in ["boat", "item_frame", "glow_item_frame", "chest_minecart", "arrow"] {
+            assert!(
+                !entity_is_living(name_to_etype(name).unwrap()),
+                "{name} is not a living crit target"
+            );
+        }
+        for name in ["zombie", "armor_stand", "wither", "bee"] {
+            assert!(
+                entity_is_living(name_to_etype(name).unwrap()),
+                "{name} is a living crit target"
+            );
+        }
+    }
+
+    fn crit_ctx(charge: f32, grounded: bool, falling: bool) -> bool {
+        is_vanilla_critical_hit(&CritContext {
+            attack_charge: charge,
+            fall_distance: if falling { 0.5 } else { 0.0 },
+            on_ground: grounded,
+            target_is_living: true,
+            ..Default::default()
+        })
+    }
+
+    // #79 — the ×1.5 lands on the charge-scaled base before the enchant bonus,
+    // exactly the order vanilla's `Player.attack` computes f and f1.
+    #[test]
+    fn p5a_parity_crit_multiplies_scaled_base_only() {
+        let base = 7.0f32; // diamond sword
+        let sharp = 1.5f32; // sharpness III bonus
+        // Full charge crit: (7 * 1.0) * 1.5 + 1.5 = 12.0, not (7 + 1.5) * 1.5.
+        assert_eq!(melee_hit_damage(base, sharp, 1.0, true), 12.0);
+        // Same blow without crit: 7 + 1.5 = 8.5.
+        assert_eq!(melee_hit_damage(base, sharp, 1.0, false), 8.5);
+        // Half charge: base pays the 0.2 + 0.8*c^2 scale, the enchant bonus
+        // pays a bare charge factor and is never crit-multiplied.
+        let dmg = melee_hit_damage(base, sharp, 0.5, true);
+        let expected = 7.0 * (0.2 + 0.8 * 0.25) * 1.5 + 1.5 * 0.5;
+        assert!((dmg - expected).abs() < 1e-5, "{dmg} vs {expected}");
+        assert!(crit_ctx(1.0, false, true));
+        assert!(!crit_ctx(1.0, true, true));
+    }
+
+    // #80 — the unenchanted sword still sweeps for 1.0, and levels I..III use
+    // the exact `1 + base * lvl/(lvl+1)` vanilla formula.
+    #[test]
+    fn p5a_parity_sweeping_edge_formula() {
+        for (base, expected) in [(1.0f32, [1.0, 1.5, 1.666_666_7, 1.75]),
+                                (7.0f32, [1.0, 4.5, 5.666_666_5, 6.25]),
+                                (10.0f32, [1.0, 6.0, 7.666_666_5, 8.5])]
+        {
+            for (level, want) in expected.iter().enumerate() {
+                let got = sweeping_edge_damage(level as i32, base);
+                assert!(
+                    (got - want).abs() < 1e-5,
+                    "level {level} base {base}: {got} vs {want}"
+                );
+            }
+        }
+        assert_eq!(sweeping_edge_damage(0, 7.0), 1.0);
+    }
+
+    // #80 — sweep requires a charged, grounded, non-crit, non-sprint sword hit
+    // plus the walking-speed cap and the 0.4 knockback constant.
+    #[test]
+    fn p5a_parity_sweeping_gate_speed_and_knockback() {
+        assert!(sweeping_attack_gate(0.95, true, false, false));
+        assert!(!sweeping_attack_gate(0.9, true, false, false));
+        assert!(!sweeping_attack_gate(0.95, false, false, false));
+        assert!(!sweeping_attack_gate(0.95, true, true, false));
+        assert!(!sweeping_attack_gate(0.95, true, false, true));
+        assert!(sweeping_movement_ok(0.05, 0.1));
+        assert!(!sweeping_movement_ok(0.1, 0.1));
+        assert!(!sweeping_movement_ok(0.2, 0.1));
+        assert_eq!(SWEEP_KNOCKBACK, 0.4);
+        // Geometry through the live `sweeping_attack`: a neighbour inside the
+        // 1.0/0.25 inflated target box within 9.0 squared takes the hit.
+        let target = PlayerAabb {
+            min: [3.0, 64.0, 3.0],
+            max: [4.0, 65.0, 4.0],
+        };
+        let near = PlayerAabb {
+            min: [4.5, 64.0, 3.5],
+            max: [5.0, 65.0, 4.0],
+        };
+        let far = PlayerAabb {
+            min: [8.0, 64.0, 3.0],
+            max: [9.0, 65.0, 4.0],
+        };
+        let sweep = sweeping_attack(
+            0.95, true, false, false,
+            [2.0, 64.0, 1.0], target, near, 7.0, 0,
+        );
+        assert!(sweep.eligible);
+        assert_eq!(sweep.damage, 1.0, "unenchanted sweep pays exactly 1.0");
+        // A candidate outside the inflated target box is never swept.
+        assert!(!sweeping_attack(
+            0.95, true, false, false,
+            [2.0, 64.0, 1.0], target, far, 7.0, 0,
+        )
+        .eligible);
+        // An attacker farther than sqrt(9.0) from the target never sweeps.
+        assert!(!sweeping_attack(
+            0.95, true, false, false,
+            [3.5, 64.0, -1.5], target, near, 7.0, 0,
+        )
+        .eligible);
+        // A crit blocks the sweep; so does sprinting or a short charge.
+        for (sprint, crit, charge) in [(true, false, 0.95), (false, true, 0.95), (false, false, 0.85)] {
+            assert!(!sweeping_attack(
+                charge, true, sprint, crit,
+                [2.0, 64.0, 1.0], target, near, 7.0, 3,
+            )
+            .eligible);
+        }
+    }
+
+    // #81 — Smite's undead family: every tag member pays +2.5/level.
+    #[test]
+    fn p5a_parity_smite_covers_full_undead_family() {
+        for name in [
+            "zombie", "zombie_villager", "husk", "drowned", "zombified_piglin",
+            "zoglin", "skeleton", "stray", "bogged", "wither_skeleton",
+            "skeleton_horse", "zombie_horse", "phantom", "wither",
+        ] {
+            let etype = name_to_etype(name).unwrap();
+            assert!(enchantment_targets_undead(etype), "{name}");
+            assert_eq!(typed_damage_bonus(34, 5, etype), 12.5, "{name} smite V");
+        }
+        for name in ["spider", "creeper", "zoglin_piglin_unknown", "cow", "piglin"] {
+            let Some(etype) = name_to_etype(name) else { continue };
+            assert!(!enchantment_targets_undead(etype), "{name}");
+            assert_eq!(typed_damage_bonus(34, 5, etype), 0.0, "{name}");
+        }
+        // The live path's own enchant_level id for smite is 34.
+        assert_eq!(enchant_id("minecraft:smite"), Some(34));
+    }
+
+    // #81 — Bane's arthropod family plus the Slowness IV rider.
+    #[test]
+    fn p5a_parity_bane_covers_arthropods_and_slowness_iv() {
+        for name in ["spider", "cave_spider", "silverfish", "endermite", "bee"] {
+            let etype = name_to_etype(name).unwrap();
+            assert!(enchantment_targets_arthropod(etype), "{name}");
+            assert_eq!(typed_damage_bonus(1, 3, etype), 7.5, "{name} bane III");
+        }
+        assert!(!enchantment_targets_arthropod(name_to_etype("zombie").unwrap()));
+        assert_eq!(bane_slowness_iv(0), None);
+        assert_eq!(bane_slowness_iv(1), Some((3, 20, 30)));
+        assert_eq!(bane_slowness_iv(2), Some((3, 20, 40)));
+        assert_eq!(bane_slowness_iv(5), Some((3, 20, 70)));
+        // Amplifier 3 is vanilla's Slowness IV on the internal wire too.
+        assert_eq!(name_to_effect("slowness"), Some(1));
+        assert_eq!(enchant_id("minecraft:bane_of_arthropods"), Some(1));
+    }
+
+    // #81 — Impaling's aquatic family (vanilla `#minecraft:sensitive_to_impaling`).
+    #[test]
+    fn p5a_parity_impaling_covers_full_aquatic_family() {
+        for name in [
+            "cod", "salmon", "pufferfish", "tropical_fish", "squid", "glow_squid",
+            "dolphin", "turtle", "guardian", "elder_guardian", "axolotl", "tadpole",
+        ] {
+            let etype = name_to_etype(name).unwrap();
+            assert!(enchantment_targets_aquatic(etype), "{name}");
+            assert_eq!(typed_damage_bonus(15, 2, etype), 5.0, "{name} impaling II");
+        }
+        for name in ["drowned", "frog", "guardian_z"] {
+            let Some(etype) = name_to_etype(name) else { continue };
+            assert!(!enchantment_targets_aquatic(etype), "{name}");
+        }
+        // Drowned is undead (Smite), not aquatic — the families stay disjoint.
+        let drowned = name_to_etype("drowned").unwrap();
+        assert!(!enchantment_targets_aquatic(drowned));
+        assert!(enchantment_targets_undead(drowned));
+        assert_eq!(enchant_id("minecraft:impaling"), Some(15));
+    }
+
+    // #78 + #81 — a sword-level Fire Aspect hit on a fire-immune mob records
+    // the burn but pays no damage, matching the melee gate.
+    #[test]
+    fn p5a_parity_fire_aspect_immune_mob_records_no_damage() {
+        let _g = FireGuard::new();
+        let blaze = name_to_etype("blaze").unwrap();
+        ignite_mob_fire_aspect(4245, 1);
+        assert_eq!(mob_fire_ticks_of(4245), server_ticks(80) as u32);
+        assert!(mob_fire_immune(blaze));
+        for tick in 1..=server_ticks(40) {
+            assert!(!tick_mob_fire(4245, tick, mob_fire_immune(blaze), false));
+        }
     }
 }

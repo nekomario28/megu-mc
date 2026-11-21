@@ -5021,6 +5021,121 @@ impl Beacon {
     }
 }
 
+/// `BeaconMenu` (1.21.1): a single payment slot (`ItemTags.BEACON_PAYMENT_ITEMS`,
+/// max stack size 1) plus the three `ContainerData` rows the screen reads —
+/// power level, primary effect, secondary effect. `power_level` mirrors the
+/// anchored `Beacon` block entity on every sync; `anchor` lets
+/// `apply_live_beacon_update` write a confirmed choice back to it.
+#[derive(Default)]
+struct BeaconMenu {
+    payment: Stack,
+    anchor: Option<DimBlockPos>,
+    power_level: i16,
+}
+
+/// `#minecraft:beacon_payment_items` (1.21.1): the five items the beacon's
+/// payment slot and `BeaconBlockEntity.setEffects` both accept.
+fn beacon_payment_item(stack: &Stack) -> bool {
+    item_to_name(stack.0).is_some_and(|item| {
+        matches!(
+            item,
+            "iron_ingot" | "gold_ingot" | "diamond" | "emerald" | "netherite_ingot"
+        )
+    })
+}
+
+/// `minecraft:mob_effect` registry id a beacon `ContainerData` row carries
+/// (the same id space `set_beacon_effect` decodes; -1 when no effect is set).
+fn beacon_effect_wire_id(effect: BeaconEffect) -> i16 {
+    // name_to_effect is the internal effect id; the registry id is +1
+    // (verified against `beacon_effect_from_wire`'s decoder).
+    name_to_effect(BeaconEffect::IDS[effect as usize].1).unwrap() as i16 + 1
+}
+
+/// The pyramid tier that unlocks an effect on the vanilla beacon screen:
+/// tier 1 Speed/Haste, tier 2 Resistance/Jump Boost, tier 3 Strength,
+/// tier 4 Regeneration.
+#[cfg_attr(not(test), allow(dead_code))]
+fn beacon_effect_tier(effect: BeaconEffect) -> i16 {
+    match effect {
+        BeaconEffect::Speed | BeaconEffect::Haste => 1,
+        BeaconEffect::Resistance | BeaconEffect::JumpBoost => 2,
+        BeaconEffect::Strength => 3,
+        BeaconEffect::Regeneration => 4,
+    }
+}
+
+/// Vanilla `BeaconScreen`/`BeaconMenu` gating: a primary effect must be
+/// unlocked by the pyramid's level, and a secondary exists only at level 4 —
+/// either Regeneration or the primary again (which vanilla applies as Tier II).
+#[cfg_attr(not(test), allow(dead_code))]
+fn beacon_selection_allowed(
+    power_level: i16,
+    primary: Option<BeaconEffect>,
+    secondary: Option<BeaconEffect>,
+) -> bool {
+    if power_level < 1 || (primary.is_none() && secondary.is_some()) {
+        return false;
+    }
+    if let Some(primary) = primary {
+        if beacon_effect_tier(primary) > power_level {
+            return false;
+        }
+    }
+    if let Some(secondary) = secondary {
+        if power_level < 4 {
+            return false;
+        }
+        if secondary != BeaconEffect::Regeneration && Some(secondary) != primary {
+            return false;
+        }
+    }
+    true
+}
+
+/// Applies a beacon menu confirmation (vanilla `BeaconMenu`'s effect choice
+/// reaching `BeaconBlockEntity`): validates the effects against the pyramid
+/// tiers, consumes one `#minecraft:beacon_payment_items` item from slot 0,
+/// and updates the beacon state. Returns whether the update was applied.
+#[cfg_attr(not(test), allow(dead_code))]
+fn apply_live_beacon_update(
+    menu: &mut BeaconMenu,
+    primary_effect: Option<BeaconEffect>,
+    secondary_effect: Option<BeaconEffect>,
+) -> bool {
+    if !beacon_payment_item(&menu.payment) {
+        return false;
+    }
+    // The pyramid tier gates on the anchored block entity's real level so the
+    // check cannot run on a stale menu mirror; the menu's own power_level is
+    // the fallback for an unanchored menu.
+    if let Some((dim, x, y, z)) = menu.anchor {
+        let Some(reg) = breg() else { return false };
+        let state = block_at_dim(dim, x, y, z);
+        let mut store = live_block_entities().lock().unwrap();
+        let Some(LiveBlockEntity::Beacon(beacon)) =
+            store.at(reg, (dim, x, y, z), state)
+        else {
+            return false;
+        };
+        menu.power_level = beacon.levels() as i16;
+        if !beacon_selection_allowed(menu.power_level, primary_effect, secondary_effect) {
+            return false;
+        }
+        beacon.primary = primary_effect;
+        beacon.secondary = secondary_effect;
+    } else if !beacon_selection_allowed(menu.power_level, primary_effect, secondary_effect) {
+        return false;
+    }
+    // Slot 0 pays exactly one item; `getMaxStackSize` on the vanilla slot is 1.
+    menu.payment = if menu.payment.1 <= 1 {
+        Stack::default()
+    } else {
+        (menu.payment.0, menu.payment.1 - 1, menu.payment.2.clone())
+    };
+    true
+}
+
 #[derive(Debug, Default, PartialEq)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Campfire {
@@ -8643,12 +8758,16 @@ enum LiveMenu {
     Grindstone(GrindstoneMenu),
     Loom(LoomMenu),
     Cartography(CartographyMenu),
+    Beacon(BeaconMenu),
 }
 
 impl LiveMenu {
     fn screen(&self) -> (i64, &'static str) {
         match self {
             Self::Anvil(_) => (8, "Repair & Name"),
+            // `minecraft:beacon` is index 9 in the protocol-767 menu registry
+            // (`proto::data_v767::V767_MENUS`; crafter_3x3 holds 7, anvil 8).
+            Self::Beacon(_) => (9, "Beacon"),
             Self::Brewing => (11, "Brewing Stand"),
             Self::Crafter => (7, "Crafter"),
             Self::Lectern => (17, "Lectern"),
@@ -8672,6 +8791,7 @@ impl LiveMenu {
             Self::Grindstone(menu) => vec![&mut menu.top, &mut menu.bottom],
             Self::Loom(menu) => vec![&mut menu.banner, &mut menu.dye, &mut menu.pattern_item],
             Self::Cartography(menu) => vec![&mut menu.map, &mut menu.addition],
+            Self::Beacon(menu) => vec![&mut menu.payment],
             Self::Brewing | Self::Crafter | Self::Lectern => Vec::new(),
         }
     }
@@ -8831,6 +8951,10 @@ fn open_live_block_menu(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u3
         "minecraft:grindstone" => LiveMenu::Grindstone(GrindstoneMenu::default()),
         "minecraft:loom" => LiveMenu::Loom(LoomMenu::default()),
         "minecraft:cartography_table" => LiveMenu::Cartography(CartographyMenu::default()),
+        "minecraft:beacon" => LiveMenu::Beacon(BeaconMenu {
+            anchor: Some(key),
+            ..Default::default()
+        }),
         _ => return use_live_block_entity(c, key, state),
     };
     if !c.is_spectator() {
@@ -9267,6 +9391,36 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
                 .unwrap_or_default();
             vec![menu.map.clone(), menu.addition.clone(), result]
         }
+        LiveMenu::Beacon(menu) => {
+            // The beacon block entity is the source of truth for all three
+            // `ContainerData` rows (vanilla BeaconBlockEntity.dataAccess).
+            let (dim, x, y, z) = session.anchor.unwrap();
+            let (Some(reg), state) = (breg(), block_at_dim(dim, x, y, z)) else {
+                return;
+            };
+            let mut store = live_block_entities().lock().unwrap();
+            let Some(LiveBlockEntity::Beacon(beacon)) =
+                store.at(reg, (dim, x, y, z), state)
+            else {
+                return;
+            };
+            menu.power_level = beacon.levels() as i16;
+            properties.extend([
+                WindowPropertyUpdate {
+                    property: 0,
+                    value: menu.power_level,
+                },
+                WindowPropertyUpdate {
+                    property: 1,
+                    value: beacon.primary.map_or(-1, beacon_effect_wire_id),
+                },
+                WindowPropertyUpdate {
+                    property: 2,
+                    value: beacon.secondary.map_or(-1, beacon_effect_wire_id),
+                },
+            ]);
+            vec![menu.payment.clone()]
+        }
     };
     session.state_id = (session.state_id + 1) & 0x7fff;
     let inventory = c.inv.lock().unwrap();
@@ -9527,6 +9681,10 @@ fn live_input_limit(menu: &LiveMenu, slot: usize, stack: &Stack) -> u8 {
         {
             0
         }
+        // `BeaconMenu`'s slot: `#minecraft:beacon_payment_items` and at most
+        // one at a time (`Slot.getMaxStackSize() == 1`).
+        LiveMenu::Beacon(_) if !beacon_payment_item(stack) => 0,
+        LiveMenu::Beacon(_) => 1,
         _ => stack_max_of(stack) as u8,
     }
 }
@@ -9574,6 +9732,7 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
         LiveMenu::Stonecutter(_) => 2,
         LiveMenu::Grindstone(_) | LiveMenu::Cartography(_) => 3,
         LiveMenu::Loom(_) => 4,
+        LiveMenu::Beacon(_) => 1,
     };
     let output_slot = match session.menu {
         LiveMenu::Crafter => 9,
@@ -9959,6 +10118,7 @@ fn live_menu_valid(c: &Client, session: &LiveMenuSession) -> bool {
             | (LiveMenu::Grindstone(_), "minecraft:grindstone")
             | (LiveMenu::Loom(_), "minecraft:loom")
             | (LiveMenu::Cartography(_), "minecraft:cartography_table")
+            | (LiveMenu::Beacon(_), "minecraft:beacon")
     )
 }
 
@@ -10870,5 +11030,386 @@ mod p1_combat_item_tests {
             comp_get(round, COMP_ATTRIBUTE_MODIFIERS).and_then(attr_modifiers_parse),
             Some(comp)
         );
+    }
+}
+
+#[cfg(test)]
+mod p5a_beacon_tests {
+    use super::*;
+    use crate::effect_tests::client_pair;
+    use std::io::Read;
+
+    /// Restores the block-entity store, placed cells, menu sessions, clients
+    /// and drops around a live beacon-menu test.
+    struct BeaconWorld {
+        store: LiveBlockEntityStore,
+        cells: Vec<(DimBlockPos, u32)>,
+        sessions: HashMap<i32, PlayerMechanismSession>,
+        players: Vec<Arc<Client>>,
+    }
+
+    impl BeaconWorld {
+        fn new() -> Self {
+            Self {
+                store: std::mem::take(&mut *live_block_entities().lock().unwrap()),
+                cells: Vec::new(),
+                sessions: std::mem::take(&mut *player_mechanism_sessions().lock().unwrap()),
+                players: std::mem::take(&mut *clients().lock().unwrap()),
+            }
+        }
+
+        fn place(&mut self, key @ (dim, x, y, z): DimBlockPos, block: &str) -> u32 {
+            let state = item_to_state(name_to_item(block).unwrap()).unwrap();
+            let old = block_at_dim(dim, x, y, z);
+            self.cells.push((key, old));
+            place_block_dim(dim, x, y, z, state);
+            assert_eq!(block_at_dim(dim, x, y, z), state, "{block}");
+            state
+        }
+    }
+
+    impl std::ops::Drop for BeaconWorld {
+        fn drop(&mut self) {
+            for &((dim, x, y, z), state) in self.cells.iter().rev() {
+                set_block_dim(dim, x, y, z, state);
+            }
+            *live_block_entities().lock().unwrap() = std::mem::take(&mut self.store);
+            *player_mechanism_sessions().lock().unwrap() = std::mem::take(&mut self.sessions);
+            *clients().lock().unwrap() = std::mem::take(&mut self.players);
+        }
+    }
+
+    fn attach(c: &Client) {
+        c.enter_play_wire(None, Default::default());
+        player_mechanism_sessions().lock().unwrap().insert(
+            c.eid,
+            PlayerMechanismSession {
+                xp_bar: (0, 0.0),
+                food_timer: 0,
+                menus: Arc::new(LiveMenuConnection {
+                    active: Mutex::new(None),
+                    next_id: std::sync::atomic::AtomicU8::new(4),
+                    enchantment_seed: Mutex::new(0),
+                }),
+            },
+        );
+    }
+
+    /// Drain every frame the socket received; `read` hits the fixture's 1s
+    /// timeout once the batch is exhausted.
+    fn read_frames(rx: &mut TcpStream) -> Vec<(i64, Vec<u8>)> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        while let Ok(n) = rx.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let mut frames = Vec::new();
+        let mut rest = buf.as_slice();
+        while !rest.is_empty() {
+            let mut view = rest;
+            let Some(len) = read_varint(&mut view) else { break };
+            let len = len as usize;
+            if view.len() < len {
+                break;
+            }
+            let mut body = &view[..len];
+            rest = &view[len..];
+            let Some(id) = read_varint(&mut body) else { break };
+            frames.push((id, body.to_vec()));
+        }
+        frames
+    }
+
+    fn beacon_of(key: DimBlockPos) -> (Option<BeaconEffect>, Option<BeaconEffect>, i32) {
+        let store = live_block_entities().lock().unwrap();
+        let Some((_, LiveBlockEntity::Beacon(beacon))) = store.entries.get(&key) else {
+            panic!("beacon entity missing at {key:?}");
+        };
+        (beacon.primary, beacon.secondary, beacon.levels)
+    }
+
+    // #204 — `minecraft:beacon` is registry id 9 on protocol 767 (index of
+    // `proto::data_v767::V767_MENUS`; crafter_3x3 is 7, anvil 8), and the menu
+    // owns exactly one input slot: the payment slot.
+    #[test]
+    fn p5a_parity_beacon_menu_type_and_slots() {
+        let mut menu = LiveMenu::Beacon(BeaconMenu::default());
+        assert_eq!(menu.screen(), (9, "Beacon"));
+        assert_eq!(menu.input_slots().len(), 1);
+    }
+
+    // #204 — slot 0 accepts only `#minecraft:beacon_payment_items`, stacked to
+    // a maximum of one (vanilla `Slot.getMaxStackSize() == 1`).
+    #[test]
+    fn p5a_parity_beacon_payment_slot_accepts_only_tag_items() {
+        let menu = LiveMenu::Beacon(BeaconMenu::default());
+        for item in [
+            "iron_ingot",
+            "gold_ingot",
+            "diamond",
+            "emerald",
+            "netherite_ingot",
+        ] {
+            let st = (name_to_item(item).unwrap(), 1, Vec::new());
+            assert_eq!(live_input_limit(&menu, 0, &st), 1, "{item}");
+            assert!(beacon_payment_item(&st), "{item}");
+        }
+        for item in ["coal", "iron_sword", "stone", "iron_block", "bread"] {
+            let st = (name_to_item(item).unwrap(), 1, Vec::new());
+            assert_eq!(live_input_limit(&menu, 0, &st), 0, "{item}");
+            assert!(!beacon_payment_item(&st), "{item}");
+        }
+    }
+
+    // #204 — the pyramid tiers gate the choice exactly like the vanilla
+    // beacon screen: tier 1 Speed/Haste, tier 2 Resistance/Jump Boost,
+    // tier 3 Strength, tier 4 Regeneration or the primary again (Tier II).
+    #[test]
+    fn p5a_parity_beacon_pyramid_tier_gating() {
+        use BeaconEffect::*;
+        // Level 0: nothing selectable.
+        assert!(!beacon_selection_allowed(0, Some(Speed), None));
+        // Level 1: Speed/Haste only — Strength and Regeneration refused.
+        assert!(beacon_selection_allowed(1, Some(Speed), None));
+        assert!(beacon_selection_allowed(1, Some(Haste), None));
+        assert!(!beacon_selection_allowed(1, Some(Strength), None));
+        assert!(!beacon_selection_allowed(1, Some(Regeneration), None));
+        assert!(!beacon_selection_allowed(1, Some(Speed), Some(Regeneration)));
+        // Level 2 unlocks Resistance/Jump Boost but no secondary.
+        assert!(beacon_selection_allowed(2, Some(JumpBoost), None));
+        assert!(beacon_selection_allowed(2, Some(Resistance), None));
+        assert!(!beacon_selection_allowed(2, Some(Strength), None));
+        assert!(!beacon_selection_allowed(2, Some(Speed), Some(Speed)));
+        // Level 3 unlocks Strength; secondary still gated to level 4.
+        assert!(beacon_selection_allowed(3, Some(Strength), None));
+        assert!(!beacon_selection_allowed(3, Some(Regeneration), None));
+        assert!(!beacon_selection_allowed(3, Some(Strength), Some(Regeneration)));
+        // Level 4: Regeneration as primary, Regeneration as secondary, or the
+        // primary repeated for the Tier-II upgrade.
+        assert!(beacon_selection_allowed(4, Some(Regeneration), None));
+        assert!(beacon_selection_allowed(4, Some(Strength), Some(Regeneration)));
+        assert!(beacon_selection_allowed(4, Some(Strength), Some(Strength)));
+        // ...but never an unrelated tier effect as the secondary.
+        assert!(!beacon_selection_allowed(4, Some(Strength), Some(JumpBoost)));
+        assert!(!beacon_selection_allowed(4, Some(Strength), Some(Speed)));
+        // A secondary with no primary is not a valid selection.
+        assert!(!beacon_selection_allowed(4, None, Some(Regeneration)));
+        assert_eq!(beacon_effect_tier(Speed), 1);
+        assert_eq!(beacon_effect_tier(Haste), 1);
+        assert_eq!(beacon_effect_tier(Resistance), 2);
+        assert_eq!(beacon_effect_tier(JumpBoost), 2);
+        assert_eq!(beacon_effect_tier(Strength), 3);
+        assert_eq!(beacon_effect_tier(Regeneration), 4);
+    }
+
+    // #204 — applying an unanchored update still enforces payment + tiers and
+    // consumes exactly one payment item.
+    #[test]
+    fn p5a_parity_beacon_apply_consumes_one_payment() {
+        let diamond = name_to_item("diamond").unwrap();
+        let mut menu = BeaconMenu {
+            payment: (diamond, 3, Vec::new()),
+            anchor: None,
+            power_level: 4,
+        };
+        assert!(apply_live_beacon_update(
+            &mut menu,
+            Some(BeaconEffect::Strength),
+            Some(BeaconEffect::Regeneration)
+        ));
+        assert_eq!(menu.payment, (diamond, 2, Vec::new()));
+        // Tier gate rejects before paying: payment untouched.
+        menu.power_level = 1;
+        assert!(!apply_live_beacon_update(
+            &mut menu,
+            Some(BeaconEffect::Strength),
+            None
+        ));
+        assert_eq!(menu.payment.1, 2);
+        // A non-payment item never reaches the entity.
+        menu.payment = (name_to_item("coal").unwrap(), 1, Vec::new());
+        assert!(!apply_live_beacon_update(&mut menu, Some(BeaconEffect::Speed), None));
+        // Slot drains to empty after the last valid payment.
+        menu.payment = (diamond, 1, Vec::new());
+        menu.power_level = 4;
+        assert!(apply_live_beacon_update(&mut menu, Some(BeaconEffect::Speed), None));
+        assert_eq!(menu.payment.1, 0);
+        assert!(!apply_live_beacon_update(&mut menu, Some(BeaconEffect::Speed), None));
+    }
+
+    // #204 — opening a real beacon emits the open packet (menu type 9), the
+    // three `ContainerSetData` rows, and the payment slot; `apply` writes the
+    // choice into the anchored block entity.
+    #[test]
+    fn p5a_parity_beacon_live_menu_wire_and_apply() {
+        let _guard = world_guard();
+        let mut world = BeaconWorld::new();
+        let key @ (dim, x, y, z) = (DimId::Overworld, 9_300_000, 220, 9_300_000);
+        let state = world.place(key, "beacon");
+        // Seed a level-4 pyramid with a running Speed effect.
+        {
+            let reg = breg().unwrap();
+            let mut store = live_block_entities().lock().unwrap();
+            let Some(LiveBlockEntity::Beacon(beacon)) =
+                store.at(reg, key, block_at_dim(dim, x, y, z))
+            else {
+                panic!("beacon entity must materialize");
+            };
+            beacon.levels = 4;
+            beacon.primary = Some(BeaconEffect::Speed);
+        }
+        let (mut c, mut rx) = client_pair();
+        c.eid = 5252;
+        *c.pos.lock().unwrap() = (
+            f64::from(x) + 0.5,
+            f64::from(y) + 1.0,
+            f64::from(z) + 0.5,
+            0.0,
+            0.0,
+            true,
+        );
+        attach(&c);
+        assert!(open_live_block_menu(&c, key, state));
+        let frames = read_frames(&mut rx);
+        let (window, kind) = frames
+            .iter()
+            .find(|(id, _)| *id == 0x33)
+            .map(|(_, body)| {
+                let mut b = body.as_slice();
+                let window = read_varint(&mut b).unwrap();
+                (window as u8, read_varint(&mut b).unwrap())
+            })
+            .expect("0x33 open packet");
+        assert_eq!(kind, 9, "beacon menu type");
+        let props: Vec<(i16, i16)> = frames
+            .iter()
+            .filter(|(id, _)| *id == 0x14)
+            .map(|(_, b)| {
+                assert_eq!(b[0], window);
+                assert_eq!(b.len(), 5);
+                (
+                    i16::from_be_bytes([b[1], b[2]]),
+                    i16::from_be_bytes([b[3], b[4]]),
+                )
+            })
+            .collect();
+        assert_eq!(
+            props,
+            vec![(0, 4), (1, 1), (2, -1)],
+            "level 4, primary speed(1), no secondary"
+        );
+        let conn = live_menu_connection(&c).unwrap();
+        let mut active = conn.active.lock().unwrap();
+        let session = active.as_mut().unwrap();
+        assert!(live_menu_valid(&c, session));
+        let LiveMenu::Beacon(menu) = &mut session.menu else {
+            panic!("beacon menu expected");
+        };
+        assert_eq!(menu.power_level, 4);
+        // A diamond in slot 0 pays for the Strength + Regeneration choice.
+        menu.payment = (name_to_item("diamond").unwrap(), 1, Vec::new());
+        assert!(apply_live_beacon_update(
+            menu,
+            Some(BeaconEffect::Strength),
+            Some(BeaconEffect::Regeneration)
+        ));
+        assert_eq!(menu.payment.1, 0);
+        assert_eq!(
+            beacon_of(key),
+            (
+                Some(BeaconEffect::Strength),
+                Some(BeaconEffect::Regeneration),
+                4
+            )
+        );
+        // Tier enforcement is live: a level-1 beacon refuses Strength.
+        let key2 @ (dim2, x2, y2, z2) = (DimId::Overworld, 9_300_001, 220, 9_300_000);
+        world.place(key2, "beacon");
+        {
+            let reg = breg().unwrap();
+            let mut store = live_block_entities().lock().unwrap();
+            let Some(LiveBlockEntity::Beacon(beacon)) =
+                store.at(reg, (dim2, x2, y2, z2), block_at_dim(dim2, x2, y2, z2))
+            else {
+                panic!("second beacon entity must materialize");
+            };
+            beacon.levels = 1;
+        }
+        let mut low = BeaconMenu {
+            payment: (name_to_item("iron_ingot").unwrap(), 1, Vec::new()),
+            anchor: Some(key2),
+            power_level: 0,
+        };
+        assert!(!apply_live_beacon_update(&mut low, Some(BeaconEffect::Strength), None));
+        assert_eq!(low.payment.1, 1, "rejected choice never consumes payment");
+        assert_eq!(beacon_of(key2), (None, None, 1));
+        assert!(apply_live_beacon_update(&mut low, Some(BeaconEffect::Haste), None));
+        assert_eq!(beacon_of(key2), (Some(BeaconEffect::Haste), None, 1));
+        drop(active);
+        close_live_menu(&c, false, false);
+    }
+
+    // #204 — a click on slot 0 follows the payment rules through the real
+    // `live_menu_click` path: one item lands, non-payment items are refused.
+    #[test]
+    fn p5a_parity_beacon_slot_click_enforces_payment_rules() {
+        let _guard = world_guard();
+        let mut world = BeaconWorld::new();
+        let key @ (_dim, x, y, z) = (DimId::Overworld, 9_300_010, 220, 9_300_010);
+        let state = world.place(key, "beacon");
+        let (mut c, mut rx) = client_pair();
+        c.eid = 5253;
+        *c.pos.lock().unwrap() = (
+            f64::from(x) + 0.5,
+            f64::from(y) + 1.0,
+            f64::from(z) + 0.5,
+            0.0,
+            0.0,
+            true,
+        );
+        attach(&c);
+        assert!(open_live_block_menu(&c, key, state));
+        let _ = read_frames(&mut rx);
+        let window = live_menu_id(&c).unwrap();
+        // Cursor with 3 iron ingots: a click pays exactly one into slot 0.
+        let iron = name_to_item("iron_ingot").unwrap();
+        *c.cursor.lock().unwrap() = (iron, 3, Vec::new());
+        live_menu_click(&c, window, 0, 0, 0);
+        {
+            let conn = live_menu_connection(&c).unwrap();
+            let active = conn.active.lock().unwrap();
+            let LiveMenu::Beacon(menu) = &active.as_ref().unwrap().menu else {
+                panic!("beacon menu expected");
+            };
+            assert_eq!(menu.payment, (iron, 1, Vec::new()));
+        }
+        assert_eq!(c.cursor.lock().unwrap().1, 2);
+        // A sword on the cursor cannot displace the payment or enter the slot.
+        let sword = name_to_item("iron_sword").unwrap();
+        *c.cursor.lock().unwrap() = (sword, 1, Vec::new());
+        live_menu_click(&c, window, 0, 0, 0);
+        {
+            let conn = live_menu_connection(&c).unwrap();
+            let active = conn.active.lock().unwrap();
+            let LiveMenu::Beacon(menu) = &active.as_ref().unwrap().menu else {
+                panic!("beacon menu expected");
+            };
+            assert_eq!(menu.payment, (iron, 1, Vec::new()));
+        }
+        assert_eq!(*c.cursor.lock().unwrap(), (sword, 1, Vec::new()));
+        // With an empty cursor the payment comes back out of slot 0.
+        *c.cursor.lock().unwrap() = Stack::default();
+        live_menu_click(&c, window, 0, 0, 0);
+        let conn = live_menu_connection(&c).unwrap();
+        let active = conn.active.lock().unwrap();
+        let LiveMenu::Beacon(menu) = &active.as_ref().unwrap().menu else {
+            panic!("beacon menu expected");
+        };
+        assert_eq!(menu.payment.1, 0);
+        drop(active);
+        close_live_menu(&c, false, false);
     }
 }
