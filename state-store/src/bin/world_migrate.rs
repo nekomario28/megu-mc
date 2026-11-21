@@ -8,8 +8,9 @@
 
 use mc_spine_core::version::TargetVersion;
 use mc_spine_state_store::{
-    inspect_anvil_world_dir, inspect_snapshot, migrate_json_document, migrate_snapshot,
-    to_data_json, write_file_atomic, DataValue, MigrationError, SnapshotSummary,
+    inspect_anvil_world_dir, inspect_snapshot, migrate_anvil_level_dat, migrate_json_document,
+    migrate_snapshot, to_data_json, write_file_atomic, AnvilInspectError, DataValue,
+    MigrationError, SnapshotSummary,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -24,6 +25,7 @@ USAGE:
     mc-spine-world-migrate inspect-anvil <world_dir> [--json]
     mc-spine-world-migrate migrate --in <in.stv1> --out <out.stv1> --to <1.21.1|26.3> [--allow-downgrade] [--json]
     mc-spine-world-migrate migrate-json --in <in.json> --out <out.json> --to <1.21.1|26.3> [--allow-downgrade] [--json]
+    mc-spine-world-migrate migrate-level --in <in_level.dat> --out <out_level.dat> --to <1.21.1|26.3> [--allow-downgrade] [--backup-old] [--json]
     mc-spine-world-migrate --help
 
 COMMANDS:
@@ -42,6 +44,11 @@ COMMANDS:
     migrate-json   Run a JSON world-metadata document (level.dat export,
                    chunk or datapack metadata) through the data migration
                    pipeline. Output is deterministic sorted-key JSON.
+    migrate-level  Migrate a vanilla level.dat directly: decode gzip or raw
+                   NBT, run the DataFixer pipeline, and write a verified
+                   gzip level.dat atomically. With --backup-old and an
+                   existing --out, the prior file is copied to <out>_old
+                   (vanilla's level.dat_old convention) before the swap.
 
 OPTIONS:
     --in <path>          Input file.
@@ -51,6 +58,9 @@ OPTIONS:
     --allow-downgrade    Permit migrating to an older version. Required for
                          any 26.3 -> 1.21.1 migration; downgrades can lose
                          data the older format cannot represent.
+    --backup-old         migrate-level only: when --out already exists, copy
+                         it to <out>_old before writing the migrated file —
+                         matching vanilla's level.dat_old convention.
     --json               Print the report as JSON instead of text.
     -h, --help           Show this help.
 
@@ -107,15 +117,25 @@ enum Command {
         allow_downgrade: bool,
         json: bool,
     },
+    MigrateLevel {
+        input: PathBuf,
+        output: PathBuf,
+        to: TargetVersion,
+        allow_downgrade: bool,
+        backup_old: bool,
+        json: bool,
+    },
 }
 
-/// The shared `--in`/`--out`/`--to`/`--allow-downgrade`/`--json` flag set of
-/// the two migrate subcommands.
+/// The shared `--in`/`--out`/`--to`/`--allow-downgrade`/`--backup-old`/
+/// `--json` flag set of the three migrate subcommands (`--backup-old` is
+/// only accepted on `migrate-level`).
 struct MigrateFlags {
     input: Option<PathBuf>,
     output: Option<PathBuf>,
     to: Option<TargetVersion>,
     allow_downgrade: bool,
+    backup_old: bool,
     json: bool,
 }
 
@@ -125,6 +145,7 @@ fn parse_migrate_flags(cmd: &str, args: &[String]) -> Result<MigrateFlags, CliEr
         output: None,
         to: None,
         allow_downgrade: false,
+        backup_old: false,
         json: false,
     };
     let mut i = 0;
@@ -158,6 +179,7 @@ fn parse_migrate_flags(cmd: &str, args: &[String]) -> Result<MigrateFlags, CliEr
                 })?);
             }
             "--allow-downgrade" => flags.allow_downgrade = true,
+            "--backup-old" => flags.backup_old = true,
             "--json" => flags.json = true,
             other if other.starts_with('-') => {
                 return Err(usage(format!("{cmd}: unknown option {other:?}")))
@@ -226,29 +248,41 @@ fn parse_args(args: &[String]) -> Result<Command, CliError> {
                 json,
             })
         }
-        cmd @ ("migrate" | "migrate-json") => {
+        cmd @ ("migrate" | "migrate-json" | "migrate-level") => {
             let flags = parse_migrate_flags(cmd, &args[1..])?;
             let parsed = (
                 require("--in", flags.input)?,
                 require("--out", flags.output)?,
                 require("--to", flags.to)?,
             );
-            if cmd == "migrate" {
-                Ok(Command::Migrate {
+            if cmd != "migrate-level" && flags.backup_old {
+                return Err(usage(format!(
+                    "{cmd}: --backup-old only applies to migrate-level"
+                )));
+            }
+            match cmd {
+                "migrate" => Ok(Command::Migrate {
                     input: parsed.0,
                     output: parsed.1,
                     to: parsed.2,
                     allow_downgrade: flags.allow_downgrade,
                     json: flags.json,
-                })
-            } else {
-                Ok(Command::MigrateJson {
+                }),
+                "migrate-json" => Ok(Command::MigrateJson {
                     input: parsed.0,
                     output: parsed.1,
                     to: parsed.2,
                     allow_downgrade: flags.allow_downgrade,
                     json: flags.json,
-                })
+                }),
+                _ => Ok(Command::MigrateLevel {
+                    input: parsed.0,
+                    output: parsed.1,
+                    to: parsed.2,
+                    allow_downgrade: flags.allow_downgrade,
+                    backup_old: flags.backup_old,
+                    json: flags.json,
+                }),
             }
         }
         other => Err(usage(format!("unknown command {other:?}; try --help"))),
@@ -492,6 +526,120 @@ fn cmd_migrate_json(
     Ok(())
 }
 
+/// `<out>_old` — the vanilla `level.dat_old` convention applied to whatever
+/// name `--out` carries.
+fn old_backup_path(output: &Path) -> PathBuf {
+    let mut name = output.as_os_str().to_os_string();
+    name.push("_old");
+    PathBuf::from(name)
+}
+
+fn cmd_migrate_level(
+    input: &Path,
+    output: &Path,
+    to: TargetVersion,
+    allow_downgrade: bool,
+    backup_old: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    let bytes = read_input(input)?;
+    // The whole migration runs in memory and verifies its own output, so a
+    // refused downgrade or a corrupt input leaves every file on disk — the
+    // output included — exactly as it was.
+    let (out, report) = migrate_anvil_level_dat(&bytes, to, allow_downgrade).map_err(|e| match e {
+        AnvilInspectError::DowngradeNotAllowed { .. } => usage(format!(
+            "{}: {e} (pass --allow-downgrade to permit it)",
+            input.display()
+        )),
+        other => fail(format!("{}: {other}", input.display())),
+    })?;
+
+    // Only now is anything on disk touched: with --backup-old a pre-existing
+    // output is copied to <out>_old first (vanilla's level.dat_old), then
+    // the migrated bytes replace --out in one atomic rename.
+    let mut backup_path = None;
+    if backup_old && output.exists() {
+        let backup = old_backup_path(output);
+        let previous = std::fs::read(output).map_err(|e| {
+            fail(format!(
+                "cannot read existing {} for backup: {e}",
+                output.display()
+            ))
+        })?;
+        write_file_atomic(&backup, &previous).map_err(|e| {
+            fail(format!("cannot write backup {}: {e}", backup.display()))
+        })?;
+        backup_path = Some(backup);
+    }
+    write_file_atomic(output, &out)
+        .map_err(|e| fail(format!("cannot write {}: {e}", output.display())))?;
+
+    for warning in &report.warnings {
+        eprintln!("warning: {warning}");
+    }
+
+    let already_at_target = report.original_dv == to.data_version();
+
+    if json {
+        println!(
+            "{}",
+            to_data_json(&map(vec![
+                ("already_at_target", DataValue::Bool(already_at_target)),
+                ("applied_steps", str_list(&report.applied_steps)),
+                (
+                    "backup_file",
+                    backup_path.as_ref().map_or(DataValue::Null, |p| {
+                        DataValue::Str(p.display().to_string())
+                    }),
+                ),
+                (
+                    "final_data_version",
+                    DataValue::Int(report.final_dv as i64),
+                ),
+                ("input_bytes", int(bytes.len())),
+                ("input_file", DataValue::Str(input.display().to_string())),
+                (
+                    "original_data_version",
+                    DataValue::Int(report.original_dv as i64),
+                ),
+                ("output_bytes", int(out.len())),
+                ("output_file", DataValue::Str(output.display().to_string())),
+                ("renamed_entries", int(report.renamed_entries)),
+                ("target_version", DataValue::Str(to.id().to_string())),
+                ("warnings", str_list(&report.warnings)),
+            ]))
+        );
+        return Ok(());
+    }
+
+    if already_at_target {
+        println!(
+            "{}: already at {}; wrote canonical level.dat to {}",
+            input.display(),
+            to,
+            output.display()
+        );
+    } else {
+        println!(
+            "{}: migrated data version {} -> {} to {}",
+            input.display(),
+            report.original_dv,
+            report.final_dv,
+            output.display()
+        );
+        if report.applied_steps.is_empty() {
+            println!("  no migration steps needed");
+        } else {
+            println!("  applied steps: {}", report.applied_steps.join(", "));
+        }
+    }
+    println!("  {} -> {} bytes", bytes.len(), out.len());
+    if let Some(backup) = &backup_path {
+        println!("  previous output backed up to {}", backup.display());
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = match parse_args(&args) {
@@ -522,6 +670,14 @@ fn main() -> ExitCode {
             allow_downgrade,
             json,
         } => cmd_migrate_json(&input, &output, to, allow_downgrade, json),
+        Command::MigrateLevel {
+            input,
+            output,
+            to,
+            allow_downgrade,
+            backup_old,
+            json,
+        } => cmd_migrate_level(&input, &output, to, allow_downgrade, backup_old, json),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

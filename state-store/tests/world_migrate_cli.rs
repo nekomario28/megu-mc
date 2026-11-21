@@ -6,7 +6,7 @@
 use mc_spine_core::version::TargetVersion;
 use mc_spine_state_store::{
     decode_snapshot, encode_data_value_to_nbt, encode_snapshot, gzip_encode_stored,
-    parse_data_json, BlockCoord, ChunkCoord, DataValue, ServerContext,
+    inspect_level_dat, parse_data_json, BlockCoord, ChunkCoord, DataValue, ServerContext,
 };
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -582,4 +582,174 @@ fn migrate_json_fail_closed_on_malformed_input() {
         "26.3",
     ]);
     assert_eq!(code(&out), 1, "{}", stdout(&out));
+}
+
+// ---------------------------------------------------------- migrate-level
+
+/// A gzip `level.dat` at `data_version` written to `dir/name`.
+fn level_dat_file(dir: &TestDir, name: &str, data_version: i64) -> PathBuf {
+    dir.write(
+        name,
+        &gzip_encode_stored(&level_dat_nbt(data_version, "Level", 7)),
+    )
+}
+
+#[test]
+fn migrate_level_upgrade_backup_old_and_json() {
+    let dir = TestDir::new("level-up");
+    let input = level_dat_file(&dir, "level.dat", 3955);
+    let output = dir.path("out.dat");
+    // A pre-existing output the backup must preserve byte-for-byte.
+    let prior = gzip_encode_stored(&level_dat_nbt(3955, "Prior", 1));
+    std::fs::write(&output, &prior).unwrap();
+
+    let out = run(&[
+        "migrate-level",
+        "--in",
+        input.to_str().unwrap(),
+        "--out",
+        output.to_str().unwrap(),
+        "--to",
+        "26.3",
+        "--backup-old",
+        "--json",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let doc = parse_data_json(&stdout(&out)).unwrap();
+    let m = doc.as_map().unwrap();
+    assert_eq!(m["original_data_version"], DataValue::Int(3955));
+    assert_eq!(m["final_data_version"], DataValue::Int(5023));
+    assert_eq!(m["target_version"], DataValue::Str("26.3".to_string()));
+    assert_eq!(m["already_at_target"], DataValue::Bool(false));
+    assert_eq!(
+        m["backup_file"],
+        DataValue::Str(format!("{}_old", output.display()))
+    );
+    assert!(matches!(m["applied_steps"], DataValue::List(_)));
+    assert_eq!(m["warnings"], DataValue::List(vec![]));
+
+    // The backup is an exact copy of the previous output — the vanilla
+    // level.dat_old convention — and the swapped-in output is a verified
+    // gzip level.dat at 5023 with the world's metadata intact.
+    let backup = dir.path("out.dat_old");
+    assert_eq!(std::fs::read(&backup).unwrap(), prior);
+    let written = std::fs::read(&output).unwrap();
+    assert_ne!(written, prior);
+    let s = inspect_level_dat(&written).unwrap();
+    assert_eq!(s.compression.label(), "gzip");
+    assert_eq!(s.data_version, 5023);
+    assert_eq!(s.version_name.as_deref(), Some("26.3"));
+    assert_eq!(s.level_name.as_deref(), Some("Level"));
+    assert_eq!(s.random_seed, Some(7));
+}
+
+#[test]
+fn migrate_level_refused_downgrade_touches_nothing() {
+    let dir = TestDir::new("level-down-ref");
+    let input = level_dat_file(&dir, "new.dat", 5023);
+    let output = dir.path("level.dat");
+    let prior = gzip_encode_stored(&level_dat_nbt(5023, "Keep", 2));
+    std::fs::write(&output, &prior).unwrap();
+
+    // Refused without the flag: exit 2, output untouched, no backup taken.
+    let out = run(&[
+        "migrate-level",
+        "--in",
+        input.to_str().unwrap(),
+        "--out",
+        output.to_str().unwrap(),
+        "--to",
+        "1.21.1",
+        "--backup-old",
+    ]);
+    assert_eq!(code(&out), 2, "{}", stdout(&out));
+    assert!(stderr(&out).contains("--allow-downgrade"), "{}", stderr(&out));
+    assert_eq!(std::fs::read(&output).unwrap(), prior);
+    assert!(!dir.path("level.dat_old").exists());
+
+    // With the flag the downgrade lands: gzip level.dat back at 3955.
+    let out = run(&[
+        "migrate-level",
+        "--in",
+        input.to_str().unwrap(),
+        "--out",
+        output.to_str().unwrap(),
+        "--to",
+        "1.21.1",
+        "--allow-downgrade",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let s = inspect_level_dat(&std::fs::read(&output).unwrap()).unwrap();
+    assert_eq!(s.data_version, 3955);
+    assert_eq!(s.version_name.as_deref(), Some("1.21.1"));
+}
+
+#[test]
+fn migrate_level_corrupt_input_exits_1() {
+    let dir = TestDir::new("level-bad");
+    let mut bad = gzip_encode_stored(&level_dat_nbt(3955, "W", 0));
+    let n = bad.len();
+    bad[n - 5] ^= 0xff; // corrupt the CRC32 trailer
+    let input = dir.write("corrupt.dat", &bad);
+    let output = dir.path("out.dat");
+    let out = run(&[
+        "migrate-level",
+        "--in",
+        input.to_str().unwrap(),
+        "--out",
+        output.to_str().unwrap(),
+        "--to",
+        "26.3",
+    ]);
+    assert_eq!(code(&out), 1, "{}", stdout(&out));
+    assert!(!output.exists(), "corrupt input must never produce output");
+
+    // A missing input file is also exit 1, not a usage error.
+    let out = run(&[
+        "migrate-level",
+        "--in",
+        dir.path("missing.dat").to_str().unwrap(),
+        "--out",
+        output.to_str().unwrap(),
+        "--to",
+        "26.3",
+    ]);
+    assert_eq!(code(&out), 1);
+    assert!(!output.exists());
+}
+
+#[test]
+fn migrate_level_already_at_target_and_arg_errors() {
+    let dir = TestDir::new("level-noop");
+    let input = level_dat_file(&dir, "done.dat", 5023);
+    let output = dir.path("out.dat");
+    let out = run(&[
+        "migrate-level",
+        "--in",
+        input.to_str().unwrap(),
+        "--out",
+        output.to_str().unwrap(),
+        "--to",
+        "26.3",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(stdout(&out).contains("already at 26.3"), "{}", stdout(&out));
+    let s = inspect_level_dat(&std::fs::read(&output).unwrap()).unwrap();
+    assert_eq!(s.data_version, 5023);
+    // No --backup-old flag means no _old file is ever created.
+    assert!(!dir.path("out.dat_old").exists());
+
+    for args in [
+        &["migrate-level"][..],
+        &["migrate-level", "--in", "a"][..],
+        &["migrate-level", "--in", "a", "--out", "b"][..],
+        &["migrate-level", "--in", "a", "--out", "b", "--to", "1.21"][..],
+        &["migrate-level", "--in", "a", "--out", "b", "--to", "26.3", "--wat"][..],
+        // --backup-old does not belong to the other migrate subcommands.
+        &["migrate", "--in", "a", "--out", "b", "--to", "26.3", "--backup-old"][..],
+        &["migrate-json", "--in", "a", "--out", "b", "--to", "26.3", "--backup-old"][..],
+    ] {
+        let out = run(args);
+        assert_eq!(code(&out), 2, "{args:?} -> {}", stdout(&out));
+    }
 }

@@ -48,8 +48,14 @@
 //!   `r.<x>.<z>.mca` files. The resulting [`AnvilWorldReport`] renders as
 //!   deterministic JSON ([`AnvilWorldReport::to_json`]) or a plain-English
 //!   summary ([`AnvilWorldReport::to_human`]).
+//!
+//! [`migrate_anvil_level_dat`] closes the loop: it decodes a `level.dat`
+//! (gzip or raw), runs the document through the
+//! [`crate::datafix::DataFixer`] between the two pinned targets, and
+//! re-seals it as a verified RFC 1952 gzip member — the direct file-level
+//! migrator behind `mc-spine-world-migrate migrate-level`.
 
-use crate::datafix::{DataValue, DV_1_21_1, DV_26_3};
+use crate::datafix::{DataFixError, DataFixReport, DataFixer, DataValue, DV_1_21_1, DV_26_3};
 use crate::migrate::to_data_json;
 use mc_spine_core::version::TargetVersion;
 use std::collections::BTreeMap;
@@ -138,6 +144,23 @@ pub enum AnvilInspectError {
     /// A file inside the world directory failed inspection; `message`
     /// carries the underlying reason with the path attached for context.
     InvalidWorldFile { path: PathBuf, message: String },
+    /// A `26.3` -> `1.21.1` `level.dat` migration was requested without the
+    /// explicit `allow_downgrade` opt-in. Refusing is the default:
+    /// downgrades can lose data the older format cannot represent.
+    DowngradeNotAllowed {
+        /// `DataVersion` the input document carries.
+        from_dv: i32,
+        /// `DataVersion` the caller asked for.
+        to_dv: i32,
+    },
+    /// The [`DataFixer`] refused the decoded document (a `DataVersion` it
+    /// has no schema for, or one it cannot read).
+    Fix(DataFixError),
+    /// A freshly encoded `level.dat` failed its own decode check. This is
+    /// an internal invariant — it should be unreachable — and it is checked
+    /// so a bug can never ship an unreadable output as a successful
+    /// migration.
+    OutputInvalid { message: String },
 }
 
 impl fmt::Display for AnvilInspectError {
@@ -212,6 +235,15 @@ impl fmt::Display for AnvilInspectError {
             AnvilInspectError::InvalidWorldFile { path, message } => {
                 write!(f, "{}: {message}", path.display())
             }
+            AnvilInspectError::DowngradeNotAllowed { from_dv, to_dv } => write!(
+                f,
+                "refusing to downgrade data version {from_dv} -> {to_dv} without explicit opt-in"
+            ),
+            AnvilInspectError::Fix(e) => write!(f, "document migration refused: {e}"),
+            AnvilInspectError::OutputInvalid { message } => write!(
+                f,
+                "internal error: migrated level.dat failed decode: {message}"
+            ),
         }
     }
 }
@@ -1369,6 +1401,76 @@ pub fn inspect_level_dat(bytes: &[u8]) -> Result<LevelDatSummary, AnvilInspectEr
     })
 }
 
+// --------------------------------------------------------- level.dat migrate
+
+/// Migrate a vanilla `level.dat` between the two supported releases.
+///
+/// `bytes` may be gzip-wrapped (the vanilla on-disk form) or a bare NBT
+/// document; the output is always a fresh RFC 1952 gzip member wrapping the
+/// re-encoded document, with the NBT root name preserved verbatim (vanilla
+/// writes an empty one). `Data.DataVersion` is required and authoritative —
+/// [`inspect_level_dat`] reads it fail-closed, and it is mirrored at the
+/// document root for the fix run exactly the way
+/// [`crate::migrate::migrate_json_document`] presents a `level.dat` export.
+///
+/// Toward `26.3` the document runs [`DataFixer::v1_21_1_to_26_3`]; toward
+/// `1.21.1` it runs the explicit
+/// [`DataFixer::v26_3_to_1_21_1_downgrade`] pipeline, which any `file_dv`
+/// above `3955` reaches only when `allow_downgrade` is set — a document
+/// already at `3955` passes through as a clean no-op without the flag.
+/// Either way the output is re-encoded and verified, so an already-at-target
+/// input still produces the canonical gzip form of itself.
+///
+/// Fail-closed end to end: a missing or non-integer `Data.DataVersion`, a
+/// document newer than the pipeline's ceiling, and a refused downgrade are
+/// errors — and the encoded output is itself decoded through
+/// [`inspect_level_dat`] before it is returned, so the bytes can only ever
+/// be a `level.dat` this build reads back.
+pub fn migrate_anvil_level_dat(
+    bytes: &[u8],
+    to: TargetVersion,
+    allow_downgrade: bool,
+) -> Result<(Vec<u8>, DataFixReport), AnvilInspectError> {
+    let summary = inspect_level_dat(bytes)?;
+    let file_dv = summary.data_version;
+    let fixer = match to {
+        TargetVersion::V26_3 => DataFixer::v1_21_1_to_26_3(),
+        TargetVersion::V1_21_1 => {
+            if file_dv > DV_1_21_1 && !allow_downgrade {
+                return Err(AnvilInspectError::DowngradeNotAllowed {
+                    from_dv: file_dv,
+                    to_dv: DV_1_21_1,
+                });
+            }
+            DataFixer::v26_3_to_1_21_1_downgrade()
+        }
+    };
+    // The fixer reads `DataVersion` from the document root; a real level.dat
+    // keeps it inside `Data`, so mirror it at the root for the run and drop
+    // the mirror afterward unless the input already carried one.
+    let mut root = summary.root;
+    let map = root
+        .as_map_mut()
+        .ok_or(AnvilInspectError::MissingLevelField { field: "Data" })?;
+    let had_root_dv = map.contains_key("DataVersion");
+    map.insert("DataVersion".to_string(), DataValue::Int(i64::from(file_dv)));
+    let report = fixer.fix(&mut root).map_err(AnvilInspectError::Fix)?;
+    if !had_root_dv {
+        if let Some(map) = root.as_map_mut() {
+            map.remove("DataVersion");
+        }
+    }
+    let out = gzip_encode_stored(&encode_data_value_to_nbt(&summary.root_name, &root)?);
+    // Round-trip check on the bytes about to leave: `inspect_level_dat`
+    // verifies the gzip trailer and requires `Data.DataVersion`, so the
+    // output can only ever be a document this build reads back. A failure
+    // here is an internal invariant violation, not bad user data.
+    inspect_level_dat(&out).map_err(|e| AnvilInspectError::OutputInvalid {
+        message: e.to_string(),
+    })?;
+    Ok((out, report))
+}
+
 /// `r.<rx>.<rz>.mca` -> `(rx, rz)`; names in any other shape are ignored by
 /// the scan the same way vanilla ignores stray files in `region/`.
 fn region_file_coords(file_name: &str) -> Option<(i32, i32)> {
@@ -2439,6 +2541,163 @@ mod tests {
         assert_eq!(s2.data_version, DV_26_3);
         assert_eq!(s2.level_name.as_deref(), Some("Bridge"));
         assert_eq!(s2.version_name.as_deref(), Some("26.3"));
+    }
+
+    // ------------------------------------------------- level.dat migrate
+
+    /// Verify the RFC 1952 trailer by hand: CRC32 then ISIZE, both
+    /// little-endian, both over the inflated payload.
+    fn assert_valid_gzip_member(wrapped: &[u8]) -> Vec<u8> {
+        assert_eq!(&wrapped[..3], &[0x1f, 0x8b, 8], "gzip member header");
+        let payload = gzip_decompress(wrapped, NBT_SIZE_CAP).unwrap();
+        let n = wrapped.len();
+        let crc = u32::from_le_bytes(wrapped[n - 8..n - 4].try_into().unwrap());
+        let isize = u32::from_le_bytes(wrapped[n - 4..].try_into().unwrap());
+        assert_eq!(crc, crc32(&payload), "CRC32 trailer");
+        assert_eq!(isize, payload.len() as u32, "ISIZE trailer");
+        payload
+    }
+
+    #[test]
+    fn migrate_level_dat_upgrade_gzip_end_to_end() {
+        let doc = level_doc(DV_1_21_1 as i64, "Direct", "1.21.1", 77);
+        let input = gzip_encode_stored(&encode_data_value_to_nbt("", &doc).unwrap());
+        let (out, report) = migrate_anvil_level_dat(&input, TargetVersion::V26_3, false).unwrap();
+        assert_eq!(report.original_dv, DV_1_21_1);
+        assert_eq!(report.final_dv, DV_26_3);
+        assert!(report
+            .applied_steps
+            .contains(&"level_dat_version_metadata".to_string()));
+        assert!(report
+            .applied_steps
+            .contains(&"stamp_data_version_26_3".to_string()));
+
+        // Output is a real gzip member with a correct RFC 1952 trailer...
+        let nbt = assert_valid_gzip_member(&out);
+        // ...that inspect_level_dat reads back at 26.3 with every field
+        // intact and the synthesized root DataVersion gone again.
+        let s = inspect_level_dat(&out).unwrap();
+        assert_eq!(s.compression, LevelDatCompression::Gzip);
+        assert_eq!(s.data_version, DV_26_3);
+        assert_eq!(s.version_name.as_deref(), Some("26.3"));
+        assert_eq!(s.level_name.as_deref(), Some("Direct"));
+        assert_eq!(s.random_seed, Some(77));
+        assert_eq!(s.enabled_datapacks, ["vanilla", "test_pack"]);
+        assert_eq!(s.disabled_datapacks, ["old_pack"]);
+        assert_eq!(s.root_name, "");
+        assert!(!s.root.as_map().unwrap().contains_key("DataVersion"));
+        assert_eq!(decode_nbt_to_data_value(&nbt).unwrap().0, "");
+    }
+
+    #[test]
+    fn migrate_level_dat_raw_input_and_root_name_preserved() {
+        // Raw (uncompressed) NBT input still produces gzip output, and a
+        // non-empty root name survives the round-trip verbatim.
+        let doc = level_doc(DV_1_21_1 as i64, "Raw", "1.21.1", 0);
+        let nbt = encode_data_value_to_nbt("Level", &doc).unwrap();
+        let (out, _) = migrate_anvil_level_dat(&nbt, TargetVersion::V26_3, false).unwrap();
+        assert_valid_gzip_member(&out);
+        let s = inspect_level_dat(&out).unwrap();
+        assert_eq!(s.compression, LevelDatCompression::Gzip);
+        assert_eq!(s.root_name, "Level");
+        assert_eq!(s.data_version, DV_26_3);
+    }
+
+    #[test]
+    fn migrate_level_dat_idempotent_byte_deterministic() {
+        let nbt = encode_data_value_to_nbt("", &level_doc(DV_26_3 as i64, "N", "26.3", 1)).unwrap();
+        let input = gzip_encode_stored(&nbt);
+        // Already at the target: a clean no-op that still re-seals to the
+        // canonical gzip form (stored blocks, zero MTIME — byte-identical to
+        // the identically-produced input).
+        let (out1, report) = migrate_anvil_level_dat(&input, TargetVersion::V26_3, false).unwrap();
+        assert_eq!(report.original_dv, DV_26_3);
+        assert_eq!(report.final_dv, DV_26_3);
+        assert!(report.applied_steps.is_empty());
+        assert!(report.warnings.is_empty());
+        // Re-running the migrator on its own output is byte-identical.
+        let (out2, report2) = migrate_anvil_level_dat(&out1, TargetVersion::V26_3, false).unwrap();
+        assert_eq!(out1, out2);
+        assert_eq!(report2.applied_steps, Vec::<String>::new());
+    }
+
+    #[test]
+    fn migrate_level_dat_downgrade_gate() {
+        let nbt = encode_data_value_to_nbt("", &level_doc(DV_26_3 as i64, "N", "26.3", 1)).unwrap();
+        let input = gzip_encode_stored(&nbt);
+
+        // Refused without the explicit opt-in.
+        assert_eq!(
+            migrate_anvil_level_dat(&input, TargetVersion::V1_21_1, false).unwrap_err(),
+            AnvilInspectError::DowngradeNotAllowed {
+                from_dv: DV_26_3,
+                to_dv: DV_1_21_1
+            }
+        );
+
+        // Allowed with opt-in: back to 3955 with 1.21.1 metadata stamped.
+        let (out, report) =
+            migrate_anvil_level_dat(&input, TargetVersion::V1_21_1, true).unwrap();
+        assert_eq!(report.original_dv, DV_26_3);
+        assert_eq!(report.final_dv, DV_1_21_1);
+        assert_valid_gzip_member(&out);
+        let s = inspect_level_dat(&out).unwrap();
+        assert_eq!(s.data_version, DV_1_21_1);
+        assert_eq!(s.version_name.as_deref(), Some("1.21.1"));
+        assert!(!s.root.as_map().unwrap().contains_key("DataVersion"));
+
+        // A document already at 3955 targets 1.21.1 with no flag — it is a
+        // no-op, not a downgrade.
+        let (noop, report) = migrate_anvil_level_dat(&out, TargetVersion::V1_21_1, false).unwrap();
+        assert_eq!(report.original_dv, DV_1_21_1);
+        assert_eq!(inspect_level_dat(&noop).unwrap().data_version, DV_1_21_1);
+    }
+
+    #[test]
+    fn migrate_level_dat_fails_closed() {
+        // Missing Data.DataVersion.
+        let nbt = encode_data_value_to_nbt("", &map(vec![("Data", map(vec![]))])).unwrap();
+        assert!(matches!(
+            migrate_anvil_level_dat(&nbt, TargetVersion::V26_3, false),
+            Err(AnvilInspectError::MissingLevelField {
+                field: "Data.DataVersion"
+            })
+        ));
+        // Non-integer DataVersion.
+        let doc = map(vec![(
+            "Data",
+            map(vec![("DataVersion", DataValue::Str("new".to_string()))]),
+        )]);
+        let nbt = encode_data_value_to_nbt("", &doc).unwrap();
+        assert!(matches!(
+            migrate_anvil_level_dat(&nbt, TargetVersion::V26_3, false),
+            Err(AnvilInspectError::MissingLevelField {
+                field: "Data.DataVersion"
+            })
+        ));
+        // Corrupt gzip.
+        let mut bad = gzip_encode_stored(b"x");
+        bad[2] = 7; // method 7 is not deflate
+        assert!(matches!(
+            migrate_anvil_level_dat(&bad, TargetVersion::V26_3, false),
+            Err(AnvilInspectError::InvalidGzip(_))
+        ));
+        // DataVersion newer than the pipeline's ceiling.
+        let nbt = encode_data_value_to_nbt("", &level_doc(6000, "F", "x", 0)).unwrap();
+        assert!(matches!(
+            migrate_anvil_level_dat(&nbt, TargetVersion::V26_3, false),
+            Err(AnvilInspectError::Fix(
+                DataFixError::NewerThanTarget { .. }
+            ))
+        ));
+        // Same refusal going down: 6000 is newer than the downgrade
+        // pipeline's source too, even with the flag set.
+        assert!(matches!(
+            migrate_anvil_level_dat(&nbt, TargetVersion::V1_21_1, true),
+            Err(AnvilInspectError::Fix(
+                DataFixError::NewerThanTarget { .. }
+            ))
+        ));
     }
 
     // ------------------------------------------------------ world inspect

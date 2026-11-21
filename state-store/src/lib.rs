@@ -52,7 +52,10 @@
 //!   scanning, and [`anvil_inspect::inspect_anvil_world_dir`] which reads
 //!   `level.dat` (gzip or raw), classifies the save's `DataVersion` against
 //!   the two pinned targets, and counts populated chunks across
-//!   `region/`, `DIM-1/region/` and `DIM1/region/`.
+//!   `region/`, `DIM-1/region/` and `DIM1/region/` — plus
+//!   [`anvil_inspect::migrate_anvil_level_dat`], which runs a decoded
+//!   `level.dat` through the fixer and re-seals it as a verified gzip
+//!   member.
 
 pub mod anvil_inspect;
 pub mod datafix;
@@ -63,10 +66,11 @@ pub mod snapshot;
 
 pub use anvil_inspect::{
     decode_nbt_to_data_value, encode_data_value_to_nbt, gzip_decompress, gzip_encode_stored,
-    inspect_anvil_world_dir, inspect_level_dat, inspect_mca_header, AnvilCompatibility,
-    AnvilDimensionReport, AnvilInspectError, AnvilRegionFileReport, AnvilWorldReport,
-    LevelDatCompression, LevelDatSummary, McaChunkInfo, McaCompression, McaRegionSummary,
-    MCA_HEADER_BYTES, MCA_SECTOR_BYTES, MCA_SLOT_COUNT, NBT_DEPTH_CAP, NBT_SIZE_CAP,
+    inspect_anvil_world_dir, inspect_level_dat, inspect_mca_header, migrate_anvil_level_dat,
+    AnvilCompatibility, AnvilDimensionReport, AnvilInspectError, AnvilRegionFileReport,
+    AnvilWorldReport, LevelDatCompression, LevelDatSummary, McaChunkInfo, McaCompression,
+    McaRegionSummary, MCA_HEADER_BYTES, MCA_SECTOR_BYTES, MCA_SLOT_COUNT, NBT_DEPTH_CAP,
+    NBT_SIZE_CAP,
 };
 pub use datafix::{DataFixError, DataFixReport, DataFixStep, DataFixer, DataValue, DV_1_21_1, DV_26_3};
 pub use migrate::{
