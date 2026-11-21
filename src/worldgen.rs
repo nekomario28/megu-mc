@@ -282,7 +282,7 @@ impl DimId {
         };
         DIMENSION_REGISTRY
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .by_key
             .get(canonical.as_ref())
             .map(|&raw| DimId(raw))
@@ -452,19 +452,19 @@ const MAX_DIMENSIONS: usize = 255;
 
 /// Total registered slots: the pinned vanilla three plus every custom dimension.
 pub(crate) fn registered_dimension_count() -> usize {
-    DimId::ALL.len() + DIMENSION_REGISTRY.read().unwrap().specs.len()
+    DimId::ALL.len() + DIMENSION_REGISTRY.read().unwrap_or_else(|e| e.into_inner()).specs.len()
 }
 
 /// The spec a custom dimension registered under, cloned. Vanilla dimensions and
 /// unregistered slots answer `None` — their facts live in `GenFacts`.
 pub(crate) fn dimension_spec(dimension: DimId) -> Option<DimensionSpec> {
     let index = dimension.index().checked_sub(DimId::ALL.len())?;
-    DIMENSION_REGISTRY.read().unwrap().specs.get(index).cloned()
+    DIMENSION_REGISTRY.read().unwrap_or_else(|e| e.into_inner()).specs.get(index).cloned()
 }
 
 /// Every custom dimension, in registration (and therefore slot) order.
 pub(crate) fn custom_dimension_specs() -> Vec<DimensionSpec> {
-    DIMENSION_REGISTRY.read().unwrap().specs.clone()
+    DIMENSION_REGISTRY.read().unwrap_or_else(|e| e.into_inner()).specs.clone()
 }
 
 /// A custom dimension's canonical key without cloning its spec.
@@ -472,7 +472,7 @@ fn dimension_key(dimension: DimId) -> Option<&'static str> {
     let index = dimension.index().checked_sub(DimId::ALL.len())?;
     DIMENSION_REGISTRY
         .read()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .specs
         .get(index)
         .map(|spec| spec.key)
@@ -481,7 +481,7 @@ fn dimension_key(dimension: DimId) -> Option<&'static str> {
 /// Install `spec` under its canonical key. Re-registering an existing key updates it
 /// in place so slots stay stable across a datapack rescan.
 fn register_dimension_spec(mut spec: DimensionSpec) -> Result<DimId, String> {
-    let mut registry = DIMENSION_REGISTRY.write().unwrap();
+    let mut registry = DIMENSION_REGISTRY.write().unwrap_or_else(|e| e.into_inner());
     if let Some(&raw) = registry.by_key.get(spec.key) {
         spec.id = DimId(raw);
         registry.specs[raw as usize - DimId::ALL.len()] = spec;
@@ -506,13 +506,13 @@ fn register_dimension_spec(mut spec: DimensionSpec) -> Result<DimId, String> {
 #[cfg(test)]
 #[allow(dead_code)]
 pub(crate) fn reset_dimension_registry() {
-    let mut registry = DIMENSION_REGISTRY.write().unwrap();
+    let mut registry = DIMENSION_REGISTRY.write().unwrap_or_else(|e| e.into_inner());
     registry.specs.clear();
     registry.by_key.clear();
     drop(registry);
-    PER_DIM.gens.lock().unwrap().truncate(DimId::ALL.len());
-    PER_DIM.data.lock().unwrap().truncate(DimId::ALL.len());
-    PER_DIM.facts.lock().unwrap().truncate(DimId::ALL.len());
+    PER_DIM.gens.lock().unwrap_or_else(|e| e.into_inner()).truncate(DimId::ALL.len());
+    PER_DIM.data.lock().unwrap_or_else(|e| e.into_inner()).truncate(DimId::ALL.len());
+    PER_DIM.facts.lock().unwrap_or_else(|e| e.into_inner()).truncate(DimId::ALL.len());
 }
 
 /// `j.num()` as an integer, or `None` when the field is absent or not a whole number.
@@ -732,7 +732,7 @@ pub(crate) fn register_datapack_dimensions(
     sources: &[DatapackDimensionSource],
     res: fn(&str) -> Option<u32>,
 ) -> Result<usize, String> {
-    *BLOCK_LOOKUP.lock().unwrap() = Some(res);
+    *BLOCK_LOOKUP.lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
     let mut types: std::collections::BTreeMap<(String, String), J> = Default::default();
     let mut dims: std::collections::BTreeMap<(String, String), J> = Default::default();
     for source in sources {
@@ -1191,11 +1191,11 @@ static GLOBAL_BEARD_RESOLVER: Mutex<Option<BeardResolver>> = Mutex::new(None);
 
 /// Register the process-wide beardifier resolver (`main.rs` and the structure tests).
 pub(crate) fn register_beard_resolver(resolver: BeardResolver) {
-    *GLOBAL_BEARD_RESOLVER.lock().unwrap() = Some(resolver);
+    *GLOBAL_BEARD_RESOLVER.lock().unwrap_or_else(|e| e.into_inner()) = Some(resolver);
 }
 
 fn global_beard_resolver() -> Option<BeardResolver> {
-    *GLOBAL_BEARD_RESOLVER.lock().unwrap()
+    *GLOBAL_BEARD_RESOLVER.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[derive(Clone)]
@@ -7435,7 +7435,7 @@ struct GeneratedTickQueues {
 static GEN_TICK_QUEUES: Mutex<Option<GeneratedTickQueues>> = Mutex::new(None);
 
 fn drain_generated_ticks(queue: &Mutex<PendingGeneratedTicks>) -> Vec<GeneratedTick> {
-    let mut q = queue.lock().unwrap();
+    let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
     q.1.clear();
     std::mem::take(&mut q.0)
 }
@@ -7447,7 +7447,7 @@ pub fn take_generated_leaf_ticks() -> Vec<GeneratedTick> {
 }
 
 pub fn take_generated_fluid_ticks() -> Vec<GeneratedTick> {
-    let queues = GEN_TICK_QUEUES.lock().unwrap().clone();
+    let queues = GEN_TICK_QUEUES.lock().unwrap_or_else(|e| e.into_inner()).clone();
     queues.map_or_else(Vec::new, |q| drain_generated_ticks(&q.fluids))
 }
 
@@ -7546,7 +7546,7 @@ pub(crate) mod parallel_probe {
     const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
     pub(crate) fn arm(expect: usize) {
-        *RENDEZVOUS.lock().unwrap() = Some(Rendezvous {
+        *RENDEZVOUS.lock().unwrap_or_else(|e| e.into_inner()) = Some(Rendezvous {
             expect,
             arrived: 0,
             timed_out: false,
@@ -7556,7 +7556,7 @@ pub(crate) mod parallel_probe {
     /// Called by a worker at the start of a chunk fill. Blocks until `expect` workers are
     /// inside this window; a timeout records the failure instead of hanging.
     pub(crate) fn arrive() {
-        let mut guard = RENDEZVOUS.lock().unwrap();
+        let mut guard = RENDEZVOUS.lock().unwrap_or_else(|e| e.into_inner());
         let Some(r) = guard.as_mut() else { return };
         r.arrived += 1;
         CV.notify_all();
@@ -7574,7 +7574,7 @@ pub(crate) mod parallel_probe {
 
     /// Disarm and report `(arrived, timed_out)`.
     pub(crate) fn disarm() -> (usize, bool) {
-        let mut guard = RENDEZVOUS.lock().unwrap();
+        let mut guard = RENDEZVOUS.lock().unwrap_or_else(|e| e.into_inner());
         let out = guard
             .as_ref()
             .map(|r| (r.arrived, r.timed_out))
@@ -7672,7 +7672,7 @@ pub(crate) fn data_snapshot_dim(dimension: DimId) -> Option<std::sync::Arc<GenDa
     PER_DIM
         .data
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(dimension.index())
         .cloned()
         .flatten()
@@ -7689,7 +7689,7 @@ pub(crate) fn facts_dim(dimension: DimId) -> Option<GenFacts> {
     PER_DIM
         .facts
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(dimension.index())
         .copied()
         .flatten()
@@ -7715,7 +7715,7 @@ fn gen_lock_dim(dimension: DimId) -> GenLock {
     // that queues behind a section pass.
     let prof = env_flag!("FEAT_PROFILE") || env_flag!("MC_SPINE_TICK_PROFILE");
     let started = prof.then(std::time::Instant::now);
-    let mut guard = PER_DIM.gens.lock().unwrap();
+    let mut guard = PER_DIM.gens.lock().unwrap_or_else(|e| e.into_inner());
     // The caller's slot always exists: a custom dimension registers before it can be
     // named, and this grow is what turns "slot beyond the vanilla three" from a panic
     // into a `None` generator.
@@ -7797,7 +7797,7 @@ fn install(dimension: DimId, seed: u64, res: fn(&str) -> Option<u32>, activate: 
     // Published before the generator, in the order a reader needs them: once a reader can see
     // this dimension as active, its facts, its data snapshot and its generator are all there.
     GEN_SEED.store(seed, std::sync::atomic::Ordering::Relaxed);
-    *BLOCK_LOOKUP.lock().unwrap() = Some(res);
+    *BLOCK_LOOKUP.lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
     // A custom `Noise` dimension keeps its preset's generator window but its own
     // declared world window — the same split the Nether's 0..255 world over a 0..127
     // generator already exercises. `block_state_at` answers air outside the generator
@@ -7811,7 +7811,7 @@ fn install(dimension: DimId, seed: u64, res: fn(&str) -> Option<u32>, activate: 
     let (world_min_y, world_height) = (g.world_min_y, g.world_height);
     let slot = dimension.index();
     {
-        let mut facts = PER_DIM.facts.lock().unwrap();
+        let mut facts = PER_DIM.facts.lock().unwrap_or_else(|e| e.into_inner());
         if facts.len() <= slot {
             facts.resize(slot + 1, None);
         }
@@ -7831,7 +7831,7 @@ fn install(dimension: DimId, seed: u64, res: fn(&str) -> Option<u32>, activate: 
         });
     }
     {
-        let mut data = PER_DIM.data.lock().unwrap();
+        let mut data = PER_DIM.data.lock().unwrap_or_else(|e| e.into_inner());
         if data.len() <= slot {
             data.resize(slot + 1, None);
         }
@@ -8109,13 +8109,13 @@ fn ensure_dim_generator(dimension: DimId) {
     let slot_ready = PER_DIM
         .gens
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(dimension.index())
         .is_some_and(|slot| slot.is_some());
     if slot_ready {
         return;
     }
-    let Some(res) = *BLOCK_LOOKUP.lock().unwrap() else {
+    let Some(res) = *BLOCK_LOOKUP.lock().unwrap_or_else(|e| e.into_inner()) else {
         return;
     };
     install(dimension, GEN_SEED.load(std::sync::atomic::Ordering::Relaxed), res, false);
@@ -8501,14 +8501,14 @@ impl Gen {
         if self.suppress_generated_ticks {
             return;
         }
-        let mut q = self.generated_ticks.leaves.lock().unwrap();
+        let mut q = self.generated_ticks.leaves.lock().unwrap_or_else(|e| e.into_inner());
         if q.1.insert((pos, block)) {
             q.0.push((pos, block));
         }
     }
 
     pub(crate) fn generated_leaf_ticks(&self) -> Vec<((i32, i32, i32), u32)> {
-        self.generated_ticks.leaves.lock().unwrap().0.clone()
+        self.generated_ticks.leaves.lock().unwrap_or_else(|e| e.into_inner()).0.clone()
     }
 
     /// Queue a generated fluid tick: same reasoning as the leaf queue above — the tick
@@ -8517,7 +8517,7 @@ impl Gen {
         if self.suppress_generated_ticks {
             return;
         }
-        let mut q = self.generated_ticks.fluids.lock().unwrap();
+        let mut q = self.generated_ticks.fluids.lock().unwrap_or_else(|e| e.into_inner());
         if q.1.insert((pos, fluid)) {
             q.0.push((pos, fluid));
         }
@@ -8525,7 +8525,7 @@ impl Gen {
 
     /// Snapshot pending fluid ticks without transferring ownership, for saves.
     pub(crate) fn generated_fluid_ticks(&self) -> Vec<GeneratedTick> {
-        self.generated_ticks.fluids.lock().unwrap().0.clone()
+        self.generated_ticks.fluids.lock().unwrap_or_else(|e| e.into_inner()).0.clone()
     }
 
     pub(crate) fn tick_sources(&self) -> HashSet<(i32, i32)> {
@@ -8546,11 +8546,11 @@ impl Gen {
     ) {
         // Restore only this world's queues, never another generator's pending work.
         {
-            let mut q = self.generated_ticks.leaves.lock().unwrap();
+            let mut q = self.generated_ticks.leaves.lock().unwrap_or_else(|e| e.into_inner());
             q.1 = blocks.iter().copied().collect();
             q.0 = blocks;
         }
-        let mut fq = self.generated_ticks.fluids.lock().unwrap();
+        let mut fq = self.generated_ticks.fluids.lock().unwrap_or_else(|e| e.into_inner());
         fq.1 = fluids.iter().copied().collect();
         fq.0 = fluids;
     }
@@ -8575,7 +8575,7 @@ impl Gen {
             (&self.generated_ticks.leaves, leaves),
             (&self.generated_ticks.fluids, fluids),
         ] {
-            let mut q = queue.lock().unwrap();
+            let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
             for tick in ticks {
                 if q.1.insert(tick) {
                     q.0.push(tick);
@@ -17760,7 +17760,7 @@ mod wg_tests {
                     g.set_beard_resolver(resolver);
                     barrier.wait();
                     let cc = g.cols(7, 7).expect("columns for the raced chunk");
-                    fingers.lock().unwrap().push(cols_fingerprint(&mut g, &cc));
+                    fingers.lock().unwrap_or_else(|e| e.into_inner()).push(cols_fingerprint(&mut g, &cc));
                 });
             }
         });

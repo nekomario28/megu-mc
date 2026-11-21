@@ -259,11 +259,11 @@ fn ac_install(config: AcConfig) {
         eprintln!("{note}");
     }
     eprintln!("[anticheat] {}", config.summary());
-    *AC_CONFIG.write().unwrap() = Some(Arc::new(config));
+    *AC_CONFIG.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(config));
 }
 
 fn ac_config() -> Arc<AcConfig> {
-    if let Some(c) = AC_CONFIG.read().unwrap().as_ref() {
+    if let Some(c) = AC_CONFIG.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
         return c.clone();
     }
     Arc::new(ac_unbooted_default())
@@ -374,7 +374,7 @@ static TEST_PRESETS: Mutex<Vec<(String, AcPreset)>> = Mutex::new(Vec::new());
 /// anti-cheat fixture from changing what concurrent fixtures see.
 #[cfg(test)]
 fn ac_test_set_player_preset(name: &str, preset: AcPreset) {
-    let mut v = TEST_PRESETS.lock().unwrap();
+    let mut v = TEST_PRESETS.lock().unwrap_or_else(|e| e.into_inner());
     v.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
     v.push((name.to_owned(), preset));
 }
@@ -384,7 +384,7 @@ fn ac_preset_for(name: &str) -> AcPreset {
     #[cfg(test)]
     if let Some((_, p)) = TEST_PRESETS
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .iter()
         .find(|(n, _)| n.eq_ignore_ascii_case(name))
     {
@@ -692,7 +692,7 @@ fn ac_block_name(state: u32) -> &'static str {
 
 fn ac_capture(me: &Client, (x, y, z): (f64, f64, f64)) -> AcMoverState {
     let mut s = AcMoverState::vanilla();
-    if let Some(map) = attrs().lock().unwrap().get(&format!("p:{}", me.name)) {
+    if let Some(map) = attrs().lock().unwrap_or_else(|e| e.into_inner()).get(&format!("p:{}", me.name)) {
         for (name, value) in map {
             let v = *value;
             if !v.is_finite() {
@@ -710,7 +710,7 @@ fn ac_capture(me: &Client, (x, y, z): (f64, f64, f64)) -> AcMoverState {
             }
         }
     }
-    for e in me.effs.lock().unwrap().iter() {
+    for e in me.effs.lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let level = e.amp + 1;
         match e.id {
             0 => s.speed_level = s.speed_level.max(level),
@@ -722,8 +722,8 @@ fn ac_capture(me: &Client, (x, y, z): (f64, f64, f64)) -> AcMoverState {
         }
     }
     {
-        let inv = me.inv.lock().unwrap();
-        let held = *me.held.lock().unwrap();
+        let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+        let held = *me.held.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((_, _, comps)) = inv.get(&8) {
             s.depth_strider = enchant_level(comps, 7);
             s.soul_speed = enchant_level(comps, 35);
@@ -733,9 +733,9 @@ fn ac_capture(me: &Client, (x, y, z): (f64, f64, f64)) -> AcMoverState {
             .filter_map(|slot| inv.get(slot))
             .any(|(_, _, comps)| enchant_level(comps, 31) > 0);
     }
-    s.gliding = *me.fall_fly.lock().unwrap();
-    s.game_mode = *me.gm.lock().unwrap();
-    let dim = *me.dim.lock().unwrap();
+    s.gliding = *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner());
+    s.game_mode = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
+    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
     let (bx, bz) = (x.floor() as i32, z.floor() as i32);
     for dy in [-1.0f64, 0.0, 1.0] {
         let raw_name = ac_block_name(block_at_dim(dim, bx, (y + dy).floor() as i32, bz));
@@ -907,7 +907,7 @@ fn ac_players() -> &'static Mutex<HashMap<i32, PlayerAc>> {
 }
 
 fn ac_with_player<R>(me: &Client, f: impl FnOnce(&mut PlayerAc) -> R) -> R {
-    let mut map = ac_players().lock().unwrap();
+    let mut map = ac_players().lock().unwrap_or_else(|e| e.into_inner());
     let entry = map.entry(me.eid).or_insert_with(|| PlayerAc::new(&me.name));
     f(entry)
 }
@@ -926,7 +926,7 @@ fn ac_exemption(me: &Client) -> Option<&'static str> {
     if !c.check_ops && player_is_admin(&me.name) {
         return Some("operator");
     }
-    let gm = *me.gm.lock().unwrap();
+    let gm = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
     let in_grace = ac_with_player(me, |ac| {
         if ac.last_game_mode != Some(gm) {
@@ -1019,7 +1019,7 @@ fn ac_note_carried_motion(eid: i32, delta: [f64; 3]) {
 
 /// The server placed the player somewhere: refill credit from the new position.
 fn ac_expect_teleport(eid: i32) {
-    if let Some(p) = ac_players().lock().unwrap().get_mut(&eid) {
+    if let Some(p) = ac_players().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&eid) {
         p.moves.fresh = true;
     }
 }
@@ -1027,7 +1027,7 @@ fn ac_expect_teleport(eid: i32) {
 /// Public hook: skip movement checks for `for_time` (custom abilities, cutscenes).
 #[allow(dead_code)]
 fn ac_grant_grace(eid: i32, for_time: Duration) {
-    if let Some(p) = ac_players().lock().unwrap().get_mut(&eid) {
+    if let Some(p) = ac_players().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&eid) {
         p.moves.grace_until = Some(Instant::now() + for_time);
     }
 }
@@ -1036,9 +1036,9 @@ fn ac_grant_grace(eid: i32, for_time: Duration) {
 fn ac_note_explosion(dim: DimId, pos: [f64; 3], power: f64) {
     let targets: Vec<(i32, (f64, f64, f64))> = client_snapshot()
         .iter()
-        .filter(|c| *c.dim.lock().unwrap() == dim)
+        .filter(|c| *c.dim.lock().unwrap_or_else(|e| e.into_inner()) == dim)
         .map(|c| {
-            let (x, y, z, ..) = *c.pos.lock().unwrap();
+            let (x, y, z, ..) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
             (c.eid, (x, y, z))
         })
         .collect();
@@ -1172,13 +1172,13 @@ fn ac_lag_comp() -> &'static Mutex<LagCompensationState> {
 /// tick from the tick loop. The value is milliseconds of work, not the period.
 #[allow(dead_code)]
 pub(crate) fn ac_note_server_tick_ms(tick_ms: u32) {
-    ac_lag_comp().lock().unwrap().note_tick(tick_ms);
+    ac_lag_comp().lock().unwrap_or_else(|e| e.into_inner()).note_tick(tick_ms);
 }
 
 /// The last tick cost the tick loop reported; 0 means "no ticks measured yet"
 /// which reads as healthy, so an unwired server keeps the strict envelope.
 fn ac_last_tick_ms() -> u32 {
-    ac_lag_comp().lock().unwrap().last_tick_ms
+    ac_lag_comp().lock().unwrap_or_else(|e| e.into_inner()).last_tick_ms
 }
 
 /// `base_max_speed` as the movement check should treat it right now: exact
@@ -1193,7 +1193,7 @@ pub(crate) fn ac_effective_speed_allowance(
 ) -> f64 {
     ac_lag_comp()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .effective_speed_allowance(base_max_speed, tick_ms, player_rtt_ms)
 }
 
@@ -1207,13 +1207,13 @@ fn ac_rtts() -> &'static Mutex<HashMap<i32, u32>> {
 /// Record a player's measured round-trip (ms) for lag compensation.
 #[allow(dead_code)]
 fn ac_note_player_rtt_ms(eid: i32, rtt_ms: u32) {
-    ac_rtts().lock().unwrap().insert(eid, rtt_ms);
+    ac_rtts().lock().unwrap_or_else(|e| e.into_inner()).insert(eid, rtt_ms);
 }
 
 fn ac_player_rtt_ms(eid: i32) -> u32 {
     ac_rtts()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(&eid)
         .copied()
         .unwrap_or(0)
@@ -1267,7 +1267,7 @@ fn ac_flag(me: &Client, check: AcCheckId, amount: f64, detail: &str) -> bool {
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn ac_violation_level(eid: i32, check: AcCheckId) -> f64 {
-    let map = ac_players().lock().unwrap();
+    let map = ac_players().lock().unwrap_or_else(|e| e.into_inner());
     let Some(p) = map.get(&eid) else { return 0.0 };
     let decay = ac_policy(check, ac_preset_for(&p.name))
         .map(|p| p.decay_per_sec)
@@ -1279,7 +1279,7 @@ fn ac_violation_level(eid: i32, check: AcCheckId) -> f64 {
 fn ac_flag_count(eid: i32, check: AcCheckId) -> u64 {
     ac_players()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(&eid)
         .map(|p| p.flags[check.index()])
         .unwrap_or(0)
@@ -1322,12 +1322,12 @@ fn ac_check_place(
 /// Survival placement uses up the item (creative and the `off` preset keep the old path).
 /// Not an exemption-aware check: an operator in survival uses up items like anyone else.
 fn ac_consume_placed_item(me: &Client, held_slot: i16) {
-    if ac_policy(AcCheckId::Place, ac_preset_for(&me.name)).is_none() || *me.gm.lock().unwrap() != 0 {
+    if ac_policy(AcCheckId::Place, ac_preset_for(&me.name)).is_none() || *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 0 {
         return;
     }
     let slot = 36 + held_slot;
     let stack = {
-        let mut inv = me.inv.lock().unwrap();
+        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
         map_take(&mut inv, slot, 1);
         inv.get(&slot).cloned().unwrap_or_default()
     };
@@ -1335,7 +1335,7 @@ fn ac_consume_placed_item(me: &Client, held_slot: i16) {
     write_varint(&mut packet, 0);
     packet.extend_from_slice(&slot.to_be_bytes());
     packet.extend_from_slice(&slot_wire(&stack));
-    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, packet);
+    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, packet);
 }
 
 /// Undo a client-side prediction for one cell.
@@ -1345,7 +1345,7 @@ fn ac_resync_block(me: &Client, dim: DimId, (x, y, z): BlockPos) {
     let mut body = Vec::new();
     write_pos(&mut body, x, y, z);
     write_varint(&mut body, i64::from(visible));
-    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x09, body);
+    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x09, body);
 }
 
 // ---------- ground and movement ----------
@@ -1400,9 +1400,9 @@ fn ac_server_supported(dim: DimId, (x, y, z): (f64, f64, f64)) -> bool {
         }
     }
     // Boats, minecarts, shulkers and the like can carry a player.
-    mobs().lock().unwrap().iter().any(|m| {
+    mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|m| {
         m.dim == dim && {
-            let (mx, my, mz, ..) = *m.pos.lock().unwrap();
+            let (mx, my, mz, ..) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
             (mx - x).abs() < 1.6 && (mz - z).abs() < 1.6 && my <= y + 0.1 && my >= y - 2.5
         }
     })
@@ -1421,7 +1421,7 @@ fn ac_effective_ground(me: &Client, pos: (f64, f64, f64), claimed: bool) -> bool
     if !claimed || ac_policy(AcCheckId::NoFall, ac_checked_preset(me)).is_none() {
         return claimed;
     }
-    let dim = *me.dim.lock().unwrap();
+    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
     claimed && ac_server_supported(dim, pos)
 }
 
@@ -1495,7 +1495,7 @@ fn ac_check_move(
     }
     let mut ground = claimed_ground;
     if nofall.is_some() && claimed_ground {
-        let dim = *me.dim.lock().unwrap();
+        let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
         let carried = ac_with_player(me, |ac| {
             ac.moves.carried_until.is_some_and(|t| now < t)
         });
@@ -1518,10 +1518,10 @@ fn ac_check_move(
 
 /// Pull the player back to `to` without refilling their movement credit.
 fn ac_setback(me: &Client, to: (f64, f64, f64, f32, f32, bool)) {
-    let mut sock = me.sock.lock().unwrap();
-    let mut teleport = me.teleport.lock().unwrap();
+    let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut teleport = me.teleport.lock().unwrap_or_else(|e| e.into_inner());
     let id = teleport.begin();
-    *me.pos.lock().unwrap() = to;
+    *me.pos.lock().unwrap_or_else(|e| e.into_inner()) = to;
     send_prepared_teleport(&mut sock, &mut teleport, (to.0, to.1, to.2, to.3, to.4), id);
 }
 
@@ -1727,21 +1727,21 @@ mod anticheat_unit_tests {
     fn carried_contraption_motion_grants_exact_allowance_without_allowing_teleports() {
         let eid = 900_777;
         {
-            let mut map = ac_players().lock().unwrap();
+            let mut map = ac_players().lock().unwrap_or_else(|e| e.into_inner());
             map.insert(eid, PlayerAc::new("Rider"));
         }
         let p = MovementCheck::policy(AcPreset::Standard).unwrap();
         let a = AcAllowance::from_state(&AcMoverState::vanilla());
         let t0 = Instant::now();
         {
-            let mut map = ac_players().lock().unwrap();
+            let mut map = ac_players().lock().unwrap_or_else(|e| e.into_inner());
             map.get_mut(&eid).unwrap().moves.evaluate(t0, &a, &p, [0.0; 3]);
         }
         // Contraption carries rider by (3.0, 1.5, 0.0) in one tick: allowed cleanly!
         ac_note_carried_motion(eid, [3.0, 1.5, 0.0]);
         let t1 = t0 + Duration::from_millis(50);
         let (carry_res, still_carried, tp_res) = {
-            let mut map = ac_players().lock().unwrap();
+            let mut map = ac_players().lock().unwrap_or_else(|e| e.into_inner());
             let st = &mut map.get_mut(&eid).unwrap().moves;
             let carry_res = st.evaluate(t1, &a, &p, [3.0, 1.5, 0.0]);
             let still_carried = st.carried_until.is_some_and(|u| t1 < u);
@@ -1758,7 +1758,7 @@ mod anticheat_unit_tests {
 
     /// Reset the shared lag state so a test does not inherit another's spikes.
     fn ops2_reset_lag() {
-        *ac_lag_comp().lock().unwrap() = LagCompensationState::default();
+        *ac_lag_comp().lock().unwrap_or_else(|e| e.into_inner()) = LagCompensationState::default();
     }
 
     /// The healthy path is bit-exact: nothing about the checks gets weaker when

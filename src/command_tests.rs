@@ -60,12 +60,12 @@ fn help_reports_specific_usage_and_alias_is_read_only() {
 #[test]
 fn forceload_can_query_negative_chunk_and_remove_all() {
     let _world = world_guard();
-    let previous = std::mem::replace(&mut *forceloaded().lock().unwrap(), HashSet::new());
+    let previous = std::mem::replace(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()), HashSet::new());
     let ctx = command_context(None);
     let added = run_command_ctx(&ctx, "/forceload add -1 -1", &mut None);
     let queried = run_command_ctx(&ctx, "/forceload query -1 -1", &mut None);
     let removed = run_command_ctx(&ctx, "/forceload remove all", &mut None);
-    *forceloaded().lock().unwrap() = previous;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = previous;
     assert!(added.contains("1 chunks"), "{added}");
     assert!(queried.contains("Chunk -1, -1 is force loaded"), "{queried}");
     assert!(removed.contains("Removed 1"), "{removed}");
@@ -77,11 +77,11 @@ fn entity_selectors_include_live_non_players_and_select_nearest_or_random() {
     let (mut player, _hold) = crate::effect_tests::client_pair();
     player.eid = 4244;
     player.name = "selector-test".into();
-    *player.gm.lock().unwrap() = 1;
-    *player.pos.lock().unwrap() = (0.5, 16.0, 0.5, 0.0, 0.0, false);
+    *player.gm.lock().unwrap_or_else(|e| e.into_inner()) = 1;
+    *player.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 16.0, 0.5, 0.0, 0.0, false);
     let player_eid = player.eid;
-    clients().lock().unwrap().push(Arc::new(player));
-    drops().lock().unwrap().push(Drop {
+    clients().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(player));
+    drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
         eid: 4245,
         x: 1.0,
         y: 16.0,
@@ -93,7 +93,7 @@ fn entity_selectors_include_live_non_players_and_select_nearest_or_random() {
         target: None,
         thrower: None,
     });
-    drops().lock().unwrap().push(Drop {
+    drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
         eid: 4246,
         x: 4.0,
         y: 16.0,
@@ -112,26 +112,26 @@ fn entity_selectors_include_live_non_players_and_select_nearest_or_random() {
         10.0,
         None,
     ));
-    let mob_eid = mobs().lock().unwrap().last().unwrap().eid;
+    let mob_eid = mobs().lock().unwrap_or_else(|e| e.into_inner()).last().unwrap().eid;
 
     {
-        let mut board = scoreboard().lock().unwrap();
+        let mut board = scoreboard().lock().unwrap_or_else(|e| e.into_inner());
         apply_scoreboard_command(&mut board, &["objectives", "add", "selector_test", "dummy"]).unwrap();
         board.set("selector-test", "selector_test", 7).unwrap();
     }
     let player_filter = resolve_selector("@a[name=selector-test,gamemode=creative,level=0,scores={selector_test=7}]", None);
-    scoreboard().lock().unwrap().remove_objective("selector_test");
+    scoreboard().lock().unwrap_or_else(|e| e.into_inner()).remove_objective("selector_test");
     let all_entities = resolve_selector("@e", None);
     let all_players = resolve_selector("@a", None);
     let nearest_item = resolve_selector("@n[type=item]", None);
     let random_item = resolve_selector("@r[type=item]", None);
     let filtered = resolve_selector(r#"@e[type=item,nbt={Item:{id:"minecraft:stone"}},distance=..2,sort=nearest,limit=1]"#, None);
-    tags().lock().unwrap().entry("d:4246".into()).or_default().insert("marked".into());
+    tags().lock().unwrap_or_else(|e| e.into_inner()).entry("d:4246".into()).or_default().insert("marked".into());
     let tagged = resolve_selector("@e[type=item,tag=marked,sort=furthest,limit=1]", None);
-    tags().lock().unwrap().remove("d:4246");
+    tags().lock().unwrap_or_else(|e| e.into_inner()).remove("d:4246");
 
-    clients().lock().unwrap().retain(|c| c.eid != player_eid);
-    drops().lock().unwrap().retain(|d| d.eid != 4245 && d.eid != 4246);
+    clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.eid != player_eid);
+    drops().lock().unwrap_or_else(|e| e.into_inner()).retain(|d| d.eid != 4245 && d.eid != 4246);
     remove_live_mob(mob_eid);
 
     assert_eq!(player_filter, vec![player_eid.to_string()]);
@@ -169,12 +169,12 @@ fn summon_uses_the_mobs_initial_health() {
         run_command_ctx(&ctx, "/summon minecraft:cow 0 64 0", &mut None),
         "Summoned minecraft:cow"
     );
-    let mobs = mobs().lock().unwrap();
+    let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
     let [cow] = mobs.as_slice() else {
         panic!("expected exactly one summoned mob");
     };
     assert_eq!(cow.etype, name_to_etype("cow").unwrap());
-    assert_eq!(*cow.hp.lock().unwrap(), 10.0);
+    assert_eq!(*cow.hp.lock().unwrap_or_else(|e| e.into_inner()), 10.0);
 }
 
 // `/tag <targets> list <tag>` is a console/RCON path: players may only run
@@ -194,8 +194,8 @@ fn tag_list_reports_every_matched_target() {
     first.eid = 4242;
     second.eid = 4243;
     let (ea, eb) = (first.eid, second.eid);
-    clients().lock().unwrap().push(Arc::new(first));
-    clients().lock().unwrap().push(Arc::new(second));
+    clients().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(first));
+    clients().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(second));
 
     let ctx = CmdCtx {
         me: None,
@@ -209,10 +209,10 @@ fn tag_list_reports_every_matched_target() {
     // put the shared registries back the way they were
     clients()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .retain(|c| c.eid != ea && c.eid != eb);
     {
-        let mut tm = tags().lock().unwrap();
+        let mut tm = tags().lock().unwrap_or_else(|e| e.into_inner());
         for st in tm.values_mut() {
             st.remove("repo_test_tag");
         }
@@ -407,7 +407,7 @@ fn operators_persist_and_gate_player_commands() {
     );
     assert_eq!(run(&player, "/time set 123"), "Set time to 123");
 
-    OPERATORS.lock().unwrap().clear();
+    OPERATORS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_operators(path).unwrap();
     assert!(player_is_admin("FIXTURE_OP"));
     assert!(run(&player, "/op Another").contains("a server operator"));
@@ -489,30 +489,30 @@ fn datapack_reload_replaces_caches_and_replays_the_load_hook() {
     assert_eq!(WORLD_TIME.load(Ordering::Relaxed), 73);
     let enabled = |present| {
         assert_eq!(
-            item_tags().lock().unwrap().contains_key("test:bundle"),
+            item_tags().lock().unwrap_or_else(|e| e.into_inner()).contains_key("test:bundle"),
             present
         );
         assert_eq!(
-            block_tags().lock().unwrap().contains_key("test:bundle"),
+            block_tags().lock().unwrap_or_else(|e| e.into_inner()).contains_key("test:bundle"),
             present
         );
-        assert!(block_tags().lock().unwrap().contains_key("minecraft:logs"));
-        assert_eq!(!json_recipes().lock().unwrap().is_empty(), present);
-        assert_eq!(!json_smelts().lock().unwrap().is_empty(), present);
-        assert_eq!(!loot_tables().lock().unwrap().is_empty(), present);
-        assert_eq!(!mob_loot_tables().lock().unwrap().is_empty(), present);
+        assert!(block_tags().lock().unwrap_or_else(|e| e.into_inner()).contains_key("minecraft:logs"));
+        assert_eq!(!json_recipes().lock().unwrap_or_else(|e| e.into_inner()).is_empty(), present);
+        assert_eq!(!json_smelts().lock().unwrap_or_else(|e| e.into_inner()).is_empty(), present);
+        assert_eq!(!loot_tables().lock().unwrap_or_else(|e| e.into_inner()).is_empty(), present);
+        assert_eq!(!mob_loot_tables().lock().unwrap_or_else(|e| e.into_inner()).is_empty(), present);
         assert_eq!(
-            advancements().lock().unwrap().contains_key("test:first"),
+            advancements().lock().unwrap_or_else(|e| e.into_inner()).contains_key("test:first"),
             present
         );
         assert_eq!(
-            predicates().lock().unwrap().contains_key("test:any"),
+            predicates().lock().unwrap_or_else(|e| e.into_inner()).contains_key("test:any"),
             present
         );
         assert_eq!(
             packs()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .iter()
                 .any(|pack| pack.tick == ["test:on_tick"]),
             present
@@ -520,7 +520,7 @@ fn datapack_reload_replaces_caches_and_replays_the_load_hook() {
     };
     enabled(true);
     adv_event("FirstPlayer", "tick", None);
-    assert!(adv_done().lock().unwrap()["FirstPlayer"].contains("test:first"));
+    assert!(adv_done().lock().unwrap_or_else(|e| e.into_inner())["FirstPlayer"].contains("test:first"));
 
     assert_eq!(run("/datapack disable absent"), "Unknown datapack 'absent'");
     assert_eq!(content_revision(), revision + 1);
@@ -529,7 +529,7 @@ fn datapack_reload_replaces_caches_and_replays_the_load_hook() {
     assert_eq!(run("/reload"), "Reloading! (1 pack(s))");
     enabled(false);
     adv_event("SecondPlayer", "tick", None);
-    assert!(!adv_done().lock().unwrap().contains_key("SecondPlayer"));
+    assert!(!adv_done().lock().unwrap_or_else(|e| e.into_inner()).contains_key("SecondPlayer"));
     WORLD_TIME.store(90, Ordering::Relaxed);
 
     assert!(run("/datapack enable test.zip").starts_with("Enabled datapack"));
@@ -537,7 +537,7 @@ fn datapack_reload_replaces_caches_and_replays_the_load_hook() {
     enabled(true);
     assert_eq!(WORLD_TIME.load(Ordering::Relaxed), 73);
     adv_event("SecondPlayer", "tick", None);
-    assert!(adv_done().lock().unwrap()["SecondPlayer"].contains("test:first"));
+    assert!(adv_done().lock().unwrap_or_else(|e| e.into_inner())["SecondPlayer"].contains("test:first"));
 }
 
 #[test]
@@ -829,17 +829,17 @@ fn clear_max_count_applies_per_player_and_zero_only_counts() {
     first.eid = 76301;
     second.eid = 76302;
     let stone = name_to_item("stone").unwrap();
-    first.inv.lock().unwrap().insert(0, (stone, 10, Vec::new()));
-    second.inv.lock().unwrap().insert(0, (stone, 10, Vec::new()));
+    first.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(0, (stone, 10, Vec::new()));
+    second.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(0, (stone, 10, Vec::new()));
     let first = Arc::new(first);
     let second = Arc::new(second);
-    clients().lock().unwrap().extend([first.clone(), second.clone()]);
+    clients().lock().unwrap_or_else(|e| e.into_inner()).extend([first.clone(), second.clone()]);
     let ctx = command_context(None);
     let counted = run_command_ctx(&ctx, "/clear @a stone 0", &mut None);
-    let unchanged = (first.inv.lock().unwrap()[&0].1, second.inv.lock().unwrap()[&0].1);
+    let unchanged = (first.inv.lock().unwrap_or_else(|e| e.into_inner())[&0].1, second.inv.lock().unwrap_or_else(|e| e.into_inner())[&0].1);
     let cleared = run_command_ctx(&ctx, "/clear @a stone 3", &mut None);
-    let remaining = (first.inv.lock().unwrap()[&0].1, second.inv.lock().unwrap()[&0].1);
-    clients().lock().unwrap().retain(|c| c.eid != first.eid && c.eid != second.eid);
+    let remaining = (first.inv.lock().unwrap_or_else(|e| e.into_inner())[&0].1, second.inv.lock().unwrap_or_else(|e| e.into_inner())[&0].1);
+    clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.eid != first.eid && c.eid != second.eid);
     assert_eq!(counted, "Cleared 20 item(s)");
     assert_eq!(unchanged, (10, 10));
     assert_eq!(cleared, "Cleared 6 item(s)");
@@ -858,14 +858,14 @@ fn enchant_rejects_invalid_levels_and_kill_removes_selected_items() {
     let _world = world_guard();
     let ctx = command_context(None);
     assert_eq!(run_command_ctx(&ctx, "/enchant nobody sharpness nope", &mut None), "Invalid enchantment level");
-    drops().lock().unwrap().push(Drop {
+    drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
         eid: 5251, x: 0.5, y: 16.0, z: 0.5,
         item: name_to_item("stone").unwrap(), cnt: 1, comps: Vec::new(),
         age: 0, target: None, thrower: None,
     });
     let result = run_command_ctx(&ctx, "/kill @e[type=item,nbt={Item:{id:\"minecraft:stone\"}},limit=1]", &mut None);
     assert_eq!(result, "Killed 1");
-    assert!(!drops().lock().unwrap().iter().any(|item| item.eid == 5251));
+    assert!(!drops().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|item| item.eid == 5251));
 }
 
 // ---------- /spreadplayers, /particle, /playsound, raw loot tables (#197) ----------
@@ -874,7 +874,7 @@ fn packet_client(eid: i32, name: &str, x: f64, y: f64, z: f64) -> (Arc<Client>, 
     let (mut client, receiver) = crate::effect_tests::client_pair();
     client.eid = eid;
     client.name = name.into();
-    *client.pos.lock().unwrap() = (x, y, z, 0.0, 0.0, true);
+    *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (x, y, z, 0.0, 0.0, true);
     receiver
         .set_read_timeout(Some(std::time::Duration::from_millis(300)))
         .unwrap();
@@ -935,10 +935,10 @@ fn spreadplayers_rejects_bad_arguments_and_empty_targets() {
     // `under` at the dimension floor leaves no scannable column, so the
     // 10,000-attempt spread must fail deterministically.
     let (a, _ra) = packet_client(8301, "spread-floor", 0.5, 16.0, 0.5);
-    clients().lock().unwrap().push(a.clone());
+    clients().lock().unwrap_or_else(|e| e.into_inner()).push(a.clone());
     assert!(run("/spreadplayers 0 0 1 10 under -64 false spread-floor")
         .starts_with("Could not spread"));
-    clients().lock().unwrap().retain(|c| c.eid != a.eid);
+    clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.eid != a.eid);
 }
 
 #[test]
@@ -946,7 +946,7 @@ fn spreadplayers_places_players_and_mobs_deterministically() {
     let _world = world_guard();
     let (a, _ra) = packet_client(8311, "spread-a", 0.5, 16.0, 0.5);
     let (b, _rb) = packet_client(8312, "spread-b", 1.5, 16.0, 0.5);
-    clients().lock().unwrap().extend([a.clone(), b.clone()]);
+    clients().lock().unwrap_or_else(|e| e.into_inner()).extend([a.clone(), b.clone()]);
     assert!(insert_live_mob(
         name_to_etype("cow").unwrap(),
         DimId::Overworld,
@@ -954,12 +954,12 @@ fn spreadplayers_places_players_and_mobs_deterministically() {
         10.0,
         None,
     ));
-    let mob_eid = mobs().lock().unwrap().last().unwrap().eid;
+    let mob_eid = mobs().lock().unwrap_or_else(|e| e.into_inner()).last().unwrap().eid;
     // Tag the fixture mob so the selector cannot pick up mobs left behind by
     // earlier tests in this process.
     tags()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .entry(format!("e:{mob_eid}"))
         .or_default()
         .insert("spread_fixture".into());
@@ -968,36 +968,36 @@ fn spreadplayers_places_players_and_mobs_deterministically() {
     let run = |msg| run_command_ctx(&ctx, msg, &mut None);
     let state = world_rng::saved_state();
     let first = run("/spreadplayers 0 0 5 20 false spread-a spread-b @e[tag=spread_fixture]");
-    let pa = *a.pos.lock().unwrap();
-    let pb = *b.pos.lock().unwrap();
+    let pa = *a.pos.lock().unwrap_or_else(|e| e.into_inner());
+    let pb = *b.pos.lock().unwrap_or_else(|e| e.into_inner());
     let mob_pos = {
-        let mobs = mobs().lock().unwrap();
+        let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
         let m = mobs.iter().find(|m| m.eid == mob_eid).unwrap();
-        let p = m.pos.lock().unwrap();
+        let p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
         *p
     };
     // Replay from the same RNG state: vanilla spread is deterministic.
-    *a.pos.lock().unwrap() = (0.5, 16.0, 0.5, 0.0, 0.0, true);
-    *b.pos.lock().unwrap() = (1.5, 16.0, 0.5, 0.0, 0.0, true);
+    *a.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 16.0, 0.5, 0.0, 0.0, true);
+    *b.pos.lock().unwrap_or_else(|e| e.into_inner()) = (1.5, 16.0, 0.5, 0.0, 0.0, true);
     {
-        let mobs = mobs().lock().unwrap();
+        let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
         let m = mobs.iter().find(|m| m.eid == mob_eid).unwrap();
-        *m.pos.lock().unwrap() = (2.0, 16.0, 0.5, 0.0, 0.0);
+        *m.pos.lock().unwrap_or_else(|e| e.into_inner()) = (2.0, 16.0, 0.5, 0.0, 0.0);
     }
     world_rng::restore(state);
     let second = run("/spreadplayers 0 0 5 20 false spread-a spread-b @e[tag=spread_fixture]");
-    let pa2 = *a.pos.lock().unwrap();
-    let pb2 = *b.pos.lock().unwrap();
+    let pa2 = *a.pos.lock().unwrap_or_else(|e| e.into_inner());
+    let pb2 = *b.pos.lock().unwrap_or_else(|e| e.into_inner());
     let mob_pos2 = {
-        let mobs = mobs().lock().unwrap();
+        let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
         let m = mobs.iter().find(|m| m.eid == mob_eid).unwrap();
-        let p = m.pos.lock().unwrap();
+        let p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
         *p
     };
 
-    clients().lock().unwrap().retain(|c| c.eid != 8311 && c.eid != 8312);
+    clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.eid != 8311 && c.eid != 8312);
     remove_live_mob(mob_eid);
-    tags().lock().unwrap().remove(&format!("e:{mob_eid}"));
+    tags().lock().unwrap_or_else(|e| e.into_inner()).remove(&format!("e:{mob_eid}"));
 
     assert!(first.starts_with("Successfully spread 3 entities"), "{first}");
     assert_eq!(first, second);
@@ -1018,10 +1018,10 @@ fn spreadplayers_places_players_and_mobs_deterministically() {
 
     // `under` bounds the surface scan by maxHeight.
     let (c, _rc) = packet_client(8313, "spread-under", 0.5, 16.0, 0.5);
-    clients().lock().unwrap().push(c.clone());
+    clients().lock().unwrap_or_else(|e| e.into_inner()).push(c.clone());
     let under = run("/spreadplayers 0 0 1 10 under 100 false spread-under");
-    let pc = *c.pos.lock().unwrap();
-    clients().lock().unwrap().retain(|cl| cl.eid != c.eid);
+    let pc = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+    clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|cl| cl.eid != c.eid);
     assert!(under.starts_with("Successfully spread"), "{under}");
     assert!(pc.1 <= 100.0 && pc.1 >= -64.0, "y {}", pc.1);
 }
@@ -1031,7 +1031,7 @@ fn particle_validates_ids_and_encodes_viewer_scoped_packets() {
     let _world = world_guard();
     let (a, mut ra) = packet_client(8321, "particle-a", 0.5, 16.0, 0.5);
     let (b, mut rb) = packet_client(8322, "particle-b", 100.0, 16.0, 0.5);
-    clients().lock().unwrap().extend([a.clone(), b.clone()]);
+    clients().lock().unwrap_or_else(|e| e.into_inner()).extend([a.clone(), b.clone()]);
     let ctx = command_context(None);
     let run = |msg| run_command_ctx(&ctx, msg, &mut None);
 
@@ -1084,7 +1084,7 @@ fn particle_validates_ids_and_encodes_viewer_scoped_packets() {
 
     // `normal` mode uses the 32-block radius: move b to 40 blocks and give it
     // force explicitly through a second viewer selector.
-    *b.pos.lock().unwrap() = (40.5, 16.0, 0.5, 0.0, 0.0, true);
+    *b.pos.lock().unwrap_or_else(|e| e.into_inner()) = (40.5, 16.0, 0.5, 0.0, 0.0, true);
     let ranged = run("/particle flame 0.5 16 0.5 0 0 0 0 1 normal particle-b");
     assert_eq!(ranged, "No players in range");
     let forced = run("/particle flame 0.5 16 0.5 0 0 0 0 1 force particle-b");
@@ -1095,14 +1095,14 @@ fn particle_validates_ids_and_encodes_viewer_scoped_packets() {
     assert_eq!(be_i32(&payload, 41), 1);
     assert!(read_frame(&mut ra).is_none(), "viewer-scoped: a gets nothing");
 
-    clients().lock().unwrap().retain(|c| c.eid != 8321 && c.eid != 8322);
+    clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.eid != 8321 && c.eid != 8322);
 }
 
 #[test]
 fn playsound_validates_arguments_and_encodes_sound_packets() {
     let _world = world_guard();
     let (a, mut ra) = packet_client(8331, "sound-a", 0.5, 16.0, 0.5);
-    clients().lock().unwrap().push(a.clone());
+    clients().lock().unwrap_or_else(|e| e.into_inner()).push(a.clone());
     std::env::set_var("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS", "1");
     let ctx = command_context(Some(a.clone()));
     let run = |msg| run_command_ctx(&ctx, msg, &mut None);
@@ -1189,7 +1189,7 @@ fn playsound_validates_arguments_and_encodes_sound_packets() {
 
     // minVolume: a target outside 16*volume hears the sound re-centred two
     // blocks from itself toward the source, at minVolume.
-    *a.pos.lock().unwrap() = (200.0, 16.0, 0.5, 0.0, 0.0, true);
+    *a.pos.lock().unwrap_or_else(|e| e.into_inner()) = (200.0, 16.0, 0.5, 0.0, 0.0, true);
     let distant = run("/playsound entity.player.levelup @a 0 16 0 1.0 1.0 0.5");
     assert_eq!(distant, "Played sound to 1 player(s)");
     let (_id, payload) = read_frame(&mut ra).expect("minVolume packet");
@@ -1202,7 +1202,7 @@ fn playsound_validates_arguments_and_encodes_sound_packets() {
     assert_eq!(be_f32(&payload, base + 12), 0.5, "minVolume");
     assert_eq!(be_f32(&payload, base + 16), 1.0);
 
-    clients().lock().unwrap().retain(|c| c.eid != 8331);
+    clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.eid != 8331);
     std::env::remove_var("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS");
 }
 
@@ -1255,7 +1255,7 @@ fn datapack_raw_loot_tables_keep_json_and_follow_reload() {
         loot_table_json("other:no_pools").as_deref(),
         Some(r#"{"note":"raw only, nothing the pool parser keeps"}"#)
     );
-    assert!(!loot_tables().lock().unwrap().contains_key("other:no_pools"));
+    assert!(!loot_tables().lock().unwrap_or_else(|e| e.into_inner()).contains_key("other:no_pools"));
     // Singular and plural folder spellings share the same resource id space.
     assert_eq!(
         loot_table_json("test:plural/only").as_deref(),
@@ -1265,7 +1265,7 @@ fn datapack_raw_loot_tables_keep_json_and_follow_reload() {
     // parsed pool registry agrees with the raw winner.
     let shared = loot_table_json("test:chests/shared").unwrap();
     assert!(shared.contains("\"note\":\"zip\""), "{shared}");
-    assert!(loot_tables().lock().unwrap()["test:chests/shared"]
+    assert!(loot_tables().lock().unwrap_or_else(|e| e.into_inner())["test:chests/shared"]
         .iter()
         .any(|pool| !pool.entries.is_empty()));
     assert!(loot_table_json("test:chests/zipped").unwrap().contains("emerald"));
@@ -1303,19 +1303,19 @@ fn live_commands_dispatch_ban_whitelist_team_tick_locate_random_and_recipe() {
     beta.eid = 8402;
     beta.name = "wl_beta".into();
     let (ea, eb) = (alpha.eid, beta.eid);
-    clients().lock().unwrap().extend([Arc::new(alpha), Arc::new(beta)]);
+    clients().lock().unwrap_or_else(|e| e.into_inner()).extend([Arc::new(alpha), Arc::new(beta)]);
 
     // /ban + /banlist + /pardon reach BanRegistry (and persist under ".").
     assert!(run("/ban wl_alpha").starts_with("Banned wl_alpha"));
-    assert!(ban_registry().lock().unwrap().player_ban("wl_alpha").is_some());
+    assert!(ban_registry().lock().unwrap_or_else(|e| e.into_inner()).player_ban("wl_alpha").is_some());
     assert!(run("/banlist").contains("wl_alpha"));
     assert!(run("/pardon wl_alpha").contains("wl_alpha"));
-    assert!(ban_registry().lock().unwrap().player_ban("wl_alpha").is_none());
+    assert!(ban_registry().lock().unwrap_or_else(|e| e.into_inner()).player_ban("wl_alpha").is_none());
 
     // /whitelist add/on/list/off/remove.
     assert!(run("/whitelist add wl_beta").contains("wl_beta"));
     assert!(run("/whitelist on").contains("turned on"));
-    assert!(whitelist_registry().lock().unwrap().enabled);
+    assert!(whitelist_registry().lock().unwrap_or_else(|e| e.into_inner()).enabled);
     assert!(run("/whitelist list").contains("wl_beta"));
     assert!(run("/whitelist off").contains("turned off"));
     assert!(run("/whitelist remove wl_beta").contains("wl_beta"));
@@ -1347,18 +1347,18 @@ fn live_commands_dispatch_ban_whitelist_team_tick_locate_random_and_recipe() {
     assert!(rolled.contains("Server rolled"), "{rolled}");
 
     // /recipe give|take against the live recipe universe.
-    recipe_ids().lock().unwrap().insert("fixture:stone".to_owned());
+    recipe_ids().lock().unwrap_or_else(|e| e.into_inner()).insert("fixture:stone".to_owned());
     assert_eq!(run("/recipe give wl_beta fixture:stone"), "Gave 1 new recipes to wl_beta");
     assert_eq!(run("/recipe take wl_beta fixture:stone"), "Took 1 recipes from wl_beta");
     assert_eq!(run("/recipe give wl_beta fixture:bogus"), "Unknown recipe 'fixture:bogus'");
 
     // Restore every shared registry the test mutated.
     run("/tick unfreeze");
-    teams().lock().unwrap().remove("wl_team").ok();
-    whitelist_registry().lock().unwrap().enabled = false;
-    recipe_ids().lock().unwrap().remove("fixture:stone");
-    recipe_books().lock().unwrap().clear();
-    clients().lock().unwrap().retain(|c| c.eid != ea && c.eid != eb);
+    teams().lock().unwrap_or_else(|e| e.into_inner()).remove("wl_team").ok();
+    whitelist_registry().lock().unwrap_or_else(|e| e.into_inner()).enabled = false;
+    recipe_ids().lock().unwrap_or_else(|e| e.into_inner()).remove("fixture:stone");
+    recipe_books().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.eid != ea && c.eid != eb);
 }
 
 /// Vanilla `hasPermission(level)`: level-0 players get only the everyone set,
@@ -1380,7 +1380,7 @@ fn live_permission_levels_gate_commands_and_function_return_stops_execution() {
         client.name = name.to_owned();
         client.eid = eid;
         let client = Arc::new(client);
-        clients().lock().unwrap().push(client.clone());
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(client.clone());
         command_context(Some(client))
     };
     let plain = fixture("perm_none", 8411);
@@ -1388,7 +1388,7 @@ fn live_permission_levels_gate_commands_and_function_return_stops_execution() {
     let level3 = fixture("perm_three", 8413);
     let level4 = fixture("perm_four", 8414);
     {
-        let mut ops = ops_registry().lock().unwrap();
+        let mut ops = ops_registry().lock().unwrap_or_else(|e| e.into_inner());
         ops.entries.clear();
         ops.set("perm_two", 2, false);
         ops.set("perm_three", 3, false);
@@ -1457,7 +1457,7 @@ fn live_permission_levels_gate_commands_and_function_return_stops_execution() {
             "test:w1_macro".to_owned(),
             vec!["$time set $(t)".to_owned()],
         );
-        packs().lock().unwrap().push(Datapack {
+        packs().lock().unwrap_or_else(|e| e.into_inner()).push(Datapack {
             name: "w1test".to_owned(),
             functions,
             load: Vec::new(),
@@ -1477,13 +1477,13 @@ fn live_permission_levels_gate_commands_and_function_return_stops_execution() {
 
     // Restore shared state.
     WORLD_TIME.store(before_time, Ordering::Relaxed);
-    packs().lock().unwrap().retain(|p| p.name != "w1test");
+    packs().lock().unwrap_or_else(|e| e.into_inner()).retain(|p| p.name != "w1test");
     {
-        let mut ops = ops_registry().lock().unwrap();
+        let mut ops = ops_registry().lock().unwrap_or_else(|e| e.into_inner());
         ops.entries.clear();
     }
-    ban_registry().lock().unwrap().players.clear();
-    clients().lock().unwrap().retain(|c| !(8411..=8414).contains(&c.eid));
+    ban_registry().lock().unwrap_or_else(|e| e.into_inner()).players.clear();
+    clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|c| !(8411..=8414).contains(&c.eid));
 }
 
 /// W5: the console/RCON `status` diagnostic. A console source (me = None,
@@ -1527,14 +1527,14 @@ fn w5_console_status_reports_health_and_players_cannot_see_status() {
     player.name = "w5_status_probe".to_owned();
     player.eid = 8461;
     let player = Arc::new(player);
-    clients().lock().unwrap().push(player.clone());
+    clients().lock().unwrap_or_else(|e| e.into_inner()).push(player.clone());
     let pctx = command_context(Some(player));
 
     // A level-0 player is stopped by the permission gate.
     assert!(!run_command_ctx(&pctx, "/status", &mut None).starts_with("Status:"));
     // Even a level-4 player source is not the console: `status` stays
     // console/RCON only.
-    ops_registry().lock().unwrap().set("w5_status_probe", 4, false);
+    ops_registry().lock().unwrap_or_else(|e| e.into_inner()).set("w5_status_probe", 4, false);
     assert_eq!(
         run_command_ctx(&pctx, "/status", &mut None),
         "Unknown command: status"
@@ -1543,10 +1543,10 @@ fn w5_console_status_reports_health_and_players_cannot_see_status() {
     // Restore shared state.
     ops_registry()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .entries
         .retain(|e| e.name != "w5_status_probe");
-    clients().lock().unwrap().retain(|c| c.eid != 8461);
+    clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.eid != 8461);
     reset_live_load_balancer();
 }
 

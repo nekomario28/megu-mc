@@ -270,7 +270,7 @@ fn container_loot_roll_stays_inside_the_block_its_table_came_from() {
     use crate::generation_payload::{ContainerKind, GenerationPayload};
     let redstone = name_to_item("minecraft:redstone").unwrap() as i64;
     let table = "spinetest:one_item";
-    loot_tables().lock().unwrap().insert(
+    loot_tables().lock().unwrap_or_else(|e| e.into_inner()).insert(
         table.to_owned(),
         vec![LootPool {
             rolls: 1,
@@ -300,17 +300,17 @@ fn container_loot_roll_stays_inside_the_block_its_table_came_from() {
             },
         )]);
         assert!(
-            !chests().lock().unwrap().contains_key(&ContainerKey::ow(pos)),
+            !chests().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&ContainerKey::ow(pos)),
             "{kind:?} LootTable stays unmaterialized before unpack"
         );
         assert!(
-            pending_block_loot().lock().unwrap().contains_key(&ow_block(pos)),
+            pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&ow_block(pos)),
             "{kind:?} LootTable staged in pending_block_loot"
         );
         assert!(unpack_block_loot_if_needed(ow_block(pos)));
         let slots = chests()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&ContainerKey::ow(pos))
             .cloned()
             .expect("a container entry is created on unpack");
@@ -321,8 +321,8 @@ fn container_loot_roll_stays_inside_the_block_its_table_came_from() {
                 "{kind:?} cannot hold slot {slot} (highest is {highest})"
             );
         }
-        chests().lock().unwrap().remove(&ContainerKey::ow(pos));
-        pending_block_loot().lock().unwrap().remove(&ow_block(pos));
+        chests().lock().unwrap_or_else(|e| e.into_inner()).remove(&ContainerKey::ow(pos));
+        pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()).remove(&ow_block(pos));
     }
     // A furnace's table names the furnace store, never the chest store.
     let furnace_pos = (6, 70, 6);
@@ -337,16 +337,16 @@ fn container_loot_roll_stays_inside_the_block_its_table_came_from() {
     assert!(
         !chests()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .contains_key(&ContainerKey::ow(furnace_pos)),
         "a furnace's loot belongs in furnaces(), not chests()"
     );
     assert!(furnaces()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .contains_key(&ow_block(furnace_pos)));
-    furnaces().lock().unwrap().remove(&ow_block(furnace_pos));
-    loot_tables().lock().unwrap().remove(table);
+    furnaces().lock().unwrap_or_else(|e| e.into_inner()).remove(&ow_block(furnace_pos));
+    loot_tables().lock().unwrap_or_else(|e| e.into_inner()).remove(table);
 }
 
 #[test]
@@ -1275,14 +1275,14 @@ mod block_entity_helpers {
     impl LiveWorld {
         fn new() -> Self {
             Self {
-                store: std::mem::take(&mut *live_block_entities().lock().unwrap()),
+                store: std::mem::take(&mut *live_block_entities().lock().unwrap_or_else(|e| e.into_inner())),
                 time: TICK_IDX.swap(0, Ordering::Relaxed),
-                players: std::mem::take(&mut *clients().lock().unwrap()),
-                sessions: std::mem::take(&mut *player_mechanism_sessions().lock().unwrap()),
-                drops: std::mem::take(&mut *drops().lock().unwrap()),
+                players: std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner())),
+                sessions: std::mem::take(&mut *player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner())),
+                drops: std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner())),
                 rng: world_rng::saved_state(),
                 cells: Vec::new(),
-                map_states: std::mem::take(&mut *live_map_states().lock().unwrap()),
+                map_states: std::mem::take(&mut *live_map_states().lock().unwrap_or_else(|e| e.into_inner())),
             }
         }
 
@@ -1308,11 +1308,11 @@ mod block_entity_helpers {
             }
             world_rng::restore(self.rng);
             TICK_IDX.store(self.time, Ordering::Relaxed);
-            *live_block_entities().lock().unwrap() = std::mem::take(&mut self.store);
-            *clients().lock().unwrap() = std::mem::take(&mut self.players);
-            *player_mechanism_sessions().lock().unwrap() = std::mem::take(&mut self.sessions);
-            *drops().lock().unwrap() = std::mem::take(&mut self.drops);
-            *live_map_states().lock().unwrap() = std::mem::take(&mut self.map_states);
+            *live_block_entities().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.store);
+            *clients().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.players);
+            *player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.sessions);
+            *drops().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.drops);
+            *live_map_states().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.map_states);
         }
     }
 
@@ -1322,7 +1322,7 @@ mod block_entity_helpers {
         let decoded = saved(&tag);
         assert!(live_block_entities()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .entries
             .remove(&key)
             .is_some());
@@ -1336,7 +1336,7 @@ mod block_entity_helpers {
 
     fn attach_live_menu(c: &Client) {
         c.enter_play_wire(None, Default::default());
-        player_mechanism_sessions().lock().unwrap().insert(
+        player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner()).insert(
             c.eid,
             PlayerMechanismSession {
                 xp_bar: (0, 0.0),
@@ -1353,7 +1353,7 @@ mod block_entity_helpers {
     fn put_hand(c: &Client, item: &str, count: u8) {
         c.inv
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(36, (name_to_item(item).unwrap(), count, vec![]));
     }
 
@@ -1389,7 +1389,7 @@ mod block_entity_helpers {
             assert!(
                 live_block_entities()
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .entries
                     .contains_key(&key),
                 "{id}"
@@ -1445,7 +1445,7 @@ mod block_entity_helpers {
         world.tick_at(40);
         assert!(!live_block_entities()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .entries
             .contains_key(&key));
         world.place(key, "red_banner");
@@ -1459,7 +1459,7 @@ mod block_entity_helpers {
         let (client, _receiver) = effect_tests::client_pair();
         let reg = breg().unwrap();
         let (dim, x, y, z) = (DimId::Overworld, 92_000, 312, 92_000);
-        *client.pos.lock().unwrap() = (
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (
             x as f64 + 0.5,
             y as f64 - 0.7,
             z as f64 - 1.0,
@@ -1474,7 +1474,7 @@ mod block_entity_helpers {
         set_block_dim(dim, x, y, z, reg.with_prop(shelf_state, "facing", "north"));
         put_hand(&client, "book", 2);
         assert!(click_block(&client, shelf));
-        assert_eq!(client.inv.lock().unwrap()[&36].1, 1);
+        assert_eq!(client.inv.lock().unwrap_or_else(|e| e.into_inner())[&36].1, 1);
         assert_eq!(
             reg.get_prop(block_at_dim(dim, x, y, z), "slot_1_occupied")
                 .as_deref(),
@@ -1483,7 +1483,7 @@ mod block_entity_helpers {
         let shelf_tag = reload_at(shelf);
         assert_eq!(block_entity_int(&shelf_tag, "last_interacted_slot"), 1);
         assert!(click_block(&client, shelf));
-        assert_eq!(client.inv.lock().unwrap()[&36].1, 2);
+        assert_eq!(client.inv.lock().unwrap_or_else(|e| e.into_inner())[&36].1, 2);
 
         let pot = (dim, x + 1, y, z);
         world.place(pot, "decorated_pot");
@@ -1491,7 +1491,7 @@ mod block_entity_helpers {
         assert!(click_block(&client, pot));
         put_hand(&client, "emerald", 1);
         assert!(!click_block(&client, pot));
-        assert_eq!(client.inv.lock().unwrap()[&36].1, 1);
+        assert_eq!(client.inv.lock().unwrap_or_else(|e| e.into_inner())[&36].1, 1);
         assert_eq!(
             reload_at(pot).get("item"),
             Some(&item_nbt("minecraft:brick", 1))
@@ -1501,7 +1501,7 @@ mod block_entity_helpers {
         world.place(lectern, "lectern");
         put_hand(&client, "writable_book", 1);
         assert!(click_block(&client, lectern));
-        assert!(!client.inv.lock().unwrap().contains_key(&36));
+        assert!(!client.inv.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&36));
         let (_, inserted) = live_block_entity_snapshot(lectern).unwrap();
         assert_eq!(
             inserted.get("Book"),
@@ -1539,7 +1539,7 @@ mod block_entity_helpers {
         assert!(reload_at(box_key).get("RecordItem").is_none());
         assert!(drops()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .any(|drop| item_to_name(drop.item) == Some("music_disc_13")));
     }
@@ -1550,10 +1550,10 @@ mod block_entity_helpers {
         let mut world = LiveWorld::new();
         let (client, _receiver) = effect_tests::client_pair();
         let client = Arc::new(client);
-        clients().lock().unwrap().push(client.clone());
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(client.clone());
         let reg = breg().unwrap();
         let (dim, x, y, z) = (DimId::Overworld, 93_000, 318, 93_000);
-        *client.pos.lock().unwrap() = (
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (
             x as f64 + 0.5,
             y as f64 - 0.7,
             z as f64 - 1.0,
@@ -1592,7 +1592,7 @@ mod block_entity_helpers {
         world.place(campfire, "campfire");
         put_hand(&client, "beef", 2);
         assert!(click_block(&client, campfire));
-        assert_eq!(client.inv.lock().unwrap()[&36].1, 1);
+        assert_eq!(client.inv.lock().unwrap_or_else(|e| e.into_inner())[&36].1, 1);
         for now in (0..600).step_by(GAME_TICKS_PER_TICK as usize) {
             world.tick_at(now);
             if now == 200 {
@@ -1605,14 +1605,14 @@ mod block_entity_helpers {
         assert!(block_entity_entries(&reload_at(campfire), "Items").is_empty());
         assert!(drops()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .any(|drop| item_to_name(drop.item) == Some("cooked_beef")));
         assert_eq!(block_entity_int(&reload_at(beacon), "Levels"), 1);
         assert!(client
             .effs
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .any(|effect| effect.id == 0));
 
@@ -1620,7 +1620,7 @@ mod block_entity_helpers {
         world.place(crafter, "crafter");
         assert!(click_block(&client, crafter));
         let window = live_menu_id(&client).unwrap();
-        *client.cursor.lock().unwrap() = (name_to_item("oak_log").unwrap(), 2, vec![]);
+        *client.cursor.lock().unwrap_or_else(|e| e.into_inner()) = (name_to_item("oak_log").unwrap(), 2, vec![]);
         with_save_guard(|| live_menu_click(&client, window, 0, 0, 0));
         assert_eq!(block_entity_entries(&reload_at(crafter), "Items").len(), 1);
         let power = (dim, x + 3, y, z);
@@ -1646,7 +1646,7 @@ mod block_entity_helpers {
         );
         assert!(drops()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .any(|drop| item_to_name(drop.item) == Some("oak_planks") && drop.cnt == 4));
         assert_eq!(
@@ -1720,7 +1720,7 @@ mod block_entity_helpers {
         };
         block_entity_put(fields, "config", config);
         assert!(restore_live_block_entity(vault, &vault_tag));
-        let old_table = loot_tables().lock().unwrap().insert(
+        let old_table = loot_tables().lock().unwrap_or_else(|e| e.into_inner()).insert(
             table.into(),
             vec![LootPool {
                 rolls: 1,
@@ -1736,14 +1736,14 @@ mod block_entity_helpers {
         );
         put_hand(&client, "trial_key", 2);
         let unlocked = click_block(&client, vault);
-        let mut tables = loot_tables().lock().unwrap();
+        let mut tables = loot_tables().lock().unwrap_or_else(|e| e.into_inner());
         tables.remove(table);
         if let Some(old) = old_table {
             tables.insert(table.into(), old);
         }
         drop(tables);
         assert!(unlocked);
-        assert_eq!(client.inv.lock().unwrap()[&36].1, 1);
+        assert_eq!(client.inv.lock().unwrap_or_else(|e| e.into_inner())[&36].1, 1);
         assert!(!click_block(&client, vault));
         let pending = reload_at(vault);
         assert_eq!(
@@ -1754,7 +1754,7 @@ mod block_entity_helpers {
         world.tick_at(740);
         assert!(drops()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .any(|drop| item_to_name(drop.item) == Some("emerald") && drop.cnt == 2));
     }
@@ -1765,7 +1765,7 @@ mod block_entity_helpers {
         let mut world = LiveWorld::new();
         let (client, _receiver) = effect_tests::client_pair();
         let (dim, x, y, z) = (DimId::Overworld, 94_000, 322, 94_000);
-        *client.pos.lock().unwrap() = (
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (
             x as f64 + 0.5,
             y as f64 - 0.7,
             z as f64 - 1.0,
@@ -1799,7 +1799,7 @@ mod block_entity_helpers {
         let mut world = LiveWorld::new();
         let (client, _receiver) = effect_tests::client_pair();
         let (dim, x, y, z) = (DimId::Overworld, 94_000, 320, 94_000);
-        *client.pos.lock().unwrap() = (
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (
             x as f64 + 0.5,
             y as f64 + 0.5,
             z as f64 - 1.5,
@@ -1815,18 +1815,18 @@ mod block_entity_helpers {
         let window = live_menu_id(&client).unwrap();
         {
             let connection = live_menu_connection(&client).unwrap();
-            let active = connection.active.lock().unwrap();
+            let active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
             let session = active.as_ref().unwrap();
             assert!(matches!(session.menu, LiveMenu::Stonecutter(_)));
             assert_eq!(session.menu.screen(), (24, "Stonecutter"));
         }
 
         // Four stone into input slot 0 -> the deterministic recipe list appears.
-        *client.cursor.lock().unwrap() = (name_to_item("stone").unwrap(), 4, vec![]);
+        *client.cursor.lock().unwrap_or_else(|e| e.into_inner()) = (name_to_item("stone").unwrap(), 4, vec![]);
         with_save_guard(|| live_menu_click(&client, window, 0, 0, 0));
         let recipes = {
             let connection = live_menu_connection(&client).unwrap();
-            let active = connection.active.lock().unwrap();
+            let active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
             let LiveMenu::Stonecutter(menu) = &active.as_ref().unwrap().menu else {
                 panic!("stonecutter session lost")
             };
@@ -1838,11 +1838,11 @@ mod block_entity_helpers {
         // ContainerButtonClick selects recipe index 0; the result slot fills.
         with_save_guard(|| live_enchant_button(&client, i32::from(window), 0));
         with_save_guard(|| live_menu_click(&client, window, 1, 0, 0));
-        let taken = client.cursor.lock().unwrap().clone();
+        let taken = client.cursor.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!(taken, (recipes[0].0, recipes[0].1, vec![]));
         {
             let connection = live_menu_connection(&client).unwrap();
-            let active = connection.active.lock().unwrap();
+            let active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
             let LiveMenu::Stonecutter(menu) = &active.as_ref().unwrap().menu else {
                 panic!("stonecutter session lost")
             };
@@ -1852,12 +1852,12 @@ mod block_entity_helpers {
         }
 
         // Emptying the input clears the selection; the menu stays live.
-        *client.cursor.lock().unwrap() = Stack::default();
+        *client.cursor.lock().unwrap_or_else(|e| e.into_inner()) = Stack::default();
         with_save_guard(|| live_menu_click(&client, window, 0, 0, 0));
-        assert_eq!(client.cursor.lock().unwrap().1, 3);
+        assert_eq!(client.cursor.lock().unwrap_or_else(|e| e.into_inner()).1, 3);
         {
             let connection = live_menu_connection(&client).unwrap();
-            let active = connection.active.lock().unwrap();
+            let active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
             let LiveMenu::Stonecutter(menu) = &active.as_ref().unwrap().menu else {
                 panic!("stonecutter session lost")
             };
@@ -1871,7 +1871,7 @@ mod block_entity_helpers {
         let mut world = LiveWorld::new();
         let (client, _receiver) = effect_tests::client_pair();
         let (dim, x, y, z) = (DimId::Overworld, 95_000, 320, 95_000);
-        *client.pos.lock().unwrap() = (
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (
             x as f64 + 0.5,
             y as f64 + 0.5,
             z as f64 - 1.5,
@@ -1887,7 +1887,7 @@ mod block_entity_helpers {
         let window = live_menu_id(&client).unwrap();
         {
             let connection = live_menu_connection(&client).unwrap();
-            let active = connection.active.lock().unwrap();
+            let active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
             let session = active.as_ref().unwrap();
             assert!(matches!(session.menu, LiveMenu::Grindstone(_)));
             assert_eq!(session.menu.screen(), (15, "Repair & Disenchant"));
@@ -1904,21 +1904,21 @@ mod block_entity_helpers {
         );
         comp_set_varint(&mut comps, COMP_MAX_DAMAGE, 1561);
         comp_set_varint(&mut comps, COMP_DAMAGE, 40);
-        *client.cursor.lock().unwrap() = (sword, 1, comps);
+        *client.cursor.lock().unwrap_or_else(|e| e.into_inner()) = (sword, 1, comps);
         with_save_guard(|| live_menu_click(&client, window, 0, 0, 0));
-        let xp_before = *client.xp.lock().unwrap();
+        let xp_before = *client.xp.lock().unwrap_or_else(|e| e.into_inner());
         with_save_guard(|| live_menu_click(&client, window, 2, 0, 0));
-        let taken = client.cursor.lock().unwrap().clone();
+        let taken = client.cursor.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!(taken.0, sword);
         assert_eq!(taken.1, 1);
         assert_eq!(enchantments_get(&taken.2), vec![(2, 1)]);
         assert_eq!(comp_varint(&taken.2, COMP_DAMAGE), Some(40));
         // xp_base = min_cost(sharpness II) = 11 -> j = 6, xp in [6, 11].
-        let gained = *client.xp.lock().unwrap() - xp_before;
+        let gained = *client.xp.lock().unwrap_or_else(|e| e.into_inner()) - xp_before;
         assert!((6..=11).contains(&gained), "grindstone xp {gained}");
         {
             let connection = live_menu_connection(&client).unwrap();
-            let active = connection.active.lock().unwrap();
+            let active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
             let LiveMenu::Grindstone(menu) = &active.as_ref().unwrap().menu else {
                 panic!("grindstone session lost")
             };
@@ -1936,20 +1936,20 @@ mod block_entity_helpers {
         comp_set(&mut damaged_b, COMP_ENCHANTMENTS, enchantments_data(&[(34, 3)], true));
         comp_set_varint(&mut damaged_b, COMP_MAX_DAMAGE, 1561);
         comp_set_varint(&mut damaged_b, COMP_DAMAGE, 1200);
-        *client.cursor.lock().unwrap() = (sword, 1, damaged);
+        *client.cursor.lock().unwrap_or_else(|e| e.into_inner()) = (sword, 1, damaged);
         with_save_guard(|| live_menu_click(&client, window, 0, 0, 0));
-        *client.cursor.lock().unwrap() = (sword, 1, damaged_b);
+        *client.cursor.lock().unwrap_or_else(|e| e.into_inner()) = (sword, 1, damaged_b);
         with_save_guard(|| live_menu_click(&client, window, 1, 0, 0));
-        let xp_before = *client.xp.lock().unwrap();
+        let xp_before = *client.xp.lock().unwrap_or_else(|e| e.into_inner());
         with_save_guard(|| live_menu_click(&client, window, 2, 0, 0));
-        let repaired = client.cursor.lock().unwrap().clone();
+        let repaired = client.cursor.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!(repaired.0, sword);
         assert_eq!(repaired.1, 1);
         assert!(enchantments_get(&repaired.2).is_empty());
         // 361 + 361 + 1561*5% = 800 remaining -> 1561 - 800 = 761 damage.
         assert_eq!(comp_varint(&repaired.2, COMP_DAMAGE), Some(761));
         // xp_base = 11 + 21 = 32 -> j = 16, xp in [16, 31].
-        let gained = *client.xp.lock().unwrap() - xp_before;
+        let gained = *client.xp.lock().unwrap_or_else(|e| e.into_inner()) - xp_before;
         assert!((16..=31).contains(&gained), "grindstone xp {gained}");
     }
 
@@ -1959,7 +1959,7 @@ mod block_entity_helpers {
         let mut world = LiveWorld::new();
         let (client, _receiver) = effect_tests::client_pair();
         let (dim, x, y, z) = (DimId::Overworld, 96_000, 320, 96_000);
-        *client.pos.lock().unwrap() = (
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (
             x as f64 + 0.5,
             y as f64 + 0.5,
             z as f64 - 1.5,
@@ -1976,18 +1976,18 @@ mod block_entity_helpers {
         let window = live_menu_id(&client).unwrap();
         {
             let connection = live_menu_connection(&client).unwrap();
-            let active = connection.active.lock().unwrap();
+            let active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(active.as_ref().unwrap().menu.screen(), (18, "Loom"));
         }
         let banner = name_to_item("white_banner").unwrap();
-        *client.cursor.lock().unwrap() = (banner, 1, vec![]);
+        *client.cursor.lock().unwrap_or_else(|e| e.into_inner()) = (banner, 1, vec![]);
         with_save_guard(|| live_menu_click(&client, window, 0, 0, 0));
-        *client.cursor.lock().unwrap() = (name_to_item("red_dye").unwrap(), 3, vec![]);
+        *client.cursor.lock().unwrap_or_else(|e| e.into_inner()) = (name_to_item("red_dye").unwrap(), 3, vec![]);
         with_save_guard(|| live_menu_click(&client, window, 1, 0, 0));
         // Button 13 is "cross" in the no-item-required pattern list.
         with_save_guard(|| live_enchant_button(&client, i32::from(window), 13));
         with_save_guard(|| live_menu_click(&client, window, 3, 0, 0));
-        let taken = client.cursor.lock().unwrap().clone();
+        let taken = client.cursor.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!(taken.0, banner);
         assert_eq!(
             live_banner_layers(&taken),
@@ -1998,7 +1998,7 @@ mod block_entity_helpers {
         );
         {
             let connection = live_menu_connection(&client).unwrap();
-            let active = connection.active.lock().unwrap();
+            let active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
             let LiveMenu::Loom(menu) = &active.as_ref().unwrap().menu else {
                 panic!("loom session lost")
             };
@@ -2010,16 +2010,16 @@ mod block_entity_helpers {
         client
             .inv
             .lock()
-            .unwrap()
-            .insert(10, std::mem::take(&mut *client.cursor.lock().unwrap()));
-        *client.cursor.lock().unwrap() = (banner, 1, vec![]);
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(10, std::mem::take(&mut *client.cursor.lock().unwrap_or_else(|e| e.into_inner())));
+        *client.cursor.lock().unwrap_or_else(|e| e.into_inner()) = (banner, 1, vec![]);
         with_save_guard(|| live_menu_click(&client, window, 0, 0, 0));
-        *client.cursor.lock().unwrap() =
+        *client.cursor.lock().unwrap_or_else(|e| e.into_inner()) =
             (name_to_item("creeper_banner_pattern").unwrap(), 1, vec![]);
         with_save_guard(|| live_menu_click(&client, window, 2, 0, 0));
         with_save_guard(|| live_enchant_button(&client, i32::from(window), 0));
         with_save_guard(|| live_menu_click(&client, window, 3, 0, 0));
-        let taken = client.cursor.lock().unwrap().clone();
+        let taken = client.cursor.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!(
             live_banner_layers(&taken),
             vec![BannerLayer {
@@ -2029,7 +2029,7 @@ mod block_entity_helpers {
         );
         {
             let connection = live_menu_connection(&client).unwrap();
-            let active = connection.active.lock().unwrap();
+            let active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
             let LiveMenu::Loom(menu) = &active.as_ref().unwrap().menu else {
                 panic!("loom session lost")
             };
@@ -2039,7 +2039,7 @@ mod block_entity_helpers {
         // Closing returns the remaining dye and the (preserved) pattern item.
         with_save_guard(|| close_live_menu(&client, true, true));
         {
-            let inventory = client.inv.lock().unwrap();
+            let inventory = client.inv.lock().unwrap_or_else(|e| e.into_inner());
             assert!(inventory
                 .values()
                 .any(|s| item_to_name(s.0) == Some("red_dye") && s.1 == 1));
@@ -2051,7 +2051,7 @@ mod block_entity_helpers {
         // ---- cartography table ----
         let carto = (dim, x + 1, y, z);
         world.place(carto, "cartography_table");
-        live_map_states().lock().unwrap().insert(
+        live_map_states().lock().unwrap_or_else(|e| e.into_inner()).insert(
             7,
             MapState {
                 map_id: 7,
@@ -2063,7 +2063,7 @@ mod block_entity_helpers {
         let window = live_menu_id(&client).unwrap();
         {
             let connection = live_menu_connection(&client).unwrap();
-            let active = connection.active.lock().unwrap();
+            let active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(
                 active.as_ref().unwrap().menu.screen(),
                 (23, "Cartography Table")
@@ -2074,17 +2074,17 @@ mod block_entity_helpers {
         comp_set_varint(&mut map_comps, WM_COMP_MAP_ID, 7);
 
         // Zoom out: map + paper -> fresh map id at scale 1.
-        *client.cursor.lock().unwrap() = (filled, 1, map_comps.clone());
+        *client.cursor.lock().unwrap_or_else(|e| e.into_inner()) = (filled, 1, map_comps.clone());
         with_save_guard(|| live_menu_click(&client, window, 0, 0, 0));
-        *client.cursor.lock().unwrap() = (name_to_item("paper").unwrap(), 1, vec![]);
+        *client.cursor.lock().unwrap_or_else(|e| e.into_inner()) = (name_to_item("paper").unwrap(), 1, vec![]);
         with_save_guard(|| live_menu_click(&client, window, 1, 0, 0));
         with_save_guard(|| live_menu_click(&client, window, 2, 0, 0));
-        let zoomed = client.cursor.lock().unwrap().clone();
+        let zoomed = client.cursor.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!((zoomed.0, zoomed.1), (filled, 1));
         let zoomed_id = comp_varint(&zoomed.2, WM_COMP_MAP_ID).unwrap();
         assert_ne!(zoomed_id, 7);
         assert_eq!(
-            live_map_states().lock().unwrap().get(&zoomed_id).copied(),
+            live_map_states().lock().unwrap_or_else(|e| e.into_inner()).get(&zoomed_id).copied(),
             Some(MapState {
                 map_id: zoomed_id,
                 scale: 1,
@@ -2095,10 +2095,10 @@ mod block_entity_helpers {
         // Clone: the zoomed map (already on the cursor) + an empty map yields
         // two copies sharing the same id.
         with_save_guard(|| live_menu_click(&client, window, 0, 0, 0));
-        *client.cursor.lock().unwrap() = (name_to_item("map").unwrap(), 1, vec![]);
+        *client.cursor.lock().unwrap_or_else(|e| e.into_inner()) = (name_to_item("map").unwrap(), 1, vec![]);
         with_save_guard(|| live_menu_click(&client, window, 1, 0, 0));
         with_save_guard(|| live_menu_click(&client, window, 2, 0, 0));
-        let cloned = client.cursor.lock().unwrap().clone();
+        let cloned = client.cursor.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!((cloned.0, cloned.1), (filled, 2));
         assert_eq!(comp_varint(&cloned.2, WM_COMP_MAP_ID), Some(zoomed_id));
 
@@ -2106,18 +2106,18 @@ mod block_entity_helpers {
         client
             .inv
             .lock()
-            .unwrap()
-            .insert(11, std::mem::take(&mut *client.cursor.lock().unwrap()));
-        *client.cursor.lock().unwrap() = (filled, 1, map_comps);
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(11, std::mem::take(&mut *client.cursor.lock().unwrap_or_else(|e| e.into_inner())));
+        *client.cursor.lock().unwrap_or_else(|e| e.into_inner()) = (filled, 1, map_comps);
         with_save_guard(|| live_menu_click(&client, window, 0, 0, 0));
-        *client.cursor.lock().unwrap() = (name_to_item("glass_pane").unwrap(), 2, vec![]);
+        *client.cursor.lock().unwrap_or_else(|e| e.into_inner()) = (name_to_item("glass_pane").unwrap(), 2, vec![]);
         with_save_guard(|| live_menu_click(&client, window, 1, 0, 0));
         with_save_guard(|| live_menu_click(&client, window, 2, 0, 0));
-        let locked = client.cursor.lock().unwrap().clone();
+        let locked = client.cursor.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!((locked.0, locked.1), (filled, 1));
         assert_eq!(comp_varint(&locked.2, WM_COMP_MAP_ID), Some(7));
         assert_eq!(
-            live_map_states().lock().unwrap().get(&7).copied(),
+            live_map_states().lock().unwrap_or_else(|e| e.into_inner()).get(&7).copied(),
             Some(MapState {
                 map_id: 7,
                 scale: 0,
@@ -2127,7 +2127,7 @@ mod block_entity_helpers {
 
         // One glass pane remains in the addition slot; closing returns it.
         with_save_guard(|| close_live_menu(&client, true, true));
-        let inventory = client.inv.lock().unwrap();
+        let inventory = client.inv.lock().unwrap_or_else(|e| e.into_inner());
         assert!(inventory
             .values()
             .any(|s| item_to_name(s.0) == Some("glass_pane") && s.1 == 1));

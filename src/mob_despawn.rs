@@ -30,17 +30,17 @@ impl NaturalHostile {
             // Live Mob currently has no pickup, name-tag, leash or riding state.
             persistent_or_passenger: false,
             rng: Lcg::new(seed),
-            previous_hp: *mob.hp.lock().unwrap(),
-            previous_hurt_at: *mob.hurt_at.lock().unwrap(),
-            previous_hurt_tick: *mob.last_hurt_tick.lock().unwrap(),
+            previous_hp: *mob.hp.lock().unwrap_or_else(|e| e.into_inner()),
+            previous_hurt_at: *mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner()),
+            previous_hurt_tick: *mob.last_hurt_tick.lock().unwrap_or_else(|e| e.into_inner()),
         }
     }
 }
 
 impl NaturalHostile {
     fn observe_hurt(&mut self, mob: &Mob, hp: f32) {
-        let hurt_at = *mob.hurt_at.lock().unwrap();
-        let hurt_tick = *mob.last_hurt_tick.lock().unwrap();
+        let hurt_at = *mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner());
+        let hurt_tick = *mob.last_hurt_tick.lock().unwrap_or_else(|e| e.into_inner());
         // Melee and cramming have hurt stamps. Other live damage paths write HP directly.
         if hp < self.previous_hp
             || hurt_at != self.previous_hurt_at
@@ -119,13 +119,13 @@ fn tick_natural_hostile_despawn() {
             let Some(mob) = hostile.mob.upgrade() else {
                 return false;
             };
-            let hp = *mob.hp.lock().unwrap();
+            let hp = *mob.hp.lock().unwrap_or_else(|e| e.into_inner());
             if hp <= 0.0 {
                 return true; // Leave deaths and their drops to the existing combat/environment path.
             }
             hostile.observe_hurt(&mob, hp);
 
-            let (x, y, z, ..) = *mob.pos.lock().unwrap();
+            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
             let distance = nearest_player_distance_sq(&players[mob.dim.index()], [x, y, z]);
             if hostile.check_despawn(peaceful, distance) {
                 discarded.insert(mob.eid, mob);
@@ -219,16 +219,16 @@ fn discard_natural_hostiles(discarded: &HashMap<i32, Arc<Mob>>) {
     }
     let removed = with_save_guard(|| {
         let mut removed = Vec::new();
-        mobs().lock().unwrap().retain(|mob| {
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).retain(|mob| {
             let discard = discarded.get(&mob.eid).is_some_and(|candidate| {
-                Arc::ptr_eq(mob, candidate) && *mob.hp.lock().unwrap() > 0.0
+                Arc::ptr_eq(mob, candidate) && *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0
             });
             if discard {
                 removed.push(mob.eid);
             }
             !discard
         });
-        let mut tags = tags().lock().unwrap();
+        let mut tags = tags().lock().unwrap_or_else(|e| e.into_inner());
         for &eid in &removed {
             tags.remove(&format!("e:{eid}"));
         }
@@ -326,8 +326,8 @@ mod mob_despawn_tests {
         let mob = zombie(10, (0.0, 70.0, 0.0));
         let mut hostile = NaturalHostile::new(&mob, ZERO_ROLL_SEED);
         hostile.no_action_time = 601;
-        *mob.hp.lock().unwrap() = 19.0;
-        hostile.observe_hurt(&mob, *mob.hp.lock().unwrap());
+        *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) = 19.0;
+        hostile.observe_hurt(&mob, *mob.hp.lock().unwrap_or_else(|e| e.into_inner()));
         assert_eq!(hostile.no_action_time, 0);
         assert!(!hostile.check_despawn(false, Some(64.0_f64.powi(2))));
     }
@@ -355,38 +355,38 @@ mod mob_despawn_tests {
         tick_natural_hostile_despawn();
 
         let (spectator, mut receiver) = client_pair();
-        *spectator.gm.lock().unwrap() = 3;
-        spectator.seen.lock().unwrap().insert(40);
+        *spectator.gm.lock().unwrap_or_else(|e| e.into_inner()) = 3;
+        spectator.seen.lock().unwrap_or_else(|e| e.into_inner()).insert(40);
         let spectator = Arc::new(spectator);
         let (nether_player, _) = client_pair();
-        *nether_player.dim.lock().unwrap() = DimId::Nether;
+        *nether_player.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Nether;
         let (survival, _) = client_pair();
-        *survival.pos.lock().unwrap() = (0.0, 199.0, 0.0, 0.0, 0.0, true);
+        *survival.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.0, 199.0, 0.0, 0.0, 0.0, true);
         let survival = Arc::new(survival);
 
         let natural = zombie(40, (0.0, 70.0, 0.0));
         let other = zombie(41, (0.0, 70.0, 0.0));
         {
-            let mut mobs = mobs().lock().unwrap();
+            let mut mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
             push_natural_hostile(&mut mobs, natural);
             mobs.push(other);
             assert!(!has_room_for_nightly_monster(&mobs, 2));
         }
         crate::clients()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .extend([spectator, Arc::new(nether_player)]);
         tick_natural_hostile_despawn();
         assert_eq!(
-            mobs().lock().unwrap().len(),
+            mobs().lock().unwrap_or_else(|e| e.into_inner()).len(),
             2,
             "no eligible Overworld player is present"
         );
 
-        crate::clients().lock().unwrap().push(survival);
+        crate::clients().lock().unwrap_or_else(|e| e.into_inner()).push(survival);
         tick_natural_hostile_despawn();
         {
-            let mobs = mobs().lock().unwrap();
+            let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(mobs.iter().map(|mob| mob.eid).collect::<Vec<_>>(), [41]);
             assert!(has_room_for_nightly_monster(&mobs, 2));
         }
@@ -408,20 +408,20 @@ mod mob_despawn_tests {
         crate::WORLD_TIME.store(18000, Ordering::Relaxed);
         crate::set_test_region([(0, 0)].into(), Default::default());
         let (player, _) = client_pair();
-        player.pos.lock().unwrap().0 = 64.0;
-        crate::clients().lock().unwrap().push(Arc::new(player));
+        player.pos.lock().unwrap_or_else(|e| e.into_inner()).0 = 64.0;
+        crate::clients().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(player));
         tick_natural_hostile_despawn();
-        push_natural_hostile(&mut mobs().lock().unwrap(), zombie(40, (0.0, 70.0, 0.0)));
+        push_natural_hostile(&mut mobs().lock().unwrap_or_else(|e| e.into_inner()), zombie(40, (0.0, 70.0, 0.0)));
         NATURAL_HOSTILES.with(|hostiles| {
             hostiles.get().unwrap().borrow_mut()[0].rng = Lcg::new(ZERO_ROLL_SEED);
         });
 
         for _ in 0..601 {
             tick_natural_hostile_despawn();
-            assert_eq!(mobs().lock().unwrap().len(), 1);
+            assert_eq!(mobs().lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
         }
         tick_natural_hostile_despawn();
-        assert!(mobs().lock().unwrap().is_empty());
+        assert!(mobs().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
     }
 
     #[test]
@@ -431,8 +431,8 @@ mod mob_despawn_tests {
         }
         DIFFICULTY.store(0, Ordering::Relaxed);
         tick_natural_hostile_despawn();
-        push_natural_hostile(&mut mobs().lock().unwrap(), zombie(40, (0.0, 70.0, 0.0)));
+        push_natural_hostile(&mut mobs().lock().unwrap_or_else(|e| e.into_inner()), zombie(40, (0.0, 70.0, 0.0)));
         tick_natural_hostile_despawn();
-        assert!(mobs().lock().unwrap().is_empty());
+        assert!(mobs().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
     }
 }

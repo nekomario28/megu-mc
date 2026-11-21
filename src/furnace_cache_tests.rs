@@ -14,7 +14,7 @@ fn pack_changed() {
 }
 
 fn reference_tick() {
-    let mut fs = furnaces().lock().unwrap();
+    let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
     let mut dirty_pos: Vec<(i32, i32, i32)> = Vec::new();
     for (pos, f) in fs.iter_mut() {
         if !is_warm(pos.1, pos.3) {
@@ -70,13 +70,13 @@ fn reference_tick() {
     if dirty_pos.is_empty() {
         return;
     }
-    let cs: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+    let cs: Vec<Arc<Client>> = { clients().lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect() };
     for c in cs {
-        let fp = *c.open_furnace.lock().unwrap();
+        let fp = *c.open_furnace.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((DimId::Overworld, x, y, z)) = fp {
             let fp = (x, y, z);
             if dirty_pos.contains(&fp) {
-                let inv = c.inv.lock().unwrap().clone();
+                let inv = c.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 if let Ok(mut w) = c.sock.lock() {
                     furnace_push_items(&mut w, fp, &inv);
                 }
@@ -116,16 +116,16 @@ fn run(scenario: usize, tick: fn()) -> Vec<Frame> {
     let gold = name_to_item("gold_ingot").unwrap();
     let coal = name_to_item("coal").unwrap();
     let diamond = name_to_item("diamond").unwrap();
-    json_smelts().lock().unwrap().clear();
-    item_tags().lock().unwrap().remove("test:smelt");
+    json_smelts().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    item_tags().lock().unwrap_or_else(|e| e.into_inner()).remove("test:smelt");
     test_region_warm_insert((0, 0));
-    furnaces().lock().unwrap().clear();
-    furnaces().lock().unwrap().insert(pos, new_furnace());
+    furnaces().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    furnaces().lock().unwrap_or_else(|e| e.into_inner()).insert(pos, new_furnace());
     let mut trace = Vec::new();
     // 160 ticks was 40s at 4TPS; the same 40s is 800 ticks at 20TPS.
     for time in 0..server_ticks(2000) as usize {
         {
-            let mut fs = furnaces().lock().unwrap();
+            let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
             let f = fs.get_mut(&pos).unwrap();
             if time == server_ticks(50) as usize {
                 f.input = (if scenario == 2 { diamond } else { iron }, 3, Vec::new());
@@ -150,13 +150,13 @@ fn run(scenario: usize, tick: fn()) -> Vec<Frame> {
                     // Cached builtin miss must not conceal a newly added datapack recipe.
                     json_smelts()
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .push((Ingr::Item(diamond), gold, 2, 1.5));
                     pack_changed();
                 }
                 if time == server_ticks(325) as usize {
-                    json_smelts().lock().unwrap().clear();
-                    json_smelts().lock().unwrap().push((
+                    json_smelts().lock().unwrap_or_else(|e| e.into_inner()).clear();
+                    json_smelts().lock().unwrap_or_else(|e| e.into_inner()).push((
                         Ingr::Tag("test:smelt".into()),
                         gold,
                         2,
@@ -167,12 +167,12 @@ fn run(scenario: usize, tick: fn()) -> Vec<Frame> {
                 if time == server_ticks(350) as usize {
                     item_tags()
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .insert("test:smelt".into(), vec!["diamond".into()]);
                     pack_changed();
                 }
                 if time == server_ticks(425) as usize {
-                    item_tags().lock().unwrap().remove("test:smelt");
+                    item_tags().lock().unwrap_or_else(|e| e.into_inner()).remove("test:smelt");
                     pack_changed();
                 }
                 if time == server_ticks(500) as usize {
@@ -183,7 +183,7 @@ fn run(scenario: usize, tick: fn()) -> Vec<Frame> {
             }
         }
         tick();
-        let fs = furnaces().lock().unwrap();
+        let fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
         let f = fs.get(&pos).unwrap();
         trace.push(Frame {
             input: f.input.clone(),
@@ -231,9 +231,9 @@ fn cached_tick_matches_v237_with_input_output_recipe_and_tag_changes() {
             );
         }
     }
-    furnaces().lock().unwrap().clear();
-    json_smelts().lock().unwrap().clear();
-    item_tags().lock().unwrap().remove("test:smelt");
+    furnaces().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    json_smelts().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    item_tags().lock().unwrap_or_else(|e| e.into_inner()).remove("test:smelt");
     test_region_warm_remove(&(0, 0));
 }
 
@@ -257,21 +257,21 @@ fn nether_furnace_ticks_and_keeps_its_dimension_key() {
     let input = name_to_item("raw_iron").unwrap();
     let coal = name_to_item("coal").unwrap();
     test_region_warm_insert((0, 0));
-    furnaces().lock().unwrap().clear();
+    furnaces().lock().unwrap_or_else(|e| e.into_inner()).clear();
     let mut furnace = new_furnace();
     furnace.input = (input, 1, Vec::new());
     furnace.fuel = (coal, 1, Vec::new());
-    furnaces().lock().unwrap().insert(pos, furnace);
+    furnaces().lock().unwrap_or_else(|e| e.into_inner()).insert(pos, furnace);
 
     furnace_tick();
 
-    let guard = furnaces().lock().unwrap();
+    let guard = furnaces().lock().unwrap_or_else(|e| e.into_inner());
     let furnace = guard.get(&pos).unwrap();
     assert_eq!(furnace.progress, 1);
     assert_eq!(furnace.output, (0, 0, Vec::new()));
     assert!(guard.get(&ow_block((0, 70, 0))).is_none());
     drop(guard);
-    furnaces().lock().unwrap().clear();
+    furnaces().lock().unwrap_or_else(|e| e.into_inner()).clear();
     super::test_region_warm_remove(&(0, 0));
 }
 
@@ -284,7 +284,7 @@ fn a_content_reload_invalidates_cached_smelting() {
     let _guard = world_guard();
     // `Ingr` is not Clone, so the pack recipe is appended and then truncated off
     // rather than saved and restored.
-    let len_before = json_smelts().lock().unwrap().len();
+    let len_before = json_smelts().lock().unwrap_or_else(|e| e.into_inner()).len();
     let item = name_to_item("oak_log").expect("oak_log must exist");
     let mut cache: CachedLookup<(i64, u64), Option<(i64, u8)>> = CachedLookup::default();
 
@@ -299,7 +299,7 @@ fn a_content_reload_invalidates_cached_smelting() {
     // A pack now overrides the recipe, but nothing has announced a reload yet.
     json_smelts()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .push((Ingr::Item(item), 42, 3, 0.5));
     assert_eq!(
         cache.get_or_compute((item, rev), || smelt_out(item)),
@@ -315,7 +315,7 @@ fn a_content_reload_invalidates_cached_smelting() {
         "a new revision must re-resolve the recipe"
     );
 
-    json_smelts().lock().unwrap().truncate(len_before);
+    json_smelts().lock().unwrap_or_else(|e| e.into_inner()).truncate(len_before);
     CONTENT_REVISION.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -326,12 +326,12 @@ fn a_content_reload_invalidates_cached_smelting() {
 #[test]
 fn cached_smelting_beats_rescanning_datapack_recipes() {
     let _guard = world_guard();
-    let len_before = json_smelts().lock().unwrap().len();
+    let len_before = json_smelts().lock().unwrap_or_else(|e| e.into_inner()).len();
     // Recipes that match nothing under test, so every scan runs to the end.
     for i in 0..40i64 {
         json_smelts()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .push((Ingr::Item(900_000 + i), 42, 1, 0.0));
     }
     let names = ["oak_log", "raw_iron", "sand", "cobblestone", "raw_gold"];
@@ -363,7 +363,7 @@ fn cached_smelting_beats_rescanning_datapack_recipes() {
     }
     let cached = t1.elapsed();
 
-    json_smelts().lock().unwrap().truncate(len_before);
+    json_smelts().lock().unwrap_or_else(|e| e.into_inner()).truncate(len_before);
     CONTENT_REVISION.fetch_add(1, Ordering::Relaxed);
     assert_eq!(
         uncached_sum, cached_sum,

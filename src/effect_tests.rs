@@ -4,23 +4,23 @@ use crate::effects::*;
 #[test]
 fn respawn_reset_clears_transient_state_and_retains_inventory() {
     let (client, _receiver) = client_pair();
-    client.inv.lock().unwrap().insert(45, (1, 1, Vec::new()));
-    client.effs.lock().unwrap().push(Eff { id: 1, amp: 0, left: 100 });
-    *client.absorb.lock().unwrap() = 4.0;
-    *client.air.lock().unwrap() = 0;
-    *client.invulnerable.lock().unwrap() = 10;
-    *client.last_hurt.lock().unwrap() = 5.0;
-    *client.blocking.lock().unwrap() = true;
-    *client.food.lock().unwrap() = 2;
+    client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(45, (1, 1, Vec::new()));
+    client.effs.lock().unwrap_or_else(|e| e.into_inner()).push(Eff { id: 1, amp: 0, left: 100 });
+    *client.absorb.lock().unwrap_or_else(|e| e.into_inner()) = 4.0;
+    *client.air.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+    *client.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) = 10;
+    *client.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) = 5.0;
+    *client.blocking.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    *client.food.lock().unwrap_or_else(|e| e.into_inner()) = 2;
     reset_player_food(&client);
-    assert!(client.effs.lock().unwrap().is_empty());
-    assert_eq!(*client.absorb.lock().unwrap(), 0.0);
-    assert_eq!(*client.air.lock().unwrap(), AIR_SUPPLY_GT as i32);
-    assert_eq!(*client.invulnerable.lock().unwrap(), 0);
-    assert_eq!(*client.last_hurt.lock().unwrap(), 0.0);
-    assert!(!*client.blocking.lock().unwrap());
-    assert_eq!(*client.food.lock().unwrap(), 20);
-    assert!(client.inv.lock().unwrap().contains_key(&45));
+    assert!(client.effs.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+    assert_eq!(*client.absorb.lock().unwrap_or_else(|e| e.into_inner()), 0.0);
+    assert_eq!(*client.air.lock().unwrap_or_else(|e| e.into_inner()), AIR_SUPPLY_GT as i32);
+    assert_eq!(*client.invulnerable.lock().unwrap_or_else(|e| e.into_inner()), 0);
+    assert_eq!(*client.last_hurt.lock().unwrap_or_else(|e| e.into_inner()), 0.0);
+    assert!(!*client.blocking.lock().unwrap_or_else(|e| e.into_inner()));
+    assert_eq!(*client.food.lock().unwrap_or_else(|e| e.into_inner()), 20);
+    assert!(client.inv.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&45));
 }
 
 #[test]
@@ -28,10 +28,10 @@ fn attack_speed_effects_change_live_melee_charge() {
     let (client, _receiver) = client_pair();
     let client = Arc::new(client);
     let sword = name_to_item("diamond_sword").unwrap();
-    *client.last_melee.lock().unwrap() = Instant::now() - Duration::from_millis(300);
+    *client.last_melee.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now() - Duration::from_millis(300);
     let normal = melee_charge(&client, sword);
-    client.effs.lock().unwrap().push(Eff { id: 2, amp: 1, left: 100 });
-    *client.last_melee.lock().unwrap() = Instant::now() - Duration::from_millis(300);
+    client.effs.lock().unwrap_or_else(|e| e.into_inner()).push(Eff { id: 2, amp: 1, left: 100 });
+    *client.last_melee.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now() - Duration::from_millis(300);
     let haste = melee_charge(&client, sword);
     assert!(haste > normal * 1.1 && haste < 1.0);
 }
@@ -42,11 +42,11 @@ fn armor_damage_honors_custom_maximum_and_breaks() {
     let client = Arc::new(client);
     let mut comps = Vec::new();
     comp_set_varint(&mut comps, COMP_MAX_DAMAGE, 2);
-    client.inv.lock().unwrap().insert(5, (name_to_item("iron_helmet").unwrap(), 1, comps));
+    client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(5, (name_to_item("iron_helmet").unwrap(), 1, comps));
     damage_armor(&client, 4.0);
-    assert_eq!(comp_varint(&client.inv.lock().unwrap()[&5].2, COMP_DAMAGE), Some(1));
+    assert_eq!(comp_varint(&client.inv.lock().unwrap_or_else(|e| e.into_inner())[&5].2, COMP_DAMAGE), Some(1));
     damage_armor(&client, 4.0);
-    assert!(!client.inv.lock().unwrap().contains_key(&5));
+    assert!(!client.inv.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&5));
 }
 
 #[test]
@@ -166,30 +166,30 @@ fn death_protection_updates_state_and_sends_effect_changes() {
     client
         .inv
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .insert(45, (totem, 2, Vec::new()));
-    *client.hp.lock().unwrap() = 0.0;
-    client.effs.lock().unwrap().push(Eff {
+    *client.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+    client.effs.lock().unwrap_or_else(|e| e.into_inner()).push(Eff {
         id: 18,
         amp: 1,
         left: 80,
     });
     totem_check(&client);
-    assert_eq!(*client.hp.lock().unwrap(), 1.0);
+    assert_eq!(*client.hp.lock().unwrap_or_else(|e| e.into_inner()), 1.0);
     assert_eq!(
-        client.inv.lock().unwrap().get(&45),
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45),
         Some(&(totem, 1, Vec::new()))
     );
-    assert_eq!(*client.absorb.lock().unwrap(), 8.0);
+    assert_eq!(*client.absorb.lock().unwrap_or_else(|e| e.into_inner()), 8.0);
     assert_eq!(hurt_absorb(&client, 3.0), 0.0);
-    assert_eq!(*client.absorb.lock().unwrap(), 5.0);
+    assert_eq!(*client.absorb.lock().unwrap_or_else(|e| e.into_inner()), 5.0);
     assert_eq!(hurt_absorb(&client, 7.0), 2.0);
-    assert_eq!(*client.absorb.lock().unwrap(), 0.0);
+    assert_eq!(*client.absorb.lock().unwrap_or_else(|e| e.into_inner()), 0.0);
 
     client
         .sock
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .shutdown(std::net::Shutdown::Write)
         .unwrap();
     let mut changes = Vec::new();
@@ -266,12 +266,12 @@ fn totem_replaces_existing_effects_with_vanilla_grant() {
 #[test]
 fn wither_death_protection_stops_old_effects_and_keeps_new_grants() {
     let (client, _receiver) = client_pair();
-    client.inv.lock().unwrap().insert(
+    client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(
         45,
         (name_to_item("totem_of_undying").unwrap(), 1, Vec::new()),
     );
-    *client.hp.lock().unwrap() = 1.0;
-    *client.effs.lock().unwrap() = vec![
+    *client.hp.lock().unwrap_or_else(|e| e.into_inner()) = 1.0;
+    *client.effs.lock().unwrap_or_else(|e| e.into_inner()) = vec![
         Eff {
             id: 21,
             amp: 0,
@@ -289,14 +289,14 @@ fn wither_death_protection_stops_old_effects_and_keeps_new_grants() {
         }, // must not run after death protection removes it
     ];
     effects::tick_effects(&client);
-    assert_eq!(*client.hp.lock().unwrap(), 1.0);
-    assert!(!client.inv.lock().unwrap().contains_key(&45));
-    assert_eq!(*client.food.lock().unwrap(), 20);
-    assert_eq!(*client.absorb.lock().unwrap(), 8.0);
+    assert_eq!(*client.hp.lock().unwrap_or_else(|e| e.into_inner()), 1.0);
+    assert!(!client.inv.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&45));
+    assert_eq!(*client.food.lock().unwrap_or_else(|e| e.into_inner()), 20);
+    assert_eq!(*client.absorb.lock().unwrap_or_else(|e| e.into_inner()), 8.0);
     let mut actual: Vec<_> = client
         .effs
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .iter()
         .map(|e| (e.id, e.amp, e.left))
         .collect();
@@ -307,26 +307,26 @@ fn wither_death_protection_stops_old_effects_and_keeps_new_grants() {
 #[test]
 fn absorption_expiry_removes_unspent_shield() {
     let (client, _receiver) = client_pair();
-    *client.absorb.lock().unwrap() = 8.0;
-    client.effs.lock().unwrap().push(Eff {
+    *client.absorb.lock().unwrap_or_else(|e| e.into_inner()) = 8.0;
+    client.effs.lock().unwrap_or_else(|e| e.into_inner()).push(Eff {
         id: 21,
         amp: 1,
         left: 2,
     });
     effects::tick_effects(&client);
     assert_eq!(
-        *client.absorb.lock().unwrap(),
+        *client.absorb.lock().unwrap_or_else(|e| e.into_inner()),
         8.0,
         "still active before expiry"
     );
     effects::tick_effects(&client);
-    assert!(client.effs.lock().unwrap().is_empty());
+    assert!(client.effs.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
     assert_eq!(
         hurt_absorb(&client, 3.0),
         3.0,
         "expired absorption must not intercept damage"
     );
-    assert_eq!(*client.absorb.lock().unwrap(), 0.0);
+    assert_eq!(*client.absorb.lock().unwrap_or_else(|e| e.into_inner()), 0.0);
 }
 
 /// `LivingEntity.hurt`'s invulnerability rule, checked against what the 1.21.1
@@ -339,11 +339,11 @@ fn vulnerability_follows_vanillas_invulnerable_time_rule() {
 
     // a first hit applies in full and arms the twenty-tick window
     assert_eq!(damage_after_invulnerability(&c, 5.0), Some((5.0, true)));
-    assert_eq!(*c.invulnerable.lock().unwrap(), 20);
-    assert_eq!(*c.last_hurt.lock().unwrap(), 5.0);
+    assert_eq!(*c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()), 20);
+    assert_eq!(*c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()), 5.0);
 
     // nine ticks later the window is still open (20 -> 11)
-    *c.invulnerable.lock().unwrap() = 11;
+    *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) = 11;
     assert_eq!(
         damage_after_invulnerability(&c, 5.0),
         None,
@@ -360,21 +360,21 @@ fn vulnerability_follows_vanillas_invulnerable_time_rule() {
         "a stronger hit applies only the difference without a new hurt event"
     );
     assert_eq!(
-        *c.invulnerable.lock().unwrap(),
+        *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()),
         11,
         "the difference hit must not refresh the timer"
     );
     assert_eq!(
-        *c.last_hurt.lock().unwrap(),
+        *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()),
         8.0,
         "the difference hit moves the recorded amount up"
     );
 
     // at ten ticks the full-immunity window is over
-    *c.invulnerable.lock().unwrap() = 10;
+    *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) = 10;
     assert_eq!(damage_after_invulnerability(&c, 1.0), Some((1.0, true)));
-    assert_eq!(*c.invulnerable.lock().unwrap(), 20);
-    assert_eq!(*c.last_hurt.lock().unwrap(), 1.0);
+    assert_eq!(*c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()), 20);
+    assert_eq!(*c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()), 1.0);
 }
 
 /// A rejected hit must leave the state it is measured against untouched - the
@@ -383,10 +383,10 @@ fn vulnerability_follows_vanillas_invulnerable_time_rule() {
 fn a_rejected_hit_changes_nothing() {
     let (c, _sock) = client_pair();
     assert_eq!(damage_after_invulnerability(&c, 4.0), Some((4.0, true)));
-    *c.invulnerable.lock().unwrap() = 15;
+    *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) = 15;
     assert_eq!(damage_after_invulnerability(&c, 4.0), None);
-    assert_eq!(*c.last_hurt.lock().unwrap(), 4.0);
-    assert_eq!(*c.invulnerable.lock().unwrap(), 15);
+    assert_eq!(*c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()), 4.0);
+    assert_eq!(*c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()), 15);
 }
 
 #[test]
@@ -565,11 +565,11 @@ fn vanilla_food_air_levitation_and_instant_effect_formulas() {
 #[test]
 fn tick_effects_apply_saturation_water_breathing_and_regeneration() {
     let (client, _receiver) = client_pair();
-    *client.food.lock().unwrap() = 18;
-    *client.sat.lock().unwrap() = 4.0;
-    *client.air.lock().unwrap() = 3;
-    *client.hp.lock().unwrap() = 10.0;
-    *client.effs.lock().unwrap() = vec![
+    *client.food.lock().unwrap_or_else(|e| e.into_inner()) = 18;
+    *client.sat.lock().unwrap_or_else(|e| e.into_inner()) = 4.0;
+    *client.air.lock().unwrap_or_else(|e| e.into_inner()) = 3;
+    *client.hp.lock().unwrap_or_else(|e| e.into_inner()) = 10.0;
+    *client.effs.lock().unwrap_or_else(|e| e.into_inner()) = vec![
         Eff {
             id: 22,
             amp: 0,
@@ -589,31 +589,31 @@ fn tick_effects_apply_saturation_water_breathing_and_regeneration() {
 
     effects::tick_effects(&client);
 
-    assert_eq!(*client.food.lock().unwrap(), 19);
-    assert_eq!(*client.sat.lock().unwrap(), 6.0);
-    assert_eq!(*client.air.lock().unwrap(), AIR_SUPPLY_GT as i32);
-    assert_eq!(*client.hp.lock().unwrap(), 11.0);
+    assert_eq!(*client.food.lock().unwrap_or_else(|e| e.into_inner()), 19);
+    assert_eq!(*client.sat.lock().unwrap_or_else(|e| e.into_inner()), 6.0);
+    assert_eq!(*client.air.lock().unwrap_or_else(|e| e.into_inner()), AIR_SUPPLY_GT as i32);
+    assert_eq!(*client.hp.lock().unwrap_or_else(|e| e.into_inner()), 11.0);
 }
 
 #[test]
 fn tick_effects_keep_poison_nonlethal_and_wither_lethal() {
     let (client, _receiver) = client_pair();
-    *client.hp.lock().unwrap() = 1.0;
-    client.effs.lock().unwrap().push(Eff {
+    *client.hp.lock().unwrap_or_else(|e| e.into_inner()) = 1.0;
+    client.effs.lock().unwrap_or_else(|e| e.into_inner()).push(Eff {
         id: 18,
         amp: 0,
         left: 26,
     });
     effects::tick_effects(&client);
-    assert_eq!(*client.hp.lock().unwrap(), 1.0);
+    assert_eq!(*client.hp.lock().unwrap_or_else(|e| e.into_inner()), 1.0);
 
-    client.effs.lock().unwrap().clear();
-    *client.hp.lock().unwrap() = 1.0;
-    client.effs.lock().unwrap().push(Eff {
+    client.effs.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    *client.hp.lock().unwrap_or_else(|e| e.into_inner()) = 1.0;
+    client.effs.lock().unwrap_or_else(|e| e.into_inner()).push(Eff {
         id: 19,
         amp: 0,
         left: 41,
     });
     effects::tick_effects(&client);
-    assert_eq!(*client.hp.lock().unwrap(), 0.0);
+    assert_eq!(*client.hp.lock().unwrap_or_else(|e| e.into_inner()), 0.0);
 }

@@ -309,27 +309,27 @@ fn apply_entity_push_step(
         // `this.hurt(cramming(), 6.0F)`: the invulnerability window can reject the hit
         // outright, and a rejected hit does not stop the entity moving this tick.
         let accepted = if dmg > 0.0 {
-            let mut last = m.last_hurt_tick.lock().unwrap();
+            let mut last = m.last_hurt_tick.lock().unwrap_or_else(|e| e.into_inner());
             hurt_window_accepts(&mut last, TICK.load(Ordering::Relaxed))
         } else {
             false
         };
         if accepted {
-            let mut hp = m.hp.lock().unwrap();
+            let mut hp = m.hp.lock().unwrap_or_else(|e| e.into_inner());
             *hp -= dmg;
             let dead = *hp <= 0.0;
             drop(hp);
             broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
             if dead {
-                let (mx, my, mz, _, _) = *m.pos.lock().unwrap();
-                mob_env_die(m.eid, m.etype, mx, my, mz, *m.fire_ticks.lock().unwrap() > 0);
+                let (mx, my, mz, _, _) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
+                mob_env_die(m.eid, m.etype, mx, my, mz, *m.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) > 0);
                 dead_by_cramming[idx] = true;
                 continue;
             }
         }
         let [dx, dz] = mob_deltas[idx];
         if dx != 0.0 || dz != 0.0 {
-            let mut mp = m.pos.lock().unwrap();
+            let mut mp = m.pos.lock().unwrap_or_else(|e| e.into_inner());
             let (prev_x, prev_z) = (mp.0, mp.2);
             mob_collide_move(m, &mut mp, dx, dz);
             if (mp.0 - prev_x).abs() > 1e-9 || (mp.2 - prev_z).abs() > 1e-9 {
@@ -378,11 +378,11 @@ mod entity_push_tests {
     impl PushTestWorldSnapshot {
         fn take() -> Self {
             Self {
-                world: std::mem::take(&mut *world().lock().unwrap()),
-                mobs: std::mem::take(&mut *mobs().lock().unwrap()),
-                drops: std::mem::take(&mut *drops().lock().unwrap()),
-                region: std::mem::take(&mut *region().lock().unwrap()),
-                clients: std::mem::take(&mut *clients().lock().unwrap()),
+                world: std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner())),
+                mobs: std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner())),
+                drops: std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner())),
+                region: std::mem::take(&mut *region().lock().unwrap_or_else(|e| e.into_inner())),
+                clients: std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner())),
                 cramming: GR_MAX_ENTITY_CRAMMING.load(Ordering::Relaxed),
                 tick: TICK.load(Ordering::Relaxed),
                 rng: world_rng::saved_state(),
@@ -698,14 +698,14 @@ mod entity_push_tests {
         // 5. Breeding cows within 3.0 blocks using EntitySpatialGrid::query_radius_xz_into.
         let breed_a = spawn_test_mob(9607, 22, 4.5, 64.0, 8.5, 10.0);
         let breed_b = spawn_test_mob(9608, 22, 7.0, 64.0, 8.5, 10.0);
-        *breed_a.love.lock().unwrap() = 20;
-        *breed_b.love.lock().unwrap() = 20;
+        *breed_a.love.lock().unwrap_or_else(|e| e.into_inner()) = 20;
+        *breed_b.love.lock().unwrap_or_else(|e| e.into_inner()) = 20;
 
         clients()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .extend([spec_client, surv_client.clone()]);
-        mobs().lock().unwrap().extend([
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).extend([
             cow_a.clone(),
             cow_b.clone(),
             cow_spec.clone(),
@@ -720,24 +720,24 @@ mod entity_push_tests {
         TICK.store(1, Ordering::Relaxed);
         mob_tick();
 
-        let ax = cow_a.pos.lock().unwrap().0;
-        let bx = cow_b.pos.lock().unwrap().0;
+        let ax = cow_a.pos.lock().unwrap_or_else(|e| e.into_inner()).0;
+        let bx = cow_b.pos.lock().unwrap_or_else(|e| e.into_inner()).0;
         assert!(ax < 0.35, "cow_a should be pushed -X away from cow_b, got {ax}");
         assert!(
             bx <= 0.55 + 1e-6,
             "cow_b must NOT penetrate stone wall at x=1.0 (max center 0.55), got {bx}"
         );
         assert!(
-            (cow_spec.pos.lock().unwrap().0 - 4.5).abs() < 1e-12,
+            (cow_spec.pos.lock().unwrap_or_else(|e| e.into_inner()).0 - 4.5).abs() < 1e-12,
             "spectator client must NOT push cow_spec"
         );
         assert!(
-            cow_surv.pos.lock().unwrap().0 < 8.5,
+            cow_surv.pos.lock().unwrap_or_else(|e| e.into_inner()).0 < 8.5,
             "survival client must push cow_surv -X, got {}",
-            cow_surv.pos.lock().unwrap().0
+            cow_surv.pos.lock().unwrap_or_else(|e| e.into_inner()).0
         );
         assert!(
-            (cow_nonpush.pos.lock().unwrap().0 - 4.6).abs() < 1e-12,
+            (cow_nonpush.pos.lock().unwrap_or_else(|e| e.into_inner()).0 - 4.6).abs() < 1e-12,
             "armor stand must NOT push cow_nonpush"
         );
         // Survival client should have received a 0x5a SetEntityMotion packet.
@@ -750,10 +750,10 @@ mod entity_push_tests {
         assert_eq!(read_varint(&mut r), Some(9692));
 
         // Breeding must have spawned a baby cow + consumed love.
-        assert_eq!(*breed_a.love.lock().unwrap(), 0);
-        assert_eq!(*breed_b.love.lock().unwrap(), 0);
+        assert_eq!(*breed_a.love.lock().unwrap_or_else(|e| e.into_inner()), 0);
+        assert_eq!(*breed_b.love.lock().unwrap_or_else(|e| e.into_inner()), 0);
         assert!(
-            mobs().lock().unwrap().len() >= 9,
+            mobs().lock().unwrap_or_else(|e| e.into_inner()).len() >= 9,
             "breeding must spawn baby cow via spatial grid"
         );
 
@@ -784,10 +784,10 @@ mod entity_push_tests {
             run_command_ctx(&console_ctx, "/gamerule maxEntityCramming 24", &mut None),
             "Gamerule maxEntityCramming is now set to: 24"
         );
-        mobs().lock().unwrap().clear();
-        drops().lock().unwrap().clear();
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
         for i in 0..25 {
-            mobs().lock().unwrap().push(spawn_test_mob(
+            mobs().lock().unwrap_or_else(|e| e.into_inner()).push(spawn_test_mob(
                 9700 + i,
                 22,
                 0.5 + (i as f64) * 1e-4,
@@ -801,27 +801,27 @@ mod entity_push_tests {
         for _ in 0..8 {
             TICK.fetch_add(1, Ordering::Relaxed);
             mob_tick();
-            if mobs().lock().unwrap().len() < 25 {
+            if mobs().lock().unwrap_or_else(|e| e.into_inner()).len() < 25 {
                 break;
             }
         }
-        let alive_after = mobs().lock().unwrap().len();
+        let alive_after = mobs().lock().unwrap_or_else(|e| e.into_inner()).len();
         assert!(
             alive_after < 25,
             "25 stacked cows with maxEntityCramming=24 must suffer lethal cramming, alive={alive_after}"
         );
         assert!(
-            !drops().lock().unwrap().is_empty(),
+            !drops().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
             "lethal cramming must drop mob loot via mob_env_die"
         );
 
         // 7. The damage goes through `LivingEntity.hurt`, so the 10-tick invulnerability window
         //    applies: no mob can lose more than one 6.0 hit inside two ticks. Without the window
         //    a pile takes damage on every tick its own `nextInt(4) == 0` roll fires.
-        mobs().lock().unwrap().clear();
-        drops().lock().unwrap().clear();
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
         for i in 0..25 {
-            mobs().lock().unwrap().push(spawn_test_mob(
+            mobs().lock().unwrap_or_else(|e| e.into_inner()).push(spawn_test_mob(
                 9800 + i,
                 22,
                 0.5 + (i as f64) * 1e-4,
@@ -836,10 +836,10 @@ mod entity_push_tests {
             mob_tick();
         }
         {
-            let ms = mobs().lock().unwrap();
+            let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(ms.len(), 25, "two ticks of cramming must not kill a 20 hp cow");
             for m in ms.iter() {
-                let lost = 20.0 - *m.hp.lock().unwrap();
+                let lost = 20.0 - *m.hp.lock().unwrap_or_else(|e| e.into_inner());
                 assert!(
                     lost <= ENTITY_CRAMMING_DAMAGE + 1e-6,
                     "mob {} lost {lost} hp in two ticks; the hurt window allows one 6.0 hit",
@@ -851,12 +851,12 @@ mod entity_push_tests {
         for _ in 0..80 {
             TICK.fetch_add(1, Ordering::Relaxed);
             mob_tick();
-            if mobs().lock().unwrap().len() < 25 {
+            if mobs().lock().unwrap_or_else(|e| e.into_inner()).len() < 25 {
                 break;
             }
         }
         assert!(
-            mobs().lock().unwrap().len() < 25,
+            mobs().lock().unwrap_or_else(|e| e.into_inner()).len() < 25,
             "cramming must still kill a 20 hp pile at the window-limited rate"
         );
     }
@@ -944,26 +944,26 @@ mod entity_push_tests {
         }
         let cow_a = spawn_test_mob(9501, 22, 0.35, 64.0, 0.5, 10.0);
         let cow_b = spawn_test_mob(9502, 22, 0.54, 64.0, 0.5, 10.0);
-        mobs().lock().unwrap().extend([cow_a.clone(), cow_b.clone()]);
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).extend([cow_a.clone(), cow_b.clone()]);
         refresh_hot();
         TICK.store(1, Ordering::Relaxed);
         assert!(
-            clients().lock().unwrap().is_empty(),
+            clients().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
             "this fixture must start without a client for the gate to be the thing measured"
         );
         mob_tick();
         assert_eq!(
-            *cow_a.pos.lock().unwrap(),
+            *cow_a.pos.lock().unwrap_or_else(|e| e.into_inner()),
             (0.35, 64.0, 0.5, 0.0, 0.0),
             "with no client, mob_tick must not touch mobs at all"
         );
         // The same overlapping pair with one client present: now the loop runs.
         let (client, _peer) = make_dummy_client(9591, 0.9, 64.0, 0.5, 0);
-        clients().lock().unwrap().push(client);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(client);
         refresh_hot();
         mob_tick();
         assert_ne!(
-            cow_a.pos.lock().unwrap().0,
+            cow_a.pos.lock().unwrap_or_else(|e| e.into_inner()).0,
             0.35,
             "with a client present, mob_tick must do mob work"
         );
