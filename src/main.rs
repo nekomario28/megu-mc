@@ -39,6 +39,7 @@ mod worldgen;
 include!("paletted.rs");
 include!("server_config.rs");
 include!("server_ops.rs");
+include!("server_reliability.rs");
 include!("anticheat.rs");
 include!("lighting.rs");
 include!("entity_collision.rs");
