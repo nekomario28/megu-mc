@@ -516,3 +516,174 @@ fn spawner_validates_general_1211_mobs_and_weighted_potentials() {
         "selected SpawnData id: {active:?}"
     );
 }
+
+/// The live pass each generated chunk runs at most once, plus the daytime
+/// animal, water and End spawn gates the drivers feed. Globals the live path
+/// touches are swapped out and restored like `container_tests`' LiveWorld.
+#[test]
+fn chunk_gen_and_natural_spawning_cover_passive_aquatic_and_end() {
+    use crate::{DimId, MobCategory};
+    use std::sync::atomic::Ordering;
+
+    let mob_spawning = crate::GR_MOB_SPAWNING.swap(1, Ordering::Relaxed);
+    let difficulty = crate::DIFFICULTY.swap(1, Ordering::Relaxed);
+    let saved_visited = std::mem::take(&mut *crate::spawned_creature_chunks().lock().unwrap());
+    let saved_mobs = std::mem::take(&mut *crate::mobs().lock().unwrap());
+    let mut cells: Vec<(crate::DimBlockPos, u32)> = Vec::new();
+    let mut place = |dim: DimId, x: i32, y: i32, z: i32, state: u32| {
+        cells.push(((dim, x, y, z), crate::block_at_dim(dim, x, y, z)));
+        crate::set_block_dim(dim, x, y, z, state);
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // First-visit creature herds: one pass per dimension+chunk.
+        assert!(crate::live_chunkgen_visit(DimId::Overworld, 41, -17));
+        assert!(
+            !crate::live_chunkgen_visit(DimId::Overworld, 41, -17),
+            "the chunk-generation creature pass must run once per chunk"
+        );
+        assert!(crate::spawned_creature_chunks()
+            .lock()
+            .unwrap()
+            .contains(&(DimId::Overworld, 41, -17)));
+
+        // A forced pass on plains actually inserts live creature mobs: a
+        // grass plateau across the chunk and its jitter margin is the herd's
+        // ground regardless of the terrain generator underneath. Chunk
+        // (43, -17) is chosen because its deterministic per-chunk seed draws
+        // below the forced 0.9 probability - a chunk whose first draw clears
+        // the vanilla `while nextFloat < probability` gate legitimately
+        // spawns no herd (about one chunk in ten at 0.9).
+        let grass = crate::name_to_state("grass_block").unwrap();
+        let air = crate::name_to_state("air").unwrap_or(0);
+        for x in (43 * 16 - 10)..=(43 * 16 + 25) {
+            for z in (-17 * 16 - 10)..=(-17 * 16 + 25) {
+                place(DimId::Overworld, x, 250, z, grass);
+                place(DimId::Overworld, x, 251, z, air);
+                place(DimId::Overworld, x, 252, z, air);
+            }
+        }
+        let before = crate::mobs().lock().unwrap().len();
+        assert!(crate::live_chunkgen_run(
+            DimId::Overworld,
+            43,
+            -17,
+            Some(0.9),
+        ));
+        assert!(
+            crate::mobs().lock().unwrap().len() > before,
+            "a high-probability creature pass should insert mobs"
+        );
+
+        // Daytime animals: grass below, clear standing room and light >= 9,
+        // bounded by the creature cap.
+        let (gx, gy, gz) = (70_000, 100, 70_000);
+        let grass = crate::name_to_state("grass_block").unwrap();
+        let air = crate::name_to_state("air").unwrap_or(0);
+        place(DimId::Overworld, gx, gy - 1, gz, grass);
+        place(DimId::Overworld, gx, gy, gz, air);
+        place(DimId::Overworld, gx, gy + 1, gz, air);
+        let creatures = crate::live_category_count(DimId::Overworld, MobCategory::Creature);
+        assert!(
+            crate::live_passive_spawn_attempt(gx, gy, gz, 15, creatures + 1, "sheep"),
+            "a lit grass site should accept a daytime animal"
+        );
+        let sheep = crate::entity_spec_by_name("sheep").unwrap().id;
+        assert!(crate::mobs().lock().unwrap().iter().any(|mob| {
+            mob.dim == DimId::Overworld && mob.etype == sheep
+        }));
+        assert!(
+            !crate::live_passive_spawn_attempt(gx, gy, gz, 15, creatures + 1, "cow"),
+            "the creature cap bounds the pass"
+        );
+        assert!(
+            !crate::live_passive_spawn_attempt(gx, gy, gz, 8, creatures + 2, "cow"),
+            "animals need light above 8"
+        );
+
+        // Aquatic mobs: a water cell inside the 50..=63 sea-level band under
+        // the water-creature cap; outside the band or on dry land fails.
+        let (wx, wy, wz) = (70_010, 55, 70_000);
+        let water = crate::name_to_state("water").unwrap();
+        place(DimId::Overworld, wx, wy, wz, water);
+        assert!(crate::live_aquatic_spawn_attempt(
+            wx,
+            wy,
+            wz,
+            MobCategory::WaterCreature,
+            usize::MAX,
+            "squid"
+        ));
+        assert!(!crate::live_aquatic_spawn_attempt(
+            wx,
+            40,
+            wz,
+            MobCategory::WaterCreature,
+            usize::MAX,
+            "squid"
+        ));
+        assert!(crate::mobs().lock().unwrap().iter().any(|mob| {
+            mob.dim == DimId::Overworld
+                && mob.etype == crate::entity_spec_by_name("squid").unwrap().id
+        }));
+
+        // End endermen: end_stone below, clear room, light <= 7, hostile cap
+        // and a non-peaceful difficulty.
+        let (ex, ey, ez) = (70_000, 100, 70_010);
+        let end_stone = crate::name_to_state("end_stone").unwrap();
+        place(DimId::End, ex, ey - 1, ez, end_stone);
+        place(DimId::End, ex, ey, ez, air);
+        place(DimId::End, ex, ey + 1, ez, air);
+        assert!(crate::live_end_spawn_attempt(ex, ey, ez, 7, usize::MAX));
+        assert!(crate::mobs().lock().unwrap().iter().any(|mob| {
+            mob.dim == DimId::End
+                && mob.etype == crate::entity_spec_by_name("enderman").unwrap().id
+        }));
+        assert!(
+            !crate::live_end_spawn_attempt(ex, ey, ez, 8, usize::MAX),
+            "endermen need light 7 or darker"
+        );
+        assert!(
+            !crate::live_end_spawn_attempt(ex, ey, ez, 7, 0),
+            "the hostile cap bounds the End pass"
+        );
+        let peaceful = crate::DIFFICULTY.swap(0, Ordering::Relaxed);
+        assert!(
+            !crate::live_end_spawn_attempt(ex, ey, ez, 0, usize::MAX),
+            "peaceful difficulty blocks enderman spawning"
+        );
+        crate::DIFFICULTY.store(peaceful, Ordering::Relaxed);
+
+        // doMobSpawning = false blocks every category.
+        crate::GR_MOB_SPAWNING.store(0, Ordering::Relaxed);
+        assert!(
+            !crate::live_passive_spawn_attempt(gx, gy, gz, 15, usize::MAX, "pig"),
+            "doMobSpawning=false blocks animals"
+        );
+        assert!(
+            !crate::live_aquatic_spawn_attempt(
+                wx,
+                wy,
+                wz,
+                MobCategory::WaterCreature,
+                usize::MAX,
+                "cod"
+            ),
+            "doMobSpawning=false blocks water mobs"
+        );
+        assert!(
+            !crate::live_end_spawn_attempt(ex, ey, ez, 0, usize::MAX),
+            "doMobSpawning=false blocks endermen"
+        );
+        crate::GR_MOB_SPAWNING.store(1, Ordering::Relaxed);
+    }));
+    for &((dim, x, y, z), state) in cells.iter().rev() {
+        crate::set_block_dim(dim, x, y, z, state);
+    }
+    crate::GR_MOB_SPAWNING.store(mob_spawning, Ordering::Relaxed);
+    crate::DIFFICULTY.store(difficulty, Ordering::Relaxed);
+    *crate::spawned_creature_chunks().lock().unwrap() = saved_visited;
+    *crate::mobs().lock().unwrap() = saved_mobs;
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}

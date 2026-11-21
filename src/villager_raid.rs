@@ -1540,6 +1540,690 @@ impl Raid {
     }
 }
 
+// ---------- live world wiring ----------
+//
+// The types above model the vanilla data; the functions below connect them to
+// the running server: a per-dimension `PoiRegistry` filled by lazy scans, the
+// live `Villager` records keyed by entity id, raid-omen conversion, and the
+// `saved_raids()` raid list. Lock order wherever two of these are held at once
+// is `live_villagers`/`saved_raids` before `live_pois` before `world`.
+
+/// One POI registry per dimension, populated by scanning the loaded surface
+/// around villagers and omen carriers. Scans are the only writer, so a broken
+/// workstation or bed drops its record — and its claims — on the next pass.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_pois() -> &'static LockedMap<DimId, PoiRegistry> {
+    static POIS: Registry<DimId, PoiRegistry> = OnceLock::new();
+    POIS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Horizontal POI discovery range around a villager. Vanilla villagers notice
+/// workstations within 16 blocks; the scan's vertical band stays inside the
+/// dimension's height.
+#[cfg_attr(not(test), allow(dead_code))]
+const LIVE_POI_SCAN_RADIUS: i32 = 16;
+
+/// POI bindings are re-scanned on a slow cadence (20 s), not per tick: the scan
+/// walks a 33x33x33 box through `block_at_dim`.
+#[cfg_attr(not(test), allow(dead_code))]
+const LIVE_POI_RESCAN_GT: u64 = 400;
+
+/// Raid-omen countdowns for players who stepped into a village, keyed by UUID.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_raid_omens() -> &'static LockedMap<VillageUuid, RaidOmen> {
+    static OMENS: Registry<VillageUuid, RaidOmen> = OnceLock::new();
+    OMENS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Live raider entity id -> (dimension, raid center, wave slot). A raider
+/// death is translated into `Raid::record_defeat` through this map.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_raid_mobs() -> &'static LockedMap<i32, (DimId, BlockPos, RaidRaiderId)> {
+    static RAIDERS: Registry<i32, (DimId, BlockPos, RaidRaiderId)> = OnceLock::new();
+    RAIDERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Raider count of the wave currently in flight per (dimension, raid center),
+/// so the bossbar can show the wave draining.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_raid_wave_totals() -> &'static LockedMap<(DimId, BlockPos), i32> {
+    static TOTALS: Registry<(DimId, BlockPos), i32> = OnceLock::new();
+    TOTALS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Reconcile one dimension's POI registry against the loaded box around
+/// `center`. Returns the number of POI blocks found.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_poi_scan(dim: DimId, center: BlockPos) -> usize {
+    let Some(reg) = crate::block_registry::breg() else {
+        return 0;
+    };
+    let min_y = (center.1 - LIVE_POI_SCAN_RADIUS).max(dim.min_y());
+    let max_y = (center.1 + LIVE_POI_SCAN_RADIUS).min(dim.min_y() + dim.height() - 1);
+    let mut registries = live_pois().lock().unwrap();
+    scan_poi_box(
+        registries.entry(dim).or_default(),
+        reg,
+        (
+            center.0 - LIVE_POI_SCAN_RADIUS,
+            min_y,
+            center.2 - LIVE_POI_SCAN_RADIUS,
+        ),
+        (
+            center.0 + LIVE_POI_SCAN_RADIUS,
+            max_y,
+            center.2 + LIVE_POI_SCAN_RADIUS,
+        ),
+        |pos| block_at_dim(dim, pos.0, pos.1, pos.2),
+    )
+}
+
+/// The novice buy-and-sell rows each job-site profession opens with, in the
+/// same `MerchantOffer` shape `farmer_merchant` builds for the composter.
+/// Unemployed and nitwit villagers sell nothing.
+#[cfg_attr(not(test), allow(dead_code))]
+fn profession_offers(profession: VillagerProfession) -> Vec<MerchantOffer> {
+    let table: &[(&str, i32, &str, i32, i32)] = match profession {
+        VillagerProfession::Armorer => {
+            &[("coal", 15, "emerald", 1, 2), ("emerald", 7, "iron_leggings", 1, 1)]
+        }
+        VillagerProfession::Butcher => {
+            &[("chicken", 14, "emerald", 1, 2), ("emerald", 1, "cooked_porkchop", 5, 1)]
+        }
+        VillagerProfession::Cartographer => {
+            &[("paper", 24, "emerald", 1, 2), ("emerald", 7, "map", 1, 1)]
+        }
+        VillagerProfession::Cleric => {
+            &[("rotten_flesh", 32, "emerald", 1, 2), ("emerald", 1, "redstone", 2, 1)]
+        }
+        VillagerProfession::Farmer => {
+            &[("wheat", 20, "emerald", 1, 2), ("emerald", 1, "bread", 6, 1)]
+        }
+        VillagerProfession::Fisherman => {
+            &[("string", 20, "emerald", 1, 2), ("emerald", 3, "cod_bucket", 1, 1)]
+        }
+        VillagerProfession::Fletcher => {
+            &[("stick", 32, "emerald", 1, 2), ("emerald", 1, "arrow", 16, 1)]
+        }
+        VillagerProfession::Leatherworker => {
+            &[("leather", 6, "emerald", 1, 2), ("emerald", 5, "leather_leggings", 1, 1)]
+        }
+        VillagerProfession::Librarian => {
+            &[("paper", 24, "emerald", 1, 2), ("emerald", 9, "bookshelf", 1, 1)]
+        }
+        VillagerProfession::Mason => {
+            &[("clay_ball", 10, "emerald", 1, 2), ("emerald", 1, "brick", 10, 1)]
+        }
+        VillagerProfession::Shepherd => {
+            &[("white_wool", 18, "emerald", 1, 2), ("emerald", 2, "shears", 1, 1)]
+        }
+        VillagerProfession::Toolsmith => {
+            &[("coal", 15, "emerald", 1, 2), ("emerald", 1, "stone_axe", 1, 1)]
+        }
+        VillagerProfession::Weaponsmith => {
+            &[("coal", 15, "emerald", 1, 2), ("emerald", 3, "iron_axe", 1, 1)]
+        }
+        VillagerProfession::None | VillagerProfession::Nitwit => return Vec::new(),
+    };
+    table
+        .iter()
+        .filter_map(|&(buy, count, sell, result_count, xp_reward)| {
+            Some(MerchantOffer {
+                cost_a: ItemCost {
+                    item: name_to_item(buy)?,
+                    count,
+                    components: Vec::new(),
+                },
+                cost_b: None,
+                result: (name_to_item(sell)?, result_count as u8, Vec::new()),
+                uses: 0,
+                max_uses: 16,
+                xp_reward,
+                price_multiplier: 0.05,
+                demand: 0,
+                special_price_diff: 0,
+            })
+        })
+        .collect()
+}
+
+/// Scan around a live villager, claim a free workstation (assigning its
+/// profession and trade table) and pick up an unclaimed bed or the village
+/// bell so the village exists for raid logic. Called on the rescan cadence
+/// and before a merchant opens.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_villager_bind_pois(dim: DimId, position: BlockPos, villager: &mut Villager) {
+    live_poi_scan(dim, position);
+    let mut registries = live_pois().lock().unwrap();
+    let pois = registries.entry(dim).or_default();
+    let mut nearby: Vec<(BlockPos, PoiKind)> = pois
+        .records
+        .iter()
+        .map(|(&pos, poi)| (pos, poi.kind))
+        .filter(|(pos, _)| villager_within(position, *pos, LIVE_POI_SCAN_RADIUS as u16))
+        .collect();
+    nearby.sort_by_key(|(pos, _)| {
+        let [dx, dy, dz] = [pos.0 - position.0, pos.1 - position.1, pos.2 - position.2];
+        dx * dx + dy * dy + dz * dz
+    });
+    for (pos, kind) in nearby {
+        match kind {
+            PoiKind::JobSite(_) => {
+                if villager.job_site.is_none() {
+                    villager.claim_poi(pois, pos);
+                }
+            }
+            PoiKind::Bed if villager.home.is_none() => {
+                villager.claim_poi(pois, pos);
+            }
+            PoiKind::Bell if villager.meeting_point.is_none() => {
+                villager.claim_poi(pois, pos);
+            }
+            _ => {}
+        }
+    }
+    villager.refresh_pois(pois);
+    if villager.offers.is_empty() {
+        villager.offers = profession_offers(villager.profession);
+    }
+}
+
+/// Villager schedule work: prune records whose mob died, re-scan POI bindings
+/// on the slow cadence, and advance each villager's activity/restock tick.
+/// Called once per game tick from [`villager_raid_tick`].
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_villager_tick(tick: u64) {
+    let villager_etype = name_to_etype("villager");
+    let live: Vec<(i32, [u8; 16], DimId, BlockPos)> = mobs()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|mob| {
+            Some(mob.etype) == villager_etype && *mob.hp.lock().unwrap() > 0.0
+        })
+        .map(|mob| {
+            let (x, y, z, ..) = *mob.pos.lock().unwrap();
+            (
+                mob.eid,
+                mob.uuid,
+                mob.dim,
+                (x.floor() as i32, y.floor() as i32, z.floor() as i32),
+            )
+        })
+        .collect();
+    let mut villagers = live_villagers().lock().unwrap();
+    let live_eids: HashSet<i32> = live.iter().map(|&(eid, ..)| eid).collect();
+    // A removed or dead villager releases its POI claims before its record
+    // goes; without this a village stays claimed by ghosts.
+    let retired_eids: Vec<i32> = villagers
+        .keys()
+        .filter(|eid| !live_eids.contains(*eid))
+        .copied()
+        .collect();
+    if !retired_eids.is_empty() {
+        let mut registries = live_pois().lock().unwrap();
+        for eid in retired_eids {
+            let Some(mut villager) = villagers.remove(&eid) else {
+                continue;
+            };
+            for pois in registries.values_mut() {
+                villager.release_pois(pois);
+            }
+        }
+    }
+    if live.is_empty() {
+        return;
+    }
+    let world_time = WORLD_TIME.load(Ordering::Relaxed);
+    let rescan = tick.is_multiple_of(server_ticks(LIVE_POI_RESCAN_GT));
+    for (eid, uuid, dim, position) in live {
+        let villager = villagers
+            .entry(eid)
+            .or_insert_with(|| Villager::new(uuid, VillagerProfession::None));
+        if rescan {
+            live_villager_bind_pois(dim, position, villager);
+        }
+        {
+            let registries = live_pois().lock().unwrap();
+            let empty = PoiRegistry::default();
+            let pois = registries.get(&dim).unwrap_or(&empty);
+            villager.tick(pois, position, world_time);
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn raid_difficulty() -> RaidDifficulty {
+    match DIFFICULTY.load(Ordering::Relaxed) {
+        0 => RaidDifficulty::Peaceful,
+        1 => RaidDifficulty::Easy,
+        3 => RaidDifficulty::Hard,
+        _ => RaidDifficulty::Normal,
+    }
+}
+
+fn live_effect_id(name: &str) -> Option<i32> {
+    effects::effect_registry_id(name).and_then(effects::effect_internal_id)
+}
+
+/// Push an effect onto a client and mirror it to watchers, the same way
+/// `live_mob_player_effect` does for potion contact effects.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_grant_effect(client: &Client, id: i32, amp: i32, left: i32) {
+    {
+        let mut effs = client.effs.lock().unwrap();
+        if effs
+            .iter()
+            .any(|eff| eff.id == id && eff.left >= left && eff.amp >= amp)
+        {
+            return;
+        }
+        effs.retain(|eff| eff.id != id);
+        effs.push(Eff { id, amp, left });
+    }
+    let packet = entity_effect_pkt(client.eid, id, amp, left);
+    if let Ok(mut sock) = client.sock.lock() {
+        let _ = send_packet(&mut sock, 0x76, packet.clone());
+    }
+    broadcast_seen_ex(client.eid, client.eid, |_| (0x76, packet.clone()));
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_remove_effect(client: &Client, id: i32) {
+    client.effs.lock().unwrap().retain(|eff| eff.id != id);
+    let packet = remove_effect_pkt(client.eid, id);
+    if let Ok(mut sock) = client.sock.lock() {
+        let _ = send_packet(&mut sock, 0x43, packet.clone());
+    }
+    broadcast_seen_ex(client.eid, client.eid, |_| (0x43, packet.clone()));
+}
+
+/// Bad Omen converts to a raid omen when the carrier steps into a claimed
+/// village (a bed or bell with claimants). The omen counts down in game ticks;
+/// when it expires `Raid::try_start` either takes the village or drops it.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_raid_omen_tick() {
+    let clients = client_snapshot();
+    if clients.is_empty() {
+        return;
+    }
+    let bad_omen = live_effect_id("bad_omen");
+    let raid_omen = live_effect_id("raid_omen");
+    let difficulty = raid_difficulty();
+    let mut omens = live_raid_omens().lock().unwrap();
+    for client in clients.iter().filter(|client| !client.is_spectator()) {
+        let (dim, x, y, z, ..) = client_dim_pos(client);
+        let position = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
+        if let Some(omen) = omens.get_mut(&client.uuid) {
+            if !omen.tick() {
+                continue;
+            }
+            let mut omen = Some(*omen);
+            let raid = {
+                let registries = live_pois().lock().unwrap();
+                registries.get(&dim).and_then(|pois| {
+                    Raid::try_start(pois, position, client.uuid, &mut omen, difficulty)
+                })
+            };
+            omens.remove(&client.uuid);
+            if let Some(raid_omen) = raid_omen {
+                live_remove_effect(client, raid_omen);
+            }
+            if let Some(raid) = raid {
+                live_raid_bossbar_write(dim, raid.center, None, 0, &clients);
+                saved_raids().lock().unwrap().push((dim, raid));
+            }
+            continue;
+        }
+        let amplifier = {
+            let effs = client.effs.lock().unwrap();
+            effs.iter()
+                .find(|eff| Some(eff.id) == bad_omen)
+                .map(|eff| eff.amp)
+        };
+        let Some(amplifier) = amplifier else {
+            continue;
+        };
+        let in_village = {
+            let registries = live_pois().lock().unwrap();
+            registries.get(&dim).is_some_and(|pois| {
+                pois.claimed_near(position)
+                    .any(|(_, kind)| matches!(kind, PoiKind::Bed | PoiKind::Bell))
+            })
+        };
+        if !in_village {
+            continue;
+        }
+        let bad_omen_level = (amplifier + 1).clamp(1, 5) as u8;
+        omens.insert(
+            client.uuid,
+            BadOmen {
+                level: bad_omen_level,
+                duration_ticks: BAD_OMEN_TICKS,
+            }
+            .enter_village(),
+        );
+        if let (Some(bad_omen), Some(raid_omen)) = (bad_omen, raid_omen) {
+            live_remove_effect(client, bad_omen);
+            live_grant_effect(
+                client,
+                raid_omen,
+                amplifier,
+                server_ticks(u64::from(RAID_OMEN_TICKS)) as i32,
+            );
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_raid_bar_id(dim: DimId, center: BlockPos) -> String {
+    format!(
+        "mc-spine:raid-{}-{}-{}-{}",
+        dim.raw(),
+        center.0,
+        center.1,
+        center.2
+    )
+}
+
+/// Audience for a raid bossbar: same-dimension players inside the vanilla
+/// 96-block raid tracking range.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_raid_audience<'a>(
+    clients: &'a [Arc<Client>],
+    dim: DimId,
+    center: BlockPos,
+) -> Vec<&'a Arc<Client>> {
+    clients
+        .iter()
+        .filter(|client| {
+            let (cdim, x, y, z, ..) = client_dim_pos(client);
+            cdim == dim
+                && villager_within(
+                    (x.floor() as i32, y.floor() as i32, z.floor() as i32),
+                    center,
+                    96,
+                )
+        })
+        .collect()
+}
+
+/// Write one bossbar action for a raid: 0 add, 1 remove, 2 progress update.
+/// `raid` supplies the remaining/total raider counts for the progress bar.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_raid_bossbar_write(
+    dim: DimId,
+    center: BlockPos,
+    raid: Option<&Raid>,
+    action: u8,
+    clients: &[Arc<Client>],
+) {
+    let id = live_raid_bar_id(dim, center);
+    let audience = live_raid_audience(clients, dim, center);
+    if action == 1 {
+        let bar = bossbars().lock().unwrap().remove(&id);
+        let pkt = bossbar_pkt(&id, 1, bar.as_ref());
+        for client in audience {
+            if let Ok(mut sock) = client.sock.lock() {
+                let _ = send_packet(&mut sock, 0x0a, pkt.clone());
+            }
+        }
+        return;
+    }
+    let total = live_raid_wave_totals()
+        .lock()
+        .unwrap()
+        .get(&(dim, center))
+        .copied()
+        .unwrap_or(1)
+        .max(1);
+    let remaining = raid.map_or(0, |raid| raid.remaining.len() as i32);
+    let mut bars = bossbars().lock().unwrap();
+    let bar = bars.entry(id.clone()).or_insert_with(|| Bossbar {
+        name: "Raid".into(),
+        color: 1,
+        style: 0,
+        value: total,
+        max: total,
+        visible: true,
+        players: HashSet::new(),
+    });
+    bar.players = audience.iter().map(|client| client.uuid).collect();
+    if action == 0 {
+        bar.max = total.max(1);
+        bar.value = bar.max;
+        let pkt = bossbar_pkt(&id, 0, Some(bar));
+        for client in audience {
+            if let Ok(mut sock) = client.sock.lock() {
+                let _ = send_packet(&mut sock, 0x0a, pkt.clone());
+            }
+        }
+    } else {
+        bar.max = total.max(1);
+        bar.value = remaining;
+        let pkt = bossbar_pkt(&id, 2, Some(bar));
+        for client in audience {
+            if let Ok(mut sock) = client.sock.lock() {
+                let _ = send_packet(&mut sock, 0x0a, pkt.clone());
+            }
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn raider_entity_name(kind: RaiderType) -> &'static str {
+    match kind {
+        RaiderType::Vindicator => "vindicator",
+        RaiderType::Evoker => "evoker",
+        RaiderType::Pillager => "pillager",
+        RaiderType::Witch => "witch",
+        RaiderType::Ravager => "ravager",
+    }
+}
+
+/// Spread one wave's raiders on a ring outside the village center. Vanilla
+/// hunts down from the village's surface for each slot; a rotated ring on the
+/// terrain surface is the bounded version of that search.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_raid_spawn_wave(dim: DimId, raid: &Raid, wave: RaidWave) {
+    let total = wave.raiders().count().max(1);
+    let cx = raid.center.0 as f64 + 0.5;
+    let cz = raid.center.2 as f64 + 0.5;
+    for (index, (raider_id, kind)) in wave.raiders().enumerate() {
+        let Some(spec) = entity_spec_by_name(raider_entity_name(kind)) else {
+            continue;
+        };
+        let angle = index as f64 / total as f64 * std::f64::consts::TAU;
+        let radius = 24.0 + world_rng::next_below(9) as f64;
+        let bx = (cx + angle.cos() * radius).floor() as i32;
+        let bz = (cz + angle.sin() * radius).floor() as i32;
+        let by = if dim == DimId::Overworld {
+            surface_y(bx, bz).floor() as i32
+        } else {
+            dim.min_y() + 64
+        };
+        let yaw = world_rng::next_below(360) as f32;
+        let spawned = with_save_guard(|| {
+            let mut current = mobs().lock().unwrap();
+            if current.len() >= MOB_CAP {
+                return None;
+            }
+            let mob = new_live_mob(
+                spec.id,
+                dim,
+                (bx as f64 + 0.5, by as f64, bz as f64 + 0.5, yaw, 0.0),
+                spec.max_health,
+                None,
+            );
+            push_natural_hostile(&mut current, mob.clone());
+            Some(mob)
+        });
+        if let Some(mob) = spawned {
+            live_raid_mobs()
+                .lock()
+                .unwrap()
+                .insert(mob.eid, (dim, raid.center, raider_id));
+        }
+    }
+    live_raid_wave_totals()
+        .lock()
+        .unwrap()
+        .insert((dim, raid.center), total as i32);
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_raid_nearest_player(
+    clients: &[Arc<Client>],
+    dim: DimId,
+    pos: (f64, f64, f64),
+) -> Option<VillageUuid> {
+    let mut best = None;
+    let mut best_sq = 64.0 * 64.0;
+    for client in clients.iter().filter(|client| !client.is_spectator()) {
+        let (cdim, x, y, z, ..) = client_dim_pos(client);
+        if cdim != dim {
+            continue;
+        }
+        let dist_sq = (x - pos.0).powi(2) + (y - pos.1).powi(2) + (z - pos.2).powi(2);
+        if dist_sq < best_sq {
+            best_sq = dist_sq;
+            best = Some(client.uuid);
+        }
+    }
+    best
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn living_villagers_near(dim: DimId, center: BlockPos) -> usize {
+    let villager_etype = name_to_etype("villager");
+    mobs()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|mob| {
+            mob.dim == dim
+                && Some(mob.etype) == villager_etype
+                && *mob.hp.lock().unwrap() > 0.0
+                && {
+                    let (x, y, z, ..) = *mob.pos.lock().unwrap();
+                    villager_within(
+                        (x.floor() as i32, y.floor() as i32, z.floor() as i32),
+                        center,
+                        64,
+                    )
+                }
+        })
+        .count()
+}
+
+/// Per-game-tick raid step: count raider deaths as wave defeats, advance the
+/// raid, spawn waves, grant Hero of the Village on victory, and keep the
+/// bossbar mirroring the raid.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_raid_step() {
+    let clients = client_snapshot();
+    let mut raids = saved_raids().lock().unwrap();
+    if raids.is_empty() {
+        live_raid_mobs().lock().unwrap().clear();
+        return;
+    }
+    // A tracked raider that died (or left the live list) counts as defeated;
+    // the closest player inside 64 blocks is recorded as the killer.
+    let mut defeated = Vec::new();
+    {
+        let tracked = live_raid_mobs().lock().unwrap();
+        let mob_list = mobs().lock().unwrap();
+        for (&eid, &(dim, center, raider)) in tracked.iter() {
+            let mob = mob_list.iter().find(|mob| mob.eid == eid);
+            let dead = mob.is_none_or(|mob| *mob.hp.lock().unwrap() <= 0.0);
+            if dead {
+                let killer = mob.and_then(|mob| {
+                    let (x, y, z, ..) = *mob.pos.lock().unwrap();
+                    live_raid_nearest_player(&clients, dim, (x, y, z))
+                });
+                defeated.push((eid, dim, center, raider, killer));
+            }
+        }
+    }
+    if !defeated.is_empty() {
+        let mut tracked = live_raid_mobs().lock().unwrap();
+        for (eid, dim, center, raider, killer) in defeated {
+            tracked.remove(&eid);
+            if let Some((_, raid)) = raids
+                .iter_mut()
+                .find(|(d, raid)| *d == dim && raid.center == center)
+            {
+                raid.record_defeat(raider, killer);
+            }
+        }
+    }
+    for (dim, raid) in raids.iter_mut() {
+        let living = living_villagers_near(*dim, raid.center);
+        let event = {
+            let registries = live_pois().lock().unwrap();
+            let empty = PoiRegistry::default();
+            let pois = registries.get(dim).unwrap_or(&empty);
+            raid.tick(pois, living)
+        };
+        match event {
+            Some(RaidEvent::SpawnWave(wave)) => live_raid_spawn_wave(*dim, raid, wave),
+            Some(RaidEvent::Victory {
+                participants,
+                effect,
+            }) => {
+                if let Some(hero) = live_effect_id("hero_of_the_village") {
+                    let left = server_ticks(u64::from(effect.duration_ticks)) as i32;
+                    let amp = i32::from(effect.level.saturating_sub(1));
+                    for uuid in participants {
+                        if let Some(client) = clients.iter().find(|c| c.uuid == uuid) {
+                            live_grant_effect(client, hero, amp, left);
+                        }
+                    }
+                }
+                live_raid_bossbar_write(*dim, raid.center, None, 1, &clients);
+            }
+            Some(RaidEvent::Loss) => {
+                live_raid_bossbar_write(*dim, raid.center, None, 1, &clients);
+            }
+            None => live_raid_bossbar_write(*dim, raid.center, Some(raid), 2, &clients),
+        }
+    }
+    let ended: Vec<(DimId, BlockPos)> = raids
+        .iter()
+        .filter(|(_, raid)| raid.state == RaidState::Stopped)
+        .map(|(dim, raid)| (*dim, raid.center))
+        .collect();
+    if !ended.is_empty() {
+        let mut tracked = live_raid_mobs().lock().unwrap();
+        let mut totals = live_raid_wave_totals().lock().unwrap();
+        for (dim, center) in &ended {
+            tracked.retain(|_, (d, c, _)| !(*d == *dim && *c == *center));
+            totals.remove(&(*dim, *center));
+            live_raid_bossbar_write(*dim, *center, None, 1, &clients);
+        }
+    }
+    raids.retain(|(_, raid)| raid.state != RaidState::Stopped);
+}
+
+/// One game tick of live villager/raid work, called from `game_tick`. The
+/// `Villager` and `Raid` units keep their "once per game tick" contracts.
+#[cfg_attr(not(test), allow(dead_code))]
+fn villager_raid_tick() {
+    live_villager_tick(TICK.load(Ordering::Relaxed));
+    if command_gamerules()
+        .lock()
+        .unwrap()
+        .get("disableRaids")
+        .copied()
+        .unwrap_or(0)
+        != 0
+    {
+        return;
+    }
+    live_raid_omen_tick();
+    live_raid_step();
+}
+
 #[cfg(test)]
 mod villager_raid_tests {
     use super::*;
@@ -2874,5 +3558,236 @@ mod villager_raid_tests {
         assert_eq!(gossip.by_player[&PLAYER], [0, 0, 0, 20, 0]);
         assert_eq!(gossip.reputation(PLAYER), 100);
         assert!(!gossip.golem_hostile(PLAYER));
+    }
+
+    /// The scan-and-claim step `open_live_merchant` runs before the table
+    /// opens: a lectern next to the villager claims into Librarian with the
+    /// real site trades, so the `farmer_merchant` fallback never applies.
+    #[test]
+    fn live_poi_assigns_non_farmer_villager_profession_and_trades() {
+        let lectern = (50_000, 70, 50_000);
+        let old = block_at(lectern.0, lectern.1, lectern.2);
+        set_block(
+            lectern.0,
+            lectern.1,
+            lectern.2,
+            name_to_state("lectern").unwrap(),
+        );
+        let mut villager = Villager::new([7; 16], VillagerProfession::None);
+        live_villager_bind_pois(
+            DimId::Overworld,
+            (lectern.0 + 2, lectern.1, lectern.2),
+            &mut villager,
+        );
+        let (profession, job_site, offers) = (
+            villager.profession,
+            villager.job_site,
+            villager.offers.clone(),
+        );
+        let claim_holds = {
+            let registries = live_pois().lock().unwrap();
+            registries.get(&DimId::Overworld).is_some_and(|pois| {
+                pois.has_claim(
+                    lectern,
+                    PoiKind::JobSite(VillagerProfession::Librarian),
+                    villager.id,
+                )
+            })
+        };
+        // Restore the cell and reconcile the record out of the live registry.
+        set_block(lectern.0, lectern.1, lectern.2, old);
+        live_poi_scan(DimId::Overworld, lectern);
+
+        assert_eq!(profession, VillagerProfession::Librarian);
+        assert_eq!(job_site, Some(lectern));
+        assert!(claim_holds);
+        assert!(!offers.is_empty());
+        let (paper, bookshelf, wheat, bread) = (
+            name_to_item("paper").unwrap(),
+            name_to_item("bookshelf").unwrap(),
+            name_to_item("wheat").unwrap(),
+            name_to_item("bread").unwrap(),
+        );
+        assert!(offers.iter().any(|offer| offer.cost_a.item == paper));
+        assert!(offers.iter().any(|offer| offer.result.0 == bookshelf));
+        // None of the farmer fallback rows leaked in.
+        assert!(!offers.iter().any(|offer| offer.cost_a.item == wheat));
+        assert!(!offers.iter().any(|offer| offer.result.0 == bread));
+    }
+
+    /// Swap-and-restore guard for the process-wide raid/villager globals so
+    /// neighbouring tests see their own state back afterwards.
+    struct LiveRaidFixture {
+        clients: Vec<Arc<Client>>,
+        mob_list: Vec<Arc<Mob>>,
+        raids: Vec<(DimId, Raid)>,
+        villagers: HashMap<i32, Villager>,
+        pois: HashMap<DimId, PoiRegistry>,
+        omens: HashMap<VillageUuid, RaidOmen>,
+        raiders: HashMap<i32, (DimId, BlockPos, RaidRaiderId)>,
+        totals: HashMap<(DimId, BlockPos), i32>,
+        cells: Vec<(DimBlockPos, u32)>,
+        mob_spawning: u8,
+        difficulty: u8,
+        tick: u64,
+    }
+
+    impl LiveRaidFixture {
+        fn new() -> Self {
+            Self {
+                clients: std::mem::take(&mut *clients().lock().unwrap()),
+                mob_list: std::mem::take(&mut *mobs().lock().unwrap()),
+                raids: std::mem::take(&mut *saved_raids().lock().unwrap()),
+                villagers: std::mem::take(&mut *live_villagers().lock().unwrap()),
+                pois: std::mem::take(&mut *live_pois().lock().unwrap()),
+                omens: std::mem::take(&mut *live_raid_omens().lock().unwrap()),
+                raiders: std::mem::take(&mut *live_raid_mobs().lock().unwrap()),
+                totals: std::mem::take(&mut *live_raid_wave_totals().lock().unwrap()),
+                cells: Vec::new(),
+                mob_spawning: GR_MOB_SPAWNING.swap(1, Ordering::Relaxed),
+                difficulty: DIFFICULTY.swap(1, Ordering::Relaxed),
+                // A tick off the POI-rescan cadence keeps `live_villager_tick`
+                // from re-scanning the world on every call below.
+                tick: TICK.swap(1, Ordering::Relaxed),
+            }
+        }
+    }
+
+    impl std::ops::Drop for LiveRaidFixture {
+        fn drop(&mut self) {
+            for &((dim, x, y, z), state) in self.cells.iter().rev() {
+                set_block_dim(dim, x, y, z, state);
+            }
+            GR_MOB_SPAWNING.store(self.mob_spawning, Ordering::Relaxed);
+            DIFFICULTY.store(self.difficulty, Ordering::Relaxed);
+            TICK.store(self.tick, Ordering::Relaxed);
+            *clients().lock().unwrap() = std::mem::take(&mut self.clients);
+            *mobs().lock().unwrap() = std::mem::take(&mut self.mob_list);
+            *saved_raids().lock().unwrap() = std::mem::take(&mut self.raids);
+            *live_villagers().lock().unwrap() = std::mem::take(&mut self.villagers);
+            *live_pois().lock().unwrap() = std::mem::take(&mut self.pois);
+            *live_raid_omens().lock().unwrap() = std::mem::take(&mut self.omens);
+            *live_raid_mobs().lock().unwrap() = std::mem::take(&mut self.raiders);
+            *live_raid_wave_totals().lock().unwrap() = std::mem::take(&mut self.totals);
+        }
+    }
+
+    /// Bad Omen inside a claimed village starts a real raid: `saved_raids`
+    /// gains it, the wave spawns live raider mobs through the tracker, and
+    /// killing them advances the raid to its next wave.
+    #[test]
+    fn live_raid_starts_on_bad_omen_and_spawns_and_advances_waves() {
+        let mut fixture = LiveRaidFixture::new();
+        let _ = &mut fixture;
+        let bad_omen = live_effect_id("bad_omen").expect("bad_omen effect id");
+        let village = (60_000, 70, 60_000);
+        // A claimed bed and bell make the POI set a village for raid logic.
+        let (bed, bell) = (village, (village.0 + 4, village.1, village.2));
+        let villager_etype = name_to_etype("villager").unwrap();
+        let villager_spec = entity_spec_by_name("villager").unwrap();
+        assert_eq!(villager_spec.id, villager_etype);
+        let villager_mob = new_live_mob(
+            villager_etype,
+            DimId::Overworld,
+            (
+                village.0 as f64 + 2.5,
+                village.1 as f64,
+                village.2 as f64 + 0.5,
+                0.0,
+                0.0,
+            ),
+            villager_spec.max_health,
+            None,
+        );
+        {
+            let mut registries = live_pois().lock().unwrap();
+            let pois = registries.entry(DimId::Overworld).or_default();
+            pois.register(bed, PoiKind::Bed);
+            pois.register(bell, PoiKind::Bell);
+            assert!(pois.claim(bed, villager_mob.uuid));
+            assert!(pois.claim(bell, villager_mob.uuid));
+        }
+        mobs().lock().unwrap().push(Arc::clone(&villager_mob));
+        // The omen carrier stands inside the village with Bad Omen.
+        let (client, _receiver) = effect_tests::client_pair();
+        *client.pos.lock().unwrap() = (
+            village.0 as f64 + 0.5,
+            village.1 as f64,
+            village.2 as f64 + 0.5,
+            0.0,
+            0.0,
+            true,
+        );
+        client.effs.lock().unwrap().push(Eff {
+            id: bad_omen,
+            amp: 0,
+            left: server_ticks(u64::from(BAD_OMEN_TICKS)) as i32,
+        });
+        let client = Arc::new(client);
+        clients().lock().unwrap().push(Arc::clone(&client));
+
+        // Bad Omen converts to a raid omen on the first tick, then counts
+        // down the vanilla 600 ticks before `Raid::try_start` takes over.
+        for _ in 0..=u64::from(RAID_OMEN_TICKS) {
+            villager_raid_tick();
+        }
+        assert!(
+            client
+                .effs
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|eff| eff.id != bad_omen),
+            "bad omen should have converted on village entry"
+        );
+        let raids_now = saved_raids().lock().unwrap().len();
+        assert_eq!(raids_now, 1, "a raid should start inside the village");
+        // Wave one spawns after the vanilla 300-tick countdown.
+        for _ in 0..=u64::from(RAID_WAVE_COUNTDOWN) {
+            villager_raid_tick();
+        }
+        let first_wave: Vec<i32> = live_raid_mobs().lock().unwrap().keys().copied().collect();
+        assert!(
+            !first_wave.is_empty(),
+            "the first raid wave should spawn live raider mobs"
+        );
+        {
+            let mob_list = mobs().lock().unwrap();
+            let pillager = name_to_etype("pillager").unwrap();
+            for &eid in &first_wave {
+                let mob = mob_list
+                    .iter()
+                    .find(|mob| mob.eid == eid)
+                    .expect("tracked raider missing from the live mob list");
+                assert_eq!(mob.etype, pillager, "wave one is four pillagers");
+                assert_eq!(mob.dim, DimId::Overworld);
+            }
+        }
+        // Killing every raider counts as defeats; the next countdown then
+        // advances the raid to wave two.
+        {
+            let mob_list = mobs().lock().unwrap();
+            for &eid in &first_wave {
+                let mob = mob_list.iter().find(|mob| mob.eid == eid).unwrap();
+                *mob.hp.lock().unwrap() = 0.0;
+            }
+        }
+        for _ in 0..=(u64::from(RAID_WAVE_COUNTDOWN) + 30) {
+            villager_raid_tick();
+        }
+        {
+            let raids = saved_raids().lock().unwrap();
+            let (_, raid) = raids.first().expect("the raid should still be active");
+            assert_eq!(
+                raid.waves_spawned, 2,
+                "the raid should advance to the next wave once its raiders die"
+            );
+            assert_eq!(raid.state, RaidState::InProgress);
+        }
+        let second_wave: Vec<i32> = live_raid_mobs().lock().unwrap().keys().copied().collect();
+        assert!(
+            !second_wave.is_empty() && second_wave.iter().all(|eid| !first_wave.contains(eid)),
+            "wave two should spawn a fresh set of live raider mobs"
+        );
     }
 }

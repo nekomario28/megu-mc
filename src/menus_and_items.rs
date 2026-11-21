@@ -8430,12 +8430,36 @@ fn open_live_merchant(c: &Client, mob: &Mob) {
     {
         return;
     }
-    let opened = live_villagers()
-        .lock()
-        .unwrap()
-        .entry(mob.eid)
-        .or_insert_with(|| farmer_merchant(mob))
-        .start_trading(&PoiRegistry::default(), c.uuid, None);
+    // Bind a nearby workstation before the table opens: claiming it assigns
+    // the site profession and its real trade rows. Only a villager with no
+    // workstation nearby keeps the historical farmer fallback.
+    let dim = *c.dim.lock().unwrap();
+    {
+        let mut villagers = live_villagers().lock().unwrap();
+        let villager = villagers
+            .entry(mob.eid)
+            .or_insert_with(|| Villager::new(mob.uuid, VillagerProfession::None));
+        if villager.job_site.is_none() || villager.offers.is_empty() {
+            let (x, y, z, ..) = *mob.pos.lock().unwrap();
+            live_villager_bind_pois(
+                dim,
+                (x.floor() as i32, y.floor() as i32, z.floor() as i32),
+                villager,
+            );
+        }
+        if matches!(villager.profession, VillagerProfession::None) {
+            *villager = farmer_merchant(mob);
+        }
+    }
+    let opened = {
+        let mut villagers = live_villagers().lock().unwrap();
+        let registries = live_pois().lock().unwrap();
+        let empty = PoiRegistry::default();
+        let pois = registries.get(&dim).unwrap_or(&empty);
+        villagers
+            .get_mut(&mob.eid)
+            .is_some_and(|villager| villager.start_trading(pois, c.uuid, None))
+    };
     if opened {
         open_live_menu(
             c,

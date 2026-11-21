@@ -1062,6 +1062,18 @@ fn environment_time_tick() {
         if t % nether_spawn_cycle() == 0 {
             spawn_nether_natural(t);
         }
+        if !(13000..=23000).contains(&wt) && t % cycle == cycle / 4 {
+            spawn_passive_natural(t);
+        }
+        if t % cycle == cycle / 2 + 1 {
+            spawn_aquatic_natural(t);
+        }
+        if t % cycle == cycle / 4 + 1 {
+            spawn_end_natural(t);
+        }
+        if t % cycle == cycle - 1 {
+            spawn_chunkgen_creatures(t);
+        }
     }
     {
         // fishing bobbers: fly, land on water, bite after 3-7 s
@@ -1337,6 +1349,544 @@ fn environment_time_tick() {
         if let Some(t) = __t {
             tickprof::add("env/rest", t.elapsed());
         }
+    }
+}
+
+// ---------- creature / aquatic / End natural spawning ----------
+// The categories vanilla `NaturalSpawner` covers that the nightly monster and
+// Nether cycles never reached: daytime animals on grass, water mobs in water
+// columns, endermen in the End, and each eligible chunk's one-time creature
+// herd from `spawn_mobs_for_chunk_generation`. The drivers keep the shared
+// contract of `spawn_nightly_hostile`: players anchor eligible chunks, the
+// category cap bounds the pass, and a spawn is one `with_save_guard` insert.
+
+/// The `MobCategory` a live mob counts under, or `None` for `Misc` entities —
+/// vanilla never lets those into the spawn-cap counts.
+fn live_mob_category(etype: i64) -> Option<MobCategory> {
+    Some(match entity_category_1211(etype) {
+        EntityMobCategory::Monster => MobCategory::Monster,
+        EntityMobCategory::Creature => MobCategory::Creature,
+        EntityMobCategory::Ambient => MobCategory::Ambient,
+        EntityMobCategory::Axolotls => MobCategory::Axolotls,
+        EntityMobCategory::UndergroundWaterCreature => {
+            MobCategory::UndergroundWaterCreature
+        }
+        EntityMobCategory::WaterCreature => MobCategory::WaterCreature,
+        EntityMobCategory::WaterAmbient => MobCategory::WaterAmbient,
+        EntityMobCategory::Misc => return None,
+    })
+}
+
+/// Live mobs in `dim` counting toward `category`'s cap; dead entries still in
+/// the list do not count against it.
+fn live_category_count(dim: DimId, category: MobCategory) -> usize {
+    mobs()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|mob| {
+            mob.dim == dim
+                && *mob.hp.lock().unwrap() > 0.0
+                && live_mob_category(mob.etype) == Some(category)
+        })
+        .count()
+}
+
+/// One natural spawn under the shared guards: `doMobSpawning`, the live-mob
+/// ceiling and, for monsters, the despawn tracker. Creatures are persistent
+/// in vanilla, so only monsters take the despawn-tracking arm.
+fn live_natural_spawn(kind: &str, dim: DimId, pos: (f64, f64, f64, f32, f32)) -> bool {
+    if GR_MOB_SPAWNING.load(Ordering::Relaxed) != 1 {
+        return false;
+    }
+    let Some(spec) = entity_spec_by_name(kind) else {
+        return false;
+    };
+    with_save_guard(|| {
+        let mut current = mobs().lock().unwrap();
+        if current.len() >= MOB_CAP {
+            return false;
+        }
+        let mob = new_live_mob(spec.id, dim, pos, spec.max_health, None);
+        if spec.category == EntityMobCategory::Monster {
+            push_natural_hostile(&mut current, mob);
+        } else {
+            current.push(mob);
+        }
+        true
+    })
+}
+
+/// The two-block clearance `SpawnPlacements.checkSpawnRules` requires for a
+/// standing mob: no full collision shape, no liquid and no
+/// `#prevent_mob_spawning_inside` block at the feet or the head.
+fn live_spawn_clear(reg: &BReg, dim: DimId, x: i32, y: i32, z: i32) -> bool {
+    let clear = |state| {
+        !reg.is_collision_shape_full_block(state)
+            && !reg.is_liquid(state)
+            && !reg.in_tag(state, "minecraft:prevent_mob_spawning_inside")
+    };
+    clear(block_at_dim(dim, x, y, z)) && clear(block_at_dim(dim, x, y + 1, z))
+}
+
+/// `LevelReader.getMaxLocalRawBrightness`: the larger of the sky and block
+/// light at the cell, from the settled/windowed light passes.
+fn live_light_at(clients: &[Arc<Client>], dim: DimId, x: i32, y: i32, z: i32) -> i32 {
+    let (cx, cz) = (x >> 4, z >> 4);
+    let sky = nibble_at_dim(&sky_light_sections_dim(dim, cx, cz), dim, x, y, z);
+    let sources = natural_spawn_light_sources(clients, dim, cx, cz);
+    let block = nibble_at_dim(
+        &block_light_sections_dim(dim, cx, cz, &sources),
+        dim,
+        x,
+        y,
+        z,
+    );
+    sky.max(block)
+}
+
+/// Non-spectator player positions in `dim`, the anchors every pass shares.
+fn live_spawn_anchors(clients: &[Arc<Client>], dim: DimId) -> Vec<[f64; 3]> {
+    clients
+        .iter()
+        .filter_map(|client| {
+            if client.is_spectator() || *client.dim.lock().unwrap() != dim {
+                return None;
+            }
+            let (x, y, z, ..) = *client.pos.lock().unwrap();
+            Some([x, y, z])
+        })
+        .collect()
+}
+
+/// The union of spawnable chunks the vanilla cap formula reads.
+fn live_spawn_chunks(players: &[[f64; 3]]) -> HashSet<(i32, i32)> {
+    let mut chunks = HashSet::new();
+    for &[x, _, z] in players {
+        extend_chunk_square(
+            &mut chunks,
+            ((x.floor() as i32).div_euclid(16), (z.floor() as i32).div_euclid(16)),
+            NATURAL_SPAWN_CHUNK_RADIUS,
+        );
+    }
+    chunks
+}
+
+/// The nearest-player distance gate vanilla applies to every category, plus a
+/// world-border membership check like the nightly pass'.
+fn live_spawn_position_ok(
+    players: &[[f64; 3]],
+    spawn_chunks: &HashSet<(i32, i32)>,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> bool {
+    if !spawn_chunks.contains(&(x >> 4, z >> 4)) {
+        return false;
+    }
+    let nearest_squared = players
+        .iter()
+        .map(|&[px, py, pz]| {
+            (px - (f64::from(x) + 0.5)).powi(2)
+                + (py - f64::from(y)).powi(2)
+                + (pz - (f64::from(z) + 0.5)).powi(2)
+        })
+        .fold(f64::INFINITY, f64::min);
+    if nearest_squared <= SPAWN_MIN_PLAYER_DIST_SQ {
+        return false;
+    }
+    let (min_x, min_z, max_x, max_z) = world_border().lock().unwrap().bounds(border_now_ms());
+    (min_x..max_x).contains(&f64::from(x)) && (min_z..max_z).contains(&f64::from(z))
+}
+
+/// One animal attempt: `Animal.checkAnimalSpawnRules` plus the brightness
+/// gate (`isBrightEnoughToSpawn`, light above 8) under the creature cap.
+fn live_passive_spawn_attempt(x: i32, y: i32, z: i32, light: i32, cap: usize, kind: &str) -> bool {
+    if live_category_count(DimId::Overworld, MobCategory::Creature) >= cap {
+        return false;
+    }
+    let Some(reg) = breg() else {
+        return false;
+    };
+    if reg.name_of(block_at(x, y - 1, z)) != "minecraft:grass_block"
+        || !live_spawn_clear(reg, DimId::Overworld, x, y, z)
+        || light <= 8
+    {
+        return false;
+    }
+    live_natural_spawn(
+        kind,
+        DimId::Overworld,
+        (f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5, 0.0, 0.0),
+    )
+}
+
+/// Daytime animal spawning: one weighted pick from the biome's `creature`
+/// spawners (the farm animals the runtime can simulate) plus a small group on
+/// jittered grass. Runs only outside the night window; the caller gates it.
+fn spawn_passive_natural(tick: u64) {
+    let clients = client_snapshot();
+    let players = live_spawn_anchors(&clients, DimId::Overworld);
+    if players.is_empty() || breg().is_none() {
+        return;
+    }
+    let spawn_chunks = live_spawn_chunks(&players);
+    let cap = MobCategory::Creature.global_cap(spawn_chunks.len() as u32) as usize;
+    if cap == 0 || live_category_count(DimId::Overworld, MobCategory::Creature) >= cap {
+        return;
+    }
+    let attempt = SPAWN_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+    let &[px, _, pz] = &players[attempt as usize % players.len()];
+    let angle = tick as f64 * 2.399;
+    let bx = (px + angle.cos() * 32.0).floor() as i32;
+    let bz = (pz + angle.sin() * 32.0).floor() as i32;
+    if !live_spawn_position_ok(&players, &spawn_chunks, bx, 64, bz) {
+        return;
+    }
+    let biome = worldgen::with_gen_dim(DimId::Overworld, |g| g.biome_name_at(bx, 64, bz))
+        .flatten()
+        .unwrap_or_else(|| "minecraft:plains".to_string());
+    const FARM_ANIMALS: [&str; 4] = [
+        "minecraft:sheep",
+        "minecraft:cow",
+        "minecraft:pig",
+        "minecraft:chicken",
+    ];
+    let entries: Vec<&feature::SpawnerData> = feature::spawners_for(&biome, "creature")
+        .unwrap_or_default()
+        .iter()
+        .filter(|entry| FARM_ANIMALS.contains(&entry.kind.as_str()))
+        .collect();
+    let total: i32 = entries.iter().map(|entry| entry.weight).sum();
+    if total <= 0 {
+        return;
+    }
+    let mut rng = generation_math::Lcg::new(
+        WORLD_SEED
+            .load(Ordering::Relaxed)
+            .wrapping_add(tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+    );
+    let mut roll = rng.next_bound(total);
+    let Some(entry) = entries.iter().find(|entry| {
+        roll -= entry.weight;
+        roll < 0
+    }) else {
+        return;
+    };
+    let span = (entry.max_count - entry.min_count + 1).max(1);
+    let count = entry.min_count + rng.next_bound(span);
+    for _ in 0..count {
+        let x = bx + rng.next_bound(5) - 2;
+        let z = bz + rng.next_bound(5) - 2;
+        if !live_spawn_position_ok(&players, &spawn_chunks, x, 64, z) {
+            continue;
+        }
+        let y = surface_y(x, z).floor() as i32;
+        let light = live_light_at(&clients, DimId::Overworld, x, y, z);
+        let kind = entry.kind.strip_prefix("minecraft:").unwrap_or(&entry.kind);
+        live_passive_spawn_attempt(x, y, z, light, cap, kind);
+    }
+}
+
+/// One water-mob attempt: the cell holds water in the sea-level band vanilla
+/// water spawning reads (50..=63), under the category's cap.
+fn live_aquatic_spawn_attempt(
+    x: i32,
+    y: i32,
+    z: i32,
+    category: MobCategory,
+    cap: usize,
+    kind: &str,
+) -> bool {
+    if !(50..=63).contains(&y)
+        || live_category_count(DimId::Overworld, category) >= cap
+    {
+        return false;
+    }
+    let Some(reg) = breg() else {
+        return false;
+    };
+    if reg.name_of(block_at(x, y, z)) != "minecraft:water" {
+        return false;
+    }
+    live_natural_spawn(
+        kind,
+        DimId::Overworld,
+        (f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5, 0.0, 0.0),
+    )
+}
+
+/// Water-column spawning: squid for `water_creature` and a cod/salmon school
+/// for `water_ambient`, each under its own cap like the vanilla category loop.
+fn spawn_aquatic_natural(tick: u64) {
+    let clients = client_snapshot();
+    let players = live_spawn_anchors(&clients, DimId::Overworld);
+    let Some(reg) = breg().filter(|_| !players.is_empty()) else {
+        return;
+    };
+    let spawn_chunks = live_spawn_chunks(&players);
+    for (category, kinds) in [
+        (MobCategory::WaterCreature, &["squid"][..]),
+        (MobCategory::WaterAmbient, &["cod", "salmon"][..]),
+    ] {
+        let cap = category.global_cap(spawn_chunks.len() as u32) as usize;
+        if cap == 0 || live_category_count(DimId::Overworld, category) >= cap {
+            continue;
+        }
+        let attempt = SPAWN_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+        let &[px, _, pz] = &players[attempt as usize % players.len()];
+        let angle = tick as f64 * 2.399 + category.index() as f64;
+        let bx = (px + angle.cos() * 32.0).floor() as i32;
+        let bz = (pz + angle.sin() * 32.0).floor() as i32;
+        if !live_spawn_position_ok(&players, &spawn_chunks, bx, 56, bz) {
+            continue;
+        }
+        let mut rng = generation_math::Lcg::new(
+            WORLD_SEED
+                .load(Ordering::Relaxed)
+                .wrapping_add(tick.wrapping_mul(0x85EB_CA6B)),
+        );
+        for _ in 0..4 {
+            let x = bx + rng.next_bound(7) - 3;
+            let z = bz + rng.next_bound(7) - 3;
+            if !live_spawn_position_ok(&players, &spawn_chunks, x, 56, z) {
+                continue;
+            }
+            let Some(y) = (50..=63)
+                .rev()
+                .find(|&y| reg.name_of(block_at(x, y, z)) == "minecraft:water")
+            else {
+                continue;
+            };
+            let kind = kinds[rng.next_bound(kinds.len() as i32) as usize];
+            live_aquatic_spawn_attempt(x, y, z, category, cap, kind);
+        }
+    }
+}
+
+/// One enderman attempt in the End: `end_stone` below, clear standing room,
+/// light level 7 or darker, under the hostile cap and a non-peaceful
+/// difficulty — `Monster.checkMonsterSpawnRules` for `the_end`.
+fn live_end_spawn_attempt(x: i32, y: i32, z: i32, light: i32, cap: usize) -> bool {
+    if DIFFICULTY.load(Ordering::Relaxed) == 0
+        || live_category_count(DimId::End, MobCategory::Monster) >= cap
+    {
+        return false;
+    }
+    let Some(reg) = breg() else {
+        return false;
+    };
+    if reg.name_of(block_at_dim(DimId::End, x, y - 1, z)) != "minecraft:end_stone"
+        || !live_spawn_clear(reg, DimId::End, x, y, z)
+        || light > 7
+    {
+        return false;
+    }
+    live_natural_spawn(
+        "enderman",
+        DimId::End,
+        (f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5, 0.0, 0.0),
+    )
+}
+
+/// The End's only natural spawn: endermen near End-resident players, gated by
+/// `doMobSpawning`, difficulty and the hostile cap like every monster pass.
+fn spawn_end_natural(tick: u64) {
+    if DIFFICULTY.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let clients = client_snapshot();
+    let players = live_spawn_anchors(&clients, DimId::End);
+    if players.is_empty() {
+        return;
+    }
+    let spawn_chunks = live_spawn_chunks(&players);
+    let cap = MobCategory::Monster.global_cap(spawn_chunks.len() as u32) as usize;
+    if cap == 0 || live_category_count(DimId::End, MobCategory::Monster) >= cap {
+        return;
+    }
+    let attempt = SPAWN_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+    let &[px, _, pz] = &players[attempt as usize % players.len()];
+    let angle = tick as f64 * 2.399;
+    let bx = (px + angle.cos() * 32.0).floor() as i32;
+    let bz = (pz + angle.sin() * 32.0).floor() as i32;
+    if !live_spawn_position_ok(&players, &spawn_chunks, bx, 64, bz) {
+        return;
+    }
+    let Some(reg) = breg() else {
+        return;
+    };
+    let mut rng = generation_math::Lcg::new(
+        WORLD_SEED
+            .load(Ordering::Relaxed)
+            .wrapping_add(tick.wrapping_mul(0x27D4_EB2F)),
+    );
+    for _ in 0..4 {
+        let x = bx + rng.next_bound(7) - 3;
+        let z = bz + rng.next_bound(7) - 3;
+        // The End surface: the first non-air cell below the spawn band.
+        let Some(y) = (DimId::End.min_y()..=128)
+            .rev()
+            .find(|&y| !reg.is_air(block_at_dim(DimId::End, x, y, z)))
+            .map(|y| y + 1)
+        else {
+            continue;
+        };
+        if !live_spawn_position_ok(&players, &spawn_chunks, x, y, z) {
+            continue;
+        }
+        let light = live_light_at(&clients, DimId::End, x, y, z);
+        live_end_spawn_attempt(x, y, z, light, cap);
+    }
+}
+
+/// Chunks whose first-visit creature herd already ran, per dimension. Vanilla
+/// attaches the pass to chunk creation; the live server marks each chunk the
+/// pass has seen, so a re-entered chunk never spawns a second herd.
+fn spawned_creature_chunks() -> &'static Mutex<HashSet<DimChunkKey>> {
+    static DONE: OnceLock<Mutex<HashSet<DimChunkKey>>> = OnceLock::new();
+    DONE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// The live `ChunkGenerationWorld` adapter for
+/// `spawn_mobs_for_chunk_generation`: surface placement against generated or
+/// overlaid terrain, and each accepted creature joins the live mob list.
+struct LiveChunkGenWorld {
+    dim: DimId,
+    added: usize,
+}
+
+impl spawner::ChunkGenerationWorld for LiveChunkGenWorld {
+    fn spawn_y(&mut self, x: i32, z: i32) -> i32 {
+        let base = if self.dim == DimId::Overworld {
+            surface_y(x, z).floor() as i32
+        } else {
+            height_at_dim(self.dim, x, z) + 1
+        };
+        // An edited block above the generated surface is the standing point,
+        // like the world-surface heightmap vanilla herds read.
+        let world = timed_world();
+        world
+            .get(&(self.dim, x >> 4, z >> 4))
+            .and_then(|cells| {
+                let reg = breg();
+                (base..self.dim.min_y() + self.dim.height())
+                    .rev()
+                    .find(|&y| {
+                        cells
+                            .get(&local_idx(x, y, z))
+                            .is_some_and(|&st| reg.is_none_or(|reg| !reg.is_air(st)))
+                    })
+                    .map(|y| y + 1)
+            })
+            .unwrap_or(base)
+    }
+
+    fn ground_spawnable(&mut self, _kind: &str, pos: (i32, i32, i32)) -> bool {
+        let Some(reg) = breg() else {
+            return false;
+        };
+        let below = block_at_dim(self.dim, pos.0, pos.1 - 1, pos.2);
+        (reg.name_of(below) == "minecraft:grass_block" || reg.side_solid(below, 1))
+            && live_spawn_clear(reg, self.dim, pos.0, pos.1, pos.2)
+    }
+
+    fn water_spawnable(&mut self, _kind: &str, pos: (i32, i32, i32)) -> bool {
+        breg().is_some_and(|reg| {
+            reg.name_of(block_at_dim(self.dim, pos.0, pos.1, pos.2)) == "minecraft:water"
+        })
+    }
+
+    fn air_spawnable(&mut self, _kind: &str, pos: (i32, i32, i32)) -> bool {
+        let Some(reg) = breg() else {
+            return false;
+        };
+        reg.is_air(block_at_dim(self.dim, pos.0, pos.1, pos.2))
+            && reg.is_air(block_at_dim(self.dim, pos.0, pos.1 + 1, pos.2))
+    }
+
+    fn add_creature(&mut self, kind: &str, pos: (i32, i32, i32)) {
+        if live_natural_spawn(
+            kind.strip_prefix("minecraft:").unwrap_or(kind),
+            self.dim,
+            (f64::from(pos.0) + 0.5, f64::from(pos.1), f64::from(pos.2) + 0.5, 0.0, 0.0),
+        ) {
+            self.added += 1;
+        }
+    }
+}
+
+/// `NaturalSpawner.spawnMobsForChunkGeneration` for one generated chunk: the
+/// call runs at most once per dimension+chunk, recorded in
+/// `spawned_creature_chunks` before the gamerule gate — a chunk created while
+/// `doMobSpawning` was off does not retroactively spawn a herd, matching the
+/// vanilla chunk-creation attachment. Returns whether the pass ran.
+fn live_chunkgen_visit(dim: DimId, cx: i32, cz: i32) -> bool {
+    if !spawned_creature_chunks().lock().unwrap().insert((dim, cx, cz)) {
+        return false;
+    }
+    live_chunkgen_run(dim, cx, cz, None)
+}
+
+/// Run the chunk-generation creature pass for the biome at the chunk centre.
+/// Split from the once-per-chunk gate so a test can pin the spawn mechanics
+/// separately from the visit tracking. Returns whether the pass executed.
+fn live_chunkgen_run(dim: DimId, cx: i32, cz: i32, probability: Option<f32>) -> bool {
+    if GR_MOB_SPAWNING.load(Ordering::Relaxed) != 1 {
+        return false;
+    }
+    let biome = worldgen::with_gen_dim(dim, |g| g.biome_name_at(cx * 16 + 8, 64, cz * 16 + 8))
+        .flatten()
+        .unwrap_or_else(|| "minecraft:plains".to_string());
+    let mut world = LiveChunkGenWorld { dim, added: 0 };
+    // Per-chunk seeded like the decoration random vanilla draws from: the same
+    // chunk replays the same herd under the same seed.
+    let mut rng = generation_math::Lcg::new(
+        WORLD_SEED
+            .load(Ordering::Relaxed)
+            .wrapping_add((cx as u64 & 0xffff_ffff) << 32 ^ (cz as u64 & 0xffff_ffff)),
+    );
+    spawner::spawn_mobs_for_chunk_generation(
+        cx,
+        cz,
+        &biome,
+        probability,
+        |b, category| {
+            feature::spawners_for(b, category)
+                .unwrap_or_default()
+                .iter()
+                .map(|entry| spawner::CreatureSpawnerData {
+                    kind: entry.kind.clone(),
+                    min_count: entry.min_count,
+                    max_count: entry.max_count,
+                    weight: entry.weight,
+                })
+                .collect()
+        },
+        &mut world,
+        &mut rng,
+    );
+    true
+}
+
+/// First-visit creature herds for the Overworld chunks players can see. Each
+/// chunk runs `spawn_mobs_for_chunk_generation` once; `doMobSpawning` gates
+/// the pass inside `live_chunkgen_run`.
+fn spawn_chunkgen_creatures(_tick: u64) {
+    let mut chunks = HashSet::new();
+    for client in client_snapshot() {
+        if client.is_spectator() || *client.dim.lock().unwrap() != DimId::Overworld {
+            continue;
+        }
+        let (x, _, z, ..) = *client.pos.lock().unwrap();
+        extend_chunk_square(
+            &mut chunks,
+            ((x.floor() as i32).div_euclid(16), (z.floor() as i32).div_euclid(16)),
+            4,
+        );
+    }
+    for (cx, cz) in chunks {
+        live_chunkgen_visit(DimId::Overworld, cx, cz);
     }
 }
 
@@ -12162,6 +12712,7 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     run("neoforge_player_tick", neoforge_player_tick);
     run("mobs", mob_tick);
     run("spawners", spawner_tick);
+    run("villager_raid", villager_raid_tick);
     run("carts", cart_tick);
     run("falling", falling_tick);
     run("random_ticks", random_tick_pass);
