@@ -19,6 +19,7 @@ pub mod model_baker;
 mod packed;
 mod region;
 mod section;
+pub mod shaderpack;
 pub mod upload_budget;
 pub mod visibility;
 
@@ -78,6 +79,14 @@ pub use region::{
     REGION_SECTIONS, REGION_X, REGION_Y, REGION_Z,
 };
 pub use section::*;
+pub use shaderpack::{
+    plan_shader_pipeline, preprocess_shader_source, AlphaTest, BlendDirective, CustomImage,
+    CustomTexture, GpuShaderCaps, IdMap, IdMatcher, IrisFeature, PackDimension, PackOrigin,
+    PassKind, PipelineStage, PreprocessedShader, Profile, ShaderCompatibilityReport, ShaderKind,
+    ShaderOption, ShaderPackError, ShaderPackSource, ShaderPass, ShaderProperties, ShadowSettings,
+    SsboSpec, MAX_INCLUDE_DEPTH, MAX_PACK_FILES, MAX_PACK_UNPACKED_BYTES, MAX_PROPERTIES_BYTES,
+    MAX_SHADER_FILE_BYTES, MAX_TOTAL_INCLUDES, MAX_ZIP_FILE_BYTES,
+};
 pub use upload_budget::{
     ChunkUploadBudget, DEFAULT_MAX_UPLOADS_PER_FRAME, DEFAULT_MAX_UPLOAD_BYTES_PER_FRAME,
     DEFAULT_MAX_UPLOAD_WORK_US_PER_FRAME, DEFAULT_MIN_UPLOADS_PER_FRAME, DEFAULT_TARGET_FRAME_US,
