@@ -74,6 +74,14 @@ impl RsDir {
         Self::HORIZONTAL.iter().position(|&dir| dir == self)
     }
 
+    fn axis(self) -> RsAxis {
+        match self {
+            Self::West | Self::East => RsAxis::X,
+            Self::Down | Self::Up => RsAxis::Y,
+            Self::North | Self::South => RsAxis::Z,
+        }
+    }
+
     fn from_property(value: &str) -> Option<Self> {
         Some(match value {
             "down" => Self::Down,
@@ -109,9 +117,26 @@ impl RsPos {
         Self(self.0 + dx, self.1 + dy, self.2 + dz)
     }
 
+    fn steps(self, dir: RsDir, count: i32) -> Self {
+        let (dx, dy, dz) = dir.offset();
+        Self(
+            self.0 + dx * count,
+            self.1 + dy * count,
+            self.2 + dz * count,
+        )
+    }
+
     fn above(self) -> Self {
         self.relative(RsDir::Up)
     }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RsAxis {
+    X,
+    Y,
+    Z,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -930,6 +955,538 @@ fn container_analog_output_signal(slots: &[(u32, u32)], num_slots: usize) -> u8 
     (1.0 + (14.0 * (fullness / num_slots as f32)).floor()).min(15.0) as u8
 }
 
+// ---------- Vanilla 1.21.1 analog comparator outputs ----------
+
+/// A block family's analog output inputs. `getAnalogOutputSignal` lives on the
+/// block (or its block entity) in vanilla; these are the exact per-family
+/// formulas from the 1.21.1 server classes.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug)]
+enum RsAnalogSource {
+    /// (item count, per-slot max stack) per occupied container slot; the
+    /// vanilla formula divides each by `min(item_max, container_max)`.
+    Container { slots: Vec<(u32, u32)>, num_slots: usize },
+    /// `LayeredCauldronBlock`: water and powder snow read LEVEL directly.
+    LayeredCauldron { level: u8 },
+    /// `LavaCauldronBlock` is a constant 3.
+    LavaCauldron,
+    /// `ComposterBlock` reads LEVEL (0..=8) directly.
+    Composter { level: u8 },
+    /// `CakeBlock.getOutputSignal`: `(7 - bites) * 2`.
+    Cake { bites: u8 },
+    /// `LecternBlockEntity.getRedstoneSignal`:
+    /// `floor(page/(pageCount-1) * 14) + 1`, or 15 for a one-page book; no
+    /// book means no comparator source at all.
+    Lectern { has_book: bool, page: u16, page_count: u16 },
+    /// `EndPortalFrameBlock`: 15 while HAS_EYE.
+    EndPortalFrame { eye: bool },
+    /// `RespawnAnchorBlock.getScaledAnalogOutput`:
+    /// `floor((charges - min) / (max - min) * 15)`.
+    RespawnAnchor { charges: u8 },
+    /// `DecoratedPotBlock` defers to the one-slot container formula.
+    DecoratedPot { count: u32, max_stack: u32 },
+    /// `ChiseledBookShelfBlock`: `lastInteractedSlot + 1`, 0 with no last slot.
+    ChiseledBookshelf { last_slot: Option<u8> },
+    /// `BeehiveBlock` reads HONEY_LEVEL (0..=5) directly.
+    Beehive { honey_level: u8 },
+    /// `JukeboxBlockEntity`: the loaded record's jukebox_song
+    /// `comparator_output`, or 0 when empty.
+    Jukebox { song_output: Option<u8> },
+    /// `CommandBlock`: the command chain's success count.
+    CommandBlock { success_count: i32 },
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_comparator_signal(source: &RsAnalogSource) -> u8 {
+    match source {
+        RsAnalogSource::Container { slots, num_slots } => {
+            container_analog_output_signal(slots, *num_slots)
+        }
+        RsAnalogSource::LayeredCauldron { level } => (*level).min(3),
+        RsAnalogSource::LavaCauldron => 3,
+        RsAnalogSource::Composter { level } => (*level).min(8),
+        RsAnalogSource::Cake { bites } => 7u8.saturating_sub((*bites).min(6)) * 2,
+        RsAnalogSource::Lectern {
+            has_book,
+            page,
+            page_count,
+        } => {
+            if !*has_book {
+                return 0;
+            }
+            let ratio = if *page_count > 1 {
+                (*page).min(*page_count - 1) as f32 / (*page_count - 1) as f32
+            } else {
+                1.0
+            };
+            ((ratio * 14.0).floor() as u8 + 1).min(15)
+        }
+        RsAnalogSource::EndPortalFrame { eye } => u8::from(*eye) * 15,
+        RsAnalogSource::RespawnAnchor { charges } => {
+            ((*charges).min(4) as f32 / 4.0 * 15.0).floor() as u8
+        }
+        RsAnalogSource::DecoratedPot { count, max_stack } => {
+            container_analog_output_signal(&[(*count, *max_stack)], 1)
+        }
+        RsAnalogSource::ChiseledBookshelf { last_slot } => {
+            last_slot.map_or(0, |slot| slot.min(5) + 1)
+        }
+        RsAnalogSource::Beehive { honey_level } => (*honey_level).min(5),
+        RsAnalogSource::Jukebox { song_output } => song_output.unwrap_or(0).min(15),
+        RsAnalogSource::CommandBlock { success_count } => {
+            (*success_count).clamp(0, 15) as u8
+        }
+    }
+}
+
+/// Vanilla 1.21.1 jukebox_song `comparator_output` values (the record item's
+/// registry entry), by disc item name.
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_jukebox_song_output(disc: &str) -> Option<u8> {
+    Some(match disc {
+        "music_disc_13" => 1,
+        "music_disc_cat" => 2,
+        "music_disc_blocks" => 3,
+        "music_disc_chirp" => 4,
+        "music_disc_far" => 5,
+        "music_disc_mall" => 6,
+        "music_disc_mellohi" => 7,
+        "music_disc_stal" => 8,
+        "music_disc_strad" => 9,
+        "music_disc_ward" => 10,
+        "music_disc_11" | "music_disc_creator_music_box" => 11,
+        "music_disc_wait" | "music_disc_creator" => 12,
+        "music_disc_pigstep" | "music_disc_precipice" => 13,
+        "music_disc_otherside" | "music_disc_relic" => 14,
+        "music_disc_5" => 15,
+        _ => return None,
+    })
+}
+
+// ---------- Vanilla 1.21.1 target block (dog) ----------
+
+const RS_TARGET_PROJECTILE_PULSE_TICKS: u64 = 20;
+const RS_TARGET_PULSE_TICKS: u64 = 8;
+
+/// `TargetBlock.getSignal` (dog): the radial hit strength in the plane
+/// perpendicular to the hit face — `max(1, ceil(15 * (0.5 - d) / 0.5))` where
+/// `d` is the larger of the two perpendicular |frac(coord) - 0.5| offsets.
+/// Arrows and other projectiles get the same signal; the projectile flag only
+/// sets the longer power-off schedule.
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_target_block_signal(hit: [f64; 3], face_axis: RsAxis) -> u8 {
+    let frac = |v: f64| (v - v.floor()).abs();
+    let dx = (frac(hit[0]) - 0.5).abs();
+    let dy = (frac(hit[1]) - 0.5).abs();
+    let dz = (frac(hit[2]) - 0.5).abs();
+    let d = match face_axis {
+        RsAxis::X => dy.max(dz),
+        RsAxis::Y => dx.max(dz),
+        RsAxis::Z => dx.max(dy),
+    };
+    let t = ((0.5 - d) / 0.5).clamp(0.0, 1.0);
+    ((15.0 * t).ceil() as u8).max(1)
+}
+
+/// The power-off delay `TargetBlock` schedules: 20 game ticks for arrows
+/// (`instanceof AbstractArrow`), 8 for every other projectile.
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_target_pulse_ticks(arrow: bool) -> u64 {
+    if arrow {
+        RS_TARGET_PROJECTILE_PULSE_TICKS
+    } else {
+        RS_TARGET_PULSE_TICKS
+    }
+}
+
+// ---------- Vanilla 1.21.1 piston push model (dsv/dsz) ----------
+
+/// `PistonBaseBlock#MAX_PUSH` / `PistonStructureResolver#a`.
+const RS_PISTON_MAX_PUSH: usize = 12;
+
+/// `PushReaction` (epj) as it affects `isPushable`.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RsPushReaction {
+    #[default]
+    Normal,
+    /// Breaks instead of moving when *pushed* (torches, flowers, crops, snow).
+    Destroy,
+    /// Never movable (moving_piston, spawners via BLOCK, ...).
+    Block,
+    /// Only pushable in the piston's facing direction.
+    PushOnly,
+}
+
+/// Slime/honey glue families (`isStickyBlock`).
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RsSticky {
+    #[default]
+    None,
+    Slime,
+    Honey,
+}
+
+impl RsSticky {
+    fn sticks(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+/// Everything `isPushable` (dsv.a) reads off a block state.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default)]
+struct RsPushBlock {
+    air: bool,
+    /// The hard-coded list: obsidian, crying_obsidian, respawn_anchor,
+    /// reinforced_deepslate.
+    immovable: bool,
+    /// `destroySpeed == -1`: bedrock, barrier, end_portal_frame, command
+    /// blocks, spawners, structure blocks, portals/gateways.
+    unbreakable: bool,
+    /// A piston or sticky_piston body (retracted bases are pushable, extended
+    /// ones are not and skip the breakability/reaction checks).
+    piston_base: bool,
+    extended: bool,
+    /// `hasBlockEntity`: chests, furnaces, signs and every other BE block.
+    block_entity: bool,
+    reaction: RsPushReaction,
+    sticky: RsSticky,
+}
+
+/// `PistonBaseBlock.isPushable` minus the world-border checks, which the
+/// resolver applies separately via `rs_piston_is_pushable_at`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_piston_is_pushable(
+    block: &RsPushBlock,
+    allow_destroy: bool,
+    same_direction: bool,
+) -> bool {
+    if block.air {
+        return true;
+    }
+    if block.immovable {
+        return false;
+    }
+    if block.piston_base {
+        if block.extended {
+            return false;
+        }
+    } else {
+        if block.unbreakable {
+            return false;
+        }
+        match block.reaction {
+            RsPushReaction::Block => return false,
+            RsPushReaction::Destroy => return allow_destroy,
+            RsPushReaction::PushOnly => return same_direction,
+            RsPushReaction::Normal => {}
+        }
+    }
+    !block.block_entity
+}
+
+/// `PistonStructureResolver.canStickToEachOther` (dsz.a(dtc,dtc)): slime and
+/// honey never stick to each other; otherwise the pair sticks when either side
+/// is sticky — a sticky block also drags plain pushable neighbours.
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_piston_can_stick(front: RsSticky, back: RsSticky) -> bool {
+    match (front, back) {
+        (RsSticky::Slime, RsSticky::Honey) | (RsSticky::Honey, RsSticky::Slime) => false,
+        _ => front.sticks() || back.sticks(),
+    }
+}
+
+/// The block-storage half of `PistonStructureResolver`: a position lookup plus
+/// the vanilla `isPushable` world bounds (build height, world border).
+#[cfg_attr(not(test), allow(dead_code))]
+trait RsPistonWorld {
+    fn piston_block(&self, pos: RsPos) -> RsPushBlock;
+    fn in_world_border(&self, _pos: RsPos) -> bool {
+        true
+    }
+    /// (min_y, max_y) build range, like `level.getMinBuildHeight() /
+    /// getMaxBuildHeight()`.
+    fn build_height(&self) -> (i32, i32) {
+        (i32::MIN / 2, i32::MAX / 2)
+    }
+}
+
+/// The world-border half of `PistonBaseBlock.isPushable`: out-of-bounds and
+/// build-edge moves are refused before the block itself is examined.
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_piston_is_pushable_at(
+    world: &impl RsPistonWorld,
+    pos: RsPos,
+    move_dir: RsDir,
+    allow_destroy: bool,
+    piston_facing: RsDir,
+) -> bool {
+    let (min_y, max_y) = world.build_height();
+    if pos.1 < min_y || pos.1 > max_y - 1 || !world.in_world_border(pos) {
+        return false;
+    }
+    let block = world.piston_block(pos);
+    if block.air {
+        return true;
+    }
+    if block.immovable {
+        return false;
+    }
+    if move_dir == RsDir::Down && pos.1 == min_y {
+        return false;
+    }
+    if move_dir == RsDir::Up && pos.1 == max_y - 1 {
+        return false;
+    }
+    rs_piston_is_pushable(&block, allow_destroy, move_dir == piston_facing)
+}
+
+/// The resolver outcome: every cell the piston actually moves plus the cells
+/// whose `DESTROY` reaction ends a push line.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RsPistonPlan {
+    to_move: Vec<RsPos>,
+    to_destroy: Vec<RsPos>,
+}
+
+/// Faithful port of `PistonStructureResolver` (dsz): extension walks forward
+/// from the piston face, retraction starts two cells out and pulls. `None`
+/// means vanilla `resolve()` returned false — nothing moves.
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_piston_resolve(
+    world: &impl RsPistonWorld,
+    piston_pos: RsPos,
+    piston_facing: RsDir,
+    extending: bool,
+) -> Option<RsPistonPlan> {
+    let (push_dir, start) = if extending {
+        (piston_facing, piston_pos.relative(piston_facing))
+    } else {
+        (piston_facing.opposite(), piston_pos.steps(piston_facing, 2))
+    };
+    let mut resolver = RsPistonResolver {
+        world,
+        piston_pos,
+        push_dir,
+        to_move: Vec::new(),
+        to_destroy: Vec::new(),
+    };
+    let head = world.piston_block(start);
+    if !rs_piston_is_pushable_at(world, start, push_dir, false, piston_facing) {
+        return if extending && head.reaction == RsPushReaction::Destroy {
+            Some(RsPistonPlan {
+                to_move: Vec::new(),
+                to_destroy: vec![start],
+            })
+        } else {
+            None
+        };
+    }
+    if !resolver.add_block_line(start, push_dir) {
+        return None;
+    }
+    let mut index = 0;
+    while index < resolver.to_move.len() {
+        let pos = resolver.to_move[index];
+        let block = world.piston_block(pos);
+        if block.sticky.sticks() && !resolver.add_branching_blocks(pos) {
+            return None;
+        }
+        index += 1;
+    }
+    Some(RsPistonPlan {
+        to_move: resolver.to_move,
+        to_destroy: resolver.to_destroy,
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+struct RsPistonResolver<'w, W: RsPistonWorld> {
+    world: &'w W,
+    piston_pos: RsPos,
+    push_dir: RsDir,
+    to_move: Vec<RsPos>,
+    to_destroy: Vec<RsPos>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl<W: RsPistonWorld> RsPistonResolver<'_, W> {
+    /// `addBlockLine`: walk the line from `pos` along `push_dir`, pulling a
+    /// sticky chain behind the anchor first, then walking forward until air,
+    /// a DESTROY block, an immovable block, or the 12-block cap.
+    fn add_block_line(&mut self, pos: RsPos, dir: RsDir) -> bool {
+        let mut state = self.world.piston_block(pos);
+        if state.air
+            || !rs_piston_is_pushable_at(self.world, pos, self.push_dir, false, dir)
+            || pos == self.piston_pos
+            || self.to_move.contains(&pos)
+        {
+            return true;
+        }
+
+        let mut back_count = 1usize;
+        if back_count + self.to_move.len() > RS_PISTON_MAX_PUSH {
+            return false;
+        }
+        while state.sticky.sticks() {
+            let back = pos.steps(self.push_dir.opposite(), back_count as i32);
+            let prev = state;
+            state = self.world.piston_block(back);
+            if state.air
+                || !rs_piston_can_stick(prev.sticky, state.sticky)
+                || !rs_piston_is_pushable_at(
+                    self.world,
+                    back,
+                    self.push_dir,
+                    false,
+                    self.push_dir.opposite(),
+                )
+                || back == self.piston_pos
+            {
+                break;
+            }
+            back_count += 1;
+            if back_count + self.to_move.len() > RS_PISTON_MAX_PUSH {
+                return false;
+            }
+        }
+
+        let mut added = 0usize;
+        for step in (0..back_count).rev() {
+            self.to_move
+                .push(pos.steps(self.push_dir.opposite(), step as i32));
+            added += 1;
+        }
+
+        let mut ahead = 1i32;
+        loop {
+            let front = pos.steps(self.push_dir, ahead);
+            if let Some(collision) = self.to_move.iter().position(|&p| p == front) {
+                reorder_list_at_collision(&mut self.to_move, added, collision);
+                for index in 0..=collision + added {
+                    let cell = self.to_move[index];
+                    let block = self.world.piston_block(cell);
+                    if block.sticky.sticks() && !self.add_branching_blocks(cell) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            state = self.world.piston_block(front);
+            if state.air {
+                return true;
+            }
+            if !rs_piston_is_pushable_at(self.world, front, self.push_dir, true, self.push_dir)
+                || front == self.piston_pos
+            {
+                return false;
+            }
+            if state.reaction == RsPushReaction::Destroy {
+                self.to_destroy.push(front);
+                return true;
+            }
+            if self.to_move.len() >= RS_PISTON_MAX_PUSH {
+                return false;
+            }
+            self.to_move.push(front);
+            added += 1;
+            ahead += 1;
+        }
+    }
+
+    /// `addBranchingBlocks`: sticky cells pull perpendicular neighbours that
+    /// `canStickToEachOther` matches; each pulled neighbour resolves its own
+    /// line along that branch direction.
+    fn add_branching_blocks(&mut self, pos: RsPos) -> bool {
+        let state = self.world.piston_block(pos);
+        let push_axis = self.push_dir.axis();
+        for dir in RsDir::ALL {
+            if dir.axis() == push_axis {
+                continue;
+            }
+            let neighbour = pos.relative(dir);
+            let neighbour_state = self.world.piston_block(neighbour);
+            if rs_piston_can_stick(neighbour_state.sticky, state.sticky)
+                && !self.add_block_line(neighbour, dir)
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// `reorderListAtCollision` (dsz.a(int,int)): the newly walked segment is
+/// spliced in right after the cell it collided with.
+#[cfg_attr(not(test), allow(dead_code))]
+fn reorder_list_at_collision(to_move: &mut Vec<RsPos>, added: usize, collision: usize) {
+    let tail_start = to_move.len() - added;
+    let mut reordered = Vec::with_capacity(to_move.len());
+    reordered.extend_from_slice(&to_move[..collision]);
+    reordered.extend_from_slice(&to_move[tail_start..]);
+    reordered.extend_from_slice(&to_move[collision..tail_start]);
+    *to_move = reordered;
+}
+
+/// A `moving_piston` block entity still extending when its base retracts.
+/// `progress` is `getProgress(0)` in [0, 1); `last_ticked` is the block
+/// entity's last ticked game time.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+struct RsMovingPiston {
+    progress: f32,
+    last_ticked: u64,
+}
+
+/// Vanilla `PistonBaseBlock.checkIfExtend` retraction events: a sticky piston
+/// that is switched off while the block it pushed is still a mid-extension
+/// `moving_piston` (`progress < 0.5`, same tick, or during tick processing)
+/// fires block-event `2` — it "drops" the pushed block instead of pulling it.
+/// Event `1` is the normal pull-back. This is the 1-tick pulse rule.
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_piston_retraction_event(
+    sticky: bool,
+    moving_extension: Option<RsMovingPiston>,
+    now: u64,
+    handling_tick: bool,
+) -> u8 {
+    const EVENT_PULL: u8 = 1;
+    const EVENT_DROP: u8 = 2;
+    if !sticky {
+        return EVENT_PULL;
+    }
+    match moving_extension {
+        Some(moving)
+            if moving.progress < 0.5 || moving.last_ticked == now || handling_tick =>
+        {
+            EVENT_DROP
+        }
+        _ => EVENT_PULL,
+    }
+}
+
+// ---------- Vanilla 1.21.1 observer (dlj) ----------
+
+/// `ObserverBlock`: the 2-game-tick delay between scheduling and each state
+/// flip, which is also the whole powered pulse width.
+const RS_OBSERVER_PULSE_TICKS: u64 = 2;
+
+/// Vanilla `ObserverBlock.updateShape`: a change at the observed face
+/// schedules the next tick, but only while unpowered — a lit observer ignores
+/// further updates until its pulse ends.
+#[cfg_attr(not(test), allow(dead_code))]
+fn rs_observer_neighbor_update(world: &mut impl RedstoneUpdates, pos: RsPos, changed: RsPos) {
+    let RsBlock::Observer { facing, powered } = world.redstone_block(pos) else {
+        return;
+    };
+    if !powered && pos.relative(facing) == changed {
+        world.schedule(pos, RS_OBSERVER_PULSE_TICKS, RsTickPriority::Normal);
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn is_piston_powered(world: &impl RedstoneWorld, pos: RsPos, facing: RsDir) -> bool {
     RsDir::ALL.into_iter().any(|dir| {
@@ -1417,6 +1974,23 @@ fn rs_run_tick(world: &mut impl RedstoneUpdates, pos: RsPos, now: u64) {
         RsBlock::Dispenser { .. } | RsBlock::Dropper { .. } => {
             world.dispense(pos);
             block
+        }
+        // Vanilla ObserverBlock.tick: a powered observer turns off; an
+        // unpowered one turns on and schedules the off-edge 2 ticks out, so
+        // each observed change produces a 2-game-tick high pulse.
+        RsBlock::Observer { facing, powered } => {
+            if powered {
+                RsBlock::Observer {
+                    facing,
+                    powered: false,
+                }
+            } else {
+                world.schedule(pos, RS_OBSERVER_PULSE_TICKS, RsTickPriority::Normal);
+                RsBlock::Observer {
+                    facing,
+                    powered: true,
+                }
+            }
         }
         _ => block,
     };
@@ -3300,5 +3874,637 @@ mod redstone_tests {
             Some("inactive")
         );
         assert_eq!(prop(&world, loud, "power").as_deref(), Some("0"));
+    }
+}
+
+#[cfg(test)]
+mod p4b_parity_tests {
+    use super::*;
+
+    fn push_cell(
+        cells: &mut std::collections::BTreeMap<RsPos, RsPushBlock>,
+        x: i32,
+        y: i32,
+        z: i32,
+        block: RsPushBlock,
+    ) {
+        cells.insert(RsPos(x, y, z), block);
+    }
+
+    fn movable() -> RsPushBlock {
+        RsPushBlock::default()
+    }
+
+    fn slime() -> RsPushBlock {
+        RsPushBlock {
+            sticky: RsSticky::Slime,
+            ..Default::default()
+        }
+    }
+
+    struct LineWorld {
+        cells: std::collections::BTreeMap<RsPos, RsPushBlock>,
+    }
+
+    impl RsPistonWorld for LineWorld {
+        fn piston_block(&self, pos: RsPos) -> RsPushBlock {
+            self.cells.get(&pos).copied().unwrap_or(RsPushBlock {
+                air: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[test]
+    fn p4b_parity_comparator_analog_containers_empty_one_full() {
+        // Inventory fill: empty=0, any non-empty floor(14*fill)+1, full=15.
+        let empty = RsAnalogSource::Container {
+            slots: vec![],
+            num_slots: 27,
+        };
+        assert_eq!(rs_comparator_signal(&empty), 0);
+        // A single item in a 27-slot chest still emits 1, not 0.
+        let one = RsAnalogSource::Container {
+            slots: vec![(1, 64)],
+            num_slots: 27,
+        };
+        assert_eq!(rs_comparator_signal(&one), 1);
+        // One full stack in 27 slots: floor(14/27)+1 = 1.
+        let stack = RsAnalogSource::Container {
+            slots: vec![(64, 64)],
+            num_slots: 27,
+        };
+        assert_eq!(rs_comparator_signal(&stack), 1);
+        // Half of 27 stacks: floor(14*0.5)+1 = 8.
+        let half = RsAnalogSource::Container {
+            slots: vec![(64, 64); 14].into_iter().take(13).chain([(32, 64)]).collect(),
+            num_slots: 27,
+        };
+        assert_eq!(rs_comparator_signal(&half), 8);
+        // Full 27 stacks of 64 -> 15.
+        let full = RsAnalogSource::Container {
+            slots: vec![(64, 64); 27],
+            num_slots: 27,
+        };
+        assert_eq!(rs_comparator_signal(&full), 15);
+        // Furnace-style 3 slots: one item -> floor(14*(1/64)/3)+1 = 1.
+        let furnace = RsAnalogSource::Container {
+            slots: vec![(1, 64)],
+            num_slots: 3,
+        };
+        assert_eq!(rs_comparator_signal(&furnace), 1);
+    }
+
+    #[test]
+    fn p4b_parity_comparator_analog_all_block_families() {
+        // Layered cauldrons read LEVEL directly; lava is a constant 3.
+        for level in 0..=3 {
+            assert_eq!(
+                rs_comparator_signal(&RsAnalogSource::LayeredCauldron { level }),
+                level
+            );
+        }
+        assert_eq!(rs_comparator_signal(&RsAnalogSource::LavaCauldron), 3);
+        // Composter: raw 0..=8 level.
+        for level in 0..=8 {
+            assert_eq!(
+                rs_comparator_signal(&RsAnalogSource::Composter { level }),
+                level
+            );
+        }
+        // Cake: (7 - bites) * 2 -> 14 down to 2.
+        for bites in 0..=6 {
+            assert_eq!(
+                rs_comparator_signal(&RsAnalogSource::Cake { bites }),
+                (7 - bites) * 2
+            );
+        }
+        // Lectern: floor(page/(count-1)*14)+1, 15 for a 1-page book, 0 empty.
+        assert_eq!(
+            rs_comparator_signal(&RsAnalogSource::Lectern {
+                has_book: true,
+                page: 0,
+                page_count: 1
+            }),
+            15
+        );
+        assert_eq!(
+            rs_comparator_signal(&RsAnalogSource::Lectern {
+                has_book: true,
+                page: 0,
+                page_count: 10
+            }),
+            1
+        );
+        assert_eq!(
+            rs_comparator_signal(&RsAnalogSource::Lectern {
+                has_book: true,
+                page: 9,
+                page_count: 10
+            }),
+            15
+        );
+        assert_eq!(
+            rs_comparator_signal(&RsAnalogSource::Lectern {
+                has_book: true,
+                page: 4,
+                page_count: 9
+            }),
+            8
+        );
+        assert_eq!(
+            rs_comparator_signal(&RsAnalogSource::Lectern {
+                has_book: false,
+                page: 0,
+                page_count: 0
+            }),
+            0
+        );
+        // End portal frame: 15 only with the eye inserted.
+        assert_eq!(
+            rs_comparator_signal(&RsAnalogSource::EndPortalFrame { eye: true }),
+            15
+        );
+        assert_eq!(
+            rs_comparator_signal(&RsAnalogSource::EndPortalFrame { eye: false }),
+            0
+        );
+        // Respawn anchor: floor(charges/4 * 15) -> 0, 3, 7, 11, 15.
+        for (charges, signal) in [(0u8, 0u8), (1, 3), (2, 7), (3, 11), (4, 15)] {
+            assert_eq!(
+                rs_comparator_signal(&RsAnalogSource::RespawnAnchor { charges }),
+                signal,
+                "charges {charges}"
+            );
+        }
+        // Decorated pot: single-slot container formula.
+        assert_eq!(
+            rs_comparator_signal(&RsAnalogSource::DecoratedPot {
+                count: 0,
+                max_stack: 64
+            }),
+            0
+        );
+        assert_eq!(
+            rs_comparator_signal(&RsAnalogSource::DecoratedPot {
+                count: 1,
+                max_stack: 64
+            }),
+            1
+        );
+        assert_eq!(
+            rs_comparator_signal(&RsAnalogSource::DecoratedPot {
+                count: 64,
+                max_stack: 64
+            }),
+            15
+        );
+        // Chiseled bookshelf: last interacted slot + 1, 0 when none.
+        assert_eq!(
+            rs_comparator_signal(&RsAnalogSource::ChiseledBookshelf { last_slot: None }),
+            0
+        );
+        for slot in 0..6u8 {
+            assert_eq!(
+                rs_comparator_signal(&RsAnalogSource::ChiseledBookshelf {
+                    last_slot: Some(slot)
+                }),
+                slot + 1
+            );
+        }
+        // Beehive/bee nest reads honey level 0..=5 directly.
+        for level in 0..=5 {
+            assert_eq!(
+                rs_comparator_signal(&RsAnalogSource::Beehive { honey_level: level }),
+                level
+            );
+        }
+        // Jukebox: the song's comparator_output; verify the 1.21.1 table and
+        // that vanilla values (5 -> 15, pigstep -> 13) match the jar data.
+        assert_eq!(rs_jukebox_song_output("music_disc_13"), Some(1));
+        assert_eq!(rs_jukebox_song_output("music_disc_cat"), Some(2));
+        assert_eq!(rs_jukebox_song_output("music_disc_11"), Some(11));
+        assert_eq!(rs_jukebox_song_output("music_disc_creator_music_box"), Some(11));
+        assert_eq!(rs_jukebox_song_output("music_disc_wait"), Some(12));
+        assert_eq!(rs_jukebox_song_output("music_disc_creator"), Some(12));
+        assert_eq!(rs_jukebox_song_output("music_disc_pigstep"), Some(13));
+        assert_eq!(rs_jukebox_song_output("music_disc_precipice"), Some(13));
+        assert_eq!(rs_jukebox_song_output("music_disc_otherside"), Some(14));
+        assert_eq!(rs_jukebox_song_output("music_disc_relic"), Some(14));
+        assert_eq!(rs_jukebox_song_output("music_disc_5"), Some(15));
+        assert_eq!(rs_jukebox_song_output("music_disc_rellic"), None);
+        assert_eq!(
+            rs_comparator_signal(&RsAnalogSource::Jukebox {
+                song_output: rs_jukebox_song_output("music_disc_ward")
+            }),
+            10
+        );
+        assert_eq!(
+            rs_comparator_signal(&RsAnalogSource::Jukebox { song_output: None }),
+            0
+        );
+        // Command block passes the success counter through.
+        assert_eq!(
+            rs_comparator_signal(&RsAnalogSource::CommandBlock { success_count: 7 }),
+            7
+        );
+        assert_eq!(
+            rs_comparator_signal(&RsAnalogSource::CommandBlock { success_count: -1 }),
+            0
+        );
+    }
+
+    #[test]
+    fn p4b_parity_target_block_bullseye_vs_edge() {
+        // Bullseye on a horizontal face: x/z fractions both 0.5 -> 15.
+        assert_eq!(rs_target_block_signal([0.5, 0.0, 0.5], RsAxis::Y), 15);
+        // Dead-center hits on every face axis -> 15.
+        for axis in [RsAxis::X, RsAxis::Y, RsAxis::Z] {
+            assert_eq!(rs_target_block_signal([0.5, 0.5, 0.5], axis), 15);
+        }
+        // Grazing the block edge: perpendicular distance ~0.5 -> signal 1.
+        assert_eq!(rs_target_block_signal([0.99, 0.0, 0.5], RsAxis::Y), 1);
+        assert_eq!(rs_target_block_signal([0.5, 0.0, 0.99], RsAxis::Y), 1);
+        // Halfway between center and edge: |0.75 - 0.5| = 0.25
+        // -> ceil(15 * (0.5 - 0.25) / 0.5) = ceil(7.5) = 8.
+        assert_eq!(rs_target_block_signal([0.75, 0.0, 0.5], RsAxis::Y), 8);
+        // The ignored axis does not count: on an X face only y/z matter.
+        assert_eq!(rs_target_block_signal([0.0, 0.5, 0.5], RsAxis::X), 15);
+        assert_eq!(rs_target_block_signal([0.0, 0.0, 0.5], RsAxis::X), 1);
+        // The larger of the two perpendicular offsets dominates.
+        assert_eq!(rs_target_block_signal([0.0, 0.99, 0.5], RsAxis::X), 1);
+        assert_eq!(rs_target_block_signal([0.0, 0.75, 0.5], RsAxis::X), 8);
+        // Negative coordinates fraction-wrap like Mth.frac.
+        assert_eq!(rs_target_block_signal([-8.5, 0.0, -3.5], RsAxis::Y), 15);
+        // Pulse lengths: 20 game ticks for arrows, 8 otherwise.
+        assert_eq!(rs_target_pulse_ticks(true), 20);
+        assert_eq!(rs_target_pulse_ticks(false), 8);
+    }
+
+    #[test]
+    fn p4b_parity_piston_is_pushable_truth_table() {
+        let air = RsPushBlock {
+            air: true,
+            ..Default::default()
+        };
+        assert!(rs_piston_is_pushable(&air, false, false));
+        // Vanilla hard-coded immovable: obsidian, crying obsidian, respawn
+        // anchor, reinforced deepslate.
+        let obsidian = RsPushBlock {
+            immovable: true,
+            ..Default::default()
+        };
+        assert!(!rs_piston_is_pushable(&obsidian, true, true));
+        // destroySpeed -1: bedrock, barrier, end_portal_frame, spawner,
+        // command blocks, structure blocks.
+        let bedrock = RsPushBlock {
+            unbreakable: true,
+            ..Default::default()
+        };
+        assert!(!rs_piston_is_pushable(&bedrock, true, true));
+        // Extended pistons never move; retracted ones are pushable.
+        let extended = RsPushBlock {
+            piston_base: true,
+            extended: true,
+            ..Default::default()
+        };
+        assert!(!rs_piston_is_pushable(&extended, true, true));
+        let retracted = RsPushBlock {
+            piston_base: true,
+            ..Default::default()
+        };
+        assert!(rs_piston_is_pushable(&retracted, true, true));
+        // PushReaction::BLOCK is immovable.
+        let blocked = RsPushBlock {
+            reaction: RsPushReaction::Block,
+            ..Default::default()
+        };
+        assert!(!rs_piston_is_pushable(&blocked, true, true));
+        // DESTROY only resolves when the resolver allows breaking (the
+        // forward walk passes allow_destroy=true).
+        let torch = RsPushBlock {
+            reaction: RsPushReaction::Destroy,
+            ..Default::default()
+        };
+        assert!(rs_piston_is_pushable(&torch, true, true));
+        assert!(!rs_piston_is_pushable(&torch, false, true));
+        // PUSH_ONLY only moves in the piston's facing direction.
+        let glazed = RsPushBlock {
+            reaction: RsPushReaction::PushOnly,
+            ..Default::default()
+        };
+        assert!(rs_piston_is_pushable(&glazed, false, true));
+        assert!(!rs_piston_is_pushable(&glazed, false, false));
+        // Block entities never push.
+        let chest = RsPushBlock {
+            block_entity: true,
+            ..Default::default()
+        };
+        assert!(!rs_piston_is_pushable(&chest, true, true));
+        // Slime/honey mutual exclusion, both stick to plain blocks.
+        assert!(rs_piston_can_stick(RsSticky::Slime, RsSticky::None));
+        assert!(rs_piston_can_stick(RsSticky::Honey, RsSticky::None));
+        assert!(rs_piston_can_stick(RsSticky::Slime, RsSticky::Slime));
+        assert!(rs_piston_can_stick(RsSticky::Honey, RsSticky::Honey));
+        assert!(!rs_piston_can_stick(RsSticky::Slime, RsSticky::Honey));
+        assert!(!rs_piston_can_stick(RsSticky::Honey, RsSticky::Slime));
+        assert!(!rs_piston_can_stick(RsSticky::None, RsSticky::None));
+    }
+
+    #[test]
+    fn p4b_parity_piston_twelve_block_push_cap() {
+        // 12 movable cells ahead of the piston resolve fine.
+        let mut cells = std::collections::BTreeMap::new();
+        for i in 1..=12 {
+            push_cell(&mut cells, i, 0, 0, movable());
+        }
+        let world = LineWorld { cells };
+        let plan = rs_piston_resolve(&world, RsPos(0, 0, 0), RsDir::East, true)
+            .expect("12 blocks push");
+        assert_eq!(plan.to_move.len(), 12);
+        assert_eq!(plan.to_move[0], RsPos(1, 0, 0));
+        assert_eq!(plan.to_move[11], RsPos(12, 0, 0));
+
+        // The 13th cell breaks the resolve.
+        let mut cells = std::collections::BTreeMap::new();
+        for i in 1..=13 {
+            push_cell(&mut cells, i, 0, 0, movable());
+        }
+        let world = LineWorld { cells };
+        assert_eq!(
+            rs_piston_resolve(&world, RsPos(0, 0, 0), RsDir::East, true),
+            None,
+            "13 blocks must fail"
+        );
+
+        // An immovable cell anywhere in the line blocks everything.
+        let mut cells = std::collections::BTreeMap::new();
+        for i in 1..=5 {
+            push_cell(&mut cells, i, 0, 0, movable());
+        }
+        push_cell(
+            &mut cells,
+            3,
+            0,
+            0,
+            RsPushBlock {
+                immovable: true,
+                ..Default::default()
+            },
+        );
+        let world = LineWorld { cells };
+        assert_eq!(
+            rs_piston_resolve(&world, RsPos(0, 0, 0), RsDir::East, true),
+            None
+        );
+
+        // Obsidian directly at the face: nothing moves.
+        let mut cells = std::collections::BTreeMap::new();
+        push_cell(
+            &mut cells,
+            1,
+            0,
+            0,
+            RsPushBlock {
+                immovable: true,
+                ..Default::default()
+            },
+        );
+        let world = LineWorld { cells };
+        assert_eq!(
+            rs_piston_resolve(&world, RsPos(0, 0, 0), RsDir::East, true),
+            None
+        );
+
+        // Bedrock via destroySpeed -1 likewise.
+        let mut cells = std::collections::BTreeMap::new();
+        push_cell(
+            &mut cells,
+            1,
+            0,
+            0,
+            RsPushBlock {
+                unbreakable: true,
+                ..Default::default()
+            },
+        );
+        let world = LineWorld { cells };
+        assert_eq!(
+            rs_piston_resolve(&world, RsPos(0, 0, 0), RsDir::East, true),
+            None
+        );
+
+        // A DESTROY-reaction block at the face is destroyed in place with no
+        // moves; deeper in the line it ends the push after the movable run.
+        let mut cells = std::collections::BTreeMap::new();
+        push_cell(
+            &mut cells,
+            1,
+            0,
+            0,
+            RsPushBlock {
+                reaction: RsPushReaction::Destroy,
+                ..Default::default()
+            },
+        );
+        let world = LineWorld { cells };
+        let plan = rs_piston_resolve(&world, RsPos(0, 0, 0), RsDir::East, true).unwrap();
+        assert!(plan.to_move.is_empty());
+        assert_eq!(plan.to_destroy, vec![RsPos(1, 0, 0)]);
+
+        let mut cells = std::collections::BTreeMap::new();
+        for i in 1..=3 {
+            push_cell(&mut cells, i, 0, 0, movable());
+        }
+        push_cell(
+            &mut cells,
+            4,
+            0,
+            0,
+            RsPushBlock {
+                reaction: RsPushReaction::Destroy,
+                ..Default::default()
+            },
+        );
+        push_cell(&mut cells, 5, 0, 0, movable());
+        let world = LineWorld { cells };
+        let plan = rs_piston_resolve(&world, RsPos(0, 0, 0), RsDir::East, true).unwrap();
+        assert_eq!(plan.to_move.len(), 3);
+        assert_eq!(plan.to_destroy, vec![RsPos(4, 0, 0)]);
+    }
+
+    #[test]
+    fn p4b_parity_piston_slime_honey_non_stickiness() {
+        // A slime block beside the line is dragged along: pushed line at
+        // (1..3, 0, 0) with slime at (1, 1, 0) branches into the move.
+        let mut cells = std::collections::BTreeMap::new();
+        for i in 1..=2 {
+            push_cell(&mut cells, i, 0, 0, slime());
+        }
+        push_cell(&mut cells, 1, 1, 0, movable());
+        let world = LineWorld { cells };
+        let plan = rs_piston_resolve(&world, RsPos(0, 0, 0), RsDir::East, true).unwrap();
+        assert!(
+            plan.to_move.contains(&RsPos(1, 1, 0)),
+            "slime drags its plain neighbour"
+        );
+
+        // A honey block beside a slime is NOT dragged (mutual exclusion).
+        let mut cells = std::collections::BTreeMap::new();
+        push_cell(&mut cells, 1, 0, 0, slime());
+        push_cell(
+            &mut cells,
+            1,
+            1,
+            0,
+            RsPushBlock {
+                sticky: RsSticky::Honey,
+                ..Default::default()
+            },
+        );
+        let world = LineWorld { cells };
+        let plan = rs_piston_resolve(&world, RsPos(0, 0, 0), RsDir::East, true).unwrap();
+        assert!(
+            !plan.to_move.contains(&RsPos(1, 1, 0)),
+            "slime cannot pull honey"
+        );
+
+        // Symmetric: honey does not pull slime either.
+        let mut cells = std::collections::BTreeMap::new();
+        push_cell(
+            &mut cells,
+            1,
+            0,
+            0,
+            RsPushBlock {
+                sticky: RsSticky::Honey,
+                ..Default::default()
+            },
+        );
+        push_cell(&mut cells, 1, 1, 0, slime());
+        let world = LineWorld { cells };
+        let plan = rs_piston_resolve(&world, RsPos(0, 0, 0), RsDir::East, true).unwrap();
+        assert!(
+            !plan.to_move.contains(&RsPos(1, 1, 0)),
+            "honey cannot pull slime"
+        );
+    }
+
+    #[test]
+    fn p4b_parity_sticky_piston_one_tick_drop() {
+        // Sticky piston pulsed off while its pushed block is still mid-
+        // extension (progress < 0.5): block-event 2 -> drop, no pull.
+        let mid = RsMovingPiston {
+            progress: 0.4,
+            last_ticked: 100,
+        };
+        assert_eq!(rs_piston_retraction_event(true, Some(mid), 110, false), 2);
+        // Same tick as the extension started, or inside tick processing.
+        let same_tick = RsMovingPiston {
+            progress: 0.9,
+            last_ticked: 110,
+        };
+        assert_eq!(rs_piston_retraction_event(true, Some(same_tick), 110, false), 2);
+        let old = RsMovingPiston {
+            progress: 0.9,
+            last_ticked: 100,
+        };
+        assert_eq!(rs_piston_retraction_event(true, Some(old), 110, true), 2);
+        // Extension finished before the pulse ended -> normal pull-back.
+        assert_eq!(rs_piston_retraction_event(true, Some(old), 110, false), 1);
+        // Nothing mid-extension (head already converted) -> pull.
+        assert_eq!(rs_piston_retraction_event(true, None, 110, false), 1);
+        // Non-sticky pistons never drop: always the plain event.
+        assert_eq!(rs_piston_retraction_event(false, Some(mid), 110, false), 1);
+    }
+
+    #[test]
+    fn p4b_parity_observer_two_tick_pulse() {
+        let mut grid = RedstoneSimGrid::default();
+        let obs = RsPos(0, 0, 0);
+        grid.set_block(
+            obs,
+            RsBlock::Observer {
+                facing: RsDir::East,
+                powered: false,
+            },
+        );
+        // A change at the watched face schedules the pulse.
+        rs_observer_neighbor_update(&mut grid, obs, RsPos(1, 0, 0));
+        grid.advance(1);
+        assert_eq!(
+            grid.redstone_block(obs),
+            RsBlock::Observer {
+                facing: RsDir::East,
+                powered: false
+            },
+            "no power before the 2-tick tick runs"
+        );
+        grid.advance(1);
+        assert_eq!(
+            grid.redstone_block(obs),
+            RsBlock::Observer {
+                facing: RsDir::East,
+                powered: true
+            },
+            "t+2: pulse high"
+        );
+        grid.advance(1);
+        assert_eq!(
+            grid.redstone_block(obs),
+            RsBlock::Observer {
+                facing: RsDir::East,
+                powered: true
+            },
+            "still high one tick in"
+        );
+        grid.advance(1);
+        assert_eq!(
+            grid.redstone_block(obs),
+            RsBlock::Observer {
+                facing: RsDir::East,
+                powered: false
+            },
+            "t+4: exactly 2 game ticks of power"
+        );
+
+        // A change NOT at the observed face does not trigger.
+        let mut grid = RedstoneSimGrid::default();
+        grid.set_block(
+            obs,
+            RsBlock::Observer {
+                facing: RsDir::East,
+                powered: false,
+            },
+        );
+        rs_observer_neighbor_update(&mut grid, obs, RsPos(-1, 0, 0));
+        rs_observer_neighbor_update(&mut grid, obs, RsPos(0, 1, 0));
+        grid.advance(4);
+        assert_eq!(
+            grid.redstone_block(obs),
+            RsBlock::Observer {
+                facing: RsDir::East,
+                powered: false
+            },
+            "side/back changes never power the observer"
+        );
+
+        // The pulse emits from the back (opposite the watched face).
+        assert_eq!(
+            RsBlock::Observer {
+                facing: RsDir::East,
+                powered: true
+            }
+            .weak_signal(RsDir::West),
+            15
+        );
+        assert_eq!(
+            RsBlock::Observer {
+                facing: RsDir::East,
+                powered: true
+            }
+            .weak_signal(RsDir::East),
+            0
+        );
     }
 }

@@ -1236,35 +1236,37 @@ impl VehicleKind {
 
     // Per-tick horizontal speed allowance feeding the anti-cheat carry bridge
     // (vanilla ServerGamePacketListenerImpl "moved too quickly" precedents,
-    // per-tick scale): boats cap near 0.4 b/t paddled on water and slide far on
-    // ice; carts cap at the 0.4 rail maximum; rideable mobs scale with their
-    // MOVEMENT_SPEED attribute (vanilla travel terminal ~= 2.4 * attribute).
+    // per-tick scale), now sourced from the vanilla vehicle physics below:
+    // boats sit at the paddled terminal thrust/(1-friction), carts are clamped
+    // to getMaxSpeed on every path, and boosted mounts scale with their
+    // MOVEMENT_SPEED attribute at the maximum 1 + 1.15 boost multiplier.
     fn max_step(self, env: &VehicleEnv) -> f64 {
         match self {
             Self::Boat | Self::ChestBoat => {
-                if env.on_ice {
-                    1.0
-                } else if env.on_water {
-                    0.45
+                // `on_ice` covers every icy support; the gate uses blue_ice's
+                // 0.989 so a legal blue-ice slide can never trip it.
+                let friction = if env.on_water {
+                    WM_BOAT_FRICTION_SURFACE
+                } else if env.on_ice {
+                    wm_support_friction("blue_ice")
                 } else {
-                    0.1
-                }
+                    wm_support_friction("")
+                };
+                // 1.25 slack covers surface transitions and entry momentum.
+                wm_boat_terminal_speed(friction) * 1.25
             }
-            Self::Minecart => {
-                if env.on_rail {
-                    0.4
-                } else {
-                    0.05
-                }
+            // Both the on-rail (cot.c) and off-rail (cot.s) vanilla moves clamp
+            // horizontal velocity to getMaxSpeed each tick.
+            Self::Minecart if env.on_rail => wm_minecart_max_speed(env.on_water),
+            Self::Minecart => wm_minecart_max_speed(env.on_water),
+            Self::Pig => {
+                wm_pig_ride_speed(env.move_speed.max(WM_PIG_BASE_SPEED), WM_BOOST_MAX)
             }
-            Self::Pig => 0.15,
-            Self::Strider => {
-                if env.on_lava {
-                    0.35
-                } else {
-                    0.05
-                }
-            }
+            Self::Strider => wm_strider_ride_speed(
+                env.move_speed.max(WM_STRIDER_BASE_SPEED),
+                !env.on_lava,
+                WM_BOOST_MAX,
+            ),
             Self::Horse | Self::Donkey | Self::Mule | Self::Llama | Self::Camel => {
                 (2.4 * env.move_speed).clamp(0.05, 0.9)
             }
@@ -1278,6 +1280,368 @@ impl VehicleKind {
             _ => [0.85, 0.0, 0.0],
         }
     }
+}
+
+// ---------- Vanilla 1.21.1 vehicle physics (cov/cot/chi/cfv/ckq) ----------
+
+/// `Boat.Status` (cov$a): the hull's relation to its support, re-evaluated
+/// every tick before `floatBoat` picks friction and buoyancy terms.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WmBoatStatus {
+    InWater,
+    UnderFlowingWater,
+    UnderWater,
+    OnLand,
+    InAir,
+}
+
+const WM_BOAT_FRICTION_SURFACE: f64 = 0.9;
+const WM_BOAT_FRICTION_SUBMERGED: f64 = 0.45;
+/// `getDefaultGravity` for boats (cov.aZ); the buoyancy rise scales by it/0.65.
+const WM_BOAT_GRAVITY: f64 = 0.04;
+const WM_BOAT_FLOWING_SINK: f64 = -7.0e-4;
+const WM_BOAT_SUBMERGED_LIFT: f64 = 0.01;
+
+/// Vanilla block `getFriction` (BlockBehaviour.Properties#friction): the
+/// support-block value an ON_LAND boat slides on.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_support_friction(block: &str) -> f64 {
+    match block {
+        "ice" | "packed_ice" | "frosted_ice" => 0.98,
+        "blue_ice" => 0.989,
+        "slime_block" => 0.8,
+        "honey_block" | "soul_sand" => 0.4,
+        _ => 0.6,
+    }
+}
+
+/// `floatBoat` (cov.I) `invFriction` per status. ON_LAND uses the support
+/// block's friction; vanilla's `landFriction /= 2` for a steering player is a
+/// dead write — `getStatus` recomputes the field before it is read again.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_boat_friction(status: WmBoatStatus, land_friction: f64) -> f64 {
+    match status {
+        WmBoatStatus::InWater | WmBoatStatus::UnderFlowingWater | WmBoatStatus::InAir => {
+            WM_BOAT_FRICTION_SURFACE
+        }
+        WmBoatStatus::UnderWater => WM_BOAT_FRICTION_SUBMERGED,
+        WmBoatStatus::OnLand => land_friction,
+    }
+}
+
+/// Steady-state horizontal speed of a paddled boat: thrust per tick divided by
+/// the fraction of velocity lost to friction (`v*0.04 = v*(1-f)`).
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_boat_terminal_speed(friction: f64) -> f64 {
+    WM_BOAT_FORWARD_THRUST / (1.0 - friction)
+}
+
+/// The vanilla `d1` buoyancy term: hull submersion fraction on the surface,
+/// a fixed 0.01 while UNDER_WATER, 0 otherwise.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_boat_lift(status: WmBoatStatus, submerged_fraction: f64) -> f64 {
+    match status {
+        WmBoatStatus::InWater => submerged_fraction,
+        WmBoatStatus::UnderWater => WM_BOAT_SUBMERGED_LIFT,
+        _ => 0.0,
+    }
+}
+
+/// One `floatBoat` step (cov.I): `v = (vx*f, vy + buoyTerm, vz*f)` and
+/// `deltaRotation *= f`; when `lift > 0` the y term is rescaled by 0.75 after
+/// the buoyancy kick. Returns `(velocity, damped_delta_rotation)`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_boat_float_tick(
+    status: WmBoatStatus,
+    land_friction: f64,
+    gravity: f64,
+    vel: [f64; 3],
+    lift: f64,
+    delta_rot: f64,
+) -> ([f64; 3], f64) {
+    let friction = wm_boat_friction(status, land_friction);
+    let buoy_term = if status == WmBoatStatus::UnderFlowingWater {
+        WM_BOAT_FLOWING_SINK
+    } else {
+        -gravity
+    };
+    let mut next = [vel[0] * friction, vel[1] + buoy_term, vel[2] * friction];
+    let rot = delta_rot * friction;
+    if lift > 0.0 {
+        next[1] = (next[1] + lift * (WM_BOAT_GRAVITY / 0.65)) * 0.75;
+    }
+    (next, rot)
+}
+
+/// Paddle flags from `ServerboundPaddleBoatPacket` / steering input.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct WmBoatInput {
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+}
+
+const WM_BOAT_PADDLE_YAW: f64 = 1.0;
+const WM_BOAT_TURN_DRIFT: f64 = 0.005;
+const WM_BOAT_FORWARD_THRUST: f64 = 0.04;
+const WM_BOAT_REVERSE_THRUST: f64 = 0.005;
+
+/// Vanilla `controlBoat` (cov.J): each rowing side paddle steps deltaRotation
+/// by 1 degree/tick, one-sided paddling without row input drifts at 0.005,
+/// `up` rows forward at 0.04, `down` backpaddles at 0.005. The thrust vector
+/// uses the yaw *after* the rotation step. Returns `(yaw, delta_rot, vel)`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_boat_control_tick(
+    input: WmBoatInput,
+    yaw: f64,
+    delta_rot: f64,
+    vel: [f64; 3],
+) -> (f64, f64, [f64; 3]) {
+    let mut rot = delta_rot;
+    if input.left {
+        rot -= WM_BOAT_PADDLE_YAW;
+    }
+    if input.right {
+        rot += WM_BOAT_PADDLE_YAW;
+    }
+    let mut thrust = 0.0;
+    if input.right != input.left && !input.up && !input.down {
+        thrust += WM_BOAT_TURN_DRIFT;
+    }
+    let yaw = yaw + rot;
+    if input.up {
+        thrust += WM_BOAT_FORWARD_THRUST;
+    }
+    if input.down {
+        thrust -= WM_BOAT_REVERSE_THRUST;
+    }
+    let rad = yaw.to_radians();
+    (
+        yaw,
+        rot,
+        [
+            vel[0] + -rad.sin() * thrust,
+            vel[1],
+            vel[2] + rad.cos() * thrust,
+        ],
+    )
+}
+
+/// `AbstractMinecart.getMaxSpeed` (cot.p): `(inWater ? 4.0 : 8.0) / 20` per
+/// tick — the vanilla 8 m/s rail cap, halved under water.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_minecart_max_speed(in_water: bool) -> f64 {
+    (if in_water { 4.0 } else { 8.0 }) / 20.0
+}
+
+/// `applyNaturalSlowdown` (cot.t): `v *= (d, 0, d)` with `d = 0.997` when a
+/// passenger rides, else `0.96`; under water every axis takes a further 0.95.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_minecart_slowdown(has_passenger: bool, in_water: bool, vel: [f64; 3]) -> [f64; 3] {
+    let damp = if has_passenger { 0.997 } else { 0.96 };
+    let mut next = [vel[0] * damp, 0.0, vel[2] * damp];
+    if in_water {
+        next = [next[0] * 0.95, next[1] * 0.95, next[2] * 0.95];
+    }
+    next
+}
+
+const WM_MINECART_SLOPE_BOOST: f64 = 0.0078125;
+
+/// Acceleration applied along ascending rail shapes each tick; 0.2x in water.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_minecart_slope_boost(in_water: bool) -> f64 {
+    WM_MINECART_SLOPE_BOOST * if in_water { 0.2 } else { 1.0 }
+}
+
+/// The straight `RailShape`s that can give the powered-rail static kick.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WmRailShape {
+    NorthSouth,
+    EastWest,
+    Other,
+}
+
+/// Powered-rail tail of `moveAlongTrack` (cot.c): at speed above 0.01 the cart
+/// gains 0.06 along its own direction; a standing cart is kicked 0.02 away
+/// from a redstone-conductor wall along the rail axis.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_minecart_powered_boost(
+    vx: f64,
+    vz: f64,
+    shape: WmRailShape,
+    conductor_neg: bool,
+    conductor_pos: bool,
+) -> (f64, f64) {
+    let len = vx.hypot(vz);
+    if len > 0.01 {
+        (vx + vx / len * 0.06, vz + vz / len * 0.06)
+    } else {
+        match shape {
+            WmRailShape::EastWest => (
+                if conductor_neg {
+                    0.02
+                } else if conductor_pos {
+                    -0.02
+                } else {
+                    vx
+                },
+                vz,
+            ),
+            WmRailShape::NorthSouth => (
+                vx,
+                if conductor_neg {
+                    0.02
+                } else if conductor_pos {
+                    -0.02
+                } else {
+                    vz
+                },
+            ),
+            WmRailShape::Other => (vx, vz),
+        }
+    }
+}
+
+/// An unpowered powered-rail brakes the cart (`$$7` in cot.c): below 0.03
+/// blocks/tick it stops dead, otherwise half the horizontal speed is shed.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_minecart_rail_brake(vx: f64, vz: f64) -> (f64, f64) {
+    if vx.hypot(vz) < 0.03 {
+        (0.0, 0.0)
+    } else {
+        (vx * 0.5, vz * 0.5)
+    }
+}
+
+/// `moveAlongTrack`'s move call: horizontal velocity (0.75x while ridden) is
+/// clamped to the per-tick max speed; y is carried by the rail, not velocity.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_minecart_rail_move(
+    vx: f64,
+    vz: f64,
+    has_passenger: bool,
+    in_water: bool,
+) -> (f64, f64) {
+    let max = wm_minecart_max_speed(in_water);
+    let scale = if has_passenger { 0.75 } else { 1.0 };
+    (
+        (scale * vx).clamp(-max, max),
+        (scale * vz).clamp(-max, max),
+    )
+}
+
+/// `DetectorRailBlock`: emits 15 while a minecart stands on it.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_detector_rail_signal(occupied: bool) -> u8 {
+    if occupied {
+        15
+    } else {
+        0
+    }
+}
+
+/// `ItemBasedSteering` (cjp/cjq) shared by pig and strider boosts: the total
+/// boost is `nextInt(841) + 140` ticks and the multiplier sweeps
+/// `1 + 1.15 * sin(pi * t / total)`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_boost_total_ticks(roll_0_840: u32) -> u32 {
+    140 + roll_0_840
+}
+
+const WM_BOOST_MAX: f64 = 1.0 + 1.15;
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_boost_multiplier(elapsed: u32, total: u32) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    1.0 + 1.15 * (elapsed as f64 / total as f64 * std::f64::consts::PI).sin()
+}
+
+/// Vanilla pig ride speed (cfv): `MOVEMENT_SPEED * 0.225 * boostFactor`, with
+/// the 0.25 base attribute this is 0.05625 before the carrot-on-a-stick boost.
+const WM_PIG_BASE_SPEED: f64 = 0.25;
+const WM_PIG_RIDE_FACTOR: f64 = 0.225;
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_pig_ride_speed(movement_speed: f64, boost_multiplier: f64) -> f64 {
+    movement_speed * WM_PIG_RIDE_FACTOR * boost_multiplier
+}
+
+/// Vanilla strider ride speed (ckq): `MOVEMENT_SPEED * (cold ? 0.35 : 0.55)
+/// * boostFactor`, on the 0.175 base attribute. A strider is cold whenever it
+/// is not standing on warm lava — the shivering state.
+const WM_STRIDER_BASE_SPEED: f64 = 0.175;
+const WM_STRIDER_COLD_FACTOR: f64 = 0.35;
+const WM_STRIDER_WARM_FACTOR: f64 = 0.55;
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_strider_ride_speed(movement_speed: f64, cold: bool, boost_multiplier: f64) -> f64 {
+    movement_speed * if cold { WM_STRIDER_COLD_FACTOR } else { WM_STRIDER_WARM_FACTOR }
+        * boost_multiplier
+}
+
+/// Strider lava buoyancy (ckq): inside lava `v *= 0.5` then +0.05 to y.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_strider_lava_buoyancy(vel: [f64; 3]) -> [f64; 3] {
+    [vel[0] * 0.5, vel[1] * 0.5 + 0.05, vel[2] * 0.5]
+}
+
+/// `AbstractHorse.handleStartJump` (chi.b(int)): the client's 0..=100 jump
+/// meter clamps negatives to 0, maps <90 onto 0.4..0.8 and >=90 to 1.0.
+/// Shared by every AbstractHorse descendant (horses, donkeys, mules, camels).
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_horse_jump_scale(charge: i32) -> f64 {
+    let charge = charge.max(0);
+    if charge >= 90 {
+        1.0
+    } else {
+        0.4 + 0.4 * charge as f64 / 90.0
+    }
+}
+
+/// `executeRidersJump` vertical term: `getCustomJump() * scale *
+/// getBlockJumpFactor() + getJumpBoostPower()`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_horse_jump_velocity(
+    jump_strength: f64,
+    scale: f64,
+    block_jump_factor: f64,
+    jump_boost: f64,
+) -> f64 {
+    jump_strength * scale * block_jump_factor + jump_boost
+}
+
+/// `LivingEntity.getJumpBoostPower`: `0.1 * (amplifier + 1)` while the jump
+/// boost effect is active.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_jump_boost_power(amplifier: Option<i32>) -> f64 {
+    amplifier.map_or(0.0, |amp| 0.1 * (amp as f64 + 1.0))
+}
+
+/// The horizontal kick `executeRidersJump` adds while the rider steers forward
+/// (`vec3.z > 0`): `(-0.4 * sin(yaw) * scale, 0, 0.4 * cos(yaw) * scale)`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_horse_jump_horizontal(yaw: f64, scale: f64) -> (f64, f64) {
+    let rad = yaw.to_radians();
+    (-0.4 * rad.sin() * scale, 0.4 * rad.cos() * scale)
+}
+
+/// Spawn attribute rolls (chi.a/chi.b): JUMP_STRENGTH = `0.4 + 0.2 * (r1+r2+r3)`
+/// and MOVEMENT_SPEED = `(0.45 + 0.3 * (r1+r2+r3)) * 0.25`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_horse_spawn_jump_strength(rolls: [f64; 3]) -> f64 {
+    0.4 + 0.2 * rolls.iter().sum::<f64>()
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn wm_horse_spawn_movement_speed(rolls: [f64; 3]) -> f64 {
+    (0.45 + 0.3 * rolls.iter().sum::<f64>()) * 0.25
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1916,5 +2280,284 @@ mod workstations_and_mounts_tests {
             default_mob_equipment("drowned", 3, 50).get(EquipmentSlot::MainHand).1,
             0
         );
+    }
+
+    #[test]
+    fn p4b_parity_boat_friction_surfaces_and_terminal_speeds() {
+        // cov.I invFriction: water/flowing/air share 0.9, submerged is 0.45,
+        // land reads the support block friction.
+        for status in [
+            WmBoatStatus::InWater,
+            WmBoatStatus::UnderFlowingWater,
+            WmBoatStatus::InAir,
+        ] {
+            assert_eq!(wm_boat_friction(status, 0.6), 0.9);
+        }
+        assert_eq!(wm_boat_friction(WmBoatStatus::UnderWater, 0.6), 0.45);
+        assert_eq!(wm_boat_friction(WmBoatStatus::OnLand, 0.6), 0.6);
+        // Support-block friction table: water < land < ice < blue ice speed.
+        assert_eq!(wm_support_friction("ice"), 0.98);
+        assert_eq!(wm_support_friction("packed_ice"), 0.98);
+        assert_eq!(wm_support_friction("frosted_ice"), 0.98);
+        assert_eq!(wm_support_friction("blue_ice"), 0.989);
+        assert_eq!(wm_support_friction("slime_block"), 0.8);
+        assert_eq!(wm_support_friction("honey_block"), 0.4);
+        assert_eq!(wm_support_friction("soul_sand"), 0.4);
+        assert_eq!(wm_support_friction("stone"), 0.6);
+        // Paddled terminal = 0.04 / (1 - f): 0.4 water, 0.1 land, 2.0 ice.
+        assert!((wm_boat_terminal_speed(0.9) - 0.4).abs() < 1e-9);
+        assert!((wm_boat_terminal_speed(0.6) - 0.1).abs() < 1e-9);
+        assert!((wm_boat_terminal_speed(0.98) - 2.0).abs() < 1e-9);
+        assert!((wm_boat_terminal_speed(0.989) - 0.04 / 0.011).abs() < 1e-9);
+        assert!(
+            wm_boat_terminal_speed(0.989) > wm_boat_terminal_speed(0.98),
+            "blue ice slides faster than ice"
+        );
+        // floatBoat step: horizontal damped, gravity sinks, buoyancy lifts.
+        let (v, rot) = wm_boat_float_tick(
+            WmBoatStatus::InWater,
+            0.6,
+            WM_BOAT_GRAVITY,
+            [1.0, 0.0, 0.0],
+            0.0,
+            2.0,
+        );
+        assert!((v[0] - 0.9).abs() < 1e-12 && (v[1] + 0.04).abs() < 1e-12);
+        assert!((rot - 1.8).abs() < 1e-12, "deltaRotation scales by friction");
+        let (sub, _) = wm_boat_float_tick(
+            WmBoatStatus::UnderWater,
+            0.6,
+            WM_BOAT_GRAVITY,
+            [1.0, 0.0, 0.0],
+            wm_boat_lift(WmBoatStatus::UnderWater, 0.0),
+            0.0,
+        );
+        assert!((sub[0] - 0.45).abs() < 1e-12);
+        assert!(
+            (sub[1] - ((0.01 * (0.04 / 0.65) - 0.04) * 0.75)).abs() < 1e-12,
+            "submerged lift = 0.01 then the whole y term * 0.75"
+        );
+        let (land, _) = wm_boat_float_tick(
+            WmBoatStatus::OnLand,
+            0.989,
+            WM_BOAT_GRAVITY,
+            [1.0, 0.0, 0.0],
+            0.0,
+            0.0,
+        );
+        assert!((land[0] - 0.989).abs() < 1e-12);
+        assert_eq!(wm_boat_lift(WmBoatStatus::InWater, 0.3), 0.3);
+        assert_eq!(wm_boat_lift(WmBoatStatus::OnLand, 0.3), 0.0);
+        // Anti-cheat gate: water terminal * 1.25 slack; ice supports beat water.
+        let water = VehicleEnv {
+            on_water: true,
+            ..Default::default()
+        };
+        assert!((VehicleKind::Boat.max_step(&water) - 0.5).abs() < 1e-9);
+        let ice = VehicleEnv {
+            on_ice: true,
+            ..Default::default()
+        };
+        assert!(VehicleKind::Boat.max_step(&ice) > VehicleKind::Boat.max_step(&water));
+    }
+
+    #[test]
+    fn p4b_parity_boat_single_paddle_yaw_and_thrust() {
+        // One right paddle: +1 degree/tick and a gentle 0.005 drift.
+        let (yaw, rot, v) = wm_boat_control_tick(
+            WmBoatInput {
+                right: true,
+                ..Default::default()
+            },
+            0.0,
+            0.0,
+            [0.0; 3],
+        );
+        assert_eq!(yaw, 1.0);
+        assert_eq!(rot, 1.0);
+        let rad = 1.0f64.to_radians();
+        assert!((v[0] - -rad.sin() * 0.005).abs() < 1e-12);
+        assert!((v[2] - rad.cos() * 0.005).abs() < 1e-12);
+        // Left paddle turns the other way.
+        let (yaw, _, _) = wm_boat_control_tick(
+            WmBoatInput {
+                left: true,
+                ..Default::default()
+            },
+            0.0,
+            0.0,
+            [0.0; 3],
+        );
+        assert_eq!(yaw, -1.0);
+        // Two paddles cancel the turn and add no drift.
+        let (yaw, _, v) = wm_boat_control_tick(
+            WmBoatInput {
+                left: true,
+                right: true,
+                ..Default::default()
+            },
+            0.0,
+            0.0,
+            [0.0; 3],
+        );
+        assert_eq!(yaw, 0.0);
+        assert_eq!(v, [0.0; 3]);
+        // Rowing forward gives the full 0.04 thrust along the new yaw; the
+        // turn drift does not stack while `up` is held.
+        let (_, _, v) = wm_boat_control_tick(
+            WmBoatInput {
+                left: true,
+                up: true,
+                ..Default::default()
+            },
+            0.0,
+            0.0,
+            [0.0; 3],
+        );
+        let rad = (-1.0f64).to_radians();
+        assert!((v[0] - -rad.sin() * 0.04).abs() < 1e-12);
+        assert!((v[2] - rad.cos() * 0.04).abs() < 1e-12);
+        // Backpaddle pushes backward at 0.005.
+        let (_, _, v) = wm_boat_control_tick(
+            WmBoatInput {
+                down: true,
+                ..Default::default()
+            },
+            0.0,
+            0.0,
+            [0.0; 3],
+        );
+        assert!((v[2] + 0.005).abs() < 1e-12);
+    }
+
+    #[test]
+    fn p4b_parity_minecart_powered_rail_cap_and_acceleration() {
+        // 8 m/s cap dry, 4 m/s submerged (cot.p).
+        assert_eq!(wm_minecart_max_speed(false), 0.4);
+        assert_eq!(wm_minecart_max_speed(true), 0.2);
+        // Powered rail adds 0.06 along the current direction when moving.
+        let (x, z) = wm_minecart_powered_boost(0.3, 0.4, WmRailShape::EastWest, false, false);
+        assert!((x - (0.3 + 0.3 / 0.5 * 0.06)).abs() < 1e-12);
+        assert!((z - (0.4 + 0.4 / 0.5 * 0.06)).abs() < 1e-12);
+        // A parked cart is kicked 0.02 away from a conductor along the axis.
+        assert_eq!(
+            wm_minecart_powered_boost(0.0, 0.0, WmRailShape::EastWest, true, false),
+            (0.02, 0.0)
+        );
+        assert_eq!(
+            wm_minecart_powered_boost(0.0, 0.0, WmRailShape::EastWest, false, true),
+            (-0.02, 0.0)
+        );
+        assert_eq!(
+            wm_minecart_powered_boost(0.0, 0.0, WmRailShape::NorthSouth, true, false),
+            (0.0, 0.02)
+        );
+        assert_eq!(
+            wm_minecart_powered_boost(0.0, 0.0, WmRailShape::NorthSouth, false, true),
+            (0.0, -0.02)
+        );
+        // No conductor and no non-straight shape => no kick.
+        assert_eq!(
+            wm_minecart_powered_boost(0.0, 0.0, WmRailShape::EastWest, false, false),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            wm_minecart_powered_boost(0.0, 0.0, WmRailShape::Other, true, true),
+            (0.0, 0.0)
+        );
+        // The rail move clamps every axis to the 8 m/s cap; a passenger
+        // scales velocity by 0.75 before the clamp.
+        assert_eq!(wm_minecart_rail_move(0.9, -0.5, false, false), (0.4, -0.4));
+        let (rx, rz) = wm_minecart_rail_move(0.4, 0.0, true, false);
+        assert!((rx - 0.3).abs() < 1e-12 && rz == 0.0);
+        // The mount gate on rails is the exact cap.
+        let rail = VehicleEnv {
+            on_rail: true,
+            ..Default::default()
+        };
+        assert_eq!(VehicleKind::Minecart.max_step(&rail), 0.4);
+        // applyNaturalSlowdown: 0.96 free/0.997 ridden, y zeroed, +0.95 in water.
+        let damped = wm_minecart_slowdown(false, false, [0.4, 0.5, 0.4]);
+        assert!((damped[0] - 0.4 * 0.96).abs() < 1e-12 && damped[1] == 0.0);
+        let wet = wm_minecart_slowdown(true, true, [0.4, 0.5, 0.4]);
+        assert!((wet[0] - 0.4 * 0.997 * 0.95).abs() < 1e-12);
+        // Ascending-rail boost constant, 0.2x under water.
+        assert_eq!(wm_minecart_slope_boost(false), 0.0078125);
+        assert!((wm_minecart_slope_boost(true) - 0.0078125 * 0.2).abs() < 1e-15);
+    }
+
+    #[test]
+    fn p4b_parity_minecart_unpowered_brake_and_detector_signal() {
+        // Unpowered powered-rail: *0.5 above 0.03, dead stop below it.
+        assert_eq!(wm_minecart_rail_brake(0.4, 0.0), (0.2, 0.0));
+        assert_eq!(wm_minecart_rail_brake(0.03, 0.0), (0.015, 0.0));
+        assert_eq!(wm_minecart_rail_brake(0.029, 0.0), (0.0, 0.0));
+        // Detector rail emits 15 only while a cart occupies it.
+        assert_eq!(wm_detector_rail_signal(true), 15);
+        assert_eq!(wm_detector_rail_signal(false), 0);
+    }
+
+    #[test]
+    fn p4b_parity_horse_jump_charge_curve() {
+        // handleStartJump: clamp to 0, <90 -> 0.4..0.8, >=90 -> 1.0.
+        assert_eq!(wm_horse_jump_scale(-10), 0.4);
+        assert_eq!(wm_horse_jump_scale(0), 0.4);
+        assert!((wm_horse_jump_scale(45) - 0.6).abs() < 1e-12);
+        assert!((wm_horse_jump_scale(89) - (0.4 + 0.4 * 89.0 / 90.0)).abs() < 1e-12);
+        assert_eq!(wm_horse_jump_scale(90), 1.0);
+        assert_eq!(wm_horse_jump_scale(100), 1.0);
+        // executeRidersJump: strength * scale * blockFactor + jump boost.
+        assert!((wm_horse_jump_velocity(0.7, 0.6, 1.0, 0.0) - 0.42).abs() < 1e-12);
+        assert!((wm_horse_jump_velocity(0.7, 1.0, 1.0, 0.2) - 0.9).abs() < 1e-12);
+        assert_eq!(wm_jump_boost_power(None), 0.0);
+        assert!((wm_jump_boost_power(Some(1)) - 0.2).abs() < 1e-12);
+        // Forward kick (-0.4 sin * s, 0, 0.4 cos * s): yaw 90 -> -0.4*s on x.
+        let (hx, hz) = wm_horse_jump_horizontal(90.0, 0.5);
+        assert!((hx + 0.2).abs() < 1e-12 && hz.abs() < 1e-9);
+        // Spawn rolls: jump 0.4 + 0.2*3r, speed (0.45 + 0.3*3r) * 0.25.
+        assert!((wm_horse_spawn_jump_strength([0.0; 3]) - 0.4).abs() < 1e-12);
+        assert!((wm_horse_spawn_jump_strength([1.0; 3]) - 1.0).abs() < 1e-12);
+        assert!((wm_horse_spawn_movement_speed([0.0; 3]) - 0.1125).abs() < 1e-12);
+        assert!((wm_horse_spawn_movement_speed([1.0; 3]) - 0.3375).abs() < 1e-9);
+    }
+
+    #[test]
+    fn p4b_parity_pig_strider_boost_and_lava_temperature() {
+        // ItemBasedSteering: total 140..=980 ticks, 1 + 1.15*sin(pi*t/total).
+        assert_eq!(wm_boost_total_ticks(0), 140);
+        assert_eq!(wm_boost_total_ticks(840), 980);
+        assert_eq!(wm_boost_multiplier(0, 0), 0.0);
+        assert!((wm_boost_multiplier(0, 980) - 1.0).abs() < 1e-12);
+        assert!((wm_boost_multiplier(490, 980) - (1.0 + 1.15)).abs() < 1e-12);
+        assert!((wm_boost_multiplier(980, 980) - 1.0).abs() < 1e-9);
+        // Pig: MOVEMENT_SPEED * 0.225 * boost; 0.25 base -> 0.05625.
+        assert!((wm_pig_ride_speed(0.25, 1.0) - 0.05625).abs() < 1e-12);
+        assert!((wm_pig_ride_speed(0.25, WM_BOOST_MAX) - 0.05625 * 2.15).abs() < 1e-9);
+        // Strider: cold 0.35 off lava, warm 0.55 on lava (0.175 base attr).
+        assert!((wm_strider_ride_speed(0.175, true, 1.0) - 0.06125).abs() < 1e-12);
+        assert!((wm_strider_ride_speed(0.175, false, 1.0) - 0.09625).abs() < 1e-12);
+        assert!(
+            wm_strider_ride_speed(0.175, false, 1.0)
+                > wm_strider_ride_speed(0.175, true, 1.0),
+            "warm lava strider outruns a shivering one"
+        );
+        // Lava buoyancy halves velocity then adds 0.05 upward.
+        assert_eq!(wm_strider_lava_buoyancy([0.4, -0.2, 0.4]), [0.2, -0.05, 0.2]);
+        // The mount gates source the boosted vanilla speeds.
+        let pig = VehicleEnv {
+            move_speed: 0.25,
+            ..Default::default()
+        };
+        assert!((VehicleKind::Pig.max_step(&pig) - 0.05625 * 2.15).abs() < 1e-9);
+        let warm = VehicleEnv {
+            on_lava: true,
+            move_speed: 0.175,
+            ..Default::default()
+        };
+        let cold = VehicleEnv {
+            move_speed: 0.175,
+            ..Default::default()
+        };
+        assert!(VehicleKind::Strider.max_step(&warm) > VehicleKind::Strider.max_step(&cold));
     }
 }
