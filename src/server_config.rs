@@ -255,6 +255,7 @@ const SERVER_PROPERTIES_KEYS: &[(&str, &str)] = &[
     ("op-permission-level", "MC_SPINE_OP_PERMISSION_LEVEL"),
     ("pvp", "MC_SPINE_PVP"),
     ("allow-flight", "MC_SPINE_ALLOW_FLIGHT"),
+    ("online-mode", "MC_SPINE_ONLINE_MODE"),
 ];
 
 /// Java `.properties` escape sequences. `\n`, `\t`, `\r`, `\f` and `\uXXXX` produce
@@ -407,6 +408,19 @@ const SERVER_CONFIG_KEYS: &[(&str, &str)] = &[
     ("resource_pack_url", "MC_SPINE_RESOURCE_PACK_URL"),
     ("resource_pack_required", "MC_SPINE_RESOURCE_PACK_REQUIRED"),
     ("rcon_port", "MC_SPINE_RCON_PORT"),
+    // Reliability / ops / multi-version keys read by `RuntimeOpsConfig`. Keeping
+    // them in the shared table means the boot export reaches the consumers that
+    // already read the variable directly (`MC_SPINE_VERSION_DIR` in
+    // block_registry, `MC_SPINE_MC_VERSION` in save_v2).
+    ("online_mode", "MC_SPINE_ONLINE_MODE"),
+    ("velocity_forwarding", "MC_SPINE_VELOCITY_FORWARDING"),
+    ("velocity_forwarding_secret", "MC_SPINE_VELOCITY_SECRET"),
+    ("autosave_interval_secs", "MC_SPINE_AUTOSAVE_SECS"),
+    ("backup_max_keep", "MC_SPINE_BACKUP_MAX_KEEP"),
+    ("lan_broadcast", "MC_SPINE_LAN_BROADCAST"),
+    ("auto_load_balance", "MC_SPINE_AUTO_LOAD_BALANCE"),
+    ("target_mc_version", "MC_SPINE_MC_VERSION"),
+    ("version_pack_dir", "MC_SPINE_VERSION_DIR"),
 ];
 
 /// `[anticheat]` keys: the ones in the default file, then old ones that still work
@@ -515,6 +529,14 @@ fn server_config_boot() -> ServerConfigDoc {
             std::env::set_var(env, value);
         }
     }
+    // The environment now carries every file layer, so resolving the ops knobs
+    // sees the same values the env-reading consumers do. Reported once, like
+    // the unknown-key warnings above.
+    let ops = RuntimeOpsConfig::from_doc(&doc, |name| std::env::var(name).ok());
+    for note in &ops.notes {
+        eprintln!("[config] {note}");
+    }
+    let _ = RUNTIME_OPS.set(ops);
     doc
 }
 
@@ -527,6 +549,288 @@ fn server_config_reread() -> Result<(ServerConfigDoc, Vec<String>), String> {
     let (doc, mut warnings) = server_config_parse(&text);
     warnings.extend(server_config_unknown_keys(&doc));
     Ok((doc, warnings))
+}
+
+// ---------- production ops knobs ----------
+//
+// The typed view of the `[server]` keys the reliability, operator-UX and
+// multi-version lanes read. Resolution is deliberately small: the file fills
+// what the environment leaves unset and `MC_SPINE_*` always wins, exactly like
+// `AcConfig::from_doc`. A dropped-in vanilla `server.properties` reaches the
+// same variables through `server_config_boot` (`online-mode` is the only one
+// of these that has a vanilla key).
+
+/// The MC release the bundled data pack targets; `MC_SPINE_MC_VERSION` and the
+/// `[server] target_mc_version` key move it together.
+pub(crate) const RUNTIME_OPS_DEFAULT_MC_VERSION: &str = "1.21.1";
+// Autosave cadence bounds: tight enough that a typo cannot stall saving for a
+// day or spin the writer every tick.
+const AUTOSAVE_SECS_DEFAULT: u64 = 300;
+const AUTOSAVE_SECS_MIN: u64 = 10;
+const AUTOSAVE_SECS_MAX: u64 = 86_400;
+const BACKUP_MAX_KEEP_DEFAULT: usize = 5;
+
+/// The ops-facing switches for authentication, persistence, LAN/UX smoothing
+/// and version-pack selection. Every field is optional; the defaults keep a
+/// loopback development server behaving exactly as it did before the lanes
+/// landed (offline mode, no forwarding, five-minute autosave, five backups,
+/// no LAN broadcast, load smoothing on, bundled 1.21.1 data).
+#[derive(Clone, PartialEq)]
+pub(crate) struct RuntimeOpsConfig {
+    /// Mojang session authentication (vanilla `online-mode`,
+    /// `MC_SPINE_ONLINE_MODE`). Off keeps the loopback test behaviour: no
+    /// encryption request, offline UUIDs.
+    pub(crate) online_mode: bool,
+    /// Velocity modern forwarding (`MC_SPINE_VELOCITY_FORWARDING`): the login
+    /// handshake trusts the signed `velocity:player_info` payload instead of a
+    /// Mojang session lookup. Meaningful only with a secret.
+    pub(crate) velocity_forwarding: bool,
+    /// Shared secret Velocity signs forwarding data with
+    /// (`MC_SPINE_VELOCITY_SECRET`). Never printed: `Debug` and `summary()`
+    /// show `[REDACTED]`; the raw value leaves the struct only through
+    /// `velocity_forwarding_secret()`.
+    velocity_forwarding_secret: Option<String>,
+    /// Autosave cadence for the background save worker
+    /// (`MC_SPINE_AUTOSAVE_SECS`), clamped to
+    /// `AUTOSAVE_SECS_MIN..=AUTOSAVE_SECS_MAX`.
+    pub(crate) autosave_interval_secs: u64,
+    /// Generations `rotate_world_backups` keeps (`MC_SPINE_BACKUP_MAX_KEEP`).
+    pub(crate) backup_max_keep: usize,
+    /// Vanilla-style LAN broadcast announcements (`MC_SPINE_LAN_BROADCAST`) so
+    /// the server appears in the client multiplayer list.
+    pub(crate) lan_broadcast: bool,
+    /// `AutoLoadBalancer` tick smoothing (`MC_SPINE_AUTO_LOAD_BALANCE`). On
+    /// unless an operator explicitly turns it off.
+    pub(crate) auto_load_balance: bool,
+    /// The MC release the active version pack describes
+    /// (`MC_SPINE_MC_VERSION`).
+    pub(crate) target_mc_version: String,
+    /// Explicit version-pack directory (`MC_SPINE_VERSION_DIR`); unset means
+    /// the bundled tables.
+    pub(crate) version_pack_dir: Option<String>,
+    /// One line per value that had to be repaired, ignored or is incomplete,
+    /// like `AcConfig::notes`.
+    pub(crate) notes: Vec<String>,
+}
+
+impl Default for RuntimeOpsConfig {
+    fn default() -> Self {
+        RuntimeOpsConfig {
+            online_mode: false,
+            velocity_forwarding: false,
+            velocity_forwarding_secret: None,
+            autosave_interval_secs: AUTOSAVE_SECS_DEFAULT,
+            backup_max_keep: BACKUP_MAX_KEEP_DEFAULT,
+            lan_broadcast: false,
+            auto_load_balance: true,
+            target_mc_version: RUNTIME_OPS_DEFAULT_MC_VERSION.to_owned(),
+            version_pack_dir: None,
+            notes: Vec::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for RuntimeOpsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeOpsConfig")
+            .field("online_mode", &self.online_mode)
+            .field("velocity_forwarding", &self.velocity_forwarding)
+            .field(
+                "velocity_forwarding_secret",
+                &self.redacted_secret(),
+            )
+            .field("autosave_interval_secs", &self.autosave_interval_secs)
+            .field("backup_max_keep", &self.backup_max_keep)
+            .field("lan_broadcast", &self.lan_broadcast)
+            .field("auto_load_balance", &self.auto_load_balance)
+            .field("target_mc_version", &self.target_mc_version)
+            .field("version_pack_dir", &self.version_pack_dir)
+            .field("notes", &self.notes)
+            .finish()
+    }
+}
+
+/// Strict boolean reading of an env-var string: the same spellings `truthy`
+/// accepts, plus the explicit-off set, so a mistyped value is a note rather
+/// than a silent `false`.
+fn ops_bool_str(v: &str) -> Option<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn ops_bool(
+    notes: &mut Vec<String>,
+    label: &str,
+    file: Option<&ServerConfigValue>,
+    env: Option<String>,
+    default: bool,
+) -> bool {
+    let file = match file {
+        Some(ServerConfigValue::Bool(b)) => Some(*b),
+        Some(v) => {
+            notes.push(format!("[server] {label} must be true or false, got {v:?}"));
+            None
+        }
+        None => None,
+    };
+    match env.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => match ops_bool_str(v) {
+            Some(b) => b,
+            None => {
+                notes.push(format!("{label}: unrecognized value `{v}`; using {}", file.unwrap_or(default)));
+                file.unwrap_or(default)
+            }
+        },
+        None => file.unwrap_or(default),
+    }
+}
+
+fn ops_u64(
+    notes: &mut Vec<String>,
+    label: &str,
+    file: Option<&ServerConfigValue>,
+    env: Option<String>,
+    default: u64,
+) -> u64 {
+    let file = match file {
+        Some(ServerConfigValue::Int(i)) if *i >= 0 => Some(*i as u64),
+        Some(v) => {
+            notes.push(format!("[server] {label} must be a non-negative integer, got {v:?}"));
+            None
+        }
+        None => None,
+    };
+    match env.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                notes.push(format!("{label}: unrecognized value `{v}`; using {}", file.unwrap_or(default)));
+                file.unwrap_or(default)
+            }
+        },
+        None => file.unwrap_or(default),
+    }
+}
+
+fn ops_str(
+    notes: &mut Vec<String>,
+    label: &str,
+    file: Option<&ServerConfigValue>,
+    env: Option<String>,
+) -> Option<String> {
+    let file = match file {
+        Some(ServerConfigValue::Str(s)) => Some(s.clone()),
+        Some(v) => {
+            notes.push(format!("[server] {label} must be a string, got {v:?}"));
+            None
+        }
+        None => None,
+    };
+    env.map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .or(file)
+        .filter(|s| !s.is_empty())
+}
+
+impl RuntimeOpsConfig {
+    /// `[server]` from the parsed file, then the environment on top:
+    /// `MC_SPINE_ONLINE_MODE`, `MC_SPINE_VELOCITY_FORWARDING`,
+    /// `MC_SPINE_VELOCITY_SECRET`, `MC_SPINE_AUTOSAVE_SECS`,
+    /// `MC_SPINE_BACKUP_MAX_KEEP`, `MC_SPINE_LAN_BROADCAST`,
+    /// `MC_SPINE_AUTO_LOAD_BALANCE`, `MC_SPINE_MC_VERSION`,
+    /// `MC_SPINE_VERSION_DIR`.
+    pub(crate) fn from_doc(
+        doc: &ServerConfigDoc,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> RuntimeOpsConfig {
+        let table = doc.get("server");
+        let get = |k: &str| table.and_then(|t| t.get(k));
+        let mut notes = Vec::new();
+        let mut c = RuntimeOpsConfig {
+            online_mode: ops_bool(&mut notes, "online_mode", get("online_mode"), env("MC_SPINE_ONLINE_MODE"), false),
+            velocity_forwarding: ops_bool(&mut notes, "velocity_forwarding", get("velocity_forwarding"), env("MC_SPINE_VELOCITY_FORWARDING"), false),
+            velocity_forwarding_secret: ops_str(&mut notes, "velocity_forwarding_secret", get("velocity_forwarding_secret"), env("MC_SPINE_VELOCITY_SECRET")),
+            autosave_interval_secs: {
+                let raw = ops_u64(&mut notes, "autosave_interval_secs", get("autosave_interval_secs"), env("MC_SPINE_AUTOSAVE_SECS"), AUTOSAVE_SECS_DEFAULT);
+                let clamped = raw.clamp(AUTOSAVE_SECS_MIN, AUTOSAVE_SECS_MAX);
+                if raw != clamped {
+                    notes.push(format!(
+                        "autosave_interval_secs {raw} outside {AUTOSAVE_SECS_MIN}..={AUTOSAVE_SECS_MAX}; clamped to {clamped}"
+                    ));
+                }
+                clamped
+            },
+            backup_max_keep: {
+                let raw = ops_u64(&mut notes, "backup_max_keep", get("backup_max_keep"), env("MC_SPINE_BACKUP_MAX_KEEP"), BACKUP_MAX_KEEP_DEFAULT as u64);
+                usize::try_from(raw).unwrap_or_else(|_| {
+                    notes.push(format!("backup_max_keep {raw} does not fit; using {BACKUP_MAX_KEEP_DEFAULT}"));
+                    BACKUP_MAX_KEEP_DEFAULT
+                })
+            },
+            lan_broadcast: ops_bool(&mut notes, "lan_broadcast", get("lan_broadcast"), env("MC_SPINE_LAN_BROADCAST"), false),
+            auto_load_balance: ops_bool(&mut notes, "auto_load_balance", get("auto_load_balance"), env("MC_SPINE_AUTO_LOAD_BALANCE"), true),
+            target_mc_version: ops_str(&mut notes, "target_mc_version", get("target_mc_version"), env("MC_SPINE_MC_VERSION"))
+                .unwrap_or_else(|| RUNTIME_OPS_DEFAULT_MC_VERSION.to_owned()),
+            version_pack_dir: ops_str(&mut notes, "version_pack_dir", get("version_pack_dir"), env("MC_SPINE_VERSION_DIR")),
+            notes: Vec::new(),
+        };
+        if c.velocity_forwarding && c.velocity_forwarding_secret.is_none() {
+            notes.push(
+                "velocity_forwarding is on but no secret is set (velocity_forwarding_secret / MC_SPINE_VELOCITY_SECRET); forwarding data cannot be verified"
+                    .to_owned(),
+            );
+        }
+        if !c.velocity_forwarding && c.velocity_forwarding_secret.is_some() {
+            notes.push(
+                "velocity_forwarding_secret is set but velocity_forwarding is off; the secret has no effect"
+                    .to_owned(),
+            );
+        }
+        c.notes = notes;
+        c
+    }
+
+    /// The forwarding secret for the handshake code — the only place the raw
+    /// value leaves this struct. `None` means forwarding cannot be verified.
+    #[allow(dead_code)]
+    pub(crate) fn velocity_forwarding_secret(&self) -> Option<&str> {
+        self.velocity_forwarding_secret.as_deref()
+    }
+
+    fn redacted_secret(&self) -> Option<&'static str> {
+        self.velocity_forwarding_secret.as_ref().map(|_| "[REDACTED]")
+    }
+
+    /// One operator-log line naming every effective knob; the forwarding
+    /// secret stays `[REDACTED]` so a pasted startup log cannot leak it.
+    #[allow(dead_code)]
+    pub(crate) fn summary(&self) -> String {
+        format!(
+            "ops: online_mode={} velocity_forwarding={} (secret {}) autosave={}s backups={} lan={} load_balance={} mc_version={} pack_dir={}",
+            self.online_mode,
+            self.velocity_forwarding,
+            if self.velocity_forwarding_secret.is_some() { "[REDACTED]" } else { "unset" },
+            self.autosave_interval_secs,
+            self.backup_max_keep,
+            self.lan_broadcast,
+            self.auto_load_balance,
+            self.target_mc_version,
+            self.version_pack_dir.as_deref().unwrap_or("<bundled>"),
+        )
+    }
+}
+
+static RUNTIME_OPS: OnceLock<RuntimeOpsConfig> = OnceLock::new();
+
+/// The resolved ops knobs, defaulting until `server_config_boot` installs the
+/// values the file and environment produced. U1/U2 wiring reads this instead of
+/// re-parsing so every consumer sees the same clamped choices.
+#[allow(dead_code)]
+pub(crate) fn runtime_ops() -> &'static RuntimeOpsConfig {
+    RUNTIME_OPS.get_or_init(RuntimeOpsConfig::default)
 }
 
 #[cfg(test)]
@@ -661,5 +965,164 @@ mod server_config_tests {
         let doc = server_config_read_or_create(&path);
         assert_eq!(doc["anticheat"]["antixray"], ServerConfigValue::Bool(false));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runtime_ops_defaults_keep_pre_lane_behaviour() {
+        // The generated default file resolves to exactly the knobs a loopback
+        // dev server had before the ops lanes landed.
+        let (doc, warnings) = server_config_parse(SERVER_CONFIG_DEFAULT_FILE);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let c = RuntimeOpsConfig::from_doc(&doc, |_| None);
+        assert_eq!(c, RuntimeOpsConfig::default());
+        assert!(c.notes.is_empty(), "{:?}", c.notes);
+        assert!(!c.online_mode);
+        assert!(!c.velocity_forwarding);
+        assert_eq!(c.velocity_forwarding_secret(), None);
+        assert_eq!(c.autosave_interval_secs, 300);
+        assert_eq!(c.backup_max_keep, 5);
+        assert!(!c.lan_broadcast);
+        assert!(c.auto_load_balance);
+        assert_eq!(c.target_mc_version, "1.21.1");
+        assert_eq!(c.version_pack_dir, None);
+    }
+
+    #[test]
+    fn runtime_ops_reads_server_table_and_environment_wins() {
+        let (doc, warnings) = server_config_parse(
+            "[server]\n\
+             online_mode = true\n\
+             velocity_forwarding = true\n\
+             velocity_forwarding_secret = \"file-secret\"\n\
+             autosave_interval_secs = 60\n\
+             backup_max_keep = 3\n\
+             lan_broadcast = true\n\
+             auto_load_balance = false\n\
+             target_mc_version = \"1.21.4\"\n\
+             version_pack_dir = \"packs/1214\"\n",
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(server_config_unknown_keys(&doc).is_empty());
+        let env = |name: &str| match name {
+            "MC_SPINE_ONLINE_MODE" => Some("0".to_owned()),
+            "MC_SPINE_AUTOSAVE_SECS" => Some("45".to_owned()),
+            "MC_SPINE_BACKUP_MAX_KEEP" => Some("8".to_owned()),
+            "MC_SPINE_MC_VERSION" => Some("1.21.5".to_owned()),
+            _ => None,
+        };
+        let c = RuntimeOpsConfig::from_doc(&doc, env);
+        // The environment wins over the file on every knob it sets.
+        assert!(!c.online_mode);
+        assert_eq!(c.autosave_interval_secs, 45);
+        assert_eq!(c.backup_max_keep, 8);
+        assert_eq!(c.target_mc_version, "1.21.5");
+        // Everything else comes from the file.
+        assert!(c.velocity_forwarding);
+        assert_eq!(c.velocity_forwarding_secret(), Some("file-secret"));
+        assert!(c.lan_broadcast);
+        assert!(!c.auto_load_balance);
+        assert_eq!(c.version_pack_dir.as_deref(), Some("packs/1214"));
+        assert!(c.notes.is_empty(), "{:?}", c.notes);
+    }
+
+    #[test]
+    fn runtime_ops_new_keys_export_through_the_env_layer() {
+        // A `[server]` key with no environment override lands in the same
+        // `MC_SPINE_*` variable its env-reading consumers already watch.
+        let (doc, _) = server_config_parse(
+            "[server]\nonline_mode = true\ntarget_mc_version = \"1.21.4\"\nversion_pack_dir = \"p\"\n",
+        );
+        let env = server_config_server_env(&doc, |name| name == "MC_SPINE_ONLINE_MODE");
+        let got: BTreeMap<&str, String> = env.into_iter().collect();
+        assert!(!got.contains_key("MC_SPINE_ONLINE_MODE")); // env already won
+        assert_eq!(got["MC_SPINE_MC_VERSION"], "1.21.4");
+        assert_eq!(got["MC_SPINE_VERSION_DIR"], "p");
+        // And resolving the file sees the value the env layer would have set.
+        let c = RuntimeOpsConfig::from_doc(&doc, |_| None);
+        assert!(c.online_mode);
+    }
+
+    #[test]
+    fn online_mode_maps_from_vanilla_server_properties() {
+        let props = server_properties_parse("online-mode=true\nmotd=x\n");
+        let env = server_properties_env(&props, |_| false);
+        let got: BTreeMap<&str, String> = env.into_iter().collect();
+        assert_eq!(got["MC_SPINE_ONLINE_MODE"], "true");
+        // A higher layer that already decided the variable keeps it.
+        let env = server_properties_env(&props, |n| n == "MC_SPINE_ONLINE_MODE");
+        assert!(env.iter().all(|(name, _)| *name != "MC_SPINE_ONLINE_MODE"));
+    }
+
+    #[test]
+    fn runtime_ops_secret_is_redacted_in_debug_and_summary() {
+        let (doc, _) = server_config_parse(
+            "[server]\nvelocity_forwarding = true\nvelocity_forwarding_secret = \"hunter2\"\n",
+        );
+        let c = RuntimeOpsConfig::from_doc(&doc, |_| None);
+        let debug = format!("{c:?}");
+        let summary = c.summary();
+        assert!(!debug.contains("hunter2"), "{debug}");
+        assert!(debug.contains("[REDACTED]"), "{debug}");
+        assert!(!summary.contains("hunter2"), "{summary}");
+        assert!(summary.contains("[REDACTED]"), "{summary}");
+        // The real value is still reachable through the dedicated accessor.
+        assert_eq!(c.velocity_forwarding_secret(), Some("hunter2"));
+    }
+
+    #[test]
+    fn runtime_ops_clamps_autosave_and_notes_bad_values() {
+        let (doc, _) = server_config_parse(
+            "[server]\nautosave_interval_secs = 2\nbackup_max_keep = \"many\"\nonline_mode = 7\n",
+        );
+        let env = |name: &str| match name {
+            "MC_SPINE_AUTOSAVE_SECS" => Some("notanum".to_owned()),
+            _ => None,
+        };
+        let c = RuntimeOpsConfig::from_doc(&doc, env);
+        // The unparsable env value falls back to the file's 2, which is then
+        // clamped into the safe band.
+        assert_eq!(c.autosave_interval_secs, AUTOSAVE_SECS_MIN);
+        assert_eq!(c.backup_max_keep, BACKUP_MAX_KEEP_DEFAULT);
+        assert!(!c.online_mode);
+        assert_eq!(c.notes.len(), 4, "{:?}", c.notes);
+        assert!(c.notes.iter().any(|n| n.contains("unrecognized value `notanum`")));
+        assert!(c.notes.iter().any(|n| n.contains("clamped")));
+        assert!(c.notes.iter().any(|n| n.contains("backup_max_keep")));
+        assert!(c.notes.iter().any(|n| n.contains("online_mode")));
+    }
+
+    #[test]
+    fn runtime_ops_autosave_upper_bound_and_huge_keep_are_bounded() {
+        let (doc, _) = server_config_parse("[server]\nautosave_interval_secs = 99999999\n");
+        let c = RuntimeOpsConfig::from_doc(&doc, |_| None);
+        assert_eq!(c.autosave_interval_secs, AUTOSAVE_SECS_MAX);
+        assert!(c.notes.iter().any(|n| n.contains("clamped")));
+    }
+
+    #[test]
+    fn runtime_ops_flags_velocity_forwarding_without_a_secret() {
+        let (doc, _) = server_config_parse("[server]\nvelocity_forwarding = true\n");
+        let c = RuntimeOpsConfig::from_doc(&doc, |_| None);
+        assert!(c.notes.iter().any(|n| n.contains("velocity_forwarding") && n.contains("secret")));
+        let (doc, _) = server_config_parse("[server]\nvelocity_forwarding_secret = \"s\"\n");
+        let c = RuntimeOpsConfig::from_doc(&doc, |_| None);
+        assert!(c.notes.iter().any(|n| n.contains("no effect")));
+    }
+
+    #[test]
+    fn runtime_ops_env_bool_spellings_and_empty_env_falls_back() {
+        let doc = ServerConfigDoc::new();
+        let env = |name: &str| match name {
+            "MC_SPINE_ONLINE_MODE" => Some("TRUE".to_owned()),
+            "MC_SPINE_LAN_BROADCAST" => Some(" yes ".to_owned()),
+            "MC_SPINE_AUTO_LOAD_BALANCE" => Some("".to_owned()),
+            _ => None,
+        };
+        let c = RuntimeOpsConfig::from_doc(&doc, env);
+        assert!(c.online_mode);
+        assert!(c.lan_broadcast);
+        // An empty env var is unset, so the default still applies.
+        assert!(c.auto_load_balance);
+        assert!(c.notes.is_empty(), "{:?}", c.notes);
     }
 }

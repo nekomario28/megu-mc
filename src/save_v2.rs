@@ -2352,17 +2352,166 @@ fn save_world_into(f: &mut Vec<u8>) {
         }
     }
     append_dxt_footer(f, &dxt);
+    // VER1 rides just beneath the seed trailer: `read_world_seed_footer` peels
+    // both, so a reader that predates the record still sees its whole frame.
+    // A native 1.21.1 save emits nothing, like the other default-only footers.
+    if let Some(header) = save_version_header() {
+        append_save_version_footer(f, &header);
+    }
     append_world_seed_footer(f, WORLD_SEED.load(Ordering::Relaxed));
     // Keep full UUID records for players who go offline before the next save.
     *saved_players().lock().unwrap() = players;
 }
 
-fn append_world_seed_footer(out: &mut Vec<u8>, seed: u64) {
-    out.extend_from_slice(&seed.to_be_bytes());
-    out.extend_from_slice(WORLD_SEED_MAGIC);
+// ---------- save version header ----------
+//
+// Which Minecraft release a snapshot describes: its release name, the vanilla
+// `DataVersion` integer and the network protocol version. Written as a VER1
+// footer tucked just beneath the SED1 seed trailer — `read_world_seed_footer`
+// peels both, so callers stripping the tail by hand (and every snapshot a
+// pre-header build wrote) see the exact same bytes as before. Like the other
+// additive footers, nothing is emitted for a native 1.21.1 save: the loader
+// infers the same header from the record's absence.
+
+const SAVE_VERSION_MAGIC: &[u8; 4] = b"VER1";
+
+/// `(release name, vanilla DataVersion, network protocol)` for each milestone
+/// the version table knows. The DataVersion column mirrors
+/// `AnvilSchemaVersion`; the protocol column is the release's handshake number.
+const SAVE_VERSION_TABLE: &[(&str, i32, i32)] = &[
+    ("1.20.4", 3700, 765),
+    ("1.20.6", 3839, 766),
+    ("1.21", 3953, 767),
+    ("1.21.1", 3955, 767),
+    ("1.21.3", 4082, 768),
+    ("1.21.4", 4189, 769),
+    ("1.21.5", 4325, 770),
+];
+
+/// The save schema this build writes natively. The version header records it so
+/// a future build can tell a save's vintage before parsing a byte of content.
+const SAVE_DATA_VERSION_RUNNING: i32 = 3955;
+const SAVE_PROTOCOL_VERSION_RUNNING: i32 = 767;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SaveVersionHeader {
+    mc_version: String,
+    data_version: i32,
+    protocol_version: i32,
+    /// The file carried no VER1 record and the defaults were inferred rather
+    /// than read. Diagnostic only — never on the wire.
+    inferred_legacy_header: bool,
 }
 
-fn read_world_seed_footer(payload: &[u8]) -> Result<(&[u8], Option<u64>), &'static str> {
+impl SaveVersionHeader {
+    /// The header a snapshot written before VER1 existed gets: the only save
+    /// schema this codebase had at the time.
+    fn v1_21_1() -> Self {
+        SaveVersionHeader {
+            mc_version: "1.21.1".to_owned(),
+            data_version: 3955,
+            protocol_version: 767,
+            inferred_legacy_header: false,
+        }
+    }
+
+    /// `v1_21_1()` marked as inferred, for a file with no VER1 record.
+    fn legacy() -> Self {
+        SaveVersionHeader {
+            inferred_legacy_header: true,
+            ..Self::v1_21_1()
+        }
+    }
+
+    /// The header for a named release. A name the table does not know keeps
+    /// the name verbatim but takes the running schema's version pair, so a
+    /// custom pack never silently claims a DataVersion it did not write.
+    fn for_mc_version(mc_version: &str) -> Self {
+        let name = mc_version.trim();
+        let (data_version, protocol_version) = SAVE_VERSION_TABLE
+            .iter()
+            .find(|(n, _, _)| *n == name)
+            .map(|entry| (entry.1, entry.2))
+            .unwrap_or((SAVE_DATA_VERSION_RUNNING, SAVE_PROTOCOL_VERSION_RUNNING));
+        SaveVersionHeader {
+            mc_version: name.to_owned(),
+            data_version,
+            protocol_version,
+            inferred_legacy_header: false,
+        }
+    }
+}
+
+/// The record new snapshots carry: `MC_SPINE_MC_VERSION` when the operator
+/// pointed the server at another version pack, else `None`. Like every other
+/// additive footer here, a record that would only restate the native defaults
+/// is never emitted — a 1.21.1 save keeps the exact pre-header byte layout and
+/// its loader infers the same values instead.
+fn save_version_header() -> Option<SaveVersionHeader> {
+    match std::env::var("MC_SPINE_MC_VERSION") {
+        Ok(v) if !v.trim().is_empty() => {
+            let header = SaveVersionHeader::for_mc_version(&v);
+            (header != SaveVersionHeader::v1_21_1()).then_some(header)
+        }
+        _ => None,
+    }
+}
+
+/// How a snapshot's DataVersion relates to this build's save schema.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaveVersionCompat {
+    /// Same DataVersion as the running build.
+    Exact,
+    /// The file predates the running schema; the migration lanes own the
+    /// upgrade. `delta` is how many DataVersions behind the file is.
+    OlderUpgradeable { delta: i32 },
+    /// The file names a DataVersion newer than this build knows — reported so
+    /// a downgrade can never pass for a native save and silently drop content.
+    NewerUnknown { file_dv: i32, running_dv: i32 },
+}
+
+fn classify_save_v2_version(
+    header: &SaveVersionHeader,
+    running_data_version: i32,
+) -> SaveVersionCompat {
+    let file_dv = header.data_version;
+    match file_dv.cmp(&running_data_version) {
+        std::cmp::Ordering::Equal => SaveVersionCompat::Exact,
+        std::cmp::Ordering::Less => SaveVersionCompat::OlderUpgradeable {
+            delta: running_data_version - file_dv,
+        },
+        std::cmp::Ordering::Greater => SaveVersionCompat::NewerUnknown {
+            file_dv,
+            running_dv: running_data_version,
+        },
+    }
+}
+
+/// The version record of the most recently decoded snapshot, for diagnostics.
+static LOADED_SAVE_VERSION: Mutex<Option<SaveVersionHeader>> = Mutex::new(None);
+
+#[allow(dead_code)]
+fn loaded_save_version_header() -> Option<SaveVersionHeader> {
+    LOADED_SAVE_VERSION.lock().unwrap().clone()
+}
+
+/// `[schema u8][varint name len][name utf8][data_version i32][protocol i32]`,
+/// framed `[body][body size u64][VER1]` like the other save-state footers.
+fn append_save_version_footer(out: &mut Vec<u8>, header: &SaveVersionHeader) {
+    let start = out.len();
+    out.push(1); // VER1 schema version
+    write_varint(out, header.mc_version.len() as i64);
+    out.extend_from_slice(header.mc_version.as_bytes());
+    save_numbers!(out, header.data_version, header.protocol_version);
+    let size = (out.len() - start) as u64;
+    save_numbers!(out, size);
+    out.extend_from_slice(SAVE_VERSION_MAGIC);
+}
+
+/// Peel just the seed trailer, leaving any VER1 record in place for a caller
+/// that reads it. `read_world_seed_footer` is the full strip every existing
+/// caller expects.
+fn strip_world_seed_footer(payload: &[u8]) -> Result<(&[u8], Option<u64>), &'static str> {
     if !payload.ends_with(WORLD_SEED_MAGIC) {
         return Ok((payload, None));
     }
@@ -2376,6 +2525,50 @@ fn read_world_seed_footer(payload: &[u8]) -> Result<(&[u8], Option<u64>), &'stat
             .map_err(|_| "truncated world seed footer")?,
     );
     Ok((&payload[..end], Some(seed)))
+}
+
+/// The VER1 record in `payload`, if present. The record sits just beneath the
+/// seed trailer, so the trailer is lifted to reach it — this only reads, it
+/// does not shorten `payload` for the caller: `read_world_seed_footer` is the
+/// strip that hides VER1 exactly like a pre-header save does.
+fn read_save_version_header(payload: &[u8]) -> Result<Option<SaveVersionHeader>, &'static str> {
+    let (payload, _) = strip_world_seed_footer(payload)?;
+    let (_, body) = split_save_footer(payload, SAVE_VERSION_MAGIC)?;
+    let Some(body) = body else { return Ok(None) };
+    let mut input = SaveInput(body);
+    if input.byte()? != 1 {
+        return Err("unsupported save version header");
+    }
+    let name_len =
+        usize::try_from(input.varint()?).map_err(|_| "invalid save version name")?;
+    let mc_version = std::str::from_utf8(input.bytes(name_len)?)
+        .map_err(|_| "invalid save version name")?
+        .to_owned();
+    let data_version = i32::from_be_bytes(input.take()?);
+    let protocol_version = i32::from_be_bytes(input.take()?);
+    if !input.0.is_empty() {
+        return Err("trailing bytes in save version header");
+    }
+    Ok(Some(SaveVersionHeader {
+        mc_version,
+        data_version,
+        protocol_version,
+        inferred_legacy_header: false,
+    }))
+}
+
+fn append_world_seed_footer(out: &mut Vec<u8>, seed: u64) {
+    out.extend_from_slice(&seed.to_be_bytes());
+    out.extend_from_slice(WORLD_SEED_MAGIC);
+}
+
+fn read_world_seed_footer(payload: &[u8]) -> Result<(&[u8], Option<u64>), &'static str> {
+    let (payload, seed) = strip_world_seed_footer(payload)?;
+    // The VER1 record rides just beneath the seed trailer: peel it too, so
+    // callers that strip the tail by hand see the same boundary a pre-header
+    // save had.
+    let (payload, _) = split_save_footer(payload, SAVE_VERSION_MAGIC)?;
+    Ok((payload, seed))
 }
 
 fn load_world_seed_in(dir: &std::path::Path) -> Result<Option<u64>, &'static str> {
@@ -3524,6 +3717,23 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
 }
 
 fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
+    // The optional VER1 record sits just beneath the seed trailer; read it
+    // before peeling so a save written for another release is announced rather
+    // than silently parsed under the wrong schema. A file without the record
+    // is a pre-header save and gets the 1.21.1 header it always meant.
+    let save_version =
+        read_save_version_header(payload)?.unwrap_or_else(SaveVersionHeader::legacy);
+    match classify_save_v2_version(&save_version, SAVE_DATA_VERSION_RUNNING) {
+        SaveVersionCompat::Exact => {}
+        SaveVersionCompat::OlderUpgradeable { delta } => eprintln!(
+            "[save] world was written for {} (DataVersion {}, {delta} versions behind the running schema); loading it under the 1.21.1 layout",
+            save_version.mc_version, save_version.data_version
+        ),
+        SaveVersionCompat::NewerUnknown { file_dv, running_dv } => eprintln!(
+            "[save] world was written for a NEWER DataVersion ({file_dv} > running {running_dv}); content this build does not know may be ignored on load"
+        ),
+    }
+    *LOADED_SAVE_VERSION.lock().unwrap() = Some(save_version);
     // Footers are stripped last-written-first.
     let (payload, _) = read_world_seed_footer(payload)?;
     let (payload, dxt) = read_dxt_footer(payload)?;
@@ -5159,5 +5369,172 @@ mod save_backup_tests {
         assert!(err.contains("world.bin.tmp"), "{err}");
         assert_eq!(std::fs::read(&world).unwrap(), b"good");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod save_v2_version_tests {
+    use super::*;
+
+    #[test]
+    fn save_v2_version_header_round_trips_1211_and_1214() {
+        for header in [
+            SaveVersionHeader::v1_21_1(),
+            SaveVersionHeader::for_mc_version("1.21.4"),
+        ] {
+            let mut payload = b"save-body".to_vec();
+            append_save_version_footer(&mut payload, &header);
+            append_world_seed_footer(&mut payload, 42);
+            let got = read_save_version_header(&payload).unwrap().unwrap();
+            assert_eq!(got.mc_version, header.mc_version);
+            assert_eq!(got.data_version, header.data_version);
+            assert_eq!(got.protocol_version, header.protocol_version);
+            assert!(!got.inferred_legacy_header);
+            // The seed strip hides VER1 completely: the caller sees the frame
+            // a pre-header save would have ended with.
+            let (rest, seed) = read_world_seed_footer(&payload).unwrap();
+            assert_eq!(seed, Some(42));
+            assert_eq!(rest, b"save-body");
+        }
+        // Known milestones map to vanilla's version pair.
+        let h = SaveVersionHeader::for_mc_version("1.21.4");
+        assert_eq!((h.data_version, h.protocol_version), (4189, 769));
+        // An unlisted name keeps its spelling but never claims a version pair
+        // it did not write.
+        let custom = SaveVersionHeader::for_mc_version("1.21.5-custom");
+        assert_eq!(custom.mc_version, "1.21.5-custom");
+        assert_eq!(
+            (custom.data_version, custom.protocol_version),
+            (SAVE_DATA_VERSION_RUNNING, SAVE_PROTOCOL_VERSION_RUNNING)
+        );
+    }
+
+    #[test]
+    fn save_v2_missing_version_header_infers_legacy_1211() {
+        let mut payload = b"save-body".to_vec();
+        append_world_seed_footer(&mut payload, 7);
+        assert_eq!(read_save_version_header(&payload).unwrap(), None);
+        let header = SaveVersionHeader::legacy();
+        assert!(header.inferred_legacy_header);
+        assert_eq!(header.mc_version, "1.21.1");
+        assert_eq!((header.data_version, header.protocol_version), (3955, 767));
+    }
+
+    #[test]
+    fn save_v2_version_header_survives_seed_only_strip() {
+        // A payload that already lost its seed trailer still yields the record.
+        let mut payload = b"save-body".to_vec();
+        append_save_version_footer(&mut payload, &SaveVersionHeader::v1_21_1());
+        let got = read_save_version_header(&payload).unwrap().unwrap();
+        assert_eq!(got.mc_version, "1.21.1");
+        assert!(!got.inferred_legacy_header);
+    }
+
+    #[test]
+    fn save_v2_version_header_fails_closed_on_corruption() {
+        // An honest non-VER1 tail is simply "no header", never a misparse.
+        let mut payload = b"save-body".to_vec();
+        payload.extend_from_slice(b"XXXX");
+        assert_eq!(read_save_version_header(&payload).unwrap(), None);
+        // A VER1 trailer whose declared body cannot exist is an error.
+        let mut bad = b"body".to_vec();
+        bad.extend_from_slice(&999u64.to_be_bytes());
+        bad.extend_from_slice(SAVE_VERSION_MAGIC);
+        assert!(read_save_version_header(&bad).is_err());
+        // An unknown footer schema version is an error, not a silent skip.
+        let mut bad = b"body".to_vec();
+        bad.push(9);
+        let size = 1u64;
+        bad.extend_from_slice(&size.to_be_bytes());
+        bad.extend_from_slice(SAVE_VERSION_MAGIC);
+        assert!(read_save_version_header(&bad).is_err());
+        // Trailing junk inside the body is an error too.
+        let mut bad = b"body".to_vec();
+        bad.extend_from_slice(&[1, 0, 0]);
+        let size = 3u64;
+        bad.extend_from_slice(&size.to_be_bytes());
+        bad.extend_from_slice(SAVE_VERSION_MAGIC);
+        assert!(read_save_version_header(&bad).is_err());
+    }
+
+    #[test]
+    fn save_v2_classify_version_marks_exact_older_and_newer() {
+        assert_eq!(
+            classify_save_v2_version(&SaveVersionHeader::v1_21_1(), SAVE_DATA_VERSION_RUNNING),
+            SaveVersionCompat::Exact
+        );
+        let older = SaveVersionHeader::for_mc_version("1.20.6");
+        assert_eq!(
+            classify_save_v2_version(&older, SAVE_DATA_VERSION_RUNNING),
+            SaveVersionCompat::OlderUpgradeable {
+                delta: SAVE_DATA_VERSION_RUNNING - 3839
+            }
+        );
+        let newer = SaveVersionHeader {
+            mc_version: "9.9.9".to_owned(),
+            data_version: 9999,
+            protocol_version: 9999,
+            inferred_legacy_header: false,
+        };
+        assert_eq!(
+            classify_save_v2_version(&newer, SAVE_DATA_VERSION_RUNNING),
+            SaveVersionCompat::NewerUnknown {
+                file_dv: 9999,
+                running_dv: SAVE_DATA_VERSION_RUNNING
+            }
+        );
+    }
+
+    #[test]
+    fn save_v2_mc_version_env_selects_the_written_header() {
+        std::env::set_var("MC_SPINE_MC_VERSION", "1.21.4");
+        let header = save_version_header();
+        std::env::remove_var("MC_SPINE_MC_VERSION");
+        let header = header.unwrap();
+        assert_eq!(
+            (
+                header.mc_version.as_str(),
+                header.data_version,
+                header.protocol_version
+            ),
+            ("1.21.4", 4189, 769)
+        );
+        // Native or unset: nothing is emitted, the loader infers instead.
+        assert_eq!(save_version_header(), None);
+        std::env::set_var("MC_SPINE_MC_VERSION", "1.21.1");
+        assert_eq!(save_version_header(), None);
+        std::env::remove_var("MC_SPINE_MC_VERSION");
+    }
+
+    #[test]
+    fn save_v2_native_save_has_no_header_and_infers_legacy_1211() {
+        let mut payload = Vec::new();
+        save_world_into(&mut payload);
+        assert!(payload.ends_with(WORLD_SEED_MAGIC));
+        // The native write emits no VER1 record, so the frame is byte-for-byte
+        // the pre-header layout and the loader infers the 1.21.1 defaults.
+        assert_eq!(read_save_version_header(&payload).unwrap(), None);
+        load_world_from(&payload).unwrap();
+        let loaded = loaded_save_version_header().unwrap();
+        assert!(loaded.inferred_legacy_header);
+        assert_eq!(loaded.mc_version, "1.21.1");
+        assert_eq!(loaded.data_version, SAVE_DATA_VERSION_RUNNING);
+    }
+
+    #[test]
+    fn save_v2_foreign_version_header_round_trips_through_load() {
+        // A snapshot carrying a VER1 record keeps its release name and version
+        // pair all the way through decode.
+        let mut payload = Vec::new();
+        save_world_into(&mut payload);
+        let (stripped, seed) = strip_world_seed_footer(&payload).unwrap();
+        let mut foreign = stripped.to_vec();
+        append_save_version_footer(&mut foreign, &SaveVersionHeader::for_mc_version("1.21.4"));
+        append_world_seed_footer(&mut foreign, seed.unwrap());
+        load_world_from(&foreign).unwrap();
+        let loaded = loaded_save_version_header().unwrap();
+        assert!(!loaded.inferred_legacy_header);
+        assert_eq!(loaded.mc_version, "1.21.4");
+        assert_eq!((loaded.data_version, loaded.protocol_version), (4189, 769));
     }
 }
