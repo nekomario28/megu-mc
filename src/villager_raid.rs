@@ -872,7 +872,7 @@ impl GossipType {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct VillagerGossip {
     by_player: HashMap<VillageUuid, [i32; GossipType::ALL.len()]>,
 }
@@ -1572,6 +1572,828 @@ impl Raid {
         };
         self.remaining.extend(wave.raiders().map(|(id, _)| id));
         Some(RaidEvent::SpawnWave(wave))
+    }
+}
+
+// ---------- native golem and utility-mob states ----------
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConstructedGolem {
+    Iron,
+    Snow,
+}
+
+/// Match the pumpkin above the iron T (in either horizontal orientation) or
+/// two vertically stacked snow blocks. Returns precisely the consumed cells.
+#[cfg_attr(not(test), allow(dead_code))]
+fn detect_golem_construction<'a>(
+    pumpkin: BlockPos,
+    mut block_name: impl FnMut(BlockPos) -> &'a str,
+) -> Option<(ConstructedGolem, Vec<BlockPos>)> {
+    let (x, y, z) = pumpkin;
+    if !matches!(block_name(pumpkin), "minecraft:carved_pumpkin" | "minecraft:jack_o_lantern") {
+        return None;
+    }
+    let base = (x, y - 2, z);
+    let neck = (x, y - 1, z);
+    if block_name(base) == "minecraft:snow_block" && block_name(neck) == "minecraft:snow_block" {
+        return Some((ConstructedGolem::Snow, vec![pumpkin, neck, base]));
+    }
+    if block_name(base) != "minecraft:iron_block" || block_name(neck) != "minecraft:iron_block" {
+        return None;
+    }
+    for (dx, dz) in [(1, 0), (0, 1)] {
+        let left = (x - dx, y - 1, z - dz);
+        let right = (x + dx, y - 1, z + dz);
+        if block_name(left) == "minecraft:iron_block" && block_name(right) == "minecraft:iron_block" {
+            return Some((ConstructedGolem::Iron, vec![pumpkin, neck, base, left, right]));
+        }
+    }
+    None
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default)]
+struct IronGolemState {
+    player_created: bool,
+}
+
+impl IronGolemState {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn hostile_to_player(self, gossip: &VillagerGossip, player: VillageUuid) -> bool {
+        !self.player_created && gossip.golem_hostile(player)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn repair(hp: &mut f32, iron_ingot: bool) -> bool {
+        if !iron_ingot || *hp >= 100.0 {
+            return false;
+        }
+        *hp = (*hp + 25.0).min(100.0);
+        true
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn crack_stage(hp: f32) -> u8 {
+        if hp <= 25.0 { 3 } else if hp <= 50.0 { 2 } else if hp <= 75.0 { 1 } else { 0 }
+    }
+}
+
+/// Nearby panic and a recent exchange among at least three villagers permit
+/// another village-created iron golem when no existing one is within 16 blocks.
+#[cfg_attr(not(test), allow(dead_code))]
+fn village_golem_spawn_allowed(
+    gossiping_villagers: usize,
+    panicking: bool,
+    golem_within_16: bool,
+) -> bool {
+    gossiping_villagers >= 3 && panicking && !golem_within_16
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default)]
+struct SnowGolemState {
+    sheared: bool,
+}
+
+impl SnowGolemState {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn shear(&mut self) -> bool {
+        if self.sheared { false } else { self.sheared = true; true }
+    }
+
+    /// Called once every 20 game ticks. Snow may form beneath the mob only
+    /// where the cold-biome and block-survival checks both succeed.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn environment_tick(hp: &mut f32, too_hot: bool, rain_exposed: bool, cold_and_supported: bool) -> bool {
+        if too_hot || rain_exposed {
+            *hp = (*hp - 1.0).max(0.0);
+        }
+        cold_and_supported && *hp > 0.0
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+struct AxolotlState {
+    dry_ticks: u32,
+    playing_dead_ticks: u32,
+    previous_hp: f32,
+}
+
+impl AxolotlState {
+    const DRY_TICKS: u32 = 6_000;
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn new(hp: f32) -> Self {
+        Self { dry_ticks: Self::DRY_TICKS, playing_dead_ticks: 0, previous_hp: hp }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn tick(&mut self, hydrated: bool, hp: &mut f32, max_hp: f32, tick: u64) {
+        if hydrated {
+            self.dry_ticks = Self::DRY_TICKS;
+        } else {
+            self.dry_ticks = self.dry_ticks.saturating_sub(1);
+            if self.dry_ticks == 0 && tick.is_multiple_of(20) {
+                *hp = (*hp - 1.0).max(0.0);
+            }
+        }
+        if *hp < self.previous_hp && *hp < max_hp / 2.0 {
+            self.playing_dead_ticks = 200;
+        }
+        if self.playing_dead_ticks > 0 {
+            self.playing_dead_ticks -= 1;
+            if tick.is_multiple_of(25) {
+                *hp = (*hp + 1.0).min(max_hp);
+            }
+        }
+        self.previous_hp = *hp;
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn reward_player_for_target_kill(player_killed_target: bool) -> Option<(i32, i32)> {
+        player_killed_target.then_some((0, 100)) // Regeneration I, 5 seconds
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, Default)]
+struct AllayState {
+    owner: Option<VillageUuid>,
+    held: Option<Stack>,
+    collected: Option<Stack>,
+    note_block: Option<(BlockPos, u64)>,
+    duplication_ready_at: u64,
+}
+
+impl AllayState {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn give_item(&mut self, owner: VillageUuid, stack: Stack) -> bool {
+        if stack.1 == 0 || self.held.is_some() {
+            return false;
+        }
+        self.owner = Some(owner);
+        self.held = Some((stack.0, 1, stack.2));
+        true
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn hears_note(&mut self, position: BlockPos, now: u64) {
+        self.note_block = Some((position, now.saturating_add(600)));
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn delivery_target(&mut self, now: u64) -> Option<BlockPos> {
+        if self.note_block.is_some_and(|(_, expires)| now >= expires) {
+            self.note_block = None;
+        }
+        self.note_block.map(|(pos, _)| pos)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn matches_drop(&self, drop: &Drop, allay_pos: [f64; 3]) -> bool {
+        self.collected.is_none() && self.held.as_ref().is_some_and(|held| {
+            held.0 == drop.item && held.2 == drop.comps && drop.cnt > 0
+                && drop.target.is_none()
+                && (drop.x - allay_pos[0]).powi(2)
+                    + (drop.y - allay_pos[1]).powi(2)
+                    + (drop.z - allay_pos[2]).powi(2) <= 32.0_f64.powi(2)
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn collect_drop(&mut self, drop: &Drop, at: [f64; 3]) -> bool {
+        if !drop.pickup_delay_elapsed() || !self.matches_drop(drop, at) {
+            return false;
+        }
+        self.collected = Some((drop.item, drop.cnt, drop.comps.clone()));
+        true
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn duplicate(&mut self, dancing: bool, jukebox_active: bool, amethyst_shard: bool, now: u64) -> bool {
+        if !dancing || !jukebox_active || !amethyst_shard || now < self.duplication_ready_at {
+            return false;
+        }
+        self.duplication_ready_at = now.saturating_add(6_000);
+        true
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, Default)]
+struct FoxState {
+    trusted: [Option<VillageUuid>; 2],
+    sleeping: bool,
+    held: Option<Stack>,
+}
+
+impl FoxState {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn trust(&mut self, player: VillageUuid) {
+        if !self.trusted.contains(&Some(player)) {
+            if let Some(slot) = self.trusted.iter_mut().find(|entry| entry.is_none()) {
+                *slot = Some(player);
+            }
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn tick(&mut self, daytime: bool, threatened: bool, in_water: bool) {
+        self.sleeping = daytime && !threatened && !in_water;
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn pickup(&mut self, stack: Stack) -> bool {
+        if stack.1 == 0 || self.held.is_some() { return false; }
+        self.held = Some((stack.0, 1, stack.2));
+        true
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default)]
+struct CamelState {
+    sitting: bool,
+    last_dash_tick: Option<u64>,
+}
+
+impl CamelState {
+    #[cfg_attr(not(test), allow(dead_code))]
+    const PASSENGERS: usize = 2;
+    const DASH_COOLDOWN: u64 = 55;
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn toggle_sitting(&mut self) { self.sitting = !self.sitting; }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn dash(&mut self, now: u64, yaw_degrees: f32) -> Option<[f64; 3]> {
+        if self.sitting || self.last_dash_tick.is_some_and(|last| now.saturating_sub(last) < Self::DASH_COOLDOWN) {
+            return None;
+        }
+        self.last_dash_tick = Some(now);
+        let yaw = f64::from(yaw_degrees).to_radians();
+        Some([-yaw.sin() * 1.8, 0.6, yaw.cos() * 1.8])
+    }
+}
+
+/// Live per-entity data for the utility mobs. The server's shared `Mob`
+/// allocation cannot be extended by this lane.
+#[allow(dead_code)] // Interaction entry points are consumed by packet handlers owned by other lanes.
+#[derive(Clone, Debug)]
+enum NativeUtilityState {
+    Iron(IronGolemState),
+    Snow(SnowGolemState),
+    Axolotl(AxolotlState),
+    Allay(AllayState),
+    Fox(FoxState),
+    Camel(CamelState),
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_native_utility_states() -> &'static Mutex<HashMap<i32, NativeUtilityState>> {
+    static STATES: OnceLock<Mutex<HashMap<i32, NativeUtilityState>>> = OnceLock::new();
+    STATES.get_or_init(Mutex::default)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
+fn live_native_mob(eid: i32, name: &str) -> Option<Arc<Mob>> {
+    let etype = name_to_etype(name)?;
+    mobs().lock().unwrap_or_else(|e| e.into_inner())
+        .iter().find(|mob| mob.eid == eid && mob.etype == etype)
+        .cloned()
+}
+
+/// Item-interaction entry points maintain the same per-entity state as the
+/// periodic tick. Their callers are the corresponding packet/block handlers.
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
+fn live_iron_golem_repair(eid: i32, iron_ingot: bool) -> bool {
+    let Some(mob) = live_native_mob(eid, "iron_golem") else { return false };
+    let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
+    let state = states.entry(eid)
+        .or_insert(NativeUtilityState::Iron(IronGolemState::default()));
+    if let NativeUtilityState::Iron(_) = state {
+        IronGolemState::repair(&mut mob.hp.lock().unwrap_or_else(|e| e.into_inner()), iron_ingot)
+    } else {
+        false
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
+fn live_iron_golem_hostile_to_player(eid: i32, gossip: &VillagerGossip, player: VillageUuid) -> bool {
+    if live_native_mob(eid, "iron_golem").is_none() { return false; }
+    let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
+    let state = states.entry(eid)
+        .or_insert(NativeUtilityState::Iron(IronGolemState::default()));
+    matches!(state, NativeUtilityState::Iron(golem) if golem.hostile_to_player(gossip, player))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
+fn live_snow_golem_shear(eid: i32) -> bool {
+    let Some(mob) = live_native_mob(eid, "snow_golem") else { return false };
+    let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
+    let state = states.entry(eid)
+        .or_insert(NativeUtilityState::Snow(SnowGolemState::default()));
+    if let NativeUtilityState::Snow(snow) = state {
+        if snow.shear() {
+            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(item) = name_to_item("carved_pumpkin") {
+                drop_live_stack((x, y, z), (item, 1, Vec::new()));
+            }
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
+fn live_allay_give(eid: i32, player: VillageUuid, item: Stack) -> bool {
+    if live_native_mob(eid, "allay").is_none() { return false; }
+    let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
+    let state = states.entry(eid)
+        .or_insert_with(|| NativeUtilityState::Allay(AllayState::default()));
+    if let NativeUtilityState::Allay(allay) = state {
+        allay.give_item(player, item)
+    } else {
+        false
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
+fn live_allay_note(eid: i32, note: BlockPos, tick: u64) -> bool {
+    if live_native_mob(eid, "allay").is_none() { return false; }
+    let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
+    let state = states.entry(eid)
+        .or_insert_with(|| NativeUtilityState::Allay(AllayState::default()));
+    if let NativeUtilityState::Allay(allay) = state {
+        allay.hears_note(note, tick);
+        true
+    } else { false }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
+fn live_allay_duplicate(eid: i32, dancing: bool, jukebox_active: bool, shard: bool, tick: u64) -> Option<Arc<Mob>> {
+    let original = live_native_mob(eid, "allay")?;
+    let spec = entity_spec_by_name("allay")?;
+    with_save_guard(|| {
+        if mobs().lock().unwrap_or_else(|e| e.into_inner()).len() >= MOB_CAP {
+            return None;
+        }
+        let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
+        let state = states.entry(eid)
+            .or_insert_with(|| NativeUtilityState::Allay(AllayState::default()));
+        let NativeUtilityState::Allay(allay) = state else { return None };
+        if !allay.duplicate(dancing, jukebox_active, shard, tick) { return None; }
+        let position = *original.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let mob = new_live_mob(spec.id, original.dim, position, spec.max_health, None);
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob.clone());
+        states.insert(mob.eid, NativeUtilityState::Allay(AllayState::default()));
+        Some(mob)
+    })
+}
+
+/// The allay keeps the sample item while carrying a matching ground stack to
+/// its linked note block or the player who handed it the sample.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_allay_collect_and_deliver(mob: &Arc<Mob>, at: [f64; 3], tick: u64) {
+    let (owner, note, carrying) = {
+        let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
+        let state = states.entry(mob.eid).or_insert_with(|| NativeUtilityState::Allay(AllayState::default()));
+        let NativeUtilityState::Allay(allay) = state else { return };
+        (allay.owner, allay.delivery_target(tick), allay.collected.is_some())
+    };
+    if carrying {
+        let destination = note.map(|(x, y, z)| [x as f64 + 0.5, y as f64 + 1.0, z as f64 + 0.5])
+            .or_else(|| owner.and_then(|uuid| client_snapshot().into_iter().find_map(|client| {
+                (client.uuid == uuid && !client.is_spectator() && client_dim_pos(&client).0 == mob.dim)
+                    .then(|| {
+                        let (_, x, y, z, ..) = client_dim_pos(&client);
+                        [x, y + 1.0, z]
+                    })
+            })));
+        if let Some(destination) = destination {
+            let distance_sq = (0..3).map(|axis| (destination[axis] - at[axis]).powi(2)).sum::<f64>();
+            if distance_sq <= 2.5_f64.powi(2) {
+                with_save_guard(|| {
+                    let carried = {
+                        let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
+                        match states.get_mut(&mob.eid) {
+                            Some(NativeUtilityState::Allay(allay)) => allay.collected.take(),
+                            _ => None,
+                        }
+                    };
+                    if let Some(stack) = carried {
+                        drop_live_stack((destination[0], destination[1], destination[2]), stack);
+                    }
+                });
+            } else {
+                live_utility_move_toward(mob, at, destination);
+            }
+        }
+        return;
+    }
+    // The drop registry does not carry a dimension, so it represents the
+    // Overworld. Never collect an item from another dimension's coordinates.
+    if mob.dim != DimId::Overworld {
+        return;
+    }
+    let candidate = {
+        let states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(NativeUtilityState::Allay(allay)) = states.get(&mob.eid) else { return };
+        drops().lock().unwrap_or_else(|e| e.into_inner()).iter()
+            .filter(|drop| drop.pickup_delay_elapsed() && allay.matches_drop(drop, at))
+            .min_by(|a, b| {
+                let distance = |drop: &Drop| (drop.x - at[0]).powi(2)
+                    + (drop.y - at[1]).powi(2) + (drop.z - at[2]).powi(2);
+                distance(a).total_cmp(&distance(b))
+            })
+            .map(|drop| (drop.eid, [drop.x, drop.y, drop.z]))
+    };
+    let Some((eid, position)) = candidate else { return };
+    let distance_sq = (0..3).map(|axis| (position[axis] - at[axis]).powi(2)).sum::<f64>();
+    if distance_sq > 2.0_f64.powi(2) {
+        live_utility_move_toward(mob, at, position);
+        return;
+    }
+    let consumed = with_save_guard(|| {
+        let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(NativeUtilityState::Allay(allay)) = states.get_mut(&mob.eid) else { return None };
+        let mut ground = drops().lock().unwrap_or_else(|e| e.into_inner());
+        let index = ground.iter().position(|drop| drop.eid == eid)?;
+        if !allay.collect_drop(&ground[index], at) { return None; }
+        let count = ground[index].cnt;
+        ground.remove(index);
+        Some(count)
+    });
+    if let Some(count) = consumed {
+        broadcast_seen(eid, |_c| (0x6f, collect_pkt(eid, mob.eid, count)));
+        broadcast_seen_destroy(eid);
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_utility_move_toward(mob: &Mob, from: [f64; 3], to: [f64; 3]) {
+    let delta = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+    let distance = delta.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if distance > f64::EPSILON {
+        let mut velocity = mob.vel.lock().unwrap_or_else(|e| e.into_inner());
+        for axis in 0..3 {
+            velocity[axis] = delta[axis] / distance * 0.28;
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_fox_collect(mob: &Arc<Mob>, at: [f64; 3]) {
+    if mob.dim != DimId::Overworld { return; }
+    let collected = with_save_guard(|| {
+        let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(NativeUtilityState::Fox(fox)) = states.get_mut(&mob.eid) else { return None };
+        if fox.sleeping || fox.held.is_some() { return None; }
+        let mut ground = drops().lock().unwrap_or_else(|e| e.into_inner());
+        let drop = ground.iter_mut().find(|drop| {
+            drop.target.is_none() && drop.pickup_delay_elapsed() && drop.cnt > 0
+                && (drop.x - at[0]).powi(2) + (drop.y - at[1]).powi(2)
+                    + (drop.z - at[2]).powi(2) < 1.5_f64.powi(2)
+        })?;
+        if !fox.pickup((drop.item, 1, drop.comps.clone())) { return None; }
+        drop.cnt -= 1;
+        let remaining = (drop.cnt > 0).then(|| drop_meta_pkt(drop));
+        let eid = drop.eid;
+        if remaining.is_none() { ground.retain(|drop| drop.eid != eid); }
+        Some((eid, remaining))
+    });
+    if let Some((eid, remaining)) = collected {
+        broadcast_seen(eid, |_c| (0x6f, collect_pkt(eid, mob.eid, 1)));
+        if let Some(packet) = remaining {
+            broadcast_seen(eid, |_c| (0x58, packet.clone()));
+        } else {
+            broadcast_seen_destroy(eid);
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
+fn live_fox_trust(eid: i32, player: VillageUuid) -> bool {
+    if live_native_mob(eid, "fox").is_none() { return false; }
+    let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
+    let state = states.entry(eid)
+        .or_insert_with(|| NativeUtilityState::Fox(FoxState::default()));
+    if let NativeUtilityState::Fox(fox) = state {
+        fox.trust(player);
+        true
+    } else { false }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
+fn live_camel_toggle_sitting(eid: i32) -> bool {
+    if live_native_mob(eid, "camel").is_none() { return false; }
+    let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
+    let state = states.entry(eid)
+        .or_insert_with(|| NativeUtilityState::Camel(CamelState::default()));
+    if let NativeUtilityState::Camel(camel) = state {
+        camel.toggle_sitting();
+        true
+    } else { false }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
+fn live_camel_dash(eid: i32, tick: u64, yaw: f32) -> Option<[f64; 3]> {
+    let mob = live_native_mob(eid, "camel")?;
+    let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
+    let state = states.entry(eid)
+        .or_insert_with(|| NativeUtilityState::Camel(CamelState::default()));
+    let impulse = match state {
+        NativeUtilityState::Camel(camel) => camel.dash(tick, yaw)?,
+        _ => return None,
+    };
+    drop(states);
+    let mut velocity = mob.vel.lock().unwrap_or_else(|e| e.into_inner());
+    velocity[0] += impulse[0];
+    velocity[1] += impulse[1];
+    velocity[2] += impulse[2];
+    Some(impulse)
+}
+
+/// A pumpkin placed on the completed frame consumes all frame blocks and
+/// spawns the corresponding player-created golem.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_construct_golem(dim: DimId, pumpkin: BlockPos) -> Option<Arc<Mob>> {
+    let reg = crate::block_registry::breg()?;
+    with_save_guard(|| {
+        let (kind, blocks) = detect_golem_construction(pumpkin, |(x, y, z)| {
+            reg.name_of(block_at_dim(dim, x, y, z))
+        })?;
+        let name = match kind {
+            ConstructedGolem::Iron => "iron_golem",
+            ConstructedGolem::Snow => "snow_golem",
+        };
+        let spec = entity_spec_by_name(name)?;
+        if mobs().lock().unwrap_or_else(|e| e.into_inner()).len() >= MOB_CAP {
+            return None;
+        }
+        for (x, y, z) in blocks {
+            set_block_dim(dim, x, y, z, reg.state_of("minecraft:air", None));
+        }
+        let mob = new_live_mob(
+            spec.id, dim,
+            (pumpkin.0 as f64 + 0.5, (pumpkin.1 - 2) as f64, pumpkin.2 as f64 + 0.5, 0.0, 0.0),
+            spec.max_health, None,
+        );
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob.clone());
+        let state = match kind {
+            ConstructedGolem::Iron => NativeUtilityState::Iron(IronGolemState { player_created: true }),
+            ConstructedGolem::Snow => NativeUtilityState::Snow(SnowGolemState::default()),
+        };
+        live_native_utility_states()
+            .lock().unwrap_or_else(|e| e.into_inner()).insert(mob.eid, state);
+        Some(mob)
+    })
+}
+
+/// Existing placement handlers are owned by another lane. Scan only player-edited
+/// pumpkin blocks, avoiding thousands of generated-block lookups each second.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_golem_formation_tick(tick: u64) {
+    if !tick.is_multiple_of(20) {
+        return;
+    }
+    let Some(reg) = crate::block_registry::breg() else { return };
+    let clients = client_snapshot();
+    let mut candidates = HashSet::new();
+    let overlay = world().lock().unwrap_or_else(|e| e.into_inner());
+    for client in clients.iter().filter(|c| !c.is_spectator()) {
+        let (dim, x, y, z, ..) = client_dim_pos(client);
+        let (cx, cy, cz) = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
+        for dx in -3..=3 {
+            for dz in -3..=3 {
+                for dy in -4..=4 {
+                    let pos = (cx + dx, cy + dy, cz + dz);
+                    if pos.1 < dim.min_y() + 2 || pos.1 >= dim.min_y() + dim.height() {
+                        continue;
+                    }
+                    if overlay.get(&(dim, pos.0 >> 4, pos.2 >> 4))
+                        .and_then(|chunk| chunk.get(&local_idx(pos.0, pos.1, pos.2)))
+                        .is_some_and(|&state| matches!(reg.name_of(state),
+                            "minecraft:carved_pumpkin" | "minecraft:jack_o_lantern")) {
+                        candidates.insert((dim, pos));
+                    }
+                }
+            }
+        }
+    }
+    drop(overlay);
+    for (dim, pos) in candidates {
+        live_construct_golem(dim, pos);
+    }
+}
+
+/// Villagers near the same claimed bell exchange gossip during their meeting
+/// period. A recently gossiping group can summon a defender while threatened.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_village_golem_tick(tick: u64) {
+    if !tick.is_multiple_of(200) || GR_MOB_SPAWNING.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let world_time = WORLD_TIME.load(Ordering::Relaxed);
+    let snapshots: Vec<_> = mobs().lock().unwrap_or_else(|e| e.into_inner())
+        .iter().filter(|mob| *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0)
+        .map(|mob| {
+            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            (mob.eid, mob.dim, (x.floor() as i32, y.floor() as i32, z.floor() as i32), mob.etype)
+        }).collect();
+    let villager_type = name_to_etype("villager");
+    let golem_type = name_to_etype("iron_golem");
+    let positions: HashMap<i32, (DimId, BlockPos)> = snapshots.iter()
+        .filter(|(_, _, _, ty)| Some(*ty) == villager_type)
+        .map(|(eid, dim, pos, _)| (*eid, (*dim, *pos))).collect();
+    let mut groups: HashMap<(DimId, BlockPos), Vec<(i32, BlockPos)>> = HashMap::new();
+    let mut villagers = live_villagers().lock().unwrap_or_else(|e| e.into_inner());
+    for (&eid, villager) in villagers.iter() {
+        let (Some(bell), Some(&(dim, pos))) = (villager.meeting_point, positions.get(&eid)) else { continue };
+        if villager_within(pos, bell, 6) {
+            groups.entry((dim, bell)).or_default().push((eid, pos));
+        }
+    }
+    if VillagerActivity::at(world_time) == VillagerActivity::Meet {
+        for group in groups.values() {
+            if group.len() < 2 { continue; }
+            let mut shared = VillagerGossip::default();
+            for (eid, _) in group {
+                if let Some(villager) = villagers.get(eid) {
+                    shared.hear_from(&villager.gossip);
+                }
+            }
+            for (eid, _) in group {
+                if let Some(villager) = villagers.get_mut(eid) {
+                    if villager.last_gossip.is_none_or(|last| world_time.saturating_sub(last) >= VILLAGER_GOSSIP_COOLDOWN) {
+                        villager.gossip.hear_from(&shared);
+                        villager.last_gossip = Some(world_time);
+                    }
+                }
+            }
+        }
+    }
+    let eligible: Vec<_> = groups.into_iter().filter_map(|((dim, _), group)| {
+        let recent: Vec<BlockPos> = group.into_iter().filter_map(|(eid, pos)| {
+            villagers.get(&eid).and_then(|villager| {
+                villager.last_gossip.is_some_and(|last| world_time.saturating_sub(last) <= VILLAGER_GOSSIP_COOLDOWN)
+                    .then_some(pos)
+            })
+        }).collect();
+        (recent.len() >= 3).then_some((dim, recent))
+    }).collect();
+    drop(villagers);
+
+    let Some(reg) = crate::block_registry::breg() else { return };
+    let Some(spec) = entity_spec_by_name("iron_golem") else { return };
+    for (dim, villagers) in eligible {
+        let center = villagers[0];
+        let within_16 = |other: BlockPos| {
+            (center.0 - other.0).pow(2) + (center.1 - other.1).pow(2)
+                + (center.2 - other.2).pow(2) <= 16_i32.pow(2)
+        };
+        let panicking = snapshots.iter().any(|(_, other_dim, pos, ty)| {
+            *other_dim == dim && live_mob_category(*ty) == Some(MobCategory::Monster) && within_16(*pos)
+        });
+        let golem_nearby = snapshots.iter().any(|(_, other_dim, pos, ty)| {
+            *other_dim == dim && Some(*ty) == golem_type && within_16(*pos)
+        });
+        if !village_golem_spawn_allowed(villagers.len(), panicking, golem_nearby) {
+            continue;
+        }
+        let site = villagers.iter().copied().find(|&(x, y, z)| {
+            reg.is_solid(block_at_dim(dim, x, y - 1, z))
+                && reg.is_air(block_at_dim(dim, x, y, z))
+                && reg.is_air(block_at_dim(dim, x, y + 1, z))
+                && reg.is_air(block_at_dim(dim, x, y + 2, z))
+        });
+        let Some((x, y, z)) = site else { continue };
+        with_save_guard(|| {
+            let mut current = mobs().lock().unwrap_or_else(|e| e.into_inner());
+            if current.len() >= MOB_CAP { return; }
+            // Recheck inside the save transaction in case another village
+            // created a defender since the snapshot was taken.
+            if current.iter().any(|mob| mob.dim == dim && Some(mob.etype) == golem_type && {
+                let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+                (mx - f64::from(x)).powi(2) + (my - f64::from(y)).powi(2)
+                    + (mz - f64::from(z)).powi(2) <= 16.0_f64.powi(2)
+            }) { return; }
+            let mob = new_live_mob(spec.id, dim,
+                (x as f64 + 0.5, y as f64, z as f64 + 0.5, 0.0, 0.0), spec.max_health, None);
+            current.push(mob.clone());
+            drop(current);
+            live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner())
+                .insert(mob.eid, NativeUtilityState::Iron(IronGolemState { player_created: false }));
+        });
+    }
+}
+
+/// The shared server tick drives hydrated axolotls and snow-golem weather and
+/// trails even when no player interaction packet is in flight.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_utility_mob_tick(tick: u64) {
+    let axolotl_type = name_to_etype("axolotl");
+    let snow_type = name_to_etype("snow_golem");
+    let fox_type = name_to_etype("fox");
+    let allay_type = name_to_etype("allay");
+    let relevant: Vec<Arc<Mob>> = mobs()
+        .lock().unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|mob| [axolotl_type, snow_type, fox_type, allay_type].contains(&Some(mob.etype)))
+        .cloned()
+        .collect();
+    let alive = tick.is_multiple_of(400).then(|| {
+        mobs().lock().unwrap_or_else(|e| e.into_inner())
+            .iter().map(|mob| mob.eid).collect::<HashSet<i32>>()
+    });
+    if let Some(alive) = alive {
+        live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner())
+            .retain(|eid, _| alive.contains(eid));
+    }
+    if relevant.is_empty() { return; }
+    let Some(reg) = crate::block_registry::breg() else { return };
+    for mob in relevant {
+        if *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0 { continue; }
+        let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let (bx, by, bz) = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
+        if Some(mob.etype) == axolotl_type {
+            let rain_exposed = mob.dim == DimId::Overworld
+                && RAINING.load(Ordering::Relaxed) > 0
+                && random_tick_sky_exposed(mob.dim, bx, by, bz);
+            let hydrated = rain_exposed || [by, by + 1].iter().any(|&layer| {
+                let block = block_at_dim(mob.dim, bx, layer, bz);
+                fluid_from_block(block).is_some_and(|fluid| fluid.kind == flowing_fluid::Kind::Water)
+                    || waterlogged_source(block)
+            });
+            let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
+            let mut hp = mob.hp.lock().unwrap_or_else(|e| e.into_inner());
+            let state = states.entry(mob.eid).or_insert_with(|| NativeUtilityState::Axolotl(AxolotlState::new(*hp)));
+            if let NativeUtilityState::Axolotl(axolotl) = state {
+                axolotl.tick(hydrated, &mut hp, 14.0, tick);
+            }
+        } else if Some(mob.etype) == snow_type && tick.is_multiple_of(20) {
+            let rain_exposed = mob.dim == DimId::Overworld
+                && RAINING.load(Ordering::Relaxed) > 0
+                && random_tick_sky_exposed(mob.dim, bx, by, bz);
+            let hot = mob.dim == DimId::Nether || (mob.dim == DimId::Overworld
+                && worldgen::with_gen_dim(mob.dim, |g| {
+                    g.biome_name_at(bx, by, bz).is_some_and(|name| matches!(name.as_str(),
+                        "minecraft:desert" | "minecraft:savanna" | "minecraft:savanna_plateau"
+                        | "minecraft:windswept_savanna" | "minecraft:badlands"
+                        | "minecraft:wooded_badlands" | "minecraft:eroded_badlands"))
+                }).unwrap_or(false));
+            let snow_here = mob.dim == DimId::Overworld
+                && reg.is_air(block_at_dim(mob.dim, bx, by, bz))
+                && reg.is_solid(block_at_dim(mob.dim, bx, by - 1, bz))
+                && cold_biome_at(mob.dim, bx, by, bz)
+                && GR_MOB_GRIEFING.load(Ordering::Relaxed) != 0;
+            let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
+            let state = states.entry(mob.eid).or_insert_with(|| NativeUtilityState::Snow(SnowGolemState::default()));
+            let place = if let NativeUtilityState::Snow(_) = state {
+                let mut hp = mob.hp.lock().unwrap_or_else(|e| e.into_inner());
+                SnowGolemState::environment_tick(&mut hp, hot, rain_exposed, snow_here)
+            } else { false };
+            drop(states);
+            if place {
+                let current = block_at_dim(mob.dim, bx, by, bz);
+                set_block_if_dim(mob.dim, bx, by, bz, reg.state_of("minecraft:snow", None), Some(current));
+            }
+        } else if Some(mob.etype) == allay_type {
+            if tick.is_multiple_of(10) {
+                live_allay_collect_and_deliver(&mob, [x, y, z], tick);
+            }
+        } else if Some(mob.etype) == fox_type && tick.is_multiple_of(20) {
+            let nearby = client_snapshot().iter().filter_map(|client| {
+                let (dim, px, py, pz, ..) = client_dim_pos(client);
+                (!client.is_spectator() && dim == mob.dim
+                    && (px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2) <= 16.0_f64.powi(2))
+                    .then_some(client.uuid)
+            }).collect::<Vec<_>>();
+            let in_water = reg.has_water(block_at_dim(mob.dim, bx, by, bz));
+            let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
+            let state = states.entry(mob.eid)
+                .or_insert_with(|| NativeUtilityState::Fox(FoxState::default()));
+            if let NativeUtilityState::Fox(fox) = state {
+                let threatened = nearby.iter().any(|uuid| !fox.trusted.contains(&Some(*uuid)));
+                fox.tick(WORLD_TIME.load(Ordering::Relaxed) % 24_000 < 12_000,
+                    threatened, in_water);
+            }
+            drop(states);
+            live_fox_collect(&mob, [x, y, z]);
+        }
     }
 }
 
@@ -2527,7 +3349,11 @@ fn live_special_spawn_tick(clients: &[Arc<Client>]) {
 /// `Villager` and `Raid` units keep their "once per game tick" contracts.
 #[cfg_attr(not(test), allow(dead_code))]
 fn villager_raid_tick() {
-    live_villager_tick(TICK.load(Ordering::Relaxed));
+    let tick = TICK.load(Ordering::Relaxed);
+    live_villager_tick(tick);
+    live_utility_mob_tick(tick);
+    live_golem_formation_tick(tick);
+    live_village_golem_tick(tick);
     // Patrols, traders, wardens and phantoms are not raids — their gamerules
     // gate them individually inside the special-spawn tick.
     live_special_spawn_tick(&client_snapshot());
@@ -2553,6 +3379,215 @@ mod villager_raid_tests {
     const BOOK: i64 = 925;
     const EMERALD: i64 = 806;
     const ENDER_PEARL: i64 = 993;
+
+    #[test]
+    fn vanilla_mobs2_golem_construction_requires_iron_t_or_two_snow_blocks() {
+        let pumpkin = (4, 70, 9);
+        for (axis, arms) in [
+            (0, [(3, 69, 9), (5, 69, 9)]),
+            (1, [(4, 69, 8), (4, 69, 10)]),
+        ] {
+            let blocks = HashMap::from([
+                (pumpkin, "minecraft:carved_pumpkin"),
+                ((4, 69, 9), "minecraft:iron_block"),
+                ((4, 68, 9), "minecraft:iron_block"),
+                (arms[0], "minecraft:iron_block"),
+                (arms[1], "minecraft:iron_block"),
+            ]);
+            let found = detect_golem_construction(pumpkin, |p| blocks.get(&p).copied().unwrap_or("minecraft:air"));
+            let (kind, consumed) = found.expect("complete T construction");
+            assert_eq!(kind, ConstructedGolem::Iron, "axis {axis}");
+            assert_eq!(consumed.len(), 5);
+            assert!(consumed.iter().all(|p| blocks.contains_key(p)));
+
+            let mut lantern = blocks.clone();
+            lantern.insert(pumpkin, "minecraft:jack_o_lantern");
+            assert_eq!(
+                detect_golem_construction(pumpkin, |p| lantern.get(&p).copied().unwrap_or("minecraft:air")),
+                Some((ConstructedGolem::Iron, consumed.clone())),
+            );
+
+            let mut missing_arm = blocks.clone();
+            missing_arm.remove(&arms[0]);
+            assert_eq!(detect_golem_construction(pumpkin, |p| {
+                missing_arm.get(&p).copied().unwrap_or("minecraft:air")
+            }), None);
+            missing_arm.insert(arms[0], "minecraft:iron_block");
+            missing_arm.insert(pumpkin, "minecraft:pumpkin");
+            assert_eq!(detect_golem_construction(pumpkin, |p| {
+                missing_arm.get(&p).copied().unwrap_or("minecraft:air")
+            }), None);
+        }
+
+        let snow = HashMap::from([
+            (pumpkin, "minecraft:carved_pumpkin"),
+            ((4, 69, 9), "minecraft:snow_block"),
+            ((4, 68, 9), "minecraft:snow_block"),
+        ]);
+        let (kind, consumed) = detect_golem_construction(pumpkin, |p| {
+            snow.get(&p).copied().unwrap_or("minecraft:air")
+        }).expect("stacked snow construction");
+        assert_eq!(kind, ConstructedGolem::Snow);
+        assert_eq!(consumed.len(), 3);
+        let mut lantern_snow = snow.clone();
+        lantern_snow.insert(pumpkin, "minecraft:jack_o_lantern");
+        assert_eq!(
+            detect_golem_construction(pumpkin, |p| lantern_snow.get(&p).copied().unwrap_or("minecraft:air")),
+            Some((ConstructedGolem::Snow, consumed)),
+        );
+    }
+
+    #[test]
+    fn vanilla_mobs2_iron_golem_creation_reputation_repair_cracks_and_gossip_spawn() {
+        let mut gossip = VillagerGossip::default();
+        gossip.add(PLAYER, GossipType::MajorNegative, 20);
+        let spawned_by_player = IronGolemState { player_created: true };
+        let village_golem = IronGolemState { player_created: false };
+        assert!(!spawned_by_player.hostile_to_player(&gossip, PLAYER));
+        assert!(village_golem.hostile_to_player(&gossip, PLAYER));
+        assert!(!village_golem.hostile_to_player(&gossip, OTHER_PLAYER));
+
+        let mut hp = 20.0;
+        assert_eq!(IronGolemState::crack_stage(hp), 3);
+        assert!(!IronGolemState::repair(&mut hp, false));
+        assert!(IronGolemState::repair(&mut hp, true));
+        assert_eq!(hp, 45.0);
+        assert_eq!(IronGolemState::crack_stage(hp), 2);
+        assert!(IronGolemState::repair(&mut hp, true));
+        assert_eq!(hp, 70.0);
+        assert_eq!(IronGolemState::crack_stage(hp), 1);
+        assert!(IronGolemState::repair(&mut hp, true));
+        assert_eq!(hp, 95.0);
+        assert_eq!(IronGolemState::crack_stage(hp), 0);
+        assert!(IronGolemState::repair(&mut hp, true));
+        assert_eq!(hp, 100.0);
+        assert!(!IronGolemState::repair(&mut hp, true));
+        for (hp, stage) in [(0.0, 3), (25.0, 3), (25.1, 2), (50.0, 2), (50.1, 1), (75.0, 1), (75.1, 0), (100.0, 0)] {
+            assert_eq!(IronGolemState::crack_stage(hp), stage);
+        }
+        assert!(village_golem_spawn_allowed(3, true, false));
+        assert!(!village_golem_spawn_allowed(2, true, false));
+        assert!(!village_golem_spawn_allowed(3, false, false));
+        assert!(!village_golem_spawn_allowed(3, true, true));
+    }
+
+    #[test]
+    fn vanilla_mobs2_snow_golem_shearing_melting_and_cold_trail() {
+        let mut snow = SnowGolemState::default();
+        assert!(snow.shear());
+        assert!(snow.sheared);
+        assert!(!snow.shear());
+
+        let mut hp = 4.0;
+        assert!(SnowGolemState::environment_tick(&mut hp, false, false, true));
+        assert_eq!(hp, 4.0);
+        assert!(!SnowGolemState::environment_tick(&mut hp, false, false, false));
+        assert!(!SnowGolemState::environment_tick(&mut hp, true, false, false));
+        assert_eq!(hp, 3.0);
+        assert!(!SnowGolemState::environment_tick(&mut hp, false, true, false));
+        assert_eq!(hp, 2.0);
+        assert!(!SnowGolemState::environment_tick(&mut hp, true, true, false));
+        assert_eq!(hp, 1.0, "warmth and rain apply one tick of damage, not two");
+        assert!(!SnowGolemState::environment_tick(&mut hp, true, false, true));
+        assert_eq!(hp, 0.0);
+    }
+
+    #[test]
+    fn vanilla_mobs2_axolotl_hydration_play_dead_healing_and_player_reward() {
+        let mut axolotl = AxolotlState::new(14.0);
+        let mut hp = 14.0;
+        for tick in 1..6_000 {
+            axolotl.tick(false, &mut hp, 14.0, tick);
+        }
+        assert_eq!(axolotl.dry_ticks, 1);
+        assert_eq!(hp, 14.0);
+        axolotl.tick(false, &mut hp, 14.0, 6_000);
+        assert_eq!(axolotl.dry_ticks, 0);
+        assert_eq!(hp, 13.0);
+        axolotl.tick(true, &mut hp, 14.0, 6_001);
+        assert_eq!(axolotl.dry_ticks, AxolotlState::DRY_TICKS);
+
+        hp = 5.0;
+        axolotl.tick(true, &mut hp, 14.0, 6_002);
+        assert!(axolotl.playing_dead_ticks > 0);
+        let initial_timer = axolotl.playing_dead_ticks;
+        axolotl.tick(true, &mut hp, 14.0, 6_025);
+        assert_eq!(hp, 6.0);
+        assert!(axolotl.playing_dead_ticks < initial_timer);
+        assert_eq!(AxolotlState::reward_player_for_target_kill(false), None);
+        assert_eq!(AxolotlState::reward_player_for_target_kill(true), Some((0, 100)));
+    }
+
+    #[test]
+    fn vanilla_mobs2_allay_delivery_matching_notes_and_jukebox_duplication() {
+        let mut allay = AllayState::default();
+        assert!(!allay.give_item(PLAYER, stack(WHEAT, 0)));
+        assert!(allay.give_item(PLAYER, stack(WHEAT, 9)));
+        assert_eq!(allay.owner, Some(PLAYER));
+        assert_eq!(allay.held, Some(stack(WHEAT, 1)));
+        assert!(!allay.give_item(OTHER_PLAYER, stack(BOOK, 1)));
+
+        let ground_drop = |x, item, target| Drop {
+            eid: 23_678, x, y: 0.0, z: 0.0, item, cnt: 2,
+            comps: Vec::new(), age: 15, target, thrower: None,
+        };
+        assert!(allay.matches_drop(&ground_drop(31.0, WHEAT, None), [0.0, 0.0, 0.0]));
+        assert!(!allay.matches_drop(&ground_drop(32.1, WHEAT, None), [0.0, 0.0, 0.0]));
+        assert!(!allay.matches_drop(&ground_drop(31.0, BOOK, None), [0.0, 0.0, 0.0]));
+        assert!(!allay.matches_drop(&ground_drop(31.0, WHEAT, Some(PLAYER)), [0.0, 0.0, 0.0]));
+
+        let ground = ground_drop(1.0, WHEAT, None);
+        assert!(allay.collect_drop(&ground, [0.0, 0.0, 0.0]));
+        assert_eq!(allay.collected, Some(stack(WHEAT, 2)));
+        assert!(!allay.matches_drop(&ground, [0.0, 0.0, 0.0]));
+        assert!(!allay.collect_drop(&ground, [0.0, 0.0, 0.0]));
+        allay.collected = None;
+        let mut delayed = ground;
+        delayed.age = -20;
+        assert!(!allay.collect_drop(&delayed, [0.0, 0.0, 0.0]));
+
+        allay.hears_note((3, 64, 2), 99);
+        assert_eq!(allay.delivery_target(698), Some((3, 64, 2)));
+        assert_eq!(allay.delivery_target(699), None);
+        assert!(!allay.duplicate(false, true, true, 0));
+        assert!(!allay.duplicate(true, false, true, 0));
+        assert!(!allay.duplicate(true, true, false, 0));
+        assert!(allay.duplicate(true, true, true, 0));
+        assert!(!allay.duplicate(true, true, true, 5_999));
+        assert!(allay.duplicate(true, true, true, 6_000));
+    }
+
+    #[test]
+    fn vanilla_mobs2_fox_trust_sleep_and_pickup() {
+        let mut fox = FoxState::default();
+        fox.trust(PLAYER);
+        fox.trust(PLAYER);
+        fox.trust(OTHER_PLAYER);
+        assert_eq!(fox.trusted, [Some(PLAYER), Some(OTHER_PLAYER)]);
+        fox.tick(true, false, false);
+        assert!(fox.sleeping);
+        fox.tick(true, true, false);
+        assert!(!fox.sleeping);
+        assert!(!fox.pickup(stack(WHEAT, 0)));
+        assert!(fox.pickup(stack(WHEAT, 3)));
+        assert_eq!(fox.held, Some(stack(WHEAT, 1)));
+        assert!(!fox.pickup(stack(BOOK, 1)));
+    }
+
+    #[test]
+    fn vanilla_mobs2_camel_two_seats_sitting_dash_and_cooldown() {
+        assert_eq!(CamelState::PASSENGERS, 2);
+        assert_eq!(VehicleKind::Camel.max_passengers(), 2);
+        let mut camel = CamelState::default();
+        assert_eq!(camel.dash(100, 0.0), Some([0.0, 0.6, 1.8]));
+        assert_eq!(camel.dash(154, 0.0), None);
+        assert!(camel.dash(155, 90.0).is_some());
+        camel.toggle_sitting();
+        assert!(camel.sitting);
+        assert_eq!(camel.dash(220, 0.0), None);
+        camel.toggle_sitting();
+        assert!(camel.dash(220, 180.0).is_some());
+    }
 
     fn stack(item: i64, count: u8) -> Stack {
         (item, count, Vec::new())

@@ -6,6 +6,67 @@ use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::sync::Weak;
 
+/// Entity persistence causes independent of the nearest-player distance.
+/// The live Mob type is shared by other lanes, so these flags live beside it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MobPersistenceFlags {
+    custom_named: bool,
+    leashed: bool,
+    riding_or_ridden: bool,
+    persistence_required: bool,
+    tamed: bool,
+}
+
+fn should_exempt_from_despawn(flags: MobPersistenceFlags) -> bool {
+    flags.custom_named
+        || flags.leashed
+        || flags.riding_or_ridden
+        || flags.persistence_required
+        || flags.tamed
+}
+
+/// Call from an entity interaction whenever its persistent attributes change.
+/// Entries are keyed by the live entity id, which is unique within a session.
+#[cfg_attr(not(test), allow(dead_code))]
+fn mob_persistence_flags() -> &'static Mutex<HashMap<i32, MobPersistenceFlags>> {
+    static FLAGS: OnceLock<Mutex<HashMap<i32, MobPersistenceFlags>>> = OnceLock::new();
+    FLAGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn set_mob_persistence_flags(eid: i32, flags: MobPersistenceFlags) {
+    let mut known = mob_persistence_flags().lock().unwrap_or_else(|e| e.into_inner());
+    if should_exempt_from_despawn(flags) {
+        known.insert(eid, flags);
+    } else {
+        known.remove(&eid);
+    }
+}
+
+fn live_despawn_exempt(mob: &Mob) -> bool {
+    let mut flags = mob_persistence_flags()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&mob.eid)
+        .copied()
+        .unwrap_or_default();
+    flags.tamed |= live_mob_states()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&mob.eid)
+        .and_then(|state| match state.behavior.as_ref() {
+            Some(MobBehaviorState::Wolf(pet) | MobBehaviorState::Cat(pet)) => pet.owner,
+            _ => None,
+        })
+        .is_some();
+    // Live mounting is authoritative. A passenger or a ridden mob cannot
+    // despawn merely because nobody explicitly set the persistence bit.
+    let mounts = mounts().lock().unwrap_or_else(|e| e.into_inner());
+    flags.riding_or_ridden |= mounts.registry.vehicle_of.contains_key(&mob.eid)
+        || !mounts.registry.passengers_of(mob.eid).is_empty();
+    should_exempt_from_despawn(flags)
+}
+
 thread_local! {
     // Spawn insertion and despawn checks run on the game tick thread. The first despawn
     // tick enables tracking. Weak references don't extend the entity's lifetime.
@@ -27,7 +88,7 @@ impl NaturalHostile {
         Self {
             mob: Arc::downgrade(mob),
             no_action_time: 0,
-            // Live Mob currently has no pickup, name-tag, leash or riding state.
+            // Retained for the existing natural-spawner persistence contract.
             persistent_or_passenger: false,
             rng: Lcg::new(seed),
             previous_hp: *mob.hp.lock().unwrap_or_else(|e| e.into_inner()),
@@ -54,10 +115,12 @@ impl NaturalHostile {
     }
 
     fn check_despawn(&mut self, peaceful: bool, distance_sq: Option<f64>) -> bool {
+        let persistent = self.persistent_or_passenger
+            || self.mob.upgrade().is_some_and(|mob| live_despawn_exempt(&mob));
         // Mob.checkDespawn draws before testing the inner radius, even after a far discard.
         // These naturally spawned monsters inherit both removal policies.
         let roll = if !peaceful
-            && !self.persistent_or_passenger
+            && !persistent
             && distance_sq.is_some()
             && self.no_action_time > 600
         {
@@ -70,7 +133,7 @@ impl NaturalHostile {
             true,
             distance_sq,
             self.no_action_time,
-            self.persistent_or_passenger,
+            persistent,
             true,
             MobCategory::Monster,
             roll,
@@ -241,6 +304,7 @@ fn discard_natural_hostiles(discarded: &HashMap<i32, Arc<Mob>>) {
         removed
     });
     for eid in removed {
+        mob_persistence_flags().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
         broadcast_seen_destroy(eid);
     }
 }
@@ -252,6 +316,31 @@ mod mob_despawn_tests {
 
     // The first Java nextInt(800) for seed 923 is zero.
     const ZERO_ROLL_SEED: u64 = 923;
+
+    #[test]
+    fn vanilla_mobs2_named_leashed_ridden_required_and_tamed_survive_both_distances() {
+        let mob = zombie(981_238, (0.0, 70.0, 0.0));
+        for flags in [
+            MobPersistenceFlags { custom_named: true, ..Default::default() },
+            MobPersistenceFlags { leashed: true, ..Default::default() },
+            MobPersistenceFlags { riding_or_ridden: true, ..Default::default() },
+            MobPersistenceFlags { persistence_required: true, ..Default::default() },
+            MobPersistenceFlags { tamed: true, ..Default::default() },
+        ] {
+            set_mob_persistence_flags(mob.eid, flags);
+            let mut hostile = NaturalHostile::new(&mob, ZERO_ROLL_SEED);
+            hostile.no_action_time = 601;
+            let initial_rng = hostile.rng.state48();
+            assert!(!hostile.check_despawn(false, Some(129.0_f64.powi(2))));
+            assert!(!hostile.check_despawn(false, Some(64.0_f64.powi(2))));
+            assert_eq!(hostile.no_action_time, 0);
+            assert_eq!(hostile.rng.state48(), initial_rng);
+            assert!(hostile.check_despawn(true, None));
+        }
+        set_mob_persistence_flags(mob.eid, MobPersistenceFlags::default());
+        let mut hostile = NaturalHostile::new(&mob, ZERO_ROLL_SEED);
+        assert!(hostile.check_despawn(false, Some(129.0_f64.powi(2))));
+    }
 
     fn zombie(eid: i32, pos: (f64, f64, f64)) -> Arc<Mob> {
         zombie_in(eid, pos, DimId::Overworld)
