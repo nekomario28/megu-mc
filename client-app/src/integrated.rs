@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::cli::CliConfig;
+use crate::settings::{ClientSettings, HostMapFairPlaySettings};
 
 /// Upper bound for the integrated server to start listening.
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -224,6 +225,77 @@ pub fn server_view_distance(cfg: &CliConfig) -> Option<i8> {
     (cfg.view_distance_explicit || cfg.settings_source_present).then_some(cfg.view_distance)
 }
 
+/// Environment variable carrying the map fair-play master switch.
+pub const FAIR_PLAY_ENV_ENABLED: &str = "MC_SPINE_FAIR_PLAY";
+/// Environment variable carrying the cave-map permission.
+pub const FAIR_PLAY_ENV_ALLOW_CAVE_MAP: &str = "MC_SPINE_FAIR_PLAY_ALLOW_CAVE_MAP";
+/// Environment variable carrying the entity-radar permission.
+pub const FAIR_PLAY_ENV_ALLOW_ENTITY_RADAR: &str = "MC_SPINE_FAIR_PLAY_ALLOW_ENTITY_RADAR";
+/// Environment variable carrying the waypoint-teleport permission.
+pub const FAIR_PLAY_ENV_ALLOW_WAYPOINT_TELEPORT: &str =
+    "MC_SPINE_FAIR_PLAY_ALLOW_WAYPOINT_TELEPORT";
+/// Environment variable carrying the Xaero `§`-coded control signal the
+/// hosted server broadcasts to joining map-mod clients.
+pub const FAIR_PLAY_ENV_XAERO_SIGNAL: &str = "MC_SPINE_FAIR_PLAY_XAERO_SIGNAL";
+
+/// Launch policy carried by a world this client hosts — integrated
+/// (`--quickPlaySingleplayer`), LAN share, or a `MEGU-XXXX-XXXX` friend
+/// relay. Built once from the resolved [`ClientSettings`] so the spawned
+/// server receives the exact same map-mod fair-play policy the player's
+/// TOML or CLI flags expressed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntegratedServerConfig {
+    /// The resolved map fair-play policy.
+    pub map_fair_play: HostMapFairPlaySettings,
+    /// The `§`-coded Xaero control signal derived from `map_fair_play`:
+    /// `"§f§a§i§r§x§a§e§r§o"` under full fair play, `"§r§e§s§e§t§x§a§e§r§o"`
+    /// when the policy is off, or the reset signal plus selective lock
+    /// codes for a partial lock (see
+    /// [`HostMapFairPlaySettings::xaero_control_string`]).
+    pub xaero_control: String,
+}
+
+impl IntegratedServerConfig {
+    /// Snapshot the fair-play policy from resolved client settings.
+    pub fn from_settings(settings: &ClientSettings) -> Self {
+        Self {
+            map_fair_play: settings.map_fair_play,
+            xaero_control: settings.map_fair_play.xaero_control_string(),
+        }
+    }
+
+    /// Deterministic `(name, value)` env pairs for the spawned server,
+    /// always emitted in this fixed order: the master switch, the three
+    /// `allow_*` permissions as `true`/`false`, then the Xaero control
+    /// signal.
+    pub fn env_pairs(&self) -> Vec<(&'static str, String)> {
+        let fp = &self.map_fair_play;
+        vec![
+            (FAIR_PLAY_ENV_ENABLED, fp.minimap_fair_play.to_string()),
+            (
+                FAIR_PLAY_ENV_ALLOW_CAVE_MAP,
+                fp.allow_cave_map.to_string(),
+            ),
+            (
+                FAIR_PLAY_ENV_ALLOW_ENTITY_RADAR,
+                fp.allow_entity_radar.to_string(),
+            ),
+            (
+                FAIR_PLAY_ENV_ALLOW_WAYPOINT_TELEPORT,
+                fp.allow_waypoint_teleport.to_string(),
+            ),
+            (FAIR_PLAY_ENV_XAERO_SIGNAL, self.xaero_control.clone()),
+        ]
+    }
+
+    /// Forward every fair-play environment variable onto `command`.
+    pub fn apply_env(&self, command: &mut Command) {
+        for (name, value) in self.env_pairs() {
+            command.env(name, value);
+        }
+    }
+}
+
 /// Launch the integrated server for `--quickPlaySingleplayer`. On success the
 /// returned guard keeps the child alive until dropped.
 pub fn launch(cfg: &CliConfig) -> Result<SingleplayerServer, String> {
@@ -270,6 +342,11 @@ pub fn launch(cfg: &CliConfig) -> Result<SingleplayerServer, String> {
     if let Some(seed) = cfg.seed {
         command.env("MC_SPINE_SEED", seed.to_string());
     }
+    // The hosted world inherits the resolved map fair-play policy:
+    // LAN-opened and friend-relay worlds share this spawn path, so the
+    // same MC_SPINE_FAIR_PLAY* env vars and Xaero signal apply to all of
+    // them.
+    IntegratedServerConfig::from_settings(&cfg.client_settings).apply_env(&mut command);
     let mut child = command.spawn().map_err(|e| {
         format!(
             "failed to spawn mc-spine server '{}': {e}",

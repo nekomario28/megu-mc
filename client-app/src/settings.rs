@@ -171,6 +171,75 @@ impl BuiltInOptimizations {
     };
 }
 
+/// Xaero's Minimap/WorldMap fair-play control signal: a server broadcasts
+/// this to clients to lock cave-map mode and entity radar.
+pub const XAERO_FAIR_PLAY_SIGNAL: &str = "§f§a§i§r§x§a§e§r§o";
+/// Control signal restoring a client's default map-mod feature set.
+pub const XAERO_RESET_SIGNAL: &str = "§r§e§s§e§t§x§a§e§r§o";
+/// Selective Xaero control signal locking cave-map mode only.
+pub const XAERO_NO_CAVE_MAP_SIGNAL: &str = "§n§o§c§a§v§e§m§a§p§x§a§e§r§o";
+/// Selective Xaero control signal locking entity radar only.
+pub const XAERO_NO_ENTITY_RADAR_SIGNAL: &str = "§n§o§e§n§t§i§t§y§r§a§d§a§r§x§a§e§r§o";
+
+/// Map-mod fair-play policy for a world this client hosts directly
+/// (integrated server, LAN share, or a `MEGU-XXXX-XXXX` friend relay).
+///
+/// Xaero's Minimap/WorldMap honor server-sent `§`-coded control strings that
+/// lock cave-map mode and entity radar; the waypoint-teleport flag carries
+/// the same idea for world-map teleports and is forwarded to the hosted
+/// server alongside the control signal (see `integrated.rs`). All four
+/// fields are optional TOML keys and keep their permissive defaults when a
+/// settings file written before this feature omits them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostMapFairPlaySettings {
+    /// Master switch: when `false`, hosted clients get
+    /// [`XAERO_RESET_SIGNAL`] regardless of the `allow_*` flags.
+    pub minimap_fair_play: bool,
+    /// Cave-map mode (below-ground ore/cave exposure) stays allowed.
+    pub allow_cave_map: bool,
+    /// Entity radar stays allowed.
+    pub allow_entity_radar: bool,
+    /// World-map waypoint teleportation stays allowed.
+    pub allow_waypoint_teleport: bool,
+}
+
+impl Default for HostMapFairPlaySettings {
+    fn default() -> Self {
+        Self {
+            minimap_fair_play: false,
+            allow_cave_map: true,
+            allow_entity_radar: true,
+            allow_waypoint_teleport: true,
+        }
+    }
+}
+
+impl HostMapFairPlaySettings {
+    /// The `§`-coded control signal a hosted server broadcasts to joining
+    /// clients. Deterministic: [`XAERO_RESET_SIGNAL`] when fair play is off,
+    /// [`XAERO_FAIR_PLAY_SIGNAL`] when it is on with cave maps and entity
+    /// radar both locked, otherwise the reset signal followed by the
+    /// selective lock code for each feature that stays blocked.
+    /// `allow_waypoint_teleport` is not a Xaero `§`-code feature — it rides
+    /// the `MC_SPINE_FAIR_PLAY_ALLOW_WAYPOINT_TELEPORT` env var instead.
+    pub fn xaero_control_string(&self) -> String {
+        if !self.minimap_fair_play {
+            return XAERO_RESET_SIGNAL.to_string();
+        }
+        if !self.allow_cave_map && !self.allow_entity_radar {
+            return XAERO_FAIR_PLAY_SIGNAL.to_string();
+        }
+        let mut signal = String::from(XAERO_RESET_SIGNAL);
+        if !self.allow_cave_map {
+            signal.push_str(XAERO_NO_CAVE_MAP_SIGNAL);
+        }
+        if !self.allow_entity_radar {
+            signal.push_str(XAERO_NO_ENTITY_RADAR_SIGNAL);
+        }
+        signal
+    }
+}
+
 /// Everything a player can tune. Fields are self-documenting; the TOML file
 /// mirrors them 1:1.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -197,6 +266,10 @@ pub struct ClientSettings {
     /// capabilities, `classic-low-spec` pins the minimal-hardware path for
     /// legacy Intel integrated GPUs (GL 3.3 / Vulkan 1.1 only).
     pub gpu_backend: RenderBackendPreference,
+    /// Map-mod fair-play policy applied when this client hosts a world
+    /// (integrated server, LAN share, friend relay); ignored on plain
+    /// client joins to a remote server.
+    pub map_fair_play: HostMapFairPlaySettings,
 }
 
 impl Default for ClientSettings {
@@ -222,6 +295,7 @@ impl ClientSettings {
             max_fps: None,
             background_fps_limit: DEFAULT_BACKGROUND_FPS_LIMIT,
             gpu_backend: RenderBackendPreference::Auto,
+            map_fair_play: HostMapFairPlaySettings::default(),
         };
         match preset {
             QualityPreset::Fast => {
@@ -291,7 +365,13 @@ impl ClientSettings {
              vsync = {}\n\
              max_fps = {}\n\
              background_fps_limit = {}\n\
-             gpu_backend = \"{}\"\n",
+             gpu_backend = \"{}\"\n\
+             \n\
+             [host_map_fair_play]\n\
+             minimap_fair_play = {}\n\
+             allow_cave_map = {}\n\
+             allow_entity_radar = {}\n\
+             allow_waypoint_teleport = {}\n",
             self.preset.as_str(),
             self.view_distance,
             self.distant_horizon.as_str(),
@@ -304,6 +384,10 @@ impl ClientSettings {
             max_fps,
             self.background_fps_limit,
             self.gpu_backend.as_str(),
+            self.map_fair_play.minimap_fair_play,
+            self.map_fair_play.allow_cave_map,
+            self.map_fair_play.allow_entity_radar,
+            self.map_fair_play.allow_waypoint_teleport,
         )
     }
 
@@ -337,6 +421,21 @@ impl ClientSettings {
                     self.background_fps_limit = parsed.background_fps_limit;
                 }
                 "gpu_backend" => self.gpu_backend = parsed.gpu_backend,
+                "minimap_fair_play" => {
+                    self.map_fair_play.minimap_fair_play =
+                        parsed.map_fair_play.minimap_fair_play;
+                }
+                "allow_cave_map" => {
+                    self.map_fair_play.allow_cave_map = parsed.map_fair_play.allow_cave_map;
+                }
+                "allow_entity_radar" => {
+                    self.map_fair_play.allow_entity_radar =
+                        parsed.map_fair_play.allow_entity_radar;
+                }
+                "allow_waypoint_teleport" => {
+                    self.map_fair_play.allow_waypoint_teleport =
+                        parsed.map_fair_play.allow_waypoint_teleport;
+                }
                 _ => {}
             }
         }
@@ -488,6 +587,34 @@ impl ClientSettings {
                     Some(g) => {
                         settings.gpu_backend = g;
                         seen.push("gpu_backend");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "minimap_fair_play" => match parse_bool(value) {
+                    Some(b) => {
+                        settings.map_fair_play.minimap_fair_play = b;
+                        seen.push("minimap_fair_play");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "allow_cave_map" => match parse_bool(value) {
+                    Some(b) => {
+                        settings.map_fair_play.allow_cave_map = b;
+                        seen.push("allow_cave_map");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "allow_entity_radar" => match parse_bool(value) {
+                    Some(b) => {
+                        settings.map_fair_play.allow_entity_radar = b;
+                        seen.push("allow_entity_radar");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "allow_waypoint_teleport" => match parse_bool(value) {
+                    Some(b) => {
+                        settings.map_fair_play.allow_waypoint_teleport = b;
+                        seen.push("allow_waypoint_teleport");
                     }
                     None => invalid(&mut warnings),
                 },
@@ -731,6 +858,12 @@ mod tests {
             max_fps: Some(144),
             background_fps_limit: 45,
             gpu_backend: RenderBackendPreference::ClassicLowSpec,
+            map_fair_play: HostMapFairPlaySettings {
+                minimap_fair_play: true,
+                allow_cave_map: false,
+                allow_entity_radar: false,
+                allow_waypoint_teleport: false,
+            },
         };
         let text = s.to_toml();
         let (back, warnings) = ClientSettings::from_toml(&text);

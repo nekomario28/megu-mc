@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use mc_spine_client_mesh::RenderBackendPreference;
 use mc_spine_proto::friend_relay::InviteCode;
 
+use crate::hardware_profile::{probe_host_hardware, recommend_tuning};
 use crate::settings::{
     ClientSettings, CloudMode, DistantHorizon, ParticleLevel, QualityPreset, MAX_BACKGROUND_FPS,
     MAX_FOV, MAX_MAX_FPS, MAX_VIEW_DISTANCE, MIN_FOV, MIN_MAX_FPS, MIN_VIEW_DISTANCE,
@@ -146,6 +147,21 @@ pub struct CliConfig {
     /// `--gpu-backend`: explicit GPU pipeline selection; overrides the
     /// TOML `gpu_backend` key when given.
     pub gpu_backend: Option<RenderBackendPreference>,
+    /// `--auto-tune`: seed settings from `recommend_tuning` of the probed
+    /// host hardware before TOML keys and explicit flags are overlaid.
+    pub auto_tune: bool,
+    /// `--fair-play`: host the world in map-mod fair-play mode —
+    /// `minimap_fair_play` on with cave map, entity radar and waypoint
+    /// teleport locked unless an `--allow-*` flag re-enables one.
+    pub fair_play: bool,
+    /// `--allow-cave-map <true|false>`: explicit cave-map override applied
+    /// on top of `--fair-play` or the TOML `allow_cave_map` key.
+    pub allow_cave_map: Option<bool>,
+    /// `--allow-entity-radar <true|false>`: explicit entity-radar override.
+    pub allow_entity_radar: Option<bool>,
+    /// `--allow-waypoint-teleport <true|false>`: explicit
+    /// waypoint-teleport override.
+    pub allow_waypoint_teleport: Option<bool>,
     /// Whether `--view-distance` was given on the command line.
     pub view_distance_explicit: bool,
 
@@ -212,6 +228,11 @@ impl Default for CliConfig {
             max_fps: None,
             background_fps: None,
             gpu_backend: None,
+            auto_tune: false,
+            fair_play: false,
+            allow_cave_map: None,
+            allow_entity_radar: None,
+            allow_waypoint_teleport: None,
             view_distance_explicit: false,
             client_settings: ClientSettings::default(),
             settings_source_present: false,
@@ -276,6 +297,11 @@ impl fmt::Debug for CliConfig {
             .field("max_fps", &self.max_fps)
             .field("background_fps", &self.background_fps)
             .field("gpu_backend", &self.gpu_backend)
+            .field("auto_tune", &self.auto_tune)
+            .field("fair_play", &self.fair_play)
+            .field("allow_cave_map", &self.allow_cave_map)
+            .field("allow_entity_radar", &self.allow_entity_radar)
+            .field("allow_waypoint_teleport", &self.allow_waypoint_teleport)
             .field("view_distance_explicit", &self.view_distance_explicit)
             .field("client_settings", &self.client_settings)
             .field("settings_source_present", &self.settings_source_present)
@@ -348,6 +374,15 @@ impl CliConfig {
             .preset
             .map(ClientSettings::from_preset)
             .unwrap_or_default();
+
+        // `--auto-tune` seeds the base from the probed host hardware BEFORE
+        // the settings file, the options.txt import, and explicit flags are
+        // overlaid, so every manual value always wins over the
+        // recommendation.
+        if self.auto_tune {
+            recommend_tuning(&probe_host_hardware()).apply_to(&mut settings);
+            source_present = true;
+        }
 
         let file_path = self.settings_path.clone().or_else(|| {
             let auto = auto_dir.join(SETTINGS_FILE_NAME);
@@ -424,6 +459,25 @@ impl CliConfig {
         if let Some(value) = self.gpu_backend {
             settings.gpu_backend = value;
             tuned = true;
+        }
+        // Host fair-play policy: `--fair-play` locks all three allowances,
+        // then each `--allow-*` flag re-enables its own feature. These are
+        // host-policy flags, not quality-preset dimensions, so they do not
+        // mark the preset `Custom`.
+        if self.fair_play {
+            settings.map_fair_play.minimap_fair_play = true;
+            settings.map_fair_play.allow_cave_map = false;
+            settings.map_fair_play.allow_entity_radar = false;
+            settings.map_fair_play.allow_waypoint_teleport = false;
+        }
+        if let Some(value) = self.allow_cave_map {
+            settings.map_fair_play.allow_cave_map = value;
+        }
+        if let Some(value) = self.allow_entity_radar {
+            settings.map_fair_play.allow_entity_radar = value;
+        }
+        if let Some(value) = self.allow_waypoint_teleport {
+            settings.map_fair_play.allow_waypoint_teleport = value;
         }
         if tuned {
             settings.preset = QualityPreset::Custom;
@@ -756,6 +810,18 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
                     )
                 })?);
             }
+            "--auto-tune" => cfg.auto_tune = true,
+            "--fair-play" => cfg.fair_play = true,
+            "--allow-cave-map" => {
+                cfg.allow_cave_map = Some(parse_on_off(&take_val(flag, &mut i)?, flag)?);
+            }
+            "--allow-entity-radar" => {
+                cfg.allow_entity_radar = Some(parse_on_off(&take_val(flag, &mut i)?, flag)?);
+            }
+            "--allow-waypoint-teleport" => {
+                cfg.allow_waypoint_teleport =
+                    Some(parse_on_off(&take_val(flag, &mut i)?, flag)?);
+            }
             "--mc-version" => {
                 let raw = take_val(flag, &mut i)?;
                 cfg.mc_version = parse_mc_version(&raw)?;
@@ -912,6 +978,22 @@ PLAYER SETTINGS:
                                    compute-indirect|classic-low-spec|classic
                                    (classic-low-spec targets legacy Intel
                                    HD/UHD iGPUs: GL 3.3 / Vulkan 1.1 only)
+  --auto-tune                      Seed settings from probed host hardware;
+                                   the settings file, options.txt import, and
+                                   explicit flags still override
+
+HOST WORLD MAP FAIR PLAY:
+  Applied when this client hosts a world (--quickPlaySingleplayer, LAN
+  share, or a MEGU-XXXX-XXXX friend relay) and forwarded to the spawned
+  mc-spine server as MC_SPINE_FAIR_PLAY* environment variables plus the
+  Xaero §-coded control signal.
+  --fair-play                      Enable map-mod fair play: cave map, entity
+                                   radar, and waypoint teleport default OFF;
+                                   re-enable individually with the flags below
+  --allow-cave-map <true|false>    Allow Xaero cave-map mode (default off
+                                   under --fair-play, on otherwise)
+  --allow-entity-radar <t|f>       Allow Xaero entity radar (same defaulting)
+  --allow-waypoint-teleport <t|f>  Allow world-map waypoint teleport (same)
 "
     )
 }
