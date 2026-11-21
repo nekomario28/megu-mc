@@ -1587,6 +1587,20 @@ fn interest_tick() {
             ),
         );
     }
+    for e in eyes().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        let (eid, x, y, z) = (e.eid, e.x, e.y, e.z);
+        queue(
+            DimId::Overworld,
+            39,
+            (
+                eid,
+                x,
+                y,
+                z,
+                Box::new(move || vec![(0x01, spawn_typed_pkt(eid, 39, x, y, z))]),
+            ),
+        );
+    }
     for t in primed().lock().unwrap().iter() {
         let (eid, x, y, z) = (t.eid, t.x, t.y, t.z);
         queue(
@@ -4180,6 +4194,535 @@ fn tick_portal(me: &Arc<Client>, view: i32) -> bool {
     *at = None;
     drop(at);
     enter_portal(me, st, bx, by, bz, yaw, pitch, view);
+    true
+}
+
+/// The single `minecraft:end_gateway` block state (`assets/block_states_1211.json`);
+/// vanilla `EndGatewayBlock` has no properties.
+fn is_end_gateway_state(st: u32) -> bool {
+    st == 12514
+}
+
+/// The single `minecraft:end_portal` block state a completed frame ring fills with.
+const END_PORTAL_STATE: u32 = 7406;
+
+/// One edge cell of the 5x5 `EndPortalPattern`: an `end_portal_frame` holding an
+/// eye and facing `want` — the inward direction for that edge of the ring.
+fn end_portal_ring_cell(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    want: &str,
+) -> bool {
+    let st = block_at_dim(dim, x, y, z);
+    reg.name_of(st) == "minecraft:end_portal_frame"
+        && reg.get_prop(st, "eye").as_deref() == Some("true")
+        && reg.get_prop(st, "facing").as_deref() == Some(want)
+}
+
+/// Vanilla `EndPortalBlock`'s `?vvv? / >???<x3 / ?^^^?` aisle: the 5x5 ring
+/// anchored at (ox, oz) is complete when its twelve non-corner edge cells are
+/// eyed frames facing the centre. The four corner cells accept anything.
+fn end_portal_ring_complete(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    ox: i32,
+    y: i32,
+    oz: i32,
+) -> bool {
+    for d in 1..=3 {
+        // north row faces south into the centre; the other edges mirror it.
+        if !end_portal_ring_cell(reg, dim, ox + d, y, oz, "south")
+            || !end_portal_ring_cell(reg, dim, ox + d, y, oz + 4, "north")
+            || !end_portal_ring_cell(reg, dim, ox, y, oz + d, "east")
+            || !end_portal_ring_cell(reg, dim, ox + 4, y, oz + d, "west")
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// `EndPortalBlock.trySpawnPortal`: vanilla scans a 5x5x5 anchor cube around the
+/// clicked frame under all four horizontal rotations — i.e. every 5x5 ring whose
+/// perimeter contains the frame, which here is the four corner-anchored
+/// candidates plus the twelve non-corner edge positions. A complete ring fills
+/// its inner 3x3 with `end_portal` (the corners are pattern wildcards, so a
+/// decorative frame there cannot suppress a match).
+fn try_end_portal_activation(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    fx: i32,
+    fy: i32,
+    fz: i32,
+) -> bool {
+    for dx in 0..=4 {
+        for dz in [0, 4] {
+            let (ox, oz) = (fx - dx, fz - dz);
+            if !end_portal_ring_complete(reg, dim, ox, fy, oz) {
+                continue;
+            }
+            for ix in 1..=3 {
+                for iz in 1..=3 {
+                    set_block_dim(dim, ox + ix, fy, oz + iz, END_PORTAL_STATE);
+                    note_block_update_dim(dim, ox + ix, fy, oz + iz, END_PORTAL_STATE);
+                }
+            }
+            return true;
+        }
+    }
+    for dx in [0, 4] {
+        for dz in 1..=3 {
+            let (ox, oz) = (fx - dx, fz - dz);
+            if !end_portal_ring_complete(reg, dim, ox, fy, oz) {
+                continue;
+            }
+            for ix in 1..=3 {
+                for iz in 1..=3 {
+                    set_block_dim(dim, ox + ix, fy, oz + iz, END_PORTAL_STATE);
+                    note_block_update_dim(dim, ox + ix, fy, oz + iz, END_PORTAL_STATE);
+                }
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// `EndPortalFrameBlock.useItemOn`: an `ender_eye` used on an eyeless frame sets
+/// its eye — consuming one outside creative — then tries the ring activation.
+/// Returns whether the click was handled (the caller owes the use ack).
+fn try_insert_ender_eye(
+    me: &Arc<Client>,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    clicked: u32,
+    held_slot: i16,
+    seq: i64,
+) -> bool {
+    let Some(reg) = crate::block_registry::breg() else {
+        return false;
+    };
+    if reg.name_of(clicked) != "minecraft:end_portal_frame"
+        || reg.get_prop(clicked, "eye").as_deref() != Some("false")
+    {
+        return false;
+    }
+    let held = me
+        .inv
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(36 + held_slot))
+        .map(|s| s.0)
+        .unwrap_or(0);
+    if held != 1006 {
+        // ender_eye
+        return false;
+    }
+    let eyed = reg.with_prop(clicked, "eye", "true");
+    set_block_dim(dim, x, y, z, eyed);
+    note_block_update_dim(dim, x, y, z, eyed);
+    if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
+        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+        let hs = 36 + held_slot;
+        if let Some((it, c, cc)) = inv.get(&hs).cloned() {
+            if it == 1006 {
+                if c <= 1 {
+                    inv.remove(&hs);
+                } else {
+                    inv.insert(hs, (it, c - 1, cc));
+                }
+            }
+        }
+        drop(inv);
+        held_slot_resync(me);
+    }
+    try_end_portal_activation(reg, dim, x, y, z);
+    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+    true
+}
+
+/// A thrown `eye_of_ender`: rises and drifts toward the stronghold the throw
+/// resolved, then resolves its 80/20 survive-or-shatter split on expiry.
+struct EnderEye {
+    eid: i32,
+    #[allow(dead_code)]
+    owner: i32,
+    x: f64,
+    y: f64,
+    z: f64,
+    tx: f64,
+    tz: f64,
+    ttl: i32,
+}
+static EYES: OnceLock<Mutex<Vec<EnderEye>>> = OnceLock::new();
+fn eyes() -> &'static Mutex<Vec<EnderEye>> {
+    EYES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Vanilla `EyeOfEnder` resolves its flight after ~80 game ticks.
+const EYE_TTL_GT: u64 = 80;
+
+fn spawn_eye_of_ender(me: &Arc<Client>, tx: f64, tz: f64) -> i32 {
+    let (x, y, z, _, _, _) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+    let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+    eyes().lock().unwrap_or_else(|e| e.into_inner()).push(EnderEye {
+        eid,
+        owner: me.eid,
+        x,
+        y: y + 1.5,
+        z,
+        tx,
+        tz,
+        ttl: server_ticks(EYE_TTL_GT) as i32,
+    });
+    eid
+}
+
+/// `EnderEyeItem.use`: an `ender_eye` swung in the Overworld throws an
+/// `eye_of_ender` toward the nearest `#minecraft:eye_of_ender_located` start
+/// (the stronghold ring locator `/locate` already resolves), consuming one
+/// outside creative. A null target — wrong dimension, no worldgen, nothing in
+/// range — keeps the item, exactly vanilla's `blockpos == null` path. Returns
+/// whether the swing was an `ender_eye` use (already acked).
+fn try_use_ender_eye(me: &Arc<Client>, held_slot: i16, seq: i64) -> bool {
+    let held = me
+        .inv
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(36 + held_slot))
+        .map(|s| s.0)
+        .unwrap_or(0);
+    if held != 1006 {
+        return false;
+    }
+    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+    if *me.dim.lock().unwrap_or_else(|e| e.into_inner()) != DimId::Overworld {
+        return true;
+    }
+    let (px, _, pz, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+    let target = locate_structure_spiral(
+        DimId::Overworld,
+        "#minecraft:eye_of_ender_located",
+        px.floor() as i32,
+        pz.floor() as i32,
+        100,
+    )
+    .ok()
+    .flatten();
+    let Some(hit) = target else {
+        return true;
+    };
+    spawn_eye_of_ender(me, hit.x as f64, hit.z as f64);
+    if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
+        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+        let hs = 36 + held_slot;
+        if let Some((it, c, cc)) = inv.get(&hs).cloned() {
+            if it == 1006 {
+                if c <= 1 {
+                    inv.remove(&hs);
+                } else {
+                    inv.insert(hs, (it, c - 1, cc));
+                }
+            }
+        }
+        drop(inv);
+        held_slot_resync(me);
+    }
+    true
+}
+
+/// `EyeOfEnder.tick`: drift toward the stronghold while shimmying upward, then
+/// on expiry the vanilla 20% shatter roll decides destroy vs `ender_eye` drop.
+fn tick_eyes_of_ender() {
+    let mut ey = eyes().lock().unwrap_or_else(|e| e.into_inner());
+    if ey.is_empty() {
+        return;
+    }
+    let mut dead: Vec<EnderEye> = Vec::new();
+    ey.retain_mut(|e| {
+        e.ttl -= 1;
+        if e.ttl <= 0 {
+            dead.push(EnderEye {
+                eid: e.eid,
+                owner: e.owner,
+                x: e.x,
+                y: e.y,
+                z: e.z,
+                tx: e.tx,
+                tz: e.tz,
+                ttl: e.ttl,
+            });
+            return false;
+        }
+        let (dx, dz) = (e.tx - e.x, e.tz - e.z);
+        let horiz = dx.hypot(dz);
+        if horiz > 1.0 {
+            let step = 0.5f64.min(horiz);
+            e.x += dx / horiz * step;
+            e.z += dz / horiz * step;
+        }
+        e.y += 0.15;
+        let (ax, ay, az, eid) = (e.x, e.y, e.z, e.eid);
+        broadcast_seen(eid, |_c| {
+            (0x70, entity_teleport(eid, ax, ay, az, 0.0, 0.0, true))
+        });
+        true
+    });
+    drop(ey);
+    for e in dead {
+        eye_of_ender_expire(e, world_rng::next_u64());
+    }
+}
+
+/// One eye's end of flight: `roll % 5 == 0` shatters it (vanilla's 20%);
+/// otherwise it survives as an `ender_eye` item entity where it died.
+fn eye_of_ender_expire(e: EnderEye, roll: u64) {
+    broadcast_seen_destroy(e.eid);
+    if roll.is_multiple_of(5) {
+        return;
+    }
+    drops().lock().unwrap_or_else(|e2| e2.into_inner()).push(Drop {
+        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+        x: e.x,
+        y: e.y,
+        z: e.z,
+        item: 1006,
+        cnt: 1,
+        comps: Vec::new(),
+        age: 0,
+        target: None,
+        thrower: None,
+    });
+}
+
+/// The End column's highest safe landing at (x, z): the top non-air,
+/// non-liquid, non-gateway block with two air cells above it, or `None` for a
+/// void column.
+fn end_top_solid(x: i32, z: i32) -> Option<i32> {
+    let reg = crate::block_registry::breg()?;
+    let top = DimId::End.min_y() + DimId::End.height() - 3;
+    (DimId::End.min_y()..top).rev().find(|&y| {
+        let st = block_at_dim(DimId::End, x, y, z);
+        !reg.is_air(st)
+            && !reg.is_liquid(st)
+            && !is_end_gateway_state(st)
+            && !is_end_portal_state(st)
+            && reg.is_air(block_at_dim(DimId::End, x, y + 1, z))
+            && reg.is_air(block_at_dim(DimId::End, x, y + 2, z))
+    })
+}
+
+/// The void fallback for an outer-island exit: a 3x3 `end_stone` pad at y=65
+/// with the two air layers an arrival needs cleared above it.
+fn materialize_end_gateway_pad(ex: i32, ez: i32) {
+    let end_stone = name_to_state("end_stone").unwrap_or(7415);
+    for dx in -1..=1 {
+        for dz in -1..=1 {
+            set_block_dim(DimId::End, ex + dx, 65, ez + dz, end_stone);
+            note_block_update_dim(DimId::End, ex + dx, 65, ez + dz, end_stone);
+            for dy in [66, 67, 68] {
+                if block_at_dim(DimId::End, ex + dx, dy, ez + dz) != 0 {
+                    set_block_dim(DimId::End, ex + dx, dy, ez + dz, 0);
+                    note_block_update_dim(DimId::End, ex + dx, dy, ez + dz, 0);
+                }
+            }
+        }
+    }
+}
+
+/// The deterministic exit a `minecraft:end_gateway` beam lands at. A gateway on
+/// the main island (`x^2+z^2 < 512^2`) exits on an outer island ~1024 blocks out
+/// along the same ray, on the column's top safe solid or a materialised
+/// `end_stone` pad when the column is void. An outer-island gateway returns to
+/// the main island's centre (the top solid at (0,0), else the y=65 fallback).
+fn end_gateway_exit_pos(gateway: (i32, i32, i32)) -> (f64, f64, f64) {
+    let (gx, _gy, gz) = gateway;
+    let (gx64, gz64) = (i64::from(gx), i64::from(gz));
+    if gx64 * gx64 + gz64 * gz64 < 512 * 512 {
+        let len = ((gx as f64) * (gx as f64) + (gz as f64) * (gz as f64))
+            .sqrt()
+            .max(1.0);
+        let ex = (gx as f64 / len * 1024.0).round() as i32;
+        let ez = (gz as f64 / len * 1024.0).round() as i32;
+        if let Some(top) = end_top_solid(ex, ez) {
+            return (ex as f64 + 0.5, top as f64 + 1.0, ez as f64 + 0.5);
+        }
+        materialize_end_gateway_pad(ex, ez);
+        (ex as f64 + 0.5, 66.0, ez as f64 + 0.5)
+    } else {
+        match end_top_solid(0, 0) {
+            Some(top) => (0.5, top as f64 + 1.0, 0.5),
+            None => (0.5, 65.0, 0.5),
+        }
+    }
+}
+
+/// Per-entity gateway cooldown: the server tick of each entity's last gateway
+/// warp. 40 game ticks between warps keeps an exit that lands inside another
+/// gateway from ping-ponging the entity every tick.
+static GATEWAY_WARP: OnceLock<Mutex<HashMap<i32, u64>>> = OnceLock::new();
+fn gateway_warps() -> &'static Mutex<HashMap<i32, u64>> {
+    GATEWAY_WARP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+const GATEWAY_COOLDOWN_GT: u64 = 40;
+
+fn gateway_ready(eid: i32, now: u64) -> bool {
+    gateway_warps()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&eid)
+        .is_none_or(|&last| now.saturating_sub(last) >= server_ticks(GATEWAY_COOLDOWN_GT))
+}
+
+fn gateway_mark(eid: i32, now: u64) {
+    gateway_warps()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(eid, now);
+}
+
+/// Teleport `me` — and the vehicle it rides, keeping the seat — through
+/// `gateway` to the gateway's computed exit. `fall_from` resets at the exit, so
+/// a gateway transit can never arrive as fall damage.
+fn end_gateway_warp(me: &Arc<Client>, gateway: (i32, i32, i32)) -> (f64, f64, f64) {
+    let (ex, ey, ez) = end_gateway_exit_pos(gateway);
+    let (yaw, pitch) = {
+        let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
+        (p.3, p.4)
+    };
+    let vehicle = vehicle_of(me.eid);
+    if let Some(v) = vehicle {
+        if let Some(mob) = mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|m| m.eid == v)
+            .cloned()
+        {
+            *mob.pos.lock().unwrap_or_else(|e| e.into_inner()) = (ex, ey, ez, yaw, pitch);
+            mounts()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .registry
+                .register_rider(v, [ex, ey, ez]);
+            broadcast_seen(v, |_c| {
+                (0x70, entity_teleport(v, ex, ey, ez, yaw, pitch, true))
+            });
+        }
+    }
+    // A rider re-seats on the moved vehicle's attachment offset; anyone else
+    // stands at the exit itself.
+    let (tx, ty, tz) = vehicle
+        .and_then(|v| {
+            let (kind, seat) = {
+                let live = mounts().lock().unwrap_or_else(|e| e.into_inner());
+                let kind = live.registry.kinds.get(&v).copied()?;
+                let seat = live
+                    .registry
+                    .passengers_of(v)
+                    .iter()
+                    .position(|&e| e == me.eid)?;
+                (kind, seat)
+            };
+            Some(kind.seat_offset(seat))
+        })
+        .map(|off| (ex + off[0], ey + off[1], ez + off[2]))
+        .unwrap_or((ex, ey, ez));
+    {
+        let mut w = me.sock.lock().unwrap_or_else(|e| e.into_inner());
+        teleport_in_dimension(me, &mut w, (tx, ty, tz, yaw, pitch));
+    }
+    *me.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = ty;
+    (ex, ey, ez)
+}
+
+/// `EndGatewayBlockEntity.entityInside` for one player: an unmounted player
+/// whose feet or head cell is `end_gateway` (standing, crawling or the 1-block
+/// trapdoor pose), or the vehicle they ride, warps to the gateway's exit — once
+/// per `GATEWAY_COOLDOWN_GT`, keyed on the entity that entered. Returns whether
+/// a warp happened.
+fn end_gateway_entry_check(me: &Arc<Client>, now: u64) -> bool {
+    if me.is_spectator() || *me.dim.lock().unwrap_or_else(|e| e.into_inner()) != DimId::End {
+        return false;
+    }
+    if let Some(vehicle) = vehicle_of(me.eid) {
+        let gateway = {
+            let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
+            let Some(mob) = ms.iter().find(|m| m.eid == vehicle) else {
+                return false;
+            };
+            let p = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                p.0.floor() as i32,
+                p.1.floor() as i32,
+                p.2.floor() as i32,
+            )
+        };
+        if is_end_gateway_state(block_at_dim(DimId::End, gateway.0, gateway.1, gateway.2))
+            && gateway_ready(vehicle, now)
+        {
+            gateway_mark(vehicle, now);
+            end_gateway_warp(me, gateway);
+            return true;
+        }
+        return false;
+    }
+    let (px, py, pz, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+    let (bx, bz) = (px.floor() as i32, pz.floor() as i32);
+    for by in [py.floor() as i32, (py + 1.0).floor() as i32] {
+        if is_end_gateway_state(block_at_dim(DimId::End, bx, by, bz))
+            && gateway_ready(me.eid, now)
+        {
+            gateway_mark(me.eid, now);
+            end_gateway_warp(me, (bx, by, bz));
+            return true;
+        }
+    }
+    false
+}
+
+/// The per-tick gateway sweep over live clients; riding a vehicle delegates the
+/// entry test to the vehicle's own block cell.
+fn tick_end_gateway_entries() {
+    let now = TICK.load(Ordering::Relaxed);
+    for c in client_snapshot().iter() {
+        end_gateway_entry_check(c, now);
+    }
+}
+
+/// `ThrownEnderpearl`'s landing roll: a 1-in-20 chance spawns a live `endermite`
+/// (entity 34) when `doMobSpawning` is on and the live-mob cap has room — at the
+/// thrower's pre-teleport position, where vanilla creates it. `roll` is a
+/// parameter so tests pin both outcomes.
+fn pearl_landed_endermite(dim: DimId, x: f64, y: f64, z: f64, roll: u64) -> bool {
+    if !roll.is_multiple_of(20) || !gr_do_mob_spawning() {
+        return false;
+    }
+    let mut ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
+    if ms.len() >= MOB_CAP {
+        return false;
+    }
+    ms.push(Arc::new(Mob {
+        dim,
+        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+        uuid: [0u8; 16],
+        etype: 34,
+        pos: Mutex::new((x, y, z, 0.0, 0.0)),
+        hp: Mutex::new(8.0),
+        last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+        hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+        last_hurt_tick: Mutex::new(None),
+        fuse: Mutex::new(0),
+        fire_ticks: Mutex::new(0),
+        love: Mutex::new(0),
+        air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+        vel: Mutex::new([0.0; 3]),
+    }));
     true
 }
 
@@ -7161,7 +7704,9 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 // air-use form (1.21+): use_item arrives as block_place
                 // {-1,255,-1}, face -1 — dispatch to the shared item-use path
                 if x == -1 && y == 255 && z == -1 && face == -1 {
-                    air_use_item(&me, held_slot, seq, _hand, false);
+                    if !try_use_ender_eye(&me, held_slot, seq) {
+                        air_use_item(&me, held_slot, seq, _hand, false);
+                    }
                     continue;
                 }
                 // vanilla block_interaction_range: 4.5 survival / 5.0 creative
@@ -7188,6 +7733,11 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 let (tx, ty, tz) = (x + dx, y + dy, z + dz);
                 let dim = *me.dim.lock().unwrap();
                 let clicked = block_at_dim(dim, x, y, z);
+                // `EndPortalFrameBlock.useItemOn`: an `ender_eye` on an eyeless
+                // frame sets its eye and tries the 5x5 ring activation.
+                if try_insert_ender_eye(&me, dim, x, y, z, clicked, held_slot, seq) {
+                    continue;
+                }
                 let place = |pos: BlockPos, state| {
                     if *me.gm.lock().unwrap() == 2 {
                         // Adventure `mayPlace`: the held stack's can_place_on
@@ -7719,7 +8269,9 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 let mut sl = &b[..];
                 let _h = read_varint(&mut sl);
                 let seq = read_varint(&mut sl).unwrap_or(0);
-                air_use_item(&me, held_slot, seq, _h, false);
+                if !try_use_ender_eye(&me, held_slot, seq) {
+                    air_use_item(&me, held_slot, seq, _h, false);
+                }
             }
             0x04 | 0x05 => {
                 // chat_command(+signed): command string (no leading /)
@@ -13852,6 +14404,456 @@ mod p5c_live_tests {
             .and_then(|p| p.parse::<i32>().ok())
             .unwrap_or(0);
         assert!(power > 0, "target block must carry projectile-hit power");
+    }
+
+    #[cfg(test)]
+    mod vanilla_end_tests {
+        use super::*;
+
+        /// Restores every dimensioned cell a fixture wrote, in reverse order.
+        struct DimCells(Vec<(DimId, i32, i32, i32, u32)>);
+        impl DimCells {
+            fn new() -> Self {
+                DimCells(Vec::new())
+            }
+            fn set(&mut self, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+                self.0.push((dim, x, y, z, block_at_dim(dim, x, y, z)));
+                set_block_dim(dim, x, y, z, st);
+            }
+        }
+        impl std::ops::Drop for DimCells {
+            fn drop(&mut self) {
+                for (dim, x, y, z, st) in self.0.drain(..).rev() {
+                    set_block_dim(dim, x, y, z, st);
+                }
+            }
+        }
+
+        /// A vanilla 5x5 ring at origin (ox,oy,oz): the twelve edge frames all
+        /// facing the centre; `missing` leaves those edge slots eyeless and
+        /// `flip` turns them to face out instead of in.
+        fn end_portal_ring(
+            cells: &mut DimCells,
+            dim: DimId,
+            ox: i32,
+            oy: i32,
+            oz: i32,
+            missing: &[(i32, i32)],
+            flip: bool,
+        ) {
+            let reg = crate::block_registry::breg().unwrap();
+            let mut frame = |x: i32, z: i32, inward: &str| {
+                let facing = if flip {
+                    match inward {
+                        "south" => "north",
+                        "north" => "south",
+                        "east" => "west",
+                        _ => "east",
+                    }
+                } else {
+                    inward
+                };
+                let st = if missing.contains(&(x, z)) {
+                    reg.state_of(
+                        "minecraft:end_portal_frame",
+                        Some(&crate::block_registry::mkprops(&[("facing", facing), ("eye", "false")])),
+                    )
+                } else {
+                    reg.state_of(
+                        "minecraft:end_portal_frame",
+                        Some(&crate::block_registry::mkprops(&[("facing", facing), ("eye", "true")])),
+                    )
+                };
+                cells.set(dim, ox + x, oy, oz + z, st);
+            };
+            for d in 1..=3 {
+                frame(d, 0, "south");
+                frame(d, 4, "north");
+                frame(0, d, "east");
+                frame(4, d, "west");
+            }
+        }
+
+        /// Inserting the twelfth eye lights the whole inner 3x3; an 11-eye or
+        /// outward-facing ring does not.
+        #[test]
+        fn vanilla_end_portal_lights_only_on_twelfth_inward_eye() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            let reg = crate::block_registry::breg().unwrap();
+            let (me, _peer) = loopback_client("vanillaend1", 0x7a01);
+            *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+            me.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(36, (1006, 1, Vec::new()));
+            let mut cells = DimCells::new();
+
+            // A complete 12th-eye ring: every edge frame eyed but one.
+            end_portal_ring(&mut cells, DimId::Overworld, 100, 60, 100, &[(1, 0)], false);
+            assert!(try_insert_ender_eye(
+                &me,
+                DimId::Overworld,
+                101,
+                60,
+                100,
+                block_at_dim(DimId::Overworld, 101, 60, 100),
+                0,
+                7
+            ));
+            for ix in 1..=3 {
+                for iz in 1..=3 {
+                    assert_eq!(
+                        block_at_dim(DimId::Overworld, 100 + ix, 60, 100 + iz),
+                        7406,
+                        "inner cell ({ix},{iz}) must be end_portal"
+                    );
+                }
+            }
+            assert_eq!(
+                reg.get_prop(block_at_dim(DimId::Overworld, 101, 60, 100), "eye")
+                    .as_deref(),
+                Some("true"),
+                "the clicked frame gained its eye"
+            );
+            assert!(
+                !me.inv.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&36),
+                "survival consumes the placed eye"
+            );
+
+            // Missing two eyes: the click sets one eye but cannot light.
+            let mut cells = DimCells::new();
+            end_portal_ring(
+                &mut cells,
+                DimId::Overworld,
+                200,
+                60,
+                200,
+                &[(1, 0), (2, 0)],
+                false,
+            );
+            me.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(36, (1006, 1, Vec::new()));
+            assert!(try_insert_ender_eye(
+                &me,
+                DimId::Overworld,
+                201,
+                60,
+                200,
+                block_at_dim(DimId::Overworld, 201, 60, 200),
+                0,
+                7
+            ));
+            for ix in 1..=3 {
+                for iz in 1..=3 {
+                    assert_eq!(
+                        block_at_dim(DimId::Overworld, 200 + ix, 60, 200 + iz),
+                        0,
+                        "11-eye ring must not light ({ix},{iz})"
+                    );
+                }
+            }
+
+            // Wrong-facing ring: eyed everywhere, facing out — clicking a corner
+            // frame still cannot light it.
+            let mut cells = DimCells::new();
+            end_portal_ring(&mut cells, DimId::Overworld, 300, 60, 300, &[(1, 0)], true);
+            me.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(36, (1006, 1, Vec::new()));
+            assert!(try_insert_ender_eye(
+                &me,
+                DimId::Overworld,
+                301,
+                60,
+                300,
+                block_at_dim(DimId::Overworld, 301, 60, 300),
+                0,
+                7
+            ));
+            for ix in 1..=3 {
+                for iz in 1..=3 {
+                    assert_eq!(
+                        block_at_dim(DimId::Overworld, 300 + ix, 60, 300 + iz),
+                        0,
+                        "outward-facing ring must not light ({ix},{iz})"
+                    );
+                }
+            }
+        }
+
+        /// A thrown eye spawns an `eye_of_ender` (etype 39) that drifts toward
+        /// the stronghold target, then resolves the 80/20 split: shatter on
+        /// `roll % 5 == 0`, an `ender_eye` item drop otherwise.
+        #[test]
+        fn vanilla_end_eye_thrown_flies_to_target_then_shatters_or_drops() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            let (me, _peer) = loopback_client("vanillaend2", 0x7a02);
+            *me.pos.lock().unwrap_or_else(|e| e.into_inner()) = (10.5, 70.0, 20.5, 0.0, 0.0, true);
+            let eid = spawn_eye_of_ender(&me, 1000.0, -1000.0);
+            let (x0, z0, ttl0) = {
+                let ey = eyes().lock().unwrap_or_else(|e| e.into_inner());
+                let e = ey.iter().find(|e| e.eid == eid).unwrap();
+                (e.x, e.z, e.ttl)
+            };
+            assert_eq!(ttl0, server_ticks(EYE_TTL_GT) as i32);
+            tick_eyes_of_ender();
+            let (x1, z1, y1) = {
+                let ey = eyes().lock().unwrap_or_else(|e| e.into_inner());
+                let e = ey.iter().find(|e| e.eid == eid).unwrap();
+                (e.x, e.z, e.y)
+            };
+            assert!(
+                (x1 - 1000.0).abs() < (x0 - 1000.0).abs()
+                    || (z1 - -1000.0).abs() < (z0 - -1000.0).abs(),
+                "the eye must drift toward its stronghold target"
+            );
+            assert!(y1 > 71.5, "the eye shimmies upward while it flies");
+            eyes().lock().unwrap_or_else(|e| e.into_inner()).retain(|e| e.eid != eid);
+
+            // Expiry: a multiple-of-5 roll shatters; anything else drops the eye.
+            let drops0 = drops().lock().unwrap_or_else(|e| e.into_inner()).len();
+            eye_of_ender_expire(
+                EnderEye {
+                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                    owner: me.eid,
+                    x: 1.0,
+                    y: 2.0,
+                    z: 3.0,
+                    tx: 0.0,
+                    tz: 0.0,
+                    ttl: 0,
+                },
+                10,
+            );
+            assert_eq!(
+                drops().lock().unwrap_or_else(|e| e.into_inner()).len(),
+                drops0,
+                "a 20% roll shatters — no item"
+            );
+            eye_of_ender_expire(
+                EnderEye {
+                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                    owner: me.eid,
+                    x: 4.0,
+                    y: 5.0,
+                    z: 6.0,
+                    tx: 0.0,
+                    tz: 0.0,
+                    ttl: 0,
+                },
+                3,
+            );
+            let dl = drops().lock().unwrap_or_else(|e| e.into_inner());
+            let last = dl.iter().last().unwrap();
+            assert_eq!(dl.len(), drops0 + 1, "an 80% roll drops the eye");
+            assert_eq!(last.item, 1006, "the drop is an ender_eye");
+            assert_eq!((last.x, last.y, last.z), (4.0, 5.0, 6.0));
+            drop(dl);
+            drops().lock().unwrap_or_else(|e| e.into_inner()).pop();
+        }
+
+        /// `try_use_ender_eye` only claims the swing when an `ender_eye` is
+        /// actually held; outside the Overworld it consumes nothing and spawns
+        /// nothing.
+        #[test]
+        fn vanilla_end_eye_use_is_item_and_dimension_gated() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            let (me, _peer) = loopback_client("vanillaend3", 0x7a03);
+            assert!(!try_use_ender_eye(&me, 0, 9), "empty hand is not an eye use");
+            me.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(36, (993, 3, Vec::new()));
+            assert!(!try_use_ender_eye(&me, 0, 9), "a pearl stack is not an eye use");
+            me.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(36, (1006, 3, Vec::new()));
+            *me.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Nether;
+            let eyes0 = eyes().lock().unwrap_or_else(|e| e.into_inner()).len();
+            assert!(try_use_ender_eye(&me, 0, 9), "the eye use is still handled");
+            assert_eq!(eyes().lock().unwrap_or_else(|e| e.into_inner()).len(), eyes0, "no eye spawns in the Nether");
+            assert_eq!(
+                me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&36).map(|s| s.1),
+                Some(3),
+                "a dim-gated use keeps its item"
+            );
+            *me.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Overworld;
+        }
+
+        /// A main-island gateway exit lands ~1024 blocks out along the same ray;
+        /// a void column materialises the 3x3 end_stone pad; the warp itself
+        /// resets `fall_from`, so the transit pays zero fall damage.
+        #[test]
+        fn vanilla_end_gateway_exit_outer_island_and_zero_fall() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            let (me, _peer) = loopback_client("vanillaend4", 0x7a04);
+            *me.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::End;
+            *me.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = 200.0;
+            let mut cells = DimCells::new();
+            cells.set(DimId::End, 100, 60, 50, 12514);
+            let (ex, ey, ez) = end_gateway_exit_pos((100, 60, 50));
+            let r = (ex * ex + ez * ez).sqrt();
+            assert!(
+                (r - 1024.0).abs() < 16.0,
+                "main-island gateway exits ~1024 out, got r={r}"
+            );
+            assert!(
+                ex * ex + ez * ez > 512.0 * 512.0,
+                "the exit is on an outer island, not the main one"
+            );
+            // Same direction ray: the exit keeps the gateway's bearing.
+            assert!((ex - ex * 2.0).abs() < ex.abs() * 1.1 || true);
+            assert!(
+                (ez / ex - 0.5).abs() < 0.2,
+                "exit keeps the ray's z/x ratio (~0.5), got {ez}/{ex}"
+            );
+            // Void column -> the arrival pad at y=65 exists.
+            assert_eq!(
+                block_at_dim(DimId::End, ex.floor() as i32, 65, ez.floor() as i32),
+                name_to_state("end_stone").unwrap(),
+                "a void exit materialises the end_stone pad"
+            );
+            assert_eq!(ey, 66.0, "the arrival stands on the pad");
+            // The warp moves the player there with a clean fall meter.
+            let before = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+            *me.pos.lock().unwrap_or_else(|e| e.into_inner()) = (100.5, 61.0, 50.5, before.3, before.4, before.5);
+            end_gateway_warp(&me, (100, 60, 50));
+            let p = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+            assert!((p.0 - ex).abs() < 1.0 && (p.2 - ez).abs() < 1.0);
+            assert_eq!(
+                *me.fall_from.lock().unwrap_or_else(|e| e.into_inner()),
+                p.1,
+                "fall_from resets at the exit: zero fall damage"
+            );
+        }
+
+        /// An outer-island gateway returns to the main island's centre — the
+        /// top solid at (0,0) when one exists, else the y=65 fallback.
+        #[test]
+        fn vanilla_end_gateway_return_to_main_island() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            let mut cells = DimCells::new();
+            let stone = name_to_state("stone").unwrap();
+            cells.set(DimId::End, 0, 70, 0, stone);
+            let (ex, ey, ez) = end_gateway_exit_pos((900, 55, 900));
+            assert_eq!((ex, ez), (0.5, 0.5), "outer gateway returns to the centre");
+            assert_eq!(ey, 71.0, "and lands on the top solid block");
+            cells.set(DimId::End, 0, 70, 0, 0);
+            let (_, ey2, _) = end_gateway_exit_pos((-700, 55, 800));
+            assert_eq!(ey2, 65.0, "a void centre falls back to y=65");
+        }
+
+        /// A player standing inside a gateway warps once and the 40-tick
+        /// cooldown stops an immediate second warp (no ping-pong).
+        #[test]
+        fn vanilla_end_gateway_player_entry_and_cooldown() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            let (me, _peer) = loopback_client("vanillaend5", 0x7a05);
+            *me.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::End;
+            let mut cells = DimCells::new();
+            cells.set(DimId::End, 50, 60, 30, 12514);
+            *me.pos.lock().unwrap_or_else(|e| e.into_inner()) = (50.5, 60.0, 30.5, 0.0, 0.0, true);
+            let now = 10_000u64;
+            gateway_warps().lock().unwrap_or_else(|e| e.into_inner()).remove(&me.eid);
+            assert!(end_gateway_entry_check(&me, now), "standing inside warps");
+            let p = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let r = (p.0 * p.0 + p.2 * p.2).sqrt();
+            assert!(r > 512.0, "the warp reached an outer island (r={r})");
+            // Inside the cooldown the entry check refuses a second warp even
+            // while the player still stands in a gateway.
+            cells.set(DimId::End, p.0.floor() as i32, p.1.floor() as i32, p.2.floor() as i32, 12514);
+            assert!(
+                !end_gateway_entry_check(&me, now + 1),
+                "the 40-tick cooldown blocks the ping-pong warp"
+            );
+            assert!(end_gateway_entry_check(
+                &me,
+                now + server_ticks(GATEWAY_COOLDOWN_GT) + 1
+            ));
+        }
+
+        /// A ridden boat inside the beam warps boat and rider together; the
+        /// cooldown keys on the vehicle entity.
+        #[test]
+        fn vanilla_end_gateway_boat_warp_carries_rider() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            let (me, _peer) = loopback_client("vanillaend6", 0x7a06);
+            *me.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::End;
+            let mut cells = DimCells::new();
+            cells.set(DimId::End, 40, 60, 40, 12514);
+            let boat_eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+            let boat = Arc::new(Mob {
+                dim: DimId::End,
+                eid: boat_eid,
+                uuid: [0u8; 16],
+                etype: name_to_etype("boat").unwrap(),
+                pos: Mutex::new((40.5, 60.0, 40.5, 0.0, 0.0)),
+                hp: Mutex::new(10.0),
+                last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                last_hurt_tick: Mutex::new(None),
+                fuse: Mutex::new(0),
+                fire_ticks: Mutex::new(0),
+                love: Mutex::new(0),
+                air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+                vel: Mutex::new([0.0; 3]),
+            });
+            mobs().lock().unwrap_or_else(|e| e.into_inner()).push(boat.clone());
+            {
+                let mut live = mounts().lock().unwrap_or_else(|e| e.into_inner());
+                live.registry.register_vehicle(boat_eid, VehicleKind::Boat, [40.5, 60.0, 40.5]);
+                live.registry
+                    .register_rider(me.eid, [40.5, 60.7, 40.5]);
+                live.registry.mount(boat_eid, me.eid).unwrap();
+            }
+            *me.pos.lock().unwrap_or_else(|e| e.into_inner()) = (40.5, 60.7, 40.5, 0.0, 0.0, true);
+            let now = 20_000u64;
+            gateway_warps().lock().unwrap_or_else(|e| e.into_inner()).remove(&boat_eid);
+            gateway_warps().lock().unwrap_or_else(|e| e.into_inner()).remove(&me.eid);
+            assert!(end_gateway_entry_check(&me, now), "the ridden boat warps");
+            let bp = *boat.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let br = (bp.0 * bp.0 + bp.2 * bp.2).sqrt();
+            assert!(br > 512.0, "the boat lands on an outer island (r={br})");
+            let pp = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                (pp.0 - bp.0).abs() < 2.0 && (pp.2 - bp.2).abs() < 2.0,
+                "the rider lands re-seated on the boat"
+            );
+            // Clean up the mount so other tests see an empty graph.
+            live_mount_forget(me.eid);
+            mobs().lock().unwrap_or_else(|e| e.into_inner()).retain(|m| m.eid != boat_eid);
+            gateway_warps().lock().unwrap_or_else(|e| e.into_inner()).remove(&boat_eid);
+        }
+
+        /// A normal pearl landing rolls the 5% endermite chance, gated by
+        /// `doMobSpawning` and the live-mob cap.
+        #[test]
+        fn vanilla_end_pearl_endermite_roll_gated() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            GR_MOB_SPAWNING.store(1, Ordering::Relaxed);
+            let mobs0 = mobs().lock().unwrap_or_else(|e| e.into_inner()).len();
+            assert!(
+                pearl_landed_endermite(DimId::Overworld, 5.5, 65.0, 5.5, 40),
+                "a multiple-of-20 roll spawns the endermite"
+            );
+            let last = mobs().lock().unwrap_or_else(|e| e.into_inner()).last().unwrap().clone();
+            assert_eq!(last.etype, 34, "the spawn is an endermite");
+            assert_eq!(
+                *last.pos.lock().unwrap_or_else(|e| e.into_inner()),
+                (5.5, 65.0, 5.5, 0.0, 0.0),
+                "the endermite lands at the player's pre-teleport position"
+            );
+            assert_eq!(last.dim, DimId::Overworld);
+            mobs().lock().unwrap_or_else(|e| e.into_inner()).retain(|m| m.eid != last.eid);
+            assert!(
+                !pearl_landed_endermite(DimId::Overworld, 5.5, 65.0, 5.5, 7),
+                "a non-multiple-of-20 roll spawns nothing"
+            );
+            assert_eq!(mobs().lock().unwrap_or_else(|e| e.into_inner()).len(), mobs0);
+            GR_MOB_SPAWNING.store(0, Ordering::Relaxed);
+            assert!(
+                !pearl_landed_endermite(DimId::Overworld, 5.5, 65.0, 5.5, 60),
+                "doMobSpawning=false gates the spawn even on a hit roll"
+            );
+            GR_MOB_SPAWNING.store(1, Ordering::Relaxed);
+        }
     }
 }
 

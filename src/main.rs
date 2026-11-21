@@ -600,6 +600,11 @@ fn gr_do_entity_drops() -> bool {
 fn gr_do_vines_spread() -> bool {
     GR_DO_VINES_SPREAD.load(Ordering::Relaxed) != 0
 }
+/// `doMobSpawning`: the gamerule that gates the pearl-landing endermite roll —
+/// the same atomic the natural-spawn passes read.
+fn gr_do_mob_spawning() -> bool {
+    GR_MOB_SPAWNING.load(Ordering::Relaxed) == 1
+}
 /// `FlowableFluid.canConvertToSource` per kind, from the two conversion rules.
 fn source_conversion_enabled(kind: flowing_fluid::Kind) -> bool {
     match kind {
@@ -1213,19 +1218,30 @@ fn environment_time_tick() {
     {
         // thrown pearls: fly, on expiry teleport owner
         let mut pl = pearls().lock().unwrap();
-        let mut done: Vec<(i32, f64, f64, f64)> = vec![];
+        let mut done: Vec<(i32, f64, f64, f64, u32)> = vec![];
+        // A pearl flies in its thrower's dimension: an End pearl has to collide
+        // with End blocks — most importantly an `end_gateway` beam.
+        let pearl_dims: HashMap<i32, DimId> = client_snapshot()
+            .iter()
+            .map(|c| (c.eid, *c.dim.lock().unwrap_or_else(|e| e.into_inner())))
+            .collect();
         for p0 in pl.iter_mut() {
             if !region.is_hot(p0.x as i32, p0.z as i32) {
                 continue;
             }
             p0.ttl -= 1;
-            let hit = block_at(
+            let pdim = pearl_dims
+                .get(&p0.owner)
+                .copied()
+                .unwrap_or(DimId::Overworld);
+            let hit_state = block_at_dim(
+                pdim,
                 p0.x.floor() as i32,
                 p0.y.floor() as i32,
                 p0.z.floor() as i32,
-            ) != 0;
-            if hit || p0.ttl <= 0 {
-                done.push((p0.owner, p0.x, p0.y, p0.z));
+            );
+            if hit_state != 0 || p0.ttl <= 0 {
+                done.push((p0.owner, p0.x, p0.y, p0.z, hit_state));
             } else {
                 // vanilla ThrowableProjectile: scale 0.99, add -0.03, integrate.
                 p0.dx *= 0.99;
@@ -1241,7 +1257,7 @@ fn environment_time_tick() {
                 (0x70, entity_teleport(eid, ax, ay, az, 0.0, 0.0, true))
             });
         }
-        for (owner, tx, ty, tz) in done {
+        for (owner, tx, ty, tz, hit_st) in done {
             let dead_pearl = pl.iter().find(|p0| p0.owner == owner).map(|p0| p0.eid);
             pl.retain(|p0| p0.owner != owner);
             if let Some(peid) = dead_pearl {
@@ -1249,6 +1265,22 @@ fn environment_time_tick() {
             }
             let cls: Vec<Arc<Client>> = client_snapshot();
             if let Some(c) = cls.iter().find(|c| c.eid == owner) {
+                if is_end_gateway_state(hit_st) {
+                    // A pearl that lands in a gateway beam warps its owner to
+                    // the beam's exit: no pearl damage, no fall damage.
+                    end_gateway_warp(
+                        c,
+                        (tx.floor() as i32, ty.floor() as i32, tz.floor() as i32),
+                    );
+                    continue;
+                }
+                // The endermite appears where the player was standing when the
+                // pearl landed — vanilla rolls it before the teleport happens.
+                let (pre_x, pre_y, pre_z) = {
+                    let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
+                    (p.0, p.1, p.2)
+                };
+                let pdim = *c.dim.lock().unwrap_or_else(|e| e.into_inner());
                 let (_, _, _, yaw, pitch, _) = *c.pos.lock().unwrap();
                 if let Ok(mut w) = c.sock.lock() {
                     teleport_in_dimension(c, &mut w, (tx, ty, tz, yaw, pitch));
@@ -1263,8 +1295,17 @@ fn environment_time_tick() {
                     drop(h);
                     let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, c));
                 }
+                if hit_st != 0 {
+                    pearl_landed_endermite(pdim, pre_x, pre_y, pre_z, world_rng::next_u64());
+                }
             }
         }
+    }
+    {
+        // eyes of ender: fly toward their stronghold target, then shatter or
+        // drop, and players or ridden boats inside an end_gateway beam warp.
+        tick_eyes_of_ender();
+        tick_end_gateway_entries();
     }
     {
         // snowballs: fly, hit mob -> hurt flash
