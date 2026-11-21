@@ -13067,6 +13067,7 @@ mod mineshaft_runtime_tests {
 
         let (client, mut receiver) = effect_tests::client_pair();
         *client.pos.lock().unwrap() = (2.0, 70.0, 0.5, 0.0, 0.0, true);
+        client.chunks.lock().unwrap().insert((0, 0));
         let client = Arc::new(client);
         clients().lock().unwrap().push(client.clone());
 
@@ -13264,6 +13265,7 @@ mod mineshaft_runtime_tests {
         // A client in range is spawned the frame and sent its stack.
         let (client, mut receiver) = effect_tests::client_pair();
         *client.pos.lock().unwrap() = (4.5, 70.0, 4.5, 0.0, 0.0, true);
+        client.chunks.lock().unwrap().insert((0, 0));
         let client = Arc::new(client);
         clients().lock().unwrap().push(client.clone());
         interest_tick();

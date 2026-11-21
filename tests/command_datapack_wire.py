@@ -293,10 +293,8 @@ def command_cases(rcon, client):
     expect(rcon, "execute at @a if entity @a", "Test passed", "execute-at-selector")
     expect(rcon, "execute as @a run time query daytime", "executed 1 command(s)", "execute-as-selector")
     expect(rcon, "execute in minecraft:the_nether run setblock 33 80 33 minecraft:gold_block", "executed 1 command(s)", "execute-in-nether")
-    # Current `execute if block` calls the overworld-only block_at().
-    # Preserve this concrete gap as a regression boundary until it is fixed.
     expect(rcon, "execute in minecraft:the_nether if block 33 80 33 minecraft:gold_block",
-           "Test failed", "execute-in-dimension-block-condition-boundary")
+           "Test passed", "execute-in-dimension-block-condition")
     expect(rcon, "forceload add 32 32", "(1 chunks)", "forceload-add")
     expect(rcon, "forceload query", "1 forceloaded", "forceload-query")
     expect(rcon, "forceload remove 32 32", "(1 chunks)", "forceload-remove")
