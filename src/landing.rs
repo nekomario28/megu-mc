@@ -211,7 +211,11 @@ pub fn player_move(me: &Arc<Client>, previous_ground: bool) {
         }
     }
     // Cancellation changes farmland conversion only; the existing damage path still runs.
-    if distance > 3.0 && !wet && *me.gm.lock().unwrap() != 1 {
+    if distance > 3.0
+        && !wet
+        && *me.gm.lock().unwrap() != 1
+        && GR_FALL_DAMAGE.load(Ordering::Relaxed) != 0
+    {
         let mut hp = me.hp.lock().unwrap();
         let damage = (distance - 3.0).ceil() as f32;
         *hp = (*hp - damage * (1.0 - 0.04 * enchant_epf(me, 1) as f32)).max(0.0);

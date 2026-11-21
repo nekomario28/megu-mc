@@ -217,7 +217,11 @@ fn mob_snap_y(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32)) -> Option<((i32,
             (mp.1 - sy) as f32,
         ));
         // fall damage on descent >3 blocks; chicken/cat/ocelot immune (vanilla); water resets fall distance
-        if !landed_in_water && mp.1 - sy > 3.0 && !matches!(m.etype, 19 | 15 | 72) {
+        if !landed_in_water
+            && mp.1 - sy > 3.0
+            && !matches!(m.etype, 19 | 15 | 72)
+            && GR_FALL_DAMAGE.load(Ordering::Relaxed) != 0
+        {
             let mut hp = m.hp.lock().unwrap();
             *hp -= (mp.1 - sy - 3.0).floor() as f32;
             drop(hp);
@@ -400,6 +404,168 @@ static GR_MOB_GRIEFING: AtomicU8 = AtomicU8::new(1);
 static GR_NATURAL_REGEN: AtomicU8 = AtomicU8::new(1);
 static GR_MOB_LOOT: AtomicU8 = AtomicU8::new(1);
 static GR_MAX_ENTITY_CRAMMING: AtomicI32 = AtomicI32::new(ENTITY_CRAMMING_DEFAULT);
+// P1-A: the next tranche of vanilla gamerules with live consumers. The first
+// six gate the random-tick and drop systems; the damage/death set gates the
+// environmental damage arms in this file and the death announcements; the rest
+// are stored atomics whose consumers land with the systems they govern.
+static GR_RANDOM_TICK_SPEED: AtomicI32 = AtomicI32::new(3);
+static GR_DO_FIRE_TICK: AtomicU8 = AtomicU8::new(1);
+static GR_SNOW_ACCUMULATION_HEIGHT: AtomicI32 = AtomicI32::new(1);
+static GR_DO_TILE_DROPS: AtomicU8 = AtomicU8::new(1);
+static GR_DO_ENTITY_DROPS: AtomicU8 = AtomicU8::new(1);
+static GR_FALL_DAMAGE: AtomicU8 = AtomicU8::new(1);
+static GR_DROWNING_DAMAGE: AtomicU8 = AtomicU8::new(1);
+static GR_FIRE_DAMAGE: AtomicU8 = AtomicU8::new(1);
+static GR_FREEZE_DAMAGE: AtomicU8 = AtomicU8::new(1);
+static GR_DO_IMMEDIATE_RESPAWN: AtomicU8 = AtomicU8::new(0);
+static GR_SHOW_DEATH_MESSAGES: AtomicU8 = AtomicU8::new(1);
+static GR_ANNOUNCE_ADVANCEMENTS: AtomicU8 = AtomicU8::new(1);
+static GR_DISABLE_RAIDS: AtomicU8 = AtomicU8::new(0);
+static GR_PLAYERS_SLEEPING_PERCENTAGE: AtomicI32 = AtomicI32::new(100);
+static GR_WATER_SOURCE_CONVERSION: AtomicU8 = AtomicU8::new(1);
+static GR_LAVA_SOURCE_CONVERSION: AtomicU8 = AtomicU8::new(0);
+static GR_SEND_COMMAND_FEEDBACK: AtomicU8 = AtomicU8::new(1);
+static GR_COMMAND_MODIFICATION_BLOCK_LIMIT: AtomicI32 = AtomicI32::new(32768);
+static GR_DO_VINES_SPREAD: AtomicU8 = AtomicU8::new(1);
+
+/// The gamerules with a live runtime atomic, as one name -> atomic mapping.
+/// `/gamerule` (set, query and list), the save footer and the load path all
+/// resolve through these two, so a rule can never be stored but unread, or
+/// read but unrestorable.
+fn gamerule_atomic_value(name: &str) -> Option<i32> {
+    Some(match name {
+        "keepInventory" => GR_KEEP_INVENTORY.load(Ordering::Relaxed) as i32,
+        "doDaylightCycle" => GR_DAYLIGHT_CYCLE.load(Ordering::Relaxed) as i32,
+        "doWeatherCycle" => GR_WEATHER_CYCLE.load(Ordering::Relaxed) as i32,
+        "doMobSpawning" => GR_MOB_SPAWNING.load(Ordering::Relaxed) as i32,
+        "mobGriefing" => GR_MOB_GRIEFING.load(Ordering::Relaxed) as i32,
+        "naturalRegeneration" => GR_NATURAL_REGEN.load(Ordering::Relaxed) as i32,
+        "doMobLoot" => GR_MOB_LOOT.load(Ordering::Relaxed) as i32,
+        "maxEntityCramming" => GR_MAX_ENTITY_CRAMMING.load(Ordering::Relaxed),
+        "randomTickSpeed" => GR_RANDOM_TICK_SPEED.load(Ordering::Relaxed),
+        "doFireTick" => GR_DO_FIRE_TICK.load(Ordering::Relaxed) as i32,
+        "snowAccumulationHeight" => GR_SNOW_ACCUMULATION_HEIGHT.load(Ordering::Relaxed),
+        "doTileDrops" => GR_DO_TILE_DROPS.load(Ordering::Relaxed) as i32,
+        "doEntityDrops" => GR_DO_ENTITY_DROPS.load(Ordering::Relaxed) as i32,
+        "fallDamage" => GR_FALL_DAMAGE.load(Ordering::Relaxed) as i32,
+        "drowningDamage" => GR_DROWNING_DAMAGE.load(Ordering::Relaxed) as i32,
+        "fireDamage" => GR_FIRE_DAMAGE.load(Ordering::Relaxed) as i32,
+        "freezeDamage" => GR_FREEZE_DAMAGE.load(Ordering::Relaxed) as i32,
+        "doImmediateRespawn" => GR_DO_IMMEDIATE_RESPAWN.load(Ordering::Relaxed) as i32,
+        "showDeathMessages" => GR_SHOW_DEATH_MESSAGES.load(Ordering::Relaxed) as i32,
+        "announceAdvancements" => GR_ANNOUNCE_ADVANCEMENTS.load(Ordering::Relaxed) as i32,
+        "disableRaids" => GR_DISABLE_RAIDS.load(Ordering::Relaxed) as i32,
+        "playersSleepingPercentage" => {
+            GR_PLAYERS_SLEEPING_PERCENTAGE.load(Ordering::Relaxed)
+        }
+        "waterSourceConversion" => GR_WATER_SOURCE_CONVERSION.load(Ordering::Relaxed) as i32,
+        "lavaSourceConversion" => GR_LAVA_SOURCE_CONVERSION.load(Ordering::Relaxed) as i32,
+        "sendCommandFeedback" => GR_SEND_COMMAND_FEEDBACK.load(Ordering::Relaxed) as i32,
+        "commandModificationBlockLimit" => {
+            GR_COMMAND_MODIFICATION_BLOCK_LIMIT.load(Ordering::Relaxed)
+        }
+        "doVinesSpread" => GR_DO_VINES_SPREAD.load(Ordering::Relaxed) as i32,
+        _ => return None,
+    })
+}
+fn gamerule_atomic_store(name: &str, value: i32) -> bool {
+    match name {
+        "keepInventory" => GR_KEEP_INVENTORY.store(value as u8, Ordering::Relaxed),
+        "doDaylightCycle" => GR_DAYLIGHT_CYCLE.store(value as u8, Ordering::Relaxed),
+        "doWeatherCycle" => GR_WEATHER_CYCLE.store(value as u8, Ordering::Relaxed),
+        "doMobSpawning" => GR_MOB_SPAWNING.store(value as u8, Ordering::Relaxed),
+        "mobGriefing" => GR_MOB_GRIEFING.store(value as u8, Ordering::Relaxed),
+        "naturalRegeneration" => GR_NATURAL_REGEN.store(value as u8, Ordering::Relaxed),
+        "doMobLoot" => GR_MOB_LOOT.store(value as u8, Ordering::Relaxed),
+        "maxEntityCramming" => GR_MAX_ENTITY_CRAMMING.store(value, Ordering::Relaxed),
+        "randomTickSpeed" => GR_RANDOM_TICK_SPEED.store(value, Ordering::Relaxed),
+        "doFireTick" => GR_DO_FIRE_TICK.store(value as u8, Ordering::Relaxed),
+        "snowAccumulationHeight" => {
+            GR_SNOW_ACCUMULATION_HEIGHT.store(value, Ordering::Relaxed)
+        }
+        "doTileDrops" => GR_DO_TILE_DROPS.store(value as u8, Ordering::Relaxed),
+        "doEntityDrops" => GR_DO_ENTITY_DROPS.store(value as u8, Ordering::Relaxed),
+        "fallDamage" => GR_FALL_DAMAGE.store(value as u8, Ordering::Relaxed),
+        "drowningDamage" => GR_DROWNING_DAMAGE.store(value as u8, Ordering::Relaxed),
+        "fireDamage" => GR_FIRE_DAMAGE.store(value as u8, Ordering::Relaxed),
+        "freezeDamage" => GR_FREEZE_DAMAGE.store(value as u8, Ordering::Relaxed),
+        "doImmediateRespawn" => GR_DO_IMMEDIATE_RESPAWN.store(value as u8, Ordering::Relaxed),
+        "showDeathMessages" => GR_SHOW_DEATH_MESSAGES.store(value as u8, Ordering::Relaxed),
+        "announceAdvancements" => {
+            GR_ANNOUNCE_ADVANCEMENTS.store(value as u8, Ordering::Relaxed)
+        }
+        "disableRaids" => GR_DISABLE_RAIDS.store(value as u8, Ordering::Relaxed),
+        "playersSleepingPercentage" => {
+            GR_PLAYERS_SLEEPING_PERCENTAGE.store(value, Ordering::Relaxed)
+        }
+        "waterSourceConversion" => {
+            GR_WATER_SOURCE_CONVERSION.store(value as u8, Ordering::Relaxed)
+        }
+        "lavaSourceConversion" => {
+            GR_LAVA_SOURCE_CONVERSION.store(value as u8, Ordering::Relaxed)
+        }
+        "sendCommandFeedback" => {
+            GR_SEND_COMMAND_FEEDBACK.store(value as u8, Ordering::Relaxed)
+        }
+        "commandModificationBlockLimit" => {
+            GR_COMMAND_MODIFICATION_BLOCK_LIMIT.store(value, Ordering::Relaxed)
+        }
+        "doVinesSpread" => GR_DO_VINES_SPREAD.store(value as u8, Ordering::Relaxed),
+        _ => return false,
+    }
+    true
+}
+
+/// `randomTickSpeed`, clamped to the range a pass can honor: `0` disables
+/// random ticks; the upper bound keeps one tick from sampling a section more
+/// than once per cell on average.
+fn gr_random_tick_speed() -> u32 {
+    (GR_RANDOM_TICK_SPEED.load(Ordering::Relaxed)).clamp(0, 4096) as u32
+}
+/// `snowAccumulationHeight`: `0` disables accumulation; the snow block's
+/// `layers` property tops out at 8.
+fn gr_snow_accumulation_height() -> u8 {
+    (GR_SNOW_ACCUMULATION_HEIGHT.load(Ordering::Relaxed)).clamp(0, 8) as u8
+}
+/// Ready for the raid lane (P1-B): raids do not start while the rule is set.
+#[allow(dead_code)]
+fn gr_disable_raids() -> bool {
+    GR_DISABLE_RAIDS.load(Ordering::Relaxed) != 0
+}
+/// Ready for the sleep lane (P1-C): percent of players required to skip night.
+#[allow(dead_code)]
+fn gr_players_sleeping_percentage() -> i32 {
+    GR_PLAYERS_SLEEPING_PERCENTAGE.load(Ordering::Relaxed)
+}
+/// Ready for the freeze lane: powder-snow damage has no damage site yet, so
+/// the rule is stored and synced but has nothing to gate.
+#[allow(dead_code)]
+fn gr_freeze_damage() -> bool {
+    GR_FREEZE_DAMAGE.load(Ordering::Relaxed) != 0
+}
+/// `doEntityDrops`: non-mob entity drops — broken minecarts and falling blocks
+/// that leave the world.
+fn gr_do_entity_drops() -> bool {
+    GR_DO_ENTITY_DROPS.load(Ordering::Relaxed) != 0
+}
+/// Ready for the vine lane: vines have no random tick yet.
+#[allow(dead_code)]
+fn gr_do_vines_spread() -> bool {
+    GR_DO_VINES_SPREAD.load(Ordering::Relaxed) != 0
+}
+/// `FlowableFluid.canConvertToSource` per kind, from the two conversion rules.
+fn source_conversion_enabled(kind: flowing_fluid::Kind) -> bool {
+    match kind {
+        flowing_fluid::Kind::Water => {
+            GR_WATER_SOURCE_CONVERSION.load(Ordering::Relaxed) != 0
+        }
+        flowing_fluid::Kind::Lava => GR_LAVA_SOURCE_CONVERSION.load(Ordering::Relaxed) != 0,
+    }
+}
+/// `dimension_type.ultrawarm`: water cannot exist and ice sublimates to air.
+fn dim_ultrawarm(dim: DimId) -> bool {
+    dim == DimId::Nether || worldgen::dimension_spec(dim).is_some_and(|spec| spec.ultrawarm)
+}
 // world spawn (vanilla /setworldspawn) + difficulty — both persisted
 static WORLD_SPAWN: Mutex<(f64, f64, f64, f32)> = Mutex::new((0.5, 16.0, 0.5, 0.0));
 // 0=peaceful 1=easy 2=normal 3=hard; gates hostile night spawns
@@ -616,7 +782,9 @@ fn environment_time_tick() {
                     if resp == 0 || t.is_multiple_of((resp + 1) as u64) {
                         *air -= 1;
                     }
-                } else if t.is_multiple_of(server_ticks(20)) {
+                } else if t.is_multiple_of(server_ticks(20))
+                    && GR_DROWNING_DAMAGE.load(Ordering::Relaxed) != 0
+                {
                     *h = (*h - 2.0).max(0.0);
                     dirty = true;
                     // vanilla: environmental damage arms the same timer, so a melee hit in
@@ -633,7 +801,9 @@ fn environment_time_tick() {
             {
                 // lava: 1.21.1 Entity.isInLava (fluidHeight[LAVA] > 0.0 with deflate(0.001))
                 let fire_immune = c.effs.lock().unwrap().iter().any(|e| e.id == 11);
-                let in_lava = !fire_immune && player_in_lava(player_dim, px, py, pz, sneaking, fall_fly);
+                let in_lava = !fire_immune
+                    && GR_FIRE_DAMAGE.load(Ordering::Relaxed) != 0
+                    && player_in_lava(player_dim, px, py, pz, sneaking, fall_fly);
                 if in_lava && t.is_multiple_of(server_ticks(10)) {
                     *h = (*h - 4.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0);
                     dirty = true;
@@ -651,6 +821,7 @@ fn environment_time_tick() {
                 // fire_protection epf applies, armor does not
                 let fst = name_to_state("fire").unwrap_or(u32::MAX);
                 let in_fire = !fire_immune
+                    && GR_FIRE_DAMAGE.load(Ordering::Relaxed) != 0
                     && (block_at_dim(player_dim, px.floor() as i32, py.floor() as i32, pz.floor() as i32) == fst);
                 if in_fire && t.is_multiple_of(server_ticks(20)) {
                     *h = (*h - 1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0);
@@ -724,6 +895,7 @@ fn environment_time_tick() {
                     }
                     let mst = name_to_state("magma_block").unwrap_or(u32::MAX);
                     let on_magma = !fire_immune
+                        && GR_FIRE_DAMAGE.load(Ordering::Relaxed) != 0
                         && !*c.sneaking.lock().unwrap()
                         && block_at(bx, (py - 0.5).floor() as i32, bz) == mst;
                     if on_magma {
@@ -1295,7 +1467,11 @@ fn actor_tick() {
                 "attack" => {
                     let st = block_at(tx, ty, tz);
                     if st != 0 {
-                        for it in block_drops(st) {
+                        for it in if GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0 {
+                            block_drops(st)
+                        } else {
+                            Vec::new()
+                        } {
                             let d = Drop {
                                 eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                                 x: tx as f64 + 0.5,
@@ -2871,7 +3047,10 @@ fn live_mob_tick_dimension(
             {
                 damage += 1.0;
             }
-            if in_lava && !mob_fire_immune(m.etype) {
+            if in_lava
+                && !mob_fire_immune(m.etype)
+                && GR_FIRE_DAMAGE.load(Ordering::Relaxed) != 0
+            {
                 damage += 4.0;
             }
         }
@@ -2881,7 +3060,9 @@ fn live_mob_tick_dimension(
                 *air = server_ticks(AIR_SUPPLY_GT) as i32;
             } else if *air > 0 {
                 *air -= 1;
-            } else if tick.is_multiple_of(server_ticks(20)) {
+            } else if tick.is_multiple_of(server_ticks(20))
+                && GR_DROWNING_DAMAGE.load(Ordering::Relaxed) != 0
+            {
                 damage += 2.0;
             }
         }
@@ -2902,7 +3083,7 @@ fn live_mob_tick_dimension(
             let (remaining, fire_damage) =
                 fire_tick_update(*fire_ticks, tick, mob_fire_immune(m.etype));
             *fire_ticks = remaining;
-            if fire_damage {
+            if fire_damage && GR_FIRE_DAMAGE.load(Ordering::Relaxed) != 0 {
                 damage += 1.0;
             }
         }
@@ -3706,7 +3887,7 @@ fn break_generated_cart(target_eid: i32, drop_loot: bool) -> bool {
     let Some((uuid, pos, spilled)) = broken else {
         return false;
     };
-    if drop_loot {
+    if drop_loot && gr_do_entity_drops() {
         let mut ds = drops().lock().unwrap();
         if let Some(cart_item) = name_to_item("chest_minecart") {
             ds.push(Drop {
@@ -5292,7 +5473,7 @@ impl GeneratedFluidOwner {
                 event.pos,
                 kind,
                 source,
-                kind == flowing_fluid::Kind::Water,
+                source_conversion_enabled(kind),
             ) {
                 Ok(plan) => {
                     self.reported.remove(&event.pos);
@@ -5484,8 +5665,9 @@ impl flowing_fluid::Reader for PassFluidReader<'_> {
 
 /// `FluidState.tick(level, pos)` at one marked cell. `expected_source` is the cell's own
 /// source-ness (so a marked flowing cell takes the `getNewLiquid` arm and a source goes
-/// straight to `spread`, which is vanilla's split), and `source_conversion` is water-only,
-/// matching `FlowableFluid`'s `canConvertToSource` as the runtime scheduler already reads it.
+/// straight to `spread`, which is vanilla's split), and `source_conversion` is the live
+/// `waterSourceConversion`/`lavaSourceConversion` gamerule per kind, matching
+/// `FlowableFluid`'s `canConvertToSource` as the runtime scheduler already reads it.
 fn promotion_fluid_tick(
     world: &mut dyn structure_template::FluidTickTarget,
     pos: flowing_fluid::Pos,
@@ -5500,7 +5682,7 @@ fn promotion_fluid_tick(
     };
     let plan = {
         let mut reader = PassFluidReader(&mut *world);
-        flowing_fluid::tick(&mut reader, pos, kind, level == 0, water)
+        flowing_fluid::tick(&mut reader, pos, kind, level == 0, source_conversion_enabled(kind))
     };
     let plan = match plan {
         Ok(plan) => plan,
@@ -5682,20 +5864,22 @@ fn ticked_sections(cx: i32, cz: i32) -> Vec<i32> {
     out
 }
 
-/// Vanilla's random tick speed: this many positions per chunk section per tick.
-const RANDOM_TICK_SPEED: u32 = 3;
-
 /// One pass of vanilla's random block ticks. A position is drawn per section rather than
 /// walking every block, so the cost follows the number of sections instead of the number
-/// of blocks, and a position that holds nothing costs one array lookup.
+/// of blocks, and a position that holds nothing costs one array lookup. The `randomTickSpeed`
+/// gamerule sets the number of samples per section; `0` skips the pass entirely.
 fn random_tick_pass() {
+    let speed = gr_random_tick_speed();
+    if speed == 0 {
+        return;
+    }
     // The registry is looked up once per pass, not once per sample.
     let Some(reg) = crate::block_registry::breg() else {
         return;
     };
     for (cx, cz) in ticked_chunks() {
         for sy in ticked_sections(cx, cz) {
-            for _ in 0..RANDOM_TICK_SPEED {
+            for _ in 0..speed {
                 let x = cx * 16 + world_rng::next_below(16) as i32;
                 let y = sy * 16 + world_rng::next_below(16) as i32;
                 let z = cz * 16 + world_rng::next_below(16) as i32;
@@ -5708,24 +5892,113 @@ fn random_tick_pass() {
 /// What a block does when a random tick lands on it. Vanilla calls the block's
 /// `randomTick`; here the block is identified by name from the registry rather than by a
 /// hand-written id range, so a block added from the asset needs no edit to this file.
+/// `on_random_tick` keeps the Overworld-only signature existing callers and tests use;
+/// the dimension-aware work lives in `on_random_tick_dim`.
 fn on_random_tick(reg: &crate::block_registry::BReg, x: i32, y: i32, z: i32) {
-    let st = block_at(x, y, z);
-    // One compare against zero for the common case, rather than a string compare against
-    // the block's name on every sample.
-    if reg.behaviour_of(st) == crate::block_registry::B_SUGAR_CANE {
-        sugar_cane_random_tick(reg, x, y, z, st)
+    on_random_tick_dim(reg, DimId::Overworld, x, y, z)
+}
+
+fn on_random_tick_dim(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32) {
+    let st = block_at_dim(dim, x, y, z);
+    // Two cheap rejections cover the overwhelming share of sampled cells — air is
+    // most of the volume and stone is most of the rest — so a string lookup runs
+    // only for cells that might actually tick.
+    if reg.is_air(st) || st == reg.default_state(1) {
+        return;
     }
+    // One compare against zero for the behaviour table's only random-tick id,
+    // rather than a string compare against the block's name on every sample.
+    if reg.behaviour_of(st) == crate::block_registry::B_SUGAR_CANE {
+        sugar_cane_random_tick(reg, dim, x, y, z, st);
+        return;
+    }
+    match reg.name_of(st) {
+        "minecraft:wheat" | "minecraft:carrots" | "minecraft:potatoes"
+        | "minecraft:beetroots" | "minecraft:nether_wart" | "minecraft:melon_stem"
+        | "minecraft:pumpkin_stem" | "minecraft:sweet_berry_bush" | "minecraft:cocoa" => {
+            crop_random_tick(reg, dim, x, y, z, st)
+        }
+        "minecraft:fire" | "minecraft:soul_fire" => fire_random_tick(reg, dim, x, y, z, st),
+        "minecraft:ice" => ice_random_tick(reg, dim, x, y, z),
+        "minecraft:water" => water_random_tick(reg, dim, x, y, z, st),
+        "minecraft:snow" => snow_random_tick(reg, dim, x, y, z, st),
+        "minecraft:grass_block" | "minecraft:mycelium" => {
+            grass_random_tick(reg, dim, x, y, z, st)
+        }
+        name if name.ends_with("_leaves") => leaf_random_tick(reg, dim, x, y, z, st),
+        name if name.ends_with("_sapling") => sapling_random_tick(reg, dim, x, y, z, st),
+        _ => {}
+    }
+}
+
+/// `Level.getBrightness(LightLayer.BLOCK, pos)` approximated from the block
+/// registry: the cell's own emission and the strongest neighbour minus one step
+/// of attenuation. The light engine does not index cells a tick wrote, so the
+/// rules that want block light — ice melt, snow accumulation, fire spread —
+/// read the emissions of the written state instead.
+fn random_tick_block_light(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32) -> u8 {
+    let mut light = reg.luminance_of(block_at_dim(dim, x, y, z));
+    for (dx, dy, dz) in [
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    ] {
+        let n = reg.luminance_of(block_at_dim(dim, x + dx, y + dy, z + dz));
+        light = light.max(n.saturating_sub(1));
+    }
+    light
+}
+
+/// `Level.canSeeSky(pos)`: the cell sits at or above the surface the column
+/// heightmap recorded, in a dimension with skylight.
+fn random_tick_sky_exposed(dim: DimId, x: i32, y: i32, z: i32) -> bool {
+    dim.has_skylight() && y >= height_at_dim(dim, x, z)
+}
+
+/// `Level.getMaxLocalRawBrightness`: block light combined with full sky light
+/// where the column is exposed.
+fn random_tick_light(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32) -> u8 {
+    let block = random_tick_block_light(reg, dim, x, y, z);
+    let sky = if random_tick_sky_exposed(dim, x, y, z) {
+        15
+    } else {
+        0
+    };
+    block.max(sky)
+}
+
+/// `Biome.shouldSnow`/`Biome.coldEnoughToSnow` from the biome the generator
+/// resolves at the cell. Cold means the biome's `temperature` is below 0.15.
+fn cold_biome_at(dim: DimId, x: i32, y: i32, z: i32) -> bool {
+    if dim == DimId::Nether || dim == DimId::End {
+        return false;
+    }
+    worldgen::with_gen_dim(dim, |g| {
+        g.biome_blended(x, y, z)
+            .is_some_and(|(_, leaf)| g.biome_cold_at_leaf(leaf, x, y, z))
+    })
+    .unwrap_or(false)
 }
 
 /// Vanilla grows sugar cane one stage per random tick, from age 0 to 15, and the tick
 /// that would take it past 15 places a new cane above and resets the age. Sixteen
 /// random ticks therefore add one block to the column, up to a height of three.
-fn sugar_cane_random_tick(reg: &crate::block_registry::BReg, x: i32, y: i32, z: i32, st: u32) {
-    if !reg.is_air(block_at(x, y + 1, z)) {
+fn sugar_cane_random_tick(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    st: u32,
+) {
+    if !reg.is_air(block_at_dim(dim, x, y + 1, z)) {
         return;
     }
     let mut height = 1;
-    while reg.name_of(block_at(x, y - height, z)) == "minecraft:sugar_cane" {
+    while reg.name_of(block_at_dim(dim, x, y - height, z)) == "minecraft:sugar_cane" {
         height += 1;
     }
     if height >= 3 {
@@ -5736,10 +6009,401 @@ fn sugar_cane_random_tick(reg: &crate::block_registry::BReg, x: i32, y: i32, z: 
         .and_then(|a| a.parse().ok())
         .unwrap_or(0);
     if age >= 15 {
-        set_block(x, y + 1, z, reg.state_of("minecraft:sugar_cane", None));
-        set_block(x, y, z, reg.with_prop(st, "age", "0"));
+        set_block_dim(dim, x, y + 1, z, reg.state_of("minecraft:sugar_cane", None));
+        set_block_dim(dim, x, y, z, reg.with_prop(st, "age", "0"));
     } else {
-        set_block(x, y, z, reg.with_prop(st, "age", &(age + 1).to_string()));
+        set_block_dim(dim, x, y, z, reg.with_prop(st, "age", &(age + 1).to_string()));
+    }
+}
+
+/// Reads the world around a crop into `CropTickInput` and writes the evaluated
+/// `age` back. Moisture and the 3x3 farmland context come from the cells the
+/// crop actually neighbours; the same-crop diagonal rule samples the four
+/// orthogonal neighbours.
+fn crop_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+    let name = reg.name_of(st);
+    let kind = match name {
+        "minecraft:wheat" => CropKind::Wheat,
+        "minecraft:carrots" => CropKind::Carrots,
+        "minecraft:potatoes" => CropKind::Potatoes,
+        "minecraft:beetroots" => CropKind::Beetroots,
+        "minecraft:melon_stem" => CropKind::MelonStem,
+        "minecraft:pumpkin_stem" => CropKind::PumpkinStem,
+        "minecraft:sweet_berry_bush" => CropKind::SweetBerryBush,
+        "minecraft:cocoa" => CropKind::Cocoa,
+        _ => CropKind::NetherWart,
+    };
+    let age: u8 = reg
+        .get_prop(st, "age")
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(0);
+    let mut farmland_3x3 = [[None; 3]; 3];
+    for dz in 0..3usize {
+        for dx in 0..3usize {
+            let b = block_at_dim(dim, x + dx as i32 - 1, y - 1, z + dz as i32 - 1);
+            if reg.name_of(b) == "minecraft:farmland" {
+                farmland_3x3[dz][dx] = reg
+                    .get_prop(b, "moisture")
+                    .and_then(|m| m.parse().ok());
+            }
+        }
+    }
+    let same_crop = |dx: i32, dz: i32| reg.name_of(block_at_dim(dim, x + dx, y, z + dz)) == name;
+    let input = CropTickInput {
+        kind,
+        age,
+        light: random_tick_light(reg, dim, x, y, z),
+        farmland_below: farmland_3x3[1][1].is_some(),
+        farmland_3x3,
+        same_crop_north_south: same_crop(0, -1) || same_crop(0, 1),
+        same_crop_east_west: same_crop(-1, 0) || same_crop(1, 0),
+        random_value: world_rng::next_u64() as u32,
+    };
+    if let Some(new_age) = eval_crop_random_tick(input) {
+        set_block_dim(dim, x, y, z, reg.with_prop(st, "age", &new_age.to_string()));
+        note_block_update_dim(dim, x, y, z, st);
+    }
+}
+
+/// The vanilla catch-fire cover: blocks `BaseFireBlock` lights on a random
+/// tick. There is no flammable tag in the assets, so this names the common
+/// combustible materials directly.
+fn fire_flammable(reg: &crate::block_registry::BReg, st: u32) -> bool {
+    if reg.in_tag(st, "minecraft:logs_that_burn") || reg.in_tag(st, "minecraft:leaves") {
+        return true;
+    }
+    let name = reg.name_of(st);
+    name.ends_with("_planks")
+        || name.ends_with("_wool")
+        || name.ends_with("_carpet")
+        || name.ends_with("_log")
+        || name.ends_with("_wood")
+        || (name.ends_with("_fence") || name.ends_with("_fence_gate"))
+            && !name.contains("nether_brick")
+        || name.ends_with("_bookshelf")
+        || matches!(
+            name,
+            "minecraft:tnt"
+                | "minecraft:coal_block"
+                | "minecraft:hay_block"
+                | "minecraft:dried_kelp_block"
+                | "minecraft:composter"
+                | "minecraft:beehive"
+                | "minecraft:bookshelf"
+                | "minecraft:target"
+                | "minecraft:bamboo"
+        )
+}
+
+/// `FireBlock.tick` reduced to its observable outcomes: rain and the
+/// `doFireTick` gamerule gate the whole pass; the evaluator owns the age,
+/// burnout and spread probabilities.
+fn fire_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+    if GR_DO_FIRE_TICK.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let soul_fire = reg.name_of(st) == "minecraft:soul_fire";
+    let dirs = [
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    ];
+    let mut flammable_neighbors = [false; 6];
+    let mut spread_rolls = [0u8; 6];
+    for i in 0..6 {
+        let (dx, dy, dz) = dirs[i];
+        flammable_neighbors[i] = fire_flammable(reg, block_at_dim(dim, x + dx, y + dy, z + dz));
+        spread_rolls[i] = world_rng::next_below(16) as u8;
+    }
+    let age: u8 = reg
+        .get_prop(st, "age")
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(0);
+    let result = eval_fire_tick(FireTickInput {
+        age,
+        rain_exposed: RAINING.load(Ordering::Relaxed) != 0
+            && dim == DimId::Overworld
+            && random_tick_sky_exposed(dim, x, y, z),
+        soul_fire,
+        flammable_neighbors,
+        spread_rolls,
+        age_roll: world_rng::next_below(256) as u8,
+        burnout_roll: world_rng::next_below(256) as u8,
+    });
+    if result.extinguished || result.burned_out {
+        set_block_dim(dim, x, y, z, 0);
+        note_block_update_dim(dim, x, y, z, 0);
+        return;
+    }
+    if let Some(new_age) = result.age {
+        if new_age != age {
+            set_block_dim(dim, x, y, z, reg.with_prop(st, "age", &new_age.to_string()));
+            note_block_update_dim(dim, x, y, z, st);
+        }
+    }
+    for i in 0..6 {
+        if !result.spread[i] {
+            continue;
+        }
+        let (dx, dy, dz) = dirs[i];
+        let (nx, ny, nz) = (x + dx, y + dy, z + dz);
+        if fire_flammable(reg, block_at_dim(dim, nx, ny, nz)) {
+            let fire = reg.state_of("minecraft:fire", None);
+            set_block_dim(dim, nx, ny, nz, fire);
+            note_block_update_dim(dim, nx, ny, nz, fire);
+        }
+    }
+}
+
+/// `LeavesBlock.randomTick`: a leaf with `persistent=false` and `distance=7`
+/// decays; one tick in twenty drops the block's loot. `doTileDrops` gates the
+/// drop, not the decay.
+fn leaf_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+    let persistent = reg.get_prop(st, "persistent").as_deref() == Some("true");
+    let distance: u8 = reg
+        .get_prop(st, "distance")
+        .and_then(|d| d.parse().ok())
+        .unwrap_or(1);
+    let result = eval_leaf_decay(LeafDecayInput {
+        persistent,
+        distance,
+        random_roll: world_rng::next_below(256) as u8,
+    });
+    if !result.decay {
+        return;
+    }
+    set_block_dim(dim, x, y, z, 0);
+    note_block_update_dim(dim, x, y, z, 0);
+    if result.drop_item && GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0 {
+        for item in block_drops(st) {
+            drops().lock().unwrap().push(Drop {
+                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                x: x as f64 + 0.5,
+                y: y as f64 + 0.4,
+                z: z as f64 + 0.5,
+                item,
+                cnt: 1,
+                comps: Vec::new(),
+                age: 0,
+                target: None,
+                thrower: None,
+            });
+        }
+    }
+}
+
+/// `IceBlock.randomTick`: block light of 11 or more melts the block — to a
+/// water source where water can exist, to nothing in an ultrawarm dimension.
+fn ice_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32) {
+    let input = SnowIceTickInput {
+        cold_biome: cold_biome_at(dim, x, y, z),
+        sky_exposed: random_tick_sky_exposed(dim, x, y, z),
+        light: random_tick_block_light(reg, dim, x, y, z),
+        support_is_full_solid: false,
+        water_source: false,
+        random_roll: world_rng::next_below(256) as u8,
+    };
+    if eval_ice_freeze_melt(input, true) == SnowIceTickResult::MeltIce
+    {
+        let out = if dim_ultrawarm(dim) {
+            0
+        } else {
+            reg.state_of("minecraft:water", None)
+        };
+        set_block_dim(dim, x, y, z, out);
+        note_block_update_dim(dim, x, y, z, out);
+    }
+}
+
+/// `SnowAndFreezeCheck`/`LiquidBlock`: a water source in a biome cold enough to
+/// snow freezes to ice when it can see the sky and its block light stays under
+/// 11. Flowing water does not freeze.
+fn water_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+    let source = fluid_from_block(st).is_some_and(|f| f.source());
+    if !source {
+        return;
+    }
+    let input = SnowIceTickInput {
+        cold_biome: cold_biome_at(dim, x, y, z),
+        sky_exposed: random_tick_sky_exposed(dim, x, y, z),
+        light: random_tick_block_light(reg, dim, x, y, z),
+        support_is_full_solid: false,
+        water_source: true,
+        random_roll: world_rng::next_below(256) as u8,
+    };
+    if eval_ice_freeze_melt(input, false)
+        == SnowIceTickResult::FreezeWater
+    {
+        let ice = reg.state_of("minecraft:ice", None);
+        set_block_dim(dim, x, y, z, ice);
+        note_block_update_dim(dim, x, y, z, ice);
+    }
+}
+
+/// `SnowLayerBlock.randomTick`: while it is snowing a layer may deepen, up to
+/// the `snowAccumulationHeight` gamerule — and that depth still needs the same
+/// cold, sky and low-light conditions water needs to freeze, plus a full solid
+/// layer above to gather the fall. `0` disables accumulation entirely.
+fn snow_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+    let cap = gr_snow_accumulation_height();
+    if cap == 0 || RAINING.load(Ordering::Relaxed) == 0 || dim != DimId::Overworld {
+        return;
+    }
+    let layers: u8 = reg
+        .get_prop(st, "layers")
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(1);
+    if layers >= cap {
+        return;
+    }
+    let input = SnowIceTickInput {
+        cold_biome: cold_biome_at(dim, x, y, z),
+        sky_exposed: random_tick_sky_exposed(dim, x, y, z),
+        light: random_tick_block_light(reg, dim, x, y, z),
+        support_is_full_solid: reg.is_collision_shape_full_block(block_at_dim(dim, x, y + 1, z)),
+        water_source: false,
+        random_roll: world_rng::next_below(256) as u8,
+    };
+    if eval_snow_accumulation(input)
+        == SnowIceTickResult::AccumulateSnow
+    {
+        let next = reg.with_prop(st, "layers", &(layers + 1).to_string());
+        set_block_dim(dim, x, y, z, next);
+        note_block_update_dim(dim, x, y, z, next);
+    }
+}
+
+/// `SaplingBlock.randomTick`/`BonemealableFeaturePlaceSection`: a stage-0
+/// sapling under sky-equivalent light advances to stage 1; a stage-1 sapling
+/// with the headroom grows a tree. The roll matches vanilla's `nextInt(7)`.
+fn sapling_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+    let stage: u8 = reg
+        .get_prop(st, "stage")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    // The canopy needs y+2..y+5 clear of everything but air and the sapling
+    // itself before a grow is offered to the evaluator.
+    let headroom = (2..=5).all(|dy| reg.is_air(block_at_dim(dim, x, y + dy, z)));
+    let input = SaplingTickInput {
+        stage,
+        light: random_tick_light(reg, dim, x, y + 1, z),
+        headroom,
+        random_roll: world_rng::next_below(64) as u8,
+    };
+    match eval_sapling_random_tick(input) {
+        SaplingTickResult::NoChange => {}
+        SaplingTickResult::AdvanceStage => {
+            let next = reg.with_prop(st, "stage", "1");
+            set_block_dim(dim, x, y, z, next);
+            note_block_update_dim(dim, x, y, z, next);
+        }
+        SaplingTickResult::Grow => {
+            grow_sapling_tree(reg, dim, x, y, z, reg.name_of(st));
+        }
+    }
+}
+
+/// The trunk/leaf pair a `*_sapling` name resolves to. Saplings without a
+/// canopy pair — `mangrove_propagule` is not a `*_sapling` — never reach this.
+fn sapling_tree_blocks(name: &str) -> Option<(&'static str, &'static str)> {
+    Some(match name {
+        "minecraft:oak_sapling" => ("minecraft:oak_log", "minecraft:oak_leaves"),
+        "minecraft:birch_sapling" => ("minecraft:birch_log", "minecraft:birch_leaves"),
+        "minecraft:spruce_sapling" => ("minecraft:spruce_log", "minecraft:spruce_leaves"),
+        "minecraft:jungle_sapling" => ("minecraft:jungle_log", "minecraft:jungle_leaves"),
+        "minecraft:acacia_sapling" => ("minecraft:acacia_log", "minecraft:acacia_leaves"),
+        "minecraft:dark_oak_sapling" => ("minecraft:dark_oak_log", "minecraft:dark_oak_leaves"),
+        "minecraft:cherry_sapling" => ("minecraft:cherry_log", "minecraft:cherry_leaves"),
+        _ => return None,
+    })
+}
+
+/// The smallest structurally-valid tree: a four-block trunk, a 3x3 leaf ring at
+/// y+2 and y+3, and a plus of leaves at y+4. Leaves are placed
+/// `persistent=false, distance=1` so they behave like generated canopy. Only
+/// air and the sapling cell are replaced.
+fn grow_sapling_tree(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32, name: &str) {
+    let Some((log_name, leaf_name)) = sapling_tree_blocks(name) else {
+        return;
+    };
+    let log = reg.state_of(log_name, None);
+    let mut leaves = reg.state_of(leaf_name, None);
+    if reg.get_prop(leaves, "persistent").is_some() {
+        leaves = reg.with_prop(leaves, "persistent", "false");
+    }
+    if reg.get_prop(leaves, "distance").is_some() {
+        leaves = reg.with_prop(leaves, "distance", "1");
+    }
+    let set = |bx: i32, by: i32, bz: i32, st: u32| {
+        let cur = block_at_dim(dim, bx, by, bz);
+        if reg.is_air(cur) || cur == st || (by == y && bx == x && bz == z) {
+            set_block_dim(dim, bx, by, bz, st);
+            note_block_update_dim(dim, bx, by, bz, st);
+        }
+    };
+    for dy in 0..4 {
+        set(x, y + dy, z, log);
+    }
+    for dy in [2, 3] {
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                if dx != 0 || dz != 0 {
+                    set(x + dx, y + dy, z + dz, leaves);
+                }
+            }
+        }
+    }
+    for (dx, dz) in [(0, -1), (-1, 0), (1, 0), (0, 1)] {
+        set(x + dx, y + 4, z + dz, leaves);
+    }
+}
+
+/// `SpreadingSnowyDirtBlock` (`GrassBlock`/`MyceliumBlock`): an opaque block
+/// overhead with light below 4 kills the grass back to dirt; otherwise a lit
+/// grass block tries four random offsets and converts a dirt cell whose top is
+/// clear. The `snowy` flag follows a snow cover above the target.
+fn grass_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+    let name = reg.name_of(st);
+    let above = block_at_dim(dim, x, y + 1, z);
+    let covered_opaque = reg.can_occlude(above);
+    let light_above = random_tick_light(reg, dim, x, y + 1, z);
+    let input = |target_is_dirt, target_above_blocks| GrassSpreadInput {
+        covered_opaque,
+        light_above,
+        target_is_dirt,
+        target_above_blocks,
+    };
+    if eval_grass_spread(input(false, false)) == GrassSpreadResult::DieToDirt {
+        let dead = reg.state_of("minecraft:dirt", None);
+        set_block_dim(dim, x, y, z, dead);
+        note_block_update_dim(dim, x, y, z, dead);
+        return;
+    }
+    for _ in 0..4 {
+        let nx = x + world_rng::next_below(3) as i32 - 1;
+        let ny = y + world_rng::next_below(5) as i32 - 3;
+        let nz = z + world_rng::next_below(3) as i32 - 1;
+        let target_above = block_at_dim(dim, nx, ny + 1, nz);
+        let target_is_dirt =
+            reg.name_of(block_at_dim(dim, nx, ny, nz)) == "minecraft:dirt";
+        let target_above_blocks =
+            reg.can_occlude(target_above) || reg.is_liquid(target_above);
+        if eval_grass_spread(input(target_is_dirt, target_above_blocks))
+            != GrassSpreadResult::SpreadToNeighbor
+        {
+            continue;
+        }
+        let mut grass = reg.state_of(name, None);
+        if reg.get_prop(grass, "snowy").is_some() {
+            let snowy = reg.name_of(target_above) == "minecraft:snow_block";
+            grass = reg.with_prop(grass, "snowy", if snowy { "true" } else { "false" });
+        }
+        set_block_dim(dim, nx, ny, nz, grass);
+        note_block_update_dim(dim, nx, ny, nz, grass);
+        return;
     }
 }
 
@@ -6254,7 +6918,7 @@ fn set_block_if_inner_dim(
                         .filter(|(it, cn, _)| *it > 0 && *cn > 0),
                 );
             }
-            if !spill.is_empty() {
+            if !spill.is_empty() && GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0 {
                 let mut ds = drops().lock().unwrap();
                 for (item, cnt, comps) in spill {
                     ds.push(Drop {
@@ -7242,8 +7906,9 @@ fn falling_tick() {
             }
             if new_y < MIN_Y as f64 {
                 // Below the world vanilla cannot place the block, so it drops it rather than
-                // destroying the item that left the world when the fall started.
-                if let Some(item) = block_drop(f.state) {
+                // destroying the item that left the world when the fall started. The drop is
+                // the entity's, so `doEntityDrops` gates it.
+                if let Some(item) = block_drop(f.state).filter(|_| gr_do_entity_drops()) {
                     below.push(Drop {
                         eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                         x: f.x,
@@ -7317,7 +7982,10 @@ fn note_fragile_supports(x: i32, y: i32, z: i32) {
         }
         if set_block_if(q.0, q.1, q.2, 0, Some(state)) {
             note_block_update(q.0, q.1, q.2, 0);
-            if let Some(item) = reg.block_drop(state) {
+            if let Some(item) = reg
+                .block_drop(state)
+                .filter(|_| GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0)
+            {
                 drops().lock().unwrap().push(Drop {
                     eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                     x: q.0 as f64 + 0.5,

@@ -1198,7 +1198,7 @@ fn arrow_tick() {
             let vname = c.name.clone();
             drop(cls);
             broadcast_seen_ex(veid, veid, |_c| (0x24, hurt_anim(veid)));
-            if hh <= 0.0 {
+            if hh <= 0.0 && GR_SHOW_DEATH_MESSAGES.load(Ordering::Relaxed) != 0 {
                 let line = system_chat(&format!("{} was shot by Skeleton", vname));
                 broadcast(-1, |_c| (0x6c, line.clone()));
             }
@@ -1389,7 +1389,9 @@ fn live_mob_melee(mob: &Mob, player: &Arc<Client>, pos: [f64; 3], amount: f32, u
         *mob.hurt_at.lock().unwrap() = Instant::now();
         broadcast_seen(mob.eid, |_| (0x24, hurt_anim(mob.eid)));
     }
-    if *player.hp.lock().unwrap() <= 0.0 {
+    if *player.hp.lock().unwrap() <= 0.0
+        && GR_SHOW_DEATH_MESSAGES.load(Ordering::Relaxed) != 0
+    {
         let name = entity_spec_by_id(mob.etype).map_or("mob", |spec| {
             spec.name.strip_prefix("minecraft:").unwrap_or(spec.name)
         });

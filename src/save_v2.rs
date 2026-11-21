@@ -844,44 +844,44 @@ fn read_saved_raid(input: &mut SaveInput<'_>) -> Result<(DimId, Raid), &'static 
 const SAVE_STATE_MAGIC: &[u8; 4] = b"SVP1";
 const SAVE_ENTITY_RULES_MAGIC: &[u8; 4] = b"SVX1";
 
-// The eight live rules have dedicated atomics. All other rules live in the
+// The live rules have dedicated atomics. All other rules live in the
 // command registry; capture the atomics as authoritative when saving.
 fn gamerule_value(name: &str, rules: &HashMap<&'static str, i32>) -> i32 {
-    match name {
-        "keepInventory" => GR_KEEP_INVENTORY.load(Ordering::Relaxed) as i32,
-        "doDaylightCycle" => GR_DAYLIGHT_CYCLE.load(Ordering::Relaxed) as i32,
-        "doWeatherCycle" => GR_WEATHER_CYCLE.load(Ordering::Relaxed) as i32,
-        "doMobSpawning" => GR_MOB_SPAWNING.load(Ordering::Relaxed) as i32,
-        "mobGriefing" => GR_MOB_GRIEFING.load(Ordering::Relaxed) as i32,
-        "naturalRegeneration" => GR_NATURAL_REGEN.load(Ordering::Relaxed) as i32,
-        "doMobLoot" => GR_MOB_LOOT.load(Ordering::Relaxed) as i32,
-        "maxEntityCramming" => GR_MAX_ENTITY_CRAMMING.load(Ordering::Relaxed),
-        _ => rules[name],
-    }
+    gamerule_atomic_value(name).unwrap_or(rules[name])
 }
+
+/// The eight rules a pre-SVP1 save could carry: their runtime values lived in
+/// the atomics the file format never wrote, so a legacy load keeps the
+/// atomics authoritative for them. Every other rule has no legacy carrier —
+/// it restores to its default.
+const LEGACY_ATOMIC_GAMERULES: &[&str] = &[
+    "keepInventory",
+    "doDaylightCycle",
+    "doWeatherCycle",
+    "doMobSpawning",
+    "mobGriefing",
+    "naturalRegeneration",
+    "doMobLoot",
+    "maxEntityCramming",
+];
 
 fn restore_gamerules(saved: Option<&[i32]>) {
     let mut rules = command_gamerules().lock().unwrap();
     rules.clear();
     rules.extend(COMMAND_GAMERULE_DEFAULTS.iter().map(|&(name, _, default)| (name, default)));
     for (index, &(name, _, _)) in COMMAND_GAMERULE_DEFAULTS.iter().enumerate() {
-        // Legacy files carry the eight live rules outside SVP1. Read their
-        // atomics back into the command registry, while defaulting the rest.
-        let value = saved.map_or_else(|| gamerule_value(name, &rules), |values| values[index]);
+        let value = saved.map_or_else(
+            || {
+                if LEGACY_ATOMIC_GAMERULES.contains(&name) {
+                    gamerule_value(name, &rules)
+                } else {
+                    rules[name]
+                }
+            },
+            |values| values[index],
+        );
         rules.insert(name, value);
-        if saved.is_some() {
-            match name {
-                "keepInventory" => GR_KEEP_INVENTORY.store(value as u8, Ordering::Relaxed),
-                "doDaylightCycle" => GR_DAYLIGHT_CYCLE.store(value as u8, Ordering::Relaxed),
-                "doWeatherCycle" => GR_WEATHER_CYCLE.store(value as u8, Ordering::Relaxed),
-                "doMobSpawning" => GR_MOB_SPAWNING.store(value as u8, Ordering::Relaxed),
-                "mobGriefing" => GR_MOB_GRIEFING.store(value as u8, Ordering::Relaxed),
-                "naturalRegeneration" => GR_NATURAL_REGEN.store(value as u8, Ordering::Relaxed),
-                "doMobLoot" => GR_MOB_LOOT.store(value as u8, Ordering::Relaxed),
-                "maxEntityCramming" => GR_MAX_ENTITY_CRAMMING.store(value, Ordering::Relaxed),
-                _ => {}
-            }
-        }
+        gamerule_atomic_store(name, value);
     }
 }
 

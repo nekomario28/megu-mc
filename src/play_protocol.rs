@@ -1290,7 +1290,7 @@ fn finish_block_break(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, old:
             (it, n)
         };
         crops().lock().unwrap().remove(&ow_block((x, y, z)));
-        if old == 4285 {
+        if old == 4285 && GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0 {
             // ripe: extra wheat drop
             let d = Drop {
                 eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
@@ -1306,7 +1306,9 @@ fn finish_block_break(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, old:
             };
             drops().lock().unwrap().push(d);
         }
-        if let Some(item) = if !can_harvest(old as i64, held.0) {
+        if let Some(item) = if !can_harvest(old as i64, held.0)
+            || GR_DO_TILE_DROPS.load(Ordering::Relaxed) == 0
+        {
             None
         } else {
             drop_item
@@ -3769,6 +3771,14 @@ fn drop_player_items_on_death(player: &Arc<Client>) {
     let death_evt = entity_event_pkt(player.eid, 3);
     if let Ok(mut w) = player.sock.lock() {
         let _ = send_packet(&mut w, 0x1f, death_evt.clone());
+        // Game Event (0x22) id 11 = IMMEDIATE_RESPAWN: 1.0 tells the client to
+        // respawn without the death screen — vanilla's doImmediateRespawn.
+        let mut ge = vec![11u8];
+        ge.extend_from_slice(
+            &((GR_DO_IMMEDIATE_RESPAWN.load(Ordering::Relaxed) != 0) as i32 as f32)
+                .to_be_bytes(),
+        );
+        let _ = send_packet(&mut w, 0x22, ge);
     }
     broadcast_seen_ex(player.eid, player.eid, |_c| (0x1f, death_evt.clone()));
     if GR_KEEP_INVENTORY.load(Ordering::Relaxed) != 0
@@ -6050,9 +6060,13 @@ fn handle(mut s: TcpStream) {
                                 if let Some(victim) = victim {
                                     drop_player_items_on_death(&victim);
                                 }
-                                let line =
-                                    system_chat(&format!("{} was slain by {}", vname, me.name));
-                                broadcast(-1, |_c| (0x6c, line.clone()));
+                                if GR_SHOW_DEATH_MESSAGES.load(Ordering::Relaxed) != 0 {
+                                    let line = system_chat(&format!(
+                                        "{} was slain by {}",
+                                        vname, me.name
+                                    ));
+                                    broadcast(-1, |_c| (0x6c, line.clone()));
+                                }
                             }
                             continue;
                         }
@@ -6334,8 +6348,11 @@ fn handle(mut s: TcpStream) {
                             100 => "Spider",
                             _ => "mob",
                         };
-                        let line = system_chat(&format!("{} was slain by {}", mn, me.name));
-                        broadcast(-1, |_c| (0x6c, line.clone()));
+                        if GR_SHOW_DEATH_MESSAGES.load(Ordering::Relaxed) != 0 {
+                            let line =
+                                system_chat(&format!("{} was slain by {}", mn, me.name));
+                            broadcast(-1, |_c| (0x6c, line.clone()));
+                        }
                         let Some((mob, state)) = remove_live_mob(deid) else { continue };
                         let burn_kill = *mob.fire_ticks.lock().unwrap() > 0;
                         live_mob_death(&mob, state, [mx, my, mz]);

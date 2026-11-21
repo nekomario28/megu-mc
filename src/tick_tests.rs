@@ -7512,6 +7512,10 @@ fn the_tick_preserves_the_saved_world_payload_byte_for_byte() {
         RAINING.swap(0, Ordering::Relaxed),
         THUNDERING.swap(0, Ordering::Relaxed),
     );
+    // Random ticks are live now and the fixture world is not reset between the
+    // two runs, so a tick that mutates a cell makes the second payload differ
+    // from the first. Freeze the pass for the duration of the fixture.
+    let old_tick_speed = GR_RANDOM_TICK_SPEED.swap(0, Ordering::Relaxed);
     let old_rng = world_rng::saved_state();
     // Exactly one forceloaded chunk, so the orbs and drops in it age through the tick
     // while the payload stays deterministic: `save_world_into` writes the forceload set
@@ -7605,6 +7609,7 @@ fn the_tick_preserves_the_saved_world_payload_byte_for_byte() {
     WORLD_TIME.store(old_time, Ordering::Relaxed);
     RAINING.store(old_weather.0, Ordering::Relaxed);
     THUNDERING.store(old_weather.1, Ordering::Relaxed);
+    GR_RANDOM_TICK_SPEED.store(old_tick_speed, Ordering::Relaxed);
     world_rng::restore(old_rng);
     set_test_region(old_hot, old_warm);
     // Pin the legacy payload (including BRD1) and the payload with the SED1 suffix.
@@ -7625,8 +7630,8 @@ fn the_tick_preserves_the_saved_world_payload_byte_for_byte() {
     let (legacy_prefix, _) = split_save_footer(before_state, BLOCK_ENTITIES_MAGIC).unwrap();
     let mut legacy = legacy_prefix.to_vec();
     legacy.extend_from_slice(&before_seed[before_generated.len()..]);
-    assert_eq!(payload_digest(&legacy), "ccb95841c40f2d55ccd155989ad93fc8");
-    assert_eq!(first, "5bdc0aa461c9f2c5cea3febebd51728d");
+    assert_eq!(payload_digest(&legacy), "2ac52d760306bb99e6dc846359b1fff0");
+    assert_eq!(first, "86a587a98e008ba49be0f7e2d57baae6");
 }
 
 // ---------- chest world-side contract remainder (M2 slice 3d) ----------

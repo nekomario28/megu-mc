@@ -2045,7 +2045,6 @@ fn eval_clone(
 // world storage and RNG so callers can supply snapshots and apply returned changes.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum CropKind {
     Wheat,
     Carrots,
@@ -2059,7 +2058,6 @@ enum CropKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct CropTickInput {
     kind: CropKind,
     age: u8,
@@ -2073,7 +2071,6 @@ struct CropTickInput {
     random_value: u32,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn crop_growth_speed(
     farmland_3x3: [[Option<u8>; 3]; 3],
     same_crop_north_south: bool,
@@ -2100,7 +2097,6 @@ fn crop_growth_speed(
     speed
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn eval_crop_random_tick(input: CropTickInput) -> Option<u8> {
     let max_age = match input.kind {
         CropKind::Beetroots | CropKind::NetherWart | CropKind::SweetBerryBush => 3,
@@ -2248,7 +2244,6 @@ fn eval_random_ticks_default(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct FireTickInput {
     age: u8,
     rain_exposed: bool,
@@ -2264,7 +2259,6 @@ struct FireTickInput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct FireTickResult {
     extinguished: bool,
     age: Option<u8>,
@@ -2272,7 +2266,6 @@ struct FireTickResult {
     burned_out: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn eval_fire_tick(input: FireTickInput) -> FireTickResult {
     let mut result = FireTickResult {
         extinguished: false,
@@ -2306,7 +2299,6 @@ fn eval_fire_tick(input: FireTickInput) -> FireTickResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct LeafDecayInput {
     persistent: bool,
     distance: u8,
@@ -2314,13 +2306,11 @@ struct LeafDecayInput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct LeafDecayResult {
     decay: bool,
     drop_item: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn eval_leaf_decay(input: LeafDecayInput) -> LeafDecayResult {
     let decay = !input.persistent && input.distance >= 7;
     LeafDecayResult {
@@ -2330,7 +2320,6 @@ fn eval_leaf_decay(input: LeafDecayInput) -> LeafDecayResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct SnowIceTickInput {
     cold_biome: bool,
     sky_exposed: bool,
@@ -2341,7 +2330,6 @@ struct SnowIceTickInput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum SnowIceTickResult {
     NoChange,
     AccumulateSnow,
@@ -2349,7 +2337,6 @@ enum SnowIceTickResult {
     MeltIce,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn eval_snow_accumulation(input: SnowIceTickInput) -> SnowIceTickResult {
     if input.cold_biome
         && input.sky_exposed
@@ -2363,7 +2350,6 @@ fn eval_snow_accumulation(input: SnowIceTickInput) -> SnowIceTickResult {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn eval_ice_freeze_melt(input: SnowIceTickInput, is_ice: bool) -> SnowIceTickResult {
     if is_ice && input.light >= 11 {
         return SnowIceTickResult::MeltIce;
@@ -2372,6 +2358,75 @@ fn eval_ice_freeze_melt(input: SnowIceTickInput, is_ice: bool) -> SnowIceTickRes
         return SnowIceTickResult::FreezeWater;
     }
     SnowIceTickResult::NoChange
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SaplingTickInput {
+    stage: u8,
+    /// `Level.getMaxLocalRawBrightness(pos.above())`: full sky light at the cell
+    /// above a sky-exposed sapling, or the local block light under cover.
+    light: u8,
+    /// The canopy envelope is clear: every cell the grown tree would occupy is
+    /// air (or the sapling cell itself) before the grow is offered.
+    headroom: bool,
+    /// Raw caller-provided roll; vanilla draws `random.nextInt(7)` and grows on 0.
+    random_roll: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaplingTickResult {
+    NoChange,
+    AdvanceStage,
+    Grow,
+}
+
+/// `SaplingBlock.randomTick` + `BonemealableFeaturePlaceSection`: a stage-0
+/// sapling under at least light 9 advances to stage 1 on a one-in-seven roll;
+/// a stage-1 sapling with headroom grows. Dark or crowded saplings never move.
+fn eval_sapling_random_tick(input: SaplingTickInput) -> SaplingTickResult {
+    if input.light < 9 || input.random_roll % 7 != 0 {
+        return SaplingTickResult::NoChange;
+    }
+    if input.stage == 0 {
+        return SaplingTickResult::AdvanceStage;
+    }
+    if !input.headroom {
+        return SaplingTickResult::NoChange;
+    }
+    SaplingTickResult::Grow
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GrassSpreadInput {
+    /// A full-occluding block sits on the spreader.
+    covered_opaque: bool,
+    /// The light level at the cell above the spreader.
+    light_above: u8,
+    /// The sampled spread target holds `minecraft:dirt`.
+    target_is_dirt: bool,
+    /// The cell above the sampled target is opaque or liquid and would seal the
+    /// new grass off from the sky.
+    target_above_blocks: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrassSpreadResult {
+    NoChange,
+    DieToDirt,
+    SpreadToNeighbor,
+}
+
+/// `SpreadingSnowyDirtBlock` (`GrassBlock`/`MyceliumBlock`) random tick: an
+/// opaque block overhead with light below 4 kills the grass to dirt; otherwise
+/// a lit spreader converts a sampled dirt cell whose top stays clear.
+fn eval_grass_spread(input: GrassSpreadInput) -> GrassSpreadResult {
+    if input.covered_opaque && input.light_above < 4 {
+        return GrassSpreadResult::DieToDirt;
+    }
+    if input.light_above >= 9 && input.target_is_dirt && !input.target_above_blocks {
+        return GrassSpreadResult::SpreadToNeighbor;
+    }
+    GrassSpreadResult::NoChange
 }
 
 #[cfg(test)]
@@ -4517,5 +4572,647 @@ mod world_mechanisms_tests {
         ] {
             assert_eq!(eval_ice_freeze_melt(changed, false), NoChange);
         }
+    }
+}
+
+/// P1-A live wiring tests: production `on_random_tick` and the live gamerule
+/// atomics, not just the pure evaluators.
+#[cfg(test)]
+mod p1a_random_tick_and_gamerule_tests {
+    use super::*;
+
+    /// Records the original state of every cell a test writes and restores
+    /// them on drop, so a failed assertion cannot leak world edits into the
+    /// next test under the world lock.
+    struct Cells(Vec<(i32, i32, i32, u32)>);
+    impl Cells {
+        fn new() -> Self {
+            Cells(Vec::new())
+        }
+        fn set(&mut self, x: i32, y: i32, z: i32, st: u32) {
+            self.record(x, y, z);
+            set_block(x, y, z, st);
+        }
+        fn record(&mut self, x: i32, y: i32, z: i32) {
+            self.0.push((x, y, z, block_at(x, y, z)));
+        }
+    }
+    impl std::ops::Drop for Cells {
+        fn drop(&mut self) {
+            for (x, y, z, st) in self.0.drain(..).rev() {
+                set_block(x, y, z, st);
+            }
+        }
+    }
+
+    /// Restores the gamerule atomics a test changed, on every exit path.
+    struct Rules(Vec<(&'static str, i32)>);
+    impl Rules {
+        fn take(names: &[&'static str]) -> Self {
+            Rules(
+                names
+                    .iter()
+                    .map(|name| (*name, gamerule_atomic_value(name).unwrap_or(0)))
+                    .collect(),
+            )
+        }
+    }
+    impl std::ops::Drop for Rules {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                gamerule_atomic_store(name, value);
+            }
+        }
+    }
+
+    fn prop_u8(reg: &crate::block_registry::BReg, st: u32, key: &str) -> Option<u8> {
+        reg.get_prop(st, key).and_then(|v| v.parse().ok())
+    }
+
+    /// Calls `on_random_tick` until `done` holds, returning false when the cap
+    /// was hit first. Random-tick outcomes are rolls; the caps sit orders of
+    /// magnitude past the expected count so a miss means the wiring broke, not
+    /// that the roll was unlucky.
+    fn tick_until(
+        reg: &crate::block_registry::BReg,
+        x: i32,
+        y: i32,
+        z: i32,
+        cap: usize,
+        done: impl Fn() -> bool,
+    ) -> bool {
+        for _ in 0..cap {
+            on_random_tick(reg, x, y, z);
+            if done() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn moist_farmland(reg: &crate::block_registry::BReg) -> u32 {
+        reg.with_prop(reg.state_of("minecraft:farmland", None), "moisture", "7")
+    }
+
+    fn new_mob(eid: i32, etype: i64, x: f64, y: f64, z: f64, hp: f32, air: i32) -> Arc<Mob> {
+        let last_action = Instant::now() - Duration::from_secs(10);
+        let mut uuid = [0; 16];
+        uuid[12..].copy_from_slice(&eid.to_be_bytes());
+        Arc::new(Mob {
+            dim: DimId::Overworld,
+            eid,
+            uuid,
+            etype,
+            pos: Mutex::new((x, y, z, 0.0, 0.0)),
+            hp: Mutex::new(hp),
+            last_hit: Mutex::new(last_action),
+            hurt_at: Mutex::new(last_action),
+            last_hurt_tick: Mutex::new(None),
+            vel: Mutex::new([0.0; 3]),
+            fuse: Mutex::new(0),
+            fire_ticks: Mutex::new(0),
+            love: Mutex::new(0),
+            air: Mutex::new(air),
+        })
+    }
+
+    #[test]
+    fn random_tick_wires_crops_fire_leaves_snow_ice_saplings_and_grass() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let reg = crate::block_registry::breg().unwrap();
+        let mut cells = Cells::new();
+        let old_rain = RAINING.swap(0, Ordering::Relaxed);
+        let rules = Rules::take(&["doFireTick"]);
+
+        let name = |x: i32, y: i32, z: i32| reg.name_of(block_at(x, y, z)).to_owned();
+        let age = |x: i32, y: i32, z: i32| prop_u8(reg, block_at(x, y, z), "age");
+
+        // --- crops: wheat and carrots on hydrated farmland, nether wart on
+        // soul sand. All sit well above the surface, so the sky-light arm
+        // supplies the >=9 the evaluator asks for.
+        let farmland = moist_farmland(reg);
+        cells.set(0, 149, 0, farmland);
+        cells.set(0, 150, 0, reg.state_of("minecraft:wheat", None));
+        assert!(
+            tick_until(reg, 0, 150, 0, 5000, || {
+                age(0, 150, 0).is_some_and(|a| a > 0)
+            }),
+            "production on_random_tick must grow wheat on farmland"
+        );
+        cells.set(4, 149, 0, farmland);
+        cells.set(4, 150, 0, reg.state_of("minecraft:carrots", None));
+        assert!(
+            tick_until(reg, 4, 150, 0, 5000, || {
+                age(4, 150, 0).is_some_and(|a| a > 0)
+            }),
+            "production on_random_tick must grow carrots on farmland"
+        );
+        cells.set(8, 149, 0, reg.state_of("minecraft:soul_sand", None));
+        cells.set(8, 150, 0, reg.state_of("minecraft:nether_wart", None));
+        assert!(
+            tick_until(reg, 8, 150, 0, 3000, || {
+                age(8, 150, 0).is_some_and(|a| a > 0)
+            }),
+            "production on_random_tick must grow nether wart on soul sand"
+        );
+
+        // --- fire: rain extinguishes a sky-exposed fire; a fire with no
+        // flammable neighbour burns out; doFireTick=false freezes both. Clear
+        // the neighbourhoods first so the fixture does not depend on whatever
+        // the generator happened to leave in the air cells.
+        for x in 12..=15 {
+            for y in 149..=151 {
+                for z in -1..=1 {
+                    cells.set(x, y, z, 0);
+                }
+            }
+        }
+        cells.set(12, 150, 0, reg.state_of("minecraft:fire", None));
+        RAINING.store(60, Ordering::Relaxed);
+        on_random_tick(reg, 12, 150, 0);
+        assert_eq!(
+            block_at(12, 150, 0),
+            0,
+            "rain on a sky-exposed fire must extinguish it"
+        );
+        RAINING.store(0, Ordering::Relaxed);
+
+        cells.set(13, 150, 0, reg.state_of("minecraft:fire", None));
+        assert!(
+            tick_until(reg, 13, 150, 0, 200, || block_at(13, 150, 0) == 0),
+            "a fire with no flammable neighbours must burn out"
+        );
+
+        let fire = reg.state_of("minecraft:fire", None);
+        cells.set(14, 150, 0, fire);
+        cells.set(14, 150, 1, reg.state_of("minecraft:oak_planks", None));
+        GR_DO_FIRE_TICK.store(0, Ordering::Relaxed);
+        for _ in 0..64 {
+            on_random_tick(reg, 14, 150, 0);
+        }
+        assert_eq!(
+            block_at(14, 150, 0),
+            fire,
+            "doFireTick=false must freeze the fire tick entirely"
+        );
+        assert_eq!(
+            name(14, 150, 1),
+            "minecraft:oak_planks",
+            "doFireTick=false must stop spread onto flammable neighbours"
+        );
+        GR_DO_FIRE_TICK.store(1, Ordering::Relaxed);
+        // ...and re-enabled, the same fixture must ignite the planks.
+        assert!(
+            tick_until(reg, 14, 150, 0, 4000, || block_at(14, 150, 1) == fire),
+            "doFireTick=true must let fire spread to a flammable neighbour"
+        );
+
+        // --- leaves: a distance-7 non-persistent leaf decays; a persistent one
+        // does not.
+        let mut decaying = reg.state_of("minecraft:oak_leaves", None);
+        decaying = reg.with_prop(decaying, "persistent", "false");
+        decaying = reg.with_prop(decaying, "distance", "7");
+        cells.set(20, 150, 0, decaying);
+        on_random_tick(reg, 20, 150, 0);
+        assert_eq!(
+            block_at(20, 150, 0),
+            0,
+            "non-persistent distance-7 leaves must decay to air on one tick"
+        );
+        let mut persistent = reg.state_of("minecraft:oak_leaves", None);
+        persistent = reg.with_prop(persistent, "persistent", "true");
+        persistent = reg.with_prop(persistent, "distance", "7");
+        cells.set(21, 150, 0, persistent);
+        for _ in 0..8 {
+            on_random_tick(reg, 21, 150, 0);
+        }
+        assert_eq!(
+            block_at(21, 150, 0),
+            persistent,
+            "persistent leaves must survive random ticks"
+        );
+
+        // --- ice: block light >= 11 melts it to a water source.
+        cells.set(24, 150, 0, reg.state_of("minecraft:ice", None));
+        cells.set(25, 150, 0, reg.state_of("minecraft:torch", None));
+        on_random_tick(reg, 24, 150, 0);
+        assert_eq!(
+            name(24, 150, 0),
+            "minecraft:water",
+            "ice next to a torch must melt into water"
+        );
+
+        // --- sapling: stage 0 -> stage 1 -> grown tree.
+        cells.set(28, 150, 0, reg.state_of("minecraft:oak_sapling", None));
+        for dy in 1..6 {
+            cells.set(28, 150 + dy, 0, 0);
+        }
+        assert!(
+            tick_until(reg, 28, 150, 0, 30000, || {
+                name(28, 150, 0) == "minecraft:oak_log"
+            }),
+            "a lit sapling must grow into a tree through production ticks"
+        );
+        assert_eq!(name(28, 151, 0), "minecraft:oak_log");
+        assert_eq!(
+            name(29, 152, 0),
+            "minecraft:oak_leaves",
+            "the grown tree must carry a leaf canopy"
+        );
+
+        // --- grass: spreads to adjacent dirt in the light, dies to dirt under
+        // an opaque cap in the dark.
+        cells.set(32, 150, 0, reg.state_of("minecraft:grass_block", None));
+        cells.set(33, 150, 0, reg.state_of("minecraft:dirt", None));
+        assert!(
+            tick_until(reg, 32, 150, 0, 2000, || {
+                name(33, 150, 0) == "minecraft:grass_block"
+            }),
+            "lit grass must spread to adjacent dirt"
+        );
+        cells.set(36, 5, 0, reg.state_of("minecraft:grass_block", None));
+        cells.set(36, 6, 0, reg.state_of("minecraft:stone", None));
+        assert!(
+            tick_until(reg, 36, 5, 0, 8, || name(36, 5, 0) == "minecraft:dirt"),
+            "grass buried under an opaque block must die back to dirt"
+        );
+
+        RAINING.store(old_rain, Ordering::Relaxed);
+        drop(rules);
+    }
+
+    #[test]
+    fn gamerule_random_tick_speed_and_damage_rules_take_effect_live() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let reg = crate::block_registry::breg().unwrap();
+        let mut cells = Cells::new();
+        let rules = Rules::take(&[
+            "randomTickSpeed",
+            "doFireTick",
+            "fallDamage",
+            "fireDamage",
+            "drowningDamage",
+            "commandModificationBlockLimit",
+            "waterSourceConversion",
+            "lavaSourceConversion",
+        ]);
+        let ctx = CmdCtx {
+            me: None,
+            x: 0.5,
+            y: 16.0,
+            z: 0.5,
+        };
+        let mut sink: Option<&Client> = None;
+        let name = |x: i32, y: i32, z: i32| reg.name_of(block_at(x, y, z)).to_owned();
+        let gamerule = |sink: &mut Option<&Client>, name: &str| {
+            let (cmd, value) = name.split_once(' ').unwrap();
+            run_command_ctx(&ctx, &format!("/gamerule {cmd} {value}"), sink)
+        };
+        assert_eq!(
+            gamerule(&mut sink, "randomTickSpeed 0"),
+            "Gamerule randomTickSpeed is now set to: 0"
+        );
+
+        // randomTickSpeed 0: the pass leaves the world untouched; a non-zero
+        // speed reaches the cells the pass samples.
+        let farmland = moist_farmland(reg);
+        cells.set(0, 149, 0, farmland);
+        cells.set(0, 150, 0, reg.state_of("minecraft:wheat", None));
+        let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+        forceloaded().lock().unwrap().insert((0, 0));
+        for _ in 0..3 {
+            random_tick_pass();
+        }
+        assert_eq!(
+            prop_u8(reg, block_at(0, 150, 0), "age"),
+            Some(0),
+            "randomTickSpeed=0 must stop every random tick"
+        );
+        assert_eq!(
+            gamerule(&mut sink, "randomTickSpeed 4096"),
+            "Gamerule randomTickSpeed is now set to: 4096"
+        );
+        assert_eq!(gr_random_tick_speed(), 4096);
+        let mut grew = false;
+        for _ in 0..80 {
+            random_tick_pass();
+            if prop_u8(reg, block_at(0, 150, 0), "age").is_some_and(|a| a > 0) {
+                grew = true;
+                break;
+            }
+        }
+        *forceloaded().lock().unwrap() = old_forced;
+        assert!(grew, "a non-zero randomTickSpeed must reach the wheat");
+
+        // doFireTick false: production on_random_tick leaves fire alone.
+        gamerule(&mut sink, "doFireTick false");
+        let fire = reg.state_of("minecraft:fire", None);
+        for x in 4..=5 {
+            for z in -1..=1 {
+                cells.set(x, 150, z, 0);
+            }
+        }
+        cells.set(4, 150, 0, fire);
+        cells.set(4, 150, 1, reg.state_of("minecraft:oak_planks", None));
+        for _ in 0..40 {
+            on_random_tick(reg, 4, 150, 0);
+        }
+        assert_eq!(block_at(4, 150, 0), fire, "doFireTick=false froze the fire");
+        assert_eq!(name(4, 150, 1), "minecraft:oak_planks");
+
+        // fallDamage: mob_snap_y's fall arm honors it.
+        gamerule(&mut sink, "fallDamage false");
+        let ground = surface_y(48, 0) as i32;
+        for dy in 0..14 {
+            cells.set(48, ground + dy, 0, 0);
+        }
+        let safe = new_mob(9601, 22, 48.5, ground as f64 + 12.0, 0.5, 20.0, 300);
+        let mut pos = *safe.pos.lock().unwrap();
+        mob_snap_y(&safe, &mut pos);
+        assert_eq!(
+            *safe.hp.lock().unwrap(),
+            20.0,
+            "fallDamage=false suppresses mob fall damage"
+        );
+        gamerule(&mut sink, "fallDamage true");
+        let hurt = new_mob(9602, 22, 48.5, ground as f64 + 12.0, 0.5, 20.0, 300);
+        let mut pos = *hurt.pos.lock().unwrap();
+        mob_snap_y(&hurt, &mut pos);
+        assert!(
+            *hurt.hp.lock().unwrap() < 20.0,
+            "fallDamage=true must let the same fall hurt: {}",
+            *hurt.hp.lock().unwrap()
+        );
+
+        // fireDamage + drowningDamage: the live mob tick's environmental arms
+        // honor them. This is the same dummy-client fixture entity_fluid's
+        // mob-tick test uses.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = std::net::TcpStream::connect(addr).unwrap();
+        let _accepted = listener.accept().unwrap();
+        let dummy_client = Arc::new(Client {
+            eid: 9999,
+            uuid: [9u8; 16],
+            name: "gamerule_tester".to_string(),
+            player_attack_damage_id: None,
+            pos: Mutex::new((0.5, 65.0, 0.5, 0.0, 0.0, true)),
+            teleport: Mutex::new(Default::default()),
+            hp: Mutex::new(20.0),
+            sock: Mutex::new(stream),
+            inv: Mutex::new(HashMap::new()),
+            cursor: Mutex::new((0, 0, Vec::new())),
+            drag: Mutex::new((0, Vec::new())),
+            open_chest: Mutex::new(None),
+            chest_sync: Mutex::new(None),
+            open_furnace: Mutex::new(None),
+            craft: Mutex::new(HashMap::new()),
+            craft9: Mutex::new(HashMap::new()),
+            open_table: Mutex::new(false),
+            open_merchant: Mutex::new(false),
+            trade_sel: Mutex::new(0),
+            merchant_in: Mutex::new([(0, 0, Vec::new()), (0, 0, Vec::new())]),
+            bow_draw: Mutex::new(None),
+            dig: Mutex::new(None),
+            eat_start: Mutex::new(None),
+            blocking: Mutex::new(false),
+            sprinting: Mutex::new(false),
+            sneaking: Mutex::new(false),
+            last_melee: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            fall_fly: Mutex::new(false),
+            invulnerable: Mutex::new(0),
+            last_hurt: Mutex::new(0.0),
+            shield_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            absorb: Mutex::new(0.0),
+            pearl_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            xp: Mutex::new(0),
+            skin: Mutex::new(None),
+            seen: Mutex::new(HashSet::new()),
+            chunks: Mutex::new(HashSet::from([(-1, -1), (-1, 0), (0, -1), (0, 0)])),
+            chunk_ack: Mutex::new(ChunkFeedback::new(1)),
+            gen_sources: Mutex::new(GenSources::default()),
+            gm: Mutex::new(1),
+            fall_from: Mutex::new(65.0),
+            food: Mutex::new(20),
+            air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+            armor_pts: Mutex::new(0),
+            sat: Mutex::new(5.0),
+            walk_acc: Mutex::new(0.0),
+            lastp: Mutex::new((0.5, 65.0, 0.5)),
+            spawn_pt: Mutex::new(None),
+            dim: Mutex::new(DimId::Overworld),
+            spawn_dim: Mutex::new(DimId::Overworld),
+            view: Mutex::new(2),
+            in_portal: Mutex::new(false),
+            portal_at: Mutex::new(None),
+            held: Mutex::new(0),
+            effs: Mutex::new(Vec::new()),
+            lod_v1_enabled: AtomicBool::new(false),
+            underground_revealed: AtomicBool::new(false),
+        });
+        let old_clients = std::mem::take(&mut *clients().lock().unwrap());
+        let old_mobs = std::mem::take(&mut *mobs().lock().unwrap());
+        let old_tick = TICK.load(Ordering::Relaxed);
+        let old_world_time = WORLD_TIME.load(Ordering::Relaxed);
+        clients().lock().unwrap().push(dummy_client);
+        TICK.store(server_ticks(20), Ordering::Relaxed);
+        WORLD_TIME.store(6000, Ordering::Relaxed);
+
+        let pig_in_lava = |eid: i32| {
+            let mob = new_mob(
+                eid,
+                77,
+                -2.5,
+                60.0,
+                -2.5,
+                10.0,
+                server_ticks(AIR_SUPPLY_GT) as i32,
+            );
+            mobs().lock().unwrap().push(mob.clone());
+            mob
+        };
+        let submerged_chicken = |eid: i32| {
+            let mob = new_mob(eid, 19, 0.5, 60.0, 0.5, 4.0, 0);
+            mobs().lock().unwrap().push(mob.clone());
+            mob
+        };
+        cells.set(-3, 60, -3, 102); // flowing lava under the pig
+        cells.set(0, 60, 0, 81); // water at the chicken's eye level
+        cells.set(0, 61, 0, 81);
+        gamerule(&mut sink, "fireDamage false");
+        gamerule(&mut sink, "drowningDamage false");
+        let pig = pig_in_lava(9610);
+        let chicken = submerged_chicken(9611);
+        refresh_hot();
+        mob_tick();
+        assert_eq!(
+            *pig.hp.lock().unwrap(),
+            10.0,
+            "fireDamage=false suppresses lava damage"
+        );
+        assert_eq!(
+            *chicken.hp.lock().unwrap(),
+            4.0,
+            "drowningDamage=false suppresses drowning"
+        );
+        mobs().lock().unwrap().clear();
+        gamerule(&mut sink, "fireDamage true");
+        gamerule(&mut sink, "drowningDamage true");
+        let pig = pig_in_lava(9612);
+        let chicken = submerged_chicken(9613);
+        mob_tick();
+        assert!(
+            *pig.hp.lock().unwrap() < 10.0,
+            "fireDamage=true must let lava hurt: {}",
+            *pig.hp.lock().unwrap()
+        );
+        assert!(
+            *chicken.hp.lock().unwrap() < 4.0,
+            "drowningDamage=true must let drowning hurt: {}",
+            *chicken.hp.lock().unwrap()
+        );
+        mobs().lock().unwrap().clear();
+        *clients().lock().unwrap() = old_clients;
+        *mobs().lock().unwrap() = old_mobs;
+        TICK.store(old_tick, Ordering::Relaxed);
+        WORLD_TIME.store(old_world_time, Ordering::Relaxed);
+
+        // commandModificationBlockLimit: /fill honors it.
+        gamerule(&mut sink, "commandModificationBlockLimit 4");
+        for x in 0..5 {
+            cells.set(x, 150, 4, 0);
+        }
+        let reply = run_command_ctx(&ctx, "/fill 0 150 4 4 150 4 stone", &mut sink);
+        assert!(
+            reply.contains("Too many blocks"),
+            "a 5-block fill over a limit of 4 must be refused: {reply}"
+        );
+        gamerule(&mut sink, "commandModificationBlockLimit 32768");
+        let reply = run_command_ctx(&ctx, "/fill 0 150 4 4 150 4 stone", &mut sink);
+        assert!(
+            !reply.contains("Too many blocks"),
+            "the default limit must allow a 5-block fill: {reply}"
+        );
+        assert_eq!(name(0, 150, 4), "minecraft:stone");
+
+        // Source conversion: a flowing cell flanked by two same-kind sources
+        // over solid ground converts to a source only while the rule is on.
+        // Ticking the cell itself runs `FlowingFluid.getNewLiquid`, the exact
+        // place the gamerule feeds.
+        let run_fluid = |cells: &mut Cells, pos: (i32, i32, i32), kind: flowing_fluid::Kind| {
+            let plan = flowing_fluid::tick(
+                &mut FluidReader,
+                pos,
+                kind,
+                false,
+                source_conversion_enabled(kind),
+            )
+            .expect("fluid tick over a stone floor must not be refused");
+            for (p, cell) in plan.writes {
+                cells.record(p.0, p.1, p.2);
+                match cell {
+                    flowing_fluid::Cell::Fluid(f) => {
+                        let base = if f.kind == flowing_fluid::Kind::Water {
+                            80
+                        } else {
+                            96
+                        };
+                        set_block(p.0, p.1, p.2, base + u32::from(f.level));
+                    }
+                    flowing_fluid::Cell::Air => set_block(p.0, p.1, p.2, 0),
+                    _ => {}
+                }
+            }
+        };
+        cells.set(52, 150, 0, 80);
+        cells.set(53, 149, 0, reg.state_of("minecraft:stone", None));
+        cells.set(53, 150, 0, 81);
+        cells.set(53, 151, 0, 0);
+        cells.set(54, 150, 0, 80);
+        gamerule(&mut sink, "waterSourceConversion false");
+        run_fluid(&mut cells, (53, 150, 0), flowing_fluid::Kind::Water);
+        assert_ne!(
+            block_at(53, 150, 0),
+            80,
+            "waterSourceConversion=false must leave the gap flowing"
+        );
+        cells.set(52, 150, 0, 80);
+        cells.set(53, 150, 0, 81);
+        cells.set(54, 150, 0, 80);
+        gamerule(&mut sink, "waterSourceConversion true");
+        run_fluid(&mut cells, (53, 150, 0), flowing_fluid::Kind::Water);
+        assert_eq!(
+            block_at(53, 150, 0),
+            80,
+            "waterSourceConversion=true must convert the gap to a source"
+        );
+
+        cells.set(58, 150, 0, 96);
+        cells.set(59, 149, 0, reg.state_of("minecraft:stone", None));
+        cells.set(59, 150, 0, 100);
+        cells.set(59, 151, 0, 0);
+        cells.set(60, 150, 0, 96);
+        run_fluid(&mut cells, (59, 150, 0), flowing_fluid::Kind::Lava);
+        assert_ne!(
+            block_at(59, 150, 0),
+            96,
+            "lavaSourceConversion=false must leave the gap flowing"
+        );
+        cells.set(58, 150, 0, 96);
+        cells.set(59, 150, 0, 100);
+        cells.set(60, 150, 0, 96);
+        gamerule(&mut sink, "lavaSourceConversion true");
+        run_fluid(&mut cells, (59, 150, 0), flowing_fluid::Kind::Lava);
+        assert_eq!(
+            block_at(59, 150, 0),
+            96,
+            "lavaSourceConversion=true must convert the gap to a source"
+        );
+
+        drop(rules);
+    }
+
+    #[test]
+    fn gamerule_save_v2_syncs_new_runtime_atomics() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let rules = Rules::take(&[
+            "randomTickSpeed",
+            "doFireTick",
+            "commandModificationBlockLimit",
+            "lavaSourceConversion",
+            "fallDamage",
+            "showDeathMessages",
+        ]);
+        // Change rules, save, flip them back, then load: the atomics must come
+        // back to the saved values without any further writes.
+        let changed: Vec<(&'static str, i32)> = vec![
+            ("randomTickSpeed", 7),
+            ("doFireTick", 0),
+            ("commandModificationBlockLimit", 64),
+            ("lavaSourceConversion", 1),
+            ("fallDamage", 0),
+            ("showDeathMessages", 0),
+        ];
+        for (name, value) in &changed {
+            gamerule_atomic_store(name, *value);
+            command_gamerules().lock().unwrap().insert(name, *value);
+        }
+        let mut saved = Vec::new();
+        save_world_into(&mut saved);
+        for (name, _) in &changed {
+            gamerule_atomic_store(name, 12345);
+        }
+        load_world_from(&saved).expect("a save written by save_world_into must load");
+        for (name, value) in &changed {
+            assert_eq!(
+                gamerule_atomic_value(name),
+                Some(*value),
+                "loading a save must restore {name} into its runtime atomic"
+            );
+        }
+        drop(rules);
     }
 }

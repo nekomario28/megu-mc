@@ -3515,8 +3515,10 @@ fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
             .get(&id)
             .map(|a| a.title.clone())
             .unwrap_or(id.clone());
-        let line = system_chat(&format!("{} has made the advancement [{}]", pname, t));
-        broadcast(-1, |_c| (0x6c, line.clone()));
+        if GR_ANNOUNCE_ADVANCEMENTS.load(Ordering::Relaxed) != 0 {
+            let line = system_chat(&format!("{} has made the advancement [{}]", pname, t));
+            broadcast(-1, |_c| (0x6c, line.clone()));
+        }
     }
 }
 
@@ -3584,6 +3586,11 @@ fn run_block_modification(ctx: &CmdCtx, cmd: &str, args: &[&str]) -> Result<Stri
     );
     let dim = cmd_dim(ctx);
     let read = |(x, y, z)| block_at_dim(dim, x, y, z);
+    // commandModificationBlockLimit is a live gamerule: /fill and /clone read
+    // it here, not the compiled default.
+    let mod_limit = GR_COMMAND_MODIFICATION_BLOCK_LIMIT
+        .load(Ordering::Relaxed)
+        .clamp(1, i32::MAX) as usize;
     with_save_guard(|| {
         let changes = if cmd == "fill" {
             let fill = parse_fill_command(args, origin, modification_block_state)?;
@@ -3594,7 +3601,7 @@ fn run_block_modification(ctx: &CmdCtx, cmd: &str, args: &[&str]) -> Result<Stri
                 fill.to,
                 fill.state,
                 fill.mode,
-                MODIFICATION_BLOCK_LIMIT,
+                mod_limit,
                 read,
             )
         } else {
@@ -3616,7 +3623,7 @@ fn run_block_modification(ctx: &CmdCtx, cmd: &str, args: &[&str]) -> Result<Stri
                 clone.destination,
                 clone.filter,
                 clone.mode,
-                MODIFICATION_BLOCK_LIMIT,
+                mod_limit,
                 |pos| {
                     let state = read(pos);
                     if clone.filter == CloneFilter::Masked
@@ -3640,7 +3647,9 @@ fn run_block_modification(ctx: &CmdCtx, cmd: &str, args: &[&str]) -> Result<Stri
             if let Some(previous) = destroyed {
                 set_block_dim(dim, x, y, z, COMMAND_AIR_STATE);
                 // Item entities currently belong to the Overworld item simulation.
-                if dim == DimId::Overworld {
+                // /fill destroy honors doTileDrops the way vanilla's
+                // dropResources check does.
+                if dim == DimId::Overworld && GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0 {
                     let mut drops = drops().lock().unwrap();
                     let remaining = DROP_CAP.saturating_sub(drops.len());
                     drops.extend(
@@ -5867,17 +5876,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             let Some(name) = args.first() else {
                 let rules = command_gamerules().lock().unwrap();
                 return COMMAND_GAMERULE_DEFAULTS.iter().map(|&(name, is_bool, _)| {
-                    let value = match name {
-                        "keepInventory" => GR_KEEP_INVENTORY.load(Ordering::Relaxed) as i32,
-                        "doDaylightCycle" => GR_DAYLIGHT_CYCLE.load(Ordering::Relaxed) as i32,
-                        "doWeatherCycle" => GR_WEATHER_CYCLE.load(Ordering::Relaxed) as i32,
-                        "doMobSpawning" => GR_MOB_SPAWNING.load(Ordering::Relaxed) as i32,
-                        "mobGriefing" => GR_MOB_GRIEFING.load(Ordering::Relaxed) as i32,
-                        "naturalRegeneration" => GR_NATURAL_REGEN.load(Ordering::Relaxed) as i32,
-                        "doMobLoot" => GR_MOB_LOOT.load(Ordering::Relaxed) as i32,
-                        "maxEntityCramming" => GR_MAX_ENTITY_CRAMMING.load(Ordering::Relaxed),
-                        _ => rules[name],
-                    };
+                    let value = gamerule_atomic_value(name).unwrap_or(rules[name]);
                     let value = if is_bool { (value != 0).to_string() } else { value.to_string() };
                     format!("{name}={value}")
                 }).collect::<Vec<_>>().join(", ");
@@ -5896,31 +5895,11 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     match raw.parse::<i32>() { Ok(value) => value,
                         Err(_) => return format!("usage: /gamerule {name} <int>") }
                 };
-                match canonical {
-                        "keepInventory" => GR_KEEP_INVENTORY.store(value as u8, Ordering::Relaxed),
-                        "doDaylightCycle" => GR_DAYLIGHT_CYCLE.store(value as u8, Ordering::Relaxed),
-                        "doWeatherCycle" => GR_WEATHER_CYCLE.store(value as u8, Ordering::Relaxed),
-                        "doMobSpawning" => GR_MOB_SPAWNING.store(value as u8, Ordering::Relaxed),
-                        "mobGriefing" => GR_MOB_GRIEFING.store(value as u8, Ordering::Relaxed),
-                        "naturalRegeneration" => GR_NATURAL_REGEN.store(value as u8, Ordering::Relaxed),
-                        "doMobLoot" => GR_MOB_LOOT.store(value as u8, Ordering::Relaxed),
-                        "maxEntityCramming" => GR_MAX_ENTITY_CRAMMING.store(value as i32, Ordering::Relaxed),
-                    _ => {}
-                }
+                gamerule_atomic_store(canonical, value);
                 rules.insert(canonical, value);
                 value
             } else {
-                match canonical {
-                    "keepInventory" => GR_KEEP_INVENTORY.load(Ordering::Relaxed) as i32,
-                    "doDaylightCycle" => GR_DAYLIGHT_CYCLE.load(Ordering::Relaxed) as i32,
-                    "doWeatherCycle" => GR_WEATHER_CYCLE.load(Ordering::Relaxed) as i32,
-                    "doMobSpawning" => GR_MOB_SPAWNING.load(Ordering::Relaxed) as i32,
-                    "mobGriefing" => GR_MOB_GRIEFING.load(Ordering::Relaxed) as i32,
-                    "naturalRegeneration" => GR_NATURAL_REGEN.load(Ordering::Relaxed) as i32,
-                    "doMobLoot" => GR_MOB_LOOT.load(Ordering::Relaxed) as i32,
-                    "maxEntityCramming" => GR_MAX_ENTITY_CRAMMING.load(Ordering::Relaxed) as i32,
-                    _ => rules[canonical],
-                }
+                gamerule_atomic_value(canonical).unwrap_or(rules[canonical])
             };
             let value = if is_bool { (value != 0).to_string() } else { value.to_string() };
             if args.len() == 2 { format!("Gamerule {canonical} is now set to: {value}") }
@@ -6191,12 +6170,46 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
     };
     if !reply.is_empty() {
         if let Some(client) = s {
-            let _ = send_packet(&mut client.sock.lock().unwrap(), 0x6c, system_chat(&reply));
+            // sendCommandFeedback suppresses success output to the executor —
+            // errors still surface so a mistyped command is never silently eaten.
+            if GR_SEND_COMMAND_FEEDBACK.load(Ordering::Relaxed) != 0
+                || command_reply_is_error(&reply)
+            {
+                let _ = send_packet(&mut client.sock.lock().unwrap(), 0x6c, system_chat(&reply));
+            }
         } else {
             eprintln!("[cmd] {}", reply);
         }
     }
     reply
+}
+
+/// Whether a command reply is a failure the player should see even when
+/// `sendCommandFeedback` is off. The replies are plain strings, so the check
+/// names the failure phrasings the handlers actually produce.
+fn command_reply_is_error(reply: &str) -> bool {
+    let lower = reply.to_ascii_lowercase();
+    [
+        "usage:",
+        "unknown command",
+        "unknown gamerule",
+        "unknown ",
+        "invalid ",
+        "expected ",
+        "cannot ",
+        "could not",
+        "no player",
+        "no item",
+        "no block",
+        "not found",
+        "outside the world",
+        "too many blocks",
+        "failed",
+        "error",
+        "permission",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 #[cfg(test)]

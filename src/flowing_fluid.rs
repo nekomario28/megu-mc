@@ -146,7 +146,10 @@ impl<W: Reader> Context<'_, W> {
                 sources += u8::from(f.source());
             }
         }
-        if source_conversion && self.kind == Kind::Water && sources >= 2 {
+        // `source_conversion` carries `FlowableFluid.canConvertToSource` — the
+        // waterSourceConversion / lavaSourceConversion gamerules, resolved per
+        // kind by the caller — so the rule itself is not re-checked here.
+        if source_conversion && sources >= 2 {
             let below = self.get(add(p, (0, -1, 0)))?;
             if matches!(below, Cell::Solid) || self.same(below).is_some_and(Fluid::source) {
                 return Ok(Some(Fluid {
@@ -449,13 +452,18 @@ mod tests {
         let plan = tick(&mut one_source, (0, 0, 0), Kind::Water, false, true).unwrap();
         assert_ne!(plan.updated_self, Some(fluid(Kind::Water, 0)));
 
+        // `source_conversion` is `FlowableFluid.canConvertToSource` resolved by
+        // the caller per kind — lava converts when the flag is on and does not
+        // when it is off; the kind restriction no longer lives here.
         let mut lava = fixture_with_floor(fluid(Kind::Lava, 3));
         lava.0
             .insert((-1, 0, 0), Some(Cell::Fluid(fluid(Kind::Lava, 0))));
         lava.0
             .insert((1, 0, 0), Some(Cell::Fluid(fluid(Kind::Lava, 0))));
-        let plan = tick(&mut lava, (0, 0, 0), Kind::Lava, false, true).unwrap();
+        let plan = tick(&mut lava, (0, 0, 0), Kind::Lava, false, false).unwrap();
         assert_ne!(plan.updated_self, Some(fluid(Kind::Lava, 0)));
+        let plan = tick(&mut lava, (0, 0, 0), Kind::Lava, false, true).unwrap();
+        assert_eq!(plan.updated_self, Some(fluid(Kind::Lava, 0)));
     }
 
     #[test]
