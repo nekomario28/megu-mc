@@ -4873,9 +4873,23 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 }
                 _ => me.map(|c| vec![c.eid.to_string()]).unwrap_or_default(),
             };
-            let want = args.iter().skip(1).find(|a| name_to_item(a).is_some())
-                .and_then(|a| name_to_item(a));
-            let max = args.iter().rev().find_map(|a| a.parse::<u8>().ok());
+            if args.len() > 3 {
+                return "usage: /clear [target] [item] [maxCount]".into();
+            }
+            let want = match args.get(1) {
+                Some(item) => match name_to_item(item) {
+                    Some(id) => Some(id),
+                    None => return format!("Unknown item '{item}'"),
+                },
+                None => None,
+            };
+            let max = match args.get(2) {
+                Some(count) => match count.parse::<u32>() {
+                    Ok(value) => Some(value),
+                    Err(_) => return "Invalid maximum count".into(),
+                },
+                None => None,
+            };
             let mut removed = 0i64;
             let cls: Vec<Arc<Client>> = client_snapshot();
             for t in &targets {
@@ -4884,12 +4898,22 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     let keys: Vec<i16> = inv.iter()
                         .filter(|(_, (it, _, _))| want.map(|w| w == *it).unwrap_or(true))
                         .map(|(&k, _)| k).collect();
+                    let mut player_removed = 0u32;
                     for k in keys {
-                        let (it, cnt, _cc) = inv[&k].clone();
-                        let take = max.map(|m| cnt.min(m - removed.min(255) as u8)).unwrap_or(cnt);
+                        let (it, cnt, comps) = inv[&k].clone();
+                        let take = if max == Some(0) {
+                            u32::from(cnt)
+                        } else {
+                            max.map(|m| u32::from(cnt).min(m.saturating_sub(player_removed)))
+                                .unwrap_or(u32::from(cnt))
+                        };
                         if take == 0 { break }
-                        removed += take as i64;
-                        if take >= cnt { inv.remove(&k); } else { inv.insert(k, (it, cnt - take, _cc)); }
+                        player_removed += take;
+                        removed += i64::from(take);
+                        if max != Some(0) {
+                            if take == u32::from(cnt) { inv.remove(&k); }
+                            else { inv.insert(k, (it, cnt - take as u8, comps)); }
+                        }
                     }
                     // resync window 0 so the client drops the cleared items
                     let mut q = vec![0u8];
@@ -4956,7 +4980,12 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 }
                 "clear" => {
                     let ename = args.get(2).copied().unwrap_or("");
-                    let want: Option<i32> = if ename.is_empty() { None } else { name_to_effect(ename) };
+                    let want: Option<i32> = if ename.is_empty() { None } else {
+                        match name_to_effect(ename) {
+                            Some(effect) => Some(effect),
+                            None => return format!("unknown effect '{ename}'"),
+                        }
+                    };
                     for t in &targets {
                         if let Some(c) = cls_snap.iter().find(|c| c.eid.to_string() == *t) {
                             let gone: Vec<i32> = { let mut ef = c.effs.lock().unwrap();

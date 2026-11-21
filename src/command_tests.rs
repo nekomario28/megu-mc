@@ -798,3 +798,35 @@ fn command_dispatch_rejects_unclosed_quotes_and_incomplete_title() {
     assert_eq!(run_command_ctx(&ctx, r#"/title @a title {"text": "hello world"}"#, &mut None), "Title title to 0 player(s)");
     assert!(run_command_ctx(&ctx, "/gamerule randomTickSpeed 1 extra", &mut None).starts_with("usage:"));
 }
+
+#[test]
+fn clear_max_count_applies_per_player_and_zero_only_counts() {
+    let _world = world_guard();
+    let (mut first, _hold_a) = crate::effect_tests::client_pair();
+    let (mut second, _hold_b) = crate::effect_tests::client_pair();
+    first.eid = 76301;
+    second.eid = 76302;
+    let stone = name_to_item("stone").unwrap();
+    first.inv.lock().unwrap().insert(0, (stone, 10, Vec::new()));
+    second.inv.lock().unwrap().insert(0, (stone, 10, Vec::new()));
+    let first = Arc::new(first);
+    let second = Arc::new(second);
+    clients().lock().unwrap().extend([first.clone(), second.clone()]);
+    let ctx = command_context(None);
+    let counted = run_command_ctx(&ctx, "/clear @a stone 0", &mut None);
+    let unchanged = (first.inv.lock().unwrap()[&0].1, second.inv.lock().unwrap()[&0].1);
+    let cleared = run_command_ctx(&ctx, "/clear @a stone 3", &mut None);
+    let remaining = (first.inv.lock().unwrap()[&0].1, second.inv.lock().unwrap()[&0].1);
+    clients().lock().unwrap().retain(|c| c.eid != first.eid && c.eid != second.eid);
+    assert_eq!(counted, "Cleared 20 item(s)");
+    assert_eq!(unchanged, (10, 10));
+    assert_eq!(cleared, "Cleared 6 item(s)");
+    assert_eq!(remaining, (7, 7));
+}
+
+#[test]
+fn effect_clear_rejects_unknown_effect() {
+    let ctx = command_context(None);
+    assert_eq!(run_command_ctx(&ctx, "/effect clear @a not_an_effect", &mut None),
+        "unknown effect 'not_an_effect'");
+}
