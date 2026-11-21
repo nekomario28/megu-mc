@@ -26,9 +26,23 @@
 //! auto-skipped, native culinary, clean data, Tier 2 lifted, or Tier 3
 //! requiring fallback.
 //!
+//! `--adapt-jar` and `--adapt-mods-dir` run
+//! [`auto_adapter`](mod_adapter_core::auto_adapter)'s full zero-JVM
+//! pipeline automatically — loader metadata, generic data / culinary /
+//! dimension discovery, Mixin bytecode lifting — and either emit a
+//! validated `mc-spine-mod-bundle/1` document (`--out` writes
+//! `<mod_id>.bundle.json` + `adaptation-report.json`) or report the exact
+//! blockers that keep a mod at Tier 3.
+//!
+//! `--scaffold-native` emits a validated starter `mc-spine-mod-bundle/1`
+//! document (via
+//! [`scaffold_native_bundle`](mod_adapter_core::auto_adapter::scaffold_native_bundle))
+//! for authors building native zero-JVM Megu mods.
+//!
 //! Exit codes mirror `tools/mod_launcher.py --modpack`: `0` the input is
 //! fully usable on this server, `2` a version mismatch, unliftable mixin
-//! sites, or invalid arguments, `1` an unreadable or unsafe input.
+//! sites, a Tier 3 adaptation verdict, or invalid arguments, `1` an
+//! unreadable or unsafe input.
 
 use std::collections::BTreeSet;
 use std::env;
@@ -36,6 +50,10 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use mod_adapter_core::auto_adapter::{
+    auto_adapt_jar, auto_adapt_mods_dir, scaffold_native_bundle, write_adaptation_outputs,
+    AutoAdaptOptions,
+};
 use mod_adapter_core::class_mixin_scanner::{
     scan_jar_mixins_with_options, scan_jar_path_with_options, JarMixinScanReport, JarScanOptions,
 };
@@ -51,12 +69,15 @@ use mod_adapter_core::version_compat::McVersion;
 
 const USAGE: &str = "\
 mc-spine-mod-check — check whether a modpack can run on this mc-spine server,
-scan one mod JAR's mixin bytecode for Tier 2 liftability, or inspect a whole
-mods/ directory with zero JVM
+scan one mod JAR's mixin bytecode for Tier 2 liftability, inspect a whole
+mods/ directory, or auto-adapt mod JARs into native bundles — all zero JVM
 
 Usage: mc-spine-mod-check --modpack <path> [options]
        mc-spine-mod-check --scan-jar <mod.jar> [--include-client-mixins] [--json]
        mc-spine-mod-check --scan-mods-dir <dir> [--include-client-mixins] [--json]
+       mc-spine-mod-check --adapt-jar <mod.jar> [--out <dir>] [--include-client-mixins] [--json]
+       mc-spine-mod-check --adapt-mods-dir <dir> [--out <dir>] [--include-client-mixins] [--json]
+       mc-spine-mod-check --scaffold-native <mod_id> [--name <display>] [--version <ver>] [--out <file>]
 
 --modpack accepts a Modrinth .mrpack archive, a standalone modrinth.index.json,
 or a CurseForge manifest.json / pack .zip, and reports — before anything is
@@ -78,12 +99,30 @@ discovery (cooking/cutting recipes, item/block tags, loot modifiers), and
 each one is classified as auto-skipped, native culinary, clean data,
 Tier 2 lifted, or requiring a Tier 3 fallback.
 
+--adapt-jar / --adapt-mods-dir run the full automatic adapter engine: loader
+metadata, generic data/culinary/dimension discovery, and Mixin bytecode
+lifting combine into a per-JAR tier — auto-skipped, native bundle,
+Tier 2 lifted shim, or Tier 3 fallback with exact blockers. With --out,
+each adapted JAR's <mod_id>.bundle.json plus an adaptation-report.json are
+written to the output directory.
+
+--scaffold-native emits a validated mc-spine-mod-bundle/1 starter document
+for a native zero-JVM mod: to stdout, or to the exact --out file.
+
 Options:
   --modpack <path>        modpack file to check
   --scan-jar <path>       mod JAR to bytecode-scan for mixin sites
-                          (mutually exclusive with --modpack/--scan-mods-dir)
   --scan-mods-dir <dir>   directory of mod JARs to inspect together
-                          (mutually exclusive with --modpack/--scan-jar)
+  --adapt-jar <path>      mod JAR to auto-adapt into a native bundle or a
+                          classified fallback verdict
+  --adapt-mods-dir <dir>  directory of mod JARs to auto-adapt together
+  --scaffold-native <id>  bare mod id to emit a starter native bundle for
+  --out <path>            output directory for adapted bundles and
+                          adaptation-report.json (--adapt-*), or the exact
+                          bundle file to write (--scaffold-native)
+  --name <display>        display name for --scaffold-native
+  --version <ver>         mc_version_range for --scaffold-native (a version
+                          pin or Maven/SemVer range; default: [1.21,))
   --mc-version <version>  Minecraft version this server runs: 1.21.1 or 26.3
                           (default: 1.21.1; --modpack only)
   --flagship <ids>        comma-separated mod ids handled by a flagship
@@ -96,6 +135,10 @@ Options:
                           human summary
   -h, --help              show this help and exit
 
+Exactly one of --modpack, --scan-jar, --scan-mods-dir, --adapt-jar,
+--adapt-mods-dir or --scaffold-native is required; they are mutually
+exclusive.
+
 Exit status: for --modpack, 0 the pack can run on this server (native, with
 automatic skips, or pending a bytecode inspection), 2 the pack targets a
 different Minecraft version or the arguments were invalid, 1 the pack could
@@ -104,8 +147,15 @@ standard event hook (Tier 2 eligible), 2 at least one site stays at Tier 3
 or the arguments were invalid, 1 the JAR or a .class member could not be
 read or parsed. For --scan-mods-dir, 0 no JAR requires a Tier 3 fallback,
 2 at least one does (or the arguments were invalid), 1 the directory is
-missing/unreadable or a JAR could not be read or parsed.";
+missing/unreadable or a JAR could not be read or parsed. For --adapt-jar
+and --adapt-mods-dir, 0 every JAR adapted (auto-skipped, native bundle, or
+Tier 2 shim), 2 at least one JAR needs a Tier 3 fallback or the arguments
+were invalid, 1 an input could not be read or failed the fail-closed
+archive checks. For --scaffold-native, 0 the bundle document was emitted,
+2 the mod id / name / version was invalid, 1 the --out file could not be
+written.";
 
+#[derive(Debug)]
 struct Cli {
     modpack: PathBuf,
     target: McVersion,
@@ -114,6 +164,7 @@ struct Cli {
     json: bool,
 }
 
+#[derive(Debug)]
 struct JarCli {
     jar: PathBuf,
     /// [`JarScanOptions::server_only`] — `false` once
@@ -122,6 +173,7 @@ struct JarCli {
     json: bool,
 }
 
+#[derive(Debug)]
 struct ModsDirCli {
     dir: PathBuf,
     /// [`JarScanOptions::server_only`] — `false` once
@@ -130,11 +182,39 @@ struct ModsDirCli {
     json: bool,
 }
 
+/// Shared shape of `--adapt-jar` and `--adapt-mods-dir`.
+#[derive(Debug)]
+struct AdaptCli {
+    path: PathBuf,
+    /// `--out` directory for `<mod_id>.bundle.json` +
+    /// `adaptation-report.json`.
+    out: Option<PathBuf>,
+    /// [`AutoAdaptOptions::server_only`] — `false` once
+    /// `--include-client-mixins` is passed.
+    server_only: bool,
+    json: bool,
+}
+
+#[derive(Debug)]
+struct ScaffoldCli {
+    mod_id: String,
+    /// `--name` — validated, report-only; the v1 bundle schema is closed.
+    name: Option<String>,
+    /// `--version` — becomes the bundle `mc_version_range`.
+    version: Option<String>,
+    /// `--out` — the exact bundle file to write (stdout when absent).
+    out: Option<PathBuf>,
+}
+
+#[derive(Debug)]
 enum Action {
     Help,
     RunModpack(Cli),
     ScanJar(JarCli),
     ScanModsDir(ModsDirCli),
+    AdaptJar(AdaptCli),
+    AdaptModsDir(AdaptCli),
+    ScaffoldNative(ScaffoldCli),
 }
 
 fn csv_ids(value: &OsString) -> Result<BTreeSet<String>, String> {
@@ -157,6 +237,12 @@ fn parse_args(argv: &[OsString]) -> Result<Action, String> {
     let mut modpack: Option<PathBuf> = None;
     let mut scan_jar: Option<PathBuf> = None;
     let mut mods_dir: Option<PathBuf> = None;
+    let mut adapt_jar: Option<PathBuf> = None;
+    let mut adapt_dir: Option<PathBuf> = None;
+    let mut scaffold: Option<String> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut name: Option<String> = None;
+    let mut version: Option<String> = None;
     let mut mc_version: Option<String> = None;
     let mut flagship: Option<BTreeSet<String>> = None;
     let mut profiles: Option<BTreeSet<String>> = None;
@@ -217,6 +303,42 @@ fn parse_args(argv: &[OsString]) -> Result<Action, String> {
                 let v = take_value(argv, &mut i, "--scan-mods-dir", inline_os.as_ref())?;
                 mods_dir = Some(PathBuf::from(v));
             }
+            "--adapt-jar" => {
+                let v = take_value(argv, &mut i, "--adapt-jar", inline_os.as_ref())?;
+                adapt_jar = Some(PathBuf::from(v));
+            }
+            "--adapt-mods-dir" => {
+                let v = take_value(argv, &mut i, "--adapt-mods-dir", inline_os.as_ref())?;
+                adapt_dir = Some(PathBuf::from(v));
+            }
+            "--scaffold-native" => {
+                let v = take_value(argv, &mut i, "--scaffold-native", inline_os.as_ref())?;
+                scaffold = Some(
+                    v.to_str()
+                        .ok_or_else(|| format!("invalid non-UTF-8 --scaffold-native '{v:?}'"))?
+                        .to_string(),
+                );
+            }
+            "--out" => {
+                let v = take_value(argv, &mut i, "--out", inline_os.as_ref())?;
+                out = Some(PathBuf::from(v));
+            }
+            "--name" => {
+                let v = take_value(argv, &mut i, "--name", inline_os.as_ref())?;
+                name = Some(
+                    v.to_str()
+                        .ok_or_else(|| format!("invalid non-UTF-8 --name '{v:?}'"))?
+                        .to_string(),
+                );
+            }
+            "--version" => {
+                let v = take_value(argv, &mut i, "--version", inline_os.as_ref())?;
+                version = Some(
+                    v.to_str()
+                        .ok_or_else(|| format!("invalid non-UTF-8 --version '{v:?}'"))?
+                        .to_string(),
+                );
+            }
             "--mc-version" => {
                 let v = take_value(argv, &mut i, "--mc-version", inline_os.as_ref())?;
                 mc_version = Some(
@@ -246,14 +368,17 @@ fn parse_args(argv: &[OsString]) -> Result<Action, String> {
     }
     let modes = modpack.is_some() as usize
         + scan_jar.is_some() as usize
-        + mods_dir.is_some() as usize;
+        + mods_dir.is_some() as usize
+        + adapt_jar.is_some() as usize
+        + adapt_dir.is_some() as usize
+        + scaffold.is_some() as usize;
     match modes {
-        0 => return Err("one of --modpack, --scan-jar or --scan-mods-dir is required".to_string()),
+        0 => {
+            return Err("one of --modpack, --scan-jar, --scan-mods-dir, --adapt-jar, --adapt-mods-dir or --scaffold-native is required".to_string())
+        }
         1 => {}
         _ => {
-            return Err(
-                "--modpack, --scan-jar and --scan-mods-dir are mutually exclusive".to_string(),
-            )
+            return Err("the mode flags (--modpack, --scan-jar, --scan-mods-dir, --adapt-jar, --adapt-mods-dir, --scaffold-native) are mutually exclusive".to_string())
         }
     }
     let reject_modpack_only = |mode: &str| -> Result<(), String> {
@@ -268,30 +393,46 @@ fn parse_args(argv: &[OsString]) -> Result<Action, String> {
         }
         Ok(())
     };
-    match (modpack, scan_jar, mods_dir) {
-        (None, None, Some(dir)) => {
+    // `--out`/`--name`/`--version` apply only to the modes in `allow`.
+    let reject_adapt_scaffold_flags = |mode: &str, allow: &[&str]| -> Result<(), String> {
+        for (flag, present) in [
+            ("--out", out.is_some()),
+            ("--name", name.is_some()),
+            ("--version", version.is_some()),
+        ] {
+            if present && !allow.contains(&flag) {
+                return Err(format!("{flag} does not apply to {mode}"));
+            }
+        }
+        Ok(())
+    };
+    match (modpack, scan_jar, mods_dir, adapt_jar, adapt_dir, scaffold) {
+        (None, None, Some(dir), None, None, None) => {
             reject_modpack_only("--scan-mods-dir")?;
+            reject_adapt_scaffold_flags("--scan-mods-dir", &[])?;
             Ok(Action::ScanModsDir(ModsDirCli {
                 dir,
                 server_only: !include_client_mixins,
                 json,
             }))
         }
-        (None, Some(jar), None) => {
+        (None, Some(jar), None, None, None, None) => {
             reject_modpack_only("--scan-jar")?;
+            reject_adapt_scaffold_flags("--scan-jar", &[])?;
             Ok(Action::ScanJar(JarCli {
                 jar,
                 server_only: !include_client_mixins,
                 json,
             }))
         }
-        (Some(modpack), None, None) => {
+        (Some(modpack), None, None, None, None, None) => {
             if include_client_mixins {
                 return Err(
-                    "--include-client-mixins only applies to --scan-jar or --scan-mods-dir"
+                    "--include-client-mixins only applies to the scan and adapt modes"
                         .to_string(),
                 );
             }
+            reject_adapt_scaffold_flags("--modpack", &[])?;
             let declared = mc_version.unwrap_or_else(|| "1.21.1".to_string());
             let target = McVersion::parse(declared.trim())
                 .filter(|v| *v == McVersion::V1_21_1 || *v == McVersion::V26_3)
@@ -304,6 +445,44 @@ fn parse_args(argv: &[OsString]) -> Result<Action, String> {
                 flagship: flagship.unwrap_or_else(|| csv_ids(&OsString::from("create")).unwrap()),
                 profiles: profiles.unwrap_or_default(),
                 json,
+            }))
+        }
+        (None, None, None, Some(path), None, None) => {
+            reject_modpack_only("--adapt-jar")?;
+            reject_adapt_scaffold_flags("--adapt-jar", &["--out"])?;
+            Ok(Action::AdaptJar(AdaptCli {
+                path,
+                out,
+                server_only: !include_client_mixins,
+                json,
+            }))
+        }
+        (None, None, None, None, Some(path), None) => {
+            reject_modpack_only("--adapt-mods-dir")?;
+            reject_adapt_scaffold_flags("--adapt-mods-dir", &["--out"])?;
+            Ok(Action::AdaptModsDir(AdaptCli {
+                path,
+                out,
+                server_only: !include_client_mixins,
+                json,
+            }))
+        }
+        (None, None, None, None, None, Some(mod_id)) => {
+            reject_modpack_only("--scaffold-native")?;
+            reject_adapt_scaffold_flags("--scaffold-native", &["--out", "--name", "--version"])?;
+            if include_client_mixins {
+                return Err(
+                    "--include-client-mixins does not apply to --scaffold-native".to_string(),
+                );
+            }
+            if json {
+                return Err("--json does not apply to --scaffold-native".to_string());
+            }
+            Ok(Action::ScaffoldNative(ScaffoldCli {
+                mod_id,
+                name,
+                version,
+                out,
             }))
         }
         // More than one mode flag was rejected above.
@@ -1079,6 +1258,113 @@ fn run_scan_mods_dir(cli: &ModsDirCli) -> ExitCode {
     }
 }
 
+// ---------------------------------------------------------------------------
+// --adapt-jar / --adapt-mods-dir / --scaffold-native
+// ---------------------------------------------------------------------------
+
+/// Exit convention shared by `--scan-*` and `--adapt-*`: `0` the input
+/// fully runs (auto-skipped, native bundle, or bounded Tier 2 shim), `2`
+/// at least one JAR needs a Tier 3 fallback (a `1` exit is reserved for
+/// unreadable or unsafe inputs and `2` also covers invalid arguments).
+fn adapt_exit_code(requires_fallback: bool) -> u8 {
+    if requires_fallback {
+        2
+    } else {
+        0
+    }
+}
+
+fn adapt_options(server_only: bool) -> AutoAdaptOptions {
+    AutoAdaptOptions {
+        server_only,
+        ..AutoAdaptOptions::default()
+    }
+}
+
+fn run_adapt_jar(cli: &AdaptCli) -> ExitCode {
+    let result = match auto_adapt_jar(&cli.path, &adapt_options(cli.server_only)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("mc-spine-mod-check: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(out) = &cli.out {
+        if let Err(e) =
+            write_adaptation_outputs(out, &result.to_json(), std::slice::from_ref(&result))
+        {
+            eprintln!("mc-spine-mod-check: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    if cli.json {
+        print!("{}", result.to_json());
+    } else {
+        println!("{}", result.format_human());
+    }
+    ExitCode::from(adapt_exit_code(result.requires_fallback()))
+}
+
+fn run_adapt_mods_dir(cli: &AdaptCli) -> ExitCode {
+    let report = match auto_adapt_mods_dir(&cli.path, &adapt_options(cli.server_only)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("mc-spine-mod-check: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(out) = &cli.out {
+        if let Err(e) = write_adaptation_outputs(out, &report.to_json(), &report.jars) {
+            eprintln!("mc-spine-mod-check: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    if cli.json {
+        print!("{}", report.to_json());
+    } else {
+        println!("{}", report.format_human());
+    }
+    ExitCode::from(adapt_exit_code(report.requires_fallback()))
+}
+
+fn run_scaffold_native(cli: &ScaffoldCli) -> ExitCode {
+    let json = match scaffold_native_bundle(
+        &cli.mod_id,
+        cli.name.as_deref().unwrap_or(""),
+        cli.version.as_deref().unwrap_or(""),
+    ) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("mc-spine-mod-check: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    match &cli.out {
+        None => {
+            print!("{json}");
+            ExitCode::SUCCESS
+        }
+        Some(path) => match std::fs::write(path, &json) {
+            Ok(()) => {
+                println!(
+                    "wrote {}: mc-spine-mod-bundle/1 starter for mod id '{}' ({} bytes)",
+                    path.display(),
+                    cli.mod_id,
+                    json.len()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!(
+                    "mc-spine-mod-check: '{}': cannot write scaffold bundle: {e}",
+                    path.display()
+                );
+                ExitCode::FAILURE
+            }
+        },
+    }
+}
+
 fn main() -> ExitCode {
     let argv: Vec<OsString> = env::args_os().skip(1).collect();
     match parse_args(&argv) {
@@ -1089,10 +1375,181 @@ fn main() -> ExitCode {
         Ok(Action::RunModpack(cli)) => run_modpack(cli),
         Ok(Action::ScanJar(cli)) => run_scan_jar(&cli),
         Ok(Action::ScanModsDir(cli)) => run_scan_mods_dir(&cli),
+        Ok(Action::AdaptJar(cli)) => run_adapt_jar(&cli),
+        Ok(Action::AdaptModsDir(cli)) => run_adapt_mods_dir(&cli),
+        Ok(Action::ScaffoldNative(cli)) => run_scaffold_native(&cli),
         Err(msg) => {
             eprintln!("mc-spine-mod-check: {msg}");
             eprintln!("Try 'mc-spine-mod-check --help' for usage.");
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<OsString> {
+        list.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn adapt_jar_mode_parses() {
+        match parse_args(&args(&[
+            "--adapt-jar",
+            "mods/mymod.jar",
+            "--out",
+            "bundles",
+            "--include-client-mixins",
+            "--json",
+        ])) {
+            Ok(Action::AdaptJar(cli)) => {
+                assert_eq!(cli.path, PathBuf::from("mods/mymod.jar"));
+                assert_eq!(cli.out.as_deref(), Some(Path::new("bundles")));
+                assert!(!cli.server_only);
+                assert!(cli.json);
+            }
+            other => panic!("unexpected action for --adapt-jar: {other:?}"),
+        }
+        match parse_args(&args(&["--adapt-jar", "m.jar"])) {
+            Ok(Action::AdaptJar(cli)) => {
+                assert!(cli.server_only);
+                assert!(cli.out.is_none());
+                assert!(!cli.json);
+            }
+            _ => panic!("--adapt-jar alone must parse"),
+        }
+    }
+
+    #[test]
+    fn adapt_mods_dir_mode_parses() {
+        match parse_args(&args(&["--adapt-mods-dir=mods", "--out=o"])) {
+            Ok(Action::AdaptModsDir(cli)) => {
+                assert_eq!(cli.path, PathBuf::from("mods"));
+                assert_eq!(cli.out.as_deref(), Some(Path::new("o")));
+            }
+            other => panic!("unexpected action for --adapt-mods-dir: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scaffold_native_mode_parses() {
+        match parse_args(&args(&[
+            "--scaffold-native",
+            "mymod",
+            "--name",
+            "My Mod",
+            "--version",
+            "1.21.1",
+            "--out",
+            "mymod.bundle.json",
+        ])) {
+            Ok(Action::ScaffoldNative(cli)) => {
+                assert_eq!(cli.mod_id, "mymod");
+                assert_eq!(cli.name.as_deref(), Some("My Mod"));
+                assert_eq!(cli.version.as_deref(), Some("1.21.1"));
+                assert_eq!(cli.out.as_deref(), Some(Path::new("mymod.bundle.json")));
+            }
+            other => panic!("unexpected action for --scaffold-native: {other:?}"),
+        }
+        match parse_args(&args(&["--scaffold-native=mymod"])) {
+            Ok(Action::ScaffoldNative(cli)) => assert_eq!(cli.mod_id, "mymod"),
+            other => panic!("--scaffold-native=id must parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn modes_are_mutually_exclusive() {
+        for argv in [
+            ["--adapt-jar", "a.jar", "--scan-jar", "b.jar"],
+            ["--adapt-jar", "a.jar", "--adapt-mods-dir", "mods"],
+            ["--scaffold-native", "x", "--modpack", "p.zip"],
+            ["--scan-mods-dir", "mods", "--scaffold-native", "x"],
+        ] {
+            assert!(
+                parse_args(&args(&argv)).is_err(),
+                "{argv:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mode_flag_is_required() {
+        assert!(parse_args(&args(&["--json"])).is_err());
+        assert!(parse_args(&args(&["--out", "d"])).is_err());
+    }
+
+    #[test]
+    fn mode_specific_flags_are_rejected() {
+        // --out/--name/--version only apply to the modes that declare them.
+        assert!(parse_args(&args(&["--scan-jar", "a.jar", "--out", "d"])).is_err());
+        assert!(parse_args(&args(&["--scan-mods-dir", "m", "--name", "n"])).is_err());
+        assert!(parse_args(&args(&["--modpack", "p.zip", "--out", "d"])).is_err());
+        assert!(parse_args(&args(&["--adapt-jar", "a.jar", "--name", "n"])).is_err());
+        assert!(parse_args(&args(&["--adapt-mods-dir", "m", "--version", "1.21"])).is_err());
+        // The old modpack-only flags keep their dedicated error.
+        assert!(parse_args(&args(&["--adapt-jar", "a.jar", "--mc-version", "1.21.1"])).is_err());
+        assert!(parse_args(&args(&["--scaffold-native", "x", "--flagship", "create"])).is_err());
+        // --json and --include-client-mixins are meaningless for scaffold.
+        assert!(parse_args(&args(&["--scaffold-native", "x", "--json"])).is_err());
+        assert!(parse_args(&args(&[
+            "--scaffold-native",
+            "x",
+            "--include-client-mixins"
+        ]))
+        .is_err());
+        assert!(parse_args(&args(&["--modpack", "p.zip", "--include-client-mixins"])).is_err());
+    }
+
+    #[test]
+    fn existing_modes_still_parse() {
+        for (argv, expect) in [
+            (
+                vec!["--scan-jar", "a.jar", "--include-client-mixins", "--json"],
+                "scan-jar",
+            ),
+            (vec!["--scan-mods-dir", "mods"], "scan-mods-dir"),
+            (vec!["--modpack", "p.zip", "--mc-version", "1.21.1"], "modpack"),
+        ] {
+            let action = parse_args(&args(&argv)).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            match (expect, action) {
+                ("scan-jar", Action::ScanJar(_))
+                | ("scan-mods-dir", Action::ScanModsDir(_))
+                | ("modpack", Action::RunModpack(_)) => {}
+                (_, other) => panic!("{argv:?} produced the wrong action: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn adapt_exit_code_maps_tier3_to_2() {
+        assert_eq!(adapt_exit_code(true), 2);
+        assert_eq!(adapt_exit_code(false), 0);
+    }
+
+    #[test]
+    fn scaffold_function_contract() {
+        use mod_adapter_core::auto_adapter::bundle_file_name;
+        use mod_adapter_core::unified_bundle::DeclarativeModBundle;
+
+        let json = scaffold_native_bundle("mymod", "My Mod", "1.21.1").unwrap();
+        let bundle = DeclarativeModBundle::from_json(&json).unwrap();
+        assert_eq!(bundle.mod_id, "mymod");
+        assert_eq!(bundle.mc_version_range, "1.21.1");
+        assert_eq!(bundle_file_name(&bundle.mod_id).unwrap(), "mymod.bundle.json");
+
+        for bad in ["", "bad id", "..", "ns:id", "UPPER"] {
+            assert!(scaffold_native_bundle(bad, "", "").is_err(), "{bad:?}");
+        }
+        assert!(scaffold_native_bundle("ok", "n\ne", "").is_err());
+        assert!(scaffold_native_bundle("ok", "", "definitely not a range").is_err());
+    }
+
+    #[test]
+    fn action_debug_is_implemented_for_panics() {
+        // The tests above panic with {other:?} — keep every Action member
+        // debuggable.
+        let _ = format!("{:?}", Action::Help);
     }
 }

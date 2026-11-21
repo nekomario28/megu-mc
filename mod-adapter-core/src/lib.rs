@@ -123,6 +123,14 @@
 //!   [`unified_bundle::UnifiedModRuntime`] with zero lines of mod-specific
 //!   Rust, plus [`unified_bundle::export_builtin_dimension_bundles`]
 //!   proving the built-in dimension profiles are pure data.
+//! - [`auto_adapter`]: built-in zero-JVM automatic mod adapter engine —
+//!   one [`auto_adapter::auto_adapt_jar`]/[`auto_adapter::auto_adapt_mods_dir`]
+//!   call chains superseded-perf-mod skip, loader-manifest metadata,
+//!   generic data/culinary/dimension discovery, `.class` Mixin bytecode
+//!   lifting, and `mc-spine-mod-bundle/1` synthesis into a four-tier
+//!   [`auto_adapter::AdaptationTier`] verdict with exact human-readable
+//!   blockers, plus [`auto_adapter::scaffold_native_bundle`] emitting a
+//!   validated starter bundle for native mod authors.
 //! - [`mod_tick_runtime`]: generic modded block-entity tick runtime on
 //!   `mc_spine_core::perf_kit` — O(1) dirty-fingerprint idle skips,
 //!   exact-tick wake scheduling, per-tick-budget burst slicing, and
@@ -130,6 +138,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod auto_adapter;
 pub mod blockstates;
 pub mod bytecode_subset_vm;
 pub mod class_mixin_scanner;
