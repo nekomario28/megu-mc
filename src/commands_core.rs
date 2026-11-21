@@ -5218,6 +5218,9 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                         let _ = send_packet(&mut w, 0x22, g);
                         let _ = send_packet(&mut w, 0x38, ab);
                     }
+                    // Gamemode feeds the anti-xray lane: switching to spectator
+                    // reveals, switching back re-arms the hysteresis.
+                    update_underground_lane(&c);
                     format!("Set {}'s gamemode to {}", c.name, gm)
                 }
                 None => "player only".into(),

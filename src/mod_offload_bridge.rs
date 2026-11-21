@@ -813,6 +813,8 @@ mod mod_offload_bridge_tests {
             last_hurt: Mutex::new(0.0),
             shield_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
             absorb: Mutex::new(0.0),
+            lod_v1_enabled: AtomicBool::new(false),
+            underground_revealed: AtomicBool::new(false),
             pearl_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
             xp: Mutex::new(0),
             skin: Mutex::new(None),

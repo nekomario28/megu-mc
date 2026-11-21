@@ -513,6 +513,7 @@ mod entity_push_tests {
             held: Mutex::new(0),
             effs: Mutex::new(Vec::new()),
             lod_v1_enabled: AtomicBool::new(false),
+            underground_revealed: AtomicBool::new(false),
         });
         (client, peer)
     }

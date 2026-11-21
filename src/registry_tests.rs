@@ -3715,14 +3715,14 @@ fn dynamic_dim_chunk_packet_cache_isolates_dimensions() {
     let dims = [DimId::Overworld, DimId::Nether, DimId::End, custom];
     let mut cache = connection_limits::ChunkPacketCache::new();
     for (i, &dim) in dims.iter().enumerate() {
-        cache.insert(7, (dim, 0, 0), 100, Vec::new(), vec![0xa0 + i as u8]);
+        cache.insert(7, (dim, 0, 0, false), 100, Vec::new(), vec![0xa0 + i as u8]);
     }
     // The same (cx, cz) in four dimensions: four distinct frames, and a hit
     // returns the same shared Arc a rebuild would produce.
     let mut frames = Vec::new();
     for &dim in &dims {
-        let (first, _) = cache.frame(7, (dim, 0, 0), 100, None).expect("cached frame");
-        let (second, _) = cache.frame(7, (dim, 0, 0), 100, None).expect("second read hits");
+        let (first, _) = cache.frame(7, (dim, 0, 0, false), 100, None).expect("cached frame");
+        let (second, _) = cache.frame(7, (dim, 0, 0, false), 100, None).expect("second read hits");
         assert!(Arc::ptr_eq(&first, &second), "a cache hit shares one Arc");
         frames.push(first);
     }
@@ -3732,16 +3732,16 @@ fn dynamic_dim_chunk_packet_cache_isolates_dimensions() {
         }
     }
     // A revision miss invalidates only the dimension asked with it.
-    assert!(cache.frame(7, (DimId::Overworld, 0, 0), 101, None).is_none());
+    assert!(cache.frame(7, (DimId::Overworld, 0, 0, false), 101, None).is_none());
     for &dim in &dims[1..] {
         assert!(
-            cache.frame(7, (dim, 0, 0), 100, None).is_some(),
+            cache.frame(7, (dim, 0, 0, false), 100, None).is_some(),
             "a revision miss in one dimension never touches the others"
         );
     }
     // The designed wholesale invalidation moves the generation, not one slot.
     for &dim in &dims {
-        assert!(cache.frame(8, (dim, 0, 0), 100, None).is_none());
+        assert!(cache.frame(8, (dim, 0, 0, false), 100, None).is_none());
     }
     worldgen::reset_dimension_registry();
 }

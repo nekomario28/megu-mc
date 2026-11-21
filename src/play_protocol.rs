@@ -556,6 +556,10 @@ struct Client {
     // payload. Vanilla clients never set it and must never receive a `lod_v1`
     // packet, so the flag is checked before every channel write.
     lod_v1_enabled: AtomicBool,
+    // Anti-xray lane hysteresis: `true` while the player is underground enough
+    // to see real chunks, `false` while they get the surface-occluded lane.
+    // Flipped by `update_underground_lane`, which re-sends held chunks.
+    underground_revealed: AtomicBool,
 }
 
 impl Client {
@@ -2417,14 +2421,19 @@ fn write_shared_frame(s: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
 /// block-entity splice, the light cull — then stored under the revision the
 /// build started from only when those inputs held to the end; a mid-build edit
 /// gets correct bytes that are simply not cached.
+///
+/// `occluded` selects the anti-xray lane: `true` is the surface player's
+/// masked chunk, `false` the real one. The lanes are separate cache keys, so
+/// every surface reader shares one `Arc` and every underground reader another.
 fn cached_chunk_frame(
     compression: Option<usize>,
     gen: &mut GenSources,
     dim: DimId,
     cx: i32,
     cz: i32,
+    occluded: bool,
 ) -> Arc<Vec<u8>> {
-    let key = (dim, cx, cz);
+    let key = (dim, cx, cz, occluded);
     let generation = current_gen_seq();
     // `live_chunk_block_entities` iterates a map; sort so the spliced bytes
     // (and their fingerprint) are deterministic across readers.
@@ -2433,6 +2442,13 @@ fn cached_chunk_frame(
     // LootTableSeed, vaults, etc.) for fully buried cells until exposed.
     if anti_xray_enabled() {
         entities.retain(|&((x, y, z), _, _)| block_exposed_dim(dim, x, y, z));
+    }
+    // The occluded lane strips every live block entity under the ceiling too:
+    // a buried beacon, spawner or chest must not reach a surface client at all.
+    if occluded {
+        if let Some(ceil) = underground_occlude_ceil(dim, cx, cz) {
+            entities.retain(|&((_, y, _), _, _)| y >= ceil);
+        }
     }
     entities.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
     let versions = chunk_versions_3x3(dim, cx, cz);
@@ -2447,7 +2463,7 @@ fn cached_chunk_frame(
         gen.insert((cx, cz), emitters);
         return frame;
     }
-    let mut packet = map_chunk(cx, cz, dim, gen);
+    let mut packet = map_chunk_lane(cx, cz, dim, gen, occluded);
     let emitters = gen.get(&(cx, cz)).cloned().unwrap_or_default();
     let still_current = chunk_packet_revision(
         &chunk_versions_3x3(dim, cx, cz),
@@ -2481,6 +2497,10 @@ fn stream_chunks(
     announce_center: bool,
     // The first batch is sent before the shared Play writer has been registered.
     initial_delivery: Option<&mut connection_limits::ChunkDelivery>,
+    // Anti-xray lane for this player: `true` masks deep sections to solid host
+    // rock for a surface player, `false` sends the real chunk. Decided by
+    // `update_underground_lane` before the stream, never per chunk.
+    occluded: bool,
 ) {
     let tick = TICK_IDX.load(Ordering::Relaxed);
     let select = |delivery: &mut connection_limits::ChunkDelivery| {
@@ -2542,7 +2562,7 @@ fn stream_chunks(
     'delivery: for chunk_group in news.chunks(terrain_group(delivery_workers)) {
         prefetch_terrain_group_dim(dim, chunk_group, lo, hi, delivery_workers, delivery_round);
         for (cx, cz) in chunk_group {
-            let frame = cached_chunk_frame(compression, gen, dim, *cx, *cz);
+            let frame = cached_chunk_frame(compression, gen, dim, *cx, *cz, occluded);
             if write_shared_frame(s, &frame).is_err() {
                 failed = true;
                 break 'delivery;
@@ -2572,7 +2592,13 @@ fn stream_chunks(
             continue;
         }
         let __t = chunkprof::enabled().then(std::time::Instant::now);
-        let pkt = update_light_packet_dim(dim, cx, cz, gen);
+        let pkt = update_light_packet_lane(
+            dim,
+            cx,
+            cz,
+            gen,
+            occluded.then(|| underground_occlude_ceil(dim, cx, cz)).flatten(),
+        );
         if let Some(t) = __t {
             use std::sync::atomic::Ordering;
             chunkprof::add(&chunkprof::RE_LIGHT, t);
@@ -2775,7 +2801,78 @@ fn live_beacon_anchor(me: &Client, dim: DimId) -> Option<DimBlockPos> {
         .map(|(_, key)| key)
 }
 
+/// The anti-xray lane a player belongs in right now. Pure: the caller's
+/// `currently_revealed` carries the hysteresis.
+///
+/// * `false` (revealed, real chunks) whenever the feature is off, the
+///   dimension has no skylight (Nether/End: open cavities are normal), or the
+///   player is a spectator.
+/// * A still-occluded player reveals once they are under Y=48, or more than 8
+///   blocks under their column's surface — long before the masked ceiling is
+///   within the 16 blocks around them.
+/// * A revealed player re-occludes only once clearly back on the surface
+///   (Y>=60 and within 2 of the local surface), so bobbing across the reveal
+///   line never flaps the lane.
+fn should_occlude_underground(
+    dim: DimId,
+    player_y: f64,
+    local_surface_y: i32,
+    gamemode: u8,
+    currently_revealed: bool,
+) -> bool {
+    if !ac_underground_occlusion_enabled() || !dim.has_skylight() || gamemode == 3 {
+        return false;
+    }
+    if currently_revealed {
+        player_y >= 60.0 && player_y >= local_surface_y as f64 - 2.0
+    } else {
+        !(player_y < 48.0 || player_y < local_surface_y as f64 - 8.0)
+    }
+}
+
+/// Re-send every chunk the client currently holds in the other lane, nearest
+/// first so the reveal reaches the area around the player before anything 16
+/// blocks away can be seen. A re-sent `0x27` just replaces the client's copy.
+fn resend_loaded_chunks(me: &Client, occluded: bool) {
+    let (dim, px, _py, pz, ..) = client_dim_pos(me);
+    let (pcx, pcz) = (spatial_chunk_coord(px), spatial_chunk_coord(pz));
+    let mut ordered: Vec<(i32, i32)> = me.chunks.lock().unwrap().iter().copied().collect();
+    ordered.sort_by_key(|&(cx, cz)| {
+        let (dx, dz) = (cx - pcx, cz - pcz);
+        dx * dx + dz * dz
+    });
+    // Lock order matches `pump_client_chunks`: gen_sources before sock.
+    let mut gen = me.gen_sources.lock().unwrap();
+    let mut sock = me.sock.lock().unwrap();
+    let compression = socket_compression(&sock);
+    for (cx, cz) in ordered {
+        let frame = cached_chunk_frame(compression, &mut gen, dim, cx, cz, occluded);
+        if write_shared_frame(&mut sock, &frame).is_err() {
+            return;
+        }
+    }
+}
+
+/// Evaluate the player's occlusion lane after a position or game-mode change.
+/// Returns the lane to stream in; on a flip it also re-sends every held chunk
+/// in the new lane so the transition is seamless both ways (descend: caves and
+/// strongholds appear; resurface: anti-cave-xray re-arms).
+fn update_underground_lane(me: &Client) -> bool {
+    let (dim, px, py, pz, ..) = client_dim_pos(me);
+    let gm = *me.gm.lock().unwrap();
+    let surface = height_at_dim(dim, px.floor() as i32, pz.floor() as i32);
+    let revealed = me.underground_revealed.load(Ordering::Relaxed);
+    let occluded = should_occlude_underground(dim, py, surface, gm, revealed);
+    if occluded == !revealed {
+        return occluded;
+    }
+    me.underground_revealed.store(!occluded, Ordering::Relaxed);
+    resend_loaded_chunks(me, occluded);
+    occluded
+}
+
 fn pump_client_chunks(client: &Client, announce_center: bool) -> bool {
+    let occluded = update_underground_lane(client);
     let mut ack = client.chunk_ack.lock().unwrap();
     let view = *client.view.lock().unwrap();
     let mut chunks = client.chunks.lock().unwrap();
@@ -2793,6 +2890,7 @@ fn pump_client_chunks(client: &Client, announce_center: bool) -> bool {
         yaw,
         announce_center,
         None,
+        occluded,
     );
     !ack.awaiting()
         && with_play_wire(&socket, |play| play.chunk_delivery.has_pending()).unwrap_or(false)
@@ -3023,6 +3121,9 @@ fn switch_client_dimension(
     let mut ge = vec![13u8]; // START_WAITING_CHUNKS
     ge.extend_from_slice(&0f32.to_be_bytes());
     let _ = send_packet(&mut me.sock.lock().unwrap(), 0x22, ge);
+    // A dimension hop re-derives the lane from scratch: Nether/End always get
+    // the real lane, and the hysteresis restarts on the new surface.
+    let dim_occluded = update_underground_lane(me);
     {
         let mut ch = me.chunks.lock().unwrap();
         let mut gen = me.gen_sources.lock().unwrap();
@@ -3036,6 +3137,7 @@ fn switch_client_dimension(
             target.3,
             true,
             None,
+            dim_occluded,
         );
     }
     let mut sock = me.sock.lock().unwrap();
@@ -3968,7 +4070,15 @@ fn handle(mut s: TcpStream) {
     let initial_window = ChunkWindow::at(sx, sz, view);
     // vanilla: a returning player resumes where they logged out — the chunk window,
     // spawn teleport and authoritative pos all agree. The dimension was read above,
-    // before Join Game, and is threaded through the first stream as well.
+    // before Join Game, and is threaded through the first stream as well. The join
+    // lane starts occluded unless the saved position is already underground.
+    let initial_occluded = should_occlude_underground(
+        saved_dim,
+        sy,
+        height_at_dim(saved_dim, sx.floor() as i32, sz.floor() as i32),
+        initial_gm,
+        false,
+    );
     stream_chunks(
         &mut s,
         &mut sent,
@@ -3979,6 +4089,7 @@ fn handle(mut s: TcpStream) {
         syaw,
         true,
         Some(&mut chunk_delivery),
+        initial_occluded,
     );
     let mut tm = Vec::new();
     tm.extend_from_slice(&0i64.to_be_bytes());
@@ -4086,6 +4197,7 @@ fn handle(mut s: TcpStream) {
             save.effects.iter().map(|&(id, amp, left)| Eff { id, amp, left }).collect()
         })),
         lod_v1_enabled: AtomicBool::new(false),
+        underground_revealed: AtomicBool::new(!initial_occluded),
     });
     let mut retry_chunks = chunk_delivery.has_pending();
     me.enter_play_wire(compression, chunk_delivery);
@@ -4373,6 +4485,13 @@ fn handle(mut s: TcpStream) {
                     // immediately trigger the return trip.
                     if tick_portal(&me, view) {
                         continue;
+                    }
+                    // A vertical move inside the same chunk window still crosses the
+                    // occlusion hysteresis (descending into a cave); the lane flip
+                    // re-sends held chunks in the new lane. The window pump below
+                    // re-runs the same check as a no-op when nothing changed.
+                    if before.1 != py {
+                        update_underground_lane(&me);
                     }
                     let window = ChunkWindow::at(px, pz, view);
                     let current = with_play_wire(&me.sock.lock().unwrap(), |play| {
@@ -8400,9 +8519,9 @@ mod connection_limits_wire_tests {
         clear_chunk_caches_for_tests();
         chunk_packet_cache().lock().unwrap().clear();
         let mut gen = GenSources::new();
-        let f1 = cached_chunk_frame(None, &mut gen, dim, cx, cz);
+        let f1 = cached_chunk_frame(None, &mut gen, dim, cx, cz, false);
         let mut gen2 = GenSources::new();
-        let f2 = cached_chunk_frame(None, &mut gen2, dim, cx, cz);
+        let f2 = cached_chunk_frame(None, &mut gen2, dim, cx, cz, false);
         assert!(
             Arc::ptr_eq(&f1, &f2),
             "a second reader reuses the exact frame Arc"
@@ -8422,17 +8541,17 @@ mod connection_limits_wire_tests {
         let cur = block_at_dim(dim, 8, 70, 8);
         let st = if cur == stone { 12958 } else { stone };
         set_block_dim(dim, 8, 70, 8, st);
-        let f3 = cached_chunk_frame(None, &mut gen, dim, cx, cz);
+        let f3 = cached_chunk_frame(None, &mut gen, dim, cx, cz, false);
         assert!(!Arc::ptr_eq(&f1, &f3), "the edit must not hit the old frame");
         assert_ne!(f1, f3, "the rebuild carries the edited cell");
-        let f4 = cached_chunk_frame(None, &mut GenSources::new(), dim, cx, cz);
+        let f4 = cached_chunk_frame(None, &mut GenSources::new(), dim, cx, cz, false);
         assert!(Arc::ptr_eq(&f3, &f4), "the rebuilt frame is shared too");
         // Compressed readers share one lazily compressed frame of the same body.
-        let c1 = cached_chunk_frame(Some(256), &mut gen, dim, cx, cz);
-        let c2 = cached_chunk_frame(Some(256), &mut gen, dim, cx, cz);
+        let c1 = cached_chunk_frame(Some(256), &mut gen, dim, cx, cz, false);
+        let c2 = cached_chunk_frame(Some(256), &mut gen, dim, cx, cz, false);
         assert!(Arc::ptr_eq(&c1, &c2));
         set_block_dim(dim, 8, 70, 8, cur);
-        let f5 = cached_chunk_frame(None, &mut gen, dim, cx, cz);
+        let f5 = cached_chunk_frame(None, &mut gen, dim, cx, cz, false);
         assert_eq!(f1, f5, "restoring the cell restores the bytes");
     }
 }

@@ -9309,24 +9309,62 @@ fn sky_light_sections_from_dim(
 /// whatever `init` installed: a Nether section is built by the Nether's generator, and the
 /// Overworld arm passes [`DimId::Overworld`] and is byte-for-byte what it was before the
 /// per-dimension registry existed.
+#[cfg(test)]
 fn chunk_data(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8> {
-    chunk_data_opt(
-        cx,
-        cz,
-        dim,
-        gen,
-        // On by default. `MC_SPINE_NO_PREFETCH_NEIGHBOUR=1` turns it off (the digest guard
-        // passes the setting explicitly, so it can compare both without the environment).
-        std::env::var("MC_SPINE_NO_PREFETCH_NEIGHBOUR").is_err(),
-    )
+    chunk_data_opt(cx, cz, dim, gen, chunk_prefetch_enabled())
 }
 
+/// On by default. `MC_SPINE_NO_PREFETCH_NEIGHBOUR=1` turns it off (the digest guard
+/// passes the setting explicitly, so it can compare both without the environment).
+fn chunk_prefetch_enabled() -> bool {
+    std::env::var("MC_SPINE_NO_PREFETCH_NEIGHBOUR").is_err()
+}
+
+#[cfg(test)]
 fn chunk_data_opt(
     cx: i32,
     cz: i32,
     dim: DimId,
     gen: &mut GenSources,
     prefetch: bool,
+) -> Vec<u8> {
+    chunk_data_lane(cx, cz, dim, gen, prefetch, false)
+}
+
+/// The chunk's own occlusion ceiling, from the lowest surface column in it.
+/// Every section whose top is at or below it is sent as solid host rock in the
+/// `occluded` lane, so a surface x-ray client cannot see caves, mineshafts,
+/// trial chambers or strongholds at all. `hmin - 16` keeps the ceiling under a
+/// deep ocean floor or an open ravine mouth, so an honest player looking down
+/// one never sees fake stone sealing the opening; the `.min(32)` caps it under
+/// ordinary plains and hills.
+fn occlusion_ceil_from_hmin(hmin: i32) -> i32 {
+    ((hmin - 16).min(32)) & !15
+}
+
+/// The occlusion ceiling for one chunk in a skylight dimension, `None` where
+/// section occlusion does not apply (Nether, End, or a `has_skylight = false`
+/// custom dimension: open ceiling/void cavities are normal there).
+fn underground_occlude_ceil(dim: DimId, cx: i32, cz: i32) -> Option<i32> {
+    if !dim.has_skylight() {
+        return None;
+    }
+    let mut hmin = i32::MAX;
+    for lz in 0..16 {
+        for lx in 0..16 {
+            hmin = hmin.min(height_at_dim(dim, cx * 16 + lx, cz * 16 + lz));
+        }
+    }
+    Some(occlusion_ceil_from_hmin(hmin))
+}
+
+fn chunk_data_lane(
+    cx: i32,
+    cz: i32,
+    dim: DimId,
+    gen: &mut GenSources,
+    prefetch: bool,
+    occluded: bool,
 ) -> Vec<u8> {
     let mut data = Vec::new();
     let reg = crate::block_registry::breg();
@@ -9364,6 +9402,24 @@ fn chunk_data_opt(
             hmax = hmax.max(h);
         }
     }
+    // Occluded lane: sections fully below the ceiling are sent as solid host rock
+    // instead of terrain, so a surface x-ray client sees no caves at all. The same
+    // `hmin` the terrain fast path uses decides the ceiling; skylight dimensions
+    // only — Nether/End keep their open cavities. Overlay edits cannot unmask a
+    // section: the whole point is that buried builds stay invisible too.
+    let occlude_ceil_y = if occluded && dim.has_skylight() {
+        Some(occlusion_ceil_from_hmin(hmin))
+    } else {
+        None
+    };
+    let (mask_deep, mask_shallow) = if occlude_ceil_y.is_some() {
+        (
+            name_to_state("deepslate").unwrap_or(1),
+            name_to_state("stone").unwrap_or(1),
+        )
+    } else {
+        (0, 0)
+    };
     // The anti-xray exposure test reads ±1 in y as well as x/z, and its vertical
     // neighbours are the adjacent sections. Carrying the next section's terrain forward
     // (and the previous one back) means those reads are array reads too: measured, the
@@ -9391,6 +9447,20 @@ fn chunk_data_opt(
             .unwrap_or_else(|| Box::new([39i64; 64])); // plains
         if let Some(t) = __tb {
             chunkprof::add(&chunkprof::BIOMES, t);
+        }
+        // Occluded lane: this section's whole column band is below the ceiling, so
+        // it reaches the wire as one solid host-rock palette. No terrain pass, no
+        // exposure reads, and no generated emitters — recording one would let cave
+        // lava/torch glow leak through `gen_sources_here` into the light arrays.
+        if occlude_ceil_y.is_some_and(|ceil| sy + 16 <= ceil) {
+            PalettedSection::single(if sy < 0 { mask_deep } else { mask_shallow }, true, false)
+                .write_wire(&biomes, &mut data);
+            // A masked section has no real base to carry: clearing both keeps the
+            // next real section's vertical exposure reads on actual terrain (via
+            // the band/overlay/base_state fallbacks) instead of a stale neighbor.
+            prev_base = None;
+            carried_next = None;
+            continue;
         }
         // uniform fast path only when overlay empty AND terrain can't reach the section
         let wg = worldgen::enabled();
@@ -9839,8 +9909,8 @@ struct MapChunkEntry {
 
 #[derive(Default)]
 struct MapChunkCache {
-    map: HashMap<(DimId, i32, i32), MapChunkEntry>,
-    order: std::collections::VecDeque<(DimId, i32, i32)>,
+    map: HashMap<(DimId, i32, i32, bool), MapChunkEntry>,
+    order: std::collections::VecDeque<(DimId, i32, i32, bool)>,
     generation: u64,
 }
 
@@ -9958,11 +10028,24 @@ fn clear_chunk_caches_for_tests() {
     pending_light_edits().lock().unwrap().clear();
 }
 
+#[cfg(test)]
 fn map_chunk(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8> {
+    map_chunk_lane(cx, cz, dim, gen, false)
+}
+
+fn map_chunk_lane(
+    cx: i32,
+    cz: i32,
+    dim: DimId,
+    gen: &mut GenSources,
+    occluded: bool,
+) -> Vec<u8> {
     // M3 P5: the 0x27 payload is shared by every player that loads the same chunk at
     // matching 3x3 versions and entity/neighbor-light signatures; a hit also restores
     // `(cx, cz)`'s generated emitters into `gen` so downstream light updates stay exact.
-    let key = (dim, cx, cz);
+    // `occluded` splits the lanes: a surface player's masked payload must never be
+    // served to an underground player nor the other way round.
+    let key = (dim, cx, cz, occluded);
     let versions = chunk_versions_3x3(dim, cx, cz);
     let candidate_sig = {
         let mut cache = map_chunk_cache().lock().unwrap();
@@ -9985,7 +10068,7 @@ fn map_chunk(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8> {
             }
         }
     }
-    let payload = build_map_chunk(cx, cz, dim, gen);
+    let payload = build_map_chunk_lane(cx, cz, dim, gen, occluded);
     if chunk_versions_3x3(dim, cx, cz) == versions {
         let sig = map_chunk_sig(dim, cx, cz, gen);
         let own_emitters = gen.get(&(cx, cz)).cloned().unwrap_or_default();
@@ -10017,8 +10100,18 @@ fn map_chunk(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8> {
 
 /// The uncached `map_chunk` build: heightmaps, the terrain encode, the sign block
 /// entities and the light arrays, per player.
-fn build_map_chunk(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8> {
+fn build_map_chunk_lane(
+    cx: i32,
+    cz: i32,
+    dim: DimId,
+    gen: &mut GenSources,
+    occluded: bool,
+) -> Vec<u8> {
     let __t = chunkprof::enabled().then(std::time::Instant::now);
+    // The occluded lane's ceiling: decided by the same `hmin` `chunk_data_lane`
+    // computes, so block entities and light are stripped over exactly the
+    // sections the terrain encode masks.
+    let occlude_ceil_y = occluded.then(|| underground_occlude_ceil(dim, cx, cz)).flatten();
     let mut p = Vec::new();
     p.extend_from_slice(&cx.to_be_bytes());
     p.extend_from_slice(&cz.to_be_bytes());
@@ -10033,7 +10126,7 @@ fn build_map_chunk(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8
     }
     p.extend_from_slice(&heightmaps_nbt_dim(&tops, dim.min_y()));
     let __td = chunkprof::enabled().then(std::time::Instant::now);
-    let data = chunk_data(cx, cz, dim, gen);
+    let data = chunk_data_lane(cx, cz, dim, gen, chunk_prefetch_enabled(), occluded);
     if let Some(t) = __td {
         chunkprof::add(&chunkprof::DATA, t);
     }
@@ -10071,6 +10164,11 @@ fn build_map_chunk(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8
                 .filter(|&((x, y, z), _, _)| !hide_buried || block_exposed_dim(dim, x, y, z)),
         );
     }
+    // Occluded lane: stronghold chests, spawners and buried bases must not leak
+    // through block-entity NBT either — everything under the ceiling is dropped.
+    if let Some(ceil) = occlude_ceil_y {
+        be.retain(|&((_, y, _), _, _)| y >= ceil);
+    }
     write_varint(&mut p, be.len() as i64);
     for ((x, y, z), ty, n) in be {
         p.push(((x & 15) as u8) << 4 | (z & 15) as u8);
@@ -10080,7 +10178,7 @@ fn build_map_chunk(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8
     }
     overlay_band(dim, cx, cz);
     let __tl = chunkprof::enabled().then(std::time::Instant::now);
-    write_light_arrays(&mut p, cx, cz, dim, gen);
+    write_light_arrays_lane(&mut p, cx, cz, dim, gen, occlude_ceil_y);
     if let Some(t) = __tl {
         chunkprof::add(&chunkprof::LIGHT, t);
     }
@@ -10302,11 +10400,27 @@ fn block_light_update(chunk: Chunk, block: &[[u8; 2048]]) -> Vec<u8> {
 
 /// The light half of a chunk packet, shared with `update_light_packet`: four section masks, then
 /// sky and block light as two counted lists of 2048-byte arrays.
+#[cfg(test)]
 fn write_light_arrays(p: &mut Vec<u8>, cx: i32, cz: i32, dim: DimId, gen: &GenSources) {
+    write_light_arrays_lane(p, cx, cz, dim, gen, None)
+}
+
+/// `write_light_arrays` for one occlusion lane: `occlude_ceil` masks every light
+/// section whose whole 16-block band sits under it, so cave lava or torch glow
+/// in a masked section cannot leak through the light arrays either. Masked
+/// sections are all-zero and travel in the empty masks like any unlit section.
+fn write_light_arrays_lane(
+    p: &mut Vec<u8>,
+    cx: i32,
+    cz: i32,
+    dim: DimId,
+    gen: &GenSources,
+    occlude_ceil: Option<i32>,
+) {
     let all = dim.light_mask();
     let has_sky = worldgen::has_skylight(dim);
     let __tsky = chunkprof::enabled().then(std::time::Instant::now);
-    let sky = if has_sky {
+    let mut sky = if has_sky {
         sky_light_sections_dim(dim, cx, cz)
     } else {
         Vec::new()
@@ -10318,6 +10432,20 @@ fn write_light_arrays(p: &mut Vec<u8>, cx: i32, cz: i32, dim: DimId, gen: &GenSo
     let mut block = block_light_sections_dim(dim, cx, cz, gen);
     if let Some(t) = __tbl {
         chunkprof::add(&chunkprof::BLOCKLIGHT, t);
+    }
+    if let Some(ceil) = occlude_ceil {
+        let lmin = dim.light_min_y();
+        let occluded = |i: usize| lmin + 16 * (i as i32 + 1) <= ceil;
+        for (i, arr) in sky.iter_mut().enumerate() {
+            if occluded(i) {
+                arr.fill(0);
+            }
+        }
+        for (i, arr) in block.iter_mut().enumerate() {
+            if occluded(i) {
+                arr.fill(0);
+            }
+        }
     }
     hide_sealed_block_light(
         dim,
@@ -10360,13 +10488,35 @@ fn write_light_arrays(p: &mut Vec<u8>, cx: i32, cz: i32, dim: DimId, gen: &GenSo
     }
 }
 
-#[allow(dead_code)] // retained as the Overworld-named seam for light tests
+#[cfg(test)] // the Overworld-named seam for light tests
 fn update_light_packet(cx: i32, cz: i32, gen: &GenSources) -> Vec<u8> {
     update_light_packet_dim(DimId::Overworld, cx, cz, gen)
 }
 
+#[cfg(test)]
 fn update_light_packet_dim(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> Vec<u8> {
+    update_light_packet_lane(dim, cx, cz, gen, None)
+}
+
+/// `update_light_packet_dim` for one occlusion lane: the sections a surface
+/// player's chunk packet shows as solid rock must not glow in a later light
+/// update, so the same ceiling masks them to zero before the packet is built.
+fn update_light_packet_lane(
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+    gen: &GenSources,
+    occlude_ceil: Option<i32>,
+) -> Vec<u8> {
     let mut block = block_light_sections_dim(dim, cx, cz, gen);
+    if let Some(ceil) = occlude_ceil {
+        let lmin = dim.light_min_y();
+        for (i, arr) in block.iter_mut().enumerate() {
+            if lmin + 16 * (i as i32 + 1) <= ceil {
+                arr.fill(0);
+            }
+        }
+    }
     hide_sealed_block_light(dim, cx, cz, None, block.iter_mut().enumerate());
     block_light_update((cx, cz), &block)
 }

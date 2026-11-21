@@ -363,10 +363,15 @@ fn body_of_frame(plain: &[u8]) -> &[u8] {
 /// literally the same `Arc`, and a player re-entering a column reuses it too.
 /// Entries are bounded (the same 512 the payload/light caches use) and dropped
 /// wholesale when the generator's `generation` moves, like `MapChunkCache`.
+///
+/// The key's last field is the anti-xray occlusion lane: `false` is the real
+/// chunk (underground players, spectators), `true` the surface lane whose deep
+/// sections are masked to solid host rock. Two lanes for one column never
+/// share a frame.
 pub(crate) struct ChunkPacketCache {
     generation: u64,
-    map: HashMap<(crate::DimId, i32, i32), CachedChunkPacket>,
-    order: VecDeque<(crate::DimId, i32, i32)>,
+    map: HashMap<(crate::DimId, i32, i32, bool), CachedChunkPacket>,
+    order: VecDeque<(crate::DimId, i32, i32, bool)>,
 }
 
 /// Entries retained; each holds a full chunk frame plus (at most) its
@@ -396,7 +401,7 @@ impl ChunkPacketCache {
     pub(crate) fn frame(
         &mut self,
         generation: u64,
-        key: (crate::DimId, i32, i32),
+        key: (crate::DimId, i32, i32, bool),
         revision: u64,
         compression: Option<usize>,
     ) -> Option<(Arc<Vec<u8>>, Vec<((i32, i32, i32), u8)>)> {
@@ -429,7 +434,7 @@ impl ChunkPacketCache {
     pub(crate) fn insert(
         &mut self,
         generation: u64,
-        key: (crate::DimId, i32, i32),
+        key: (crate::DimId, i32, i32, bool),
         revision: u64,
         own_emitters: Vec<((i32, i32, i32), u8)>,
         payload: Vec<u8>,
@@ -1411,7 +1416,7 @@ mod tests {
     #[test]
     fn chunk_packet_cache_shares_frames_until_the_revision_moves() {
         let mut cache = ChunkPacketCache::new();
-        let key = (crate::DimId::Overworld, 4, -7);
+        let key = (crate::DimId::Overworld, 4, -7, false);
         assert!(cache.frame(10, key, 41, None).is_none());
         cache.insert(10, key, 41, vec![((1, 2, 3), 15)], vec![9, 9, 9]);
         let (f1, emitters) = cache.frame(10, key, 41, None).unwrap();
@@ -1455,7 +1460,7 @@ mod tests {
     #[test]
     fn chunk_packet_cache_drops_everything_on_a_generation_change() {
         let mut cache = ChunkPacketCache::new();
-        let key = (crate::DimId::Overworld, 0, 0);
+        let key = (crate::DimId::Overworld, 0, 0, false);
         cache.insert(10, key, 1, vec![], vec![1]);
         assert!(cache.frame(11, key, 1, None).is_none());
         cache.insert(11, key, 1, vec![], vec![2]);
@@ -1470,11 +1475,17 @@ mod tests {
     fn chunk_packet_cache_stays_bounded() {
         let mut cache = ChunkPacketCache::new();
         for i in 0..(CHUNK_PACKET_CACHE_CAP + 4) {
-            cache.insert(1, (crate::DimId::Overworld, i as i32, 0), 1, vec![], vec![i as u8]);
+            cache.insert(
+                1,
+                (crate::DimId::Overworld, i as i32, 0, false),
+                1,
+                vec![],
+                vec![i as u8],
+            );
         }
         assert!(cache.map.len() <= CHUNK_PACKET_CACHE_CAP);
         assert!(cache
-            .frame(1, (crate::DimId::Overworld, 0, 0), 1, None)
+            .frame(1, (crate::DimId::Overworld, 0, 0, false), 1, None)
             .is_none());
     }
 

@@ -1527,6 +1527,7 @@ mod entity_fluid_tests {
             held: Mutex::new(0),
             effs: Mutex::new(Vec::new()),
             lod_v1_enabled: AtomicBool::new(false),
+            underground_revealed: AtomicBool::new(false),
         });
         let old_clients = std::mem::take(&mut *clients().lock().unwrap());
         clients().lock().unwrap().push(dummy_client);

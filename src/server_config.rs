@@ -27,6 +27,8 @@ const SERVER_CONFIG_DEFAULT_FILE: &str = r#"# mc-spine settings. Every key is op
 enabled = true
 # Hide buried ores (vanilla + #c:ores / #forge:ores), chests and buried block-entity NBT from x-ray clients and mods.
 antixray = true
+# Hide whole deep sections (caves, mineshafts, strongholds) as solid rock until a player descends; needs antixray.
+hide_underground = true
 # Hide light from sealed underground caves (gamma/fullbright can't be blocked by a server).
 antifullbright = true
 # Set true to check operators too (creative and spectator players are never checked).
@@ -244,11 +246,12 @@ const SERVER_CONFIG_KEYS: &[(&str, &str)] = &[
     ("rcon_port", "MC_SPINE_RCON_PORT"),
 ];
 
-/// `[anticheat]` keys: the three in the default file, then old ones that still work
+/// `[anticheat]` keys: the ones in the default file, then old ones that still work
 /// (with a deprecation note from `anticheat::AcConfig::from_doc`).
 const SERVER_CONFIG_ANTICHEAT_KEYS: &[&str] = &[
     "antixray",
     "antifullbright",
+    "hide_underground",
     "check_ops",
     "enabled",
     "preset",
@@ -361,15 +364,25 @@ mod server_config_tests {
     use super::*;
 
     #[test]
-    fn default_file_is_four_switches_with_one_line_comments() {
+    fn default_file_is_five_switches_with_one_line_comments() {
         let (doc, warnings) = server_config_parse(SERVER_CONFIG_DEFAULT_FILE);
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(server_config_unknown_keys(&doc).is_empty());
         let keys: Vec<&str> = doc["anticheat"].keys().map(String::as_str).collect();
-        assert_eq!(keys, ["antifullbright", "antixray", "check_ops", "enabled"]);
+        assert_eq!(
+            keys,
+            [
+                "antifullbright",
+                "antixray",
+                "check_ops",
+                "enabled",
+                "hide_underground"
+            ]
+        );
         assert_eq!(doc["anticheat"]["enabled"], ServerConfigValue::Bool(true));
         assert_eq!(doc["anticheat"]["antixray"], ServerConfigValue::Bool(true));
         assert_eq!(doc["anticheat"]["antifullbright"], ServerConfigValue::Bool(true));
+        assert_eq!(doc["anticheat"]["hide_underground"], ServerConfigValue::Bool(true));
         assert_eq!(doc["anticheat"]["check_ops"], ServerConfigValue::Bool(false));
         let c = AcConfig::from_doc(&doc, |_| None);
         assert_eq!(c, AcConfig::default());

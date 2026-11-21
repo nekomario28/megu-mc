@@ -1,7 +1,7 @@
 // Anti-cheat foundation: the server decides the limits, the operator only switches things.
 //
-// `server.toml` has three anti-cheat keys: `antixray`, `antifullbright` and
-// `check_ops`. The movement, fall and placement checks are always on (only
+// `server.toml` has four anti-cheat keys: `antixray`, `antifullbright`,
+// `hide_underground` and `check_ops`. The movement, fall and placement checks are always on (only
 // `MC_SPINE_ANTICHEAT=off`, meant for tests and development, turns them off). Every
 // threshold is a constant here, derived from vanilla 1.21.1 movement physics, and is
 // scaled per player, per packet, from state the server already owns: attributes
@@ -61,6 +61,10 @@ pub(crate) struct AcConfig {
     pub anti_xray: bool,
     /// Hide light from sealed generated cavities (see `crate::anti_fullbright_enabled`).
     pub anti_fullbright: bool,
+    /// Send deep sections as solid host rock to players still on the surface, so
+    /// x-ray clients cannot see caves, mineshafts or strongholds at all
+    /// (see `crate::ac_underground_occlusion_enabled`). Needs `anti_xray`.
+    pub hide_underground: bool,
     /// Deprecated keys found in the file, reported once per load.
     pub notes: Vec<String>,
 }
@@ -74,6 +78,7 @@ impl Default for AcConfig {
             check_ops: false,
             anti_xray: true,
             anti_fullbright: true,
+            hide_underground: true,
             notes: Vec::new(),
         }
     }
@@ -85,7 +90,8 @@ fn ac_env_bool(v: &str) -> bool {
 
 impl AcConfig {
     /// `[anticheat]` from the parsed file, then the environment on top:
-    /// `MC_SPINE_ANTICHEAT` (on/off), `MC_SPINE_ANTI_XRAY`, `MC_SPINE_ANTI_FULLBRIGHT`.
+    /// `MC_SPINE_ANTICHEAT` (on/off), `MC_SPINE_ANTI_XRAY`, `MC_SPINE_ANTI_FULLBRIGHT`,
+    /// `MC_SPINE_ANTI_XRAY_UNDERGROUND`.
     /// Old keys (`preset`, `enabled`, `alerts`, `exempt`, `exempt_ops`, `ops_bypass`,
     /// `anti_xray`) are still honoured, with a note asking to move off them.
     pub(crate) fn from_doc(
@@ -163,7 +169,17 @@ impl AcConfig {
         if let Some(ServerConfigValue::Bool(b)) = get("antifullbright") {
             anti_fullbright = Some(*b);
         }
-        for key in ["enabled", "antixray", "antifullbright", "check_ops"] {
+        let mut hide_underground = None;
+        if let Some(ServerConfigValue::Bool(b)) = get("hide_underground") {
+            hide_underground = Some(*b);
+        }
+        for key in [
+            "enabled",
+            "antixray",
+            "antifullbright",
+            "check_ops",
+            "hide_underground",
+        ] {
             if let Some(v) = get(key) {
                 if !matches!(v, ServerConfigValue::Bool(_)) {
                     c.notes.push(format!(
@@ -188,6 +204,9 @@ impl AcConfig {
         if let Some(b) = anti_fullbright {
             c.anti_fullbright = b;
         }
+        if let Some(b) = hide_underground {
+            c.hide_underground = b;
+        }
         if let Some(v) = env("MC_SPINE_ANTICHEAT") {
             match AcPreset::parse(&v) {
                 Some(p) => c.preset = p,
@@ -202,15 +221,19 @@ impl AcConfig {
         if let Some(v) = env("MC_SPINE_ANTI_FULLBRIGHT") {
             c.anti_fullbright = ac_env_bool(&v);
         }
+        if let Some(v) = env("MC_SPINE_ANTI_XRAY_UNDERGROUND") {
+            c.hide_underground = ac_env_bool(&v);
+        }
         c
     }
 
     pub(crate) fn summary(&self) -> String {
         format!(
-            "checks={} antixray={} antifullbright={} check_ops={}{}{}",
+            "checks={} antixray={} antifullbright={} hideunderground={} check_ops={}{}{}",
             self.preset.name(),
             self.anti_xray,
             self.anti_fullbright,
+            self.hide_underground,
             self.check_ops,
             if self.alerts { "" } else { " alerts=off" },
             if self.exempt.is_empty() {
@@ -225,11 +248,13 @@ impl AcConfig {
 static AC_CONFIG: std::sync::RwLock<Option<Arc<AcConfig>>> = std::sync::RwLock::new(None);
 static AC_ANTI_XRAY: AtomicBool = AtomicBool::new(true);
 static AC_ANTI_FULLBRIGHT: AtomicBool = AtomicBool::new(true);
+static AC_ANTI_XRAY_UNDERGROUND: AtomicBool = AtomicBool::new(true);
 
 /// Swap in new settings (boot and `/anticheat reload`).
 fn ac_install(config: AcConfig) {
     AC_ANTI_XRAY.store(config.anti_xray, Ordering::Relaxed);
     AC_ANTI_FULLBRIGHT.store(config.anti_fullbright, Ordering::Relaxed);
+    AC_ANTI_XRAY_UNDERGROUND.store(config.hide_underground, Ordering::Relaxed);
     for note in &config.notes {
         eprintln!("{note}");
     }
@@ -260,6 +285,11 @@ fn ac_unbooted_default() -> AcConfig {
         anti_fullbright: std::env::var("MC_SPINE_ANTI_FULLBRIGHT")
             .map(|v| ac_env_bool(&v))
             .unwrap_or(!cfg!(test)),
+        // Same fixture rule as anti-fullbright: tests keep byte-identical chunks
+        // unless a fixture opts the occlusion in explicitly.
+        hide_underground: std::env::var("MC_SPINE_ANTI_XRAY_UNDERGROUND")
+            .map(|v| ac_env_bool(&v))
+            .unwrap_or(!cfg!(test)),
         ..AcConfig::default()
     }
 }
@@ -270,6 +300,10 @@ fn ac_booted() -> bool {
 
 /// Read on the chunk-encode hot path: one relaxed load.
 fn ac_anti_xray_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(v) = TEST_XRAY.with(|c| c.get()) {
+        return v;
+    }
     if !ac_booted() {
         static UNBOOTED: OnceLock<bool> = OnceLock::new();
         return *UNBOOTED.get_or_init(|| ac_unbooted_default().anti_xray);
@@ -290,15 +324,47 @@ fn ac_anti_fullbright_enabled() -> bool {
     AC_ANTI_FULLBRIGHT.load(Ordering::Relaxed)
 }
 
+/// Whether the surface player's chunk lane occludes deep sections: the section
+/// mask is part of anti-xray, so `antixray = false` turns it off too. Read on
+/// the per-player lane decision, not per section.
+fn ac_underground_occlusion_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(v) = TEST_UNDERGROUND.with(|c| c.get()) {
+        return v && ac_anti_xray_enabled();
+    }
+    if !ac_booted() {
+        static UNBOOTED: OnceLock<bool> = OnceLock::new();
+        let on = *UNBOOTED.get_or_init(|| ac_unbooted_default().hide_underground);
+        return ac_anti_xray_enabled() && on;
+    }
+    ac_anti_xray_enabled() && AC_ANTI_XRAY_UNDERGROUND.load(Ordering::Relaxed)
+}
+
 #[cfg(test)]
 thread_local! {
+    static TEST_XRAY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static TEST_FULLBRIGHT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static TEST_UNDERGROUND: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Per-thread override so a test can flip the anti-xray master switch without
+/// changing what concurrent tests see; `None` restores the configured default.
+#[cfg(test)]
+fn ac_test_set_anti_xray(on: Option<bool>) {
+    TEST_XRAY.with(|c| c.set(on));
 }
 
 /// Per-thread override so a light test does not change what concurrent tests see.
 #[cfg(test)]
 fn ac_test_set_anti_fullbright(on: Option<bool>) {
     TEST_FULLBRIGHT.with(|c| c.set(on));
+}
+
+/// Per-thread override so an occlusion test does not change what concurrent
+/// tests see; `None` restores the configured default.
+#[cfg(test)]
+fn ac_test_set_underground_occlusion(on: Option<bool>) {
+    TEST_UNDERGROUND.with(|c| c.set(on));
 }
 
 #[cfg(test)]
