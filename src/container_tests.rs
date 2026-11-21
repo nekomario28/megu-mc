@@ -1244,8 +1244,7 @@ mod block_entity_helpers {
     }
 
     fn attach_live_menu(c: &Client) {
-        let (x, _, z, ..) = *c.pos.lock().unwrap();
-        c.enter_play_wire(None, ChunkWindow::at(x, z, 2));
+        c.enter_play_wire(None, Default::default());
         player_mechanism_sessions().lock().unwrap().insert(
             c.eid,
             PlayerMechanismSession {
