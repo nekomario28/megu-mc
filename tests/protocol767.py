@@ -1,4 +1,8 @@
-"""Headless protocol-767 fixtures. No desktop, account credentials, or runtime deps."""
+"""Headless protocol-767 fixtures. No desktop, account credentials, or runtime deps.
+
+Run directly (`python3 tests/protocol767.py [binary]`) for the 0x03 compression
+and live wire parity suite: one isolated server per framing mode, the full
+login/configuration/play login each time, and identical delivered payloads."""
 import contextlib
 import hashlib
 import json
@@ -290,13 +294,14 @@ def unpack_position(data):
 
 
 @contextlib.contextmanager
-def local_server(binary, root=None):
+def local_server(binary, root=None, extra_env=None):
     """Run the server on a loopback port. `root` keeps the world: a caller that hands
     in the same directory twice is a restart, which is the only way to observe what a
-    save actually persisted."""
+    save actually persisted. `extra_env` overrides the spawned environment; a value
+    of None deletes the variable so the server's own default is what runs."""
     if root is None:
         with tempfile.TemporaryDirectory(prefix="spine-wire-") as tmp:
-            with local_server(binary, Path(tmp)) as game:
+            with local_server(binary, Path(tmp), extra_env=extra_env) as game:
                 yield game
         return
     root = Path(root)
@@ -311,6 +316,11 @@ def local_server(binary, root=None):
     # These clients warp across chunks in single packets to exercise the protocol;
     # the anti-cheat has its own live tests (cargo test anticheat_live).
     env.setdefault("MC_SPINE_ANTICHEAT", "off")
+    for key, value in (extra_env or {}).items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
     with (root / "server.log").open("w+") as log:
         proc = subprocess.Popen([str(binary)], cwd=root, env=env, stdout=log, stderr=log)
         try:
@@ -358,6 +368,10 @@ class Client:
         self.light_updates = []
         self.chunk_light = {}
         self.raw_chunk = {}
+        # how many received frames carried a zlib body vs. a plain data_len==0
+        # body while compression framing was negotiated (probes, not decoding)
+        self.compressed_frames = 0
+        self.uncompressed_frames = 0
         self.pos, self.contract_started = None, False
         self.phase, self.registry_counts = "login", {}
         self.dimension_types_by_id = {}
@@ -429,6 +443,11 @@ class Client:
     def read(self, timeout):
         self.socket.settimeout(timeout)
         frame_data = recv_exact(self.socket, recv_vint(self.socket))
+        if self._compression() >= 0:
+            if Reader(frame_data).varint():
+                self.compressed_frames = getattr(self, "compressed_frames", 0) + 1
+            else:
+                self.uncompressed_frames = getattr(self, "uncompressed_frames", 0) + 1
         response = Reader(unframe_packet(frame_data, self._compression()))
         pid = response.varint()
         body = response.take(len(response.data) - response.pos)
@@ -608,3 +627,81 @@ class Client:
 
     def chat(self, text):
         self.send(6, string(text) + struct.pack(">qq", int(time.time() * 1000), 0) + bytes(5))
+
+
+def spawn_window(radius=2):
+    """Chunk coords a fresh login at the default view must end up holding."""
+    return {(x, z) for x in range(-radius, radius + 1)
+            for z in range(-radius, radius + 1)}
+
+
+def wire_session(binary, extra_env):
+    """One isolated server (temp dir, ephemeral port, killed on exit) driven
+    through login and the paced spawn-window delivery. Returns what the wire
+    actually delivered so two framing modes can be compared packet for packet."""
+    observed = {}
+    with local_server(binary, extra_env=extra_env) as game, Client(game) as client:
+        client.login()
+        client.until_chunks(spawn_window(), "spawn-window")
+        if client.pos is None:
+            client.until_id(0x40, "spawn-teleport")
+        require(client.chunk_batches, "chunk-batch-finished")
+        observed.update(
+            threshold=client.compression_threshold,
+            compressed_frames=getattr(client, "compressed_frames", 0),
+            uncompressed_frames=getattr(client, "uncompressed_frames", 0),
+            chunks=set(client.chunks),
+            raw_chunks=dict(client.raw_chunk),
+            batches=list(client.chunk_batches),
+            pos=client.pos,
+        )
+    return observed
+
+
+def live_wire_parity(binary):
+    os.environ.setdefault("MC_PROBE_DEADLINE", "30")
+    # Deleting any ambient override makes this session see the server's own
+    # default: vanilla 1.21.1 negotiates the 256-byte threshold over 0x03.
+    compressed = wire_session(binary, {"MC_SPINE_COMPRESSION_THRESHOLD": None})
+    require(compressed["threshold"] == 256, "0x03-default-threshold")
+    require(compressed["chunks"] == spawn_window(), "0x03-window")
+    # Real 0x03 wire evidence: some frames (chunk data) ride zlib bodies while
+    # short packets (login success, teleports, batch markers) stay data_len==0.
+    require(compressed["compressed_frames"] > 0, "0x03-no-zlib-frames")
+    require(compressed["uncompressed_frames"] > 0, "0x03-no-plain-frames")
+
+    # 0x03 negotiated above every packet's size: the compression wrapper is on
+    # the wire yet no body is large enough to compress.
+    wrapped = wire_session(binary, {"MC_SPINE_COMPRESSION_THRESHOLD": "1048576"})
+    require(wrapped["threshold"] == 1048576, "0x03-high-threshold")
+    require(wrapped["chunks"] == spawn_window(), "0x03-high-window")
+    require(wrapped["compressed_frames"] == 0, "0x03-high-zlib-frames")
+    require(wrapped["uncompressed_frames"] > 0, "0x03-high-plain-frames")
+
+    # Compression off: no 0x03, every frame is a bare length-prefixed packet.
+    plain = wire_session(binary, {"MC_SPINE_COMPRESSION_THRESHOLD": "-1"})
+    require(plain["threshold"] == -1, "uncompressed-negotiated")
+    require(plain["chunks"] == spawn_window(), "uncompressed-window")
+    require(plain["compressed_frames"] == 0 and plain["uncompressed_frames"] == 0,
+            "uncompressed-framing")
+
+    # A fresh world always resolves seed 0, so the three sessions generated the
+    # same spawn area: the transport must not change a single delivered byte.
+    require(wrapped["raw_chunks"] == compressed["raw_chunks"], "0x03-high-payload-parity")
+    require(plain["raw_chunks"] == compressed["raw_chunks"], "uncompressed-payload-parity")
+    require(plain["pos"] == compressed["pos"], "spawn-position-parity")
+
+
+def main(binary):
+    require(binary.is_file(), f"missing-binary-{binary}")
+    live_wire_parity(binary)
+
+
+if __name__ == "__main__":
+    target = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "target/debug/mc-spine"
+    try:
+        main(target)
+    except ContractFailure as error:
+        print(f"protocol767 live wire: FAIL {error.code}", file=sys.stderr)
+        raise
+    print("protocol767 live wire: 0x03 compressed, wrapped, and uncompressed paths PASS")
