@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """Drive real protocol-767 chest clicks; assertions read only server replies."""
+import contextlib
 import json
 import math
+import os
 from pathlib import Path
+import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import time
-from protocol767 import Client, ContractFailure, Reader, WIRE_BLOCKS, local_server, position, require, vint
+from protocol767 import (Client, ContractFailure, Reader, ROOT, WIRE_BLOCKS,
+                         local_server, port, position, require, status, vint)
+
+RCON_SECRET = "container-wire-rcon-secret"
 
 
 def wire_stack(item=0, count=0):
@@ -200,13 +207,107 @@ def place(client, pos):
     use_on(client, pos, 1)
 
 
-def exercise(game):
+@contextlib.contextmanager
+def local_server_rcon(binary, root):
+    """`local_server` plus an RCON listener. protocol767.local_server strips
+    MC_SPINE_RCON_PORT, so the one session that must issue `gamemode creative`
+    (0x32 creative-slot packets are ignored in the survival default) gets its
+    own launcher here, shaped like command_datapack_wire.server."""
+    root = Path(root)
+    for link, target in (("config_packets.bin", ROOT / "config_packets.bin"),
+                         ("assets", ROOT / "assets")):
+        if not (root / link).exists():
+            (root / link).symlink_to(target, target_is_directory=target.is_dir())
+    game, rcon_port = port(), port()
+    while rcon_port == game:
+        rcon_port = port()
+    env = dict(os.environ, MC_SPINE_PORT=str(game), MC_SPINE_BIND_ADDR="127.0.0.1",
+               MC_SPINE_RCON_PORT=str(rcon_port), MC_SPINE_RCON_BIND_ADDR="127.0.0.1",
+               MC_SPINE_RCON_PASS=RCON_SECRET, MC_SPINE_WG="old",
+               MC_SPINE_RESOURCE_PACK_URL="")
+    env.pop("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS", None)
+    with (root / "server.log").open("w+") as log:
+        proc = subprocess.Popen([str(binary)], cwd=root, env=env, stdout=log, stderr=log)
+        try:
+            for _ in range(100):
+                assert proc.poll() is None, "server exited before login"
+                try:
+                    status(game)
+                    with socket.create_connection(("127.0.0.1", rcon_port), timeout=0.5):
+                        break
+                except (OSError, AssertionError):
+                    time.sleep(0.05)
+            else:
+                raise AssertionError("listener did not become ready")
+            yield game, rcon_port
+        except Exception:
+            log.flush()
+            log.seek(0)
+            print(log.read()[-4000:], file=sys.stderr)
+            raise
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+
+
+class Rcon:
+    """Minimal Source-RCON client, same wire shape as command_datapack_wire's."""
+
+    def __init__(self, rcon_port, password):
+        self.sock = socket.create_connection(("127.0.0.1", rcon_port), timeout=10)
+        self.sock.settimeout(10)
+        self.number = 10
+        rid, kind, _ = self.send(3, password)
+        self.authorized = rid == 10 and kind == 2
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.sock.close()
+
+    def send(self, kind, payload):
+        data = struct.pack("<ii", self.number, kind) + payload.encode("utf-8") + b"\0\0"
+        self.sock.sendall(struct.pack("<i", len(data)) + data)
+        size = struct.unpack("<i", self.exact(4))[0]
+        require(10 <= size <= 8192, "rcon-response-size")
+        body = self.exact(size)
+        require(body[-2:] == b"\0\0", "rcon-response-terminator")
+        return (*struct.unpack("<ii", body[:8]), body[8:-2].decode("utf-8"))
+
+    def exact(self, n):
+        data = bytearray()
+        while len(data) < n:
+            part = self.sock.recv(n - len(data))
+            if not part:
+                raise EOFError("RCON unexpectedly closed")
+            data.extend(part)
+        return bytes(data)
+
+    def command(self, command):
+        require(self.authorized, "rcon-unauthorized-command-attempt")
+        self.number += 1
+        rid, kind, reply = self.send(2, command)
+        require((rid, kind) == (self.number, 0), f"rcon-packet-{command}: {(rid, kind)}")
+        return reply
+
+
+def exercise(game, rcon):
     by_name = {block["name"]: block for block in WIRE_BLOCKS}
     # Item ids are the pinned 1.21.1 protocol registry ids, not block-state ids.
     stone, dirt, chest, trapped = 1, 28, 299, 678
     with Client(game, "ContainerTester") as client:
         client.login()
         sx, sy, sz = enter(client)
+        # Creative-slot packets (0x32) only apply in creative mode; players join
+        # in the server default gamemode (survival), so switch via RCON first —
+        # the same setup craft_cases uses in command_datapack_wire.py.
+        require("gamemode" in rcon.command(f"gamemode creative {client.name}"),
+                "gamemode-creative")
         x, z = math.floor(sx) + 1, math.floor(sz)
         solid = {state for b in WIRE_BLOCKS if b["boundingBox"] == "block"
                  for state in range(b["minStateId"], b["maxStateId"] + 1)}
@@ -421,8 +522,9 @@ if __name__ == "__main__":
     by_name = {block["name"]: block for block in WIRE_BLOCKS}
     try:
         with tempfile.TemporaryDirectory(prefix="spine-chest-restart-") as root:
-            with local_server(binary, Path(root)) as game:
-                saved = exercise(game)
+            with local_server_rcon(binary, Path(root)) as (game, rcon_port):
+                with Rcon(rcon_port, RCON_SECRET) as rcon:
+                    saved = exercise(game, rcon)
             with local_server(binary, Path(root)) as game:
                 verify_restart(game, saved, by_name)
     except ContractFailure as error:
