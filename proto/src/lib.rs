@@ -43,6 +43,7 @@ mod data_v767;
 mod data_v777;
 pub mod resolver;
 pub mod router;
+pub mod session;
 pub mod table;
 pub mod version;
 pub mod wire;
@@ -53,6 +54,9 @@ pub use codec::{
 };
 pub use resolver::{resolve as resolve_server_address, ResolveError};
 pub use router::{SessionRemapSummary, SessionRemapper, TableDrivenCodec, VersionRouter};
+pub use session::{
+    text_component, ServerSession, ServerSessionConfig, SessionEvent, SessionOutput, SessionPhase,
+};
 pub use table::{IdRemapper, PacketDir, PacketPhase, ProtocolTable, Registry, RemapReport};
 pub use version::{
     BlockStateJsonFormat, NoTargetVersion, ProtocolVersion, RecipeSyncMode,
