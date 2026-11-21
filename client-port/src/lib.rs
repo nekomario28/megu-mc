@@ -11,6 +11,7 @@ pub mod ffi;
 pub mod gpu_pipeline;
 mod lod;
 mod mesh;
+pub mod model_baker;
 mod packed;
 mod region;
 mod section;
@@ -43,6 +44,12 @@ pub use lod::{summarize_column, LodCell, LodSummary, LOD_COARSE, LOD_FINE};
 pub use mesh::{
     bucket_draw_mask, mesh_section, DirectionBuckets, Layer, Quad, DIRECTION_BUCKETS,
     DIRECTION_BUCKET_UNASSIGNED, QUAD_FALLING, QUAD_TINTED,
+};
+pub use model_baker::{
+    bake_model, resolve_item_override, Axis, BakedModel, BakedModelQuad, ElementFace,
+    ElementRotation, ItemModelOverride, JsonError, ModelElement, ModelError, RawModelJson,
+    ResourcePackModelStack, MAX_ELEMENTS_PER_MODEL, MAX_JSON_DEPTH, MAX_MODEL_COORD,
+    MAX_PARENT_DEPTH, MIN_MODEL_COORD, MODEL_UNITS_PER_BLOCK,
 };
 pub use region::{
     DrawElementsCommand, MultiDrawCommand, RegionStats, RenderRegion, RenderRegions, SectionSlab,
