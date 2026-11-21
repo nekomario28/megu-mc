@@ -231,6 +231,18 @@ def check_site_config_keys():
         r'data-i18n(?:-placeholder|-aria-label)?="([a-z0-9_]+)"', markup))
     for key in sorted(referenced - keys):
         findings.append(f"index.html is missing JA copy for '{key}'")
+    for required in (
+        "Runs 100% locally in your browser — nothing is uploaded.",
+        "ブラウザ内で完結します — ファイルは一切送信されません。",
+        "mc-spine-mod-check --scan-mods-dir",
+        "Mixin/.class",
+        'id="paste-json"',
+        'id="paste-analyze-btn"',
+        'id="sample-pack-btn"',
+        'id="report-stats"',
+    ):
+        if required not in markup:
+            findings.append(f"index.html is missing checker UX contract: {required}")
     return findings
 
 
@@ -344,6 +356,56 @@ assert.strictEqual(
 assert.strictEqual(
   cls["resourcepacks/faithful-32x.zip"], "universal_native");
 
+// --- Real-shape Modrinth manifest: loader, files and conservative IDs ---
+const realMr = JSON.stringify({
+  formatVersion: 1,
+  game: "minecraft",
+  name: "Real-shape pack",
+  versionId: "1.0",
+  dependencies: {minecraft: "1.21.1", "fabric-loader": "0.16.10"},
+  files: [
+    {path: "mods/sodium-fabric-0.6.3.jar", hashes: {sha1: "1234"}},
+    {path: "mods/lithium-fabric-0.15.0.jar"},
+    {path: "mods/create-6.0.6.jar"},
+    {path: "mods/unknown-library-1.0.jar"},
+  ],
+});
+const realMrResult = m.analyzeModpackJson(realMr);
+assert.strictEqual(realMrResult.version_verdict.kind, "compatible");
+assert.deepStrictEqual(realMrResult.loaders,
+  [{id: "fabric-loader", version: "0.16.10", primary: true}]);
+assert.deepStrictEqual(realMrResult.entries.map(e => e["class"]), [
+  "superseded_perf_mod", "superseded_perf_mod", "native_flagship",
+  "needs_inspection",
+]);
+assert.deepStrictEqual(realMrResult.skipped_perf_mods, ["lithium", "sodium"]);
+assert.strictEqual(realMrResult.needs_inspection_mods.length, 1);
+
+// Only specific known native/adapter family IDs are recognized.
+const knownFamilies = [
+  "farmers-delight", "openpac", "ftb-chunks", "ae2", "twilightforest",
+  "the-aether", "terrablender", "appleskin", "xaeros-minimap",
+  "xaeros-world-map", "simplevoicechat",
+];
+const familyPack = JSON.stringify({
+  formatVersion: 1, game: "minecraft", name: "Known adapters", versionId: "1",
+  dependencies: {minecraft: "1.21.1", neoforge: "21.1.93"},
+  files: knownFamilies.map(id => ({path: "mods/" + id + ".jar"})).concat([
+    {path: "mods/unrelated-create-compat.jar"},
+  ]),
+});
+const familyResult = m.analyzeModpackJson(familyPack);
+assert.deepStrictEqual(familyResult.entries.map(e => e["class"]),
+  knownFamilies.map(() => "native_flagship").concat(["needs_inspection"]));
+assert.ok(familyResult.entries[0].note.includes("local inspection"));
+const prototypeName = JSON.stringify({
+  formatVersion: 1, game: "minecraft", name: "Unrecognized", versionId: "1",
+  dependencies: {minecraft: "1.21.1"},
+  files: [{path: "mods/constructor.jar"}],
+});
+assert.strictEqual(m.analyzeModpackJson(prototypeName).entries[0]["class"],
+  "needs_inspection");
+
 // --- CurseForge manifest ------------------------------------------------
 const cf = JSON.stringify({
   manifestType: "minecraftModpack",
@@ -371,6 +433,37 @@ assert.strictEqual(
   cfCls["mods/curseforge-project-5-file-6.jar"], "needs_inspection");
 assert.deepStrictEqual(cfReport.loaders,
   [{id: "neoforge", version: "21.1.93", primary: true}]);
+
+// Actual CurseForge exports contain numeric IDs, often without slugs.
+const cf26 = JSON.stringify({
+  minecraft: {version: "26.3", modLoaders: [
+    {id: "neoforge-26.3.0", primary: true},
+  ]},
+  manifestType: "minecraftModpack",
+  manifestVersion: 1,
+  name: "26.3 export",
+  version: "1.0",
+  author: "Example",
+  files: [
+    {projectID: 4321, fileID: 1234, required: true},
+    {projectID: 4322, fileID: 1235, fileName: "appleskin-26.3.jar"},
+  ],
+  overrides: "overrides",
+});
+const cf26Report = m.analyzeModpackJson(cf26, {fileName: "manifest.json", target: "26.3"});
+assert.strictEqual(cf26Report.version_verdict.kind, "compatible");
+assert.deepStrictEqual(cf26Report.entries.map(e => e["class"]),
+  ["needs_inspection", "native_flagship"]);
+assert.strictEqual(m.analyzeModpackJson(cf26, {target: "1.20.1"})
+  .readiness, "version_mismatch");
+const cfOld = JSON.stringify({
+  manifestType: "minecraftModpack", manifestVersion: 1,
+  name: "Old CF pack", version: "1",
+  minecraft: {version: "1.20.1", modLoaders: [{id: "forge-47.4.0", primary: true}]},
+  files: [{projectID: 700, fileID: 900}],
+});
+assert.strictEqual(m.analyzeModpackJson(cfOld, {target: "26.3"})
+  .readiness, "version_mismatch");
 
 // --- Version gate --------------------------------------------------------
 const oldPack = JSON.stringify({
@@ -443,6 +536,8 @@ expectThrow(JSON.stringify({
 }), "modrinth.index.json", "formatVersion");
 expectThrow("{not json", "manifest.json", "invalid JSON");
 expectThrow("{}", "pack.json", "cannot determine pack format");
+expectThrow(" ".repeat(2 * 1024 * 1024 + 1), "manifest.json", "2 MiB");
+expectThrow("界".repeat(700000), "manifest.json", "2 MiB");
 
 // --- .mrpack / .zip archive extraction (pure-JS ZIP reader) --------------
 const zlib = require("zlib");
@@ -602,24 +697,30 @@ async function expectExtractThrow(bytes, fileName, needle) {
     new Uint8Array(corrupt), "corrupt.mrpack",
     /crc|corrupt|deflate|mismatch|size/i);
 
-  // Declared >16 MiB uncompressed: rejected before a byte is inflated.
+  // Declared >2 MiB uncompressed: rejected before a byte is inflated.
   const declaredBomb = Buffer.from(mrpack);
   declaredBomb.writeUInt32LE(
-    17 * 1024 * 1024,
+    3 * 1024 * 1024,
     findCdEntry(declaredBomb, "modrinth.index.json") + 24);
   await expectExtractThrow(
-    new Uint8Array(declaredBomb), "declared-bomb.mrpack", "16 MiB");
+    new Uint8Array(declaredBomb), "declared-bomb.mrpack", "2 MiB");
 
-  // Lying about the size: real output is 17 MiB while the central
+  // Lying about the size: real output is 3 MiB while the central
   // directory claims 100 — the streaming cap must still stop it.
   const streamBomb = Buffer.from(buildZip([
     {name: "modrinth.index.json",
-     data: Buffer.alloc(17 * 1024 * 1024), method: 8},
+     data: Buffer.alloc(3 * 1024 * 1024), method: 8},
   ]));
   streamBomb.writeUInt32LE(
     100, findCdEntry(streamBomb, "modrinth.index.json") + 24);
   await expectExtractThrow(
-    new Uint8Array(streamBomb), "stream-bomb.mrpack", "16 MiB");
+    new Uint8Array(streamBomb), "stream-bomb.mrpack", "2 MiB");
+
+  const overArchive = buildZip([
+    {name: "manifest.json", data: Buffer.alloc(2 * 1024 * 1024), method: 0},
+  ]);
+  await expectExtractThrow(new Uint8Array(overArchive),
+    "oversized.zip", "file exceeds the 2 MiB limit");
 
   const encrypted = Buffer.from(cfZip);
   encrypted.writeUInt16LE(

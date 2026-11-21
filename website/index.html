@@ -131,7 +131,7 @@
       <div class="wrap">
         <div class="section-head">
           <h2 data-i18n="checker_title">Check your modpack right here.</h2>
-          <p class="section-note" data-i18n="checker_note">Runs entirely in this tab — nothing is uploaded.</p>
+          <p class="section-note" data-i18n="checker_note">Runs 100% locally in your browser — nothing is uploaded.</p>
         </div>
         <p class="section-desc" data-i18n="checker_desc">
           Drop a Modrinth <code>.mrpack</code> or CurseForge <code>.zip</code> to see which optimization mods are skipped automatically,
@@ -158,11 +158,22 @@
             <span class="hint" data-i18n="checker_hint">or click to browse</span>
             <input type="file" id="file-input" accept=".mrpack,.zip,.json" hidden>
           </div>
+          <div class="checker-paste">
+            <label for="paste-json" data-i18n="checker_paste_label">Or paste Modrinth modrinth.index.json / CurseForge manifest.json</label>
+            <textarea id="paste-json" rows="5" spellcheck="false" aria-describedby="checker-limit"
+                      placeholder="Paste the manifest JSON here" data-i18n-placeholder="checker_paste_placeholder"></textarea>
+            <div class="checker-paste-actions">
+              <span id="checker-limit" class="hint" data-i18n="checker_limit">Maximum input size: 2 MiB (file or pasted JSON).</span>
+              <button class="btn small" id="paste-analyze-btn" type="button" data-i18n="checker_paste_button">Analyze pasted JSON</button>
+            </div>
+          </div>
 
           <div class="checker-error" id="checker-error" role="alert"></div>
 
           <div class="report" id="report" aria-live="polite">
             <div class="readiness" id="readiness"><span class="r-icon" id="readiness-icon"></span><span id="readiness-text"></span></div>
+            <div class="report-stats" id="report-stats" aria-label="Compatibility summary" data-i18n-aria-label="checker_stats_aria"></div>
+            <p class="checker-inspection-note" data-i18n="checker_inspection">Needs mc-spine-mod-check --scan-mods-dir for Mixin/.class inspection — never guesses arbitrary Java compatibility!</p>
             <div class="report-grid" id="report-groups"></div>
             <div class="entries-table-wrap">
               <table class="entries-table">
@@ -427,12 +438,18 @@ cargo run --locked</code></pre>
       m_startup_val: "JVM 不要 / GC 停止 0 ms",
       bench_caveat: "RAM・スレッド数：tools/load_compare.sh（同一マシン・20 秒移動負荷、evidence/gameplay/load-compare/receipt.json）。セクション直列化：issue41-palette-bench（release）。ボイス中継：mc-spine-voice-relay --bench-packets（32人・3次元・約64万 frame/s）。※ Alpha 版は本家より機能が少なく、データパック込みの本番起動速度・地形生成 CPU 最適化は引き続き計測・改善中です。",
       checker_title: "手元の Modpack をその場で診断。",
-      checker_note: "このタブ内で完結 — ファイルは一切送信されません。",
+      checker_note: "ブラウザ内で完結します — ファイルは一切送信されません。",
       checker_desc: "Modrinth の .mrpack や CurseForge の .zip を落とすだけで、自動スキップされる軽量化 Mod・ネイティブ動作・要検査 JAR を即座に表示します。",
       checker_target: "対象バージョン",
       checker_sample: "サンプルパックを試す",
       checker_drop: ".mrpack / CurseForge .zip / manifest .json をドロップ",
       checker_hint: "またはクリックしてファイルを選択",
+      checker_paste_label: "または Modrinth modrinth.index.json / CurseForge manifest.json を貼り付け",
+      checker_paste_placeholder: "manifest の JSON を貼り付けてください",
+      checker_limit: "入力上限: 2 MiB（ファイル・貼り付け JSON）。",
+      checker_paste_button: "貼り付けた JSON を診断",
+      checker_inspection: "任意の Java Mod の互換性を推測しません。Mixin/.class の検査には mc-spine-mod-check --scan-mods-dir が必要です。",
+      checker_stats_aria: "互換性の概要",
       checker_raw: "JSON レポートとテキスト要約",
       how_title: "軽さの理由と仕組み",
       p1_title: "Create 工場が重くならない設計",

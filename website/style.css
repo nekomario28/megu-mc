@@ -455,6 +455,51 @@ h3 {
   color: var(--text-faint);
 }
 
+.checker-paste {
+  margin-top: 14px;
+  display: grid;
+  gap: 8px;
+}
+
+.checker-paste label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+.checker-paste textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 110px;
+  padding: 12px;
+  resize: vertical;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.checker-paste textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.checker-paste-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.checker-paste-actions .hint {
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
 .checker-error {
   display: none;
   margin-top: 12px;
@@ -477,6 +522,39 @@ h3 {
 
 .report.visible {
   display: block;
+}
+
+.report-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
+  gap: 10px;
+  margin: 14px 0;
+}
+
+.report-stats .stat-card {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.report-stats .stat-num {
+  overflow-wrap: anywhere;
+}
+
+.report-stats .stat-card.warning .stat-num {
+  color: var(--red);
+}
+
+.checker-inspection-note {
+  padding: 9px 12px;
+  margin: 12px 0 4px;
+  border-inline-start: 3px solid var(--yellow);
+  color: var(--text-dim);
+  background: var(--bg);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
 }
 
 .readiness {

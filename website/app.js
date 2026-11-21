@@ -647,8 +647,30 @@
   var READINESS_NEEDS_JAR_INSPECTION = "needs_jar_inspection";
   var READINESS_VERSION_MISMATCH = "version_mismatch";
 
-  // Standalone-manifest size cap, mirroring MAX_MANIFEST_MEMBER_BYTES.
-  var MAX_MANIFEST_MEMBER_BYTES = 16 * 1024 * 1024;
+  // Bound dropped archives, extracted manifests and pasted JSON alike.
+  var MAX_MANIFEST_MEMBER_BYTES = 2 * 1024 * 1024;
+
+  // Candidate identifiers for known native/adapter families. A name
+  // match never proves that a particular Java JAR or Mixin is compatible.
+  var KNOWN_NATIVE_ADAPTER_FAMILIES = {
+    create: "Create",
+    farmersdelight: "Farmer's Delight",
+    openpac: "Open Parties and Claims",
+    openpartiesandclaims: "Open Parties and Claims",
+    ftbchunks: "FTB Chunks",
+    ae2: "Applied Energistics 2",
+    appliedenergistics2: "Applied Energistics 2",
+    twilightforest: "Twilight Forest",
+    thetwilightforest: "Twilight Forest",
+    aether: "Aether",
+    theaether: "Aether",
+    terrablender: "TerraBlender",
+    appleskin: "AppleSkin",
+    xaerosminimap: "Xaero's Minimap",
+    xaerosworldmap: "Xaero's World Map",
+    simplevoicechat: "Simple Voice Chat",
+    voicechat: "Simple Voice Chat",
+  };
 
   // ---------------------------------------------------------------------
   // JSON field helpers (req_obj/req_str/req_u64/req_array)
@@ -1034,7 +1056,7 @@
   // ---------------------------------------------------------------------
   // Minimal ZIP reader — just enough to pull the manifest member out of a
   // dropped .mrpack or CurseForge .zip. Bounds-checked end to end and
-  // fail-closed: multi-disk, encrypted, ZIP64, corrupt, and >16 MiB
+  // fail-closed: multi-disk, encrypted, ZIP64, corrupt, and >2 MiB
   // members are all hard errors, never silent skips. Compression method 0
   // (Stored) needs no decoder; method 8 (Deflate) inflates through the
   // standard DecompressionStream('deflate-raw') that modern browsers (and
@@ -1239,7 +1261,7 @@
     }
     if (entry.uncompressedSize > MAX_MANIFEST_MEMBER_BYTES) {
       throw new ModpackError(
-        ctx + ": '" + entry.name + "' exceeds the 16 MiB limit");
+        ctx + ": '" + entry.name + "' exceeds the 2 MiB limit");
     }
     var off = entry.localOffset;
     if (off + 30 > bytes.length ||
@@ -1295,7 +1317,7 @@
         if (total > MAX_MANIFEST_MEMBER_BYTES) {
           return reader.cancel().then(function () {
             throw new ModpackError(
-              ctx + ": decompressed data exceeds the 16 MiB limit");
+              ctx + ": decompressed data exceeds the 2 MiB limit");
           });
         }
         chunks.push(result.value);
@@ -1334,6 +1356,10 @@
     } else {
       return Promise.reject(new ModpackError(
         ctx + ": archive bytes must be a Uint8Array"));
+    }
+    if (buf.byteLength > MAX_MANIFEST_MEMBER_BYTES) {
+      return Promise.reject(new ModpackError(
+        ctx + ": file exceeds the 2 MiB limit"));
     }
     var member;
     var data;
@@ -1402,6 +1428,14 @@
           note: "covered by a declarative offload profile (no Java)",
         };
       }
+      if (hasKey(KNOWN_NATIVE_ADAPTER_FAMILIES, key)) {
+        return {
+          cls: CLASS_NATIVE_FLAGSHIP,
+          note: "recognized " + KNOWN_NATIVE_ADAPTER_FAMILIES[key] +
+            " native/adapter family; actual JAR and Mixin compatibility " +
+            "requires local inspection",
+        };
+      }
     }
     if (f.path.indexOf("datapacks/") === 0) {
       return {
@@ -1417,13 +1451,13 @@
     }
     return {
       cls: CLASS_NEEDS_INSPECTION,
-      note: "unrecognized Java mod — its bytecode still needs a " +
-        "compatibility inspection before launch",
+      note: "unrecognized Java mod — use mc-spine-mod-check " +
+        "--scan-mods-dir to inspect Mixin/.class before launch",
     };
   }
 
   function keySet(ids) {
-    var set = {};
+    var set = Object.create(null);
     ids.forEach(function (id) {
       set[normalizedModKey(id)] = true;
     });
@@ -1543,30 +1577,31 @@
     if (native.length) {
       lines.push(
         "  - " + native.length +
-          " mod(s) run natively with no Java needed: " +
+          " known native/adapter family or data-file candidate(s) " +
+          "(JAR-level support requires validation): " +
           native.join(", "));
     }
     var inspect = report.needs_inspection_mods;
     if (inspect.length) {
       lines.push(
         "  - " + inspect.length +
-          " Java mod(s) still need a compatibility inspection before " +
-          "launch: " + inspect.join(", "));
+          " Java mod(s) need mc-spine-mod-check --scan-mods-dir " +
+          "for Mixin/.class inspection: " + inspect.join(", "));
     }
 
     var result;
     switch (report.readiness) {
       case READINESS_READY_NATIVE:
-        result = "ready — every file in this pack runs natively on " +
-          "mc-spine.";
+        result = "no unknown Java mod IDs found in this manifest; " +
+          "validate JAR support in the local runtime.";
         break;
       case READINESS_READY_WITH_AUTO_SKIPS:
-        result = "ready — redundant and client-only files are skipped " +
-          "automatically; the rest runs natively.";
+        result = "redundant and client-only files can be skipped; " +
+          "validate remaining JAR support in the local runtime.";
         break;
       case READINESS_NEEDS_JAR_INSPECTION:
-        result = "almost ready — the Java mod(s) listed above still need " +
-          "a compatibility check before launch.";
+        result = "unrecognized Java mods require local Mixin/.class " +
+          "inspection before launch.";
         break;
       default:
         result = "not compatible — this pack was built for a different " +
@@ -1600,12 +1635,13 @@
     if (typeof text !== "string") {
       throw new ModpackError(display + ": manifest is not UTF-8 text");
     }
-    var byteLen = typeof TextEncoder !== "undefined"
-      ? new TextEncoder().encode(text).length
-      : text.length;
+    if (typeof TextEncoder === "undefined") {
+      throw new ModpackError(display + ": UTF-8 size validation unavailable");
+    }
+    var byteLen = new TextEncoder().encode(text).length;
     if (byteLen > MAX_MANIFEST_MEMBER_BYTES) {
       throw new ModpackError(
-        display + ": manifest exceeds the 16 MiB limit");
+        display + ": manifest exceeds the 2 MiB limit");
     }
 
     var targetStr = opts.target ||
@@ -2165,6 +2201,7 @@
   // -- Pre-flight checker UI ------------------------------------------------
 
   var lastInput = null; // {text, fileName}
+  var lastReport = null;
 
   function showError(message) {
     var box = $("checker-error");
@@ -2182,18 +2219,17 @@
   var READINESS_LABEL = {};
   READINESS_LABEL[READINESS_READY_NATIVE] = {
     icon: "✓",
-    text: "ready — every file in this pack runs natively on " +
-      CFG.projectName + ".",
+    text: "no unknown Java mod IDs found; validate JAR support locally.",
   };
   READINESS_LABEL[READINESS_READY_WITH_AUTO_SKIPS] = {
     icon: "✓",
-    text: "ready — redundant and client-only files are skipped " +
-      "automatically; the rest runs natively.",
+    text: "redundant and client-only files can be skipped; " +
+      "validate remaining JAR support locally.",
   };
   READINESS_LABEL[READINESS_NEEDS_JAR_INSPECTION] = {
     icon: "⚠",
-    text: "almost ready — the Java mod(s) listed below still need a " +
-      "compatibility check before launch.",
+    text: "unrecognized Java mods need local Mixin/.class " +
+      "inspection before launch.",
   };
   READINESS_LABEL[READINESS_VERSION_MISMATCH] = {
     icon: "✕",
@@ -2232,6 +2268,7 @@
 
   function renderReport(report) {
     clearError();
+    lastReport = report;
     var reportEl = $("report");
     reportEl.classList.add("visible");
 
@@ -2243,6 +2280,48 @@
       "Pre-flight for \"" + report.pack_name + "\" " + report.pack_version +
       " (" + report.format + ", declared MC " + report.mc_version_declared +
       ", server " + report.target + "): " + label.text;
+
+    var ja = document.documentElement.lang === "ja";
+    var verdictOk = report.version_verdict.kind === "compatible";
+    var nativeAdapterCount = report.entries.filter(function (entry) {
+      return entry["class"] === CLASS_NATIVE_FLAGSHIP ||
+        (entry["class"] === CLASS_UNIVERSAL_NATIVE &&
+         isJarName(entry.path.split("/").pop()));
+    }).length;
+    var stats = $("report-stats");
+    stats.textContent = "";
+    [
+      {
+        value: verdictOk ? (ja ? "一致" : "Match") : (ja ? "不一致" : "Mismatch"),
+        label: (ja ? "MC バージョン" : "MC version verdict") +
+          " · " + report.mc_version_declared + " → " + report.target,
+        warning: !verdictOk,
+      },
+      {
+        value: report.skipped_perf_mods.length,
+        label: ja ? "自動スキップする軽量化 Mod" : "Auto-skipped perf mods",
+      },
+      {
+        value: nativeAdapterCount,
+        label: ja ? "既知のネイティブ／アダプター候補" : "Native / adapter families",
+      },
+      {
+        value: report.needs_inspection_mods.length,
+        label: ja ? "ローカル JAR 検査が必要" : "Needs local JAR inspection",
+      },
+    ].forEach(function (stat) {
+      var card = document.createElement("div");
+      card.className = "stat-card" + (stat.warning ? " warning" : "");
+      var num = document.createElement("div");
+      num.className = "stat-num";
+      num.textContent = String(stat.value);
+      var desc = document.createElement("div");
+      desc.className = "stat-label";
+      desc.textContent = stat.label;
+      card.appendChild(num);
+      card.appendChild(desc);
+      stats.appendChild(card);
+    });
 
     var groups = $("report-groups");
     groups.textContent = "";
@@ -2257,10 +2336,12 @@
       groups, "client-only", "Client-side only — server skips",
       report.client_only_mods);
     addGroup(
-      groups, "native", "Runs natively — no Java",
+      groups, "native", ja ? "ネイティブ／アダプター候補・データファイル" :
+        "Native / adapter candidates and data files",
       report.native_mods);
     addGroup(
-      groups, "inspect", "Needs compatibility inspection",
+      groups, "inspect", ja ? "ローカル JAR 検査が必要" :
+        "Needs compatibility inspection",
       report.needs_inspection_mods);
 
     var body = $("entries-body");
@@ -2304,7 +2385,7 @@
       renderReport(report);
     } catch (e) {
       if (e instanceof ModpackError) {
-        showError(fileName + ": " + e.message);
+        showError(e.message);
       } else {
         showError(fileName + ": unexpected error (" + e.message + ")");
       }
@@ -2316,6 +2397,8 @@
     var fileInput = $("file-input");
     var sampleBtn = $("sample-pack-btn");
     var select = $("mc-target-select");
+    var pasteInput = $("paste-json");
+    var pasteBtn = $("paste-analyze-btn");
 
     dropzone.addEventListener("click", function () {
       fileInput.click();
@@ -2356,6 +2439,16 @@
       runAnalysis(SAMPLE_MODRINTH_INDEX_JSON, "modrinth.index.json");
     });
 
+    pasteBtn.addEventListener("click", function () {
+      runAnalysis(pasteInput.value, "pasted JSON");
+    });
+
+    document.addEventListener("megu:languagechange", function () {
+      if (lastReport && $("report").classList.contains("visible")) {
+        renderReport(lastReport);
+      }
+    });
+
     select.addEventListener("change", function () {
       if (lastInput) {
         runAnalysis(lastInput.text, lastInput.fileName);
@@ -2373,11 +2466,20 @@
   }
 
   function readManifestFile(file) {
+    if (file.size > MAX_MANIFEST_MEMBER_BYTES) {
+      showError(file.name + ": file exceeds the 2 MiB limit");
+      return;
+    }
     var reader = new FileReader();
     reader.onload = function () {
       var bytes = new Uint8Array(reader.result);
       if (!looksLikeZipBytes(bytes)) {
-        runAnalysis(utf8DecodeLossy(bytes), file.name);
+        var decoded = utf8DecodeStrict(bytes);
+        if (decoded === null) {
+          showError(file.name + ": manifest is not valid UTF-8");
+          return;
+        }
+        runAnalysis(decoded, file.name);
         return;
       }
       extractManifestFromZipBytes(bytes, file.name).then(function (res) {
