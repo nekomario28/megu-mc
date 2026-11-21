@@ -3,7 +3,9 @@
 //! Integer pressure-head equilibrium. A connected component carries at most
 //! one fluid. A positive link head raises the equilibrium fill on its b side.
 
-use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, VecDeque};
+use std::collections::{
+    btree_map::Entry as BTreeEntry, hash_map::Entry, BTreeMap, BTreeSet, HashMap, VecDeque,
+};
 
 pub type TankId = u32;
 pub type FluidId = u32;
@@ -40,8 +42,12 @@ struct Tank {
 
 #[derive(Default)]
 pub struct FluidNetwork {
-    tanks: BTreeMap<TankId, Tank>,
+    tanks: HashMap<TankId, Tank>,
     dirty: BTreeSet<TankId>,
+    scratch_offsets: HashMap<TankId, i128>,
+    scratch_queue: VecDeque<TankId>,
+    scratch_ids: Vec<TankId>,
+    scratch_columns: Vec<(TankId, i128, u32)>,
 }
 
 impl FluidNetwork {
@@ -130,14 +136,14 @@ impl FluidNetwork {
         if amount == 0 {
             return Ok(0);
         }
-        let resident = tank
-            .state
-            .fluid
-            .or_else(|| self.fluid_in(&self.component(id, None)));
+        let capacity = tank.capacity;
+        let current = tank.state.amount;
+        let resident_fluid = tank.state.fluid;
+        let resident = resident_fluid.or_else(|| self.fluid_in_component(id));
         if resident.is_some_and(|other| other != fluid) {
             return Err(FluidError::IncompatibleFluids);
         }
-        let accepted = amount.min(tank.capacity - tank.state.amount);
+        let accepted = amount.min(capacity - current);
         if accepted != 0 {
             let state = &mut self.tanks.get_mut(&id).unwrap().state;
             state.fluid = Some(fluid);
@@ -174,29 +180,62 @@ impl FluidNetwork {
 
     /// Solve one dirty component and report only solver-induced state changes.
     pub fn step(&mut self) -> Option<FluidSolve> {
-        let source = self.dirty.pop_first()?;
-        let component = self.component(source, None);
-        let mut result = FluidSolve {
+        let mut changes = Vec::new();
+        let (source, visited_nodes) = self.step_into(&mut changes)?;
+        Some(FluidSolve {
             source,
-            visited_nodes: component.len(),
-            changes: Vec::new(),
-        };
+            visited_nodes,
+            changes,
+        })
+    }
+
+    /// Solve one dirty component into a caller-reused change buffer.
+    pub(crate) fn step_into(
+        &mut self,
+        changes: &mut Vec<(TankId, TankState)>,
+    ) -> Option<(TankId, usize)> {
+        changes.clear();
+        let source = self.dirty.pop_first()?;
+        let mut offsets = std::mem::take(&mut self.scratch_offsets);
+        let mut queue = std::mem::take(&mut self.scratch_queue);
+        offsets.clear();
+        queue.clear();
+        offsets.insert(source, 0);
+        queue.push_back(source);
+        while let Some(id) = queue.pop_front() {
+            let offset = offsets[&id];
+            for (&other, &head) in &self.tanks[&id].links {
+                if let Entry::Vacant(entry) = offsets.entry(other) {
+                    entry.insert(offset + i128::from(head));
+                    queue.push_back(other);
+                }
+            }
+        }
+        let visited_nodes = offsets.len();
+
+        let mut ids = std::mem::take(&mut self.scratch_ids);
+        ids.clear();
+        ids.extend(offsets.keys().copied());
+        ids.sort_unstable();
+        let mut columns = std::mem::take(&mut self.scratch_columns);
+        columns.clear();
         let mut volume = 0_u64;
         let mut capacity = 0_u64;
         let mut fluid = None;
-        let columns: Vec<_> = component
-            .into_iter()
-            .map(|(id, head)| {
-                self.dirty.remove(&id);
-                let tank = &self.tanks[&id];
-                volume += u64::from(tank.state.amount);
-                capacity += u64::from(tank.capacity);
-                fluid = fluid.or(tank.state.fluid);
-                (id, i128::from(tank.elevation) - head, tank.capacity)
-            })
-            .collect();
+        for &id in &ids {
+            self.dirty.remove(&id);
+            let tank = &self.tanks[&id];
+            volume += u64::from(tank.state.amount);
+            capacity += u64::from(tank.capacity);
+            fluid = fluid.or(tank.state.fluid);
+            columns.push((id, i128::from(tank.elevation) - offsets[&id], tank.capacity));
+        }
+        self.scratch_offsets = offsets;
+        self.scratch_queue = queue;
+        self.scratch_ids = ids;
         if columns.len() == 1 || volume == 0 || volume == capacity {
-            return Some(result);
+            self.scratch_columns = columns;
+            return Some((source, visited_nodes));
         }
 
         // Find the highest integer surface whose fill does not exceed the
@@ -226,7 +265,7 @@ impl FluidNetwork {
                 .iter()
                 .map(|&(_, base, cap)| u64::from(filled(low, base, cap)))
                 .sum::<u64>();
-        for (id, base, cap) in columns {
+        for &(id, base, cap) in &columns {
             let mut amount = filled(low, base, cap);
             if remainder > 0 && filled(high, base, cap) > amount {
                 amount += 1;
@@ -239,15 +278,45 @@ impl FluidNetwork {
             let tank = self.tanks.get_mut(&id).unwrap();
             if tank.state != state {
                 tank.state = state;
-                result.changes.push((id, state));
+                changes.push((id, state));
             }
         }
         debug_assert_eq!(remainder, 0);
-        Some(result)
+        self.scratch_columns = columns;
+        Some((source, visited_nodes))
     }
 
     fn get(&self, id: TankId) -> Result<&Tank, FluidError> {
         self.tanks.get(&id).ok_or(FluidError::MissingTank(id))
+    }
+
+    /// Find the resident fluid of a component in ascending tank-ID order,
+    /// reusing the same scratch buffers as the solver.
+    fn fluid_in_component(&mut self, source: TankId) -> Option<FluidId> {
+        let mut offsets = std::mem::take(&mut self.scratch_offsets);
+        let mut queue = std::mem::take(&mut self.scratch_queue);
+        offsets.clear();
+        queue.clear();
+        offsets.insert(source, 0);
+        queue.push_back(source);
+        while let Some(id) = queue.pop_front() {
+            let offset = offsets[&id];
+            for (&other, &head) in &self.tanks[&id].links {
+                if let Entry::Vacant(entry) = offsets.entry(other) {
+                    entry.insert(offset + i128::from(head));
+                    queue.push_back(other);
+                }
+            }
+        }
+        let mut ids = std::mem::take(&mut self.scratch_ids);
+        ids.clear();
+        ids.extend(offsets.keys().copied());
+        ids.sort_unstable();
+        let fluid = ids.iter().find_map(|&id| self.tanks[&id].state.fluid);
+        self.scratch_offsets = offsets;
+        self.scratch_queue = queue;
+        self.scratch_ids = ids;
+        fluid
     }
 
     fn component(
@@ -263,7 +332,7 @@ impl FluidNetwork {
                 if skip_edge == Some((id, other)) || skip_edge == Some((other, id)) {
                     continue;
                 }
-                if let Entry::Vacant(entry) = offsets.entry(other) {
+                if let BTreeEntry::Vacant(entry) = offsets.entry(other) {
                     entry.insert(offset + i128::from(head));
                     queue.push_back(other);
                 }

@@ -98,7 +98,8 @@ pub struct Region {
     transport: SleepingTransport,
     fluid: FluidNetwork,
     recipes: RecipeProcessor,
-    fluid_updates: std::vec::IntoIter<(u32, TankState)>,
+    fluid_updates: Vec<(u32, TankState)>,
+    fluid_cursor: usize,
     pub(crate) batch: BatchQueue,
 }
 
@@ -113,12 +114,46 @@ struct Delta {
     tick: u64,
     source: u32,
     kind: u16,
-    payload: Box<[u8]>,
+    payload: Payload,
+}
+
+/// Built-in records fit inline; only adapter snapshots larger than this spill
+/// to the heap.
+const INLINE_PAYLOAD_BYTES: usize = 16;
+
+enum Payload {
+    Inline {
+        len: u16,
+        bytes: [u8; INLINE_PAYLOAD_BYTES],
+    },
+    Heap(Box<[u8]>),
+}
+
+impl Payload {
+    fn new(bytes: &[u8]) -> Self {
+        if bytes.len() <= INLINE_PAYLOAD_BYTES {
+            let mut inline = [0; INLINE_PAYLOAD_BYTES];
+            inline[..bytes.len()].copy_from_slice(bytes);
+            Self::Inline {
+                len: bytes.len() as u16,
+                bytes: inline,
+            }
+        } else {
+            Self::Heap(bytes.into())
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Inline { len, bytes } => &bytes[..*len as usize],
+            Self::Heap(bytes) => bytes,
+        }
+    }
 }
 
 impl Delta {
     fn bytes(&self) -> usize {
-        RECORD_HEADER_BYTES + self.payload.len()
+        RECORD_HEADER_BYTES + self.payload.as_slice().len()
     }
 }
 
@@ -130,7 +165,8 @@ impl Region {
             transport: SleepingTransport::default(),
             fluid: FluidNetwork::default(),
             recipes: RecipeProcessor::default(),
-            fluid_updates: Vec::new().into_iter(),
+            fluid_updates: Vec::new(),
+            fluid_cursor: 0,
             batch: BatchQueue::new(key),
         }
     }
@@ -243,10 +279,14 @@ impl Region {
             self.recipes.advance_idle_to(due);
             match work {
                 Work::Fluid => {
-                    if self.fluid_updates.len() == 0 {
-                        self.fluid_updates = self.fluid.step().unwrap().changes.into_iter();
+                    if self.fluid_cursor == self.fluid_updates.len() {
+                        self.fluid_updates.clear();
+                        self.fluid_cursor = 0;
+                        self.fluid.step_into(&mut self.fluid_updates);
                     }
-                    if let Some((id, state)) = self.fluid_updates.next() {
+                    if self.fluid_cursor < self.fluid_updates.len() {
+                        let (id, state) = self.fluid_updates[self.fluid_cursor];
+                        self.fluid_cursor += 1;
                         self.queue_tank(due, id, state);
                     }
                 }
@@ -277,7 +317,7 @@ impl Region {
     }
 
     fn next_work(&self) -> Option<(u64, Work)> {
-        if self.fluid_updates.len() != 0 || self.fluid.has_pending() {
+        if self.fluid_cursor < self.fluid_updates.len() || self.fluid.has_pending() {
             return Some((self.transport.now(), Work::Fluid));
         }
         match (self.transport.next_wake_tick(), self.recipes.next_due()) {
@@ -400,9 +440,9 @@ impl BatchQueue {
             record[..8].copy_from_slice(&delta.tick.to_le_bytes());
             record[8..12].copy_from_slice(&delta.source.to_le_bytes());
             record[12..14].copy_from_slice(&delta.kind.to_le_bytes());
-            record[14..16].copy_from_slice(&(delta.payload.len() as u16).to_le_bytes());
+            record[14..16].copy_from_slice(&(delta.payload.as_slice().len() as u16).to_le_bytes());
             write(offset, &record);
-            write(offset + RECORD_HEADER_BYTES, &delta.payload);
+            write(offset + RECORD_HEADER_BYTES, delta.payload.as_slice());
             offset += bytes;
             count += 1;
             self.pending_bytes -= bytes;
@@ -435,7 +475,7 @@ impl BatchQueue {
             tick,
             source,
             kind,
-            payload: payload.into(),
+            payload: Payload::new(payload),
         });
     }
 }

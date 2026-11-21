@@ -3,7 +3,9 @@
 //! Kinetic topology and cached component solutions. Edits solve synchronously and
 //! only traverse adjacent edges of affected components.
 
-use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, VecDeque};
+use std::collections::{
+    btree_map::Entry as BTreeEntry, hash_map::Entry, BTreeMap, BTreeSet, HashMap, VecDeque,
+};
 
 /// Capacity and load are additive stress units in a common frame. A mod adapter
 /// can normalize its own speed-dependent rules before supplying these values.
@@ -50,7 +52,10 @@ struct Node {
 
 #[derive(Default)]
 pub struct KineticGraph {
-    nodes: BTreeMap<u32, Node>,
+    nodes: HashMap<u32, Node>,
+    scratch_scales: BTreeMap<u32, f64>,
+    scratch_queue: VecDeque<u32>,
+    scratch_members: Vec<u32>,
 }
 
 impl KineticGraph {
@@ -84,9 +89,8 @@ impl KineticGraph {
         }
         let mut visited = 0;
         while let Some(start) = neighbors.pop_first() {
-            let component = self.solve(start);
-            visited += component.len();
-            for member in component.keys() {
+            visited += self.solve(start);
+            for member in &self.scratch_members {
                 neighbors.remove(member);
             }
         }
@@ -102,7 +106,7 @@ impl KineticGraph {
         }
         node.input = input;
         let root = node.solution.component;
-        Ok(self.solve(root).len())
+        Ok(self.solve(root))
     }
 
     /// Connect two nodes with `speed[b] = speed[a] * ratio`. A negative ratio
@@ -122,7 +126,7 @@ impl KineticGraph {
             .min(self.nodes[&b].solution.component);
         self.nodes.get_mut(&a).unwrap().edges.insert(b, ratio);
         self.nodes.get_mut(&b).unwrap().edges.insert(a, inverse);
-        Ok(self.solve(root).len())
+        Ok(self.solve(root))
     }
 
     /// Remove an edge and solve each resulting component once.
@@ -134,12 +138,13 @@ impl KineticGraph {
         self.nodes.get_mut(&b).unwrap().edges.remove(&a);
         let root = self.nodes[&a].solution.component;
         let first = self.solve(root);
-        for endpoint in [a, b] {
-            if !first.contains_key(&endpoint) {
-                return Ok(first.len() + self.solve(endpoint).len());
-            }
+        if self.scratch_members.binary_search(&a).is_err() {
+            return Ok(first + self.solve(a));
         }
-        Ok(first.len())
+        if self.scratch_members.binary_search(&b).is_err() {
+            return Ok(first + self.solve(b));
+        }
+        Ok(first)
     }
 
     pub fn solution(&self, id: u32) -> Option<Solution> {
@@ -163,22 +168,29 @@ impl KineticGraph {
         Ok(())
     }
 
-    fn solve(&mut self, start: u32) -> BTreeMap<u32, f64> {
-        let mut queue = VecDeque::from([start]);
-        let mut scales = BTreeMap::from([(start, 1.0)]);
+    /// Solve one connected component, publishing its solution and leaving the
+    /// sorted member IDs in `scratch_members`. Returns the number of members.
+    fn solve(&mut self, start: u32) -> usize {
+        let mut scales = std::mem::take(&mut self.scratch_scales);
+        let mut queue = std::mem::take(&mut self.scratch_queue);
+        scales.clear();
+        queue.clear();
+        scales.insert(start, 1.0);
+        queue.push_back(start);
         let mut conflict = false;
         while let Some(id) = queue.pop_front() {
+            let base = scales[&id];
             for (&neighbor, &ratio) in &self.nodes[&id].edges {
-                let scale = scales[&id] * ratio;
+                let scale = base * ratio;
                 if !scale.is_finite() || scale == 0.0 {
                     conflict = true;
                 }
                 match scales.entry(neighbor) {
-                    Entry::Vacant(entry) => {
+                    BTreeEntry::Vacant(entry) => {
                         entry.insert(scale);
                         queue.push_back(neighbor);
                     }
-                    Entry::Occupied(entry) => conflict |= !close(*entry.get(), scale),
+                    BTreeEntry::Occupied(entry) => conflict |= !close(*entry.get(), scale),
                 }
             }
         }
@@ -227,7 +239,15 @@ impl KineticGraph {
                 status,
             };
         }
-        scales
+
+        let mut members = std::mem::take(&mut self.scratch_members);
+        members.clear();
+        members.extend(scales.keys().copied());
+        let count = members.len();
+        self.scratch_members = members;
+        self.scratch_scales = scales;
+        self.scratch_queue = queue;
+        count
     }
 }
 

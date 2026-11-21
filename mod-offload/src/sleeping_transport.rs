@@ -3,7 +3,7 @@
 //! Deterministic item-slot FIFO transport with one scheduled wake per machine.
 //! Each connection carries items from a machine to its downstream input.
 
-use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, VecDeque};
+use std::collections::{hash_map::Entry, BTreeSet, HashMap, VecDeque};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransportError {
@@ -63,7 +63,7 @@ struct Machine {
 #[derive(Default)]
 pub struct SleepingTransport {
     now: u64,
-    machines: BTreeMap<u32, Machine>,
+    machines: HashMap<u32, Machine>,
     wakes: BTreeSet<(u64, u32)>,
 }
 

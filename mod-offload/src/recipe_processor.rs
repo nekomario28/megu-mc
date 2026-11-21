@@ -3,7 +3,7 @@
 //! Item and fluid recipes with one deadline per running machine. Ingress
 //! reconciles only affected machines. Work between deadlines accrues lazily.
 
-use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
+use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap};
 
 pub const REFERENCE_RPM: u32 = 16;
 
@@ -71,30 +71,46 @@ pub enum RecipeError {
 
 #[derive(Default)]
 struct Inventory {
-    stacks: BTreeMap<Resource, u32>,
+    /// Sorted by resource so lookups stay allocation-free.
+    stacks: Vec<(Resource, u32)>,
     used: u32,
 }
 
 impl Inventory {
     fn amount(&self, resource: Resource) -> u32 {
-        self.stacks.get(&resource).copied().unwrap_or(0)
+        match self
+            .stacks
+            .binary_search_by(|(other, _)| other.cmp(&resource))
+        {
+            Ok(index) => self.stacks[index].1,
+            Err(_) => 0,
+        }
     }
 
     fn put(&mut self, resource: Resource, amount: u32) {
         if amount > 0 {
-            *self.stacks.entry(resource).or_default() += amount;
+            match self
+                .stacks
+                .binary_search_by(|(other, _)| other.cmp(&resource))
+            {
+                Ok(index) => self.stacks[index].1 += amount,
+                Err(index) => self.stacks.insert(index, (resource, amount)),
+            }
             self.used += amount;
         }
     }
 
     fn take(&mut self, resource: Resource, requested: u32) -> u32 {
-        let Entry::Occupied(mut entry) = self.stacks.entry(resource) else {
+        let Ok(index) = self
+            .stacks
+            .binary_search_by(|(other, _)| other.cmp(&resource))
+        else {
             return 0;
         };
-        let amount = requested.min(*entry.get());
-        *entry.get_mut() -= amount;
-        if *entry.get() == 0 {
-            entry.remove();
+        let amount = requested.min(self.stacks[index].1);
+        self.stacks[index].1 -= amount;
+        if self.stacks[index].1 == 0 {
+            self.stacks.remove(index);
         }
         self.used -= amount;
         amount
@@ -105,7 +121,8 @@ struct Machine {
     input_capacity: u32,
     output_capacity: u32,
     recipes: Vec<Recipe>,
-    input_filter: BTreeSet<Resource>,
+    /// Sorted, deduplicated resources accepted at the input.
+    input_filter: Vec<Resource>,
     drive: Drive,
     input: Inventory,
     output: Inventory,
@@ -181,7 +198,7 @@ impl Machine {
 #[derive(Default)]
 pub struct RecipeProcessor {
     now: u64,
-    machines: BTreeMap<u32, Machine>,
+    machines: HashMap<u32, Machine>,
     wakes: BTreeSet<(u64, u32)>,
 }
 
@@ -201,7 +218,7 @@ impl RecipeProcessor {
             return Err(RecipeError::DuplicateMachine);
         };
         let mut ids = BTreeSet::new();
-        let mut input_filter = BTreeSet::new();
+        let mut input_filter = Vec::new();
         for recipe in &mut recipes {
             if recipe.base_ticks == 0 || recipe.outputs.is_empty() || !ids.insert(recipe.id) {
                 return Err(RecipeError::InvalidRecipe);
@@ -210,6 +227,8 @@ impl RecipeProcessor {
             normalize(&mut recipe.outputs, output_capacity)?;
             input_filter.extend(recipe.inputs.iter().map(|stack| stack.resource));
         }
+        input_filter.sort_unstable();
+        input_filter.dedup();
         entry.insert(Machine {
             input_capacity,
             output_capacity,
@@ -246,7 +265,7 @@ impl RecipeProcessor {
             .machines
             .get_mut(&id)
             .ok_or(RecipeError::UnknownMachine)?;
-        if !machine.input_filter.contains(&stack.resource) {
+        if machine.input_filter.binary_search(&stack.resource).is_err() {
             return Ok(0);
         }
         let amount = stack
@@ -345,13 +364,16 @@ impl RecipeProcessor {
 
     fn reconcile(&mut self, id: u32) {
         let machine = self.machines.get_mut(&id).unwrap();
-        if let Some(old) = machine.due {
-            self.wakes.remove(&(old, id));
-        }
         machine.accrue(self.now);
-        machine.due = machine.schedule(self.now);
-        if let Some(next) = machine.due {
-            self.wakes.insert((next, id));
+        let next = machine.schedule(self.now);
+        let old = std::mem::replace(&mut machine.due, next);
+        if old != next {
+            if let Some(old) = old {
+                self.wakes.remove(&(old, id));
+            }
+            if let Some(next) = next {
+                self.wakes.insert((next, id));
+            }
         }
     }
 }

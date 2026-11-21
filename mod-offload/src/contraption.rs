@@ -206,6 +206,7 @@ pub struct Contraption {
     cluster: BlockCluster,
     pose: Pose,
     bounds: Option<Aabb>,
+    local_axes: [Vec3; 3],
 }
 
 impl Contraption {
@@ -215,7 +216,13 @@ impl Contraption {
             cluster,
             pose,
             bounds,
+            local_axes: pose_geometry(pose),
         }
+    }
+
+    fn refresh_geometry(&mut self) {
+        self.local_axes = pose_geometry(self.pose);
+        self.bounds = cluster_bounds(&self.cluster, self.pose);
     }
 
     pub fn cluster(&self) -> &BlockCluster {
@@ -237,7 +244,7 @@ impl Contraption {
             return None;
         }
         self.pose = pose;
-        self.bounds = cluster_bounds(&self.cluster, pose);
+        self.refresh_geometry();
         Some(pose)
     }
 
@@ -264,8 +271,8 @@ impl Contraption {
             }
         });
         let next = BlockCluster::from_sorted(merged)?;
-        self.bounds = cluster_bounds(&next, self.pose);
         self.cluster = next;
+        self.refresh_geometry();
         Ok(())
     }
 
@@ -311,41 +318,63 @@ impl Contraption {
             state: Some(state),
         }));
         if !deltas.is_empty() {
-            self.bounds = cluster_bounds(&next, self.pose);
             self.cluster = next;
+            self.refresh_geometry();
         }
         deltas
     }
 
-    /// Broadphase against the cluster AABB, then test the world AABB against
-    /// occupied oriented unit boxes using the separating axis theorem.
+    /// Broadphase against the cluster AABB, then a conservative local-space
+    /// AABB reject (binary-searched by local X) before the exact SAT test on
+    /// the few remaining occupied oriented unit boxes.
     pub fn intersects(&self, query: Aabb) -> bool {
         if !self.bounds.is_some_and(|bounds| bounds.intersects(query)) {
             return false;
         }
         let center: Vec3 = std::array::from_fn(|i| query.min[i] * 0.5 + query.max[i] * 0.5);
         let half = std::array::from_fn(|i| query.max[i] * 0.5 - query.min[i] * 0.5);
-        let local_axes: [Vec3; 3] = std::array::from_fn(|i| self.pose.rotation.map(|row| row[i]));
-        self.cluster.cells.iter().any(|&(position, _)| {
-            let cell = self.pose.cell_center(position);
-            let displacement = std::array::from_fn(|i| cell[i] - center[i]);
-            let separated = |axis: Vec3| {
-                let world_radius = dot(half, axis.map(f64::abs));
-                let cell_radius = local_axes
-                    .iter()
-                    .map(|&local| dot(local, axis).abs())
-                    .sum::<f64>()
-                    * 0.5;
-                dot(displacement, axis).abs() > world_radius + cell_radius
-            };
-            !AXES.iter().chain(&local_axes).copied().any(separated)
-                && !AXES.iter().any(|&world| {
-                    local_axes
-                        .iter()
-                        .any(|&local| separated(cross(world, local)))
-                })
+        let relative: Vec3 = std::array::from_fn(|i| center[i] - self.pose.translation[i]);
+        let local_center: Vec3 = std::array::from_fn(|i| dot(self.local_axes[i], relative));
+        let local_half: Vec3 =
+            std::array::from_fn(|i| dot(half, self.pose.rotation.map(|row| row[i].abs())));
+        let local_min: Vec3 = std::array::from_fn(|i| local_center[i] - local_half[i]);
+        let local_max: Vec3 = std::array::from_fn(|i| local_center[i] + local_half[i]);
+        let cells = &self.cluster.cells;
+        let start =
+            cells.partition_point(|&(position, _)| f64::from(position[0]) + 1.0 < local_min[0]);
+        let end = cells.partition_point(|&(position, _)| f64::from(position[0]) <= local_max[0]);
+        cells[start..end].iter().any(|&(position, _)| {
+            (0..3).all(|i| {
+                f64::from(position[i]) <= local_max[i]
+                    && local_min[i] <= f64::from(position[i]) + 1.0
+            }) && self.cell_intersects(position, center, half)
         })
     }
+
+    fn cell_intersects(&self, position: BlockPos, center: Vec3, half: Vec3) -> bool {
+        let cell = self.pose.cell_center(position);
+        let displacement = std::array::from_fn(|i| cell[i] - center[i]);
+        let separated = |axis: Vec3| {
+            let world_radius = dot(half, axis.map(f64::abs));
+            let cell_radius = self
+                .local_axes
+                .iter()
+                .map(|&local| dot(local, axis).abs())
+                .sum::<f64>()
+                * 0.5;
+            dot(displacement, axis).abs() > world_radius + cell_radius
+        };
+        !AXES.iter().chain(&self.local_axes).copied().any(separated)
+            && !AXES.iter().any(|&world| {
+                self.local_axes
+                    .iter()
+                    .any(|&local| separated(cross(world, local)))
+            })
+    }
+}
+
+fn pose_geometry(pose: Pose) -> [Vec3; 3] {
+    std::array::from_fn(|i| pose.rotation.map(|row| row[i]))
 }
 
 fn cluster_bounds(cluster: &BlockCluster, pose: Pose) -> Option<Aabb> {
