@@ -1,7 +1,7 @@
 # 実装・検証チェックリスト（`perf/worldgen-parallel`）
 
 作成: 2026-11-06。基点: `48dfe73b4e1db64d5ce295f0e533d30780a8fc37`。
-更新: 2026-11-19（同期基準: `e82fbc6`）。状態: **部分実装・限定検証済み。上位P0〜P4の完了は別判定**。
+更新: 2026-11-21（同期基準: `cfffac7`）。状態: **部分実装・限定検証済み。上位P0〜P4の完了は別判定**。Wave 5（B4 昇格・Save v2・protocol 767・execute・gamerules・block entities・fluids・M3 計測）を下記「Wave 5 同期受入」に反映済み。
 作成時点の履歴と、下記の現行棚卸しを混同しない。
 
 この文書は**作業順、担当する既存owner、完了ゲートを一覧化する実行台帳**。
@@ -19,6 +19,23 @@
 - 同じseed、dimension、datapack、structures設定、source順、margin、chunk FULL、時計、生成stageを固定。**生成停止（paused）とruntime tick後を別々**に比較し、全block state、書き込み順、RNG、NBT、pending/delivered tick、保存/再読込、wireを混同しない。
 - **ステータスは実際に検証した項目だけ `[x]`** にする。`tests/verify.sh`、native JAR比較、GitHub Actions、第三者レビューは別々に記録する。ホストCI未起動は成功ではない。
 - 既に確認済みの限定契約（forest 3×3の旧checkpoint、template processor・fossil・proto tickのnative fixtures）は消さずに回帰として維持する。新HEADでの全体合格には置き換えない。
+
+## Wave 5 同期受入（2026-11-21、HEAD `cfffac7`）
+
+以下は `git log` と checkout 内の `evidence/` で確認できるコミット／証拠のみを根拠にした実行記録。上位 P0〜P4 の完了判定や `P4-1` 同一 SHA gate に代わるものではない。
+
+| 同期項目 | 完了根拠（commit / evidence） | 残す境界 |
+|---|---|---|
+| Batch B4 3構造物 0-diff 昇格 | `1de42a3`（lily pad 支持規則、mushroom の cold skylight、mineshaft spawner claim、tree leaf 更新境界、fuzzy section palette の surface biome）＋調査 [`structure-batch-b4-hold-fix-20261121.md`](../evidence/gameplay/feature-parity/structure-batch-b4-hold-fix-20261121.md)（`8624a38`） | default と記録済み population order の両方で一致。以降の worldgen 変更（`a82df1a`, `cfffac7`）は dump SHA-256 で回帰確認済み |
+| Save v2 snapshot／全 gamerule／mob属性／wire hook | `06c2a98`（UUID-keyed player state・spawn向き/targets・mob挙動・villager・raid、atomic world write）、`6aca648`（全 Save v2 gamerules と mob属性）、`ec8e31c`（gameplay mechanics と player save hook の本番配線）、`81476b9`（seed 保存 #74）／#73・#172・#218・#84・#75 | 逐次 input の往復/test は通過。並行更新下の snapshot 整合性は別契約 |
+| Protocol 767 compression／RelMove／culling／`0x07` registry | `0bd0520`（compression & entity movement codec）、`4fed912`（compression・registry・visibility の本番 wire）、`74ae654`（datapack から Configuration registry を構築、`47d834d` で end-to-end 検証）、`7e87ef6` + `32b556c`（pure visibility／bounded chunk scheduling）、`c63a84e`（live chunk delivery budget と冗長 update の cull） | 新 wire は `P4-1` の同一 SHA 再収集対象 |
+| `/execute` 全 pipeline | `35a075f`（全 subcommand AST/parser）、`f6e2d98`（parsed pipeline 評価）、`da6e5c0`（synthetic client chunk／execute wire expectation）、`61d2b2f`（selector matching の core 共有）／#180〜#189 | `execute in ... if block` の dimension-scoped readback は既知境界（[commands-datapacks-20261120.md](../evidence/gameplay/feature-parity/commands-datapacks-20261120.md)） |
+| 全 51 GameRules | `525ac1e`（canonical 1.21.1 GameRule inventory、#169）、`90e7930`（部分 command coverage）、`6aca648`（全 Save v2 gamerule 永続化） | 全 51 の本番 wire 往復は `P4-1` で再確認 |
+| 12 Block Entity 状態 helper | `140b089`（Vanilla 1.21.1 block entity state helpers、Refs #216） | P1-2 の template/NBT 初期化 parity は依然オープン |
+| 流体伝播・waterlogging | `c1848f4`（伝播/waterlogging parity 拡張）、`8a2a23a`（solidifications と wash-away reader の本番配線）、`cfc2f31`（保存時の生成 fluid reservation 維持）／#106 | 全 fluid event trace の網羅は既存の限定契約の範囲 |
+| M3 worldgen CPU／アロケーション | `a82df1a`（CPU/alloc 削減）、`cfffac7`（octave noise cache）＋ [`m3-warm-worldgen.md`](../evidence/perf/m3-warm-worldgen.md) | **`WARM=1` live CPU は mc-spine 16.82 s 対 Vanilla 4.23 s。equal-work live throughput／G3 50 ms budget は未検証**。`cfffac7` は end-to-end 利得なし |
+
+`9ab10ca`／`9bfba2d` 等の同名コミットは HEAD の祖先ではないため、この台帳の完了根拠には使わない。
 
 ## 現行の棚卸し（2026-11-13、上位項目の一括完了ではない）
 
@@ -63,7 +80,7 @@
   - [x] **P2-1-T0 (`35cf12c`)**: `StructurePiece.placeBlock` の `SHAPE_CHECK_BLOCKS` マーク（template/jigsaw 経路）＋ `Feature.markAboveForPostProcessing` ＋ promotion 限定 `BushBlock` 除去（`village-taiga` 0 / 884,736 達成）。
   - [x] **P2-1-T1**: チャンク昇格時（`postProcessGeneration`）の非空流体セルに対する fluid tick 予約・配送接続（`src/main.rs` の `structure_template::register_fluid_ticker` / `promotion_fluid_tick` 登録済み）。
   - [x] **P2-1-T2 (`5fb816b`)**: `structure_pipeline::load_defs_inner` で1つの不正な構造物 JSON が全パイプラインを `None` に落とす欠陥を要素単位の fail-skip + ログに修正。
-  - [x] **P2-1-T3 Phase C-2 / D-2b / Wave E2 / Wave 3/4 構造物受入拡大 (`ba6e2c3`, `d139913`, `8d51b1d`, `6a39df7`, `3f1cb4a`)**: Batch B1〜B6 合計23 fixtureが **23/23 MATCH, 0 DIFF**。Batch B5では `fortress` (0/98,304), `end_city` (0/65,536), `ruined_portal_nether` (0/49,152), `bastion_remnant` (0/65,536), `trial_chambers` (0/98,304) を昇格。B4 HOLDの `buried_treasure`, `swamp_hut`, `jungle_pyramid` は別途未解決。
+  - [x] **P2-1-T3 Phase C-2 / D-2b / Wave E2 / Wave 3/4 構造物受入拡大 (`ba6e2c3`, `d139913`, `8d51b1d`, `6a39df7`, `3f1cb4a`)**: Batch B1〜B6 合計23 fixtureが **23/23 MATCH, 0 DIFF**。Batch B5では `fortress` (0/98,304), `end_city` (0/65,536), `ruined_portal_nether` (0/49,152), `bastion_remnant` (0/65,536), `trial_chambers` (0/98,304) を昇格。B4 HOLDだった `buried_treasure`, `swamp_hut`, `jungle_pyramid` は `1de42a3` で default／記録済み population order の両方が 0-diff となり昇格（[調査](../evidence/gameplay/feature-parity/structure-batch-b4-hold-fix-20261121.md)）。
 - [ ] **P2-2 残るconfigured featuresと実chunk差分** — `bonus_chest` および End の `minecraft:end_spike` は実装・native oracle 照合・4 mutation ゲート済み（`src/feature.rs`, `src/generation_contract_tests.rs`, `tools/mutation_check.sh`）。`sculk_patch` は `ebd19fd` で `spc_can_spread_from` entry predicateを修正し、記録済みnative population pass orderで `sculk_gate.py --require-match` が0/0/0 diff。その他の未対応featureと最新population順の範囲確認は継続。
 - [x] **P2-3 三dimensionの通常サーバー経路（Stage F2 の中核）** — `MC_SPINE_WG_PRESET=end|nether` は offline 診断限定のため、以下の S0〜S4 で通常サーバーの3次元生成・保存・配信・移動を完成済み：
   - [x] **P2-3-S0 (`b38aa75`)**: `tests/protocol767.py` CLI ハーネスの次元対応（`dimension_type` の `min_y`/`height`/`has_skylight` 動的解釈）。
@@ -87,6 +104,8 @@
   - [x] **M3 P4a (`3e1ba0b`) / Layer A1-a/b/c (`101b9f7`, `cd3abf9`, `482e81b`) / Layer A2-a/b/c (`79a2002`, `2733c13`, `7b3917f`)**: Aquifer `AqChunkGrid` 化、`beard`/stronghold 遅延化、2D コーナーメモ＋AVX2/AVX-512 `DfProg`/noise、lazy surface mats、`Cond::Biome(u128)`＋`Rule::Seq` 直接反復。
   - [x] **M3 P5 & Layer A4 (`d4fa504`, `0c88980`, `30d0346`, `d06032e`)**: 配信パレット書込 -89%、sky spill -52〜63%、floor cache -88%、`EntitySpatialGrid` 単一マップ化、512-entry `MapChunkCache`、`tools/pgo_build.sh`（PGO `full j=8` `2.971s -> 2.656s`、-10.6%、全 dump SHA-256 ビット完全一致）。
   - [x] **Wave 3/4 評価と起動修正**: Issue `#41` palette churn（`01badc1`）および Issue `#42` region storage（`eec10bf`）はそれぞれ評価結果 NO-GO。`WARM=1` 初期81-chunk login timeoutは `6e4e534` + `80617f3` で修正し、`WARM=1 bash tools/load_compare.sh 20 0` が `LOAD ok packets=3265 chunks_moved=90`。当該測定では mc-spine 17.510s CPU / 357.7 MiB / 3 threads、Vanilla 4.610s CPU / 1138.1 MiB / 66 threads。これは記録された負荷の結果で、P4-1全gateの代替ではない。
+  - [x] **Wave 5 M3 CPU／アロケーション削減 (`a82df1a`, `cfffac7`)**: [M3 計測](../evidence/perf/m3-warm-worldgen.md) に記録。オフライン full 8-worker CPU `8.748 → 4.821 s`、4×4 アロケーション `10,762,088 → 565,305`（−94.7%）、full/no-feature/terrain の全 dump SHA-256 と cross-seed/dimension のブロック・heightmap が byte 一致。`cfffac7` の octave-noise cache は five-round A/B で full 1-worker CPU −1.00%／8-worker +0.57% の小さく混在した差にとどまり **end-to-end 利得なし**。
+  - [ ] **M3 残り出口（未完了）**: `WARM=1` live CPU は candidate 中央値 16.82 s（baseline 20.56 s）対 Vanilla 4.23 s で依然上回る。live driver の chunk 配信数が異なるため equal-work 比較は未実施、G3 50 ms tick budget も未検証。統合候補 SHA での back-to-back は `P4-1` に委譲。
 
 ### R5 — Mod 互換層（NeoForge 1.21.1 S0〜S3+）
 
@@ -118,21 +137,21 @@
 
 - [x] **GP-0（Entity Framework & 全 130 エンティティ型データ駆動レジストリ — エンジン＆主要配線完了 `89669a8`, `d6f17ac`）**: `src/entity_registry.rs` に protocol 767 全 130 `EntityType`（`0..=129`）を一元化し、`name_to_etype`・`mob_dimensions`・`default_mob_hp`・`/summon` 初期 HP を接続済み。
 - [x] **GP-1（1.21.1 `GoalSelector` & A* `PathNavigation` — live wiring `f218379`）**: `GoalSelector` とA* `WorldPathAdapter`を `mob_tick` で起動。
-- [x] **GP-2（1.21.1 `NaturalSpawner`, Mob Cap, `SpawnCosts`, Despawn）**: Overworld の pack spawning と despawn を維持。Nether は次元別 Mob census、バイオーム／要塞の選択、配置・明暗、cap・距離および `SpawnCosts` を本番 tick に接続。[`gp2_nether_spawn_wire.py`](../tests/gp2_nether_spawn_wire.py) で soul sand valley の自然スポーンと予算による密度制限を確認。
+- [x] **GP-2（1.21.1 `NaturalSpawner`, Mob Cap, `SpawnCosts`, Despawn）**: Overworld の pack spawning と despawn を維持。Nether は次元別 Mob census、バイオーム／要塞の選択、配置・明暗、cap・距離および `SpawnCosts` を本番 tick に接続。[`gp2_nether_spawn_wire.py`](../tests/gp2_nether_spawn_wire.py) で soul sand valley の自然スポーンと予算による密度制限を確認。`SpawnCosts` 状態 `fd0c863`、Nether spawn rules `2cfd249` で energy budget まで本番配線済み。
 - [x] **GP-3（1.21.1 レッドストーン伝播エンジン — live wiring `e279113`）**: wire/torch/repeater/comparator/piston/lamp/door/hopper/dropperを `src/main.rs` に接続（`tests/gp3_gp4_gp5_wire.py` PASS）。
 - [x] **GP-4（村人 AI・職業 POI・取引・gossip・Raid — live wiring `e279113`）**: Villager profession POI、`0x2d` Merchant Offers / `0x2f` Select Trade、restock/demandを本番接続（wire suite PASS）。
 - [x] **GP-5（エンチャント台・金床・醸造・鍛冶・空腹・XP — `e279113`）**: 3-slot enchant options、Anvil repair/rename、Brewing stand tick、Smithing tableに加え `/xp set` と `FoodData::tick` を接続し、wire検証済み。
 - [x] **GP-6（残存 Mob 群のグループ別行動・戦闘 — live wiring `f218379`）**: 14 mob behaviorsを `mob_tick` に接続（例: Zombie A*, Cow wheat follow, Slime split, Enderman water escape, Blaze fireball, Piglin zombification）。
-- [x] **GP-7（Advancements・Scoreboard・WorldBorder・`/fill`・`/clone`・Commands/Datapacks）**: GP-7 gameplay wiring `7b60c93` (`gp5_gp7_wire.py` 6/6 PASS) に加え、`861f4c7`/`df347b6` で Protocol 767 Brigadier `0x10` login Commands、`/op`/`/deop`/`/reload`/`/datapack enable|disable`、`0x0b`/`0x0f` tab suggestions、`ops.json` persistence、`.zip` datapacksを実配線（`command_brigadier_ops_wire.py` PASS、`command_datapack_wire.py` 81/81 PASS）。既知境界: Scoreboard任意表示名/sidebar外スロット・BE clone。
+- [x] **GP-7（Advancements・Scoreboard・WorldBorder・`/fill`・`/clone`・Commands/Datapacks）**: GP-7 gameplay wiring `7b60c93` (`gp5_gp7_wire.py` 6/6 PASS) に加え、`861f4c7`/`df347b6` で Protocol 767 Brigadier `0x10` login Commands、`/op`/`/deop`/`/reload`/`/datapack enable|disable`、`0x0b`/`0x0f` tab suggestions、`ops.json` persistence、`.zip` datapacksを実配線（`command_brigadier_ops_wire.py` PASS、`command_datapack_wire.py` 81/81 PASS）。`/execute` は `35a075f` で全 subcommand AST/parser、`f6e2d98` で parsed pipeline 評価、`da6e5c0` で wire expectation を完了（#180〜#189）。既知境界: Scoreboard任意表示名/sidebar外スロット・BE clone、`execute in ... if block` の dimension-scoped readback。
 
 ### P4 — 統合前のゲート（自動ではmergeしない）
 
-- [ ] **P4-1 同一SHAの全gateと独立レビュー** — `tests/verify.sh` 完走、native oracle、本番wire、mutation、serial/parallel、adapter、layers/debt、Fossil/structure/feature・dimension回帰の結果を同一revisionで収集。hosted CIを使えない場合は未実行と明記。過去の[Issue #7](https://github.com/nekomario28/mc-spine/issues/7)はクローズ済み。
+- [ ] **P4-1 同一SHAの全gateと独立レビュー（未完了）** — `tests/verify.sh` 完走、native oracle、本番wire、mutation、serial/parallel、adapter、layers/debt、Fossil/structure/feature・dimension回帰の結果を同一revisionで収集。hosted CIを使えない場合は未実行と明記。Wave 5 で追加された Save v2／compression・`0x07` registry／`/execute`／gamerules／block entities／fluids／B4 昇格の wire と M3 `WARM=1` back-to-back も同じ `cfffac7` 系候補 SHA で再収集する必要がある。過去の[Issue #7](https://github.com/nekomario28/mc-spine/issues/7)はクローズ済み。
 - [x] **P4-2 配布物・ライセンス・履歴クリーンアップ（Stage F1 & F2 完了 `bd06c8a`）** — P0-3（D1〜D5）、本体 `GPL-3.0-or-later` ＋ 寄稿 `LGPL-3.0-or-later / GPL-3.0-or-later / AGPL-3.0-or-later` トリプルライセンス確定、`git filter-repo --invert-paths` による過去の削除済み不純ファイルの全履歴抹消、`main` への統合完了。
 
 ## 次の着手
 
-[ROADMAPの直近の状態と出口](ROADMAP.md#直近の実行順2026-11-20-phase-e-wave-34-同期)を参照する。Wave 3/4の完了済みレーンを反映済み。次の統合出口は未完了項目の追跡と `P4-1` 同一SHA Release Gate。
+[ROADMAPの直近の状態と出口](ROADMAP.md#直近の実行順2026-11-21-wave-5-同期)を参照する。Wave 3/4 と Wave 5 の完了済みレーンを反映済み。次の統合出口は `WARM=1` live CPU（Vanilla 4.23 s 対比）、P1 template/Fossil 残件の追跡と `P4-1` 同一SHA Release Gate。
 下記の作成時点の「未実行」を、現在の未実装一覧や最新gate結果に読み替えない。
 
 ## 履歴: 作成時点の作業実績（2026-11-06〜07）
