@@ -670,3 +670,444 @@ fn version_dir_registry_bounds_sections_to_its_state_count() {
         Err(Error::OutOfRange)
     ));
 }
+
+// ---------- tall (>62 payload section) multi-word light windows ----------
+
+const TORCH: LightFact = LightFact {
+    emission: 14,
+    ..AIR
+};
+const LANTERN: LightFact = LightFact {
+    emission: 15,
+    ..AIR
+};
+
+fn light_edit(x: i32, y: i32, z: i32, fact: LightFact) -> LightEdit {
+    LightEdit { x, y, z, fact }
+}
+
+/// Index `i` of `cells` answers the `(x, y - min_y, z)` cell as `load_chunk`
+/// orders it: y, z, x from the window bottom.
+fn cell_index(min_y: i32, x: i32, y: i32, z: i32) -> usize {
+    ((y - min_y) as usize) << 8 | ((z & 15) as usize) << 4 | (x & 15) as usize
+}
+
+/// A fresh `new_tall` engine whose (0,0) column holds `cells` and (1,0) is air:
+/// `load_chunk` rebuilds the whole window, so this is the full-rebuild oracle.
+fn tall_oracle(min_y: i32, height: u32, cells: &[LightFact], has_skylight: bool) -> LightEngine {
+    let mut oracle = LightEngine::new_tall(min_y, height, has_skylight).unwrap();
+    oracle.load_chunk(0, 0, cells).unwrap();
+    oracle
+        .load_chunk(1, 0, &column(height as usize, |_, _, _, _| AIR))
+        .unwrap();
+    oracle
+}
+
+fn assert_matches_oracle(engine: &LightEngine, oracle: &LightEngine, height: u32) {
+    let sections = (height / 16 + 2) as usize;
+    for kind in [LightKind::Sky, LightKind::Block] {
+        for cx in [0, 1] {
+            for index in 0..sections {
+                assert_eq!(
+                    engine.section(cx, 0, kind, index),
+                    oracle.section(cx, 0, kind, index),
+                    "{kind:?} chunk {cx} section {index}"
+                );
+            }
+        }
+        for cx in [0, 1] {
+            assert_eq!(
+                engine.section_masks_multi_word(cx, 0),
+                oracle.section_masks_multi_word(cx, 0),
+            );
+        }
+    }
+}
+
+#[test]
+fn tall_light_engine_accepts_128_payload_sections_and_rejects_more() {
+    assert!(LightEngine::new_tall(0, 16, true).is_ok());
+    assert!(LightEngine::new_tall(0, 16 * 62, true).is_ok());
+    // 96 payload sections: the documented tall-dimension shape.
+    assert!(LightEngine::new_tall(-512, 1536, true).is_ok());
+    let capped = LightEngine::new_tall(0, 16 * 128, true).unwrap();
+    assert_eq!(capped.section_count(), 130);
+    // Fail closed above 128 payload sections and on the same malformed
+    // geometry `new` rejects.
+    assert_eq!(
+        LightEngine::new_tall(0, 16 * 129, true).err(),
+        Some(Error::InvalidArgument)
+    );
+    assert!(LightEngine::new_tall(1, 16, true).is_err());
+    assert_eq!(
+        LightEngine::new_tall(0, 0, true).err(),
+        Some(Error::InvalidArgument)
+    );
+    assert!(LightEngine::new_tall(0, 17, true).is_err());
+    assert_eq!(
+        LightEngine::new_tall(2_147_483_632, 16, true).err(),
+        Some(Error::InvalidArgument)
+    );
+    // A small window via `new_tall` still runs the `u64`-mask engine.
+    let mut engine = LightEngine::new_tall(0, 32, true).unwrap();
+    engine
+        .load_chunk(0, 0, &column(32, |_, _, _, _| AIR))
+        .unwrap();
+    let update = engine
+        .apply_edits(&[light_edit(4, 4, 4, LANTERN)])
+        .unwrap();
+    // Emission 15 spreads to y -10..18 -> payload sections 0 and 1 -> bits 1,2.
+    assert_eq!(update.chunks[0].block_mask, 0b110);
+}
+
+#[test]
+fn multi_word_masks_match_u64_masks_on_standard_dimensions() {
+    // 24 payload sections like the Overworld: word zero must equal the u64
+    // mask for every report, and there is no second word to disagree.
+    let mut engine = LightEngine::new(-64, 384, true).unwrap();
+    engine
+        .load_chunk(0, 0, &column(384, |_, _, _, _| AIR))
+        .unwrap();
+    engine
+        .load_chunk(1, 0, &column(384, |_, _, _, _| AIR))
+        .unwrap();
+    assert_eq!(engine.section_count(), 26);
+    assert!(engine.section_masks_multi_word(7, 0).is_none());
+
+    let masks = engine.section_masks_multi_word(0, 0).unwrap();
+    // Open sky lights payload sections 1..25 plus the top guard; the bottom
+    // guard is all-zero. Block light is dark everywhere: the lit mask trims
+    // to zero words and the empty mask covers all 26 sections.
+    assert_eq!(masks.sky_mask, vec![0x3ff_fffe]);
+    assert_eq!(masks.empty_sky_mask, vec![1]);
+    assert_eq!(masks.sky_arrays.len(), 25);
+    assert!(masks
+        .sky_arrays
+        .iter()
+        .all(|array| array.iter().all(|&byte| byte == 0xff)));
+    assert!(masks.block_mask.is_empty());
+    assert_eq!(masks.empty_block_mask, vec![0x3ff_ffff]);
+    assert!(masks.block_arrays.is_empty());
+
+    // The same edits through both APIs report identical chunk updates, with
+    // word zero of each multi-word mask equal to the u64 mask.
+    let mut legacy = LightEngine::new(-64, 384, true).unwrap();
+    legacy
+        .load_chunk(0, 0, &column(384, |_, _, _, _| AIR))
+        .unwrap();
+    legacy
+        .load_chunk(1, 0, &column(384, |_, _, _, _| AIR))
+        .unwrap();
+    let edits = [light_edit(15, 4, 4, TORCH)];
+    let u64_update = legacy.apply_edits(&edits).unwrap();
+    let words_update = engine.apply_edits_multi_word(&edits).unwrap();
+    assert_eq!(
+        u64_update.invalidated_cells,
+        words_update.invalidated_cells
+    );
+    assert_eq!(u64_update.chunks.len(), words_update.chunks.len());
+    let word = |mask: u64| {
+        if mask == 0 {
+            Vec::new()
+        } else {
+            vec![mask]
+        }
+    };
+    for (u64_chunk, words_chunk) in u64_update.chunks.iter().zip(&words_update.chunks) {
+        assert_eq!(u64_chunk.chunk, words_chunk.chunk);
+        assert_eq!(word(u64_chunk.sky_mask), words_chunk.sky_mask);
+        assert_eq!(word(u64_chunk.empty_sky_mask), words_chunk.empty_sky_mask);
+        assert_eq!(word(u64_chunk.block_mask), words_chunk.block_mask);
+        assert_eq!(
+            word(u64_chunk.empty_block_mask),
+            words_chunk.empty_block_mask
+        );
+        assert_eq!(u64_chunk.sky_sections, words_chunk.sky_sections);
+        assert_eq!(u64_chunk.block_sections, words_chunk.block_sections);
+    }
+    // The packed change itself: torch at y=4 (min_y = -64) spreads to
+    // y -10..18 -> payload sections 3..5 -> mask bits 4..6.
+    assert_eq!(words_update.chunks[0].block_mask, vec![0b111_0000]);
+    // Index 5 carries y 0..15: the emitter cell reads 14.
+    assert_eq!(words_update.chunks[0].block_sections[1].0, 5);
+    assert_eq!(
+        nibble(&words_update.chunks[0].block_sections[1].1, 15, 4, 4),
+        14
+    );
+}
+
+#[test]
+fn tall_light_engine_lights_and_reports_sections_above_64() {
+    // 96 payload sections: min_y = -512, height = 1536.
+    let (min_y, height) = (-512, 1536u32);
+    let mut engine = LightEngine::new_tall(min_y, height, true).unwrap();
+    assert_eq!(engine.section_count(), 98);
+    engine
+        .load_chunk(0, 0, &column(1536, |_, _, _, _| AIR))
+        .unwrap();
+    engine
+        .load_chunk(1, 0, &column(1536, |_, _, _, _| AIR))
+        .unwrap();
+    assert!(engine.section_masks_multi_word(5, 0).is_none());
+    assert_eq!(engine.section_masks_multi_word(0, 0).unwrap().sky_mask.len(), 2);
+
+    // The u64-mask edit API fails closed on a window this tall and mutates
+    // nothing.
+    assert_eq!(
+        engine
+            .apply_edits(&[light_edit(8, 700, 8, LANTERN)])
+            .err(),
+        Some(Error::OutOfRange)
+    );
+    assert!(engine
+        .section(0, 0, LightKind::Block, 76)
+        .unwrap()
+        .iter()
+        .all(|&byte| byte == 0));
+
+    // y = 700 -> payload section 75 -> packet bit 76 -> word 1, bit 12.
+    let update = engine
+        .apply_edits_multi_word(&[light_edit(8, 700, 8, LANTERN)])
+        .unwrap();
+    assert!(update.invalidated_cells > 0);
+    let chunk = update
+        .chunks
+        .iter()
+        .find(|chunk| chunk.chunk == (0, 0))
+        .unwrap();
+    // Fourteen-step spread covers sections 74..76 -> bits 75..77.
+    assert_eq!(chunk.block_mask, vec![0, 0x3800]);
+    assert!(chunk.block_mask[0] == 0 && chunk.block_mask[1] != 0);
+    assert_eq!(
+        chunk
+            .block_sections
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>(),
+        [75, 76, 77]
+    );
+    assert_eq!(
+        chunk.block_sections.len(),
+        chunk
+            .block_mask
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum::<usize>()
+    );
+    // A light kind that did not change reports trimmed-empty word lists.
+    assert!(chunk.sky_mask.is_empty() && chunk.empty_sky_mask.is_empty());
+    assert!(chunk.sky_sections.is_empty());
+
+    // Light levels: 15 at the emitter, decaying across the section boundary.
+    let section76 = engine.section(0, 0, LightKind::Block, 76).unwrap();
+    assert_eq!(nibble(&section76, 8, 12, 8), 15); // y = 700
+    assert_eq!(nibble(&section76, 8, 15, 8), 12); // y = 703
+    let section77 = engine.section(0, 0, LightKind::Block, 77).unwrap();
+    assert_eq!(nibble(&section77, 8, 0, 8), 11); // y = 704, next section up
+    // Sky light through the emitter stays full-bright (no occlusion change).
+    assert_eq!(
+        nibble(&engine.section(0, 0, LightKind::Sky, 76).unwrap(), 8, 12, 8),
+        15
+    );
+
+    // Incremental state equals a from-scratch rebuild of the same facts.
+    let mut cells = column(1536, |_, _, _, _| AIR);
+    cells[cell_index(min_y, 8, 700, 8)] = LANTERN;
+    let oracle = tall_oracle(min_y, height, &cells, true);
+    assert_matches_oracle(&engine, &oracle, height);
+
+    // Removing the emitter darkens exactly the same sections via empty masks.
+    let cleared = engine
+        .apply_edits_multi_word(&[light_edit(8, 700, 8, AIR)])
+        .unwrap();
+    let chunk = cleared
+        .chunks
+        .iter()
+        .find(|chunk| chunk.chunk == (0, 0))
+        .unwrap();
+    assert!(chunk.block_mask.is_empty() && chunk.block_sections.is_empty());
+    assert_eq!(chunk.empty_block_mask, vec![0, 0x3800]);
+    let oracle = tall_oracle(min_y, height, &column(1536, |_, _, _, _| AIR), true);
+    assert_matches_oracle(&engine, &oracle, height);
+}
+
+#[test]
+fn tall_sky_light_masks_cross_the_word_boundary() {
+    let (min_y, height) = (-512, 1536u32);
+    let mut engine = LightEngine::new_tall(min_y, height, true).unwrap();
+    engine
+        .load_chunk(0, 0, &column(1536, |_, _, _, _| AIR))
+        .unwrap();
+    engine
+        .load_chunk(1, 0, &column(1536, |_, _, _, _| AIR))
+        .unwrap();
+
+    // A stone roof at y = 700 drops direct skylight in its column; every
+    // payload section at or below section 75 changes -> mask bits 1..76.
+    let update = engine
+        .apply_edits_multi_word(&[light_edit(8, 700, 8, STONE)])
+        .unwrap();
+    let chunk = update
+        .chunks
+        .iter()
+        .find(|chunk| chunk.chunk == (0, 0))
+        .unwrap();
+    assert_eq!(chunk.sky_mask, vec![0xffff_ffff_ffff_fffe, 0x1fff]);
+    assert!(chunk.empty_sky_mask.is_empty());
+    assert_eq!(chunk.sky_sections.len(), 76);
+    assert!(chunk
+        .sky_sections
+        .iter()
+        .enumerate()
+        .all(|(i, (index, _))| *index == i + 1));
+
+    // The occluding cell itself is dark; above the roof stays full-bright.
+    // Deep in the shadow column skylight leaks back in laterally to 14 — one
+    // Manhattan step from a fully lit column — as vanilla resolves it.
+    assert_eq!(
+        nibble(&engine.section(0, 0, LightKind::Sky, 76).unwrap(), 8, 12, 8),
+        0
+    );
+    assert_eq!(
+        nibble(&engine.section(0, 0, LightKind::Sky, 77).unwrap(), 8, 0, 8),
+        15
+    );
+    assert_eq!(
+        nibble(&engine.section(0, 0, LightKind::Sky, 2).unwrap(), 8, 0, 8),
+        14
+    );
+
+    let mut cells = column(1536, |_, _, _, _| AIR);
+    cells[cell_index(min_y, 8, 700, 8)] = STONE;
+    let oracle = tall_oracle(min_y, height, &cells, true);
+    assert_matches_oracle(&engine, &oracle, height);
+}
+
+#[test]
+fn eighty_section_window_and_word_trimming() {
+    // 80 payload sections: bits 64..81 live in word 1.
+    let (min_y, height) = (-512, 1280u32);
+    let mut engine = LightEngine::new_tall(min_y, height, true).unwrap();
+    assert_eq!(engine.section_count(), 82);
+    engine
+        .load_chunk(0, 0, &column(1280, |_, _, _, _| AIR))
+        .unwrap();
+    assert_eq!(engine.section(0, 0, LightKind::Sky, 81).unwrap(), [0xff; 2048]);
+    assert!(engine
+        .section(0, 0, LightKind::Block, 81)
+        .unwrap()
+        .iter()
+        .all(|&byte| byte == 0));
+    assert_eq!(
+        engine.section(0, 0, LightKind::Block, 82).err(),
+        Some(Error::OutOfRange)
+    );
+
+    // y = 600 -> payload section 69 -> packet bit 70 -> word 1, bit 6.
+    let update = engine
+        .apply_edits_multi_word(&[light_edit(8, 600, 8, LANTERN)])
+        .unwrap();
+    let chunk = &update.chunks[0];
+    assert_eq!(chunk.block_mask.len(), 2);
+    assert_ne!(chunk.block_mask[1] & (1 << 6), 0);
+    assert_eq!(
+        chunk
+            .block_sections
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>(),
+        [69, 70, 71]
+    );
+
+    // A change confined below bit 64 keeps a single-word mask: no trailing
+    // all-zero word is ever produced.
+    let update = engine
+        .apply_edits_multi_word(&[light_edit(4, 40, 4, TORCH)])
+        .unwrap();
+    let chunk = &update.chunks[0];
+    assert_eq!(chunk.block_mask.len(), 1);
+    assert!(chunk.block_mask[0] != 0);
+
+    // Full-column masks cover all 82 bits exactly once across mask and empty.
+    let masks = engine.section_masks_multi_word(0, 0).unwrap();
+    let mut union = masks.sky_mask.clone();
+    union.resize(2, 0);
+    for (word, empty) in union.iter_mut().zip(masks.empty_sky_mask.iter().chain([0].iter())) {
+        *word |= *empty;
+    }
+    assert_eq!(union, vec![u64::MAX, (1 << 18) - 1]);
+    assert!(masks.empty_sky_mask.len() <= 2);
+    assert_eq!(masks.sky_mask[1] >> 17, 1); // top guard section 81 is lit
+    for mask in [
+        &masks.sky_mask,
+        &masks.block_mask,
+        &masks.empty_sky_mask,
+        &masks.empty_block_mask,
+    ] {
+        assert!(mask.last().map_or(true, |word| *word != 0), "untrimmed tail");
+    }
+}
+
+#[test]
+fn tall_dimension_without_skylight_reports_no_sky_masks() {
+    let mut engine = LightEngine::new_tall(-512, 1536, false).unwrap();
+    engine
+        .load_chunk(0, 0, &column(1536, |_, _, _, _| AIR))
+        .unwrap();
+    let masks = engine.section_masks_multi_word(0, 0).unwrap();
+    assert!(masks.sky_mask.is_empty());
+    assert!(masks.empty_sky_mask.is_empty());
+    assert!(masks.sky_arrays.is_empty());
+    // Block light still splits all 98 sections: dark -> empty mask only.
+    assert!(masks.block_mask.is_empty() && masks.block_arrays.is_empty());
+    assert_eq!(
+        masks.empty_block_mask,
+        vec![u64::MAX, 0x3_ffff_ffff] // 98 bits: 64 + 34
+    );
+}
+
+#[test]
+fn tall_light_edits_are_atomic_and_fail_closed() {
+    let mut engine = LightEngine::new_tall(-512, 1536, true).unwrap();
+    engine
+        .load_chunk(0, 0, &column(1536, |_, _, _, _| AIR))
+        .unwrap();
+    assert_eq!(
+        engine.apply_edits_multi_word(&[]).err(),
+        Some(Error::InvalidArgument)
+    );
+    let good = light_edit(8, 700, 8, LANTERN);
+    for bad in [
+        light_edit(8, 1024, 8, LANTERN),  // above the window (top = 1024)
+        light_edit(8, -513, 8, LANTERN),  // below the window
+        light_edit(20, 700, 8, LANTERN),  // unloaded chunk
+        LightEdit {
+            fact: LightFact {
+                opacity: 16,
+                ..LANTERN
+            },
+            ..good
+        },
+        LightEdit {
+            fact: LightFact {
+                occlusion: [0x10; 6],
+                ..LANTERN
+            },
+            ..good
+        },
+    ] {
+        assert!(engine.apply_edits_multi_word(&[good, bad]).is_err());
+    }
+    // Rejected batches left the window untouched.
+    assert!(engine
+        .section(0, 0, LightKind::Block, 76)
+        .unwrap()
+        .iter()
+        .all(|&byte| byte == 0));
+    assert!(engine
+        .apply_edits_multi_word(&[good])
+        .unwrap()
+        .chunks
+        .iter()
+        .any(|chunk| chunk.block_mask.len() == 2));
+}

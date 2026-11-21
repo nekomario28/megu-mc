@@ -27,8 +27,8 @@ mod nbt {
 
 pub use command::{CommandDispatcher, CommandParse, Suggestions};
 pub use light::{
-    ChunkLightUpdate, LightEdit, LightEngine, LightFact, LightKind, LightUpdate,
-    LIGHT_SECTION_BYTES,
+    ChunkLightUpdate, ChunkLightUpdateMultiWord, LightEdit, LightEngine, LightFact, LightKind,
+    LightMasksMultiWord, LightUpdate, LightUpdateMultiWord, LIGHT_SECTION_BYTES,
 };
 pub use mc_spine_core::id::ResourceLocation;
 pub use mc_spine_core::version::{TargetVersion, VersionMeta};
