@@ -658,34 +658,12 @@ impl WireWriter {
 
     /// Write `v` as a VarInt (five or fewer bytes of 7-bit groups).
     pub fn write_varint(&mut self, v: i32) {
-        let mut v = v as u32;
-        loop {
-            let mut b = (v & 0x7f) as u8;
-            v >>= 7;
-            if v != 0 {
-                b |= 0x80;
-            }
-            self.buf.push(b);
-            if v == 0 {
-                return;
-            }
-        }
+        write_varint_into(&mut self.buf, v);
     }
 
     /// Write `v` as a VarLong (ten or fewer bytes of 7-bit groups).
     pub fn write_varlong(&mut self, v: i64) {
-        let mut v = v as u64;
-        loop {
-            let mut b = (v & 0x7f) as u8;
-            v >>= 7;
-            if v != 0 {
-                b |= 0x80;
-            }
-            self.buf.push(b);
-            if v == 0 {
-                return;
-            }
-        }
+        write_varlong_into(&mut self.buf, v);
     }
 
     /// `VarInt(len)` + raw bytes.
@@ -718,25 +696,108 @@ impl WireWriter {
 
     /// `VarInt(n)` + `n` little-endian bytes — the 1.21.5+
     /// `java.util.BitSet.toByteArray` form, which drops trailing zero bytes.
+    /// The trimmed length is computed over the words directly so the encode
+    /// never materializes the intermediate byte buffer.
     pub fn write_bitset_bytes(&mut self, set: &BitSet) {
-        let mut bytes = Vec::with_capacity(set.words.len() * 8);
-        for &word in &set.words {
-            bytes.extend_from_slice(&word.to_le_bytes());
+        let mut len = 0usize;
+        for (i, &word) in set.words.iter().enumerate() {
+            let used = word.to_le_bytes().iter().rposition(|&b| b != 0);
+            if let Some(last) = used {
+                len = i * 8 + last + 1;
+            }
         }
-        let len = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
-        self.write_bytes(&bytes[..len]);
+        self.write_varint(len as i32);
+        let full_words = len / 8;
+        self.buf.reserve(len);
+        for &word in &set.words[..full_words] {
+            self.buf.extend_from_slice(&word.to_le_bytes());
+        }
+        if !len.is_multiple_of(8) {
+            self.buf
+                .extend_from_slice(&set.words[full_words].to_le_bytes()[..len % 8]);
+        }
     }
+}
+
+/// Canonical encoded length of `v` as a VarInt — the exact byte count
+/// [`WireWriter::write_varint`] emits, 1–5 bytes of 7-bit groups.
+#[inline]
+pub const fn varint_len(v: i32) -> usize {
+    let mut v = v as u32;
+    let mut len = 1;
+    while v >= 0x80 {
+        v >>= 7;
+        len += 1;
+    }
+    len
+}
+
+/// Canonical encoded length of `v` as a VarLong — 1–10 bytes of 7-bit groups.
+#[inline]
+pub const fn varlong_len(v: i64) -> usize {
+    let mut v = v as u64;
+    let mut len = 1;
+    while v >= 0x80 {
+        v >>= 7;
+        len += 1;
+    }
+    len
+}
+
+/// Append `v`'s VarInt encoding to `out`. The bytes are staged on the stack so
+/// the whole encoding lands in one reserve-and-copy instead of up to five
+/// individually bounds-checked pushes.
+pub fn write_varint_into(out: &mut Vec<u8>, v: i32) {
+    let mut v = v as u32;
+    let mut buf = [0u8; 5];
+    let mut len = 0;
+    loop {
+        let mut b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            b |= 0x80;
+        }
+        buf[len] = b;
+        len += 1;
+        if v == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&buf[..len]);
+}
+
+/// Append `v`'s VarLong encoding to `out`, same staged-copy scheme as
+/// [`write_varint_into`].
+pub fn write_varlong_into(out: &mut Vec<u8>, v: i64) {
+    let mut v = v as u64;
+    let mut buf = [0u8; 10];
+    let mut len = 0;
+    loop {
+        let mut b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            b |= 0x80;
+        }
+        buf[len] = b;
+        len += 1;
+        if v == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&buf[..len]);
 }
 
 /// Write the protocol frame `VarInt(len(body)) + VarInt(id) + payload`, where
 /// the length counts the packet-id VarInt plus the payload.
+///
+/// Both header varints encode straight into `out` — [`varint_len`] computes
+/// their widths without materializing them — so a frame costs one reserve and
+/// zero intermediate buffers.
 pub fn write_frame(out: &mut Vec<u8>, packet_id: i32, payload: &[u8]) {
-    let mut id = WireWriter::new();
-    id.write_varint(packet_id);
-    let mut len = WireWriter::new();
-    len.write_varint((id.as_slice().len() + payload.len()) as i32);
-    out.extend_from_slice(len.as_slice());
-    out.extend_from_slice(id.as_slice());
+    let body_len = varint_len(packet_id) + payload.len();
+    out.reserve(varint_len(body_len as i32) + body_len);
+    write_varint_into(out, body_len as i32);
+    write_varint_into(out, packet_id);
     out.extend_from_slice(payload);
 }
 

@@ -356,8 +356,36 @@ fn check_string(s: &str) -> Result<(), ProtoError> {
 /// Fails closed — rather than truncating — when the result would exceed
 /// [`MAX_FRL1_FRAME_BYTES`] or a field exceeds its own bound.
 pub fn encode_packet(packet: &FriendPacket) -> Result<Vec<u8>, ProtoError> {
-    let mut w = WireWriter::with_capacity(64);
+    let mut out = Vec::with_capacity(64);
+    encode_packet_into(packet, &mut out)?;
+    Ok(out)
+}
+
+/// [`encode_packet`] appending to a caller-owned buffer. On error `out` is
+/// left exactly as it was.
+pub fn encode_packet_into(packet: &FriendPacket, out: &mut Vec<u8>) -> Result<(), ProtoError> {
+    let start = out.len();
+    let mut w = WireWriter::from_vec(std::mem::take(out));
     w.raw(&FRIEND_MAGIC);
+    let result = encode_packet_body(packet, &mut w);
+    *out = w.into_vec();
+    let len = out.len() - start;
+    if let Err(e) = result {
+        out.truncate(start);
+        return Err(e);
+    }
+    if len > MAX_FRL1_FRAME_BYTES {
+        out.truncate(start);
+        return Err(ProtoError::FrameTooLarge {
+            length: len,
+            max: MAX_FRL1_FRAME_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// The `FRL1` body (tag + fields) after the magic.
+fn encode_packet_body(packet: &FriendPacket, w: &mut WireWriter) -> Result<(), ProtoError> {
     match packet {
         FriendPacket::HostRegister {
             protocol_version,
@@ -444,14 +472,7 @@ pub fn encode_packet(packet: &FriendPacket) -> Result<Vec<u8>, ProtoError> {
             w.write_u64(*nonce);
         }
     }
-    let out = w.into_vec();
-    if out.len() > MAX_FRL1_FRAME_BYTES {
-        return Err(ProtoError::FrameTooLarge {
-            length: out.len(),
-            max: MAX_FRL1_FRAME_BYTES,
-        });
-    }
-    Ok(out)
+    Ok(())
 }
 
 /// Decode one `FRL1` frame body (no length prefix). Every failure mode —
@@ -551,11 +572,24 @@ fn next_frame_len(inbuf: &[u8]) -> Result<Option<usize>, ProtoError> {
 /// Encode one packet as a complete wire frame: `u32be(len) + "FRL1" + tag +
 /// fields`.
 pub fn encode_frame(packet: &FriendPacket) -> Result<Vec<u8>, ProtoError> {
-    let body = encode_packet(packet)?;
-    let mut out = Vec::with_capacity(4 + body.len());
-    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    out.extend_from_slice(&body);
+    let mut out = Vec::new();
+    encode_frame_into(packet, &mut out)?;
     Ok(out)
+}
+
+/// [`encode_frame`] appending to a caller-owned buffer: the fixed-width
+/// length prefix is patched in place, so no body `Vec` is ever materialized.
+/// On error `out` is left exactly as it was.
+pub fn encode_frame_into(packet: &FriendPacket, out: &mut Vec<u8>) -> Result<(), ProtoError> {
+    let start = out.len();
+    out.extend_from_slice(&[0; 4]);
+    if let Err(e) = encode_packet_into(packet, out) {
+        out.truncate(start);
+        return Err(e);
+    }
+    let body_len = (out.len() - start - 4) as u32;
+    out[start..start + 4].copy_from_slice(&body_len.to_be_bytes());
+    Ok(())
 }
 
 /// Decode one complete wire frame. The declared length must match the
@@ -1280,10 +1314,10 @@ impl TcpFriendRelay {
     }
 
     fn queue_packet(&mut self, id: u64, packet: &FriendPacket) {
-        if let Ok(frame) = encode_frame(packet) {
-            if let Some(c) = self.conns.get_mut(&id) {
-                c.outbuf.extend_from_slice(&frame);
-            }
+        if let Some(c) = self.conns.get_mut(&id) {
+            // Encode straight into the outbound queue: no intermediate body or
+            // frame buffer, and a failed encode leaves `outbuf` untouched.
+            let _ = encode_frame_into(packet, &mut c.outbuf);
         }
     }
 

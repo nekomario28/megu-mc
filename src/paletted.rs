@@ -688,6 +688,28 @@ impl PalettedSection {
         std::mem::size_of::<Self>() + heap
     }
 
+    /// Exact byte count `write_block_states_wire` appends. Used only to size a
+    /// single `reserve` — capacity sizing, never output bytes.
+    fn block_states_wire_len(&self) -> usize {
+        match &self.states {
+            SectionPalette::Single(st) => 1 + varint_len_u64(*st as u64) + 1,
+            SectionPalette::Indirect {
+                entries, words, ..
+            } => {
+                1 + varint_len_u64(entries.len() as u64)
+                    + entries
+                        .iter()
+                        .map(|&e| varint_len_u64(e as u64))
+                        .sum::<usize>()
+                    + varint_len_u64(words.len() as u64)
+                    + words.len() * 8
+            }
+            SectionPalette::Direct { words } => {
+                1 + varint_len_u64(words.len() as u64) + words.len() * 8
+            }
+        }
+    }
+
     pub(crate) fn write_block_states_wire(&self, out: &mut Vec<u8>) {
         match &self.states {
             SectionPalette::Single(st) => {
@@ -706,24 +728,52 @@ impl PalettedSection {
                     write_varint(out, entry as i64);
                 }
                 write_varint(out, words.len() as i64);
-                for &word in words.iter() {
-                    out.extend_from_slice(&word.to_be_bytes());
-                }
+                append_be_words(out, words);
             }
             SectionPalette::Direct { words } => {
                 out.push(15);
                 write_varint(out, words.len() as i64);
-                for &word in words.iter() {
-                    out.extend_from_slice(&word.to_be_bytes());
-                }
+                append_be_words(out, words);
             }
         }
     }
 
     pub(crate) fn write_wire(&self, biomes: &[i64; 64], out: &mut Vec<u8>) {
+        // One reserve for the whole section payload: 2 bytes of non-air count,
+        // the block-state stream, and a bound for the quart-biome palette
+        // (64 cells, at most one byte header + one VarInt count + 64 two-byte
+        // VarInt ids + 8-byte words — always under 512).
+        out.reserve(2 + self.block_states_wire_len() + 512);
         out.extend_from_slice(&(self.non_air as i16).to_be_bytes());
         self.write_block_states_wire(out);
         write_palette(out, biomes, 1, 3, 6);
+    }
+}
+
+/// VarInt byte count for a non-negative value — capacity sizing only.
+#[inline]
+fn varint_len_u64(v: u64) -> usize {
+    let mut v = v;
+    let mut len = 1;
+    while v >= 0x80 {
+        v >>= 7;
+        len += 1;
+    }
+    len
+}
+
+/// Append `words` big-endian, staging 256 words per extend: a Direct section
+/// is 1,024 words and used to pay one bounds-checked 8-byte `extend_from_slice`
+/// per word — now four.
+fn append_be_words(out: &mut Vec<u8>, words: &[u64]) {
+    const WORDS_PER_CHUNK: usize = 256;
+    out.reserve(words.len() * 8);
+    let mut buf = [0u8; WORDS_PER_CHUNK * 8];
+    for chunk in words.chunks(WORDS_PER_CHUNK) {
+        for (slot, &word) in chunk.iter().enumerate() {
+            buf[slot * 8..slot * 8 + 8].copy_from_slice(&word.to_be_bytes());
+        }
+        out.extend_from_slice(&buf[..chunk.len() * 8]);
     }
 }
 
@@ -741,6 +791,7 @@ pub(crate) fn run_paletted_bench() {
     ];
 
     let mut sections_raw: Vec<Box<[u32; 4096]>> = Vec::with_capacity(11_000);
+    let mut sections_packed: Vec<PalettedSection> = Vec::with_capacity(11_000);
     let mut ow_bytes = 0usize;
     let mut ow_sections = 0usize;
     let mut total_bytes = 0usize;
@@ -775,6 +826,7 @@ pub(crate) fn run_paletted_bench() {
                     }
                     hist[sec.palette_bits() as usize] += 1;
                     sections_raw.push(arr);
+                    sections_packed.push(sec);
                     count += 1;
                     sy += 16;
                 }
@@ -800,6 +852,21 @@ pub(crate) fn run_paletted_bench() {
     std::hint::black_box(sink);
     let pack_ns_per_sec = elapsed_ns / (total * rounds) as f64;
 
+    // Wire-encode throughput over the same packed sections (10 rounds), writing
+    // into the one reused `wire` buffer so the measure is pure encode work.
+    let t1 = Instant::now();
+    let mut sink2 = 0u64;
+    for _ in 0..rounds {
+        for sec in &sections_packed {
+            wire.clear();
+            sec.write_wire(&biomes, &mut wire);
+            sink2 = sink2.wrapping_add(wire.len() as u64);
+        }
+    }
+    let write_ns = t1.elapsed().as_secs_f64() * 1e9;
+    std::hint::black_box(sink2);
+    let write_ns_per_sec = write_ns / (total * rounds) as f64;
+
     println!("sections_total={total}");
     println!("wire_identity_mismatches=0");
     println!("cell_get_mismatches=0");
@@ -813,6 +880,7 @@ pub(crate) fn run_paletted_bench() {
         (ow_bytes as f64 / (ow_sections as f64 / 24.0)) / 1024.0
     );
     println!("pack_ns_per_section={pack_ns_per_sec:.1} rounds={rounds}");
+    println!("write_wire_ns_per_section={write_ns_per_sec:.1} rounds={rounds}");
 }
 
 #[cfg(test)]
@@ -1216,5 +1284,99 @@ mod paletted_tests {
         sec.write_wire(&biomes, &mut dirty);
         assert_ne!(dirty, section_encode(&states, &biomes));
         assert_eq!(decode_wire_section(&dirty).1, states);
+    }
+
+    /// PERF-MEM-ZERO-ALLOC lane benchmark: real generated sections, byte-identity
+    /// asserted during setup, then legacy `section_encode_into` vs `write_wire`
+    /// timed into one reused buffer. Run with `--nocapture` to see the µs/chunk
+    /// lines; identical output under baseline and the lane gives before/after.
+    #[test]
+    fn perf_mem_chunk_encode_bench() {
+        crate::test_support::require_vanilla_data();
+        let reg = crate::block_registry::breg().expect("block registry");
+        let hidden = hidden_states();
+        let is_opaque = |st: u32| reg.opacity_of(st) == 15;
+        let is_hid = |st: u32| hidden.contains(&st);
+        let biomes: [i64; 64] = std::array::from_fn(|i| (i % 11) as i64);
+
+        let specs = [
+            ("overworld", worldgen::NoisePreset::Overworld, 4i32, 24usize),
+            ("nether", worldgen::NoisePreset::Nether, 3i32, 16usize),
+            ("end", worldgen::NoisePreset::End, 3i32, 16usize),
+        ];
+        let mut raws: Vec<Box<[u32; 4096]>> = Vec::new();
+        let mut packed: Vec<PalettedSection> = Vec::new();
+        let mut secs_per_chunk = 0usize;
+        let mut wire = Vec::with_capacity(16384);
+        for (label, preset, side, want_secs) in specs {
+            let mut gen = worldgen::Gen::load_preset(4242, crate::name_to_state, preset)
+                .expect("load worldgen preset");
+            let lo = gen.data.world_min_y;
+            let hi = lo + gen.data.world_height - 1;
+            for cz in 0..side {
+                for cx in 0..side {
+                    let mut sy = lo;
+                    while sy <= hi {
+                        let arr = gen.terrain_section_at(cx, sy, cz, crate::feature::populate);
+                        let sec = PalettedSection::pack(&arr, &is_opaque, &is_hid);
+                        wire.clear();
+                        sec.write_wire(&biomes, &mut wire);
+                        assert_eq!(
+                            wire,
+                            section_encode(&arr, &biomes),
+                            "wire mismatch {label} ({cx},{cz}) sy={sy}"
+                        );
+                        raws.push(arr);
+                        packed.push(sec);
+                        if label == "overworld" {
+                            secs_per_chunk += 1;
+                        }
+                        sy += 16;
+                    }
+                }
+            }
+            assert_eq!(secs_per_chunk % want_secs, 0);
+        }
+        secs_per_chunk /= 16; // counted over the 4x4 overworld grid
+        assert_eq!(secs_per_chunk, 24);
+        let nether_secs = 16usize; // sections per chunk in nether/end
+
+        let rounds = 40usize;
+        let mut sink = 0u64;
+        let t0 = Instant::now();
+        for _ in 0..rounds {
+            for arr in &raws {
+                wire.clear();
+                section_encode_into(&mut wire, arr, &biomes);
+                sink = sink.wrapping_add(wire.len() as u64);
+            }
+        }
+        let legacy_ns = t0.elapsed().as_secs_f64() * 1e9;
+        let t1 = Instant::now();
+        for _ in 0..rounds {
+            for sec in &packed {
+                wire.clear();
+                sec.write_wire(&biomes, &mut wire);
+                sink = sink.wrapping_add(wire.len() as u64);
+            }
+        }
+        let packed_ns = t1.elapsed().as_secs_f64() * 1e9;
+        std::hint::black_box(sink);
+
+        let n = (raws.len() * rounds) as f64;
+        eprintln!(
+            "perf_mem_chunk_encode sections={} legacy={:.2}us/chunk({}s) write_wire={:.2}us/chunk({}s)",
+            raws.len(),
+            legacy_ns / n * secs_per_chunk as f64 / 1000.0,
+            secs_per_chunk,
+            packed_ns / n * secs_per_chunk as f64 / 1000.0,
+            secs_per_chunk,
+        );
+        eprintln!(
+            "perf_mem_chunk_encode legacy={:.1}ns/section write_wire={:.1}ns/section nether_chunk_us={:.2}",
+            legacy_ns / n,
+            packed_ns / n,
+            packed_ns / n * nether_secs as f64 / 1000.0,
+        );
     }
 }

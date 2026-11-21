@@ -157,8 +157,38 @@ pub enum VoicePacket {
 /// truncating — when the result would exceed [`MAX_VOICE_DATAGRAM_BYTES`]
 /// or an audio payload exceeds [`MAX_OPUS_PAYLOAD_BYTES`].
 pub fn encode_packet(packet: &VoicePacket) -> Result<Vec<u8>, ProtoError> {
-    let mut w = WireWriter::with_capacity(64);
+    let mut out = Vec::with_capacity(64);
+    encode_packet_into(packet, &mut out)?;
+    Ok(out)
+}
+
+/// [`encode_packet`] appending to a caller-owned buffer: the relay fan-out
+/// reuses one scratch datagram instead of allocating one `Vec` per recipient.
+/// On error `out` is left exactly as it was.
+pub fn encode_packet_into(packet: &VoicePacket, out: &mut Vec<u8>) -> Result<(), ProtoError> {
+    let start = out.len();
+    let mut w = WireWriter::from_vec(std::mem::take(out));
     w.raw(&VOICE_MAGIC);
+    let result = encode_packet_body(packet, &mut w);
+    *out = w.into_vec();
+    let len = out.len() - start;
+    if let Err(e) = result {
+        out.truncate(start);
+        return Err(e);
+    }
+    if len > MAX_VOICE_DATAGRAM_BYTES {
+        out.truncate(start);
+        return Err(ProtoError::FrameTooLarge {
+            length: len,
+            max: MAX_VOICE_DATAGRAM_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// The `VCR1` body (tag + fields) after the magic — shared by
+/// [`encode_packet_into`] and the fan-out fast path.
+fn encode_packet_body(packet: &VoicePacket, w: &mut WireWriter) -> Result<(), ProtoError> {
     match packet {
         VoicePacket::Auth {
             player_uuid,
@@ -203,25 +233,44 @@ pub fn encode_packet(packet: &VoicePacket) -> Result<Vec<u8>, ProtoError> {
             group,
             opus_payload,
         } => {
-            check_opus_len(opus_payload)?;
-            w.write_u8(TAG_PLAYER_SOUND);
-            w.write_uuid(sender_uuid);
-            w.write_u64(*seq);
-            w.write_bool(*whispering);
-            w.write_f32(*distance_sq);
-            w.write_bool(*group);
-            w.write_u16(opus_payload.len() as u16);
-            w.raw(opus_payload);
+            write_player_sound(
+                w,
+                sender_uuid,
+                *seq,
+                *whispering,
+                *distance_sq,
+                *group,
+                opus_payload,
+            )?;
         }
     }
-    let out = w.into_vec();
-    if out.len() > MAX_VOICE_DATAGRAM_BYTES {
-        return Err(ProtoError::FrameTooLarge {
-            length: out.len(),
-            max: MAX_VOICE_DATAGRAM_BYTES,
-        });
-    }
-    Ok(out)
+    Ok(())
+}
+
+/// The `PlayerSound` tag + fields. Shared by [`encode_packet_body`] and the
+/// fan-out hot path, which encodes from a borrowed payload — cloning the opus
+/// bytes into a fresh `VoicePacket` per recipient was the dominant
+/// per-datagram allocation.
+#[allow(clippy::too_many_arguments)]
+fn write_player_sound(
+    w: &mut WireWriter,
+    sender_uuid: &[u8; 16],
+    seq: u64,
+    whispering: bool,
+    distance_sq: f32,
+    group: bool,
+    opus_payload: &[u8],
+) -> Result<(), ProtoError> {
+    check_opus_len(opus_payload)?;
+    w.write_u8(TAG_PLAYER_SOUND);
+    w.write_uuid(sender_uuid);
+    w.write_u64(seq);
+    w.write_bool(whispering);
+    w.write_f32(distance_sq);
+    w.write_bool(group);
+    w.write_u16(opus_payload.len() as u16);
+    w.raw(opus_payload);
+    Ok(())
 }
 
 fn check_opus_len(payload: &[u8]) -> Result<(), ProtoError> {
@@ -698,6 +747,9 @@ pub struct UdpVoiceRelay {
     socket: UdpSocket,
     state: VoiceRelayState,
     metrics: VoiceRelayMetrics,
+    /// Reused encode buffer for outbound datagrams; the fan-out sends one
+    /// `PlayerSound` per recipient, so per-packet allocation dominated.
+    tx_scratch: Vec<u8>,
 }
 
 impl UdpVoiceRelay {
@@ -710,6 +762,7 @@ impl UdpVoiceRelay {
             socket,
             state,
             metrics: VoiceRelayMetrics::default(),
+            tx_scratch: Vec::new(),
         })
     }
 
@@ -798,16 +851,14 @@ impl UdpVoiceRelay {
                 match self.state.route_mic(&player_uuid, whispering, now) {
                     Ok(deliveries) => {
                         for d in deliveries {
-                            self.send(
+                            self.send_player_sound(
                                 d.addr,
-                                &VoicePacket::PlayerSound {
-                                    sender_uuid: player_uuid,
-                                    seq,
-                                    whispering,
-                                    distance_sq: d.distance_sq,
-                                    group: d.group,
-                                    opus_payload: opus_payload.clone(),
-                                },
+                                &player_uuid,
+                                seq,
+                                whispering,
+                                d.distance_sq,
+                                d.group,
+                                &opus_payload,
                             );
                         }
                     }
@@ -842,10 +893,48 @@ impl UdpVoiceRelay {
     /// send error is silently absorbed — `tx_packets` only counts sends
     /// that made it to the wire.
     fn send(&mut self, dest: SocketAddr, packet: &VoicePacket) {
-        if let Ok(bytes) = encode_packet(packet) {
-            if self.socket.send_to(&bytes, dest).is_ok() {
-                self.metrics.tx_packets += 1;
-            }
+        self.tx_scratch.clear();
+        if encode_packet_into(packet, &mut self.tx_scratch).is_ok()
+            && self.socket.send_to(&self.tx_scratch, dest).is_ok()
+        {
+            self.metrics.tx_packets += 1;
+        }
+    }
+
+    /// The `PlayerSound` fan-out: encodes straight from the decoded
+    /// `MicFrame`'s borrowed opus payload into `tx_scratch` — one reused
+    /// buffer per recipient, no `VoicePacket` construction and no payload
+    /// clone. Wire-identical to `send` on the equivalent packet.
+    #[allow(clippy::too_many_arguments)]
+    fn send_player_sound(
+        &mut self,
+        dest: SocketAddr,
+        sender_uuid: &[u8; 16],
+        seq: u64,
+        whispering: bool,
+        distance_sq: f32,
+        group: bool,
+        opus_payload: &[u8],
+    ) {
+        self.tx_scratch.clear();
+        let mut w = WireWriter::from_vec(std::mem::take(&mut self.tx_scratch));
+        w.raw(&VOICE_MAGIC);
+        let result = write_player_sound(
+            &mut w,
+            sender_uuid,
+            seq,
+            whispering,
+            distance_sq,
+            group,
+            opus_payload,
+        );
+        self.tx_scratch = w.into_vec();
+        if result.is_err() || self.tx_scratch.len() > MAX_VOICE_DATAGRAM_BYTES {
+            self.tx_scratch.clear();
+            return;
+        }
+        if self.socket.send_to(&self.tx_scratch, dest).is_ok() {
+            self.metrics.tx_packets += 1;
         }
     }
 }

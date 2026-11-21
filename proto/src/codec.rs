@@ -840,12 +840,26 @@ pub(crate) fn framed(
     Ok(())
 }
 
-pub(crate) fn encode_s2c_body(
+/// Append `packet`'s body to `out` and report its `(phase, name)`. Callers
+/// that already hold a reusable buffer never pay a body allocation.
+pub(crate) fn encode_s2c_body_into(
     caps: &VersionCapabilities,
     table: &ProtocolTable,
     packet: &S2CPacket,
-) -> Result<(PacketPhase, &'static str, Vec<u8>), ProtoError> {
-    let mut w = WireWriter::new();
+    out: &mut Vec<u8>,
+) -> Result<(PacketPhase, &'static str), ProtoError> {
+    let mut w = WireWriter::from_vec(std::mem::take(out));
+    let result = encode_s2c_body_write(caps, table, packet, &mut w);
+    *out = w.into_vec();
+    result
+}
+
+fn encode_s2c_body_write(
+    caps: &VersionCapabilities,
+    table: &ProtocolTable,
+    packet: &S2CPacket,
+    w: &mut WireWriter,
+) -> Result<(PacketPhase, &'static str), ProtoError> {
     let (phase, name) = match packet {
         S2CPacket::LoginDisconnect { reason } => {
             w.raw(reason);
@@ -947,10 +961,10 @@ pub(crate) fn encode_s2c_body(
                     w.write_bitset(mask);
                 }
             };
-            write_mask(&mut w, sky_mask);
-            write_mask(&mut w, block_mask);
-            write_mask(&mut w, empty_sky_mask);
-            write_mask(&mut w, empty_block_mask);
+            write_mask(w, sky_mask);
+            write_mask(w, block_mask);
+            write_mask(w, empty_sky_mask);
+            write_mask(w, empty_block_mask);
             w.write_varint(sky_light.len() as i32);
             for array in sky_light {
                 w.write_bytes(array);
@@ -988,7 +1002,7 @@ pub(crate) fn encode_s2c_body(
             for (i, entry) in slots.iter().enumerate() {
                 let more = u8::from(i + 1 < slots.len()) << 7;
                 w.write_u8(entry.slot | more);
-                write_item_stack(&mut w, &entry.item);
+                write_item_stack(w, &entry.item);
             }
             (PacketPhase::Play, "set_equipment")
         }
@@ -1008,23 +1022,23 @@ pub(crate) fn encode_s2c_body(
             match operation {
                 TeamOperation::Create { info, members } => {
                     w.write_u8(0);
-                    write_team_info(&mut w, info);
-                    write_string_list(&mut w, members);
+                    write_team_info(w, info);
+                    write_string_list(w, members);
                 }
                 TeamOperation::Remove => {
                     w.write_u8(1);
                 }
                 TeamOperation::UpdateInfo { info } => {
                     w.write_u8(2);
-                    write_team_info(&mut w, info);
+                    write_team_info(w, info);
                 }
                 TeamOperation::AddMembers { members } => {
                     w.write_u8(3);
-                    write_string_list(&mut w, members);
+                    write_string_list(w, members);
                 }
                 TeamOperation::RemoveMembers { members } => {
                     w.write_u8(4);
-                    write_string_list(&mut w, members);
+                    write_string_list(w, members);
                 }
             }
             (PacketPhase::Play, "set_player_team")
@@ -1047,14 +1061,26 @@ pub(crate) fn encode_s2c_body(
             (PacketPhase::Play, "ticking_step")
         }
     };
-    Ok((phase, name, w.into_vec()))
+    Ok((phase, name))
 }
 
-pub(crate) fn encode_c2s_body(
+/// [`encode_s2c_body_into`] for the serverbound direction.
+pub(crate) fn encode_c2s_body_into(
     caps: &VersionCapabilities,
     packet: &C2SPacket,
-) -> Result<(PacketPhase, &'static str, Vec<u8>), ProtoError> {
-    let mut w = WireWriter::new();
+    out: &mut Vec<u8>,
+) -> Result<(PacketPhase, &'static str), ProtoError> {
+    let mut w = WireWriter::from_vec(std::mem::take(out));
+    let result = encode_c2s_body_write(caps, packet, &mut w);
+    *out = w.into_vec();
+    result
+}
+
+fn encode_c2s_body_write(
+    caps: &VersionCapabilities,
+    packet: &C2SPacket,
+    w: &mut WireWriter,
+) -> Result<(PacketPhase, &'static str), ProtoError> {
     let (phase, name) = match packet {
         C2SPacket::Handshake {
             protocol_version,
@@ -1165,7 +1191,7 @@ pub(crate) fn encode_c2s_body(
             (PacketPhase::Play, "player_input")
         }
     };
-    Ok((phase, name, w.into_vec()))
+    Ok((phase, name))
 }
 
 /// Dispatch on the resolved wire name — decoders never see numeric ids.
@@ -1515,6 +1541,32 @@ fn read_c2s(
     })
 }
 
+thread_local! {
+    /// Packet-body scratch shared by every codec on this thread. Encoding used
+    /// to pay a fresh `Vec` per packet plus the two tiny writers `write_frame`
+    /// built; steady-state emission now allocates nothing.
+    static BODY_SCRATCH: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Capacity [`BODY_SCRATCH`] keeps between packets: a one-off giant packet (a
+/// multi-MiB registry dump) must not pin that allocation per thread forever.
+const BODY_SCRATCH_KEEP: usize = 256 * 1024;
+
+/// Run `f` with the cleared shared packet-body scratch. The encode path never
+/// re-enters `with_body_scratch` — nested use would panic on the `RefCell`.
+pub(crate) fn with_body_scratch<R>(f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+    BODY_SCRATCH.with(|cell| {
+        let mut body = cell.borrow_mut();
+        body.clear();
+        let result = f(&mut body);
+        if body.capacity() > BODY_SCRATCH_KEEP {
+            body.shrink_to(BODY_SCRATCH_KEEP);
+        }
+        result
+    })
+}
+
 impl ProtocolCodec for CodecV767 {
     fn capabilities(&self) -> &VersionCapabilities {
         &self.capabilities
@@ -1527,8 +1579,11 @@ impl ProtocolCodec for CodecV767 {
     fn encode_s2c(&self, packet: &S2CPacket, out: &mut Vec<u8>) -> Result<(), ProtoError> {
         // A keep_alive in configuration and play share a field shape but are
         // different packets — the IR variant names the phase explicitly.
-        let (phase, name, body) = encode_s2c_body(&self.capabilities, &self.table, packet)?;
-        framed(&self.table, phase, PacketDir::Clientbound, name, &body, out)
+        with_body_scratch(|body| {
+            let (phase, name) =
+                encode_s2c_body_into(&self.capabilities, &self.table, packet, body)?;
+            framed(&self.table, phase, PacketDir::Clientbound, name, body, out)
+        })
     }
 
     fn decode_s2c(&self, frame: &[u8]) -> Result<S2CPacket, ProtoError> {
@@ -1536,8 +1591,10 @@ impl ProtocolCodec for CodecV767 {
     }
 
     fn encode_c2s(&self, packet: &C2SPacket, out: &mut Vec<u8>) -> Result<(), ProtoError> {
-        let (phase, name, body) = encode_c2s_body(&self.capabilities, packet)?;
-        framed(&self.table, phase, PacketDir::Serverbound, name, &body, out)
+        with_body_scratch(|body| {
+            let (phase, name) = encode_c2s_body_into(&self.capabilities, packet, body)?;
+            framed(&self.table, phase, PacketDir::Serverbound, name, body, out)
+        })
     }
 
     fn decode_c2s(&self, frame: &[u8]) -> Result<C2SPacket, ProtoError> {

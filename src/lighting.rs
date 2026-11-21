@@ -268,6 +268,32 @@ struct Scratch {
     patch: Vec<Position>,
     frontier: LightingVecDeque<(Position, u8)>,
     queue: LightingVecDeque<(Position, u8)>,
+    // `edit_batch` change lists, kept with the BFS buffers so a tick of edits
+    // allocates nothing: `block_changes`/`sky_changes` feed `relight_patch`,
+    // `columns` dedups the vertical sky refreshes between them.
+    block_changes: Vec<Position>,
+    sky_changes: Vec<Position>,
+    columns: Vec<(i32, i32)>,
+}
+
+/// Retained-capacity bound for each reused lighting buffer. A pathological
+/// edit batch can spike a queue far past the steady-state working set; past
+/// this bound the buffer is shrunk on the way back into the scratch rather
+/// than pinning its peak forever.
+const SCRATCH_KEEP_BYTES: usize = 256 * 1024;
+
+fn bound_vec_scratch<T>(v: &mut Vec<T>) {
+    let keep = SCRATCH_KEEP_BYTES / std::mem::size_of::<T>().max(1);
+    if v.capacity() > keep {
+        v.shrink_to(keep);
+    }
+}
+
+fn bound_deque_scratch<T>(v: &mut LightingVecDeque<T>) {
+    let keep = SCRATCH_KEEP_BYTES / std::mem::size_of::<T>().max(1);
+    if v.capacity() > keep {
+        v.shrink_to(keep);
+    }
 }
 
 /// Pre-edit copies of the light sections an edit batch writes to, taken on
@@ -506,7 +532,11 @@ impl IncrementalLighting {
     }
 
     fn rebuild(&mut self) {
-        let mut block = LightingVecDeque::new();
+        // The block and sky BFS queues ride the engine scratch: `load_chunk`
+        // and the coverage-miss path in the game layer rebuild often, and two
+        // fresh multi-kilobyte `VecDeque`s per rebuild were pure heap churn.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.queue.clear();
         for (&(cx, cz), chunk) in &mut self.chunks {
             chunk.clear_light();
             if self.has_skylight {
@@ -518,7 +548,7 @@ impl IncrementalLighting {
             for (i, state) in chunk.blocks.iter().enumerate() {
                 if state.emission > 0 {
                     chunk.block[i] = state.emission;
-                    block.push_back((
+                    scratch.queue.push_back((
                         Position::new(
                             cx * 16 + (i & 15) as i32,
                             self.min_y + (i >> 8) as i32,
@@ -530,13 +560,14 @@ impl IncrementalLighting {
             }
         }
 
-        self.propagate(LightKind::Block, &mut block, None);
+        self.propagate(LightKind::Block, &mut scratch.queue, None);
         if !self.has_skylight {
+            self.stash_scratch(scratch);
             return;
         }
         // Direct light already handles vertical propagation. Seed the spread
         // where a column can illuminate a less-lit horizontal neighbor.
-        let mut sky = LightingVecDeque::new();
+        scratch.frontier.clear();
         for (&(cx, cz), chunk) in &self.chunks {
             for i in 0..256 {
                 let x = cx * 16 + (i & 15) as i32;
@@ -552,13 +583,14 @@ impl IncrementalLighting {
                         let offset = ((y - self.min_y) as usize) << 8;
                         let from = chunk.direct_sky[offset | i];
                         if from > other.direct_sky[offset | ni] + 1 {
-                            sky.push_back((Position::new(x, y, z), from));
+                            scratch.frontier.push_back((Position::new(x, y, z), from));
                         }
                     }
                 }
             }
         }
-        self.propagate(LightKind::Sky, &mut sky, None);
+        self.propagate(LightKind::Sky, &mut scratch.frontier, None);
+        self.stash_scratch(scratch);
     }
 
     /// Computes direct skylight independently of the lateral light field.
@@ -624,19 +656,36 @@ impl IncrementalLighting {
         }
     }
 
+    /// Store a detached scratch back on the engine, shrinking any buffer
+    /// whose retained capacity outgrew [`SCRATCH_KEEP_BYTES`].
+    fn stash_scratch(&mut self, mut scratch: Scratch) {
+        bound_vec_scratch(&mut scratch.patch);
+        bound_deque_scratch(&mut scratch.frontier);
+        bound_deque_scratch(&mut scratch.queue);
+        bound_vec_scratch(&mut scratch.block_changes);
+        bound_vec_scratch(&mut scratch.sky_changes);
+        bound_vec_scratch(&mut scratch.columns);
+        self.scratch = scratch;
+    }
+
     /// The two BFS passes limit invalidation to 14 Manhattan steps per changed
     /// light source, because a level-15 source cannot illuminate a fifteenth step.
     /// Cells outside that region preserve their previously settled light.
-    fn relight_patch(&mut self, kind: LightKind, changed: &[Position]) -> usize {
+    fn relight_patch(
+        &mut self,
+        kind: LightKind,
+        changed: &[Position],
+        scratch: &mut Scratch,
+    ) -> usize {
         if changed.is_empty() {
             return 0;
         }
-        let mut scratch = std::mem::take(&mut self.scratch);
         let Scratch {
             patch,
             frontier,
             queue,
-        } = &mut scratch;
+            ..
+        } = scratch;
         patch.clear();
         frontier.clear();
         queue.clear();
@@ -685,9 +734,7 @@ impl IncrementalLighting {
             }
         }
         self.propagate(kind, queue, Some(stamp));
-        let len = patch.len();
-        self.scratch = scratch;
-        len
+        patch.len()
     }
 
     /// Replays an edit batch against a complete pre-edit window. Each affected
@@ -707,9 +754,12 @@ impl IncrementalLighting {
         self.snap.entries.clear();
         self.snap.arena.clear();
         self.snap.active = true;
-        let mut block_changes = Vec::new();
-        let mut sky_changes = Vec::new();
-        let mut columns = Vec::new();
+        // The change lists ride the engine scratch: a tick of edits used to
+        // allocate three fresh `Vec`s before either relight pass ran.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let mut block_changes = std::mem::take(&mut scratch.block_changes);
+        let mut sky_changes = std::mem::take(&mut scratch.sky_changes);
+        let mut columns = std::mem::take(&mut scratch.columns);
         for (p, block) in edits {
             let Some(i) = self.index(p) else { continue };
             let Some(chunk) = self.chunks.get_mut(&p.chunk()) else {
@@ -730,17 +780,25 @@ impl IncrementalLighting {
         }
         columns.sort_unstable();
         columns.dedup();
-        for (x, z) in columns {
+        for (x, z) in columns.drain(..) {
             let chunk = self.chunks.get_mut(&(x >> 4, z >> 4)).unwrap();
             let i = ((z & 15) << 4 | (x & 15)) as usize;
             Self::refresh_column(self.min_y, self.height, chunk, i, &mut |y| {
                 sky_changes.push(Position::new(x, y, z));
             });
         }
-        let work = self.relight_patch(LightKind::Sky, &sky_changes)
-            + self.relight_patch(LightKind::Block, &block_changes);
+        let work = self.relight_patch(LightKind::Sky, &sky_changes, &mut scratch)
+            + self.relight_patch(LightKind::Block, &block_changes, &mut scratch);
         self.snap.active = false;
         self.snap.entries.sort_unstable();
+        // Hand the drained lists back: their capacity is the next batch's
+        // allocation it no longer has to make.
+        block_changes.clear();
+        sky_changes.clear();
+        scratch.block_changes = block_changes;
+        scratch.sky_changes = sky_changes;
+        scratch.columns = columns;
+        self.stash_scratch(scratch);
         let mut updates = Vec::new();
         for chunk in targets {
             let Some(light) = self.chunks.get(&chunk) else {
@@ -787,6 +845,10 @@ impl IncrementalLighting {
                 updates.push(update);
             }
         }
+        // Same retention bound as the BFS scratch: a huge batch's snapshot
+        // arena must not stay resident once the updates are built.
+        bound_vec_scratch(&mut self.snap.arena);
+        bound_vec_scratch(&mut self.snap.entries);
         updates.sort_by_key(|update| update.chunk);
         LightUpdate {
             chunks: updates,
@@ -1276,5 +1338,60 @@ mod incremental_lighting_tests {
                 }
             }
         }
+    }
+
+    /// PERF-MEM-ZERO-ALLOC lane benchmark: settled light is rebuilt and
+    /// edit-batched in rounds over a fixed 5x5 world. The identical body compiles
+    /// and runs at the lane base, so `cargo test --release perf_mem_ -- --nocapture`
+    /// on both trees prints the before/after µs/chunk lines.
+    #[test]
+    fn perf_mem_lighting_scratch_bench() {
+        let chunks: Vec<Chunk> = (0..5)
+            .flat_map(|cx| (0..5).map(move |cz| (cx, cz)))
+            .collect();
+        let mut engine = world(64, &chunks);
+        // Seed emitters and a partial roof so both light kinds propagate.
+        for &(cx, cz) in &chunks {
+            engine.edit_batch(
+                [
+                    (p(cx * 16 + 4, 30, cz * 16 + 4), LANTERN),
+                    (p(cx * 16 + 11, 34, cz * 16 + 9), TORCH),
+                    (p(cx * 16 + 8, 50, cz * 16 + 8), STONE),
+                ],
+                chunks.iter().copied(),
+            );
+        }
+
+        let rounds = 20usize;
+        let t0 = Instant::now();
+        for _ in 0..rounds {
+            engine.rebuild();
+        }
+        let rebuild_ns = t0.elapsed().as_secs_f64() * 1e9;
+
+        // Alternating place/remove keeps every batch doing real relight work.
+        let place: Vec<(Position, LightBlock)> = (0..24)
+            .map(|i| (p(16 + i as i32, 22, 16 + (i as i32 * 5) % 40), LANTERN))
+            .collect();
+        let remove: Vec<(Position, LightBlock)> =
+            place.iter().map(|&(pos, _)| (pos, AIR)).collect();
+        let t1 = Instant::now();
+        let mut sink = 0usize;
+        for i in 0..rounds {
+            let edits = if i % 2 == 0 { &place } else { &remove };
+            let update = engine.edit_batch(edits.iter().copied(), chunks.iter().copied());
+            sink = sink.wrapping_add(update.chunks.len());
+        }
+        let batch_ns = t1.elapsed().as_secs_f64() * 1e9;
+        std::hint::black_box(sink);
+
+        assert_matches_full_rebuild(&engine);
+        let n = (rounds * chunks.len()) as f64;
+        eprintln!(
+            "perf_mem_lighting chunks={} rebuild={:.2}us/chunk edit_batch={:.2}us/chunk rounds={rounds}",
+            chunks.len(),
+            rebuild_ns / n / 1000.0,
+            batch_ns / n / 1000.0,
+        );
     }
 }

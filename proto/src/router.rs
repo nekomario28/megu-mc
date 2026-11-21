@@ -317,16 +317,18 @@ impl ProtocolCodec for TableDrivenCodec {
     }
 
     fn encode_s2c(&self, packet: &S2CPacket, out: &mut Vec<u8>) -> Result<(), ProtoError> {
-        let (phase, name, body) =
-            codec::encode_s2c_body(&self.capabilities, &self.table, packet)?;
-        codec::framed(
-            &self.table,
-            phase,
-            crate::table::PacketDir::Clientbound,
-            name,
-            &body,
-            out,
-        )
+        codec::with_body_scratch(|body| {
+            let (phase, name) =
+                codec::encode_s2c_body_into(&self.capabilities, &self.table, packet, body)?;
+            codec::framed(
+                &self.table,
+                phase,
+                crate::table::PacketDir::Clientbound,
+                name,
+                body,
+                out,
+            )
+        })
     }
 
     fn decode_s2c(&self, frame: &[u8]) -> Result<S2CPacket, ProtoError> {
@@ -334,15 +336,17 @@ impl ProtocolCodec for TableDrivenCodec {
     }
 
     fn encode_c2s(&self, packet: &C2SPacket, out: &mut Vec<u8>) -> Result<(), ProtoError> {
-        let (phase, name, body) = codec::encode_c2s_body(&self.capabilities, packet)?;
-        codec::framed(
-            &self.table,
-            phase,
-            crate::table::PacketDir::Serverbound,
-            name,
-            &body,
-            out,
-        )
+        codec::with_body_scratch(|body| {
+            let (phase, name) = codec::encode_c2s_body_into(&self.capabilities, packet, body)?;
+            codec::framed(
+                &self.table,
+                phase,
+                crate::table::PacketDir::Serverbound,
+                name,
+                body,
+                out,
+            )
+        })
     }
 
     fn decode_c2s(&self, frame: &[u8]) -> Result<C2SPacket, ProtoError> {

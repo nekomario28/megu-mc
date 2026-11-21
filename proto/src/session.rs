@@ -658,30 +658,33 @@ impl ServerSession {
             codec.encode_s2c(&S2CPacket::SetCompression { threshold }, &mut frame)?;
             frames.push(frame);
         }
-        let (phase, name, mut body) = codec::encode_s2c_body(
-            codec.capabilities(),
-            codec.table(),
-            &S2CPacket::LoginSuccess {
-                uuid,
-                username: username.to_string(),
-                properties,
-            },
-        )?;
-        if matches!(
-            codec.capabilities().recipe_sync_mode,
-            RecipeSyncMode::RecipeBookDisplays
-        ) {
-            body.extend_from_slice(&session_id);
-        }
         let mut frame = Vec::new();
-        codec::framed(
-            codec.table(),
-            phase,
-            PacketDir::Clientbound,
-            name,
-            &body,
-            &mut frame,
-        )?;
+        codec::with_body_scratch(|body| {
+            let (phase, name) = codec::encode_s2c_body_into(
+                codec.capabilities(),
+                codec.table(),
+                &S2CPacket::LoginSuccess {
+                    uuid,
+                    username: username.to_string(),
+                    properties,
+                },
+                body,
+            )?;
+            if matches!(
+                codec.capabilities().recipe_sync_mode,
+                RecipeSyncMode::RecipeBookDisplays
+            ) {
+                body.extend_from_slice(&session_id);
+            }
+            codec::framed(
+                codec.table(),
+                phase,
+                PacketDir::Clientbound,
+                name,
+                body,
+                &mut frame,
+            )
+        })?;
         frames.push(frame);
         self.phase = SessionPhase::Login {
             username: username.to_string(),
@@ -814,22 +817,24 @@ impl ServerSession {
             .codec
             .as_ref()
             .ok_or(ProtoError::Malformed("no negotiated codec"))?;
-        let (phase, name, body) =
-            codec::encode_s2c_body(codec.capabilities(), codec.table(), packet)?;
-        if phase != want {
-            return Err(ProtoError::Malformed(
-                "packet does not belong to the session phase",
-            ));
-        }
         let mut out = Vec::new();
-        codec::framed(
-            codec.table(),
-            phase,
-            PacketDir::Clientbound,
-            name,
-            &body,
-            &mut out,
-        )?;
+        codec::with_body_scratch(|body| {
+            let (phase, name) =
+                codec::encode_s2c_body_into(codec.capabilities(), codec.table(), packet, body)?;
+            if phase != want {
+                return Err(ProtoError::Malformed(
+                    "packet does not belong to the session phase",
+                ));
+            }
+            codec::framed(
+                codec.table(),
+                phase,
+                PacketDir::Clientbound,
+                name,
+                body,
+                &mut out,
+            )
+        })?;
         Ok(out)
     }
 
