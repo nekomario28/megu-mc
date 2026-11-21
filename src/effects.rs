@@ -213,8 +213,19 @@ pub(super) fn hunger_exhaustion_per_tick(amplifier: i32) -> f32 {
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn saturation_tick(food: i32, saturation: f32) -> (i32, f32) {
-    let food = (food + 1).clamp(0, 20);
-    (food, (saturation + 2.0).clamp(0.0, food as f32))
+    saturation_tick_for(food, saturation, 0)
+}
+
+/// `SaturationEffect.applyEffectTick`: `FoodData.eat(amplifier + 1, 1.0)`
+/// restores `amplifier + 1` food and twice that in saturation every tick,
+/// saturation capped at the resulting food level.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn saturation_tick_for(food: i32, saturation: f32, amplifier: i32) -> (i32, f32) {
+    let food = (food + amplifier + 1).clamp(0, 20);
+    (
+        food,
+        (saturation + 2.0 * (amplifier as f32 + 1.0)).clamp(0.0, food as f32),
+    )
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -236,6 +247,109 @@ pub(super) fn levitation_velocity_delta(vertical_velocity: f64, amplifier: i32) 
 pub(super) fn instant_effect_amount(healing: bool, amplifier: i32) -> f32 {
     let base = if healing { 4i32 } else { 6i32 };
     base.wrapping_shl(amplifier as u32) as f32
+}
+
+/// The entity carries `name` (a registry id from [`EFFECT_REGISTRY`]) at any
+/// amplifier. `registry_ids` holds the one-based registry ids the wire and the
+/// save format use.
+#[cfg_attr(not(test), allow(dead_code))]
+fn effect_named_present(registry_ids: &[i32], name: &str) -> bool {
+    registry_ids
+        .iter()
+        .any(|id| effect_registry_name(*id) == Some(name))
+}
+
+/// `MobEffects.SLOW_FALLING` empties `LivingEntity`'s fall-damage arm.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn effect_negates_fall_damage(registry_ids: &[i32]) -> bool {
+    effect_named_present(registry_ids, "slow_falling")
+}
+
+/// The `gravity` attribute slow falling contributes while active: 0.125 of
+/// normal, or 1.0 without it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn effect_gravity_scale(registry_ids: &[i32]) -> f32 {
+    slow_falling_gravity_multiplier(effect_negates_fall_damage(registry_ids))
+}
+
+/// `MobEffects.FIRE_RESISTANCE` empties the fire and lava damage arms.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn effect_negates_fire_damage(registry_ids: &[i32]) -> bool {
+    effect_named_present(registry_ids, "fire_resistance")
+}
+
+/// The `max_absorption`/`max_health` attribute total over `effects`, which
+/// carries `(registry id, amplifier)` pairs: +4.0 per effect level.
+#[cfg_attr(not(test), allow(dead_code))]
+fn effect_attribute_bonus(effects: &[(i32, i32)], name: &str) -> f32 {
+    effects
+        .iter()
+        .filter(|&&(id, _)| effect_registry_name(id) == Some(name))
+        .map(|&(_, amplifier)| 4.0 * (amplifier as f32 + 1.0))
+        .sum()
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn effect_bonus_absorption(effects: &[(i32, i32)]) -> f32 {
+    effect_attribute_bonus(effects, "absorption")
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn effect_bonus_max_health(effects: &[(i32, i32)]) -> f32 {
+    effect_attribute_bonus(effects, "health_boost")
+}
+
+/// Night vision brightens the client's view; the server side of the contract
+/// is the flag itself.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn effect_grants_night_vision(registry_ids: &[i32]) -> bool {
+    effect_named_present(registry_ids, "night_vision")
+}
+
+/// `Entity.setInvisible`/the invisible flag the client and target selection
+/// consume.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn effect_is_invisible(registry_ids: &[i32]) -> bool {
+    effect_named_present(registry_ids, "invisibility")
+}
+
+/// `SharedEntityFlags`' glowing outline flag.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn effect_outlines_entity(registry_ids: &[i32]) -> bool {
+    effect_named_present(registry_ids, "glowing")
+}
+
+/// `MobEffects.DARKNESS` dims the fog client-side; the flag is the whole
+/// server-side contract.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn effect_darkens_view(registry_ids: &[i32]) -> bool {
+    effect_named_present(registry_ids, "darkness")
+}
+
+/// `LivingEntity.travel`'s water branch: Dolphin's Grace overrides the
+/// slowdown factor to 0.96F. Returns the factor in force.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn effect_swim_slow_down(registry_ids: &[i32]) -> f32 {
+    if effect_named_present(registry_ids, "dolphins_grace") {
+        super::DOLPHINS_GRACE_SLOW_DOWN
+    } else {
+        1.0
+    }
+}
+
+/// `Levitation.applyEffectTick` lerps vertical velocity toward
+/// `0.05 * (amplifier + 1)` every tick.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn levitation_upward_velocity(amplifier: i32) -> f64 {
+    0.05 * (amplifier as f64 + 1.0)
+}
+
+/// `Villager.updateSpecialPrices`: Hero of the Village discounts the base
+/// cost by `0.3 + 0.0625 * (level - 1)`, `level` being the 1-based effect
+/// level (amplifier + 1).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn hero_trade_discount(level: i32) -> f32 {
+    0.3 + 0.0625 * (level - 1).max(0) as f32
 }
 
 pub(super) fn tick_effects(c: &Client) {
@@ -330,7 +444,7 @@ pub(super) fn tick_effects(c: &Client) {
                 drop(h);
                 let mut f = c.food.lock().unwrap();
                 let mut sat = c.sat.lock().unwrap();
-                let (next_food, next_sat) = saturation_tick(*f, *sat);
+                let (next_food, next_sat) = saturation_tick_for(*f, *sat, e.amp);
                 dirty2 |= next_food != *f || next_sat != *sat;
                 *f = next_food;
                 *sat = next_sat;
@@ -375,5 +489,112 @@ pub(super) fn tick_effects(c: &Client) {
     // Expired effects belong to the old set, not to the death-protection grant.
     if grant_totem {
         grant_totem_effects(c, &mut ef);
+    }
+}
+
+// The anti-xray unit shares this module: root `mod` declarations belong to
+// `main.rs` alone, so the lane's new file is included the same way the
+// main-adjacent units are.
+include!("antixray.rs");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Eff;
+
+    #[test]
+    fn p5b_parity_status_effects_cover_vanilla_1211_hooks() {
+        // Registry ids are one-based; the registry test pins the full table.
+        assert!(effect_prevents_drowning(&[13]) && effect_prevents_drowning(&[29]));
+        assert!(!effect_prevents_drowning(&[1, 12]));
+        assert!(effect_negates_fall_damage(&[28]));
+        assert_eq!(effect_gravity_scale(&[28]), 0.125);
+        assert_eq!(effect_gravity_scale(&[]), 1.0);
+        assert!(effect_negates_fire_damage(&[12]));
+        assert!(!effect_negates_fire_damage(&[28]));
+        assert!(effect_grants_night_vision(&[16]));
+        assert!(effect_is_invisible(&[14]));
+        assert!(effect_outlines_entity(&[24]));
+        assert!(effect_darkens_view(&[33]));
+        assert_eq!(effect_swim_slow_down(&[30]), 0.96);
+        assert_eq!(effect_swim_slow_down(&[]), 1.0);
+    }
+
+    #[test]
+    fn p5b_parity_periodic_rates_and_lethal_bounds_match_vanilla() {
+        // Poison every max(1, 25 >> amp) ticks, never below 1 HP of damage
+        // application; wither every max(1, 40 >> amp) and lethal; regen every
+        // max(1, 50 >> amp).
+        assert_eq!(periodic_effect_interval(25, 0), 25);
+        assert_eq!(periodic_effect_interval(25, 1), 12);
+        assert_eq!(periodic_effect_interval(40, 0), 40);
+        assert_eq!(periodic_effect_interval(40, 2), 10);
+        assert_eq!(periodic_effect_interval(50, 0), 50);
+        assert_eq!(periodic_effect_interval(25, 31), 1);
+        assert_eq!(periodic_effect_interval(40, 255), 1);
+        assert_eq!(poison_damage(4), 1.0);
+        assert_eq!(wither_damage(4), 1.0);
+        assert_eq!(regeneration_heal(4), 1.0);
+    }
+
+    #[test]
+    fn p5b_parity_poison_stops_at_one_hp_and_wither_is_lethal_live() {
+        let (client, _receiver) = crate::effect_tests::client_pair();
+        *client.hp.lock().unwrap() = 1.0;
+        client.effs.lock().unwrap().push(Eff {
+            id: 18,
+            amp: 0,
+            left: 26,
+        });
+        tick_effects(&client);
+        assert_eq!(*client.hp.lock().unwrap(), 1.0);
+
+        client.effs.lock().unwrap().clear();
+        *client.hp.lock().unwrap() = 1.0;
+        client.effs.lock().unwrap().push(Eff {
+            id: 19,
+            amp: 0,
+            left: 41,
+        });
+        tick_effects(&client);
+        assert_eq!(*client.hp.lock().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn p5b_parity_health_absorption_levitation_and_hero_values() {
+        assert_eq!(effect_bonus_absorption(&[(22, 0)]), 4.0);
+        assert_eq!(effect_bonus_absorption(&[(22, 3)]), 16.0);
+        assert_eq!(effect_bonus_max_health(&[(21, 0)]), 4.0);
+        assert_eq!(effect_bonus_max_health(&[(21, 4), (1, 0)]), 20.0);
+        assert_eq!(levitation_upward_velocity(0), 0.05);
+        assert_eq!(levitation_upward_velocity(1), 0.10);
+        assert!((hero_trade_discount(1) - 0.30).abs() < 1e-6);
+        assert!((hero_trade_discount(2) - 0.3625).abs() < 1e-6);
+        assert!((hero_trade_discount(5) - 0.55).abs() < 1e-6);
+    }
+
+    #[test]
+    fn p5b_parity_hunger_and_saturation_follow_vanilla_food_math() {
+        assert_eq!(hunger_exhaustion_per_tick(0), 0.005);
+        assert_eq!(hunger_exhaustion_per_tick(2), 0.015);
+        // `eat(amplifier + 1, 1.0)`: +amp+1 food, twice that saturation.
+        assert_eq!(saturation_tick_for(10, 3.0, 0), (11, 5.0));
+        assert_eq!(saturation_tick_for(10, 0.0, 1), (12, 4.0));
+        assert_eq!(saturation_tick_for(19, 19.0, 4), (20, 20.0));
+    }
+
+    #[test]
+    fn p5b_parity_tick_effects_apply_amplified_saturation_live() {
+        let (client, _receiver) = crate::effect_tests::client_pair();
+        *client.food.lock().unwrap() = 10;
+        *client.sat.lock().unwrap() = 0.0;
+        client.effs.lock().unwrap().push(Eff {
+            id: 22,
+            amp: 1,
+            left: 20,
+        });
+        tick_effects(&client);
+        assert_eq!(*client.food.lock().unwrap(), 12);
+        assert_eq!(*client.sat.lock().unwrap(), 4.0);
     }
 }

@@ -38,19 +38,45 @@ impl Fluid {
             8 - self.level
         }
     }
-    fn drop_off(self) -> u8 {
-        if self.kind == Kind::Water {
-            1
-        } else {
-            2
-        }
+}
+
+/// `DimensionType.ultraWarm` as a function of the protocol dimension index
+/// (Overworld 0, Nether -1, End 1): the only vanilla dimension where lava
+/// flows at water speed and reach.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn lava_spreads_fast_in_dim(dim: i32) -> bool {
+    dim == -1
+}
+
+/// `LavaFluid.getTickDelay`: 10 game ticks in an ultrawarm dimension, 30 game
+/// ticks everywhere else.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn lava_tick_delay_for_dim(dim: i32) -> u32 {
+    if lava_spreads_fast_in_dim(dim) {
+        10
+    } else {
+        30
     }
-    fn slope_limit(self) -> u8 {
-        if self.kind == Kind::Water {
-            4
-        } else {
-            2
-        }
+}
+
+/// `LavaFluid.getDropOff`: ultrawarm lava loses 1 level per step and so reaches
+/// 7 blocks horizontally like water; elsewhere it loses 2 and reaches 3.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn lava_drop_off_for_dim(dim: i32) -> u8 {
+    if lava_spreads_fast_in_dim(dim) {
+        1
+    } else {
+        2
+    }
+}
+
+/// `FlowingFluid.getTickDelay` for a scheduled tick of `kind` in `dim`: water
+/// is always 5 game ticks; lava is dimension-aware.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn fluid_tick_delay(kind: Kind, dim: i32) -> u32 {
+    match kind {
+        Kind::Water => 5,
+        Kind::Lava => lava_tick_delay_for_dim(dim),
     }
 }
 
@@ -105,6 +131,11 @@ struct Context<'a, W> {
     writes: Vec<(Pos, Cell)>,
     solidifications: Vec<(Pos, Solidification)>,
     kind: Kind,
+    /// `getDropOff` for `kind` in the caller's dimension.
+    drop_off: u8,
+    /// `getSlopeFindDistance` for `kind` in the caller's dimension: 4 for
+    /// water and ultrawarm lava, 2 for lava elsewhere.
+    slope_limit: u8,
 }
 
 impl<W: Reader> Context<'_, W> {
@@ -165,7 +196,7 @@ impl<W: Reader> Context<'_, W> {
                 level: 8,
             }));
         }
-        let amount = maximum.saturating_sub(if self.kind == Kind::Water { 1 } else { 2 });
+        let amount = maximum.saturating_sub(self.drop_off);
         Ok((amount > 0).then_some(Fluid {
             kind: self.kind,
             level: 8 - amount,
@@ -224,7 +255,7 @@ impl<W: Reader> Context<'_, W> {
         let strength = if fluid.falling() {
             7
         } else {
-            fluid.amount().saturating_sub(fluid.drop_off())
+            fluid.amount().saturating_sub(self.drop_off)
         };
         if strength == 0 {
             return Ok(());
@@ -240,7 +271,7 @@ impl<W: Reader> Context<'_, W> {
             let distance = if self.hole(q)? {
                 0
             } else {
-                self.slope(q, 1, opposite(d), fluid.slope_limit())?
+                self.slope(q, 1, opposite(d), self.slope_limit)?
             };
             if distance < best {
                 choices.clear();
@@ -268,12 +299,41 @@ pub(crate) fn tick<W: Reader>(
     expected_source: bool,
     source_conversion: bool,
 ) -> Result<Plan, W::Error> {
+    tick_in_dim(world, p, kind, expected_source, source_conversion, 0)
+}
+
+/// `tick` with the protocol dimension index the world belongs to (Overworld 0,
+/// Nether -1, End 1). Only lava's rules are dimension-aware in vanilla 1.21.1:
+/// `LavaFluid.getDropOff` and `getSlopeFindDistance` take the water values in an
+/// ultrawarm dimension, which is why Nether lava reaches 7 blocks horizontally.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn tick_in_dim<W: Reader>(
+    world: &mut W,
+    p: Pos,
+    kind: Kind,
+    expected_source: bool,
+    source_conversion: bool,
+    dim: i32,
+) -> Result<Plan, W::Error> {
+    let (drop_off, slope_limit) = match kind {
+        Kind::Water => (1, 4),
+        Kind::Lava => (
+            lava_drop_off_for_dim(dim),
+            if lava_spreads_fast_in_dim(dim) {
+                4
+            } else {
+                2
+            },
+        ),
+    };
     let mut cx = Context {
         world,
         overlay: HashMap::new(),
         writes: Vec::new(),
         solidifications: Vec::new(),
         kind,
+        drop_off,
+        slope_limit,
     };
     let cell = cx.get(p)?;
     let Some(mut current) = cx.same(cell).filter(|f| f.source() == expected_source) else {
@@ -692,5 +752,95 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 28);
+    }
+
+    /// Vanilla 1.21.1 `LavaFluid`: `getTickDelay` is 10 game ticks in an
+    /// ultrawarm dimension and 30 elsewhere; `getDropOff` is 1 there (a
+    /// 7-block reach like water) and 2 elsewhere (a 3-block reach).
+    #[test]
+    fn p5b_parity_lava_tick_delay_and_drop_off_are_dimension_aware() {
+        assert_eq!(lava_tick_delay_for_dim(-1), 10);
+        assert_eq!(lava_tick_delay_for_dim(0), 30);
+        assert_eq!(lava_tick_delay_for_dim(1), 30);
+        assert_eq!(lava_drop_off_for_dim(-1), 1);
+        assert_eq!(lava_drop_off_for_dim(0), 2);
+        assert_eq!(lava_drop_off_for_dim(1), 2);
+        assert!(lava_spreads_fast_in_dim(-1));
+        assert!(!lava_spreads_fast_in_dim(0));
+        assert!(!lava_spreads_fast_in_dim(1));
+        assert_eq!(fluid_tick_delay(Kind::Water, -1), 5);
+        assert_eq!(fluid_tick_delay(Kind::Lava, -1), 10);
+        assert_eq!(fluid_tick_delay(Kind::Lava, 0), 30);
+    }
+
+    /// One source spread across an open channel, ticking each newly written
+    /// cell the way the live scheduler would: Nether lava reaches 7 blocks
+    /// horizontally with levels 1..=7; Overworld lava reaches 3 with levels
+    /// 2, 4, 6.
+    #[test]
+    fn p5b_parity_nether_lava_flows_seven_overworld_lava_three() {
+        for (dim, reach, last_level) in [(-1, 7, 7), (0, 3, 6), (1, 3, 6)] {
+            let mut cells: HashMap<Pos, Option<Cell>> = HashMap::new();
+            for x in -10..=10 {
+                for z in -10..=10 {
+                    cells.insert((x, -1, z), Some(Cell::Solid));
+                    cells.insert((x, 0, z), Some(Cell::Solid));
+                    cells.insert((x, 1, z), Some(Cell::Air));
+                }
+            }
+            for x in 0..=8 {
+                cells.insert((x, 0, 0), Some(Cell::Air));
+            }
+            cells.insert((0, 0, 0), Some(Cell::Fluid(fluid(Kind::Lava, 0))));
+            let mut fixture = Fixture(cells);
+            let mut frontier = vec![((0, 0, 0), fluid(Kind::Lava, 0))];
+            let mut spread: HashMap<Pos, u8> = HashMap::new();
+            for _ in 0..64 {
+                let Some((p, f)) = frontier.pop() else { break };
+                let plan = tick_in_dim(&mut fixture, p, Kind::Lava, f.source(), false, dim)
+                    .unwrap();
+                for (q, cell) in plan.writes {
+                    let Cell::Fluid(next) = cell else { continue };
+                    if spread.insert(q, next.level).is_none() {
+                        fixture.0.insert(q, Some(cell));
+                        frontier.push((q, next));
+                    }
+                }
+            }
+            for x in 1..=reach {
+                assert_eq!(
+                    spread.get(&(x, 0, 0)),
+                    Some(&(x as u8 * lava_drop_off_for_dim(dim))),
+                    "dim {dim} lava level at distance {x}: {spread:?}"
+                );
+            }
+            assert_eq!(spread.len(), reach as usize, "dim {dim} reach: {spread:?}");
+            assert_eq!(spread[&(reach, 0, 0)], last_level);
+        }
+    }
+
+    /// `getSlopeFindDistance` is 4 for ultrawarm lava like water — the distant
+    /// downhill route exists and the flow prefers it — and 2 elsewhere, where
+    /// every direction ties and spreads.
+    #[test]
+    fn p5b_parity_nether_lava_finds_the_distant_downhill_route() {
+        for (dim, writes_west) in [(-1, false), (0, true)] {
+            let mut fixture = fixture_with_floor(fluid(Kind::Lava, 0));
+            for x in [-1, 1, 2, 3, 4] {
+                fixture.0.insert((x, 0, 0), Some(Cell::Air));
+            }
+            fixture.0.insert((4, -1, 0), Some(Cell::Air));
+            let plan = tick_in_dim(&mut fixture, (0, 0, 0), Kind::Lava, true, false, dim).unwrap();
+            assert_eq!(
+                plan.writes.iter().any(|(pos, _)| *pos == (-1, 0, 0)),
+                writes_west,
+                "dim {dim}: {:?}",
+                plan.writes
+            );
+            assert!(plan.writes.contains(&(
+                (1, 0, 0),
+                Cell::Fluid(fluid(Kind::Lava, lava_drop_off_for_dim(dim)))
+            )));
+        }
     }
 }

@@ -2352,6 +2352,12 @@ fn save_world_into(f: &mut Vec<u8>) {
         }
     }
     append_dxt_footer(f, &dxt);
+    // WBD1 rides alongside VER1 beneath the seed trailer and, like every other
+    // additive footer, is emitted only when it would say something a default
+    // save does not already imply.
+    if let Some(border) = save_world_border_record() {
+        append_world_border_footer(f, &border);
+    }
     // VER1 rides just beneath the seed trailer: `read_world_seed_footer` peels
     // both, so a reader that predates the record still sees its whole frame.
     // A native 1.21.1 save emits nothing, like the other default-only footers.
@@ -2557,6 +2563,125 @@ fn read_save_version_header(payload: &[u8]) -> Result<Option<SaveVersionHeader>,
     }))
 }
 
+// ---------- world border record ----------
+//
+// The static world-border settings a snapshot carries alongside VER1: the
+// vanilla `level.dat` `Border*` fields minus the in-flight lerp, which BRD1
+// keeps owning. Written as a WBD1 footer beneath SED1 — `read_world_seed_footer`
+// peels all three records — and emitted only when the live border differs from
+// the vanilla defaults, so a default save keeps the exact pre-record layout.
+
+const WORLD_BORDER_MAGIC: &[u8; 4] = b"WBD1";
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WorldBorderSave {
+    center_x: f64,
+    center_z: f64,
+    diameter: f64,
+    damage_per_block: f64,
+    damage_safe_zone: f64,
+    warning_blocks: i32,
+    warning_time: i32,
+}
+
+/// The vanilla `level.dat` defaults: a border at the origin reaching the
+/// world edge, 0.2 damage per block past a 5-block safe zone, warning 5
+/// blocks out and 15 seconds ahead.
+const WORLD_BORDER_SAVE_DEFAULT: WorldBorderSave = WorldBorderSave {
+    center_x: 0.0,
+    center_z: 0.0,
+    diameter: WORLD_BORDER_MAX_SIZE,
+    damage_per_block: 0.2,
+    damage_safe_zone: 5.0,
+    warning_blocks: 5,
+    warning_time: 15,
+};
+
+/// The record new snapshots carry, or `None` when the live border is already
+/// the vanilla default: the `new_size` target is the diameter that survives a
+/// load, while BRD1 keeps the live interpolation.
+fn save_world_border_record() -> Option<WorldBorderSave> {
+    let border = *world_border().lock().unwrap();
+    let record = WorldBorderSave {
+        center_x: border.center_x,
+        center_z: border.center_z,
+        diameter: border.new_size,
+        damage_per_block: border.damage_per_block,
+        damage_safe_zone: border.damage_safe_zone,
+        warning_blocks: border.warning_blocks,
+        warning_time: border.warning_time_secs,
+    };
+    (record != WORLD_BORDER_SAVE_DEFAULT).then_some(record)
+}
+
+/// `[schema u8][center_x f64][center_z f64][diameter f64][damage f64]
+/// [safe zone f64][warning blocks i32][warning time i32]`, framed
+/// `[body][body size u64][WBD1]` like the other save-state footers.
+fn append_world_border_footer(out: &mut Vec<u8>, border: &WorldBorderSave) {
+    let start = out.len();
+    out.push(1); // WBD1 schema version
+    save_numbers!(
+        out,
+        border.center_x,
+        border.center_z,
+        border.diameter,
+        border.damage_per_block,
+        border.damage_safe_zone,
+        border.warning_blocks,
+        border.warning_time
+    );
+    let size = (out.len() - start) as u64;
+    save_numbers!(out, size);
+    out.extend_from_slice(WORLD_BORDER_MAGIC);
+}
+
+/// The WBD1 record in `payload`, if present. The record sits just beneath the
+/// VER1 record, which itself sits beneath the seed trailer; this only reads —
+/// `read_world_seed_footer` is the strip that hides WBD1 exactly like a
+/// pre-record save does.
+fn read_world_border_footer(payload: &[u8]) -> Result<Option<WorldBorderSave>, &'static str> {
+    let (payload, _) = strip_world_seed_footer(payload)?;
+    let (payload, _) = split_save_footer(payload, SAVE_VERSION_MAGIC)?;
+    let (_, body) = split_save_footer(payload, WORLD_BORDER_MAGIC)?;
+    let Some(body) = body else { return Ok(None) };
+    let mut input = SaveInput(body);
+    if input.byte()? != 1 {
+        return Err("unsupported world border footer");
+    }
+    let border = WorldBorderSave {
+        center_x: input.f64()?,
+        center_z: input.f64()?,
+        diameter: input.f64()?,
+        damage_per_block: input.f64()?,
+        damage_safe_zone: input.f64()?,
+        warning_blocks: i32::from_be_bytes(input.take()?),
+        warning_time: i32::from_be_bytes(input.take()?),
+    };
+    if !input.0.is_empty() {
+        return Err("trailing bytes in world border footer");
+    }
+    Ok(Some(border))
+}
+
+/// Install a WBD1 record as the live border: the diameter is the settled
+/// target, so a saved lerp completes on load while BRD1 keeps any still-live
+/// transition in saves that carry both records.
+fn apply_saved_world_border(border: &WorldBorderSave) {
+    *world_border().lock().unwrap() = WorldBorderState {
+        center_x: border.center_x,
+        center_z: border.center_z,
+        old_size: border.diameter,
+        new_size: border.diameter,
+        lerp_start_ms: border_now_ms(),
+        lerp_duration_ms: 0,
+        damage_per_block: border.damage_per_block,
+        damage_safe_zone: border.damage_safe_zone,
+        warning_blocks: border.warning_blocks,
+        warning_time_secs: border.warning_time,
+        absolute_max_size: WORLD_BORDER_MAX_CENTER,
+    };
+}
+
 fn append_world_seed_footer(out: &mut Vec<u8>, seed: u64) {
     out.extend_from_slice(&seed.to_be_bytes());
     out.extend_from_slice(WORLD_SEED_MAGIC);
@@ -2564,10 +2689,11 @@ fn append_world_seed_footer(out: &mut Vec<u8>, seed: u64) {
 
 fn read_world_seed_footer(payload: &[u8]) -> Result<(&[u8], Option<u64>), &'static str> {
     let (payload, seed) = strip_world_seed_footer(payload)?;
-    // The VER1 record rides just beneath the seed trailer: peel it too, so
-    // callers that strip the tail by hand see the same boundary a pre-header
-    // save had.
+    // The VER1 record rides just beneath the seed trailer and WBD1 beneath
+    // VER1: peel both too, so callers that strip the tail by hand see the same
+    // boundary a pre-record save had.
     let (payload, _) = split_save_footer(payload, SAVE_VERSION_MAGIC)?;
+    let (payload, _) = split_save_footer(payload, WORLD_BORDER_MAGIC)?;
     Ok((payload, seed))
 }
 
@@ -3734,8 +3860,15 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         ),
     }
     *LOADED_SAVE_VERSION.lock().unwrap() = Some(save_version);
+    // WBD1 tucks beneath VER1: read it before the peel hides it, and restore
+    // it before the body scan so a BRD1 record in the same save keeps owning
+    // the live transition.
+    let world_border_save = read_world_border_footer(payload)?;
     // Footers are stripped last-written-first.
     let (payload, _) = read_world_seed_footer(payload)?;
+    if let Some(border) = world_border_save {
+        apply_saved_world_border(&border);
+    }
     let (payload, dxt) = read_dxt_footer(payload)?;
     let (payload, mut mob_dimensions) = read_mob_dimensions_footer(payload)?;
     let (payload, mut brewing) = read_brewing_footer(payload)?;
@@ -5536,5 +5669,164 @@ mod save_v2_version_tests {
         assert!(!loaded.inferred_legacy_header);
         assert_eq!(loaded.mc_version, "1.21.4");
         assert_eq!((loaded.data_version, loaded.protocol_version), (4189, 769));
+    }
+}
+
+#[cfg(test)]
+mod p5b_parity_world_border_tests {
+    use super::*;
+
+    fn custom_border_state() -> WorldBorderState {
+        WorldBorderState {
+            center_x: 120.5,
+            center_z: -40.25,
+            old_size: 300.0,
+            new_size: 300.0,
+            lerp_start_ms: 0,
+            lerp_duration_ms: 0,
+            damage_per_block: 0.5,
+            damage_safe_zone: 10.0,
+            warning_blocks: 20,
+            warning_time_secs: 30,
+            absolute_max_size: WORLD_BORDER_MAX_CENTER,
+        }
+    }
+
+    fn custom_record() -> WorldBorderSave {
+        WorldBorderSave {
+            center_x: 120.5,
+            center_z: -40.25,
+            diameter: 300.0,
+            damage_per_block: 0.5,
+            damage_safe_zone: 10.0,
+            warning_blocks: 20,
+            warning_time: 30,
+        }
+    }
+
+    #[test]
+    fn p5b_parity_world_border_footer_round_trips_fields() {
+        let mut payload = b"save-body".to_vec();
+        append_world_border_footer(&mut payload, &custom_record());
+        append_world_seed_footer(&mut payload, 42);
+        assert_eq!(
+            read_world_border_footer(&payload).unwrap(),
+            Some(custom_record())
+        );
+        // The seed strip hides WBD1 completely: the caller sees the frame a
+        // pre-record save would have ended with.
+        let (rest, seed) = read_world_seed_footer(&payload).unwrap();
+        assert_eq!(seed, Some(42));
+        assert_eq!(rest, b"save-body");
+    }
+
+    #[test]
+    fn p5b_parity_world_border_default_save_emits_no_footer() {
+        let _guard = world_guard();
+        let old = *world_border().lock().unwrap();
+        *world_border().lock().unwrap() = WorldBorderState::default();
+        let mut payload = Vec::new();
+        save_world_into(&mut payload);
+        *world_border().lock().unwrap() = old;
+        assert!(payload.ends_with(WORLD_SEED_MAGIC));
+        assert_eq!(read_world_border_footer(&payload).unwrap(), None);
+        // A default save is byte-for-byte the pre-record layout: the 12-byte
+        // seed trailer is the only record at the tail.
+        let (rest, seed) = read_world_seed_footer(&payload).unwrap();
+        assert!(seed.is_some());
+        assert_eq!(rest.len() + 12, payload.len());
+    }
+
+    #[test]
+    fn p5b_parity_world_border_custom_state_round_trips() {
+        let _guard = world_guard();
+        let old = *world_border().lock().unwrap();
+        *world_border().lock().unwrap() = custom_border_state();
+        let mut payload = Vec::new();
+        save_world_into(&mut payload);
+        assert_eq!(
+            read_world_border_footer(&payload).unwrap(),
+            Some(custom_record())
+        );
+        *world_border().lock().unwrap() = WorldBorderState::default();
+        load_world_from(&payload).unwrap();
+        let loaded = *world_border().lock().unwrap();
+        *world_border().lock().unwrap() = old;
+        assert_eq!(
+            (
+                loaded.center_x,
+                loaded.center_z,
+                loaded.new_size,
+                loaded.damage_per_block,
+                loaded.damage_safe_zone,
+                loaded.warning_blocks,
+                loaded.warning_time_secs
+            ),
+            (120.5, -40.25, 300.0, 0.5, 10.0, 20, 30)
+        );
+    }
+
+    #[test]
+    fn p5b_parity_world_border_record_restores_without_brd1() {
+        let _guard = world_guard();
+        let old = *world_border().lock().unwrap();
+        *world_border().lock().unwrap() = custom_border_state();
+        let mut payload = Vec::new();
+        save_world_into(&mut payload);
+        *world_border().lock().unwrap() = WorldBorderState::default();
+        // Remove the BRD1 body record (magic + 8*7 + 4*3 body bytes) so only
+        // WBD1 can restore the border.
+        const BRD1_LEN: usize = 4 + 8 * 7 + 4 * 3;
+        let at = payload
+            .windows(4)
+            .position(|w| w == b"BRD1")
+            .expect("BRD1 record present");
+        payload.drain(at..at + BRD1_LEN);
+        load_world_from(&payload).unwrap();
+        let loaded = *world_border().lock().unwrap();
+        *world_border().lock().unwrap() = old;
+        assert_eq!(
+            (
+                loaded.center_x,
+                loaded.center_z,
+                loaded.new_size,
+                loaded.warning_blocks,
+                loaded.warning_time_secs
+            ),
+            (120.5, -40.25, 300.0, 20, 30)
+        );
+    }
+
+    #[test]
+    fn p5b_parity_world_border_corrupt_footer_fails_closed() {
+        // An honest non-WBD1 tail is simply "no record", never a misparse.
+        let mut payload = b"save-body".to_vec();
+        payload.extend_from_slice(b"XXXX");
+        assert_eq!(read_world_border_footer(&payload).unwrap(), None);
+        // A WBD1 trailer whose declared body cannot exist is an error.
+        let mut bad = b"body".to_vec();
+        bad.extend_from_slice(&999u64.to_be_bytes());
+        bad.extend_from_slice(WORLD_BORDER_MAGIC);
+        assert!(read_world_border_footer(&bad).is_err());
+        // An unknown footer schema version is an error, not a silent skip.
+        let mut bad = b"body".to_vec();
+        bad.push(9);
+        bad.extend_from_slice(&1u64.to_be_bytes());
+        bad.extend_from_slice(WORLD_BORDER_MAGIC);
+        assert!(read_world_border_footer(&bad).is_err());
+        // A corrupt record inside a real save fails the whole load closed.
+        let _guard = world_guard();
+        let old = *world_border().lock().unwrap();
+        *world_border().lock().unwrap() = custom_border_state();
+        let mut payload = Vec::new();
+        save_world_into(&mut payload);
+        *world_border().lock().unwrap() = old;
+        let at = payload
+            .windows(4)
+            .position(|w| w == b"WBD1")
+            .expect("WBD1 record present");
+        // A non-finite center is rejected by the finite-double read.
+        payload[at - 48..at - 40].copy_from_slice(&f64::NAN.to_be_bytes());
+        assert!(load_world_from(&payload).is_err());
     }
 }
