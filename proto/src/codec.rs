@@ -515,7 +515,7 @@ fn write_item_stack(w: &mut WireWriter, stack: &ItemStack) {
 /// for fails closed.
 fn read_item_stack(r: &mut WireReader<'_>, table: &ProtocolTable) -> Result<ItemStack, ProtoError> {
     let count = r.read_varint()?;
-    if count < 0 || count > 127 {
+    if !(0..=127).contains(&count) {
         return Err(ProtoError::InvalidDiscriminant {
             value: i64::from(count),
             what: "item stack count",

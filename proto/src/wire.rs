@@ -181,7 +181,7 @@ impl BitSet {
     pub fn get(&self, index: usize) -> bool {
         self.words
             .get(index / 64)
-            .map_or(false, |w| (w >> (index % 64)) & 1 != 0)
+            .is_some_and(|w| (w >> (index % 64)) & 1 != 0)
     }
 
     pub fn set(&mut self, index: usize, value: bool) {
