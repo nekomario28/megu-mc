@@ -7,6 +7,8 @@
 
 use std::collections::BTreeSet;
 
+use crate::version_compat::{check_mod_mc_version, McVersion, VersionCompatVerdict};
+
 /// Execution tier assigned to one discovered mod JAR or datapack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ExecutionTier {
@@ -128,6 +130,13 @@ pub struct DiscoveredMod {
     pub shimcheck_compatible: bool,
     pub has_unsupported_mixin_or_at: bool,
     pub rejection_reasons: Vec<String>,
+    /// Optional declared Minecraft compatibility range in either loader
+    /// syntax — NeoForge/Forge Maven interval (`"[1.21.1,1.22)"`, `"1.21.1"`)
+    /// or Fabric SemVer (`">=1.21.1 <1.21.5"`, `"~1.21.1"`, `"1.21.x"`) — read
+    /// from `neoforge.mods.toml`/`fabric.mod.json`/pack metadata. `None` means
+    /// the mod declares nothing, so [`classify_mod_for_version`] applies no
+    /// version gate to it.
+    pub mc_version_range: Option<String>,
 }
 
 /// Per-mod decision inside the computed startup plan.
@@ -166,9 +175,115 @@ pub enum StartupPlan {
     },
 }
 
+/// The shared Tier 0/1/2/3 classification chain *below* the superseded
+/// catalog: flagship adapters first, then zero-JVM offload profiles and pure
+/// datapacks, then the bounded JVM shim, then Tier 3 fallback.
+fn classify_execution_path(
+    m: &DiscoveredMod,
+    flagship_mod_ids: &BTreeSet<String>,
+    profile_mod_ids: &BTreeSet<String>,
+) -> (ExecutionTier, Vec<String>) {
+    if flagship_mod_ids.contains(&m.mod_id) {
+        (
+            ExecutionTier::NativeFlagship,
+            vec!["handled by flagship native Rust adapter".to_string()],
+        )
+    } else if !m.has_java_bytecode || profile_mod_ids.contains(&m.mod_id) {
+        (
+            ExecutionTier::UniversalNative,
+            vec!["handled by zero-JVM universal adapter / offload profile".to_string()],
+        )
+    } else if m.shimcheck_compatible && !m.has_unsupported_mixin_or_at {
+        (
+            ExecutionTier::BoundedJvmShim,
+            vec!["verified compatible with bounded S0-S4 JVM shim".to_string()],
+        )
+    } else {
+        let mut reasons = m.rejection_reasons.clone();
+        if reasons.is_empty() {
+            reasons.push("unsupported Mixin/AT or Minecraft API surface".to_string());
+        }
+        (ExecutionTier::RequiresFallback, reasons)
+    }
+}
+
+/// Classify one discovered mod with no Minecraft version gate — equivalent to
+/// [`classify_mod_for_version`] on a mod whose `mc_version_range` is `None`.
+pub fn classify_mod(
+    m: &DiscoveredMod,
+    flagship_mod_ids: &BTreeSet<String>,
+    profile_mod_ids: &BTreeSet<String>,
+) -> (ExecutionTier, Vec<String>) {
+    if is_builtin_superseded_mod(&m.mod_id) {
+        // Checked before flagship/ShimCheck/Tier 3: a superseded perf
+        // mod's Mixins must never reach the fallback cascade.
+        (
+            ExecutionTier::BuiltInSuperseded,
+            vec![REASON_SUPERSEDED.to_string()],
+        )
+    } else {
+        classify_execution_path(m, flagship_mod_ids, profile_mod_ids)
+    }
+}
+
+/// Classify one discovered mod for a server running Minecraft `target`.
+///
+/// [`BUILTIN_SUPERSEDED_PERF_MODS`] is still checked *first*, so a redundant
+/// performance mod built for another version (e.g. `sodium` declaring
+/// `1.20.1`) stays a clean [`ExecutionTier::BuiltInSuperseded`] skip with
+/// zero fallback noise. For every other mod, a declared `mc_version_range`
+/// that fails [`check_mod_mc_version`] for `target` classifies
+/// [`ExecutionTier::RequiresFallback`] with a plain-language reason —
+/// preventing a mod built for another Minecraft release from silently
+/// executing broken native code — and an unparseable range fails closed the
+/// same way.
+pub fn classify_mod_for_version(
+    m: &DiscoveredMod,
+    flagship_mod_ids: &BTreeSet<String>,
+    profile_mod_ids: &BTreeSet<String>,
+    target: McVersion,
+) -> (ExecutionTier, Vec<String>) {
+    if is_builtin_superseded_mod(&m.mod_id) {
+        return (
+            ExecutionTier::BuiltInSuperseded,
+            vec![REASON_SUPERSEDED.to_string()],
+        );
+    }
+    if let Some(declared) = m.mc_version_range.as_deref() {
+        match check_mod_mc_version(target, declared) {
+            VersionCompatVerdict::Compatible => {}
+            VersionCompatVerdict::InvalidRange { declared, reason } => {
+                return (
+                    ExecutionTier::RequiresFallback,
+                    vec![format!(
+                        "declares an invalid Minecraft version range '{declared}' \
+                         ({reason}); cannot confirm it supports server {target}"
+                    )],
+                );
+            }
+            VersionCompatVerdict::MinorMismatch { declared, .. }
+            | VersionCompatVerdict::MajorMismatch { declared, .. } => {
+                return (
+                    ExecutionTier::RequiresFallback,
+                    vec![format!(
+                        "built for Minecraft {declared}, server is running {target}"
+                    )],
+                );
+            }
+        }
+    }
+    classify_execution_path(m, flagship_mod_ids, profile_mod_ids)
+}
+
 /// Classify discovered mods against registered flagship adapters, declarative
 /// offload profiles, existing saved-world namespaces, and the chosen fallback
 /// policy.
+///
+/// Mods that set [`DiscoveredMod::mc_version_range`] are additionally gated
+/// against [`McVersion::CURRENT`] (the Minecraft version this runtime
+/// implements); use [`plan_mod_startup_for_version`] to plan against a
+/// different target. Mods declaring no range are classified exactly as
+/// before.
 pub fn plan_mod_startup(
     mods: &[DiscoveredMod],
     flagship_mod_ids: &BTreeSet<String>,
@@ -176,43 +291,39 @@ pub fn plan_mod_startup(
     saved_world_namespaces: &BTreeSet<String>,
     policy: FallbackPolicy,
 ) -> StartupPlan {
+    plan_mod_startup_for_version(
+        mods,
+        flagship_mod_ids,
+        profile_mod_ids,
+        saved_world_namespaces,
+        policy,
+        McVersion::CURRENT,
+    )
+}
+
+/// Version-aware variant of [`plan_mod_startup`]: identical planning and
+/// policy semantics, but each mod's declared `mc_version_range` is checked
+/// against `target` via [`classify_mod_for_version`] (after the
+/// [`BUILTIN_SUPERSEDED_PERF_MODS`] skip, before every other tier check).
+pub fn plan_mod_startup_for_version(
+    mods: &[DiscoveredMod],
+    flagship_mod_ids: &BTreeSet<String>,
+    profile_mod_ids: &BTreeSet<String>,
+    saved_world_namespaces: &BTreeSet<String>,
+    policy: FallbackPolicy,
+    target: McVersion,
+) -> StartupPlan {
     let mut assignments = Vec::with_capacity(mods.len());
     let mut tier3 = Vec::new();
     let mut superseded = Vec::new();
     let mut needs_bounded_jvm = false;
 
     for m in mods {
-        let (tier, reasons) = if is_builtin_superseded_mod(&m.mod_id) {
-            // Checked before flagship/ShimCheck/Tier 3: a superseded perf
-            // mod's Mixins must never reach the fallback cascade.
-            (
-                ExecutionTier::BuiltInSuperseded,
-                vec![REASON_SUPERSEDED.to_string()],
-            )
-        } else if flagship_mod_ids.contains(&m.mod_id) {
-            (
-                ExecutionTier::NativeFlagship,
-                vec!["handled by flagship native Rust adapter".to_string()],
-            )
-        } else if !m.has_java_bytecode || profile_mod_ids.contains(&m.mod_id) {
-            (
-                ExecutionTier::UniversalNative,
-                vec!["handled by zero-JVM universal adapter / offload profile".to_string()],
-            )
-        } else if m.shimcheck_compatible && !m.has_unsupported_mixin_or_at {
+        let (tier, reasons) =
+            classify_mod_for_version(m, flagship_mod_ids, profile_mod_ids, target);
+        if tier == ExecutionTier::BoundedJvmShim {
             needs_bounded_jvm = true;
-            (
-                ExecutionTier::BoundedJvmShim,
-                vec!["verified compatible with bounded S0-S4 JVM shim".to_string()],
-            )
-        } else {
-            let mut reasons = m.rejection_reasons.clone();
-            if reasons.is_empty() {
-                reasons.push("unsupported Mixin/AT or Minecraft API surface".to_string());
-            }
-            (ExecutionTier::RequiresFallback, reasons)
-        };
-
+        }
         let assignment = ModAssignment {
             mod_id: m.mod_id.clone(),
             tier,
@@ -333,6 +444,7 @@ mod tests {
                 shimcheck_compatible: false,
                 has_unsupported_mixin_or_at: true,
                 rejection_reasons: vec!["UNSUPPORTED_MIXIN_INJECTION".into()],
+                mc_version_range: None,
             },
             DiscoveredMod {
                 mod_id: "twilight_datapack".into(),
@@ -340,6 +452,7 @@ mod tests {
                 shimcheck_compatible: true,
                 has_unsupported_mixin_or_at: false,
                 rejection_reasons: vec![],
+                mc_version_range: None,
             },
         ];
         let plan = plan_mod_startup(
@@ -367,6 +480,7 @@ mod tests {
                 shimcheck_compatible: false,
                 has_unsupported_mixin_or_at: true,
                 rejection_reasons: vec![],
+                mc_version_range: None,
             },
             DiscoveredMod {
                 mod_id: "heavy_mixin_mod".into(),
@@ -374,6 +488,7 @@ mod tests {
                 shimcheck_compatible: false,
                 has_unsupported_mixin_or_at: true,
                 rejection_reasons: vec!["UNSUPPORTED_MIXIN_INJECTION".into()],
+                mc_version_range: None,
             },
         ];
 
@@ -445,6 +560,7 @@ mod tests {
             shimcheck_compatible: false,
             has_unsupported_mixin_or_at: true,
             rejection_reasons: vec!["UNSUPPORTED_MIXIN_INJECTION".into()],
+            mc_version_range: None,
         };
         let mods = vec![
             heavy("create"),
@@ -454,6 +570,7 @@ mod tests {
                 shimcheck_compatible: false,
                 has_unsupported_mixin_or_at: false,
                 rejection_reasons: vec![],
+                mc_version_range: None,
             },
             heavy("sodium"),
             heavy("lithium"),
@@ -524,5 +641,156 @@ mod tests {
         assert!(is_builtin_superseded_mod("alternate-current"));
         assert!(!is_builtin_superseded_mod("create"));
         assert!(!is_builtin_superseded_mod("ae2"));
+    }
+
+    fn versioned_mod(mod_id: &str, mc_version_range: Option<&str>) -> DiscoveredMod {
+        DiscoveredMod {
+            mod_id: mod_id.into(),
+            has_java_bytecode: true,
+            shimcheck_compatible: false,
+            has_unsupported_mixin_or_at: true,
+            rejection_reasons: vec!["UNSUPPORTED_MIXIN_INJECTION".into()],
+            mc_version_range: mc_version_range.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn superseded_perf_mod_skips_version_check_entirely() {
+        // `sodium` built only for 1.20.1 on a 1.21.1 server: the superseded
+        // catalog wins before the version gate, so it is still a clean
+        // BuiltInSuperseded skip — never a version-mismatch Tier 3 report.
+        let sodium = versioned_mod("sodium", Some("[1.20.1,1.20.2)"));
+        let (tier, reasons) =
+            classify_mod_for_version(&sodium, &set(&[]), &set(&[]), McVersion::V1_21_1);
+        assert_eq!(tier, ExecutionTier::BuiltInSuperseded);
+        assert_eq!(reasons, vec![REASON_SUPERSEDED.to_string()]);
+    }
+
+    #[test]
+    fn incompatible_declared_range_is_tier3_with_plain_language_reason() {
+        // A real content mod declaring a 1.20.1-only Maven range on a 1.21.1
+        // server must never silently execute broken native code.
+        let jei = versioned_mod("jei", Some("[1.20.1,1.20.2)"));
+        let (tier, reasons) =
+            classify_mod_for_version(&jei, &set(&[]), &set(&[]), McVersion::V1_21_1);
+        assert_eq!(tier, ExecutionTier::RequiresFallback);
+        assert_eq!(
+            reasons,
+            vec!["built for Minecraft [1.20.1,1.20.2), server is running 1.21.1".to_string()]
+        );
+    }
+
+    #[test]
+    fn compatible_declared_range_runs_on_every_target_in_band() {
+        let m = versioned_mod("somecontent", Some("[1.21.1,1.21.5)"));
+        for target in [McVersion::V1_21_1, McVersion::V1_21_3, McVersion::V1_21_4] {
+            // Mixin-incompatible with no profile: falls through to Tier 3
+            // *only* on technical grounds — the version gate stays silent.
+            let (_, reasons) = classify_mod_for_version(&m, &set(&[]), &set(&[]), target);
+            assert_eq!(
+                reasons,
+                vec!["UNSUPPORTED_MIXIN_INJECTION".to_string()],
+                "target {target}"
+            );
+        }
+        // A profile-backed mod stays Tier 1 on every in-band target.
+        for target in [McVersion::V1_21_1, McVersion::V1_21_4] {
+            let (tier, _) = classify_mod_for_version(&m, &set(&[]), &set(&["somecontent"]), target);
+            assert_eq!(tier, ExecutionTier::UniversalNative, "target {target}");
+        }
+    }
+
+    #[test]
+    fn invalid_declared_range_fails_closed_as_tier3() {
+        let m = versioned_mod("broken_manifest", Some("not-a-version-range!!"));
+        let (tier, reasons) =
+            classify_mod_for_version(&m, &set(&[]), &set(&[]), McVersion::V1_21_1);
+        assert_eq!(tier, ExecutionTier::RequiresFallback);
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].starts_with("declares an invalid Minecraft version range"));
+        assert!(reasons[0].contains("not-a-version-range!!"));
+    }
+
+    #[test]
+    fn plan_mod_startup_for_version_flags_mismatch_per_policy() {
+        let mods = vec![
+            versioned_mod("jei", Some("[1.20.1,1.20.2)")),
+            versioned_mod("sodium", Some("[1.20.1,1.20.2)")),
+            versioned_mod("okmod", Some("[1.21.1,1.21.5)")),
+        ];
+        // Under delegate, only `jei` triggers; sodium is still superseded.
+        let plan = plan_mod_startup_for_version(
+            &mods,
+            &set(&[]),
+            &set(&["okmod"]),
+            &set(&[]),
+            FallbackPolicy::DelegateNeoForge,
+            McVersion::V1_21_1,
+        );
+        match plan {
+            StartupPlan::DelegateToNeoForge {
+                triggering_mods,
+                all_assignments,
+            } => {
+                assert_eq!(triggering_mods.len(), 1);
+                assert_eq!(triggering_mods[0].mod_id, "jei");
+                assert_eq!(
+                    triggering_mods[0].reasons,
+                    vec![
+                        "built for Minecraft [1.20.1,1.20.2), server is running 1.21.1".to_string()
+                    ]
+                );
+                let tiers: Vec<(String, ExecutionTier)> = all_assignments
+                    .iter()
+                    .map(|a| (a.mod_id.clone(), a.tier))
+                    .collect();
+                assert_eq!(
+                    tiers,
+                    vec![
+                        ("jei".to_string(), ExecutionTier::RequiresFallback),
+                        ("sodium".to_string(), ExecutionTier::BuiltInSuperseded),
+                        ("okmod".to_string(), ExecutionTier::UniversalNative),
+                    ]
+                );
+            }
+            other => panic!("expected DelegateToNeoForge, got {other:?}"),
+        }
+        // On a 1.21.4 target every declared range still holds -> pure native.
+        let plan = plan_mod_startup_for_version(
+            &mods,
+            &set(&[]),
+            &set(&["okmod"]),
+            &set(&[]),
+            FallbackPolicy::DelegateNeoForge,
+            McVersion::V1_21_4,
+        );
+        assert!(matches!(plan, StartupPlan::DelegateToNeoForge { .. }));
+        // `jei`'s 1.20.1 range mismatches on 1.21.4 too; drop it and plan again.
+        let mods = &mods[1..];
+        let plan = plan_mod_startup_for_version(
+            mods,
+            &set(&[]),
+            &set(&["okmod"]),
+            &set(&[]),
+            FallbackPolicy::DelegateNeoForge,
+            McVersion::V1_21_4,
+        );
+        assert!(matches!(plan, StartupPlan::RunNative { .. }));
+        // Strict refuses cleanly with the version reason in the audit trail.
+        let plan = plan_mod_startup_for_version(
+            &[versioned_mod("jei", Some("[1.20.1,1.20.2)"))],
+            &set(&[]),
+            &set(&[]),
+            &set(&[]),
+            FallbackPolicy::Strict,
+            McVersion::V1_21_1,
+        );
+        match plan {
+            StartupPlan::RefuseStartup { blocking_mods, .. } => {
+                assert_eq!(blocking_mods[0].mod_id, "jei");
+                assert!(blocking_mods[0].reasons[0].contains("server is running 1.21.1"));
+            }
+            other => panic!("expected RefuseStartup, got {other:?}"),
+        }
     }
 }

@@ -132,6 +132,7 @@ mod tests {
                 shimcheck_compatible: false,
                 has_unsupported_mixin_or_at: true,
                 rejection_reasons: vec!["UNSUPPORTED_MIXIN_INJECTION".into()],
+                mc_version_range: None,
             },
             DiscoveredMod {
                 mod_id: "mekanism".into(),
@@ -139,6 +140,7 @@ mod tests {
                 shimcheck_compatible: false,
                 has_unsupported_mixin_or_at: false,
                 rejection_reasons: vec![],
+                mc_version_range: None,
             },
             DiscoveredMod {
                 mod_id: "pipez".into(),
@@ -146,6 +148,7 @@ mod tests {
                 shimcheck_compatible: false,
                 has_unsupported_mixin_or_at: false,
                 rejection_reasons: vec![],
+                mc_version_range: None,
             },
             DiscoveredMod {
                 mod_id: "shim_ok".into(),
@@ -153,6 +156,7 @@ mod tests {
                 shimcheck_compatible: true,
                 has_unsupported_mixin_or_at: false,
                 rejection_reasons: vec![],
+                mc_version_range: None,
             },
             DiscoveredMod {
                 mod_id: "mixin_heavy".into(),
@@ -160,6 +164,7 @@ mod tests {
                 shimcheck_compatible: false,
                 has_unsupported_mixin_or_at: true,
                 rejection_reasons: vec!["UNSUPPORTED_MIXIN_INJECTION".into()],
+                mc_version_range: None,
             },
         ];
         let set = |items: &[&str]| -> BTreeSet<String> {

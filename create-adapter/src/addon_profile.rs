@@ -20,6 +20,9 @@ use mod_adapter_core::blockstates::{
 };
 use mod_adapter_core::data_loader::{parse_json, DataLoadError, JsonValue, LoadedModData};
 use mod_adapter_core::profile::ModOffloadProfile;
+use mod_adapter_core::version_compat::{
+    check_mod_mc_version, McVersion, VersionCompatVerdict, VersionRange, VersionRangeError,
+};
 
 use crate::blockstates::{core_create_block_defs, CreateBlockRegistry, CreateBlockRole};
 use crate::factory::Axis;
@@ -164,6 +167,12 @@ pub struct CreateAddonProfile {
     /// Explicit or discovered blockstate property tables (`id -> props`).
     /// Overrides the axis/facing defaults in `block_defs()`.
     pub block_properties: BTreeMap<String, Vec<PropertyDef>>,
+    /// Declared Minecraft version compatibility for this profile, in either
+    /// loader syntax — NeoForge/Forge Maven interval (`"[1.21.1,1.22)"`) or
+    /// Fabric SemVer (`">=1.21.1 <1.22"`, `"1.21.x"`) — parsed by
+    /// [`VersionRange`]. `None` means the profile makes no version claim and
+    /// [`Self::supports_mc_version`] returns `true` for every target.
+    pub mc_version_range: Option<String>,
 }
 
 impl CreateAddonProfile {
@@ -188,6 +197,7 @@ impl CreateAddonProfile {
             decorative_blocks: Vec::new(),
             hidden_blocks: Vec::new(),
             block_properties: BTreeMap::new(),
+            mc_version_range: None,
         }
     }
 
@@ -298,6 +308,9 @@ impl CreateAddonProfile {
                 }
             }
             profile.propulsion = Some(spec);
+        }
+        if let Some(range) = obj.get("mc_version_range").and_then(JsonValue::as_str) {
+            profile.mc_version_range = Some(range.to_string());
         }
         profile.finalize();
         Ok(profile)
@@ -463,6 +476,37 @@ impl CreateAddonProfile {
             );
         }
         out
+    }
+
+    /// Parse [`Self::mc_version_range`] via [`VersionRange`]. `Ok(None)` when
+    /// the profile declares no range; `Err` on a malformed declaration so
+    /// callers can fail closed instead of trusting it.
+    pub fn parsed_mc_version_range(&self) -> Result<Option<VersionRange>, VersionRangeError> {
+        self.mc_version_range
+            .as_deref()
+            .map(VersionRange::parse)
+            .transpose()
+    }
+
+    /// Compatibility verdict for this profile on a server running `target` —
+    /// [`VersionCompatVerdict`] distinguishing minor/major mismatches and
+    /// malformed declarations. `None` when the profile declares no range.
+    pub fn check_mc_version(&self, target: McVersion) -> Option<VersionCompatVerdict> {
+        self.mc_version_range
+            .as_deref()
+            .map(|declared| check_mod_mc_version(target, declared))
+    }
+
+    /// Whether this profile applies to a server running `target`: `true` when
+    /// no range is declared or the declared range contains `target`. A
+    /// malformed declaration returns `false` (fail closed — an unreadable
+    /// claim must not silently enable a flagship adapter).
+    pub fn supports_mc_version(&self, target: McVersion) -> bool {
+        match self.parsed_mc_version_range() {
+            Ok(Some(range)) => range.contains(target),
+            Ok(None) => true,
+            Err(_) => false,
+        }
     }
 
     /// Keep `offload` synchronized: every Create-side block gains a
@@ -912,10 +956,17 @@ fn axis_from_name(name: &str) -> Axis {
 // Built-in reference profiles
 // ---------------------------------------------------------------------------
 
+/// Minecraft compatibility declared by every built-in reference profile:
+/// the 1.21.x release line starting at 1.21.1 (Maven interval syntax, parsed
+/// by [`VersionRange`]). Lets callers gate profile applicability across
+/// 1.21.1/1.21.3/1.21.4/1.21.5+ via [`CreateAddonProfile::supports_mc_version`].
+pub const BUILTIN_ADDON_MC_VERSION_RANGE: &str = "[1.21.1,1.22)";
+
 /// Create: Aeronautics (`createaeronautics`): airship assembly anchor,
 /// propeller bearings/thrusters, balloon envelopes, and rudder/helm control.
 pub fn createaeronautics_profile() -> CreateAddonProfile {
     let mut p = CreateAddonProfile::new("createaeronautics");
+    p.mc_version_range = Some(BUILTIN_ADDON_MC_VERSION_RANGE.to_string());
     p.assembly_anchors = vec!["createaeronautics:airship_assembler".into()];
     p.kinetic_sources = vec![KineticSourceSpec {
         id: "createaeronautics:propeller_engine".into(),
@@ -979,6 +1030,7 @@ pub fn createaeronautics_profile() -> CreateAddonProfile {
 /// conductor blocks (all non-kinetic, decorative on the flagship tier).
 pub fn railways_profile() -> CreateAddonProfile {
     let mut p = CreateAddonProfile::new("railways");
+    p.mc_version_range = Some(BUILTIN_ADDON_MC_VERSION_RANGE.to_string());
     p.decorative_blocks = vec![
         "railways:semaphore".into(),
         "railways:track_coupler".into(),
@@ -1003,6 +1055,7 @@ pub fn railways_profile() -> CreateAddonProfile {
 /// alternator/tesla coil consumers, rolling mill processor, connectors.
 pub fn createaddition_profile() -> CreateAddonProfile {
     let mut p = CreateAddonProfile::new("createaddition");
+    p.mc_version_range = Some(BUILTIN_ADDON_MC_VERSION_RANGE.to_string());
     p.kinetic_sources = vec![KineticSourceSpec {
         id: "createaddition:electric_motor".into(),
         base_rpm: 96,
@@ -1043,6 +1096,7 @@ pub fn createaddition_profile() -> CreateAddonProfile {
 /// generator-coil / carbon-brush consumers.
 pub fn create_new_age_profile() -> CreateAddonProfile {
     let mut p = CreateAddonProfile::new("create_new_age");
+    p.mc_version_range = Some(BUILTIN_ADDON_MC_VERSION_RANGE.to_string());
     p.kinetic_sources = vec![
         KineticSourceSpec {
             id: "create_new_age:energiser_t1".into(),
@@ -1192,6 +1246,100 @@ mod tests {
         ] {
             assert!(mirror.contains(id), "mirror missing {id}");
         }
+    }
+
+    #[test]
+    fn builtin_profiles_declare_mc_version_range_across_1_21_x() {
+        for profile in builtin_create_addon_profiles() {
+            assert_eq!(
+                profile.mc_version_range.as_deref(),
+                Some(BUILTIN_ADDON_MC_VERSION_RANGE),
+                "profile {}",
+                profile.mod_id
+            );
+            for target in [
+                McVersion::V1_21_1,
+                McVersion::V1_21_3,
+                McVersion::V1_21_4,
+                McVersion::V1_21_5,
+            ] {
+                assert!(
+                    profile.supports_mc_version(target),
+                    "profile {} must apply to {target}",
+                    profile.mod_id
+                );
+                assert_eq!(
+                    profile.check_mc_version(target),
+                    Some(VersionCompatVerdict::Compatible)
+                );
+            }
+            // Other release lines and a hypothetical 1.22 do not apply.
+            assert!(!profile.supports_mc_version(McVersion::V1_20_4));
+            assert!(!profile.supports_mc_version(McVersion::V1_20_6));
+            assert!(!profile.supports_mc_version(McVersion::new(1, 22, 0)));
+            assert!(!profile.supports_mc_version(McVersion::V1_21_0));
+        }
+    }
+
+    #[test]
+    fn aeronautics_profile_version_verdicts_distinguish_minor_and_major() {
+        let aero = createaeronautics_profile();
+        // `[1.21.1,1.22)` excludes 1.21.0 but shares its 1.21.x line -> minor.
+        assert_eq!(
+            aero.check_mc_version(McVersion::V1_21_0),
+            Some(VersionCompatVerdict::MinorMismatch {
+                target: McVersion::V1_21_0,
+                declared: BUILTIN_ADDON_MC_VERSION_RANGE.to_string(),
+            })
+        );
+        // A 1.20.x server is a different release line entirely -> major.
+        assert_eq!(
+            aero.check_mc_version(McVersion::V1_20_4),
+            Some(VersionCompatVerdict::MajorMismatch {
+                target: McVersion::V1_20_4,
+                declared: BUILTIN_ADDON_MC_VERSION_RANGE.to_string(),
+            })
+        );
+        // The declared range really parses back into a usable VersionRange.
+        let range = aero.parsed_mc_version_range().unwrap().unwrap();
+        assert!(range.contains(McVersion::V1_21_4));
+        assert!(!range.contains(McVersion::V1_20_6));
+    }
+
+    #[test]
+    fn profile_version_range_from_json_and_fail_closed_edges() {
+        // `mc_version_range` round-trips through declarative profile JSON.
+        let profile = CreateAddonProfile::from_json(
+            br#"{
+          "mod_id": "rangecheck",
+          "mc_version_range": ">=1.21.1 <1.21.5",
+          "blocks": [{"id": "rangecheck:pipe", "role": "transport_pipe"}]
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            profile.mc_version_range.as_deref(),
+            Some(">=1.21.1 <1.21.5")
+        );
+        assert!(profile.supports_mc_version(McVersion::V1_21_4));
+        assert!(!profile.supports_mc_version(McVersion::V1_21_5));
+
+        // Undeclared profile: no gate, every target applies.
+        let mut open = CreateAddonProfile::new("noversion");
+        assert!(open.supports_mc_version(McVersion::V1_20_4));
+        assert!(open.supports_mc_version(McVersion::new(9, 9, 9)));
+        assert!(open.check_mc_version(McVersion::V1_21_1).is_none());
+        assert!(open.parsed_mc_version_range().unwrap().is_none());
+
+        // Malformed declaration fails closed: unparseable, unsupported,
+        // and the verdict carries the parse reason.
+        open.mc_version_range = Some("[unterminated".to_string());
+        assert!(!open.supports_mc_version(McVersion::V1_21_1));
+        assert!(open.parsed_mc_version_range().is_err());
+        assert!(matches!(
+            open.check_mc_version(McVersion::V1_21_1),
+            Some(VersionCompatVerdict::InvalidRange { .. })
+        ));
     }
 
     #[test]

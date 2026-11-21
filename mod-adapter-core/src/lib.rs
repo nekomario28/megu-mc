@@ -22,6 +22,11 @@
 //!   (`Strict`, `Quarantine` with Save v2 block-loss guard, `DelegateNeoForge`),
 //!   plus [`fallback::BUILTIN_SUPERSEDED_PERF_MODS`] superseding of redundant
 //!   optimization mods (skipped before any Tier 3 check).
+//! - [`version_compat`]: multi-version Minecraft compatibility engine —
+//!   dependency-free Maven interval (NeoForge/Forge) and SemVer (Fabric)
+//!   version-range parsing, the `pack_format`/`DataVersion` lookup table, and
+//!   target-version-aware compat verdicts consumed by
+//!   [`fallback::plan_mod_startup_for_version`].
 
 #![deny(unsafe_code)]
 
@@ -31,6 +36,7 @@ pub mod dimension_mod;
 pub mod fallback;
 pub mod neoforge_wire;
 pub mod profile;
+pub mod version_compat;
 
 pub use dimension_mod::{
     DimEntryDescriptor, DimTypeDescriptor, DimensionEnvProfile, DimensionModClassification,
