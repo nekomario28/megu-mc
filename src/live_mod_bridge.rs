@@ -65,9 +65,21 @@ enum LiveProgressionVerdict {
 // ===========================================================================
 
 #[cfg(feature = "mod-suite")]
+use mod_adapter_core::bytecode_subset_vm::{
+    execute_verified_method, parse_class_methods, verify_subset_method, HostCallKind, SubsetVmHost,
+    VerifiedMethod, VmError, VmValue, DEFAULT_FUEL,
+};
+#[cfg(feature = "mod-suite")]
 use mod_adapter_core::class_mixin_scanner::{scan_jar_mixins_with_options, JarScanOptions};
 #[cfg(feature = "mod-suite")]
-use mod_adapter_core::culinary_adapter::{CulinaryDiscoveryStats, CulinaryRegistry};
+use mod_adapter_core::culinary_adapter::{
+    CookResult, CookingPotState, CulinaryDiscoveryStats, CulinaryRegistry, CuttingOutcome,
+};
+#[cfg(feature = "mod-suite")]
+use mod_adapter_core::ecosystem_compat::{
+    plan_dual_loader_mods_dir, AccessoryError, AccessoryInventory, AccessoryItem, AttributeTotals,
+    DualLoaderPlan,
+};
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::fallback::{
     classify_mod_with_mixins, is_builtin_superseded_mod, DiscoveredMod, ExecutionTier,
@@ -129,11 +141,22 @@ struct LiveModSuite {
     active: bool,
     /// Per-JAR classification audit, in sorted file order.
     reports: Vec<LiveModJarReport>,
+    /// Validated merged Fabric + NeoForge server-side manifest table.
+    dual_loader: DualLoaderPlan,
+    /// Methods verified against the restricted JVM opcode and host-call sets.
+    damage_hooks: Vec<VerifiedMethod>,
     /// Merged Farmer's Delight + addon culinary content across all loaded
     /// JARs (cooking/cutting recipes, tags, loot modifiers, food specs).
     culinary: CulinaryRegistry,
     /// Aggregated discovery counters over `culinary` (for the boot report).
     culinary_stats: CulinaryDiscoveryStats,
+    /// Live pots are keyed by dimension and block position.
+    cooking_pots: HashMap<(DimId, i32, i32, i32), CookingPotState>,
+    /// Only active completion deadlines enter the scheduler. Idle pots have
+    /// no entries and therefore cost no work during ticks.
+    cooking_deadlines: std::collections::BTreeSet<(u64, DimId, i32, i32, i32)>,
+    /// Independent Curios/Trinkets-compatible inventories for each player.
+    accessories: HashMap<String, AccessoryInventory>,
     /// Declarative dimension/biome progression gates; empty = no gating.
     barriers: ProgressionBarrierEngine,
     /// `(player, advancement)` grants for ids the vanilla advancement tree
@@ -145,6 +168,7 @@ struct LiveModSuite {
     appleskin: HashMap<i32, AppleSkinDeltaTracker>,
     /// Encoded `MSY1` body for `mc-spine:mod_sync_v1`, validated at arm time.
     mod_sync_body: Option<Vec<u8>>,
+    mod_sync_root_hash: Option<[u8; 32]>,
 }
 
 #[cfg(feature = "mod-suite")]
@@ -153,12 +177,18 @@ impl LiveModSuite {
         Self {
             active: false,
             reports: Vec::new(),
+            dual_loader: DualLoaderPlan::default(),
+            damage_hooks: Vec::new(),
             culinary: CulinaryRegistry::new(),
             culinary_stats: CulinaryDiscoveryStats::default(),
+            cooking_pots: HashMap::new(),
+            cooking_deadlines: std::collections::BTreeSet::new(),
+            accessories: HashMap::new(),
             barriers: ProgressionBarrierEngine::new(Vec::new()),
             extra_advancements: BTreeSet::new(),
             appleskin: HashMap::new(),
             mod_sync_body: None,
+            mod_sync_root_hash: None,
         }
     }
 
@@ -195,9 +225,63 @@ impl LiveModSuite {
             return;
         }
         let jars = Self::jar_listing(dir);
+        let mut bounded_jars = Vec::new();
         for (file_name, path) in &jars {
             self.scan_jar(file_name, path);
+            if let Ok(metadata) = std::fs::metadata(path) {
+                if metadata.len() <= lmb_sync::MAX_MOD_JAR_BYTES {
+                    if let Ok(bytes) = std::fs::read(path) {
+                        bounded_jars.push((file_name.clone(), bytes));
+                    }
+                }
+            }
         }
+        let plan = plan_dual_loader_mods_dir(
+            bounded_jars
+                .iter()
+                .map(|(name, bytes)| (name.as_str(), bytes.as_slice())),
+        );
+        let accepted: BTreeSet<&str> = plan
+            .unified_mods
+            .iter()
+            .map(|entry| entry.jar_name.as_str())
+            .collect();
+        for (name, bytes) in &bounded_jars {
+            if accepted.contains(name.as_str()) {
+                self.load_damage_hooks(name, bytes);
+            }
+        }
+        eprintln!(
+            "[live-mods] dual-loader: {} unified, {} client-only, {} superseded, {} rejected, {} duplicate ids, {} missing deps, {} verified damage hooks",
+            plan.unified_mods.len(),
+            plan.skipped_client_only.len(),
+            plan.skipped_superseded.len(),
+            plan.rejected_jars.len(),
+            plan.duplicate_conflicts.len(),
+            plan.missing_dependencies.len(),
+            self.damage_hooks.len(),
+        );
+        for rejected in &plan.rejected_jars {
+            eprintln!(
+                "[live-mods] rejected {}: {}",
+                rejected.jar_name, rejected.reason
+            );
+        }
+        for conflict in &plan.duplicate_conflicts {
+            eprintln!(
+                "[live-mods] duplicate id {}: {:?}",
+                conflict.mod_id, conflict.jar_names
+            );
+        }
+        for missing in &plan.missing_dependencies {
+            eprintln!(
+                "[live-mods] {} requires missing {} ({})",
+                missing.mod_id,
+                missing.required_mod_id,
+                missing.version_range.as_deref().unwrap_or("unspecified"),
+            );
+        }
+        self.dual_loader = plan;
         self.log_boot_report(jars.len());
     }
 
@@ -274,6 +358,88 @@ impl LiveModSuite {
         });
     }
 
+    /// Install only an explicitly named damage entrypoint after full static
+    /// verification. The archive scanner enforces ZIP and decoded-size bounds.
+    fn load_damage_hooks(&mut self, jar_name: &str, jar: &[u8]) {
+        const DAMAGE_DESCRIPTOR: &str = "(Lmcspine/api/Event;)V";
+        let classes = match live_mod_class_members(jar) {
+            Ok(classes) => classes,
+            Err(reason) => {
+                eprintln!("[live-mods] {jar_name}: class scan rejected: {reason}");
+                return;
+            }
+        };
+        for (class_name, bytes) in classes {
+            if self.damage_hooks.len() >= 128 {
+                eprintln!("[live-mods] damage hook count bound reached ({jar_name})");
+                return;
+            }
+            let Ok(parsed) = parse_class_methods(&bytes) else {
+                continue;
+            };
+            if !parsed
+                .methods
+                .iter()
+                .any(|m| m.name == "onDamage" && m.descriptor == DAMAGE_DESCRIPTOR)
+            {
+                continue;
+            }
+            match verify_subset_method(&parsed, "onDamage", DAMAGE_DESCRIPTOR) {
+                Ok(method) => self.damage_hooks.push(method),
+                Err(error) => {
+                    eprintln!("[live-mods] {jar_name} {class_name}: damage hook rejected: {error}")
+                }
+            }
+        }
+    }
+
+    /// Replace the state of a pot after an inventory/heat/world interaction.
+    /// Inserting a sleeping pot adds no deadline to the tick scheduler.
+    fn set_cooking_pot(
+        &mut self,
+        key: (DimId, i32, i32, i32),
+        mut pot: CookingPotState,
+        tick: u64,
+    ) {
+        if let Some(previous) = self.cooking_pots.get(&key) {
+            if let Some(deadline) = previous.next_completion_tick {
+                self.cooking_deadlines
+                    .remove(&(deadline, key.0, key.1, key.2, key.3));
+            }
+        }
+        pot.refresh(&self.culinary, tick);
+        if let Some(deadline) = pot.next_completion_tick {
+            self.cooking_deadlines
+                .insert((deadline, key.0, key.1, key.2, key.3));
+        }
+        self.cooking_pots.insert(key, pot);
+    }
+
+    fn tick_cooking_pots(&mut self, tick: u64) -> Vec<((DimId, i32, i32, i32), CookResult)> {
+        let mut completed = Vec::new();
+        // With no active pots this checks one empty BTreeSet and returns.
+        while let Some(&(deadline, dim, x, y, z)) = self.cooking_deadlines.first() {
+            if deadline > tick {
+                break;
+            }
+            self.cooking_deadlines.pop_first();
+            let key = (dim, x, y, z);
+            let Some(pot) = self.cooking_pots.get_mut(&key) else {
+                continue;
+            };
+            if pot.next_completion_tick != Some(deadline) {
+                continue;
+            }
+            if let Some(result) = pot.advance_to(tick, &self.culinary) {
+                completed.push((key, result));
+            }
+            if let Some(next) = pot.next_completion_tick {
+                self.cooking_deadlines.insert((next, dim, x, y, z));
+            }
+        }
+        completed
+    }
+
     /// Startup report: one line per tier group, then per-mod detail for
     /// anything needing operator attention (lifted and unliftable alike).
     fn log_boot_report(&self, jars_seen: usize) {
@@ -281,9 +447,7 @@ impl LiveModSuite {
             eprintln!("[live-mods] mods dir scanned: {jars_seen} jar(s), none classified");
             return;
         }
-        let count = |tier: ExecutionTier| {
-            self.reports.iter().filter(|r| r.tier == tier).count()
-        };
+        let count = |tier: ExecutionTier| self.reports.iter().filter(|r| r.tier == tier).count();
         eprintln!(
             "[live-mods] {jars_seen} jar(s): {} superseded, {} native, {} data-only, {} bounded-shim, {} tier3",
             count(ExecutionTier::BuiltInSuperseded),
@@ -307,7 +471,10 @@ impl LiveModSuite {
         }
         for report in &self.reports {
             let skipped = if report.skipped_client_mixins > 0 {
-                format!(", {} client-only mixin(s) skipped", report.skipped_client_mixins)
+                format!(
+                    ", {} client-only mixin(s) skipped",
+                    report.skipped_client_mixins
+                )
             } else {
                 String::new()
             };
@@ -354,8 +521,11 @@ impl LiveModSuite {
         };
         let policy = match std::env::var("MC_SPINE_MOD_SYNC_MIRRORS") {
             Ok(spec) => {
-                let mirrors: Vec<&str> =
-                    spec.split(',').map(str::trim).filter(|h| !h.is_empty()).collect();
+                let mirrors: Vec<&str> = spec
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|h| !h.is_empty())
+                    .collect();
                 match lmb_sync::SyncPolicy::with_operator_mirrors(&mirrors) {
                     Ok(policy) => policy,
                     Err(error) => {
@@ -381,12 +551,20 @@ impl LiveModSuite {
                 eprintln!(
                     "[live-mods] mod sync manifest armed: {} entr{}",
                     manifest.entries.len(),
-                    if manifest.entries.len() == 1 { "y" } else { "ies" }
+                    if manifest.entries.len() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    }
                 );
                 self.mod_sync_body = Some(body);
+                self.mod_sync_root_hash = Some(lmb_sync::manifest_root_hash(&manifest));
             }
             Err(error) => {
-                eprintln!("[live-mods] mod sync manifest encode failed: {}", error.reason());
+                eprintln!(
+                    "[live-mods] mod sync manifest encode failed: {}",
+                    error.reason()
+                );
             }
         }
     }
@@ -401,7 +579,10 @@ impl LiveModSuite {
             .and_then(|bytes| live_mod_progression_rules_from_json(&bytes));
         match result {
             Ok(rules) => {
-                eprintln!("[live-mods] progression barriers armed: {} rule(s)", rules.len());
+                eprintln!(
+                    "[live-mods] progression barriers armed: {} rule(s)",
+                    rules.len()
+                );
                 self.barriers = ProgressionBarrierEngine::new(rules);
             }
             Err(error) => {
@@ -409,6 +590,149 @@ impl LiveModSuite {
             }
         }
     }
+}
+
+/// A bounded ZIP central-directory reader for `.class` member bytes. The
+/// adapter's public manifest scanner validates the mod archive separately.
+/// This reader accepts STORE and DEFLATE, checks size and CRC, and never
+/// executes or loads a JVM class.
+#[cfg(feature = "mod-suite")]
+fn live_mod_class_members(jar: &[u8]) -> Result<Vec<(String, Vec<u8>)>, &'static str> {
+    use std::io::Read;
+
+    const MAX_CLASSES: usize = 8192;
+    const MAX_CLASS_BYTES: usize = 2 * 1024 * 1024;
+    const MAX_TOTAL_CLASS_BYTES: usize = 64 * 1024 * 1024;
+
+    let u16_at = |p: usize| -> Option<u16> {
+        Some(u16::from_le_bytes(
+            jar.get(p..p.checked_add(2)?)?.try_into().ok()?,
+        ))
+    };
+    let u32_at = |p: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(
+            jar.get(p..p.checked_add(4)?)?.try_into().ok()?,
+        ))
+    };
+    if jar.len() < 22 {
+        return Err("truncated zip footer");
+    }
+    let eocd = (jar.len().saturating_sub(65_557)..=jar.len() - 22)
+        .rev()
+        .find(|&p| {
+            u32_at(p) == Some(0x0605_4b50)
+                && u16_at(p + 20).is_some_and(|len| p + 22 + usize::from(len) == jar.len())
+        })
+        .ok_or("missing zip central directory")?;
+    if u16_at(eocd + 4) != Some(0) || u16_at(eocd + 6) != Some(0) {
+        return Err("multi-disk zip unsupported");
+    }
+    let count = usize::from(u16_at(eocd + 10).ok_or("zip entry count")?);
+    if count != usize::from(u16_at(eocd + 8).ok_or("zip disk entry count")?) || count > 65_000 {
+        return Err("zip entry count mismatch");
+    }
+    let directory = usize::try_from(u32_at(eocd + 16).ok_or("zip directory offset")?)
+        .map_err(|_| "zip offset overflow")?;
+    let directory_len = usize::try_from(u32_at(eocd + 12).ok_or("zip directory size")?)
+        .map_err(|_| "zip length overflow")?;
+    if directory
+        .checked_add(directory_len)
+        .is_none_or(|end| end > eocd)
+    {
+        return Err("zip directory truncated");
+    }
+    let mut cursor = directory;
+    let mut decoded_total = 0usize;
+    let mut classes = Vec::new();
+    for _ in 0..count {
+        if u32_at(cursor) != Some(0x0201_4b50) {
+            return Err("invalid zip central member");
+        }
+        let flags = u16_at(cursor + 8).ok_or("zip flags")?;
+        let method = u16_at(cursor + 10).ok_or("zip method")?;
+        let crc = u32_at(cursor + 16).ok_or("zip crc")?;
+        let compressed = usize::try_from(u32_at(cursor + 20).ok_or("zip compressed size")?)
+            .map_err(|_| "zip compressed length overflow")?;
+        let expanded = usize::try_from(u32_at(cursor + 24).ok_or("zip expanded size")?)
+            .map_err(|_| "zip expanded length overflow")?;
+        let name_len = usize::from(u16_at(cursor + 28).ok_or("zip name size")?);
+        let extra_len = usize::from(u16_at(cursor + 30).ok_or("zip extra size")?);
+        let comment_len = usize::from(u16_at(cursor + 32).ok_or("zip comment size")?);
+        let local = usize::try_from(u32_at(cursor + 42).ok_or("zip local offset")?)
+            .map_err(|_| "zip local offset overflow")?;
+        let name_start = cursor.checked_add(46).ok_or("zip header overflow")?;
+        let name_end = name_start
+            .checked_add(name_len)
+            .ok_or("zip name overflow")?;
+        let name = jar.get(name_start..name_end).ok_or("zip name truncated")?;
+        cursor = name_end
+            .checked_add(extra_len)
+            .and_then(|p| p.checked_add(comment_len))
+            .ok_or("zip member overflow")?;
+        if cursor > directory + directory_len {
+            return Err("zip central member truncated");
+        }
+        if !name.ends_with(b".class") {
+            continue;
+        }
+        if classes.len() >= MAX_CLASSES || expanded > MAX_CLASS_BYTES {
+            return Err("class count or size bound exceeded");
+        }
+        if flags & 1 != 0 || (method != 0 && method != 8) {
+            return Err("encrypted or unsupported compressed class");
+        }
+        let name = std::str::from_utf8(name).map_err(|_| "non-UTF8 class name")?;
+        if name.starts_with('/') || name.split('/').any(|segment| segment == "..") {
+            return Err("unsafe class member name");
+        }
+        if u32_at(local) != Some(0x0403_4b50) {
+            return Err("invalid local class header");
+        }
+        let payload_start = local
+            .checked_add(30)
+            .and_then(|p| p.checked_add(usize::from(u16_at(local + 26)?)))
+            .and_then(|p| p.checked_add(usize::from(u16_at(local + 28)?)))
+            .ok_or("class payload offset overflow")?;
+        let payload_end = payload_start
+            .checked_add(compressed)
+            .ok_or("class payload overflow")?;
+        let payload = jar
+            .get(payload_start..payload_end)
+            .ok_or("class payload truncated")?;
+        let decoded = if method == 0 {
+            payload.to_vec()
+        } else {
+            let mut decoder = flate2::read::DeflateDecoder::new(payload);
+            let mut out = Vec::new();
+            decoder
+                .by_ref()
+                .take((MAX_CLASS_BYTES + 1) as u64)
+                .read_to_end(&mut out)
+                .map_err(|_| "invalid class deflate stream")?;
+            out
+        };
+        decoded_total = decoded_total
+            .checked_add(decoded.len())
+            .ok_or("class total size overflow")?;
+        if decoded.len() != expanded || decoded_total > MAX_TOTAL_CLASS_BYTES {
+            return Err("class expanded size mismatch or total bound exceeded");
+        }
+        let mut checksum = !0u32;
+        for &byte in &decoded {
+            checksum ^= u32::from(byte);
+            for _ in 0..8 {
+                checksum = (checksum >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(checksum & 1));
+            }
+        }
+        if !checksum != crc {
+            return Err("class crc mismatch");
+        }
+        classes.push((name.to_string(), decoded));
+    }
+    if cursor != directory + directory_len {
+        return Err("zip directory size mismatch");
+    }
+    Ok(classes)
 }
 
 /// The process-wide suite. Constructed empty: until `live_mod_suite_boot`
@@ -419,12 +743,169 @@ fn live_mod_suite() -> &'static Mutex<LiveModSuite> {
     SUITE.get_or_init(|| Mutex::new(LiveModSuite::new()))
 }
 
+/// The only capabilities exposed to verified damage bytecode. Each method
+/// receives a fresh host so that failures cannot leak partial mutations.
+#[cfg(feature = "mod-suite")]
+struct LiveModDamageHost {
+    damage: f32,
+}
+
+#[cfg(feature = "mod-suite")]
+impl SubsetVmHost for LiveModDamageHost {
+    fn call(&mut self, kind: HostCallKind, args: &[VmValue]) -> Result<Option<VmValue>, VmError> {
+        match (kind, args) {
+            (HostCallKind::EventGetDamage, [VmValue::Ref(1)]) => {
+                Ok(Some(VmValue::Float(self.damage)))
+            }
+            (HostCallKind::EventSetDamage, [VmValue::Ref(1), VmValue::Float(value)])
+                if value.is_finite() && *value >= 0.0 =>
+            {
+                self.damage = *value;
+                Ok(None)
+            }
+            _ => Err(VmError::HostError(
+                "unsupported damage event host call".into(),
+            )),
+        }
+    }
+}
+
+/// Evaluate preverified onDamage methods in deterministic scan order, with
+/// an independent fuel budget and atomic damage update per invocation.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_eval_damage_hooks(initial_damage: f32) -> f32 {
+    if !initial_damage.is_finite() || initial_damage < 0.0 {
+        return initial_damage;
+    }
+    let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+    if !suite.active {
+        return initial_damage;
+    }
+    let mut damage = initial_damage;
+    for method in &suite.damage_hooks {
+        let mut host = LiveModDamageHost { damage };
+        match execute_verified_method(method, &[VmValue::Ref(1)], &mut host, DEFAULT_FUEL) {
+            Ok(_) => damage = host.damage,
+            Err(error) => eprintln!("[live-mods] damage hook execution rejected: {error}"),
+        }
+    }
+    damage
+}
+
+/// Install an updated pot snapshot after an inventory, heat, or block event.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_set_cooking_pot(dim: DimId, x: i32, y: i32, z: i32, pot: CookingPotState, tick: u64) {
+    let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+    if suite.active {
+        suite.set_cooking_pot((dim, x, y, z), pot, tick);
+    }
+}
+
+/// Remove a broken pot and its scheduled wake-up, if any.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_remove_cooking_pot(dim: DimId, x: i32, y: i32, z: i32) {
+    let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(pot) = suite.cooking_pots.remove(&(dim, x, y, z)) {
+        if let Some(deadline) = pot.next_completion_tick {
+            suite.cooking_deadlines.remove(&(deadline, dim, x, y, z));
+        }
+    }
+}
+
+/// Wake only pots whose deadline is due. Empty or unheated pots perform no
+/// per-tick work, irrespective of how many are registered.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_tick_cooking_pots(tick: u64) -> Vec<((DimId, i32, i32, i32), CookResult)> {
+    let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+    if suite.active {
+        suite.tick_cooking_pots(tick)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Execute cutting recipes discovered from base and unknown-addon JARs.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_cutting_board_use(item: &str, tool: &str, seed: u64) -> Option<CuttingOutcome> {
+    let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+    suite
+        .active
+        .then(|| suite.culinary.execute_cutting(item, tool, seed))
+        .flatten()
+}
+
+/// Equip for a single player without affecting any other player's slots.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_equip_accessory(
+    player: &str,
+    slot_type: &str,
+    index: usize,
+    item: AccessoryItem,
+) -> Result<(), AccessoryError> {
+    let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+    suite
+        .accessories
+        .entry(player.to_string())
+        .or_insert_with(AccessoryInventory::standard)
+        .equip(slot_type, index, item)
+}
+
+/// Aggregate the three vanilla attribute-modifier stages for a player.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_accessory_attributes(player: &str) -> BTreeMap<String, AttributeTotals> {
+    live_mod_suite()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .accessories
+        .get(player)
+        .map(AccessoryInventory::aggregate_attribute_modifiers)
+        .unwrap_or_default()
+}
+
+/// Probe the armed manifest using the NET-3c MSH1 magic and 32-byte root.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_sync_root_hash_probe() -> Option<[u8; 36]> {
+    live_mod_suite()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .mod_sync_root_hash
+        .as_ref()
+        .map(lmb_sync::encode_root_hash_probe)
+}
+
+/// A matching client MSH1 probe avoids a redundant MSY1 transfer. A missing
+/// or invalid probe requires the full manifest for reconciliation.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_sync_manifest_for_client_probe(client_probe: Option<&[u8]>) -> Option<Vec<u8>> {
+    let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+    if let (Some(expected), Some(probe)) = (suite.mod_sync_root_hash, client_probe) {
+        if let Ok(actual) = lmb_sync::decode_root_hash_probe(probe) {
+            if lmb_sync::digest_eq(&actual, &expected) {
+                return None;
+            }
+        }
+    }
+    suite.mod_sync_body.clone()
+}
+
 /// Tier-classify one JAR's bytes: the pure-Rust `.class` scanner extracts
 /// every Mixin site, then `classify_mod_with_mixins` runs the shared
 /// superseded→version→flagship/profile→shim→fallback chain with the clean-room
 /// promotion step. Returns `(tier, diagnostic, classes, sites, skipped_client)`.
 #[cfg(feature = "mod-suite")]
-fn live_mod_classify(mod_id: &str, jar_bytes: &[u8]) -> (ExecutionTier, String, usize, usize, usize) {
+fn live_mod_classify(
+    mod_id: &str,
+    jar_bytes: &[u8],
+) -> (ExecutionTier, String, usize, usize, usize) {
     let flagship = live_mod_flagship_ids();
     let profiles: BTreeSet<String> = lmb_profile::builtin_reference_profiles()
         .iter()
@@ -557,10 +1038,16 @@ fn live_mod_appleskin_sync(client: &Client) {
             .or_insert_with(AppleSkinDeltaTracker::new);
         let mut bodies = Vec::with_capacity(2);
         if let Some(payload) = tracker.poll_exhaustion(exhaustion) {
-            bodies.push(live_mod_payload_body(CHANNEL_APPLESKIN_EXHAUSTION, &payload));
+            bodies.push(live_mod_payload_body(
+                CHANNEL_APPLESKIN_EXHAUSTION,
+                &payload,
+            ));
         }
         if let Some(payload) = tracker.poll_saturation(saturation) {
-            bodies.push(live_mod_payload_body(CHANNEL_APPLESKIN_SATURATION, &payload));
+            bodies.push(live_mod_payload_body(
+                CHANNEL_APPLESKIN_SATURATION,
+                &payload,
+            ));
         }
         bodies
     };
@@ -579,7 +1066,11 @@ fn live_mod_appleskin_sync(client: &Client) {
 /// are cloned so no lock is held across per-client socket writes.
 #[cfg(feature = "mod-suite")]
 fn live_mod_tick() {
-    if live_mod_suite().lock().map(|suite| !suite.active).unwrap_or(true) {
+    if live_mod_suite()
+        .lock()
+        .map(|suite| !suite.active)
+        .unwrap_or(true)
+    {
         return;
     }
     let players = clients().lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -620,10 +1111,12 @@ fn live_check_progression_barrier(
     let Ok(suite) = live_mod_suite().lock() else {
         return LiveProgressionVerdict::Allowed;
     };
-    match suite
-        .barriers
-        .check_progression(dim, biome, player_advancements, is_creative_or_spectator)
-    {
+    match suite.barriers.check_progression(
+        dim,
+        biome,
+        player_advancements,
+        is_creative_or_spectator,
+    ) {
         ProgressionVerdict::Allowed => LiveProgressionVerdict::Allowed,
         ProgressionVerdict::Locked {
             rule_id,
@@ -648,7 +1141,9 @@ fn live_check_progression_barrier(
 /// into before checking the barrier engine.
 #[cfg(feature = "mod-suite")]
 fn live_player_advancement_set(player: &str) -> BTreeSet<String> {
-    let tracker = player_advancements().lock().unwrap_or_else(|e| e.into_inner());
+    let tracker = player_advancements()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     tracker
         .definitions
         .iter()
@@ -1036,10 +1531,7 @@ mod wire_mods_tests {
     fn ann(desc: &str, elems: Vec<(&str, Ev)>, invisible: bool) -> Ann {
         Ann {
             desc: desc.to_string(),
-            elems: elems
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect(),
+            elems: elems.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
             invisible,
         }
     }
@@ -1175,7 +1667,10 @@ mod wire_mods_tests {
                 class_attrs.push((cp.utf8(name), anns_payload(&mut cp, &group)));
             }
         }
-        class_attrs.push((cp.utf8("SourceFile"), cp.utf8("Dummy.java").to_be_bytes().to_vec()));
+        class_attrs.push((
+            cp.utf8("SourceFile"),
+            cp.utf8("Dummy.java").to_be_bytes().to_vec(),
+        ));
 
         let mut out = Vec::new();
         out.extend(0xCAFE_BABEu32.to_be_bytes());
@@ -1329,7 +1824,10 @@ mod wire_mods_tests {
         );
         lmb_test_jar(&[
             ("test.mixins.json", config.as_bytes()),
-            (&format!("{mod_pkg}/mixin/TestMixin.class"), class.as_slice()),
+            (
+                &format!("{mod_pkg}/mixin/TestMixin.class"),
+                class.as_slice(),
+            ),
         ])
     }
 
@@ -1353,7 +1851,10 @@ mod wire_mods_tests {
         );
         lmb_test_jar(&[
             ("test.mixins.json", config.as_bytes()),
-            (&format!("{mod_pkg}/mixin/RedirectMixin.class"), class.as_slice()),
+            (
+                &format!("{mod_pkg}/mixin/RedirectMixin.class"),
+                class.as_slice(),
+            ),
         ])
     }
 
@@ -1378,12 +1879,18 @@ mod wire_mods_tests {
         );
         let food = r#"{"nutrition":6,"saturation":0.6}"#;
         lmb_test_jar(&[
-            (&format!("data/{ns}/recipes/test_soup.json"), cooking.as_bytes()),
+            (
+                &format!("data/{ns}/recipes/test_soup.json"),
+                cooking.as_bytes(),
+            ),
             (
                 &format!("data/{ns}/recipes/test_soup_slice.json"),
                 cutting.as_bytes(),
             ),
-            (&format!("data/{ns}/tags/item/vegetables.json"), tag.as_bytes()),
+            (
+                &format!("data/{ns}/tags/item/vegetables.json"),
+                tag.as_bytes(),
+            ),
             (
                 &format!("data/{ns}/loot_modifiers/soup_slice.json"),
                 loot_mod.as_bytes(),
@@ -1529,18 +2036,37 @@ mod wire_mods_tests {
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
         let dir = lmb_temp_dir("scan");
-        std::fs::write(dir.join("sodium-0.6.13.jar"), lmb_test_jar(&[("x.bin", b"x")])).unwrap();
-        std::fs::write(dir.join("farmersdelight-1.2.jar"), lmb_culinary_jar("farmersdelight"))
-            .unwrap();
-        std::fs::write(dir.join("delightaddon-9.jar"), lmb_culinary_jar("delightaddon")).unwrap();
+        std::fs::write(
+            dir.join("sodium-0.6.13.jar"),
+            lmb_test_jar(&[("x.bin", b"x")]),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("farmersdelight-1.2.jar"),
+            lmb_culinary_jar("farmersdelight"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("delightaddon-9.jar"),
+            lmb_culinary_jar("delightaddon"),
+        )
+        .unwrap();
         std::fs::write(
             dir.join("safemod-1.0.jar"),
-            lmb_inject_jar("com/safemod", "net/minecraft/world/entity/LivingEntity", "hurt"),
+            lmb_inject_jar(
+                "com/safemod",
+                "net/minecraft/world/entity/LivingEntity",
+                "hurt",
+            ),
         )
         .unwrap();
         std::fs::write(
             dir.join("redirectmod-2.0.jar"),
-            lmb_redirect_jar("com/redmod", "net/minecraft/world/entity/LivingEntity", "hurt"),
+            lmb_redirect_jar(
+                "com/redmod",
+                "net/minecraft/world/entity/LivingEntity",
+                "hurt",
+            ),
         )
         .unwrap();
 
@@ -1555,7 +2081,10 @@ mod wire_mods_tests {
             .expect("sodium report");
         assert_eq!(sodium.tier, ExecutionTier::BuiltInSuperseded);
         assert_eq!(sodium.diagnostic, REASON_SUPERSEDED);
-        assert_eq!(sodium.classes_scanned, 0, "superseded jars are never scanned");
+        assert_eq!(
+            sodium.classes_scanned, 0,
+            "superseded jars are never scanned"
+        );
 
         // Culinary jars merged base + addon content into the live registry.
         let stats = &suite.culinary_stats;
@@ -1564,7 +2093,10 @@ mod wire_mods_tests {
         assert_eq!(stats.loot_modifiers, 2, "{stats:?}");
         assert_eq!(stats.food_specs, 2, "{stats:?}");
         assert!(stats.tag_values >= 4, "{stats:?}");
-        assert!(suite.culinary.food_spec("farmersdelight:test_soup").is_some());
+        assert!(suite
+            .culinary
+            .food_spec("farmersdelight:test_soup")
+            .is_some());
         assert!(suite.culinary.food_spec("delightaddon:test_soup").is_some());
 
         // The safe @Inject jar promotes Tier 3 -> bounded Tier 2.
@@ -1573,7 +2105,12 @@ mod wire_mods_tests {
             .iter()
             .find(|r| r.mod_id == "safemod")
             .expect("safemod report");
-        assert_eq!(safe.tier, ExecutionTier::BoundedJvmShim, "{}", safe.diagnostic);
+        assert_eq!(
+            safe.tier,
+            ExecutionTier::BoundedJvmShim,
+            "{}",
+            safe.diagnostic
+        );
         assert_eq!(safe.mixin_sites, 1);
 
         // The @Redirect jar stays Tier 3 with a mixin diagnostic.
@@ -1620,7 +2157,10 @@ mod wire_mods_tests {
     fn wire_mods_appleskin_emits_767_custom_payload_with_delta_suppression() {
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
-        live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()).active = true;
+        live_mod_suite()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active = true;
         let (me, mut peer) = lmb_client("wire_appleskin", 977_101);
 
         // First observation emits both channels once each on the verified
@@ -1698,8 +2238,10 @@ mod wire_mods_tests {
     fn wire_mods_progression_barrier_locks_and_allows() {
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
-        live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()).barriers =
-            ProgressionBarrierEngine::new(vec![lmb_gate_rule()]);
+        live_mod_suite()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .barriers = ProgressionBarrierEngine::new(vec![lmb_gate_rule()]);
 
         // Missing the gate advancement -> Locked with the full payload.
         let verdict = live_check_progression_barrier(
@@ -1771,19 +2313,40 @@ mod wire_mods_tests {
 
         // The gate's `""` biome entry matches the ungenerated test world, so
         // the dig is denied and the cell resynced (0x09 block update).
-        assert!(live_progression_denies_break(&me, DimId::Overworld, 4, 64, 4));
+        assert!(live_progression_denies_break(
+            &me,
+            DimId::Overworld,
+            4,
+            64,
+            4
+        ));
         let mut stash = Vec::new();
         let (id, _) = lmb_read_frame(&mut peer, &mut stash).expect("resync frame");
         assert_eq!(id, 0x09, "denied dig resyncs the client block view");
 
         // Granting the required advancement (outside the vanilla tree, via
         // the bridge-side grant path) opens the gate.
-        assert!(live_progression_grant(&me.name, "minecraft:story/mine_diamond"));
-        assert!(!live_progression_denies_break(&me, DimId::Overworld, 4, 64, 4));
+        assert!(live_progression_grant(
+            &me.name,
+            "minecraft:story/mine_diamond"
+        ));
+        assert!(!live_progression_denies_break(
+            &me,
+            DimId::Overworld,
+            4,
+            64,
+            4
+        ));
 
         // Empty rules short-circuit before any world lookup.
         fresh_suite();
-        assert!(!live_progression_denies_break(&me, DimId::Overworld, 4, 64, 4));
+        assert!(!live_progression_denies_break(
+            &me,
+            DimId::Overworld,
+            4,
+            64,
+            4
+        ));
     }
 
     #[test]
@@ -1880,7 +2443,10 @@ mod wire_mods_tests {
         {
             let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
             suite.arm_mod_sync_json(&bad);
-            assert!(suite.mod_sync_body.is_none(), "untrusted scheme must not arm");
+            assert!(
+                suite.mod_sync_body.is_none(),
+                "untrusted scheme must not arm"
+            );
         }
         // Malformed JSON arms nothing either.
         let worse = dir.join("worse.json");
@@ -1897,7 +2463,10 @@ mod wire_mods_tests {
 
     #[test]
     fn wire_mods_protocol_table_pins_767() {
-        assert_eq!(mc_spine_core::version::TargetVersion::V1_21_1.protocol(), 767);
+        assert_eq!(
+            mc_spine_core::version::TargetVersion::V1_21_1.protocol(),
+            767
+        );
         assert_eq!(LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID, 0x19);
     }
 
@@ -1906,7 +2475,11 @@ mod wire_mods_tests {
     #[test]
     fn wire_mods_inject_sites_lift_and_redirects_fail_closed() {
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let jar = lmb_inject_jar("com/safemod", "net/minecraft/world/entity/LivingEntity", "hurt");
+        let jar = lmb_inject_jar(
+            "com/safemod",
+            "net/minecraft/world/entity/LivingEntity",
+            "hurt",
+        );
         let report = scan_jar_mixins_with_options(&jar, JarScanOptions::default()).unwrap();
         assert_eq!(report.sites.len(), 1);
         assert_eq!(report.sites[0].annotation, MixinAnnotationKind::Inject);
@@ -1916,11 +2489,267 @@ mod wire_mods_tests {
         };
         assert_eq!(bindings[0].hook, StandardEventHook::EntityDamagePre);
 
-        let jar = lmb_redirect_jar("com/redmod", "net/minecraft/world/entity/LivingEntity", "hurt");
+        let jar = lmb_redirect_jar(
+            "com/redmod",
+            "net/minecraft/world/entity/LivingEntity",
+            "hurt",
+        );
         let report = scan_jar_mixins_with_options(&jar, JarScanOptions::default()).unwrap();
         let MixinLiftVerdict::RequiresFallback { unliftable, .. } = &report.verdict else {
-            panic!("redirect site must stay unliftable, got {:?}", report.verdict);
+            panic!(
+                "redirect site must stay unliftable, got {:?}",
+                report.verdict
+            );
         };
         assert_eq!(unliftable.len(), 1);
+    }
+
+    #[test]
+    fn w_mod_live_mixed_loader_boot_and_manifest_diagnostics() {
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        let dir = lmb_temp_dir("dual-loader");
+        let fabric = br#"{"schemaVersion":1,"id":"fabricharm","version":"1.0.0",
+            "environment":"*","depends":{"mylibrary":">=1.0"}}"#;
+        let neoforge = br#"modLoader="javafml"
+loaderVersion="[4.0.39]"
+license="MIT"
+[[mods]]
+modId="neoharm"
+version="2.0.0"
+"#;
+        let duplicate = br#"modLoader="javafml"
+loaderVersion="[4.0.39]"
+license="MIT"
+[[mods]]
+modId="fabricharm"
+version="3.0.0"
+"#;
+        std::fs::write(
+            dir.join("fabricharm-1.jar"),
+            lmb_test_jar(&[("fabric.mod.json", fabric)]),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("neoharm-2.jar"),
+            lmb_test_jar(&[("META-INF/neoforge.mods.toml", neoforge)]),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("z-fabricharm-3.jar"),
+            lmb_test_jar(&[("META-INF/neoforge.mods.toml", duplicate)]),
+        )
+        .unwrap();
+
+        let mut suite = LiveModSuite::new();
+        suite.scan_mods_dir(&dir);
+        assert_eq!(
+            suite.dual_loader.unified_mod_ids(),
+            ["fabricharm", "neoharm"]
+        );
+        assert_eq!(suite.dual_loader.duplicate_conflicts.len(), 1);
+        assert_eq!(
+            suite.dual_loader.duplicate_conflicts[0].mod_id,
+            "fabricharm"
+        );
+        assert_eq!(suite.dual_loader.missing_dependencies.len(), 1);
+        assert_eq!(
+            suite.dual_loader.missing_dependencies[0].required_mod_id,
+            "mylibrary"
+        );
+        assert_eq!(suite.reports.len(), 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn w_mod_live_cafebabe_damage_hook_executes_without_jvm() {
+        use mod_adapter_core::bytecode_subset_vm::testkit::{ClassAssembler, MethodSpec};
+
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        let mut asm = ClassAssembler::new("example/ThresholdDamage");
+        let get = asm.cp.method_ref("mcspine/api/Event", "getDamage", "()F");
+        let set = asm.cp.method_ref("mcspine/api/Event", "setDamage", "(F)V");
+        let ten = asm.cp.float(10.0);
+        let half = asm.cp.float(0.5);
+        let code = vec![
+            0x2a,
+            0xb6,
+            (get >> 8) as u8,
+            get as u8,
+            0x12,
+            ten as u8,
+            0x95,
+            0x9e,
+            0,
+            14,
+            0x2a,
+            0x2a,
+            0xb6,
+            (get >> 8) as u8,
+            get as u8,
+            0x12,
+            half as u8,
+            0x6a,
+            0xb6,
+            (set >> 8) as u8,
+            set as u8,
+            0xb1,
+        ];
+        let class = asm.finish(&[MethodSpec::new(
+            "onDamage",
+            "(Lmcspine/api/Event;)V",
+            4,
+            1,
+            code,
+        )]);
+        assert_eq!(&class[..4], &[0xca, 0xfe, 0xba, 0xbe]);
+        let dir = lmb_temp_dir("damage-class");
+        let manifest = br#"{"schemaVersion":1,"id":"damagehook","version":"1.0.0"}"#;
+        std::fs::write(
+            dir.join("damagehook-1.jar"),
+            lmb_test_jar(&[
+                ("fabric.mod.json", manifest),
+                ("example/ThresholdDamage.class", &class),
+            ]),
+        )
+        .unwrap();
+        let mut suite = LiveModSuite::new();
+        suite.scan_mods_dir(&dir);
+        assert_eq!(suite.damage_hooks.len(), 1);
+        suite.active = true;
+        *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = suite;
+        assert_eq!(live_mod_eval_damage_hooks(14.0), 7.0);
+        assert_eq!(live_mod_eval_damage_hooks(6.0), 6.0);
+        assert!(live_mod_eval_damage_hooks(f32::NAN).is_nan());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn w_mod_live_pot_sleep_completion_and_unknown_addon_cutting() {
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        let dir = lmb_temp_dir("pot-cutting");
+        std::fs::write(
+            dir.join("farmersdelight.jar"),
+            lmb_culinary_jar("farmersdelight"),
+        )
+        .unwrap();
+        let addon_manifest = br#"{"schemaVersion":1,"id":"unknownaddon","version":"1.0.0"}"#;
+        let cutting = br#"{"type":"unknownaddon:cutting",
+            "ingredients":[{"item":"minecraft:carrot"}],
+            "tool":{"item":"unknownaddon:knife"},
+            "result":[{"item":"unknownaddon:carrot_slices","count":3}]}"#;
+        std::fs::write(
+            dir.join("unknownaddon.jar"),
+            lmb_test_jar(&[
+                ("fabric.mod.json", addon_manifest),
+                ("data/unknownaddon/recipes/carrot_slices.json", cutting),
+            ]),
+        )
+        .unwrap();
+        let mut suite = LiveModSuite::new();
+        suite.scan_mods_dir(&dir);
+        assert!(suite.culinary_stats.cutting_recipes >= 2);
+        suite.active = true;
+        *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = suite;
+
+        let key = (DimId::Overworld, 10, 64, -3);
+        let mut pot = CookingPotState::new();
+        assert!(pot.insert_input("minecraft:carrot", 1));
+        pot.container = Some(("minecraft:bowl".into(), 1));
+        live_mod_set_cooking_pot(key.0, key.1, key.2, key.3, pot.clone(), 100);
+        {
+            let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(suite.cooking_pots[&key].is_sleeping());
+            assert!(suite.cooking_deadlines.is_empty());
+        }
+        assert!(live_mod_tick_cooking_pots(100_000).is_empty());
+        pot.heated = true;
+        live_mod_set_cooking_pot(key.0, key.1, key.2, key.3, pot, 100_000);
+        assert!(live_mod_tick_cooking_pots(100_199).is_empty());
+        let completed = live_mod_tick_cooking_pots(100_200);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].0, key);
+        assert_eq!(completed[0].1.result_item, "farmersdelight:test_soup");
+        assert!(live_mod_tick_cooking_pots(100_201).is_empty());
+        let cut = live_mod_cutting_board_use("minecraft:carrot", "unknownaddon:knife", 42).unwrap();
+        assert_eq!(cut.outputs, [("unknownaddon:carrot_slices".to_string(), 3)]);
+        live_mod_remove_cooking_pot(key.0, key.1, key.2, key.3);
+        assert!(live_mod_suite()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cooking_pots
+            .is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn w_mod_live_accessory_aggregation_and_msh1_probe() {
+        use mod_adapter_core::ecosystem_compat::{AttributeModifier, ModifierOperation};
+
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        let attr = "minecraft:generic.armor";
+        let ring = AccessoryItem::new("example:ring", ["ring"]).with_modifiers(vec![
+            AttributeModifier {
+                attribute: attr.into(),
+                operation: ModifierOperation::AddValue,
+                amount: 2.0,
+            },
+            AttributeModifier {
+                attribute: attr.into(),
+                operation: ModifierOperation::AddMultipliedBase,
+                amount: 0.1,
+            },
+            AttributeModifier {
+                attribute: attr.into(),
+                operation: ModifierOperation::AddMultipliedTotal,
+                amount: 0.25,
+            },
+        ]);
+        live_mod_equip_accessory("alice", "ring", 0, ring.clone()).unwrap();
+        assert!(matches!(
+            live_mod_equip_accessory("alice", "ring", 0, ring.clone()),
+            Err(AccessoryError::SlotOccupied { .. })
+        ));
+        assert!(live_mod_accessory_attributes("bob").is_empty());
+        let totals = live_mod_accessory_attributes("alice");
+        assert_eq!(totals[attr].add_value, 2.0);
+        assert_eq!(totals[attr].add_multiplied_base, 0.1);
+        assert_eq!(totals[attr].add_multiplied_total, 0.25);
+        assert_eq!(totals[attr].apply(20.0), 30.0);
+        live_mod_equip_accessory("bob", "ring", 1, ring).unwrap();
+        assert_eq!(live_mod_accessory_attributes("bob")[attr].apply(20.0), 30.0);
+
+        assert!(live_mod_sync_root_hash_probe().is_none());
+        let dir = lmb_temp_dir("msh1");
+        let file = dir.join("manifest.json");
+        let json = format!(
+            r#"{{"entries":[{{"mod_id":"jei","file_name":"jei.jar",
+            "download_url":"https://cdn.modrinth.com/data/jei/jei.jar",
+            "sha256_hex":"{}","size_bytes":12345}}]}}"#,
+            "a".repeat(64),
+        );
+        std::fs::write(&file, json).unwrap();
+        live_mod_suite()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .arm_mod_sync_json(&file);
+        let probe = live_mod_sync_root_hash_probe().expect("armed MSH1 probe");
+        assert_eq!(probe.len(), 36);
+        assert_eq!(&probe[..4], b"MSH1");
+        assert_eq!(
+            lmb_sync::decode_root_hash_probe(&probe).unwrap(),
+            probe[4..]
+        );
+        assert!(live_mod_sync_manifest_for_client_probe(Some(&probe)).is_none());
+        let mut mismatch = probe;
+        mismatch[10] ^= 1;
+        assert!(live_mod_sync_manifest_for_client_probe(Some(&mismatch))
+            .unwrap()
+            .starts_with(b"MSY1"));
+        assert!(live_mod_sync_manifest_for_client_probe(None).is_some());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
