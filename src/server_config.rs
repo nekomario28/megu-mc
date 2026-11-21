@@ -227,6 +227,169 @@ fn server_config_parse_value(s: &str) -> Option<ServerConfigValue> {
         .map(ServerConfigValue::Float)
 }
 
+/// Vanilla `server.properties` keys and the environment variable each stands for. A
+/// dropped-in Vanilla file is the lowest layer: it only fills a variable that neither
+/// the environment nor `server.toml` set. Keys with a dot in their name (`rcon.port`)
+/// are still single properties keys; Java has no nested sections. `enforce-whitelist`
+/// is listed first so it wins over `white-list` for the shared target variable, the
+/// same precedence Vanilla gives it.
+const SERVER_PROPERTIES_KEYS: &[(&str, &str)] = &[
+    ("server-port", "MC_SPINE_PORT"),
+    ("server-ip", "MC_SPINE_BIND_ADDR"),
+    ("motd", "MC_SPINE_MOTD"),
+    ("max-players", "MC_SPINE_MAX_PLAYERS"),
+    ("level-seed", "MC_SPINE_SEED"),
+    ("network-compression-threshold", "MC_SPINE_COMPRESSION_THRESHOLD"),
+    ("enforce-whitelist", "MC_SPINE_WHITELIST_ENABLED"),
+    ("white-list", "MC_SPINE_WHITELIST_ENABLED"),
+    ("difficulty", "MC_SPINE_DIFFICULTY"),
+    ("gamemode", "MC_SPINE_DEFAULT_GAMEMODE"),
+    ("view-distance", "MC_SPINE_VIEW_DISTANCE"),
+    ("simulation-distance", "MC_SPINE_SIMULATION_DISTANCE"),
+    ("rcon.port", "MC_SPINE_RCON_PORT"),
+    ("rcon.password", "MC_SPINE_RCON_PASSWORD"),
+    // The listener actually reads `MC_SPINE_RCON_PASS`; the properties layer feeds
+    // both so a Vanilla file's `rcon.password` takes effect, not just parses.
+    ("rcon.password", "MC_SPINE_RCON_PASS"),
+    ("player-idle-timeout", "MC_SPINE_IDLE_TIMEOUT_SECS"),
+    ("op-permission-level", "MC_SPINE_OP_PERMISSION_LEVEL"),
+    ("pvp", "MC_SPINE_PVP"),
+    ("allow-flight", "MC_SPINE_ALLOW_FLIGHT"),
+];
+
+/// Java `.properties` escape sequences. `\n`, `\t`, `\r`, `\f` and `\uXXXX` produce
+/// the named character; any other escaped character (including `\=`, `\:` and `\\`)
+/// stands for itself.
+fn server_properties_unescape(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            None => out.push('\\'),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('f') => out.push('\u{0C}'),
+            Some('u') => {
+                let hex: String = chars.by_ref().take(4).collect();
+                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    Some(c) => out.push(c),
+                    None => {
+                        out.push('\\');
+                        out.push('u');
+                        out.push_str(&hex);
+                    }
+                }
+            }
+            Some(other) => out.push(other),
+        }
+    }
+    out
+}
+
+/// Parse a Vanilla `server.properties` body: `#`/`!` comment lines, `key=value` and
+/// `key:value` pairs, Java escapes. Later duplicate keys win, as they do in Vanilla.
+fn server_properties_parse(text: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+            continue;
+        }
+        // The first unescaped `=` or `:` separates key from value.
+        let mut split = None;
+        let mut escaped = false;
+        for (i, c) in line.char_indices() {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '=' || c == ':' {
+                split = Some(i);
+                break;
+            }
+        }
+        let (key, value) = match split {
+            Some(i) => (&line[..i], &line[i + 1..]),
+            None => (line, ""),
+        };
+        let key = server_properties_unescape(key.trim());
+        if key.is_empty() {
+            continue;
+        }
+        out.insert(key, server_properties_unescape(value.trim()));
+    }
+    out
+}
+
+/// `server.properties` lives next to the `server.toml` in use (the working directory
+/// for the default `server.toml`, the custom file's directory under `MC_SPINE_CONFIG`).
+fn server_properties_path(config_path: &std::path::Path) -> std::path::PathBuf {
+    config_path
+        .parent()
+        .map(|dir| dir.join("server.properties"))
+        .unwrap_or_else(|| std::path::PathBuf::from("server.properties"))
+}
+
+/// Read the Vanilla file when one exists. Unlike `server.toml` it is never created:
+/// the commented `server.toml` stays the clean default, an operator's dropped-in
+/// `server.properties` is simply honored.
+fn server_properties_read(path: &std::path::Path) -> Option<BTreeMap<String, String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Some(server_properties_parse(&text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            eprintln!("[config] could not read {}: {e}; skipping", path.display());
+            None
+        }
+    }
+}
+
+/// Vanilla keys as `(env var, value)` for every variable not already set. Values
+/// needing a unit change are converted here (`player-idle-timeout` is minutes,
+/// `MC_SPINE_IDLE_TIMEOUT_SECS` is seconds); `op-permission-level` is clamped to
+/// Vanilla's `1..=4` range. Empty values are skipped: Vanilla writes e.g.
+/// `server-ip=` to mean "unset".
+fn server_properties_env(
+    props: &BTreeMap<String, String>,
+    is_set: impl Fn(&str) -> bool,
+) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    let mut emitted = HashSet::new();
+    for &(key, env) in SERVER_PROPERTIES_KEYS {
+        if emitted.contains(env) || is_set(env) {
+            continue;
+        }
+        let Some(raw) = props.get(key) else { continue };
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let value = match key {
+            "player-idle-timeout" => raw
+                .parse::<u64>()
+                .ok()
+                .map(|minutes| minutes.saturating_mul(60).to_string()),
+            "op-permission-level" => Some(
+                raw.parse::<i64>()
+                    .map(|level| level.clamp(1, 4))
+                    .unwrap_or(4)
+                    .to_string(),
+            ),
+            _ => Some(raw.to_owned()),
+        };
+        if let Some(value) = value {
+            out.push((env, value));
+            emitted.insert(env);
+        }
+    }
+    out
+}
+
 /// `[server]` keys and the environment variable each one stands for. The file only
 /// fills a variable that is not already set, so the environment keeps priority.
 const SERVER_CONFIG_KEYS: &[(&str, &str)] = &[
@@ -345,6 +508,13 @@ fn server_config_boot() -> ServerConfigDoc {
         // Single-threaded here (called before any thread is spawned).
         std::env::set_var(env, value);
     }
+    // A Vanilla `server.properties` next to the config sits under both layers above:
+    // it only fills variables still unset after the environment and `server.toml`.
+    if let Some(props) = server_properties_read(&server_properties_path(&path)) {
+        for (env, value) in server_properties_env(&props, |name| std::env::var_os(name).is_some()) {
+            std::env::set_var(env, value);
+        }
+    }
     doc
 }
 
@@ -434,6 +604,45 @@ mod server_config_tests {
                 ("MC_SPINE_ALLOWLIST", "A,B".to_owned())
             ]
         );
+    }
+
+    #[test]
+    fn server_properties_parses_vanilla_keys_and_respects_env_and_toml_precedence() {
+        let props = server_properties_parse(
+            "# vanilla comment\n\
+             ! also a comment\n\
+             server-port=25599\n\
+             server-ip=\n\
+             motd=A\\: escaped server\\nline two\n\
+             max-players: 5\n\
+             player-idle-timeout=10\n\
+             op-permission-level=9\n\
+             white-list=true\n\
+             enforce-whitelist=false\n\
+             escaped\\=key=v\n\
+             unicode=\\u00e9\n",
+        );
+        assert_eq!(props["server-port"], "25599");
+        assert_eq!(props["motd"], "A: escaped server\nline two");
+        assert_eq!(props["max-players"], "5");
+        assert_eq!(props["escaped=key"], "v");
+        assert_eq!(props["unicode"], "é");
+        // Empty values parse but are never exported: Vanilla writes `server-ip=` for unset.
+        assert_eq!(props["server-ip"], "");
+
+        // `is_set` stands for "a higher layer already decided this variable":
+        // the environment wins over everything, `server.toml` over the properties.
+        let decided: HashSet<&str> = ["MC_SPINE_PORT", "MC_SPINE_MOTD"].into_iter().collect();
+        let env = server_properties_env(&props, |name| decided.contains(name));
+        let got: BTreeMap<&str, String> = env.into_iter().collect();
+        assert!(!got.contains_key("MC_SPINE_PORT")); // server.toml won
+        assert!(!got.contains_key("MC_SPINE_MOTD")); // environment won
+        assert!(!got.contains_key("MC_SPINE_BIND_ADDR")); // `server-ip=` skipped
+        assert_eq!(got["MC_SPINE_MAX_PLAYERS"], "5");
+        assert_eq!(got["MC_SPINE_IDLE_TIMEOUT_SECS"], "600"); // minutes × 60
+        assert_eq!(got["MC_SPINE_OP_PERMISSION_LEVEL"], "4"); // clamped to 1..=4
+        // `enforce-whitelist` wins over `white-list` for the shared variable.
+        assert_eq!(got["MC_SPINE_WHITELIST_ENABLED"], "false");
     }
 
     #[test]
