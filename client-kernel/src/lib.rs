@@ -15,6 +15,7 @@ mod gzip;
 #[path = "../../src/json.rs"]
 mod json;
 mod light;
+pub mod occlusion_table;
 mod physics;
 mod registry;
 mod section;
@@ -32,6 +33,10 @@ pub use light::{
 };
 pub use mc_spine_core::id::ResourceLocation;
 pub use mc_spine_core::version::{TargetVersion, VersionMeta};
+pub use occlusion_table::{
+    BlockLightState, BlockShapeKind, ChunkLightBatch, CoalescedLightQueue, Direction, FaceMask,
+    HorizontalFacing, PackedLightProps, PrebakedLightTable, QueuedLightEdit,
+};
 pub use physics::{
     collide, fluid_impulse, Aabb, Collision, FluidCell, FluidImpulse, FluidKind, FluidQuery,
 };
