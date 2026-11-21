@@ -5049,6 +5049,10 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         "reload" if args.is_empty() => {
             match reload_datapacks(std::path::Path::new(DATAPACK_DIRECTORY), None, true) {
                 Ok(count) => {
+                    // Naturally refresh [anticheat] from server.toml (if present) and
+                    // auto-hidden #c:ores / #forge:ores / #c:chests tags on vanilla /reload.
+                    ac_reload_quiet();
+                    refresh_hidden_tags_from_datapacks(std::path::Path::new(DATAPACK_DIRECTORY));
                     let ops = load_operators(std::path::Path::new(OPS_FILE));
                     for client in client_snapshot() {
                         update_client_commands(&client);

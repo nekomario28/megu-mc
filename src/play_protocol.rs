@@ -418,6 +418,17 @@ fn negotiate_compression(
 }
 
 fn send_packet(s: &mut TcpStream, mut id: i64, mut payload: Vec<u8>) -> std::io::Result<()> {
+    if id == 0x5a {
+        // SetEntityMotion: whatever the server (or a mod acting through it) launches a
+        // player with is movement the anti-cheat must allow for.
+        let mut body = payload.as_slice();
+        if let Some(eid) = read_varint(&mut body) {
+            if body.len() >= 6 {
+                let axis = |i: usize| f64::from(i16::from_be_bytes([body[i], body[i + 1]])) / 8000.0;
+                ac_note_server_velocity(eid as i32, [axis(0), axis(2), axis(4)]);
+            }
+        }
+    }
     let mut send = true;
     let compression = SOCKET_WIRE.get().and_then(|states| {
         let mut states = states.lock().unwrap();
@@ -575,6 +586,7 @@ impl Client {
 
 impl std::ops::Drop for Client {
     fn drop(&mut self) {
+        ac_forget(self.eid);
         let socket = self.sock.get_mut().unwrap_or_else(|e| e.into_inner());
         unregister_socket_wire(socket_key(socket));
     }
@@ -2413,6 +2425,11 @@ fn cached_chunk_frame(
     // `live_chunk_block_entities` iterates a map; sort so the spliced bytes
     // (and their fingerprint) are deterministic across readers.
     let mut entities = live_chunk_block_entities(dim, cx, cz);
+    // Anti-xray: do not leak block-entity NBT (chests, barrels, suspicious sand/gravel
+    // LootTableSeed, vaults, etc.) for fully buried cells until exposed.
+    if anti_xray_enabled() {
+        entities.retain(|&((x, y, z), _, _)| block_exposed_dim(dim, x, y, z));
+    }
     entities.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
     let versions = chunk_versions_3x3(dim, cx, cz);
     let revision = chunk_packet_revision(&versions, map_chunk_sig(dim, cx, cz, gen), &entities);
@@ -2983,6 +3000,7 @@ fn switch_client_dimension(
     let teleport_id = {
         let mut teleport = me.teleport.lock().unwrap();
         let id = teleport.begin();
+        ac_expect_teleport(me.eid);
         // Spawn eligibility reads this pair in the same lock order.
         let mut dim = me.dim.lock().unwrap();
         let mut p = me.pos.lock().unwrap();
@@ -3301,6 +3319,7 @@ fn teleport_in_dimension(
 ) {
     let mut teleport = c.teleport.lock().unwrap();
     let id = teleport.begin();
+    ac_expect_teleport(c.eid);
     *c.pos.lock().unwrap() = (x, y, z, yaw, pitch, true);
     send_prepared_teleport(sock, &mut teleport, (x, y, z, yaw, pitch), id);
 }
@@ -4304,18 +4323,40 @@ fn handle(mut s: TcpStream) {
                     let px = f64::from_be_bytes(b[..8].try_into().unwrap());
                     let py = f64::from_be_bytes(b[8..16].try_into().unwrap());
                     let pz = f64::from_be_bytes(b[16..24].try_into().unwrap());
+                    if !me.teleport.lock().unwrap().movement_allowed() {
+                        continue;
+                    }
+                    // Anti-cheat runs before any lock is taken: it reads attributes, effects
+                    // and blocks around the player, and may pull the player back.
+                    let before = *me.pos.lock().unwrap();
+                    let claimed = if pid == 0x1b && b.len() >= 33 {
+                        b[32] != 0
+                    } else if pid == 0x1a && b.len() >= 25 {
+                        b[24] != 0
+                    } else {
+                        before.5
+                    };
+                    let checked_gnd = match ac_check_move(
+                        &me,
+                        (before.0, before.1, before.2),
+                        (px, py, pz),
+                        claimed,
+                    ) {
+                        AcMoveVerdict::Accept { ground } => ground,
+                        AcMoveVerdict::Setback => {
+                            ac_setback(&me, before);
+                            continue;
+                        }
+                    };
                     let teleport = me.teleport.lock().unwrap();
                     if !teleport.movement_allowed() {
                         continue;
                     }
                     let mut p = me.pos.lock().unwrap();
-                    let (mut yaw, mut pitch, mut gnd) = (p.3, p.4, p.5);
+                    let (mut yaw, mut pitch, gnd) = (p.3, p.4, checked_gnd);
                     if pid == 0x1b && b.len() >= 33 {
                         yaw = f32::from_be_bytes(b[24..28].try_into().unwrap());
                         pitch = f32::from_be_bytes(b[28..32].try_into().unwrap());
-                        gnd = b[32] != 0;
-                    } else if pid == 0x1a && b.len() >= 25 {
-                        gnd = b[24] != 0;
                     }
                     let prev_gnd = p.5;
                     *p = (px, py, pz, yaw, pitch, gnd);
@@ -4357,11 +4398,16 @@ fn handle(mut s: TcpStream) {
                     if !teleport.movement_allowed() {
                         continue;
                     }
+                    let at = {
+                        let p = me.pos.lock().unwrap();
+                        (p.0, p.1, p.2)
+                    };
+                    let gnd = ac_effective_ground(&me, at, b[8] != 0);
                     let mut p = me.pos.lock().unwrap();
                     let prev_gnd = p.5;
                     p.3 = yaw;
                     p.4 = pitch;
-                    p.5 = b[8] != 0;
+                    p.5 = gnd;
                     let (px, py, pz, g) = (p.0, p.1, p.2, p.5);
                     drop(p);
                     drop(teleport);
@@ -4425,9 +4471,14 @@ fn handle(mut s: TcpStream) {
                     if !teleport.movement_allowed() {
                         continue;
                     }
+                    let at = {
+                        let p = me.pos.lock().unwrap();
+                        (p.0, p.1, p.2)
+                    };
+                    let gnd = ac_effective_ground(&me, at, b[0] != 0);
                     let mut p = me.pos.lock().unwrap();
                     let prev_gnd = p.5;
-                    p.5 = b[0] != 0;
+                    p.5 = gnd;
                     drop(p);
                     drop(teleport);
                     landing::player_move(&me, prev_gnd);
@@ -4890,6 +4941,10 @@ fn handle(mut s: TcpStream) {
                     if *me.gm.lock().unwrap() == 2 {
                         return false;
                     }
+                    if !ac_check_place(&me, dim, (x, y, z), clicked, pos) {
+                        ac_resync_block(&me, dim, pos);
+                        return false;
+                    }
                     #[cfg(feature = "neoforge-events")]
                     if java_compat::NEOFORGE.get().is_some() {
                         let (x, y, z) = pos;
@@ -5318,6 +5373,7 @@ fn handle(mut s: TcpStream) {
                             let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                             continue;
                         }
+                        ac_consume_placed_item(&me, held_slot);
                         let mut op = Vec::new();
                         write_pos(&mut op, tx, ty, tz);
                         op.push(1);
@@ -5355,7 +5411,9 @@ fn handle(mut s: TcpStream) {
                             }
                             None => st,
                         };
-                        place((tx, ty, tz), st);
+                        if place((tx, ty, tz), st) {
+                            ac_consume_placed_item(&me, held_slot);
+                        }
                     }
                 }
                 let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));

@@ -32,6 +32,8 @@ logs/
 # and a fixture that runs a second overlay writes world_overlay_<name>.bin. Both spellings are
 # local state: the file is regenerable from the seed and must never be committed.
 /world_overlay*.bin
+# The settings file the server writes on first boot (`src/server_config.rs`) is local too.
+/server.toml
 /world_overlay*.bin.*
 /world/
 /saves/

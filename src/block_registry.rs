@@ -640,7 +640,6 @@ impl BReg {
     }
     /// Number of states the registry knows. Callers that walk the state space need
     /// this rather than a literal, so the extent has one owner.
-    #[cfg(test)]
     pub(crate) fn state_count(&self) -> usize {
         self.st_blk.len()
     }

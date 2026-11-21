@@ -37,6 +37,8 @@ mod tree;
 mod world_rng;
 mod worldgen;
 include!("paletted.rs");
+include!("server_config.rs");
+include!("anticheat.rs");
 include!("lighting.rs");
 include!("entity_collision.rs");
 include!("entity_fluid.rs");
@@ -4423,16 +4425,12 @@ fn base_state_h(x: i32, y: i32, z: i32, h: i32) -> u32 {
 // AND defeats x-ray, since buried ore never reaches the wire.
 static HIDDEN: OnceLock<HashSet<u32>> = OnceLock::new();
 static EMPTY_HIDDEN: OnceLock<HashSet<u32>> = OnceLock::new();
-static ANTI_XRAY_ENABLED: OnceLock<bool> = OnceLock::new();
 fn anti_xray_value_enabled(value: &str) -> bool {
     !matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
 }
+/// `[anticheat] antixray` in `server.toml` (default: on); `MC_SPINE_ANTI_XRAY` overrides.
 fn anti_xray_enabled() -> bool {
-    *ANTI_XRAY_ENABLED.get_or_init(|| {
-        std::env::var("MC_SPINE_ANTI_XRAY")
-            .map(|value| anti_xray_value_enabled(&value))
-            .unwrap_or(true)
-    })
+    ac_anti_xray_enabled()
 }
 /// Blocks hidden from clients until seen (anti-xray). Named here rather than inline
 /// so the list has one owner and a test can require every name to resolve: the
@@ -4455,18 +4453,44 @@ const HIDDEN_BLOCK_NAMES: &[&str] = &[
     "deepslate_redstone_ore",
     "deepslate_copper_ore",
     "deepslate_emerald_ore",
+    "nether_gold_ore",
+    "nether_quartz_ore",
     "ancient_debris",
     "chest",
     "trapped_chest",
     "barrel",
     "ender_chest",
+    "spawner",
+    "trial_spawner",
+    "vault",
+    "end_portal_frame",
+    "budding_amethyst",
+    "suspicious_sand",
+    "suspicious_gravel",
+    "reinforced_deepslate",
 ];
+/// Every state of every hidden block, from the registry: a lit redstone ore or a chest
+/// facing east is as much a give-away as the default state the names resolve to.
 fn hidden_states() -> &'static HashSet<u32> {
     HIDDEN.get_or_init(|| {
-        HIDDEN_BLOCK_NAMES
+        // Load the environment's extra ids now, so `is_hidden` knows whether to look.
+        if !hidden_extra().lock().unwrap().is_empty() {
+            HIDDEN_EXTRA_USED.store(true, Ordering::Relaxed);
+        }
+        let mut set: HashSet<u32> = HIDDEN_BLOCK_NAMES
             .iter()
             .filter_map(|n| name_to_state(n))
-            .collect()
+            .collect();
+        if let Some(reg) = breg() {
+            for st in 0..reg.state_count() as u32 {
+                let name = reg.name_of(st);
+                let name = name.strip_prefix("minecraft:").unwrap_or(name);
+                if HIDDEN_BLOCK_NAMES.contains(&name) {
+                    set.insert(st);
+                }
+            }
+        }
+        set
     })
 }
 static HIDDEN_EXTRA: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
@@ -4481,9 +4505,162 @@ fn hidden_extra() -> &'static Mutex<HashSet<u32>> {
         )
     })
 }
+/// Set once anything is added to `hidden_extra`, so the common case skips its mutex.
+static HIDDEN_EXTRA_USED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Automatically discover modded ores and containers tagged under standard
+/// conventional tags (`#c:ores`, `#forge:ores`, `#c:chests`, `#forge:chests`,
+/// `#c:barrels`, `#forge:barrels`, plus sub-tags like `#c:ores/zinc`) from
+/// datapacks/mods and register every state into `hidden_extra()` so Anti-Xray
+/// hides custom mod ores automatically with zero manual config.
+fn register_hidden_tags_from_dir(root: &std::path::Path) -> usize {
+    let data_dir = root.join("data");
+    if !data_dir.is_dir() {
+        return 0;
+    }
+    let mut tag_entries: HashMap<String, Vec<String>> = HashMap::new();
+    let mut stack = vec![data_dir.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(&data_dir) else {
+                continue;
+            };
+            let parts: Vec<String> = rel
+                .iter()
+                .map(|c| c.to_string_lossy().into_owned())
+                .collect();
+            // data/<ns>/tags/block/<tag>.json OR data/<ns>/tags/blocks/<tag>.json
+            if parts.len() < 4 || parts[1] != "tags" || (parts[2] != "block" && parts[2] != "blocks")
+            {
+                continue;
+            }
+            let ns = &parts[0];
+            let stem_joined = parts[3..].join("/");
+            let Some(stem) = stem_joined.strip_suffix(".json") else {
+                continue;
+            };
+            let tag_key = format!("{ns}:{stem}");
+            let Ok(raw) = std::fs::read(&path) else {
+                continue;
+            };
+            let Some(J::Obj(obj)) = jparse(&raw) else {
+                continue;
+            };
+            let Some((_, J::Arr(values))) = obj.iter().find(|(k, _)| k == "values") else {
+                continue;
+            };
+            let list = tag_entries.entry(tag_key).or_default();
+            for item in values {
+                match item {
+                    J::Str(s) => list.push(s.clone()),
+                    J::Obj(map) => {
+                        if let Some((_, J::Str(id))) = map.iter().find(|(k, _)| k == "id") {
+                            list.push(id.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if tag_entries.is_empty() {
+        return 0;
+    }
+
+    let is_hidden_root_tag = |tag: &str| {
+        matches!(
+            tag,
+            "c:ores"
+                | "forge:ores"
+                | "c:chests"
+                | "forge:chests"
+                | "c:barrels"
+                | "forge:barrels"
+        ) || tag.starts_with("c:ores/")
+            || tag.starts_with("forge:ores/")
+            || tag.ends_with(":ores")
+    };
+
+    let mut queue: Vec<String> = tag_entries
+        .keys()
+        .filter(|k| is_hidden_root_tag(k))
+        .cloned()
+        .collect();
+    let mut visited_tags: HashSet<String> = queue.iter().cloned().collect();
+    let mut block_ids: HashSet<String> = HashSet::new();
+    while let Some(tag) = queue.pop() {
+        let Some(entries) = tag_entries.get(&tag) else {
+            continue;
+        };
+        for entry in entries {
+            if let Some(sub) = entry.strip_prefix('#') {
+                let normalized = if sub.contains(':') {
+                    sub.to_owned()
+                } else {
+                    format!("minecraft:{sub}")
+                };
+                if visited_tags.insert(normalized.clone()) {
+                    queue.push(normalized);
+                }
+            } else {
+                let normalized = if entry.contains(':') {
+                    entry.clone()
+                } else {
+                    format!("minecraft:{entry}")
+                };
+                block_ids.insert(normalized);
+            }
+        }
+    }
+
+    let Some(reg) = breg() else {
+        return 0;
+    };
+    let mut added = 0usize;
+    let mut extra = hidden_extra().lock().unwrap();
+    for st in 0..reg.state_count() as u32 {
+        let name = reg.name_of(st);
+        if block_ids.contains(name) && extra.insert(st) {
+            added += 1;
+        }
+    }
+    if added > 0 {
+        HIDDEN_EXTRA_USED.store(true, Ordering::Relaxed);
+    }
+    added
+}
+
+fn refresh_hidden_tags_from_datapacks(datapacks_root: &std::path::Path) {
+    let mut total = register_hidden_tags_from_dir(datapacks_root);
+    if let Ok(rd) = std::fs::read_dir(datapacks_root) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                total += register_hidden_tags_from_dir(&p);
+            }
+        }
+    }
+    if total > 0 {
+        eprintln!("[anticheat] auto-hid {total} block state(s) from #c:ores / #forge:ores / #c:chests tags");
+    }
+}
+
 fn is_hidden(st: u32) -> bool {
     anti_xray_enabled()
-        && (hidden_states().contains(&st) || hidden_extra().lock().unwrap().contains(&st))
+        && (hidden_states().contains(&st)
+            || (HIDDEN_EXTRA_USED.load(Ordering::Relaxed)
+                && hidden_extra().lock().unwrap().contains(&st)))
 }
 
 /// `is_hidden` for a whole chunk's encode loop: the same answer without taking the
@@ -4510,30 +4687,53 @@ impl HiddenSet {
         self.base.contains(&st) || self.extra.contains(&st)
     }
 }
-// neighbors that expose a face (non-occluding): air, liquids, leaves, glass, ice, torches, signs
+/// Whether a neighbour lets a client see the face of the cell next to it: anything that
+/// is not a full opaque cube (`isSolidRender` from the registry: air, fluids, glass and
+/// tinted glass, leaves, slabs, torches, ...). A hidden neighbour does not count: unless
+/// it is itself exposed it reaches the wire as solid filler.
 fn exposes(st: u32) -> bool {
-    st == 0
-        || (80..=112).contains(&st)
-        || (264..=291).contains(&st)
-        || (519..=526).contains(&st)
-        || st == 5780
-        || (2354..=2355).contains(&st)
-        || (4302..=4589).contains(&st)
-        || (19276..=19339).contains(&st)
+    match breg() {
+        Some(reg) => !reg.is_solid_render(st) && !is_hidden(st),
+        None => st == 0,
+    }
 }
-// context-matched filler: majority vote over the six neighbors' WIRE
-// states — what the client already sees around the cell. Matches natural
-// strata AND player-built disguise (a stone blob inside a dirt wall is
-// itself an x-ray signature; blending with the cover kills it). A hidden
-// block is only hidden when fully surrounded, so every voter is opaque.
-// Falls back to the terrain function when the neighborhood is empty.
-fn hidden_filler(x: i32, y: i32, z: i32, h: i32) -> u32 {
-    hidden_filler_with(&mut |a: i32, b: i32, c: i32| block_at(a, b, c), x, y, z, h)
+
+/// The rock a buried hidden block is disguised as when none of its neighbours can vote.
+fn host_rock(dim: DimId, x: i32, y: i32, z: i32, h: i32) -> u32 {
+    let solid = |st: u32| !exposes(st) && !is_hidden(st);
+    if dim == DimId::Nether {
+        name_to_state("netherrack").unwrap_or(1)
+    } else if dim == DimId::End {
+        name_to_state("end_stone").unwrap_or(1)
+    } else {
+        let st = column_state(x, y, z, h);
+        if solid(st) {
+            st
+        } else if y < 0 {
+            name_to_state("deepslate").unwrap_or(1)
+        } else {
+            name_to_state("stone").unwrap_or(1)
+        }
+    }
+}
+
+// Context-matched filler: majority vote over the six neighbours, so the disguise matches
+// the strata or the player-built wall around the cell. Only plain opaque neighbours vote.
+fn hidden_filler_dim(dim: DimId, x: i32, y: i32, z: i32, h: i32) -> u32 {
+    hidden_filler_with(
+        &mut |a: i32, b: i32, c: i32| block_at_dim(dim, a, b, c),
+        dim,
+        x,
+        y,
+        z,
+        h,
+    )
 }
 // `rd` supplies block reads — chunk_data already holds world() and passes
 // its own reader; taking the lock here would self-deadlock.
 fn hidden_filler_with<F: FnMut(i32, i32, i32) -> u32>(
     rd: &mut F,
+    dim: DimId,
     x: i32,
     y: i32,
     z: i32,
@@ -4549,47 +4749,30 @@ fn hidden_filler_with<F: FnMut(i32, i32, i32) -> u32>(
         (0, 0, 1),
         (0, 0, -1),
     ] {
-        let (nx, ny, nz) = (x + dx, y + dy, z + dz);
-        let ns = rd(nx, ny, nz);
-        // a hidden neighbor contributes its own wire state, not the truth —
-        // otherwise a buried cluster would betray itself through the mask
-        let w = if is_hidden(ns)
-            && ![
-                (1, 0, 0),
-                (-1, 0, 0),
-                (0, 1, 0),
-                (0, -1, 0),
-                (0, 0, 1),
-                (0, 0, -1),
-            ]
-            .iter()
-            .any(|(ddx, ddy, ddz)| exposes(rd(nx + ddx, ny + ddy, nz + ddz)))
-        {
-            base_state(nx, ny, nz)
+        let w = rd(x + dx, y + dy, z + dz);
+        if is_hidden(w) || exposes(w) {
+            continue;
+        }
+        if let Some(entry) = counts[..len].iter_mut().find(|(st, _)| *st == w) {
+            entry.1 += 1;
         } else {
-            ns
-        };
-        if !exposes(w) {
-            if let Some(entry) = counts[..len].iter_mut().find(|(st, _)| *st == w) {
-                entry.1 += 1;
-            } else {
-                counts[len] = (w, 1);
-                len += 1;
-            }
+            counts[len] = (w, 1);
+            len += 1;
         }
     }
     counts[..len]
         .iter()
         .max_by_key(|(st, n)| (*n, std::cmp::Reverse(*st)))
         .map(|(st, _)| *st)
-        .unwrap_or_else(|| {
-            let st = column_state(x, y, z, h);
-            if is_hidden(st) || exposes(st) {
-                name_to_state("stone").unwrap_or(1)
-            } else {
-                st
-            }
-        })
+        .unwrap_or_else(|| host_rock(dim, x, y, z, h))
+}
+/// The Overworld column height `host_rock` reads; other dimensions do not use it.
+fn filler_height(dim: DimId, x: i32, z: i32) -> i32 {
+    if dim == DimId::Overworld {
+        height_at(x, z)
+    } else {
+        0
+    }
 }
 fn block_exposed_dim(dim: DimId, x: i32, y: i32, z: i32) -> bool {
     [
@@ -4623,7 +4806,7 @@ fn refresh_hidden_neighbors_dim(dim: DimId, x: i32, y: i32, z: i32) {
             let out = if block_exposed_dim(dim, nx, ny, nz) {
                 ns
             } else {
-                hidden_filler(nx, ny, nz, height_at(nx, nz))
+                hidden_filler_dim(dim, nx, ny, nz, filler_height(dim, nx, nz))
             };
             note_block_update_dim(dim, nx, ny, nz, out);
         }
@@ -5639,6 +5822,7 @@ impl PluginApi {
     pub fn mark_hidden(&mut self, st: u32) -> Result<(), &'static str> {
         self.spend()?;
         hidden_extra().lock().unwrap().insert(st);
+        HIDDEN_EXTRA_USED.store(true, Ordering::Relaxed);
         Ok(())
     }
     pub fn schedule_cell(
@@ -5847,7 +6031,7 @@ fn note_block_update(x: i32, y: i32, z: i32, st: u32) {
 fn visible_block_update_state(dim: DimId, x: i32, y: i32, z: i32, st: u32) -> u32 {
     // A hidden, unexposed block's true ID cannot reach the wire.
     if is_hidden(st) && !block_exposed_dim(dim, x, y, z) {
-        hidden_filler(x, y, z, height_at(x, z))
+        hidden_filler_dim(dim, x, y, z, filler_height(dim, x, z))
     } else {
         st
     }
@@ -6195,6 +6379,11 @@ fn set_block_if_dim_edit(
     store_patch(dim, x, y, z, st);
     bump_world_epoch_dim(dim, x, z);
     note_light_edit(dim, Position::new(x, y, z), old, st);
+    if old != st {
+        // The Overworld path does this in `set_block_if_inner_dim`: a mined neighbour
+        // reveals a hidden block, a filled one hides it again.
+        refresh_hidden_neighbors_dim(dim, x, y, z);
+    }
     live_block_changed(dim, RsPos(x, y, z), old, st);
     if old != st {
         if let Some(reg) = breg() {
@@ -9528,7 +9717,7 @@ fn chunk_data_opt(
                                 }
                             }
                             let vis = if hidden_cell {
-                                hidden_filler_with(&mut read, wx, wy, wz, hs[(lz << 4) | lx])
+                                hidden_filler_with(&mut read, dim, wx, wy, wz, hs[(lz << 4) | lx])
                             } else {
                                 st
                             };
@@ -9872,7 +10061,12 @@ fn build_map_chunk(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8
     // Overworld spawner at the same coordinates would send a block entity the client cannot
     // place there.
     if dim == DimId::Overworld {
-        be.extend(generated_spawner_chunk_entities(cx, cz));
+        let hide_buried = anti_xray_enabled();
+        be.extend(
+            generated_spawner_chunk_entities(cx, cz)
+                .into_iter()
+                .filter(|&((x, y, z), _, _)| !hide_buried || block_exposed_dim(dim, x, y, z)),
+        );
     }
     write_varint(&mut p, be.len() as i64);
     for ((x, y, z), ty, n) in be {
@@ -9897,68 +10091,199 @@ fn build_map_chunk(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8
     p
 }
 
-/// The light half of a chunk packet, shared with `update_light_packet`: four section masks, then
-/// sky and block light as two counted lists of 2048-byte arrays. Both light kinds are sent for
-/// every section rather than masked per section - the mask would save 53 KB on a chunk with no
-/// light source and cost a pass to compute, and the simpler form is the one that can be shown
-/// correct.
-fn write_light_arrays(p: &mut Vec<u8>, cx: i32, cz: i32, dim: DimId, gen: &GenSources) {
-    // `DimensionType.hasSkyLight()`: a dimension with no sky light layer has no sky arrays to
-    // send, so it sends an empty sky list and an empty mask instead of the Overworld's
-    // all-sections ones. The Overworld — every dimension this build streams today — takes the
-    // unchanged path; the Nether/End shape here is the packet's own contract and is not
-    // exercised by a delivery test until streaming is wired (P2-3-S2).
-    let mask = dim.light_mask();
-    let sky_mask: i64 = if worldgen::has_skylight(dim) { mask } else { 0 };
-    write_varint(p, 1);
-    p.extend_from_slice(&sky_mask.to_be_bytes()); // skyLightMask
-    write_varint(p, 1);
-    p.extend_from_slice(&mask.to_be_bytes()); // blockLightMask
-    write_varint(p, 0); // emptySky
-    write_varint(p, 0); // emptyBlock
-                        // The arrays follow as two counted lists, each entry prefixed by its length.
-                        // Sky light per column instead of the placeholder 0xff that read as noon everywhere,
-                        // then the block light a torch contributes. Two counted lists, sky first.
-    let __tsky = chunkprof::enabled().then(std::time::Instant::now);
-    let sky = if sky_mask == 0 {
-        Vec::new()
-    } else {
-        sky_light_sections_dim(dim, cx, cz)
-    };
-    if let Some(t) = __tsky {
-        chunkprof::add(&chunkprof::SKY, t);
+// ---------- anti-fullbright ----------
+//
+// What `antifullbright` can and cannot do. A server cannot stop a client from raising its
+// gamma or running a fullbright mod: brightness is drawn on the client from whatever light
+// data it holds. What the server controls is which light data it sends. Block light inside
+// a sealed generated pocket (a buried lava pocket, a geode's amethyst glow, glow lichen in a
+// closed crack) tells a client where that pocket is although no face of it can be seen;
+// darkness would hide it from an honest player. So that light is sent as zero until the
+// pocket is opened. It does not make caves dark for someone with fullbright - an open cave
+// is visible and keeps its real light.
+//
+// "Sealed": the connected light-passing cells (opacity < 15) around the lit cell number at
+// most `SEALED_CAVITY_MAX`, stay inside the chunk's 3x3 light window, and none of them is a
+// player edit. Opening a pocket is an edit, so it is no longer sealed, and
+// `apply_queued_light_updates` re-sends the real light of the chunks around the opening.
+
+/// Larger closed spaces are treated as open: they are caves, not pockets, and walking them
+/// is what the cost bound is for.
+const SEALED_CAVITY_MAX: usize = 1024;
+
+struct SealedCavities {
+    dim: DimId,
+    reg: &'static block_registry::BReg,
+    /// The 3x3 chunk window around the chunk being sent.
+    x0: i32,
+    x1: i32,
+    z0: i32,
+    z1: i32,
+    sealed: HashMap<(i32, i32, i32), bool>,
+}
+
+impl SealedCavities {
+    fn new(dim: DimId, cx: i32, cz: i32, reg: &'static block_registry::BReg) -> Self {
+        SealedCavities {
+            dim,
+            reg,
+            x0: cx * 16 - 16,
+            x1: cx * 16 + 31,
+            z0: cz * 16 - 16,
+            z1: cz * 16 + 31,
+            sealed: HashMap::new(),
+        }
     }
-    write_varint(p, sky.len() as i64);
-    for sec in sky {
-        write_varint(p, 2048);
-        p.extend_from_slice(&sec);
+
+    fn passes(&self, st: u32) -> bool {
+        self.reg.opacity_of(st) < 15
     }
-    let __tbl = chunkprof::enabled().then(std::time::Instant::now);
-    let block = block_light_sections_dim(dim, cx, cz, gen);
-    if let Some(t) = __tbl {
-        chunkprof::add(&chunkprof::BLOCKLIGHT, t);
+
+    fn inside(&self, (x, y, z): (i32, i32, i32)) -> bool {
+        (self.x0..=self.x1).contains(&x)
+            && (self.z0..=self.z1).contains(&z)
+            && (self.dim.min_y()..self.dim.min_y() + self.dim.height()).contains(&y)
     }
-    write_varint(p, block.len() as i64);
-    for sec in block {
-        write_varint(p, 2048);
-        p.extend_from_slice(&sec);
+
+    /// Whether the light-passing region containing `start` is a sealed generated pocket.
+    fn region_sealed(&mut self, start: (i32, i32, i32)) -> bool {
+        if let Some(&known) = self.sealed.get(&start) {
+            return known;
+        }
+        let mut seen: HashSet<(i32, i32, i32)> = HashSet::from([start]);
+        let mut queue = vec![start];
+        let mut sealed = true;
+        'walk: while let Some(p) = queue.pop() {
+            if overlay_block_dim(self.dim, p.0, p.1, p.2).is_some() {
+                sealed = false;
+                break;
+            }
+            for (dx, dy, dz) in [
+                (1, 0, 0),
+                (-1, 0, 0),
+                (0, 1, 0),
+                (0, -1, 0),
+                (0, 0, 1),
+                (0, 0, -1),
+            ] {
+                let n = (p.0 + dx, p.1 + dy, p.2 + dz);
+                if seen.contains(&n) {
+                    continue;
+                }
+                if self.sealed.get(&n) == Some(&false) {
+                    sealed = false;
+                    break 'walk;
+                }
+                if !self.inside(n) {
+                    sealed = false;
+                    break 'walk;
+                }
+                if self.passes(block_at_dim(self.dim, n.0, n.1, n.2)) {
+                    if seen.len() >= SEALED_CAVITY_MAX {
+                        sealed = false;
+                        break 'walk;
+                    }
+                    seen.insert(n);
+                    queue.push(n);
+                }
+            }
+        }
+        for p in seen {
+            self.sealed.insert(p, sealed);
+        }
+        sealed
+    }
+
+    /// A lit cell whose light no client could see without opening something.
+    fn hidden(&mut self, p: (i32, i32, i32)) -> bool {
+        if !self.inside(p) {
+            return false;
+        }
+        if let Some(&known) = self.sealed.get(&p) {
+            return known;
+        }
+        if self.passes(block_at_dim(self.dim, p.0, p.1, p.2)) {
+            return self.region_sealed(p);
+        }
+        if overlay_block_dim(self.dim, p.0, p.1, p.2).is_some() {
+            return false;
+        }
+        [
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ]
+        .into_iter()
+        .all(|(dx, dy, dz)| {
+            let n = (p.0 + dx, p.1 + dy, p.2 + dz);
+            !self.inside(n)
+                && !self.passes(block_at_dim(self.dim, n.0, n.1, n.2))
+                || self.inside(n)
+                    && (!self.passes(block_at_dim(self.dim, n.0, n.1, n.2))
+                        || self.region_sealed(n))
+        })
     }
 }
 
-/// A client already holding a chunk receives this when a later neighbour is generated: the held
-/// chunk's block data is unchanged, only its light is recomputed with the new emitters. Vanilla's
-/// `ClientboundLightUpdatePacket` (protocol 767 id 0x2a) carries light after a varint chunk
-/// position. Sky light is omitted: it depends on the chunk's own terrain, not on a neighbour's
-/// emitters, and the client leaves a section out of both masks unchanged (verified against
-/// `ClientPacketListener.applyLightData`). Sections whose block light is zero go in the empty
-/// mask with no array, which is vanilla's own encoding for them.
-#[allow(dead_code)] // retained as the Overworld-named seam for light tests
-fn update_light_packet(cx: i32, cz: i32, gen: &GenSources) -> Vec<u8> {
-    update_light_packet_dim(DimId::Overworld, cx, cz, gen)
+/// Zero the block light of sealed generated pockets in `sections` (light-section index,
+/// array) of chunk `(cx, cz)`, when `antifullbright` is on. Returns the cells cleared.
+fn hide_sealed_block_light<'a>(
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+    sky: Option<&[[u8; 2048]]>,
+    sections: impl Iterator<Item = (usize, &'a mut [u8; 2048])>,
+) -> usize {
+    if !ac_anti_fullbright_enabled() {
+        return 0;
+    }
+    let Some(reg) = breg() else { return 0 };
+    let mut cavities: Option<SealedCavities> = None;
+    let mut cleared = 0;
+    for (i, arr) in sections {
+        if arr.iter().all(|b| *b == 0) {
+            continue;
+        }
+        let sy = dim.light_min_y() + 16 * i as i32;
+        for k in 0..4096usize {
+            let shift = (k & 1) * 4;
+            if (arr[k >> 1] >> shift) & 15 == 0 {
+                continue;
+            }
+            if sky
+                .and_then(|sky| sky.get(i))
+                .is_some_and(|s| (s[k >> 1] >> shift) & 15 != 0)
+            {
+                continue;
+            }
+            let p = (
+                cx * 16 + (k & 15) as i32,
+                sy + (k >> 8) as i32,
+                cz * 16 + ((k >> 4) & 15) as i32,
+            );
+            let c = cavities.get_or_insert_with(|| SealedCavities::new(dim, cx, cz, reg));
+            if c.hidden(p) {
+                arr[k >> 1] &= !(15u8 << shift);
+                cleared += 1;
+            }
+        }
+    }
+    cleared
 }
 
-fn update_light_packet_dim(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> Vec<u8> {
-    let block = block_light_sections_dim(dim, cx, cz, gen);
+/// Cells where an edit turned an opaque block into a light-passing one: a sealed pocket
+/// next to them may have just been opened. Drained by `apply_queued_light_updates`.
+fn light_reveals() -> &'static Mutex<HashMap<DimId, Vec<Position>>> {
+    static REVEALS: OnceLock<Mutex<HashMap<DimId, Vec<Position>>>> = OnceLock::new();
+    REVEALS.get_or_init(Mutex::default)
+}
+
+/// The block-light half of a light update for a whole chunk: lit sections in the mask,
+/// all-zero ones in the empty mask (vanilla's encoding for them).
+fn block_light_update(chunk: Chunk, block: &[[u8; 2048]]) -> Vec<u8> {
     let (mut mask, mut empty) = (0u64, 0u64);
     let mut lit = Vec::new();
     for (i, section) in block.iter().enumerate() {
@@ -9969,12 +10294,78 @@ fn update_light_packet_dim(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> Ve
             lit.push(section);
         }
     }
-    encode_light_update(
-        (cx, cz),
-        [0, mask, 0, empty],
-        [].into_iter(),
-        lit.into_iter(),
-    )
+    encode_light_update(chunk, [0, mask, 0, empty], [].into_iter(), lit.into_iter())
+}
+
+/// The light half of a chunk packet, shared with `update_light_packet`: four section masks, then
+/// sky and block light as two counted lists of 2048-byte arrays.
+fn write_light_arrays(p: &mut Vec<u8>, cx: i32, cz: i32, dim: DimId, gen: &GenSources) {
+    let all = dim.light_mask();
+    let has_sky = worldgen::has_skylight(dim);
+    let __tsky = chunkprof::enabled().then(std::time::Instant::now);
+    let sky = if has_sky {
+        sky_light_sections_dim(dim, cx, cz)
+    } else {
+        Vec::new()
+    };
+    if let Some(t) = __tsky {
+        chunkprof::add(&chunkprof::SKY, t);
+    }
+    let __tbl = chunkprof::enabled().then(std::time::Instant::now);
+    let mut block = block_light_sections_dim(dim, cx, cz, gen);
+    if let Some(t) = __tbl {
+        chunkprof::add(&chunkprof::BLOCKLIGHT, t);
+    }
+    hide_sealed_block_light(
+        dim,
+        cx,
+        cz,
+        has_sky.then_some(&sky[..]),
+        block.iter_mut().enumerate(),
+    );
+    // A section that is all zero goes in the empty mask with no array: vanilla's own
+    // encoding, saving 2 KB per empty section before compression.
+    let split = |sections: &[[u8; 2048]]| {
+        let (mut mask, mut empty) = (0i64, 0i64);
+        for (i, s) in sections.iter().enumerate() {
+            if s.iter().all(|b| *b == 0) {
+                empty |= 1 << i;
+            } else {
+                mask |= 1 << i;
+            }
+        }
+        (mask & all, empty & all)
+    };
+    let (sky_mask, sky_empty) = split(&sky);
+    let (block_mask, block_empty) = split(&block);
+    for m in [sky_mask, block_mask, sky_empty, block_empty] {
+        if m == 0 {
+            write_varint(p, 0);
+        } else {
+            write_varint(p, 1);
+            p.extend_from_slice(&m.to_be_bytes());
+        }
+    }
+    for (sections, mask) in [(&sky, sky_mask), (&block, block_mask)] {
+        write_varint(p, mask.count_ones() as i64);
+        for (i, sec) in sections.iter().enumerate() {
+            if mask & (1 << i) != 0 {
+                write_varint(p, 2048);
+                p.extend_from_slice(sec);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)] // retained as the Overworld-named seam for light tests
+fn update_light_packet(cx: i32, cz: i32, gen: &GenSources) -> Vec<u8> {
+    update_light_packet_dim(DimId::Overworld, cx, cz, gen)
+}
+
+fn update_light_packet_dim(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> Vec<u8> {
+    let mut block = block_light_sections_dim(dim, cx, cz, gen);
+    hide_sealed_block_light(dim, cx, cz, None, block.iter_mut().enumerate());
+    block_light_update((cx, cz), &block)
 }
 
 fn encode_light_update<'a>(
@@ -10059,6 +10450,14 @@ fn note_light_edit(dim: DimId, pos: Position, old: u32, new: u32) {
         return;
     }
     let Some(reg) = breg() else { return };
+    if reg.opacity_of(old) == 15 && reg.opacity_of(new) < 15 && ac_anti_fullbright_enabled() {
+        light_reveals()
+            .lock()
+            .unwrap()
+            .entry(dim)
+            .or_default()
+            .push(pos);
+    }
     let old = light_properties(reg, old);
     let new = light_properties(reg, new);
     if old != new {
@@ -10302,6 +10701,7 @@ fn apply_queued_light_updates() {
             entry.chunks = neighbors;
             entry.generation = generation;
         }
+        let held_targets = targets.clone();
         let updates = entry.engine.edit_batch(new, targets);
         {
             let mut cache = live_light_cache().lock().unwrap();
@@ -10334,8 +10734,15 @@ fn apply_queued_light_updates() {
                 }
             }
         }
-        for update in updates.chunks {
+        for mut update in updates.chunks {
             let (cx, cz) = update.chunk;
+            hide_sealed_block_light(
+                dim,
+                cx,
+                cz,
+                None,
+                update.block_sections.iter_mut().map(|(i, a)| (*i, a)),
+            );
             let packet = encode_light_update(
                 update.chunk,
                 [
@@ -10348,6 +10755,22 @@ fn apply_queued_light_updates() {
                 update.block_sections.iter().map(|(_, array)| array),
             );
             broadcast_chunk_dim_in(dim, &audience, cx, cz, |_| (0x2a, packet.clone()));
+        }
+        // antifullbright: an edit that opened a sealed pocket does not change the light in
+        // it, so the update above may not cover the sections the client holds as zero.
+        // Re-send the chunks around each opening in full; they are no longer sealed.
+        let reveals = light_reveals().lock().unwrap().remove(&dim).unwrap_or_default();
+        if !reveals.is_empty() {
+            for &chunk @ (cx, cz) in &held_targets {
+                if !reveals.iter().any(|p| chunk_in_light_reach(chunk, *p)) {
+                    continue;
+                }
+                let mut block = entry.engine.sections(chunk, LightKind::Block);
+                let sky = entry.engine.sections(chunk, LightKind::Sky);
+                hide_sealed_block_light(dim, cx, cz, Some(&sky), block.iter_mut().enumerate());
+                let packet = block_light_update(chunk, &block);
+                broadcast_chunk_dim_in(dim, &audience, cx, cz, |_| (0x2a, packet.clone()));
+            }
         }
     }
 }
@@ -10926,6 +11349,17 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
 }
 
 fn main() {
+    // `server.toml` first, while the process is single-threaded: its `[server]` keys are
+    // exported as the `MC_SPINE_*` variables everything below already reads.
+    // Tool modes (probe arguments, worldgen dumps) never touch it.
+    if std::env::args().nth(1).is_none()
+        && std::env::var_os("MC_SPINE_WG_DUMP").is_none()
+        && std::env::var_os("MC_SPINE_WG_PROFILE").is_none()
+    {
+        let doc = server_config_boot();
+        ac_install(AcConfig::from_doc(&doc, |name| std::env::var(name).ok()));
+        refresh_hidden_tags_from_datapacks(std::path::Path::new(DATAPACK_DIRECTORY));
+    }
     // Terrain evaluates `add(final_density, beardifier)` (see `worldgen`), and the
     // structure pipeline owns the starts that feed it. `worldgen` sits below `feature`
     // in `tools/layers_check.sh`, so the edge is a registered function pointer rather
@@ -12126,6 +12560,8 @@ mod tick_persistence;
 mod tick_queue;
 #[cfg(test)]
 mod tick_tests;
+#[cfg(test)]
+mod anticheat_world_tests;
 mod generation_payload;
 mod generated_content;
 mod chest_loot;
@@ -12601,6 +13037,270 @@ mod mineshaft_runtime_tests {
                 && comp_get(&d.comps, COMP_STORED_ENCHANTMENTS).is_some());
         assert!(has_book, "breaking an unopened seeded cart in survival must spill rolled loot");
 
+        let _ = sock.shutdown(Shutdown::Both);
+        drop(sock);
+        let _ = server_thread.join();
+    }
+
+    /// What one player got away with, per exploit, under one anti-cheat preset.
+    #[derive(Debug)]
+    struct AcOutcome {
+        first_place_consumed: bool,
+        second_place_with_empty_hand: bool,
+        placed_into_stone: bool,
+        air_placed: bool,
+        teleport_accepted: bool,
+        nofall_hp: f32,
+    }
+
+    fn ac_place(sock: &mut TcpStream, pos: BlockPos, face: i64, seq: i64) {
+        let mut pkt = Vec::new();
+        write_varint(&mut pkt, 0);
+        write_pos(&mut pkt, pos.0, pos.1, pos.2);
+        write_varint(&mut pkt, face);
+        pkt.extend_from_slice(&0.5f32.to_be_bytes());
+        pkt.extend_from_slice(&1.0f32.to_be_bytes());
+        pkt.extend_from_slice(&0.5f32.to_be_bytes());
+        pkt.push(0);
+        write_varint(&mut pkt, seq);
+        send_packet(sock, 0x38, pkt).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (pid, body) = read_server_packet(sock, deadline).expect("block ack");
+            if pid == 0x05 && read_varint(&mut &body[..]) == Some(seq) {
+                return;
+            }
+        }
+    }
+
+    fn ac_move(sock: &mut TcpStream, (x, y, z): (f64, f64, f64), ground: bool) {
+        let mut b = Vec::new();
+        b.extend_from_slice(&x.to_be_bytes());
+        b.extend_from_slice(&y.to_be_bytes());
+        b.extend_from_slice(&z.to_be_bytes());
+        b.push(ground as u8);
+        send_packet(sock, 0x1a, b).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+    }
+
+    /// Confirm a pending server teleport (a setback), if one arrives.
+    fn ac_confirm_teleport(sock: &mut TcpStream) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(800);
+        while let Some((pid, body)) = read_server_packet(sock, deadline) {
+            if pid == 0x40 && body.len() > 33 {
+                let id = read_varint(&mut &body[33..]).unwrap();
+                let mut c = Vec::new();
+                write_varint(&mut c, id);
+                send_packet(sock, 0x00, c).unwrap();
+                std::thread::sleep(Duration::from_millis(60));
+                return true;
+            }
+        }
+        false
+    }
+
+    fn ac_floor() {
+        let stone = name_to_state("stone").unwrap();
+        for x in -2..=3 {
+            for z in -2..=3 {
+                set_block(x, 69, z, stone);
+                set_block(x, 70, z, stone);
+                for y in 71..=74 {
+                    set_block(x, y, z, 0);
+                }
+            }
+        }
+    }
+
+    fn ac_exploit_run(name: &str, uuid: [u8; 16], preset: AcPreset) -> AcOutcome {
+        ac_test_set_player_preset(name, preset);
+        ac_floor();
+        let stone = name_to_state("stone").unwrap();
+        let (mut sock, server_thread, me) = connect_play_client(name, uuid);
+        *me.gm.lock().unwrap() = 0;
+        {
+            let mut inv = me.inv.lock().unwrap();
+            inv.insert(36, (name_to_item("stone").unwrap(), 1, Vec::new()));
+            inv.insert(37, (name_to_item("dirt").unwrap(), 1, Vec::new()));
+        }
+        *me.pos.lock().unwrap() = (0.5, 71.0, 0.5, 0.0, 0.0, true);
+        // Infinite blocks: a one-item stack placed twice.
+        ac_place(&mut sock, (1, 70, 0), 1, 1);
+        assert_eq!(block_at(1, 71, 0), stone, "{name}: an honest placement must succeed");
+        let first_place_consumed = me.inv.lock().unwrap().get(&36).is_none();
+        ac_place(&mut sock, (1, 71, 0), 1, 2);
+        let second_place_with_empty_hand = block_at(1, 72, 0) == stone;
+        // Placing into a solid block, then against nothing.
+        send_packet(&mut sock, 0x2f, 1i16.to_be_bytes().to_vec()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        ac_place(&mut sock, (2, 69, 0), 1, 3);
+        let placed_into_stone = block_at(2, 70, 0) != stone;
+        ac_place(&mut sock, (-1, 72, 0), 1, 4);
+        let air_placed = block_at(-1, 73, 0) != 0;
+        // A one-packet teleport.
+        ac_move(&mut sock, (0.5, 71.0, 0.5), true);
+        ac_move(&mut sock, (9000.5, 71.0, -9000.5), true);
+        let teleport_accepted = me.pos.lock().unwrap().0 > 100.0;
+        if teleport_accepted {
+            ac_move(&mut sock, (0.5, 71.0, 0.5), true);
+        } else {
+            assert!(ac_confirm_teleport(&mut sock), "{name}: a setback teleport must be sent");
+        }
+        // NoFall: fall 29 blocks while claiming to stand on the ground.
+        *me.hp.lock().unwrap() = 20.0;
+        *me.pos.lock().unwrap() = (0.5, 100.0, 0.5, 0.0, 0.0, true);
+        *me.fall_from.lock().unwrap() = 100.0;
+        let mut y = 100.0;
+        while y > 71.0 {
+            y = (y - 3.0f64).max(71.0);
+            ac_move(&mut sock, (0.5, y, 0.5), true);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let nofall_hp = *me.hp.lock().unwrap();
+        let _ = sock.shutdown(Shutdown::Both);
+        drop(sock);
+        let _ = server_thread.join();
+        AcOutcome {
+            first_place_consumed,
+            second_place_with_empty_hand,
+            placed_into_stone,
+            air_placed,
+            teleport_accepted,
+            nofall_hp,
+        }
+    }
+
+    #[test]
+    fn anticheat_live_standard_blocks_exploits_and_off_allows_them() {
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _snap = RuntimeSnapshot::take();
+        *WORLD_SPAWN.lock().unwrap() = (0.5, 71.0, 0.5, 0.0);
+        forceloaded().lock().unwrap().insert((0, 0));
+        refresh_hot();
+        let off = ac_exploit_run("AcOff", [0x41u8; 16], AcPreset::Off);
+        println!("ACLIVE off: {off:?}");
+        let standard = ac_exploit_run("AcStandard", [0x42u8; 16], AcPreset::Standard);
+        println!("ACLIVE standard: {standard:?}");
+        assert!(!off.first_place_consumed && off.second_place_with_empty_hand, "{off:?}");
+        assert!(off.placed_into_stone && off.air_placed && off.teleport_accepted, "{off:?}");
+        assert_eq!(off.nofall_hp, 20.0, "{off:?}");
+        assert!(standard.first_place_consumed && !standard.second_place_with_empty_hand, "{standard:?}");
+        assert!(!standard.placed_into_stone && !standard.air_placed, "{standard:?}");
+        assert!(!standard.teleport_accepted, "{standard:?}");
+        assert!(standard.nofall_hp < 20.0, "{standard:?}");
+    }
+
+    /// Moves 2 blocks per packet (~33 blocks/s): fine with movement_speed 0.4 and Speed II,
+    /// pulled back without them.
+    fn ac_speed_run(name: &str, uuid: [u8; 16], boosted: bool) -> (u64, f64) {
+        ac_test_set_player_preset(name, AcPreset::Standard);
+        ac_floor();
+        let (mut sock, server_thread, me) = connect_play_client(name, uuid);
+        *me.gm.lock().unwrap() = 0;
+        if boosted {
+            attrs()
+                .lock()
+                .unwrap()
+                .entry(format!("p:{name}"))
+                .or_default()
+                .insert("generic.movement_speed".into(), 0.4);
+            me.effs.lock().unwrap().push(Eff { id: 0, amp: 1, left: 1_000_000 });
+        }
+        *me.pos.lock().unwrap() = (0.5, 71.0, 0.5, 0.0, 0.0, true);
+        for i in 0..80 {
+            let x = if i % 2 == 0 { 2.5 } else { 0.5 };
+            ac_move(&mut sock, (x, 71.0, 0.5), true);
+        }
+        let flags = ac_flag_count(me.eid, AcCheckId::Movement);
+        let vl = ac_violation_level(me.eid, AcCheckId::Movement);
+        attrs().lock().unwrap().remove(&format!("p:{name}"));
+        let _ = sock.shutdown(Shutdown::Both);
+        drop(sock);
+        let _ = server_thread.join();
+        (flags, vl)
+    }
+
+    #[test]
+    fn anticheat_live_speed_attribute_and_potion_are_not_flagged() {
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _snap = RuntimeSnapshot::take();
+        *WORLD_SPAWN.lock().unwrap() = (0.5, 71.0, 0.5, 0.0);
+        forceloaded().lock().unwrap().insert((0, 0));
+        refresh_hot();
+        let boosted = ac_speed_run("AcBoosted", [0x43u8; 16], true);
+        let plain = ac_speed_run("AcPlain", [0x44u8; 16], false);
+        println!("ACLIVE speed: boosted (flags, vl) = {boosted:?}, plain = {plain:?}");
+        assert_eq!(boosted.0, 0, "attribute + potion speed must not be flagged");
+        assert!(plain.0 > 0, "the same speed without them must be");
+    }
+
+    #[test]
+    fn anticheat_live_creative_spectator_and_ops_are_exempt_with_survival_grace() {
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _snap = RuntimeSnapshot::take();
+        *WORLD_SPAWN.lock().unwrap() = (0.5, 71.0, 0.5, 0.0);
+        forceloaded().lock().unwrap().insert((0, 0));
+        refresh_hot();
+        ac_floor();
+        let x_of = |me: &Arc<Client>| me.pos.lock().unwrap().0;
+
+        ac_test_set_player_preset("AcBuilder", AcPreset::Standard);
+        let (mut sock, server_thread, me) = connect_play_client("AcBuilder", [0x45u8; 16]);
+        *me.gm.lock().unwrap() = 1;
+        *me.pos.lock().unwrap() = (0.5, 71.0, 0.5, 0.0, 0.0, true);
+        me.inv.lock().unwrap().insert(36, (name_to_item("dirt").unwrap(), 1, Vec::new()));
+        // Creative: a 40-block flight in one packet and an air-placement are fine.
+        ac_move(&mut sock, (40.5, 90.0, 0.5), false);
+        assert_eq!(x_of(&me), 40.5, "creative flight must not be pulled back");
+        assert_eq!(ac_exemption(&me), Some("creative"));
+        ac_move(&mut sock, (0.5, 71.0, 0.5), true);
+        ac_place(&mut sock, (-1, 72, 0), 1, 1);
+        assert_ne!(block_at(-1, 73, 0), 0, "creative may place against air");
+        // Spectator: same.
+        *me.gm.lock().unwrap() = 3;
+        ac_move(&mut sock, (30.5, 60.0, 0.5), false);
+        assert_eq!(x_of(&me), 30.5, "spectator flight must not be pulled back");
+        // Back to survival mid-air: the landing is graced...
+        *me.gm.lock().unwrap() = 0;
+        ac_move(&mut sock, (20.5, 71.0, 0.5), true);
+        assert_eq!(ac_exemption(&me), Some("game mode change"));
+        assert_eq!(x_of(&me), 20.5, "the move right after leaving spectator is graced");
+        // ...and once the grace runs out survival is checked again.
+        std::thread::sleep(Duration::from_millis(3200));
+        assert_eq!(ac_exemption(&me), None);
+        ac_move(&mut sock, (9000.5, 71.0, 0.5), true);
+        assert_eq!(x_of(&me), 20.5, "survival teleport must be pulled back after the grace");
+        assert!(ac_confirm_teleport(&mut sock));
+        assert_eq!(ac_flag_count(me.eid, AcCheckId::Movement), 1);
+        let _ = sock.shutdown(Shutdown::Both);
+        drop(sock);
+        let _ = server_thread.join();
+
+        // An operator in survival is trusted (check_ops defaults to false).
+        ac_test_set_player_preset("AcOperator", AcPreset::Standard);
+        std::env::set_var("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS", "1");
+        let (mut sock, server_thread, me) = connect_play_client("AcOperator", [0x46u8; 16]);
+        *me.gm.lock().unwrap() = 0;
+        *me.pos.lock().unwrap() = (0.5, 71.0, 0.5, 0.0, 0.0, true);
+        ac_move(&mut sock, (9000.5, 71.0, 0.5), true);
+        let op_x = x_of(&me);
+        let reason = ac_exemption(&me);
+        std::env::remove_var("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS");
+        assert_eq!(reason, Some("operator"));
+        assert_eq!(op_x, 9000.5, "an operator's move is not checked");
+        ac_move(&mut sock, (0.5, 71.0, 0.5), true);
         let _ = sock.shutdown(Shutdown::Both);
         drop(sock);
         let _ = server_thread.join();

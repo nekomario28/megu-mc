@@ -438,11 +438,16 @@ fn every_hidden_block_name_resolves_to_the_block_it_names() {
         unresolved.len(),
         unresolved.join("\n")
     );
-    assert_eq!(
-        hidden_states().len(),
-        HIDDEN_BLOCK_NAMES.len(),
-        "a name was dropped while building the hidden set"
-    );
+    // Every state of every named block is hidden (lit redstone ore, every chest facing),
+    // and nothing else is.
+    for st in 0..reg.state_count() as u32 {
+        let name = reg.name_of(st).trim_start_matches("minecraft:");
+        assert_eq!(
+            hidden_states().contains(&st),
+            HIDDEN_BLOCK_NAMES.contains(&name),
+            "state {st} ({name})"
+        );
+    }
 }
 
 /// `block_hardness` answers 0.6 for every block it does not list. That is a silent

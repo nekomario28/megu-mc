@@ -1234,6 +1234,7 @@ fn explode_at(ex: f64, ey: f64, ez: f64, power: f64) {
         }
     }
     broadcast(-1, |_c| (0x20, explosion_pkt(ex, ey, ez, &offs)));
+    ac_note_explosion(DimId::Overworld, [ex, ey, ez], power);
     let cs: Vec<Arc<Client>> = client_snapshot();
     for cl in cs {
         let (px, py, pz, ..) = {
@@ -1421,6 +1422,12 @@ fn live_mob_explosion(dim: DimId, pos: [f64; 3], power: f32, players: &[LiveMobP
         }
     }
     let packet = explosion_pkt_with_power(x, y, z, power, &records);
+    let targets: Vec<(i32, (f64, f64, f64))> = players
+        .iter()
+        .filter(|player| player.dim == dim)
+        .map(|player| (player.client.eid, player.pos))
+        .collect();
+    ac_note_explosion_for(pos, f64::from(power), &targets);
     for player in players.iter().filter(|player| player.dim == dim) {
         if let Ok(mut sock) = player.client.sock.lock() {
             let _ = send_packet(&mut sock, 0x20, packet.clone());

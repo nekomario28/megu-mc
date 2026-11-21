@@ -150,9 +150,11 @@ ln -s "$ROOT/datapacks" "$SPINE_DIR/datapacks"
 ln -s "$ROOT/assets" "$SPINE_DIR/assets"
 [ -f "$ROOT/config_packets.bin" ] && ln -s "$ROOT/config_packets.bin" "$SPINE_DIR/config_packets.bin" || true
 # No resource pack, so the configuration exchange matches vanilla's and the
-# driver reaches finish-configuration without a pack handshake.
+# driver reaches finish-configuration without a pack handshake. Anti-cheat off: the
+# driver climbs 4 blocks per packet with no world model, which vanilla only accepts
+# because it runs in creative; a survival mc-spine viewer would be pulled back.
 ( cd "$SPINE_DIR" && MC_SPINE_PORT="$SPINE_PORT" MC_SPINE_SEED="$SEED" MC_SPINE_RESOURCE_PACK_URL="" \
-    exec "$ROOT/target/release/mc-spine" ) > "$SPINE_DIR/spine.log" 2>&1 &
+    MC_SPINE_ANTICHEAT=off exec "$ROOT/target/release/mc-spine" ) > "$SPINE_DIR/spine.log" 2>&1 &
 SPID=$!
 wait_for_line "$SPINE_DIR/spine.log" "$SPID" 'listening' 60
 SPI=$(sample_load "$SPID" "$SPINE_PORT" "$WORK/spine-load.txt")

@@ -272,6 +272,9 @@ def local_server(binary, root=None):
     env = dict(os.environ, MC_SPINE_PORT=str(game), MC_SPINE_BIND_ADDR="127.0.0.1",
                MC_SPINE_WG="old", MC_SPINE_RESOURCE_PACK_URL="")
     env.pop("MC_SPINE_RCON_PORT", None)
+    # These clients warp across chunks in single packets to exercise the protocol;
+    # the anti-cheat has its own live tests (cargo test anticheat_live).
+    env.setdefault("MC_SPINE_ANTICHEAT", "off")
     with (root / "server.log").open("w+") as log:
         proc = subprocess.Popen([str(binary)], cwd=root, env=env, stdout=log, stderr=log)
         try:

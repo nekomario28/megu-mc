@@ -9048,18 +9048,29 @@ fn s3_parse_map_chunk(bytes: &[u8]) -> S3Packet {
         s3_skip_nbt(&mut b, 10); // anonymous root compound
     }
 
-    assert_eq!(s3_varint(&mut b), 1, "sky mask is one long");
-    let sky_mask = i64::from_be_bytes(s3_take(&mut b, 8).try_into().unwrap());
-    assert_eq!(s3_varint(&mut b), 1, "block mask is one long");
-    let block_mask = i64::from_be_bytes(s3_take(&mut b, 8).try_into().unwrap());
-    assert_eq!(s3_varint(&mut b), 0, "empty sky list");
-    assert_eq!(s3_varint(&mut b), 0, "empty block list");
+    // Four bitsets: sky, block, empty sky, empty block. Each is zero or one long here.
+    let mut masks = [0i64; 4];
+    for m in &mut masks {
+        let longs = s3_varint(&mut b);
+        assert!(longs <= 1, "a light mask is at most one long");
+        if longs == 1 {
+            *m = i64::from_be_bytes(s3_take(&mut b, 8).try_into().unwrap());
+        }
+    }
+    let [sky_lit, block_lit, sky_empty, block_empty] = masks;
+    assert_eq!(sky_lit & sky_empty, 0, "a sky section is lit or empty, not both");
+    assert_eq!(block_lit & block_empty, 0, "a block section is lit or empty, not both");
+    // All-zero sections travel in the empty masks; together they cover every section.
+    let sky_mask = sky_lit | sky_empty;
+    let block_mask = block_lit | block_empty;
     let sky_arrays = s3_varint(&mut b);
+    assert_eq!(sky_arrays, sky_lit.count_ones() as usize, "one array per lit sky section");
     for _ in 0..sky_arrays {
         assert_eq!(s3_varint(&mut b), 2048);
         s3_take(&mut b, 2048);
     }
     let block_arrays = s3_varint(&mut b);
+    assert_eq!(block_arrays, block_lit.count_ones() as usize, "one array per lit block section");
     for _ in 0..block_arrays {
         assert_eq!(s3_varint(&mut b), 2048);
         s3_take(&mut b, 2048);
@@ -9108,8 +9119,9 @@ fn p2_3_s3_nether_and_end_chunk_packets_emit_16_sections_and_zero_sky_mask() {
         );
         assert_eq!(packet.sky_mask, sky_mask, "{dim:?}: skyLightMask");
         assert_eq!(packet.block_mask, block_mask, "{dim:?}: blockLightMask");
-        assert_eq!(packet.sky_arrays, sky_arrays, "{dim:?}: sky light arrays");
-        assert_eq!(packet.block_arrays, block_arrays, "{dim:?}: block light arrays");
+        // Arrays are sent only for sections with light; the rest are in the empty masks.
+        assert!(packet.sky_arrays <= sky_arrays, "{dim:?}: sky light arrays");
+        assert!(packet.block_arrays <= block_arrays, "{dim:?}: block light arrays");
         // MOTION_BLOCKING is stored relative to this dimension's min_y, not -64.
         let cols = worldgen::chunk_cols_dim(dim, 0, 0).unwrap_or_else(|| panic!("{dim:?}: columns"));
         let top = cols.wtop(0, 0) + 1;
