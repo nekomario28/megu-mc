@@ -26,9 +26,13 @@
 #                                               sends (registries, tags, ...), only with --accept-eula
 #
 #   tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/server.jar [--mappings DIR] \
-#       [--fetch-fabric-mappings] [--accept-eula]
+#       [--fetch-fabric-mappings] [--accept-eula] [--emit-version-pack DIR]
 #   tools/vanilla_data/gen_vanilla_data.sh --verify [--pack DIR]
 #       check an already-generated tree without the jar (inventory + member hashes)
+#
+#   --emit-version-pack DIR: after the data generator's --reports run, also build a
+#       VersionPack (tools/vanilla_data/version_pack.py) from those reports into DIR
+#       and verify it. Opt-in; DIR must be empty or absent.
 #
 # This branch tracks most of these outputs (see `.gitignore` and `THIRD_PARTY.md`), so a fresh
 # clone does not need to run this; a tree that should not carry Mojang data does, once, and the
@@ -76,6 +80,7 @@ STAGE="$ROOT/datapacks/vanilla.stage"
 FETCH=0
 EULA=0
 VERIFY_ONLY=0
+EMIT_VP=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --jar) JAR="$2"; shift 2 ;;
@@ -84,11 +89,13 @@ while [ $# -gt 0 ]; do
     --fetch-fabric-mappings) FETCH=1; shift ;;
     --accept-eula) EULA=1; shift ;;
     --verify) VERIFY_ONLY=1; shift ;;
+    --emit-version-pack) EMIT_VP="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
 if [ "$VERIFY_ONLY" = 1 ]; then
+  [ -z "$EMIT_VP" ] || { echo "--emit-version-pack has no reports under --verify" >&2; exit 2; }
   exec python3 "$HERE/verify_pack.py" --pack "$DP" --jar-sha1 "$JAR_SHA1"
 fi
 
@@ -151,4 +158,16 @@ if [ "$EULA" = 1 ]; then
   python3 "$HERE/capture_config_packets.py" "$JAR" "$ROOT/config_packets.bin" --accept-eula
 else
   echo "config_packets.bin not generated (needs --accept-eula, see the header of this script)" >&2
+fi
+
+# Opt-in VersionPack: the same --reports output the extractor consumed above, plus
+# the nested jar's own version.json for mc/protocol/data-version metadata.
+if [ -n "$EMIT_VP" ]; then
+  unzip -p "$WORK/run/versions/1.21.1/server-1.21.1.jar" version.json >"$WORK/version.json"
+  python3 "$HERE/version_pack.py" build \
+      --reports "$WORK/run/gen/reports" \
+      --out "$EMIT_VP" \
+      --version-json "$WORK/version.json" \
+      --jar-sha1 "$JAR_SHA1"
+  python3 "$HERE/version_pack.py" verify --pack "$EMIT_VP"
 fi

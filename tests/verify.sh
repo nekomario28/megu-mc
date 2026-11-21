@@ -90,6 +90,7 @@ python3 tests/culling_perf_gate.py --self-test
 python3 tests/client_fork_e2e.py --self-test
 python3 tests/perf_bench_test.py
 python3 tests/pgo_build_test.py
+python3 tools/vanilla_data/version_pack.py --self-test
 python3 tests/verify_gate_coverage_test.py
 
 echo "== module layering"
@@ -158,6 +159,7 @@ timeout 180 python3 tests/gp1_gp6_wire.py "$binary"
 timeout 180 python3 tests/gp2_nether_spawn_wire.py "$binary"
 timeout 180 python3 tests/command_brigadier_ops_wire.py "$binary"
 timeout 180 python3 tests/command_datapack_wire.py
+timeout 180 python3 tests/w1_w3_live_wire.py "$binary"
 timeout 180 python3 tests/client_prediction_wire.py --binary "$binary"
 timeout 180 python3 tests/client_inventory_pickup_wire.py --binary "$binary"
 timeout 180 python3 tests/client_kernel_wire.py "$binary"
