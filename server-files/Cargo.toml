@@ -14,5 +14,9 @@ description = "Standalone Vanilla server files for mc-spine: server.properties, 
 mc_spine_core = { package = "mc-spine-core", path = "../core" }
 
 [[bin]]
-name = "mc-spine-init"
+name = "mc-spine-admin"
 path = "src/bin/server_init.rs"
+
+[[bin]]
+name = "mc-spine-init"
+path = "src/bin/mc_spine_init.rs"
