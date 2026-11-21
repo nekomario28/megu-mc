@@ -7609,6 +7609,7 @@ fn set_block_if_inner_dim(
     refresh_hidden_neighbors(x, y, z);
     block_updated(x, y, z);
     live_block_changed(dim, RsPos(x, y, z), old, st);
+    dwal_note_block_set(dim, x, y, z, st);
     true
 }
 
@@ -7678,6 +7679,7 @@ fn set_block_if_dim_edit(
             }
         }
     }
+    dwal_note_block_set(dim, x, y, z, st);
     true
 }
 
@@ -12908,10 +12910,206 @@ fn submit_world_snapshot(
     Ok(())
 }
 
+// ---------- opt-in delta WAL (`MC_SPINE_WAL_PATH`) live wiring ----------
+//
+// When the operator names a WAL file, every committed overlay block write is
+// journaled (`DeltaWalRecord::BlockSet`, flushed per frame) so a crash loses
+// near-zero seconds instead of a whole autosave window. Boot replays whatever
+// the last durable checkpoint did not cover; each confirmed full save then
+// compacts the log. With the variable unset every path below costs at most
+// one relaxed atomic load and writes nothing.
+
+/// `true` once `dwal_boot_recover_and_arm` parked an open journal in
+/// `live_dwal`. An atomic (not "is the slot set") so a test or a failed
+/// re-arm can take the append path back to its zero-cost early return.
+static DWAL_ON: AtomicBool = AtomicBool::new(false);
+
+fn live_dwal() -> &'static Mutex<Option<DeltaWalJournal>> {
+    static JOURNAL: OnceLock<Mutex<Option<DeltaWalJournal>>> = OnceLock::new();
+    JOURNAL.get_or_init(|| Mutex::new(None))
+}
+
+fn dwal_enabled() -> bool {
+    DWAL_ON.load(Ordering::Relaxed)
+}
+
+/// `MC_SPINE_WAL_PATH`, screened by the same `..`/NUL/control-character rule
+/// every operator-controlled data path goes through. An invalid value is
+/// treated like an unset one: the WAL is opt-in, so a bad path must not crash
+/// boot — it logs and stays off.
+fn dwal_path_from_env() -> Option<std::path::PathBuf> {
+    let raw = std::env::var_os("MC_SPINE_WAL_PATH")?;
+    if raw.is_empty() {
+        return None;
+    }
+    let path = std::path::PathBuf::from(raw);
+    match ops_data_path_checked(&path, "delta WAL") {
+        Ok(()) => Some(path),
+        Err(error) => {
+            eprintln!("[spine] {error} — delta WAL disabled");
+            None
+        }
+    }
+}
+
+/// Journal one committed overlay edit. Called from `set_block_if_inner_dim`
+/// and `set_block_if_dim_edit`, so it always runs inside the caller's
+/// `SAVE_LOCK` hold — the frame order on disk is exactly the order a full
+/// save's snapshot sees the edits in. A rejected `expected` write never
+/// reaches this; append failures are reported, never fatal.
+fn dwal_note_block_set(dim: DimId, x: i32, y: i32, z: i32, state: u32) {
+    if !DWAL_ON.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut journal = live_dwal().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(wal) = journal.as_mut() {
+        if let Err(error) =
+            wal.append_and_flush(&DeltaWalRecord::BlockSet { dim, x, y, z, state })
+        {
+            eprintln!("[spine] delta WAL append failed: {error}");
+        }
+    }
+}
+
+/// A full save run as a WAL checkpoint. `compact_after_checkpoint` rewrites
+/// the log down to a single marker, so it may only run once the covering save
+/// is durable *and* the log cannot still gain frames the snapshot missed.
+/// Both properties come from one discipline: `SAVE_LOCK` is held from before
+/// the capture until the write has landed and the compaction is done, and the
+/// journal mutex is taken inside it — the same order every journaled block
+/// write uses (`SAVE_LOCK` then journal, via `set_block_if_dim` →
+/// `dwal_note_block_set`), so there is no lock inversion and no interleaving
+/// window. Writers simply wait out the save; a frame that lands afterwards is
+/// newer than the marker and survives.
+///
+/// This mirrors `save_world_guarded`'s `SAVE_WRITER`/flag discipline — the
+/// thread-local guard flag keeps a nested `with_save_guard` inside the
+/// capture re-entrant instead of deadlocking on `SAVE_LOCK`.
+fn dwal_save_checkpointed(
+    write: impl FnOnce(WorldSaveSnapshot) -> Result<(), String>,
+) -> Result<(), String> {
+    if SAVE_GUARD.with(|g| g.get()) {
+        return Err("world save called inside an ownership transition".into());
+    }
+    let _writer = SAVE_WRITER.lock().unwrap_or_else(|e| e.into_inner());
+    let _save = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    SAVE_GUARD.with(|g| g.set(true));
+    struct Reset;
+    impl std::ops::Drop for Reset {
+        fn drop(&mut self) {
+            SAVE_GUARD.with(|g| g.set(false));
+        }
+    }
+    let _reset = Reset;
+    let snapshot = persistence_boundary("world snapshot panicked", || {
+        Ok(WorldSaveSnapshot::capture())
+    })
+    .map_err(|e| e.to_string())?;
+    let mut journal = live_dwal().lock().unwrap_or_else(|e| e.into_inner());
+    write(snapshot)?;
+    if let Some(wal) = journal.as_mut() {
+        let checkpoint_seq = wal.next_seq();
+        wal.compact_after_checkpoint(checkpoint_seq)?;
+    }
+    Ok(())
+}
+
+/// The armed-path autosave: the same worker-vs-serial split as
+/// `autosave_world`, but the worker arm includes the `flush` that confirms
+/// the queued snapshot actually reached disk before the WAL is compacted — a
+/// checkpoint that outran its own write would leave a crash with neither the
+/// frames nor the save that was supposed to cover them.
+fn dwal_autosave_checkpointed() {
+    let dir = world_save_dir();
+    let result = match live_save_worker() {
+        Some(worker) => dwal_save_checkpointed(|snapshot| {
+            submit_world_snapshot(worker, snapshot, &dir)?;
+            worker.flush().map_err(|e| format!("async save flush: {e}"))
+        }),
+        None => dwal_save_checkpointed(|snapshot| snapshot.write(&dir)),
+    };
+    if let Err(error) = result {
+        eprintln!("[spine] WORLD SAVE FAILED: {error}");
+    }
+    live_anvil_save_if_armed();
+}
+
+/// The armed-path shutdown save: `flush_live_saves` lands any queued snapshot
+/// first, then the checkpointed write + compact runs under the same freeze as
+/// the autosave.
+fn dwal_shutdown_save_checkpointed() {
+    flush_live_saves();
+    let dir = world_save_dir();
+    if let Err(error) = dwal_save_checkpointed(|snapshot| {
+        rotate_save_backups(&dir, &snapshot);
+        snapshot.write(&dir)
+    }) {
+        eprintln!("[spine] WORLD SAVE FAILED: {error}");
+    }
+    live_anvil_save_if_armed();
+}
+
+/// Boot wiring, called once from `main` after `load_world` and the Anvil
+/// import so a journaled edit — newer than both stores — wins its cell.
+/// Recovered `BlockSet` frames replay through `set_block_dim` while the
+/// journal is still disarmed, so replay does not journal itself; the journal
+/// then opens on the same file (continuing sequence numbers past whatever
+/// recovery found) and live writes start appending. A WAL that fails
+/// validation or recovery is logged and left off: the overlay save stays the
+/// authoritative store and boot continues without delta coverage.
+fn dwal_boot_recover_and_arm() {
+    let Some(path) = dwal_path_from_env() else {
+        return;
+    };
+    match recover_after_checkpoint(&path) {
+        Ok(report) => {
+            let mut replayed = 0usize;
+            let mut skipped = 0usize;
+            for record in &report.records {
+                match *record {
+                    DeltaWalRecord::BlockSet { dim, x, y, z, state } => {
+                        set_block_dim(dim, x, y, z, state);
+                        replayed += 1;
+                    }
+                    _ => skipped += 1,
+                }
+            }
+            eprintln!(
+                "[spine] delta WAL {}: replayed {replayed} block edit(s){}",
+                path.display(),
+                if skipped > 0 {
+                    format!(", skipped {skipped} non-block record(s)")
+                } else {
+                    String::new()
+                },
+            );
+            if report.truncated_tail_bytes > 0 {
+                eprintln!(
+                    "[spine] delta WAL: dropped {} torn tail byte(s)",
+                    report.truncated_tail_bytes
+                );
+            }
+        }
+        Err(error) => eprintln!("[spine] delta WAL recovery failed: {error}"),
+    }
+    match DeltaWalJournal::open(&path) {
+        Ok(wal) => {
+            *live_dwal().lock().unwrap_or_else(|e| e.into_inner()) = Some(wal);
+            DWAL_ON.store(true, Ordering::Relaxed);
+            eprintln!("[spine] delta WAL armed at {}", path.display());
+        }
+        Err(error) => eprintln!("[spine] delta WAL disabled: {error}"),
+    }
+}
+
 /// The autosave: identical to `save_world` until the live worker exists, then
 /// a non-blocking submit. The worker's one-slot queue coalesces slow writes so
 /// a 20 TPS loop never waits on disk.
 fn autosave_world() {
+    if dwal_enabled() {
+        dwal_autosave_checkpointed();
+        return;
+    }
     let Some(worker) = live_save_worker() else {
         save_world();
         live_anvil_save_if_armed();
@@ -12938,6 +13136,10 @@ fn flush_live_saves() {
 /// written first (the worker may be mid-write), backups rotate, then the final
 /// overlay files land before the process is allowed to exit.
 fn shutdown_world_save() {
+    if dwal_enabled() {
+        dwal_shutdown_save_checkpointed();
+        return;
+    }
     flush_live_saves();
     let dir = world_save_dir();
     if let Err(error) = save_world_guarded(|snapshot| {
@@ -13115,6 +13317,14 @@ fn compute_safe_initial_world_spawn() -> (f64, f64, f64) {
     find_safe_world_spawn(DimId::Overworld)
 }
 
+/// The live hotspot profiler fed by every real `game_tick`: one shared ring
+/// for the operator `/tick`-style readouts (`operator_ux` renders it). Lock
+/// poisoning degrades to `into_inner` rather than panicking the tick loop.
+fn live_server_profiler() -> &'static Mutex<ServerHotspotProfiler> {
+    static PROFILER: OnceLock<Mutex<ServerHotspotProfiler>> = OnceLock::new();
+    PROFILER.get_or_init(|| Mutex::new(ServerHotspotProfiler::default()))
+}
+
 fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     // `/tick freeze` skips world ticks unless `/tick step` or `/tick sprint`
     // queued budget; a sprint always runs. The default is unfrozen, so callers
@@ -13122,6 +13332,10 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     if !tick_controller().lock().unwrap().should_run_game_tick() {
         return;
     }
+    // Wall-clock cost of the whole tick body, measured once with a monotonic
+    // `Instant`: feeds the shared hotspot profiler and the OPS-2
+    // lag-compensation envelope. A skipped (frozen) tick records nothing.
+    let wire_tick_start = Instant::now();
     let prof = tickprof::enabled();
     let n = tickprof::TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     if prof && n % 100 == 0 {
@@ -13176,6 +13390,12 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     #[cfg(feature = "create-offload")]
     run("mod_offload", mod_offload_tick);
     run("live_mods", live_mod_tick);
+    let wire_us = wire_tick_start.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
+    live_server_profiler()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .record_tick_us(wire_us);
+    ac_note_server_tick_ms((wire_us / 1000) as u32);
 }
 
 fn main() {
@@ -14216,6 +14436,10 @@ fn main() {
     // A configured live Anvil directory imports after the overlay save so its
     // chunks win where both stores name the same position.
     live_anvil_load_if_armed();
+    // Opt-in delta WAL (`MC_SPINE_WAL_PATH`): replay journaled post-save edits
+    // last so the newest recorded write wins, then arm the journal for live
+    // edits. A no-op unless the variable names a valid path.
+    dwal_boot_recover_and_arm();
     // The initial-spawn decision happens after the save loads so a recorded
     // `setworldspawn` always wins; only a world with nothing recorded (or an
     // explicit MC_SPINE_SAFE_SPAWN=1) takes the dry-ground search.
@@ -16323,5 +16547,144 @@ mod dim_block_entity_invalidation_tests {
         set_block_dim(dim, x, y, z, banner);
         let (_, fresh) = live_block_entity_snapshot(key).unwrap();
         assert!(fresh.get("patterns").is_none());
+    }
+}
+
+#[cfg(test)]
+mod wire_ops_tests {
+    use super::*;
+
+    /// Poison-tolerant lock: the ratchet forbids growing `.lock().unwrap()`,
+    /// tests included.
+    fn wire_lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn wire_ops_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("mc-spine-wire-ops-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Disarm the journal: the append path returns to its zero-cost early
+    /// return and the slot is emptied so a later `dwal_boot_recover_and_arm`
+    /// starts clean.
+    fn wire_ops_dwal_disarm() {
+        DWAL_ON.store(false, Ordering::Relaxed);
+        *wire_lock(live_dwal()) = None;
+    }
+
+    /// Every real `game_tick` must land in the shared profiler and in the
+    /// OPS-2 lag-compensation feed, in matching units off one `Instant`.
+    #[test]
+    fn wire_ops_game_tick_feeds_profiler_and_lag_compensation() {
+        {
+            // Another test may leave the controller frozen; a skipped tick
+            // would feed nothing.
+            let mut ctl = wire_lock(tick_controller());
+            ctl.frozen = false;
+            ctl.step_remaining = 0;
+            ctl.sprint_remaining = 0;
+        }
+        let before = wire_lock(live_server_profiler()).summary(0).ticks_recorded;
+        game_tick(|_, tick| tick());
+        let last_us = {
+            let profiler = wire_lock(live_server_profiler());
+            assert!(profiler.summary(0).ticks_recorded > before);
+            profiler.ring[(profiler.ring_next + PROFILER_RING_CAPACITY - 1)
+                % PROFILER_RING_CAPACITY]
+        };
+        assert_eq!(ac_last_tick_ms(), last_us / 1000);
+    }
+
+    /// The play loop feeds `ac_note_player_rtt_ms` on every keepalive reply;
+    /// the readback is what the movement envelope scales with.
+    #[test]
+    fn wire_ops_keepalive_rtt_feeds_lag_compensation() {
+        ac_note_player_rtt_ms(-4242, 250);
+        assert_eq!(ac_player_rtt_ms(-4242), 250);
+    }
+
+    /// Opt-in `MC_SPINE_WAL_PATH`: a live edit lands in the journal, a
+    /// crash-recovery replays it into the live overlay, and a checkpointed
+    /// full save compacts the log to its anchor marker.
+    #[test]
+    fn wire_ops_dwal_append_recover_replay_and_compact() {
+        let dir = wire_ops_dir("dwal");
+        let wal_path = dir.join("delta.wal");
+        let save_dir = dir.join("save");
+        std::fs::create_dir_all(&save_dir).unwrap();
+        std::env::set_var("MC_SPINE_WAL_PATH", &wal_path);
+        wire_ops_dwal_disarm();
+
+        let dim = DimId::Overworld;
+        let (x, y, z) = (3_000_001, 80, -2_999_999);
+        let chunk_key = (dim, x >> 4, z >> 4);
+        let state = name_to_state("stone").unwrap_or(1);
+        assert_ne!(block_at_dim(dim, x, y, z), state);
+
+        // Arm through the same entry point boot uses.
+        dwal_boot_recover_and_arm();
+        assert!(dwal_enabled());
+
+        // A live edit lands in the journal immediately.
+        set_block_dim(dim, x, y, z, state);
+        let report = recover_after_checkpoint(&wal_path).unwrap();
+        assert!(report.records.contains(&DeltaWalRecord::BlockSet {
+            dim,
+            x,
+            y,
+            z,
+            state,
+        }));
+
+        // Crash: journal handle gone, the overlay edit lost with it.
+        wire_ops_dwal_disarm();
+        wire_lock(world()).remove(&chunk_key);
+        assert!(overlay_block_dim(dim, x, y, z).is_none());
+
+        // Boot recovery replays the journaled edit into the live overlay.
+        dwal_boot_recover_and_arm();
+        assert_eq!(block_at_dim(dim, x, y, z), state);
+
+        // A checkpointed full save compacts the log to its anchor marker.
+        dwal_save_checkpointed(|snapshot| snapshot.write(&save_dir)).unwrap();
+        let report = recover_after_checkpoint(&wal_path).unwrap();
+        assert!(report.checkpoint_seq.is_some());
+        assert!(report.records.is_empty());
+
+        // Post-checkpoint edits keep journaling on the rotated sequence.
+        set_block_dim(dim, x, y, z, 0);
+        let report = recover_after_checkpoint(&wal_path).unwrap();
+        assert!(report.records.contains(&DeltaWalRecord::BlockSet {
+            dim,
+            x,
+            y,
+            z,
+            state: 0,
+        }));
+
+        // Leave nothing behind: journal off, env cleared, cells dropped.
+        wire_ops_dwal_disarm();
+        std::env::remove_var("MC_SPINE_WAL_PATH");
+        wire_lock(world()).remove(&chunk_key);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An invalid `MC_SPINE_WAL_PATH` must behave like an unset one — no
+    /// journal, no writes, no crash.
+    #[test]
+    fn wire_ops_dwal_rejects_traversal_path() {
+        let dir = wire_ops_dir("dwal-bad");
+        let saved = std::env::var_os("MC_SPINE_WAL_PATH");
+        std::env::set_var("MC_SPINE_WAL_PATH", dir.join("..").join("escape.wal"));
+        assert!(dwal_path_from_env().is_none());
+        match saved {
+            Some(v) => std::env::set_var("MC_SPINE_WAL_PATH", v),
+            None => std::env::remove_var("MC_SPINE_WAL_PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

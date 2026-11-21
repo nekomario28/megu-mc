@@ -4603,6 +4603,42 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Opt-in minimap policy (`MC_SPINE_FAIR_PLAY`, default **off**). The Xaero
+/// fair-play control code `§f§a§i§r§x§a§e§r§o` is only ever emitted when the
+/// operator armed the flag — a client that did not ask for enforcement must
+/// never see it. The two `allow` switches record what a fair-play server
+/// still permits: they default off under fair-play, on otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MapFairPlayPolicy {
+    fair_play: bool,
+    allow_cave_map: bool,
+    allow_entity_radar: bool,
+}
+
+fn map_fair_play_policy() -> MapFairPlayPolicy {
+    let fair_play = env_flag("MC_SPINE_FAIR_PLAY");
+    let allow = |name: &str| {
+        std::env::var_os(name)
+            .map(|_| env_flag(name))
+            .unwrap_or(!fair_play)
+    };
+    MapFairPlayPolicy {
+        fair_play,
+        allow_cave_map: allow("MC_SPINE_ALLOW_CAVE_MAP"),
+        allow_entity_radar: allow("MC_SPINE_ALLOW_ENTITY_RADAR"),
+    }
+}
+
+/// The system-chat control codes a joining client needs, as encoded `0x6c`
+/// payloads. Empty unless fair-play is armed: default (`unset`/`0`) emits
+/// zero codes, `MC_SPINE_FAIR_PLAY=1` emits `§f§a§i§r§x§a§e§r§o` exactly once.
+fn map_fair_play_join_chats(policy: &MapFairPlayPolicy) -> Vec<Vec<u8>> {
+    if !policy.fair_play {
+        return Vec::new();
+    }
+    vec![system_chat("§f§a§i§r§x§a§e§r§o")]
+}
+
 /// Velocity "modern forwarding" gate (`MC_SPINE_VELOCITY_FORWARDING=1`). When
 /// on, the connecting peer must answer `velocity:player_info` with an
 /// HMAC-SHA256-signed identity — a direct client, a dropped response or one
@@ -5928,10 +5964,29 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         // drops/xp/mobs stream via interest_tick (distance-gated)
     }
     let me_cleanup = me.clone();
+    // Opt-in minimap fair-play (`MC_SPINE_FAIR_PLAY`, default off): the control
+    // code goes out once here, on play join. Off by default — nothing is sent
+    // unless the operator armed the flag.
+    {
+        let policy = map_fair_play_policy();
+        if policy.fair_play {
+            eprintln!(
+                "[spine] {} map fair-play on: cave_map={} entity_radar={}",
+                me.name, policy.allow_cave_map, policy.allow_entity_radar
+            );
+        }
+        for chat in map_fair_play_join_chats(&policy) {
+            let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = send_packet(&mut sock, 0x6c, chat);
+        }
+    }
     // ---- consume loop ----
     s.set_write_timeout(Some(Duration::from_secs(2))).ok();
     let mut keepalive = connection_limits::KeepaliveState::new(Instant::now());
     let mut next_keepalive_id = 1i64;
+    // The instant the outstanding keepalive challenge went out, mirrored so a
+    // matching reply can be turned into a round-trip measurement.
+    let mut keepalive_sent_at: Option<Instant> = None;
     let mut held_slot: i16 = initial_held;
     // `EntityEquipment.setChanged` baseline: every consumed packet may touch
     // the menu (hotbar switch, armor drag, plugin write), so the loop head
@@ -5963,6 +6018,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 {
                     break 'conn;
                 }
+                keepalive_sent_at = Some(Instant::now());
                 next_keepalive_id = next_keepalive_id.wrapping_add(1);
             }
             KeepaliveAction::TimedOut => {
@@ -6043,6 +6099,14 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 if !keepalive.reply(Instant::now(), &b) {
                     play_disconnect(&mut me.sock.lock().unwrap(), "Timed out");
                     break 'conn;
+                }
+                // A reply that matched the pending challenge is a measured
+                // round-trip: feed it into the OPS-2 lag-compensation envelope
+                // so latency spikes do not read as movement cheats.
+                if let Some(sent_at) = keepalive_sent_at.take() {
+                    let rtt_ms =
+                        sent_at.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+                    ac_note_player_rtt_ms(me.eid, rtt_ms);
                 }
             }
             0x02 => {
@@ -11870,5 +11934,72 @@ mod p5c_live_tests {
         let mut inv = HashMap::new();
         inv.insert(38i16, (stone, 3, vec![(COMP_CUSTOM_NAME, vec![0])]));
         assert_eq!(pick_item_plan(&inv, stone, false), None);
+    }
+}
+
+#[cfg(test)]
+mod wire_ops_fair_play_tests {
+    use super::*;
+
+    const FAIR_PLAY_ENV: [&str; 3] = [
+        "MC_SPINE_FAIR_PLAY",
+        "MC_SPINE_ALLOW_CAVE_MAP",
+        "MC_SPINE_ALLOW_ENTITY_RADAR",
+    ];
+
+    fn save_env() -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+        FAIR_PLAY_ENV
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect()
+    }
+
+    fn restore_env(saved: Vec<(&'static str, Option<std::ffi::OsString>)>) {
+        for (name, value) in saved {
+            match value {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    /// `MC_SPINE_FAIR_PLAY` unset or explicit-off emits zero control codes;
+    /// only the armed flag emits `§f§a§i§r§x§a§e§r§o`, and the allow switches
+    /// follow the documented defaults.
+    #[test]
+    fn wire_ops_fair_play_codes_only_on_opt_in() {
+        let saved = save_env();
+        for name in FAIR_PLAY_ENV {
+            std::env::remove_var(name);
+        }
+        // Default (unset): no fair-play, no codes, both maps allowed.
+        let policy = map_fair_play_policy();
+        assert!(!policy.fair_play);
+        assert!(policy.allow_cave_map);
+        assert!(policy.allow_entity_radar);
+        assert!(map_fair_play_join_chats(&policy).is_empty());
+
+        // Explicit-off spellings must not emit codes either.
+        for v in ["0", "false", "off"] {
+            std::env::set_var("MC_SPINE_FAIR_PLAY", v);
+            assert!(map_fair_play_join_chats(&map_fair_play_policy()).is_empty());
+        }
+
+        // Armed: exactly one chat carrying the control code, allow defaults
+        // flip to off, an explicit allow still wins.
+        std::env::set_var("MC_SPINE_FAIR_PLAY", "1");
+        let chats = map_fair_play_join_chats(&map_fair_play_policy());
+        assert_eq!(chats.len(), 1);
+        let code = "§f§a§i§r§x§a§e§r§o".as_bytes();
+        assert!(chats[0].windows(code.len()).any(|w| w == code));
+        let policy = map_fair_play_policy();
+        assert!(!policy.allow_cave_map);
+        assert!(!policy.allow_entity_radar);
+
+        std::env::set_var("MC_SPINE_ALLOW_CAVE_MAP", "true");
+        assert!(map_fair_play_policy().allow_cave_map);
+        assert!(!map_fair_play_policy().allow_entity_radar);
+
+        restore_env(saved);
     }
 }
