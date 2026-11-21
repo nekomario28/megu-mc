@@ -29,6 +29,22 @@ JAR="$WORK/server.jar"
 JAR_SHA1="59353fb40c36d304f2035d51e7d6e6baa98dc05c"
 VAN_PORT=25601
 SPINE_PORT=25602
+# Allow the client's bounded play-ready wait (120s) before its measured drive.
+LOAD_TIMEOUT_EXTRA=150
+
+VPID=
+SPID=
+cleanup() {
+  if [ -n "$VPID" ]; then
+    kill "$VPID" 2>/dev/null || true
+    wait "$VPID" 2>/dev/null || true
+  fi
+  if [ -n "$SPID" ]; then
+    kill "$SPID" 2>/dev/null || true
+    wait "$SPID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
 
 setup_vanilla() {
   rm -rf "$VANILLA_DIR"; mkdir -p "$VANILLA_DIR"; cp "$JAR" "$VANILLA_DIR/server.jar"
@@ -65,24 +81,36 @@ wait_for_line() { # logfile pid marker timeout_s
 }
 
 sample_load() { # pid port loadout -> "cpu(s) rss(MiB) threads chunks ms/chunk"
-  local pid=$1 port=$2 out=$3 hz c0 c1 rss thr load chunks
+  local pid=$1 port=$2 out=$3 hz c0 c1 rss thr load chunks warm
   # WARM=1 spends one window driving first, so the measured window does not
   # contain the spawn/ login burst. The sweep is deterministic, so the warm pass
   # covers the first half of the path and the measured pass the second.
   if [ "${WARM:-0}" = 1 ]; then
-    ( cd "$ROOT" && timeout $((SECONDS_WINDOW + 30)) \
-        python3 tools/load_client.py "$port" "$SECONDS_WINDOW" LoadWarm --view-distance 4 ) >/dev/null 2>&1 || true
+    if ! warm=$( ( cd "$ROOT" && timeout $((SECONDS_WINDOW + LOAD_TIMEOUT_EXTRA)) \
+        python3 tools/load_client.py "$port" "$SECONDS_WINDOW" LoadWarm --view-distance 4 ) 2>&1 ); then
+      printf 'warm-up failed on port %s: %s\n' "$port" "$warm" >&2
+      return 1
+    fi
+    if [[ "$warm" != LOAD\ ok\ * ]]; then
+      printf 'warm-up did not finish on port %s: %s\n' "$port" "$warm" >&2
+      return 1
+    fi
   fi
   hz=$(getconf CLK_TCK)
   c0=$(awk '{print $14+$15}' "/proc/$pid/stat")
   # Let the viewer settle, then measure the same window of movement.
   sleep 3
-  # `|| ...` rather than a following `[ $? -eq 0 ]`: under `set -e` a failed
-  # command substitution exits the script before that test runs, so a failed
-  # driver used to abort the whole comparison instead of reporting the failure.
-  load=$( ( cd "$ROOT" && timeout $((SECONDS_WINDOW + 30)) \
-      python3 tools/load_client.py "$port" "$SECONDS_WINDOW" LoadA --view-distance 4 ) 2>&1 ) \
-    || load="LOAD failed: $load"
+  # A failed driver has no valid CPU-per-chunk measurement. Abort the comparison
+  # rather than printing a plausible-looking row for an invalid window.
+  if ! load=$( ( cd "$ROOT" && timeout $((SECONDS_WINDOW + LOAD_TIMEOUT_EXTRA)) \
+      python3 tools/load_client.py "$port" "$SECONDS_WINDOW" LoadA --view-distance 4 ) 2>&1 ); then
+    printf 'measured load failed on port %s: %s\n' "$port" "$load" >&2
+    return 1
+  fi
+  if [[ "$load" != LOAD\ ok\ * ]]; then
+    printf 'measured load incomplete on port %s: %s\n' "$port" "$load" >&2
+    return 1
+  fi
   c1=$(awk '{print $14+$15}' "/proc/$pid/stat")
   rss=$(awk '/VmRSS/{print $2}' "/proc/$pid/status")
   thr=$(awk '/Threads/{print $2}' "/proc/$pid/status")
@@ -137,6 +165,7 @@ VPID=$!
 wait_for_line "$VANILLA_DIR/server.log" "$VPID" 'Done (' 180
 VAN=$(sample_load "$VPID" "$VAN_PORT" "$WORK/van-load.txt")
 kill "$VPID" 2>/dev/null || true; wait "$VPID" 2>/dev/null || true
+VPID=
 
 echo "-- mc-spine, datapack worldgen, seed $SEED, moving viewer ${SECONDS_WINDOW}s"
 # Build into the directory this script runs from. With CARGO_TARGET_DIR exported (the project's
@@ -154,11 +183,14 @@ ln -s "$ROOT/assets" "$SPINE_DIR/assets"
 # driver climbs 4 blocks per packet with no world model, which vanilla only accepts
 # because it runs in creative; a survival mc-spine viewer would be pulled back.
 ( cd "$SPINE_DIR" && MC_SPINE_PORT="$SPINE_PORT" MC_SPINE_SEED="$SEED" MC_SPINE_RESOURCE_PACK_URL="" \
+    MC_SPINE_COMPRESSION_THRESHOLD=-1 \
     MC_SPINE_ANTICHEAT=off exec "$ROOT/target/release/mc-spine" ) > "$SPINE_DIR/spine.log" 2>&1 &
 SPID=$!
 wait_for_line "$SPINE_DIR/spine.log" "$SPID" 'listening' 60
 SPI=$(sample_load "$SPID" "$SPINE_PORT" "$WORK/spine-load.txt")
 kill "$SPID" 2>/dev/null || true
+wait "$SPID" 2>/dev/null || true
+SPID=
 
 printf '\n%-12s %8s %9s %8s %9s %10s\n' "load ${SECONDS_WINDOW}s" "cpu(s)" "rss(MiB)" "threads" "chunks" "ms/chunk"
 row vanilla "$VAN"

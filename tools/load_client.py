@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Representative-load CLI driver for the server comparison.
 
-Speaks protocol 767 with compression disabled, so the same driver drives both
-vanilla 1.21.1 and mc-spine from the same movement script. It consumes and
+Speaks protocol 767 with or without negotiated compression, so the same driver
+drives both vanilla 1.21.1 and mc-spine from the same movement script. It consumes and
 acknowledges packets but never decodes chunk bodies: the point is to make both
 servers do the same work (stream chunks for a moving viewer, tick the world),
 not to assert one server's chunk format.
@@ -48,10 +48,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
-from wire_smoke import frame, recv_exact, recv_vint, vint  # noqa: E402
+from wire_smoke import recv_exact, recv_vint, vint  # noqa: E402
 import protocol767 as P  # noqa: E402
 
 LOGIN_TIMEOUT = 15.0
+# Initial world generation may take longer than the login/configuration exchange.
+# This budget ends before movement timing begins, for either server.
+PLAY_READY_TIMEOUT = 120.0
 LOGIN_CHUNK_TIMEOUT = 30.0
 MOVE_INTERVAL = 0.05  # 20 Hz, the rate a vanilla client sends position updates
 CRUISE_Y = 250.0     # above the terrain; chunk streaming is per column
@@ -71,6 +74,9 @@ TELEPORT_CONFIRM = 0x00
 CHUNK_BATCH_RECEIVED = 0x08
 KEEP_ALIVE_ACK = 0x18
 SET_POSITION = 0x1A
+# configuration (packet IDs are scoped to their protocol state)
+CONFIG_KEEP_ALIVE = 0x04
+CONFIG_PING = 0x05
 
 
 def read_varint(data, pos=0):
@@ -93,6 +99,7 @@ class RawClient:
         self.chunks_per_tick = chunks_per_tick
         self.wait_login_chunks = wait_login_chunks
         self.phase = "login"
+        self.compression_threshold = -1
         self.pos = None
         self.buffer = bytearray()
         self.packets = 0
@@ -106,14 +113,20 @@ class RawClient:
         self.distance = 0.0
 
     def send(self, pid, body=b""):
-        self.sock.sendall(frame(pid, body))
+        self.sock.sendall(P.frame_packet(vint(pid) + body, self.compression_threshold))
+
+    def decode(self, data):
+        payload = P.unframe_packet(data, self.compression_threshold)
+        pid, offset = read_varint(payload)
+        if pid is None:
+            raise ValueError("missing packet ID")
+        return pid, payload[offset:]
 
     def read(self, timeout):
         self.sock.settimeout(timeout)
         length = recv_vint(self.sock)
         data = recv_exact(self.sock, length)
-        pid, offset = read_varint(data)
-        return pid, data[offset:]
+        return self.decode(data)
 
     def note_rtt(self, body):
         """Vanilla puts its send time in the keepalive id, so its age is an RTT.
@@ -131,11 +144,32 @@ class RawClient:
     def handle(self, pid, body, stage):
         """Consume one packet. `stage` is "login" or "drive" for chunk accounting.
 
-        Only play packets are acted on: packet ids are state-scoped, and 0x0C in
-        configuration is Feature Flags, not Chunk Batch Finished. Answering it
-        there made vanilla drop the connection ("unknown packet id 8").
+        Packet IDs are state-scoped. Configuration 0x0C is Feature Flags, not
+        Chunk Batch Finished. Answering it as a batch acknowledgement made
+        vanilla drop the connection ("unknown packet id 8").
         """
         self.packets += 1
+        if self.phase == "login":
+            if pid == 0x03:  # Set Compression, sent with uncompressed framing
+                threshold, end = read_varint(body)
+                if (threshold is None or end != len(body) or self.compression_threshold >= 0):
+                    raise AssertionError("invalid or duplicate Set Compression")
+                self.compression_threshold = threshold
+            elif pid == 0x00:
+                raise ConnectionError("disconnected during login")
+            return
+        if self.phase == "config":
+            if pid == CONFIG_KEEP_ALIVE:
+                if len(body) != 8:
+                    raise AssertionError("invalid configuration KeepAlive")
+                self.send(CONFIG_KEEP_ALIVE, body)
+            elif pid == CONFIG_PING:
+                if len(body) != 4:
+                    raise AssertionError("invalid configuration Ping")
+                self.send(CONFIG_PING, body)
+            elif pid == 0x02:
+                raise ConnectionError("disconnected during configuration")
+            return
         if self.phase != "play":
             return
         if pid == CHUNK_BATCH_FINISHED:
@@ -166,7 +200,7 @@ class RawClient:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise AssertionError("login did not complete before the deadline")
+                raise TimeoutError(f"{self.phase} did not complete before the deadline")
             pid, body = self.read(remaining)
             self.handle(pid, body, "login")
             if predicate(pid, body):
@@ -190,9 +224,10 @@ class RawClient:
         self.read_until(lambda pid, _: pid == 3, deadline)
         self.send(3)
         self.phase = "play"
-        # The spawn position is what a server is waiting on before it accepts
-        # movement, so the play handshake is not done until it has been confirmed.
-        self.read_until(lambda pid, _: pid == SYNC_POSITION, deadline)
+        # Initial chunk generation can exceed the login/configuration deadline.
+        # Wait for the play teleport before starting the measured movement window.
+        self.read_until(lambda pid, _: pid == SYNC_POSITION,
+                        time.monotonic() + PLAY_READY_TIMEOUT)
         if self.chunks_login < self.wait_login_chunks:
             self.wait_for_login_chunks()
 
@@ -220,8 +255,8 @@ class RawClient:
                 return received
             payload = bytes(self.buffer[start:start + length])
             del self.buffer[:start + length]
-            pid, offset = read_varint(payload)
-            self.handle(pid, payload[offset:], "drive")
+            pid, body = self.decode(payload)
+            self.handle(pid, body, "drive")
             received += 1
 
     def drain(self, timeout):
