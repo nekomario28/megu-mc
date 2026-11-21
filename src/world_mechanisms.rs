@@ -7865,3 +7865,1211 @@ mod perf1_sleeping_hopper_facing_tests {
         assert!(!engine.remove_hopper(a), "second removal is a no-op");
     }
 }
+
+// ============================================================================
+// VANILLA-BLOCKS lane — native mechanisms recovered from Minecraft 1.21.1:
+// note blocks, cauldrons, composters, respawn anchors, lodestone compasses,
+// and the sponge 65-block BFS water absorption.
+// ============================================================================
+
+/// Vanilla `NoteBlockInstrument` (1.21.1 `dud`), in the pinned `instrument`
+/// state-property order: the 16 tunable instruments, six mob heads, then
+/// `custom_head` for player heads.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoteBlockInstrument {
+    Harp,
+    Basedrum,
+    Snare,
+    Hat,
+    Bass,
+    Flute,
+    Bell,
+    Guitar,
+    Chime,
+    Xylophone,
+    IronXylophone,
+    CowBell,
+    Didgeridoo,
+    Bit,
+    Banjo,
+    Pling,
+    Zombie,
+    Skeleton,
+    Creeper,
+    Dragon,
+    WitherSkeleton,
+    Piglin,
+    CustomHead,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl NoteBlockInstrument {
+    /// `note_block[instrument=...]` state value.
+    pub(crate) fn state_name(self) -> &'static str {
+        match self {
+            NoteBlockInstrument::Harp => "harp",
+            NoteBlockInstrument::Basedrum => "basedrum",
+            NoteBlockInstrument::Snare => "snare",
+            NoteBlockInstrument::Hat => "hat",
+            NoteBlockInstrument::Bass => "bass",
+            NoteBlockInstrument::Flute => "flute",
+            NoteBlockInstrument::Bell => "bell",
+            NoteBlockInstrument::Guitar => "guitar",
+            NoteBlockInstrument::Chime => "chime",
+            NoteBlockInstrument::Xylophone => "xylophone",
+            NoteBlockInstrument::IronXylophone => "iron_xylophone",
+            NoteBlockInstrument::CowBell => "cow_bell",
+            NoteBlockInstrument::Didgeridoo => "didgeridoo",
+            NoteBlockInstrument::Bit => "bit",
+            NoteBlockInstrument::Banjo => "banjo",
+            NoteBlockInstrument::Pling => "pling",
+            NoteBlockInstrument::Zombie => "zombie",
+            NoteBlockInstrument::Skeleton => "skeleton",
+            NoteBlockInstrument::Creeper => "creeper",
+            NoteBlockInstrument::Dragon => "dragon",
+            NoteBlockInstrument::WitherSkeleton => "wither_skeleton",
+            NoteBlockInstrument::Piglin => "piglin",
+            NoteBlockInstrument::CustomHead => "custom_head",
+        }
+    }
+
+    /// `NoteBlockInstrument.worksAboveNoteBlock()`: head instruments play the
+    /// skull's ambient sound from the mob head sitting on the note block; the
+    /// note block itself does not play a pitched note for them.
+    pub(crate) fn works_above_note_block(self) -> bool {
+        matches!(
+            self,
+            NoteBlockInstrument::Zombie
+                | NoteBlockInstrument::Skeleton
+                | NoteBlockInstrument::Creeper
+                | NoteBlockInstrument::Dragon
+                | NoteBlockInstrument::WitherSkeleton
+                | NoteBlockInstrument::Piglin
+                | NoteBlockInstrument::CustomHead
+        )
+    }
+
+    /// `NoteBlockInstrument.isTunable()`: the sixteen player-tunable
+    /// instruments — exactly the non-head instruments.
+    pub(crate) fn is_tunable(self) -> bool {
+        !self.works_above_note_block()
+    }
+}
+
+/// Vanilla `BlockState.instrument()` for 1.21.1: the per-block `instrument`
+/// flag baked into `Blocks` (`dga`). Blocks not listed resolve to HARP, which
+/// is also what wall heads produce (they never register an instrument).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn note_block_instrument_from_below(block_name: &str) -> NoteBlockInstrument {
+    match block_name.strip_prefix("minecraft:").unwrap_or(block_name) {
+            "andesite" | "andesite_slab" | "andesite_stairs" | "andesite_wall" | "basalt" | "bedrock" | "black_concrete" | "black_glazed_terracotta" | "black_terracotta" | "blackstone" | "blackstone_slab" | "blackstone_stairs" | "blackstone_wall" | "blast_furnace" | "blue_concrete" | "blue_glazed_terracotta" | "blue_terracotta" | "brain_coral_block" | "brick_slab" | "brick_stairs" | "brick_wall" | "bricks" | "brown_concrete" | "brown_glazed_terracotta" | "brown_terracotta" | "bubble_coral_block" | "calcite" | "chiseled_deepslate" | "chiseled_nether_bricks" | "chiseled_polished_blackstone" | "chiseled_quartz_block" | "chiseled_red_sandstone" | "chiseled_sandstone" | "chiseled_stone_bricks" | "chiseled_tuff" | "chiseled_tuff_bricks" | "coal_block" | "coal_ore" | "cobbled_deepslate" | "cobbled_deepslate_slab" | "cobbled_deepslate_stairs" | "cobbled_deepslate_wall" | "cobblestone" | "cobblestone_slab" | "cobblestone_stairs" | "cobblestone_wall" | "copper_ore" | "cracked_deepslate_bricks" | "cracked_deepslate_tiles" | "cracked_nether_bricks" | "cracked_polished_blackstone_bricks" | "cracked_stone_bricks" | "crimson_nylium" | "crying_obsidian" | "cut_red_sandstone" | "cut_red_sandstone_slab" | "cut_sandstone" | "cut_sandstone_slab" | "cyan_concrete" | "cyan_glazed_terracotta" | "cyan_terracotta" | "dark_prismarine" | "dark_prismarine_slab" | "dark_prismarine_stairs" | "dead_brain_coral" | "dead_brain_coral_block" | "dead_brain_coral_fan" | "dead_brain_coral_wall_fan" | "dead_bubble_coral" | "dead_bubble_coral_block" | "dead_bubble_coral_fan" | "dead_bubble_coral_wall_fan" | "dead_fire_coral" | "dead_fire_coral_block" | "dead_fire_coral_fan" | "dead_fire_coral_wall_fan" | "dead_horn_coral" | "dead_horn_coral_block" | "dead_horn_coral_fan" | "dead_horn_coral_wall_fan" | "dead_tube_coral" | "dead_tube_coral_block" | "dead_tube_coral_fan" | "dead_tube_coral_wall_fan" | "deepslate" | "deepslate_brick_slab" | "deepslate_brick_stairs" | "deepslate_brick_wall" | "deepslate_bricks" | "deepslate_coal_ore" | "deepslate_copper_ore" | "deepslate_diamond_ore" | "deepslate_emerald_ore" | "deepslate_gold_ore" | "deepslate_iron_ore" | "deepslate_lapis_ore" | "deepslate_redstone_ore" | "deepslate_tile_slab" | "deepslate_tile_stairs" | "deepslate_tile_wall" | "deepslate_tiles" | "diamond_ore" | "diorite" | "diorite_slab" | "diorite_stairs" | "diorite_wall" | "dispenser" | "dripstone_block" | "dropper" | "emerald_ore" | "enchanting_table" | "end_portal_frame" | "end_stone" | "end_stone_brick_slab" | "end_stone_brick_stairs" | "end_stone_brick_wall" | "end_stone_bricks" | "ender_chest" | "fire_coral_block" | "furnace" | "gilded_blackstone" | "gold_ore" | "granite" | "granite_slab" | "granite_stairs" | "granite_wall" | "gray_concrete" | "gray_glazed_terracotta" | "gray_terracotta" | "green_concrete" | "green_glazed_terracotta" | "green_terracotta" | "horn_coral_block" | "iron_ore" | "lapis_ore" | "light_blue_concrete" | "light_blue_glazed_terracotta" | "light_blue_terracotta" | "light_gray_concrete" | "light_gray_glazed_terracotta" | "light_gray_terracotta" | "lime_concrete" | "lime_glazed_terracotta" | "lime_terracotta" | "magenta_concrete" | "magenta_glazed_terracotta" | "magenta_terracotta" | "magma_block" | "mossy_cobblestone" | "mossy_cobblestone_slab" | "mossy_cobblestone_stairs" | "mossy_cobblestone_wall" | "mossy_stone_brick_slab" | "mossy_stone_brick_stairs" | "mossy_stone_brick_wall" | "mossy_stone_bricks" | "mud_brick_slab" | "mud_brick_stairs" | "mud_brick_wall" | "mud_bricks" | "nether_brick_fence" | "nether_brick_slab" | "nether_brick_stairs" | "nether_brick_wall" | "nether_bricks" | "nether_gold_ore" | "nether_quartz_ore" | "netherrack" | "observer" | "obsidian" | "orange_concrete" | "orange_glazed_terracotta" | "orange_terracotta" | "petrified_oak_slab" | "pink_concrete" | "pink_glazed_terracotta" | "pink_terracotta" | "pointed_dripstone" | "polished_andesite" | "polished_andesite_slab" | "polished_andesite_stairs" | "polished_basalt" | "polished_blackstone" | "polished_blackstone_brick_slab" | "polished_blackstone_brick_stairs" | "polished_blackstone_brick_wall" | "polished_blackstone_bricks" | "polished_blackstone_pressure_plate" | "polished_blackstone_slab" | "polished_blackstone_stairs" | "polished_blackstone_wall" | "polished_deepslate" | "polished_deepslate_slab" | "polished_deepslate_stairs" | "polished_deepslate_wall" | "polished_diorite" | "polished_diorite_slab" | "polished_diorite_stairs" | "polished_granite" | "polished_granite_slab" | "polished_granite_stairs" | "polished_tuff" | "polished_tuff_slab" | "polished_tuff_stairs" | "polished_tuff_wall" | "prismarine" | "prismarine_brick_slab" | "prismarine_brick_stairs" | "prismarine_bricks" | "prismarine_slab" | "prismarine_stairs" | "prismarine_wall" | "purple_concrete" | "purple_glazed_terracotta" | "purple_terracotta" | "purpur_block" | "purpur_pillar" | "purpur_slab" | "purpur_stairs" | "quartz_block" | "quartz_bricks" | "quartz_pillar" | "quartz_slab" | "quartz_stairs" | "raw_copper_block" | "raw_gold_block" | "raw_iron_block" | "red_concrete" | "red_glazed_terracotta" | "red_nether_brick_slab" | "red_nether_brick_stairs" | "red_nether_brick_wall" | "red_nether_bricks" | "red_sandstone" | "red_sandstone_slab" | "red_sandstone_stairs" | "red_sandstone_wall" | "red_terracotta" | "redstone_ore" | "reinforced_deepslate" | "respawn_anchor" | "sandstone" | "sandstone_slab" | "sandstone_stairs" | "sandstone_wall" | "smoker" | "smooth_basalt" | "smooth_quartz" | "smooth_quartz_slab" | "smooth_quartz_stairs" | "smooth_red_sandstone" | "smooth_red_sandstone_slab" | "smooth_red_sandstone_stairs" | "smooth_sandstone" | "smooth_sandstone_slab" | "smooth_sandstone_stairs" | "smooth_stone" | "smooth_stone_slab" | "spawner" | "stone" | "stone_brick_slab" | "stone_brick_stairs" | "stone_brick_wall" | "stone_bricks" | "stone_pressure_plate" | "stone_slab" | "stone_stairs" | "stonecutter" | "terracotta" | "trial_spawner" | "tube_coral_block" | "tuff" | "tuff_brick_slab" | "tuff_brick_stairs" | "tuff_brick_wall" | "tuff_bricks" | "tuff_slab" | "tuff_stairs" | "tuff_wall" | "vault" | "warped_nylium" | "white_concrete" | "white_glazed_terracotta" | "white_terracotta" | "yellow_concrete" | "yellow_glazed_terracotta" | "yellow_terracotta" => NoteBlockInstrument::Basedrum,
+            "acacia_door" | "acacia_fence" | "acacia_fence_gate" | "acacia_hanging_sign" | "acacia_log" | "acacia_planks" | "acacia_pressure_plate" | "acacia_sign" | "acacia_slab" | "acacia_stairs" | "acacia_trapdoor" | "acacia_wall_hanging_sign" | "acacia_wall_sign" | "acacia_wood" | "bamboo_block" | "bamboo_door" | "bamboo_fence" | "bamboo_fence_gate" | "bamboo_hanging_sign" | "bamboo_mosaic" | "bamboo_mosaic_slab" | "bamboo_mosaic_stairs" | "bamboo_planks" | "bamboo_pressure_plate" | "bamboo_sign" | "bamboo_slab" | "bamboo_stairs" | "bamboo_trapdoor" | "bamboo_wall_hanging_sign" | "bamboo_wall_sign" | "barrel" | "bee_nest" | "beehive" | "birch_door" | "birch_fence" | "birch_fence_gate" | "birch_hanging_sign" | "birch_log" | "birch_planks" | "birch_pressure_plate" | "birch_sign" | "birch_slab" | "birch_stairs" | "birch_trapdoor" | "birch_wall_hanging_sign" | "birch_wall_sign" | "birch_wood" | "black_banner" | "black_wall_banner" | "blue_banner" | "blue_wall_banner" | "bookshelf" | "brown_banner" | "brown_mushroom_block" | "brown_wall_banner" | "campfire" | "cartography_table" | "cherry_door" | "cherry_fence" | "cherry_fence_gate" | "cherry_hanging_sign" | "cherry_log" | "cherry_planks" | "cherry_pressure_plate" | "cherry_sign" | "cherry_slab" | "cherry_stairs" | "cherry_trapdoor" | "cherry_wall_hanging_sign" | "cherry_wall_sign" | "cherry_wood" | "chest" | "chiseled_bookshelf" | "composter" | "crafting_table" | "crimson_door" | "crimson_fence" | "crimson_fence_gate" | "crimson_hanging_sign" | "crimson_hyphae" | "crimson_planks" | "crimson_pressure_plate" | "crimson_sign" | "crimson_slab" | "crimson_stairs" | "crimson_stem" | "crimson_trapdoor" | "crimson_wall_hanging_sign" | "crimson_wall_sign" | "cyan_banner" | "cyan_wall_banner" | "dark_oak_door" | "dark_oak_fence" | "dark_oak_fence_gate" | "dark_oak_hanging_sign" | "dark_oak_log" | "dark_oak_planks" | "dark_oak_pressure_plate" | "dark_oak_sign" | "dark_oak_slab" | "dark_oak_stairs" | "dark_oak_trapdoor" | "dark_oak_wall_hanging_sign" | "dark_oak_wall_sign" | "dark_oak_wood" | "daylight_detector" | "fletching_table" | "gray_banner" | "gray_wall_banner" | "green_banner" | "green_wall_banner" | "jukebox" | "jungle_door" | "jungle_fence" | "jungle_fence_gate" | "jungle_hanging_sign" | "jungle_log" | "jungle_planks" | "jungle_pressure_plate" | "jungle_sign" | "jungle_slab" | "jungle_stairs" | "jungle_trapdoor" | "jungle_wall_hanging_sign" | "jungle_wall_sign" | "jungle_wood" | "lectern" | "light_blue_banner" | "light_blue_wall_banner" | "light_gray_banner" | "light_gray_wall_banner" | "lime_banner" | "lime_wall_banner" | "loom" | "magenta_banner" | "magenta_wall_banner" | "mangrove_door" | "mangrove_fence" | "mangrove_fence_gate" | "mangrove_hanging_sign" | "mangrove_log" | "mangrove_planks" | "mangrove_pressure_plate" | "mangrove_roots" | "mangrove_sign" | "mangrove_slab" | "mangrove_stairs" | "mangrove_trapdoor" | "mangrove_wall_hanging_sign" | "mangrove_wall_sign" | "mangrove_wood" | "mushroom_stem" | "note_block" | "oak_door" | "oak_fence" | "oak_fence_gate" | "oak_hanging_sign" | "oak_log" | "oak_planks" | "oak_pressure_plate" | "oak_sign" | "oak_slab" | "oak_stairs" | "oak_trapdoor" | "oak_wall_hanging_sign" | "oak_wall_sign" | "oak_wood" | "orange_banner" | "orange_wall_banner" | "pink_banner" | "pink_wall_banner" | "purple_banner" | "purple_wall_banner" | "red_banner" | "red_mushroom_block" | "red_wall_banner" | "smithing_table" | "soul_campfire" | "spruce_door" | "spruce_fence" | "spruce_fence_gate" | "spruce_hanging_sign" | "spruce_log" | "spruce_planks" | "spruce_pressure_plate" | "spruce_sign" | "spruce_slab" | "spruce_stairs" | "spruce_trapdoor" | "spruce_wall_hanging_sign" | "spruce_wall_sign" | "spruce_wood" | "stripped_acacia_log" | "stripped_acacia_wood" | "stripped_bamboo_block" | "stripped_birch_log" | "stripped_birch_wood" | "stripped_cherry_log" | "stripped_cherry_wood" | "stripped_crimson_hyphae" | "stripped_crimson_stem" | "stripped_dark_oak_log" | "stripped_dark_oak_wood" | "stripped_jungle_log" | "stripped_jungle_wood" | "stripped_mangrove_log" | "stripped_mangrove_wood" | "stripped_oak_log" | "stripped_oak_wood" | "stripped_spruce_log" | "stripped_spruce_wood" | "stripped_warped_hyphae" | "stripped_warped_stem" | "trapped_chest" | "warped_door" | "warped_fence" | "warped_fence_gate" | "warped_hanging_sign" | "warped_hyphae" | "warped_planks" | "warped_pressure_plate" | "warped_sign" | "warped_slab" | "warped_stairs" | "warped_stem" | "warped_trapdoor" | "warped_wall_hanging_sign" | "warped_wall_sign" | "white_banner" | "white_wall_banner" | "yellow_banner" | "yellow_wall_banner" => NoteBlockInstrument::Bass,
+            "black_concrete_powder" | "blue_concrete_powder" | "brown_concrete_powder" | "cyan_concrete_powder" | "gravel" | "gray_concrete_powder" | "green_concrete_powder" | "heavy_core" | "light_blue_concrete_powder" | "light_gray_concrete_powder" | "lime_concrete_powder" | "magenta_concrete_powder" | "orange_concrete_powder" | "pink_concrete_powder" | "purple_concrete_powder" | "red_concrete_powder" | "red_sand" | "sand" | "suspicious_gravel" | "suspicious_sand" | "white_concrete_powder" | "yellow_concrete_powder" => NoteBlockInstrument::Snare,
+            "beacon" | "black_stained_glass" | "black_stained_glass_pane" | "blue_stained_glass" | "blue_stained_glass_pane" | "brown_stained_glass" | "brown_stained_glass_pane" | "conduit" | "cyan_stained_glass" | "cyan_stained_glass_pane" | "glass" | "glass_pane" | "gray_stained_glass" | "gray_stained_glass_pane" | "green_stained_glass" | "green_stained_glass_pane" | "light_blue_stained_glass" | "light_blue_stained_glass_pane" | "light_gray_stained_glass" | "light_gray_stained_glass_pane" | "lime_stained_glass" | "lime_stained_glass_pane" | "magenta_stained_glass" | "magenta_stained_glass_pane" | "orange_stained_glass" | "orange_stained_glass_pane" | "pink_stained_glass" | "pink_stained_glass_pane" | "purple_stained_glass" | "purple_stained_glass_pane" | "red_stained_glass" | "red_stained_glass_pane" | "sea_lantern" | "tinted_glass" | "white_stained_glass" | "white_stained_glass_pane" | "yellow_stained_glass" | "yellow_stained_glass_pane" => NoteBlockInstrument::Hat,
+            "black_wool" | "blue_wool" | "brown_wool" | "cyan_wool" | "gray_wool" | "green_wool" | "light_blue_wool" | "light_gray_wool" | "lime_wool" | "magenta_wool" | "orange_wool" | "pink_wool" | "purple_wool" | "red_wool" | "white_wool" | "yellow_wool" => NoteBlockInstrument::Guitar,
+            "clay" => NoteBlockInstrument::Flute,
+            "gold_block" => NoteBlockInstrument::Bell,
+            "packed_ice" => NoteBlockInstrument::Chime,
+            "bone_block" => NoteBlockInstrument::Xylophone,
+            "iron_block" => NoteBlockInstrument::IronXylophone,
+            "soul_sand" => NoteBlockInstrument::CowBell,
+            "pumpkin" => NoteBlockInstrument::Didgeridoo,
+            "emerald_block" => NoteBlockInstrument::Bit,
+            "hay_block" => NoteBlockInstrument::Banjo,
+            "glowstone" => NoteBlockInstrument::Pling,
+            "zombie_head" => NoteBlockInstrument::Zombie,
+            "skeleton_skull" => NoteBlockInstrument::Skeleton,
+            "creeper_head" => NoteBlockInstrument::Creeper,
+            "dragon_head" => NoteBlockInstrument::Dragon,
+            "wither_skeleton_skull" => NoteBlockInstrument::WitherSkeleton,
+            "piglin_head" => NoteBlockInstrument::Piglin,
+            "player_head" => NoteBlockInstrument::CustomHead,
+        _ => NoteBlockInstrument::Harp,
+    }
+}
+
+/// Vanilla `NoteBlock.updateNoteBlockState` (`dlh.b`): a mob head directly
+/// above supplies the instrument; otherwise the block directly below does,
+/// falling back to HARP when that block is itself a head.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn note_block_update_instrument(
+    above_block: &str,
+    below_block: &str,
+) -> NoteBlockInstrument {
+    let above = note_block_instrument_from_below(above_block);
+    if above.works_above_note_block() {
+        return above;
+    }
+    let below = note_block_instrument_from_below(below_block);
+    if below.works_above_note_block() {
+        NoteBlockInstrument::Harp
+    } else {
+        below
+    }
+}
+
+/// Vanilla `NoteBlock.getPitchFromNote` (`dlh`): `2^((note - 12) / 12)` for
+/// note values 0..=24, i.e. F#1 through F#3.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn note_block_pitch(note: u8) -> f32 {
+    2.0_f32.powf((note as f32 - 12.0) / 12.0)
+}
+
+/// Right-click tuning: `useWithoutItem` cycles `(note + 1) % 25` and resets
+/// `powered`; returns the new note and its pitch.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn note_block_tune(note: u8) -> (u8, f32) {
+    let next = (note + 1) % 25;
+    (next, note_block_pitch(next))
+}
+
+/// Vanilla `playNote`/`triggerEvent` gate: the block event fires when the
+/// block above is air; with a head instrument it targets the head above and
+/// plays the skull's ambient sound instead.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn note_block_trigger(instrument: NoteBlockInstrument, above_is_air: bool) -> bool {
+    above_is_air || instrument.works_above_note_block()
+}
+
+/// Vanilla `neighborUpdate`: persist the new `powered` flag and fire only on
+/// the rising edge (unpowered -> powered). Returns `(new_powered, trigger)`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn note_block_neighbor_update(powered: bool, has_signal: bool) -> (bool, bool) {
+    (has_signal, has_signal && !powered)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn note_block_name(reg: &crate::block_registry::BReg, st: u32) -> &str {
+    reg.name_of(st)
+}
+
+/// Resolve the effective instrument for the note block at `pos`, mirroring
+/// `updateNoteBlockState`: mob head above wins, else the block below.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn note_block_instrument_at_dim(
+    dim: DimId,
+    pos: BlockPos,
+) -> Option<NoteBlockInstrument> {
+    let reg = breg()?;
+    let above = note_block_name(reg, block_at_dim(dim, pos.0, pos.1 + 1, pos.2));
+    let below = note_block_name(reg, block_at_dim(dim, pos.0, pos.1 - 1, pos.2));
+    Some(note_block_update_instrument(above, below))
+}
+
+/// Recompute and persist the `instrument` property of the note block at `pos`
+/// and queue the visible update — the vanilla `updateNoteBlockState` effect.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn note_block_refresh_instrument_dim(
+    dim: DimId,
+    pos: BlockPos,
+) -> Option<NoteBlockInstrument> {
+    let reg = breg()?;
+    let st = block_at_dim(dim, pos.0, pos.1, pos.2);
+    if reg.name_of(st) != "minecraft:note_block" {
+        return None;
+    }
+    let inst = note_block_instrument_at_dim(dim, pos)?;
+    let new_st = reg.with_prop(st, "instrument", inst.state_name());
+    set_block_dim(dim, pos.0, pos.1, pos.2, new_st);
+    note_block_update_dim(dim, pos.0, pos.1, pos.2, new_st);
+    Some(inst)
+}
+
+/// Right-click (`useWithoutItem`) a note block: cycle `note`, clear `powered`,
+/// refresh `instrument`, then play iff the gate passes. Returns
+/// `(instrument, new_note, pitch, played)`; None when `pos` is not a note block.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn note_block_use_dim(
+    dim: DimId,
+    pos: BlockPos,
+) -> Option<(NoteBlockInstrument, u8, f32, bool)> {
+    let reg = breg()?;
+    let st = block_at_dim(dim, pos.0, pos.1, pos.2);
+    if reg.name_of(st) != "minecraft:note_block" {
+        return None;
+    }
+    let note: u8 = reg.get_prop(st, "note")?.parse().ok()?;
+    let (next, pitch) = note_block_tune(note);
+    let inst = note_block_instrument_at_dim(dim, pos)?;
+    let new_st = reg.with_prop(
+        reg.with_prop(reg.with_prop(st, "note", &next.to_string()), "instrument", inst.state_name()),
+        "powered",
+        "false",
+    );
+    set_block_dim(dim, pos.0, pos.1, pos.2, new_st);
+    note_block_update_dim(dim, pos.0, pos.1, pos.2, new_st);
+    let above_is_air = reg.is_air(block_at_dim(dim, pos.0, pos.1 + 1, pos.2));
+    let played = note_block_trigger(inst, above_is_air);
+    Some((inst, next, pitch, played))
+}
+
+/// Redstone handling for `neighborUpdate`: flip `powered` to `has_signal`,
+/// refresh the instrument, and report whether the block event fired (rising
+/// edge plus the `playNote` gate). Returns `(new_powered, played)`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn note_block_power_dim(
+    dim: DimId,
+    pos: BlockPos,
+    has_signal: bool,
+) -> Option<(bool, bool)> {
+    let reg = breg()?;
+    let st = block_at_dim(dim, pos.0, pos.1, pos.2);
+    if reg.name_of(st) != "minecraft:note_block" {
+        return None;
+    }
+    let powered = reg.get_prop(st, "powered").as_deref() == Some("true");
+    if powered == has_signal {
+        return Some((powered, false));
+    }
+    let inst = note_block_instrument_at_dim(dim, pos)?;
+    let new_st = reg.with_prop(st, "powered", if has_signal { "true" } else { "false" });
+    set_block_dim(dim, pos.0, pos.1, pos.2, new_st);
+    note_block_update_dim(dim, pos.0, pos.1, pos.2, new_st);
+    let above_is_air = reg.is_air(block_at_dim(dim, pos.0, pos.1 + 1, pos.2));
+    let played = has_signal && note_block_trigger(inst, above_is_air);
+    Some((has_signal, played))
+}
+
+/// Vanilla cauldron contents (1.21.1 `dgt`/`dkh`/`dkg`): plain cauldron, and
+/// the layered water / powder-snow cauldrons at level 1..=3, plus full lava.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CauldronState {
+    Empty,
+    Water(u8),
+    Lava,
+    PowderSnow(u8),
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl CauldronState {
+    pub(crate) fn block_name(self) -> &'static str {
+        match self {
+            CauldronState::Empty => "minecraft:cauldron",
+            CauldronState::Water(_) => "minecraft:water_cauldron",
+            CauldronState::Lava => "minecraft:lava_cauldron",
+            CauldronState::PowderSnow(_) => "minecraft:powder_snow_cauldron",
+        }
+    }
+
+    /// `LayeredCauldronBlock.LEVEL` value (None for non-layered contents).
+    pub(crate) fn level(self) -> Option<u8> {
+        match self {
+            CauldronState::Water(l) | CauldronState::PowderSnow(l) => Some(l),
+            _ => None,
+        }
+    }
+
+    /// `AbstractCauldronBlock.getAnalogOutputSignal`: layered cauldrons emit
+    /// their level; lava emits 3; an empty cauldron emits 0.
+    pub(crate) fn comparator_signal(self) -> u8 {
+        match self {
+            CauldronState::Empty => 0,
+            CauldronState::Water(l) | CauldronState::PowderSnow(l) => l,
+            CauldronState::Lava => 3,
+        }
+    }
+
+    /// Registry block state for this content.
+    pub(crate) fn to_state(self, reg: &crate::block_registry::BReg) -> Option<u32> {
+        let st = reg.state_of(self.block_name(), None);
+        if reg.is_air(st) && self.block_name() != "minecraft:air" && reg.name_of(st) == "minecraft:air" {
+            return None;
+        }
+        Some(match self.level() {
+            Some(l) => reg.with_prop(st, "level", &l.to_string()),
+            None => st,
+        })
+    }
+}
+
+/// Read the cauldron content from a registry block state; None for non-cauldrons.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn cauldron_state_of(reg: &crate::block_registry::BReg, st: u32) -> Option<CauldronState> {
+    let level = |name: &str| {
+        reg.get_prop(st, "level")
+            .and_then(|v| v.parse::<u8>().ok())
+            .filter(|l| (1..=3).contains(l))
+            .unwrap_or(if name == "minecraft:lava_cauldron" { 3 } else { 1 })
+    };
+    match reg.name_of(st) {
+        "minecraft:cauldron" => Some(CauldronState::Empty),
+        "minecraft:water_cauldron" => Some(CauldronState::Water(level("minecraft:water_cauldron"))),
+        "minecraft:lava_cauldron" => Some(CauldronState::Lava),
+        "minecraft:powder_snow_cauldron" => {
+            Some(CauldronState::PowderSnow(level("minecraft:powder_snow_cauldron")))
+        }
+        _ => None,
+    }
+}
+
+/// The result of a `CauldronInteraction`: the cauldron's next content plus the
+/// item the player's stack becomes (`returns`, e.g. an emptied bucket or a
+/// filled bottle).
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CauldronOutcome {
+    pub new_state: CauldronState,
+    pub returns: Option<String>,
+}
+
+/// Vanilla `CauldronInteraction` map (1.21.1 `kj`): the bucket fills apply on
+/// every content map; empties apply only to their own content at the right
+/// level; bottle/potion fills and the dye wash families live on the water map.
+/// `potion` means a water-potion bottle; `dyed` means a dyable leather item.
+/// Returns None when the interaction is a PASS (state untouched).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn cauldron_use(state: CauldronState, item_name: &str) -> Option<CauldronOutcome> {
+    let item = item_name.strip_prefix("minecraft:").unwrap_or(item_name);
+    let outcome = |new_state, returns: Option<&str>| {
+        Some(CauldronOutcome { new_state, returns: returns.map(str::to_owned) })
+    };
+    match item {
+        // Default bucket fills are registered on every map.
+        "water_bucket" => outcome(CauldronState::Water(3), Some("minecraft:bucket")),
+        "lava_bucket" => outcome(CauldronState::Lava, Some("minecraft:bucket")),
+        "powder_snow_bucket" => outcome(CauldronState::PowderSnow(3), Some("minecraft:bucket")),
+        "bucket" => match state {
+            CauldronState::Water(3) => outcome(CauldronState::Empty, Some("minecraft:water_bucket")),
+            CauldronState::Lava => outcome(CauldronState::Empty, Some("minecraft:lava_bucket")),
+            CauldronState::PowderSnow(3) => {
+                outcome(CauldronState::Empty, Some("minecraft:powder_snow_bucket"))
+            }
+            _ => None,
+        },
+        "glass_bottle" => match state {
+            CauldronState::Water(1) => outcome(CauldronState::Empty, Some("minecraft:potion")),
+            CauldronState::Water(l) => outcome(CauldronState::Water(l - 1), Some("minecraft:potion")),
+            _ => None,
+        },
+        "potion" => match state {
+            CauldronState::Empty => outcome(CauldronState::Water(1), Some("minecraft:glass_bottle")),
+            CauldronState::Water(l) if l < 3 => {
+                outcome(CauldronState::Water(l + 1), Some("minecraft:glass_bottle"))
+            }
+            _ => None,
+        },
+        // Dye washing: dyable leather armor, banners, and colored shulker
+        // boxes each cost one water level and leave the undyed item.
+        "leather_helmet" | "leather_chestplate" | "leather_leggings" | "leather_boots"
+        | "leather_horse_armor" | "wolf_armor" => match state {
+            CauldronState::Water(1) => outcome(CauldronState::Empty, Some(item_name)),
+            CauldronState::Water(l) => outcome(CauldronState::Water(l - 1), Some(item_name)),
+            _ => None,
+        },
+        _ if item.ends_with("_banner") => match state {
+            CauldronState::Water(1) => outcome(CauldronState::Empty, Some(item_name)),
+            CauldronState::Water(l) => outcome(CauldronState::Water(l - 1), Some(item_name)),
+            _ => None,
+        },
+        _ if item.ends_with("_shulker_box") => match state {
+            CauldronState::Water(1) => {
+                outcome(CauldronState::Empty, Some("minecraft:shulker_box"))
+            }
+            CauldronState::Water(l) => {
+                outcome(CauldronState::Water(l - 1), Some("minecraft:shulker_box"))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Precipitation kinds for `CauldronBlock.handlePrecipitation`.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CauldronPrecip {
+    Rain,
+    Snow,
+}
+
+/// Vanilla `handlePrecipitation` (`dgt`/`dkh`): with the pre-rolled random
+/// `roll` under the 0.05 (rain) / 0.10 (snow) chance, rain grows only water
+/// cauldrons and snow only powder-snow cauldrons (each while level < 3); an
+/// empty cauldron takes level 1 of the matching content.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn cauldron_weather_fill(
+    state: CauldronState,
+    precip: CauldronPrecip,
+    roll: f64,
+) -> CauldronState {
+    let chance = match precip {
+        CauldronPrecip::Rain => 0.05,
+        CauldronPrecip::Snow => 0.10,
+    };
+    if roll >= chance {
+        return state;
+    }
+    match (state, precip) {
+        (CauldronState::Empty, CauldronPrecip::Rain) => CauldronState::Water(1),
+        (CauldronState::Empty, CauldronPrecip::Snow) => CauldronState::PowderSnow(1),
+        (CauldronState::Water(l), CauldronPrecip::Rain) if l < 3 => CauldronState::Water(l + 1),
+        (CauldronState::PowderSnow(l), CauldronPrecip::Snow) if l < 3 => {
+            CauldronState::PowderSnow(l + 1)
+        }
+        _ => state,
+    }
+}
+
+/// Fluids a pointed dripstone can drip into a cauldron.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CauldronDripFluid {
+    Water,
+    Lava,
+}
+
+/// Vanilla `receiveStalactiteDrip`/`canReceiveStalactiteDrip` (`dgt`/`dkh`):
+/// an empty cauldron accepts water -> Water(1) or lava -> Lava; a water
+/// cauldron below full accepts water drips (+1). Powder-snow and lava
+/// cauldrons receive nothing.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn cauldron_drip_fill(state: CauldronState, fluid: CauldronDripFluid) -> CauldronState {
+    match (state, fluid) {
+        (CauldronState::Empty, CauldronDripFluid::Water) => CauldronState::Water(1),
+        (CauldronState::Empty, CauldronDripFluid::Lava) => CauldronState::Lava,
+        (CauldronState::Water(l), CauldronDripFluid::Water) if l < 3 => CauldronState::Water(l + 1),
+        _ => state,
+    }
+}
+
+/// `LayeredCauldronBlock.entityInside` (`dkh.e`): a burning entity inside the
+/// content extinguishes — water loses a level (level 1 empties), powder snow
+/// turns into water at the same level.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn cauldron_extinguish(state: CauldronState) -> CauldronState {
+    match state {
+        CauldronState::Water(1) => CauldronState::Empty,
+        CauldronState::Water(l) => CauldronState::Water(l - 1),
+        CauldronState::PowderSnow(l) => CauldronState::Water(l),
+        s => s,
+    }
+}
+
+/// Vanilla `ComposterBlock.COMPOSTABLES` (1.21.1 `dhj` clinit): the item ->
+/// chance table. Returns None for non-compostable items.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn composter_chance(item_name: &str) -> Option<f64> {
+    match item_name.strip_prefix("minecraft:").unwrap_or(item_name) {
+        "acacia_leaves" | "acacia_sapling" | "azalea_leaves" | "beetroot_seeds" | "birch_leaves" | "birch_sapling" | "cherry_leaves" | "cherry_sapling" | "dark_oak_leaves" | "dark_oak_sapling" | "dried_kelp" | "glow_berries" | "hanging_roots" | "jungle_leaves" | "jungle_sapling" | "kelp" | "mangrove_leaves" | "mangrove_propagule" | "mangrove_roots" | "melon_seeds" | "moss_carpet" | "oak_leaves" | "oak_sapling" | "pink_petals" | "pitcher_pod" | "pumpkin_seeds" | "seagrass" | "short_grass" | "small_dripleaf" | "spruce_leaves" | "spruce_sapling" | "sweet_berries" | "torchflower_seeds" | "wheat_seeds" => Some(0.3),
+        "cactus" | "dried_kelp_block" | "flowering_azalea_leaves" | "glow_lichen" | "melon_slice" | "nether_sprouts" | "sugar_cane" | "tall_grass" | "twisting_vines" | "vine" | "weeping_vines" => Some(0.5),
+        "allium" | "apple" | "azalea" | "azure_bluet" | "beetroot" | "big_dripleaf" | "blue_orchid" | "brown_mushroom" | "carrot" | "carved_pumpkin" | "cocoa_beans" | "cornflower" | "crimson_fungus" | "crimson_roots" | "dandelion" | "fern" | "large_fern" | "lilac" | "lily_of_the_valley" | "lily_pad" | "melon" | "moss_block" | "mushroom_stem" | "nether_wart" | "orange_tulip" | "oxeye_daisy" | "peony" | "pink_tulip" | "poppy" | "potato" | "pumpkin" | "red_mushroom" | "red_tulip" | "rose_bush" | "sea_pickle" | "shroomlight" | "spore_blossom" | "sunflower" | "warped_fungus" | "warped_roots" | "wheat" | "white_tulip" | "wither_rose" => Some(0.65),
+        "baked_potato" | "bread" | "brown_mushroom_block" | "cookie" | "flowering_azalea" | "hay_block" | "nether_wart_block" | "pitcher_plant" | "red_mushroom_block" | "torchflower" | "warped_wart_block" => Some(0.85),
+        "bone_meal" | "cake" | "pumpkin_pie" => Some(1.0),
+        _ => None,
+    }
+}
+
+/// Result of a composter insert attempt (`dhj` use path).
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum ComposterInsert {
+    /// Item not compostable, or the composter already reads level 7+ — the
+    /// interaction is a PASS and nothing is consumed.
+    Rejected,
+    /// Compostable consumed but the chance roll failed — level unchanged.
+    ConsumedNoAdvance,
+    /// Compostable consumed and the roll passed: `level -> level + 1`. When
+    /// the new level is 7 vanilla schedules the ~20-tick maturation that later
+    /// shows level 8.
+    Advanced { new_level: u8, schedules_maturation: bool },
+}
+
+/// Vanilla `addItem`: accepts a compostable only while level < 7, advances the
+/// RNG for the attempt, and bumps the level when `roll < chance`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn composter_insert(level: u8, item_name: &str, roll: f64) -> ComposterInsert {
+    if level >= 7 {
+        return ComposterInsert::Rejected;
+    }
+    let Some(chance) = composter_chance(item_name) else {
+        return ComposterInsert::Rejected;
+    };
+    if roll >= chance {
+        return ComposterInsert::ConsumedNoAdvance;
+    }
+    let new_level = level + 1;
+    ComposterInsert::Advanced { new_level, schedules_maturation: new_level == 7 }
+}
+
+/// Scheduled-tick maturation (`dhj.tick`): level 7 becomes 8 — the "ready"
+/// state a player harvests.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn composter_mature(level: u8) -> u8 {
+    if level == 7 {
+        8
+    } else {
+        level
+    }
+}
+
+/// `extractProduce` on level 8: pop one `minecraft:bone_meal` and reset to 0.
+/// Returns the new level and produced item, or None below level 8.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn composter_harvest(level: u8) -> Option<(u8, &'static str)> {
+    if level == 8 {
+        Some((0, "minecraft:bone_meal"))
+    } else {
+        None
+    }
+}
+
+/// `ComposterBlock.getAnalogOutputSignal`: the level itself (0..=8).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn composter_comparator(level: u8) -> u8 {
+    level
+}
+
+/// Vanilla `RespawnAnchorBlock` (1.21.1 `dmh`) interact outcome. `charges` is
+/// the block's `charges` property (0..=4) before the interaction.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum AnchorOutcome {
+    /// Glowstone accepted: `charges -> charges + 1`.
+    Charged { charges: u8 },
+    /// Glowstone on a full anchor: vanilla consumes it but the state is
+    /// unchanged (already at max charge).
+    Full,
+    /// Charged anchor clicked where anchors work (`respawnAnchorWorks`, i.e.
+    /// the Nether): the player respawn point is set; the charge is only
+    /// consumed on the actual respawn.
+    RespawnSet,
+    /// Charged anchor clicked where anchors don't work (Overworld/End):
+    /// power-5 explosion and the anchor is destroyed.
+    Explode { power: f32 },
+    /// Uncharged anchor: PASS, nothing happens.
+    Pass,
+}
+
+/// `dmh` interact: `held_item` is the used stack's item name (None = empty
+/// hand); `anchors_work` is `dimensionType.respawnAnchorWorks` (true for the
+/// Nether and nether-like custom dimensions).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn respawn_anchor_use(
+    charges: u8,
+    held_item: Option<&str>,
+    anchors_work: bool,
+) -> AnchorOutcome {
+    let is_glowstone = held_item
+        .map(|i| i.strip_prefix("minecraft:").unwrap_or(i) == "glowstone")
+        .unwrap_or(false);
+    if is_glowstone {
+        return if charges < 4 {
+            AnchorOutcome::Charged { charges: charges + 1 }
+        } else {
+            AnchorOutcome::Full
+        };
+    }
+    if charges == 0 {
+        return AnchorOutcome::Pass;
+    }
+    if anchors_work {
+        AnchorOutcome::RespawnSet
+    } else {
+        AnchorOutcome::Explode { power: 5.0 }
+    }
+}
+
+/// One charge is consumed when the player actually respawns at the anchor.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn respawn_anchor_consume(charges: u8) -> u8 {
+    charges.saturating_sub(1)
+}
+
+/// `RespawnAnchorBlock.getAnalogOutputSignal`: `min(15, charges * 4 - 1)` —
+/// exactly `[0, 3, 7, 11, 15]` for charges 0..=4.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn respawn_anchor_comparator(charges: u8) -> u8 {
+    [0, 3, 7, 11, 15][charges.min(4) as usize]
+}
+
+/// What the lodestone dimension+position binding stores on the compass (the
+/// 1.21.1 `lodestone_target` component's tracked pos and dimension).
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LodestoneTarget {
+    pub dim: DimId,
+    pub pos: BlockPos,
+}
+
+/// Vanilla `LodestoneTracker` (compass component): a compass bound by
+/// right-clicking a lodestone. `validate` mirrors `LodestoneTracker` refresh —
+/// the binding clears (and the needle spins) once the block at the target is
+/// no longer a lodestone.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LodestoneTracker {
+    pub target: Option<LodestoneTarget>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl LodestoneTracker {
+    /// Right-click `lodestone` with a `compass`: store `(dim, x, y, z)`.
+    pub(crate) fn bind(&mut self, dim: DimId, pos: BlockPos) -> LodestoneTarget {
+        let target = LodestoneTarget { dim, pos };
+        self.target = Some(target);
+        target
+    }
+
+    /// True while the tracked block is still `minecraft:lodestone`; clears the
+    /// binding and returns false once it is broken or replaced.
+    pub(crate) fn validate(&mut self, reg: &crate::block_registry::BReg) -> bool {
+        let Some(target) = self.target else { return false };
+        let st = block_at_dim(target.dim, target.pos.0, target.pos.1, target.pos.2);
+        if reg.name_of(st) == "minecraft:lodestone" {
+            true
+        } else {
+            self.target = None;
+            false
+        }
+    }
+}
+
+/// Vanilla `SpongeBlock` (1.21.1 `dno`): `BlockPos.breadthFirstTraversal`
+/// from the sponge — Manhattan depth <= 6, at most 65 visited cells, and only
+/// cells whose contents pass the absorb predicate expand the frontier. The
+/// sponge position itself always expands. Returns the absorbed positions in
+/// BFS order (does not include the sponge cell).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn sponge_absorb_water(dim: DimId, sponge: BlockPos) -> Vec<BlockPos> {
+    let Some(reg) = breg() else { return Vec::new() };
+    let offsets: [(i32, i32, i32); 6] = [
+        (0, -1, 0),
+        (0, 1, 0),
+        (-1, 0, 0),
+        (1, 0, 0),
+        (0, 0, -1),
+        (0, 0, 1),
+    ];
+    // `dno.a(jd,dcw,jd)` predicate: water fluid plus BucketPickup / LiquidBlock
+    // / kelp-family absorption. We model it against the pinned registry:
+    // `has_water` covers waterlogged states; the kelp/seagrass family is
+    // destroyed outright; flowing and source water are `minecraft:water`.
+    let absorbs = |st: u32| -> bool {
+        if reg.is_air(st) {
+            return false;
+        }
+        let name = reg.name_of(st);
+        matches!(name, "minecraft:water" | "minecraft:kelp" | "minecraft:kelp_plant" | "minecraft:seagrass" | "minecraft:tall_seagrass")
+            || reg.has_water(st)
+    };
+    let absorb_at = |p: BlockPos, st: u32| {
+        let name = reg.name_of(st);
+        if reg.get_prop(st, "waterlogged").as_deref() == Some("true") {
+            set_block_dim(dim, p.0, p.1, p.2, reg.with_prop(st, "waterlogged", "false"));
+        } else if matches!(
+            name,
+            "minecraft:water" | "minecraft:kelp" | "minecraft:kelp_plant" | "minecraft:seagrass" | "minecraft:tall_seagrass"
+        ) {
+            set_block_dim(dim, p.0, p.1, p.2, reg.state_of("minecraft:air", None));
+        }
+    };
+
+    let mut seen: HashSet<BlockPos> = HashSet::from([sponge]);
+    let mut queue: std::collections::VecDeque<(BlockPos, u8)> =
+        std::collections::VecDeque::from([(sponge, 0)]);
+    let mut absorbed: Vec<BlockPos> = Vec::new();
+    let mut visited: usize = 0;
+    while let Some((cur, depth)) = queue.pop_front() {
+        if visited >= 65 {
+            break;
+        }
+        visited += 1;
+        // The root cell expands unconditionally; other cells expand only when
+        // the predicate absorbed them, while depth < 6.
+        let expands = if cur == sponge {
+            true
+        } else {
+            let st = block_at_dim(dim, cur.0, cur.1, cur.2);
+            absorbs(st) && {
+                absorb_at(cur, st);
+                absorbed.push(cur);
+                true
+            }
+        };
+        if !expands || depth >= 6 {
+            continue;
+        }
+        for (dx, dy, dz) in offsets {
+            let next = (cur.0 + dx, cur.1 + dy, cur.2 + dz);
+            if seen.insert(next) {
+                queue.push_back((next, depth + 1));
+            }
+        }
+    }
+    absorbed
+}
+
+/// `WetSpongeBlock.onPlace` / `SpongeBlock` nether behavior: in an ultrawarm
+/// dimension (`dimension_type.ultrawarm`, i.e. the Nether) a placed sponge
+/// instantly dries — `wet_sponge` evaporates back to `sponge` rather than
+/// staying wet.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn sponge_nether_dries(dim: DimId) -> bool {
+    dim_ultrawarm(dim)
+}
+
+#[cfg(test)]
+mod vanilla_blocks_tests {
+    use super::*;
+    use crate::block_registry::BReg;
+
+    fn reg() -> &'static BReg {
+        breg().expect("block registry")
+    }
+    fn state(name: &str) -> u32 {
+        reg().state_of(name, None)
+    }
+    fn name_at(dim: DimId, x: i32, y: i32, z: i32) -> String {
+        reg().name_of(block_at_dim(dim, x, y, z)).to_owned()
+    }
+
+    #[test]
+    fn vanilla_blocks_note_instrument_table() {
+        use NoteBlockInstrument::*;
+        assert_eq!(note_block_instrument_from_below("minecraft:stone"), Basedrum);
+        assert_eq!(note_block_instrument_from_below("minecraft:netherrack"), Basedrum);
+        assert_eq!(note_block_instrument_from_below("minecraft:oak_log"), Bass);
+        assert_eq!(note_block_instrument_from_below("minecraft:oak_planks"), Bass);
+        assert_eq!(note_block_instrument_from_below("minecraft:note_block"), Bass);
+        assert_eq!(note_block_instrument_from_below("minecraft:sand"), Snare);
+        assert_eq!(note_block_instrument_from_below("minecraft:gravel"), Snare);
+        assert_eq!(note_block_instrument_from_below("minecraft:glass"), Hat);
+        assert_eq!(note_block_instrument_from_below("minecraft:gold_block"), Bell);
+        assert_eq!(note_block_instrument_from_below("minecraft:clay"), Flute);
+        assert_eq!(note_block_instrument_from_below("minecraft:packed_ice"), Chime);
+        assert_eq!(note_block_instrument_from_below("minecraft:white_wool"), Guitar);
+        assert_eq!(note_block_instrument_from_below("minecraft:bone_block"), Xylophone);
+        assert_eq!(note_block_instrument_from_below("minecraft:iron_block"), IronXylophone);
+        assert_eq!(note_block_instrument_from_below("minecraft:soul_sand"), CowBell);
+        assert_eq!(note_block_instrument_from_below("minecraft:pumpkin"), Didgeridoo);
+        assert_eq!(note_block_instrument_from_below("minecraft:emerald_block"), Bit);
+        assert_eq!(note_block_instrument_from_below("minecraft:hay_block"), Banjo);
+        assert_eq!(note_block_instrument_from_below("minecraft:glowstone"), Pling);
+        assert_eq!(note_block_instrument_from_below("minecraft:zombie_head"), Zombie);
+        assert_eq!(note_block_instrument_from_below("minecraft:skeleton_skull"), Skeleton);
+        assert_eq!(note_block_instrument_from_below("minecraft:creeper_head"), Creeper);
+        assert_eq!(note_block_instrument_from_below("minecraft:dragon_head"), Dragon);
+        assert_eq!(note_block_instrument_from_below("minecraft:wither_skeleton_skull"), WitherSkeleton);
+        assert_eq!(note_block_instrument_from_below("minecraft:piglin_head"), Piglin);
+        assert_eq!(note_block_instrument_from_below("minecraft:player_head"), CustomHead);
+        // 1.21.1 fallbacks: wall heads and unlisted blocks are HARP
+        assert_eq!(note_block_instrument_from_below("minecraft:zombie_wall_head"), Harp);
+        assert_eq!(note_block_instrument_from_below("minecraft:wither_skeleton_wall_skull"), Harp);
+        assert_eq!(note_block_instrument_from_below("minecraft:dirt"), Harp);
+        assert_eq!(note_block_instrument_from_below("minecraft:air"), Harp);
+        assert_eq!(note_block_instrument_from_below("minecraft:copper_block"), Harp);
+        // isTunable: the 16 player instruments only; heads are not tunable.
+        for inst in [
+            Harp, Basedrum, Snare, Hat, Bass, Flute, Bell, Guitar, Chime, Xylophone,
+            IronXylophone, CowBell, Didgeridoo, Bit, Banjo, Pling,
+        ] {
+            assert!(inst.is_tunable(), "{inst:?}");
+            assert!(!inst.works_above_note_block(), "{inst:?}");
+        }
+        for inst in [Zombie, Skeleton, Creeper, Dragon, WitherSkeleton, Piglin, CustomHead] {
+            assert!(!inst.is_tunable(), "{inst:?}");
+            assert!(inst.works_above_note_block(), "{inst:?}");
+        }
+    }
+
+    #[test]
+    fn vanilla_blocks_note_update_instrument_prefers_head_above() {
+        use NoteBlockInstrument::*;
+        assert_eq!(
+            note_block_update_instrument("minecraft:creeper_head", "minecraft:oak_log"),
+            Creeper
+        );
+        assert_eq!(
+            note_block_update_instrument("minecraft:player_head", "minecraft:stone"),
+            CustomHead
+        );
+        assert_eq!(
+            note_block_update_instrument("minecraft:air", "minecraft:oak_log"),
+            Bass
+        );
+        // A head *below* is not a valid host: falls back to HARP.
+        assert_eq!(
+            note_block_update_instrument("minecraft:air", "minecraft:zombie_head"),
+            Harp
+        );
+    }
+
+    #[test]
+    fn vanilla_blocks_note_pitch_and_tune() {
+        assert!((note_block_pitch(12) - 1.0).abs() < 1e-6);
+        assert!((note_block_pitch(24) - 2.0).abs() < 1e-6);
+        assert!((note_block_pitch(0) - 0.5).abs() < 1e-6);
+        let (n13, p13) = note_block_tune(12);
+        assert_eq!(n13, 13);
+        assert!((p13 - note_block_pitch(13)).abs() < 1e-6);
+        // note wraps at 25
+        assert_eq!(note_block_tune(24).0, 0);
+        assert!((note_block_tune(24).1 - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn vanilla_blocks_note_trigger_gate() {
+        use NoteBlockInstrument::*;
+        assert!(note_block_trigger(Harp, true));
+        assert!(!note_block_trigger(Harp, false));
+        // Head instruments fire even though the block above isn't air.
+        assert!(note_block_trigger(Zombie, false));
+        assert!(note_block_trigger(CustomHead, false));
+        assert_eq!(note_block_neighbor_update(false, true), (true, true));
+        assert_eq!(note_block_neighbor_update(true, true), (true, false));
+        assert_eq!(note_block_neighbor_update(true, false), (false, false));
+        assert_eq!(note_block_neighbor_update(false, false), (false, false));
+    }
+
+    #[test]
+    fn vanilla_blocks_note_dim_use_power_and_obstruction() {
+        let reg = reg();
+        let dim = DimId::Overworld;
+        let pos = (24300, 210, 24300);
+        let nb = state("minecraft:note_block");
+        set_block_dim(dim, pos.0, pos.1, pos.2, reg.with_prop(nb, "note", "12"));
+        set_block_dim(dim, pos.0, pos.1 - 1, pos.2, state("minecraft:gold_block"));
+        set_block_dim(dim, pos.0, pos.1 + 1, pos.2, state("minecraft:air"));
+
+        let (inst, note, pitch, played) = note_block_use_dim(dim, pos).unwrap();
+        assert_eq!(inst, NoteBlockInstrument::Bell);
+        assert_eq!(note, 13);
+        assert!((pitch - note_block_pitch(13)).abs() < 1e-6);
+        assert!(played);
+        assert_eq!(reg.get_prop(block_at_dim(dim, pos.0, pos.1, pos.2), "note").unwrap(), "13");
+        assert_eq!(
+            reg.get_prop(block_at_dim(dim, pos.0, pos.1, pos.2), "instrument").unwrap(),
+            "bell"
+        );
+
+        // Obstructed above: no playback.
+        set_block_dim(dim, pos.0, pos.1 + 1, pos.2, state("minecraft:stone"));
+        let (_, _, _, played2) = note_block_use_dim(dim, pos).unwrap();
+        assert!(!played2);
+
+        // Powered rising edge only.
+        set_block_dim(dim, pos.0, pos.1 + 1, pos.2, state("minecraft:air"));
+        assert_eq!(note_block_power_dim(dim, pos, true), Some((true, true)));
+        assert_eq!(note_block_power_dim(dim, pos, true), Some((true, false)));
+        assert_eq!(note_block_power_dim(dim, pos, false), Some((false, false)));
+        assert_eq!(note_block_power_dim(dim, pos, true), Some((true, true)));
+        // Not a note block -> None.
+        set_block_dim(dim, pos.0 + 4, pos.1, pos.2, state("minecraft:stone"));
+        assert_eq!(note_block_use_dim(dim, (pos.0 + 4, pos.1, pos.2)), None);
+
+        // updateNoteBlockState refresh: swap the host below and the stored
+        // instrument follows.
+        set_block_dim(dim, pos.0, pos.1 - 1, pos.2, state("minecraft:oak_log"));
+        assert_eq!(note_block_refresh_instrument_dim(dim, pos), Some(NoteBlockInstrument::Bass));
+        assert_eq!(
+            reg.get_prop(block_at_dim(dim, pos.0, pos.1, pos.2), "instrument").unwrap(),
+            "bass"
+        );
+        // A mob head above overrides the host below.
+        set_block_dim(dim, pos.0, pos.1 + 1, pos.2, state("minecraft:creeper_head"));
+        assert_eq!(note_block_refresh_instrument_dim(dim, pos), Some(NoteBlockInstrument::Creeper));
+        set_block_dim(dim, pos.0, pos.1 + 1, pos.2, state("minecraft:air"));
+        assert_eq!(
+            note_block_refresh_instrument_dim(dim, (pos.0 + 4, pos.1, pos.2)),
+            None
+        );
+    }
+
+    #[test]
+    fn vanilla_blocks_cauldron_state_and_comparator() {
+        use CauldronState::*;
+        let reg = reg();
+        let w2 = reg.with_prop(state("minecraft:water_cauldron"), "level", "2");
+        assert_eq!(cauldron_state_of(reg, w2), Some(Water(2)));
+        assert_eq!(cauldron_state_of(reg, state("minecraft:lava_cauldron")), Some(Lava));
+        assert_eq!(
+            cauldron_state_of(reg, reg.with_prop(state("minecraft:powder_snow_cauldron"), "level", "3")),
+            Some(PowderSnow(3))
+        );
+        assert_eq!(cauldron_state_of(reg, state("minecraft:cauldron")), Some(Empty));
+        assert_eq!(cauldron_state_of(reg, state("minecraft:stone")), None);
+        assert_eq!(Empty.comparator_signal(), 0);
+        assert_eq!(Water(1).comparator_signal(), 1);
+        assert_eq!(Water(3).comparator_signal(), 3);
+        assert_eq!(PowderSnow(2).comparator_signal(), 2);
+        assert_eq!(Lava.comparator_signal(), 3);
+        // Round-trip through the registry: block_name/level/to_state.
+        assert_eq!(Water(2).block_name(), "minecraft:water_cauldron");
+        assert_eq!(Water(2).level(), Some(2));
+        assert_eq!(Lava.level(), None);
+        let st = Water(2).to_state(reg).unwrap();
+        assert_eq!(reg.name_of(st), "minecraft:water_cauldron");
+        assert_eq!(reg.get_prop(st, "level").unwrap(), "2");
+        assert_eq!(cauldron_state_of(reg, st), Some(Water(2)));
+        let st = Lava.to_state(reg).unwrap();
+        assert_eq!(reg.name_of(st), "minecraft:lava_cauldron");
+    }
+
+    #[test]
+    fn vanilla_blocks_cauldron_bucket_and_bottle() {
+        use CauldronState::*;
+        // Bucket fills work on every content map and overwrite.
+        assert_eq!(
+            cauldron_use(Empty, "minecraft:water_bucket"),
+            Some(CauldronOutcome { new_state: Water(3), returns: Some("minecraft:bucket".into()) })
+        );
+        assert_eq!(cauldron_use(Empty, "minecraft:lava_bucket").unwrap().new_state, Lava);
+        assert_eq!(
+            cauldron_use(Empty, "minecraft:powder_snow_bucket").unwrap().new_state,
+            PowderSnow(3)
+        );
+        assert_eq!(cauldron_use(Water(2), "minecraft:lava_bucket").unwrap().new_state, Lava);
+        assert_eq!(
+            cauldron_use(Lava, "minecraft:powder_snow_bucket").unwrap().new_state,
+            PowderSnow(3)
+        );
+        // Empty buckets take their own content only at the full level.
+        assert_eq!(
+            cauldron_use(Water(3), "minecraft:bucket").unwrap().returns.unwrap(),
+            "minecraft:water_bucket"
+        );
+        assert_eq!(cauldron_use(Water(3), "minecraft:bucket").unwrap().new_state, Empty);
+        assert_eq!(cauldron_use(Water(2), "minecraft:bucket"), None);
+        assert_eq!(
+            cauldron_use(Lava, "minecraft:bucket").unwrap().returns.unwrap(),
+            "minecraft:lava_bucket"
+        );
+        assert_eq!(
+            cauldron_use(PowderSnow(3), "minecraft:bucket").unwrap().returns.unwrap(),
+            "minecraft:powder_snow_bucket"
+        );
+        assert_eq!(cauldron_use(PowderSnow(2), "minecraft:bucket"), None);
+        assert_eq!(cauldron_use(Empty, "minecraft:bucket"), None);
+        // Glass bottle draws one level.
+        assert_eq!(
+            cauldron_use(Water(3), "minecraft:glass_bottle"),
+            Some(CauldronOutcome { new_state: Water(2), returns: Some("minecraft:potion".into()) })
+        );
+        assert_eq!(cauldron_use(Water(1), "minecraft:glass_bottle").unwrap().new_state, Empty);
+        assert_eq!(cauldron_use(Empty, "minecraft:glass_bottle"), None);
+        // Water potion fills empty -> 1 or partial -> +1.
+        assert_eq!(cauldron_use(Empty, "minecraft:potion").unwrap().new_state, Water(1));
+        assert_eq!(cauldron_use(Water(2), "minecraft:potion").unwrap().new_state, Water(3));
+        assert_eq!(cauldron_use(Water(3), "minecraft:potion"), None);
+    }
+
+    #[test]
+    fn vanilla_blocks_cauldron_wash_weather_drip_extinguish() {
+        use CauldronState::*;
+        // Washing costs one water level.
+        assert_eq!(cauldron_use(Water(3), "minecraft:leather_chestplate").unwrap().new_state, Water(2));
+        assert_eq!(cauldron_use(Water(2), "minecraft:red_banner").unwrap().new_state, Water(1));
+        assert_eq!(cauldron_use(Water(1), "minecraft:blue_shulker_box").unwrap().new_state, Empty);
+        assert_eq!(
+            cauldron_use(Water(1), "minecraft:blue_shulker_box").unwrap().returns.unwrap(),
+            "minecraft:shulker_box"
+        );
+        // Lava and powder snow don't wash.
+        assert_eq!(cauldron_use(Lava, "minecraft:red_banner"), None);
+        assert_eq!(cauldron_use(PowderSnow(2), "minecraft:leather_boots"), None);
+        assert_eq!(cauldron_use(Empty, "minecraft:red_banner"), None);
+
+        use CauldronPrecip::*;
+        assert_eq!(cauldron_weather_fill(Empty, Rain, 0.01), Water(1));
+        assert_eq!(cauldron_weather_fill(Empty, Snow, 0.09), PowderSnow(1));
+        assert_eq!(cauldron_weather_fill(Water(1), Rain, 0.049), Water(2));
+        assert_eq!(cauldron_weather_fill(Water(3), Rain, 0.01), Water(3));
+        assert_eq!(cauldron_weather_fill(PowderSnow(1), Rain, 0.01), PowderSnow(1));
+        assert_eq!(cauldron_weather_fill(PowderSnow(2), Snow, 0.099), PowderSnow(3));
+        assert_eq!(cauldron_weather_fill(Empty, Rain, 0.05), Empty);
+        assert_eq!(cauldron_weather_fill(Empty, Snow, 0.10), Empty);
+
+        assert_eq!(cauldron_drip_fill(Empty, CauldronDripFluid::Water), Water(1));
+        assert_eq!(cauldron_drip_fill(Empty, CauldronDripFluid::Lava), Lava);
+        assert_eq!(cauldron_drip_fill(Water(2), CauldronDripFluid::Water), Water(3));
+        assert_eq!(cauldron_drip_fill(Water(3), CauldronDripFluid::Water), Water(3));
+        assert_eq!(
+            cauldron_drip_fill(PowderSnow(1), CauldronDripFluid::Water),
+            PowderSnow(1)
+        );
+        assert_eq!(cauldron_drip_fill(Lava, CauldronDripFluid::Water), Lava);
+
+        assert_eq!(cauldron_extinguish(Water(3)), Water(2));
+        assert_eq!(cauldron_extinguish(Water(1)), Empty);
+        assert_eq!(cauldron_extinguish(PowderSnow(2)), Water(2));
+        assert_eq!(cauldron_extinguish(PowderSnow(1)), Water(1));
+        assert_eq!(cauldron_extinguish(Lava), Lava);
+        assert_eq!(cauldron_extinguish(Empty), Empty);
+    }
+
+    #[test]
+    fn vanilla_blocks_composter_chance_table() {
+        assert_eq!(composter_chance("minecraft:wheat_seeds"), Some(0.3));
+        assert_eq!(composter_chance("minecraft:oak_leaves"), Some(0.3));
+        assert_eq!(composter_chance("minecraft:kelp"), Some(0.3));
+        assert_eq!(composter_chance("minecraft:pumpkin_seeds"), Some(0.3));
+        assert_eq!(composter_chance("minecraft:melon_seeds"), Some(0.3));
+        assert_eq!(composter_chance("minecraft:cactus"), Some(0.5));
+        assert_eq!(composter_chance("minecraft:sugar_cane"), Some(0.5));
+        assert_eq!(composter_chance("minecraft:melon_slice"), Some(0.5));
+        assert_eq!(composter_chance("minecraft:apple"), Some(0.65));
+        assert_eq!(composter_chance("minecraft:wheat"), Some(0.65));
+        assert_eq!(composter_chance("minecraft:potato"), Some(0.65));
+        assert_eq!(composter_chance("minecraft:pumpkin"), Some(0.65));
+        assert_eq!(composter_chance("minecraft:baked_potato"), Some(0.85));
+        assert_eq!(composter_chance("minecraft:bread"), Some(0.85));
+        assert_eq!(composter_chance("minecraft:hay_block"), Some(0.85));
+        assert_eq!(composter_chance("minecraft:cookie"), Some(0.85));
+        assert_eq!(composter_chance("minecraft:cake"), Some(1.0));
+        assert_eq!(composter_chance("minecraft:pumpkin_pie"), Some(1.0));
+        assert_eq!(composter_chance("minecraft:bone_meal"), Some(1.0));
+        assert_eq!(composter_chance("minecraft:stick"), None);
+        assert_eq!(composter_chance("minecraft:stone"), None);
+        assert_eq!(composter_chance("minecraft:poisonous_potato"), None);
+    }
+
+    #[test]
+    fn vanilla_blocks_composter_lifecycle_rng_and_comparator() {
+        use ComposterInsert::*;
+        // Level >= 7 or non-compostable: PASS — the RNG is not advanced for it.
+        assert_eq!(composter_insert(7, "minecraft:apple", 0.0), Rejected);
+        assert_eq!(composter_insert(8, "minecraft:apple", 0.0), Rejected);
+        assert_eq!(composter_insert(0, "minecraft:stick", 0.0), Rejected);
+        // roll >= chance: item consumed, level stays (the roll was still spent).
+        assert_eq!(composter_insert(0, "minecraft:wheat_seeds", 0.31), ConsumedNoAdvance);
+        // roll < chance: level advances.
+        assert_eq!(
+            composter_insert(0, "minecraft:wheat_seeds", 0.29),
+            Advanced { new_level: 1, schedules_maturation: false }
+        );
+        // roll == chance fails (strict <).
+        assert_eq!(composter_insert(0, "minecraft:bone_meal", 1.0), ConsumedNoAdvance);
+        // Reaching 7 schedules the ~20-tick maturation delay.
+        assert_eq!(
+            composter_insert(6, "minecraft:cake", 0.5),
+            Advanced { new_level: 7, schedules_maturation: true }
+        );
+        assert_eq!(composter_mature(7), 8);
+        assert_eq!(composter_mature(6), 6);
+        assert_eq!(composter_harvest(8), Some((0, "minecraft:bone_meal")));
+        assert_eq!(composter_harvest(7), None);
+        assert_eq!(
+            (0..=8).map(composter_comparator).collect::<Vec<_>>(),
+            (0u8..=8).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn vanilla_blocks_respawn_anchor_use_and_comparator() {
+        use AnchorOutcome::*;
+        assert_eq!(respawn_anchor_use(0, Some("minecraft:glowstone"), true), Charged { charges: 1 });
+        assert_eq!(respawn_anchor_use(3, Some("minecraft:glowstone"), true), Charged { charges: 4 });
+        assert_eq!(respawn_anchor_use(4, Some("minecraft:glowstone"), true), Full);
+        // Nether: charged anchor sets the respawn point; charge is kept until
+        // the player actually respawns.
+        assert_eq!(respawn_anchor_use(0, None, true), Pass);
+        assert_eq!(respawn_anchor_use(2, None, true), RespawnSet);
+        assert_eq!(respawn_anchor_use(2, Some("minecraft:stick"), true), RespawnSet);
+        // Overworld/End: charged anchor explodes at power 5.0.
+        assert_eq!(respawn_anchor_use(1, None, false), Explode { power: 5.0 });
+        assert_eq!(respawn_anchor_use(4, Some("minecraft:diamond"), false), Explode { power: 5.0 });
+        assert_eq!(respawn_anchor_use(0, None, false), Pass);
+        // Respawn consumption.
+        assert_eq!(respawn_anchor_consume(4), 3);
+        assert_eq!(respawn_anchor_consume(1), 0);
+        // Comparator table [0, 3, 7, 11, 15].
+        assert_eq!(
+            (0..=4).map(respawn_anchor_comparator).collect::<Vec<_>>(),
+            vec![0, 3, 7, 11, 15]
+        );
+    }
+
+    #[test]
+    fn vanilla_blocks_lodestone_bind_and_break() {
+        let reg = reg();
+        let dim = DimId::End;
+        let pos = (24400, 120, 24400);
+        set_block_dim(dim, pos.0, pos.1, pos.2, state("minecraft:lodestone"));
+        let mut tracker = LodestoneTracker::default();
+        assert!(!tracker.validate(reg));
+        let target = tracker.bind(dim, pos);
+        assert_eq!(target, LodestoneTarget { dim, pos });
+        assert!(tracker.validate(reg));
+        // Breaking the lodestone clears the binding (compass spins).
+        set_block_dim(dim, pos.0, pos.1, pos.2, state("minecraft:air"));
+        assert!(!tracker.validate(reg));
+        assert_eq!(tracker.target, None);
+    }
+
+    #[test]
+    fn vanilla_blocks_sponge_bfs_depth_and_connectivity() {
+        let dim = DimId::Overworld;
+        let sponge = (24500, 210, 24500);
+        set_block_dim(dim, sponge.0, sponge.1, sponge.2, state("minecraft:sponge"));
+        // A line of water along +x, plus a disconnected pool behind an air gap.
+        for i in 1..=10 {
+            set_block_dim(dim, sponge.0 + i, sponge.1, sponge.2, state("minecraft:water"));
+        }
+        set_block_dim(dim, sponge.0 - 2, sponge.1, sponge.2, state("minecraft:water"));
+        set_block_dim(dim, sponge.0 - 1, sponge.1, sponge.2, state("minecraft:air"));
+        let absorbed = sponge_absorb_water(dim, sponge);
+        // Contiguous water absorbed through Manhattan depth <= 6.
+        for i in 1..=6 {
+            assert!(absorbed.contains(&(sponge.0 + i, sponge.1, sponge.2)));
+            assert_eq!(name_at(dim, sponge.0 + i, sponge.1, sponge.2), "minecraft:air");
+        }
+        // Depth 7 is never reached.
+        assert!(!absorbed.contains(&(sponge.0 + 7, sponge.1, sponge.2)));
+        assert_eq!(name_at(dim, sponge.0 + 7, sponge.1, sponge.2), "minecraft:water");
+        // Disconnected water behind an air gap is not absorbed.
+        assert!(!absorbed.contains(&(sponge.0 - 2, sponge.1, sponge.2)));
+        assert_eq!(name_at(dim, sponge.0 - 2, sponge.1, sponge.2), "minecraft:water");
+    }
+
+    #[test]
+    fn vanilla_blocks_sponge_visited_cap_and_waterlogged() {
+        let reg = reg();
+        let dim = DimId::Overworld;
+        let sponge = (24600, 210, 24600);
+        set_block_dim(dim, sponge.0, sponge.1, sponge.2, state("minecraft:sponge"));
+        // A 5x5x5 water cube swallows the sponge; only 65 cells may be visited.
+        for dx in -2..=2 {
+            for dy in -2..=2 {
+                for dz in -2..=2 {
+                    if dx == 0 && dy == 0 && dz == 0 {
+                        continue;
+                    }
+                    set_block_dim(dim, sponge.0 + dx, sponge.1 + dy, sponge.2 + dz,
+                        state("minecraft:water"));
+                }
+            }
+        }
+        let absorbed = sponge_absorb_water(dim, sponge);
+        assert!(absorbed.len() <= 64, "root + <=64 absorbed under the 65-cell cap");
+        assert!(!absorbed.is_empty());
+        let remaining_water = (-2..=2)
+            .flat_map(|dx| (-2..=2).flat_map(move |dy| (-2..=2).map(move |dz| (dx, dy, dz))))
+            .filter(|&(dx, dy, dz)| {
+                name_at(dim, sponge.0 + dx, sponge.1 + dy, sponge.2 + dz) == "minecraft:water"
+            })
+            .count();
+        assert!(remaining_water > 0, "cap leaves unabsorbed water behind");
+
+        // A waterlogged slab is dried in place, not removed.
+        let slab = reg.with_prop(state("minecraft:oak_slab"), "waterlogged", "true");
+        let at2 = (24620, 210, 24620);
+        set_block_dim(dim, at2.0, at2.1, at2.2, state("minecraft:sponge"));
+        set_block_dim(dim, at2.0 + 1, at2.1, at2.2, slab);
+        let absorbed2 = sponge_absorb_water(dim, at2);
+        assert!(absorbed2.contains(&(at2.0 + 1, at2.1, at2.2)));
+        assert_eq!(name_at(dim, at2.0 + 1, at2.1, at2.2), "minecraft:oak_slab");
+        assert_eq!(
+            reg.get_prop(block_at_dim(dim, at2.0 + 1, at2.1, at2.2), "waterlogged").unwrap(),
+            "false"
+        );
+    }
+
+    #[test]
+    fn vanilla_blocks_sponge_nether_dry() {
+        assert!(sponge_nether_dries(DimId::Nether));
+        assert!(!sponge_nether_dries(DimId::Overworld));
+        assert!(!sponge_nether_dries(DimId::End));
+    }
+}
