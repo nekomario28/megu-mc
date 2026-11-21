@@ -61,7 +61,6 @@ CRUISE_Y = 250.0     # above the terrain; chunk streaming is per column
 ASCENT_STEP = 4.0
 
 # clientbound play
-CHUNK_BATCH_START = 0x0B
 CHUNK_BATCH_FINISHED = 0x0C
 UNLOAD_CHUNK = 0x21
 KEEP_ALIVE = 0x26
@@ -95,7 +94,6 @@ class RawClient:
         self.wait_login_chunks = wait_login_chunks
         self.phase = "login"
         self.pos = None
-        self.spawned = False
         self.buffer = bytearray()
         self.packets = 0
         self.chunks_login = 0
@@ -156,14 +154,13 @@ class RawClient:
             self.note_rtt(body)
             self.send(KEEP_ALIVE_ACK, body)
         elif pid == SYNC_POSITION:
+            # x, y, z doubles, yaw and pitch floats, flags byte, then the id.
+            if len(body) < 33:
+                raise AssertionError("truncated Synchronize Player Position")
             self.teleports += 1
-            if len(body) >= 33:
-                # x, y, z doubles, yaw and pitch floats, flags byte, then the id.
-                confirm, _ = read_varint(body, 33)
-                if confirm is not None:
-                    self.send(TELEPORT_CONFIRM, vint(confirm))
-                self.pos = struct.unpack(">ddd", body[:24])
-            self.spawned = True
+            confirm, _ = read_varint(body, 33)
+            self.send(TELEPORT_CONFIRM, vint(confirm))
+            self.pos = struct.unpack(">ddd", body[:24])
 
     def read_until(self, predicate, deadline):
         while True:
@@ -236,14 +233,20 @@ class RawClient:
         ready, _, _ = select.select([self.sock], [], [], max(0.0, timeout))
         if ready:
             self.sock.setblocking(False)
-            while True:
-                try:
-                    data = self.sock.recv(65536)
-                except (BlockingIOError, InterruptedError):
-                    break
-                if not data:
-                    raise ConnectionError("server closed the connection")
-                self.buffer.extend(data)
+            try:
+                while True:
+                    try:
+                        data = self.sock.recv(65536)
+                    except (BlockingIOError, InterruptedError):
+                        break
+                    if not data:
+                        raise ConnectionError("server closed the connection")
+                    self.buffer.extend(data)
+            finally:
+                # Movement and acknowledgements are sent from this loop; a
+                # non-blocking socket would make sendall raise when the send
+                # buffer is momentarily full.
+                self.sock.settimeout(10)
         return self.parse()
 
     def drive(self, seconds):

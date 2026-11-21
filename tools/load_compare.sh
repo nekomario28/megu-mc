@@ -77,9 +77,12 @@ sample_load() { # pid port loadout -> "cpu(s) rss(MiB) threads chunks ms/chunk"
   c0=$(awk '{print $14+$15}' "/proc/$pid/stat")
   # Let the viewer settle, then measure the same window of movement.
   sleep 3
+  # `|| ...` rather than a following `[ $? -eq 0 ]`: under `set -e` a failed
+  # command substitution exits the script before that test runs, so a failed
+  # driver used to abort the whole comparison instead of reporting the failure.
   load=$( ( cd "$ROOT" && timeout $((SECONDS_WINDOW + 30)) \
-      python3 tools/load_client.py "$port" "$SECONDS_WINDOW" LoadA --view-distance 4 ) 2>&1 )
-  [ $? -eq 0 ] || load="LOAD failed: $load"
+      python3 tools/load_client.py "$port" "$SECONDS_WINDOW" LoadA --view-distance 4 ) 2>&1 ) \
+    || load="LOAD failed: $load"
   c1=$(awk '{print $14+$15}' "/proc/$pid/stat")
   rss=$(awk '/VmRSS/{print $2}' "/proc/$pid/status")
   thr=$(awk '/Threads/{print $2}' "/proc/$pid/status")
