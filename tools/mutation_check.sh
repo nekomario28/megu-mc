@@ -617,18 +617,10 @@ check "the fancy centre layer is half the trunk half-height" \
 
 check "a fancy branch treats replaceables and logs as free" \
   src/tree.rs 'fn fancy_branch_open(reg: &BReg, cur: u32) -> bool {
-    is_replaceable(
-        reg,
-        cur,
-        &["minecraft:replaceable_by_trees", "minecraft:logs"],
-    )
+    tree_tables(reg).is_replaceable_or_log(reg, cur)
 }' \
   'fn fancy_branch_open(reg: &BReg, cur: u32) -> bool {
-    is_replaceable(
-        reg,
-        cur,
-        &["minecraft:logs"],
-    )
+    tree_tables(reg).is_replaceable_by_trees(reg, cur)
 }' \
   tree::tests::a_fancy_branch_passes_through_replaceables_and_logs_only
 
@@ -1023,8 +1015,18 @@ check "ore early-out reads the frozen worldgen floor" \
   '            if o <= ctx.hm_oc(xp, zp) {' \
   feature::generation_contract_tests::ore_uses_frozen_worldgen_floor
 check "surface-relative placement keeps its configured heightmap" \
-  src/feature.rs '            let y = i64::from(ctx.heightmap(*kind, pos.0, pos.2));' \
-  '            let y = i64::from(ctx.hm_ws(pos.0, pos.2));' \
+  src/feature.rs '        PM::SurfaceRel(kind, min_i, max_i) => {
+            let y = i64::from(ctx.heightmap(*kind, pos.0, pos.2));
+            let lo = y + i64::from(*min_i);
+            let hi = y + i64::from(*max_i);
+            if lo <= i64::from(pos.1) && i64::from(pos.1) <= hi {
+                out.push(pos);' \
+  '        PM::SurfaceRel(kind, min_i, max_i) => {
+            let y = i64::from(ctx.hm_ws(pos.0, pos.2));
+            let lo = y + i64::from(*min_i);
+            let hi = y + i64::from(*max_i);
+            if lo <= i64::from(pos.1) && i64::from(pos.1) <= hi {
+                out.push(pos);' \
   feature::generation_contract_tests::surface_relative_filter_keeps_its_heightmap_and_long_bounds
 check "dungeon loot uses the wrapped nextLong method" \
   src/feature.rs '                            let _loot_seed = rng.next_i64();' \
@@ -1035,15 +1037,15 @@ check "simple double plants write both halves" \
   '                    for (dy, half) in [(0, "lower")] {' \
   feature::generation_contract_tests::simple_block_places_both_halves_or_neither
 check "mushroom canSurvive asks isSolidRender, not the dirt tag" \
-  src/generation_providers.rs '                || (uninitialized_raw_brightness(ctx) < 13 && reg.is_solid_render(below))' \
-  '                || (uninitialized_raw_brightness(ctx) < 13 && true)' \
+  src/generation_providers.rs '                || (ctx.feature_brightness(x, y, z) < 13 && reg.is_solid_render(below))' \
+  '                || (ctx.feature_brightness(x, y, z) < 13 && true)' \
   feature::generation_contract_tests::nether_mushrooms_survive_a_solid_render_support
 check "an uninitialized sky light reads 0 in every dimension" \
-  src/generation_providers.rs '    ctx.block_light(0, 0, 0)
-}' \
-  '    15
-}' \
-  feature::generation_contract_tests::mushrooms_in_fresh_generation_need_the_special_substrate
+  src/generation_context.rs '        15
+    }' \
+  '        0
+    }' \
+  feature::generation_contract_tests::mushroom_survival_uses_feature_time_light_and_support
 # The chunk-promotion pass' two new branches. `worldgen`'s own test pins the fill's mark
 # gate on the measured cell; `structure_template`'s pins the fluid tap.
 check "the fill marks a settled aquifer fluid" \
@@ -1103,8 +1105,8 @@ check "the vegetation patch walks its surface set in HashSet order" \
   feature::generation_contract_tests::java_hashset_order_matches_java_util_hashset_iteration
 
 check "the ore vein radius matches vanilla's own output" \
-  src/feature.rs '        ds[k as usize * 4 + 3] = (s1 as f64 * hh + 1.0) / 2.0;' \
-  '        ds[k as usize * 4 + 3] = (s1 as f64 * hh + 1.0) / 2.0 + 0.01;' \
+  src/feature.rs '        ds[ki + 3] = (s1 as f64 * hh + 1.0) / 2.0;' \
+  '        ds[ki + 3] = (s1 as f64 * hh + 1.0) / 2.0 + 0.01;' \
   the_ore_vein_geometry_matches_vanillas_own_output
 
 check "the frozen population digest notices shared provider changes" \
@@ -1131,9 +1133,9 @@ check "the noise-value cache returns the value it computed" \
             } else {' \
   feature_population_output_matches_the_pre_refactor_capture
 check "the shared biome cache returns the value it computed" \
-  src/worldgen.rs '        self.bioq.insert(key, l);' \
-  '        self.bioq.insert(key, l.wrapping_add(1));' \
-  the_shared_biome_cache_returns_the_same_leaf_for_the_same_quart
+  src/worldgen.rs '                    self.bioq.insert(pos, leaf.unwrap_or(u16::MAX));' \
+  '                    self.bioq.insert(pos, leaf.unwrap_or(u16::MAX).wrapping_add(1));' \
+  worldgen::wg_tests::surface_biomes_follow_fuzzy_palettes_and_preserve_climate_ties
 
 check "the queue cap cannot visit a cell before its real backoff" \
   src/main.rs '    backoff()
@@ -1187,14 +1189,12 @@ check "play information reaches the live chunk window" \
   '                let effective = view;' \
   tests/client_settings_wire.py 'client settings wire: FAIL play-view-3'
 check "breaking changes server state, not only the predicted wire update" \
-  src/play_protocol.rs '                        } else {
-                            set_block_dim(dim, x, y, z, 0);
-                        }
-                        #[cfg(not(feature = "neoforge-events"))]
-                        set_block_dim(dim, x, y, z, 0);
-                        note_block_update_dim(dim, x, y, z, 0);' \
-  '                        }
-                        note_block_update_dim(dim, x, y, z, 0);' \
+  src/play_protocol.rs '    #[cfg(not(feature = "neoforge-events"))]
+    set_block_dim(dim, x, y, z, 0);
+    note_block_update_dim(dim, x, y, z, 0);' \
+  '    #[cfg(not(feature = "neoforge-events"))]
+    set_block_dim(dim, x, y, z, old);
+    note_block_update_dim(dim, x, y, z, 0);' \
   tests/gameplay_wire.py 'gameplay wire: FAIL fresh-reader-block'
 check "chat returns the actual sender and message" \
   src/play_protocol.rs '                    let line = format!("<{}> {}", me.name, m);' \
@@ -1666,13 +1666,13 @@ check "weird sampler multiplies the absolute noise by rarity" \
   worldgen::weird_sampler_tests::weird_sampler_matches_native_mapper_and_samples
 
 check "aquifer preliminary surface uses the pinned threshold" \
-  src/worldgen.rs 'if self.eval(id, ax, y, az, &mut HashMap::new()) > 0.390625 {' \
-  'if self.eval(id, ax, y, az, &mut HashMap::new()) > 0.0 {' \
+  src/worldgen.rs '            _ => (id, top, self.noise_cell_h.max(1), 0.390625),' \
+  '            _ => (id, top, self.noise_cell_h.max(1), 0.0),' \
   aquifer_matches_the_pinned_chunk_through_its_public_api
 
 check "aquifer preliminary surface scans quart columns" \
-  src/worldgen.rs 'let ax = (x >> 2) << 2;' \
-  'let ax = (x >> 4) << 4;' \
+  src/worldgen.rs '                let (ax, az) = (k.0 << 2, k.1 << 2);' \
+  '                let (ax, az) = ((k.0 << 2) & !15, (k.1 << 2) & !15);' \
   aquifer_matches_the_pinned_chunk_through_its_public_api
 
 check "aquifer spline keeps the native float interpolation order" \
@@ -1689,18 +1689,18 @@ check "aquifer spline keeps the native float interpolation order" \
   aquifer_matches_the_pinned_chunk_through_its_public_api
 
 check "aquifer deep test keeps the depth threshold" \
-  src/worldgen.rs '&& self.eval(c[4], x, y, z, &mut memo) > 0.9f32 as f64' \
-  '&& self.eval(c[4], x, y, z, &mut memo) > -2.0' \
+  src/worldgen.rs '&& self.eval_flat(c[4], x, y, z, &mut flat) > 0.9f32 as f64' \
+  '&& self.eval_flat(c[4], x, y, z, &mut flat) > -2.0' \
   aquifer_deep_level_reads_erosion_and_depth_in_f32
 
 check "aquifer deep test reads erosion and depth" \
-  src/worldgen.rs $'self.eval(c[3], x, y, z, &mut memo) < -0.225f32 as f64\n                    && self.eval(c[4], x, y, z, &mut memo) > 0.9f32 as f64' \
-  $'self.eval(c[2], x, y, z, &mut memo) < -0.225f32 as f64\n                    && self.eval(c[3], x, y, z, &mut memo) > 0.9f32 as f64' \
+  src/worldgen.rs $'                    let is_deep = self.eval_flat(c[3], x, y, z, &mut flat) < -0.225f32 as f64\n                        && self.eval_flat(c[4], x, y, z, &mut flat) > 0.9f32 as f64;' \
+  $'                    let is_deep = self.eval_flat(c[2], x, y, z, &mut flat) < -0.225f32 as f64\n                        && self.eval_flat(c[3], x, y, z, &mut flat) > 0.9f32 as f64;' \
   aquifer_deep_level_reads_erosion_and_depth_in_f32
 
 check "aquifer deep test promotes the f32 threshold" \
-  src/worldgen.rs '< -0.225f32 as f64' \
-  '< -0.225' \
+  src/worldgen.rs 'self.eval_flat(c[3], x, y, z, &mut flat) < -0.225f32 as f64' \
+  'self.eval_flat(c[3], x, y, z, &mut flat) < -0.225' \
   aquifer_deep_level_reads_erosion_and_depth_in_f32
 
 check "converted bare carver lists still parse" \
@@ -1729,8 +1729,8 @@ check "nextInt takes the 32-bit unsigned redraw threshold" \
   next_int_streams_match_the_game_for_every_class_seed_and_bound
 
 check "biome tree scans children in array order for ties" \
-  src/worldgen.rs '                for c in ch {' \
-  '                for c in ch.iter().rev() {' \
+  src/worldgen.rs '        for ci in start..end {' \
+  '        for ci in (start..end).rev() {' \
   biome_tree_breaks_ties_the_way_vanilla_scans_children
 
 check "spawner entries keep the pinned entity type" \
@@ -1754,8 +1754,22 @@ check "surface stone depth selects the ceiling/below fields" \
   surface_conditions_match_the_pinned_context_formulas
 
 check "surface scan keeps stone depth above the column" \
-  src/worldgen.rs '                    sda += 1;' \
-  '                    sda += 0;' \
+  src/worldgen.rs '                        for sy in (min_y..y).rev() {
+                            if cells[(sy - min_y) as usize] != SurfaceCell::Solid {
+                                min = sy + 1;
+                                break;
+                            }
+                        }
+                    }
+                    sda += 1;' \
+  '                        for sy in (min_y..y).rev() {
+                            if cells[(sy - min_y) as usize] != SurfaceCell::Solid {
+                                min = sy + 1;
+                                break;
+                            }
+                        }
+                    }
+                    sda += 0;' \
   surface_build_scan_matches_the_pinned_classes_on_synthetic_columns
 
 check "End decoration selects its own source feature indices" \
@@ -1803,12 +1817,12 @@ check "basalt columns treat cave_air and void_air as no support" \
   feature::generation_contract_tests::basalt_columns_need_a_non_air_support
 
 check "count_on_every_layer re-samples the count inside every layer pass" \
-  src/feature.rs '            let mut layer = 0i32;
-            loop {
-                let n = ip.get(rng).max(0);' \
-  '            let mut layer = 0i32;
-            let n = ip.get(rng).max(0);
-            loop {' \
+  src/feature.rs '    let mut layer = 0i32;
+    loop {
+        let n = ip.get(rng).max(0);' \
+  '    let mut layer = 0i32;
+    let n = ip.get(rng).max(0);
+    loop {' \
   feature::generation_contract_tests::count_on_every_layer_walks_motion_blocking_layers
 
 check "count_on_every_layer counts a fluid cell as an empty layer" \
@@ -1975,9 +1989,9 @@ check "freeze_top_layer sets snowy=true on the dirt below placed snow" \
   freeze_top_layer_matches_native_oracle
 
 check "freeze_top_layer refuses snow on snow_layer_cannot_survive_on blocks" \
-  src/feature.rs '    if reg.in_tag(below, "minecraft:snow_layer_cannot_survive_on") {
+  src/feature.rs '    if cannot {
         return false;
-    }' '    if reg.in_tag(below, "minecraft:snow_layer_cannot_survive_on") {
+    }' '    if cannot {
         return true;
     }' \
   freeze_top_layer_matches_native_oracle
@@ -2140,8 +2154,8 @@ check "tree consumes shared voxel faces in native order" \
   tree::tests::leaf_edge_schedules_match_native_order
 
 check "solid template consumes shared voxel faces in native order" \
-  src/structure_template.rs 'crate::voxel_faces::exposed_faces(written)' \
-  'crate::voxel_faces::exposed_faces(written).into_iter().rev()' \
+  src/structure_template.rs '        for (direction, p, q) in crate::voxel_faces::exposed_faces(written.iter().copied()) {' \
+  '        for (direction, p, q) in crate::voxel_faces::exposed_faces(written.iter().copied()).into_iter().rev() {' \
   feature::generation_contract_tests::fossil_feature_matches_actual_native_placement
 
 check "fossil parser resolves the production type rather than Unknown" \
@@ -2317,8 +2331,8 @@ check "template loot container materialization rolls mineshaft cart loot" \
   structure_template::tests::loot_table_chest_and_decorative_block_entities_place_and_materialize
 
 check "template placement updates inside boundary block shapes" \
-  src/structure_template.rs 'if let Some(state) = edge_shape(ctx, p, inside, outside, direction) {' \
-  'if let Some(state) = None::<u32> {' \
+  src/structure_template.rs '            if let Some(state) = shape_at(ctx, p, inside, outside, direction) {' \
+  '            if let Some(state) = None::<u32> {' \
   structure_template::tests::place_blocks_updates_inside_boundary_shapes_and_schedules_inside_fluids
 
 check "template placement schedules generated water on inside boundary" \
@@ -2892,11 +2906,11 @@ check "preliminary (structure-free) columns stay out of the column cache" \
 # mutant restores the pre-fix chunk-centre read, which in the Nether answers a different
 # biome (seed 4242 (-24,22): centre soul_sand_valley, scan position basalt_deltas).
 check "a template structure's biome gate reads the start, not the chunk centre" \
-  src/structure_pipeline.rs '            if !valid_biome(fc.g, &def.biomes, stub) {
+  src/structure_pipeline.rs '            if !valid_biome_fast(fc.g, &def.biomes, biome_mask, stub) {
                 return None;
             }
             let pieces = with_templates(|templates| build(&mut fc, templates, &mut gen, reg).ok())?;' \
-  '            if !valid_biome(fc.g, &def.biomes, (cx * 16 + 8, 64, cz * 16 + 8)) {
+  '            if !valid_biome_fast(fc.g, &def.biomes, biome_mask, (cx * 16 + 8, 64, cz * 16 + 8)) {
                 return None;
             }
             let pieces = with_templates(|templates| build(&mut fc, templates, &mut gen, reg).ok())?;' \
@@ -3069,13 +3083,13 @@ check "a template's hanging entity turns its facing with the piece" \
 
 check "the tree decorator lists are bucket-ordered, not insertion-ordered" \
   src/tree.rs '        let spread = h ^ ((h as u32 >> 16) as i32);
-        buckets[(spread as usize) & (cap - 1)].push(p);' \
-  '        buckets[(h as usize) & (cap - 1)].push(p);' \
+        let b = (spread as usize) & mask;' \
+  '        let b = (h as usize) & mask;' \
   feature::generation_contract_tests::tree_decorator_lists_use_hash_bucket_order_then_y
 
 check "a trunk keeps a log below it instead of burying it in dirt" \
-  src/tree.rs '        Some(reg) if !force && reg.in_tag(ctx.get(p.0, p.1, p.2), "minecraft:logs") => return,' \
-  '        Some(_) if false => return,' \
+  src/tree.rs '        Some(reg) if !force && tree_tables(reg).is_log(reg, ctx.get(p.0, p.1, p.2)) => return,' \
+  '        Some(reg) if !force && false => return,' \
   feature::generation_contract_tests::trunk_dirt_joins_the_log_list_and_a_log_below_is_kept
 
 check "the live heightmaps use each type's own predicate" \
@@ -3200,8 +3214,16 @@ check "the horizontal plane is walked north, east, south, west" \
   feature::generation_contract_tests::horizontal_plane_order_is_north_east_south_west
 
 check "cocoa binds its draws to the plane order, not the reversed array" \
-  src/tree.rs '                    for f in plane_horizontal() {' \
-  '                    for f in [3u8, 4, 5, 2] {' \
+  src/tree.rs '                    // `for (Direction dir : Direction.Plane.HORIZONTAL)`: NORTH, EAST,
+                    // SOUTH, WEST, one `nextFloat()` per direction. `p = pos.relative(
+                    // dir.getOpposite())` and `FACING = dir` (`ji.g()` is read before the
+                    // offset, so the cocoa sits on the near side of the log).
+                    for f in plane_horizontal() {' \
+  '                    // `for (Direction dir : Direction.Plane.HORIZONTAL)`: NORTH, EAST,
+                    // SOUTH, WEST, one `nextFloat()` per direction. `p = pos.relative(
+                    // dir.getOpposite())` and `FACING = dir` (`ji.g()` is read before the
+                    // offset, so the cocoa sits on the near side of the log).
+                    for f in [3u8, 4, 5, 2] {' \
   feature::generation_contract_tests::cocoa_binds_its_four_probability_draws_to_north_east_south_west
 
 
@@ -3265,8 +3287,8 @@ check "a template piece writes above the generator top" \
   feature::pipeline_tests::end_city_stores_cells_above_the_generator_top
 
 check "height_range still samples the generator window" \
-  src/feature.rs '            out.push((pos.0, hp.get(rng, ctx.g.min_y, ctx.g.height), pos.2));' \
-  '            out.push((pos.0, hp.get(rng, ctx.g.world_min_y, ctx.g.world_height), pos.2));' \
+  src/feature.rs '        PM::HeightRange(hp) => out.push((pos.0, hp.get(rng, ctx.g.min_y, ctx.g.height), pos.2)),' \
+  '        PM::HeightRange(hp) => out.push((pos.0, hp.get(rng, ctx.g.world_min_y, ctx.g.world_height), pos.2)),' \
   feature::window_tests::height_range_positions_sample_the_generator_window
 
 check "nether_fossil anchors on the generator window" \
@@ -3774,8 +3796,8 @@ check "p2_3_s2a_a_miss_reads_the_dimensions_own_generator" \
 # A companion file's table must load into its own dimension. Read into the Overworld's key, a Nether
 # save restores nothing in the Nether and overwrites the Overworld chunk of the same coordinate.
 check "p2_3_s2a_a_companion_table_loads_into_its_own_dimension" \
-  src/save_v2.rs '        let mut c = w.as_mut().map(|world| world.entry((dim, cx, cz)).or_default());' \
-  '        let mut c = w.as_mut().map(|world| world.entry((DimId::Overworld, cx, cz)).or_default());' \
+  src/save_v2.rs '        chunks.insert((dim, cx, cz), edits);' \
+  '        chunks.insert((DimId::Overworld, cx, cz), edits);' \
   persistence_tests::p2_3_s2a_legacy_overworld_save_and_dim_overlay_tables_round_trip
 
 # P2-3-S2c: the legacy sign section must hold the Overworld's signs only. Dropping the filter puts

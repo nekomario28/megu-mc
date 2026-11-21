@@ -9,6 +9,8 @@
 
 use crate::json::{jarr, jnum, jparse, js, jstr, J};
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------- block-state JSON helpers ----------
 
@@ -107,11 +109,74 @@ pub(crate) struct BReg {
     shapes: Vec<([f64; 3], [f64; 3])>,
     col_range: Vec<(u32, u8)>, // state id -> (start in col_idx, len)
     col_idx: Vec<u16>,
-    tag: HashMap<String, HashSet<u32>>, // tag name -> block idx set (expanded)
+    /// Packed per-state predicate byte (`STATE_FACTS` byte 0), copied at load so
+    /// `is_air`/`blocks_motion`/`is_solid_render` and the rest are one indexed
+    /// byte load — Lithium-style precomputed block-state flags.
+    pred: Vec<u8>,
+    /// Packed per-state light byte (`STATE_FACTS` byte 1): emission << 4 | opacity.
+    light: Vec<u8>,
+    /// `BlockStateBase.hasPostProcess` per state (`STATE_FACTS` byte 5).
+    postproc: Vec<u8>,
+    /// Packed `SupportType` face planes per state: three 6-bit planes (Full,
+    /// Center, Rigid) assembled once at load instead of per `is_face_sturdy` call.
+    faces: Vec<u32>,
+    /// Dense tag id -> canonical (namespaced) tag name, for the memoized
+    /// `in_tag` name resolution.
+    tag_names: Vec<Box<str>>,
+    /// Dense tag id -> packed block-index bitset. `in_tag` is one bit test on
+    /// the hot path; the name half is memoized in `tag_cache`.
+    tag_bits: Vec<Box<[u64]>>,
+    /// Canonical tag name -> dense id. Lookups happen once per distinct name.
+    tag_ids: HashMap<String, u32, BuildHasherDefault<TagHasher>>,
+    /// Direct-mapped memo of tag name -> dense id, keyed on the string's
+    /// pointer bits. Verified against `tag_names`, so a slot collision or a
+    /// recycled allocation can only cost a miss, never a wrong answer.
+    tag_cache: [AtomicU64; TAG_CACHE_SLOTS],
     /// tag name -> block idx list in the pack's own `values` order, nested tags expanded in
     /// place. `getRandomElement(tag, random)` indexes into that order, so a set would return
     /// a different member for the same draw.
     tag_order: HashMap<String, Vec<u32>>,
+}
+
+/// Slots in the `in_tag` name-resolution memo. Tag names at call sites are
+/// string literals, so a few dozen distinct names carry essentially every call.
+const TAG_CACHE_SLOTS: usize = 256;
+
+/// Multiply-shift mixer for the tag-name map and the memo slot: tag resolution
+/// is once-per-name, so this beats SipHash without being a cryptographic hash.
+#[derive(Clone, Copy, Debug, Default)]
+struct TagHasher(u64);
+
+type TagBuild = BuildHasherDefault<TagHasher>;
+
+impl TagHasher {
+    #[inline]
+    fn add(hash: u64, word: u64) -> u64 {
+        (hash.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95)
+    }
+}
+
+impl Hasher for TagHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = self.0;
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            hash = Self::add(hash, u64::from_ne_bytes(c.try_into().unwrap()));
+        }
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..rem.len()].copy_from_slice(rem);
+            hash = Self::add(hash, u64::from_ne_bytes(buf));
+        }
+        self.0 = hash;
+    }
 }
 
 /// The asset's `flag_bits.replaceable` bit, `BlockState.isReplaceable()`. The other bits of the
@@ -219,9 +284,26 @@ impl BReg {
             shapes,
             col_range: vec![(0, 0); state_count],
             col_idx: Vec::new(),
-            tag: HashMap::new(),
+            pred: vec![0; state_count],
+            light: vec![0; state_count],
+            postproc: vec![0; state_count],
+            faces: vec![0; state_count],
+            tag_names: Vec::new(),
+            tag_bits: Vec::new(),
+            tag_ids: HashMap::default(),
+            tag_cache: std::array::from_fn(|_| AtomicU64::new(0)),
             tag_order: HashMap::new(),
         };
+        // Copy the pinned per-state fact bytes into dense tables once, so the
+        // hot predicates below are a single indexed load rather than a slice
+        // copy plus shifts on every call.
+        for st in 0..state_count {
+            let fact = state_fact(st as u32);
+            reg.pred[st] = fact[0];
+            reg.light[st] = fact[1];
+            reg.postproc[st] = fact[5];
+            reg.faces[st] = fact[2] as u32 | (fact[3] as u32) << 8 | (fact[4] as u32) << 16;
+        }
         for b in &md {
             let name = format!("minecraft:{}", jstr(b, "name")?);
             let bi = reg.bname.len() as u32;
@@ -446,14 +528,37 @@ impl BReg {
             out
         }
         let names: Vec<String> = raw.keys().cloned().collect();
+        // `expand` memoizes every tag it touches — top-level names and nested
+        // `#tag` members alike — so the finished map is the same coverage the
+        // old `tag` field had.
+        let mut done_sets: HashMap<String, HashSet<u32>> = HashMap::new();
         for n in names {
             let mut stack = HashSet::new();
-            let set = expand(&n, &raw, &reg.idx, &mut reg.tag, &mut stack);
-            reg.tag.insert(n.clone(), set);
+            let _ = expand(&n, &raw, &reg.idx, &mut done_sets, &mut stack);
             let mut stack = HashSet::new();
             let ordered = expand_ordered(&n, &raw, &reg.idx, &mut reg.tag_order, &mut stack);
             reg.tag_order.insert(n, ordered);
         }
+        // Each expanded set becomes a packed block-index bitset: `in_tag` then
+        // costs one bit test, with no HashSet probe or string work per call.
+        let words = (reg.bname.len() + 63) / 64;
+        let mut tag_ids = HashMap::with_capacity_and_hasher(done_sets.len(), TagBuild::default());
+        reg.tag_names.reserve(done_sets.len());
+        reg.tag_bits.reserve(done_sets.len());
+        for (name, set) in done_sets {
+            let id = reg.tag_names.len() as u32;
+            tag_ids.insert(name.clone(), id);
+            let mut bits = vec![0u64; words].into_boxed_slice();
+            for bi in set {
+                let u = bi as usize;
+                if u >> 6 < words {
+                    bits[u >> 6] |= 1u64 << (u & 63);
+                }
+            }
+            reg.tag_names.push(name.into_boxed_str());
+            reg.tag_bits.push(bits);
+        }
+        reg.tag_ids = tag_ids;
         Some(reg)
     }
     /// resolve (name, props) to a 1.21.1 state id
@@ -553,15 +658,29 @@ impl BReg {
         }
     }
 
+    /// The packed predicate byte for `st`, or 0 outside the table — the same
+    /// answer `state_fact`'s zero fill gave, at one indexed load.
+    #[inline]
+    fn pred_of(&self, st: u32) -> u8 {
+        self.pred.get(st as usize).copied().unwrap_or(0)
+    }
+
+    /// The packed light byte for `st` (`emission << 4 | opacity`), or 0 outside
+    /// the table.
+    #[inline]
+    fn light_of_byte(&self, st: u32) -> u8 {
+        self.light.get(st as usize).copied().unwrap_or(0)
+    }
+
     /// Light this state emits, 0..15, from the pinned `getLightEmission()`.
     pub(crate) fn luminance_of(&self, st: u32) -> u8 {
-        state_fact(st)[1] >> 4
+        self.light_of_byte(st) >> 4
     }
 
     /// How much light this state stops, 0..15, from the pinned `getLightBlock(level, pos)`.
     /// Zero is fully transparent.
     pub(crate) fn opacity_of(&self, st: u32) -> u8 {
-        state_fact(st)[1] & 0xf
+        self.light_of_byte(st) & 0xf
     }
 
     /// `BlockStateBase.hasPostProcess(BlockGetter, BlockPos)` (`dtb$a.q`): the predicate
@@ -571,7 +690,9 @@ impl BReg {
     /// table column behind this is re-derived from `Blocks.<clinit>` by
     /// `tools/block_state_facts_from_jar.py`, so no block name is typed in here.
     pub(crate) fn has_post_process(&self, st: u32) -> bool {
-        state_fact(st)[5] & FACT_POSTPROCESS != 0
+        self.postproc
+            .get(st as usize)
+            .is_some_and(|b| b & FACT_POSTPROCESS != 0)
     }
 
     /// The random-tick behaviour of this block, or B_NONE.
@@ -622,12 +743,12 @@ impl BReg {
     /// Pinned `isAir()`. Three states answer true (air, cave air, void air); the old
     /// `state_flags` bit happened to agree on all 26,684, and the table removes the guess.
     pub(crate) fn is_air(&self, st: u32) -> bool {
-        state_fact(st)[0] & FACT_IS_AIR != 0
+        self.pred_of(st) & FACT_IS_AIR != 0
     }
     /// Pinned `blocksMotion()`: whether the state's collision shape stops an entity. Named for
     /// the native method; `is_solid` remains the name the generation callers use.
     pub(crate) fn blocks_motion(&self, st: u32) -> bool {
-        state_fact(st)[0] & FACT_BLOCKS_MOTION != 0
+        self.pred_of(st) & FACT_BLOCKS_MOTION != 0
     }
     /// The name the generation callers use for `blocksMotion`, kept because forty call sites
     /// read better as "is this solid"; the value is the native predicate, not a second one.
@@ -641,7 +762,7 @@ impl BReg {
     /// than plumbed through a call site that does not want it.
     #[allow(dead_code)]
     pub(crate) fn can_occlude(&self, st: u32) -> bool {
-        state_fact(st)[0] & FACT_CAN_OCCLUDE != 0
+        self.pred_of(st) & FACT_CAN_OCCLUDE != 0
     }
     /// The state's collision boxes, from the same `getCollisionShape(EmptyBlockView, ORIGIN)`
     /// answer the fact table records as `COLLISION_EMPTY`/`COLLISION_FULL`: `collision_boxes`
@@ -658,19 +779,19 @@ impl BReg {
     /// Pinned BlockState.isSolidRender, not isSolid or light opacity: e.g.
     /// tinted glass blocks light but does not orient a dungeon chest.
     pub(crate) fn is_solid_render(&self, st: u32) -> bool {
-        state_fact(st)[0] & FACT_SOLID_RENDER != 0
+        self.pred_of(st) & FACT_SOLID_RENDER != 0
     }
     /// Pinned `getCollisionShape(level, pos).isEmpty()`. `collision_boxes` is the geometry of the
     /// same call and agrees with this bit on all 26,684 states; a caller that needs the boxes
     /// rather than the predicate reads that, and the two cannot drift because one asset exports
     /// both from one invocation.
     pub(crate) fn is_collision_empty(&self, st: u32) -> bool {
-        state_fact(st)[0] & FACT_COLLISION_EMPTY != 0
+        self.pred_of(st) & FACT_COLLISION_EMPTY != 0
     }
     /// Pinned `BlockStateBase.isCollisionShapeFullBlock`; distinct from render, heightmap,
     /// and sturdy-face predicates.
     pub(crate) fn is_collision_shape_full_block(&self, st: u32) -> bool {
-        state_fact(st)[0] & FACT_COLLISION_FULL != 0
+        self.pred_of(st) & FACT_COLLISION_FULL != 0
     }
     /// Pinned `BlockStateBase.isRedstoneConductor(level, pos)` (`dtb$a.g`):
     /// default in `BlockBehaviour.Properties` is `blocksMotion && isCollisionShapeFullBlock`,
@@ -715,8 +836,7 @@ impl BReg {
         if direction >= 6 {
             return false;
         }
-        let fact = state_fact(st);
-        let faces = fact[2] as u32 | (fact[3] as u32) << 8 | (fact[4] as u32) << 16;
+        let faces = self.faces.get(st as usize).copied().unwrap_or(0);
         (faces >> (support as usize * 6)) & 0x3f & (1 << direction) != 0
     }
     /// The pinned FULL face, which is what vanilla's three-argument
@@ -787,20 +907,19 @@ impl BReg {
     /// plants and corals. The narrower native `liquid()` - only water, lava and bubble columns -
     /// is [`BReg::is_liquid_block`].
     pub(crate) fn is_liquid(&self, st: u32) -> bool {
-        state_fact(st)[0] & FACT_FLUID_EMPTY == 0
+        self.pred_of(st) & FACT_FLUID_EMPTY == 0
     }
     /// Pinned `BlockStateBase.liquid()`. Exported for the audit; generation asks
     /// [`BReg::is_liquid`], which is the fluid-state question the call sites mean.
     #[allow(dead_code)]
     pub(crate) fn is_liquid_block(&self, st: u32) -> bool {
-        state_fact(st)[0] & FACT_LIQUID != 0
+        self.pred_of(st) & FACT_LIQUID != 0
     }
     /// The pinned `SupportType` face planes as a six-bit mask, for the audit and for the
     /// cross-check against the older single-plane assets.
     #[allow(dead_code)]
     pub(crate) fn face_plane(&self, st: u32, support: Support) -> u8 {
-        let fact = state_fact(st);
-        let faces = fact[2] as u32 | (fact[3] as u32) << 8 | (fact[4] as u32) << 16;
+        let faces = self.faces.get(st as usize).copied().unwrap_or(0);
         ((faces >> (support as usize * 6)) & 0x3f) as u8
     }
     pub(crate) fn is_replaceable(&self, st: u32) -> bool {
@@ -1265,21 +1384,64 @@ impl BReg {
         self.dfl.get(block_idx as usize).copied().unwrap_or(0)
     }
 
+    /// Packed tag membership for `st`. The name resolves through a memoized
+    /// slot and the state test is one bit AND — no hashing or set probing per
+    /// candidate cell.
     pub(crate) fn in_tag(&self, st: u32, tag: &str) -> bool {
-        let bi = match self.st_blk.get(st as usize) {
-            Some(&b) => b,
-            None => return false,
+        let Some(&bi) = self.st_blk.get(st as usize) else {
+            return false;
         };
-        // Look the tag up by the caller's own `&str` first: this runs once per candidate
-        // cell in the feature loops, and `ns_name` would allocate a `String` each time.
-        if let Some(set) = self.tag.get(tag) {
-            return set.contains(&bi);
+        let Some(id) = self.tag_id(tag) else {
+            return false;
+        };
+        let bits = &self.tag_bits[id as usize];
+        let u = bi as usize;
+        u >> 6 < bits.len() && (bits[u >> 6] & (1u64 << (u & 63))) != 0
+    }
+
+    /// Resolve a tag name to its dense id. Call-site names are string literals,
+    /// so the same `&str` recurs for thousands of cells; a direct-mapped slot
+    /// keyed on the pointer's bits memoizes the resolution. The stored name is
+    /// always compared before trusting the slot, so a collision — or a
+    /// recycled allocation — costs a miss, never a wrong answer.
+    #[inline]
+    fn tag_id(&self, tag: &str) -> Option<u32> {
+        let slot = ((tag.as_ptr() as usize).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            >> (usize::BITS as usize - TAG_CACHE_SLOTS.trailing_zeros() as usize))
+            as usize;
+        let entry = self.tag_cache[slot].load(Ordering::Relaxed);
+        if entry != 0 {
+            let id = (entry - 1) as usize;
+            if self.tag_name_eq(id, tag) {
+                return Some(id as u32);
+            }
         }
-        // Unqualified names ("dirt") still resolve, through the one allocation they need.
-        self.tag
-            .get(&ns_name(tag))
-            .map(|s| s.contains(&bi))
-            .unwrap_or(false)
+        let id = self.resolve_tag(tag)?;
+        self.tag_cache[slot].store(id as u64 + 1, Ordering::Relaxed);
+        Some(id)
+    }
+
+    /// Whether dense tag `id`'s canonical name is what `tag` resolves to —
+    /// either verbatim or through the `minecraft:` prefix `ns_name` adds.
+    #[inline]
+    fn tag_name_eq(&self, id: usize, tag: &str) -> bool {
+        let name = self.tag_names[id].as_ref();
+        name == tag
+            || (!tag.contains(':') && name.strip_prefix("minecraft:") == Some(tag))
+    }
+
+    /// The cold half of `in_tag`: canonical-name lookup in `tag_ids`, with the
+    /// `minecraft:` prefix fallback `ns_name` documents. Runs once per distinct
+    /// name thanks to `tag_cache`.
+    fn resolve_tag(&self, tag: &str) -> Option<u32> {
+        if let Some(&id) = self.tag_ids.get(tag) {
+            return Some(id);
+        }
+        if !tag.contains(':') {
+            let qualified = format!("minecraft:{tag}");
+            return self.tag_ids.get(qualified.as_str()).copied();
+        }
+        None
     }
 }
 
