@@ -25,6 +25,9 @@ pub enum CreateBlockRole {
     FluidTank,
     ContraptionAnchor,
     Sensor,
+    /// Inert addon block with no simulation behaviour (decorative blocks,
+    /// buoyancy envelopes, control surfaces, ore/chest placeholders).
+    Decorative,
 }
 
 /// Create-specialized block registry alias backed by the universal multi-property

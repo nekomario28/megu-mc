@@ -12,6 +12,8 @@
 
 #![deny(unsafe_code)]
 
+pub mod addon_profile;
+pub mod aeronautics;
 pub mod blockstates;
 pub mod contraption_adapter;
 pub mod data_loader;

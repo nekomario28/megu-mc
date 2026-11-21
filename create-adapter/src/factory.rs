@@ -55,6 +55,34 @@ pub enum Axis {
 }
 
 impl Axis {
+    /// `x`/`y`/`z` axis name (`"x"`, `"y"`, `"z"`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::X => "x",
+            Self::Y => "y",
+            Self::Z => "z",
+        }
+    }
+
+    /// Parse `x`/`y`/`z` into an [`Axis`].
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s {
+            "x" => Some(Self::X),
+            "y" => Some(Self::Y),
+            "z" => Some(Self::Z),
+            _ => None,
+        }
+    }
+
+    /// Component index (`x`->0, `y`->1, `z`->2) into `[f64; 3]` vectors.
+    pub fn index(self) -> usize {
+        match self {
+            Self::X => 0,
+            Self::Y => 1,
+            Self::Z => 2,
+        }
+    }
+
     fn from_prop(s: Option<&str>) -> Option<Self> {
         match s {
             Some("x") => Some(Self::X),
@@ -156,6 +184,20 @@ impl CreateFactory {
             processors_by_pos: HashMap::new(),
             export_scratch: vec![0u8; MAX_BATCH_BYTES],
         }
+    }
+
+    /// Build a factory whose registry merges the core `create:*` catalog with
+    /// every [`crate::addon_profile::CreateAddonProfile`]'s flagship block
+    /// definitions. Addon ids colliding with `create:*` or each other fail
+    /// closed via [`crate::blockstates::RegistryError`].
+    pub fn new_with_addons(
+        base_state_id: u32,
+        addons: &[crate::addon_profile::CreateAddonProfile],
+    ) -> Result<Self, crate::blockstates::RegistryError> {
+        Ok(Self::new(crate::addon_profile::create_registry_with_addons(
+            base_state_id,
+            addons,
+        )?))
     }
 
     pub fn registry(&self) -> &CreateBlockRegistry {

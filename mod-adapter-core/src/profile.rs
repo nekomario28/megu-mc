@@ -146,6 +146,30 @@ impl ModOffloadProfile {
             processor_recipe_types,
         })
     }
+
+    /// Fold another profile's blocks and tuning tables into this one.
+    /// Blocks with an `id` already present are left untouched (first writer
+    /// wins), so callers control precedence by merge order. Used to compose
+    /// addon offload halves (e.g. every `CreateAddonProfile::offload`) into a
+    /// single runtime manifest without hand-merging JSON.
+    pub fn extend(&mut self, other: &ModOffloadProfile) {
+        for def in &other.blocks {
+            if !self.blocks.iter().any(|b| b.id == def.id) {
+                self.blocks.push(def.clone());
+            }
+        }
+        for (k, &v) in &other.transport_delay_ticks {
+            self.transport_delay_ticks.entry(k.clone()).or_insert(v);
+        }
+        for (k, &v) in &other.tank_capacity_mb {
+            self.tank_capacity_mb.entry(k.clone()).or_insert(v);
+        }
+        for (k, v) in &other.processor_recipe_types {
+            self.processor_recipe_types
+                .entry(k.clone())
+                .or_insert_with(|| v.clone());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

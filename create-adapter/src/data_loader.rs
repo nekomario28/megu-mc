@@ -53,6 +53,9 @@ pub struct ParsedCreateRecipe {
 pub struct LoadedCreateData {
     pub recipes: Vec<ParsedCreateRecipe>,
     pub tags: BTreeMap<String, Vec<String>>,
+    /// Declared blockstate property tables per block id (see
+    /// [`mod_adapter_core::data_loader::LoadedModData::blockstates`]).
+    pub blockstates: BTreeMap<String, Vec<mod_adapter_core::blockstates::PropertyDef>>,
     pub skipped_compressed_zip_entries: usize,
 }
 
@@ -105,6 +108,7 @@ fn filter_create_data(raw: LoadedModData) -> LoadedCreateData {
     LoadedCreateData {
         recipes,
         tags: raw.tags,
+        blockstates: raw.blockstates,
         skipped_compressed_zip_entries: raw.skipped_compressed_zip_entries,
     }
 }

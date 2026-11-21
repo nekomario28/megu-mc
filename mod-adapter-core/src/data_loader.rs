@@ -3,11 +3,13 @@
 //! Universal zero-JVM, zero-dependency JSON & stored-ZIP/JAR loader for ANY
 //! mod's recipes, tags, and declarative offload profiles.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
 use mod_offload::recipe_processor::{Recipe, Resource, ResourceKind, Stack};
+
+use crate::blockstates::PropertyDef;
 
 const MAX_JSON_DEPTH: usize = 64;
 const MAX_JSON_BYTES: usize = 4 * 1024 * 1024;
@@ -76,6 +78,11 @@ pub struct ParsedModRecipe {
 pub struct LoadedModData {
     pub recipes: Vec<ParsedModRecipe>,
     pub tags: BTreeMap<String, Vec<String>>,
+    /// Declared blockstate properties per block id, harvested from
+    /// `assets/<ns>/blockstates/*.json` `variants` keys and `multipart`
+    /// `when` clauses. Presence of an entry (even with no properties)
+    /// confirms the block exists in the mod JAR.
+    pub blockstates: BTreeMap<String, Vec<PropertyDef>>,
     pub skipped_compressed_zip_entries: usize,
 }
 
@@ -92,9 +99,11 @@ pub fn load_from_directory(
     ids: &mut ItemFluidIdTable,
 ) -> Result<LoadedModData, DataLoadError> {
     let mut files = Vec::new();
-    let data_dir = root.join("data");
-    if data_dir.is_dir() {
-        collect_json_files(&data_dir, root, &mut files)?;
+    for top in ["data", "assets"] {
+        let dir = root.join(top);
+        if dir.is_dir() {
+            collect_json_files(&dir, root, &mut files)?;
+        }
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -157,7 +166,7 @@ pub fn load_from_stored_zip(
         }
         let name = std::str::from_utf8(&bytes[name_start..name_start + name_len])
             .map_err(|_| DataLoadError::Zip("non-UTF8 ZIP entry path".into()))?;
-        if name.starts_with("data/") && name.ends_with(".json") {
+        if name.ends_with(".json") && (name.starts_with("data/") || name.starts_with("assets/")) {
             if method == 0 {
                 entries.push((name.to_string(), bytes[data_start..data_end].to_vec()));
             } else {
@@ -286,13 +295,25 @@ fn ingest_entry(
     out: &mut LoadedModData,
 ) -> Result<(), DataLoadError> {
     let parts: Vec<&str> = rel_path.split('/').collect();
-    if parts.len() < 4 || parts[0] != "data" {
+    if parts.len() < 4 {
         return Ok(());
     }
     let ns = parts[1];
     let category = parts[2];
     let stem_path = parts[3..].join("/");
     let stem = stem_path.strip_suffix(".json").unwrap_or(&stem_path);
+
+    if parts[0] == "assets" {
+        if category == "blockstates" {
+            if let Some(props) = parse_blockstate_properties(bytes) {
+                out.blockstates.insert(format!("{ns}:{stem}"), props);
+            }
+        }
+        return Ok(());
+    }
+    if parts[0] != "data" {
+        return Ok(());
+    }
 
     if category == "recipe" || category == "recipes" {
         let name = format!("{ns}:{stem}");
@@ -324,6 +345,93 @@ fn ingest_entry(
         }
     }
     Ok(())
+}
+
+/// Extract the declared `BlockState` property table from a mod's
+/// `blockstates/*.json` file. Reads `variants` selector keys (`"axis=x"`,
+/// `"facing=north,waterlogged=false"`, `""`) and `multipart[].when` clauses
+/// (including `OR` sub-clauses and `"a|b"` value unions). Returns `None`
+/// only when the file is not a blockstate object at all.
+fn parse_blockstate_properties(bytes: &[u8]) -> Option<Vec<PropertyDef>> {
+    let root = parse_json(bytes).ok()?;
+    let obj = root.as_object()?;
+    let mut props: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut seen_form = false;
+    if let Some(variants) = obj.get("variants").and_then(JsonValue::as_object) {
+        seen_form = true;
+        for key in variants.keys() {
+            record_selector_key(key, &mut props);
+        }
+    }
+    if let Some(multipart) = obj.get("multipart").and_then(JsonValue::as_array) {
+        seen_form = true;
+        for part in multipart {
+            if let Some(when) = part
+                .as_object()
+                .and_then(|o| o.get("when"))
+                .and_then(JsonValue::as_object)
+            {
+                record_when_clause(when, &mut props);
+            }
+        }
+    }
+    if !seen_form {
+        return None;
+    }
+    Some(
+        props
+            .into_iter()
+            .map(|(name, values)| PropertyDef {
+                name,
+                values: values.into_iter().collect(),
+            })
+            .collect(),
+    )
+}
+
+fn record_selector_key(key: &str, props: &mut BTreeMap<String, BTreeSet<String>>) {
+    for pair in key.split(',') {
+        let Some((name, value)) = pair.split_once('=') else {
+            continue;
+        };
+        record_property_values(name.trim(), value.trim(), props);
+    }
+}
+
+fn record_when_clause(
+    when: &BTreeMap<String, JsonValue>,
+    props: &mut BTreeMap<String, BTreeSet<String>>,
+) {
+    for (name, value) in when {
+        if name == "OR" {
+            if let Some(sub_clauses) = value.as_array() {
+                for sub in sub_clauses {
+                    if let Some(sub_obj) = sub.as_object() {
+                        record_when_clause(sub_obj, props);
+                    }
+                }
+            }
+        } else if let Some(text) = value.as_str() {
+            record_property_values(name, text, props);
+        }
+    }
+}
+
+fn record_property_values(
+    name: &str,
+    value: &str,
+    props: &mut BTreeMap<String, BTreeSet<String>>,
+) {
+    if name.is_empty() {
+        return;
+    }
+    let entry = props.entry(name.to_string()).or_default();
+    for v in value.split('|') {
+        let v = v.trim();
+        if !v.is_empty() {
+            entry.insert(v.to_string());
+        }
+    }
 }
 
 fn parse_stack(val: &JsonValue, ids: &mut ItemFluidIdTable) -> Option<Stack> {
@@ -640,5 +748,53 @@ impl<'a> JsonParser<'a> {
             .parse::<f64>()
             .map_err(|_| DataLoadError::Json(format!("invalid number '{s}'")))?;
         Ok(JsonValue::Number(n))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blockstate_variants_and_multipart_when_feed_property_discovery() {
+        let variants = br#"{
+          "variants": {
+            "axis=x": {"model": "a"},
+            "axis=y,waterlogged=false": {"model": "b"},
+            "axis=z,waterlogged=true": {"model": "c"}
+          }
+        }"#;
+        let props = parse_blockstate_properties(variants).unwrap();
+        assert_eq!(
+            props,
+            vec![
+                PropertyDef::new("axis", &["x", "y", "z"]),
+                PropertyDef::new("waterlogged", &["false", "true"]),
+            ]
+        );
+
+        let multipart = br#"{
+          "multipart": [
+            {"when": {"north": "true|false"}, "apply": {}},
+            {"when": {"OR": [{"up": "true"}, {"down": "true"}]}, "apply": {}}
+          ]
+        }"#;
+        let props = parse_blockstate_properties(multipart).unwrap();
+        assert_eq!(
+            props,
+            vec![
+                PropertyDef::new("down", &["true"]),
+                PropertyDef::new("north", &["false", "true"]),
+                PropertyDef::new("up", &["true"]),
+            ]
+        );
+
+        // A property-less blockstate still proves the block exists.
+        assert_eq!(
+            parse_blockstate_properties(br#"{"variants": {"": {"model": "x"}}}"#),
+            Some(Vec::new())
+        );
+        // Non-blockstate JSON is ignored rather than fabricated.
+        assert_eq!(parse_blockstate_properties(br#"{"type": "create:pressing"}"#), None);
     }
 }
