@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 use crate::Error;
-use std::collections::BTreeSet;
 
 // The server's lighting source is imported verbatim and extended only with
 // accessors for the facts it keeps private.
 #[allow(dead_code, clippy::all)]
 pub(crate) mod owner {
     include!("../../src/lighting.rs");
+
+    use super::LightFact;
+    use crate::Error;
 
     impl FaceOcclusion {
         pub(crate) fn from_quadrants(quadrants: [u8; 6]) -> Self {
@@ -32,6 +34,53 @@ pub(crate) mod owner {
         }
     }
 
+    impl IncrementalLighting {
+        /// `load_chunk` fed directly from the packed cell facts, skipping the
+        /// intermediate `(Position, LightBlock)` vector the iterator form
+        /// requires. Cell order and per-fact validation match `load_chunk`.
+        pub(crate) fn load_chunk_facts(
+            &mut self,
+            cx: i32,
+            cz: i32,
+            cells: &[LightFact],
+        ) -> Result<(), Error> {
+            let mut blocks = vec![LightBlock::default(); self.height as usize * 256];
+            for (block, fact) in blocks.iter_mut().zip(cells) {
+                *block = fact.block()?;
+            }
+            self.chunks.insert(
+                (cx, cz),
+                LightingChunk::new(self.min_y, self.height, blocks),
+            );
+            self.rebuild();
+            Ok(())
+        }
+
+        /// `sections` for one index without materializing every section:
+        /// index zero is the below guard, `count - 1` the above guard, and
+        /// payload sections pack nibbles straight out of `light(kind)`.
+        pub(crate) fn section_packed(
+            &self,
+            chunk: Chunk,
+            kind: LightKind,
+            index: usize,
+        ) -> [u8; 2048] {
+            let mut out = [0u8; 2048];
+            let count = (self.height / 16 + 2) as usize;
+            if index >= count {
+                return out;
+            }
+            if let Some(chunk) = self.chunks.get(&chunk) {
+                if (1..count - 1).contains(&index) {
+                    out = pack_light_nibbles(&chunk.light(kind)[(index - 1) << 12..][..4096]);
+                } else if index + 1 == count && self.has_skylight && kind == LightKind::Sky {
+                    out.fill(0xff);
+                }
+            }
+            out
+        }
+    }
+
     /// `IncrementalLighting` generalized past its baked-in `u64` section-mask
     /// cap. The algorithm, per-chunk storage, snapshot log, and 14-step patch
     /// semantics are identical to the owner's; only the `edit_batch` change
@@ -47,6 +96,17 @@ pub(crate) mod owner {
         stamp: u32,
         snap: SnapLog,
         scratch: Scratch,
+        batch_scratch: BatchScratch,
+    }
+
+    /// Per-call edit-batch temporaries retained across `edit_batch` calls so
+    /// streaming edits do not reallocate the change lists every tick. Bounded
+    /// by [`BATCH_SCRATCH_CAP`]: an oversized batch releases the buffers.
+    #[derive(Clone, Debug, Default)]
+    struct BatchScratch {
+        block_changes: Vec<Position>,
+        sky_changes: Vec<Position>,
+        columns: Vec<(i32, i32)>,
     }
 
     /// `ChunkLightUpdate` whose masks are `BitSet.toLongArray`-shaped word
@@ -72,6 +132,10 @@ pub(crate) mod owner {
 
     /// 128 payload sections plus the below/above guard sections.
     pub(crate) const TALL_SECTION_LIMIT: i32 = 128 + 2;
+
+    /// Retained-capacity ceiling (cells) for [`BatchScratch`]: a batch larger
+    /// than this releases its buffers after the update is built.
+    const BATCH_SCRATCH_CAP: usize = 1 << 15;
 
     /// `BitSet.set(bit)`: bit `bit % 64` of word `bit / 64`, growing the list.
     pub(crate) fn set_mask_bit(words: &mut Vec<u64>, bit: usize) {
@@ -118,6 +182,7 @@ pub(crate) mod owner {
                 stamp: 0,
                 snap: SnapLog::default(),
                 scratch: Scratch::default(),
+                batch_scratch: BatchScratch::default(),
             };
             engine.rebuild();
             engine
@@ -356,6 +421,51 @@ pub(crate) mod owner {
             self.rebuild();
         }
 
+        /// `load_chunk` fed directly from the packed cell facts, skipping the
+        /// intermediate `(Position, LightBlock)` vector the iterator form
+        /// requires. Cell order and per-fact validation match `load_chunk`.
+        pub(crate) fn load_chunk_facts(
+            &mut self,
+            cx: i32,
+            cz: i32,
+            cells: &[LightFact],
+        ) -> Result<(), Error> {
+            let mut blocks = vec![LightBlock::default(); self.height as usize * 256];
+            for (block, fact) in blocks.iter_mut().zip(cells) {
+                *block = fact.block()?;
+            }
+            self.chunks.insert(
+                (cx, cz),
+                LightingChunk::new(self.min_y, self.height, blocks),
+            );
+            self.rebuild();
+            Ok(())
+        }
+
+        /// `sections` for one index without materializing every section:
+        /// index zero is the below guard, `count - 1` the above guard, and
+        /// payload sections pack nibbles straight out of `light(kind)`.
+        pub(crate) fn section_packed(
+            &self,
+            chunk: Chunk,
+            kind: LightKind,
+            index: usize,
+        ) -> [u8; 2048] {
+            let mut out = [0u8; 2048];
+            let count = (self.height / 16 + 2) as usize;
+            if index >= count {
+                return out;
+            }
+            if let Some(chunk) = self.chunks.get(&chunk) {
+                if (1..count - 1).contains(&index) {
+                    out = pack_light_nibbles(&chunk.light(kind)[(index - 1) << 12..][..4096]);
+                } else if index + 1 == count && self.has_skylight && kind == LightKind::Sky {
+                    out.fill(0xff);
+                }
+            }
+            out
+        }
+
         /// The two BFS passes limit invalidation to 14 Manhattan steps per changed
         /// light source, because a level-15 source cannot illuminate a fifteenth step.
         /// Cells outside that region preserve their previously settled light.
@@ -441,9 +551,10 @@ pub(crate) mod owner {
             self.snap.entries.clear();
             self.snap.arena.clear();
             self.snap.active = true;
-            let mut block_changes = Vec::new();
-            let mut sky_changes = Vec::new();
-            let mut columns = Vec::new();
+            let mut scratch = std::mem::take(&mut self.batch_scratch);
+            scratch.block_changes.clear();
+            scratch.sky_changes.clear();
+            scratch.columns.clear();
             for (p, block) in edits {
                 let Some(i) = self.index(p) else { continue };
                 let Some(chunk) = self.chunks.get_mut(&p.chunk()) else {
@@ -453,26 +564,27 @@ pub(crate) mod owner {
                 if old == block {
                     continue;
                 }
-                block_changes.push(p);
+                scratch.block_changes.push(p);
                 if self.has_skylight
                     && (old.opacity != block.opacity || old.occlusion != block.occlusion)
                 {
-                    columns.push((p.x, p.z));
+                    scratch.columns.push((p.x, p.z));
                     // The lateral path can change even below a roof with no direct sky.
-                    sky_changes.push(p);
+                    scratch.sky_changes.push(p);
                 }
             }
-            columns.sort_unstable();
-            columns.dedup();
-            for (x, z) in columns {
+            scratch.columns.sort_unstable();
+            scratch.columns.dedup();
+            for &(x, z) in &scratch.columns {
                 let chunk = self.chunks.get_mut(&(x >> 4, z >> 4)).unwrap();
                 let i = ((z & 15) << 4 | (x & 15)) as usize;
                 Self::refresh_column(self.min_y, self.height, chunk, i, &mut |y| {
-                    sky_changes.push(Position::new(x, y, z));
+                    scratch.sky_changes.push(Position::new(x, y, z));
                 });
             }
-            let work = self.relight_patch(LightKind::Sky, &sky_changes)
-                + self.relight_patch(LightKind::Block, &block_changes);
+            let work = self.relight_patch(LightKind::Sky, &scratch.sky_changes)
+                + self.relight_patch(LightKind::Block, &scratch.block_changes);
+            self.batch_scratch = scratch;
             self.snap.active = false;
             self.snap.entries.sort_unstable();
             let mut updates = Vec::new();
@@ -523,7 +635,15 @@ pub(crate) mod owner {
                     updates.push(update);
                 }
             }
-            updates.sort_by_key(|update| update.chunk);
+            // Chunk keys are unique across `targets`, so the unstable sort
+            // keeps the deterministic order without allocating scratch.
+            updates.sort_unstable_by_key(|update| update.chunk);
+            if self.batch_scratch.block_changes.capacity() > BATCH_SCRATCH_CAP
+                || self.batch_scratch.sky_changes.capacity() > BATCH_SCRATCH_CAP
+                || self.batch_scratch.columns.capacity() > BATCH_SCRATCH_CAP
+            {
+                self.batch_scratch = BatchScratch::default();
+            }
             TallLightUpdate {
                 chunks: updates,
                 invalidated_cells: work,
@@ -693,9 +813,24 @@ enum EngineInner {
     Tall(owner::TallLighting),
 }
 
+/// Reusable per-call buffers for [`LightEngine::apply_edits`]: the validated
+/// `(Position, LightBlock)` change list and the sorted neighbor-target set.
+/// Retained across calls so steady-state edit batches do not reallocate;
+/// [`EDIT_SCRATCH_CAP`] bounds the retained footprint.
+#[derive(Default)]
+struct EditScratch {
+    changes: Vec<(owner::Position, owner::LightBlock)>,
+    targets: Vec<(i32, i32)>,
+}
+
+/// Retained-capacity ceiling (cells) for [`EditScratch`]: a batch larger than
+/// this releases its buffers after the update is built.
+const EDIT_SCRATCH_CAP: usize = 1 << 16;
+
 /// A loaded window of chunk columns lit by the server's incremental engine.
 pub struct LightEngine {
     inner: EngineInner,
+    edit_scratch: EditScratch,
 }
 
 /// Chunk coordinates keep every neighbor offset within `i32` block space.
@@ -724,6 +859,20 @@ fn split_light_sections(
     )
 }
 
+fn inner_window(inner: &EngineInner) -> (i32, i32) {
+    match inner {
+        EngineInner::Standard(engine) => engine.window(),
+        EngineInner::Tall(engine) => engine.window(),
+    }
+}
+
+fn inner_is_loaded(inner: &EngineInner, cx: i32, cz: i32) -> bool {
+    match inner {
+        EngineInner::Standard(engine) => engine.is_loaded((cx, cz)),
+        EngineInner::Tall(engine) => engine.is_loaded((cx, cz)),
+    }
+}
+
 impl LightEngine {
     pub fn new(min_y: i32, height: u32, has_skylight: bool) -> Result<Self, Error> {
         let height = i32::try_from(height).map_err(|_| Error::OutOfRange)?;
@@ -742,6 +891,7 @@ impl LightEngine {
                 has_skylight,
                 [],
             )),
+            edit_scratch: EditScratch::default(),
         })
     }
 
@@ -776,7 +926,10 @@ impl LightEngine {
                 [],
             ))
         };
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            edit_scratch: EditScratch::default(),
+        })
     }
 
     /// Number of sections per layer, including one guard section below and above.
@@ -789,17 +942,11 @@ impl LightEngine {
     }
 
     fn window(&self) -> (i32, i32) {
-        match &self.inner {
-            EngineInner::Standard(engine) => engine.window(),
-            EngineInner::Tall(engine) => engine.window(),
-        }
+        inner_window(&self.inner)
     }
 
     fn is_loaded(&self, cx: i32, cz: i32) -> bool {
-        match &self.inner {
-            EngineInner::Standard(engine) => engine.is_loaded((cx, cz)),
-            EngineInner::Tall(engine) => engine.is_loaded((cx, cz)),
-        }
+        inner_is_loaded(&self.inner, cx, cz)
     }
 
     fn has_skylight(&self) -> bool {
@@ -830,53 +977,53 @@ impl LightEngine {
         if cells.len() != self.cells_per_chunk() {
             return Err(Error::OutOfRange);
         }
-        let min_y = self.window().0;
-        let cells = cells
-            .iter()
-            .enumerate()
-            .map(|(i, fact)| {
-                let position = owner::Position::new(
-                    cx * 16 + (i & 15) as i32,
-                    min_y + (i >> 8) as i32,
-                    cz * 16 + ((i >> 4) & 15) as i32,
-                );
-                Ok((position, fact.block()?))
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
         match &mut self.inner {
-            EngineInner::Standard(engine) => engine.load_chunk(cx, cz, cells),
-            EngineInner::Tall(engine) => engine.load_chunk(cx, cz, cells),
+            EngineInner::Standard(engine) => engine.load_chunk_facts(cx, cz, cells),
+            EngineInner::Tall(engine) => engine.load_chunk_facts(cx, cz, cells),
         }
-        Ok(())
     }
 
     /// Validate a batch the way `edit_batch` requires: nonempty, each edit in
-    /// the window and in a loaded column, each fact representable.
-    #[allow(clippy::type_complexity)]
-    fn prepare_edits(
-        &self,
-        edits: &[LightEdit],
-    ) -> Result<(Vec<(owner::Position, owner::LightBlock)>, BTreeSet<(i32, i32)>), Error> {
+    /// the window and in a loaded column, each fact representable. Fills the
+    /// reusable edit scratch instead of allocating fresh lists per call; the
+    /// neighbor targets are sorted and deduplicated exactly like the `BTreeSet`
+    /// they replace, so `edit_batch` observes identical input.
+    fn prepare_edits(&mut self, edits: &[LightEdit]) -> Result<(), Error> {
         if edits.is_empty() {
             return Err(Error::InvalidArgument);
         }
-        let (min_y, height) = self.window();
-        let mut changes = Vec::with_capacity(edits.len());
-        let mut targets = BTreeSet::new();
+        let (min_y, height) = inner_window(&self.inner);
+        let inner = &self.inner;
+        let scratch = &mut self.edit_scratch;
+        scratch.changes.clear();
+        scratch.targets.clear();
+        scratch.changes.reserve(edits.len());
         for edit in edits {
             let position = owner::Position::new(edit.x, edit.y, edit.z);
             let (cx, cz) = (edit.x.div_euclid(16), edit.z.div_euclid(16));
-            if !(min_y..min_y + height).contains(&edit.y) || !self.is_loaded(cx, cz) {
+            if !(min_y..min_y + height).contains(&edit.y) || !inner_is_loaded(inner, cx, cz) {
                 return Err(Error::OutOfRange);
             }
-            changes.push((position, edit.fact.block()?));
+            scratch.changes.push((position, edit.fact.block()?));
             for (dx, dz) in (-1..=1).flat_map(|dx| (-1..=1).map(move |dz| (dx, dz))) {
-                if self.is_loaded(cx + dx, cz + dz) {
-                    targets.insert((cx + dx, cz + dz));
+                if inner_is_loaded(inner, cx + dx, cz + dz) {
+                    scratch.targets.push((cx + dx, cz + dz));
                 }
             }
         }
-        Ok((changes, targets))
+        scratch.targets.sort_unstable();
+        scratch.targets.dedup();
+        Ok(())
+    }
+
+    /// Drop oversized edit scratch so one huge batch cannot pin memory for
+    /// the engine's lifetime.
+    fn release_edit_scratch(&mut self) {
+        if self.edit_scratch.changes.capacity() > EDIT_SCRATCH_CAP
+            || self.edit_scratch.targets.capacity() > EDIT_SCRATCH_CAP
+        {
+            self.edit_scratch = EditScratch::default();
+        }
     }
 
     /// Apply one or more edits atomically and report each changed neighbor section.
@@ -886,11 +1033,16 @@ impl LightEngine {
     /// section, so this fails closed with `Error::OutOfRange`; use
     /// [`Self::apply_edits_multi_word`] there.
     pub fn apply_edits(&mut self, edits: &[LightEdit]) -> Result<LightUpdate, Error> {
-        let (changes, targets) = self.prepare_edits(edits)?;
-        match &mut self.inner {
-            EngineInner::Standard(engine) => Ok(engine.edit_batch(changes, targets)),
-            EngineInner::Tall(_) => Err(Error::OutOfRange),
-        }
+        self.prepare_edits(edits)?;
+        let update = match &mut self.inner {
+            EngineInner::Standard(engine) => engine.edit_batch(
+                self.edit_scratch.changes.iter().copied(),
+                self.edit_scratch.targets.iter().copied(),
+            ),
+            EngineInner::Tall(_) => return Err(Error::OutOfRange),
+        };
+        self.release_edit_scratch();
+        Ok(update)
     }
 
     /// `apply_edits` reporting `BitSet`-shaped multi-word masks. Works on both
@@ -900,11 +1052,23 @@ impl LightEngine {
         &mut self,
         edits: &[LightEdit],
     ) -> Result<LightUpdateMultiWord, Error> {
-        let (changes, targets) = self.prepare_edits(edits)?;
-        Ok(match &mut self.inner {
-            EngineInner::Standard(engine) => engine.edit_batch(changes, targets).into(),
-            EngineInner::Tall(engine) => engine.edit_batch(changes, targets).into(),
-        })
+        self.prepare_edits(edits)?;
+        let update = match &mut self.inner {
+            EngineInner::Standard(engine) => engine
+                .edit_batch(
+                    self.edit_scratch.changes.iter().copied(),
+                    self.edit_scratch.targets.iter().copied(),
+                )
+                .into(),
+            EngineInner::Tall(engine) => engine
+                .edit_batch(
+                    self.edit_scratch.changes.iter().copied(),
+                    self.edit_scratch.targets.iter().copied(),
+                )
+                .into(),
+        };
+        self.release_edit_scratch();
+        Ok(update)
     }
 
     /// Copy a section nibble array. Index zero starts one section below the window.
@@ -918,7 +1082,10 @@ impl LightEngine {
         if !self.is_loaded(cx, cz) || index >= self.section_count() {
             return Err(Error::OutOfRange);
         }
-        Ok(self.sections_vec(cx, cz, kind)[index])
+        Ok(match &self.inner {
+            EngineInner::Standard(engine) => engine.section_packed((cx, cz), kind, index),
+            EngineInner::Tall(engine) => engine.section_packed((cx, cz), kind, index),
+        })
     }
 
     /// One column's light sections split into the four packet masks and the

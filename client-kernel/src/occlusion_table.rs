@@ -7,7 +7,7 @@
 //! properties are two bytes per state, with a separate four-byte-per-state
 //! quadrant cache to preserve the exact scalar transmission predicate.
 
-use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     light::face_occlusion_from_octants, BlockFacts, Error, LightEdit, LightFact, Registry,
@@ -343,14 +343,24 @@ impl ChunkLightBatch {
     }
 }
 
+/// Retained-capacity ceiling for the coalescing buffers: a tick holding more
+/// cells than this releases them after `drain` instead of pinning the memory
+/// for the queue's lifetime.
+const MAX_RETAINED_QUEUE_CELLS: usize = 1 << 18;
+
 /// Tick-local, last-write-wins aggregation by chunk and block position.
 /// `drain` emits each chunk once, with deterministic chunk/position ordering.
-type ChunkEditMap = BTreeMap<(i32, i32, i32), u32>;
-
+///
+/// The accumulation buffers are reused across ticks: `entries` keeps every
+/// distinct cell, `slots` maps a cell to its entry for last-write-wins
+/// coalescing, and `chunks` tracks the pending chunk set. `drain` sorts
+/// `entries` into wire order in place, so a steady-state tick allocates only
+/// the returned batches, never the aggregation index.
 #[derive(Clone, Debug, Default)]
 pub struct CoalescedLightQueue {
-    chunks: BTreeMap<(i32, i32), ChunkEditMap>,
-    unique_positions: usize,
+    entries: Vec<QueuedLightEdit>,
+    slots: HashMap<(i32, i32, i32), usize>,
+    chunks: HashSet<(i32, i32)>,
 }
 
 impl CoalescedLightQueue {
@@ -359,24 +369,23 @@ impl CoalescedLightQueue {
     }
 
     pub fn push(&mut self, edit: QueuedLightEdit) {
-        let chunk = (edit.x.div_euclid(16), edit.z.div_euclid(16));
-        if self
-            .chunks
-            .entry(chunk)
-            .or_default()
-            .insert((edit.x, edit.y, edit.z), edit.state_id)
-            .is_none()
-        {
-            self.unique_positions += 1;
+        let cell = (edit.x, edit.y, edit.z);
+        if let Some(&index) = self.slots.get(&cell) {
+            self.entries[index].state_id = edit.state_id;
+            return;
         }
+        self.slots.insert(cell, self.entries.len());
+        self.entries.push(edit);
+        self.chunks
+            .insert((edit.x.div_euclid(16), edit.z.div_euclid(16)));
     }
 
     pub fn len(&self) -> usize {
-        self.unique_positions
+        self.entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.unique_positions == 0
+        self.entries.is_empty()
     }
 
     pub fn chunk_count(&self) -> usize {
@@ -384,16 +393,43 @@ impl CoalescedLightQueue {
     }
 
     pub fn drain(&mut self) -> Vec<ChunkLightBatch> {
-        self.unique_positions = 0;
-        std::mem::take(&mut self.chunks)
-            .into_iter()
-            .map(|(chunk, edits)| ChunkLightBatch {
+        // (chunk_x, chunk_z, x, y, z) reproduces the nested-BTreeMap order:
+        // chunks ascending, then cells ascending inside each chunk. Cell
+        // keys are unique, so the unstable sort is deterministic.
+        self.entries.sort_unstable_by_key(|edit| {
+            (
+                edit.x.div_euclid(16),
+                edit.z.div_euclid(16),
+                edit.x,
+                edit.y,
+                edit.z,
+            )
+        });
+        let mut batches = Vec::with_capacity(self.chunks.len());
+        let mut start = 0;
+        while start < self.entries.len() {
+            let first = self.entries[start];
+            let chunk = (first.x.div_euclid(16), first.z.div_euclid(16));
+            let mut end = start + 1;
+            while end < self.entries.len() {
+                let edit = self.entries[end];
+                if (edit.x.div_euclid(16), edit.z.div_euclid(16)) != chunk {
+                    break;
+                }
+                end += 1;
+            }
+            batches.push(ChunkLightBatch {
                 chunk,
-                edits: edits
-                    .into_iter()
-                    .map(|((x, y, z), state_id)| QueuedLightEdit { x, y, z, state_id })
-                    .collect(),
-            })
-            .collect()
+                edits: self.entries[start..end].to_vec(),
+            });
+            start = end;
+        }
+        self.entries.clear();
+        self.slots.clear();
+        self.chunks.clear();
+        if self.entries.capacity() > MAX_RETAINED_QUEUE_CELLS {
+            *self = Self::default();
+        }
+        batches
     }
 }
