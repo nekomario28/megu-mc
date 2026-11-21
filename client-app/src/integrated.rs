@@ -237,6 +237,17 @@ pub const FAIR_PLAY_ENV_ALLOW_WAYPOINT_TELEPORT: &str =
 /// Environment variable carrying the Xaero `§`-coded control signal the
 /// hosted server broadcasts to joining map-mod clients.
 pub const FAIR_PLAY_ENV_XAERO_SIGNAL: &str = "MC_SPINE_FAIR_PLAY_XAERO_SIGNAL";
+/// Environment variable carrying the granular minimap mode
+/// (`unrestricted`/`fair_play`/`disabled`), mirroring the server's
+/// `minimap-mode` key (OPS-4).
+pub const FAIR_PLAY_ENV_MINIMAP_MODE: &str = "MC_SPINE_MINIMAP_MODE";
+/// Environment variable carrying the mob/entity-radar permission under
+/// the server's `allow-mob-radar` spelling (OPS-4).
+pub const FAIR_PLAY_ENV_ALLOW_MOB_RADAR: &str = "MC_SPINE_ALLOW_MOB_RADAR";
+/// Environment variable carrying the player-radar scope
+/// (`all`/`party_only`/`none`), mirroring the server's
+/// `player-radar-scope` key (OPS-4).
+pub const FAIR_PLAY_ENV_PLAYER_RADAR_SCOPE: &str = "MC_SPINE_PLAYER_RADAR_SCOPE";
 
 /// Launch policy carried by a world this client hosts — integrated
 /// (`--quickPlaySingleplayer`), LAN share, or a `MEGU-XXXX-XXXX` friend
@@ -266,8 +277,9 @@ impl IntegratedServerConfig {
 
     /// Deterministic `(name, value)` env pairs for the spawned server,
     /// always emitted in this fixed order: the master switch, the three
-    /// `allow_*` permissions as `true`/`false`, then the Xaero control
-    /// signal.
+    /// `allow_*` permissions as `true`/`false`, the Xaero control signal,
+    /// then the three OPS-4 granular switches (`minimap_mode`,
+    /// `allow_mob_radar`, `player_radar_scope`).
     pub fn env_pairs(&self) -> Vec<(&'static str, String)> {
         let fp = &self.map_fair_play;
         vec![
@@ -285,6 +297,18 @@ impl IntegratedServerConfig {
                 fp.allow_waypoint_teleport.to_string(),
             ),
             (FAIR_PLAY_ENV_XAERO_SIGNAL, self.xaero_control.clone()),
+            (
+                FAIR_PLAY_ENV_MINIMAP_MODE,
+                fp.minimap_mode.as_str().to_string(),
+            ),
+            (
+                FAIR_PLAY_ENV_ALLOW_MOB_RADAR,
+                fp.allow_mob_radar.to_string(),
+            ),
+            (
+                FAIR_PLAY_ENV_PLAYER_RADAR_SCOPE,
+                fp.player_radar_scope.as_str().to_string(),
+            ),
         ]
     }
 

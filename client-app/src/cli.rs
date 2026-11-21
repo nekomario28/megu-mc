@@ -10,9 +10,9 @@ use mc_spine_proto::friend_relay::InviteCode;
 
 use crate::hardware_profile::{probe_host_hardware, recommend_tuning};
 use crate::settings::{
-    ClientSettings, CloudMode, DistantHorizon, ParticleLevel, QualityPreset, MAX_BACKGROUND_FPS,
-    MAX_FOV, MAX_MAX_FPS, MAX_VIEW_DISTANCE, MIN_FOV, MIN_MAX_FPS, MIN_VIEW_DISTANCE,
-    SETTINGS_FILE_NAME,
+    ClientSettings, CloudMode, DistantHorizon, HostMinimapMode, HostPlayerRadarScope,
+    ParticleLevel, QualityPreset, MAX_BACKGROUND_FPS, MAX_FOV, MAX_MAX_FPS, MAX_VIEW_DISTANCE,
+    MIN_FOV, MIN_MAX_FPS, MIN_VIEW_DISTANCE, SETTINGS_FILE_NAME,
 };
 
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -151,14 +151,26 @@ pub struct CliConfig {
     /// host hardware before TOML keys and explicit flags are overlaid.
     pub auto_tune: bool,
     /// `--fair-play`: host the world in map-mod fair-play mode —
-    /// `minimap_fair_play` on with cave map, entity radar and waypoint
-    /// teleport locked unless an `--allow-*` flag re-enables one.
+    /// `minimap_mode` `fair_play` with cave map, mob/entity radar, player
+    /// radar and waypoint teleport locked unless a granular flag
+    /// re-enables one.
     pub fair_play: bool,
+    /// `--minimap-mode <unrestricted|fair_play|disabled>`: explicit
+    /// minimap-mode override applied on top of `--fair-play` or the TOML
+    /// `minimap_mode` key.
+    pub minimap_mode: Option<HostMinimapMode>,
     /// `--allow-cave-map <true|false>`: explicit cave-map override applied
     /// on top of `--fair-play` or the TOML `allow_cave_map` key.
     pub allow_cave_map: Option<bool>,
-    /// `--allow-entity-radar <true|false>`: explicit entity-radar override.
+    /// `--allow-entity-radar <true|false>`: explicit entity-radar
+    /// override — the pre-granular spelling of `--allow-mob-radar`.
     pub allow_entity_radar: Option<bool>,
+    /// `--allow-mob-radar <true|false>`: explicit mob/entity-radar
+    /// override; wins over `--allow-entity-radar` when both are given.
+    pub allow_mob_radar: Option<bool>,
+    /// `--player-radar <all|party_only|none>`: explicit player-radar
+    /// scope override.
+    pub player_radar: Option<HostPlayerRadarScope>,
     /// `--allow-waypoint-teleport <true|false>`: explicit
     /// waypoint-teleport override.
     pub allow_waypoint_teleport: Option<bool>,
@@ -230,8 +242,11 @@ impl Default for CliConfig {
             gpu_backend: None,
             auto_tune: false,
             fair_play: false,
+            minimap_mode: None,
             allow_cave_map: None,
             allow_entity_radar: None,
+            allow_mob_radar: None,
+            player_radar: None,
             allow_waypoint_teleport: None,
             view_distance_explicit: false,
             client_settings: ClientSettings::default(),
@@ -299,8 +314,11 @@ impl fmt::Debug for CliConfig {
             .field("gpu_backend", &self.gpu_backend)
             .field("auto_tune", &self.auto_tune)
             .field("fair_play", &self.fair_play)
+            .field("minimap_mode", &self.minimap_mode)
             .field("allow_cave_map", &self.allow_cave_map)
             .field("allow_entity_radar", &self.allow_entity_radar)
+            .field("allow_mob_radar", &self.allow_mob_radar)
+            .field("player_radar", &self.player_radar)
             .field("allow_waypoint_teleport", &self.allow_waypoint_teleport)
             .field("view_distance_explicit", &self.view_distance_explicit)
             .field("client_settings", &self.client_settings)
@@ -460,21 +478,39 @@ impl CliConfig {
             settings.gpu_backend = value;
             tuned = true;
         }
-        // Host fair-play policy: `--fair-play` locks all three allowances,
-        // then each `--allow-*` flag re-enables its own feature. These are
-        // host-policy flags, not quality-preset dimensions, so they do not
-        // mark the preset `Custom`.
+        // Host fair-play policy: `--fair-play` switches the minimap into
+        // fair-play mode and locks every granular switch, then each
+        // `--minimap-mode`/`--allow-*`/`--player-radar` flag refines its
+        // own dimension. These are host-policy flags, not quality-preset
+        // dimensions, so they do not mark the preset `Custom`. The legacy
+        // mirrors stay in sync: `minimap_fair_play` is `minimap_mode !=
+        // Unrestricted` and `allow_entity_radar` is `allow_mob_radar`.
         if self.fair_play {
             settings.map_fair_play.minimap_fair_play = true;
+            settings.map_fair_play.minimap_mode = HostMinimapMode::FairPlay;
             settings.map_fair_play.allow_cave_map = false;
             settings.map_fair_play.allow_entity_radar = false;
+            settings.map_fair_play.allow_mob_radar = false;
+            settings.map_fair_play.player_radar_scope = HostPlayerRadarScope::None;
             settings.map_fair_play.allow_waypoint_teleport = false;
+        }
+        if let Some(mode) = self.minimap_mode {
+            settings.map_fair_play.minimap_mode = mode;
+            settings.map_fair_play.minimap_fair_play = mode != HostMinimapMode::Unrestricted;
         }
         if let Some(value) = self.allow_cave_map {
             settings.map_fair_play.allow_cave_map = value;
         }
         if let Some(value) = self.allow_entity_radar {
             settings.map_fair_play.allow_entity_radar = value;
+            settings.map_fair_play.allow_mob_radar = value;
+        }
+        if let Some(value) = self.allow_mob_radar {
+            settings.map_fair_play.allow_entity_radar = value;
+            settings.map_fair_play.allow_mob_radar = value;
+        }
+        if let Some(scope) = self.player_radar {
+            settings.map_fair_play.player_radar_scope = scope;
         }
         if let Some(value) = self.allow_waypoint_teleport {
             settings.map_fair_play.allow_waypoint_teleport = value;
@@ -812,11 +848,28 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
             }
             "--auto-tune" => cfg.auto_tune = true,
             "--fair-play" => cfg.fair_play = true,
+            "--minimap-mode" => {
+                let raw = take_val(flag, &mut i)?;
+                cfg.minimap_mode = Some(HostMinimapMode::parse(&raw).ok_or_else(|| {
+                    format!(
+                        "invalid --minimap-mode '{raw}' (expected unrestricted, fair_play, or disabled)"
+                    )
+                })?);
+            }
             "--allow-cave-map" => {
                 cfg.allow_cave_map = Some(parse_on_off(&take_val(flag, &mut i)?, flag)?);
             }
             "--allow-entity-radar" => {
                 cfg.allow_entity_radar = Some(parse_on_off(&take_val(flag, &mut i)?, flag)?);
+            }
+            "--allow-mob-radar" => {
+                cfg.allow_mob_radar = Some(parse_on_off(&take_val(flag, &mut i)?, flag)?);
+            }
+            "--player-radar" => {
+                let raw = take_val(flag, &mut i)?;
+                cfg.player_radar = Some(HostPlayerRadarScope::parse(&raw).ok_or_else(|| {
+                    format!("invalid --player-radar '{raw}' (expected all, party_only, or none)")
+                })?);
             }
             "--allow-waypoint-teleport" => {
                 cfg.allow_waypoint_teleport =
@@ -985,14 +1038,24 @@ PLAYER SETTINGS:
 HOST WORLD MAP FAIR PLAY:
   Applied when this client hosts a world (--quickPlaySingleplayer, LAN
   share, or a MEGU-XXXX-XXXX friend relay) and forwarded to the spawned
-  mc-spine server as MC_SPINE_FAIR_PLAY* environment variables plus the
-  Xaero §-coded control signal.
-  --fair-play                      Enable map-mod fair play: cave map, entity
-                                   radar, and waypoint teleport default OFF;
-                                   re-enable individually with the flags below
+  mc-spine server as MC_SPINE_FAIR_PLAY*, MC_SPINE_MINIMAP_MODE,
+  MC_SPINE_ALLOW_MOB_RADAR and MC_SPINE_PLAYER_RADAR_SCOPE environment
+  variables plus the Xaero §-coded control signal. The five granular
+  switches mirror the server's minimap-mode / allow-cave-map /
+  allow-mob-radar / player-radar-scope / allow-waypoint-teleport keys.
+  --fair-play                      Enable map-mod fair play: minimap mode
+                                   fair_play with cave map, mob radar,
+                                   player radar, and waypoint teleport all
+                                   OFF; re-enable individually below
+  --minimap-mode <mode>            Minimap policy: unrestricted|fair_play|
+                                   disabled (default: unrestricted)
   --allow-cave-map <true|false>    Allow Xaero cave-map mode (default off
                                    under --fair-play, on otherwise)
-  --allow-entity-radar <t|f>       Allow Xaero entity radar (same defaulting)
+  --allow-mob-radar <true|false>   Allow mob/entity radar (same defaulting)
+  --allow-entity-radar <t|f>       Legacy spelling of --allow-mob-radar
+  --player-radar <scope>           Player radar scope: all|party_only|none
+                                   (default none under --fair-play, all
+                                   otherwise)
   --allow-waypoint-teleport <t|f>  Allow world-map waypoint teleport (same)
 "
     )

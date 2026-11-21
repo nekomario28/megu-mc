@@ -181,26 +181,85 @@ pub const XAERO_NO_CAVE_MAP_SIGNAL: &str = "§n§o§c§a§v§e§m§a§p§x§a§e
 /// Selective Xaero control signal locking entity radar only.
 pub const XAERO_NO_ENTITY_RADAR_SIGNAL: &str = "§n§o§e§n§t§i§t§y§r§a§d§a§r§x§a§e§r§o";
 
+/// `minimap_mode`: how much minimap/world-map mods may do in a world this
+/// client hosts — 1:1 with the server's `minimap-mode` key (OPS-4).
+///
+/// Default-permissive by contract: an absent TOML key reads as
+/// [`HostMinimapMode::Unrestricted`], so no map feature is ever locked
+/// unless the host opts in. [`HostMinimapMode::parse`] fails closed —
+/// an unrecognized token is `None`, never a guess.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostMinimapMode {
+    /// Map mods run with every feature enabled (the default).
+    Unrestricted,
+    /// Maps run, gated by the host's `allow_*` restriction switches.
+    FairPlay,
+    /// No minimap/world-map features at all.
+    Disabled,
+}
+
+/// `player_radar_scope`: who may appear on a player's map radar — 1:1 with
+/// the server's `player-radar-scope` key (OPS-4). Like
+/// [`HostMinimapMode`], absent reads as the permissive default
+/// [`HostPlayerRadarScope::All`] and [`HostPlayerRadarScope::parse`] fails
+/// closed on an unrecognized token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostPlayerRadarScope {
+    /// Every player is visible on every radar (the default).
+    All,
+    /// Self, operators, and party members / allies only.
+    PartyOnly,
+    /// Self and operators only — nobody else appears on the radar.
+    None,
+}
+
+named_option!(HostMinimapMode, HostMinimapMode::Unrestricted,
+    Unrestricted => "unrestricted", FairPlay => "fair_play", Disabled => "disabled");
+named_option!(HostPlayerRadarScope, HostPlayerRadarScope::All,
+    All => "all", PartyOnly => "party_only", None => "none");
+
 /// Map-mod fair-play policy for a world this client hosts directly
 /// (integrated server, LAN share, or a `MEGU-XXXX-XXXX` friend relay).
 ///
+/// The canonical state is the five-switch granular policy shared with the
+/// server (OPS-4): `minimap_mode`, `allow_cave_map`, `allow_mob_radar`,
+/// `player_radar_scope` and `allow_waypoint_teleport`. The pre-granular
+/// spellings survive for backward compatibility: `minimap_fair_play`
+/// mirrors `minimap_mode != Unrestricted` (TOML `minimap_fair_play` maps
+/// onto the mode), and `allow_entity_radar` mirrors `allow_mob_radar` —
+/// every parser and resolver keeps each mirrored pair in sync.
+///
 /// Xaero's Minimap/WorldMap honor server-sent `§`-coded control strings that
-/// lock cave-map mode and entity radar; the waypoint-teleport flag carries
-/// the same idea for world-map teleports and is forwarded to the hosted
-/// server alongside the control signal (see `integrated.rs`). All four
-/// fields are optional TOML keys and keep their permissive defaults when a
-/// settings file written before this feature omits them.
+/// lock cave-map mode and entity radar; the waypoint-teleport and
+/// player-radar flags carry the same idea and are forwarded to the hosted
+/// server as env vars alongside the control signal (see `integrated.rs`).
+/// All seven keys are optional in TOML and keep their permissive defaults
+/// when a settings file written before this feature omits them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostMapFairPlaySettings {
-    /// Master switch: when `false`, hosted clients get
-    /// [`XAERO_RESET_SIGNAL`] regardless of the `allow_*` flags.
+    /// Legacy master switch: `true` whenever the hosted world restricts
+    /// map mods, i.e. `minimap_mode != HostMinimapMode::Unrestricted` —
+    /// the parsers and resolvers keep the two in sync. When `false`,
+    /// hosted clients get [`XAERO_RESET_SIGNAL`] regardless of the
+    /// `allow_*` flags.
     pub minimap_fair_play: bool,
     /// Cave-map mode (below-ground ore/cave exposure) stays allowed.
     pub allow_cave_map: bool,
-    /// Entity radar stays allowed.
+    /// Entity radar stays allowed — the pre-granular spelling of
+    /// `allow_mob_radar`; the two fields always carry the same value.
     pub allow_entity_radar: bool,
     /// World-map waypoint teleportation stays allowed.
     pub allow_waypoint_teleport: bool,
+    /// Granular minimap mode: `unrestricted` (default), `fair_play`
+    /// (maps run gated by the `allow_*` switches) or `disabled` (no map
+    /// features at all).
+    pub minimap_mode: HostMinimapMode,
+    /// Mob/entity radar stays allowed — the server-parity spelling of
+    /// `allow_entity_radar`.
+    pub allow_mob_radar: bool,
+    /// Who may appear on hosted players' map radar: `all` (default),
+    /// `party_only`, or `none`.
+    pub player_radar_scope: HostPlayerRadarScope,
 }
 
 impl Default for HostMapFairPlaySettings {
@@ -210,30 +269,40 @@ impl Default for HostMapFairPlaySettings {
             allow_cave_map: true,
             allow_entity_radar: true,
             allow_waypoint_teleport: true,
+            minimap_mode: HostMinimapMode::Unrestricted,
+            allow_mob_radar: true,
+            player_radar_scope: HostPlayerRadarScope::All,
         }
     }
 }
 
 impl HostMapFairPlaySettings {
     /// The `§`-coded control signal a hosted server broadcasts to joining
-    /// clients. Deterministic: [`XAERO_RESET_SIGNAL`] when fair play is off,
-    /// [`XAERO_FAIR_PLAY_SIGNAL`] when it is on with cave maps and entity
-    /// radar both locked, otherwise the reset signal followed by the
-    /// selective lock code for each feature that stays blocked.
-    /// `allow_waypoint_teleport` is not a Xaero `§`-code feature — it rides
-    /// the `MC_SPINE_FAIR_PLAY_ALLOW_WAYPOINT_TELEPORT` env var instead.
+    /// clients. Deterministic: [`XAERO_RESET_SIGNAL`] when no restriction
+    /// applies (fair play off and `minimap_mode` `Unrestricted`),
+    /// [`XAERO_FAIR_PLAY_SIGNAL`] under `Disabled` mode — the strongest
+    /// Xaero lock, since the protocol has no dedicated disable code — or
+    /// when cave maps and entity radar are both locked, otherwise the
+    /// reset signal followed by the selective lock code for each feature
+    /// that stays blocked. `allow_waypoint_teleport` and
+    /// `player_radar_scope` are not Xaero `§`-code features — they ride
+    /// env vars to the hosted server instead.
     pub fn xaero_control_string(&self) -> String {
-        if !self.minimap_fair_play {
+        let restricted =
+            self.minimap_fair_play || self.minimap_mode != HostMinimapMode::Unrestricted;
+        if !restricted {
             return XAERO_RESET_SIGNAL.to_string();
         }
-        if !self.allow_cave_map && !self.allow_entity_radar {
+        let cave_locked = !self.allow_cave_map;
+        let radar_locked = !self.allow_entity_radar || !self.allow_mob_radar;
+        if self.minimap_mode == HostMinimapMode::Disabled || (cave_locked && radar_locked) {
             return XAERO_FAIR_PLAY_SIGNAL.to_string();
         }
         let mut signal = String::from(XAERO_RESET_SIGNAL);
-        if !self.allow_cave_map {
+        if cave_locked {
             signal.push_str(XAERO_NO_CAVE_MAP_SIGNAL);
         }
-        if !self.allow_entity_radar {
+        if radar_locked {
             signal.push_str(XAERO_NO_ENTITY_RADAR_SIGNAL);
         }
         signal
@@ -371,7 +440,10 @@ impl ClientSettings {
              minimap_fair_play = {}\n\
              allow_cave_map = {}\n\
              allow_entity_radar = {}\n\
-             allow_waypoint_teleport = {}\n",
+             allow_waypoint_teleport = {}\n\
+             minimap_mode = \"{}\"\n\
+             allow_mob_radar = {}\n\
+             player_radar_scope = \"{}\"\n",
             self.preset.as_str(),
             self.view_distance,
             self.distant_horizon.as_str(),
@@ -388,6 +460,9 @@ impl ClientSettings {
             self.map_fair_play.allow_cave_map,
             self.map_fair_play.allow_entity_radar,
             self.map_fair_play.allow_waypoint_teleport,
+            self.map_fair_play.minimap_mode.as_str(),
+            self.map_fair_play.allow_mob_radar,
+            self.map_fair_play.player_radar_scope.as_str(),
         )
     }
 
@@ -421,16 +496,23 @@ impl ClientSettings {
                     self.background_fps_limit = parsed.background_fps_limit;
                 }
                 "gpu_backend" => self.gpu_backend = parsed.gpu_backend,
-                "minimap_fair_play" => {
+                "minimap_fair_play" | "minimap_mode" => {
+                    // The mirrored pair is already consistent in `parsed`.
                     self.map_fair_play.minimap_fair_play =
                         parsed.map_fair_play.minimap_fair_play;
+                    self.map_fair_play.minimap_mode = parsed.map_fair_play.minimap_mode;
                 }
                 "allow_cave_map" => {
                     self.map_fair_play.allow_cave_map = parsed.map_fair_play.allow_cave_map;
                 }
-                "allow_entity_radar" => {
+                "allow_entity_radar" | "allow_mob_radar" => {
                     self.map_fair_play.allow_entity_radar =
                         parsed.map_fair_play.allow_entity_radar;
+                    self.map_fair_play.allow_mob_radar = parsed.map_fair_play.allow_mob_radar;
+                }
+                "player_radar_scope" => {
+                    self.map_fair_play.player_radar_scope =
+                        parsed.map_fair_play.player_radar_scope;
                 }
                 "allow_waypoint_teleport" => {
                     self.map_fair_play.allow_waypoint_teleport =
@@ -592,8 +674,25 @@ impl ClientSettings {
                 },
                 "minimap_fair_play" => match parse_bool(value) {
                     Some(b) => {
+                        // Legacy master switch maps onto the granular
+                        // mode: `true` is the pre-granular full lock gate,
+                        // `false` leaves minimaps unrestricted.
                         settings.map_fair_play.minimap_fair_play = b;
+                        settings.map_fair_play.minimap_mode = if b {
+                            HostMinimapMode::FairPlay
+                        } else {
+                            HostMinimapMode::Unrestricted
+                        };
                         seen.push("minimap_fair_play");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "minimap_mode" => match HostMinimapMode::parse(value) {
+                    Some(m) => {
+                        settings.map_fair_play.minimap_mode = m;
+                        settings.map_fair_play.minimap_fair_play =
+                            m != HostMinimapMode::Unrestricted;
+                        seen.push("minimap_mode");
                     }
                     None => invalid(&mut warnings),
                 },
@@ -606,8 +705,26 @@ impl ClientSettings {
                 },
                 "allow_entity_radar" => match parse_bool(value) {
                     Some(b) => {
+                        // One switch, two spellings — keep the mirror in
+                        // sync no matter which the file uses.
                         settings.map_fair_play.allow_entity_radar = b;
+                        settings.map_fair_play.allow_mob_radar = b;
                         seen.push("allow_entity_radar");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "allow_mob_radar" => match parse_bool(value) {
+                    Some(b) => {
+                        settings.map_fair_play.allow_entity_radar = b;
+                        settings.map_fair_play.allow_mob_radar = b;
+                        seen.push("allow_mob_radar");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "player_radar_scope" => match HostPlayerRadarScope::parse(value) {
+                    Some(s) => {
+                        settings.map_fair_play.player_radar_scope = s;
+                        seen.push("player_radar_scope");
                     }
                     None => invalid(&mut warnings),
                 },
@@ -863,6 +980,9 @@ mod tests {
                 allow_cave_map: false,
                 allow_entity_radar: false,
                 allow_waypoint_teleport: false,
+                minimap_mode: HostMinimapMode::FairPlay,
+                allow_mob_radar: false,
+                player_radar_scope: HostPlayerRadarScope::None,
             },
         };
         let text = s.to_toml();

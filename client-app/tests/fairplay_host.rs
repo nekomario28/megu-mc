@@ -16,11 +16,13 @@ use mc_spine_client::cli::{help_text, parse_args};
 use mc_spine_client::hardware_profile::{probe_host_hardware, recommend_tuning};
 use mc_spine_client::integrated::{
     IntegratedServerConfig, FAIR_PLAY_ENV_ALLOW_CAVE_MAP, FAIR_PLAY_ENV_ALLOW_ENTITY_RADAR,
-    FAIR_PLAY_ENV_ALLOW_WAYPOINT_TELEPORT, FAIR_PLAY_ENV_ENABLED, FAIR_PLAY_ENV_XAERO_SIGNAL,
+    FAIR_PLAY_ENV_ALLOW_MOB_RADAR, FAIR_PLAY_ENV_ALLOW_WAYPOINT_TELEPORT,
+    FAIR_PLAY_ENV_ENABLED, FAIR_PLAY_ENV_MINIMAP_MODE, FAIR_PLAY_ENV_PLAYER_RADAR_SCOPE,
+    FAIR_PLAY_ENV_XAERO_SIGNAL,
 };
 use mc_spine_client::settings::{
-    ClientSettings, HostMapFairPlaySettings, XAERO_FAIR_PLAY_SIGNAL,
-    XAERO_NO_ENTITY_RADAR_SIGNAL, XAERO_RESET_SIGNAL,
+    ClientSettings, HostMapFairPlaySettings, HostMinimapMode, HostPlayerRadarScope,
+    XAERO_FAIR_PLAY_SIGNAL, XAERO_NO_ENTITY_RADAR_SIGNAL, XAERO_RESET_SIGNAL,
 };
 use mc_spine_client_mesh::gpu_pipeline::RenderBackendPreference;
 
@@ -49,12 +51,27 @@ fn fair_play_toml_roundtrip_is_lossless() {
             allow_cave_map: false,
             allow_entity_radar: false,
             allow_waypoint_teleport: false,
+            minimap_mode: HostMinimapMode::FairPlay,
+            allow_mob_radar: false,
+            player_radar_scope: HostPlayerRadarScope::None,
         },
         HostMapFairPlaySettings {
             minimap_fair_play: true,
             allow_cave_map: true,
             allow_entity_radar: false,
             allow_waypoint_teleport: true,
+            minimap_mode: HostMinimapMode::FairPlay,
+            allow_mob_radar: false,
+            player_radar_scope: HostPlayerRadarScope::PartyOnly,
+        },
+        HostMapFairPlaySettings {
+            minimap_fair_play: true,
+            allow_cave_map: true,
+            allow_entity_radar: true,
+            allow_waypoint_teleport: true,
+            minimap_mode: HostMinimapMode::Disabled,
+            allow_mob_radar: true,
+            player_radar_scope: HostPlayerRadarScope::All,
         },
     ] {
         let mut s = ClientSettings::default();
@@ -76,6 +93,11 @@ fn fair_play_omitted_keys_keep_permissive_defaults() {
     assert!(s.map_fair_play.allow_cave_map);
     assert!(s.map_fair_play.allow_entity_radar);
     assert!(s.map_fair_play.allow_waypoint_teleport);
+    // The granular switches default permissive too: unrestricted minimap,
+    // mob radar on, every player on the radar.
+    assert_eq!(s.map_fair_play.minimap_mode, HostMinimapMode::Unrestricted);
+    assert!(s.map_fair_play.allow_mob_radar);
+    assert_eq!(s.map_fair_play.player_radar_scope, HostPlayerRadarScope::All);
     assert!(warnings.is_empty());
 
     // apply_toml overlays only the keys a file defines.
@@ -85,16 +107,26 @@ fn fair_play_omitted_keys_keep_permissive_defaults() {
         allow_cave_map: false,
         allow_entity_radar: false,
         allow_waypoint_teleport: true,
+        minimap_mode: HostMinimapMode::FairPlay,
+        allow_mob_radar: false,
+        player_radar_scope: HostPlayerRadarScope::PartyOnly,
     };
     let warnings = s.apply_toml("view_distance = 14\n");
     assert!(warnings.is_empty());
     assert_eq!(s.map_fair_play.allow_entity_radar, false);
     s.apply_toml("allow_entity_radar = true\n");
     assert!(s.map_fair_play.allow_entity_radar);
+    // The mob-radar mirror moved with the legacy spelling.
+    assert!(s.map_fair_play.allow_mob_radar);
     // Keys the file never defined are untouched.
     assert!(s.map_fair_play.minimap_fair_play);
+    assert_eq!(s.map_fair_play.minimap_mode, HostMinimapMode::FairPlay);
     assert!(!s.map_fair_play.allow_cave_map);
     assert!(s.map_fair_play.allow_waypoint_teleport);
+    assert_eq!(
+        s.map_fair_play.player_radar_scope,
+        HostPlayerRadarScope::PartyOnly
+    );
 }
 
 #[test]
@@ -145,6 +177,9 @@ fn xaero_control_string_is_deterministic() {
             allow_cave_map: allow,
             allow_entity_radar: allow,
             allow_waypoint_teleport: allow,
+            minimap_mode: HostMinimapMode::Unrestricted,
+            allow_mob_radar: allow,
+            player_radar_scope: HostPlayerRadarScope::All,
         };
         assert_eq!(fp.xaero_control_string(), XAERO_RESET_SIGNAL);
     }
@@ -156,6 +191,9 @@ fn xaero_control_string_is_deterministic() {
         allow_cave_map: false,
         allow_entity_radar: false,
         allow_waypoint_teleport: false,
+        minimap_mode: HostMinimapMode::FairPlay,
+        allow_mob_radar: false,
+        player_radar_scope: HostPlayerRadarScope::None,
     };
     assert_eq!(fp.xaero_control_string(), "§f§a§i§r§x§a§e§r§o");
     assert_eq!(fp.xaero_control_string(), XAERO_FAIR_PLAY_SIGNAL);
@@ -167,11 +205,22 @@ fn xaero_control_string_is_deterministic() {
         allow_cave_map: true,
         allow_entity_radar: false,
         allow_waypoint_teleport: false,
+        minimap_mode: HostMinimapMode::FairPlay,
+        allow_mob_radar: false,
+        player_radar_scope: HostPlayerRadarScope::All,
     };
     let signal = fp.xaero_control_string();
     assert!(signal.starts_with(XAERO_RESET_SIGNAL));
     assert!(signal.contains(XAERO_NO_ENTITY_RADAR_SIGNAL));
     assert!(!signal.contains(XAERO_FAIR_PLAY_SIGNAL));
+
+    // `Disabled` mode emits the strongest lock the Xaero protocol can
+    // express; the granular mode itself rides the env var.
+    let fp = HostMapFairPlaySettings {
+        minimap_mode: HostMinimapMode::Disabled,
+        ..HostMapFairPlaySettings::default()
+    };
+    assert_eq!(fp.xaero_control_string(), XAERO_FAIR_PLAY_SIGNAL);
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +239,11 @@ fn fair_play_flag_locks_all_features_and_emits_fairxaero() {
     assert!(!fp.allow_cave_map);
     assert!(!fp.allow_entity_radar);
     assert!(!fp.allow_waypoint_teleport);
+    // The granular switches lock too: fair_play mode, mob radar off,
+    // player radar fully hidden.
+    assert_eq!(fp.minimap_mode, HostMinimapMode::FairPlay);
+    assert!(!fp.allow_mob_radar);
+    assert_eq!(fp.player_radar_scope, HostPlayerRadarScope::None);
 
     // The hosted-server config carries the exact policy: the pinned Xaero
     // control string plus deterministic env pairs.
@@ -198,12 +252,15 @@ fn fair_play_flag_locks_all_features_and_emits_fairxaero() {
     assert_eq!(config.xaero_control, "§f§a§i§r§x§a§e§r§o");
 
     let env = env_map(&config);
-    assert_eq!(env.len(), 5);
+    assert_eq!(env.len(), 8);
     assert_eq!(env["MC_SPINE_FAIR_PLAY"], "true");
     assert_eq!(env["MC_SPINE_FAIR_PLAY_ALLOW_CAVE_MAP"], "false");
     assert_eq!(env["MC_SPINE_FAIR_PLAY_ALLOW_ENTITY_RADAR"], "false");
     assert_eq!(env["MC_SPINE_FAIR_PLAY_ALLOW_WAYPOINT_TELEPORT"], "false");
     assert_eq!(env["MC_SPINE_FAIR_PLAY_XAERO_SIGNAL"], "§f§a§i§r§x§a§e§r§o");
+    assert_eq!(env["MC_SPINE_MINIMAP_MODE"], "fair_play");
+    assert_eq!(env["MC_SPINE_ALLOW_MOB_RADAR"], "false");
+    assert_eq!(env["MC_SPINE_PLAYER_RADAR_SCOPE"], "none");
     // The public constant names line up with the emitted keys.
     assert_eq!(FAIR_PLAY_ENV_ENABLED, "MC_SPINE_FAIR_PLAY");
     assert_eq!(FAIR_PLAY_ENV_ALLOW_CAVE_MAP, "MC_SPINE_FAIR_PLAY_ALLOW_CAVE_MAP");
@@ -219,6 +276,12 @@ fn fair_play_flag_locks_all_features_and_emits_fairxaero() {
         FAIR_PLAY_ENV_XAERO_SIGNAL,
         "MC_SPINE_FAIR_PLAY_XAERO_SIGNAL"
     );
+    assert_eq!(FAIR_PLAY_ENV_MINIMAP_MODE, "MC_SPINE_MINIMAP_MODE");
+    assert_eq!(FAIR_PLAY_ENV_ALLOW_MOB_RADAR, "MC_SPINE_ALLOW_MOB_RADAR");
+    assert_eq!(
+        FAIR_PLAY_ENV_PLAYER_RADAR_SCOPE,
+        "MC_SPINE_PLAYER_RADAR_SCOPE"
+    );
 
     // A default (non-fair-play) run resets the client's map-mod features.
     let mut cfg = parse_args::<&str>(&[]).unwrap();
@@ -230,6 +293,9 @@ fn fair_play_flag_locks_all_features_and_emits_fairxaero() {
     assert_eq!(env["MC_SPINE_FAIR_PLAY_ALLOW_CAVE_MAP"], "true");
     assert_eq!(env["MC_SPINE_FAIR_PLAY_ALLOW_ENTITY_RADAR"], "true");
     assert_eq!(env["MC_SPINE_FAIR_PLAY_ALLOW_WAYPOINT_TELEPORT"], "true");
+    assert_eq!(env["MC_SPINE_MINIMAP_MODE"], "unrestricted");
+    assert_eq!(env["MC_SPINE_ALLOW_MOB_RADAR"], "true");
+    assert_eq!(env["MC_SPINE_PLAYER_RADAR_SCOPE"], "all");
 }
 
 #[test]
@@ -360,6 +426,211 @@ fn fair_play_flags_fail_closed_on_bad_booleans() {
 }
 
 // ---------------------------------------------------------------------------
+// Granular 5-switch policy (--minimap-mode / --allow-mob-radar / --player-radar)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fair_play_with_player_radar_party_only() {
+    // `--fair-play --player-radar party_only`: minimap ON (fair_play
+    // mode) + cave/mob radar OFF + party/team player radar ON.
+    let dir = empty_scratch_dir("fp-party");
+    let mut cfg = parse_args(&["--fair-play", "--player-radar", "party_only"]).unwrap();
+    assert_eq!(cfg.player_radar, Some(HostPlayerRadarScope::PartyOnly));
+    cfg.resolve_client_settings_from(&dir).unwrap();
+
+    let fp = cfg.client_settings.map_fair_play;
+    assert!(fp.minimap_fair_play);
+    assert_eq!(fp.minimap_mode, HostMinimapMode::FairPlay);
+    assert!(!fp.allow_cave_map);
+    assert!(!fp.allow_entity_radar);
+    assert!(!fp.allow_mob_radar);
+    assert_eq!(fp.player_radar_scope, HostPlayerRadarScope::PartyOnly);
+    assert!(!fp.allow_waypoint_teleport);
+
+    let config = IntegratedServerConfig::from_settings(&cfg.client_settings);
+    let env = env_map(&config);
+    assert_eq!(env["MC_SPINE_FAIR_PLAY"], "true");
+    assert_eq!(env["MC_SPINE_MINIMAP_MODE"], "fair_play");
+    assert_eq!(env["MC_SPINE_ALLOW_MOB_RADAR"], "false");
+    assert_eq!(env["MC_SPINE_PLAYER_RADAR_SCOPE"], "party_only");
+    // Cave map + mob radar both locked -> the blanket fair-play signal.
+    assert_eq!(env["MC_SPINE_FAIR_PLAY_XAERO_SIGNAL"], XAERO_FAIR_PLAY_SIGNAL);
+
+    // Every player-radar token parses, case-insensitively.
+    for (token, want) in [
+        ("all", HostPlayerRadarScope::All),
+        ("party_only", HostPlayerRadarScope::PartyOnly),
+        ("none", HostPlayerRadarScope::None),
+        ("PARTY_ONLY", HostPlayerRadarScope::PartyOnly),
+    ] {
+        let cfg = parse_args(&["--player-radar", token]).unwrap();
+        assert_eq!(cfg.player_radar, Some(want), "{token}");
+    }
+}
+
+#[test]
+fn minimap_mode_flag_parses_and_disables() {
+    let dir = empty_scratch_dir("fp-mode");
+    // `--minimap-mode disabled` blocks map mods entirely: the master
+    // switch mirrors the mode and the hosted server gets the strongest
+    // Xaero lock available plus the granular env var.
+    let mut cfg = parse_args(&["--minimap-mode", "disabled"]).unwrap();
+    assert_eq!(cfg.minimap_mode, Some(HostMinimapMode::Disabled));
+    cfg.resolve_client_settings_from(&dir).unwrap();
+
+    let fp = cfg.client_settings.map_fair_play;
+    assert_eq!(fp.minimap_mode, HostMinimapMode::Disabled);
+    assert!(fp.minimap_fair_play);
+    // The allow switches keep their permissive defaults — the mode alone
+    // carries the restriction.
+    assert!(fp.allow_cave_map);
+    assert!(fp.allow_mob_radar);
+
+    let config = IntegratedServerConfig::from_settings(&cfg.client_settings);
+    assert_eq!(config.xaero_control, XAERO_FAIR_PLAY_SIGNAL);
+    let env = env_map(&config);
+    assert_eq!(env["MC_SPINE_FAIR_PLAY"], "true");
+    assert_eq!(env["MC_SPINE_MINIMAP_MODE"], "disabled");
+
+    // `unrestricted` is the explicit no-restriction spelling.
+    let mut cfg = parse_args(&["--minimap-mode", "unrestricted"]).unwrap();
+    cfg.resolve_client_settings_from(&dir).unwrap();
+    let fp = cfg.client_settings.map_fair_play;
+    assert_eq!(fp.minimap_mode, HostMinimapMode::Unrestricted);
+    assert!(!fp.minimap_fair_play);
+    assert_eq!(
+        IntegratedServerConfig::from_settings(&cfg.client_settings).xaero_control,
+        XAERO_RESET_SIGNAL
+    );
+
+    // `fair_play` alone gates the map features by the allow switches,
+    // which keep their permissive defaults — mirroring the server, where
+    // minimap-mode=fair_play without allow-* keys restricts nothing.
+    let mut cfg = parse_args(&["--minimap-mode", "fair_play"]).unwrap();
+    cfg.resolve_client_settings_from(&dir).unwrap();
+    let fp = cfg.client_settings.map_fair_play;
+    assert_eq!(fp.minimap_mode, HostMinimapMode::FairPlay);
+    assert!(fp.minimap_fair_play);
+    assert!(fp.allow_cave_map);
+    assert!(fp.allow_mob_radar);
+    assert_eq!(fp.player_radar_scope, HostPlayerRadarScope::All);
+    assert_eq!(
+        IntegratedServerConfig::from_settings(&cfg.client_settings).xaero_control,
+        XAERO_RESET_SIGNAL
+    );
+
+    // Every token parses, case-insensitively; the inline form works.
+    for (token, want) in [
+        ("unrestricted", HostMinimapMode::Unrestricted),
+        ("fair_play", HostMinimapMode::FairPlay),
+        ("disabled", HostMinimapMode::Disabled),
+        ("FAIR_PLAY", HostMinimapMode::FairPlay),
+    ] {
+        let cfg = parse_args(&["--minimap-mode", token]).unwrap();
+        assert_eq!(cfg.minimap_mode, Some(want), "{token}");
+    }
+    let cfg = parse_args(&["--minimap-mode=disabled"]).unwrap();
+    assert_eq!(cfg.minimap_mode, Some(HostMinimapMode::Disabled));
+}
+
+#[test]
+fn mob_radar_flag_aliases_entity_radar() {
+    let dir = empty_scratch_dir("fp-mob");
+    // `--allow-mob-radar` and `--allow-entity-radar` write the same
+    // switch; both mirrors stay equal no matter which flag is used.
+    let mut cfg = parse_args(&["--allow-mob-radar", "false"]).unwrap();
+    cfg.resolve_client_settings_from(&dir).unwrap();
+    let fp = cfg.client_settings.map_fair_play;
+    assert!(!fp.allow_mob_radar);
+    assert!(!fp.allow_entity_radar);
+
+    let mut cfg = parse_args(&["--allow-entity-radar", "true"]).unwrap();
+    cfg.resolve_client_settings_from(&dir).unwrap();
+    let fp = cfg.client_settings.map_fair_play;
+    assert!(fp.allow_mob_radar);
+    assert!(fp.allow_entity_radar);
+
+    // Both spellings in one invocation: the server-parity flag wins.
+    let mut cfg =
+        parse_args(&["--allow-entity-radar", "true", "--allow-mob-radar", "false"]).unwrap();
+    cfg.resolve_client_settings_from(&dir).unwrap();
+    let fp = cfg.client_settings.map_fair_play;
+    assert!(!fp.allow_mob_radar);
+    assert!(!fp.allow_entity_radar);
+}
+
+#[test]
+fn granular_toml_keys_parse_and_overlay() {
+    // The granular spellings parse flat and under the section header.
+    let (s, warnings) = ClientSettings::from_toml(
+        "[host_map_fair_play]\n\
+         minimap_mode = \"disabled\"\n\
+         allow_mob_radar = false\n\
+         player_radar_scope = \"party_only\"\n",
+    );
+    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    let fp = s.map_fair_play;
+    assert_eq!(fp.minimap_mode, HostMinimapMode::Disabled);
+    // A non-unrestricted mode mirrors into the legacy master switch.
+    assert!(fp.minimap_fair_play);
+    assert!(!fp.allow_mob_radar);
+    assert!(!fp.allow_entity_radar);
+    assert_eq!(fp.player_radar_scope, HostPlayerRadarScope::PartyOnly);
+    // Untouched keys keep permissive defaults.
+    assert!(fp.allow_cave_map);
+    assert!(fp.allow_waypoint_teleport);
+
+    // The legacy `minimap_fair_play` bool maps onto the mode: `true`
+    // reads as fair_play, `false` as unrestricted.
+    let (s, warnings) = ClientSettings::from_toml("minimap_fair_play = true\n");
+    assert!(warnings.is_empty());
+    assert!(s.map_fair_play.minimap_fair_play);
+    assert_eq!(s.map_fair_play.minimap_mode, HostMinimapMode::FairPlay);
+    let (s, warnings) = ClientSettings::from_toml(
+        "minimap_mode = \"disabled\"\nminimap_fair_play = false\n",
+    );
+    assert!(warnings.is_empty());
+    // Last key wins, exactly like server.properties.
+    assert_eq!(s.map_fair_play.minimap_mode, HostMinimapMode::Unrestricted);
+    assert!(!s.map_fair_play.minimap_fair_play);
+
+    // Invalid enum tokens warn and keep the permissive default, like
+    // every other named-option key in this file.
+    let (s, warnings) = ClientSettings::from_toml(
+        "minimap_mode = \"bogus\"\nplayer_radar_scope = \"everyone\"\n",
+    );
+    assert_eq!(s.map_fair_play.minimap_mode, HostMinimapMode::Unrestricted);
+    assert_eq!(s.map_fair_play.player_radar_scope, HostPlayerRadarScope::All);
+    assert!(warnings.iter().any(|w| w.contains("minimap_mode")));
+    assert!(warnings.iter().any(|w| w.contains("player_radar_scope")));
+}
+
+#[test]
+fn granular_flags_fail_closed_on_bad_values() {
+    for argv in [
+        vec!["--minimap-mode", "bogus"],
+        vec!["--minimap-mode", "on"],
+        vec!["--player-radar", "friends"],
+        vec!["--player-radar", "2"],
+        vec!["--allow-mob-radar", "maybe"],
+    ] {
+        let err = parse_args(&argv).unwrap_err();
+        assert!(
+            err.contains("invalid") || err.contains("must be"),
+            "{argv:?} -> {err}"
+        );
+    }
+    // A missing value fails closed too.
+    for argv in [
+        vec!["--minimap-mode"],
+        vec!["--player-radar"],
+        vec!["--allow-mob-radar"],
+    ] {
+        assert!(parse_args(&argv).is_err(), "{argv:?} must fail");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // --auto-tune
 // ---------------------------------------------------------------------------
 
@@ -443,11 +714,17 @@ fn help_text_documents_fair_play_and_auto_tune_flags() {
     let help = help_text();
     for needle in [
         "--fair-play",
+        "--minimap-mode",
         "--allow-cave-map",
         "--allow-entity-radar",
+        "--allow-mob-radar",
+        "--player-radar",
         "--allow-waypoint-teleport",
         "--auto-tune",
         "MC_SPINE_FAIR_PLAY",
+        "MC_SPINE_MINIMAP_MODE",
+        "MC_SPINE_ALLOW_MOB_RADAR",
+        "MC_SPINE_PLAYER_RADAR_SCOPE",
     ] {
         assert!(help.contains(needle), "help text missing {needle}");
     }
