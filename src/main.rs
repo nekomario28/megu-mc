@@ -6190,6 +6190,30 @@ fn set_block_if_dim_edit(
     bump_world_epoch_dim(dim, x, z);
     note_light_edit(dim, Position::new(x, y, z), old, st);
     live_block_changed(dim, RsPos(x, y, z), old, st);
+    if old != st {
+        if let Some(reg) = breg() {
+            // The Overworld path retires a rewritten block's live block entity inside
+            // `unpack_block_loot_if_needed` and drops sign text on identity change;
+            // this path owns every other dimension, so the same rules have to run
+            // here. Entries die with the block identity, not the state: a
+            // same-block property write keeps them, a different block drops them.
+            let mut store = live_block_entities().lock().unwrap();
+            if let Some(&(id, _)) = store.entries.get(&(dim, x, y, z)) {
+                if reg.block_id_of(st) != Some(id) {
+                    store.entries.remove(&(dim, x, y, z));
+                }
+            }
+            drop(store);
+            if reg.name_of(old) != reg.name_of(st) {
+                signs()
+                    .lock()
+                    .unwrap()
+                    .retain(|&(sdim, sx, sy, sz, _), _| {
+                        !(sdim == dim && sx == x && sy == y && sz == z)
+                    });
+            }
+        }
+    }
     true
 }
 
@@ -13538,5 +13562,103 @@ mod mineshaft_runtime_tests {
             },
         )]);
         assert_eq!(mobs().lock().unwrap().len(), MOB_CAP);
+    }
+}
+
+#[cfg(test)]
+mod dim_block_entity_invalidation_tests {
+    use super::*;
+
+    struct Restore {
+        store: LiveBlockEntityStore,
+        cells: Vec<(DimBlockPos, u32)>,
+        signs: Vec<SignKey>,
+    }
+
+    impl Restore {
+        fn take() -> Self {
+            Self {
+                store: std::mem::take(&mut *live_block_entities().lock().unwrap()),
+                cells: Vec::new(),
+                signs: Vec::new(),
+            }
+        }
+    }
+
+    impl std::ops::Drop for Restore {
+        fn drop(&mut self) {
+            for &((dim, x, y, z), state) in self.cells.iter().rev() {
+                set_block_dim(dim, x, y, z, state);
+            }
+            if !self.signs.is_empty() {
+                let mut store = signs().lock().unwrap();
+                for key in &self.signs {
+                    store.remove(key);
+                }
+            }
+            *live_block_entities().lock().unwrap() = std::mem::take(&mut self.store);
+        }
+    }
+
+    #[test]
+    fn dim_block_rewrite_drops_live_block_entity_immediately_but_keeps_state_writes() {
+        let _guard = world_guard();
+        let mut restore = Restore::take();
+        let dim = DimId::Nether;
+        let (x, y, z) = (93_500, 220, 93_500);
+        let key = (dim, x, y, z);
+        let reg = breg().unwrap();
+        let banner = item_to_state(name_to_item("red_banner").unwrap()).unwrap();
+
+        restore.cells.push((key, block_at_dim(dim, x, y, z)));
+        set_block_dim(dim, x, y, z, banner);
+        assert!(live_block_entity_snapshot(key).is_some());
+
+        // A payload a fresh placement cannot produce.
+        let layer = block_entity_compound([
+            ("pattern", block_entity_string("minecraft:stripe_center")),
+            ("color", block_entity_string("blue")),
+        ]);
+        let patterns = block_entity_list(10, vec![layer]);
+        let banner_tag = block_entity_compound([
+            ("id", block_entity_string("minecraft:banner")),
+            ("patterns", patterns.clone()),
+        ]);
+        assert!(restore_live_block_entity(key, &banner_tag));
+
+        // A same-block property write keeps the entity and its payload.
+        let rotated = reg.with_prop(banner, "rotation", "3");
+        assert_ne!(rotated, banner);
+        set_block_dim(dim, x, y, z, rotated);
+        let (_, tag) = live_block_entity_snapshot(key).unwrap();
+        assert_eq!(tag.get("patterns"), Some(&patterns));
+
+        // Sign text follows the same identity rule on this write path.
+        for side in [0u8, 1] {
+            let sign_key = (dim, x, y, z, side);
+            restore.signs.push(sign_key);
+            signs().lock().unwrap().insert(
+                sign_key,
+                ["text".to_owned(), String::new(), String::new(), String::new()],
+            );
+        }
+
+        // Breaking the block retires the entity and the sign text at once —
+        // no discovery scan required.
+        set_block_dim(dim, x, y, z, 0);
+        assert!(!live_block_entities()
+            .lock()
+            .unwrap()
+            .entries
+            .contains_key(&key));
+        let sign_store = signs().lock().unwrap();
+        assert!(!sign_store.contains_key(&(dim, x, y, z, 0)));
+        assert!(!sign_store.contains_key(&(dim, x, y, z, 1)));
+        drop(sign_store);
+
+        // Re-placing the same block must not resurrect the stale payload.
+        set_block_dim(dim, x, y, z, banner);
+        let (_, fresh) = live_block_entity_snapshot(key).unwrap();
+        assert!(fresh.get("patterns").is_none());
     }
 }

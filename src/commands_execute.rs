@@ -733,8 +733,27 @@ fn execute_block_pos([x, y, z]: [f64; 3]) -> BlockPos {
 
 fn execute_chunk_loaded(dim: DimId, x: i32, z: i32) -> bool {
     let chunk = (x >> 4, z >> 4);
-    let warm = dim == DimId::Overworld && region_guard().is_warm(x, z);
-    warm || (dim == DimId::Overworld && forceloaded().lock().unwrap().contains(&chunk))
+    // The warm ring and the forceload set are dimension-agnostic server state: they
+    // mark the chunks this server is actively ticking, whichever dimension asked.
+    // Everything below is keyed by the queried dimension, so a Nether or End chunk
+    // reports loaded on the same evidence an Overworld chunk does.
+    region_guard().is_warm(x, z)
+        || forceloaded().lock().unwrap().contains(&chunk)
+        || world()
+            .lock()
+            .unwrap()
+            .get(&(dim, chunk.0, chunk.1))
+            .is_some_and(|cells| !cells.is_empty())
+        || band_for(dim, chunk.0, chunk.1).is_some()
+        || {
+            let store = section_store().lock().unwrap();
+            store.generation == current_gen_seq()
+                && store
+                    .map
+                    .get(&(dim, chunk.0, chunk.1))
+                    .is_some_and(|sections| sections.iter().any(Option::is_some))
+        }
+        || worldgen::with_gen_dim(dim, |g| g.pop_done.contains(&chunk)).unwrap_or(false)
         || client_snapshot().iter().any(|client| {
             *client.dim.lock().unwrap() == dim && client.chunks.lock().unwrap().contains(&chunk)
         })
@@ -1394,6 +1413,14 @@ fn execute_block_data(dim: DimId, (x, y, z): BlockPos) -> Option<ExecTag> {
         )]));
     }
     let state = block_at_dim(dim, x, y, z);
+    // Live block entities (beacon, lectern, banner, ...) snapshot through the same
+    // store chunk packets and saves use; it is keyed by dimension already.
+    if let Some((_, tag)) = live_block_entity_snapshot(key) {
+        return Some(tag);
+    }
+    if is_sign_block_state(state) {
+        return Some(execute_sign_block_data(dim, (x, y, z)));
+    }
     let state_name = breg()?.canonical_state(state);
     let name = state_name
         .split('[')
@@ -1413,6 +1440,44 @@ fn execute_block_data(dim: DimId, (x, y, z): BlockPos) -> Option<ExecTag> {
             | "shulker_box"
     )
     .then(|| execute_nbt_compound([("Items", ExecTag::List(0, Vec::new()))]))
+}
+
+/// The sign's stored text projected into the same compound shape the chunk packet's
+/// `front_text`/`back_text`/`is_waxed` carries, so `if data`/`store` see what a client
+/// would. Lines are JSON-string components, matching `sign_side_nbt`.
+fn execute_sign_block_data(dim: DimId, (x, y, z): BlockPos) -> ExecTag {
+    let store = signs().lock().unwrap();
+    let side = |front: u8| {
+        let lines = store.get(&(dim, x, y, z, front)).cloned().unwrap_or_default();
+        execute_nbt_compound([
+            ("color", ExecTag::String(NbtString::text("white"))),
+            ("has_glowing_text", ExecTag::Byte(0)),
+            (
+                "filtered_messages",
+                ExecTag::List(
+                    8,
+                    [""; 4]
+                        .map(|line| ExecTag::String(NbtString::text(line)))
+                        .into(),
+                ),
+            ),
+            (
+                "messages",
+                ExecTag::List(
+                    8,
+                    lines
+                        .iter()
+                        .map(|line| ExecTag::String(NbtString::text(&json_text(line))))
+                        .collect(),
+                ),
+            ),
+        ])
+    };
+    execute_nbt_compound([
+        ("front_text", side(1)),
+        ("back_text", side(0)),
+        ("is_waxed", ExecTag::Byte(0)),
+    ])
 }
 
 fn execute_entity_data(entity: &ExecuteEntity) -> ExecTag {
@@ -1797,6 +1862,15 @@ fn execute_write_block_data(
             if let Some(slots) = containers.get_mut(&ContainerKey::Block((dim, x, y, z))) {
                 return execute_write_items(slots, path, value);
             }
+        }
+        // Live block entities (beacon, lectern, banner, ...) round-trip through the
+        // same snapshot/restore pair chunk packets and saves use, in whichever
+        // dimension the block lives.
+        if let Some((_, mut data)) = live_block_entity_snapshot((dim, x, y, z)) {
+            if path.set(&mut data, value) && restore_live_block_entity((dim, x, y, z), &data) {
+                return Ok(());
+            }
+            return Err(unsupported());
         }
         Err(unsupported())
     })
@@ -2428,5 +2502,94 @@ fn block_pred_match(st: u32, pred: &str) -> bool {
             true
         }
         None => name_to_state(name).map(|w| st == w).unwrap_or(false),
+    }
+}
+
+#[cfg(test)]
+mod execute_dimension_tests {
+    use super::*;
+
+    fn execute_console(command: &str) -> String {
+        let source = crate::CmdCtx {
+            me: None,
+            x: 0.5,
+            y: 80.0,
+            z: 0.5,
+        };
+        crate::run_command_ctx(&source, command, &mut None)
+    }
+
+    #[test]
+    fn execute_in_nether_and_end_if_block_reads_dimension_state() {
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        for (dimension, block_x) in [
+            ("minecraft:the_nether", 48),
+            ("minecraft:the_end", 52),
+        ] {
+            assert_eq!(
+                execute_console(&format!(
+                    "/execute in {dimension} run setblock {block_x} 80 40 minecraft:gold_block"
+                )),
+                "executed 1 command(s)"
+            );
+            assert_eq!(
+                execute_console(&format!(
+                    "/execute in {dimension} if block {block_x} 80 40 minecraft:gold_block"
+                )),
+                "Test passed"
+            );
+            assert_eq!(
+                execute_console(&format!(
+                    "/execute in {dimension} if block {block_x} 80 40 minecraft:stone"
+                )),
+                "Test failed"
+            );
+        }
+    }
+
+    #[test]
+    fn execute_in_nether_if_loaded_and_data_block_use_dimension_state() {
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        assert_eq!(
+            execute_console(
+                "/execute in minecraft:the_nether run setblock 56 80 40 minecraft:oak_sign"
+            ),
+            "executed 1 command(s)"
+        );
+        // `if loaded` must see the dimension-scoped edit, not just Overworld state.
+        assert_eq!(
+            execute_console("/execute in minecraft:the_nether if loaded 56 80 40"),
+            "Test passed"
+        );
+        // Sign text lives in the dimension-keyed sign store; the execute data
+        // projection reads it the way the chunk packet writes it.
+        let mut lines: SignLines = Default::default();
+        lines[0] = "Hello".to_owned();
+        signs()
+            .lock()
+            .unwrap()
+            .insert((DimId::Nether, 56, 80, 40, 1), lines);
+        assert_eq!(
+            execute_console(
+                "/execute in minecraft:the_nether if data block 56 80 40 front_text.messages[0]"
+            ),
+            "Test passed"
+        );
+        assert_eq!(
+            execute_console(
+                "/execute in minecraft:the_nether if data block 56 80 40 front_text {color:\"white\"}"
+            ),
+            "Test passed"
+        );
+        assert_eq!(
+            execute_console(
+                "/execute in minecraft:the_nether if data block 56 80 40 front_text.messages[7]"
+            ),
+            "Test failed"
+        );
     }
 }
