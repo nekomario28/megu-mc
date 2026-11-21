@@ -963,6 +963,9 @@ fn ac_forget(eid: i32) {
     if let Some(map) = ac_players().lock().ok().as_mut() {
         map.remove(&eid);
     }
+    if let Some(map) = ac_rtts().lock().ok().as_mut() {
+        map.remove(&eid);
+    }
 }
 
 // ---------- hooks for server-side motion (mods, knockback, explosions, teleports) ----------
@@ -1052,6 +1055,168 @@ fn ac_note_explosion_for(pos: [f64; 3], power: f64, targets: &[(i32, (f64, f64, 
             ac_note_server_velocity(eid, [push, push, push]);
         }
     }
+}
+
+// ---------- lag compensation: bounded grace during real lag ----------
+//
+// A 50 ms tick that takes 150 ms (autosave, worldgen) or a 300 ms latency burst
+// makes an honest client's packets arrive in a clump the movement check would
+// read as speed-hacking, so the player rubber-bands for the server's own lag.
+// `ac_note_server_tick_ms` feeds the measured tick cost in; when a spike (or a
+// player's measured RTT) is inside the transient envelope the movement
+// allowance scales proportionally to the missed ticks. Two bounds keep a real
+// speed-hacker from hiding in the grace forever: the multiplier is hard-capped
+// at `MAX_LAG_COMP_MULTIPLIER`, and a consecutive run of spiked ticks longer
+// than `MAX_CONSECUTIVE_LAG_SPIKES` ends the grace outright until a healthy
+// tick resets it. A healthy server and a quiet connection multiply by exactly
+// 1.0, so the normal path is untouched.
+
+/// Tick work at or under this is healthy (20 TPS is 50 ms; small jitter is not lag).
+const LAG_TICK_HEALTHY_MS: u32 = 55;
+/// Above this a tick spike is no longer "brief" - the cap clamps the scaling.
+const LAG_TICK_SPIKE_MAX_MS: u32 = 500;
+/// Round-trip at or under this needs no compensation.
+const LAG_RTT_HEALTHY_MS: u32 = 150;
+/// Above this a latency burst is pathological - the cap clamps the scaling.
+const LAG_RTT_SPIKE_MAX_MS: u32 = 600;
+/// The largest multiplier lag can put on the movement envelope, ever.
+#[allow(dead_code)]
+pub(crate) const MAX_LAG_COMP_MULTIPLIER: f64 = 3.0;
+/// How many consecutive spiked ticks the grace covers before it collapses back
+/// to the strict allowance: 200 ticks = 10 s of a sustained lagging server,
+/// which is an outage, not a hiccup.
+const MAX_CONSECUTIVE_LAG_SPIKES: u32 = 200;
+
+/// Server-wide lag-grace state: the last measured tick cost and how many
+/// ticks in a row have run long. The spike counter is what bounds abuse -
+/// while it is small the server is having a moment, while it is huge the
+/// server is degraded and cheats are judged strictly again.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LagCompensationState {
+    last_tick_ms: u32,
+    consecutive_spike_ticks: u32,
+}
+
+impl LagCompensationState {
+    /// Record one measured tick duration (ms). A healthy tick resets the
+    /// consecutive-spike counter; a spiked one grows it.
+    fn note_tick(&mut self, tick_ms: u32) {
+        self.last_tick_ms = tick_ms;
+        if tick_ms > LAG_TICK_HEALTHY_MS {
+            self.consecutive_spike_ticks = self.consecutive_spike_ticks.saturating_add(1);
+        } else {
+            self.consecutive_spike_ticks = 0;
+        }
+    }
+
+    /// The grace window is closed once spikes run longer than the bound: a
+    /// server that has been lagging for `MAX_CONSECUTIVE_LAG_SPIKES` ticks
+    /// straight stops granting movement leniency until a healthy tick.
+    fn spike_window_open(&self) -> bool {
+        self.consecutive_spike_ticks <= MAX_CONSECUTIVE_LAG_SPIKES
+    }
+
+    /// The envelope multiplier for `tick_ms`/`player_rtt_ms` under this state's
+    /// spike history: exactly 1.0 when nothing is lagging, proportional to the
+    /// missed ticks while lagging, hard-capped, and collapsed back to 1.0 once
+    /// the consecutive-spike window runs out.
+    fn multiplier(&self, tick_ms: u32, player_rtt_ms: u32) -> f64 {
+        if tick_ms <= LAG_TICK_HEALTHY_MS && player_rtt_ms <= LAG_RTT_HEALTHY_MS {
+            return 1.0;
+        }
+        if tick_ms > LAG_TICK_HEALTHY_MS && !self.spike_window_open() {
+            return 1.0;
+        }
+        // One missed tick per 50 ms of overrun: a 150 ms tick admits ~3x burst.
+        // Past `LAG_TICK_SPIKE_MAX_MS` the hard cap is already saturated.
+        let tick_mult = if tick_ms > LAG_TICK_HEALTHY_MS {
+            tick_ms.min(LAG_TICK_SPIKE_MAX_MS) as f64 / 50.0
+        } else {
+            1.0
+        };
+        // One burst tick per 200 ms of round-trip: 600 ms admits ~3x burst.
+        let rtt_mult = if player_rtt_ms > LAG_RTT_HEALTHY_MS {
+            player_rtt_ms.min(LAG_RTT_SPIKE_MAX_MS) as f64 / 200.0
+        } else {
+            1.0
+        };
+        tick_mult.max(rtt_mult).min(MAX_LAG_COMP_MULTIPLIER)
+    }
+
+    /// `base_max_speed` widened by `multiplier`: returned untouched (exact
+    /// `base_max_speed`) on the healthy path.
+    fn effective_speed_allowance(
+        &self,
+        base_max_speed: f64,
+        tick_ms: u32,
+        player_rtt_ms: u32,
+    ) -> f64 {
+        if !base_max_speed.is_finite() || base_max_speed <= 0.0 {
+            return base_max_speed;
+        }
+        let mult = self.multiplier(tick_ms, player_rtt_ms);
+        if mult <= 1.0 {
+            base_max_speed
+        } else {
+            base_max_speed * mult
+        }
+    }
+}
+
+fn ac_lag_comp() -> &'static Mutex<LagCompensationState> {
+    static S: OnceLock<Mutex<LagCompensationState>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(LagCompensationState::default()))
+}
+
+/// Feed the measured tick-body cost into lag compensation; called once per
+/// tick from the tick loop. The value is milliseconds of work, not the period.
+#[allow(dead_code)]
+pub(crate) fn ac_note_server_tick_ms(tick_ms: u32) {
+    ac_lag_comp().lock().unwrap().note_tick(tick_ms);
+}
+
+/// The last tick cost the tick loop reported; 0 means "no ticks measured yet"
+/// which reads as healthy, so an unwired server keeps the strict envelope.
+fn ac_last_tick_ms() -> u32 {
+    ac_lag_comp().lock().unwrap().last_tick_ms
+}
+
+/// `base_max_speed` as the movement check should treat it right now: exact
+/// `base_max_speed` when `tick_ms <= 55` and `player_rtt_ms <= 150`, up to
+/// `MAX_LAG_COMP_MULTIPLIER`x during a transient tick spike or latency burst,
+/// and strict again once spikes run longer than the bounded window.
+#[allow(dead_code)]
+pub(crate) fn ac_effective_speed_allowance(
+    base_max_speed: f64,
+    tick_ms: u32,
+    player_rtt_ms: u32,
+) -> f64 {
+    ac_lag_comp()
+        .lock()
+        .unwrap()
+        .effective_speed_allowance(base_max_speed, tick_ms, player_rtt_ms)
+}
+
+/// Server-measured round-trip per player, keyed by entity id. Populated by
+/// `ac_note_player_rtt_ms` (keepalive wiring); absent means quiet, not zero-lat.
+fn ac_rtts() -> &'static Mutex<HashMap<i32, u32>> {
+    static R: OnceLock<Mutex<HashMap<i32, u32>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record a player's measured round-trip (ms) for lag compensation.
+#[allow(dead_code)]
+fn ac_note_player_rtt_ms(eid: i32, rtt_ms: u32) {
+    ac_rtts().lock().unwrap().insert(eid, rtt_ms);
+}
+
+fn ac_player_rtt_ms(eid: i32) -> u32 {
+    ac_rtts()
+        .lock()
+        .unwrap()
+        .get(&eid)
+        .copied()
+        .unwrap_or(0)
 }
 
 // ---------- flags, VL, alerts ----------
@@ -1295,6 +1460,23 @@ fn ac_check_move(
             state.unknown_modifiers = true;
         }
         let allowance = AcAllowance::from_state(&state);
+        // Lag compensation: a measured tick spike or latency burst widens the
+        // burst envelope by the missed ticks (hard-capped and time-bounded, so
+        // a real speed hack still runs out). A healthy server and a quiet
+        // connection leave the allowance bit-exact.
+        let allowance = {
+            let lag =
+                ac_effective_speed_allowance(1.0, ac_last_tick_ms(), ac_player_rtt_ms(me.eid));
+            if lag > 1.0 {
+                AcAllowance {
+                    horizontal: allowance.horizontal * lag,
+                    up: allowance.up * lag,
+                    down: allowance.down * lag,
+                }
+            } else {
+                allowance
+            }
+        };
         let need = [
             (to.0 - from.0).hypot(to.2 - from.2),
             (to.1 - from.1).max(0.0),
@@ -1570,5 +1752,166 @@ mod anticheat_unit_tests {
         assert_eq!(carry_res, None, "carried contraption step must not flag");
         assert!(still_carried, "carried rider stays supported against false NoFall");
         assert!(tp_res.is_some(), "real 120-block teleport must still flag");
+    }
+
+    // ---------- OPS-2: lag-compensated anti-rubberband grace ----------
+
+    /// Reset the shared lag state so a test does not inherit another's spikes.
+    fn ops2_reset_lag() {
+        *ac_lag_comp().lock().unwrap() = LagCompensationState::default();
+    }
+
+    /// The healthy path is bit-exact: nothing about the checks gets weaker when
+    /// the server and the connection are fine.
+    #[test]
+    fn ops2_lag_compensation_returns_exact_base_when_healthy() {
+        ops2_reset_lag();
+        for (tick, rtt) in [(0, 0), (50, 0), (55, 150), (30, 149), (1, 60)] {
+            assert_eq!(
+                ac_effective_speed_allowance(0.5641, tick, rtt),
+                0.5641,
+                "tick={tick} rtt={rtt} must not touch the allowance"
+            );
+        }
+        // Non-finite or non-positive bases pass through, never amplified.
+        assert_eq!(ac_effective_speed_allowance(0.0, 500, 600), 0.0);
+        assert_eq!(ac_effective_speed_allowance(-2.0, 500, 600), -2.0);
+        assert!(ac_effective_speed_allowance(f64::NAN, 500, 600).is_nan());
+    }
+
+    /// Transient tick spikes and latency bursts scale the envelope by the
+    /// missed ticks, always hard-capped at `MAX_LAG_COMP_MULTIPLIER`.
+    #[test]
+    fn ops2_lag_compensation_scales_by_missed_ticks_bounded_by_cap() {
+        ops2_reset_lag();
+        // tick_ms/50 = missed ticks: 100 ms admits 2x, 150 ms hits the 3x cap.
+        assert_eq!(ac_effective_speed_allowance(0.5, 100, 0), 1.0);
+        assert_eq!(ac_effective_speed_allowance(0.5, 150, 0), 1.5);
+        assert_eq!(ac_effective_speed_allowance(0.5, 500, 0), 1.5);
+        assert_eq!(ac_effective_speed_allowance(0.5, 60_000, 0), 1.5);
+        // rtt_ms/200: 300 ms admits 1.5x, 600 ms hits the cap.
+        assert_eq!(ac_effective_speed_allowance(0.5, 0, 300), 0.75);
+        assert_eq!(ac_effective_speed_allowance(0.5, 0, 600), 1.5);
+        assert_eq!(ac_effective_speed_allowance(0.5, 0, 999_999), 1.5);
+        // Sources take the max under the cap, never multiply together past it.
+        assert_eq!(ac_effective_speed_allowance(0.5, 500, 600), 1.5);
+        // Just inside the transient bands still helps a little.
+        assert!(ac_effective_speed_allowance(0.5, 60, 0) > 0.5);
+        assert!(ac_effective_speed_allowance(0.5, 0, 250) > 0.5);
+    }
+
+    /// The consecutive-spike window bounds abuse: once spikes run past
+    /// `MAX_CONSECUTIVE_LAG_SPIKES` the grace collapses to strict until a
+    /// healthy tick resets it.
+    #[test]
+    fn ops2_lag_compensation_spike_window_bounds_abuse() {
+        let mut state = LagCompensationState::default();
+        state.note_tick(120);
+        assert!(state.multiplier(120, 0) > 1.0, "one spike grants grace");
+        for _ in 0..MAX_CONSECUTIVE_LAG_SPIKES {
+            state.note_tick(120);
+        }
+        // 201 consecutive spiked ticks = an outage, not a hiccup: strict again.
+        assert_eq!(state.effective_speed_allowance(0.5, 120, 0), 0.5);
+        assert_eq!(state.multiplier(300, 0), 1.0);
+        // A single healthy tick reopens the window for the next real hiccup.
+        state.note_tick(50);
+        state.note_tick(120);
+        assert!(state.effective_speed_allowance(0.5, 120, 0) > 0.5);
+    }
+
+    /// The global feed: `ac_note_server_tick_ms` and `ac_note_player_rtt_ms`
+    /// drive what `ac_check_move` reads. Done in one test so parallel tests
+    /// never see half-set shared state.
+    #[test]
+    fn ops2_lag_compensation_tick_feed_and_rtt_hook_drive_allowance() {
+        ops2_reset_lag();
+        assert_eq!(ac_last_tick_ms(), 0, "no ticks reported reads as healthy");
+        ac_note_server_tick_ms(200);
+        assert_eq!(ac_last_tick_ms(), 200);
+        // The same value the move check passes in now scales the envelope.
+        assert_eq!(
+            ac_effective_speed_allowance(0.5, ac_last_tick_ms(), 0),
+            1.5
+        );
+        ac_note_server_tick_ms(40);
+        assert_eq!(ac_last_tick_ms(), 40);
+        assert_eq!(ac_effective_speed_allowance(0.5, ac_last_tick_ms(), 0), 0.5);
+
+        let eid = 900_778;
+        ac_note_player_rtt_ms(eid, 300);
+        assert_eq!(ac_player_rtt_ms(eid), 300);
+        assert_eq!(
+            ac_effective_speed_allowance(0.5, 50, ac_player_rtt_ms(eid)),
+            0.75
+        );
+        ac_forget(eid);
+        assert_eq!(ac_player_rtt_ms(eid), 0);
+        assert_eq!(
+            ac_effective_speed_allowance(0.5, 50, ac_player_rtt_ms(eid)),
+            0.5
+        );
+        ops2_reset_lag();
+    }
+
+    /// End to end through the token bucket: a legit player whose movement
+    /// clumped during a spike is absorbed by the widened envelope instead of
+    /// rubber-banding, while a sustained speed-hacker still drains the capped
+    /// envelope and gets flagged.
+    #[test]
+    fn ops2_lag_compensation_prevents_rubberband_but_catches_sustained_hacks() {
+        ops2_reset_lag();
+        let p = MovementCheck::policy(AcPreset::Standard).unwrap();
+        let base = AcAllowance::from_state(&AcMoverState::vanilla());
+        // A 150 ms spike multiplies the envelope by exactly the cap.
+        let mult = ac_effective_speed_allowance(1.0, 150, 0);
+        assert_eq!(mult, MAX_LAG_COMP_MULTIPLIER);
+        let lagged = AcAllowance {
+            horizontal: base.horizontal * mult,
+            up: base.up * mult,
+            down: base.down * mult,
+        };
+
+        // Legit player: ~2.6x the vanilla rate for a while (packets clumped by
+        // the lag). Strict limits flag it quickly - a rubber-band - but the
+        // lag-compensated envelope absorbs the whole burst.
+        let honest = [base.horizontal * 2.6, 0.0, 0.0];
+        let t0 = Instant::now();
+        let mut strict = AcMoveState::default();
+        strict.evaluate(t0, &base, &p, [0.0; 3]);
+        let mut flagged = false;
+        let mut t = t0;
+        for _ in 0..60 {
+            t += Duration::from_millis(50);
+            if strict.evaluate(t, &base, &p, honest).is_some() {
+                flagged = true;
+                break;
+            }
+        }
+        assert!(flagged, "2.6x sustained must flag under strict limits");
+        let mut compensated = AcMoveState::default();
+        compensated.evaluate(t0, &lagged, &p, [0.0; 3]);
+        let mut t = t0;
+        for _ in 0..200 {
+            t += Duration::from_millis(50);
+            assert_eq!(compensated.evaluate(t, &lagged, &p, honest), None);
+        }
+
+        // Sustained speed-hack at 4x: over the 3x cap, so credit still drains
+        // every tick and flags well inside the grace window.
+        let hack = [base.horizontal * 4.0, 0.0, 0.0];
+        let mut hacker = AcMoveState::default();
+        hacker.evaluate(t0, &lagged, &p, [0.0; 3]);
+        let mut t = t0;
+        let mut caught = false;
+        for _ in 0..400 {
+            t += Duration::from_millis(50);
+            if hacker.evaluate(t, &lagged, &p, hack).is_some() {
+                caught = true;
+                break;
+            }
+        }
+        assert!(caught, "4x sustained hack must flag even at max lag comp");
+        ops2_reset_lag();
     }
 }

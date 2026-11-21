@@ -14,6 +14,10 @@
 //   slow disk can never grow an unbounded queue behind the 20 TPS tick loop, plus
 //   `rotate_world_backups` for bounded `backups/` retention. Sequence numbers, not
 //   wall-clock reads, name the files.
+// * `DeltaWalJournal`: a framed, CRC-checked, `sync_data`ed append log of world
+//   deltas so a crash loses near-zero seconds between the five-minute saves.
+// * `TickFaultQuarantine`: a panicking block entity, entity or chunk tick is
+//   caught and only that broken target frozen, keeping the world online.
 //
 // Nothing here reads a wall clock: save/backup naming comes from a monotonic
 // sequence drawn from the directory itself, which survives restarts.
@@ -986,6 +990,854 @@ pub(crate) fn rotate_world_backups(
     Ok(path)
 }
 
+// ================= crash-minimizing delta WAL (DWAL) =================
+//
+// A full world save runs on a slow timer; without a journal a crash loses the
+// whole window. This append-only log records the small deltas (block sets,
+// player snapshots, container slots) as they happen, each frame `sync_data()`ed
+// to disk, so crash loss is near-zero seconds instead of minutes. Recovery
+// replays only what the last committed checkpoint did not already cover;
+// `compact_after_checkpoint` shrinks the log once the full save lands.
+//
+// Frame layout, all big-endian:
+//   magic `DWAL` (4) | u64 sequence | u32 payload_len | payload | u32 crc32
+// where the CRC is reflected IEEE 802.3 (poly 0xEDB88320) over
+// seq||payload_len||payload. The only forgivable damage is a torn tail - an
+// append cut short by power loss - which is reported and skipped. Anything
+// corrupt mid-stream fails closed, and a forged payload_len can never reserve
+// memory: the cap is checked before any allocation.
+
+/// Largest single WAL payload. Checked before the reader allocates, so a
+/// corrupt length field cannot reserve gigabytes.
+#[allow(dead_code)]
+pub(crate) const MAX_WAL_RECORD_BYTES: usize = 1024 * 1024;
+const DWAL_MAGIC: [u8; 4] = *b"DWAL";
+/// magic(4) + seq(8) + payload_len(4).
+const DWAL_HEADER_LEN: usize = 16;
+/// Smallest possible frame: header + crc32(4).
+const DWAL_FRAME_MIN: usize = DWAL_HEADER_LEN + 4;
+
+/// Reflected IEEE 802.3 CRC-32 (poly 0xEDB88320) over every part in order.
+/// Table-free: frames are small and rare next to a full world save.
+fn crc32_ieee_parts(parts: &[&[u8]]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for part in parts {
+        for &byte in part.iter() {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+    }
+    !crc
+}
+
+/// Reject `..`, NUL and control characters in operator-controlled data paths so
+/// a crafted name can never walk out of the data directory or smuggle control
+/// bytes into operator logs.
+fn ops_data_path_checked(path: &std::path::Path, what: &str) -> Result<(), String> {
+    for component in path.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(format!("{what}: '..' not allowed in {}", path.display()));
+        }
+    }
+    let text = path
+        .as_os_str()
+        .to_str()
+        .ok_or_else(|| format!("{what}: non-UTF-8 path"))?;
+    if text.chars().any(|c| c.is_control()) {
+        return Err(format!("{what}: control character in path"));
+    }
+    Ok(())
+}
+
+/// One journaled world delta. `CheckpointMarker` is the commit boundary: frames
+/// up to and including the newest marker are already covered by a full save and
+/// recovery skips them.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DeltaWalRecord {
+    BlockSet {
+        dim: DimId,
+        x: i32,
+        y: i32,
+        z: i32,
+        state: u32,
+    },
+    PlayerSnapshot {
+        uuid: [u8; 16],
+        dim: DimId,
+        pos: [f64; 3],
+        hp: f32,
+        food: i32,
+        xp: i64,
+    },
+    ContainerSlot {
+        dim: DimId,
+        x: i32,
+        y: i32,
+        z: i32,
+        slot: i32,
+        item_id: i64,
+        count: i32,
+    },
+    CheckpointMarker {
+        checkpoint_seq: u64,
+    },
+}
+
+const DWAL_TAG_BLOCK_SET: u8 = 1;
+const DWAL_TAG_PLAYER_SNAPSHOT: u8 = 2;
+const DWAL_TAG_CONTAINER_SLOT: u8 = 3;
+const DWAL_TAG_CHECKPOINT: u8 = 4;
+
+/// Bounds-checked payload cursor; every read proves the bytes exist first.
+struct DwalReader<'a> {
+    b: &'a [u8],
+}
+
+impl<'a> DwalReader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        if self.b.len() < n {
+            return Err("truncated record payload".into());
+        }
+        let (head, tail) = self.b.split_at(n);
+        self.b = tail;
+        Ok(head)
+    }
+    fn u32(&mut self) -> Result<u32, String> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn i32(&mut self) -> Result<i32, String> {
+        Ok(i32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> Result<u64, String> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn i64(&mut self) -> Result<i64, String> {
+        Ok(i64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn f32(&mut self) -> Result<f32, String> {
+        Ok(f32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn f64(&mut self) -> Result<f64, String> {
+        Ok(f64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn dim(&mut self) -> Result<DimId, String> {
+        Ok(DimId::from_raw(self.u32()?))
+    }
+    /// Nothing may follow a record: trailing bytes mean a corrupt payload.
+    fn done(&self) -> Result<(), String> {
+        if self.b.is_empty() {
+            Ok(())
+        } else {
+            Err("trailing bytes after record".into())
+        }
+    }
+}
+
+impl DeltaWalRecord {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64);
+        match *self {
+            DeltaWalRecord::BlockSet {
+                dim,
+                x,
+                y,
+                z,
+                state,
+            } => {
+                out.push(DWAL_TAG_BLOCK_SET);
+                out.extend_from_slice(&dim.raw().to_be_bytes());
+                out.extend_from_slice(&x.to_be_bytes());
+                out.extend_from_slice(&y.to_be_bytes());
+                out.extend_from_slice(&z.to_be_bytes());
+                out.extend_from_slice(&state.to_be_bytes());
+            }
+            DeltaWalRecord::PlayerSnapshot {
+                uuid,
+                dim,
+                pos,
+                hp,
+                food,
+                xp,
+            } => {
+                out.push(DWAL_TAG_PLAYER_SNAPSHOT);
+                out.extend_from_slice(&uuid);
+                out.extend_from_slice(&dim.raw().to_be_bytes());
+                for v in pos {
+                    out.extend_from_slice(&v.to_be_bytes());
+                }
+                out.extend_from_slice(&hp.to_be_bytes());
+                out.extend_from_slice(&food.to_be_bytes());
+                out.extend_from_slice(&xp.to_be_bytes());
+            }
+            DeltaWalRecord::ContainerSlot {
+                dim,
+                x,
+                y,
+                z,
+                slot,
+                item_id,
+                count,
+            } => {
+                out.push(DWAL_TAG_CONTAINER_SLOT);
+                out.extend_from_slice(&dim.raw().to_be_bytes());
+                out.extend_from_slice(&x.to_be_bytes());
+                out.extend_from_slice(&y.to_be_bytes());
+                out.extend_from_slice(&z.to_be_bytes());
+                out.extend_from_slice(&slot.to_be_bytes());
+                out.extend_from_slice(&item_id.to_be_bytes());
+                out.extend_from_slice(&count.to_be_bytes());
+            }
+            DeltaWalRecord::CheckpointMarker { checkpoint_seq } => {
+                out.push(DWAL_TAG_CHECKPOINT);
+                out.extend_from_slice(&checkpoint_seq.to_be_bytes());
+            }
+        }
+        out
+    }
+
+    fn decode(payload: &[u8]) -> Result<DeltaWalRecord, String> {
+        let mut r = DwalReader { b: payload };
+        let record = match r.take(1)?[0] {
+            DWAL_TAG_BLOCK_SET => DeltaWalRecord::BlockSet {
+                dim: r.dim()?,
+                x: r.i32()?,
+                y: r.i32()?,
+                z: r.i32()?,
+                state: r.u32()?,
+            },
+            DWAL_TAG_PLAYER_SNAPSHOT => {
+                let uuid: [u8; 16] = r.take(16)?.try_into().unwrap();
+                let dim = r.dim()?;
+                let pos = [r.f64()?, r.f64()?, r.f64()?];
+                DeltaWalRecord::PlayerSnapshot {
+                    uuid,
+                    dim,
+                    pos,
+                    hp: r.f32()?,
+                    food: r.i32()?,
+                    xp: r.i64()?,
+                }
+            }
+            DWAL_TAG_CONTAINER_SLOT => DeltaWalRecord::ContainerSlot {
+                dim: r.dim()?,
+                x: r.i32()?,
+                y: r.i32()?,
+                z: r.i32()?,
+                slot: r.i32()?,
+                item_id: r.i64()?,
+                count: r.i32()?,
+            },
+            DWAL_TAG_CHECKPOINT => DeltaWalRecord::CheckpointMarker {
+                checkpoint_seq: r.u64()?,
+            },
+            tag => return Err(format!("unknown record tag {tag}")),
+        };
+        r.done()?;
+        Ok(record)
+    }
+}
+
+/// Serialize one frame: magic, seq, len, payload, crc32(seq||len||payload).
+fn dwal_frame_bytes(seq: u64, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(DWAL_FRAME_MIN + payload.len());
+    out.extend_from_slice(&DWAL_MAGIC);
+    out.extend_from_slice(&seq.to_be_bytes());
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(payload);
+    let crc = crc32_ieee_parts(&[&out[4..]]);
+    out.extend_from_slice(&crc.to_be_bytes());
+    out
+}
+
+/// The verified contents of a WAL file: every intact frame plus how much of a
+/// torn tail was cut short. `good_len` is the byte offset just past the last
+/// verified frame - where a repair truncation should cut.
+struct DwalScan {
+    frames: Vec<(u64, DeltaWalRecord)>,
+    last_seq: u64,
+    good_len: u64,
+    truncated_tail_bytes: usize,
+}
+
+/// Parse `bytes` frame by frame. A partial trailing frame (fewer bytes than the
+/// declared record) is a torn tail; a bad magic, an over-cap length, a CRC
+/// mismatch, or an undecodable payload anywhere is corruption and fails closed.
+fn dwal_scan(bytes: &[u8]) -> Result<DwalScan, String> {
+    let mut frames = Vec::new();
+    let mut offset = 0usize;
+    let mut last_seq = 0u64;
+    loop {
+        let rest = bytes.len() - offset;
+        if rest == 0 {
+            break;
+        }
+        if rest < DWAL_FRAME_MIN {
+            break; // torn tail: fewer bytes than the smallest frame
+        }
+        let head = &bytes[offset..];
+        if head[..4] != DWAL_MAGIC {
+            return Err(format!("delta WAL: bad frame magic at offset {offset}"));
+        }
+        let seq = u64::from_be_bytes(head[4..12].try_into().unwrap());
+        let len = u32::from_be_bytes(head[12..16].try_into().unwrap()) as usize;
+        // The cap is checked BEFORE any allocation sized by `len`.
+        if len > MAX_WAL_RECORD_BYTES {
+            return Err(format!(
+                "delta WAL: payload length {len} over cap at offset {offset}"
+            ));
+        }
+        if rest < DWAL_FRAME_MIN + len {
+            break; // torn tail: the declared payload never fully arrived
+        }
+        let payload = &head[DWAL_HEADER_LEN..DWAL_HEADER_LEN + len];
+        let crc_at = DWAL_HEADER_LEN + len;
+        let stored_crc = u32::from_be_bytes(head[crc_at..crc_at + 4].try_into().unwrap());
+        if crc32_ieee_parts(&[&head[4..DWAL_HEADER_LEN], payload]) != stored_crc {
+            return Err(format!("delta WAL: crc mismatch at offset {offset}"));
+        }
+        let record = DeltaWalRecord::decode(payload)
+            .map_err(|e| format!("delta WAL: offset {offset}: {e}"))?;
+        frames.push((seq, record));
+        last_seq = seq;
+        offset += DWAL_FRAME_MIN + len;
+    }
+    Ok(DwalScan {
+        frames,
+        last_seq,
+        good_len: offset as u64,
+        truncated_tail_bytes: bytes.len() - offset,
+    })
+}
+
+/// What `recover_after_checkpoint` learned from the log.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct WalRecoveryReport {
+    /// The newest committed checkpoint's sequence, if one was journaled.
+    pub(crate) checkpoint_seq: Option<u64>,
+    /// Highest frame sequence seen; the journal continues from `+ 1`.
+    pub(crate) last_committed_seq: u64,
+    /// Every intact record strictly newer than the last checkpoint marker.
+    pub(crate) records: Vec<DeltaWalRecord>,
+    /// Bytes of an incomplete trailing frame skipped at EOF (a crash tore the
+    /// last append). All preceding CRC-verified frames were replayed intact.
+    pub(crate) truncated_tail_bytes: usize,
+}
+
+/// Replay a WAL file: validate the path, verify every frame's CRC, then return
+/// the records strictly newer than the newest `CheckpointMarker`. A missing
+/// file recovers as empty; a torn tail reports `truncated_tail_bytes`; corrupt
+/// magic, length, CRC or payload mid-stream is an `Err`.
+#[allow(dead_code)]
+pub(crate) fn recover_after_checkpoint(
+    path: &std::path::Path,
+) -> Result<WalRecoveryReport, String> {
+    ops_data_path_checked(path, "delta WAL")?;
+    let bytes = match std::fs::read(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WalRecoveryReport {
+                checkpoint_seq: None,
+                last_committed_seq: 0,
+                records: Vec::new(),
+                truncated_tail_bytes: 0,
+            });
+        }
+        Err(e) => return Err(format!("delta WAL: read {}: {e}", path.display())),
+        Ok(b) => b,
+    };
+    let scan = dwal_scan(&bytes)?;
+    let mut checkpoint_seq = None;
+    let mut checkpoint_frame_seq = 0u64;
+    for (seq, record) in &scan.frames {
+        if let DeltaWalRecord::CheckpointMarker { checkpoint_seq: cp } = record {
+            checkpoint_seq = Some(*cp);
+            checkpoint_frame_seq = *seq;
+        }
+    }
+    let records = scan
+        .frames
+        .iter()
+        .filter(|(seq, _)| *seq > checkpoint_frame_seq)
+        .map(|(_, record)| record.clone())
+        .collect();
+    Ok(WalRecoveryReport {
+        checkpoint_seq,
+        last_committed_seq: scan.last_seq,
+        records,
+        truncated_tail_bytes: scan.truncated_tail_bytes,
+    })
+}
+
+/// Append-only journal of world deltas between full saves. `next_seq` never
+/// resets inside one journal (and `open` continues past the highest sequence on
+/// disk), so a sequence number always orders frames on the same timeline.
+#[allow(dead_code)]
+pub(crate) struct DeltaWalJournal {
+    path: std::path::PathBuf,
+    file: std::fs::File,
+    next_seq: u64,
+}
+
+#[allow(dead_code)]
+impl DeltaWalJournal {
+    /// Open (or create) a WAL. A torn tail left by a crash is truncated first,
+    /// so new frames never sit behind bytes recovery would report anyway; a
+    /// mid-stream corrupt log fails closed.
+    pub(crate) fn open(path: impl AsRef<std::path::Path>) -> Result<DeltaWalJournal, String> {
+        let path = path.as_ref().to_path_buf();
+        ops_data_path_checked(&path, "delta WAL")?;
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("delta WAL: create {}: {e}", parent.display()))?;
+            }
+        }
+        let mut next_seq = 1u64;
+        if path.exists() {
+            let existing = std::fs::read(&path)
+                .map_err(|e| format!("delta WAL: read {}: {e}", path.display()))?;
+            if !existing.is_empty() {
+                let scan = dwal_scan(&existing)?;
+                if scan.truncated_tail_bytes > 0 {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .and_then(|f| f.set_len(scan.good_len))
+                        .map_err(|e| format!("delta WAL: truncate torn tail: {e}"))?;
+                }
+                next_seq = scan.last_seq + 1;
+            }
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .map_err(|e| format!("delta WAL: open {}: {e}", path.display()))?;
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::End(0))
+            .map_err(|e| format!("delta WAL: seek: {e}"))?;
+        Ok(DeltaWalJournal {
+            path,
+            file,
+            next_seq,
+        })
+    }
+
+    /// The sequence the next appended frame will get.
+    pub(crate) fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// Frame, append and `sync_data`: on return the record survives a crash, so
+    /// data loss between full saves is bounded by the append rate, not the save
+    /// interval.
+    pub(crate) fn append_and_flush(&mut self, record: &DeltaWalRecord) -> Result<u64, String> {
+        let payload = record.encode();
+        if payload.len() > MAX_WAL_RECORD_BYTES {
+            return Err(format!(
+                "delta WAL: record payload {} over cap",
+                payload.len()
+            ));
+        }
+        let seq = self.next_seq;
+        self.file
+            .write_all(&dwal_frame_bytes(seq, &payload))
+            .and_then(|_| self.file.sync_data())
+            .map_err(|e| format!("delta WAL: append {}: {e}", self.path.display()))?;
+        self.next_seq += 1;
+        Ok(seq)
+    }
+
+    /// Convenience for journaling a checkpoint boundary.
+    pub(crate) fn append_checkpoint(&mut self, checkpoint_seq: u64) -> Result<u64, String> {
+        self.append_and_flush(&DeltaWalRecord::CheckpointMarker { checkpoint_seq })
+    }
+
+    /// After a full save succeeded, shrink the WAL to a single fresh checkpoint
+    /// marker: write the anchor frame to a sibling file, sync it, and rename it
+    /// over the log, so a crash leaves either the old WAL or the new anchor -
+    /// never a half-truncated file. The sequence counter keeps running so frame
+    /// order stays monotonic across the rotation.
+    pub(crate) fn compact_after_checkpoint(&mut self, checkpoint_seq: u64) -> Result<(), String> {
+        let mut name = self.path.file_name().unwrap_or_default().to_os_string();
+        name.push(".compact-tmp");
+        let tmp = self.path.with_file_name(name);
+        let seq = self.next_seq;
+        let frame = dwal_frame_bytes(
+            seq,
+            &DeltaWalRecord::CheckpointMarker { checkpoint_seq }.encode(),
+        );
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .map_err(|e| format!("delta WAL: compact tmp {}: {e}", tmp.display()))?;
+            let written = file.write_all(&frame).and_then(|_| file.sync_all());
+            drop(file);
+            if let Err(e) = written {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(format!("delta WAL: compact write: {e}"));
+            }
+        }
+        std::fs::rename(&tmp, &self.path)
+            .map_err(|e| format!("delta WAL: compact rename: {e}"))?;
+        self.file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .map_err(|e| format!("delta WAL: reopen {}: {e}", self.path.display()))?;
+        std::io::Seek::seek(&mut self.file, std::io::SeekFrom::End(0))
+            .map_err(|e| format!("delta WAL: seek: {e}"))?;
+        self.next_seq = seq + 1;
+        Ok(())
+    }
+}
+
+// ================= ticking-crash quarantine =================
+//
+// A block entity, entity or chunk whose tick panics used to take the tick
+// thread (and the world) down with it. `run_quarantined_tick` runs the tick
+// under `catch_unwind`: after `max_consecutive_faults` panics (default 1 for a
+// critical tick panic) only that target is frozen and skipped on later ticks,
+// with a plain-language diagnostic for operators. The world stays online and
+// uncorrupted; releasing a frozen target requires op level 4, and the frozen
+// set can be persisted so a crash-looping target stays frozen after restart.
+
+/// What one frozen tick target is. `kind`/`eid` are for the operator
+/// diagnostic; matching for `is_quarantined`/`unfreeze` is the whole value.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum QuarantineTarget {
+    BlockEntity {
+        dim: DimId,
+        x: i32,
+        y: i32,
+        z: i32,
+        kind: String,
+    },
+    Entity {
+        dim: DimId,
+        eid: i32,
+        kind: String,
+    },
+    Chunk {
+        dim: DimId,
+        cx: i32,
+        cz: i32,
+    },
+}
+
+impl QuarantineTarget {
+    /// Plain-language identity for operator logs and diagnostics.
+    fn describe(&self) -> String {
+        match self {
+            QuarantineTarget::BlockEntity { dim, x, y, z, kind } => format!(
+                "block entity {kind} at ({x},{y},{z}) in dimension {}",
+                dim.raw()
+            ),
+            QuarantineTarget::Entity { dim, eid, kind } => {
+                format!("entity {kind} (eid {eid}) in dimension {}", dim.raw())
+            }
+            QuarantineTarget::Chunk { dim, cx, cz } => {
+                format!("chunk ({cx},{cz}) in dimension {}", dim.raw())
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct QuarantineRecord {
+    consecutive_faults: u32,
+    quarantined: bool,
+    /// One sanitized line: target description + bounded panic reason.
+    diagnostic: String,
+}
+
+/// The frozen set plus per-target fault counters. Interior locking so the tick
+/// loop can share one instance across workers.
+#[allow(dead_code)]
+pub(crate) struct TickFaultQuarantine {
+    /// Faults before a target freezes; 1 for critical tick panics.
+    max_consecutive_faults: u32,
+    records: Mutex<HashMap<QuarantineTarget, QuarantineRecord>>,
+}
+
+#[allow(dead_code)]
+impl TickFaultQuarantine {
+    pub(crate) fn new(max_consecutive_faults: u32) -> Self {
+        TickFaultQuarantine {
+            max_consecutive_faults: max_consecutive_faults.max(1),
+            records: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn is_quarantined(&self, target: &QuarantineTarget) -> bool {
+        self.records
+            .lock()
+            .unwrap()
+            .get(target)
+            .is_some_and(|r| r.quarantined)
+    }
+
+    /// The operator-facing line recorded for a target's last fault.
+    pub(crate) fn diagnostic(&self, target: &QuarantineTarget) -> Option<String> {
+        self.records
+            .lock()
+            .unwrap()
+            .get(target)
+            .map(|r| r.diagnostic.clone())
+    }
+
+    /// Every currently frozen target, for `/ops` surfaces and persistence.
+    pub(crate) fn quarantined(&self) -> Vec<QuarantineTarget> {
+        self.records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, r)| r.quarantined)
+            .map(|(t, _)| t.clone())
+            .collect()
+    }
+
+    /// Release a frozen target. Releasing a crash source is an operator-level
+    /// decision, so anything below op level 4 is refused outright.
+    pub(crate) fn unfreeze(
+        &self,
+        target: &QuarantineTarget,
+        actor_op_level: u8,
+    ) -> Result<bool, String> {
+        if actor_op_level < 4 {
+            return Err(format!(
+                "refused: releasing quarantined {} requires op level 4 (got {actor_op_level})",
+                target.describe()
+            ));
+        }
+        let mut records = self.records.lock().unwrap();
+        if records.get(target).is_some_and(|r| r.quarantined) {
+            records.remove(target);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Persist the frozen set so a crash-looping target stays frozen across a
+    /// restart. One sanitized line per target; atomic temp+sync+rename write.
+    pub(crate) fn persist(&self, path: &std::path::Path) -> Result<(), String> {
+        ops_data_path_checked(path, "quarantine evidence")?;
+        let mut out = String::from(QUARANTINE_FILE_HEADER);
+        out.push('\n');
+        for (target, record) in self.records.lock().unwrap().iter() {
+            if !record.quarantined {
+                continue;
+            }
+            out.push_str(&target.persist_line(record));
+            out.push('\n');
+        }
+        write_bytes_atomic(path, out.as_bytes())
+            .map_err(|e| format!("quarantine persist {}: {e}", path.display()))
+    }
+
+    /// Load a frozen set written by `persist`. A missing file is a fresh,
+    /// empty quarantine; malformed lines are skipped.
+    pub(crate) fn load_persisted(
+        path: &std::path::Path,
+        max_consecutive_faults: u32,
+    ) -> Result<TickFaultQuarantine, String> {
+        ops_data_path_checked(path, "quarantine evidence")?;
+        let text = match std::fs::read_to_string(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(TickFaultQuarantine::new(max_consecutive_faults));
+            }
+            Err(e) => return Err(format!("quarantine load {}: {e}", path.display())),
+            Ok(t) => t,
+        };
+        let quarantine = TickFaultQuarantine::new(max_consecutive_faults);
+        for line in text.lines() {
+            if let Some((target, faults, diagnostic)) = parse_quarantine_line(line) {
+                quarantine.records.lock().unwrap().insert(
+                    target,
+                    QuarantineRecord {
+                        consecutive_faults: faults,
+                        quarantined: true,
+                        diagnostic,
+                    },
+                );
+            }
+        }
+        Ok(quarantine)
+    }
+}
+
+impl Default for TickFaultQuarantine {
+    fn default() -> Self {
+        // A critical tick panic freezes its target on first fault.
+        TickFaultQuarantine::new(1)
+    }
+}
+
+const QUARANTINE_FILE_HEADER: &str = "MCSPINE-QUARANTINE-V1";
+
+/// One line for the persisted frozen set. Control characters in `kind` and the
+/// diagnostic become spaces, so a field can never smuggle extra lines or
+/// terminal escapes into an operator file.
+fn quarantine_field(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+impl QuarantineTarget {
+    fn persist_line(&self, record: &QuarantineRecord) -> String {
+        let faults = record.consecutive_faults;
+        let diag = quarantine_field(&record.diagnostic);
+        match self {
+            QuarantineTarget::BlockEntity { dim, x, y, z, kind } => format!(
+                "be\t{}\t{x}\t{y}\t{z}\t{faults}\t{}\t{diag}",
+                dim.raw(),
+                quarantine_field(kind)
+            ),
+            QuarantineTarget::Entity { dim, eid, kind } => format!(
+                "ent\t{}\t{eid}\t{faults}\t{}\t{diag}",
+                dim.raw(),
+                quarantine_field(kind)
+            ),
+            QuarantineTarget::Chunk { dim, cx, cz } => {
+                format!("chunk\t{}\t{cx}\t{cz}\t{faults}\t{diag}", dim.raw())
+            }
+        }
+    }
+}
+
+fn parse_quarantine_line(line: &str) -> Option<(QuarantineTarget, u32, String)> {
+    let p: Vec<&str> = line.split('\t').collect();
+    let num = |s: &&str| s.parse::<i64>().ok();
+    match p.as_slice() {
+        ["be", dim, x, y, z, faults, kind, diag @ ..] => {
+            let target = QuarantineTarget::BlockEntity {
+                dim: DimId::from_raw(num(dim)? as u32),
+                x: num(x)? as i32,
+                y: num(y)? as i32,
+                z: num(z)? as i32,
+                kind: kind.to_string(),
+            };
+            Some((target, num(faults)? as u32, diag.join("\t")))
+        }
+        ["ent", dim, eid, faults, kind, diag @ ..] => {
+            let target = QuarantineTarget::Entity {
+                dim: DimId::from_raw(num(dim)? as u32),
+                eid: num(eid)? as i32,
+                kind: kind.to_string(),
+            };
+            Some((target, num(faults)? as u32, diag.join("\t")))
+        }
+        ["chunk", dim, cx, cz, faults, diag @ ..] => {
+            let target = QuarantineTarget::Chunk {
+                dim: DimId::from_raw(num(dim)? as u32),
+                cx: num(cx)? as i32,
+                cz: num(cz)? as i32,
+            };
+            Some((target, num(faults)? as u32, diag.join("\t")))
+        }
+        _ => None,
+    }
+}
+
+/// What became of one `run_quarantined_tick` call.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TickFaultOutcome {
+    /// The tick ran and finished.
+    Ticked,
+    /// The target is frozen; the closure never ran.
+    SkippedQuarantined,
+    /// The tick panicked; `quarantined` reports whether this fault froze it.
+    Faulted { quarantined: bool },
+}
+
+/// A panic message made safe for an operator file: printable characters only,
+/// whitespace collapsed, bounded length. No stack, no raw payload object, no
+/// secrets - one line a log page can show verbatim.
+fn quarantine_sanitize(message: &str) -> String {
+    let printable: String = message
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let mut out = String::with_capacity(240);
+    for word in printable.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+        if out.chars().count() >= 240 {
+            break;
+        }
+    }
+    let out: String = out.chars().take(240).collect();
+    if out.is_empty() {
+        "panic without message".into()
+    } else {
+        out
+    }
+}
+
+/// Run one tick for `target`. A frozen target is skipped without calling `f`;
+/// a panicking `f` is caught - the tick thread never sees it - counted, and
+/// past `max_consecutive_faults` the target is frozen with a sanitized
+/// diagnostic. A clean tick resets the consecutive-fault counter.
+#[allow(dead_code)]
+pub(crate) fn run_quarantined_tick(
+    quarantine: &TickFaultQuarantine,
+    target: QuarantineTarget,
+    f: impl FnOnce() + std::panic::UnwindSafe,
+) -> TickFaultOutcome {
+    {
+        let records = quarantine.records.lock().unwrap();
+        if records.get(&target).is_some_and(|r| r.quarantined) {
+            return TickFaultOutcome::SkippedQuarantined;
+        }
+    }
+    let panic = match std::panic::catch_unwind(f) {
+        Ok(()) => None,
+        Err(payload) => Some(panic_payload_message(&payload)),
+    };
+    let Some(message) = panic else {
+        let mut records = quarantine.records.lock().unwrap();
+        if let Some(record) = records.get_mut(&target) {
+            record.consecutive_faults = 0;
+        }
+        return TickFaultOutcome::Ticked;
+    };
+    let message = quarantine_sanitize(&message);
+    let mut records = quarantine.records.lock().unwrap();
+    let record = records
+        .entry(target.clone())
+        .or_insert_with(|| QuarantineRecord {
+            consecutive_faults: 0,
+            quarantined: false,
+            diagnostic: String::new(),
+        });
+    record.consecutive_faults = record.consecutive_faults.saturating_add(1);
+    if record.consecutive_faults >= quarantine.max_consecutive_faults {
+        record.quarantined = true;
+    }
+    record.diagnostic = format!(
+        "{} faulted tick {}/{}: {}",
+        target.describe(),
+        record.consecutive_faults,
+        quarantine.max_consecutive_faults,
+        message
+    );
+    let quarantined = record.quarantined;
+    if quarantined {
+        eprintln!("[quarantine] froze {}: {}", target.describe(), message);
+    }
+    TickFaultOutcome::Faulted { quarantined }
+}
+
 #[cfg(test)]
 mod server_reliability_tests {
     use super::*;
@@ -1282,5 +2134,370 @@ mod server_reliability_tests {
                 "accepted {bad}"
             );
         }
+    }
+
+    // ---------- OPS-2: delta WAL + tick-fault quarantine ----------
+
+    fn ops2_temp_dir(tag: &str) -> std::path::PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "mc-spine-ops2-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn ops2_block(x: i32, y: i32, z: i32, state: u32) -> DeltaWalRecord {
+        DeltaWalRecord::BlockSet {
+            dim: DimId::Overworld,
+            x,
+            y,
+            z,
+            state,
+        }
+    }
+
+    /// Append -> checkpoint -> post-checkpoint writes: recovery replays only
+    /// what the last marker did not already cover, and every record round-trips
+    /// byte-exact.
+    #[test]
+    fn ops2_dwal_recovers_only_post_checkpoint_records_and_roundtrips_fields() {
+        let dir = ops2_temp_dir("wal-replay");
+        let path = dir.join("delta.wal");
+        let block = ops2_block(12, -4, 700, 0x00ab_cdef);
+        let snap = DeltaWalRecord::PlayerSnapshot {
+            uuid: [0x5a; 16],
+            dim: DimId::Nether,
+            pos: [1.5, 64.25, -2.5],
+            hp: 18.5,
+            food: 17,
+            xp: 123_456,
+        };
+        let slot = DeltaWalRecord::ContainerSlot {
+            dim: DimId::End,
+            x: -9,
+            y: 70,
+            z: 33,
+            slot: 12,
+            item_id: 881,
+            count: 13,
+        };
+        {
+            let mut wal = DeltaWalJournal::open(&path).unwrap();
+            assert_eq!(wal.next_seq(), 1);
+            assert_eq!(wal.append_and_flush(&block).unwrap(), 1);
+            assert_eq!(wal.append_and_flush(&snap).unwrap(), 2);
+            wal.append_checkpoint(41).unwrap();
+            wal.append_and_flush(&slot).unwrap();
+        }
+        let report = recover_after_checkpoint(&path).unwrap();
+        assert_eq!(report.checkpoint_seq, Some(41));
+        assert_eq!(report.last_committed_seq, 4);
+        assert_eq!(report.records, vec![slot.clone()]);
+        assert_eq!(report.truncated_tail_bytes, 0);
+
+        // A WAL with no marker replays every intact frame.
+        let plain = dir.join("plain.wal");
+        {
+            let mut wal = DeltaWalJournal::open(&plain).unwrap();
+            wal.append_and_flush(&block).unwrap();
+            wal.append_and_flush(&snap).unwrap();
+        }
+        let report = recover_after_checkpoint(&plain).unwrap();
+        assert_eq!(report.checkpoint_seq, None);
+        assert_eq!(report.records, vec![block, snap]);
+
+        // A missing WAL recovers as nothing to do.
+        let report = recover_after_checkpoint(&dir.join("absent.wal")).unwrap();
+        assert!(report.records.is_empty() && report.checkpoint_seq.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A crash-torn trailing frame is reported and skipped while every prior
+    /// CRC-verified frame stays intact; corrupt magic, CRC or length mid-stream
+    /// fails closed.
+    #[test]
+    fn ops2_dwal_tolerates_torn_tail_and_fails_closed_on_corruption() {
+        let dir = ops2_temp_dir("wal-torn");
+        let path = dir.join("delta.wal");
+        let r1 = ops2_block(1, 2, 3, 0xbeef);
+        let r2 = ops2_block(4, 5, 6, 0xfeed);
+        {
+            let mut wal = DeltaWalJournal::open(&path).unwrap();
+            wal.append_checkpoint(3).unwrap();
+            wal.append_and_flush(&r1).unwrap();
+            wal.append_and_flush(&r2).unwrap();
+        }
+        let intact_len = std::fs::metadata(&path).unwrap().len();
+
+        // Simulate a crash mid-append: half a frame header at EOF.
+        let torn = b"DWAL\x00\x00\x00";
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(torn)
+            .unwrap();
+        let report = recover_after_checkpoint(&path).unwrap();
+        assert_eq!(report.truncated_tail_bytes, torn.len());
+        assert_eq!(report.records, vec![r1.clone(), r2.clone()]);
+
+        // Reopen truncates the torn tail so appends never sit behind garbage.
+        {
+            let mut wal = DeltaWalJournal::open(&path).unwrap();
+            wal.append_checkpoint(4).unwrap();
+        }
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            intact_len + (DWAL_FRAME_MIN + 9) as u64 // tag(1) + u64 checkpoint_seq(8)
+        );
+
+        // A torn tail can also stop mid-payload: full header, partial record.
+        let mut partial = Vec::new();
+        partial.extend_from_slice(&DWAL_MAGIC);
+        partial.extend_from_slice(&99u64.to_be_bytes());
+        partial.extend_from_slice(&60u32.to_be_bytes()); // claims 60 payload bytes
+        partial.extend_from_slice(&[7u8; 12]); // only 12 arrived
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&partial)
+            .unwrap();
+        let report = recover_after_checkpoint(&path).unwrap();
+        assert_eq!(report.truncated_tail_bytes, partial.len());
+        assert_eq!(report.checkpoint_seq, Some(4));
+        assert!(report.records.is_empty());
+
+        // Mid-stream corruption fails closed: flip one bit inside frame #1's
+        // payload. The torn tail behind it is not what makes this an error.
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[DWAL_HEADER_LEN + 5] ^= 0x40;
+        std::fs::write(&path, &bytes).unwrap();
+        let wal_err = recover_after_checkpoint(&path).unwrap_err();
+        assert!(wal_err.contains("crc"), "{wal_err}");
+
+        // Bad magic mid-stream fails closed too. Restore the payload bit, then
+        // corrupt the first byte of frame #2's magic (frame #1 is a checkpoint
+        // marker: tag(1) + u64(8) payload -> 16 + 9 + 4 = 29 bytes long).
+        bytes[DWAL_HEADER_LEN + 5] ^= 0x40;
+        bytes[DWAL_FRAME_MIN + 9] = b'X';
+        std::fs::write(&path, &bytes).unwrap();
+        let err = recover_after_checkpoint(&path).unwrap_err();
+        assert!(err.contains("magic"), "{err}");
+
+        // A forged length over the record cap fails closed even at EOF.
+        let mut forged = Vec::new();
+        forged.extend_from_slice(&DWAL_MAGIC);
+        forged.extend_from_slice(&1u64.to_be_bytes());
+        forged.extend_from_slice(&((MAX_WAL_RECORD_BYTES as u32) + 1).to_be_bytes());
+        forged.extend_from_slice(&[0u8; 8]);
+        std::fs::write(&path, &forged).unwrap();
+        assert!(recover_after_checkpoint(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After a successful full save, the WAL shrinks to the fresh anchor marker
+    /// atomically; sequence numbers keep climbing across the rotation.
+    #[test]
+    fn ops2_dwal_compact_after_checkpoint_truncates_and_keeps_monotonic_seq() {
+        let dir = ops2_temp_dir("wal-compact");
+        let path = dir.join("delta.wal");
+        let rec = ops2_block(1, 2, 3, 5);
+        let mut wal = DeltaWalJournal::open(&path).unwrap();
+        wal.append_and_flush(&rec).unwrap(); // seq 1
+        wal.append_checkpoint(10).unwrap(); // seq 2
+        wal.append_and_flush(&rec).unwrap(); // seq 3
+        wal.compact_after_checkpoint(10).unwrap(); // anchor = seq 4
+        let report = recover_after_checkpoint(&path).unwrap();
+        assert_eq!(report.checkpoint_seq, Some(10));
+        assert!(report.records.is_empty());
+        assert_eq!(report.last_committed_seq, 4);
+
+        // Sequence stays monotonic across the rotation; the post-compaction
+        // write is the only thing recovery replays.
+        assert_eq!(wal.append_and_flush(&rec).unwrap(), 5);
+        drop(wal);
+        let report = recover_after_checkpoint(&path).unwrap();
+        assert_eq!(report.records, vec![rec]);
+        // No compact temp file is left behind.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Operator-controlled WAL and quarantine paths refuse `..`, NUL and
+    /// control characters before any file is touched.
+    #[test]
+    fn ops2_wal_and_quarantine_paths_reject_traversal_and_control_chars() {
+        let dir = ops2_temp_dir("wal-paths");
+        assert!(DeltaWalJournal::open(dir.join("..").join("escape.wal")).is_err());
+        assert!(DeltaWalJournal::open(dir.join("bad\nname.wal")).is_err());
+        assert!(DeltaWalJournal::open(dir.join("nul\u{0}byte.wal")).is_err());
+        assert!(recover_after_checkpoint(&dir.join("..").join("x.wal")).is_err());
+        assert!(recover_after_checkpoint(&dir.join("tab\tname.wal")).is_err());
+        assert!(DeltaWalJournal::open(dir.join("fine.wal")).is_ok());
+        let q = TickFaultQuarantine::default();
+        assert!(q.persist(&dir.join("..").join("q.txt")).is_err());
+        assert!(TickFaultQuarantine::load_persisted(&dir.join("n\u{0}l.txt"), 1).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A panicking block-entity tick is caught without crashing the caller,
+    /// frozen on first fault with a coordinate diagnostic, and skipped
+    /// thereafter. Entity and chunk targets freeze independently.
+    #[test]
+    fn ops2_quarantine_freezes_panicking_target_and_skips_it() {
+        let q = TickFaultQuarantine::default();
+        let be = QuarantineTarget::BlockEntity {
+            dim: DimId::Overworld,
+            x: 12,
+            y: 64,
+            z: -5,
+            kind: "minecraft:chest".into(),
+        };
+        let ran = AtomicU64::new(0);
+        let outcome = run_quarantined_tick(&q, be.clone(), || {
+            ran.fetch_add(1, Ordering::SeqCst);
+            panic!("tick exploded\nwith \u{1}junk");
+        });
+        assert_eq!(outcome, TickFaultOutcome::Faulted { quarantined: true });
+        assert!(q.is_quarantined(&be));
+        let diag = q.diagnostic(&be).unwrap();
+        assert!(diag.contains("minecraft:chest"), "{diag}");
+        assert!(diag.contains("(12,64,-5)"), "{diag}");
+        // The recorded line carries no control bytes or raw stack spam.
+        assert!(!diag.chars().any(|c| c.is_control()), "{diag}");
+
+        // Next tick for the same target: skipped, the closure never runs.
+        let outcome = run_quarantined_tick(&q, be.clone(), || {
+            ran.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(outcome, TickFaultOutcome::SkippedQuarantined);
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+
+        // Entity + chunk targets quarantine independently.
+        let ent = QuarantineTarget::Entity {
+            dim: DimId::Nether,
+            eid: 77,
+            kind: "minecraft:zombie".into(),
+        };
+        let outcome = run_quarantined_tick(&q, ent.clone(), || panic!("mob boom"));
+        assert_eq!(outcome, TickFaultOutcome::Faulted { quarantined: true });
+        assert!(q.is_quarantined(&ent));
+        let chunk = QuarantineTarget::Chunk {
+            dim: DimId::End,
+            cx: -3,
+            cz: 8,
+        };
+        assert!(!q.is_quarantined(&chunk));
+        assert_eq!(
+            run_quarantined_tick(&q, chunk, || {}),
+            TickFaultOutcome::Ticked
+        );
+        assert_eq!(
+            q.quarantined()
+                .iter()
+                .filter(|t| **t != ent)
+                .collect::<Vec<_>>(),
+            vec![&be]
+        );
+    }
+
+    /// `unfreeze` refuses operator levels below 4 and only level 4 releases;
+    /// a higher fault threshold needs that many consecutive faults to freeze,
+    /// and one clean tick resets the run.
+    #[test]
+    fn ops2_quarantine_unfreeze_requires_op_level_4_and_threshold_resets() {
+        let q = TickFaultQuarantine::new(3);
+        let chunk = QuarantineTarget::Chunk {
+            dim: DimId::Overworld,
+            cx: 0,
+            cz: 0,
+        };
+        let boom = || panic!("chunk tick died");
+        assert_eq!(
+            run_quarantined_tick(&q, chunk.clone(), boom),
+            TickFaultOutcome::Faulted { quarantined: false }
+        );
+        assert_eq!(
+            run_quarantined_tick(&q, chunk.clone(), boom),
+            TickFaultOutcome::Faulted { quarantined: false }
+        );
+        assert!(!q.is_quarantined(&chunk));
+        // A clean tick resets the consecutive-fault counter.
+        assert_eq!(
+            run_quarantined_tick(&q, chunk.clone(), || {}),
+            TickFaultOutcome::Ticked
+        );
+        assert_eq!(
+            run_quarantined_tick(&q, chunk.clone(), boom),
+            TickFaultOutcome::Faulted { quarantined: false }
+        );
+        assert_eq!(
+            run_quarantined_tick(&q, chunk.clone(), boom),
+            TickFaultOutcome::Faulted { quarantined: false }
+        );
+        assert_eq!(
+            run_quarantined_tick(&q, chunk.clone(), boom),
+            TickFaultOutcome::Faulted { quarantined: true }
+        );
+        assert!(q.is_quarantined(&chunk));
+
+        // Only op level 4 may release a frozen crash source.
+        for level in [0u8, 1, 2, 3] {
+            assert!(q.unfreeze(&chunk, level).is_err(), "level {level}");
+            assert!(q.is_quarantined(&chunk), "level {level} released it");
+        }
+        assert_eq!(q.unfreeze(&chunk, 4), Ok(true));
+        assert!(!q.is_quarantined(&chunk));
+        assert_eq!(q.unfreeze(&chunk, 4), Ok(false));
+        let other = QuarantineTarget::Chunk {
+            dim: DimId::Overworld,
+            cx: 9,
+            cz: 9,
+        };
+        assert_eq!(q.unfreeze(&other, 4), Ok(false));
+        // After release the target ticks again.
+        assert_eq!(
+            run_quarantined_tick(&q, chunk, || {}),
+            TickFaultOutcome::Ticked
+        );
+    }
+
+    /// The frozen set round-trips through the persisted evidence file so a
+    /// crash-looping target stays frozen across a restart.
+    #[test]
+    fn ops2_quarantine_persist_roundtrip_keeps_targets_frozen() {
+        let dir = ops2_temp_dir("quar-persist");
+        let path = dir.join("quarantine.txt");
+        let q = TickFaultQuarantine::default();
+        let be = QuarantineTarget::BlockEntity {
+            dim: DimId::Overworld,
+            x: 1,
+            y: 2,
+            z: 3,
+            kind: "minecraft:hopper".into(),
+        };
+        let ent = QuarantineTarget::Entity {
+            dim: DimId::Nether,
+            eid: 42,
+            kind: "minecraft:piglin".into(),
+        };
+        run_quarantined_tick(&q, be.clone(), || panic!("be died"));
+        run_quarantined_tick(&q, ent.clone(), || panic!("ent died"));
+        q.persist(&path).unwrap();
+        let loaded = TickFaultQuarantine::load_persisted(&path, 1).unwrap();
+        assert!(loaded.is_quarantined(&be));
+        assert!(loaded.is_quarantined(&ent));
+        let diag = loaded.diagnostic(&be).unwrap();
+        assert!(diag.contains("minecraft:hopper"), "{diag}");
+        assert!(!diag.contains('\n'), "{diag}");
+        // A missing file loads as an empty quarantine.
+        let fresh = TickFaultQuarantine::load_persisted(&dir.join("absent.txt"), 1).unwrap();
+        assert!(!fresh.is_quarantined(&be));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
