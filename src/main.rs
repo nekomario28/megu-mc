@@ -56,6 +56,7 @@ include!("world_mechanisms.rs");
 include!("save_v2.rs");
 include!("commands_core.rs");
 include!("commands_execute.rs");
+include!("teams_and_commands.rs");
 include!("menus_and_items.rs");
 include!("workstations_and_mounts.rs");
 include!("combat_and_health.rs");

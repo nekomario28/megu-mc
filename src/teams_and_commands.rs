@@ -1,0 +1,2548 @@
+// ---------- Phase P3-B: teams (0x60), /tick (0x71/0x72), /locate, /random,
+// /return & .mcfunction macros ----------
+//
+// This file is `include!`d into main.rs after `commands_execute.rs`, so every
+// item here lives in the same crate module as commands_core.rs. The single
+// dispatch entry point is `exec_p3b_command`: wiring the five commands into the
+// command match is a five-line drop-in once the parallel lanes land.
+
+// ---------------------------------------------------------------------------
+// Teams (Vanilla 1.21.1 PlayerTeam) + protocol-767 S2C 0x60 SetPlayerTeam.
+// ---------------------------------------------------------------------------
+
+/// Vanilla `ChatFormatting` in wire-id order. Only 0..=15 (the named colours)
+/// and 21 (`reset`) are legal team colours; the formatting codes (16..=20) are
+/// rejected by `team_color_id` just like the vanilla brigadier suggestion set.
+#[allow(dead_code)]
+const TEAM_FORMATTING_NAMES: [&str; 22] = [
+    "black",
+    "dark_blue",
+    "dark_green",
+    "dark_aqua",
+    "dark_red",
+    "dark_purple",
+    "gold",
+    "gray",
+    "dark_gray",
+    "blue",
+    "green",
+    "aqua",
+    "red",
+    "light_purple",
+    "yellow",
+    "white",
+    "obfuscated",
+    "bold",
+    "strikethrough",
+    "underline",
+    "italic",
+    "reset",
+];
+
+/// `Team.Visibility` serialised names, enum order.
+#[allow(dead_code)]
+const TEAM_NAMETAG_VISIBILITIES: [&str; 4] =
+    ["always", "never", "hideForOtherTeams", "hideForOwnTeam"];
+/// `Team.CollisionRule` serialised names, enum order.
+#[allow(dead_code)]
+const TEAM_COLLISION_RULES: [&str; 4] =
+    ["always", "never", "pushOtherTeams", "pushOwnTeam"];
+
+/// A named colour or `reset`. Formatting codes 16..=20 are not team colours.
+#[allow(dead_code)]
+fn team_color_id(name: &str) -> Option<i32> {
+    let id = TEAM_FORMATTING_NAMES.iter().position(|n| *n == name)? as i32;
+    ((0..=15).contains(&id) || id == 21).then_some(id)
+}
+
+/// One vanilla `PlayerTeam`. `display_name`/`prefix`/`suffix` are kept as plain
+/// text and serialised as `{"text": ...}` NBT components on the wire.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
+struct Team {
+    name: String,
+    display_name: String,
+    /// `ChatFormatting` id 0..=21; `team add` starts at 21 (`reset`).
+    color: i32,
+    friendly_fire: bool,
+    see_friendly_invisibles: bool,
+    nametag_visibility: String,
+    collision_rule: String,
+    prefix: String,
+    suffix: String,
+    members: BTreeSet<String>,
+}
+
+#[allow(dead_code)]
+impl Team {
+    fn new(name: &str, display_name: Option<&str>) -> Team {
+        Team {
+            name: name.to_owned(),
+            display_name: display_name.unwrap_or(name).to_owned(),
+            color: 21,
+            friendly_fire: true,
+            see_friendly_invisibles: false,
+            nametag_visibility: "always".to_owned(),
+            collision_rule: "always".to_owned(),
+            prefix: String::new(),
+            suffix: String::new(),
+            members: BTreeSet::new(),
+        }
+    }
+    fn friendly_flags(&self) -> u8 {
+        u8::from(self.friendly_fire) | (u8::from(self.see_friendly_invisibles) << 1)
+    }
+}
+
+/// Teams by name plus the reverse index from member to its single team. Vanilla
+/// allows a score holder to sit on at most one team at a time: `join` removes
+/// the member from any prior team first.
+#[allow(dead_code)]
+#[derive(Default)]
+struct TeamRegistry {
+    teams: BTreeMap<String, Team>,
+    member_team: HashMap<String, String>,
+}
+
+#[allow(dead_code)]
+impl TeamRegistry {
+    fn add(&mut self, name: &str, display_name: Option<&str>) -> Result<(), String> {
+        if self.teams.contains_key(name) {
+            return Err(format!("A team already exists with the name '{name}'"));
+        }
+        self.teams.insert(name.to_owned(), Team::new(name, display_name));
+        Ok(())
+    }
+    fn remove(&mut self, name: &str) -> Result<Team, String> {
+        let team = self
+            .teams
+            .remove(name)
+            .ok_or_else(|| format!("No team with name '{name}'"))?;
+        for member in &team.members {
+            self.member_team.remove(member);
+        }
+        Ok(team)
+    }
+    fn empty(&mut self, name: &str) -> Result<Vec<String>, String> {
+        let team = self
+            .teams
+            .get_mut(name)
+            .ok_or_else(|| format!("No team with name '{name}'"))?;
+        let members: Vec<String> = team.members.iter().cloned().collect();
+        for member in &members {
+            self.member_team.remove(member);
+        }
+        team.members.clear();
+        Ok(members)
+    }
+    /// Returns the team the member was removed from, if any.
+    fn join(&mut self, name: &str, member: &str) -> Result<Option<String>, String> {
+        if member.is_empty() || member.chars().count() > 40 {
+            return Err(format!("'{member}' is not a valid member name"));
+        }
+        if !self.teams.contains_key(name) {
+            return Err(format!("No team with name '{name}'"));
+        }
+        let previous = self.member_team.get(member).cloned();
+        if previous.as_deref() == Some(name) {
+            return Ok(None);
+        }
+        if let Some(old) = &previous {
+            if let Some(team) = self.teams.get_mut(old) {
+                team.members.remove(member);
+            }
+        }
+        self.teams
+            .get_mut(name)
+            .expect("checked above")
+            .members
+            .insert(member.to_owned());
+        self.member_team.insert(member.to_owned(), name.to_owned());
+        Ok(previous)
+    }
+    /// Returns the team left, or an error when the member was on no team.
+    fn leave(&mut self, member: &str) -> Result<String, String> {
+        let Some(old) = self.member_team.remove(member) else {
+            return Err(format!("{member} is not on a team"));
+        };
+        if let Some(team) = self.teams.get_mut(&old) {
+            team.members.remove(member);
+        }
+        Ok(old)
+    }
+    fn list(&self) -> Vec<&Team> {
+        self.teams.values().collect()
+    }
+    fn get(&self, name: &str) -> Option<&Team> {
+        self.teams.get(name)
+    }
+    fn get_mut(&mut self, name: &str) -> Option<&mut Team> {
+        self.teams.get_mut(name)
+    }
+    fn team_of(&self, member: &str) -> Option<&str> {
+        self.member_team.get(member).map(String::as_str)
+    }
+    /// A `TeamMessage`: the sender must be on a team; every member (including
+    /// the sender) gets the `[team] <sender> message` line. Returned as
+    /// (recipient, text) pairs so the caller decides how to deliver them.
+    fn teammsg(&self, sender: &str, message: &str) -> Result<Vec<(String, String)>, String> {
+        let Some(team_name) = self.team_of(sender) else {
+            return Err("You are not in a team".to_owned());
+        };
+        let team = self.teams.get(team_name).expect("member index is consistent");
+        Ok(team
+            .members
+            .iter()
+            .map(|member| {
+                (
+                    member.clone(),
+                    format!("[{}] <{}> {}", team.name, sender, message),
+                )
+            })
+            .collect())
+    }
+}
+
+#[allow(dead_code)]
+fn teams() -> &'static Mutex<TeamRegistry> {
+    static TEAMS: OnceLock<Mutex<TeamRegistry>> = OnceLock::new();
+    TEAMS.get_or_init(|| Mutex::new(TeamRegistry::default()))
+}
+
+/// `@a[team=...]` / `spreadplayers respectTeams` hook: the single team a member
+/// belongs to. Selector lanes read this when wiring `candidate.team`.
+#[allow(dead_code)]
+fn p3b_team_of(member: &str) -> Option<String> {
+    teams()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .team_of(member)
+        .map(str::to_owned)
+}
+
+// ----- S2C 0x60 SetPlayerTeam (protocol 767) -----
+
+/// `{"text": ...}` as the anonymousNbt compound the protocol's `writeComponent`
+/// emits. Identical layout to `chat_nbt` but named for the team wire path.
+#[allow(dead_code)]
+fn team_component_nbt(text: &str) -> Vec<u8> {
+    chat_nbt(text)
+}
+
+/// Modes of `ClientboundSetPlayerTeamPacket`: create, remove, update info,
+/// add entities, remove entities.
+#[allow(dead_code)]
+const TEAM_MODE_ADD_TEAM: u8 = 0;
+#[allow(dead_code)]
+const TEAM_MODE_REMOVE_TEAM: u8 = 1;
+#[allow(dead_code)]
+const TEAM_MODE_UPDATE_INFO: u8 = 2;
+#[allow(dead_code)]
+const TEAM_MODE_ADD_ENTITIES: u8 = 3;
+#[allow(dead_code)]
+const TEAM_MODE_REMOVE_ENTITIES: u8 = 4;
+
+/// `ClientboundSetPlayerTeamPacket.write`: team name, mode byte, parameter block
+/// for modes 0/2, entity name list for modes 0/3/4.
+#[allow(dead_code)]
+fn set_player_team_packet(
+    name: &str,
+    mode: u8,
+    team: Option<&Team>,
+    entities: &[String],
+) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_str(&mut p, name);
+    p.push(mode);
+    if matches!(mode, TEAM_MODE_ADD_TEAM | TEAM_MODE_UPDATE_INFO) {
+        let team = team.expect("modes 0 and 2 carry the parameter block");
+        p.extend_from_slice(&team_component_nbt(&team.display_name));
+        p.push(team.friendly_flags());
+        write_str(&mut p, &team.nametag_visibility);
+        write_str(&mut p, &team.collision_rule);
+        write_varint(&mut p, i64::from(team.color));
+        p.extend_from_slice(&team_component_nbt(&team.prefix));
+        p.extend_from_slice(&team_component_nbt(&team.suffix));
+    }
+    if matches!(
+        mode,
+        TEAM_MODE_ADD_TEAM | TEAM_MODE_ADD_ENTITIES | TEAM_MODE_REMOVE_ENTITIES
+    ) {
+        write_varint(&mut p, entities.len() as i64);
+        for entity in entities {
+            write_str(&mut p, entity);
+        }
+    }
+    p
+}
+
+/// What [`decode_set_player_team`] extracts back off the wire: every field the
+/// encoder can emit. Parameter fields are `None` for modes that do not carry
+/// the parameter block.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq)]
+struct SetPlayerTeamPacket {
+    name: String,
+    mode: u8,
+    display_name: Option<String>,
+    friendly_flags: u8,
+    nametag_visibility: Option<String>,
+    collision_rule: Option<String>,
+    color: i32,
+    prefix: Option<String>,
+    suffix: Option<String>,
+    entities: Vec<String>,
+}
+
+/// A bounds-checked cursor over one packet body. Every read returns `None` on
+/// truncation so a malformed 0x60/0x72 fails closed instead of panicking.
+#[allow(dead_code)]
+struct P3bReader<'a> {
+    data: &'a [u8],
+    p: usize,
+}
+
+#[allow(dead_code)]
+impl<'a> P3bReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        P3bReader { data, p: 0 }
+    }
+    fn done(&self) -> bool {
+        self.p == self.data.len()
+    }
+    fn byte(&mut self) -> Option<u8> {
+        let b = *self.data.get(self.p)?;
+        self.p += 1;
+        Some(b)
+    }
+    fn varint(&mut self) -> Option<i64> {
+        let mut v = 0i64;
+        for i in 0..5 {
+            let byte = *self.data.get(self.p)?;
+            self.p += 1;
+            v |= ((byte & 0x7f) as i64) << (7 * i);
+            if byte & 0x80 == 0 {
+                return Some(v as u32 as i64);
+            }
+        }
+        None
+    }
+    fn utf(&mut self) -> Option<String> {
+        let len = self.varint()?;
+        if len < 0 || len > (1 << 20) {
+            return None;
+        }
+        let bytes = self.data.get(self.p..self.p + len as usize)?;
+        self.p += len as usize;
+        std::str::from_utf8(bytes).ok().map(str::to_owned)
+    }
+    /// Extract the `text` member of one anonymousNbt component: a compound
+    /// holding `{"text": s}` (what the encoder emits) or a bare TAG_String.
+    /// Other members are skipped through the shared wire skip so extras decode.
+    fn nbt_text(&mut self) -> Option<String> {
+        let tag = self.byte()?;
+        match tag {
+            8 => {
+                let n = u16::from_be_bytes(
+                    self.data.get(self.p..self.p + 2)?.try_into().ok()?,
+                ) as usize;
+                self.p += 2;
+                let s = std::str::from_utf8(self.data.get(self.p..self.p + n)?).ok()?;
+                self.p += n;
+                Some(s.to_owned())
+            }
+            10 => {
+                let mut text = String::new();
+                loop {
+                    let child = self.byte()?;
+                    if child == 0 {
+                        return Some(text);
+                    }
+                    let nlen = u16::from_be_bytes(
+                        self.data.get(self.p..self.p + 2)?.try_into().ok()?,
+                    ) as usize;
+                    self.p += 2;
+                    let name = std::str::from_utf8(self.data.get(self.p..self.p + nlen)?)
+                        .ok()?
+                        .to_owned();
+                    self.p += nlen;
+                    if child == 8 && name == "text" {
+                        let n = u16::from_be_bytes(
+                            self.data.get(self.p..self.p + 2)?.try_into().ok()?,
+                        ) as usize;
+                        self.p += 2;
+                        text = std::str::from_utf8(self.data.get(self.p..self.p + n)?)
+                            .ok()?
+                            .to_owned();
+                        self.p += n;
+                    } else if !nbt_wire_value(self.data, &mut self.p, child, 1) {
+                        return None;
+                    }
+                }
+            }
+            // Any other legal component tag: skip it and report empty text
+            // rather than failing the packet on a component we do not model.
+            _ => {
+                if nbt_wire_value(self.data, &mut self.p, tag, 0) {
+                    Some(String::new())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// The exact inverse of [`set_player_team_packet`]: fails on truncation or on a
+/// mode that requires blocks the packet does not contain.
+#[allow(dead_code)]
+fn decode_set_player_team(data: &[u8]) -> Option<SetPlayerTeamPacket> {
+    let mut r = P3bReader::new(data);
+    let name = r.utf()?;
+    let mode = r.byte()?;
+    let mut packet = SetPlayerTeamPacket {
+        name,
+        mode,
+        display_name: None,
+        friendly_flags: 0,
+        nametag_visibility: None,
+        collision_rule: None,
+        color: 21,
+        prefix: None,
+        suffix: None,
+        entities: Vec::new(),
+    };
+    if matches!(mode, TEAM_MODE_ADD_TEAM | TEAM_MODE_UPDATE_INFO) {
+        packet.display_name = Some(r.nbt_text()?);
+        packet.friendly_flags = r.byte()?;
+        packet.nametag_visibility = Some(r.utf()?);
+        packet.collision_rule = Some(r.utf()?);
+        packet.color = r.varint()? as i32;
+        packet.prefix = Some(r.nbt_text()?);
+        packet.suffix = Some(r.nbt_text()?);
+    }
+    if matches!(
+        mode,
+        TEAM_MODE_ADD_TEAM | TEAM_MODE_ADD_ENTITIES | TEAM_MODE_REMOVE_ENTITIES
+    ) {
+        let count = r.varint()?;
+        if !(0..=(1 << 16)).contains(&count) {
+            return None;
+        }
+        for _ in 0..count {
+            packet.entities.push(r.utf()?);
+        }
+    }
+    r.done().then_some(packet)
+}
+
+/// Send one team packet to every connected client. All five modes broadcast to
+/// the whole audience in vanilla (a client's tab list renders every team).
+#[allow(dead_code)]
+fn p3b_broadcast_team_packet(payload: Vec<u8>) {
+    let pkt = payload.clone();
+    fanout_in(&client_snapshot(), |_| true, |_| (0x60, pkt.clone()));
+}
+
+// ---------------------------------------------------------------------------
+// /tick engine (Vanilla 1.21.1 TickRateManager) + S2C 0x71/0x72 codecs.
+// ---------------------------------------------------------------------------
+
+/// `TickRateManager`: target rate in ticks per second plus the frozen/step/
+/// sprint override state. No wall clock is read anywhere in the controller —
+/// `should_run_game_tick` consumes the queued step/sprint counters and the
+/// caller paces the loop by `tick_interval_nanos`.
+#[allow(dead_code)]
+struct TickController {
+    /// Ticks per second; vanilla clamps `setTickRate` to >= 1.0 and the command
+    /// argument caps it at 10000.0.
+    tick_rate: f32,
+    frozen: bool,
+    /// Ticks queued by `/tick step`; consumed only while frozen.
+    step_remaining: i32,
+    /// Ticks queued by `/tick sprint`; consumed regardless of frozen.
+    sprint_remaining: i32,
+    /// Vanilla `finishTickSprint`: stop the sprint on the next tick boundary.
+    sprint_stop: bool,
+    /// Rolling tick-time statistics for `/tick query`: bounded reservoir so the
+    /// report tracks recent history instead of the server's whole lifetime.
+    mspt_count: u64,
+    mspt_sum_ns: u128,
+}
+
+#[allow(dead_code)]
+impl TickController {
+    const MIN_RATE: f32 = 1.0;
+    const MAX_RATE: f32 = 10000.0;
+    /// Vanilla keeps a bounded rolling window over recent ticks (the debug
+    /// overlay's 100-sample chart); 128 keeps the same "recent" character.
+    const MSPT_WINDOW: u64 = 128;
+
+    fn new() -> Self {
+        TickController {
+            tick_rate: 20.0,
+            frozen: false,
+            step_remaining: 0,
+            sprint_remaining: 0,
+            sprint_stop: false,
+            mspt_count: 0,
+            mspt_sum_ns: 0,
+        }
+    }
+    fn set_tick_rate(&mut self, rate: f32) -> Result<(), String> {
+        if !rate.is_finite() || !(Self::MIN_RATE..=Self::MAX_RATE).contains(&rate) {
+            return Err(format!(
+                "Tick rate must be between {} and {}",
+                Self::MIN_RATE as i32,
+                Self::MAX_RATE as i32
+            ));
+        }
+        self.tick_rate = rate;
+        Ok(())
+    }
+    /// `runsNormally` && sprint/step overrides, in vanilla's order: an active
+    /// sprint wins over everything (frozen included), a normally-running game
+    /// ticks, and a frozen game ticks only by consuming queued step ticks.
+    fn should_run_game_tick(&mut self) -> bool {
+        if self.sprint_remaining > 0 {
+            self.sprint_remaining -= 1;
+            if self.sprint_stop {
+                self.sprint_remaining = 0;
+            }
+            return true;
+        }
+        if !self.frozen {
+            return true;
+        }
+        if self.step_remaining > 0 {
+            self.step_remaining -= 1;
+            return true;
+        }
+        false
+    }
+    /// Wall-clock pacing between game ticks. Vanilla runs a sprint flat out
+    /// (`nanosecondsPerTick - sprintTimeSavings` collapses to the tick's own
+    /// duration), so a sprinting loop has no wait interval at all.
+    fn tick_interval_nanos(&self) -> u64 {
+        if self.sprint_remaining > 0 {
+            return 0;
+        }
+        (1_000_000_000.0_f64 / f64::from(self.tick_rate)) as u64
+    }
+    fn is_sprinting(&self) -> bool {
+        self.sprint_remaining > 0
+    }
+    fn is_stepping_forward(&self) -> bool {
+        self.step_remaining > 0
+    }
+    fn request_step(&mut self, ticks: i32) {
+        self.step_remaining = ticks.max(0);
+    }
+    fn request_sprint(&mut self, ticks: i32) {
+        self.sprint_remaining = ticks.max(0);
+        self.sprint_stop = false;
+    }
+    fn stop_sprinting(&mut self) {
+        self.sprint_stop = true;
+    }
+    /// Feed one measured tick duration for the `/tick query` average.
+    fn record_tick_nanos(&mut self, ns: u64) {
+        self.mspt_count += 1;
+        self.mspt_sum_ns += u128::from(ns);
+        if self.mspt_count > Self::MSPT_WINDOW {
+            self.mspt_count /= 2;
+            self.mspt_sum_ns /= 2;
+        }
+    }
+    fn avg_mspt(&self) -> f64 {
+        if self.mspt_count == 0 {
+            return 0.0;
+        }
+        self.mspt_sum_ns as f64 / self.mspt_count as f64 / 1.0e6
+    }
+}
+
+#[allow(dead_code)]
+fn tick_controller() -> &'static Mutex<TickController> {
+    static CTL: OnceLock<Mutex<TickController>> = OnceLock::new();
+    CTL.get_or_init(|| Mutex::new(TickController::new()))
+}
+
+/// `ClientboundTickingStatePacket` (S2C 0x71): BE f32 tick rate + frozen bool.
+#[allow(dead_code)]
+fn ticking_state_packet(tick_rate: f32, is_frozen: bool) -> Vec<u8> {
+    let mut p = Vec::with_capacity(5);
+    p.extend_from_slice(&tick_rate.to_be_bytes());
+    p.push(u8::from(is_frozen));
+    p
+}
+
+#[allow(dead_code)]
+fn decode_ticking_state(data: &[u8]) -> Option<(f32, bool)> {
+    if data.len() != 5 {
+        return None;
+    }
+    Some((
+        f32::from_be_bytes(data[..4].try_into().ok()?),
+        data[4] != 0,
+    ))
+}
+
+/// `ClientboundTickingStepPacket` (S2C 0x72): VarInt tick steps.
+#[allow(dead_code)]
+fn ticking_step_packet(tick_steps: i32) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, i64::from(tick_steps));
+    p
+}
+
+#[allow(dead_code)]
+fn decode_ticking_step(data: &[u8]) -> Option<i32> {
+    let mut b = data;
+    let steps = read_protocol_i32(&mut b)?;
+    if !b.is_empty() || steps < 0 {
+        return None;
+    }
+    Some(steps)
+}
+
+/// Vanilla `TimeArgument` units for `/tick step` and `/tick sprint`: bare
+/// numbers and `t` are ticks, `s` is 20 ticks, `d` is 24000 ticks.
+#[allow(dead_code)]
+fn parse_tick_time_arg(arg: &str) -> Option<i32> {
+    let (value, multiplier) = match arg.strip_suffix('t') {
+        Some(rest) => (rest, 1.0_f64),
+        None => match arg.strip_suffix('s') {
+            Some(rest) => (rest, 20.0),
+            None => match arg.strip_suffix('d') {
+                Some(rest) => (rest, 24_000.0),
+                None => (arg, 1.0),
+            },
+        },
+    };
+    let ticks = (value.parse::<f64>().ok()? * multiplier).round();
+    if ticks < 1.0 || ticks > f64::from(i32::MAX) {
+        return None;
+    }
+    Some(ticks as i32)
+}
+
+// ---------------------------------------------------------------------------
+// /locate: biome, structure and POI engines over the real worldgen.
+// ---------------------------------------------------------------------------
+
+/// A hit from any `/locate` engine: block position plus the horizontal (or 3D,
+/// for biomes) distance that feeds the vanilla "… blocks away" suffix.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LocateHit {
+    x: i32,
+    y: i32,
+    z: i32,
+    distance: i32,
+}
+
+/// Resource-location syntax: `namespace:path` or bare `path` over
+/// `[a-z0-9_./-]` (the set datapack ids use).
+#[allow(dead_code)]
+fn p3b_resource_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| matches!(c, 'a'..='z' | '0'..='9' | '_' | '.' | '/' | '-' | ':'))
+        && s.matches(':').count() <= 1
+}
+
+#[allow(dead_code)]
+fn p3b_ns(s: &str) -> String {
+    if s.contains(':') {
+        s.to_owned()
+    } else {
+        format!("minecraft:{s}")
+    }
+}
+
+/// One datapack `worldgen/structure_set` file reduced to what locate needs.
+#[allow(dead_code)]
+struct P3bStructureSet {
+    id: String,
+    placement: P3bPlacement,
+    /// (structure id, weight) in set order.
+    entries: Vec<(String, i32)>,
+}
+
+#[allow(dead_code)]
+enum P3bPlacement {
+    Spread {
+        spread: structure_placement::RandomSpread,
+        reducer: structure_placement::FrequencyReduction,
+        frequency: f32,
+        salt: i32,
+        spacing: i32,
+        /// `ExclusionZone`: (other set id, chunk radius).
+        exclusion: Option<(String, i32)>,
+    },
+    Rings {
+        distance: i32,
+        spread: i32,
+        count: i32,
+        preferred_biomes: HashSet<String>,
+    },
+}
+
+/// `#tag` or list-form biome holder → the explicit biome-name set, following
+/// tags recursively exactly the way the pipeline's `biome_set` does.
+#[allow(dead_code)]
+fn p3b_biome_set(value: &J, visiting: &mut HashSet<String>) -> HashSet<String> {
+    if let Some(values) = value.as_arr() {
+        return values
+            .iter()
+            .flat_map(|v| p3b_biome_set(v, visiting))
+            .collect();
+    }
+    let s = value.str();
+    if let Some(tag) = s.strip_prefix('#') {
+        let tag = p3b_ns(tag);
+        if !visiting.insert(tag.clone()) {
+            return HashSet::new();
+        }
+        let result = worldgen::Gen::dp_resource("tags/worldgen/biome", &tag, "json")
+            .and_then(|bytes| jparse(&bytes))
+            .and_then(|j| j.get("values").map(|v| p3b_biome_set(v, visiting)))
+            .unwrap_or_default();
+        visiting.remove(&tag);
+        result
+    } else if s.is_empty() {
+        HashSet::new()
+    } else {
+        HashSet::from([p3b_ns(s)])
+    }
+}
+
+/// The biome-name set a structure is allowed to generate in (`worldgen/structure`).
+#[allow(dead_code)]
+fn p3b_structure_biomes(structure_id: &str) -> HashSet<String> {
+    worldgen::Gen::dp_resource("worldgen/structure", structure_id, "json")
+        .and_then(|bytes| jparse(&bytes))
+        .and_then(|j| {
+            j.get("biomes")
+                .map(|v| p3b_biome_set(v, &mut HashSet::new()))
+        })
+        .unwrap_or_default()
+}
+
+/// The `type` field of a `worldgen/structure` file (`minecraft:mineshaft`, ...).
+#[allow(dead_code)]
+fn p3b_structure_type(structure_id: &str) -> Option<String> {
+    worldgen::Gen::dp_resource("worldgen/structure", structure_id, "json")
+        .and_then(|bytes| jparse(&bytes))
+        .map(|j| j.get("type").map(|v| p3b_ns(v.str())).unwrap_or_default())
+}
+
+/// Parse one `worldgen/structure_set` JSON into the locate-time shape.
+#[allow(dead_code)]
+fn p3b_parse_structure_set(id: &str, bytes: &[u8]) -> Result<P3bStructureSet, String> {
+    let j = jparse(bytes).ok_or_else(|| format!("malformed structure_set {id}"))?;
+    let p = j
+        .get("placement")
+        .ok_or_else(|| format!("structure_set {id} has no placement"))?;
+    let int = |field: &str| -> Result<i32, String> {
+        match p.get(field) {
+            Some(J::Num(v)) if v.fract() == 0.0 && *v >= i32::MIN as f64 && *v <= i32::MAX as f64 => {
+                Ok(*v as i32)
+            }
+            _ => Err(format!("invalid {field} in structure_set {id}")),
+        }
+    };
+    let placement = match p.get("type").map(|v| p3b_ns(v.str())) {
+        Some(ty) if ty == "minecraft:concentric_rings" => P3bPlacement::Rings {
+            distance: int("distance")?,
+            spread: int("spread")?,
+            count: int("count")?,
+            preferred_biomes: p
+                .get("preferred_biomes")
+                .map(|v| p3b_biome_set(v, &mut HashSet::new()))
+                .unwrap_or_default(),
+        },
+        Some(ty) if ty == "minecraft:random_spread" => {
+            let spread_kind = match p.get("spread_type").map(|v| v.str()).unwrap_or("linear") {
+                "linear" => structure_placement::Spread::Linear,
+                "triangular" => structure_placement::Spread::Triangular,
+                other => {
+                    return Err(format!("unknown spread_type {other} in {id}"));
+                }
+            };
+            let reducer = match p
+                .get("frequency_reduction_method")
+                .map(|v| v.str())
+                .unwrap_or("default")
+            {
+                "default" => structure_placement::FrequencyReduction::Default,
+                "legacy_type_1" => structure_placement::FrequencyReduction::LegacyType1,
+                "legacy_type_2" => structure_placement::FrequencyReduction::LegacyType2,
+                "legacy_type_3" => structure_placement::FrequencyReduction::LegacyType3,
+                other => {
+                    return Err(format!("unknown frequency method {other} in {id}"));
+                }
+            };
+            let frequency = match p.get("frequency") {
+                None => 1.0,
+                Some(J::Num(v)) if (0.0..=1.0).contains(v) => *v as f32,
+                _ => return Err(format!("invalid placement frequency in {id}")),
+            };
+            let spacing = int("spacing")?;
+            P3bPlacement::Spread {
+                spread: structure_placement::RandomSpread::new(
+                    spacing,
+                    int("separation")?,
+                    int("salt")?,
+                    spread_kind,
+                )
+                .map_err(|e| format!("{id}: {e}"))?,
+                reducer,
+                frequency,
+                salt: int("salt")?,
+                spacing,
+                exclusion: p.get("exclusion_zone").map(|zone| {
+                    (
+                        p3b_ns(
+                            zone.get("other_set")
+                                .map(|v| v.str())
+                                .unwrap_or_default(),
+                        ),
+                        zone.get("chunk_count").map(|v| v.num() as i32).unwrap_or(0),
+                    )
+                }),
+            }
+        }
+        other => {
+            return Err(format!(
+                "unsupported placement type {other:?} in {id}"
+            ));
+        }
+    };
+    let mut entries = Vec::new();
+    if let Some(list) = j.get("structures").and_then(|v| v.as_arr()) {
+        for entry in list {
+            let structure = entry.get("structure").map(|v| p3b_ns(v.str()));
+            let weight = entry.get("weight").map(|v| v.num() as i32).unwrap_or(1);
+            if let Some(s) = structure {
+                entries.push((s, weight.max(1)));
+            }
+        }
+    }
+    Ok(P3bStructureSet {
+        id: p3b_ns(id),
+        placement,
+        entries,
+    })
+}
+
+/// All `worldgen/structure_set` files, in registry enumeration order.
+#[allow(dead_code)]
+fn p3b_structure_sets() -> Vec<P3bStructureSet> {
+    let mut files: Vec<(String, Vec<u8>)> =
+        worldgen::Gen::dp_files("structure_set").into_iter().collect();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
+        .iter()
+        .filter_map(|(id, bytes)| p3b_parse_structure_set(id, bytes).ok())
+        .collect()
+}
+
+/// Does `set`'s placement admit a start chunk at `(cx, cz)`? This is the
+/// `isStructureChunk` half of `ChunkGeneratorStructureState`: candidate +
+/// frequency + exclusion, with the entry/biome half answered by the caller.
+#[allow(dead_code)]
+fn p3b_set_admits_placement(
+    sets: &BTreeMap<String, P3bStructureSet>,
+    set: &P3bStructureSet,
+    seed: u64,
+    cx: i32,
+    cz: i32,
+    depth: u32,
+) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    match &set.placement {
+        P3bPlacement::Spread {
+            spread,
+            reducer,
+            frequency,
+            salt,
+            spacing,
+            exclusion,
+        } => {
+            let (rx, rz) = (cx.div_euclid(*spacing), cz.div_euclid(*spacing));
+            if spread.candidate(seed, rx, rz) != (cx, cz) {
+                return false;
+            }
+            if !reducer.allows(seed, *salt, cx, cz, *frequency) {
+                return false;
+            }
+            if let Some((other, count)) = exclusion {
+                if let Some(other_set) = sets.get(other) {
+                    for ox in cx - count..=cx + count {
+                        for oz in cz - count..=cz + count {
+                            if p3b_set_admits_placement(
+                                sets, other_set, seed, ox, oz, depth + 1,
+                            ) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+            true
+        }
+        P3bPlacement::Rings {
+            distance,
+            spread,
+            count,
+            preferred_biomes: _,
+        } => p3b_ring_chunks(seed, *distance, *spread, *count, None)
+            .contains(&(cx, cz)),
+    }
+}
+
+/// The admitted chunks of a `concentric_rings` set, biome relocation included
+/// when a generator is supplied (the ring's `preferred_biomes` check samples
+/// the noise quart source at y-quart 0, same as the pipeline's ring path).
+#[allow(dead_code)]
+fn p3b_ring_chunks(
+    seed: u64,
+    distance: i32,
+    spread: i32,
+    count: i32,
+    relocate: Option<(&mut worldgen::Gen, &HashSet<String>)>,
+) -> Vec<(i32, i32)> {
+    let Some((g, preferred)) = relocate else {
+        return structure_placement::concentric_rings(seed, distance, spread, count, |_, _| {
+            None
+        })
+        .unwrap_or_default();
+    };
+    let preferred_leaves: HashSet<u16> = preferred
+        .iter()
+        .filter_map(|name| g.biome_leaf_of_name(name))
+        .collect();
+    let mut last: Option<u16> = None;
+    structure_placement::concentric_rings(seed, distance, spread, count, |candidate, rng| {
+        structure_placement::concentric_rings_target(
+            candidate,
+            rng,
+            112,
+            |qx, qy, qz| {
+                let res = g.biome_quart(qx, qy, qz, last);
+                if let Some((_, leaf)) = res {
+                    last = Some(leaf);
+                }
+                res
+            },
+            |b| b.is_some_and(|(_, leaf)| preferred_leaves.contains(&leaf)),
+        )
+    })
+    .unwrap_or_default()
+}
+
+/// The position `/locate structure` probes for an entry's biome: the same
+/// stub-height convention the pipeline uses (surface heightmap in the
+/// Overworld/End, sea level in the Nether where structures hang under a roof).
+#[allow(dead_code)]
+fn p3b_probe_biome_at(
+    g: &mut worldgen::Gen,
+    dim: DimId,
+    allowed: &HashSet<String>,
+    x: i32,
+    z: i32,
+) -> bool {
+    if allowed.is_empty() {
+        return true;
+    }
+    let y = if dim == DimId::Nether {
+        g.sea
+    } else {
+        g.top_ws(x, z) - 1
+    };
+    let Some((_, leaf)) = g.biome_quart(x >> 2, y >> 2, z >> 2, None) else {
+        return false;
+    };
+    g.biome_name_of_leaf(leaf)
+        .is_some_and(|name| allowed.contains(&name))
+}
+
+/// Evaluate one admitted chunk: among the set entries whose biome gate passes
+/// at the probe point, draw the weighted winner (`WeightedRandomList` over the
+/// `forLargeFeature` chunk seed, the same draw shape mineshaft::admit uses) and
+/// report it when the request covers it. All-mineshaft sets go through the
+/// verified `mineshaft::admit` instead — it answers the real placed start.
+#[allow(dead_code)]
+fn p3b_pick_structure_at(
+    g: &mut worldgen::Gen,
+    set: &P3bStructureSet,
+    wanted: &HashSet<String>,
+    dim: DimId,
+    seed: u64,
+    cx: i32,
+    cz: i32,
+    all_mineshaft: bool,
+    entry_biomes: &mut HashMap<String, HashSet<String>>,
+) -> Option<String> {
+    if all_mineshaft {
+        let start = mineshaft::admit(g, cx, cz)?;
+        let id = mineshaft::start_id(&start).to_owned();
+        return wanted.contains(&id).then_some(id);
+    }
+    let (x, z) = (cx * 16 + 8, cz * 16 + 8);
+    let mut rng = generation_math::Lcg::for_large_feature(seed, cx, cz);
+    let mut choices: Vec<usize> = Vec::new();
+    for (i, (id, _)) in set.entries.iter().enumerate() {
+        let biomes = entry_biomes
+            .entry(id.clone())
+            .or_insert_with(|| p3b_structure_biomes(id));
+        if p3b_probe_biome_at(g, dim, biomes, x, z) {
+            choices.push(i);
+        }
+    }
+    if choices.is_empty() {
+        return None;
+    }
+    let weight: i32 = choices.iter().map(|&i| set.entries[i].1).sum();
+    let mut draw = rng.next_bound(weight);
+    let winner = choices
+        .iter()
+        .position(|&i| {
+            draw -= set.entries[i].1;
+            draw < 0
+        })
+        .map(|pos| choices[pos])
+        .unwrap_or(*choices.last()?);
+    let id = &set.entries[winner].0;
+    wanted.contains(id).then(|| id.clone())
+}
+
+/// Locate the nearest chunk a set can place any of `wanted` structures at.
+/// `wanted` is the request's resolved structure-id set.
+#[allow(dead_code)]
+fn p3b_set_locate(
+    g: &mut worldgen::Gen,
+    sets: &BTreeMap<String, P3bStructureSet>,
+    set: &P3bStructureSet,
+    wanted: &HashSet<String>,
+    dim: DimId,
+    origin_cx: i32,
+    origin_cz: i32,
+    max_radius_chunks: i32,
+    entry_biomes: &mut HashMap<String, HashSet<String>>,
+) -> Option<(i32, i32, String)> {
+    let seed = g.wseed();
+    let all_mineshaft = set
+        .entries
+        .iter()
+        .all(|(id, _)| p3b_structure_type(id).as_deref() == Some("minecraft:mineshaft"));
+    match &set.placement {
+        P3bPlacement::Spread { spacing, spread, .. } => {
+            let (rx0, rz0) = (
+                origin_cx.div_euclid(*spacing),
+                origin_cz.div_euclid(*spacing),
+            );
+            // Region cells in expanding square rings; stop once the whole ring
+            // is beyond the radius (a cell's candidate lies inside its spacing
+            // square, so scan until the ring's inner edge passes).
+            let spacing = *spacing;
+            let mut ring = 0i32;
+            loop {
+                if (ring * spacing - spacing).max(0) > max_radius_chunks {
+                    break;
+                }
+                for dx in -ring..=ring {
+                    for dz in -ring..=ring {
+                        if ring > 0 && dx.abs() != ring && dz.abs() != ring {
+                            continue;
+                        }
+                        let cand = spread.candidate(seed, rx0 + dx, rz0 + dz);
+                        let dist = (cand.0 - origin_cx)
+                            .abs()
+                            .max((cand.1 - origin_cz).abs());
+                        if dist > max_radius_chunks {
+                            continue;
+                        }
+                        if !p3b_set_admits_placement(sets, set, seed, cand.0, cand.1, 0) {
+                            continue;
+                        }
+                        if let Some(id) = p3b_pick_structure_at(
+                            g,
+                            set,
+                            wanted,
+                            dim,
+                            seed,
+                            cand.0,
+                            cand.1,
+                            all_mineshaft,
+                            entry_biomes,
+                        ) {
+                            return Some((cand.0, cand.1, id));
+                        }
+                    }
+                }
+                ring += 1;
+            }
+            None
+        }
+        P3bPlacement::Rings {
+            distance,
+            spread,
+            count,
+            preferred_biomes,
+        } => {
+            let chunks = p3b_ring_chunks(
+                seed,
+                *distance,
+                *spread,
+                *count,
+                Some((g, preferred_biomes)),
+            );
+            let mut best: Option<(i32, i32, String, i32)> = None;
+            for (cx, cz) in chunks {
+                let d = (cx - origin_cx).abs().max((cz - origin_cz).abs());
+                if d > max_radius_chunks {
+                    continue;
+                }
+                if !p3b_set_admits_placement(sets, set, seed, cx, cz, 0) {
+                    continue;
+                }
+                if let Some(id) = p3b_pick_structure_at(
+                    g,
+                    set,
+                    wanted,
+                    dim,
+                    seed,
+                    cx,
+                    cz,
+                    all_mineshaft,
+                    entry_biomes,
+                ) {
+                    if best.as_ref().is_none_or(|b| d < b.3) {
+                        best = Some((cx, cz, id, d));
+                    }
+                }
+            }
+            best.map(|(cx, cz, id, _)| (cx, cz, id))
+        }
+    }
+}
+
+/// `/locate structure`: resolve the argument to structure ids, then ask each
+/// set containing any of them for its nearest admitted chunk inside
+/// `max_radius_chunks`. The reported position is the start chunk's centre, the
+/// same `[x, ~, z]` coordinate vanilla prints.
+#[allow(dead_code)]
+fn locate_structure_spiral(
+    dim: DimId,
+    structure_or_tag: &str,
+    x: i32,
+    z: i32,
+    max_radius_chunks: i32,
+) -> Result<Option<LocateHit>, String> {
+    // Resolve the request to a set of structure ids: `#tag`, a structure id, or
+    // (an extension over vanilla) a structure-set name.
+    let mut wanted: HashSet<String> = HashSet::new();
+    if let Some(tag) = structure_or_tag.strip_prefix('#') {
+        let tag_id = p3b_ns(tag);
+        let values = worldgen::Gen::dp_resource("tags/worldgen/structure", &tag_id, "json")
+            .and_then(|bytes| jparse(&bytes))
+            .and_then(|j| j.get("values").map(|v| v.clone()));
+        let Some(values) = values else {
+            return Err(format!("Unknown structure tag '{tag_id}'"));
+        };
+        if let Some(list) = values.as_arr() {
+            for v in list {
+                wanted.insert(p3b_ns(v.str()));
+            }
+        }
+    } else if p3b_resource_name(structure_or_tag) {
+        let id = p3b_ns(structure_or_tag);
+        if worldgen::Gen::dp_resource("worldgen/structure", &id, "json").is_some() {
+            wanted.insert(id);
+        } else if worldgen::Gen::dp_resource("worldgen/structure_set", &id, "json").is_some()
+        {
+            // Set-name extension: `villages` covers every entry of that set.
+            if let Some(set) = p3b_structure_sets().into_iter().find(|s| s.id == id) {
+                wanted.extend(set.entries.iter().map(|(s, _)| s.clone()));
+            }
+        }
+    }
+    if wanted.is_empty() {
+        return Err(format!("Unknown structure '{structure_or_tag}'"));
+    }
+    let sets: BTreeMap<String, P3bStructureSet> = p3b_structure_sets()
+        .into_iter()
+        .map(|s| (s.id.clone(), s))
+        .collect();
+    let relevant: Vec<&P3bStructureSet> = sets
+        .values()
+        .filter(|set| set.entries.iter().any(|(id, _)| wanted.contains(id)))
+        .collect();
+    let (origin_cx, origin_cz) = (x >> 4, z >> 4);
+    let mut entry_biomes: HashMap<String, HashSet<String>> = HashMap::new();
+    let found = worldgen::with_gen_dim(dim, |g| {
+        let mut best: Option<(i32, i32, i32)> = None;
+        for set in &relevant {
+            if let Some((cx, cz, _)) = p3b_set_locate(
+                g,
+                &sets,
+                set,
+                &wanted,
+                dim,
+                origin_cx,
+                origin_cz,
+                max_radius_chunks,
+                &mut entry_biomes,
+            ) {
+                let dx = f64::from(cx * 16 + 8 - x);
+                let dz = f64::from(cz * 16 + 8 - z);
+                let dist = (dx * dx + dz * dz).sqrt() as i32;
+                if best.is_none_or(|(_, _, b)| dist < b) {
+                    best = Some((cx, cz, dist));
+                }
+            }
+        }
+        best
+    });
+    let Some(best) = found else {
+        return Err("worldgen is not available in this dimension".to_owned());
+    };
+    Ok(best.map(|(cx, cz, dist)| LocateHit {
+        x: cx * 16 + 8,
+        y: 0,
+        z: cz * 16 + 8,
+        distance: dist,
+    }))
+}
+
+/// `/locate biome`: expanding square spiral of 8-block horizontal steps, every
+/// y quart of the world window per column — `BiomeSource.findClosestBiome3d`'s
+/// shape — stopped early once the ring radius exceeds the best 3D distance
+/// found (a farther ring cannot beat it) and hard-capped at `max_radius`.
+#[allow(dead_code)]
+fn locate_biome_spiral(
+    dim: DimId,
+    biome: &str,
+    x: i32,
+    y: i32,
+    z: i32,
+    max_radius: i32,
+) -> Option<LocateHit> {
+    let biome = p3b_ns(biome);
+    worldgen::with_gen_dim(dim, |g| {
+        let leaf = g.biome_leaf_of_name(&biome)?;
+        let (qy0, qy1) = (
+            g.world_min_y >> 2,
+            (g.world_min_y + g.world_height - 1) >> 2,
+        );
+        let mut best: Option<(i32, i32, i32, f64)> = None;
+        // Square rings of 8-block horizontal offsets. A hit in a later ring has
+        // horizontal distance >= r, so once the best 3D distance is inside the
+        // current ring radius no farther ring can beat it.
+        let mut r = 0i32;
+        while r <= max_radius {
+            if best.is_some_and(|(_, _, _, d)| (d as i32) < r) {
+                break;
+            }
+            let mut dx = -r;
+            while dx <= r {
+                let mut dz = -r;
+                while dz <= r {
+                    if r == 0 || dx.abs() == r || dz.abs() == r {
+                        p3b_locate_biome_column(
+                            g, leaf, x, y, z, x + dx, z + dz, qy0, qy1, &mut best,
+                        );
+                    }
+                    dz += 8;
+                }
+                dx += 8;
+            }
+            r += 8;
+        }
+        best.map(|(hx, hy, hz, d)| LocateHit {
+            x: hx,
+            y: hy,
+            z: hz,
+            distance: d as i32,
+        })
+    })
+    .flatten()
+}
+
+/// Probe one x/z column across all y quarts; on a leaf match, keep it when its
+/// 3D distance to the search origin beats the current best.
+#[allow(dead_code)]
+fn p3b_locate_biome_column(
+    g: &mut worldgen::Gen,
+    leaf: u16,
+    ox: i32,
+    oy: i32,
+    oz: i32,
+    x: i32,
+    z: i32,
+    qy0: i32,
+    qy1: i32,
+    best: &mut Option<(i32, i32, i32, f64)>,
+) {
+    let mut last: Option<u16> = None;
+    let mut qy = qy0;
+    while qy <= qy1 {
+        if let Some((_, l)) = g.biome_quart(x >> 2, qy, z >> 2, last) {
+            last = Some(l);
+            if l == leaf {
+                let hy = qy * 4;
+                let d = (((x - ox) as f64).powi(2)
+                    + ((z - oz) as f64).powi(2)
+                    + ((hy - oy) as f64).powi(2))
+                .sqrt();
+                if best.is_none_or(|b| d < b.3) {
+                    *best = Some((x, hy, z, d));
+                }
+            }
+        }
+        qy += 1;
+    }
+}
+
+/// The vanilla point-of-interest id a block provides, mirroring
+/// `PoiTypes`: beds → `home`, bell → `meeting`, job-site blocks → the
+/// profession id, plus the block-named types (`nether_portal`, `bee_nest`,
+/// `beehive`, `lodestone`, `lightning_rod`).
+#[allow(dead_code)]
+fn p3b_poi_id_of_block(block_name: &str) -> Option<&'static str> {
+    const BLOCK_POIS: [(&str, &str); 21] = [
+        ("bell", "minecraft:meeting"),
+        ("nether_portal", "minecraft:nether_portal"),
+        ("bee_nest", "minecraft:bee_nest"),
+        ("beehive", "minecraft:beehive"),
+        ("lodestone", "minecraft:lodestone"),
+        ("lightning_rod", "minecraft:lightning_rod"),
+        ("blast_furnace", "minecraft:armorer"),
+        ("smoker", "minecraft:butcher"),
+        ("cartography_table", "minecraft:cartographer"),
+        ("brewing_stand", "minecraft:cleric"),
+        ("composter", "minecraft:farmer"),
+        ("barrel", "minecraft:fisherman"),
+        ("fletching_table", "minecraft:fletcher"),
+        ("lectern", "minecraft:librarian"),
+        ("stonecutter", "minecraft:mason"),
+        ("loom", "minecraft:shepherd"),
+        ("smithing_table", "minecraft:toolsmith"),
+        ("grindstone", "minecraft:weaponsmith"),
+        ("cauldron", "minecraft:leatherworker"),
+        ("water_cauldron", "minecraft:leatherworker"),
+        ("lava_cauldron", "minecraft:leatherworker"),
+    ];
+    let name = block_name.strip_prefix("minecraft:").unwrap_or(block_name);
+    if name.strip_suffix("_bed").is_some() {
+        return Some("minecraft:home");
+    }
+    BLOCK_POIS
+        .iter()
+        .find(|(block, _)| *block == name)
+        .map(|(_, poi)| *poi)
+}
+
+/// `/locate poi`: the nearest matching POI inside `max_radius` blocks. POI
+/// positions live where POI blocks do; the only index this build keeps is the
+/// edited-block overlay, so the scan walks the overlay's chunk buckets in the
+/// dimension and decodes each stored cell — bounded by the overlay's size and
+/// the radius, never by a terrain re-evaluation.
+#[allow(dead_code)]
+fn locate_poi_nearest(
+    dim: DimId,
+    poi: &str,
+    x: i32,
+    y: i32,
+    z: i32,
+    max_radius: i32,
+) -> Option<LocateHit> {
+    let poi = p3b_ns(poi);
+    let reg = block_registry::breg()?;
+    let w = world().lock().unwrap_or_else(|e| e.into_inner());
+    let mut best: Option<(i32, i32, i32, i64)> = None;
+    for (&(d, cx, cz), cells) in w.iter() {
+        if d != dim {
+            continue;
+        }
+        let bx = cx * 16;
+        let bz = cz * 16;
+        if (bx + 8 - x).abs() > max_radius + 8 || (bz + 8 - z).abs() > max_radius + 8 {
+            continue;
+        }
+        for (&idx, &st) in cells {
+            let (bx0, by0, bz0) = (bx + (idx & 15) as i32, (idx >> 8) as i32 + MIN_Y, bz + ((idx >> 4) & 15) as i32);
+            if (bx0 - x).abs() > max_radius || (bz0 - z).abs() > max_radius {
+                continue;
+            }
+            let Some(id) = p3b_poi_id_of_block(reg.name_of(st)) else {
+                continue;
+            };
+            if id != poi {
+                continue;
+            }
+            let dist2 = ((bx0 - x).pow(2) + (by0 - y).pow(2) + (bz0 - z).pow(2)) as i64;
+            if best.is_none_or(|b| dist2 < b.3) {
+                best = Some((bx0, by0, bz0, dist2));
+            }
+        }
+    }
+    best.map(|(bx, by, bz, dist2)| LocateHit {
+        x: bx,
+        y: by,
+        z: bz,
+        distance: (dist2 as f64).sqrt() as i32,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// /random (Vanilla 1.21.1 RandomCommands) — deterministic named sequences.
+// ---------------------------------------------------------------------------
+
+/// Named RNG sequences for `/random`. Vanilla keeps one `RandomSequence` per id
+/// and a `minecraft:default` sequence for bare `value`/`roll`; each is seeded
+/// from the world seed so the draws replay across restarts.
+#[allow(dead_code)]
+#[derive(Default)]
+struct RandomSequenceStore {
+    /// Sequence id -> xorshift64* state (same generator as `world_rng`).
+    sequences: BTreeMap<String, u64>,
+}
+
+/// One xorshift64* step — bit-identical to `world_rng::next_u64`, so a sequence
+/// seeded identically draws the identical values the world stream would.
+#[allow(dead_code)]
+fn p3b_xorshift64s(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    x.wrapping_mul(0x2545F4914F6CDD1D)
+}
+
+/// `random`'s seed for a named sequence: `seed ^ sequence-name hash`, Java's
+/// `RandomSupport.seedUniquifier` style — the same seed and name always reopen
+/// the same sequence, while different names never share a stream.
+#[allow(dead_code)]
+fn p3b_sequence_seed(base_seed: u64, name: &str, mix_name: bool) -> u64 {
+    const NAME_HASH_SEED: u64 = 0x811C9DC5;
+    let name_hash = if mix_name {
+        name.bytes()
+            .fold(NAME_HASH_SEED, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100000001B3))
+    } else {
+        0
+    };
+    let seed = base_seed ^ name_hash;
+    // A zero state is a fixed point of xorshift; swap in the same default the
+    // world stream uses rather than letting a reset stick the sequence.
+    if seed == 0 {
+        0x9E3779B97F4A7C15
+    } else {
+        seed
+    }
+}
+
+#[allow(dead_code)]
+impl RandomSequenceStore {
+    fn draw(&mut self, sequence: &str, world_seed: u64) -> u64 {
+        let state = self
+            .sequences
+            .entry(sequence.to_owned())
+            .or_insert_with(|| p3b_sequence_seed(world_seed, sequence, true));
+        p3b_xorshift64s(state)
+    }
+    /// `random reset <sequence|*>`; returns the human-readable reply.
+    fn reset(
+        &mut self,
+        sequence: &str,
+        world_seed: u64,
+        seed: Option<u64>,
+        include_world_seed: bool,
+        include_sequence_id: bool,
+    ) -> String {
+        if sequence == "*" {
+            self.sequences.clear();
+            return "Reset all random number sequences".to_owned();
+        }
+        let base = match seed {
+            Some(s) => {
+                let mut base = s;
+                if include_world_seed {
+                    base ^= world_seed;
+                }
+                base
+            }
+            None => world_seed,
+        };
+        self.sequences.insert(
+            sequence.to_owned(),
+            p3b_sequence_seed(base, sequence, include_sequence_id),
+        );
+        format!("Reset random number sequence {sequence}")
+    }
+}
+
+/// Valid `/random` sequence names: resource locations, `*` (reset-all).
+#[allow(dead_code)]
+fn p3b_sequence_name(s: &str) -> bool {
+    s == "*" || p3b_resource_name(s)
+}
+
+/// `a..b` / `a b` / `..b` / `a..` integer ranges, like brigadier's
+/// `IntegerRangeArgument`.
+#[allow(dead_code)]
+fn p3b_parse_range(args: &[&str]) -> Result<(i32, i32, usize), String> {
+    let Some(first) = args.first() else {
+        return Err("Expected a range like 1..10".to_owned());
+    };
+    if let Some((a, b)) = first.split_once("..") {
+        let min = if a.is_empty() {
+            i32::MIN
+        } else {
+            a.parse::<i32>()
+                .map_err(|_| "Expected integer as range minimum".to_owned())?
+        };
+        let max = if b.is_empty() {
+            i32::MAX
+        } else {
+            b.parse::<i32>()
+                .map_err(|_| "Expected integer as range maximum".to_owned())?
+        };
+        if min > max {
+            return Err("Range bounds are reversed".to_owned());
+        }
+        return Ok((min, max, 1));
+    }
+    if args.len() >= 2 && args[0].parse::<i32>().is_ok() && args[1].parse::<i32>().is_ok() {
+        let (min, max) = (args[0].parse().unwrap(), args[1].parse().unwrap());
+        if min > max {
+            return Err("Range bounds are reversed".to_owned());
+        }
+        return Ok((min, max, 2));
+    }
+    if let Ok(v) = first.parse::<i32>() {
+        return Ok((v, v, 1));
+    }
+    Err("Expected a range like 1..10".to_owned())
+}
+
+/// The `/random` engine, pure of wire or client state: `value` reports to the
+/// source only, `roll` composes the broadcast line the caller fans out.
+#[allow(dead_code)]
+fn exec_random_command(
+    store: &mut RandomSequenceStore,
+    world_seed: u64,
+    args: &[&str],
+    roller_name: &str,
+) -> String {
+    match args.first().copied() {
+        Some("value") | Some("roll") => {
+            let roll = args[0] == "roll";
+            let (min, max, used) = match p3b_parse_range(&args[1..]) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            let sequence = args.get(1 + used).copied().unwrap_or("minecraft:default");
+            if !p3b_sequence_name(sequence) || sequence == "*" {
+                return format!("Invalid sequence name '{sequence}'");
+            }
+            let sequence = p3b_ns(sequence);
+            let span = (i64::from(max) - i64::from(min) + 1) as u64;
+            let v = (store.draw(&sequence, world_seed) % span) as i64 + i64::from(min);
+            if roll {
+                format!("{roller_name} rolled a {v} between {min} and {max}")
+            } else {
+                format!("Random number between {min} and {max}: {v}")
+            }
+        }
+        Some("reset") => {
+            let sequence = args.get(1).copied().unwrap_or("*");
+            if !p3b_sequence_name(sequence) {
+                return format!("Invalid sequence name '{sequence}'");
+            }
+            let seed = match args.get(2) {
+                None => None,
+                Some(s) => match s.parse::<i64>() {
+                    Ok(v) => Some(v as u64),
+                    Err(_) => return format!("Invalid seed '{s}'"),
+                },
+            };
+            let include_world = args.get(3).map(|v| *v == "true").unwrap_or(false);
+            let include_seq = args.get(4).map(|v| *v == "true").unwrap_or(true);
+            let seq_key = if sequence == "*" {
+                "*".to_owned()
+            } else {
+                p3b_ns(sequence)
+            };
+            store.reset(&seq_key, world_seed, seed, include_world, include_seq)
+        }
+        _ => "usage: /random value|roll <range> [sequence] | /random reset <sequence|*> [seed] [includeWorldSeed] [includeSequenceId]".to_owned(),
+    }
+}
+
+#[allow(dead_code)]
+fn random_sequences() -> &'static Mutex<RandomSequenceStore> {
+    static SEQS: OnceLock<Mutex<RandomSequenceStore>> = OnceLock::new();
+    SEQS.get_or_init(|| Mutex::new(RandomSequenceStore::default()))
+}
+
+/// The world seed a `/random` sequence is mixed against, or 0 when no
+/// generator is loaded yet — deterministic either way, and never wall-clock.
+#[allow(dead_code)]
+fn p3b_world_seed() -> u64 {
+    worldgen::with_gen(|g| g.wseed()).unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// /return and .mcfunction macro lines.
+// ---------------------------------------------------------------------------
+
+/// What a function's `return` produces in Vanilla 1.21.1.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
+enum FunctionReturn {
+    Value(i32),
+    Fail,
+    Run(String),
+}
+
+/// `/return <value>` | `/return fail` | `/return run <command>`.
+#[allow(dead_code)]
+fn parse_return_command(args: &[&str]) -> Result<FunctionReturn, String> {
+    match args {
+        [] => Err("usage: /return <value> | /return fail | /return run <command>".to_owned()),
+        ["fail"] => Ok(FunctionReturn::Fail),
+        ["run"] => Err("usage: /return run <command>".to_owned()),
+        ["run", rest @ ..] => Ok(FunctionReturn::Run(rest.join(" "))),
+        [value] => value
+            .parse::<i32>()
+            .map(FunctionReturn::Value)
+            .map_err(|_| format!("Expected integer return value, got '{value}'")),
+        _ => Err(
+            "usage: /return <value> | /return fail | /return run <command>".to_owned(),
+        ),
+    }
+}
+
+/// A `.mcfunction` line starting with `$` is a macro line: `$$` escapes to a
+/// literal `$` and `$(name)` is substituted from the invocation's compound
+/// args. Vanilla rejects the whole line when a variable is unbound or its name
+/// is not a legal macro variable — names are unquoted strings of
+/// `[A-Za-z0-9_.-]` (the charset datapack arguments use).
+#[allow(dead_code)]
+fn expand_mcfunction_macro(
+    line: &str,
+    args: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    if !line.starts_with('$') {
+        return Err("macro line must start with '$'".to_owned());
+    }
+    let valid_name = |name: &str| {
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    };
+    let rest = &line[1..];
+    let mut out = String::with_capacity(rest.len());
+    let mut chars = rest.char_indices().peekable();
+    while let Some((_, c)) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some((_, '$')) => out.push('$'),
+            Some((_, '(')) => {
+                let start = chars.peek().map(|&(i, _)| i);
+                let mut name = String::new();
+                let mut closed = false;
+                for (_, ch) in chars.by_ref() {
+                    if ch == ')' {
+                        closed = true;
+                        break;
+                    }
+                    name.push(ch);
+                }
+                if !closed {
+                    return Err("unterminated macro variable".to_owned());
+                }
+                let _ = start;
+                if !valid_name(&name) {
+                    return Err(format!("invalid macro variable name '{name}'"));
+                }
+                match args.get(&name) {
+                    Some(value) => out.push_str(value),
+                    None => return Err(format!("missing macro argument '{name}'")),
+                }
+            }
+            Some((_, other)) => return Err(format!("unexpected '${other}' in macro line")),
+            None => return Err("macro line ends with a bare '$'".to_owned()),
+        }
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Command bodies + the unified dispatch.
+// ---------------------------------------------------------------------------
+
+/// Resolve a `/team` member token: a bare name, or a `@`-selector expanded to
+/// entity names (online players give their names; others give their ids).
+#[allow(dead_code)]
+fn p3b_team_members(token: &str, ctx: &CmdCtx) -> Vec<String> {
+    if !token.starts_with('@') {
+        return vec![token.to_owned()];
+    }
+    let eids: HashSet<String> = resolve_selector(token, ctx.me.as_ref())
+        .into_iter()
+        .collect();
+    client_snapshot()
+        .iter()
+        .filter(|c| eids.contains(&c.eid.to_string()))
+        .map(|c| c.name.clone())
+        .collect()
+}
+
+/// `/team` — every mutation broadcasts the matching 0x60 mode to all clients.
+#[allow(dead_code)]
+fn team_command(ctx: &CmdCtx, args: &[&str]) -> String {
+    let Some(sub) = args.first().copied() else {
+        return "usage: /team list [<team>] | add <team> [<displayName>] | remove <team> | empty <team> | join <team> [<members>] | leave <members> | modify <team> <option> <value>".to_owned();
+    };
+    let registry = teams();
+    match sub {
+        "add" => {
+            let [_, name] = args[..2.min(args.len())] else {
+                return "usage: /team add <team> [<displayName>]".to_owned();
+            };
+            if name.is_empty() || name.chars().count() > 64 {
+                return format!("'{name}' is not a valid team name");
+            }
+            let display = if args.len() > 2 {
+                Some(args[2..].join(" "))
+            } else {
+                None
+            };
+            let mut reg = registry.lock().unwrap();
+            if let Err(e) = reg.add(name, display.as_deref()) {
+                return e;
+            }
+            let team = reg.get(name).expect("just added").clone();
+            drop(reg);
+            let members: Vec<String> = team.members.iter().cloned().collect();
+            p3b_broadcast_team_packet(set_player_team_packet(
+                name,
+                TEAM_MODE_ADD_TEAM,
+                Some(&team),
+                &members,
+            ));
+            format!("Created team {name}")
+        }
+        "remove" => {
+            let [_, name] = args[..2.min(args.len())] else {
+                return "usage: /team remove <team>".to_owned();
+            };
+            match registry.lock().unwrap().remove(name) {
+                Ok(_) => {
+                    p3b_broadcast_team_packet(set_player_team_packet(
+                        name,
+                        TEAM_MODE_REMOVE_TEAM,
+                        None,
+                        &[],
+                    ));
+                    format!("Removed team {name}")
+                }
+                Err(e) => e,
+            }
+        }
+        "empty" => {
+            let [_, name] = args[..2.min(args.len())] else {
+                return "usage: /team empty <team>".to_owned();
+            };
+            match registry.lock().unwrap().empty(name) {
+                Ok(members) => {
+                    p3b_broadcast_team_packet(set_player_team_packet(
+                        name,
+                        TEAM_MODE_REMOVE_ENTITIES,
+                        None,
+                        &members,
+                    ));
+                    format!("Removed all {} member(s) from team {name}", members.len())
+                }
+                Err(e) => e,
+            }
+        }
+        "join" => {
+            let [_, name] = args[..2.min(args.len())] else {
+                return "usage: /team join <team> [<members>]".to_owned();
+            };
+            let member_tokens: Vec<String> = if args.len() > 2 {
+                args[2..]
+                    .iter()
+                    .flat_map(|t| p3b_team_members(t, ctx))
+                    .collect()
+            } else {
+                vec![ctx
+                    .me
+                    .as_ref()
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| "@".to_owned())]
+            };
+            let mut joined = Vec::new();
+            let mut errors = Vec::new();
+            {
+                let mut reg = registry.lock().unwrap();
+                for member in &member_tokens {
+                    match reg.join(name, member) {
+                        Ok(_) => joined.push(member.clone()),
+                        Err(e) => errors.push(e),
+                    }
+                }
+            }
+            if !joined.is_empty() {
+                p3b_broadcast_team_packet(set_player_team_packet(
+                    name,
+                    TEAM_MODE_ADD_ENTITIES,
+                    None,
+                    &joined,
+                ));
+            }
+            match (joined.len(), errors.len()) {
+                (1, 0) => format!("Added {} to team {name}", joined[0]),
+                (n, 0) => format!("Added {n} members to team {name}"),
+                (0, _) => errors.join("; "),
+                (n, _) => format!("Added {n} members to team {name} ({})", errors.join("; ")),
+            }
+        }
+        "leave" => {
+            if args.len() < 2 {
+                return "usage: /team leave <members>".to_owned();
+            }
+            let members: Vec<String> = args[1..]
+                .iter()
+                .flat_map(|t| p3b_team_members(t, ctx))
+                .collect();
+            let mut left: Vec<(String, String)> = Vec::new(); // (member, team)
+            let mut errors = Vec::new();
+            {
+                let mut reg = registry.lock().unwrap();
+                for member in &members {
+                    match reg.leave(member) {
+                        Ok(team) => left.push((member.clone(), team)),
+                        Err(e) => errors.push(e),
+                    }
+                }
+            }
+            // Vanilla mode-4 packets target a single team name, so members who
+            // left different teams are grouped into one packet per team.
+            if !left.is_empty() {
+                let mut by_team: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                for (member, team) in &left {
+                    by_team
+                        .entry(team.clone())
+                        .or_default()
+                        .push(member.clone());
+                }
+                for (team, members) in by_team {
+                    p3b_broadcast_team_packet(set_player_team_packet(
+                        &team,
+                        TEAM_MODE_REMOVE_ENTITIES,
+                        None,
+                        &members,
+                    ));
+                }
+            }
+            let left: Vec<String> = left.into_iter().map(|(m, _)| m).collect();
+            match (left.len(), errors.len()) {
+                (1, 0) => format!("Removed {} from their team", left[0]),
+                (n, 0) => format!("Removed {n} members from their teams"),
+                (0, _) => errors.join("; "),
+                (n, _) => format!("Removed {n} members ({})", errors.join("; ")),
+            }
+        }
+        "list" => {
+            let reg = registry.lock().unwrap();
+            match args.get(1) {
+                None => {
+                    let names: Vec<&str> = reg.list().iter().map(|t| t.name.as_str()).collect();
+                    if names.is_empty() {
+                        "There are no teams".to_owned()
+                    } else {
+                        format!("There are {} teams: {}", names.len(), names.join(", "))
+                    }
+                }
+                Some(&name) => match reg.get(name) {
+                    Some(team) => {
+                        let members: Vec<&str> =
+                            team.members.iter().map(String::as_str).collect();
+                        format!(
+                            "Team {} has {} members: {}",
+                            team.name,
+                            members.len(),
+                            members.join(", ")
+                        )
+                    }
+                    None => format!("No team with name '{name}'"),
+                },
+            }
+        }
+        "modify" => {
+            let (name, option) = match (args.get(1), args.get(2)) {
+                (Some(&n), Some(&o)) => (n, o),
+                _ => return "usage: /team modify <team> <option> [<value>]".to_owned(),
+            };
+            let value = args[3..].join(" ");
+            let result = {
+                let mut reg = registry.lock().unwrap();
+                let Some(team) = reg.get_mut(name) else {
+                    return format!("No team with name '{name}'");
+                };
+                match option {
+                    "displayName" => {
+                        team.display_name = value.clone();
+                        Ok(format!("Updated display name for team {name}"))
+                    }
+                    "color" => match team_color_id(&value) {
+                        Some(id) => {
+                            team.color = id;
+                            Ok(format!("Updated color for team {name} to {value}"))
+                        }
+                        None => Err(format!("Invalid color '{value}'")),
+                    },
+                    "friendlyFire" | "seeFriendlyInvisibles" => match value.as_str() {
+                        "true" | "false" => {
+                            let v = value == "true";
+                            if option == "friendlyFire" {
+                                team.friendly_fire = v;
+                            } else {
+                                team.see_friendly_invisibles = v;
+                            }
+                            Ok(format!("Updated {option} for team {name} to {value}"))
+                        }
+                        _ => Err(format!("Expected true or false, got '{value}'")),
+                    },
+                    "nametagVisibility" => {
+                        if TEAM_NAMETAG_VISIBILITIES.contains(&value.as_str()) {
+                            team.nametag_visibility = value.clone();
+                            Ok(format!("Updated nametag visibility for team {name} to {value}"))
+                        } else {
+                            Err(format!("Invalid nametag visibility '{value}'"))
+                        }
+                    }
+                    "collisionRule" => {
+                        if TEAM_COLLISION_RULES.contains(&value.as_str()) {
+                            team.collision_rule = value.clone();
+                            Ok(format!("Updated collision rule for team {name} to {value}"))
+                        } else {
+                            Err(format!("Invalid collision rule '{value}'"))
+                        }
+                    }
+                    "prefix" => {
+                        team.prefix = value.clone();
+                        Ok(format!("Updated prefix for team {name}"))
+                    }
+                    "suffix" => {
+                        team.suffix = value.clone();
+                        Ok(format!("Updated suffix for team {name}"))
+                    }
+                    other => Err(format!("Unknown team option '{other}'")),
+                }
+            };
+            match result {
+                Ok(reply) => {
+                    let reg = registry.lock().unwrap();
+                    let team = reg.get(name).expect("present").clone();
+                    drop(reg);
+                    p3b_broadcast_team_packet(set_player_team_packet(
+                        name,
+                        TEAM_MODE_UPDATE_INFO,
+                        Some(&team),
+                        &[],
+                    ));
+                    reply
+                }
+                Err(e) => e,
+            }
+        }
+        _ => format!("unknown /team subcommand '{sub}'"),
+    }
+}
+
+/// `/teammsg` (`/tm`) — vanilla `TeamMessage`: the sender's team sees the line;
+/// the reply string reports delivery like the other chat commands.
+#[allow(dead_code)]
+fn teammsg_command(ctx: &CmdCtx, args: &[&str]) -> String {
+    if args.is_empty() {
+        return "usage: /teammsg <message>".to_owned();
+    }
+    let sender = ctx
+        .me
+        .as_ref()
+        .map(|c| c.name.clone())
+        .unwrap_or_else(|| "Server".to_owned());
+    let message = args.join(" ");
+    let deliveries = match teams()
+        .lock()
+        .unwrap()
+        .teammsg(&sender, &message)
+    {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    let names: HashSet<&str> = deliveries.iter().map(|(n, _)| n.as_str()).collect();
+    let text = deliveries.first().map(|(_, t)| t.clone()).unwrap_or_default();
+    let mut sent = 0;
+    for client in client_snapshot() {
+        if names.contains(client.name.as_str()) {
+            if let Ok(mut w) = client.sock.lock() {
+                let _ = send_packet(&mut w, 0x6c, system_chat(&text));
+                sent += 1;
+            }
+        }
+    }
+    format!("{text} (delivered to {sent})")
+}
+
+/// `/tick` — query | rate | freeze | unfreeze | step | sprint.
+#[allow(dead_code)]
+fn tick_command(args: &[&str]) -> String {
+    let ctl = tick_controller();
+    match args.first().copied() {
+        Some("query") => {
+            let c = ctl.lock().unwrap();
+            let mut lines = vec![format!(
+                "Target tick rate: {:.1} per second",
+                c.tick_rate
+            )];
+            lines.push(format!(
+                "Average time per tick: {:.1}ms (Target: {:.1}ms)",
+                c.avg_mspt(),
+                1000.0 / f64::from(c.tick_rate)
+            ));
+            lines.push(
+                if c.frozen {
+                    "The game is frozen".to_owned()
+                } else {
+                    "The game is running normally".to_owned()
+                },
+            );
+            if c.is_sprinting() {
+                lines.push(format!("The game is in tick sprint ({} ticks remaining)", c.sprint_remaining));
+            }
+            if c.is_stepping_forward() {
+                lines.push(format!("{} step tick(s) queued", c.step_remaining));
+            }
+            lines.join(" ")
+        }
+        Some("rate") => {
+            let Some(value) = args.get(1).and_then(|v| v.parse::<f32>().ok()) else {
+                return "usage: /tick rate <1.0..10000.0>".to_owned();
+            };
+            {
+                let mut c = ctl.lock().unwrap();
+                if let Err(e) = c.set_tick_rate(value) {
+                    return e;
+                }
+            }
+            let c = ctl.lock().unwrap();
+            fanout_in(&client_snapshot(), |_| true, |_| {
+                (0x71, ticking_state_packet(c.tick_rate, c.frozen))
+            });
+            format!("Set tick rate to {value}")
+        }
+        Some("freeze") => {
+            ctl.lock().unwrap().frozen = true;
+            let c = ctl.lock().unwrap();
+            fanout_in(&client_snapshot(), |_| true, |_| {
+                (0x71, ticking_state_packet(c.tick_rate, c.frozen))
+            });
+            "Froze the game".to_owned()
+        }
+        Some("unfreeze") => {
+            ctl.lock().unwrap().frozen = false;
+            let c = ctl.lock().unwrap();
+            fanout_in(&client_snapshot(), |_| true, |_| {
+                (0x71, ticking_state_packet(c.tick_rate, c.frozen))
+            });
+            "The game is no longer frozen".to_owned()
+        }
+        Some("step") => {
+            if args.get(1) == Some(&"stop") {
+                ctl.lock().unwrap().step_remaining = 0;
+                return "Stopped stepping".to_owned();
+            }
+            let ticks = match args.get(1) {
+                None => 1,
+                Some(v) => match parse_tick_time_arg(v) {
+                    Some(t) => t,
+                    None => return "Invalid step count (use ticks like 1, or time like 5s, 1d)".to_owned(),
+                },
+            };
+            let mut c = ctl.lock().unwrap();
+            if !c.frozen {
+                return "Game is not frozen; /tick step only works while frozen".to_owned();
+            }
+            c.request_step(ticks);
+            drop(c);
+            fanout_in(&client_snapshot(), |_| true, |_| {
+                (0x72, ticking_step_packet(ticks))
+            });
+            format!("Stepping forward {ticks} tick(s)")
+        }
+        Some("sprint") => {
+            if args.get(1) == Some(&"stop") {
+                ctl.lock().unwrap().stop_sprinting();
+                return "Stopped sprinting".to_owned();
+            }
+            let Some(v) = args.get(1) else {
+                return "usage: /tick sprint <ticks|time> | /tick sprint stop".to_owned();
+            };
+            let Some(ticks) = parse_tick_time_arg(v) else {
+                return "Invalid sprint length (use ticks like 1, or time like 5s, 1d)".to_owned();
+            };
+            ctl.lock().unwrap().request_sprint(ticks);
+            format!("Sprinting {ticks} tick(s)")
+        }
+        _ => "usage: /tick query | rate <rate> | freeze | unfreeze | step [ticks|stop] | sprint <ticks|stop>".to_owned(),
+    }
+}
+
+/// `/locate` — structure | biome | poi.
+#[allow(dead_code)]
+fn locate_command(ctx: &CmdCtx, args: &[&str]) -> String {
+    let (kind, arg) = match (args.first().copied(), args.get(1).copied()) {
+        (Some(k), Some(a)) => (k, a),
+        _ => return "usage: /locate structure <structure> | biome <biome> | poi <poi>".to_owned(),
+    };
+    let (x, y, z) = (ctx.x as i32, ctx.y as i32, ctx.z as i32);
+    let dim = cmd_dim(ctx);
+    let reply = |kind: &str, found: Option<LocateHit>| match found {
+        Some(hit) => format!(
+            "The nearest {arg} is at [{}, ~, {}] ({} blocks away)",
+            hit.x, hit.z, hit.distance
+        ),
+        None => {
+            format!("Could not find a {kind} of type \"{arg}\" within reasonable distance")
+        }
+    };
+    match kind {
+        "structure" => match locate_structure_spiral(dim, arg, x, z, 100) {
+            Ok(found) => reply("structure", found),
+            Err(e) => e,
+        },
+        "biome" => reply("biome", locate_biome_spiral(dim, arg, x, y, z, 6400)),
+        "poi" => reply("poi", locate_poi_nearest(dim, arg, x, y, z, 256)),
+        _ => format!("unknown /locate kind '{kind}'"),
+    }
+}
+
+/// `/random` — value | roll | reset.
+#[allow(dead_code)]
+fn random_command(ctx: &CmdCtx, args: &[&str]) -> String {
+    let roller = ctx
+        .me
+        .as_ref()
+        .map(|c| c.name.clone())
+        .unwrap_or_else(|| "Server".to_owned());
+    let reply = exec_random_command(
+        &mut random_sequences().lock().unwrap(),
+        p3b_world_seed(),
+        args,
+        &roller,
+    );
+    if args.first() == Some(&"roll") && !reply.starts_with("usage:") {
+        let text = reply.clone();
+        fanout_in(&client_snapshot(), |_| true, |_| {
+            (0x6c, system_chat(&text))
+        });
+    }
+    reply
+}
+
+/// `/return` — evaluates to a `FunctionReturn`; a `run` re-enters the command
+/// dispatcher so the executed command's reply becomes this command's result.
+#[allow(dead_code)]
+fn return_command(ctx: &CmdCtx, args: &[&str], s: &mut Option<&Client>) -> String {
+    match parse_return_command(args) {
+        Ok(FunctionReturn::Value(v)) => format!("Return value: {v}"),
+        Ok(FunctionReturn::Fail) => "Command failed".to_owned(),
+        Ok(FunctionReturn::Run(command)) => {
+            let msg = format!("/{}", command.trim_start_matches('/'));
+            run_command_ctx(ctx, &msg, s)
+        }
+        Err(e) => e,
+    }
+}
+
+/// The one entry point the command match in `commands_core.rs` calls for every
+/// P3-B command name. Kept narrow on purpose: a five-line drop-in arm.
+#[allow(dead_code)]
+fn exec_p3b_command(ctx: &CmdCtx, cmd: &str, args: &[&str], s: &mut Option<&Client>) -> String {
+    match cmd {
+        "team" => team_command(ctx, args),
+        "teammsg" | "tm" => teammsg_command(ctx, args),
+        "tick" => tick_command(args),
+        "locate" => locate_command(ctx, args),
+        "random" => random_command(ctx, args),
+        "return" => return_command(ctx, args, s),
+        _ => format!("unknown P3-B command '{cmd}'"),
+    }
+}
+
+// ------------------------------------------------------------------ tests ---
+
+#[cfg(test)]
+mod teams_and_commands_tests {
+    use super::*;
+
+    fn fresh_teams() -> TeamRegistry {
+        TeamRegistry::default()
+    }
+
+    #[test]
+    fn team_registry_crud_membership_teammsg_and_0x60_wire_roundtrip() {
+        let mut reg = fresh_teams();
+        // add / list / modify
+        assert!(reg.add("red", Some("Red Team")).is_ok());
+        assert!(reg.add("red", None).is_err(), "duplicate name rejected");
+        assert!(reg.add("blue", None).is_ok());
+        assert_eq!(reg.get("red").unwrap().display_name, "Red Team");
+        assert_eq!(reg.get("red").unwrap().color, 21, "default color is reset");
+        assert_eq!(
+            reg.list().iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["blue", "red"],
+            "list is sorted by name"
+        );
+
+        // join moves members between teams automatically
+        assert_eq!(reg.join("red", "Alice").unwrap(), None);
+        assert_eq!(reg.join("red", "Bob").unwrap(), None);
+        assert_eq!(reg.team_of("Alice"), Some("red"));
+        assert_eq!(reg.join("blue", "Alice").unwrap().as_deref(), Some("red"));
+        assert_eq!(reg.team_of("Alice"), Some("blue"));
+        assert!(!reg.get("red").unwrap().members.contains("Alice"));
+        assert!(reg.join("noteam", "Carol").is_err());
+
+        // leave / empty
+        assert_eq!(reg.leave("Bob").unwrap(), "red");
+        assert!(reg.leave("Bob").is_err());
+        let emptied = reg.empty("blue").unwrap();
+        assert_eq!(emptied, vec!["Alice".to_owned()]);
+        assert_eq!(reg.team_of("Alice"), None);
+
+        // teammsg
+        reg.join("red", "Alice").unwrap();
+        reg.join("red", "Bob").unwrap();
+        let msgs = reg.teammsg("Alice", "hello team").unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(
+            msgs[0],
+            ("Alice".to_owned(), "[red] <Alice> hello team".to_owned())
+        );
+        assert!(reg.teammsg("Carol", "hi").is_err(), "sender not on a team");
+
+        // modify fields -> packet params
+        let team = {
+            let t = reg.get_mut("red").unwrap();
+            t.color = team_color_id("gold").unwrap();
+            t.friendly_fire = false;
+            t.see_friendly_invisibles = true;
+            t.nametag_visibility = "hideForOtherTeams".to_owned();
+            t.collision_rule = "pushOwnTeam".to_owned();
+            t.prefix = "[R] ".to_owned();
+            t.suffix = "!".to_owned();
+            t.clone()
+        };
+        assert_eq!(team_color_id("gold"), Some(6));
+        assert_eq!(team_color_id("bold"), None, "format codes are not colors");
+        assert_eq!(team_color_id("reset"), Some(21));
+
+        // mode 0 roundtrip: params + full member list
+        let members: Vec<String> = team.members.iter().cloned().collect();
+        let pkt = set_player_team_packet("red", TEAM_MODE_ADD_TEAM, Some(&team), &members);
+        let back = decode_set_player_team(&pkt).expect("mode 0 decode");
+        assert_eq!(back.name, "red");
+        assert_eq!(back.mode, 0);
+        assert_eq!(back.display_name.as_deref(), Some("Red Team"));
+        assert_eq!(back.friendly_flags & 0x01, 0, "friendlyFire=false");
+        assert_eq!(back.friendly_flags & 0x02, 0x02, "seeFriendlyInvisibles=true");
+        assert_eq!(back.nametag_visibility.as_deref(), Some("hideForOtherTeams"));
+        assert_eq!(back.collision_rule.as_deref(), Some("pushOwnTeam"));
+        assert_eq!(back.color, 6);
+        assert_eq!(back.prefix.as_deref(), Some("[R] "));
+        assert_eq!(back.suffix.as_deref(), Some("!"));
+        assert_eq!(back.entities, vec!["Alice", "Bob"]);
+
+        // mode 1: name only
+        let pkt = set_player_team_packet("red", TEAM_MODE_REMOVE_TEAM, None, &[]);
+        let back = decode_set_player_team(&pkt).unwrap();
+        assert_eq!(back.mode, 1);
+        assert!(back.display_name.is_none() && back.entities.is_empty());
+
+        // mode 2: params only
+        let pkt = set_player_team_packet("red", TEAM_MODE_UPDATE_INFO, Some(&team), &[]);
+        let back = decode_set_player_team(&pkt).unwrap();
+        assert_eq!(back.mode, 2);
+        assert_eq!(back.display_name.as_deref(), Some("Red Team"));
+        assert!(back.entities.is_empty());
+
+        // modes 3/4: entity deltas only
+        for (mode, tag) in [(3u8, "add"), (4u8, "remove")] {
+            let pkt = set_player_team_packet(
+                "red",
+                mode,
+                None,
+                &["Carol".to_owned(), "Dave".to_owned()],
+            );
+            let back = decode_set_player_team(&pkt).unwrap_or_else(|| panic!("mode {tag}"));
+            assert_eq!(back.mode, mode);
+            assert_eq!(back.entities, vec!["Carol", "Dave"]);
+            assert!(back.display_name.is_none());
+        }
+        // trailing garbage and truncation both fail closed
+        let mut pkt = set_player_team_packet("red", TEAM_MODE_REMOVE_TEAM, None, &[]);
+        pkt.push(0xaa);
+        assert!(decode_set_player_team(&pkt[..pkt.len() - 1]).is_some());
+        assert!(decode_set_player_team(&pkt[..2]).is_none());
+    }
+
+    #[test]
+    fn tick_controller_freeze_step_sprint_rate_and_0x71_0x72_wire_roundtrip() {
+        let mut c = TickController::new();
+        assert_eq!(c.tick_rate, 20.0);
+        assert_eq!(c.tick_interval_nanos(), 50_000_000);
+        assert!(c.should_run_game_tick(), "unfrozen runs normally");
+
+        // rate bounds
+        assert!(c.set_tick_rate(10.0).is_ok());
+        assert_eq!(c.tick_interval_nanos(), 100_000_000);
+        assert!(c.set_tick_rate(0.5).is_err());
+        assert!(c.set_tick_rate(20000.0).is_err());
+        assert!(c.set_tick_rate(f32::NAN).is_err());
+        c.set_tick_rate(20.0).unwrap();
+
+        // freeze stops ticks; step queues consumed one per call
+        c.frozen = true;
+        assert!(!c.should_run_game_tick());
+        c.request_step(2);
+        assert!(c.should_run_game_tick());
+        assert!(c.should_run_game_tick());
+        assert!(!c.should_run_game_tick(), "step budget exhausted");
+        assert!(!c.is_stepping_forward());
+
+        // sprint bypasses freeze and consumes its own budget
+        c.request_sprint(3);
+        assert_eq!(c.tick_interval_nanos(), 0, "sprint runs flat out");
+        assert!(c.should_run_game_tick());
+        assert!(c.is_sprinting());
+        c.stop_sprinting();
+        assert!(c.should_run_game_tick(), "stop applies on next tick");
+        assert!(!c.should_run_game_tick(), "sprint ended early via stop");
+        assert!(!c.is_sprinting());
+
+        // unfreeze restores normal running
+        c.frozen = false;
+        assert!(c.should_run_game_tick());
+
+        // query statistics
+        for _ in 0..10 {
+            c.record_tick_nanos(50_000_000);
+        }
+        assert_eq!(c.avg_mspt(), 50.0);
+
+        // 0x71 roundtrip
+        let pkt = ticking_state_packet(20.0, true);
+        assert_eq!(pkt, vec![0x41, 0xa0, 0x00, 0x00, 0x01]);
+        assert_eq!(decode_ticking_state(&pkt), Some((20.0, true)));
+        assert_eq!(decode_ticking_state(&pkt[..3]), None);
+        // 0x72 roundtrip incl. multi-byte varints
+        for steps in [1, 20, 300] {
+            let pkt = ticking_step_packet(steps);
+            assert_eq!(decode_ticking_step(&pkt), Some(steps));
+        }
+        assert_eq!(decode_ticking_step(&[]), None);
+
+        // time units
+        assert_eq!(parse_tick_time_arg("1"), Some(1));
+        assert_eq!(parse_tick_time_arg("5t"), Some(5));
+        assert_eq!(parse_tick_time_arg("2s"), Some(40));
+        assert_eq!(parse_tick_time_arg("1d"), Some(24_000));
+        assert_eq!(parse_tick_time_arg("0.5s"), Some(10));
+        assert_eq!(parse_tick_time_arg("0"), None);
+        assert_eq!(parse_tick_time_arg("-3s"), None);
+        assert_eq!(parse_tick_time_arg("abc"), None);
+    }
+
+    #[test]
+    fn locate_biome_and_poi_find_real_positions_and_respect_bounds() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        // Overlay restore on any path: a panic must not leak the seeded blocks.
+        let saved_world = std::mem::take(&mut *world().lock().unwrap());
+        struct RestoreWorld(HashMap<DimChunkKey, HashMap<u32, u32>>);
+        impl std::ops::Drop for RestoreWorld {
+            fn drop(&mut self) {
+                *world().lock().unwrap_or_else(|e| e.into_inner()) =
+                    std::mem::take(&mut self.0);
+            }
+        }
+        let _restore = RestoreWorld(saved_world);
+
+        assert!(worldgen::init(0, name_to_state), "overworld gen loads");
+
+        // The biome under the search origin must locate at distance ~0.
+        let here = worldgen::with_gen(|g| g.biome_name_at(0, 64, 0))
+            .flatten()
+            .expect("origin biome resolves");
+        let hit = locate_biome_spiral(DimId::Overworld, &here, 0, 64, 0, 6400)
+            .expect("the origin's own biome is found");
+        assert!(hit.distance <= 3, "origin biome found within a quart: {hit:?}");
+        // Verify the hit's biome by asking the generator again at that spot.
+        let at_hit = worldgen::with_gen(|g| g.biome_name_at(hit.x, hit.y, hit.z))
+            .flatten()
+            .unwrap();
+        assert_eq!(at_hit, here, "the located position is really {here}");
+        // An unknown biome id is a bounded miss, never a hang.
+        assert!(locate_biome_spiral(DimId::Overworld, "minecraft:plains_plus_plus", 0, 64, 0, 64).is_none()
+            || locate_biome_spiral(DimId::Overworld, "the_void", 0, 64, 0, 0).is_none());
+
+        // Structures: mineshafts are dense enough that a 100-chunk radius is a
+        // certain hit, and the found chunk independently passes the real
+        // admission check.
+        let hit = locate_structure_spiral(
+            DimId::Overworld,
+            "minecraft:mineshaft",
+            0,
+            0,
+            100,
+        )
+        .expect("locate runs")
+        .expect("a mineshaft within 1600 blocks of spawn on seed 0");
+        let (cx, cz) = (hit.x >> 4, hit.z >> 4);
+        let independent = worldgen::with_gen(|g| mineshaft::admit(g, cx, cz))
+            .flatten()
+            .expect("the located chunk is really admitted");
+        assert_eq!(mineshaft::start_id(&independent), "minecraft:mineshaft");
+        // A bogus structure id is an error, and radius 0 cannot reach far
+        // structures but must still answer.
+        assert!(locate_structure_spiral(DimId::Overworld, "minecraft:no_such_structure", 0, 0, 4).is_err());
+        let bounded = locate_structure_spiral(DimId::Overworld, "minecraft:stronghold", 0, 0, 4)
+            .expect("bounded stronghold scan");
+        assert!(bounded.is_none(), "no stronghold start inside 4 chunks of spawn");
+
+        // POI: seed a bell and a bed into the overlay, then find them.
+        let reg = block_registry::breg().expect("block registry");
+        let bell = reg.state_of("minecraft:bell", None);
+        let bed = reg.state_of("minecraft:red_bed", None);
+        set_block_dim(DimId::Overworld, 48, 80, -32, bell);
+        set_block_dim(DimId::Overworld, 96, 70, 96, bed);
+        let hit = locate_poi_nearest(DimId::Overworld, "minecraft:meeting", 0, 70, 0, 256)
+            .expect("the bell is a meeting POI");
+        assert_eq!((hit.x, hit.y, hit.z), (48, 80, -32));
+        let hit = locate_poi_nearest(DimId::Overworld, "home", 0, 70, 0, 256)
+            .expect("the bed is a home POI");
+        assert_eq!((hit.x, hit.y, hit.z), (96, 70, 96));
+        // The radius cap is honoured: same POI, too small a radius -> miss.
+        assert!(locate_poi_nearest(DimId::Overworld, "minecraft:meeting", 0, 70, 0, 16).is_none());
+        // A POI that was never placed misses inside a large radius too.
+        assert!(locate_poi_nearest(DimId::Overworld, "minecraft:armorer", 0, 70, 0, 256).is_none());
+    }
+
+    #[test]
+    fn random_command_value_roll_and_deterministic_sequence_reset() {
+        let mut store = RandomSequenceStore::default();
+        // value: in-range, sequence advances, replay after `*` reset is identical
+        let a1 = exec_random_command(&mut store, 42, &["value", "1..10"], "Tester");
+        let a2 = exec_random_command(&mut store, 42, &["value", "1..10"], "Tester");
+        assert_ne!(a1, a2, "the sequence advances between draws");
+        assert!(a1.starts_with("Random number between 1 and 10: "));
+        let v: i32 = a1.rsplit(' ').next().unwrap().parse().unwrap();
+        assert!((1..=10).contains(&v));
+
+        let reset = exec_random_command(&mut store, 42, &["reset", "*"], "Tester");
+        assert_eq!(reset, "Reset all random number sequences");
+        let a3 = exec_random_command(&mut store, 42, &["value", "1..10"], "Tester");
+        assert_eq!(a1, a3, "reset replays the deterministic sequence");
+
+        // roll: broadcast phrasing
+        exec_random_command(&mut store, 42, &["reset", "*"], "Tester");
+        let roll = exec_random_command(&mut store, 42, &["roll", "5..5"], "Tester");
+        assert_eq!(roll, "Tester rolled a 5 between 5 and 5");
+
+        // named sequences are independent of the default stream
+        exec_random_command(&mut store, 42, &["reset", "*"], "Tester");
+        let d1 = exec_random_command(&mut store, 42, &["value", "0..1000"], "T");
+        let n1 = exec_random_command(&mut store, 42, &["value", "0..1000", "spine:test"], "T");
+        assert_ne!(d1, n1);
+        // resetting one sequence replays it alone
+        let n2 = exec_random_command(&mut store, 42, &["value", "0..1000", "spine:test"], "T");
+        exec_random_command(&mut store, 42, &["reset", "spine:test"], "T");
+        let n3 = exec_random_command(&mut store, 42, &["value", "0..1000", "spine:test"], "T");
+        assert_eq!(n1, n3);
+        assert_ne!(n2, n3, "the earlier draw consumed state before the reset");
+
+        // explicit-seed reset is deterministic across stores
+        let mut store2 = RandomSequenceStore::default();
+        exec_random_command(&mut store, 42, &["reset", "spine:test", "7"], "T");
+        exec_random_command(&mut store2, 42, &["reset", "spine:test", "7"], "T");
+        let s1 = exec_random_command(&mut store, 42, &["value", "0..1000000", "spine:test"], "T");
+        let s2 = exec_random_command(&mut store2, 42, &["value", "0..1000000", "spine:test"], "T");
+        assert_eq!(s1, s2, "same seed -> same sequence, across stores");
+
+        // validation
+        assert!(exec_random_command(&mut store, 42, &["value", "9..1"], "T").contains("reversed"));
+        assert!(exec_random_command(&mut store, 42, &["nonsense"], "T").starts_with("usage:"));
+    }
+
+    #[test]
+    fn mcfunction_macro_expansion_and_return_command_parsing() {
+        let args: BTreeMap<String, String> = [
+            ("name".to_owned(), "Steve".to_owned()),
+            ("n".to_owned(), "7".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            expand_mcfunction_macro("$say hello $(name), you got $(n)", &args).unwrap(),
+            "say hello Steve, you got 7"
+        );
+        // $$ escapes to a literal $; a lone $ inside the command is verbatim.
+        assert_eq!(
+            expand_mcfunction_macro("$give $(name) $$5 bills", &args).unwrap(),
+            "give Steve $5 bills"
+        );
+        // missing key -> the whole line fails, per vanilla macro rules
+        assert!(expand_mcfunction_macro("$say hi $(who)", &args).is_err());
+        // invalid variable names are rejected cleanly
+        assert!(expand_mcfunction_macro("$say $(a b)", &args).is_err());
+        assert!(expand_mcfunction_macro("$say $()", &args).is_err());
+        assert!(expand_mcfunction_macro("$say $(name", &args).is_err());
+        // not a macro line at all
+        assert!(expand_mcfunction_macro("say hi", &args).is_err());
+        // a macro line with no placeholders expands to itself
+        assert_eq!(
+            expand_mcfunction_macro("$say static", &args).unwrap(),
+            "say static"
+        );
+
+        // /return
+        assert_eq!(parse_return_command(&["5"]).unwrap(), FunctionReturn::Value(5));
+        assert_eq!(parse_return_command(&["-3"]).unwrap(), FunctionReturn::Value(-3));
+        assert_eq!(parse_return_command(&["fail"]).unwrap(), FunctionReturn::Fail);
+        assert_eq!(
+            parse_return_command(&["run", "say", "hi", "there"]).unwrap(),
+            FunctionReturn::Run("say hi there".to_owned())
+        );
+        assert!(parse_return_command(&[]).is_err());
+        assert!(parse_return_command(&["run"]).is_err());
+        assert!(parse_return_command(&["abc"]).is_err());
+        assert!(parse_return_command(&["1", "2"]).is_err());
+    }
+}
