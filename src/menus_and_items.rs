@@ -1444,6 +1444,24 @@ fn roll_loot_container_slots(
 }
 fn unpack_block_loot_if_needed(pos: DimBlockPos) -> bool {
     with_save_guard(|| {
+        // The world edit path calls this for every Overworld block-identity
+        // write, which is exactly when vanilla destroys the block entity —
+        // including a break followed by re-placing the same block type.
+        // Dropping the entry here keeps a same-type rewrite from resurrecting
+        // the old payload before the next discovery scan. Speculative callers
+        // (hopper moves, window opens, dispenser fire) only ever name plain
+        // container positions, and the block-id guard leaves matching entries
+        // alone.
+        {
+            let mut store = live_block_entities().lock().unwrap();
+            if let Some(&(id, _)) = store.entries.get(&pos) {
+                let current = breg()
+                    .and_then(|reg| reg.block_id_of(block_at_dim(pos.0, pos.1, pos.2, pos.3)));
+                if current != Some(id) {
+                    store.entries.remove(&pos);
+                }
+            }
+        }
         let pending = pending_block_loot().lock().unwrap().remove(&pos);
         let Some(entry) = pending else {
             return false;
@@ -1472,6 +1490,180 @@ fn unpack_window_loot_if_needed(window: (ContainerKey, Option<ContainerKey>)) {
             }
         }
     }
+}
+
+// ---------- generic JSON loot tables ----------
+//
+// `crate::chest_loot` evaluates vanilla 1.21.1 loot-table JSON (nested
+// alternatives/group/sequence, tag entries, the implemented conditions and
+// functions). This is the container-fill half of `LootTable.fill`: the
+// evaluated stacks go through the same slot shuffle and count splitting the
+// seeded `abandoned_mineshaft` table uses, then land in `slot_limit` slots.
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn loot_json_tag_items(tag: &str, depth: usize) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if depth > 8 {
+        return out;
+    }
+    // Builtin tags are keyed bare ("planks") while datapack tags keep their
+    // namespace ("minecraft:planks"); accept either spelling.
+    let members = {
+        let tags = item_tags();
+        let tags = tags.lock().unwrap();
+        tags.get(tag)
+            .or_else(|| {
+                tag.strip_prefix("minecraft:")
+                    .and_then(|bare| tags.get(bare))
+            })
+            .cloned()
+            .unwrap_or_default()
+    };
+    for member in members {
+        if let Some(inner) = member.strip_prefix('#') {
+            out.extend(loot_json_tag_items(inner, depth + 1));
+        } else if let Some(name) = name_to_item(&member).and_then(item_to_name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn loot_json_stack(item: &crate::chest_loot::LootItem) -> Option<Stack> {
+    let id = name_to_item(item.item.as_str())?;
+    if id == 0 || item.count <= 0 {
+        return None;
+    }
+    let mut comps = Vec::new();
+    if item.damage != 0 {
+        comp_set_varint(&mut comps, COMP_DAMAGE, i64::from(item.damage));
+    }
+    if let Some((ench, lvl)) = &item.enchantment {
+        if let Some(eid) = enchant_id(ench) {
+            let bare = item
+                .item
+                .strip_prefix("minecraft:")
+                .unwrap_or(item.item.as_str());
+            let ty = if bare == "enchanted_book" {
+                COMP_STORED_ENCHANTMENTS
+            } else {
+                COMP_ENCHANTMENTS
+            };
+            comps.push((ty, enchantments_data(&[(eid, i64::from(*lvl))], true)));
+        }
+    }
+    let max = item_stack_max(id, &comps).clamp(1, 99) as i32;
+    let count = item.count.clamp(0, max);
+    (count > 0).then_some((id, count as u8, comps))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn loot_json_next_int(rng: &mut crate::generation_math::Lcg, min: i32, max: i32) -> i32 {
+    if min >= max {
+        min
+    } else {
+        rng.next_bound(max - min + 1) + min
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn loot_json_shuffle<T>(list: &mut [T], rng: &mut crate::generation_math::Lcg) {
+    for i in (2..=list.len()).rev() {
+        let j = rng.next_bound(i as i32) as usize;
+        list.swap(i - 1, j);
+    }
+}
+
+// The same split vanilla applies when a rolled stack does not fit the free
+// slots: oversized stacks are divided at random, then the survivors shuffle.
+#[cfg_attr(not(test), allow(dead_code))]
+fn loot_json_split(
+    items: Vec<Stack>,
+    empty_slots: usize,
+    rng: &mut crate::generation_math::Lcg,
+) -> Vec<Stack> {
+    let mut keep = Vec::new();
+    let mut splitable = Vec::new();
+    for item in items {
+        if item.1 <= 1 {
+            keep.push(item);
+        } else {
+            splitable.push(item);
+        }
+    }
+    let mut available = empty_slots as isize - keep.len() as isize - splitable.len() as isize;
+    while available > 0 && !splitable.is_empty() {
+        available -= 1;
+        let idx = loot_json_next_int(rng, 0, splitable.len() as i32 - 1) as usize;
+        let mut stack = splitable.remove(idx);
+        let take = loot_json_next_int(rng, 1, i32::from(stack.1) / 2);
+        stack.1 -= take as u8;
+        let split = (stack.0, take as u8, stack.2.clone());
+        for part in [stack, split] {
+            if part.1 > 1 && rng.next_bool() {
+                splitable.push(part);
+            } else {
+                keep.push(part);
+            }
+        }
+    }
+    keep.extend(splitable);
+    loot_json_shuffle(&mut keep, rng);
+    keep
+}
+
+/// Fill `slot_limit` container slots from a raw loot-table JSON body
+/// (`data/<ns>/loot_table/**.json` or a vanilla table). Seed 0 is unseeded,
+/// matching `RandomizableContainer.unpackLootTable`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn unpack_loot_table_json(
+    table_json: &str,
+    seed: i64,
+    slot_limit: usize,
+) -> HashMap<i16, Stack> {
+    let mut out = HashMap::new();
+    let Some(table) = crate::chest_loot::jparse(table_json.as_bytes()) else {
+        return out;
+    };
+    let tag_items = |tag: &str| loot_json_tag_items(tag, 0);
+    let smelt = |item: &str| {
+        name_to_item(item)
+            .and_then(smelt_result)
+            .and_then(item_to_name)
+    };
+    let max_damage = |item: &str| {
+        i32::try_from(item_max_durability(item.trim_start_matches("minecraft:")).unwrap_or(0))
+            .unwrap_or(0)
+    };
+    let resolvers = crate::chest_loot::LootResolvers {
+        tags: &tag_items,
+        smelt: &smelt,
+        max_damage: &max_damage,
+    };
+    let seed = if seed == 0 {
+        world_rng::next_u64() as i64
+    } else {
+        seed
+    };
+    let mut rng = crate::generation_math::Lcg::new(seed as u64);
+    let items = crate::chest_loot::evaluate_loot_table(
+        &table,
+        &crate::chest_loot::LootContext::default(),
+        &mut rng,
+        &resolvers,
+    );
+    let stacks: Vec<Stack> = items.iter().filter_map(loot_json_stack).collect();
+    let slot_limit = slot_limit.min(i16::MAX as usize);
+    let mut slots: Vec<i16> = (0..slot_limit as i16).collect();
+    loot_json_shuffle(&mut slots, &mut rng);
+    for stack in loot_json_split(stacks, slots.len(), &mut rng) {
+        let Some(slot) = slots.pop() else {
+            break;
+        };
+        out.insert(slot, stack);
+    }
+    out
 }
 
 fn chests() -> &'static LockedMap<ContainerKey, HashMap<i16, Stack>> {
@@ -6127,6 +6319,8 @@ impl LiveBlockEntity {
 
 #[derive(Default)]
 struct LiveBlockEntityStore {
+    // (block id, entity). Vanilla drops the block entity the moment the block
+    // identity changes; same-block state writes (rotation, power) keep it.
     entries: HashMap<DimBlockPos, (i32, LiveBlockEntity)>,
     chunk_versions: HashMap<DimChunkKey, u64>,
     scanned_at: u64,
@@ -6140,7 +6334,7 @@ fn live_block_entities() -> &'static Mutex<LiveBlockEntityStore> {
 impl LiveBlockEntityStore {
     fn at(&mut self, reg: &BReg, key: DimBlockPos, state: u32) -> Option<&mut LiveBlockEntity> {
         let block = reg.block_id_of(state)?;
-        if self.entries.get(&key).is_some_and(|(id, _)| *id != block) {
+        if self.entries.get(&key).is_some_and(|&(id, _)| id != block) {
             self.entries.remove(&key);
         }
         let id = live_block_entity_id(reg.name_of(state))?;

@@ -350,6 +350,94 @@ fn container_loot_roll_stays_inside_the_block_its_table_came_from() {
 }
 
 #[test]
+fn container_json_loot_table_unpacks_nested_entries_and_fills_slots() {
+    let table = r#"{
+        "pools": [
+            {
+                "rolls": {"type": "minecraft:uniform", "min": 1, "max": 2},
+                "entries": [
+                    {"type": "item", "name": "minecraft:iron_ingot",
+                     "functions": [{"function": "minecraft:set_count",
+                                    "count": {"type": "minecraft:uniform", "min": 2, "max": 5}}]},
+                    {"type": "alternatives", "children": [
+                        {"type": "item", "name": "minecraft:gold_ingot"},
+                        {"type": "group", "children": [
+                            {"type": "sequence", "children": [
+                                {"type": "item", "name": "minecraft:bread"},
+                                {"type": "empty"}
+                            ]}
+                        ]}
+                    ]},
+                    {"type": "tag", "name": "minecraft:planks"},
+                    {"type": "empty", "weight": 3}
+                ]
+            },
+            {
+                "rolls": 1,
+                "conditions": [{"condition": "minecraft:random_chance", "chance": 0.0}],
+                "entries": [{"type": "item", "name": "minecraft:diamond",
+                             "functions": [{"function": "minecraft:set_count", "count": 3}]}]
+            },
+            {
+                "rolls": 1,
+                "entries": [{"type": "item", "name": "minecraft:iron_ingot"}]
+            }
+        ]
+    }"#;
+    let planks = [
+        "oak_planks",
+        "spruce_planks",
+        "birch_planks",
+        "jungle_planks",
+        "acacia_planks",
+        "dark_oak_planks",
+        "mangrove_planks",
+        "cherry_planks",
+        "crimson_planks",
+        "warped_planks",
+    ];
+    let allowed: HashSet<&str> = ["iron_ingot", "gold_ingot", "bread"]
+        .into_iter()
+        .chain(planks)
+        .collect();
+    let slots = unpack_loot_table_json(table, 0x5eed, 27);
+    assert!(!slots.is_empty(), "the unconditional pool always drops");
+    assert_eq!(unpack_loot_table_json(table, 0x5eed, 27), slots);
+    for (slot, stack) in &slots {
+        assert!((0..27).contains(slot), "slot {slot} inside the container");
+        let name = item_to_name(stack.0).expect("loot resolves to a known item");
+        assert!(allowed.contains(name), "unexpected loot item {name}");
+        assert!((1..=5).contains(&stack.1), "{name} count {}", stack.1);
+    }
+    let cooked = unpack_loot_table_json(
+        r#"{"pools":[{"rolls":1,"entries":[{"type":"item","name":"minecraft:beef",
+            "functions":[{"function":"minecraft:furnace_smelt"}]}]}]}"#,
+        7,
+        27,
+    );
+    assert!(cooked
+        .values()
+        .any(|stack| item_to_name(stack.0) == Some("cooked_beef")));
+    let split = unpack_loot_table_json(
+        r#"{"pools":[{"rolls":1,"entries":[{"type":"item","name":"minecraft:arrow",
+            "functions":[{"function":"minecraft:set_count","count":20}]}]}]}"#,
+        42,
+        3,
+    );
+    assert!(split.len() >= 2 && split.len() <= 3, "{split:?}");
+    assert!(split
+        .values()
+        .all(|stack| item_to_name(stack.0) == Some("arrow")));
+    assert_eq!(
+        split.values().map(|stack| u32::from(stack.1)).sum::<u32>(),
+        20,
+        "splitting conserves the rolled count"
+    );
+    assert!(unpack_loot_table_json("not json", 1, 27).is_empty());
+    assert!(unpack_loot_table_json(r#"{"pools":[]}"#, 1, 27).is_empty());
+}
+
+#[test]
 fn mining_efficiency_and_durability_use_shared_mechanics() {
     let stone = name_to_state("stone").unwrap() as i64;
     let pick = name_to_item("iron_pickaxe").unwrap();
@@ -1666,5 +1754,39 @@ mod block_entity_helpers {
             .unwrap()
             .iter()
             .any(|drop| item_to_name(drop.item) == Some("emerald") && drop.cnt == 2));
+    }
+
+    #[test]
+    fn live_block_entity_same_type_rewrite_reloads_payload() {
+        let _guard = world_guard();
+        let mut world = LiveWorld::new();
+        let (client, _receiver) = effect_tests::client_pair();
+        let (dim, x, y, z) = (DimId::Overworld, 94_000, 322, 94_000);
+        *client.pos.lock().unwrap() = (
+            x as f64 + 0.5,
+            y as f64 - 0.7,
+            z as f64 - 1.0,
+            0.0,
+            0.0,
+            true,
+        );
+        attach_live_menu(&client);
+        let key = (dim, x, y, z);
+        world.place(key, "jukebox");
+        put_hand(&client, "music_disc_13", 1);
+        assert!(click_block(&client, key));
+        world.tick_at(0);
+        assert!(reload_at(key).get("RecordItem").is_some());
+        // Break and re-place the same block before the next scan: vanilla
+        // creates a fresh block entity, so the old disc must not survive.
+        set_block_dim(dim, x, y, z, 0);
+        world.place(key, "jukebox");
+        let (_, early) = live_block_entity_snapshot(key).unwrap();
+        assert!(
+            early.get("RecordItem").is_none(),
+            "a same-type rewrite clears the payload before the next tick scan"
+        );
+        world.tick_at(u64::from(GAME_TICKS_PER_TICK));
+        assert!(reload_at(key).get("RecordItem").is_none());
     }
 }
