@@ -2,6 +2,10 @@
 //! The C pointer and lifetime contract is declared in include/mc_spine_kernel.h.
 
 use crate::{
+    entity_interp::{
+        evaluate_sky_and_fog, EntityInterpolationTable, SkyFogInput,
+        INTERP_UPDATE_POSITION, INTERP_UPDATE_REMOVE, INTERP_UPDATE_ROTATION, INTERP_UPDATE_SNAP,
+    },
     Aabb, BlockFacts, CommandDispatcher, Error, FluidCell, FluidKind, FluidQuery, LightEdit,
     LightEngine, LightFact, LightKind, LightUpdate, PalettedSection, Registry, Suggestions,
     SECTION_CELLS,
@@ -857,6 +861,213 @@ pub unsafe extern "C" fn mc_spine_kernel_fluid_impulse(
                 push: result.push,
                 max_height: result.max_height,
                 in_fluid: result.in_fluid.into(),
+            })
+        })
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct InterpEntityUpdate {
+    pub entity_id: i32,
+    pub kind: u8,
+    pub position: [f64; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+    pub head_yaw: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct InterpPoseOut {
+    pub position: [f64; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+    pub head_yaw: f32,
+    pub present: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SkyFogInputC {
+    pub day_time: i64,
+    pub rain_level: f32,
+    pub thunder_level: f32,
+    pub view_distance: f32,
+    pub biome_fog_color: [f32; 3],
+    pub biome_fog_color_next: [f32; 3],
+    pub biome_blend: f32,
+    pub underwater: u8,
+    pub in_lava: u8,
+    pub powder_snow: u8,
+    pub blindness: f32,
+    pub darkness: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SkyFogOutputC {
+    pub celestial_angle: f32,
+    pub star_brightness: f32,
+    pub sky_rgb: [f32; 3],
+    pub fog_rgb: [f32; 3],
+    pub fog_start: f32,
+    pub fog_end: f32,
+}
+
+/// Allocate a new entity interpolation table.
+///
+/// # Safety
+/// `out` must be a valid, aligned, writable pointer; on success it receives
+/// the table handle for [`mc_spine_interp_entities_batch`] and
+/// [`mc_spine_interp_table_free`].
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_interp_table_new(
+    out: *mut *mut EntityInterpolationTable,
+) -> i32 {
+    unsafe {
+        write_result(out, || {
+            Ok(Box::into_raw(Box::new(EntityInterpolationTable::new())))
+        })
+    }
+}
+
+/// Free a table from [`mc_spine_interp_table_new`]. NULL is rejected.
+///
+/// # Safety
+/// `table` must be a live handle from [`mc_spine_interp_table_new`] or NULL;
+/// it must not be used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_interp_table_free(table: *mut EntityInterpolationTable) -> i32 {
+    unsafe { drop_handle(table) }
+}
+
+/// Apply `update_count` entity updates to `table` (kinds are the
+/// `INTERP_UPDATE_*` constants) and write each entity's interpolated pose at
+/// `partial_tick` into `out`. Writes nothing to `out` on a validation error;
+/// an update error mid-batch may leave earlier updates applied. Allocates
+/// nothing beyond the table's own storage.
+///
+/// # Safety
+/// `table` must be a live handle from [`mc_spine_interp_table_new`].
+/// `updates` must point to `update_count` valid `InterpEntityUpdate` records
+/// when `update_count > 0`; `out` must point to `out_capacity` writable
+/// `InterpPoseOut` slots and `update_count <= out_capacity`. `partial_tick`
+/// must be finite.
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_interp_entities_batch(
+    table: *mut EntityInterpolationTable,
+    updates: *const InterpEntityUpdate,
+    update_count: usize,
+    partial_tick: f32,
+    out: *mut InterpPoseOut,
+    out_capacity: usize,
+) -> i32 {
+    status(|| {
+        check_ptr(table)?;
+        if !partial_tick.is_finite() {
+            return Err(Error::InvalidArgument);
+        }
+        if update_count > out_capacity {
+            return Err(Error::BufferTooSmall);
+        }
+        if update_count == 0 {
+            return Ok(());
+        }
+        check_ptr(out)?;
+        if update_count > isize::MAX as usize / size_of::<InterpPoseOut>() {
+            return Err(Error::OutOfRange);
+        }
+        let updates = unsafe { input_span(updates, update_count)? };
+        let outs = unsafe { slice::from_raw_parts_mut(out, update_count) };
+        let table = unsafe { &mut *table };
+        for (i, update) in updates.iter().enumerate() {
+            let pose = match update.kind {
+                INTERP_UPDATE_POSITION => {
+                    table.update_position(update.entity_id, update.position)?;
+                    table.sample(update.entity_id, partial_tick)
+                }
+                INTERP_UPDATE_ROTATION => {
+                    table.update_rotation(update.entity_id, update.yaw, update.pitch, update.head_yaw)?;
+                    table.sample(update.entity_id, partial_tick)
+                }
+                INTERP_UPDATE_SNAP => {
+                    table.snap_entity(
+                        update.entity_id,
+                        update.position,
+                        update.yaw,
+                        update.pitch,
+                        update.head_yaw,
+                    )?;
+                    table.sample(update.entity_id, partial_tick)
+                }
+                INTERP_UPDATE_REMOVE => {
+                    table.remove_entity(update.entity_id);
+                    None
+                }
+                _ => return Err(Error::InvalidArgument),
+            };
+            outs[i] = match pose {
+                Some(pose) => InterpPoseOut {
+                    position: pose.position,
+                    yaw: pose.yaw,
+                    pitch: pose.pitch,
+                    head_yaw: pose.head_yaw,
+                    present: 1,
+                },
+                None => InterpPoseOut {
+                    position: [0.0; 3],
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    head_yaw: 0.0,
+                    present: 0,
+                },
+            };
+        }
+        Ok(())
+    })
+}
+
+/// Evaluate the sky/celestial/weather/biome-fog state for one frame. Writes
+/// `out` only on success.
+///
+/// # Safety
+/// `input` must point to a valid `SkyFogInputC` and `out` to a writable
+/// `SkyFogOutputC`; flag bytes must be 0 or 1.
+#[no_mangle]
+pub unsafe extern "C" fn mc_spine_sky_fog_eval(
+    input: *const SkyFogInputC,
+    out: *mut SkyFogOutputC,
+) -> i32 {
+    unsafe {
+        write_result(out, || {
+            let input = *read_handle(input)?;
+            for flag in [input.underwater, input.in_lava, input.powder_snow] {
+                if flag > 1 {
+                    return Err(Error::InvalidArgument);
+                }
+            }
+            let evaluated = evaluate_sky_and_fog(&SkyFogInput {
+                day_time: input.day_time,
+                rain_level: input.rain_level,
+                thunder_level: input.thunder_level,
+                view_distance: input.view_distance,
+                biome_fog_color: input.biome_fog_color,
+                biome_fog_color_next: input.biome_fog_color_next,
+                biome_blend: input.biome_blend,
+                underwater: input.underwater == 1,
+                in_lava: input.in_lava == 1,
+                powder_snow: input.powder_snow == 1,
+                blindness: input.blindness,
+                darkness: input.darkness,
+            });
+            Ok(SkyFogOutputC {
+                celestial_angle: evaluated.celestial_angle,
+                star_brightness: evaluated.star_brightness,
+                sky_rgb: evaluated.sky_rgb,
+                fog_rgb: evaluated.fog_rgb,
+                fog_start: evaluated.fog_start,
+                fog_end: evaluated.fog_end,
             })
         })
     }

@@ -8,6 +8,7 @@
 #[path = "../../src/brigadier.rs"]
 mod brigadier;
 mod command;
+pub mod entity_interp;
 mod ffi;
 mod gzip;
 #[rustfmt::skip]
@@ -27,6 +28,12 @@ mod nbt {
 }
 
 pub use command::{CommandDispatcher, CommandParse, Suggestions};
+pub use entity_interp::{
+    evaluate_sky_and_fog, lerp_angle_deg, wrap_angle_deg, EntityInterpolationTable,
+    InterpolatedPose, SkyFogInput, SkyFogOutput, INTERP_UPDATE_POSITION, INTERP_UPDATE_REMOVE,
+    INTERP_UPDATE_ROTATION, INTERP_UPDATE_SNAP, MAX_INTERP_ENTITIES, MAX_INTERP_STEPS,
+    TELEPORT_DISTANCE_SQ,
+};
 pub use light::{
     ChunkLightUpdate, ChunkLightUpdateMultiWord, LightEdit, LightEngine, LightFact, LightKind,
     LightMasksMultiWord, LightUpdate, LightUpdateMultiWord, LIGHT_SECTION_BYTES,
@@ -39,6 +46,13 @@ pub use occlusion_table::{
 };
 pub use physics::{
     collide, fluid_impulse, Aabb, Collision, FluidCell, FluidImpulse, FluidKind, FluidQuery,
+};
+// The C-ABI entry points are also callable from Rust so integration tests can
+// pin the pointer/length contract against the checked API bit-for-bit.
+#[doc(hidden)]
+pub use ffi::{
+    mc_spine_interp_entities_batch, mc_spine_interp_table_free, mc_spine_interp_table_new,
+    mc_spine_sky_fog_eval, InterpEntityUpdate, InterpPoseOut, SkyFogInputC, SkyFogOutputC,
 };
 pub use registry::{BlockFacts, Registry};
 pub use section::PalettedSection;
