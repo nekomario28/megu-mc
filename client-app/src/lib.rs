@@ -4,6 +4,7 @@
 
 pub mod cli;
 pub mod friend_client;
+pub mod hardware_profile;
 pub mod integrated;
 pub mod lod;
 pub mod protocol;

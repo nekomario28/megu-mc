@@ -9,7 +9,7 @@ use mc_spine_client_mesh::RenderBackendPreference;
 use mc_spine_proto::friend_relay::InviteCode;
 
 use crate::settings::{
-    ClientSettings, CloudMode, DistantHorizon, ParticleLevel, QualityPreset,
+    ClientSettings, CloudMode, DistantHorizon, ParticleLevel, QualityPreset, MAX_BACKGROUND_FPS,
     MAX_FOV, MAX_MAX_FPS, MAX_VIEW_DISTANCE, MIN_FOV, MIN_MAX_FPS, MIN_VIEW_DISTANCE,
     SETTINGS_FILE_NAME,
 };
@@ -140,6 +140,9 @@ pub struct CliConfig {
     pub vsync: Option<bool>,
     /// `Some(None)` records `--max-fps unlimited`.
     pub max_fps: Option<Option<u32>>,
+    /// `--background-fps <0..=240>`: unfocused-window frame cap; `0`
+    /// disables background throttling.
+    pub background_fps: Option<u16>,
     /// `--gpu-backend`: explicit GPU pipeline selection; overrides the
     /// TOML `gpu_backend` key when given.
     pub gpu_backend: Option<RenderBackendPreference>,
@@ -207,6 +210,7 @@ impl Default for CliConfig {
             entity_shadows: None,
             vsync: None,
             max_fps: None,
+            background_fps: None,
             gpu_backend: None,
             view_distance_explicit: false,
             client_settings: ClientSettings::default(),
@@ -270,6 +274,7 @@ impl fmt::Debug for CliConfig {
             .field("entity_shadows", &self.entity_shadows)
             .field("vsync", &self.vsync)
             .field("max_fps", &self.max_fps)
+            .field("background_fps", &self.background_fps)
             .field("gpu_backend", &self.gpu_backend)
             .field("view_distance_explicit", &self.view_distance_explicit)
             .field("client_settings", &self.client_settings)
@@ -410,6 +415,10 @@ impl CliConfig {
         }
         if let Some(value) = self.max_fps {
             settings.max_fps = value;
+            tuned = true;
+        }
+        if let Some(value) = self.background_fps {
+            settings.background_fps_limit = value;
             tuned = true;
         }
         if let Some(value) = self.gpu_backend {
@@ -726,6 +735,18 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
                     cfg.max_fps = Some(Some(parsed as u32));
                 }
             }
+            "--background-fps" => {
+                let raw = take_val(flag, &mut i)?;
+                let parsed = raw
+                    .parse::<i64>()
+                    .map_err(|_| format!("invalid --background-fps '{raw}'"))?;
+                if !(0..=i64::from(MAX_BACKGROUND_FPS)).contains(&parsed) {
+                    return Err(format!(
+                        "--background-fps must be in 0..={MAX_BACKGROUND_FPS} (got {parsed})"
+                    ));
+                }
+                cfg.background_fps = Some(parsed as u16);
+            }
             "--gpu-backend" => {
                 let raw = take_val(flag, &mut i)?;
                 cfg.gpu_backend = Some(RenderBackendPreference::parse(&raw).ok_or_else(|| {
@@ -884,6 +905,9 @@ PLAYER SETTINGS:
   --entity-shadows <on|off>        Entity shadows
   --vsync <on|off>                 Vertical sync
   --max-fps <N|unlimited>          Frame rate cap, 30..=260
+  --background-fps <N>             Frame rate cap while unfocused, 0..=240
+                                   (0 disables background throttling,
+                                   default 15)
   --gpu-backend <backend>          GPU pipeline: auto|mesh-shader|
                                    compute-indirect|classic-low-spec|classic
                                    (classic-low-spec targets legacy Intel

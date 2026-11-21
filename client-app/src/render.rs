@@ -64,6 +64,9 @@ pub struct RenderConfig {
     pub vsync: bool,
     /// Frame pacing cap for windowed presentation (`None` = uncapped).
     pub max_fps: Option<u32>,
+    /// Frame pacing cap while the window is unfocused (`0` = no
+    /// background throttling).
+    pub background_fps_limit: u16,
     /// GPU pipeline selection forwarded to the hardware backend;
     /// `classic-low-spec` pins the minimal-hardware path for legacy Intel
     /// integrated GPUs (GL 3.3 / Vulkan 1.1 only).
@@ -83,7 +86,34 @@ impl RenderConfig {
             entity_shadows: settings.entity_shadows,
             vsync: settings.vsync,
             max_fps: settings.max_fps,
+            background_fps_limit: settings.background_fps_limit,
             gpu_backend: settings.gpu_backend,
+        }
+    }
+
+    /// Frame pacing cap for the current window focus state, in frames per
+    /// second (`0` = uncapped, matching the `max_fps`/`background_fps_limit`
+    /// convention). While unfocused, an enabled `background_fps_limit`
+    /// replaces the foreground cap; `0` or a focused window keeps the
+    /// normal `max_fps` pacing.
+    pub fn effective_fps_cap(&self, window_focused: bool) -> u32 {
+        if !window_focused && self.background_fps_limit > 0 {
+            u32::from(self.background_fps_limit)
+        } else {
+            self.max_fps.unwrap_or(0)
+        }
+    }
+
+    /// Dirty-section rebuild allowance for the current window focus
+    /// state. While unfocused with background throttling enabled, at most
+    /// one section rebuilds per frame so a hidden window never burns
+    /// meshing work; focused (or throttling disabled) leaves the budget
+    /// to the [`FrameBudgetGovernor`], expressed as `usize::MAX`.
+    pub fn effective_rebuilds_per_frame(&self, window_focused: bool) -> usize {
+        if !window_focused && self.background_fps_limit > 0 {
+            1
+        } else {
+            usize::MAX
         }
     }
 }
@@ -100,6 +130,7 @@ impl Default for RenderConfig {
             entity_shadows: true,
             vsync: true,
             max_fps: None,
+            background_fps_limit: crate::settings::DEFAULT_BACKGROUND_FPS_LIMIT,
             gpu_backend: RenderBackendPreference::Auto,
         }
     }

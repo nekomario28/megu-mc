@@ -36,6 +36,10 @@ pub const DEFAULT_FOV: u8 = 70;
 pub const MIN_MAX_FPS: u32 = 30;
 /// Maximum FPS cap when one is set (frames/second).
 pub const MAX_MAX_FPS: u32 = 260;
+/// Default frame-rate cap while the window is unfocused (frames/second).
+pub const DEFAULT_BACKGROUND_FPS_LIMIT: u16 = 15;
+/// Maximum selectable background FPS cap; `0` disables background throttling.
+pub const MAX_BACKGROUND_FPS: u16 = 240;
 /// Distant-horizon radius in chunks for [`DistantHorizon::Medium`].
 pub const DISTANT_HORIZON_MEDIUM_CHUNKS: i32 = 64;
 /// Distant-horizon radius in chunks for [`DistantHorizon::Far`].
@@ -184,6 +188,11 @@ pub struct ClientSettings {
     pub vsync: bool,
     /// `None` = unlimited; `Some(30..=260)` otherwise.
     pub max_fps: Option<u32>,
+    /// Frame-rate cap applied while the window is unfocused, in the spirit
+    /// of Vanilla's "Dynamic FPS" graphics toggle: `0` disables background
+    /// throttling entirely, `1..=240` caps background frames. Defaults to
+    /// [`DEFAULT_BACKGROUND_FPS_LIMIT`].
+    pub background_fps_limit: u16,
     /// GPU pipeline selection: `auto` negotiates from hardware
     /// capabilities, `classic-low-spec` pins the minimal-hardware path for
     /// legacy Intel integrated GPUs (GL 3.3 / Vulkan 1.1 only).
@@ -211,6 +220,7 @@ impl ClientSettings {
             fov: DEFAULT_FOV,
             vsync: true,
             max_fps: None,
+            background_fps_limit: DEFAULT_BACKGROUND_FPS_LIMIT,
             gpu_backend: RenderBackendPreference::Auto,
         };
         match preset {
@@ -280,6 +290,7 @@ impl ClientSettings {
              fov = {}\n\
              vsync = {}\n\
              max_fps = {}\n\
+             background_fps_limit = {}\n\
              gpu_backend = \"{}\"\n",
             self.preset.as_str(),
             self.view_distance,
@@ -291,6 +302,7 @@ impl ClientSettings {
             self.fov,
             self.vsync,
             max_fps,
+            self.background_fps_limit,
             self.gpu_backend.as_str(),
         )
     }
@@ -321,6 +333,9 @@ impl ClientSettings {
                 "fov" => self.fov = parsed.fov,
                 "vsync" => self.vsync = parsed.vsync,
                 "max_fps" => self.max_fps = parsed.max_fps,
+                "background_fps_limit" => {
+                    self.background_fps_limit = parsed.background_fps_limit;
+                }
                 "gpu_backend" => self.gpu_backend = parsed.gpu_backend,
                 _ => {}
             }
@@ -460,6 +475,15 @@ impl ClientSettings {
                         }
                     }
                 }
+                "background_fps_limit" => match value.parse::<i64>() {
+                    Ok(v) => {
+                        settings.background_fps_limit =
+                            clamp_i64(v, 0, i64::from(MAX_BACKGROUND_FPS), key, &mut warnings)
+                                as u16;
+                        seen.push("background_fps_limit");
+                    }
+                    Err(_) => invalid(&mut warnings),
+                },
                 "gpu_backend" => match RenderBackendPreference::parse(value) {
                     Some(g) => {
                         settings.gpu_backend = g;
@@ -705,6 +729,7 @@ mod tests {
             fov: 90,
             vsync: false,
             max_fps: Some(144),
+            background_fps_limit: 45,
             gpu_backend: RenderBackendPreference::ClassicLowSpec,
         };
         let text = s.to_toml();
