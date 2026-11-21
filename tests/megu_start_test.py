@@ -149,7 +149,7 @@ class MeguStartTest(unittest.TestCase):
 
     def test_valid_modpack_skips_performance_mods(self):
         pack = self.pack()
-        process = self.cli("--accept-eula", "--dry-run", "--json",
+        process = self.cli("--accept-eula", "--dry-run", "--json", "--lang", "en",
                            "--modpack", str(pack))
         self.assertEqual(process.returncode, 0, process.stdout)
         report = json.loads(process.stdout)
@@ -169,7 +169,8 @@ class MeguStartTest(unittest.TestCase):
 
     def test_traversal_in_archive_is_rejected_before_preflight(self):
         pack = self.pack(extra_members=[("../outside.jar", b"not a real mod")])
-        process = self.cli("--accept-eula", "--dry-run", "--json", "--modpack", str(pack))
+        process = self.cli("--accept-eula", "--dry-run", "--json", "--lang", "en",
+                           "--modpack", str(pack))
         self.assertEqual(process.returncode, 1)
         report = json.loads(process.stdout)
         self.assertFalse(report["ready"])
