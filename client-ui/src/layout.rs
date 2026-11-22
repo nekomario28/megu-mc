@@ -13,10 +13,12 @@
 //! modal is composited on top and — critically — only the modal's hit
 //! regions are returned, so the dimmed screen is truly inert.
 
+use mc_spine_core::sys_metrics::{format_mini_hud_lines, MiniHudAnchor};
+
 use crate::draw::{palette as pal, text_width, UiColor, UiCommand, UiDrawList, UiRect};
 use crate::state::{
-    tr, HitRegion, HudState, ModSyncChange, Screen, SettingsTab, UiLang, UiModal, UiState,
-    WidgetId, FPS_CAP_STEPS,
+    tr, HitRegion, HudState, HudSubtitle, MiniHudPreset, ModSyncChange, Screen, SettingsTab,
+    SubtitleDirection, UiLang, UiModal, UiState, WidgetId, FPS_CAP_STEPS,
 };
 
 /// Build the frame for the current screen: `(draw_list, hit_regions)`.
@@ -763,11 +765,19 @@ fn audio_tab(ctx: &mut Ctx, y0: i32) {
 fn qol_tab(ctx: &mut Ctx, y0: i32) {
     let lang = ctx.lang;
     let q = &ctx.state.settings.qol;
+    // Below 300 logical px the tab tightens to a 20px/18px rhythm so the
+    // extra MiniHUD + Subtitles row still clears Done/About Megu at the
+    // tightest size (480x270 at scale 4); larger screens keep the
+    // standard 24px/20px grid.
+    let compact = ctx.h < 300;
+    let (step, bh) = if compact { (20, 18) } else { (24, 20) };
+    let x = ctx.w / 2 - 160;
+    let y0 = if compact { y0 - 2 } else { y0 };
+    let qy = |i: i32| y0 + i * step;
 
-    let (x, y) = row(ctx, 0, y0);
     ctx.btn(
         WidgetId::QolSmoothZoom,
-        lr(x, y, 320, 20),
+        lr(x, qy(0), 320, bh),
         &format!(
             "{}: {}",
             tr(lang, "Smooth Zoom", "スムーズズーム"),
@@ -775,10 +785,9 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
         ),
     );
 
-    let (x, y) = row(ctx, 1, y0);
     ctx.slider(
         WidgetId::QolToolWarn,
-        lr(x, y, 320, 20),
+        lr(x, qy(1), 320, bh),
         q.tool_warn_percent as f32 / 100.0,
         &format!(
             "{}: {}%",
@@ -787,10 +796,9 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
         ),
     );
 
-    let (x, y) = row(ctx, 2, y0);
     ctx.btn(
         WidgetId::QolPreventBreak,
-        lr(x, y, 320, 20),
+        lr(x, qy(2), 320, bh),
         &format!(
             "{}: {} ({})",
             tr(lang, "Tool Break Guard", "ツール破壊ガード"),
@@ -799,11 +807,10 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
         ),
     );
 
-    let (x, y) = row(ctx, 3, y0);
     let frac = (q.chat_history_lines as f32 - 100.0) / 4900.0;
     ctx.slider(
         WidgetId::QolChatHistory,
-        lr(x, y, 320, 20),
+        lr(x, qy(3), 320, bh),
         frac,
         &format!(
             "{}: {} {}",
@@ -813,10 +820,9 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
         ),
     );
 
-    let (x, y) = row(ctx, 4, y0);
     ctx.btn(
         WidgetId::QolRetainChat,
-        lr(x, y, 320, 20),
+        lr(x, qy(4), 320, bh),
         &format!(
             "{}: {}",
             tr(lang, "Keep Chat on Reconnect", "再接続時にチャット保持"),
@@ -824,10 +830,9 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
         ),
     );
 
-    let (x, y) = row(ctx, 5, y0);
     ctx.btn(
         WidgetId::QolCrashMode,
-        lr(x, y, 320, 20),
+        lr(x, qy(5), 320, bh),
         &format!(
             "{}: {}",
             tr(lang, "Crash Report Mode", "クラッシュレポート"),
@@ -835,10 +840,9 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
         ),
     );
 
-    let (x, y) = row(ctx, 6, y0);
     ctx.btn(
         WidgetId::QolShowSupportLinks,
-        lr(x, y, 320, 20),
+        lr(x, qy(6), 320, bh),
         if q.show_support_links {
             tr(
                 lang,
@@ -854,10 +858,33 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
         },
     );
 
+    // The two opt-in overlays share one compact row of half-width
+    // toggles: the MiniHUD cycles Off/Basic/Advanced presets, the
+    // subtitles flip on/off.
+    let minihud_label = match q.mini_hud_preset() {
+        MiniHudPreset::Off => "OFF",
+        MiniHudPreset::Basic => tr(lang, "Basic", "基本"),
+        MiniHudPreset::Advanced => tr(lang, "Advanced", "詳細"),
+    };
+    ctx.btn(
+        WidgetId::QolMiniHud,
+        lr(x, qy(7), 156, bh),
+        &format!("MiniHUD: {minihud_label}"),
+    );
+    ctx.btn(
+        WidgetId::QolSubtitles,
+        lr(x + 164, qy(7), 156, bh),
+        &format!(
+            "{}: {}",
+            tr(lang, "Subtitles", "字幕"),
+            onoff(q.show_subtitles)
+        ),
+    );
+
     if ctx.h >= 300 {
         ctx.ctext(
             ctx.w / 2,
-            row(ctx, 7, y0).1 + 4,
+            qy(8) + 4,
             1,
             pal::TEXT_DIM,
             tr(
@@ -1177,9 +1204,18 @@ fn mod_sync(ctx: &mut Ctx) {
 
 fn hud(ctx: &mut Ctx) {
     let hud: &HudState = &ctx.state.hud;
+    let qol = &ctx.state.settings.qol;
     let lang = ctx.lang;
     let (w, h) = (ctx.w, ctx.h);
     let cx = w / 2;
+
+    // Opt-in MiniHUD lines — empty while disabled, so the disabled path
+    // emits exactly zero commands.
+    let mini_lines = if qol.mini_hud.enabled {
+        format_mini_hud_lines(&qol.mini_hud, &hud.mini_hud_data)
+    } else {
+        Vec::new()
+    };
 
     // Bossbars, stacked from the top.
     for (i, (name, frac)) in hud.bossbars.iter().take(3).enumerate() {
@@ -1283,7 +1319,64 @@ fn hud(ctx: &mut Ctx) {
         }
     }
 
-    ctx.text(4, 4, 1, pal::TEXT_DIM, "mc-spine HUD");
+    if !(qol.mini_hud.anchor == MiniHudAnchor::TopLeft && !mini_lines.is_empty()) {
+        ctx.text(4, 4, 1, pal::TEXT_DIM, "mc-spine HUD");
+    }
+
+    // Directional accessibility subtitles (opt-in): up to 4 compact
+    // right-aligned rows above the hotbar — "< sound" left,
+    // "sound >" right, "v sound" behind, no marker when centered.
+    let hotbar_top = hy - 4;
+    let mut stack_bottom = hotbar_top;
+    if qol.show_subtitles && !hud.subtitles.is_empty() {
+        let shown: Vec<&HudSubtitle> = hud.subtitles.iter().rev().take(4).collect();
+        let max_chars = ((w - 14) / 8).max(1) as usize;
+        for (i, sub) in shown.iter().rev().enumerate() {
+            let label = match sub.direction {
+                SubtitleDirection::Left => format!("< {}", sub.label),
+                SubtitleDirection::Center => sub.label.clone(),
+                SubtitleDirection::Right => format!("{} >", sub.label),
+                SubtitleDirection::Behind => format!("v {}", sub.label),
+            };
+            let label = first_chars(&label, max_chars);
+            let rw = label.chars().count() as i32 * 8 + 6;
+            let y = hotbar_top - (shown.len() - i) as i32 * 10;
+            ctx.fill(w - 4 - rw, y, rw, 10, UiColor::rgba(0, 0, 0, 110));
+            ctx.text(w - 4 - rw + 3, y + 1, 1, pal::TEXT, label);
+        }
+        // A bottom-right MiniHUD stacks above the subtitle block.
+        stack_bottom = hotbar_top - shown.len() as i32 * 10 - 2;
+    }
+
+    // MiniHUD: translucent backing + up to 4 clipped lines anchored to
+    // the configured corner, always inside the viewport.
+    if !mini_lines.is_empty() {
+        let pad = 3;
+        let max_box_w = (w - 8).max(8);
+        let max_chars = ((max_box_w - 2 * pad) / 8).max(1) as usize;
+        let clipped: Vec<&str> = mini_lines
+            .iter()
+            .map(|line| first_chars(line, max_chars))
+            .collect();
+        let text_w = clipped
+            .iter()
+            .map(|line| line.chars().count() as i32 * 8)
+            .max()
+            .unwrap_or(0);
+        let box_w = text_w + 2 * pad;
+        let box_h = 2 * pad + clipped.len() as i32 * 10 - 2;
+        let bottom_edge = stack_bottom;
+        let (bx, by) = match qol.mini_hud.anchor {
+            MiniHudAnchor::TopLeft => (4, 4),
+            MiniHudAnchor::TopRight => (w - 4 - box_w, 4),
+            MiniHudAnchor::BottomLeft => (4, (bottom_edge - box_h).max(4)),
+            MiniHudAnchor::BottomRight => (w - 4 - box_w, (bottom_edge - box_h).max(4)),
+        };
+        ctx.fill(bx, by, box_w, box_h, UiColor::rgba(0, 0, 0, 110));
+        for (i, line) in clipped.iter().enumerate() {
+            ctx.text(bx + pad, by + pad + i as i32 * 10, 1, pal::TEXT, line);
+        }
+    }
 
     if !hud.magic.is_empty() {
         let overlay = crate::magic_hud::build_magic_hud_draw_list(

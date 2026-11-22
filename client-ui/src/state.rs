@@ -24,6 +24,7 @@
 //! rasterizer — the string data stays correct for richer GPU atlases.
 
 use mc_spine_core::crash_report::CrashContext;
+use mc_spine_core::sys_metrics::{MiniHudConfig, MiniHudData};
 
 use crate::draw::UiRect;
 use crate::layout;
@@ -433,6 +434,11 @@ pub struct QolSettings {
     pub crash_report_mode: CrashReportMode,
     /// Whether optional Support/Contribute links appear on the title screen.
     pub show_support_links: bool,
+    /// Opt-in MiniHUD overlay; `enabled` stays `false` by default so the
+    /// vanilla-style HUD is untouched until the player turns it on.
+    pub mini_hud: MiniHudConfig,
+    /// Directional accessibility subtitles — opt-in (`false` by default).
+    pub show_subtitles: bool,
 }
 
 impl Default for QolSettings {
@@ -445,6 +451,79 @@ impl Default for QolSettings {
             retain_chat_on_reconnect: true,
             crash_report_mode: CrashReportMode::Ask,
             show_support_links: true,
+            mini_hud: MiniHudConfig::default(),
+            show_subtitles: false,
+        }
+    }
+}
+
+/// Coarse MiniHUD preset the QoL toggle cycles through.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MiniHudPreset {
+    /// Overlay hidden (default).
+    #[default]
+    Off,
+    /// Basic segments only: fps, coords, facing, biome, ping.
+    Basic,
+    /// Basic plus every Advanced segment (1% low, MSPT/TPS, RAM, CPU,
+    /// GPU, VRAM, chunks/entities, light, shader/audio).
+    Advanced,
+}
+
+impl QolSettings {
+    /// The preset the QoL MiniHUD toggle reports: `Off` while
+    /// `mini_hud.enabled` is `false`, `Advanced` when every advanced
+    /// segment is on, `Basic` otherwise.
+    pub fn mini_hud_preset(&self) -> MiniHudPreset {
+        if !self.mini_hud.enabled {
+            MiniHudPreset::Off
+        } else if self.mini_hud_is_advanced() {
+            MiniHudPreset::Advanced
+        } else {
+            MiniHudPreset::Basic
+        }
+    }
+
+    fn mini_hud_is_advanced(&self) -> bool {
+        let m = &self.mini_hud;
+        m.show_one_percent_low
+            && m.show_mspt_tps
+            && m.show_ram
+            && m.show_cpu
+            && m.show_gpu
+            && m.show_vram
+            && m.show_chunks_entities
+            && m.show_light_level
+            && m.show_shader_audio_status
+    }
+
+    /// Cycle the MiniHUD Off → Basic → Advanced → Off, preserving the
+    /// configured anchor and the player's individual segment choices
+    /// while the overlay stays enabled.
+    pub fn cycle_mini_hud(&mut self) {
+        match self.mini_hud_preset() {
+            MiniHudPreset::Off => {
+                self.mini_hud = MiniHudConfig {
+                    enabled: true,
+                    anchor: self.mini_hud.anchor,
+                    ..MiniHudConfig::default()
+                };
+            }
+            MiniHudPreset::Basic => {
+                let m = &mut self.mini_hud;
+                m.show_one_percent_low = true;
+                m.show_mspt_tps = true;
+                m.show_ram = true;
+                m.show_cpu = true;
+                m.show_gpu = true;
+                m.show_vram = true;
+                m.show_chunks_entities = true;
+                m.show_light_level = true;
+                m.show_shader_audio_status = true;
+            }
+            MiniHudPreset::Advanced => {
+                self.mini_hud.enabled = false;
+            }
         }
     }
 }
@@ -663,10 +742,33 @@ impl ModSyncEntry {
 // HUD state
 // ---------------------------------------------------------------------------
 
+/// Where a HUD-subtitle sound originated, relative to the player.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubtitleDirection {
+    /// Sound to the left — drawn `"< label"`.
+    Left,
+    /// Sound roughly centered — drawn `"label"`.
+    Center,
+    /// Sound to the right — drawn `"label >"`.
+    Right,
+    /// Sound behind the player — drawn `"v label"`.
+    Behind,
+}
+
+/// One accessibility subtitle row; the game fills it, the HUD draws it
+/// only when [`QolSettings::show_subtitles`] is on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HudSubtitle {
+    /// Sound label, e.g. `"Zombie groans"`.
+    pub label: String,
+    /// Direction marker to render.
+    pub direction: SubtitleDirection,
+}
+
 /// Everything the in-game HUD draws. `health`/`hunger`/`armor` are in
 /// vanilla half-icon units (20 = full bar); `air` is in bubbles×30
 /// (300 = full). Pure data — the game fills it, the HUD draws it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct HudState {
     pub health: f32,
     pub absorption: f32,
@@ -693,6 +795,11 @@ pub struct HudState {
     pub players: Vec<(String, u16)>,
     /// Optional mana, casting, cooldown, and custom status overlays.
     pub magic: crate::magic_hud::MagicHudState,
+    /// Telemetry snapshot the opt-in MiniHUD overlay reads.
+    pub mini_hud_data: MiniHudData,
+    /// Directional subtitle rows, newest last (drawn only when
+    /// [`QolSettings::show_subtitles`] is on).
+    pub subtitles: Vec<HudSubtitle>,
 }
 
 impl Default for HudState {
@@ -714,6 +821,8 @@ impl Default for HudState {
             show_player_list: false,
             players: Vec::new(),
             magic: crate::magic_hud::MagicHudState::default(),
+            mini_hud_data: MiniHudData::default(),
+            subtitles: Vec::new(),
         }
     }
 }
@@ -748,6 +857,8 @@ impl HudState {
                 ("Megu".to_string(), 88),
             ],
             magic: crate::magic_hud::MagicHudState::default(),
+            mini_hud_data: MiniHudData::default(),
+            subtitles: Vec::new(),
         }
     }
 }
@@ -897,6 +1008,8 @@ pub enum WidgetId {
     QolRetainChat,
     QolCrashMode,
     QolShowSupportLinks,
+    QolMiniHud,
+    QolSubtitles,
     // Fair-Play tab
     FpMinimapMode,
     FpCaveMap,
@@ -959,6 +1072,8 @@ impl WidgetId {
                 | Self::QolRetainChat
                 | Self::QolCrashMode
                 | Self::QolShowSupportLinks
+                | Self::QolMiniHud
+                | Self::QolSubtitles
                 | Self::FpMinimapMode
                 | Self::FpCaveMap
                 | Self::FpMobRadar
@@ -1756,6 +1871,14 @@ impl UiState {
             }
             WidgetId::QolShowSupportLinks => {
                 q.show_support_links = !q.show_support_links;
+                true
+            }
+            WidgetId::QolMiniHud => {
+                q.cycle_mini_hud();
+                true
+            }
+            WidgetId::QolSubtitles => {
+                q.show_subtitles = !q.show_subtitles;
                 true
             }
             WidgetId::FpMinimapMode => {

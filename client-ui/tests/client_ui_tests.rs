@@ -7,17 +7,19 @@
 
 use mc_spine_client_ui::draw::{
     encode_png_rgba, font_atlas_rgba, glyph_for, rasterize_draw_list, tessellate_draw_list,
-    text_width, UiCommand, UiDrawList, UiRect, FONT_ATLAS_HEIGHT, FONT_ATLAS_WIDTH,
+    text_height, text_width, UiCommand, UiDrawList, UiRect, FONT_ATLAS_HEIGHT, FONT_ATLAS_WIDTH,
 };
 use mc_spine_client_ui::magic_hud::{
     CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState,
 };
 use mc_spine_client_ui::state::{
-    invite_code_display, invite_code_parse, CrashReportMode, GamepadButton, HitRegion,
-    LanguageSetting, MinimapMode, ModSyncEntry, PlayerRadarScope, Screen, SettingsTab, UiAction,
-    UiInputEvent, UiKey, UiLang, UiModal, UiState, WidgetId, CRASH_PREVIEW_MAX_BYTES,
+    invite_code_display, invite_code_parse, CrashReportMode, GamepadButton, HitRegion, HudSubtitle,
+    LanguageSetting, MiniHudPreset, MinimapMode, ModSyncEntry, PlayerRadarScope, Screen,
+    SettingsTab, SubtitleDirection, UiAction, UiInputEvent, UiKey, UiLang, UiModal, UiState,
+    WidgetId, CRASH_PREVIEW_MAX_BYTES,
 };
 use mc_spine_core::crash_report::CrashContext;
+use mc_spine_core::sys_metrics::{MiniHudAnchor, MiniHudConfig, MiniHudData};
 
 const SIZES: [(u32, u32); 2] = [(1280, 720), (640, 360)];
 const HIT_SIZES: [(u32, u32); 4] = [(640, 360), (1280, 720), (1920, 1080), (3840, 2160)];
@@ -88,6 +90,89 @@ fn assert_hit_regions_within_viewport(regions: &[HitRegion], w: u32, h: u32) {
             "hit region outside {w}x{h}: {region:?}"
         );
     }
+}
+
+/// Every draw command — rects, bars, and text — must land inside the
+/// viewport (text boxes included, so clipped overlay lines can't spill).
+fn assert_draws_within_viewport(list: &UiDrawList, w: u32, h: u32) {
+    for cmd in &list.commands {
+        match cmd {
+            UiCommand::FillRect { rect, .. }
+            | UiCommand::BorderRect { rect, .. }
+            | UiCommand::ProgressBar { rect, .. } => {
+                assert!(
+                    rect.x >= 0
+                        && rect.y >= 0
+                        && rect.right() <= w as i32
+                        && rect.bottom() <= h as i32,
+                    "draw outside {w}x{h}: {cmd:?}"
+                );
+            }
+            UiCommand::Text {
+                x,
+                y,
+                scale,
+                text,
+                ..
+            } => {
+                let right = *x + text_width(text, *scale) as i32;
+                let bottom = *y + text_height(text, *scale) as i32;
+                assert!(
+                    *x >= 0 && *y >= 0 && right <= w as i32 && bottom <= h as i32,
+                    "text outside {w}x{h}: {cmd:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A fully populated telemetry snapshot: every MiniHudData field set so
+/// both the Basic and Advanced segments have real content to draw.
+fn populated_mini_hud_data() -> MiniHudData {
+    MiniHudData {
+        fps: Some(60.0),
+        fps_one_percent_low: Some(9.0),
+        mspt: Some(4.2),
+        tps: Some(19.8),
+        coords: Some((10.0, 64.0, -3.0)),
+        facing: Some("N".into()),
+        biome: Some("Plains".into()),
+        ping_ms: Some(24),
+        ram_used_mib: Some(512),
+        ram_total_mib: Some(1024),
+        cpu_percent: Some(9.0),
+        gpu_name: Some("Test GPU".into()),
+        gpu_busy_percent: Some(55),
+        vram_used_mib: Some(512),
+        vram_total_mib: Some(1024),
+        loaded_chunks: Some(123),
+        entity_count: Some(45),
+        block_light: Some(15),
+        sky_light: Some(15),
+        shader_name: Some("megu".into()),
+        audio_ok: Some(true),
+    }
+}
+
+fn demo_subtitles() -> Vec<HudSubtitle> {
+    vec![
+        HudSubtitle {
+            label: "Zombie groans".into(),
+            direction: SubtitleDirection::Left,
+        },
+        HudSubtitle {
+            label: "Creeper hiss".into(),
+            direction: SubtitleDirection::Center,
+        },
+        HudSubtitle {
+            label: "Skeleton shoots".into(),
+            direction: SubtitleDirection::Right,
+        },
+        HudSubtitle {
+            label: "Witch giggles".into(),
+            direction: SubtitleDirection::Behind,
+        },
+    ]
 }
 
 fn assert_non_blank(rgba: &[u8]) {
@@ -925,8 +1010,236 @@ fn hud_tab_list_toggles_and_rasterizes() {
 }
 
 // ---------------------------------------------------------------------------
-// Draw-layer unit coverage: font, PNG, tessellation
+// MiniHUD + directional subtitles (both strictly opt-in)
 // ---------------------------------------------------------------------------
+
+#[test]
+fn minihud_and_subtitles_default_off_and_emit_zero_commands() {
+    let mut ui = UiState::new();
+    ui.screen = Screen::InGameHud;
+    assert!(!ui.settings.qol.mini_hud.enabled);
+    assert!(!ui.settings.qol.show_subtitles);
+    assert_eq!(ui.settings.qol.mini_hud_preset(), MiniHudPreset::Off);
+    assert!(ui.hud.mini_hud_data.fps.is_none());
+    assert!(ui.hud.subtitles.is_empty());
+    assert!(!mc_spine_client_ui::state::QolSettings::default()
+        .mini_hud
+        .enabled);
+
+    for &(w, h) in &HIT_SIZES {
+        let baseline = ui.render(w, h);
+        // Fully populated data stays invisible while both features off.
+        ui.hud.mini_hud_data = populated_mini_hud_data();
+        ui.hud.subtitles = demo_subtitles();
+        let drawn = ui.render(w, h);
+        assert_eq!(
+            drawn, baseline,
+            "opt-out overlays emitted commands at {w}x{h}"
+        );
+        ui.hud.mini_hud_data = MiniHudData::default();
+        ui.hud.subtitles.clear();
+    }
+}
+
+#[test]
+fn qol_tab_wires_minihud_preset_and_subtitles_without_overlap() {
+    let mut ui = UiState::new();
+    for &(w, h) in &HIT_SIZES {
+        ui.screen = Screen::Settings(SettingsTab::Qol);
+        let list = ui.render(w, h);
+        assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
+        assert_draws_within_viewport(&list, w, h);
+        for id in [WidgetId::QolMiniHud, WidgetId::QolSubtitles] {
+            assert!(
+                ui.hit_regions.iter().any(|r| r.id == id),
+                "{id:?} missing at {w}x{h}"
+            );
+        }
+        for label in ["MiniHUD: OFF", "Subtitles: OFF"] {
+            assert!(
+                list.commands
+                    .iter()
+                    .any(|c| matches!(c, UiCommand::Text { text, .. } if text == label)),
+                "missing {label} at {w}x{h}"
+            );
+        }
+    }
+
+    // Cycle the MiniHUD preset OFF → Basic → Advanced → OFF.
+    ui.screen = Screen::Settings(SettingsTab::Qol);
+    assert_eq!(
+        click(&mut ui, WidgetId::QolMiniHud, 640, 360),
+        vec![UiAction::SettingsChanged]
+    );
+    assert_eq!(ui.settings.qol.mini_hud_preset(), MiniHudPreset::Basic);
+    assert!(ui.settings.qol.mini_hud.enabled);
+    assert!(ui.settings.qol.mini_hud.show_fps);
+    assert!(!ui.settings.qol.mini_hud.show_ram);
+    let list = ui.render(640, 360);
+    assert!(list
+        .commands
+        .iter()
+        .any(|c| matches!(c, UiCommand::Text { text, .. } if text == "MiniHUD: Basic")));
+
+    assert_eq!(
+        click(&mut ui, WidgetId::QolMiniHud, 640, 360),
+        vec![UiAction::SettingsChanged]
+    );
+    assert_eq!(ui.settings.qol.mini_hud_preset(), MiniHudPreset::Advanced);
+    let m = &ui.settings.qol.mini_hud;
+    assert!(
+        m.show_one_percent_low
+            && m.show_mspt_tps
+            && m.show_ram
+            && m.show_cpu
+            && m.show_gpu
+            && m.show_vram
+            && m.show_chunks_entities
+            && m.show_light_level
+            && m.show_shader_audio_status
+    );
+
+    assert_eq!(
+        click(&mut ui, WidgetId::QolMiniHud, 640, 360),
+        vec![UiAction::SettingsChanged]
+    );
+    assert_eq!(ui.settings.qol.mini_hud_preset(), MiniHudPreset::Off);
+    assert!(!ui.settings.qol.mini_hud.enabled);
+
+    // Subtitles toggle flips through the real input router.
+    assert!(!ui.settings.qol.show_subtitles);
+    assert_eq!(
+        click(&mut ui, WidgetId::QolSubtitles, 640, 360),
+        vec![UiAction::SettingsChanged]
+    );
+    assert!(ui.settings.qol.show_subtitles);
+    assert_eq!(
+        click(&mut ui, WidgetId::QolSubtitles, 640, 360),
+        vec![UiAction::SettingsChanged]
+    );
+    assert!(!ui.settings.qol.show_subtitles);
+}
+
+#[test]
+fn minihud_basic_and_advanced_render_in_bounds_at_every_anchor() {
+    for anchor in [
+        MiniHudAnchor::TopLeft,
+        MiniHudAnchor::TopRight,
+        MiniHudAnchor::BottomLeft,
+        MiniHudAnchor::BottomRight,
+    ] {
+        let mut ui = UiState::new();
+        ui.screen = Screen::InGameHud;
+        ui.hud = mc_spine_client_ui::state::HudState::demo();
+        ui.hud.mini_hud_data = populated_mini_hud_data();
+        ui.settings.qol.mini_hud = MiniHudConfig {
+            enabled: true,
+            anchor,
+            ..MiniHudConfig::default()
+        };
+        for &(w, h) in &HIT_SIZES {
+            ui.settings.qol.mini_hud = MiniHudConfig {
+                enabled: false,
+                anchor,
+                ..MiniHudConfig::default()
+            };
+            let baseline = ui.render(w, h);
+            ui.settings.qol.mini_hud.enabled = true;
+            let drawn = ui.render(w, h);
+            assert!(
+                drawn.len() > baseline.len(),
+                "Basic MiniHUD drew nothing at {w}x{h} ({anchor:?})"
+            );
+            assert_draws_within_viewport(&drawn, w, h);
+            for needle in ["60 FPS", "XYZ 10.0 64.0 -3.0", "Ping 24ms"] {
+                assert!(
+                    drawn.commands.iter().any(|c| matches!(c,
+                        UiCommand::Text { text, .. } if text.contains(needle))),
+                    "missing {needle} at {w}x{h} ({anchor:?})"
+                );
+            }
+            assert_non_blank(&rasterize_draw_list(w, h, &drawn));
+
+            // Advanced preset adds the hardware/world segments.
+            ui.settings.qol.cycle_mini_hud();
+            assert_eq!(ui.settings.qol.mini_hud_preset(), MiniHudPreset::Advanced);
+            let adv = ui.render(w, h);
+            assert!(adv.len() > drawn.len());
+            assert_draws_within_viewport(&adv, w, h);
+            for needle in [
+                "1% low 9 FPS",
+                "4.2 mspt  19.8 TPS",
+                "RAM 512/1024 MiB",
+                "CPU 9%",
+                "GPU Test GPU 55%",
+                "VRAM 512/1024 MiB",
+                "C 123  E 45",
+                "Light B15 S15",
+                "Shader megu  Audio ok",
+            ] {
+                assert!(
+                    adv.commands.iter().any(|c| matches!(c,
+                        UiCommand::Text { text, .. } if text.contains(needle))),
+                    "missing {needle} at {w}x{h} ({anchor:?})"
+                );
+            }
+            assert_non_blank(&rasterize_draw_list(w, h, &adv));
+        }
+    }
+}
+
+#[test]
+fn directional_subtitles_render_markers_and_cap_at_four_rows() {
+    let mut ui = UiState::new();
+    ui.screen = Screen::InGameHud;
+    ui.hud = mc_spine_client_ui::state::HudState::demo();
+    // Six entries: the two oldest must be trimmed to the 4-row cap.
+    ui.hud.subtitles = vec![
+        HudSubtitle {
+            label: "Trimmed A".into(),
+            direction: SubtitleDirection::Center,
+        },
+        HudSubtitle {
+            label: "Trimmed B".into(),
+            direction: SubtitleDirection::Center,
+        },
+    ];
+    ui.hud.subtitles.extend(demo_subtitles());
+
+    for &(w, h) in &HIT_SIZES {
+        ui.settings.qol.show_subtitles = false;
+        let baseline = ui.render(w, h);
+        ui.settings.qol.show_subtitles = true;
+        let drawn = ui.render(w, h);
+        assert!(
+            drawn.len() > baseline.len(),
+            "subtitles drew nothing at {w}x{h}"
+        );
+        assert_draws_within_viewport(&drawn, w, h);
+        assert_non_blank(&rasterize_draw_list(w, h, &drawn));
+        for needle in [
+            "< Zombie groans",
+            "Creeper hiss",
+            "Skeleton shoots >",
+            "v Witch giggles",
+        ] {
+            assert!(
+                drawn
+                    .commands
+                    .iter()
+                    .any(|c| matches!(c, UiCommand::Text { text, .. } if text == needle)),
+                "missing {needle} at {w}x{h}"
+            );
+        }
+        assert!(
+            !drawn
+                .commands
+                .iter()
+                .any(|c| matches!(c, UiCommand::Text { text, .. } if text.contains("Trimmed"))),
+            "subtitle rows past the cap leaked at {w}x{h}"
+        );
+    }
+}
 
 #[test]
 fn font_covers_ascii_and_fallback() {
