@@ -39,6 +39,7 @@ fn all_screens(ui: &mut UiState) -> Vec<Screen> {
             change: mc_spine_client_ui::state::ModSyncChange::Removed,
         },
     ];
+    ui.missing_mod_deps = vec!["create".into(), "jei".into()];
     ui.crash = Some(CrashContext::new(
         "panic",
         "create",
@@ -53,6 +54,7 @@ fn all_screens(ui: &mut UiState) -> Vec<Screen> {
         Screen::Settings(SettingsTab::Qol),
         Screen::Settings(SettingsTab::FairPlay),
         Screen::Settings(SettingsTab::Language),
+        Screen::AboutMegu,
         Screen::Friends,
         Screen::ModSyncConsent,
         Screen::InGameHud,
@@ -120,6 +122,7 @@ fn every_screen_lays_out_clean_and_rasterizes() {
 fn every_screen_has_separate_in_bounds_hit_regions_at_four_resolutions() {
     for &(w, h) in &HIT_SIZES {
         let mut ui = UiState::new();
+        ui.website_url = "https://example.invalid".into();
         ui.support_url = "https://example.invalid/support".into();
         ui.contribute_url = "https://example.invalid/contribute".into();
         ui.report_url = "https://example.invalid/report".into();
@@ -191,6 +194,7 @@ fn title_flow_and_support_links() {
 #[test]
 fn title_links_respect_support_preference_and_report_is_always_accessible() {
     let mut ui = UiState::new();
+    ui.website_url = "https://example.invalid".into();
     ui.support_url = "https://example.invalid/support".into();
     ui.contribute_url = "https://example.invalid/contribute".into();
     ui.report_url = "https://example.invalid/issues".into();
@@ -201,6 +205,7 @@ fn title_links_respect_support_preference_and_report_is_always_accessible() {
         let commands = ui.render(w, h);
         assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
         for (id, url) in [
+            (WidgetId::WebsiteLink, ui.website_url.clone()),
             (WidgetId::ReportLink, ui.report_url.clone()),
             (WidgetId::SupportLink, ui.support_url.clone()),
             (WidgetId::ContributeLink, ui.contribute_url.clone()),
@@ -208,33 +213,41 @@ fn title_links_respect_support_preference_and_report_is_always_accessible() {
             assert!(ui.hit_regions.iter().any(|r| r.id == id));
             assert_eq!(click(&mut ui, id, w, h), vec![UiAction::OpenUrl(url)]);
         }
-        // The version text and quiet links occupy separate horizontal ranges.
-        let version = commands
-            .commands
-            .iter()
-            .find_map(|cmd| match cmd {
-                UiCommand::Text { x, scale, text, .. }
-                    if text.starts_with("mc-spine client-ui") =>
-                {
-                    Some((*x, text_width(text, *scale) as i32))
-                }
-                _ => None,
-            })
-            .expect("version label");
-        let leftmost_link = ui
+        // Even at scale 4, links occupy the top-right above the title.
+        let s = ui.effective_scale(h) as i32;
+        let links: Vec<_> = ui
             .hit_regions
             .iter()
             .filter(|r| {
                 matches!(
                     r.id,
-                    WidgetId::ReportLink | WidgetId::SupportLink | WidgetId::ContributeLink
+                    WidgetId::WebsiteLink
+                        | WidgetId::ReportLink
+                        | WidgetId::SupportLink
+                        | WidgetId::ContributeLink
                 )
             })
-            .map(|r| r.rect.x)
-            .min()
-            .unwrap();
+            .collect();
+        assert_eq!(links.len(), 4);
+        assert!(links
+            .iter()
+            .all(|r| r.rect.y == 6 * s && r.rect.bottom() < 34 * s));
+        assert_eq!(
+            links.iter().map(|r| r.rect.right()).max(),
+            Some(w as i32 - 4 * s)
+        );
+        let version = commands
+            .commands
+            .iter()
+            .find_map(|cmd| match cmd {
+                UiCommand::Text { y, text, .. } if text.starts_with("mc-spine client-ui") => {
+                    Some(*y)
+                }
+                _ => None,
+            })
+            .expect("version label");
         assert!(
-            version.0 + version.1 < leftmost_link,
+            links.iter().all(|r| r.rect.bottom() <= version),
             "version overlaps link bar at {w}x{h}"
         );
     }
@@ -251,17 +264,73 @@ fn title_links_respect_support_preference_and_report_is_always_accessible() {
             click(&mut ui, WidgetId::ReportLink, w, h),
             vec![UiAction::OpenUrl(ui.report_url.clone())]
         );
+        assert_eq!(
+            click(&mut ui, WidgetId::WebsiteLink, w, h),
+            vec![UiAction::OpenUrl(ui.website_url.clone())]
+        );
     }
     ui.settings.language = LanguageSetting::Japanese;
     let commands = ui.render(640, 360);
     assert!(commands
         .commands
         .iter()
-        .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text == "バグ報告")));
+        .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text == "報告")));
 
     ui.report_url.clear();
     ui.render(640, 360);
     assert!(!ui.hit_regions.iter().any(|r| r.id == WidgetId::ReportLink));
+    ui.website_url.clear();
+    ui.render(640, 360);
+    assert!(!ui.hit_regions.iter().any(|r| r.id == WidgetId::WebsiteLink));
+}
+
+#[test]
+fn about_megu_opens_from_settings_and_links_ignore_title_toggle() {
+    let mut ui = UiState::new();
+    ui.website_url = "https://example.invalid".into();
+    ui.support_url = "https://example.invalid/support".into();
+    ui.contribute_url = "https://example.invalid/contribute".into();
+    ui.report_url = "https://example.invalid/report".into();
+    ui.settings.qol.show_support_links = false;
+
+    for &(w, h) in &HIT_SIZES {
+        ui.go_title();
+        assert_eq!(
+            click(&mut ui, WidgetId::TitleSettings, w, h),
+            vec![UiAction::OpenScreen(Screen::Settings(SettingsTab::Video))]
+        );
+        assert_eq!(
+            click(&mut ui, WidgetId::SettingsAboutMegu, w, h),
+            vec![UiAction::OpenScreen(Screen::AboutMegu)]
+        );
+        assert_eq!(ui.screen, Screen::AboutMegu);
+        let draw = ui.render(w, h);
+        assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
+        assert!(draw.commands.iter().any(|cmd| matches!(
+            cmd,
+            UiCommand::Text { text, .. } if text.starts_with("Megu v")
+        )));
+        assert!(draw.commands.iter().any(|cmd| matches!(
+            cmd,
+            UiCommand::Text { text, .. } if text.contains("LGPL-3.0-or-later")
+        )));
+        for (id, url) in [
+            (WidgetId::WebsiteLink, ui.website_url.clone()),
+            (WidgetId::SupportLink, ui.support_url.clone()),
+            (WidgetId::ContributeLink, ui.contribute_url.clone()),
+            (WidgetId::ReportLink, ui.report_url.clone()),
+        ] {
+            assert_eq!(click(&mut ui, id, w, h), vec![UiAction::OpenUrl(url)]);
+        }
+        assert_eq!(
+            click(&mut ui, WidgetId::AboutBack, w, h),
+            vec![UiAction::Back]
+        );
+        assert_eq!(ui.screen, Screen::Settings(SettingsTab::Video));
+        click(&mut ui, WidgetId::SettingsAboutMegu, w, h);
+        assert_eq!(key(&mut ui, UiKey::Escape), vec![UiAction::Back]);
+        assert_eq!(ui.screen, Screen::Settings(SettingsTab::Video));
+    }
 }
 
 #[test]
@@ -636,6 +705,39 @@ fn mod_sync_requires_explicit_accept() {
         other => panic!("expected ApplyModSync, got {other:?}"),
     }
     assert!(ui.pending_mod_sync.is_empty());
+}
+
+#[test]
+fn mod_sync_missing_dependencies_require_an_explicit_click() {
+    let mut ui = UiState::new();
+    ui.screen = Screen::ModSyncConsent;
+    for &(w, h) in &HIT_SIZES {
+        ui.render(w, h);
+        assert!(!ui
+            .hit_regions
+            .iter()
+            .any(|r| r.id == WidgetId::ModSyncDownloadMissing));
+    }
+
+    ui.missing_mod_deps = vec!["create".into(), "fabric-api".into()];
+    for &(w, h) in &HIT_SIZES {
+        ui.render(w, h);
+        assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
+        assert!(ui
+            .hit_regions
+            .iter()
+            .any(|r| r.id == WidgetId::ModSyncDownloadMissing));
+        assert_eq!(ui.mod_sync_decision, None);
+        assert_eq!(
+            click(&mut ui, WidgetId::ModSyncDownloadMissing, w, h),
+            vec![UiAction::DownloadMissingFromModrinth(vec![
+                "create".into(),
+                "fabric-api".into(),
+            ])]
+        );
+        assert_eq!(ui.missing_mod_deps.len(), 2);
+        assert_eq!(ui.mod_sync_decision, None);
+    }
 }
 
 #[test]

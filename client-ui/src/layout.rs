@@ -54,6 +54,7 @@ pub fn layout_screen_into(
     match state.screen {
         Screen::Title => title(&mut ctx),
         Screen::Settings(tab) => settings(&mut ctx, tab),
+        Screen::AboutMegu => about_megu(&mut ctx),
         Screen::Friends => friends(&mut ctx),
         Screen::ModSyncConsent => mod_sync(&mut ctx),
         Screen::InGameHud => hud(&mut ctx),
@@ -330,18 +331,9 @@ fn title(ctx: &mut Ctx) {
         tr(lang, "Quit", "終了"),
     );
 
-    // Quiet optional links, anchored to the right and independent of the
-    // bottom-left version label even on narrower auto-scaled viewports.
-    let ly = ctx.h - 20;
-    let mut lx = ctx.w - 4;
-    if !ctx.state.report_url.is_empty() {
-        lx -= 84;
-        ctx.btn(
-            WidgetId::ReportLink,
-            lr(lx, ly, 80, 16),
-            tr(lang, "Report Bug", "バグ報告"),
-        );
-    }
+    // Compact quiet links stay above the title, including at 480x270 logical px.
+    let ly = 6;
+    let mut lx = ctx.w;
     if ctx.state.settings.qol.show_support_links && !ctx.state.contribute_url.is_empty() {
         lx -= 76;
         ctx.btn(
@@ -351,16 +343,32 @@ fn title(ctx: &mut Ctx) {
         );
     }
     if ctx.state.settings.qol.show_support_links && !ctx.state.support_url.is_empty() {
-        lx -= 64 + 4;
+        lx -= 68;
         ctx.btn(
             WidgetId::SupportLink,
             lr(lx, ly, 64, 16),
             tr(lang, "Support", "支援する"),
         );
     }
+    if !ctx.state.report_url.is_empty() {
+        lx -= 64;
+        ctx.btn(
+            WidgetId::ReportLink,
+            lr(lx, ly, 60, 16),
+            tr(lang, "Report", "報告"),
+        );
+    }
+    if !ctx.state.website_url.is_empty() {
+        lx -= 76;
+        ctx.btn(
+            WidgetId::WebsiteLink,
+            lr(lx, ly, 72, 16),
+            tr(lang, "Website", "公式サイト"),
+        );
+    }
     let full_version = "mc-spine client-ui 0.1.0 - zero-dep pure Rust";
     let short_version = "mc-spine client-ui 0.1.0";
-    let version = if text_width(full_version, 1) as i32 + 12 <= lx {
+    let version = if text_width(full_version, 1) as i32 + 8 <= ctx.w {
         full_version
     } else {
         short_version
@@ -449,11 +457,99 @@ fn settings(ctx: &mut Ctx, active: SettingsTab) {
         SettingsTab::Language => language_tab(ctx, y0),
     }
 
-    let dw = 100;
     ctx.btn(
         WidgetId::SettingsDone,
-        lr(cx - dw / 2, ctx.h - 30, dw, 20),
+        lr(cx - 104, ctx.h - 30, 100, 20),
         tr(lang, "Done", "完了"),
+    );
+    ctx.btn(
+        WidgetId::SettingsAboutMegu,
+        lr(cx + 4, ctx.h - 30, 100, 20),
+        tr(lang, "About Megu", "Meguについて"),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// About Megu
+// ---------------------------------------------------------------------------
+
+fn about_megu(ctx: &mut Ctx) {
+    ctx.menu_background();
+    let cx = ctx.w / 2;
+    let lang = ctx.lang;
+
+    ctx.ctext(cx, 10, 2, pal::TEXT, tr(lang, "About Megu", "Meguについて"));
+    ctx.panel(cx - 180, 40, 360, ctx.h - 78);
+    ctx.fill(cx - 179, 41, 358, 2, pal::ACCENT);
+    ctx.ctext(
+        cx,
+        53,
+        1,
+        pal::ACCENT,
+        &format!("Megu v{}", env!("CARGO_PKG_VERSION")),
+    );
+    ctx.ctext(
+        cx,
+        75,
+        1,
+        pal::TEXT,
+        tr(
+            lang,
+            "Pure-Rust clean-room client UI",
+            "純Rust・クリーンルーム実装のクライアントUI",
+        ),
+    );
+    ctx.ctext(
+        cx,
+        93,
+        1,
+        pal::TEXT_DIM,
+        tr(lang, "Independently implemented", "独立した実装"),
+    );
+    ctx.ctext(cx, 115, 1, pal::TEXT_DIM, "Licenses (SPDX, choose one)");
+    ctx.ctext(
+        cx,
+        128,
+        1,
+        pal::TEXT,
+        "LGPL-3.0-or-later / GPL-3.0-or-later",
+    );
+    ctx.ctext(cx, 141, 1, pal::TEXT, "AGPL-3.0-or-later");
+
+    let left = cx - 144;
+    let right = cx + 8;
+    if !ctx.state.website_url.is_empty() {
+        ctx.btn(
+            WidgetId::WebsiteLink,
+            lr(left, 160, 136, 20),
+            tr(lang, "Website", "公式サイト"),
+        );
+    }
+    if !ctx.state.support_url.is_empty() {
+        ctx.btn(
+            WidgetId::SupportLink,
+            lr(right, 160, 136, 20),
+            tr(lang, "Support", "支援する"),
+        );
+    }
+    if !ctx.state.contribute_url.is_empty() {
+        ctx.btn(
+            WidgetId::ContributeLink,
+            lr(left, 186, 136, 20),
+            tr(lang, "Contribute", "貢献する"),
+        );
+    }
+    if !ctx.state.report_url.is_empty() {
+        ctx.btn(
+            WidgetId::ReportLink,
+            lr(right, 186, 136, 20),
+            tr(lang, "Report Bug", "バグ報告"),
+        );
+    }
+    ctx.btn(
+        WidgetId::AboutBack,
+        lr(cx - 50, ctx.h - 30, 100, 20),
+        tr(lang, "Back", "戻る"),
     );
 }
 
@@ -1066,6 +1162,13 @@ fn mod_sync(ctx: &mut Ctx) {
         lr(cx + 10, 214, 140, 20),
         tr(lang, "Decline", "拒否"),
     );
+    if !ctx.state.missing_mod_deps.is_empty() {
+        ctx.btn(
+            WidgetId::ModSyncDownloadMissing,
+            lr(cx - 120, 242, 240, 20),
+            tr(lang, "Get Missing (Modrinth)", "不足ModをModrinthから取得"),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -154,6 +154,8 @@ pub enum Screen {
     Title,
     /// Tabbed settings; [`SettingsTab`] picks the active page.
     Settings(SettingsTab),
+    /// Megu details, license, and configured project links.
+    AboutMegu,
     /// Host invite codes + guest join field.
     Friends,
     /// Explicit consent gate before a server's mod list is applied.
@@ -817,7 +819,7 @@ pub enum UiAction {
     OpenModsPacks,
     /// Show the statistics screen (owned by the app layer).
     ShowStatistics,
-    /// Open a URL in the system browser (Support / Contribute links).
+    /// Open a configured URL in the system browser.
     OpenUrl(String),
     /// Open the host application's full shader option editor.
     OpenShaderOptions,
@@ -831,6 +833,8 @@ pub enum UiAction {
     JoinWithCode(u64),
     /// Player explicitly accepted the pending mod sync; install `0`.
     ApplyModSync(Vec<ModSyncEntry>),
+    /// Player explicitly requested the missing dependencies from Modrinth.
+    DownloadMissingFromModrinth(Vec<String>),
     /// Player declined the pending mod sync.
     DeclineModSync,
     /// Player explicitly confirmed `"Send OK?"` on the crash screen.
@@ -849,11 +853,15 @@ pub enum WidgetId {
     TitleMods,
     TitleSettings,
     TitleQuit,
+    WebsiteLink,
     SupportLink,
     ContributeLink,
     ReportLink,
     // Settings chrome
     SettingsDone,
+    SettingsAboutMegu,
+    // About Megu
+    AboutBack,
     TabVideo,
     TabAudio,
     TabShaders,
@@ -907,6 +915,7 @@ pub enum WidgetId {
     // Mod sync
     ModSyncAccept,
     ModSyncDecline,
+    ModSyncDownloadMissing,
     // Pause
     PauseBackToGame,
     PauseSettings,
@@ -1046,6 +1055,8 @@ pub struct UiState {
 
     /// Pending mod-sync changes shown on [`Screen::ModSyncConsent`].
     pub pending_mod_sync: Vec<ModSyncEntry>,
+    /// Missing dependency IDs available for an explicit Modrinth request.
+    pub missing_mod_deps: Vec<String>,
     /// `Some(true)` = accepted, `Some(false)` = declined.
     pub mod_sync_decision: Option<bool>,
 
@@ -1059,6 +1070,8 @@ pub struct UiState {
 
     /// Optional quiet corner link on the title screen — hidden when empty.
     pub support_url: String,
+    /// Optional project website, shown on Title and About when configured.
+    pub website_url: String,
     /// Optional quiet corner link on the title screen — hidden when empty.
     pub contribute_url: String,
     /// Optional bug report URL on Title and Pause, hidden while empty.
@@ -1091,11 +1104,13 @@ impl Default for UiState {
             join_code_text: String::new(),
             join_error: false,
             pending_mod_sync: Vec::new(),
+            missing_mod_deps: Vec::new(),
             mod_sync_decision: None,
             hud: HudState::default(),
             crash: None,
             crash_sent: false,
             support_url: String::new(),
+            website_url: String::new(),
             contribute_url: String::new(),
             report_url: String::new(),
             active_shaderpack_name: String::new(),
@@ -1463,15 +1478,26 @@ impl UiState {
                 vec![UiAction::OpenScreen(s)]
             }
             WidgetId::TitleQuit => vec![UiAction::QuitGame],
+            WidgetId::WebsiteLink => {
+                if self.website_url.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![UiAction::OpenUrl(self.website_url.clone())]
+                }
+            }
             WidgetId::SupportLink => {
-                if !self.settings.qol.show_support_links || self.support_url.is_empty() {
+                if (self.screen == Screen::Title && !self.settings.qol.show_support_links)
+                    || self.support_url.is_empty()
+                {
                     Vec::new()
                 } else {
                     vec![UiAction::OpenUrl(self.support_url.clone())]
                 }
             }
             WidgetId::ContributeLink => {
-                if !self.settings.qol.show_support_links || self.contribute_url.is_empty() {
+                if (self.screen == Screen::Title && !self.settings.qol.show_support_links)
+                    || self.contribute_url.is_empty()
+                {
                     Vec::new()
                 } else {
                     vec![UiAction::OpenUrl(self.contribute_url.clone())]
@@ -1486,6 +1512,14 @@ impl UiState {
             }
 
             WidgetId::SettingsDone => {
+                self.back();
+                vec![UiAction::Back]
+            }
+            WidgetId::SettingsAboutMegu => {
+                self.navigate(Screen::AboutMegu);
+                vec![UiAction::OpenScreen(Screen::AboutMegu)]
+            }
+            WidgetId::AboutBack => {
                 self.back();
                 vec![UiAction::Back]
             }
@@ -1548,6 +1582,15 @@ impl UiState {
             WidgetId::ModSyncDecline => {
                 self.mod_sync_decision = Some(false);
                 vec![UiAction::DeclineModSync]
+            }
+            WidgetId::ModSyncDownloadMissing => {
+                if self.missing_mod_deps.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![UiAction::DownloadMissingFromModrinth(
+                        self.missing_mod_deps.clone(),
+                    )]
+                }
             }
 
             WidgetId::PauseBackToGame => {
