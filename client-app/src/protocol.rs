@@ -472,6 +472,10 @@ impl<'a> WireReader<'a> {
         Ok(self.take(1)?[0])
     }
 
+    pub fn read_i8(&mut self) -> Result<i8, String> {
+        Ok(self.read_u8()? as i8)
+    }
+
     pub fn read_bool(&mut self) -> Result<bool, String> {
         Ok(self.read_u8()? != 0)
     }
@@ -657,6 +661,16 @@ impl<'a> WireReader<'a> {
             other => Err(format!("unknown NBT tag {other}")),
         }
     }
+}
+
+/// Read one anonymous-NBT value and return its raw wire bytes. The bytes are
+/// validated by [`WireReader::read_nbt`] (bounded depth/array lengths) before
+/// being handed back, so callers keep the exact payload without re-parsing.
+fn read_nbt_raw<'a>(reader: &mut WireReader<'a>) -> Result<&'a [u8], String> {
+    let before = reader.rest();
+    let _ = reader.read_nbt()?;
+    let consumed = before.len() - reader.remaining();
+    Ok(&before[..consumed])
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1350,12 +1364,25 @@ pub struct DecodedLightData {
     pub block_arrays: Vec<[u8; 2048]>,
 }
 
+/// One block-entity record from a `level_chunk_with_light` packet: the
+/// packed local X/Z byte, section-relative Y, block-entity type id, and
+/// the raw anonymous-NBT payload exactly as it arrived on the wire.
+#[derive(Clone, Debug)]
+pub struct DecodedBlockEntity {
+    pub packed_xz: u8,
+    pub y: i16,
+    pub kind: i32,
+    pub nbt_bytes: Vec<u8>,
+}
+
 #[derive(Clone, Debug)]
 pub struct DecodedChunk {
     pub cx: i32,
     pub cz: i32,
     pub sections: Vec<DecodedSection>,
     pub light: DecodedLightData,
+    /// Block entities embedded in the chunk payload, in wire order.
+    pub block_entities: Vec<DecodedBlockEntity>,
 }
 
 fn decode_light_section_payload(
@@ -1521,11 +1548,26 @@ pub fn decode_chunk_packet_profiled(
 
     let block_entity_count = usize::try_from(reader.read_varint()?)
         .map_err(|_| "negative block entity count".to_string())?;
+    // Each record is at least 4 bytes (xz + y + kind varint), so a count past
+    // the remaining input can never be satisfied.
+    if block_entity_count > reader.remaining() {
+        return Err(format!(
+            "block entity count {block_entity_count} exceeds {} remaining bytes",
+            reader.remaining()
+        ));
+    }
+    let mut block_entities = Vec::with_capacity(block_entity_count);
     for _ in 0..block_entity_count {
-        let _packed_xz = reader.read_u8()?;
-        let _y = reader.read_i16()?;
-        let _kind = reader.read_varint()?;
-        let _nbt = reader.read_nbt()?;
+        let packed_xz = reader.read_u8()?;
+        let y = reader.read_i16()?;
+        let kind = reader.read_varint()?;
+        let nbt_bytes = read_nbt_raw(&mut reader)?.to_vec();
+        block_entities.push(DecodedBlockEntity {
+            packed_xz,
+            y,
+            kind,
+            nbt_bytes,
+        });
     }
 
     let light = decode_light_section_payload(
@@ -1538,6 +1580,7 @@ pub fn decode_chunk_packet_profiled(
         cz,
         sections,
         light,
+        block_entities,
     })
 }
 
@@ -1677,6 +1720,19 @@ pub struct WireStopSound {
     pub name: Option<String>,
 }
 
+/// One decoded `system_chat` payload retained bounded for consumers that
+/// need the raw NBT component (styled text, click events, translatable
+/// keys). `PlayEvent::SystemChat` carries only the extracted plain text —
+/// its field shape is frozen by downstream consumers — so the raw bytes
+/// ride this side channel exactly like [`WireSoundEvent`] does for audio.
+#[derive(Clone, Debug)]
+pub struct WireChatEvent {
+    /// Anonymous-NBT component bytes exactly as received on the wire.
+    pub nbt_bytes: Vec<u8>,
+    /// Action-bar (overlay) flag from the packet trailer.
+    pub overlay: bool,
+}
+
 /// Decode `sound_effect`/`sound_entity` payloads (`entity_bound` selects
 /// entity-id vs fixed-point-position layout) on the 767 wire.
 pub fn decode_play_sound_body(body: &[u8], entity_bound: bool) -> Result<WireSoundEvent, String> {
@@ -1777,8 +1833,241 @@ pub enum PlayEvent {
         text: String,
         overlay: bool,
     },
+    // -- Entities ---------------------------------------------------------
+    /// `add_entity` — a non-player entity spawn.
+    AddEntity {
+        eid: i32,
+        uuid: [u8; 16],
+        entity_type: i32,
+        x: f64,
+        y: f64,
+        z: f64,
+        /// Head yaw in degrees (wire angle byte decoded as `byte * 360/256`).
+        pitch: f32,
+        yaw: f32,
+        head_yaw: f32,
+        /// `objectData` — entity-type-specific spawn data (e.g. falling-block
+        /// state id, area-effect cloud radius).
+        data: i32,
+        /// Velocity in blocks/tick (wire i16 fixed-point / 8000).
+        vx: f64,
+        vy: f64,
+        vz: f64,
+    },
+    /// `remove_entities` — entity ids destroyed this tick.
+    RemoveEntities {
+        eids: Vec<i32>,
+    },
+    /// `move_entity_pos` — relative position delta in blocks (wire i16 / 4096).
+    MoveEntityPos {
+        eid: i32,
+        dx: f64,
+        dy: f64,
+        dz: f64,
+        on_ground: bool,
+    },
+    /// `move_entity_pos_rot` — relative move plus yaw/pitch (degrees).
+    MoveEntityPosRot {
+        eid: i32,
+        dx: f64,
+        dy: f64,
+        dz: f64,
+        yaw: f32,
+        pitch: f32,
+        on_ground: bool,
+    },
+    /// `move_entity_rot` — yaw/pitch only (degrees).
+    MoveEntityRot {
+        eid: i32,
+        yaw: f32,
+        pitch: f32,
+        on_ground: bool,
+    },
+    /// `teleport_entity` — absolute entity teleport.
+    TeleportEntity {
+        eid: i32,
+        x: f64,
+        y: f64,
+        z: f64,
+        yaw: f32,
+        pitch: f32,
+        on_ground: bool,
+    },
+    /// `rotate_head` — entity head-yaw rotation (degrees).
+    RotateHead {
+        eid: i32,
+        head_yaw: f32,
+    },
+    /// `set_entity_motion` — entity velocity (wire i16 / 8000).
+    SetEntityMotion {
+        eid: i32,
+        vx: f64,
+        vy: f64,
+        vz: f64,
+    },
+    /// `entity_event` — entity status byte (hurt flash, death, totem, ...).
+    EntityEvent {
+        eid: i32,
+        status: i8,
+    },
+    /// `hurt_animation` — red hurt-flash yaw for the entity.
+    HurtAnimation {
+        eid: i32,
+        yaw: f32,
+    },
+    /// `damage_event` — damage source ids plus an optional source position.
+    DamageEvent {
+        eid: i32,
+        source_type: i32,
+        source_cause: i32,
+        source_direct: i32,
+        source_position: Option<[f64; 3]>,
+    },
+    /// `set_equipment` — equipment slot entries; each `item_wire` is the raw
+    /// `Slot` payload exactly as it arrived (bounded by the slot skipper).
+    SetEquipment {
+        eid: i32,
+        entries: Vec<EquipmentEntry>,
+    },
+    /// `set_entity_data` — entity metadata entries kept as raw wire bytes
+    /// (index/type/value records terminated by `0xFF`).
+    SetEntityData {
+        eid: i32,
+        raw_entries: Vec<u8>,
+    },
+    // -- World / time / weather / particles / block entities ----------------
+    /// `set_time` — world age and time-of-day (both i64 game ticks).
+    SetTime {
+        world_age: i64,
+        time_of_day: i64,
+    },
+    /// `game_event` — game-state change (weather, game mode, win, ...).
+    GameEvent {
+        event: u8,
+        value: f32,
+    },
+    /// `level_event` — world effect at a position (particles, sounds, ...).
+    LevelEvent {
+        event: i32,
+        pos: [i32; 3],
+        data: i32,
+        disable_relative_volume: bool,
+    },
+    /// `level_particles` — particle spawn; `particle_data` is the raw
+    /// particle-type-specific payload following the type id.
+    LevelParticles {
+        particle_id: i32,
+        long_distance: bool,
+        x: f64,
+        y: f64,
+        z: f64,
+        offset_x: f32,
+        offset_y: f32,
+        offset_z: f32,
+        max_speed: f32,
+        count: i32,
+        particle_data: Vec<u8>,
+    },
+    /// `block_destruction` — block-break stage animation.
+    BlockDestruction {
+        breaker_eid: i32,
+        pos: [i32; 3],
+        stage: i8,
+    },
+    /// `block_entity_data` — block-entity NBT update; `nbt_bytes` is empty
+    /// when the packet carries the absent-NBT marker (`0x00`).
+    BlockEntityData {
+        pos: [i32; 3],
+        kind: i32,
+        nbt_bytes: Vec<u8>,
+    },
+    // -- Containers / menus -------------------------------------------------
+    /// `open_screen` — menu open; `title_nbt` is the raw anonymous-NBT title.
+    OpenScreen {
+        window_id: i32,
+        menu_type: i32,
+        title_nbt: Vec<u8>,
+    },
+    /// `container_set_content` — full container contents. `slot_count` is the
+    /// item-array count; `raw_payload` holds the remaining slot bytes
+    /// (items plus the carried item) exactly as received.
+    ContainerSetContent {
+        window_id: u8,
+        state_id: i32,
+        slot_count: i32,
+        raw_payload: Vec<u8>,
+    },
+    /// `container_set_slot` — single slot update; `raw_item` is the raw
+    /// `Slot` wire bytes.
+    ContainerSetSlot {
+        window_id: u8,
+        state_id: i32,
+        slot: i16,
+        raw_item: Vec<u8>,
+    },
+    /// `container_set_data` — container property update (progress, fuel, ...).
+    ContainerSetData {
+        window_id: u8,
+        property: i16,
+        value: i16,
+    },
+    /// `container_close` — server-initiated container close.
+    ContainerClose {
+        window_id: u8,
+    },
+    // -- HUD / player / chat ------------------------------------------------
+    /// `set_experience` — experience bar fill, level, and total.
+    SetExperience {
+        bar: f32,
+        level: i32,
+        total: i32,
+    },
+    /// `update_mob_effect` — mob-effect add/refresh.
+    UpdateMobEffect {
+        eid: i32,
+        effect_id: i32,
+        amplifier: i32,
+        duration: i32,
+        flags: u8,
+    },
+    /// `remove_mob_effect` — mob-effect removal.
+    RemoveMobEffect {
+        eid: i32,
+        effect_id: i32,
+    },
+    /// `set_action_bar_text` — action-bar text as raw anonymous-NBT bytes.
+    SetActionBarText {
+        nbt_bytes: Vec<u8>,
+    },
+    /// `set_title_text` — title text as raw anonymous-NBT bytes.
+    SetTitleText {
+        nbt_bytes: Vec<u8>,
+    },
+    /// `set_subtitle_text` — subtitle text as raw anonymous-NBT bytes.
+    SetSubtitleText {
+        nbt_bytes: Vec<u8>,
+    },
+    /// `boss_event` — boss-bar action; `raw_payload` holds the
+    /// action-dependent fields (title/health/color/dividers/flags) raw.
+    BossEvent {
+        uuid: [u8; 16],
+        action: i32,
+        raw_payload: Vec<u8>,
+    },
+    /// `player_info_remove` — player-info entries removed by UUID.
+    PlayerInfoRemove {
+        uuids: Vec<[u8; 16]>,
+    },
     Disconnect(String),
     Other(i32),
+}
+
+/// One `set_equipment` entry: the 7-bit equipment slot and the raw `Slot`
+/// wire bytes for the item in that slot.
+#[derive(Clone, Debug)]
+pub struct EquipmentEntry {
+    pub slot: u8,
+    pub item_wire: Vec<u8>,
 }
 
 /// Opt-in play receiver result with decoded clientbound custom payloads.
@@ -1786,6 +2075,1113 @@ pub enum PlayEvent {
 pub enum ClientPlayEvent {
     Play(PlayEvent),
     CustomChannel(ClientCustomChannelEvent),
+}
+
+// ---------------------------------------------------------------------------
+// Extended Protocol 767 play decoding (entities, world, containers, HUD/chat)
+// ---------------------------------------------------------------------------
+//
+// Packet layouts follow the canonical 1.21.1 (protocol 767) schemas resolved
+// through `mc_spine_proto`'s packet table — names, never hardcoded ids. Every
+// reader is bounded: counts are capped by remaining input or explicit limits,
+// NBT goes through the depth/array-bounded `WireReader::read_nbt`, and `Slot`
+// payloads are skipped by a fail-closed walker that mirrors the server-side
+// `slot_read_*` family in `src/menus_and_items.rs`.
+
+/// Wire angle byte -> degrees (`byte * 360 / 256`, signed).
+fn wire_angle(byte: i8) -> f32 {
+    f32::from(byte) * (360.0 / 256.0)
+}
+
+/// Velocity fixed-point i16 -> blocks/tick (`raw / 8000`).
+fn wire_velocity(raw: i16) -> f64 {
+    f64::from(raw) / 8000.0
+}
+
+/// Relative-move fixed-point i16 -> blocks (`raw / 4096`).
+fn wire_delta(raw: i16) -> f64 {
+    f64::from(raw) / 4096.0
+}
+
+/// Read a count-prefixed UUID array bounded by the remaining input (each
+/// entry is exactly 16 bytes).
+fn read_uuid_list(r: &mut WireReader<'_>) -> Result<Vec<[u8; 16]>, String> {
+    let count = usize::try_from(r.read_varint()?).map_err(|_| "negative uuid count".to_string())?;
+    if count > r.remaining() / 16 {
+        return Err(format!(
+            "uuid count {count} exceeds {} remaining bytes",
+            r.remaining()
+        ));
+    }
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        out.push(r.read_uuid()?);
+    }
+    Ok(out)
+}
+
+// --- Bounded `Slot` / data-component skipper -------------------------------
+//
+// A `Slot` is `VarInt count`; when non-zero: `VarInt itemId`,
+// `VarInt addedComponentCount`, `VarInt removedComponentCount`, then
+// `addedComponentCount` (component-type VarInt + payload) pairs and
+// `removedComponentCount` bare component-type VarInts. Component payloads are
+// walked — never interpreted — so hostile component bodies cannot desync the
+// parse or allocate unboundedly.
+
+const SLOT_COMPONENT_TYPE_COUNT: i64 = 57;
+const SLOT_MAX_DEPTH: usize = 16;
+const SLOT_MAX_NBT_DEPTH: usize = 64;
+const SLOT_MAX_LIST_LEN: usize = 1_000_000;
+
+/// VarInt reader over a raw slice mirroring the server's `read_protocol_i32`:
+/// at most five bytes, values must fit `u32`, then sign-extend like i32.
+fn slot_varint(b: &[u8], p: &mut usize) -> Option<i64> {
+    let mut v = 0i64;
+    for i in 0..5 {
+        let byte = *b.get(*p)?;
+        *p += 1;
+        v |= ((byte & 0x7f) as i64) << (7 * i);
+        if byte & 0x80 == 0 {
+            return Some(i64::from(u32::try_from(v).ok()? as i32));
+        }
+    }
+    None
+}
+
+fn slot_bytes(b: &[u8], p: &mut usize, len: usize) -> Option<()> {
+    let end = (*p).checked_add(len)?;
+    b.get(*p..end)?;
+    *p = end;
+    Some(())
+}
+
+/// Strict boolean byte: only `0`/`1` are valid on the component wire.
+fn slot_bool(b: &[u8], p: &mut usize) -> Option<bool> {
+    let value = *b.get(*p)?;
+    if value > 1 {
+        return None;
+    }
+    *p += 1;
+    Some(value != 0)
+}
+
+fn slot_count(b: &[u8], p: &mut usize, max: i64) -> Option<usize> {
+    usize::try_from(slot_varint(b, p)?)
+        .ok()
+        .filter(|&n| n <= max as usize)
+}
+
+fn slot_string(b: &[u8], p: &mut usize) -> Option<()> {
+    let len = slot_count(b, p, 98301)?;
+    let text = b.get(*p..(*p).checked_add(len)?)?;
+    std::str::from_utf8(text).ok()?;
+    *p += len;
+    Some(())
+}
+
+fn slot_nbt_payload(b: &[u8], p: &mut usize, tag: u8, depth: usize) -> Option<()> {
+    if depth > SLOT_MAX_NBT_DEPTH {
+        return None;
+    }
+    match tag {
+        1 => slot_bytes(b, p, 1)?,
+        2 => slot_bytes(b, p, 2)?,
+        3 | 5 => slot_bytes(b, p, 4)?,
+        4 | 6 => slot_bytes(b, p, 8)?,
+        7 | 11 | 12 => {
+            let length = i32::from_be_bytes(b.get(*p..(*p).checked_add(4)?)?.try_into().ok()?);
+            *p += 4;
+            let length = usize::try_from(length).ok()?;
+            let element_size = match tag {
+                7 => 1,
+                11 => 4,
+                12 => 8,
+                _ => return None,
+            };
+            slot_bytes(b, p, length.checked_mul(element_size)?)?;
+        }
+        8 => {
+            let length =
+                u16::from_be_bytes(b.get(*p..(*p).checked_add(2)?)?.try_into().ok()?) as usize;
+            slot_bytes(b, p, 2 + length)?;
+        }
+        9 => {
+            let element_tag = *b.get(*p)?;
+            *p += 1;
+            let length = i32::from_be_bytes(b.get(*p..(*p).checked_add(4)?)?.try_into().ok()?);
+            *p += 4;
+            let length = usize::try_from(length).ok()?;
+            if length > SLOT_MAX_LIST_LEN || (element_tag == 0 && length != 0) {
+                return None;
+            }
+            for _ in 0..length {
+                slot_nbt_payload(b, p, element_tag, depth + 1)?;
+            }
+        }
+        10 => loop {
+            let child_tag = *b.get(*p)?;
+            *p += 1;
+            if child_tag == 0 {
+                break;
+            }
+            if child_tag > 12 {
+                return None;
+            }
+            let name_length =
+                u16::from_be_bytes(b.get(*p..(*p).checked_add(2)?)?.try_into().ok()?) as usize;
+            slot_bytes(b, p, 2 + name_length)?;
+            slot_nbt_payload(b, p, child_tag, depth + 1)?;
+        },
+        _ => return None,
+    }
+    Some(())
+}
+
+fn slot_nbt(b: &[u8], p: &mut usize) -> Option<()> {
+    let tag = *b.get(*p)?;
+    if !(1..=12).contains(&tag) {
+        return None;
+    }
+    *p += 1;
+    slot_nbt_payload(b, p, tag, 0)
+}
+
+fn slot_optional_nbt(b: &[u8], p: &mut usize) -> Option<()> {
+    if *b.get(*p)? == 0 {
+        *p += 1;
+        Some(())
+    } else {
+        slot_nbt(b, p)
+    }
+}
+
+fn slot_text(b: &[u8], p: &mut usize) -> Option<()> {
+    slot_nbt(b, p)
+}
+
+fn slot_optional_string(b: &[u8], p: &mut usize) -> Option<()> {
+    if slot_bool(b, p)? {
+        slot_string(b, p)?;
+    }
+    Some(())
+}
+
+fn slot_holder_set(b: &[u8], p: &mut usize) -> Option<()> {
+    let kind = slot_varint(b, p)?;
+    if kind == 0 {
+        slot_string(b, p)?;
+    } else {
+        for _ in 0..usize::try_from(kind - 1).ok().filter(|&n| n <= 4096)? {
+            slot_varint(b, p)?;
+        }
+    }
+    Some(())
+}
+
+fn slot_block_predicate(b: &[u8], p: &mut usize) -> Option<()> {
+    if slot_bool(b, p)? {
+        slot_holder_set(b, p)?;
+    }
+    if slot_bool(b, p)? {
+        for _ in 0..slot_count(b, p, 256)? {
+            slot_string(b, p)?;
+            if slot_bool(b, p)? {
+                slot_string(b, p)?;
+            } else {
+                slot_string(b, p)?;
+                slot_string(b, p)?;
+            }
+        }
+    }
+    slot_optional_nbt(b, p)
+}
+
+fn slot_trim_material(b: &[u8], p: &mut usize) -> Option<()> {
+    slot_string(b, p)?;
+    slot_varint(b, p)?;
+    for _ in 0..slot_count(b, p, 256)? {
+        slot_varint(b, p)?;
+        slot_string(b, p)?;
+    }
+    slot_nbt(b, p)
+}
+
+fn slot_trim_pattern(b: &[u8], p: &mut usize) -> Option<()> {
+    slot_string(b, p)?;
+    slot_varint(b, p)?;
+    slot_nbt(b, p)?;
+    slot_bool(b, p)?;
+    Some(())
+}
+
+fn slot_sound_event(b: &[u8], p: &mut usize) -> Option<()> {
+    slot_string(b, p)?;
+    if slot_bool(b, p)? {
+        slot_bytes(b, p, 4)?;
+    }
+    Some(())
+}
+
+fn slot_sound_holder(b: &[u8], p: &mut usize) -> Option<()> {
+    if slot_varint(b, p)? == 0 {
+        slot_sound_event(b, p)?;
+    }
+    Some(())
+}
+
+fn slot_instrument_data(b: &[u8], p: &mut usize) -> Option<()> {
+    slot_sound_holder(b, p)?;
+    slot_bytes(b, p, 8)?;
+    slot_nbt(b, p)
+}
+
+fn slot_jukebox_song_data(b: &[u8], p: &mut usize) -> Option<()> {
+    slot_sound_holder(b, p)?;
+    slot_nbt(b, p)?;
+    slot_bytes(b, p, 4)?;
+    slot_varint(b, p)?;
+    Some(())
+}
+
+fn slot_firework_explosion(b: &[u8], p: &mut usize) -> Option<()> {
+    if !(0..=4).contains(&slot_varint(b, p)?) {
+        return None;
+    }
+    for _ in 0..2 {
+        let count = slot_count(b, p, 256)?;
+        slot_bytes(b, p, count.checked_mul(4)?)?;
+    }
+    slot_bool(b, p)?;
+    slot_bool(b, p)?;
+    Some(())
+}
+
+/// Skip an `attribute_modifiers` component payload (type 12): bounded
+/// modifier count, each {attribute varint, name varint+utf8, f64 amount,
+/// operation varint, slot varint}, then the show-in-tooltip byte.
+fn slot_attr_modifiers(b: &[u8], p: &mut usize) -> Option<()> {
+    let n = slot_varint(b, p)?;
+    if !(0..=1024).contains(&n) {
+        return None;
+    }
+    for _ in 0..n {
+        slot_varint(b, p)?; // attribute id
+        let id_len = usize::try_from(slot_varint(b, p)?).ok()?;
+        if id_len > 32767 {
+            return None;
+        }
+        slot_bytes(b, p, id_len)?;
+        slot_bytes(b, p, 8)?; // amount f64
+        slot_varint(b, p)?; // operation
+        slot_varint(b, p)?; // slot group
+    }
+    slot_bool(b, p)?;
+    Some(())
+}
+
+/// Skip one mob-effect detail record inside `potion_contents` (recursive via
+/// the optional nested-effects flag, depth-capped).
+fn slot_potion_details(b: &[u8], p: &mut usize, depth: usize) -> Option<()> {
+    if depth == 16 {
+        return None;
+    }
+    slot_varint(b, p)?; // amplifier
+    slot_varint(b, p)?; // duration
+    for _ in 0..3 {
+        slot_bool(b, p)?; // ambient, visible, icon
+    }
+    if slot_bool(b, p)? {
+        slot_potion_details(b, p, depth + 1)?;
+    }
+    Some(())
+}
+
+/// `potion_contents` component (type 31): optional potion id varint, optional
+/// custom-color i32, effect list, optional custom name.
+fn slot_potion_contents(b: &[u8], p: &mut usize) -> Option<()> {
+    if slot_bool(b, p)? {
+        slot_varint(b, p)?;
+    }
+    if slot_bool(b, p)? {
+        slot_bytes(b, p, 4)?;
+    }
+    let n = slot_varint(b, p)?;
+    if !(0..=256).contains(&n) {
+        return None;
+    }
+    for _ in 0..n {
+        slot_varint(b, p)?;
+        slot_potion_details(b, p, 0)?;
+    }
+    slot_optional_string(b, p)
+}
+
+/// Skip one data-component payload of type `ty`. Mirrors the server-side
+/// `slot_read_component` match arm-for-arm; every arm only advances `p`.
+fn slot_component(b: &[u8], p: &mut usize, ty: i64, depth: usize) -> Option<()> {
+    match ty {
+        0 => slot_nbt(b, p)?,
+        1..=3 | 13 | 16 | 26 | 28 | 41 | 50 => {
+            slot_varint(b, p)?;
+        }
+        8 => {
+            if !(0..=3).contains(&slot_varint(b, p)?) {
+                return None;
+            }
+        }
+        4 | 18 => {
+            slot_bool(b, p)?;
+        }
+        5 | 6 => slot_text(b, p)?,
+        7 => {
+            for _ in 0..slot_count(b, p, 256)? {
+                slot_optional_nbt(b, p)?;
+            }
+        }
+        9 | 23 => {
+            for _ in 0..slot_count(b, p, 256)? {
+                slot_varint(b, p)?;
+                slot_varint(b, p)?;
+            }
+            slot_bool(b, p)?;
+        }
+        10 | 11 => {
+            for _ in 0..slot_count(b, p, 256)? {
+                slot_block_predicate(b, p)?;
+            }
+            slot_bool(b, p)?;
+        }
+        12 => slot_attr_modifiers(b, p)?,
+        14 | 15 | 17 | 21 => {} // Unit components have zero-byte payloads.
+        19 | 27 | 36..=39 | 43 | 55 | 56 => slot_nbt(b, p)?,
+        20 => {
+            slot_varint(b, p)?; // nutrition
+            slot_bytes(b, p, 4)?; // saturation
+            slot_bool(b, p)?; // can always eat
+            slot_bytes(b, p, 4)?; // eating seconds
+            slot_stack(b, p, depth + 1)?; // conversion item, possibly empty
+            for _ in 0..slot_count(b, p, 256)? {
+                slot_varint(b, p)?;
+                slot_bytes(b, p, 4)?; // probability
+            }
+        }
+        22 => {
+            for _ in 0..slot_count(b, p, 256)? {
+                slot_holder_set(b, p)?;
+                if slot_bool(b, p)? {
+                    slot_bytes(b, p, 4)?;
+                }
+                if slot_bool(b, p)? {
+                    slot_bool(b, p)?;
+                }
+            }
+            slot_bytes(b, p, 4)?;
+            slot_varint(b, p)?;
+        }
+        24 => {
+            slot_bytes(b, p, 4)?;
+            slot_bool(b, p)?;
+        }
+        25 => slot_bytes(b, p, 4)?,
+        29 | 30 | 52 => {
+            for _ in 0..slot_count(b, p, 256)? {
+                slot_stack(b, p, depth + 1)?;
+            }
+        }
+        31 => slot_potion_contents(b, p)?,
+        32 => {
+            for _ in 0..slot_count(b, p, 256)? {
+                slot_varint(b, p)?;
+                slot_varint(b, p)?;
+            }
+        }
+        33 => {
+            for _ in 0..slot_count(b, p, 100)? {
+                slot_string(b, p)?;
+                slot_optional_string(b, p)?;
+            }
+        }
+        34 => {
+            slot_string(b, p)?;
+            slot_optional_string(b, p)?;
+            slot_string(b, p)?;
+            slot_varint(b, p)?;
+            for _ in 0..slot_count(b, p, 100)? {
+                slot_text(b, p)?;
+                slot_optional_nbt(b, p)?;
+            }
+            slot_bool(b, p)?;
+        }
+        35 => {
+            if slot_varint(b, p)? == 0 {
+                slot_trim_material(b, p)?;
+            }
+            if slot_varint(b, p)? == 0 {
+                slot_trim_pattern(b, p)?;
+            }
+            slot_bool(b, p)?;
+        }
+        40 => {
+            if slot_varint(b, p)? == 0 {
+                slot_instrument_data(b, p)?;
+            }
+        }
+        42 => {
+            if slot_bool(b, p)? {
+                if slot_varint(b, p)? == 0 {
+                    slot_jukebox_song_data(b, p)?;
+                }
+            } else {
+                slot_string(b, p)?;
+            }
+            slot_bool(b, p)?;
+        }
+        44 => {
+            if slot_bool(b, p)? {
+                slot_string(b, p)?;
+                slot_bytes(b, p, 8)?;
+            }
+            slot_bool(b, p)?;
+        }
+        45 => slot_firework_explosion(b, p)?,
+        46 => {
+            slot_varint(b, p)?;
+            for _ in 0..slot_count(b, p, 256)? {
+                slot_firework_explosion(b, p)?;
+            }
+        }
+        47 => {
+            if slot_bool(b, p)? {
+                slot_string(b, p)?;
+            }
+            if slot_bool(b, p)? {
+                slot_bytes(b, p, 16)?;
+            }
+            for _ in 0..slot_count(b, p, 256)? {
+                slot_string(b, p)?;
+                slot_string(b, p)?;
+                if slot_bool(b, p)? {
+                    slot_string(b, p)?;
+                }
+            }
+        }
+        48 => slot_string(b, p)?,
+        49 => {
+            for _ in 0..slot_count(b, p, 256)? {
+                if slot_varint(b, p)? == 0 {
+                    slot_string(b, p)?;
+                    slot_string(b, p)?;
+                }
+                if !(0..=15).contains(&slot_varint(b, p)?) {
+                    return None;
+                }
+            }
+        }
+        51 => {
+            for _ in 0..slot_count(b, p, 4)? {
+                slot_varint(b, p)?;
+            }
+        }
+        53 => {
+            for _ in 0..slot_count(b, p, 256)? {
+                slot_string(b, p)?;
+                slot_string(b, p)?;
+            }
+        }
+        54 => {
+            for _ in 0..slot_count(b, p, 256)? {
+                slot_nbt(b, p)?;
+                slot_varint(b, p)?;
+                slot_varint(b, p)?;
+            }
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+/// Skip one full `Slot` (count + optional item payload) starting at `*p`;
+/// advances `p` past it. Depth-capped for nested stacks (food conversion,
+/// bundle/container contents).
+fn slot_stack(b: &[u8], p: &mut usize, depth: usize) -> Option<()> {
+    if depth > SLOT_MAX_DEPTH {
+        return None;
+    }
+    let cnt = slot_varint(b, p)?;
+    if cnt == 0 {
+        return Some(());
+    }
+    if !(1..=127).contains(&cnt) {
+        return None;
+    }
+    let item = slot_varint(b, p)?;
+    if !(0..=i64::from(i32::MAX)).contains(&item) {
+        return None;
+    }
+    let nadd = slot_count(b, p, 128)?;
+    let nrem = slot_count(b, p, 128)?;
+    for _ in 0..nadd {
+        let ty = slot_varint(b, p)?;
+        if !(0..SLOT_COMPONENT_TYPE_COUNT).contains(&ty) {
+            return None;
+        }
+        slot_component(b, p, ty, depth)?;
+    }
+    for _ in 0..nrem {
+        let ty = slot_varint(b, p)?;
+        if !(0..SLOT_COMPONENT_TYPE_COUNT).contains(&ty) {
+            return None;
+        }
+    }
+    Some(())
+}
+
+/// Skip one `Slot` at `start`; returns the offset just past it.
+fn slot_skip_extent(b: &[u8], start: usize) -> Option<usize> {
+    let mut p = start;
+    slot_stack(b, &mut p, 0)?;
+    Some(p)
+}
+
+// --- Extended play event decoding -----------------------------------------
+
+/// Decode one clientbound play packet body into a [`PlayEvent`] for the
+/// families added beyond the original 18: entities, world/time/weather/
+/// particles/block entities, containers, and HUD/chat. Returns `Ok(None)`
+/// for packet names outside this set so the caller falls back to
+/// [`PlayEvent::Other`]. Only valid on the 767 wire — callers gate on
+/// `!wire_26x()`.
+pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<PlayEvent>, String> {
+    let mut r = WireReader::new(body);
+    Ok(Some(match name {
+        "add_entity" => {
+            let eid = r.read_varint()?;
+            let uuid = r.read_uuid()?;
+            let entity_type = r.read_varint()?;
+            let x = r.read_f64()?;
+            let y = r.read_f64()?;
+            let z = r.read_f64()?;
+            let pitch = wire_angle(r.read_i8()?);
+            let yaw = wire_angle(r.read_i8()?);
+            let head_yaw = wire_angle(r.read_i8()?);
+            let data = r.read_varint()?;
+            let vx = wire_velocity(r.read_i16()?);
+            let vy = wire_velocity(r.read_i16()?);
+            let vz = wire_velocity(r.read_i16()?);
+            PlayEvent::AddEntity {
+                eid,
+                uuid,
+                entity_type,
+                x,
+                y,
+                z,
+                pitch,
+                yaw,
+                head_yaw,
+                data,
+                vx,
+                vy,
+                vz,
+            }
+        }
+        "remove_entities" => {
+            let count = usize::try_from(r.read_varint()?)
+                .map_err(|_| "negative entity count".to_string())?;
+            // Each id is at least one VarInt byte.
+            if count > r.remaining() {
+                return Err(format!(
+                    "entity count {count} exceeds {} remaining bytes",
+                    r.remaining()
+                ));
+            }
+            let mut eids = Vec::with_capacity(count);
+            for _ in 0..count {
+                eids.push(r.read_varint()?);
+            }
+            PlayEvent::RemoveEntities { eids }
+        }
+        "move_entity_pos" => {
+            let eid = r.read_varint()?;
+            let dx = wire_delta(r.read_i16()?);
+            let dy = wire_delta(r.read_i16()?);
+            let dz = wire_delta(r.read_i16()?);
+            let on_ground = r.read_bool()?;
+            PlayEvent::MoveEntityPos {
+                eid,
+                dx,
+                dy,
+                dz,
+                on_ground,
+            }
+        }
+        "move_entity_pos_rot" => {
+            let eid = r.read_varint()?;
+            let dx = wire_delta(r.read_i16()?);
+            let dy = wire_delta(r.read_i16()?);
+            let dz = wire_delta(r.read_i16()?);
+            let yaw = wire_angle(r.read_i8()?);
+            let pitch = wire_angle(r.read_i8()?);
+            let on_ground = r.read_bool()?;
+            PlayEvent::MoveEntityPosRot {
+                eid,
+                dx,
+                dy,
+                dz,
+                yaw,
+                pitch,
+                on_ground,
+            }
+        }
+        "move_entity_rot" => {
+            let eid = r.read_varint()?;
+            let yaw = wire_angle(r.read_i8()?);
+            let pitch = wire_angle(r.read_i8()?);
+            let on_ground = r.read_bool()?;
+            PlayEvent::MoveEntityRot {
+                eid,
+                yaw,
+                pitch,
+                on_ground,
+            }
+        }
+        "teleport_entity" => {
+            let eid = r.read_varint()?;
+            let x = r.read_f64()?;
+            let y = r.read_f64()?;
+            let z = r.read_f64()?;
+            let yaw = wire_angle(r.read_i8()?);
+            let pitch = wire_angle(r.read_i8()?);
+            let on_ground = r.read_bool()?;
+            PlayEvent::TeleportEntity {
+                eid,
+                x,
+                y,
+                z,
+                yaw,
+                pitch,
+                on_ground,
+            }
+        }
+        "rotate_head" => {
+            let eid = r.read_varint()?;
+            let head_yaw = wire_angle(r.read_i8()?);
+            PlayEvent::RotateHead { eid, head_yaw }
+        }
+        "set_entity_motion" => {
+            let eid = r.read_varint()?;
+            let vx = wire_velocity(r.read_i16()?);
+            let vy = wire_velocity(r.read_i16()?);
+            let vz = wire_velocity(r.read_i16()?);
+            PlayEvent::SetEntityMotion { eid, vx, vy, vz }
+        }
+        "entity_event" => {
+            // entity_status writes the entity id as a fixed i32, not a VarInt.
+            let eid = r.read_i32()?;
+            let status = r.read_i8()?;
+            PlayEvent::EntityEvent { eid, status }
+        }
+        "hurt_animation" => {
+            let eid = r.read_varint()?;
+            let yaw = r.read_f32()?;
+            PlayEvent::HurtAnimation { eid, yaw }
+        }
+        "damage_event" => {
+            let eid = r.read_varint()?;
+            let source_type = r.read_varint()?;
+            let source_cause = r.read_varint()?;
+            let source_direct = r.read_varint()?;
+            let source_position = if r.read_bool()? {
+                Some([r.read_f64()?, r.read_f64()?, r.read_f64()?])
+            } else {
+                None
+            };
+            PlayEvent::DamageEvent {
+                eid,
+                source_type,
+                source_cause,
+                source_direct,
+                source_position,
+            }
+        }
+        "set_equipment" => {
+            let eid = r.read_varint()?;
+            // topBitSetTerminatedArray: each entry is a slot byte (0x80 = more
+            // follow) plus a Slot; the entry without 0x80 terminates. Vanilla
+            // equipment slots are a small fixed enum, so cap the walk to keep
+            // hostile continuation bytes from amplifying into huge vecs.
+            let mut entries = Vec::new();
+            loop {
+                if entries.len() >= 64 {
+                    return Err("set_equipment entry count exceeds bound".to_string());
+                }
+                let byte = r.read_u8()?;
+                let slot = byte & 0x7f;
+                let item_start = body.len() - r.remaining();
+                let item_end = slot_skip_extent(body, item_start)
+                    .ok_or_else(|| "malformed set_equipment slot".to_string())?;
+                // Advance the reader past the skipped slot bytes.
+                r.take(item_end - item_start)?;
+                entries.push(EquipmentEntry {
+                    slot,
+                    item_wire: body[item_start..item_end].to_vec(),
+                });
+                if byte & 0x80 == 0 {
+                    break;
+                }
+            }
+            PlayEvent::SetEquipment { eid, entries }
+        }
+        "set_entity_data" => {
+            let eid = r.read_varint()?;
+            PlayEvent::SetEntityData {
+                eid,
+                raw_entries: r.rest().to_vec(),
+            }
+        }
+        "set_time" => {
+            let world_age = r.read_i64()?;
+            let time_of_day = r.read_i64()?;
+            PlayEvent::SetTime {
+                world_age,
+                time_of_day,
+            }
+        }
+        "game_event" => {
+            let event = r.read_u8()?;
+            let value = r.read_f32()?;
+            PlayEvent::GameEvent { event, value }
+        }
+        "level_event" => {
+            let event = r.read_i32()?;
+            let pos = r.read_position()?;
+            let data = r.read_i32()?;
+            let disable_relative_volume = r.read_bool()?;
+            PlayEvent::LevelEvent {
+                event,
+                pos,
+                data,
+                disable_relative_volume,
+            }
+        }
+        "level_particles" => {
+            let long_distance = r.read_bool()?;
+            let x = r.read_f64()?;
+            let y = r.read_f64()?;
+            let z = r.read_f64()?;
+            let offset_x = r.read_f32()?;
+            let offset_y = r.read_f32()?;
+            let offset_z = r.read_f32()?;
+            let max_speed = r.read_f32()?;
+            let count = r.read_i32()?;
+            let particle_id = r.read_varint()?;
+            PlayEvent::LevelParticles {
+                particle_id,
+                long_distance,
+                x,
+                y,
+                z,
+                offset_x,
+                offset_y,
+                offset_z,
+                max_speed,
+                count,
+                particle_data: r.rest().to_vec(),
+            }
+        }
+        "block_destruction" => {
+            let breaker_eid = r.read_varint()?;
+            let pos = r.read_position()?;
+            let stage = r.read_i8()?;
+            PlayEvent::BlockDestruction {
+                breaker_eid,
+                pos,
+                stage,
+            }
+        }
+        "block_entity_data" => {
+            let pos = r.read_position()?;
+            let kind = r.read_varint()?;
+            // anonOptionalNbt: a leading 0x00 tag byte means absent; any other
+            // byte is the NBT tag type and the value follows.
+            let nbt_bytes = if r.rest().first() == Some(&0) {
+                r.read_u8()?;
+                Vec::new()
+            } else {
+                read_nbt_raw(&mut r)?.to_vec()
+            };
+            PlayEvent::BlockEntityData {
+                pos,
+                kind,
+                nbt_bytes,
+            }
+        }
+        "open_screen" => {
+            let window_id = r.read_varint()?;
+            let menu_type = r.read_varint()?;
+            let title_nbt = read_nbt_raw(&mut r)?.to_vec();
+            PlayEvent::OpenScreen {
+                window_id,
+                menu_type,
+                title_nbt,
+            }
+        }
+        "container_set_content" => {
+            let window_id = r.read_u8()?;
+            let state_id = r.read_varint()?;
+            let slot_count = r.read_varint()?;
+            PlayEvent::ContainerSetContent {
+                window_id,
+                state_id,
+                slot_count,
+                raw_payload: r.rest().to_vec(),
+            }
+        }
+        "container_set_slot" => {
+            let window_id = r.read_u8()?;
+            let state_id = r.read_varint()?;
+            let slot = r.read_i16()?;
+            PlayEvent::ContainerSetSlot {
+                window_id,
+                state_id,
+                slot,
+                raw_item: r.rest().to_vec(),
+            }
+        }
+        "container_set_data" => {
+            let window_id = r.read_u8()?;
+            let property = r.read_i16()?;
+            let value = r.read_i16()?;
+            PlayEvent::ContainerSetData {
+                window_id,
+                property,
+                value,
+            }
+        }
+        "container_close" => {
+            let window_id = r.read_u8()?;
+            PlayEvent::ContainerClose { window_id }
+        }
+        "set_experience" => {
+            let bar = r.read_f32()?;
+            let level = r.read_varint()?;
+            let total = r.read_varint()?;
+            PlayEvent::SetExperience { bar, level, total }
+        }
+        "update_mob_effect" => {
+            let eid = r.read_varint()?;
+            let effect_id = r.read_varint()?;
+            let amplifier = r.read_varint()?;
+            let duration = r.read_varint()?;
+            let flags = r.read_u8()?;
+            PlayEvent::UpdateMobEffect {
+                eid,
+                effect_id,
+                amplifier,
+                duration,
+                flags,
+            }
+        }
+        "remove_mob_effect" => {
+            let eid = r.read_varint()?;
+            let effect_id = r.read_varint()?;
+            PlayEvent::RemoveMobEffect { eid, effect_id }
+        }
+        "set_action_bar_text" => PlayEvent::SetActionBarText {
+            nbt_bytes: read_nbt_raw(&mut r)?.to_vec(),
+        },
+        "set_title_text" => PlayEvent::SetTitleText {
+            nbt_bytes: read_nbt_raw(&mut r)?.to_vec(),
+        },
+        "set_subtitle_text" => PlayEvent::SetSubtitleText {
+            nbt_bytes: read_nbt_raw(&mut r)?.to_vec(),
+        },
+        "boss_event" => {
+            let uuid = r.read_uuid()?;
+            let action = r.read_varint()?;
+            PlayEvent::BossEvent {
+                uuid,
+                action,
+                raw_payload: r.rest().to_vec(),
+            }
+        }
+        "player_info_remove" => PlayEvent::PlayerInfoRemove {
+            uuids: read_uuid_list(&mut r)?,
+        },
+        _ => return Ok(None),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Serverbound (C2S) gameplay encoder helpers
+// ---------------------------------------------------------------------------
+//
+// Each helper returns `(packet_name, payload)`: the canonical 767 packet name
+// that `mc_spine_proto`'s table resolves to the version-correct packet id at
+// send time (via `ProtocolClient::send_named` / `c2s_id`), plus the encoded
+// body. Names come from the Protocol 767 table — never hardcoded ids.
+
+/// `swing` — arm swing animation. `hand`: 0 = main hand, 1 = off hand.
+pub fn encode_swing(hand: i32) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(6);
+    write_varint(&mut p, hand);
+    ("swing", p)
+}
+
+/// `use_item_on` — use item on a block face. `face` is the direction id
+/// (0..=5); `cursor` is the hit position inside the block (`[x, y, z]`,
+/// 0..=1 each); `sequence` is the acknowledged-use sequence.
+pub fn encode_use_item_on(
+    hand: i32,
+    pos: [i32; 3],
+    face: i32,
+    cursor: [f32; 3],
+    inside: bool,
+    sequence: i32,
+) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(32);
+    write_varint(&mut p, hand);
+    p.extend_from_slice(&pack_position(pos).to_be_bytes());
+    write_varint(&mut p, face);
+    p.extend_from_slice(&cursor[0].to_be_bytes());
+    p.extend_from_slice(&cursor[1].to_be_bytes());
+    p.extend_from_slice(&cursor[2].to_be_bytes());
+    p.push(u8::from(inside));
+    write_varint(&mut p, sequence);
+    ("use_item_on", p)
+}
+
+/// `use_item` — use item in air. `yaw`/`pitch` are the player look angles.
+pub fn encode_use_item(hand: i32, sequence: i32, yaw: f32, pitch: f32) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(15);
+    write_varint(&mut p, hand);
+    write_varint(&mut p, sequence);
+    p.extend_from_slice(&yaw.to_be_bytes());
+    p.extend_from_slice(&pitch.to_be_bytes());
+    ("use_item", p)
+}
+
+/// `player_action` — start/abort/finish digging or item use at `pos` on `face`
+/// (wire i8). `status` is the player-action id (0 = start digging, ...).
+pub fn encode_player_action(
+    status: i32,
+    pos: [i32; 3],
+    face: i8,
+    sequence: i32,
+) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(18);
+    write_varint(&mut p, status);
+    p.extend_from_slice(&pack_position(pos).to_be_bytes());
+    p.push(face as u8);
+    write_varint(&mut p, sequence);
+    ("player_action", p)
+}
+
+/// `pick_item` — pick-block / pick-entity-from-hotbar slot request.
+pub fn encode_pick_item(slot: i32) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(5);
+    write_varint(&mut p, slot);
+    ("pick_item", p)
+}
+
+/// `interact` with `mouse` = 1 — attack the target entity.
+pub fn encode_interact_attack(target: i32, sneaking: bool) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(8);
+    write_varint(&mut p, target);
+    write_varint(&mut p, 1); // mouse: attack
+    p.push(u8::from(sneaking));
+    ("interact", p)
+}
+
+/// `interact` with `mouse` = 0 — interact (right-click) the target entity
+/// with `hand`.
+pub fn encode_interact_use(target: i32, hand: i32, sneaking: bool) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(9);
+    write_varint(&mut p, target);
+    write_varint(&mut p, 0); // mouse: interact
+    write_varint(&mut p, hand);
+    p.push(u8::from(sneaking));
+    ("interact", p)
+}
+
+/// Encode one minimal `Slot` payload for [`encode_container_click`]: an empty
+/// slot (`count = 0`) or a component-free stack (`count`, `item_id`).
+pub fn encode_slot_stack(item_id: i32, count: i32) -> Vec<u8> {
+    let mut p = Vec::with_capacity(8);
+    write_varint(&mut p, count);
+    if count > 0 {
+        write_varint(&mut p, item_id);
+        write_varint(&mut p, 0); // added components
+        write_varint(&mut p, 0); // removed components
+    }
+    p
+}
+
+/// `container_click` — inventory/menu click. `changed_slots` pairs a window
+/// slot index (i16) with its raw `Slot` wire bytes (see [`encode_slot_stack`]
+/// for simple stacks); `cursor_item` is the carried-item `Slot` payload.
+pub fn encode_container_click(
+    window_id: u8,
+    state_id: i32,
+    slot: i16,
+    mouse_button: i8,
+    mode: i32,
+    changed_slots: &[(i16, &[u8])],
+    cursor_item: &[u8],
+) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(64);
+    p.push(window_id);
+    write_varint(&mut p, state_id);
+    p.extend_from_slice(&slot.to_be_bytes());
+    p.push(mouse_button as u8);
+    write_varint(&mut p, mode);
+    write_varint(&mut p, changed_slots.len() as i32);
+    for (location, item) in changed_slots {
+        p.extend_from_slice(&location.to_be_bytes());
+        p.extend_from_slice(item);
+    }
+    p.extend_from_slice(cursor_item);
+    ("container_click", p)
+}
+
+/// `container_button_click` (a.k.a. `enchant_item`) — enchant-table-style
+/// button press. `window_id` is a `ContainerID` (u8); `button_id` is a VarInt.
+pub fn encode_container_button_click(window_id: u8, button_id: i32) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(10);
+    p.push(window_id);
+    write_varint(&mut p, button_id);
+    ("container_button_click", p)
+}
+
+/// `container_close` — close the open container window.
+pub fn encode_container_close(window_id: u8) -> (&'static str, Vec<u8>) {
+    ("container_close", vec![window_id])
+}
+
+/// `chat_command` — unsigned chat command (no leading `/`).
+pub fn encode_chat_command(command: &str) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::new();
+    write_string(&mut p, command);
+    ("chat_command", p)
+}
+
+/// `chat` — unsigned chat message. Produces the unsigned envelope: message,
+/// client timestamp (unix millis), zero salt, no signature, offset 0, and an
+/// empty acknowledged bitset. Servers that require signed chat will reject
+/// this form; signed envelopes need the session's signature chain.
+pub fn encode_chat_message(message: &str) -> (&'static str, Vec<u8>) {
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let mut p = Vec::with_capacity(64 + message.len());
+    write_string(&mut p, message);
+    p.extend_from_slice(&timestamp_ms.to_be_bytes());
+    p.extend_from_slice(&0i64.to_be_bytes()); // salt
+    p.push(0); // signature: absent
+    write_varint(&mut p, 0); // offset / last seen index
+    p.extend_from_slice(&[0, 0, 0]); // acknowledged bitset
+    ("chat", p)
 }
 
 // ---------------------------------------------------------------------------
@@ -1828,6 +3224,9 @@ pub struct ProtocolClient {
     pub sound_events: VecDeque<WireSoundEvent>,
     /// Decoded `stop_sound` payloads, same retention policy.
     pub stop_sound_events: VecDeque<WireStopSound>,
+    /// Decoded `system_chat` NBT payloads, retained bounded for consumers
+    /// needing the raw component (see [`WireChatEvent`]).
+    pub chat_events: VecDeque<WireChatEvent>,
     /// Live audio output pipeline — installed from the session audio
     /// config when one is configured (see
     /// [`crate::audio_out::install_session_audio_config`]); `None` when
@@ -1859,6 +3258,7 @@ impl ProtocolClient {
             packets_tx: 0,
             sound_events: VecDeque::new(),
             stop_sound_events: VecDeque::new(),
+            chat_events: VecDeque::new(),
             audio: crate::audio_out::session_audio_config()
                 .filter(crate::audio_out::AudioRuntime::enabled)
                 .map(|cfg| crate::audio_out::AudioRuntime::new(&cfg)),
@@ -2416,6 +3816,15 @@ impl ProtocolClient {
         self.stop_sound_events.push_back(s);
     }
 
+    /// Retain one decoded `system_chat` NBT payload bounded for consumers
+    /// needing the raw component.
+    fn ingest_chat_event(&mut self, ev: WireChatEvent) {
+        if self.chat_events.len() >= crate::audio_out::pending_wire_event_bound() {
+            self.chat_events.pop_front();
+        }
+        self.chat_events.push_back(ev);
+    }
+
     /// Render whatever audio is due; cheap when nothing is installed or
     /// no wall-clock time has passed.
     fn pump_audio(&mut self) {
@@ -2573,8 +3982,22 @@ impl ProtocolClient {
             }
             Some("system_chat") => {
                 let mut r = WireReader::new(body);
-                let text = r.read_nbt().map(|v| v.extract_text()).unwrap_or_default();
+                // Retain the raw anonymous-NBT component for consumers that
+                // need styled/translatable content; the PlayEvent keeps the
+                // extracted plain text (frozen downstream shape).
+                let nbt_bytes = read_nbt_raw(&mut r).map(|b| b.to_vec()).unwrap_or_default();
                 let overlay = r.read_bool()?;
+                let text = if nbt_bytes.is_empty() {
+                    String::new()
+                } else {
+                    WireReader::new(&nbt_bytes)
+                        .read_nbt()
+                        .map(|v| v.extract_text())
+                        .unwrap_or_default()
+                };
+                if !nbt_bytes.is_empty() {
+                    self.ingest_chat_event(WireChatEvent { nbt_bytes, overlay });
+                }
                 Ok(PlayEvent::SystemChat { text, overlay })
             }
             Some("disconnect") => {
@@ -2606,6 +4029,13 @@ impl ProtocolClient {
                 }
                 Ok(PlayEvent::Other(pid))
             }
+            // Extended 767 play families (entities, world, containers, HUD).
+            // On the 26.x wire these packets carry different shapes, so they
+            // stay undecoded `Other`s rather than mis-parsed.
+            Some(name) if !self.wire_26x() => match decode_extended_play_event(name, body)? {
+                Some(event) => Ok(event),
+                None => Ok(PlayEvent::Other(pid)),
+            },
             _ => Ok(PlayEvent::Other(pid)),
         }
     }

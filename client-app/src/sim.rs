@@ -646,6 +646,10 @@ impl SessionRunner {
                 return Err(format!("server disconnected during play: {reason}"));
             }
             PlayEvent::Other(_) => {}
+            // Extended 767 play families (entities, world, containers, HUD)
+            // decode into typed events; the session runner does not consume
+            // them yet, so they are acknowledged and dropped here.
+            _ => {}
         }
         Ok(())
     }

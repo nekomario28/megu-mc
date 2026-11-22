@@ -1805,6 +1805,7 @@ mod tests {
             cx,
             cz,
             sections,
+            block_entities: Vec::new(),
             light: DecodedLightData {
                 sky_mask: Vec::new(),
                 block_mask: Vec::new(),

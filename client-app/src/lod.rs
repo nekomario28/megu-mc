@@ -657,6 +657,7 @@ mod tests {
         let decoded = DecodedChunk {
             cx: 0,
             cz: 0,
+            block_entities: Vec::new(),
             sections: vec![
                 DecodedSection {
                     non_air: 1,

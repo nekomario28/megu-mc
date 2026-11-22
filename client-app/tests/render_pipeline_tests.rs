@@ -319,6 +319,7 @@ fn chunk(cx: i32, cz: i32, sections: Vec<DecodedSection>) -> DecodedChunk {
         cx,
         cz,
         sections,
+        block_entities: Vec::new(),
         light: DecodedLightData {
             sky_mask: Vec::new(),
             block_mask: Vec::new(),
