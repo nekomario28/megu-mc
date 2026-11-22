@@ -18,6 +18,8 @@ use std::path::Path;
 
 use mc_spine_client_mesh::RenderBackendPreference;
 
+use crate::crash_reporter::{parse_report_url, CrashSubmitPolicy};
+
 use crate::audio_qol::{
     DEFAULT_CHAT_HISTORY_LINES, DEFAULT_MAX_CONCURRENT_SAME_SOUND, DEFAULT_MAX_VOLUME_CAP,
     DEFAULT_TOOL_WARN_PERCENT, DEFAULT_ZOOM_DIVISOR, MAX_CHAT_HISTORY_LINES,
@@ -241,6 +243,39 @@ named_option!(HostMinimapMode, HostMinimapMode::Unrestricted,
 named_option!(HostPlayerRadarScope, HostPlayerRadarScope::All,
     All => "all", PartyOnly => "party_only", None => "none");
 
+/// `crash_report_mode`: consent gate for transmitting crash reports to the
+/// optional report relay — 1:1 with
+/// [`crate::crash_reporter::CrashSubmitPolicy`].
+///
+/// Default-safe: an absent TOML key reads as [`CrashReportMode::Ask`], so
+/// crash files are written locally and nothing is transmitted until the
+/// user confirms. [`CrashReportMode::parse`] fails closed — an
+/// unrecognized token is `None`, never a guess.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrashReportMode {
+    /// Never send automatically; explicit user confirmation required.
+    Ask,
+    /// Automatic send for crash reports only; manual bug reports still
+    /// require confirmation.
+    AutoCrashOnly,
+    /// Local files only — no report ever leaves the machine.
+    Off,
+}
+
+named_option!(CrashReportMode, CrashReportMode::Ask,
+    Ask => "ask", AutoCrashOnly => "auto_crash_only", Off => "off");
+
+impl CrashReportMode {
+    /// The [`CrashSubmitPolicy`] consent gate this mode maps onto.
+    pub const fn submit_policy(self) -> CrashSubmitPolicy {
+        match self {
+            Self::Ask => CrashSubmitPolicy::Ask,
+            Self::AutoCrashOnly => CrashSubmitPolicy::AutoCrashOnly,
+            Self::Off => CrashSubmitPolicy::Off,
+        }
+    }
+}
+
 /// Map-mod fair-play policy for a world this client hosts directly
 /// (integrated server, LAN share, or a `MEGU-XXXX-XXXX` friend relay).
 ///
@@ -416,6 +451,17 @@ pub struct ClientSettings {
     /// Quality-of-life toggles (audio limiter, zoom, tool warnings, chat
     /// history) persisted under the `[qol]` TOML table.
     pub qol: ClientQolSettings,
+    /// Crash-report consent policy (`crash_report_mode`): `ask` (the
+    /// default) writes reports locally and asks before transmitting,
+    /// `auto_crash_only` relays crash fingerprints without prompting, and
+    /// `off` disables submission entirely.
+    pub crash_report_mode: CrashReportMode,
+    /// Optional report relay endpoint (`report_endpoint`):
+    /// `https://<host>` or loopback `http://127.0.0.1:<port>/...` — the
+    /// same allowlist [`crate::crash_reporter::parse_report_url`]
+    /// enforces. `None` — the default — means zero network egress:
+    /// reports stay on disk under `crash-reports/` no matter the mode.
+    pub report_endpoint: Option<String>,
 }
 
 impl Default for ClientSettings {
@@ -451,6 +497,8 @@ impl ClientSettings {
             shader_profile: None,
             map_fair_play: HostMapFairPlaySettings::default(),
             qol: ClientQolSettings::default(),
+            crash_report_mode: CrashReportMode::default(),
+            report_endpoint: None,
         };
         match preset {
             QualityPreset::Fast => {
@@ -522,6 +570,15 @@ impl ClientSettings {
                 shader_lines.push_str(&format!("shader_profile = \"{profile}\"\n"));
             }
         }
+        // The report endpoint is omitted entirely when unset so a default
+        // file configures no egress; only values that still pass the
+        // transport URL allowlist are ever written back out.
+        let mut report_line = String::new();
+        if let Some(endpoint) = &self.report_endpoint {
+            if parse_report_url(endpoint).is_ok() {
+                report_line.push_str(&format!("report_endpoint = \"{endpoint}\"\n"));
+            }
+        }
         format!(
             "# mc-spine client settings\n\
              preset = \"{}\"\n\
@@ -536,7 +593,9 @@ impl ClientSettings {
              max_fps = {}\n\
              background_fps_limit = {}\n\
              gpu_backend = \"{}\"\n\
+             crash_report_mode = \"{}\"\n\
              {shader_lines}\
+             {report_line}\
              \n\
              [host_map_fair_play]\n\
              minimap_fair_play = {}\n\
@@ -567,6 +626,7 @@ impl ClientSettings {
             max_fps,
             self.background_fps_limit,
             self.gpu_backend.as_str(),
+            self.crash_report_mode.as_str(),
             self.map_fair_play.minimap_fair_play,
             self.map_fair_play.allow_cave_map,
             self.map_fair_play.allow_entity_radar,
@@ -656,6 +716,8 @@ impl ClientSettings {
                 "retain_chat_on_reconnect" => {
                     self.qol.retain_chat_on_reconnect = parsed.qol.retain_chat_on_reconnect;
                 }
+                "crash_report_mode" => self.crash_report_mode = parsed.crash_report_mode,
+                "report_endpoint" => self.report_endpoint = parsed.report_endpoint.clone(),
                 _ => {}
             }
         }
@@ -828,6 +890,32 @@ impl ClientSettings {
                     }
                     None => invalid(&mut warnings),
                 },
+                "crash_report_mode" => match CrashReportMode::parse(value) {
+                    Some(m) => {
+                        settings.crash_report_mode = m;
+                        seen.push("crash_report_mode");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "report_endpoint" => {
+                    if value.is_empty() {
+                        // An explicit empty string clears a configured
+                        // endpoint, restoring the no-egress default.
+                        settings.report_endpoint = None;
+                        seen.push("report_endpoint");
+                    } else {
+                        match parse_report_url(value) {
+                            // Fail closed: only allowlisted URLs are stored.
+                            Ok(_) => {
+                                settings.report_endpoint = Some(value.to_string());
+                                seen.push("report_endpoint");
+                            }
+                            Err(err) => warnings.push(format!(
+                                "invalid value for '{key}': '{value}' ({err})"
+                            )),
+                        }
+                    }
+                }
                 "minimap_fair_play" => match parse_bool(value) {
                     Some(b) => {
                         // Legacy master switch maps onto the granular
@@ -1254,6 +1342,8 @@ mod tests {
                 chat_history_lines: 250,
                 retain_chat_on_reconnect: false,
             },
+            crash_report_mode: CrashReportMode::AutoCrashOnly,
+            report_endpoint: Some("https://reports.example.com/api/report".to_owned()),
         };
         let text = s.to_toml();
         let (back, warnings) = ClientSettings::from_toml(&text);

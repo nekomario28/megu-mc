@@ -8,11 +8,13 @@ use std::path::{Path, PathBuf};
 use mc_spine_client_mesh::RenderBackendPreference;
 use mc_spine_proto::friend_relay::InviteCode;
 
+use crate::crash_reporter::parse_report_url;
 use crate::hardware_profile::{probe_host_hardware, recommend_tuning};
 use crate::settings::{
-    sanitize_shader_selector, ClientSettings, CloudMode, DistantHorizon, HostMinimapMode,
-    HostPlayerRadarScope, ParticleLevel, QualityPreset, MAX_BACKGROUND_FPS, MAX_FOV,
-    MAX_MAX_FPS, MAX_VIEW_DISTANCE, MIN_FOV, MIN_MAX_FPS, MIN_VIEW_DISTANCE, SETTINGS_FILE_NAME,
+    sanitize_shader_selector, ClientSettings, CloudMode, CrashReportMode, DistantHorizon,
+    HostMinimapMode, HostPlayerRadarScope, ParticleLevel, QualityPreset, MAX_BACKGROUND_FPS,
+    MAX_FOV, MAX_MAX_FPS, MAX_VIEW_DISTANCE, MIN_FOV, MIN_MAX_FPS, MIN_VIEW_DISTANCE,
+    SETTINGS_FILE_NAME,
 };
 
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -184,6 +186,24 @@ pub struct CliConfig {
     /// Whether `--view-distance` was given on the command line.
     pub view_distance_explicit: bool,
 
+    /// `--crash-report-mode <ask|auto_crash_only|off>`: consent-policy
+    /// override applied on top of the TOML `crash_report_mode` key.
+    pub crash_report_mode: Option<CrashReportMode>,
+    /// `--report-endpoint <url>`: report relay URL, validated through
+    /// [`parse_report_url`] at parse time; overrides the TOML
+    /// `report_endpoint` key. `None` = no network egress.
+    pub report_endpoint: Option<String>,
+    /// `--crash-reports-dir <path>`: crash-report directory override;
+    /// defaults to `<gameDir>/crash-reports` or `./crash-reports`.
+    pub crash_reports_dir: Option<PathBuf>,
+    /// `--flush-crash-reports`: offline-safe recovery pass over the crash
+    /// directory — summarizes queued `pending-*.json` payloads and sends
+    /// only what the resolved consent policy allows.
+    pub flush_crash_reports: bool,
+    /// `--confirm-send`: explicit user consent for
+    /// `--flush-crash-reports` under `ask` mode.
+    pub confirm_send: bool,
+
     /// Resolved player settings; populated by
     /// [`CliConfig::resolve_client_settings`].
     pub client_settings: ClientSettings,
@@ -258,6 +278,11 @@ impl Default for CliConfig {
             player_radar: None,
             allow_waypoint_teleport: None,
             view_distance_explicit: false,
+            crash_report_mode: None,
+            report_endpoint: None,
+            crash_reports_dir: None,
+            flush_crash_reports: false,
+            confirm_send: false,
             client_settings: ClientSettings::default(),
             settings_source_present: false,
             secrets: Vec::new(),
@@ -332,6 +357,11 @@ impl fmt::Debug for CliConfig {
             .field("player_radar", &self.player_radar)
             .field("allow_waypoint_teleport", &self.allow_waypoint_teleport)
             .field("view_distance_explicit", &self.view_distance_explicit)
+            .field("crash_report_mode", &self.crash_report_mode)
+            .field("report_endpoint", &self.report_endpoint)
+            .field("crash_reports_dir", &self.crash_reports_dir)
+            .field("flush_crash_reports", &self.flush_crash_reports)
+            .field("confirm_send", &self.confirm_send)
             .field("client_settings", &self.client_settings)
             .field("settings_source_present", &self.settings_source_present)
             .finish()
@@ -361,6 +391,19 @@ impl CliConfig {
     /// Redact any known secret tokens from an arbitrary diagnostic message.
     pub fn redact(&self, message: &str) -> String {
         redact_with_secrets(message, &self.secrets)
+    }
+
+    /// Crash-report directory: `--crash-reports-dir` when given, else
+    /// `<gameDir>/crash-reports` when `--gameDir` is set, else
+    /// `./crash-reports` relative to the working directory.
+    pub fn resolved_crash_reports_dir(&self) -> PathBuf {
+        if let Some(dir) = &self.crash_reports_dir {
+            return dir.clone();
+        }
+        if let Some(game_dir) = &self.game_dir {
+            return game_dir.join("crash-reports");
+        }
+        PathBuf::from("crash-reports")
     }
 
     /// Whether the run requests a server or render action (as opposed to a
@@ -496,6 +539,14 @@ impl CliConfig {
         if let Some(value) = &self.shader_profile {
             settings.shader_profile = Some(value.clone());
             tuned = true;
+        }
+        // Crash-report policy flags: consent and egress configuration,
+        // not quality-preset dimensions, so they do not mark `Custom`.
+        if let Some(mode) = self.crash_report_mode {
+            settings.crash_report_mode = mode;
+        }
+        if let Some(endpoint) = &self.report_endpoint {
+            settings.report_endpoint = Some(endpoint.clone());
         }
         // Host fair-play policy: `--fair-play` switches the minimap into
         // fair-play mode and locks every granular switch, then each
@@ -947,6 +998,25 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
                     .map_err(|_| format!("invalid --height '{raw_h}'"))?;
                 cfg.render_height = parsed.clamp(64, 1080);
             }
+            "--crash-report-mode" => {
+                let raw = take_val(flag, &mut i)?;
+                cfg.crash_report_mode = Some(CrashReportMode::parse(&raw).ok_or_else(|| {
+                    format!(
+                        "invalid --crash-report-mode '{raw}' (expected ask, auto_crash_only, or off)"
+                    )
+                })?);
+            }
+            "--report-endpoint" => {
+                let raw = take_val(flag, &mut i)?;
+                parse_report_url(&raw)
+                    .map_err(|err| format!("invalid --report-endpoint '{raw}': {err}"))?;
+                cfg.report_endpoint = Some(raw);
+            }
+            "--crash-reports-dir" => {
+                cfg.crash_reports_dir = Some(PathBuf::from(take_val(flag, &mut i)?));
+            }
+            "--flush-crash-reports" => cfg.flush_crash_reports = true,
+            "--confirm-send" => cfg.confirm_send = true,
             // Standard optional Minecraft launcher flags that take no value.
             "--demo" | "--fullscreen" | "--disableMultiplayer" | "--disableChat" => {}
             // Standard optional Minecraft launcher flags that take a single value.
@@ -995,6 +1065,10 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
                 "--join-code cannot be combined with another server target or --ping".to_string(),
             );
         }
+    }
+
+    if cfg.confirm_send && !cfg.flush_crash_reports {
+        return Err("--confirm-send only applies to --flush-crash-reports".to_string());
     }
 
     Ok(cfg)
@@ -1112,6 +1186,23 @@ HOST WORLD MAP FAIR PLAY:
                                    (default none under --fair-play, all
                                    otherwise)
   --allow-waypoint-teleport <t|f>  Allow world-map waypoint teleport (same)
+
+CRASH REPORTS:
+  Panics are always written as redacted crash-<fingerprint>.md files under
+  the crash-reports directory; nothing is transmitted unless a relay
+  endpoint is configured AND the consent mode allows it.
+  --crash-report-mode <mode>       Consent policy: ask|auto_crash_only|off
+                                   (default: ask; TOML crash_report_mode)
+  --report-endpoint <url>          Report relay URL: https://<host> or a
+                                   loopback http://127.0.0.1:<port>/api/report;
+                                   unset means no network egress
+  --crash-reports-dir <path>       Crash report directory (default:
+                                   <gameDir>/crash-reports or ./crash-reports)
+  --flush-crash-reports            Summarize queued reports and send the
+                                   pending ones the policy allows, then exit;
+                                   honors --json/--json-summary
+  --confirm-send                   Confirm sending queued reports for
+                                   --flush-crash-reports under 'ask' mode
 "
     )
 }
