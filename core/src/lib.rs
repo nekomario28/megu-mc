@@ -57,6 +57,13 @@
 //!   [`sys_metrics::MiniHudConfig`] + [`sys_metrics::format_mini_hud_lines`]
 //!   selectable-overlay formatter. No clocks, no panics, no external
 //!   crates.
+//! * [`romaji_ime`] — a clean-room, opt-in LunaChat-style romaji → kana
+//!   chat converter: [`romaji_ime::romaji_to_hiragana`] covers
+//!   Hepburn/Kunrei rows, youon, sokuon, small kana and `ん` rules, and
+//!   [`romaji_ime::format_romaji_chat`] adds the smart bypass pipeline
+//!   (commands, escape prefix, existing Japanese, URLs, mentions,
+//!   numerics, all-caps acronyms) with a vanilla-safe 256-char bound.
+//!   [`romaji_ime::RomajiChatMode::Off`] is the strict vanilla default.
 
 #![deny(unsafe_code)]
 
@@ -70,6 +77,7 @@ pub mod math;
 pub mod math_opt_foundation;
 pub mod perf_kit;
 pub mod random;
+pub mod romaji_ime;
 pub mod server_perf_governors;
 pub mod sys_metrics;
 pub mod version;
