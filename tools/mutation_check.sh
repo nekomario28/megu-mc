@@ -706,7 +706,7 @@ check "the light packet assembles spill into its floors" \
 
 check "a knocked-out gravity block becomes an entity" \
   src/main.rs '        let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-        falling().lock().unwrap().push(Fall {
+        falling().lock().unwrap_or_else(|e| e.into_inner()).push(Fall {
             eid,
             x: px as f64 + 0.5,
             y: py as f64,
@@ -765,8 +765,8 @@ check "a fast fall sweeps for a thin platform" \
   a_fast_falling_block_lands_on_a_thin_platform_it_crosses
 
 check "a falling tick leaves the queue visible to a save" \
-  src/main.rs '    let active: Vec<Fall> = falling().lock().unwrap().clone();' \
-  '    let active: Vec<Fall> = std::mem::take(&mut *falling().lock().unwrap());' \
+  src/main.rs '    let active: Vec<Fall> = falling().lock().unwrap_or_else(|e| e.into_inner()).clone();' \
+  '    let active: Vec<Fall> = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));' \
   beginning_a_falling_tick_leaves_the_queue_visible
 
 check "a save is serialized with the falling transition" \
@@ -855,8 +855,8 @@ check "containers must be decoded, not merely remain absent" \
   a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load
 
 check "a broken furnace cannot retain its slots" \
-  src/main.rs '            if let Some(f) = furnaces().lock().unwrap().remove(&ow_block((x, y, z))) {' \
-  '            if let Some(f) = furnaces().lock().unwrap().remove(&ow_block((x, y, z + 1000))) {' \
+  src/main.rs '            if let Some(f) = furnaces().lock().unwrap_or_else(|e| e.into_inner()).remove(&ow_block((x, y, z))) {' \
+  '            if let Some(f) = furnaces().lock().unwrap_or_else(|e| e.into_inner()).remove(&ow_block((x, y, z + 1000))) {' \
   furnace_and_sign_round_trip_keeps_only_live_owners
 
 check "broken sign text cannot survive its block" \
@@ -1200,8 +1200,8 @@ check "breaking changes server state, not only the predicted wire update" \
     note_block_update_dim(dim, x, y, z, 0);' \
   tests/gameplay_wire.py 'gameplay wire: FAIL fresh-reader-block'
 check "chat returns the actual sender and message" \
-  src/play_protocol.rs '                    let line = format!("<{}> {}", me.name, m);' \
-  '                    let line = format!("<{}> {}", me.name, "");' \
+  src/play_protocol.rs '            let system_payload = system_chat(&format!("<{}> {}", me.name, m));' \
+  '            let system_payload = system_chat(&format!("<{}> {}", me.name, ""));' \
   tests/gameplay_wire.py 'gameplay wire: FAIL chat-echo'
 
 check "light arrays agree with their section masks" \
@@ -2158,8 +2158,10 @@ check "shared voxel faces preserve transition direction" \
   voxel_faces::tests::exposed_faces_match_actual_native_sequence
 
 check "tree consumes shared voxel faces in native order" \
-  src/tree.rs 'crate::voxel_faces::exposed_faces(shape.positions())' \
-  'crate::voxel_faces::exposed_faces(shape.positions()).into_iter().rev()' \
+  src/tree.rs '            for x in 0..=xs {
+                let cur = x < xs && filled[x * yz + line];' \
+  '            for x in (0..=xs).rev() {
+                let cur = x < xs && filled[x * yz + line];' \
   tree::tests::leaf_edge_schedules_match_native_order
 
 check "solid template consumes shared voxel faces in native order" \
@@ -2677,11 +2679,11 @@ check "mineshaft structure dispatch is not gated by placed features" \
   src/feature.rs '    for step in 0..order.len().max(structures.step_count()) {
         // Structures have steps even when the biome has no placed features.
         // Their registry slots and RNG streams are independent.
-        structures.place_step(&mut ctx, step, pop as u64, sx, sz);' \
+        structures.place_step(&mut ctx, step, pop, sx, sz);' \
   '    for step in 0..order.len() {
         // Structures have steps even when the biome has no placed features.
         // Their registry slots and RNG streams are independent.
-        structures.place_step(&mut ctx, step, pop as u64, sx, sz);' \
+        structures.place_step(&mut ctx, step, pop, sx, sz);' \
   tests/mineshaft_dispatch_test.py 'mineshaft dispatch: FAIL structures without placed features'
 
 check "mineshaft spawner block stages its native block entity" \
@@ -2713,7 +2715,7 @@ check "regenerating cached blocks cannot recreate generated entities" \
   mineshaft::tests::generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once
 
 check "generated chest minecarts reach the actual entity tracker" \
-  src/play_protocol.rs '    for cart in generated_content().lock().unwrap().carts.iter() {' '    for cart in Vec::<generated_content::Cart>::new().iter() {' \
+  src/play_protocol.rs '    for cart in generated_content().lock().unwrap_or_else(|e| e.into_inner()).carts.iter() {' '    for cart in Vec::<generated_content::Cart>::new().iter() {' \
   mineshaft::tests::generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once
 
 check "generated spawner packets use the native registry type" \
@@ -2752,8 +2754,8 @@ check "unpacked empty chest minecarts persist their empty container without re-r
   mineshaft_runtime_tests::cart_deferred_loot_window_click_persistence_and_break_over_packets
 
 check "breaking a chest minecart removes its runtime container entry" \
-  src/main.rs '            if let Some(slots) = chests().lock().unwrap().remove(&ContainerKey::Cart(uuid)) {' \
-  '            if let Some(slots) = chests().lock().unwrap().get(&ContainerKey::Cart(uuid)).cloned() {' \
+  src/main.rs '            if let Some(slots) = chests().lock().unwrap_or_else(|e| e.into_inner()).remove(&ContainerKey::Cart(uuid)) {' \
+  '            if let Some(slots) = chests().lock().unwrap_or_else(|e| e.into_inner()).get(&ContainerKey::Cart(uuid)).cloned() {' \
   mineshaft_runtime_tests::cart_deferred_loot_window_click_persistence_and_break_over_packets
 
 check "cave-spider spawner light check rejects lit blocks" \
@@ -2762,13 +2764,13 @@ check "cave-spider spawner light check rejects lit blocks" \
   mineshaft_runtime_tests::spawner_runtime_tick_light_cap_break_and_persistence
 
 check "cave-spider spawner counts living nearby spiders for MaxNearbyEntities" \
-  src/main.rs '            .filter(|m| m.dim == DimId::Overworld && m.etype == cave_spider && *m.hp.lock().unwrap() > 0.0)' \
-  '            .filter(|m| m.dim == DimId::Overworld && m.etype == cave_spider && *m.hp.lock().unwrap() < 0.0)' \
+  src/main.rs '            .filter(|m| m.dim == DimId::Overworld && m.etype == cave_spider && *m.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0)' \
+  '            .filter(|m| m.dim == DimId::Overworld && m.etype == cave_spider && *m.hp.lock().unwrap_or_else(|e| e.into_inner()) < 0.0)' \
   mineshaft_runtime_tests::spawner_runtime_tick_light_cap_break_and_persistence
 
 check "breaking a spawner block removes its owned NBT entry" \
   src/main.rs '    if Some(st) != name_to_state("spawner") {
-        generated_content().lock().unwrap().spawners.remove(&(x,y,z));
+        generated_content().lock().unwrap_or_else(|e| e.into_inner()).spawners.remove(&(x,y,z));
     }' \
   '    if Some(st) != name_to_state("spawner") {
         let _ = (x, y, z);
@@ -3398,13 +3400,15 @@ check "a request's queue level is its Chebyshev ring + 31, one level per step" \
   worldgen::wg_tests::default_dispatch_runs_the_named_population_order
 
 check "the population queue pops the lowest non-empty level" \
-  src/worldgen.rs '        let Some(level) = buckets
-            .iter()
-            .find(|(_, bucket)| !bucket.is_empty())' \
-  '        let Some(level) = buckets
-            .iter()
-            .rev()
-            .find(|(_, bucket)| !bucket.is_empty())' \
+  src/worldgen.rs '    while let Some(level) = buckets
+        .iter()
+        .find(|(_, bucket)| !bucket.is_empty())
+        .map(|(level, _)| *level)' \
+  '    while let Some(level) = buckets
+        .iter()
+        .rev()
+        .find(|(_, bucket)| !bucket.is_empty())
+        .map(|(level, _)| *level)' \
   worldgen::wg_tests::default_dispatch_runs_the_named_population_order
 
 check "a compiled cache node still returns its input" \
@@ -3540,8 +3544,18 @@ check "entity_fluid_eye_immersion_respects_pose_and_surface" \
 # Chest world-side contract (M2 Gameplay Slice 3c):
 # `ChestBlock.isChestBlockedAt` on both halves, multi-viewer `broadcastChanges`, and `recheckOpeners`.
 check "chest_contract_double_chest_blocks_when_either_half_blocked" \
-  src/menus_and_items.rs '        .any(is_chest_blocked_at)' \
-  '        .all(is_chest_blocked_at)' \
+  src/menus_and_items.rs '    for pos in chest_window_halves(window) {
+        if is_chest_blocked_at(pos) {
+            return true;
+        }
+    }
+    false' \
+  '    for pos in chest_window_halves(window) {
+        if !is_chest_blocked_at(pos) {
+            return false;
+        }
+    }
+    true' \
   tick_tests::chest_contract_blocked_single_double_cat_and_unblocked_barrel
 
 check "chest_contract_broadcast_changes_diffs_both_halves" \
@@ -3646,7 +3660,7 @@ check "lake_feature_barrier_marks_above_for_post_processing" \
 # lazy block loot materialization, BarrelBlock open property, waterlogged dry partner Solid,
 # and EnderChestBlockEntity anchored 0x08 opener counting.
 check "chest_contract_3d_block_loot_lazy_defers_materialization" \
-  src/main.rs '                pending_block_loot().lock().unwrap().insert(
+  src/main.rs '                pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()).insert(
                     ow_block(pos),
                     PendingBlockLoot {
                         kind,
@@ -3892,8 +3906,8 @@ check "p2_3_s3_block_light_anchors_at_dimension_light_min_y" \
 # A band read that answers from the Overworld's key makes a Nether write invisible to its own
 # band (and lets an Overworld cell answer for it) at the same (cx, cz).
 check "p2_3_s3_band_cache_is_keyed_by_dimension" \
-  src/main.rs '    let band = op_bands().lock().unwrap().get((dim, cx, cz))?;' \
-  '    let band = op_bands().lock().unwrap().get((DimId::Overworld, cx, cz))?;' \
+  src/main.rs '    let band = op_bands().lock().unwrap_or_else(|e| e.into_inner()).get((dim, cx, cz))?;' \
+  '    let band = op_bands().lock().unwrap_or_else(|e| e.into_inner()).get((DimId::Overworld, cx, cz))?;' \
   tick_tests::p2_3_s3_chunk_caches_isolate_dimensions_on_same_coords
 
 # P2-3-S4: the dimension a client is in has to reach the wire id, the 0x47 payload, the
@@ -3917,8 +3931,8 @@ check "p2_3_s4_spawn_info_uses_wire_id" \
   tick_tests::p2_3_s4_join_game_declares_all_three_dimensions_and_names_spawn_dim
 
 check "p2_3_s4_switch_clears_the_old_window" \
-  src/play_protocol.rs '        me.chunks.lock().unwrap().clear();' \
-  '        me.chunks.lock().unwrap().insert((9999, 9999));' \
+  src/play_protocol.rs '        me.chunks.lock().unwrap_or_else(|e| e.into_inner()).clear();' \
+  '        me.chunks.lock().unwrap_or_else(|e| e.into_inner()).insert((9999, 9999));' \
   tick_tests::p2_3_s4_switch_client_dimension_emits_respawn_clears_chunks_and_syncs_position
 
 check "p2_3_s4_respawn_names_the_destination" \
@@ -3944,7 +3958,7 @@ check "p2_3_s4_chunk_deltas_respect_the_dimension_filter" \
   src/play_protocol.rs '        let Ok(mut socket) = client.sock.lock() else {
             continue;
         };
-        if *client.dim.lock().unwrap() != dim {
+        if *client.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
             continue;
         }
         let (id, packet) = mk(client);' \
@@ -3960,7 +3974,7 @@ check "p2_3_s4_block_deltas_are_dimension_scoped" \
   src/play_protocol.rs '        let Ok(mut socket) = client.sock.lock() else {
             continue;
         };
-        if *client.dim.lock().unwrap() != dim {
+        if *client.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
             continue;
         }
         let (id, packet) = mk(client);' \
