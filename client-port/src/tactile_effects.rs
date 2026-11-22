@@ -1589,7 +1589,9 @@ impl TactileEffectsSim {
                 | TactileParticleKind::WetDrip
                 | TactileParticleKind::CeilingDrip => {
                     p.vel[1] -= 14.0 * dt;
-                    let drag = 1.0 - 0.6 * dt;
+                    // Exponential drag: `exp(-k*dt)` compounds to the same
+                    // total decay at any frame rate, unlike `1 - k*dt`.
+                    let drag = (-0.6 * dt).exp();
                     for c in &mut p.vel {
                         *c *= drag;
                     }
@@ -1599,7 +1601,7 @@ impl TactileEffectsSim {
                 }
                 TactileParticleKind::SteamPuff | TactileParticleKind::ColdBreathVapor => {
                     p.vel[1] += 0.6 * dt;
-                    let drag = 1.0 - 1.4 * dt;
+                    let drag = (-1.4 * dt).exp();
                     for c in &mut p.vel {
                         *c *= drag;
                     }
@@ -1623,7 +1625,7 @@ impl TactileEffectsSim {
                     p.vel[2] = -r * w * (p.age_sec * w + p.phase).sin();
                 }
                 TactileParticleKind::FootstepPuff | TactileParticleKind::ArrowTrailMote => {
-                    let drag = 1.0 - 3.0 * dt;
+                    let drag = (-3.0 * dt).exp();
                     for c in &mut p.vel {
                         *c *= drag;
                     }

@@ -952,3 +952,59 @@ fn subtle_preset_emits_fewer_than_fancy() {
     assert!(subtle.len() < fancy.len());
     assert!(!subtle.is_empty());
 }
+
+#[test]
+fn drag_decay_is_frame_rate_independent() {
+    // Drag must compound as exp(-k*dt): the same wall-time elapsed in one
+    // coarse step or many fine steps has to leave drag-only velocity
+    // components (horizontal splash/footstep/breath motion) essentially
+    // identical. `1 - k*dt` Euler drag fails this at large dt.
+    let mut coarse = fancy_sim(VfxHardwareTier::Balanced);
+    let mut fine = fancy_sim(VfxHardwareTier::Balanced);
+    for sim in [&mut coarse, &mut fine] {
+        sim.emit_fluid_entry(&entry(FluidEntryBody::PlayerOrMediumMob, 9.0, false));
+        sim.emit_footstep_or_landing([0.0, 64.0, 0.0], GroundSurfaceKind::Snow, 8.0, 11);
+        sim.emit_cold_breath([0.0, 64.0, 0.0], [0.0, 0.0, 1.0], -5.0, false, 12);
+    }
+    assert!(!coarse.is_empty() && !fine.is_empty());
+
+    coarse.step(0.25);
+    for _ in 0..5 {
+        fine.step(0.05);
+    }
+
+    let vel_of =
+        |sim: &TactileEffectsSim, pred: fn(&TactileParticleKind) -> bool| -> Vec<[f32; 3]> {
+            sim.particles()
+                .iter()
+                .filter(|p| pred(&p.kind))
+                .map(|p| p.vel)
+                .collect()
+        };
+    let is_splash = |k: &TactileParticleKind| matches!(k, TactileParticleKind::SplashDroplet);
+    let is_puff = |k: &TactileParticleKind| matches!(k, TactileParticleKind::FootstepPuff);
+    let is_breath = |k: &TactileParticleKind| matches!(k, TactileParticleKind::ColdBreathVapor);
+    for (name, pred) in [
+        ("splash", is_splash as fn(&TactileParticleKind) -> bool),
+        ("footstep", is_puff),
+        ("breath", is_breath),
+    ] {
+        let a = vel_of(&coarse, pred);
+        let b = vel_of(&fine, pred);
+        assert_eq!(a.len(), b.len(), "{name}: particle count diverged");
+        assert!(!a.is_empty(), "{name}: no particles to compare");
+        for (i, (va, vb)) in a.iter().zip(b.iter()).enumerate() {
+            // Horizontal components see only drag (gravity/buoyancy act on
+            // vel[1]); vel[2] of breath is likewise drag-only.
+            for axis in [0usize, 2] {
+                let diff = (va[axis] - vb[axis]).abs();
+                assert!(
+                    diff < 1.0e-3,
+                    "{name}[{i}] vel[{axis}]: coarse={:?} fine={:?} diff={diff}",
+                    va[axis],
+                    vb[axis]
+                );
+            }
+        }
+    }
+}

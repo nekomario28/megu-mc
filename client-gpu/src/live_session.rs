@@ -627,6 +627,17 @@ impl LiveSession {
                 self.last_motion_delta = [0.0; 2];
                 self.chunk_fades = ChunkFadeTracker::new();
                 self.prefetcher = SpeculativeChunkPrefetcher::new();
+                // A dimension change invalidates the previous dimension's
+                // season frame: restore the untinted atmosphere base instead
+                // of snapping to a possibly season-tinted target, and drop
+                // the SSN1 bookkeeping so a stale seasonal grade (or its
+                // aurora/snow ambience) cannot leak into the new dimension.
+                self.latest_season = None;
+                self.season_ambience = SeasonAmbienceInput::default();
+                self.nature_env.season = self.season_ambience;
+                self.seasoned_atmosphere_target = None;
+                self.atmosphere_blender
+                    .set_target(self.base_atmosphere_target);
                 self.atmosphere_blender.snap_to_target();
             }
             PlayEvent::Teleport(teleport) => {
@@ -1567,6 +1578,40 @@ mod tests {
         assert!(
             tropical_target.fog_density < winter_target.fog_density,
             "tropical dims lose the snowy haze"
+        );
+    }
+
+    #[test]
+    fn respawn_clears_stale_season_tint_and_ambience() {
+        let (mut live, _tx) = session();
+        // Install a winter SSN1 frame: tinted atmosphere target + winter
+        // ambience state.
+        let winter = ssn1_frame(10, 49_151, [235, 240, 255], [220, 230, 240], 0b100);
+        live.apply_event(framed(CHANNEL_SEASON_V1, &winter))
+            .unwrap();
+        assert!(!live.season_ambience.is_seasonless);
+        assert_ne!(
+            live.atmosphere_blender.target(),
+            live.base_atmosphere_target
+        );
+
+        // Respawning into another dimension must not keep the old
+        // dimension's seasonal grade or ambience: the untinted base is
+        // restored and the SSN1 bookkeeping resets until the next frame.
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::Respawn {
+            dimension: DimensionMeta::default(),
+        }))
+        .unwrap();
+        assert!(live.latest_season.is_none());
+        assert!(live.season_ambience.is_seasonless);
+        assert!(live.nature_env.season.is_seasonless);
+        assert_eq!(
+            live.atmosphere_blender.target(),
+            live.base_atmosphere_target
+        );
+        assert_eq!(
+            live.atmosphere_blender.current(),
+            live.base_atmosphere_target
         );
     }
 

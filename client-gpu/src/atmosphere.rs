@@ -85,6 +85,17 @@ fn clean_rgb(rgb: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
     ]
 }
 
+/// Bound a sanitized rgb triple: colors are linear-space light values, so
+/// anything outside `0.0..=4.0` (negative albedo, absurd HDR) is clamped —
+/// matching the `fog_density`/`sun_intensity` bounds below.
+fn clamp_rgb(rgb: [f32; 3]) -> [f32; 3] {
+    [
+        rgb[0].clamp(0.0, 4.0),
+        rgb[1].clamp(0.0, 4.0),
+        rgb[2].clamp(0.0, 4.0),
+    ]
+}
+
 fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     [
         a[0] + (b[0] - a[0]) * t,
@@ -166,18 +177,19 @@ impl AtmosphereParams {
         }
     }
 
-    /// Sanitized copy: non-finite fields read as the neutral value so a
-    /// corrupt biome record cannot paint NaN into a frame uniform.
+    /// Sanitized copy: non-finite fields read as the neutral value and rgb
+    /// channels are bounded to `0.0..=4.0`, so a corrupt biome record cannot
+    /// paint NaN or absurd light values into a frame uniform.
     pub fn sanitized(&self) -> Self {
         let neutral = Self::default();
         Self {
-            sky_zenith_rgb: clean_rgb(self.sky_zenith_rgb, neutral.sky_zenith_rgb),
-            sky_horizon_rgb: clean_rgb(self.sky_horizon_rgb, neutral.sky_horizon_rgb),
-            fog_rgb: clean_rgb(self.fog_rgb, neutral.fog_rgb),
+            sky_zenith_rgb: clamp_rgb(clean_rgb(self.sky_zenith_rgb, neutral.sky_zenith_rgb)),
+            sky_horizon_rgb: clamp_rgb(clean_rgb(self.sky_horizon_rgb, neutral.sky_horizon_rgb)),
+            fog_rgb: clamp_rgb(clean_rgb(self.fog_rgb, neutral.fog_rgb)),
             fog_density: clean(self.fog_density, neutral.fog_density).clamp(0.0, 4.0),
-            depth_tint_rgb: clean_rgb(self.depth_tint_rgb, neutral.depth_tint_rgb),
+            depth_tint_rgb: clamp_rgb(clean_rgb(self.depth_tint_rgb, neutral.depth_tint_rgb)),
             depth_tint_strength: clean(self.depth_tint_strength, 0.0).clamp(0.0, 1.0),
-            ambient_rgb: clean_rgb(self.ambient_rgb, neutral.ambient_rgb),
+            ambient_rgb: clamp_rgb(clean_rgb(self.ambient_rgb, neutral.ambient_rgb)),
             sun_intensity: clean(self.sun_intensity, 1.0).clamp(0.0, 16.0),
         }
     }
@@ -307,6 +319,10 @@ impl Default for ChunkFadeTracker {
 impl ChunkFadeTracker {
     /// Vanilla-feel dissolve: a quarter second per newly arrived chunk.
     pub const DEFAULT_FADE_SECONDS: f32 = 0.25;
+    /// Hard bound on simultaneously tracked chunk columns. Generous enough
+    /// for the largest sane view distance (~64 chunk radius); chunks noted
+    /// while the tracker is saturated simply render fully opaque.
+    const MAX_TRACKED_CHUNKS: usize = 8192;
 
     /// Empty tracker with the default fade duration.
     pub fn new() -> Self {
@@ -319,12 +335,41 @@ impl ChunkFadeTracker {
     /// Register a chunk as just-arrived. Returns `true` when the key was
     /// newly tracked; re-noting an already-fading chunk keeps its progress
     /// (streaming systems re-announce visible chunks every frame).
+    ///
+    /// The map is bounded: at [`Self::MAX_TRACKED_CHUNKS`] finished fades
+    /// are evicted first (they are observationally identical to untracked
+    /// chunks), and a still-saturated tracker refuses the note so memory
+    /// can never grow without bound across teleports or missed unloads.
     pub fn note_chunk(&mut self, cx: i32, cz: i32) -> bool {
         if self.ages.contains_key(&(cx, cz)) {
             return false;
         }
+        if self.ages.len() >= Self::MAX_TRACKED_CHUNKS {
+            self.evict_finished();
+            if self.ages.len() >= Self::MAX_TRACKED_CHUNKS {
+                return false;
+            }
+        }
         self.ages.insert((cx, cz), 0.0);
         true
+    }
+
+    /// The fade duration `fade_alpha`/`is_fading` currently resolve to.
+    fn resolved_fade_seconds(&self) -> f32 {
+        if self.fade_seconds.is_finite() && self.fade_seconds > 0.0 {
+            self.fade_seconds
+        } else {
+            Self::DEFAULT_FADE_SECONDS
+        }
+    }
+
+    /// Drop entries whose fade already completed. A finished entry reports
+    /// `fade_alpha == 1.0` and `is_fading == false` — exactly like an
+    /// untracked chunk — so eviction cannot change rendered output, only
+    /// `len()`.
+    fn evict_finished(&mut self) {
+        let duration = self.resolved_fade_seconds();
+        self.ages.retain(|_, age| *age < duration);
     }
 
     /// Stop tracking a chunk (unload). Returns `true` when it was tracked.
@@ -345,11 +390,7 @@ impl ChunkFadeTracker {
     /// `0.0 -> 1.0` fade for a chunk column. Untracked chunks report `1.0`
     /// so anything that bypasses `note_chunk` stays fully opaque.
     pub fn fade_alpha(&self, cx: i32, cz: i32) -> f32 {
-        let duration = if self.fade_seconds.is_finite() && self.fade_seconds > 0.0 {
-            self.fade_seconds
-        } else {
-            Self::DEFAULT_FADE_SECONDS
-        };
+        let duration = self.resolved_fade_seconds();
         match self.ages.get(&(cx, cz)) {
             Some(age) => (age / duration).clamp(0.0, 1.0),
             None => 1.0,
@@ -394,6 +435,17 @@ const CLOUD_FACE_BITS: [u8; 6] = [
     FACE_NEG_Z,
 ];
 
+/// Sanitize one cloud-lighting channel: `CloudLighting` fields are public,
+/// so a hand-built value could carry NaN or negative light into vertex
+/// albedo. Non-finite reads as `0.0`, negatives clamp to `0.0`.
+fn cloud_channel(v: f32) -> f32 {
+    if v.is_finite() {
+        v.max(0.0)
+    } else {
+        0.0
+    }
+}
+
 /// Convert [`generate_layered_voxel_clouds`] cells into lit geometry: one
 /// quad per exposed face, top faces tinted `lighting.top_rgb`, bottoms
 /// `bottom_rgb`, sides `side_rgb` (upper strata slightly brighter for the
@@ -415,11 +467,8 @@ pub fn voxel_clouds_to_geometry(
             cell.min[1] + cell.size[1],
             cell.min[2] + cell.size[2],
         ];
-        if !cell
-            .min
-            .iter()
-            .chain(max.iter())
-            .all(|v| v.is_finite())
+        if !cell.min.iter().chain(max.iter()).all(|v| v.is_finite())
+            || !cell.size.iter().all(|s| s.is_finite() && *s > 0.0)
         {
             continue;
         }
@@ -435,9 +484,9 @@ pub fn voxel_clouds_to_geometry(
                 _ => lighting.side_rgb,
             };
             let albedo = [
-                (rgb[0] * cap_boost).min(1.0),
-                (rgb[1] * cap_boost).min(1.0),
-                (rgb[2] * cap_boost).min(1.0),
+                (cloud_channel(rgb[0]) * cap_boost).min(1.0),
+                (cloud_channel(rgb[1]) * cap_boost).min(1.0),
+                (cloud_channel(rgb[2]) * cap_boost).min(1.0),
             ];
             let base = vertices.len() as u32;
             for &position in corners {
@@ -468,7 +517,21 @@ pub fn extruded_mesh_to_geometry(
     let mut vertices = Vec::with_capacity(mesh.quads.len() * 4);
     let mut indices = Vec::with_capacity(mesh.quads.len() * 6);
     for quad in &mesh.quads {
-        let albedo = albedo_of(quad.tint_index);
+        // `ExtrudedMesh` fields are public: skip quads whose geometry would
+        // put non-finite data into a vertex buffer, and bound the resolved
+        // albedo to linear `0..=1`.
+        if !quad.positions.iter().flatten().all(|c| c.is_finite())
+            || !quad.normal.iter().all(|c| c.is_finite())
+        {
+            continue;
+        }
+        let albedo = albedo_of(quad.tint_index).map(|c| {
+            if c.is_finite() {
+                c.clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        });
         let base = vertices.len() as u32;
         for &position in &quad.positions {
             vertices.push(TerrainVertex {
@@ -512,21 +575,31 @@ pub fn planet_body_to_geometry(body: &PlanetSkyBody) -> (Vec<TerrainVertex>, Vec
 /// silhouette subtends `placement.apparent_angular_radius_deg`.
 /// `distance` is the far-plane draw distance the sky pass uses (keep it
 /// inside `camera.far`).
-pub fn planet_subworld_transform(
-    placement: &SkyBodyPlacement,
-    distance: f32,
-) -> SubWorldTransform {
+pub fn planet_subworld_transform(placement: &SkyBodyPlacement, distance: f32) -> SubWorldTransform {
     let distance = if distance.is_finite() && distance > 1.0 {
         distance
     } else {
         256.0
     };
-    let radius_deg = placement
-        .apparent_angular_radius_deg
-        .clamp(0.5, 90.0);
+    // `SkyBodyPlacement` fields are public: a hand-built placement could
+    // carry a zero/degenerate or non-finite direction, or a NaN radius
+    // (`f32::clamp` propagates NaN). Fall back to a sane sky point and a
+    // mid-size apparent radius so the transform can never go non-finite.
+    let radius_deg = if placement.apparent_angular_radius_deg.is_finite() {
+        placement.apparent_angular_radius_deg.clamp(0.5, 90.0)
+    } else {
+        8.0
+    };
     // Unit cube -> world diameter subtending the apparent angular diameter.
     let scale = 2.0 * distance * (radius_deg.to_radians() * 0.5).tan();
-    let dir = placement.direction;
+    let d = placement.direction;
+    let len_sq = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    let dir = if len_sq.is_finite() && len_sq > 1.0e-12 {
+        let inv = len_sq.sqrt().recip();
+        [d[0] * inv, d[1] * inv, d[2] * inv]
+    } else {
+        [0.0, 0.0, -1.0]
+    };
     let center = [dir[0] * distance, dir[1] * distance, dir[2] * distance];
     // Centre of the 0..1 mesh lands exactly on the sky-sphere point.
     let half = scale * 0.5;

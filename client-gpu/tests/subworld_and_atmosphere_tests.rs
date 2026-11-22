@@ -9,8 +9,9 @@
 use std::sync::{Arc, Mutex};
 
 use mc_spine_client_gpu::atmosphere::{
-    planet_body_to_geometry, planet_subworld_transform, voxel_clouds_to_geometry,
-    AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker, CLOUD_RENDER_ALPHA,
+    extruded_mesh_to_geometry, planet_body_to_geometry, planet_subworld_transform,
+    voxel_clouds_to_geometry, AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker,
+    CLOUD_RENDER_ALPHA,
 };
 use mc_spine_client_gpu::renderer::{
     probe_adapters, request_gpu_device, ComposedFrame, GpuRenderer, RendererError,
@@ -27,7 +28,7 @@ use mc_spine_client_mesh::builtin_shadow_wgsl::{
 };
 use mc_spine_client_mesh::space_sky_bridge::{
     compute_sky_body_placement, derive_dimension_policy, ExternalOverrideFlags,
-    PlanetDimensionMeta, PlanetSkyBody,
+    PlanetDimensionMeta, PlanetSkyBody, SkyBodyPlacement,
 };
 use mc_spine_client_mesh::vanilla_plus_nature::{
     compute_cloud_lighting, generate_layered_voxel_clouds, VanillaPlusNatureConfig,
@@ -853,4 +854,167 @@ fn composed_frame_renders_on_real_gpu() {
         captured.is_empty(),
         "wgpu/Vulkan validation errors during composed render: {captured:#?}"
     );
+}
+
+#[test]
+fn atmosphere_params_sanitized_bounds_rgb_and_fields() {
+    let hostile = AtmosphereParams {
+        sky_zenith_rgb: [-1.0, 100.0, f32::NAN],
+        sky_horizon_rgb: [f32::INFINITY, -5.0, 2.0],
+        fog_rgb: [0.5, 0.5, 0.5],
+        fog_density: f32::NAN,
+        depth_tint_rgb: [9.0, -9.0, 1.0],
+        depth_tint_strength: 7.0,
+        ambient_rgb: [f32::NEG_INFINITY, 0.5, 0.5],
+        sun_intensity: -3.0,
+    };
+    let s = hostile.sanitized();
+    // Non-finite channels fall back per-channel to the neutral default,
+    // then every rgb channel is bounded to the linear 0..=4 range.
+    assert_eq!(s.sky_zenith_rgb, [0.0, 4.0, 0.98]);
+    assert_eq!(s.sky_horizon_rgb, [0.62, 0.0, 2.0]);
+    assert_eq!(s.fog_rgb, [0.5, 0.5, 0.5]);
+    assert_eq!(s.depth_tint_rgb, [4.0, 0.0, 1.0]);
+    assert_eq!(s.depth_tint_strength, 1.0);
+    assert_eq!(s.ambient_rgb[0], 0.42);
+    assert_eq!(s.sun_intensity, 0.0);
+    assert!(s.fog_density.is_finite() && s.fog_density >= 0.0);
+    for channel in s
+        .sky_zenith_rgb
+        .iter()
+        .chain(s.sky_horizon_rgb.iter())
+        .chain(s.fog_rgb.iter())
+        .chain(s.depth_tint_rgb.iter())
+        .chain(s.ambient_rgb.iter())
+    {
+        assert!(channel.is_finite() && (0.0..=4.0).contains(channel));
+    }
+}
+
+#[test]
+fn chunk_fade_tracker_is_bounded_and_recycles_finished_fades() {
+    let mut tracker = ChunkFadeTracker::new();
+    // Saturate the hard cap with in-flight fades: further notes are refused
+    // so the map can never grow without bound.
+    let mut noted = 0usize;
+    for i in 0..20000i32 {
+        if tracker.note_chunk(i, 0) {
+            noted += 1;
+        }
+    }
+    assert!(noted <= 8192, "tracker exceeded its hard cap: {noted}");
+    assert_eq!(tracker.len(), noted);
+    assert!(!tracker.note_chunk(-1, -1), "saturated tracker must refuse");
+
+    // Once every fade has finished, the next note recycles the dead entries
+    // instead of refusing — finished fades are observationally identical to
+    // untracked chunks.
+    tracker.tick(1.0);
+    assert!(tracker.note_chunk(-1, -1));
+    assert_eq!(tracker.len(), 1);
+    assert_eq!(tracker.fade_alpha(-1, -1), 0.0);
+}
+
+#[test]
+fn voxel_cloud_geometry_sanitizes_lighting_and_degenerate_cells() {
+    use mc_spine_client_mesh::vanilla_plus_nature::{CloudLighting, VoxelCloudCell, ALL_FACES};
+    let lighting = CloudLighting {
+        top_rgb: [f32::NAN, -0.5, 0.8],
+        side_rgb: [1.0, 1.0, 1.0],
+        bottom_rgb: [0.2, 0.2, 0.2],
+        rim_warmth: 0.0,
+    };
+    let good = VoxelCloudCell {
+        min: [0.0, 0.0, 0.0],
+        size: [12.0, 4.0, 12.0],
+        layer: 0,
+        exposed_faces: ALL_FACES,
+    };
+    let zero_size = VoxelCloudCell {
+        size: [0.0, 4.0, 12.0],
+        ..good
+    };
+    let negative_size = VoxelCloudCell {
+        size: [-1.0, 4.0, 12.0],
+        ..good
+    };
+    let nan_min = VoxelCloudCell {
+        min: [f32::NAN, 0.0, 0.0],
+        ..good
+    };
+    let cells = [good, zero_size, negative_size, nan_min];
+    let (verts, indices) = voxel_clouds_to_geometry(&cells, &lighting);
+    // Only the well-formed cell contributes: 6 exposed faces x 4 vertices.
+    assert_eq!(verts.len(), 24);
+    assert_eq!(indices.len(), 36);
+    for v in &verts {
+        assert!(
+            v.albedo
+                .iter()
+                .all(|c| c.is_finite() && (0.0..=1.0).contains(c)),
+            "cloud albedo escaped bounds: {:?}",
+            v.albedo
+        );
+    }
+}
+
+#[test]
+fn extruded_mesh_to_geometry_skips_non_finite_quads_and_bounds_albedo() {
+    use mc_spine_client_mesh::vanilla_plus_3d::{ExtrudedMesh, ExtrudedQuad};
+    let quad = |positions: [[f32; 3]; 4]| ExtrudedQuad {
+        positions,
+        normal: [0.0, 0.0, 1.0],
+        uv: [[0.0, 0.0]; 4],
+        tint_index: 0,
+    };
+    let mut mesh = ExtrudedMesh::new();
+    mesh.quads.push(quad([
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ]));
+    mesh.quads.push(quad([[f32::NAN, 0.0, 0.0]; 4]));
+    let (verts, indices) = extruded_mesh_to_geometry(&mesh, |_| [2.0, -1.0, f32::NAN]);
+    assert_eq!(verts.len(), 4, "non-finite quad must be skipped");
+    assert_eq!(indices.len(), 6);
+    assert_eq!(verts[0].albedo, [1.0, 0.0, 0.0]);
+}
+
+#[test]
+fn planet_subworld_transform_survives_hostile_placement() {
+    let hostile = SkyBodyPlacement {
+        direction: [0.0, 0.0, 0.0],
+        apparent_angular_radius_deg: f32::NAN,
+        sun_direction: [0.0, 1.0, 0.0],
+        orbit_fraction: 0.0,
+        above_horizon: true,
+    };
+    let t = planet_subworld_transform(&hostile, f32::NAN);
+    assert!(t.scale.is_finite() && t.scale > 0.0);
+    assert!(t
+        .position
+        .iter()
+        .chain(t.quaternion.iter())
+        .all(|c| c.is_finite()));
+
+    // A non-unit direction must be normalized: the body centre lands
+    // `distance` blocks along the unit direction, not 5x farther out.
+    let mut placement = hostile;
+    placement.direction = [3.0, 0.0, 4.0];
+    placement.apparent_angular_radius_deg = 10.0;
+    let t = planet_subworld_transform(&placement, 100.0);
+    let half = t.scale * 0.5;
+    let center = [
+        t.position[0] + half,
+        t.position[1] + half,
+        t.position[2] + half,
+    ];
+    let len = (center[0] * center[0] + center[1] * center[1] + center[2] * center[2]).sqrt();
+    assert!(
+        (len - 100.0).abs() < 1e-3,
+        "center not on the sky sphere: {center:?}"
+    );
+    assert!((center[0] / len - 0.6).abs() < 1e-4);
+    assert!((center[2] / len - 0.8).abs() < 1e-4);
 }
