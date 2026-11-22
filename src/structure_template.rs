@@ -17,6 +17,20 @@ pub(crate) struct EntityInfo {
     pub block_pos: Pos,
     pub nbt: Tag,
 }
+/// One `placeEntities` record after the mirror/rotation transform: `pos` is the
+/// stored doubles `transform(Vec3)` produces plus the placement origin — the
+/// exact triple `Entity.moveTo` reads — `block_pos` is the anchor the clip-box
+/// filter tests, `id` is the entity type the constructor resolves, and
+/// `yaw`/`pitch` are what `moveTo` applies (`pitch` is never transformed).
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct PlacedEntity {
+    pub pos: [f64; 3],
+    pub block_pos: Pos,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub id: String,
+}
 #[derive(Clone, Debug)]
 pub(crate) struct Template {
     pub size: Pos,
@@ -99,6 +113,77 @@ fn state_from_json(value: &crate::json::J, reg: &BReg) -> Result<u32, &'static s
     }
     reg.checked_state(name, &properties)
         .ok_or("unknown template state")
+}
+
+/// `Entity.load` reads yaw/pitch from the `Rotation` list, which native writes
+/// as exactly two floats. A missing list defaults both to `0.0`; a present one
+/// that is not a float list fails closed — the spawn path would otherwise lose
+/// the entity to `loadEntityRecursive`'s empty `Optional`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn entity_rotation(nbt: &Tag) -> Result<(f32, f32), &'static str> {
+    let Some(tag) = nbt.get("Rotation") else {
+        return Ok((0.0, 0.0));
+    };
+    let items = tag
+        .list()
+        .ok_or("template entity Rotation must be a float list")?;
+    let at = |i: usize| -> Result<f32, &'static str> {
+        match items.get(i) {
+            None => Ok(0.0),
+            Some(Tag::Float(bits)) => Ok(f32::from_bits(*bits)),
+            Some(_) => Err("template entity Rotation must be a float list"),
+        }
+    };
+    let (yaw, pitch) = (at(0)?, at(1)?);
+    if !yaw.is_finite() || !pitch.is_finite() {
+        return Err("template entity Rotation is not finite");
+    }
+    Ok((yaw, pitch))
+}
+
+/// `Mth.wrapDegrees`: fold an angle into `[-180, 180)`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wrap_degrees(angle: f32) -> f32 {
+    let wrapped = angle % 360.0;
+    if wrapped >= 180.0 {
+        wrapped - 360.0
+    } else if wrapped < -180.0 {
+        wrapped + 360.0
+    } else {
+        wrapped
+    }
+}
+
+/// The yaw `placeEntities` computes: `f = entity.mirror(mirror)` then
+/// `f += entity.rotate(rotation) - entity.getYRot()`.
+///
+/// `Entity.mirror` (`bsr.a(dkv)`) is `wrapDegrees(yaw)`, then `-w` for
+/// `FRONT_BACK` (inverts x — this port's `FrontBack`) and `180 - w` for
+/// `LEFT_RIGHT` (inverts z — this port's `LeftRight`); `Entity.rotate`
+/// (`bsr.a(dmm)`) is `wrapDegrees(yaw)` plus 0/90/180/270 for
+/// none/CW90/CW180/CCW90. `getYRot()` in the subtraction is the stored yaw
+/// un-updated, so `w` is used twice rather than the wrapped result replacing it.
+#[cfg_attr(not(test), allow(dead_code))]
+fn transformed_yaw(
+    raw_yaw: f32,
+    mirror: crate::structure_transform::Mirror,
+    rotation: crate::structure_transform::Rotation,
+) -> f32 {
+    use crate::structure_transform::{Mirror, Rotation};
+    let wrapped = wrap_degrees(raw_yaw);
+    let mirrored = match mirror {
+        Mirror::None => wrapped,
+        Mirror::LeftRight => 180.0 - wrapped,
+        Mirror::FrontBack => -wrapped,
+    };
+    let rotated = wrapped
+        + match rotation {
+            Rotation::None => 0.0,
+            Rotation::Clockwise90 => 90.0,
+            Rotation::Clockwise180 => 180.0,
+            Rotation::Counterclockwise90 => 270.0,
+        };
+    mirrored + rotated - raw_yaw
 }
 
 fn parse_tag_identity(raw: &str, require_hash: bool) -> Result<String, &'static str> {
@@ -1450,6 +1535,15 @@ impl Template {
             if p.1 >= ctx.g.world_min_y && p.1 < ctx.g.world_min_y + ctx.g.world_height {
                 ctx.set(p.0, p.1, p.2, state);
                 written.push(p);
+                // The `StructurePiece.placeBlock` mark: states in the pinned
+                // `SHAPE_CHECK_BLOCKS` set are filed for `postProcessGeneration`,
+                // which re-derives their support once the chunk settles. `FC::set`
+                // already files the separate `hasPostProcess` gate; the two sets
+                // are disjoint. Full-cube-only callers (the fossil path) can never
+                // reach this mark, so their mark set is unchanged.
+                if reg.needs_postprocess_shape(state) {
+                    ctx.mark_shape(p.0, p.1, p.2);
+                }
                 if let Some(tag) = block
                     .nbt
                     .as_ref()
@@ -1478,6 +1572,36 @@ impl Template {
                 return Some(reg.state_of("minecraft:air", None));
             }
             let name = reg.name_of(state);
+            let bare = name.strip_prefix("minecraft:").unwrap_or(name);
+            // `CarpetBlock.updateShape` (`dgp.a`): `!state.canSurvive -> AIR` on
+            // EVERY direction — the direction does not gate it — and
+            // `canSurvive` is `!level.isEmptyBlock(below)`, so a liquid floor
+            // still counts as occupied.
+            if bare.ends_with("_carpet")
+                && reg.is_air(ctx.get(pos.0, pos.1.wrapping_sub(1), pos.2))
+            {
+                return Some(reg.state_of("minecraft:air", None));
+            }
+            // `RedStoneWireBlock.updateShape` (`dmb.a`): only the DOWN direction
+            // carries a survival check (`canSurviveOn` = the block below is
+            // `isFaceSturdy(_, UP, FULL)` or a hopper). The UP and horizontal
+            // arms recompute the wire's own connection graph, which this path
+            // deliberately does not own; the placed side properties are kept
+            // rather than a second wire state machine being invented here.
+            if name == "minecraft:redstone_wire"
+                && direction == 0
+                && !reg.is_face_sturdy(neighbor, 1, crate::block_registry::Support::Full)
+                && reg.name_of(neighbor) != "minecraft:hopper"
+            {
+                return Some(reg.state_of("minecraft:air", None));
+            }
+            // `BaseRailBlock.updateShape` (`dfn.a`) only schedules the waterlogged
+            // state's fluid tick and never rewrites the rail — rails fall out
+            // through `neighborChanged`, not `updateShape` — so there is nothing
+            // to add for them here; the fluid reservation below already covers
+            // the tick. `FallingBlock.updateShape` (`diu.a`) likewise only
+            // reserves a block tick, and the generation-side queue for those is
+            // owned by the chunk scheduler, not this entry point.
             let above = if name.ends_with("_wall") {
                 ctx.get(pos.0, pos.1.wrapping_add(1), pos.2)
             } else {
@@ -1617,6 +1741,65 @@ impl Template {
             })
             .collect()
     }
+
+    /// The transform half of `StructureTemplate.placeEntities`: `transform(Vec3)`
+    /// plus `Vec3.atLowerCornerOf(origin)` for the doubles `moveTo` reads,
+    /// `transform(blockPos)` plus `origin` for the clip-filter anchor, and the
+    /// yaw `entity.mirror(mirror) + entity.rotate(rotation) - entity.getYRot()`,
+    /// where `mirror`/`rotate` both wrap `getYRot()` BEFORE the raw value is
+    /// subtracted, so an out-of-range yaw is wrapped twice, not once. `UUID`
+    /// removal and the `Pos` rewrite are the spawn path's job, as native splits
+    /// them; the yaw/pitch `Rotation` list and the entity `id` are validated
+    /// here because a malformed entity silently vanishes in native
+    /// (`loadEntityRecursive` answers `Optional.empty`) and this port's contract
+    /// is to refuse it instead.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn transformed_entities(
+        &self,
+        placement: Placement,
+    ) -> Result<Vec<PlacedEntity>, &'static str> {
+        self.entities
+            .iter()
+            .map(|info| {
+                if !info.pos.iter().all(|v| v.is_finite()) {
+                    return Err("template entity position is not finite");
+                }
+                let Some(Tag::String(id)) = info.nbt.get("id") else {
+                    return Err("template entity needs a string id");
+                };
+                let id = id.to_utf8().map_err(|_| "template entity id is not UTF-8")?;
+                let (raw_yaw, pitch) = entity_rotation(&info.nbt)?;
+                let block = crate::structure_transform::block(
+                    info.block_pos,
+                    placement.mirror,
+                    placement.rotation,
+                    placement.pivot,
+                );
+                let pos = crate::structure_transform::entity(
+                    info.pos,
+                    placement.mirror,
+                    placement.rotation,
+                    placement.pivot,
+                );
+                Ok(PlacedEntity {
+                    pos: [
+                        pos[0] + f64::from(placement.origin.0),
+                        pos[1] + f64::from(placement.origin.1),
+                        pos[2] + f64::from(placement.origin.2),
+                    ],
+                    block_pos: (
+                        block.0.wrapping_add(placement.origin.0),
+                        block.1.wrapping_add(placement.origin.1),
+                        block.2.wrapping_add(placement.origin.2),
+                    ),
+                    yaw: transformed_yaw(raw_yaw, placement.mirror, placement.rotation),
+                    pitch,
+                    id,
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn load(root: &Tag, reg: &BReg) -> Result<Self, &'static str> {
         let size = integer_pos(field(root, "size")?)?;
         if size.0 < 0 || size.1 < 0 || size.2 < 0 {
@@ -4183,6 +4366,569 @@ mod tests {
             ctx.get(8, 72, 8),
             reg.state_of("minecraft:air", None),
             "a refused template wrote nothing"
+        );
+    }
+
+    /// `CarpetBlock.updateShape` checks `!level.isEmptyBlock(below)` on every
+    /// direction: a written cell that empties the floor drops the carpet, and a
+    /// liquid floor keeps it (the floor is not air even though it is fluid).
+    /// `RedStoneWireBlock.updateShape` carries its survival check only on DOWN:
+    /// a written neighbour that leaves the below cell non-`isFaceSturdy(UP, FULL)`
+    /// drops the wire, while a hopper or a sturdy top keeps it, and a horizontal
+    /// touch leaves the wire's side graph to the placed state.
+    #[test]
+    fn place_blocks_breaks_carpets_and_redstone_wire_on_lost_support() {
+        use crate::generation_context::FC;
+        use crate::generation_math::Xor;
+        use crate::structure_transform::{Mirror, Rotation};
+        let reg = crate::block_registry::breg().unwrap();
+        let air = reg.state_of("minecraft:air", None);
+        let stone = reg.state_of("minecraft:stone", None);
+        let carpet = reg.state_of("minecraft:white_carpet", None);
+        let wire = reg.state_of("minecraft:redstone_wire", None);
+        let hopper = reg.state_of("minecraft:hopper", None);
+        let bottom_slab = reg.with_prop(reg.state_of("minecraft:oak_slab", None), "type", "bottom");
+        let run = |world: &[((i32, i32, i32), u32)],
+                   writes: &[((i32, i32, i32), u32)],
+                   read: (i32, i32, i32)| {
+            let template = Template {
+                size: (1, 1, 1),
+                palettes: vec![writes
+                    .iter()
+                    .map(|&(_, state)| BlockInfo { pos: (0, 0, 0), state, nbt: None })
+                    .collect()],
+                entities: Vec::new(),
+            };
+            let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+            let mut ctx = FC::new(&mut g);
+            ctx.test_no_terrain = true;
+            ctx.test_default_air = true;
+            for &(p, st) in world {
+                ctx.test_base_cell(p, st);
+            }
+            let mut rng = Xor::seed_worldgen(7);
+            template
+                .place_blocks(
+                    &mut ctx,
+                    &mut rng,
+                    Placement {
+                        origin: writes[0].0,
+                        pivot: (0, 0, 0),
+                        mirror: Mirror::None,
+                        rotation: Rotation::None,
+                    },
+                    &[],
+                    [0, 0, 0, 31, 255, 31],
+                )
+                .unwrap();
+            ctx.get(read.0, read.1, read.2)
+        };
+        // Carpet over a floor the template erases: DOWN-touch -> air.
+        assert_eq!(
+            run(
+                &[((8, 72, 8), stone), ((8, 73, 8), carpet)],
+                &[((8, 72, 8), air)],
+                (8, 73, 8)
+            ),
+            air,
+            "a carpet whose floor becomes empty drops, on any direction"
+        );
+        // Carpet over water: `isEmptyBlock` is the air predicate, not a dry one.
+        assert_eq!(
+            run(
+                &[((8, 72, 8), reg.state_of("minecraft:water", None)), ((8, 73, 8), carpet), ((9, 73, 8), air)],
+                &[((9, 73, 8), stone)],
+                (8, 73, 8)
+            ),
+            carpet,
+            "a carpet over water stays: water is not an empty block"
+        );
+        // Wire above a written half slab: bottom slab's UP face is not FULL.
+        assert_eq!(
+            run(
+                &[((8, 73, 8), wire)],
+                &[((8, 72, 8), bottom_slab)],
+                (8, 73, 8)
+            ),
+            air,
+            "wire above a bottom slab loses isFaceSturdy(_, UP, FULL) and drops"
+        );
+        // Wire above a written hopper: `canSurviveOn` accepts hoppers.
+        assert_eq!(
+            run(
+                &[((8, 73, 8), wire)],
+                &[((8, 72, 8), hopper)],
+                (8, 73, 8)
+            ),
+            wire,
+            "wire above a hopper stays"
+        );
+        // Wire above a written full cube stays too.
+        assert_eq!(
+            run(
+                &[((8, 73, 8), wire)],
+                &[((8, 72, 8), stone)],
+                (8, 73, 8)
+            ),
+            wire,
+            "wire above a full cube stays"
+        );
+        // A horizontal touch does not rewrite the wire: the horizontal arms
+        // recompute the wire graph, which this path does not own.
+        assert_eq!(
+            run(
+                &[((8, 73, 8), wire), ((9, 73, 8), air)],
+                &[((9, 73, 8), stone)],
+                (8, 73, 8)
+            ),
+            wire,
+            "a horizontal edge leaves the wire's placed side properties alone"
+        );
+    }
+
+    /// `BaseRailBlock.updateShape` (`dfn.a`) only schedules the waterlogged
+    /// fluid tick — it never rewrites the rail — and `FallingBlock.updateShape`
+    /// (`diu.a`) only reserves a block tick. Both keep their state at a template
+    /// edge; the waterlogged rail's fluid reservation still files.
+    #[test]
+    fn place_blocks_keeps_rails_and_falling_blocks_but_reserves_rail_water_tick() {
+        use crate::generation_context::FC;
+        use crate::generation_math::Xor;
+        use crate::structure_transform::{Mirror, Rotation};
+        let reg = crate::block_registry::breg().unwrap();
+        let stone = reg.state_of("minecraft:stone", None);
+        let rail = reg.state_of("minecraft:rail", None);
+        let sand = reg.state_of("minecraft:sand", None);
+        let water_rail = reg.with_prop(rail, "waterlogged", "true");
+        let template = Template {
+            size: (1, 1, 1),
+            palettes: vec![vec![BlockInfo { pos: (0, 0, 0), state: stone, nbt: None }]],
+            entities: Vec::new(),
+        };
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+        let mut ctx = FC::new(&mut g);
+        ctx.test_no_terrain = true;
+        ctx.test_default_air = true;
+        ctx.test_base_cell((8, 73, 8), rail);
+        ctx.test_base_cell((9, 72, 8), water_rail);
+        ctx.test_base_cell((8, 71, 8), sand);
+        let mut rng = Xor::seed_worldgen(9);
+        template
+            .place_blocks(
+                &mut ctx,
+                &mut rng,
+                Placement {
+                    origin: (8, 72, 8), pivot: (0, 0, 0),
+                    mirror: Mirror::None, rotation: Rotation::None,
+                },
+                &[],
+                [0, 0, 0, 31, 255, 31],
+            )
+            .unwrap();
+        assert_eq!(ctx.get(8, 73, 8), rail, "rails ignore updateShape writes");
+        assert_eq!(
+            ctx.get(9, 72, 8),
+            water_rail,
+            "a waterlogged rail keeps its state too"
+        );
+        assert_eq!(
+            ctx.get(8, 71, 8),
+            sand,
+            "falling blocks only reserve a tick; there is no shape write"
+        );
+        assert_eq!(
+            ctx.g.generated_fluid_ticks(),
+            vec![((9, 72, 8), 0)],
+            "the waterlogged rail's fluid tick reservation still files"
+        );
+    }
+
+    /// `StructurePiece.placeBlock` files `SHAPE_CHECK_BLOCKS` writes for
+    /// `postProcessGeneration`; the bounded template path files the same mark
+    /// for its writes, and only for them.
+    #[test]
+    fn place_blocks_files_shape_check_marks_only_for_marked_states() {
+        use crate::generation_context::FC;
+        use crate::generation_math::Xor;
+        use crate::structure_transform::{Mirror, Rotation};
+        let reg = crate::block_registry::breg().unwrap();
+        let template = Template {
+            size: (2, 1, 1),
+            palettes: vec![vec![
+                BlockInfo {
+                    pos: (0, 0, 0),
+                    state: reg.state_of("minecraft:oak_fence", None),
+                    nbt: None,
+                },
+                BlockInfo {
+                    pos: (1, 0, 0),
+                    state: reg.state_of("minecraft:stone", None),
+                    nbt: None,
+                },
+            ]],
+            entities: Vec::new(),
+        };
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+        let mut ctx = FC::new(&mut g);
+        ctx.test_no_terrain = true;
+        ctx.test_default_air = true;
+        let mut rng = Xor::seed_worldgen(11);
+        template
+            .place_blocks(
+                &mut ctx,
+                &mut rng,
+                Placement {
+                    origin: (8, 72, 8), pivot: (0, 0, 0),
+                    mirror: Mirror::None, rotation: Rotation::None,
+                },
+                &[],
+                [0, 0, 0, 31, 255, 31],
+            )
+            .unwrap();
+        assert_eq!(
+            ctx.shape_marks,
+            vec![(8, 72, 8)],
+            "the fence write files its SHAPE_CHECK mark; the full cube does not"
+        );
+    }
+
+    /// `Entity.mirror`/`Entity.rotate` exactly as `placeEntities` composes them:
+    /// `f = mirror(m)(w) + rotate(r)(w) - raw` with `w = wrapDegrees(raw)`, so
+    /// the stored yaw is wrapped twice — once inside each call — and an
+    /// out-of-range stored yaw keeps its residue. `pitch` passes through.
+    #[test]
+    fn transformed_entities_applies_native_yaw_mirror_and_rotation() {
+        use crate::structure_transform::{Mirror, Rotation};
+        let entity = |yaw: f32, pitch: f32| EntityInfo {
+            pos: [0.25, 0.5, 0.75],
+            block_pos: (0, 0, 0),
+            nbt: Tag::Compound(BTreeMap::from([
+                (
+                    NbtString::text("id"),
+                    Tag::String(NbtString::text("minecraft:pig")),
+                ),
+                (
+                    NbtString::text("Rotation"),
+                    Tag::List(
+                        5,
+                        vec![Tag::Float(yaw.to_bits()), Tag::Float(pitch.to_bits())],
+                    ),
+                ),
+            ])),
+        };
+        let place = |mirror, rotation| Placement {
+            origin: (0, 0, 0),
+            pivot: (0, 0, 0),
+            mirror,
+            rotation,
+        };
+        // (yaw, mirror, rotation) -> f. Values are the literal native formula,
+        // not a wrapped yaw: e.g. north (180) mirrored left_right yields 0.
+        for (yaw, mirror, rotation, want) in [
+            (0.0f32, Mirror::None, Rotation::None, 0.0f32),
+            (0.0, Mirror::None, Rotation::Clockwise90, 90.0),
+            (0.0, Mirror::None, Rotation::Clockwise180, 180.0),
+            (0.0, Mirror::None, Rotation::Counterclockwise90, 270.0),
+            (90.0, Mirror::LeftRight, Rotation::None, 90.0),
+            (90.0, Mirror::FrontBack, Rotation::None, -90.0),
+            (180.0, Mirror::LeftRight, Rotation::None, 0.0),
+            (45.0, Mirror::LeftRight, Rotation::Clockwise90, 225.0),
+            (370.0, Mirror::None, Rotation::None, -350.0),
+        ] {
+            let template = Template {
+                size: (1, 1, 1),
+                palettes: vec![Vec::new()],
+                entities: vec![entity(yaw, 30.0)],
+            };
+            let got = template.transformed_entities(place(mirror, rotation)).unwrap();
+            assert_eq!(
+                got[0].yaw, want,
+                "yaw {yaw} under {mirror:?}/{rotation:?}"
+            );
+            assert_eq!(got[0].pitch, 30.0, "pitch is never transformed");
+        }
+    }
+
+    /// `placeEntities` transforms the stored doubles AND the `blockPos` anchor:
+    /// `pos` adds the origin after the mirror/rotation, `block_pos` goes through
+    /// the integer `transform` and then adds the origin.
+    #[test]
+    fn transformed_entities_transforms_pos_and_block_pos() {
+        use crate::structure_transform::{Mirror, Rotation};
+        let template = Template {
+            size: (4, 1, 4),
+            palettes: vec![Vec::new()],
+            entities: vec![EntityInfo {
+                pos: [0.25, 0.5, 0.75],
+                block_pos: (3, 0, 1),
+                nbt: Tag::Compound(BTreeMap::from([(
+                    NbtString::text("id"),
+                    Tag::String(NbtString::text("minecraft:cat")),
+                )])),
+            }],
+        };
+        let placement = Placement {
+            origin: (64, 80, -32),
+            pivot: (0, 0, 0),
+            mirror: Mirror::FrontBack,
+            rotation: Rotation::Clockwise90,
+        };
+        let got = template.transformed_entities(placement).unwrap();
+        assert_eq!(got.len(), 1);
+        let e = &got[0];
+        // FrontBack flips x (1-x for the doubles, -x for the block anchor),
+        // then CW90 maps (x,y,z) -> (-z, y, x) around the zero pivot.
+        assert_eq!(e.pos, [0.25 + 64.0, 0.5 + 80.0, 0.75 - 32.0]);
+        assert_eq!(e.block_pos, (63, 80, -35));
+        assert_eq!(e.id, "minecraft:cat");
+        assert_eq!(
+            e.yaw, 90.0,
+            "a missing Rotation list defaults the stored yaw to 0; CW90 still adds +90"
+        );
+    }
+
+    /// Malformed entity records fail closed instead of reaching the spawn path:
+    /// a missing or non-string `id`, a non-list/non-float `Rotation`, a
+    /// non-finite `Rotation`, or a non-finite `pos` all refuse.
+    #[test]
+    fn transformed_entities_rejects_malformed_records() {
+        use crate::structure_transform::{Mirror, Rotation};
+        let placement = Placement {
+            origin: (0, 0, 0),
+            pivot: (0, 0, 0),
+            mirror: Mirror::None,
+            rotation: Rotation::None,
+        };
+        let good_nbt = || {
+            Tag::Compound(BTreeMap::from([(
+                NbtString::text("id"),
+                Tag::String(NbtString::text("minecraft:pig")),
+            )]))
+        };
+        let template_with = |info: EntityInfo| Template {
+            size: (1, 1, 1),
+            palettes: vec![Vec::new()],
+            entities: vec![info],
+        };
+        let base = || EntityInfo {
+            pos: [0.5, 0.0, 0.5],
+            block_pos: (0, 0, 0),
+            nbt: good_nbt(),
+        };
+        // Missing id.
+        let mut e = base();
+        e.nbt = Tag::Compound(BTreeMap::new());
+        assert!(template_with(e).transformed_entities(placement).is_err());
+        // Non-string id.
+        let mut e = base();
+        e.nbt = Tag::Compound(BTreeMap::from([(
+            NbtString::text("id"),
+            Tag::Int(7),
+        )]));
+        assert!(template_with(e).transformed_entities(placement).is_err());
+        // Rotation that is not a list.
+        let mut e = base();
+        let Tag::Compound(ref mut values) = e.nbt else { unreachable!() };
+        values.insert(NbtString::text("Rotation"), Tag::Int(0));
+        assert!(template_with(e).transformed_entities(placement).is_err());
+        // Rotation with non-float elements.
+        let mut e = base();
+        let Tag::Compound(ref mut values) = e.nbt else { unreachable!() };
+        values.insert(
+            NbtString::text("Rotation"),
+            Tag::List(6, vec![Tag::Double(0u64)]),
+        );
+        assert!(template_with(e).transformed_entities(placement).is_err());
+        // One float is legal (native defaults the missing pitch to 0).
+        let mut e = base();
+        let Tag::Compound(ref mut values) = e.nbt else { unreachable!() };
+        values.insert(
+            NbtString::text("Rotation"),
+            Tag::List(5, vec![Tag::Float(45f32.to_bits())]),
+        );
+        let got = template_with(e).transformed_entities(placement).unwrap();
+        assert_eq!(got[0].yaw, 45.0);
+        assert_eq!(got[0].pitch, 0.0);
+        // Non-finite stored pos.
+        let mut e = base();
+        e.pos = [f64::NAN, 0.0, 0.0];
+        assert!(template_with(e).transformed_entities(placement).is_err());
+    }
+
+    /// Directional block-entity states transform with the same table the rest
+    /// of the template uses — a rotated chest/barrel and a rotated/mirrored
+    /// standing sign land with facing/rotation already rewritten — and their
+    /// NBT still stages. `loot` keeps `LootTableSeed`; a block entity the store
+    /// cannot carry (a jukebox record) still fails closed.
+    #[test]
+    fn place_blocks_transforms_directional_block_entities_and_stages_them() {
+        use crate::generation_context::FC;
+        use crate::generation_math::Xor;
+        use crate::generation_payload::GenerationPayload;
+        use crate::structure_transform::{Mirror, Rotation};
+        let reg = crate::block_registry::breg().unwrap();
+        let chest = reg.with_prop(
+            reg.state_of("minecraft:chest", None),
+            "facing",
+            "north",
+        );
+        let sign = reg.with_prop(reg.state_of("minecraft:oak_sign", None), "rotation", "4");
+        let mut nbt = BTreeMap::new();
+        nbt.insert(
+            NbtString::text("id"),
+            Tag::String(NbtString::text("minecraft:chest")),
+        );
+        nbt.insert(
+            NbtString::text("LootTable"),
+            Tag::String(NbtString::text("minecraft:chests/simple_dungeon")),
+        );
+        nbt.insert(NbtString::text("LootTableSeed"), Tag::Long(99));
+        let front = Tag::Compound(BTreeMap::from([
+            (
+                NbtString::text("messages"),
+                Tag::List(8, (0..4).map(|_| Tag::String(NbtString::text("\"\""))).collect()),
+            ),
+        ]));
+        let mut sign_nbt = BTreeMap::new();
+        sign_nbt.insert(NbtString::text("front_text"), front);
+        let template = Template {
+            size: (2, 1, 1),
+            palettes: vec![vec![
+                BlockInfo { pos: (0, 0, 0), state: chest, nbt: Some(Tag::Compound(nbt)) },
+                BlockInfo { pos: (1, 0, 0), state: sign, nbt: Some(Tag::Compound(sign_nbt)) },
+            ]],
+            entities: Vec::new(),
+        };
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+        let mut ctx = FC::new(&mut g);
+        ctx.test_no_terrain = true;
+        ctx.test_default_air = true;
+        let mut rng = Xor::seed_worldgen(17);
+        template
+            .place_blocks(
+                &mut ctx,
+                &mut rng,
+                Placement {
+                    origin: (8, 72, 8), pivot: (0, 0, 0),
+                    mirror: Mirror::LeftRight, rotation: Rotation::Clockwise90,
+                },
+                &[],
+                [0, 0, 0, 31, 255, 31],
+            )
+            .unwrap();
+        // Mirror LeftRight first flips z: pos (1,0,0) stays, then CW90 maps
+        // (x,y,z) -> (pivot.x + pivot.z - z, y, pivot.z - pivot.x + x); with
+        // pivot (0,0,0): (x,y,z) -> (-z, y, x).
+        assert_eq!(
+            reg.get_prop(ctx.get(8, 72, 8), "facing").as_deref(),
+            Some("west"),
+            "chest[facing=north]: mirror flips north->south, CW90 turns it to west"
+        );
+        assert_eq!(
+            reg.get_prop(ctx.get(8, 72, 9), "rotation").as_deref(),
+            Some("8"),
+            "the pinned state-transform table maps sign rotation 4 under LEFT_RIGHT+CW90 to 8"
+        );
+        assert_eq!(
+            ctx.payloads[0].0,
+            (8, 72, 8),
+            "the chest payload is staged at the transformed position"
+        );
+        assert_eq!(
+            ctx.payloads[0].1,
+            GenerationPayload::LootContainer {
+                kind: crate::generation_payload::ContainerKind::Chest,
+                loot_table: "minecraft:chests/simple_dungeon".to_owned(),
+                loot_seed: Some(99),
+            },
+            "LootTable + LootTableSeed survive the transform"
+        );
+        assert!(
+            matches!(ctx.payloads[1].1, GenerationPayload::Sign(_)),
+            "the sign's front_text stages under the transformed state"
+        );
+
+        // The jukebox is directional-free but its NBT has no store: fail closed.
+        let jukebox = Template {
+            size: (1, 1, 1),
+            palettes: vec![vec![BlockInfo {
+                pos: (0, 0, 0),
+                state: reg.state_of("minecraft:jukebox", None),
+                nbt: Some(Tag::Compound(BTreeMap::from([(
+                    NbtString::text("RecordItem"),
+                    Tag::Compound(BTreeMap::new()),
+                )]))),
+            }]],
+            entities: Vec::new(),
+        };
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+        let mut ctx = FC::new(&mut g);
+        ctx.test_no_terrain = true;
+        ctx.test_default_air = true;
+        let mut rng = Xor::seed_worldgen(17);
+        assert!(
+            jukebox
+                .place_blocks(
+                    &mut ctx,
+                    &mut rng,
+                    Placement {
+                        origin: (8, 72, 8), pivot: (0, 0, 0),
+                        mirror: Mirror::None, rotation: Rotation::None,
+                    },
+                    &[],
+                    [0, 0, 0, 31, 255, 31],
+                )
+                .is_err(),
+            "a jukebox record has no store and must refuse, not drop"
+        );
+    }
+
+    /// `fluid_name` distinguishes source and flowing states: a written source
+    /// water cell reserves `(pos, 0)` and a written source lava cell `(pos, 2)`,
+    /// while an outside flowing-water neighbour reserves nothing.
+    #[test]
+    fn place_blocks_reserves_source_fluids_and_ignores_flowing_neighbours() {
+        use crate::generation_context::FC;
+        use crate::generation_math::Xor;
+        use crate::structure_transform::{Mirror, Rotation};
+        let reg = crate::block_registry::breg().unwrap();
+        let water = reg.state_of("minecraft:water", None);
+        let lava = reg.state_of("minecraft:lava", None);
+        let flowing = reg.with_prop(water, "level", "5");
+        let template = Template {
+            size: (2, 1, 1),
+            palettes: vec![vec![
+                BlockInfo { pos: (0, 0, 0), state: water, nbt: None },
+                BlockInfo { pos: (1, 0, 0), state: lava, nbt: None },
+            ]],
+            entities: Vec::new(),
+        };
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+        let mut ctx = FC::new(&mut g);
+        ctx.test_no_terrain = true;
+        ctx.test_default_air = true;
+        ctx.test_base_cell((8, 73, 8), flowing);
+        let mut rng = Xor::seed_worldgen(19);
+        template
+            .place_blocks(
+                &mut ctx,
+                &mut rng,
+                Placement {
+                    origin: (8, 72, 8), pivot: (0, 0, 0),
+                    mirror: Mirror::None, rotation: Rotation::None,
+                },
+                &[],
+                [0, 0, 0, 31, 255, 31],
+            )
+            .unwrap();
+        let ticks = ctx.g.generated_fluid_ticks();
+        assert!(
+            ticks.contains(&((8, 72, 8), 0)) && ticks.contains(&((9, 72, 8), 2)),
+            "source water and source lava reserve their own ticks: {ticks:?}"
+        );
+        assert!(
+            !ticks.iter().any(|&(p, _)| p == (8, 73, 8)),
+            "an outside flowing-water neighbour reserves nothing"
         );
     }
 }

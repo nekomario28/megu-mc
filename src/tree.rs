@@ -2760,6 +2760,100 @@ fn handle_edge_face_cached(
     }
 }
 
+/// `StructureTemplate.updateShapeAtEdge`'s face walk over `shape`'s filled bitmap: the three
+/// transition scans native `DiscreteVoxelShape.forAllFaces` performs — z (outer x, inner y),
+/// y (outer z, inner x), then x (outer y, inner z). `visit` gets `(direction, filled_index,
+/// empty_index, filled_pos, empty_pos)`, where the indices address the `(xs+2)*(ys+2)*(zs+2)`
+/// padded cache the caller keeps and the positions are world coordinates. The sequence is
+/// exactly what `crate::voxel_faces::exposed_faces(shape.positions())` derives from the
+/// occupied set; a unit test pins the two against each other.
+fn for_each_dense_edge(
+    shape: &LeafShape,
+    xs: usize,
+    mut visit: impl FnMut(u8, usize, usize, P3, P3),
+) {
+    let filled = &shape.filled;
+    let (mx, my, mz) = shape.min;
+    let (ys, zs) = (shape.ys, shape.zs);
+    let yz = ys * zs;
+    let (pys, pzs) = (ys + 2, zs + 2);
+    let pyz = pys * pzs;
+    for x in 0..xs {
+        let wx = mx.wrapping_add(x as i32);
+        let xbase = x * yz;
+        let pxbase = (x + 1) * pyz;
+        for y in 0..ys {
+            let wy = my.wrapping_add(y as i32);
+            let row = xbase + y * zs;
+            let prow = pxbase + (y + 1) * pzs;
+            let mut prev = false;
+            for z in 0..=zs {
+                let cur = z < zs && filled[row + z];
+                if prev != cur {
+                    let wz = mz.wrapping_add(z as i32);
+                    let i_prev = prow + z;
+                    let i_cur = prow + z + 1;
+                    if prev {
+                        visit(3, i_prev, i_cur, (wx, wy, wz - 1), (wx, wy, wz));
+                    } else {
+                        visit(2, i_cur, i_prev, (wx, wy, wz), (wx, wy, wz - 1));
+                    }
+                }
+                prev = cur;
+            }
+        }
+    }
+    for z in 0..zs {
+        let wz = mz.wrapping_add(z as i32);
+        let pz = z + 1;
+        for x in 0..xs {
+            let wx = mx.wrapping_add(x as i32);
+            let col = x * yz + z;
+            let pcol = (x + 1) * pyz + pz;
+            let mut prev = false;
+            for y in 0..=ys {
+                let cur = y < ys && filled[col + y * zs];
+                if prev != cur {
+                    let wy = my.wrapping_add(y as i32);
+                    let i_prev = pcol + y * pzs;
+                    let i_cur = i_prev + pzs;
+                    if prev {
+                        visit(1, i_prev, i_cur, (wx, wy - 1, wz), (wx, wy, wz));
+                    } else {
+                        visit(0, i_cur, i_prev, (wx, wy, wz), (wx, wy - 1, wz));
+                    }
+                }
+                prev = cur;
+            }
+        }
+    }
+    for y in 0..ys {
+        let wy = my.wrapping_add(y as i32);
+        let yoff = y * zs;
+        let pyoff = (y + 1) * pzs;
+        for z in 0..zs {
+            let wz = mz.wrapping_add(z as i32);
+            let line = yoff + z;
+            let pline = pyoff + (z + 1);
+            let mut prev = false;
+            for x in 0..=xs {
+                let cur = x < xs && filled[x * yz + line];
+                if prev != cur {
+                    let wx = mx.wrapping_add(x as i32);
+                    let i_prev = x * pyz + pline;
+                    let i_cur = i_prev + pyz;
+                    if prev {
+                        visit(5, i_prev, i_cur, (wx - 1, wy, wz), (wx, wy, wz));
+                    } else {
+                        visit(4, i_cur, i_prev, (wx, wy, wz), (wx - 1, wy, wz));
+                    }
+                }
+                prev = cur;
+            }
+        }
+    }
+}
+
 /// `StructureTemplate.updateShapeAtEdge(level, 3, shape, x, y, z)`, which `TreeFeature.place`
 /// runs over the shape `updateLeaves` returns, after the decorators.
 ///
@@ -2787,149 +2881,15 @@ fn apply_edge_shape_updates(ctx: &mut FC, shape: &LeafShape) {
     }
     let xs = shape.filled.len() / yz;
     if shape.filled.len() <= 65_536 && xs * yz == shape.filled.len() {
-        let filled = &shape.filled;
-        let (mx, my, mz) = shape.min;
-        let (pxs, pys, pzs) = (xs + 2, ys + 2, zs + 2);
+        let (pys, pzs) = (ys + 2, zs + 2);
         let pyz = pys * pzs;
-        let padded_len = pxs * pyz;
+        let padded_len = (xs + 2) * pyz;
         let mut cache = EDGE_STATE_CACHE.with(|c| std::mem::take(&mut *c.borrow_mut()));
         cache.clear();
         cache.resize(padded_len, u32::MAX);
-        // Native scans z (outer x, inner y), y (outer z, inner x), then x (outer y, inner z).
-        for x in 0..xs {
-            let wx = mx.wrapping_add(x as i32);
-            let xbase = x * yz;
-            let pxbase = (x + 1) * pyz;
-            for y in 0..ys {
-                let wy = my.wrapping_add(y as i32);
-                let row = xbase + y * zs;
-                let prow = pxbase + (y + 1) * pzs;
-                let mut prev = false;
-                for z in 0..=zs {
-                    let cur = z < zs && filled[row + z];
-                    if prev != cur {
-                        let wz = mz.wrapping_add(z as i32);
-                        let i_prev = prow + z;
-                        let i_cur = prow + z + 1;
-                        if prev {
-                            handle_edge_face_cached(
-                                ctx,
-                                reg,
-                                tables,
-                                &mut cache,
-                                i_prev,
-                                i_cur,
-                                3,
-                                (wx, wy, wz - 1),
-                                (wx, wy, wz),
-                            );
-                        } else {
-                            handle_edge_face_cached(
-                                ctx,
-                                reg,
-                                tables,
-                                &mut cache,
-                                i_cur,
-                                i_prev,
-                                2,
-                                (wx, wy, wz),
-                                (wx, wy, wz - 1),
-                            );
-                        }
-                    }
-                    prev = cur;
-                }
-            }
-        }
-        for z in 0..zs {
-            let wz = mz.wrapping_add(z as i32);
-            let pz = z + 1;
-            for x in 0..xs {
-                let wx = mx.wrapping_add(x as i32);
-                let col = x * yz + z;
-                let pcol = (x + 1) * pyz + pz;
-                let mut prev = false;
-                for y in 0..=ys {
-                    let cur = y < ys && filled[col + y * zs];
-                    if prev != cur {
-                        let wy = my.wrapping_add(y as i32);
-                        let i_prev = pcol + y * pzs;
-                        let i_cur = i_prev + pzs;
-                        if prev {
-                            handle_edge_face_cached(
-                                ctx,
-                                reg,
-                                tables,
-                                &mut cache,
-                                i_prev,
-                                i_cur,
-                                1,
-                                (wx, wy - 1, wz),
-                                (wx, wy, wz),
-                            );
-                        } else {
-                            handle_edge_face_cached(
-                                ctx,
-                                reg,
-                                tables,
-                                &mut cache,
-                                i_cur,
-                                i_prev,
-                                0,
-                                (wx, wy, wz),
-                                (wx, wy - 1, wz),
-                            );
-                        }
-                    }
-                    prev = cur;
-                }
-            }
-        }
-        for y in 0..ys {
-            let wy = my.wrapping_add(y as i32);
-            let yoff = y * zs;
-            let pyoff = (y + 1) * pzs;
-            for z in 0..zs {
-                let wz = mz.wrapping_add(z as i32);
-                let line = yoff + z;
-                let pline = pyoff + (z + 1);
-                let mut prev = false;
-                for x in 0..=xs {
-                    let cur = x < xs && filled[x * yz + line];
-                    if prev != cur {
-                        let wx = mx.wrapping_add(x as i32);
-                        let i_prev = x * pyz + pline;
-                        let i_cur = i_prev + pyz;
-                        if prev {
-                            handle_edge_face_cached(
-                                ctx,
-                                reg,
-                                tables,
-                                &mut cache,
-                                i_prev,
-                                i_cur,
-                                5,
-                                (wx - 1, wy, wz),
-                                (wx, wy, wz),
-                            );
-                        } else {
-                            handle_edge_face_cached(
-                                ctx,
-                                reg,
-                                tables,
-                                &mut cache,
-                                i_cur,
-                                i_prev,
-                                4,
-                                (wx, wy, wz),
-                                (wx - 1, wy, wz),
-                            );
-                        }
-                    }
-                    prev = cur;
-                }
-            }
-        }
+        for_each_dense_edge(shape, xs, |direction, p_idx, q_idx, p, q| {
+            handle_edge_face_cached(ctx, reg, tables, &mut cache, p_idx, q_idx, direction, p, q);
+        });
         EDGE_STATE_CACHE.with(|c| {
             *c.borrow_mut() = cache;
         });
@@ -3674,6 +3634,86 @@ mod tests {
                     "state {st} tags {tags:?}"
                 );
             }
+        }
+    }
+
+    /// `for_each_dense_edge` is the padded-cache half of `updateShapeAtEdge`'s face walk; the
+    /// sparse fallback below it walks `voxel_faces::exposed_faces`. Both must emit the same
+    /// `(direction, filled, empty)` sequence for the same shape or one of them stops being the
+    /// native traversal. This samples filled bitmaps exhaustively enough to cover a single
+    /// cell, cavities, disjoint blobs and shapes that touch every box face.
+    #[test]
+    fn the_dense_edge_walk_emits_the_same_faces_as_exposed_faces() {
+        fn check(shape: &LeafShape, xs: usize) {
+            let mut dense = Vec::new();
+            for_each_dense_edge(shape, xs, |d, _, _, p, q| dense.push((d, p, q)));
+            let sparse = crate::voxel_faces::exposed_faces(shape.positions());
+            assert_eq!(
+                dense.len(),
+                sparse.len(),
+                "min {:?}: dense walk emitted a different face count",
+                shape.min
+            );
+            for (i, (a, b)) in dense.iter().zip(sparse.iter()).enumerate() {
+                assert_eq!(a, b, "face {i} of shape at min {:?}", shape.min);
+            }
+        }
+        let build = |min: P3, dims: (usize, usize, usize), cells: &[(usize, usize, usize)]| {
+            let (xs, ys, zs) = dims;
+            let mut filled = vec![false; xs * ys * zs];
+            for &(x, y, z) in cells {
+                filled[x * ys * zs + y * zs + z] = true;
+            }
+            (LeafShape { min, filled, ys, zs }, xs)
+        };
+        // Single cell, two disjoint cells, a slab touching every face, a box with a cavity,
+        // and an L through the corner.
+        for (dims, cells) in [
+            ((1, 1, 1), vec![(0, 0, 0)]),
+            ((3, 2, 3), vec![(0, 0, 0), (2, 1, 2)]),
+            (
+                (4, 3, 5),
+                (0..4)
+                    .flat_map(|x| (0..5).map(move |z| (x, 1, z)))
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                (3, 3, 3),
+                (0..3)
+                    .flat_map(|x| {
+                        (0..3).flat_map(move |y| {
+                            (0..3)
+                                .filter(move |&z| !(x == 1 && y == 1 && z == 1))
+                                .map(move |z| (x, y, z))
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            ((3, 3, 3), vec![(0, 0, 0), (1, 0, 0), (2, 0, 0), (0, 1, 0), (0, 0, 1)]),
+        ] {
+            let (shape, xs) = build((-7, 60, 4), dims, &cells);
+            check(&shape, xs);
+        }
+        // Deterministic pseudo-random masks: every fill pattern exercises the transition
+        // logic somewhere, and the comparison against `exposed_faces` is order-exact.
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for i in 0..512 {
+            let (xs, ys, zs) = (1 + (next() % 4) as usize, 1 + (next() % 3) as usize, 1 + (next() % 4) as usize);
+            let mut filled = Vec::with_capacity(xs * ys * zs);
+            for _ in 0..xs * ys * zs {
+                filled.push(next() & 3 != 0);
+            }
+            if i % 64 == 0 {
+                filled.iter_mut().for_each(|v| *v = true);
+            }
+            let min = ((next() % 100) as i32 - 50, (next() % 256) as i32 - 32, (next() % 100) as i32 - 50);
+            check(&LeafShape { min, filled, ys, zs }, xs);
         }
     }
 }
