@@ -1116,7 +1116,15 @@ mod tests {
     fn registry_open_parts_roundtrips_the_pinned_pack() {
         let blocks = read_asset("blocks_1211.json");
         let states = read_asset("block_states_1211.json");
-        let facts = read_asset("block_state_facts_1211.bin");
+        // On a stripped export the generated table is absent and the runtime
+        // fallback derives it from the pack's own `block_states.json` columns.
+        let facts = std::fs::read(format!(
+            "{}/../assets/block_state_facts_1211.bin",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap_or_else(|_| {
+            crate::registry::derive_state_facts_from_parts(&blocks, Some(&states)).unwrap()
+        });
         let mut registry: *mut Registry = ptr::null_mut();
         let mut count = 0u32;
         unsafe {

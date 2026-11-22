@@ -17,3 +17,10 @@ crate-type = ["rlib", "cdylib"]
 # exposes — still no crates.io dependencies.
 [dependencies]
 mc_spine_core = { package = "mc-spine-core", path = "../core" }
+
+# Standalone manifest: the root `[profile.release]` is not inherited, so the
+# shipped binary opts into full optimisation, LTO and symbol stripping itself.
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

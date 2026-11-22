@@ -6,14 +6,13 @@
 # runtime carries only the binary, the licence texts, the public-facing tools
 # and the entrypoint. The image ships no Mojang data: no server jar, no
 # config_packets.bin, no datapacks/vanilla tree, no generated *_1211* asset
-# file. The four generated tables the binary needs are compiled into it by
-# include_bytes! in the builder; everything the server reads at runtime is
-# regenerated into the /data volume from the operator's own 1.21.1 server.jar
-# (tools/vanilla_data/gen_vanilla_data.sh - see docs/release-checklist.md).
+# file. Every generated table the server reads is loaded at runtime from the
+# /data volume, regenerated from the operator's own 1.21.1 server.jar
+# (tools/vanilla_data/gen_vanilla_data.sh - see docs/release-checklist.md), so
+# no *_1211* input is needed at compile time.
 #
-# Build from a checkout that carries the compile-time tables: the dev tree,
-# or the public export after one gen_vanilla_data.sh run. The export strips
-# those inputs, so a bare export context fails the build - by design.
+# A stripped public export builds this image as-is: no generated or
+# Mojang-derived file is part of the build context.
 
 FROM rust:1.98.0-bookworm AS builder
 WORKDIR /build
@@ -37,11 +36,6 @@ COPY mod-offload/Cargo.toml mod-offload/Cargo.lock mod-offload/
 COPY mod-offload/src mod-offload/src
 COPY create-adapter/Cargo.toml create-adapter/Cargo.lock create-adapter/
 COPY create-adapter/src create-adapter/src
-COPY assets/feature_order_1211.json assets/feature_order_1211.json
-COPY assets/structure_state_transforms_1211.bin assets/structure_state_transforms_1211.bin
-COPY datapacks/vanilla/data/minecraft/dimension_type/overworld.json \
-     datapacks/vanilla/data/minecraft/dimension_type/the_nether.json \
-     datapacks/vanilla/data/minecraft/dimension_type/
 
 RUN if [ -n "$CARGO_FEATURES" ]; then \
       cargo build --release --locked --features "$CARGO_FEATURES"; \

@@ -95,6 +95,20 @@ LICENSE_BLOCKED_PHRASES = ("all rights reserved", "proprietary")
 _PACKAGE_TABLE = re.compile(r"(?ms)^\[package\]\s*\n(.*?)(?=^\[|\Z)")
 _LICENSE_FIELD = re.compile(r"(?m)^\s*license\s*=\s*[\"']([^\"']*)[\"']")
 
+# Gate G2 - zero production embeds of generated or Mojang-derived data. A
+# non-test `include_bytes!`/`include_str!` on one of these paths re-embeds
+# exactly what the public export strips, so the stripped tree stops compiling
+# (and ships Mojang bytes inside the binary). `#[cfg(test)]` items and files
+# under a `tests/` directory are exempt: fixtures may stay embedded.
+EMBED_FORBIDDEN = re.compile(
+    r"assets/[^\s\"']*_1211|datapacks/vanilla|config_packets\.bin")
+INCLUDE_MACRO = re.compile(r"\binclude_(?:bytes|str)!\s*\(")
+CFG_TEST_ATTR = re.compile(
+    r"#\s*\[\s*cfg\s*\(\s*(?:(?:all|any)\s*\(\s*)*test\b")
+PATH_ATTR = re.compile(r"#\s*\[\s*path\s*=\s*\"([^\"]+)\"\s*\]")
+MOD_DECL = re.compile(
+    r"(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*([{;])")
+
 
 class Unrunnable(Exception):
     pass
@@ -222,6 +236,186 @@ def check_licenses(root):
     return failures
 
 
+def _mask_noncode(text):
+    """Space out comments and string/char literal contents, keeping offsets.
+
+    Line and block comments, regular strings, byte strings, raw strings
+    (`r#"..."#`) and char literals are all blanked so a `{`, `;` or the
+    `include_` spelling inside one cannot fake code structure. Identifiers
+    inside literals can still be read from the unmasked text via the shared
+    offsets.
+    """
+    out = list(text)
+    i, n = 0, len(text)
+    while i < n:
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            end = n if end == -1 else end
+            out[i:end] = " " * (end - i)
+            i = end
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            end = n if end == -1 else end + 2
+            for k in range(i, end):
+                if text[k] != "\n":
+                    out[k] = " "
+            i = end
+        elif text.startswith('"', i) or text.startswith('b"', i):
+            start = i
+            i += 2 if text.startswith('b"', i) else 1
+            while i < n and text[i] != '"':
+                i += 2 if text[i] == "\\" else 1
+            end = min(i + 1, n)
+            for k in range(start, end):
+                if text[k] != "\n":
+                    out[k] = " "
+            i = end
+        elif text[i] == "r" or (text[i] == "b" and i + 1 < n and text[i + 1] == "r"):
+            # Raw string: r"...", r#"..."#, br#"..."#
+            m = re.match(r"(?:b)?r(#+)?\"", text[i:])
+            if m:
+                terminator = '"' + (m.group(1) or "")
+                start = i
+                i += m.end()
+                close = text.find(terminator, i)
+                end = n if close == -1 else close + len(terminator)
+                for k in range(start, end):
+                    if text[k] != "\n":
+                        out[k] = " "
+                i = end
+            else:
+                i += 1
+        elif text[i] == "'":
+            # A char literal is `'x'` or `'\n'`; a lifetime is `'a` with no
+            # closing quote, so only a pattern that actually closes masks.
+            m = re.match(r"'(?:\\.|[^\\'])'", text[i:])
+            if m:
+                out[i:i + m.end()] = " " * m.end()
+                i += m.end()
+            else:
+                i += 1
+        else:
+            i += 1
+    return "".join(out)
+
+
+def _item_end_after_attr(masked, pos):
+    """End offset of the item an attribute attaches to: the next `;` at brace
+    depth 0, or the balanced `{}` block that closes the item."""
+    while pos < len(masked) and masked[pos].isspace():
+        pos += 1
+    end, depth = pos, 0
+    while end < len(masked):
+        char = masked[end]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return end + 1
+        elif char == ";" and depth == 0:
+            return end + 1
+        end += 1
+    return end
+
+
+def _test_regions(masked):
+    """Byte spans covered by `#[cfg(test)]`-attributed items: whole `mod`
+    blocks, or the single statement the attribute decorates."""
+    regions = []
+    for attr in CFG_TEST_ATTR.finditer(masked):
+        regions.append((attr.start(), _item_end_after_attr(masked, attr.end())))
+    return regions
+
+
+def check_prod_embeds(root):
+    """Gate G2: no non-test `.rs` may `include_bytes!`/`include_str!` generated
+    or Mojang-derived data (`assets/*_1211*`, `datapacks/vanilla`,
+    `config_packets.bin`).
+
+    A file is test-only when a `#[cfg(test)] mod name;` declaration resolves
+    to it (directly or via `#[path]`), or it lives under a `tests/` directory.
+    Inside other files, includes inside a `#[cfg(test)]`-attributed item are
+    exempt; everything else naming a forbidden path fails the gate.
+    """
+    failures = []
+    skip_dirs = {".git", "target", "tests"}
+    sources = [
+        path for path in sorted(root.rglob("*.rs"))
+        if path.is_file() and not skip_dirs.intersection(
+            path.relative_to(root).parts)
+    ]
+    # First pass: files a `#[cfg(test)] mod ...;` declaration makes test-only.
+    test_only = set()
+    masked_sources = {}
+    for path in sources:
+        try:
+            masked_sources[path] = _mask_noncode(
+                path.read_text(errors="replace"))
+        except OSError:
+            continue
+        masked = masked_sources[path]
+        for attr in CFG_TEST_ATTR.finditer(masked):
+            span_end = _item_end_after_attr(masked, attr.end())
+            segment = masked[attr.end():span_end]
+            base, stem = path.parent, path.stem
+            enclosing = []
+            for decl in MOD_DECL.finditer(segment):
+                if decl.group(2) == "{":
+                    enclosing.append(decl.group(1))
+                    continue
+                name = decl.group(1)
+                candidates = [
+                    base / f"{name}.rs", base / name / "mod.rs",
+                    base / stem / f"{name}.rs", base / stem / name / "mod.rs",
+                ]
+                for outer in enclosing:
+                    candidates += (base / stem / outer / f"{name}.rs",
+                                   base / stem / outer / name / "mod.rs")
+                for resolved in PATH_ATTR.finditer(segment):
+                    candidates.append(base / resolved.group(1))
+                for candidate in candidates:
+                    test_only.add(candidate.resolve())
+    # Second pass: includes outside test regions, in non-test files. The
+    # `tests.rs` / `*_tests.rs` convention also marks a file as test-only.
+    for path in sources:
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            continue
+        if (path.resolve() in test_only or path.stem == "tests"
+                or path.stem.endswith("_tests")):
+            continue
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            continue
+        masked = masked_sources[path]
+        regions = _test_regions(masked)
+        for include in INCLUDE_MACRO.finditer(masked):
+            if any(start <= include.start() < end for start, end in regions):
+                continue
+            depth, end = 0, include.end() - 1
+            while end < len(masked):
+                if masked[end] == "(":
+                    depth += 1
+                elif masked[end] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end += 1
+                        break
+                end += 1
+            argument = text[include.end() - 1:end]
+            hit = EMBED_FORBIDDEN.search(argument)
+            if hit:
+                line = text[:include.start()].count("\n") + 1
+                failures.append(
+                    f"{relative.as_posix()}:{line} embeds {hit.group(0)!r} "
+                    "at production scope; generated/Mojang data must load at "
+                    "runtime (Gate G2)")
+    return failures
+
+
 def check_strict_public(root):
     failures = []
     index = tracked(root)
@@ -243,6 +437,7 @@ def check(root, strict_public=False):
         strict_public or (STATE_ASSET not in index and ignored(root, STATE_ASSET))
     ))
     failures += check_licenses(root)
+    failures += check_prod_embeds(root)
     if strict_public:
         failures += check_strict_public(root)
     return failures, notices
@@ -374,6 +569,41 @@ def selftest(root):
              write=[("mod-adapter-core/Cargo.toml",
                      '[package]\nname = "a"\nversion = "0.1.0"\n')],
              expect=True),
+        # Gate G2: production embeds of generated/Mojang data fail; test-scope
+        # embeds stay exempt.
+        case("a production include_bytes! of a *_1211 asset fails",
+             write=[("src/registry.rs",
+                     'const X: &[u8] = '
+                     'include_bytes!("../assets/block_state_facts_1211.bin");\n')],
+             expect=True),
+        case("a production include_str! of datapacks/vanilla fails",
+             write=[("src/dim.rs",
+                     'const X: &str = '
+                     'include_str!("../datapacks/vanilla/data/minecraft/x.json");\n')],
+             expect=True),
+        case("a cfg(test) module embed passes",
+             write=[("src/registry.rs",
+                     '#[cfg(test)]\nmod tests {\nconst X: &[u8] = '
+                     'include_bytes!("../assets/block_state_facts_1211.bin");\n}\n')],
+             expect=False),
+        case("a cfg(test) statement embed passes",
+             write=[("src/spawn.rs",
+                     '#[cfg(test)]\nconst X: &[u8] = '
+                     'include_bytes!("../datapacks/vanilla/x.json");\n')],
+             expect=False),
+        case("a tests-dir embed passes",
+             write=[("tests/embed.rs",
+                     'const X: &[u8] = '
+                     'include_bytes!("../datapacks/vanilla/x.json");\n')],
+             expect=False),
+        case("a cfg(test)-declared module file embed passes",
+             write=[("src/main.rs",
+                     '#[cfg(test)]\n#[path = "fixture_tests.rs"]\n'
+                     'mod fixture_tests;\nfn main() {}\n'),
+                    ("src/fixture_tests.rs",
+                     'const X: &[u8] = '
+                     'include_bytes!("../assets/blocks_1211.json");\n')],
+             expect=False),
     ]
     # The reference scan is what makes "reading one again" a failure, so the case that plants a
     # reference must actually have been planted.

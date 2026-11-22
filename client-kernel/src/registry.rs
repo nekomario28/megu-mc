@@ -7,10 +7,15 @@ use crate::{
 use mc_spine_core::id::ResourceLocation;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-/// Pinned `getLightEmission`, `getLightBlock`, predicate and sturdy-face facts, six bytes per
-/// state. The server registry owns the same table. The opened JSON must agree with it.
-const STATE_FACTS: &[u8] = include_bytes!("../../assets/block_state_facts_1211.bin");
+/// The physical-facts table is loaded at runtime, never embedded: a stripped
+/// public export carries no `assets/*_1211*` file, so `include_bytes!` would
+/// make this crate — and every client linking it — uncompilable there. The
+/// resolution order for the pinned 1.21.1 table is bytes staged through
+/// [`Registry::load_state_facts_from_bytes`], then the first
+/// `block_state_facts{,_1211}.bin` found on disk, then a fallback synthesized
+/// from the pack's own data.
 const FACT_BYTES: usize = 6;
 const FACT_IS_AIR: u8 = 1;
 const FACT_LIQUID: u8 = 1 << 1;
@@ -21,6 +26,181 @@ const FACT_FLUID_EMPTY: u8 = 1 << 7;
 
 /// The bundled pack's version tag, as in the server's `VersionAssetPaths`.
 const VERSION_ASSET_TAG: &str = "1211";
+
+/// Facts staged by [`Registry::load_state_facts_from_bytes`]. Explicit bytes
+/// win over any file on disk: a caller that stages them is delivering the
+/// table a live data sync provided, not pointing at a local pack.
+static STAGED_FACTS: OnceLock<Vec<u8>> = OnceLock::new();
+
+/// The first `block_state_facts` table found on disk, including the negative
+/// result, so a pack that carries none is probed once rather than on every
+/// registry open.
+static DISCOVERED_FACTS: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+
+/// Every directory a `block_state_facts` table may live in, mirroring the
+/// server's `pinned_data_candidates` order: `MC_SPINE_VERSION_DIR` first (a
+/// generated version-pack root), then the checkout's `assets/` relative to the
+/// working directory and to the manifest so in-repo callers still resolve
+/// when the working directory is somewhere else. Each directory is tried with
+/// the version-neutral name first and the bundled `*_1211` tag second, the
+/// same fallback [`version_pack_path`] uses inside a pack.
+fn state_facts_candidates() -> Vec<PathBuf> {
+    let mut dirs = Vec::with_capacity(4);
+    if let Some(dir) = std::env::var_os("MC_SPINE_VERSION_DIR") {
+        if !dir.is_empty() {
+            dirs.push(PathBuf::from(dir));
+        }
+    }
+    dirs.push(PathBuf::from("assets"));
+    dirs.push(PathBuf::from("../assets"));
+    dirs.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../assets"));
+    let mut out = Vec::with_capacity(dirs.len() * 2);
+    for dir in dirs {
+        out.push(dir.join("block_state_facts.bin"));
+        out.push(dir.join(format!("block_state_facts_{VERSION_ASSET_TAG}.bin")));
+    }
+    out
+}
+
+/// Read the first `block_state_facts` candidate that exists, or `None`.
+fn discover_state_facts() -> Option<Vec<u8>> {
+    state_facts_candidates()
+        .iter()
+        .find_map(|path| std::fs::read(path).ok())
+}
+
+/// The staged or discovered `block_state_facts` table, or `None` when the
+/// pack ships none and the caller must derive or fall back.
+fn state_facts() -> Option<&'static [u8]> {
+    if let Some(bytes) = STAGED_FACTS.get() {
+        return Some(bytes.as_slice());
+    }
+    DISCOVERED_FACTS
+        .get_or_init(discover_state_facts)
+        .as_deref()
+}
+
+/// A derived facts table claims at most this many states. Without it a
+/// hostile `blocks.json` could name a `maxStateId` near `u32::MAX` and make
+/// the fallback allocation the attack instead of the table.
+const MAX_DERIVED_STATES: usize = 1 << 20;
+
+/// Synthesize the six-bytes-per-state facts table a pack did not ship, so a
+/// stripped export still opens instead of failing closed. With
+/// `block_states.json` the pack's own columns reproduce the checked fields
+/// exactly — air, liquid, emission, opacity, sturdy faces and carried fluid
+/// are the same numbers the generated table records — and the collision
+/// boxes stand in for the physical bits (a non-empty collision blocks motion
+/// and can occlude, a lone full-cube collision marks a solid render).
+/// Without it the fallback is purely structural: `air` states pass light and
+/// motion, every other state an opaque full cube. Nothing here embeds
+/// Mojang-derived bytes.
+fn derive_state_facts(blocks: &J, states: Option<&J>) -> Result<Vec<u8>, Error> {
+    let details = blocks.as_arr().ok_or(Error::InvalidJson)?;
+    let states = match states {
+        Some(states) => states,
+        None => {
+            let mut facts = Vec::new();
+            let mut rows = 0usize;
+            for detail in details {
+                let name = text(detail.get("name").ok_or(Error::InvalidJson)?)?;
+                let min = int(
+                    detail.get("minStateId").ok_or(Error::InvalidJson)?,
+                    u32::MAX,
+                )?;
+                let max = int(
+                    detail.get("maxStateId").ok_or(Error::InvalidJson)?,
+                    u32::MAX,
+                )?;
+                let row: [u8; FACT_BYTES] = match name.rsplit(':').next() == Some("air") {
+                    true => [FACT_IS_AIR | FACT_FLUID_EMPTY, 0, 0, 0, 0, 0],
+                    false => [
+                        FACT_SOLID_RENDER | FACT_CAN_OCCLUDE | FACT_BLOCKS_MOTION
+                            | FACT_FLUID_EMPTY,
+                        0x0f,
+                        0x3f,
+                        0,
+                        0,
+                        0,
+                    ],
+                };
+                rows = rows
+                    .checked_add(max.wrapping_sub(min) as usize + usize::from(max >= min))
+                    .ok_or(Error::InvalidJson)?;
+                if rows > MAX_DERIVED_STATES {
+                    return Err(Error::InvalidJson);
+                }
+                for _ in min..=max {
+                    facts.extend_from_slice(&row);
+                }
+            }
+            return Ok(facts);
+        }
+    };
+    let flags = array(states, "flags")?;
+    let count = flags.len();
+    if count > MAX_DERIVED_STATES {
+        return Err(Error::InvalidJson);
+    }
+    let luminance = column(states, "luminance", count)?;
+    let light_block = column(states, "light_block", count)?;
+    let full_sides = column(states, "full_sides", count)?;
+    let collision = column(states, "collision_shapes", count)?;
+    let shapes = array(states, "shapes")?;
+    let full_cube = |shape: &J| -> Result<bool, Error> {
+        let corner = |key| -> Result<[f64; 3], Error> {
+            match shape.get(key).and_then(J::as_arr).map(Vec::as_slice) {
+                Some([J::Num(x), J::Num(y), J::Num(z)]) => Ok([*x, *y, *z]),
+                _ => Err(Error::InvalidJson),
+            }
+        };
+        Ok(corner("min")? == [0.0, 0.0, 0.0] && corner("max")? == [1.0, 1.0, 1.0])
+    };
+    let mut facts = Vec::with_capacity(count * FACT_BYTES);
+    for state in 0..count {
+        let state_flags = int(&flags[state], 31)?;
+        let boxes = collision[state].as_arr().ok_or(Error::InvalidJson)?;
+        let mut row = [0u8; FACT_BYTES];
+        if state_flags & 1 != 0 {
+            row[0] |= FACT_IS_AIR;
+        }
+        if state_flags & 4 != 0 {
+            row[0] |= FACT_LIQUID;
+        }
+        // The pack's `holds a fluid` bit is the liquid carrier question; a
+        // state that is no liquid and holds none has an empty fluid state.
+        if state_flags & (4 | 16) == 0 {
+            row[0] |= FACT_FLUID_EMPTY;
+        }
+        if !boxes.is_empty() {
+            row[0] |= FACT_BLOCKS_MOTION | FACT_CAN_OCCLUDE;
+            if boxes.len() == 1 {
+                let index = int(&boxes[0], u32::MAX)? as usize;
+                if full_cube(shapes.get(index).ok_or(Error::InvalidJson)?)? {
+                    row[0] |= FACT_SOLID_RENDER;
+                }
+            }
+        }
+        row[1] = ((int(&luminance[state], 15)? << 4) | int(&light_block[state], 15)?) as u8;
+        row[2] = int(&full_sides[state], 63)? as u8;
+        facts.extend_from_slice(&row);
+    }
+    Ok(facts)
+}
+
+/// [`derive_state_facts`] over the pack's raw parts, for kernel-internal
+/// callers (the FFI surface, tests) that hold file bytes rather than parsed
+/// JSON. Test-only today.
+#[cfg(test)]
+pub(crate) fn derive_state_facts_from_parts(
+    blocks_json: &[u8],
+    block_states_json: Option<&[u8]>,
+) -> Result<Vec<u8>, Error> {
+    derive_state_facts(
+        &parse(blocks_json)?,
+        block_states_json.map(parse).transpose()?.as_ref(),
+    )
+}
 
 /// The pinned asset's data is at most four containers deep. Bound recursion in the parser.
 const MAX_JSON_DEPTH: usize = 16;
@@ -175,16 +355,43 @@ struct StateColumns<'a> {
 impl Registry {
     /// Open from `assets/block_states_1211.json` and `assets/blocks_1211.json`. Both must
     /// describe the pinned 1.21.1 state table and agree with each other.
+    ///
+    /// The facts table the opened JSON is cross-checked against is resolved at
+    /// runtime — staged bytes first, then the first `block_state_facts` file
+    /// found on disk — and when the pack ships none the table is derived from
+    /// the `block_states.json` columns themselves, so a stripped public export
+    /// still opens.
     pub fn open_json(states_json: &[u8], blocks_json: &[u8]) -> Result<Self, Error> {
         let states = parse(states_json)?;
         let blocks = parse(blocks_json)?;
-        if STATE_FACTS.len() != STATE_COUNT as usize * FACT_BYTES
-            || int(states.get("format").ok_or(Error::InvalidJson)?, 1)? != 1
+        if int(states.get("format").ok_or(Error::InvalidJson)?, 1)? != 1
             || text(states.get("minecraft").ok_or(Error::InvalidJson)?)? != "1.21.1"
         {
             return Err(Error::InvalidJson);
         }
-        Self::from_parsed(&blocks, Some(&states), STATE_FACTS)
+        let facts = state_facts();
+        // A staged or discovered table that does not span the pinned state
+        // space belongs to a different version's pack, not to this JSON.
+        if facts.is_some_and(|bytes| bytes.len() != STATE_COUNT as usize * FACT_BYTES) {
+            return Err(Error::InvalidJson);
+        }
+        Self::from_parsed(&blocks, Some(&states), facts)
+    }
+
+    /// Stage the pinned pack's `block_state_facts` bytes — six per state — as
+    /// the table [`Registry::open_json`] and [`Registry::from_version_dir`]
+    /// consult before any file on disk, for the table a client synced from its
+    /// server's Configuration Phase rather than found in a local `assets/`
+    /// copy. The table must span the pinned state space exactly. The first
+    /// call wins: a second call fails closed with `Error::InvalidArgument` so
+    /// a partial loader cannot silently swap facts mid-run.
+    pub fn load_state_facts_from_bytes(bytes: &[u8]) -> Result<(), Error> {
+        if bytes.len() != STATE_COUNT as usize * FACT_BYTES {
+            return Err(Error::InvalidJson);
+        }
+        STAGED_FACTS
+            .set(bytes.to_vec())
+            .map_err(|_| Error::InvalidArgument)
     }
 
     /// Open a version pack from its raw parts. `blocks_json` is the pack's
@@ -209,27 +416,52 @@ impl Registry {
                 return Err(Error::InvalidJson);
             }
         }
-        Self::from_parsed(&blocks, states.as_ref(), state_facts_bin)
+        Self::from_parsed(&blocks, states.as_ref(), Some(state_facts_bin))
     }
 
-    /// Open a version pack directory: `blocks.json` and `block_state_facts.bin`
-    /// are required, `block_states.json` is optional. For each file the
-    /// version-neutral name wins and the bundled pack's `*_1211` spelling is the
-    /// fallback, so the pinned `assets/` directory also serves as a version dir.
-    /// A missing required file reports `Error::NotFound`.
+    /// Open a version pack directory: `blocks.json` is required,
+    /// `block_state_facts.bin` and `block_states.json` are optional. For each
+    /// file the version-neutral name wins and the bundled pack's `*_1211`
+    /// spelling is the fallback, so the pinned `assets/` directory also serves
+    /// as a version dir. A missing required file reports `Error::NotFound`.
+    ///
+    /// A pack that carries no `block_state_facts` falls back to the staged or
+    /// discovered pinned table, then to facts derived from its own
+    /// `block_states.json` columns or — with neither — a pure-structural
+    /// table (`air` passable, every other state an opaque full cube) instead
+    /// of failing, so a stripped public export still opens.
     pub fn from_version_dir(dir: &Path) -> Result<Self, Error> {
         let required = |name: &str| read_pack_file(dir, name)?.ok_or(Error::NotFound);
-        Self::from_parts(
-            &required("blocks.json")?,
-            read_pack_file(dir, "block_states.json")?.as_deref(),
-            &required("block_state_facts.bin")?,
-        )
+        let blocks = parse(&required("blocks.json")?)?;
+        let states = read_pack_file(dir, "block_states.json")?
+            .map(|bytes| parse(&bytes))
+            .transpose()?;
+        let facts = read_pack_file(dir, "block_state_facts.bin")?;
+        let facts = match &facts {
+            Some(bytes) => Some(bytes.as_slice()),
+            None => state_facts(),
+        };
+        Self::from_parsed(&blocks, states.as_ref(), facts)
     }
 
     /// Shared loader: `blocks` is the parsed `blocks.json` array, `states` the
     /// parsed `block_states.json` object when the pack provides it, and
-    /// `facts_bin` the pack's six-bytes-per-state facts table.
-    fn from_parsed(blocks: &J, states: Option<&J>, facts_bin: &[u8]) -> Result<Self, Error> {
+    /// `facts_bin` the pack's six-bytes-per-state facts table — or `None` when
+    /// the pack carries none, in which case [`derive_state_facts`]
+    /// synthesizes it from the pack's own data.
+    fn from_parsed(
+        blocks: &J,
+        states: Option<&J>,
+        facts_bin: Option<&[u8]>,
+    ) -> Result<Self, Error> {
+        let derived;
+        let facts_bin = match facts_bin {
+            Some(bytes) => bytes,
+            None => {
+                derived = derive_state_facts(blocks, states)?;
+                derived.as_slice()
+            }
+        };
         if facts_bin.is_empty() || !facts_bin.len().is_multiple_of(FACT_BYTES) {
             return Err(Error::InvalidJson);
         }
@@ -889,12 +1121,13 @@ mod tests {
     fn pinned_pack_without_states_json_still_loads() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../assets/");
         let read = |name| std::fs::read(format!("{dir}{name}")).unwrap();
-        let registry = Registry::from_parts(
-            &read("blocks_1211.json"),
-            None,
-            &read("block_state_facts_1211.bin"),
-        )
-        .unwrap();
+        // The generated table is preferred; on a stripped export it is absent
+        // and the runtime fallback derives the same coarse registry from
+        // `blocks.json` alone.
+        let blocks = read("blocks_1211.json");
+        let facts = std::fs::read(format!("{dir}block_state_facts_1211.bin"))
+            .unwrap_or_else(|_| derive_state_facts(&parse(&blocks).unwrap(), None).unwrap());
+        let registry = Registry::from_parts(&blocks, None, &facts).unwrap();
         assert_eq!(registry.state_count(), STATE_COUNT as usize);
         let stone = registry
             .facts(registry.default_state("minecraft:stone").unwrap())
@@ -908,6 +1141,85 @@ mod tests {
             .facts(registry.default_state("minecraft:oak_slab").unwrap())
             .unwrap();
         assert_eq!(slab.face_occlusion, [0xf; 6]);
+    }
+
+    #[test]
+    fn staged_facts_are_the_first_table_open_json_consults() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../assets/");
+        let bytes = match std::fs::read(format!("{dir}block_state_facts_1211.bin")) {
+            Ok(bytes) => bytes,
+            // A stripped export has nothing to stage; the derive path covers it.
+            Err(_) => return,
+        };
+        Registry::load_state_facts_from_bytes(&bytes).unwrap();
+        // The first table wins: restaging fails closed, and a table that does
+        // not span the pinned state space is never staged.
+        assert_eq!(
+            Registry::load_state_facts_from_bytes(&bytes),
+            Err(Error::InvalidArgument)
+        );
+        assert_eq!(
+            Registry::load_state_facts_from_bytes(&[0u8; FACT_BYTES]),
+            Err(Error::InvalidJson)
+        );
+        let registry = open();
+        assert_eq!(registry.state_count(), STATE_COUNT as usize);
+        assert_eq!(registry.facts(0).unwrap().is_air, 1);
+    }
+
+    #[test]
+    fn derived_facts_reproduce_the_pinned_table_columns() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../assets/");
+        let read = |name| std::fs::read(format!("{dir}{name}")).unwrap();
+        let (blocks, states) = (read("blocks_1211.json"), read("block_states_1211.json"));
+        let derived = derive_state_facts(
+            &parse(&blocks).unwrap(),
+            Some(&parse(&states).unwrap()),
+        )
+        .unwrap();
+        let fallback = Registry::from_parts(&blocks, Some(&states), &derived).unwrap();
+        let pinned = open();
+        // Every kernel-visible field must agree for the structural basics the
+        // fallback commits to: air, full cubes, slabs, stairs, fluids and
+        // partial occluders with a lone non-full collision box.
+        for name in [
+            "minecraft:air",
+            "minecraft:stone",
+            "minecraft:oak_slab",
+            "minecraft:oak_stairs",
+            "minecraft:water",
+            "minecraft:lava",
+            "minecraft:glowstone",
+            "minecraft:torch",
+            "minecraft:kelp",
+            "minecraft:dirt_path",
+        ] {
+            let state = pinned.default_state(name).unwrap();
+            assert_eq!(
+                fallback.facts(state).unwrap(),
+                pinned.facts(state).unwrap(),
+                "{name}"
+            );
+        }
+        // The purely structural table marks `air` passable and every other
+        // state an opaque full cube.
+        let structural = derive_state_facts(&parse(&blocks).unwrap(), None).unwrap();
+        let coarse = Registry::from_parts(&blocks, None, &structural).unwrap();
+        assert_eq!(coarse.state_count(), STATE_COUNT as usize);
+        let air = coarse.facts(0).unwrap();
+        assert_eq!((air.is_air, air.blocks_motion, air.can_occlude), (1, 0, 0));
+        let stone = coarse
+            .facts(coarse.default_state("minecraft:stone").unwrap())
+            .unwrap();
+        assert_eq!(
+            (
+                stone.opacity,
+                stone.is_solid_render,
+                stone.sturdy_faces_mask,
+                stone.face_occlusion
+            ),
+            (15, 1, 63, [0xf; 6])
+        );
     }
 
     #[test]
