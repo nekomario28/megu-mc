@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a crash, misbehavior, or compatibility bug in Megu (mc-spine). Crash reports need a MEGU-E fingerprint.
+description: Report a crash, misbehavior, or compatibility bug in Megu (mc-spine). Crash reports need a MEGU-E fingerprint. クラッシュ報告には MEGU-E フィンガープリントが必要です。
 title: "[Bug] "
 labels: ["triage"]
 body:
@@ -11,11 +11,15 @@ body:
         Feature requests and support questions belong in GitHub Discussions
         or Discord (see the issue chooser).
 
+        簡潔にお願いします — 1 issue = 1 bug。クラッシュ報告はクラッシュ画面の
+        `MEGU-E-XXXXXXXX` フィンガープリント付きが最もトリアージしやすいです。
+        機能要望・サポート質問は GitHub Discussions へ。
+
   - type: input
     id: fingerprint
     attributes:
       label: Crash fingerprint
-      description: "From the crash report header, e.g. `MEGU-E-1A2B3C4D`. Leave blank for non-crash bugs."
+      description: "From the crash report header, e.g. `MEGU-E-1A2B3C4D`. Leave blank for non-crash bugs. (クラッシュレポート先頭の識別子)"
       placeholder: "MEGU-E-XXXXXXXX"
     validations:
       required: false
@@ -35,24 +39,51 @@ body:
     id: engine_version
     attributes:
       label: Megu / engine version
-      description: "Commit SHA, release tag, or build identifier."
+      description: "Commit SHA, release tag, or build identifier. (コミット SHA・リリースタグ等)"
       placeholder: "e.g. alpha-2026.11.22 or git sha"
     validations:
       required: true
 
-  - type: input
+  - type: dropdown
     id: os
     attributes:
       label: Operating system
-      placeholder: "e.g. Linux x86_64, Windows 11, macOS 15"
+      description: "OS and CPU. (OS と CPU)"
+      options:
+        - "Linux x86_64"
+        - "Linux arm64 (aarch64)"
+        - "Windows 11 x86_64"
+        - "macOS (Apple Silicon / Intel)"
+        - Other / multiple
     validations:
       required: true
+
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU
+      description: "Optional — e.g. Ryzen 7 7800X3D, Apple M3, Snapdragon X Elite."
+      placeholder: "Optional"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: display_server
+    attributes:
+      label: Display server / session
+      description: "Linux only — leave blank on Windows/macOS. (Linux のみ。Windows/macOS では空欄)"
+      options:
+        - "Wayland"
+        - "X11 / XWayland"
+        - "Not applicable (headless / Windows / macOS)"
+    validations:
+      required: false
 
   - type: input
     id: gpu
     attributes:
       label: GPU / renderer
-      description: "Optional — e.g. Vulkan on RTX 4060, ClassicLowSpec on Intel UHD 630."
+      description: "Optional — e.g. Vulkan on RTX 4060, ClassicLowSpec on Intel UHD 630. (GPU とレンダラ)"
       placeholder: "Optional"
     validations:
       required: false
@@ -61,7 +92,7 @@ body:
     id: mods
     attributes:
       label: Mod count / key mods
-      description: "Optional — e.g. `14 mods, Create + Sodium`."
+      description: "Optional — e.g. `14 mods, Create + Sodium`. (導入 mod 数・主要 mod)"
       placeholder: "Optional"
     validations:
       required: false
@@ -70,7 +101,7 @@ body:
     id: summary
     attributes:
       label: Summary
-      description: "1–2 lines: what happened and what you expected."
+      description: "1–2 lines: what happened and what you expected. (何が起きたか・期待動作)"
     validations:
       required: true
 
@@ -78,7 +109,7 @@ body:
     id: steps
     attributes:
       label: Steps to reproduce
-      description: "Minimal repro — commands, world state, or modpack name."
+      description: "Minimal repro — commands, world state, or modpack name. (最小再現手順)"
       placeholder: |
         1. Start server with ...
         2. Join and run ...
@@ -87,13 +118,13 @@ body:
       required: true
 
   - type: textarea
-    id: log
+    id: crash_log
     attributes:
-      label: Masked log snippet
+      label: Crash report / log snippet
       description: |
         Paste the relevant lines only (crash header, ERROR/WARN lines,
         top stack frames — max ~20 lines). Redact home paths, IPs, and
-        tokens first.
+        tokens first. `MEGU-E-XXXXXXXX` fingerprint を必ず含めてください。
       render: shell
     validations:
       required: false

@@ -1,0 +1,108 @@
+name: Mod compatibility report
+description: Report a mod compatibility issue or share mc-spine-mod-check results. mod の互換性問題・mod-check 結果の共有用。
+title: "[ModCompat] "
+labels: ["mod-compat"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form when a mod misbehaves under Megu/mc-spine, or to share
+        `mc-spine-mod-check` output for a modpack. One mod (or one modpack)
+        per report. Please redact anything sensitive before pasting output.
+
+        Megu/mc-spine 上で mod が正常に動かない場合、または modpack の
+        `mc-spine-mod-check` 出力を共有したい場合に使用してください。
+        1 件につき 1 mod（または 1 modpack）。貼り付け前に機密情報を
+        マスクしてください。
+
+  - type: input
+    id: mod_name
+    attributes:
+      label: Mod name / display name
+      placeholder: "e.g. Create, Sodium, ImmediatelyFast"
+    validations:
+      required: true
+
+  - type: input
+    id: mod_id
+    attributes:
+      label: Mod ID / JAR file name
+      placeholder: "e.g. create-0.5.1-fabric.jar"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: loader
+    attributes:
+      label: Target loader
+      options:
+        - "Fabric"
+        - "NeoForge"
+        - "Both / unknown"
+        - "Other"
+    validations:
+      required: true
+
+  - type: input
+    id: mc_version
+    attributes:
+      label: Minecraft version
+      placeholder: "e.g. 1.21.1 or 26.3"
+    validations:
+      required: true
+
+  - type: input
+    id: mod_source
+    attributes:
+      label: Modrinth / CurseForge link
+      description: "URL of the mod page or project. (Mod の配布ページ URL)"
+      placeholder: "https://modrinth.com/mod/... or https://www.curseforge.com/..."
+    validations:
+      required: false
+
+  - type: input
+    id: engine_version
+    attributes:
+      label: Megu / engine version
+      placeholder: "e.g. alpha-2026.11.22 or git sha"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: check_status
+    attributes:
+      label: mc-spine-mod-check classification
+      description: "Run `mc-spine-mod-check --scan-jar <jar> --json` or `--modpack <pack.mrpack> --mc-version <ver> --json` first."
+      options:
+        - "`native_bundle` — native bundle available"
+        - "`auto_skipped` — auto-skipped"
+        - "`tier2_lifted_shim` — Tier 2 lifted shim"
+        - "`tier3_fallback_required` — Tier 3 fallback required"
+        - "Check not run / unknown"
+    validations:
+      required: true
+
+  - type: textarea
+    id: check_output
+    attributes:
+      label: mc-spine-mod-check output (JSON or human)
+      description: |
+        Paste the full `--json` output (preferred) or the human-readable
+        summary. Redact paths and usernames if needed.
+        `--json` 出力を貼り付けてください（推奨）。パスやユーザー名は
+        マスクしてください。
+      render: json
+    validations:
+      required: false
+
+  - type: textarea
+    id: symptom
+    attributes:
+      label: Observed behavior
+      description: "What actually happens vs. what vanilla/the mod expects. (実際の挙動と期待動作)"
+      placeholder: |
+        Expected: ...
+        Actual: ...
+        Repro: ...
+    validations:
+      required: true

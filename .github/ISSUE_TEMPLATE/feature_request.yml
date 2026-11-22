@@ -1,0 +1,64 @@
+name: Feature request
+description: Propose a feature, UX improvement, or aesthetic enhancement for Megu/mc-spine. 機能・UX・見た目の改善提案。
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem first, then the proposal. Small, focused
+        requests are much easier to evaluate. Check
+        [GitHub Discussions](https://github.com/nekomario28/mc-spine/discussions)
+        and existing issues before filing — duplicates will be closed.
+
+        まず課題を、次に提案を書いてください。小さく焦点の絞られた
+        要望ほど評価しやすいです。重複はクローズされます。
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - "Gameplay / protocol"
+        - "Mod compatibility / adapter"
+        - "Client / rendering / shaders"
+        - "Launcher / tooling (CLI)"
+        - "Website / docs"
+        - "Aesthetics / UX polish"
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: "What is missing or painful today? (現状の課題・動機)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: "What should change? Include UX details or mockups if relevant. (提案内容)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: "Optional — other approaches you weighed. (検討した代替案)"
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and Discussions first
+          required: true
+        - label: This request is about Megu/mc-spine itself, not a third-party mod bug (mod bugs → Mod compatibility form)
+          required: false
