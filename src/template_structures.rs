@@ -189,12 +189,14 @@ impl TemplateWorld for crate::generation_context::FC<'_> {
     fn sea_level(&self) -> i32 {
         self.g.sea
     }
+    #[expect(clippy::misnamed_getters, reason = "template placement reads the world build window")]
     fn min_y(&self) -> i32 {
         // `LevelAccessor.getMinBuildHeight` - the world window. `base_height`/
         // `base_column` above stay generator-side on purpose (`ChunkGenerator.getBaseHeight`
         // is the noise column, not the chunk).
         self.g.world_min_y
     }
+    #[expect(clippy::misnamed_getters, reason = "template placement reads the world build window")]
     fn height(&self) -> i32 {
         // `LevelHeightAccessor.getHeight` - the world window. Every caller here is a
         // vanilla build-height question: `TemplatePlacement`'s `VerticalAnchor`
@@ -693,7 +695,7 @@ pub(crate) fn process_block_infos<W: TemplateWorld>(
             match processor {
                 ExtProc::BlockAge { mossiness } => {
                     let mut guard = rng_cell.borrow_mut();
-                    let mut rng = settings_rng(&mut **guard, current.pos);
+                    let mut rng = settings_rng(&mut guard, current.pos);
                     block_age(&mut rng, &mut current, *mossiness, reg);
                 }
                 ExtProc::Native(processor) => {
@@ -707,7 +709,7 @@ pub(crate) fn process_block_infos<W: TemplateWorld>(
                     };
                     let mut draw = |p: Pos| {
                         let mut guard = rng_cell.borrow_mut();
-                        let mut rng = settings_rng(&mut **guard, p);
+                        let mut rng = settings_rng(&mut guard, p);
                         rng.next_f32()
                     };
                     if !apply_single_processor(
@@ -731,8 +733,6 @@ pub(crate) fn process_block_infos<W: TemplateWorld>(
             result.push(current);
         }
     }
-    drop(world_cell);
-    drop(rng_cell);
     // `CappedProcessor.finalizeProcessing`: the limit and the index shuffle draw
     // from `level.getRandom().forkPositional().at(pos)`, and only the delegate's
     // changed cells count against the cap.
@@ -774,7 +774,7 @@ pub(crate) fn process_block_infos<W: TemplateWorld>(
             };
             let mut draw = |p: Pos| {
                 let mut guard = rng_cell.borrow_mut();
-                let mut rng = settings_rng(&mut **guard, p);
+                let mut rng = settings_rng(&mut guard, p);
                 rng.next_f32()
             };
             let kept = apply_single_processor(
@@ -796,8 +796,6 @@ pub(crate) fn process_block_infos<W: TemplateWorld>(
                 result[idx] = candidate;
             }
         }
-        drop(world_cell);
-        drop(rng_cell);
     }
     Ok(result)
 }
@@ -1520,12 +1518,10 @@ fn update_shape<W: TemplateWorld>(
     }
     if name.ends_with("_button") && reg.is_air(neighbor) {
         let attached = reg.get_prop(state, "face");
-        let breaks = match (attached.as_deref(), direction) {
-            (Some("floor"), 0) => true,
-            (Some("ceiling"), 1) => true,
-            (Some("wall"), 2..=5) => true,
-            _ => false,
-        };
+        let breaks = matches!(
+            (attached.as_deref(), direction),
+            (Some("floor"), 0) | (Some("ceiling"), 1) | (Some("wall"), 2..=5)
+        );
         if breaks {
             return air;
         }
@@ -1948,7 +1944,6 @@ pub(crate) fn postprocess_shape_marks<W: TemplateWorld>(
             .unwrap_or_else(|| update_from_neighbour_shapes(reg, state, world, pos));
         if updated != state {
             if trace
-                .as_deref()
                 .is_some_and(|want| want == "all" || want == format!("{},{}", pos.0 >> 4, pos.2 >> 4))
             {
                 eprintln!(
@@ -2093,12 +2088,14 @@ fn direction_delta(direction: u8) -> (i32, i32, i32) {
 /// `--preset nether` panics in `with_templates` with "RefCell already borrowed"
 /// on the first chunk), so the mutable parts live behind their own cells and the
 /// accessor takes `&self` like the native manager.
+type TemplateLoader = Box<dyn FnMut(&str) -> Option<Vec<u8>>>;
+
 pub(crate) struct Templates {
     cache: std::cell::RefCell<std::collections::HashMap<String, Rc<Template>>>,
     /// `StructureTemplateManager.getOrCreate` behind a seam: this layer may not
     /// reach for the worldgen pack reader (the module graph forbids that edge),
     /// so the caller that owns the datapack supplies the bytes.
-    loader: std::cell::RefCell<Box<dyn FnMut(&str) -> Option<Vec<u8>>>>,
+    loader: std::cell::RefCell<TemplateLoader>,
 }
 
 impl Templates {
@@ -2443,6 +2440,7 @@ pub(crate) struct FindCtx<'a> {
     pub(crate) rng: &'a mut Lcg,
 }
 
+#[expect(clippy::too_many_arguments, reason = "preserve the established placement and simulation call signature")]
 fn piece(
     template: &str,
     pos: Pos,
@@ -3339,6 +3337,7 @@ fn ruined_portal_processors(
 
 // ---------------------------------------------------------------- postProcess
 
+#[expect(clippy::too_many_arguments, reason = "preserve the established placement and simulation call signature")]
 pub(crate) fn place_structure<W: TemplateWorld>(
     world: &mut W,
     templates: &Templates,
@@ -3372,6 +3371,7 @@ pub(crate) fn place_structure<W: TemplateWorld>(
 }
 
 impl Piece {
+    #[expect(clippy::too_many_arguments, reason = "preserve the established placement and simulation call signature")]
     fn post_process<W: TemplateWorld>(
         &mut self,
         world: &mut W,
@@ -4198,8 +4198,7 @@ mod template_structures_tests {
                 }
             }
         }
-        map.into_iter()
-            .filter_map(|(_, record)| record)
+        map.into_values().flatten()
             .map(|record| {
                 let items = record
                     .items
@@ -5223,7 +5222,8 @@ mod template_structures_tests {
     /// there reads as a hash difference; here it names the piece and the field.
     #[test]
     fn template_structure_piece_geometry_matches_1211_native() {
-        const NATIVE: &[(&str, usize, &[(i32, i32, i32, i32, i32, i32, u8, u8)])] = &[
+        type NativePieceGeometry = (i32, i32, i32, i32, i32, i32, u8, u8);
+        const NATIVE: &[(&str, usize, &[NativePieceGeometry])] = &[
             ("igloo-seed1-c0-0", 1, &[(1, 90, 2, 8, 94, 8, 1, 0)]),
             (
                 "igloo-seed9-chunk-clip",
@@ -5269,8 +5269,8 @@ mod template_structures_tests {
         ];
         let reg = breg().expect("block registry");
         let cases = load_cases();
-        let structure_cases = jarr(&cases, "structures").expect("structures");
-        let mut templates = Templates::new(|id| {
+        let structure_cases = jarr(cases, "structures").expect("structures");
+        let templates = Templates::new(|id| {
             crate::worldgen::Gen::dp_resource("structure", id, "nbt")
         });
         for (id, count, pieces) in NATIVE {
@@ -5278,7 +5278,7 @@ mod template_structures_tests {
                 .iter()
                 .find(|case| jstr(case, "id").as_deref() == Some(id))
                 .unwrap_or_else(|| panic!("missing case {id}"));
-            let (_, _, _, built) = generate(case, reg, &mut templates);
+            let (_, _, _, built) = generate(case, reg, &templates);
             let (_, got) = built.unwrap_or_else(|| panic!("{id}: no generation point"));
             assert_eq!(got.len(), *count, "{id}: piece count");
             for (index, want) in pieces.iter().enumerate() {
@@ -5305,11 +5305,11 @@ mod template_structures_tests {
     fn template_structures_match_1211_native_fixture() {
         let reg = breg().expect("block registry");
         let cases = load_cases();
-        let block_age_cases = jarr(&cases, "block_age").expect("block_age");
-        let place_cases = jarr(&cases, "place_extended").expect("place_extended");
-        let structure_cases = jarr(&cases, "structures").expect("structures");
+        let block_age_cases = jarr(cases, "block_age").expect("block_age");
+        let place_cases = jarr(cases, "place_extended").expect("place_extended");
+        let structure_cases = jarr(cases, "structures").expect("structures");
         let tsv = include_str!("../tests/data/template_structures_1211.tsv");
-        let mut templates = Templates::new(|id| {
+        let templates = Templates::new(|id| {
                 crate::worldgen::Gen::dp_resource("structure", id, "nbt")
             });
         let mut rows = 0usize;
@@ -5357,7 +5357,7 @@ mod template_structures_tests {
                         .find(|case| jstr(case, "id").as_deref() == Some(id))
                         .expect("place_extended case");
                     let (wrote, writes, events, entities, probe) =
-                        run_place_extended(case, reg, &mut templates);
+                        run_place_extended(case, reg, &templates);
                     let want_wrote: usize = f[2].parse().unwrap();
                     let want_hash = f[3];
                     let want_be_count: usize = f[4].parse().unwrap();
@@ -5410,7 +5410,7 @@ mod template_structures_tests {
                         .iter()
                         .find(|case| jstr(case, "id").as_deref() == Some(id))
                         .expect("structure case");
-                    if let Some(message) = run_structure_row(case, &f, reg, &mut templates) {
+                    if let Some(message) = run_structure_row(case, &f, reg, &templates) {
                         eprintln!("FAIL structure/{id}: {message}");
                         failures += 1;
                     }

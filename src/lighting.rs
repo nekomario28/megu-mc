@@ -424,7 +424,7 @@ impl IncrementalLighting {
         let dy = p.y - min_y;
         (0..height)
             .contains(&dy)
-            .then(|| (dy as usize) << 8 | ((p.z & 15) as usize) << 4 | (p.x & 15) as usize)
+            .then_some((dy as usize) << 8 | ((p.z & 15) as usize) << 4 | (p.x & 15) as usize)
     }
 
     fn index(&self, p: Position) -> Option<usize> {
@@ -877,7 +877,7 @@ impl IncrementalLighting {
         if let Some(chunk) = self.chunks.get(&chunk) {
             for (array, levels) in out[1..count - 1]
                 .iter_mut()
-                .zip(chunk.light(kind).chunks_exact(4096))
+                .zip(chunk.light(kind).as_chunks::<4096>().0.iter())
             {
                 *array = pack_light_nibbles(levels);
             }
@@ -891,7 +891,7 @@ impl IncrementalLighting {
 
 fn pack_light_nibbles(levels: &[u8]) -> [u8; 2048] {
     let mut out = [0u8; 2048];
-    for (byte, pair) in out.iter_mut().zip(levels.chunks_exact(2)) {
+    for (byte, pair) in out.iter_mut().zip(levels.as_chunks::<2>().0.iter()) {
         *byte = pair[0] | (pair[1] << 4);
     }
     out
@@ -942,7 +942,7 @@ mod incremental_lighting_tests {
 
     fn nibble(sections: &[[u8; 2048]], y: i32, x: usize, z: usize) -> u8 {
         let section = (y.div_euclid(16) + 1) as usize;
-        let idx = (y.rem_euclid(16) as usize * 256 + z * 16 + x) as usize;
+        let idx = y.rem_euclid(16) as usize * 256 + z * 16 + x;
         (sections[section][idx / 2] >> (4 * (idx % 2))) & 15
     }
 
@@ -1371,7 +1371,7 @@ mod incremental_lighting_tests {
 
         // Alternating place/remove keeps every batch doing real relight work.
         let place: Vec<(Position, LightBlock)> = (0..24)
-            .map(|i| (p(16 + i as i32, 22, 16 + (i as i32 * 5) % 40), LANTERN))
+            .map(|i| (p(16 + i, 22, 16 + (i * 5) % 40), LANTERN))
             .collect();
         let remove: Vec<(Position, LightBlock)> =
             place.iter().map(|&(pos, _)| (pos, AIR)).collect();

@@ -1446,7 +1446,7 @@ fn jigsaw_front_top(state: u32, reg: &BReg) -> (&'static str, &'static str) {
     (norm(front), norm(top))
 }
 
-fn nbt_str<'a>(tag: &'a Tag, key: &str) -> Option<String> {
+fn nbt_str(tag: &Tag, key: &str) -> Option<String> {
     tag.get(key)?.string()?.to_utf8().ok()
 }
 
@@ -1487,7 +1487,7 @@ fn jigsaws_can_attach(parent: &BlockInfo, cand: &BlockInfo, reg: &BReg) -> bool 
     let rollable = match joint.as_str() {
         "rollable" => true,
         "aligned" => false,
-        _ => dir_is_horizontal(p_front) == false,
+        _ => !dir_is_horizontal(p_front),
     };
     rollable || p_top == c_top
 }
@@ -1885,6 +1885,7 @@ impl JigsawWorld for LiveJigsawWorld<'_> {
     }
 }
 
+#[expect(clippy::too_many_arguments, reason = "preserve the established placement and simulation call signature")]
 fn generate_pieces_with_hm<D: JigsawData, W: JigsawWorld>(
     repo: &mut D,
     world: &mut W,
@@ -2243,7 +2244,7 @@ fn generate_pieces_with_hm<D: JigsawData, W: JigsawWorld>(
                             };
                             let child_idx = pieces.len();
                             pieces.push(child_piece);
-                            if depth + 1 <= structure.max_depth {
+                            if depth < structure.max_depth {
                                 queue.push((child_idx, active_slot, depth + 1), placement_priority);
                             }
                             break 'cand_loop;
@@ -3001,7 +3002,7 @@ fn place_element<D: JigsawData>(
         PoolElement::Feature { feature, .. } => match target {
             #[cfg(test)]
             JigsawTarget::Scene { scene, writes, gen } => {
-                let mut ctx = FC::new(*gen);
+                let mut ctx = FC::new(gen);
                 ctx.test_default_air = true;
                 ctx.test_biome("minecraft:plains");
                 let r = 16;
@@ -3035,7 +3036,7 @@ fn place_element<D: JigsawData>(
                 Ok(())
             }
             JigsawTarget::Live(ctx) => {
-                let ok = gen_placed_feature_by_name(feature, *ctx, rng, piece_pos);
+                let ok = gen_placed_feature_by_name(feature, ctx, rng, piece_pos);
                 if !ok {
                     return Err(format!("unknown placed feature in FeaturePoolElement: {feature}"));
                 }
@@ -3117,6 +3118,7 @@ fn decoration_rng(seed: i64, cx: i32, cz: i32) -> Xor {
 }
 
 #[cfg(test)]
+#[expect(clippy::too_many_arguments, reason = "preserve the established placement and simulation call signature")]
 fn place_chunk(
     repo: &mut DatapackRepo,
     pieces: &[JigsawPiece],
@@ -3161,7 +3163,7 @@ fn place_chunk(
     }
 
     let mut entries: Vec<(Pos, u32)> = writes.into_iter().collect();
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.sort_by_key(|a| a.0);
     let mut buf = String::new();
     for ((x, y, z), st) in &entries {
         buf.push_str(&format!("{x},{y},{z}={}\n", reg.canonical_state(*st)));
@@ -3180,6 +3182,7 @@ pub(crate) mod jigsaw_structures {
     ///
     /// The template is injected into a repository with no datapack behind it, so the case does
     /// not depend on which vanilla template happens to carry the shape it needs.
+    #[expect(clippy::too_many_arguments, reason = "preserve the established placement and simulation call signature")]
     fn place_single_block_piece(
         repo: &mut DatapackRepo,
         id: &str,
@@ -3385,7 +3388,7 @@ pub(crate) mod jigsaw_structures {
             reg,
         )
         .expect("blast furnace piece places");
-        let iron = crate::name_to_item("minecraft:iron_ingot").expect("iron ingot") as i64;
+        let iron = crate::name_to_item("minecraft:iron_ingot").expect("iron ingot");
         assert_eq!(
             ctx.payloads,
             vec![(

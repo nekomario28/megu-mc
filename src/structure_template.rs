@@ -768,6 +768,7 @@ impl Processor {
     }
 }
 
+#[expect(clippy::too_many_arguments, reason = "preserve the established placement and simulation call signature")]
 fn apply_single_processor(
     processor: &Processor,
     original: &BlockInfo,
@@ -879,6 +880,7 @@ impl Template {
         )
     }
 
+    #[expect(clippy::too_many_arguments, reason = "preserve the established placement and simulation call signature")]
     pub(crate) fn process_blocks_with_context(
         &self,
         palette: usize,
@@ -1937,7 +1939,7 @@ mod tests {
         assert_eq!(staged.len(), 1, "the generator holds the staged contents once");
         assert!(g.take_staged_payloads().is_empty(), "taking them twice yields nothing");
         crate::materialize_generation_payloads(staged);
-        let redstone = crate::name_to_item("minecraft:redstone").unwrap() as i64;
+        let redstone = crate::name_to_item("minecraft:redstone").unwrap();
         assert_eq!(
             crate::chests().lock().unwrap_or_else(|e| e.into_inner()).get(&crate::ContainerKey::ow((2, 70, 2))).cloned(),
             Some([(0i16, (redstone, 3u8, Vec::new()))].into_iter().collect()),
@@ -2261,7 +2263,7 @@ mod tests {
             NbtString::text("Items"),
             Tag::List(10, vec![container_entry(0, "minecraft:arrow", 1)]),
         );
-        let arrow = crate::name_to_item("minecraft:arrow").unwrap() as i64;
+        let arrow = crate::name_to_item("minecraft:arrow").unwrap();
         for (name, expected) in [
             ("minecraft:chest", ContainerKind::Chest),
             ("minecraft:barrel", ContainerKind::Chest),
@@ -3168,7 +3170,7 @@ mod tests {
                 0,
             )
             .unwrap();
-        assert_eq!(processed[0].pos, (10, 64 - 2 + 0, 20));
+        assert_eq!(processed[0].pos, (10, (64 - 2), 20));
         assert_eq!(processed[1].pos, (11, 70 - 2 + 3, 20));
     }
 

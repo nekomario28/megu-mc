@@ -830,9 +830,11 @@ impl LoomMenu {
     }
 
     fn result(&self) -> Stack {
-        self.can_apply()
-            .then(|| (self.banner.0, 1u8, self.banner.2.clone()))
-            .unwrap_or_default()
+        if self.can_apply() {
+            (self.banner.0, 1u8, self.banner.2.clone())
+        } else {
+            Default::default()
+        }
     }
 
     // Takes the result: banner + dye are consumed (banner count must be 1), the
@@ -985,7 +987,7 @@ fn wm_stack_decode(b: &[u8]) -> Option<(Stack, usize)> {
     let nadd = slot_read_varint(b, &mut p)?;
     let nrem = slot_read_varint(b, &mut p)?;
     let mut comps: Comps = Vec::new();
-    if nadd < 0 || nadd > 128 || nrem < 0 || nrem > 128 {
+    if !(0..=128).contains(&nadd) || !(0..=128).contains(&nrem) {
         return None;
     }
     if nrem != 0 {
@@ -1573,8 +1575,8 @@ fn wm_pig_ride_speed(movement_speed: f64, boost_multiplier: f64) -> f64 {
     movement_speed * WM_PIG_RIDE_FACTOR * boost_multiplier
 }
 
-/// Vanilla strider ride speed (ckq): `MOVEMENT_SPEED * (cold ? 0.35 : 0.55)
-/// * boostFactor`, on the 0.175 base attribute. A strider is cold whenever it
+/// Vanilla strider ride speed (ckq):
+/// `MOVEMENT_SPEED * (cold ? 0.35 : 0.55) * boostFactor`, on the 0.175 base attribute. A strider is cold whenever it
 /// is not standing on warm lava — the shivering state.
 const WM_STRIDER_BASE_SPEED: f64 = 0.175;
 const WM_STRIDER_COLD_FACTOR: f64 = 0.35;

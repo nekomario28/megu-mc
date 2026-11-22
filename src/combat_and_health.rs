@@ -195,9 +195,11 @@ fn equipped_pairs(c: &Client) -> Vec<(ItemAttrSlotGroup, Stack)> {
 /// health lock (main.rs player tick), so it must not take the inventory lock;
 /// the cache is refreshed on the exhaustion hook (per tick per client) and on
 /// every melee charge instead.
-static EQUIP_ATTRS: OnceLock<Mutex<HashMap<String, HashMap<i32, (f64, f64, f64)>>>> =
-    OnceLock::new();
-fn equip_attrs() -> &'static Mutex<HashMap<String, HashMap<i32, (f64, f64, f64)>>> {
+type EquipAttributeModifiers = HashMap<i32, (f64, f64, f64)>;
+type EquippedAttributes = HashMap<String, EquipAttributeModifiers>;
+
+static EQUIP_ATTRS: OnceLock<Mutex<EquippedAttributes>> = OnceLock::new();
+fn equip_attrs() -> &'static Mutex<EquippedAttributes> {
     EQUIP_ATTRS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 fn refresh_equip_attrs(c: &Client) {
@@ -486,6 +488,7 @@ fn is_vanilla_critical_hit(ctx: &CritContext) -> bool {
         && ctx.target_is_living
 }
 
+#[expect(clippy::too_many_arguments, reason = "preserve the established placement and simulation call signature")]
 fn melee_critical_allowed(
     charge: f32,
     grounded: bool,
@@ -1159,7 +1162,7 @@ fn evaluate_shield_block(ctx: &ShieldAttackCtx) -> ShieldBlock {
         return miss;
     }
     let dot = ctx.look[0] * ctx.to_attacker[0] + ctx.look[1] * ctx.to_attacker[1];
-    if !(dot > 0.0) {
+    if dot.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
         return miss;
     }
     let durability_attempts = vanilla_shield_attempts(ctx.damage);
@@ -1464,8 +1467,8 @@ fn trident_restore(c: &Arc<Client>, item: i64, comps: &Comps) {
     let hs = 36 + *c.held.lock().unwrap_or_else(|e| e.into_inner());
     {
         let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
-        if !inv.contains_key(&hs) {
-            inv.insert(hs, (item, 1, comps.clone()));
+        if let std::collections::hash_map::Entry::Vacant(e) = inv.entry(hs) {
+            e.insert((item, 1, comps.clone()));
             let st = inv.get(&hs).cloned().unwrap_or((0, 0, Vec::new()));
             drop(inv);
             resync_slot(c, 0, hs, &st);

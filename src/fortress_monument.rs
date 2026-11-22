@@ -21,6 +21,7 @@
 
 /// `BoundingBox.orientBox(x, y, z, offX, offY, offZ, width, height, depth, direction)`.
 #[cfg_attr(not(test), allow(dead_code))]
+#[expect(clippy::too_many_arguments, reason = "preserve the established placement and simulation call signature")]
 pub(crate) fn fm_orient_box(
     x: i32,
     y: i32,
@@ -676,6 +677,7 @@ impl FortressBuilder {
     }
 
     /// `NetherBridgePiece.generatePiece`: five attempts, each drawing one weight index.
+    #[expect(clippy::too_many_arguments, reason = "preserve the established placement and simulation call signature")]
     fn generate_piece<R: StructureRng + FullIntRng + ?Sized>(
         &mut self,
         which: usize,
@@ -1789,12 +1791,12 @@ mod fortress_monument_tests {
             match f[0] {
                 "fortress" => {
                     assert_eq!(f.len(), 15, "bad fortress row: {line}");
-                    failures += run_fortress_row(&reg, &f);
+                    failures += run_fortress_row(reg, &f);
                     fortress_rows += 1;
                 }
                 "monument" => {
                     assert_eq!(f.len(), 16, "bad monument row: {line}");
-                    failures += run_monument_row(&reg, &f);
+                    failures += run_monument_row(reg, &f);
                     monument_rows += 1;
                 }
                 other => panic!("unknown structure kind {other}"),
@@ -2267,11 +2269,10 @@ impl MonumentGraph {
             let Some(next) = self.room(id).connections[d] else {
                 continue;
             };
-            if self.room(id).has_opening[d] && self.room(next).scan_index != scan {
-                if self.find_source(next, scan) {
+            if self.room(id).has_opening[d] && self.room(next).scan_index != scan
+                && self.find_source(next, scan) {
                     return true;
                 }
-            }
         }
         false
     }
@@ -2336,8 +2337,7 @@ fn monument_generate_room_graph<R: StructureRng + ?Sized>(
                 let Some(room) = g.by_index[idx] else {
                     continue;
                 };
-                for d in 0..6 {
-                    let (sx, sy, sz) = DIR_STEP[d];
+                for (d, &(sx, sy, sz)) in DIR_STEP.iter().enumerate() {
                     let (nx, ny, nz) = (x + sx, y + sy, z + sz);
                     if !(0..5).contains(&nx) || !(0..5).contains(&nz) || !(0..3).contains(&ny) {
                         continue;
@@ -2928,10 +2928,10 @@ fn monument_building_body(
     }
 
     for k in 0..5 {
-        w.generate_water_box(s, -1 - k, 0 + k * 2, -1 - k, -1 - k, 23, 58 + k, sea_level);
-        w.generate_water_box(s, 58 + k, 0 + k * 2, -1 - k, 58 + k, 23, 58 + k, sea_level);
-        w.generate_water_box(s, 0 - k, 0 + k * 2, -1 - k, 57 + k, 23, -1 - k, sea_level);
-        w.generate_water_box(s, 0 - k, 0 + k * 2, 58 + k, 57 + k, 23, 58 + k, sea_level);
+        w.generate_water_box(s, -1 - k, k * 2, -1 - k, -1 - k, 23, 58 + k, sea_level);
+        w.generate_water_box(s, 58 + k, k * 2, -1 - k, 58 + k, 23, 58 + k, sea_level);
+        w.generate_water_box(s, 0 - k, k * 2, -1 - k, 57 + k, 23, -1 - k, sea_level);
+        w.generate_water_box(s, 0 - k, k * 2, 58 + k, 57 + k, 23, 58 + k, sea_level);
     }
 }
 
@@ -3344,6 +3344,7 @@ fn monument_generate_upper_wall(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[expect(clippy::too_many_arguments, reason = "preserve the established placement and simulation call signature")]
 fn monument_piece_post_process(
     w: &mut PieceWorld<'_, '_>,
     s: &MonumentStates,
@@ -4168,6 +4169,7 @@ fn monument_spawn_elder(
 /// Place one monument chunk. The building writes its own body, then every child whose box
 /// meets the clip, exactly as `MonumentBuilding.postProcess` ends.
 #[cfg_attr(not(test), allow(dead_code))]
+#[expect(clippy::too_many_arguments, reason = "preserve the established placement and simulation call signature")]
 pub(crate) fn place_monument_chunk<R: StructureRng + FullIntRng>(
     ctx: &mut FC<'_>,
     reg: &'static BReg,
@@ -4197,11 +4199,11 @@ pub(crate) fn place_monument_chunk<R: StructureRng + FullIntRng>(
         );
         monument_building_body(&mut w, &states, clip, sea_level);
     }
-    for i in 1..pieces.len() {
-        if !fm_bb_intersects(&pieces[i].bounds, &clip) {
+    for piece in pieces.iter().skip(1) {
+        if !fm_bb_intersects(&piece.bounds, &clip) {
             continue;
         }
-        let piece = pieces[i].clone();
+        let piece = piece.clone();
         let mut w = PieceWorld::new(ctx, reg, clip, piece.bounds, Some(piece.orient), loots);
         monument_piece_post_process(&mut w, &states, &piece, rooms, rng, clip, sea_level, elders);
     }

@@ -4,6 +4,10 @@ use crate::generation_math::Lcg;
 include!("mob_despawn.rs");
 include!("spawn_costs.rs");
 
+type SpawnSourceList = Vec<((i32, i32, i32), u8)>;
+type FortressChunkRooms = Vec<([i32; 6], Vec<[i32; 6]>)>;
+type NetherSpawnLightCache = HashMap<(i32, i32), Vec<[u8; 2048]>>;
+
 #[cfg_attr(not(test), allow(dead_code))]
 const SPAWN_CAP_MAGIC_NUMBER: u64 = 17 * 17;
 #[cfg_attr(not(test), allow(dead_code))]
@@ -346,6 +350,7 @@ pub(crate) fn evaluate_despawn(
 
 /// Peaceful is checked before persistence in Mob.checkDespawn.
 #[cfg_attr(not(test), allow(dead_code))]
+#[expect(clippy::too_many_arguments, reason = "preserve the established placement and simulation call signature")]
 pub(crate) fn evaluate_despawn_with_peaceful(
     peaceful: bool,
     despawns_in_peaceful: bool,
@@ -676,7 +681,7 @@ fn natural_spawn_light_sources_into(
     cx: i32,
     cz: i32,
     out: &mut GenSources,
-    list_pool: &mut Vec<Vec<((i32, i32, i32), u8)>>,
+    list_pool: &mut Vec<SpawnSourceList>,
 ) {
     out.clear();
     for client in clients {
@@ -968,9 +973,9 @@ struct SpawnTickScratch {
     chunk_player_lists: Vec<Vec<u64>>,
     sources: HashMap<(i32, i32), GenSources>,
     gen_sources: Vec<GenSources>,
-    source_lists: Vec<Vec<((i32, i32, i32), u8)>>,
+    source_lists: Vec<SpawnSourceList>,
     census: Vec<(&'static str, NaturalSpawnPos)>,
-    fortresses: HashMap<(i32, i32), Vec<([i32; 6], Vec<[i32; 6]>)>>,
+    fortresses: HashMap<(i32, i32), FortressChunkRooms>,
     nether_light: HashMap<(i32, i32), Vec<[u8; 2048]>>,
     caps: NaturalSpawnState,
 }
@@ -1996,7 +2001,7 @@ const NETHER_SPAWN_DIM: DimId = DimId::Nether;
 struct LiveNetherSpawnQueries<'a> {
     reg: &'a BReg,
     clients: &'a [Arc<Client>],
-    light: RefCell<HashMap<(i32, i32), Vec<[u8; 2048]>>>,
+    light: RefCell<NetherSpawnLightCache>,
 }
 
 impl LiveNetherSpawnQueries<'_> {

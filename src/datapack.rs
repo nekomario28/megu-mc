@@ -342,8 +342,8 @@ impl Dpc1Sha256 {
             0xc67178f2,
         ];
         let mut words = [0u32; 64];
-        for (i, chunk) in self.block.chunks_exact(4).enumerate() {
-            words[i] = u32::from_be_bytes(chunk.try_into().expect("four bytes"));
+        for (i, chunk) in self.block.as_chunks::<4>().0.iter().enumerate() {
+            words[i] = u32::from_be_bytes(*chunk);
         }
         for i in 16..64 {
             let s0 = words[i - 15].rotate_right(7)
@@ -408,7 +408,7 @@ impl Dpc1Sha256 {
         self.block[56..64].copy_from_slice(&bits.to_be_bytes());
         self.compress();
         let mut digest = [0; 32];
-        for (out, word) in digest.chunks_exact_mut(4).zip(self.state) {
+        for (out, word) in digest.as_chunks_mut::<4>().0.iter_mut().zip(self.state) {
             out.copy_from_slice(&word.to_be_bytes());
         }
         digest
@@ -1109,7 +1109,7 @@ mod bot_boot_cache_tests {
         for index in 0..500 {
             f.put(
                 &format!("datapacks/a/data/test/tags/item/tag_{index}.json"),
-                format!(r#"{{"values":["minecraft:stone","minecraft:dirt","minecraft:diamond","minecraft:coal","minecraft:iron_ingot","minecraft:gold_ingot","minecraft:emerald","minecraft:oak_log","minecraft:birch_log","minecraft:acacia_log","minecraft:netherite_ingot","minecraft:lapis_lazuli"]}}"#).as_bytes(),
+                r#"{"values":["minecraft:stone","minecraft:dirt","minecraft:diamond","minecraft:coal","minecraft:iron_ingot","minecraft:gold_ingot","minecraft:emerald","minecraft:oak_log","minecraft:birch_log","minecraft:acacia_log","minecraft:netherite_ingot","minecraft:lapis_lazuli"]}"#.as_bytes(),
             );
         }
         let root = f.root();
@@ -1507,9 +1507,10 @@ fn known_biome(id: &str) -> bool {
 /// `/fillbiome` writes: per-dimension quart-position overrides, consulted by
 /// `effective_biome_name` (and so `replace <filter>`) before the natural
 /// generator answer.
-fn biome_overrides() -> &'static Mutex<HashMap<DimId, HashMap<(i32, i32, i32), String>>> {
-    static O: OnceLock<Mutex<HashMap<DimId, HashMap<(i32, i32, i32), String>>>> =
-        OnceLock::new();
+type BiomeOverrideMap = HashMap<DimId, HashMap<(i32, i32, i32), String>>;
+
+fn biome_overrides() -> &'static Mutex<BiomeOverrideMap> {
+    static O: OnceLock<Mutex<BiomeOverrideMap>> = OnceLock::new();
     O.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -2246,7 +2247,7 @@ fn mc_re_predef(predef: u8, c: char) -> bool {
 /// Epsilon-closure: mark every consuming state reachable from `pc` at text
 /// position `pos`. `Assert` states consume nothing — they gate the path
 /// through to `pc + 1`.
-fn mc_re_add(prog: &[McInst], states: &mut Vec<bool>, pc: usize, pos: usize, len: usize) {
+fn mc_re_add(prog: &[McInst], states: &mut [bool], pc: usize, pos: usize, len: usize) {
     let mut stack = vec![pc];
     while let Some(pc) = stack.pop() {
         match &prog[pc] {
@@ -3065,7 +3066,7 @@ fn loot_smelt_result(item: &str) -> Option<String> {
             Ingr::Item(id) => *id == item_id,
             Ingr::Tag(tag) => loot_item_in_tag(tag, item),
         };
-        hit.then(|| item_to_name(*out).map(|n| loot_norm_id(n)))
+        hit.then(|| item_to_name(*out).map(loot_norm_id))
             .flatten()
     })
 }

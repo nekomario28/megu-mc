@@ -15,6 +15,10 @@ pub(crate) use crate::generation_payload::{ContainerKind, GenerationPayload};
 pub(crate) type StagedPayloads =
     Vec<((i32, i32, i32), crate::generation_payload::GenerationPayload)>;
 
+type PopulationOrder<'a> = (&'a HashMap<(i32, i32), usize>, usize);
+#[cfg(test)]
+type TestBlockWrites = Vec<((i32, i32, i32), u32)>;
+
 /// FEAT_PROFILE diagnostic: time spent in feature-side terrain reads.
 pub(crate) static READ_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static READ_N: AtomicU64 = AtomicU64::new(0);
@@ -461,7 +465,7 @@ pub(crate) struct FC<'a> {
     /// owner, it only commits its own results when the wave ends.
     owner: Option<&'a Gen>,
     /// Population indices before wave scheduling reorders independent chunks.
-    worker_order: Option<(&'a HashMap<(i32, i32), usize>, usize)>,
+    worker_order: Option<PopulationOrder<'a>>,
     /// The feature-write layer: a dense 3x3-chunk window (see
     /// [`FlatChunkWriteMap`]) instead of a plain `HashMap`. `get`/`insert` on
     /// in-window cells are O(1) array accesses; out-of-window cells fall back
@@ -506,7 +510,7 @@ pub(crate) struct FC<'a> {
     #[cfg(test)]
     pub(crate) test_block_light: u8,
     #[cfg(test)]
-    pub(crate) test_writes: Option<Vec<((i32, i32, i32), u32)>>,
+    pub(crate) test_writes: Option<TestBlockWrites>,
 }
 impl<'a> FC<'a> {
     pub(crate) fn new(g: &'a mut Gen) -> Self {
@@ -1160,10 +1164,7 @@ impl<'a> FC<'a> {
     /// `None` outside a promotion pass. Feature placement uses
     /// [`FC::feature_brightness`] for the earlier light-storage state.
     pub(crate) fn raw_brightness(&mut self, x: i32, y: i32, z: i32) -> Option<u8> {
-        let block = match &self.promo_light {
-            Some(field) => field.block.get(&(x, y, z)).copied().unwrap_or(0),
-            None => return None,
-        };
+        let block = self.promo_light.as_ref()?.block.get(&(x, y, z)).copied().unwrap_or(0);
         if !self.g.has_skylight() {
             return Some(block);
         }
@@ -1462,7 +1463,7 @@ fn perf2a_flat_wr_view_stays_authoritative() {
             -64 + ((r >> 16) % 384) as i32,
             ((r >> 32) % 64) as i32 - 32,
         );
-        if r % 11 == 0 {
+        if r.is_multiple_of(11) {
             flat.remove(&k);
             map.remove(&k);
         } else {
@@ -1510,7 +1511,7 @@ fn perf2a_flat_wr_ore_vein_bench() {
                 bz + ((r >> 32) % 11) as i32 - 5,
             );
             cells.push(k);
-            if r % 5 == 0 && !cells.is_empty() {
+            if r.is_multiple_of(5) && !cells.is_empty() {
                 reads.push(cells[(r as usize) % cells.len()]);
             }
         }

@@ -142,7 +142,7 @@ pub(crate) fn direction_from_3d_data_value(value: u8) -> Option<Dir> {
 /// `Rotation.getRotated(Rotation)`: index addition modulo four
 /// (`NONE, CLOCKWISE_90, CLOCKWISE_180, COUNTERCLOCKWISE_90`).
 pub(crate) fn rotate_rotation(this: Rotation, other: Rotation) -> Rotation {
-    Rotation::from_index(((this as u8 + other as u8) % 4) as u8).expect("rotation index")
+    Rotation::from_index((this as u8 + other as u8) % 4).expect("rotation index")
 }
 
 /// `Rotation.rotate(Direction)`: vertical directions are invariant.
@@ -2613,27 +2613,33 @@ fn create_mansion(
                         floor_kind,
                         stairs,
                     )?;
-                } else if room_type == ROOM_2X2 && door.is_some() && door != Some(Dir::Up) {
-                    let mut room_direction = door.expect("door").clock_wise();
-                    if !grid.is_room_id(
-                        walk_grid,
-                        q + room_direction.step_x(),
-                        p + room_direction.step_z(),
-                        floor_index,
-                        room_id,
-                    ) {
-                        room_direction = room_direction.opposite();
+                } else if room_type == ROOM_2X2 {
+                    match door {
+                        Some(Dir::Up) => {
+                            placer.add_room_2x2_secret(&mut list, anchor, rotation, floor_kind)?;
+                        }
+                        Some(direction) => {
+                            let mut room_direction = direction.clock_wise();
+                            if !grid.is_room_id(
+                                walk_grid,
+                                q + room_direction.step_x(),
+                                p + room_direction.step_z(),
+                                floor_index,
+                                room_id,
+                            ) {
+                                room_direction = room_direction.opposite();
+                            }
+                            placer.add_room_2x2(
+                                &mut list,
+                                anchor,
+                                rotation,
+                                Some(room_direction),
+                                door,
+                                floor_kind,
+                            )?;
+                        }
+                        None => {}
                     }
-                    placer.add_room_2x2(
-                        &mut list,
-                        anchor,
-                        rotation,
-                        Some(room_direction),
-                        door,
-                        floor_kind,
-                    )?;
-                } else if room_type == ROOM_2X2 && door == Some(Dir::Up) {
-                    placer.add_room_2x2_secret(&mut list, anchor, rotation, floor_kind)?;
                 }
             }
         }
@@ -2848,15 +2854,15 @@ fn handle_data_marker<W: TemplateWorld>(
                 mansion_create_chest(world, reg, out, chunk_bb, rng, pos, facing);
                 return;
             }
-            let spawned;
-            match metadata {
+
+            let spawned = match metadata {
                 "Mage" => {
                     out.entities.push(EntitySpawn {
                         pos,
                         id: "minecraft:evoker".to_string(),
                         hanging: None,
                     });
-                    spawned = 1;
+                    1
                 }
                 "Warrior" => {
                     out.entities.push(EntitySpawn {
@@ -2864,7 +2870,7 @@ fn handle_data_marker<W: TemplateWorld>(
                         id: "minecraft:vindicator".to_string(),
                         hanging: None,
                     });
-                    spawned = 1;
+                    1
                 }
                 "Group of Allays" => {
                     let count = world.level_next_bound(pos, 3) + 1;
@@ -2875,10 +2881,10 @@ fn handle_data_marker<W: TemplateWorld>(
                             hanging: None,
                         });
                     }
-                    spawned = count;
+                    count
                 }
                 _ => return,
-            }
+            };
             for _ in 0..spawned {
                 if !world.set(pos.0, pos.1, pos.2, reg.state_of("minecraft:air", None)) {
                     continue;
@@ -2961,6 +2967,7 @@ fn place_template_piece<W: TemplateWorld>(
 
 /// `StructureStart.placeInChunk`: the piece list in order, each intersecting
 /// piece's `postProcess`, then the structure's `afterPlace`.
+#[expect(clippy::too_many_arguments, reason = "preserve the established placement and simulation call signature")]
 pub(crate) fn place_chunk<W: TemplateWorld>(
     world: &mut W,
     templates: &Templates,
@@ -3305,8 +3312,7 @@ mod end_city_mansion_tests {
                 }
             }
         }
-        map.into_iter()
-            .filter_map(|(_, record)| record)
+        map.into_values().flatten()
             .map(|record| {
                 format!(
                     "{},{},{}|{}|{}|{}",
@@ -3754,7 +3760,7 @@ mod end_city_mansion_tests {
                 rows.insert(fields[1], line);
             }
         }
-        let mut templates =
+        let templates =
             Templates::new(|id| crate::worldgen::Gen::dp_resource("structure", id, "nbt"));
         let mut cases_run = 0usize;
         let mut failures = 0usize;
@@ -3772,7 +3778,7 @@ mod end_city_mansion_tests {
             let grids = grid_rows.get(id.as_str()).unwrap_or(&empty_grids);
             let bes = be_rows.get(id.as_str()).unwrap_or(&empty_grids);
             cases_run += 1;
-            failures += run_case(case, &row, &borrowed, grids, bes, reg, &mut templates);
+            failures += run_case(case, &row, &borrowed, grids, bes, reg, &templates);
         }
         eprintln!("end city / mansion: {cases_run} cases, {failures} failure(s)");
         assert_eq!(cases_run, rows.len(), "fixture rows without a case");
@@ -3998,7 +4004,7 @@ mod end_city_mansion_tests {
     #[test]
     fn mansion_chunk_places_the_template_and_its_foundation() {
         let reg = breg().expect("block registry");
-        let mut templates =
+        let templates =
             Templates::new(|id| crate::worldgen::Gen::dp_resource("structure", id, "nbt"));
         let mut world = TestWorld::new(flat_scene(reg, 60, 63));
         let pieces = vec![TemplatePiece {
@@ -4014,7 +4020,7 @@ mod end_city_mansion_tests {
         let mut rng = Xor::seed_worldgen(3);
         let out = place_mansion_chunk(
             &mut world,
-            &mut templates,
+            &templates,
             &pieces,
             &mut rng,
             &chunk_bb,
