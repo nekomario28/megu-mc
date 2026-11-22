@@ -23,3 +23,4 @@ pub mod sim;
 pub mod sound_assets;
 pub mod spatial_audio;
 pub mod world;
+pub mod zsh_command_bar;
