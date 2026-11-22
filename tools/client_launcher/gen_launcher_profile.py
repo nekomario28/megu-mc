@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 import shutil
 import subprocess
@@ -17,14 +18,27 @@ LIBRARY_NAME = "net.mcspine:bootstrapper:1.0.0"
 LIBRARY_PATH = Path("net/mcspine/bootstrapper/1.0.0/bootstrapper-1.0.0.jar")
 ZIP_TIME = (1980, 1, 1, 0, 0, 0)
 MC_VERSIONS = ("1.21.1", "26.3")
+WINDOWS_EXECUTABLE_SUFFIXES = (".exe", ".bat", ".cmd")
+
+
+def iso_utc_now():
+    """ISO-8601 UTC stamp; reproducible when SOURCE_DATE_EPOCH is pinned."""
+    epoch = os.environ.get("SOURCE_DATE_EPOCH")
+    stamp = (datetime.fromtimestamp(int(epoch), timezone.utc) if epoch
+             else datetime.now(timezone.utc))
+    return stamp.strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
 
 def build_jar(out_dir):
     with tempfile.TemporaryDirectory(prefix="mc-spine-javac-") as build:
         compiled = Path(build)
+        sources = [str(ROOT / "Main.java")]
+        gui = ROOT / "InstallerGui.java"
+        if gui.is_file():
+            sources.append(str(gui))
         subprocess.run(["javac", f"-J-Djava.io.tmpdir={tempfile.gettempdir()}",
                         "--release", "21", "-d", str(compiled),
-                        str(ROOT / "Main.java")], check=True)
+                        *sources], check=True)
         entries = [("META-INF/MANIFEST.MF",
                     b"Manifest-Version: 1.0\r\nMain-Class: net.mcspine.launcher.Main\r\n\r\n")]
         entries.extend((str(path.relative_to(compiled)).replace("\\", "/"), path.read_bytes())
@@ -54,7 +68,12 @@ def detect_minecraft_dir():
         return Path.home() / "AppData" / "Roaming" / ".minecraft"
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / "minecraft"
-    return Path.home() / ".minecraft"
+    standard = Path.home() / ".minecraft"
+    if not standard.is_dir():
+        flatpak = Path.home() / ".var/app/com.mojang.Minecraft/.minecraft"
+        if flatpak.is_dir():
+            return flatpak
+    return standard
 
 
 def main():
@@ -84,16 +103,24 @@ def main():
     if args.build_jar:
         jar = build_jar(out_dir)
         print(f"built {jar} ({jar.stat().st_size} bytes, sha256={hashlib.sha256(jar.read_bytes()).hexdigest()})")
+    stamp = iso_utc_now()
     game_profile = {
         "id": args.version_id,
         "inheritsFrom": args.mc_version,
         "type": "release",
         "mainClass": "net.mcspine.launcher.Main",
+        "releaseTime": stamp,
+        "time": stamp,
         "libraries": [{"name": LIBRARY_NAME}],
     }
     if args.client_bin is not None:
         path = args.client_bin.resolve()
-        if not path.is_file() or not path.stat().st_mode & 0o111:
+        # Windows executables cannot be exec-bit checked on a POSIX filesystem
+        # (and st_mode & 0o111 is meaningless on Windows), so .exe/.bat/.cmd are
+        # accepted by suffix alone; other binaries still require the exec bit.
+        if not path.is_file() or (
+                path.suffix.lower() not in WINDOWS_EXECUTABLE_SUFFIXES
+                and not path.stat().st_mode & 0o111):
             parser.error("--client-bin must point to an executable native client")
         game_profile["arguments"] = {"jvm": [f"-Dmc.spine.clientBin={path}"]}
         if args.client_sha256 and hashlib.sha256(path.read_bytes()).hexdigest() != args.client_sha256.lower():

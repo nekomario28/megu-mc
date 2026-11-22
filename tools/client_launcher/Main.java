@@ -8,9 +8,11 @@ import java.net.ServerSocket;
 import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
@@ -22,12 +24,59 @@ import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 
 /** Launcher entry point for the native client, pure-Java integrated server bridge, and Official Launcher self-installer. */
 public final class Main {
     private static final String LOOPBACK = "127.0.0.1";
     private static final String LIBRARY_COORD = "net.mcspine:bootstrapper:1.0.0";
     private static final String LIBRARY_REL = "libraries/net/mcspine/bootstrapper/1.0.0/bootstrapper-1.0.0.jar";
+    private static final DateTimeFormatter ISO_UTC =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssxxx").withZone(ZoneOffset.UTC);
+    private static final String RUN_SH = """
+            #!/bin/sh
+            # mc-spine dedicated server launcher (Linux/macOS).
+            cd "$(dirname "$0")" || exit 1
+            if [ "$EULA" != "TRUE" ] && ! grep -q '^eula=true' eula.txt 2>/dev/null; then
+                echo "mc-spine: agree to the Minecraft EULA first:" >&2
+                echo "  put 'eula=true' into eula.txt, or re-run with EULA=TRUE." >&2
+                exit 1
+            fi
+            if [ -x ./mc-spine ]; then
+                exec ./mc-spine "$@"
+            fi
+            exec mc-spine "$@"
+            """;
+    private static final String RUN_BAT = "@echo off\r\n"
+            + "rem mc-spine dedicated server launcher (Windows).\r\n"
+            + "cd /d \"%~dp0\"\r\n"
+            + "if /i \"%EULA%\"==\"TRUE\" goto :run\r\n"
+            + "findstr /b /l /c:\"eula=true\" eula.txt >nul 2>&1\r\n"
+            + "if errorlevel 1 (\r\n"
+            + "    echo mc-spine: agree to the Minecraft EULA first ^(eula=true in eula.txt, or EULA=TRUE^) 1>&2\r\n"
+            + "    exit /b 1\r\n"
+            + ")\r\n"
+            + ":run\r\n"
+            + "mc-spine.exe %*\r\n";
+    private static final String SERVER_README = """
+            mc-spine dedicated server
+            =========================
+
+            1. Accept the Minecraft EULA before the first launch. This installer
+               NEVER sets eula=true for you. Either create eula.txt yourself:
+                   eula=true
+               or pass the environment variable EULA=TRUE.
+
+            2. Start the server:
+                   ./run.sh      (Linux / macOS)
+                   run.bat       (Windows)
+               Extra arguments are forwarded to the server binary via "$@" / %*.
+
+            3. --server-bin stages the native binary next to these scripts as
+               mc-spine / mc-spine.exe. Without it the scripts use mc-spine(.exe)
+               from this directory or PATH.
+            """;
     private static final Set<String> QUICK_PLAY_TARGETS = Set.of(
             "--quickPlayMultiplayer", "--quickPlaySingleplayer", "--quickPlayRealms");
 
@@ -39,7 +88,11 @@ public final class Main {
 
     private static int run(String[] args) {
         if (args.length == 0) {
-            return runSelfInstall(null, "1.21.1");
+            if (!"1".equals(System.getenv("MC_SPINE_HEADLESS"))
+                    && !java.awt.GraphicsEnvironment.isHeadless()) {
+                return InstallerGui.show();
+            }
+            return runSelfInstall(null, "1.21.1", true, null, null);
         }
         if ("--mc-spine-integrated-watch".equals(args[0])) {
             return runIntegratedWatch(args);
@@ -50,9 +103,13 @@ public final class Main {
         String clientSha256 = null;
         String launcherAccessToken = null;
         String installDir = null;
+        String installServerDir = null;
+        String serverBin = null;
         String mcVersion = "1.21.1";
         String handoffManifest = null;
         boolean installMode = false;
+        boolean uninstallMode = false;
+        boolean noProfile = false;
         boolean detach = "1".equals(System.getenv("MC_SPINE_DETACH"));
         boolean integrated = false;
         boolean tokenEnv = "1".equals(System.getenv("MC_SPINE_TOKEN_ENV"));
@@ -61,6 +118,36 @@ public final class Main {
             String arg = args[i];
             if ("--install".equals(arg)) {
                 installMode = true;
+                continue;
+            }
+            if ("--uninstall".equals(arg)) {
+                uninstallMode = true;
+                continue;
+            }
+            if ("--no-profile".equals(arg)) {
+                noProfile = true;
+                continue;
+            }
+            if ("--install-server".equals(arg) || arg.startsWith("--install-server=")) {
+                if (arg.contains("=")) {
+                    installServerDir = arg.substring(arg.indexOf('=') + 1);
+                } else if (i + 1 < args.length) {
+                    installServerDir = args[++i];
+                } else {
+                    System.err.println("mc-spine launcher: missing value for --install-server");
+                    return 2;
+                }
+                continue;
+            }
+            if ("--server-bin".equals(arg) || arg.startsWith("--server-bin=")) {
+                if (arg.contains("=")) {
+                    serverBin = arg.substring(arg.indexOf('=') + 1);
+                } else if (i + 1 < args.length) {
+                    serverBin = args[++i];
+                } else {
+                    System.err.println("mc-spine launcher: missing value for --server-bin");
+                    return 2;
+                }
                 continue;
             }
             if ("--minecraft-dir".equals(arg) && i + 1 < args.length) {
@@ -147,8 +234,25 @@ public final class Main {
             }
         }
 
+        if (uninstallMode && (installMode || installServerDir != null)) {
+            System.err.println("mc-spine launcher: --uninstall conflicts with install flags");
+            return 2;
+        }
+        if (serverBin != null && installServerDir == null) {
+            System.err.println("mc-spine launcher: --server-bin requires --install-server");
+            return 2;
+        }
+        if (installServerDir != null) {
+            int code = runServerInstall(installServerDir, serverBin);
+            if (code != 0 || !installMode) {
+                return code;
+            }
+        }
+        if (uninstallMode) {
+            return runUninstall(installDir, mcVersion, !noProfile);
+        }
         if (installMode) {
-            return runSelfInstall(installDir, mcVersion);
+            return runSelfInstall(installDir, mcVersion, !noProfile, clientBin, clientSha256);
         }
 
         if (integrated && (detach || gameDir == null || gameDir.isBlank())) {
@@ -205,48 +309,177 @@ public final class Main {
     }
 
     /** Self-installs this bootstrapper JAR and registers a profile in Official Launcher's launcher_profiles.json. */
-    private static int runSelfInstall(String overrideDir, String mcVersion) {
-        if (!"1.21.1".equals(mcVersion) && !"26.3".equals(mcVersion)) {
-            System.err.println("mc-spine launcher: unsupported --mc-version: " + mcVersion);
-            return 2;
-        }
+    private static int runSelfInstall(String overrideDir, String mcVersion, boolean writeProfile,
+            String clientBin, String clientSha256) {
         try {
-            Path mcDir = (overrideDir != null && !overrideDir.isBlank())
-                    ? Path.of(overrideDir).toAbsolutePath().normalize()
-                    : detectMinecraftDir();
-            Path selfJar = selfJarPath();
-            if (selfJar == null || !Files.isRegularFile(selfJar)) {
-                System.err.println("mc-spine launcher: cannot locate running bootstrapper jar");
-                return 2;
-            }
-            String versionId = "mc-spine-" + mcVersion;
-            Path libDest = mcDir.resolve(LIBRARY_REL);
-            Files.createDirectories(libDest.getParent());
-            if (!selfJar.toRealPath().equals(libDest.toAbsolutePath().normalize())) {
-                Files.copy(selfJar, libDest, StandardCopyOption.REPLACE_EXISTING);
-            }
-            Path verDir = mcDir.resolve("versions").resolve(versionId);
-            Files.createDirectories(verDir);
-            String profileJson = "{\n"
-                    + "  \"id\": \"" + versionId + "\",\n"
-                    + "  \"inheritsFrom\": \"" + mcVersion + "\",\n"
-                    + "  \"type\": \"release\",\n"
-                    + "  \"mainClass\": \"net.mcspine.launcher.Main\",\n"
-                    + "  \"libraries\": [\n"
-                    + "    {\"name\": \"" + LIBRARY_COORD + "\"}\n"
-                    + "  ]\n"
-                    + "}\n";
-            atomicWriteString(verDir.resolve(versionId + ".json"), profileJson);
-            updateLauncherProfiles(mcDir.resolve("launcher_profiles.json"), versionId, "Megu (" + mcVersion + ")");
-            System.out.println("Installed " + versionId + " into " + mcDir);
+            System.out.println(installClient(resolveMinecraftDir(overrideDir), mcVersion,
+                    writeProfile, clientBin, clientSha256));
             return 0;
-        } catch (IOException error) {
+        } catch (IOException | InvalidPathException error) {
             System.err.println("mc-spine launcher: install failed: " + error.getMessage());
             return 2;
         }
     }
 
-    private static Path detectMinecraftDir() {
+    private static int runUninstall(String overrideDir, String mcVersion, boolean updateProfile) {
+        try {
+            System.out.println(uninstallClient(resolveMinecraftDir(overrideDir), mcVersion,
+                    updateProfile));
+            return 0;
+        } catch (IOException | InvalidPathException error) {
+            System.err.println("mc-spine launcher: uninstall failed: " + error.getMessage());
+            return 2;
+        }
+    }
+
+    private static int runServerInstall(String directory, String serverBin) {
+        try {
+            System.out.println(installServer(Path.of(directory), serverBin));
+            return 0;
+        } catch (IOException | InvalidPathException error) {
+            System.err.println("mc-spine launcher: server install failed: " + error.getMessage());
+            return 2;
+        }
+    }
+
+    private static Path resolveMinecraftDir(String overrideDir) {
+        return (overrideDir != null && !overrideDir.isBlank())
+                ? Path.of(overrideDir).toAbsolutePath().normalize()
+                : detectMinecraftDir();
+    }
+
+    /** Fabric/NeoForge-style client install: versions/<id>/<id>.json + libraries + launcher profile. */
+    static String installClient(Path mcDir, String mcVersion, boolean writeProfile,
+            String clientBin, String clientSha256) throws IOException {
+        String versionId = versionId(mcVersion);
+        Path selfJar = selfJarPath();
+        if (selfJar == null || !Files.isRegularFile(selfJar)) {
+            throw new IOException("cannot locate running bootstrapper jar");
+        }
+        Path pinnedBin = null;
+        if (clientBin != null && !clientBin.isBlank()) {
+            pinnedBin = Path.of(clientBin).toAbsolutePath().normalize();
+            if (!Files.isRegularFile(pinnedBin)) {
+                throw new IOException("--client-bin must be an existing file: " + clientBin);
+            }
+        }
+        if (clientSha256 != null && !clientSha256.isBlank()) {
+            if (!clientSha256.matches("(?i)[0-9a-f]{64}")) {
+                throw new IOException("--client-sha256 must be 64 hexadecimal characters");
+            }
+            if (pinnedBin != null) {
+                verifySha256(pinnedBin, clientSha256);
+            }
+        }
+        Path libDest = mcDir.resolve(LIBRARY_REL);
+        Files.createDirectories(libDest.getParent());
+        if (!selfJar.toRealPath().equals(libDest.toAbsolutePath().normalize())) {
+            Files.copy(selfJar, libDest, StandardCopyOption.REPLACE_EXISTING);
+        }
+        Path verDir = mcDir.resolve("versions").resolve(versionId);
+        Files.createDirectories(verDir);
+        atomicWriteString(verDir.resolve(versionId + ".json"),
+                versionJson(versionId, mcVersion, pinnedBin, clientSha256));
+        if (writeProfile) {
+            updateProfilesFiles(mcDir, versionId, "Megu (" + mcVersion + ")", false);
+        }
+        return "Installed " + versionId + " into " + mcDir;
+    }
+
+    /** Removes our version directory and launcher profile entry, preserving all other profiles. */
+    static String uninstallClient(Path mcDir, String mcVersion, boolean updateProfile)
+            throws IOException {
+        String versionId = versionId(mcVersion);
+        Path verDir = mcDir.resolve("versions").resolve(versionId);
+        if (Files.isSymbolicLink(verDir)) {
+            Files.deleteIfExists(verDir);
+        } else {
+            deleteTree(verDir);
+        }
+        if (updateProfile) {
+            updateProfilesFiles(mcDir, versionId, null, true);
+        }
+        return "Uninstalled " + versionId + " from " + mcDir;
+    }
+
+    /** NeoForge-style server install: stages run.sh / run.bat / README-SERVER.txt into {@code target}. */
+    static String installServer(Path target, String serverBin) throws IOException {
+        for (Path segment : target) {
+            if ("..".equals(segment.toString())) {
+                throw new IOException("refusing path traversal in --install-server: " + target);
+            }
+        }
+        Path dir = target.toAbsolutePath().normalize();
+        Files.createDirectories(dir);
+        if (Files.isSymbolicLink(dir)) {
+            throw new IOException("refusing symlinked --install-server directory: " + dir);
+        }
+        if (serverBin != null && !serverBin.isBlank()) {
+            Path binary = Path.of(serverBin).toAbsolutePath().normalize();
+            if (!Files.isRegularFile(binary)) {
+                throw new IOException("--server-bin must be an existing file: " + serverBin);
+            }
+            boolean exe = binary.getFileName().toString()
+                    .toLowerCase(Locale.ROOT).endsWith(".exe");
+            Path staged = dir.resolve(exe ? "mc-spine.exe" : "mc-spine");
+            refuseSymlink(staged);
+            Files.copy(binary, staged, StandardCopyOption.REPLACE_EXISTING);
+            makeExecutable(staged);
+        }
+        Path runSh = dir.resolve("run.sh");
+        Path runBat = dir.resolve("run.bat");
+        Path readme = dir.resolve("README-SERVER.txt");
+        refuseSymlink(runSh);
+        refuseSymlink(runBat);
+        refuseSymlink(readme);
+        atomicWriteString(runSh, RUN_SH);
+        makeExecutable(runSh);
+        atomicWriteString(runBat, RUN_BAT);
+        atomicWriteString(readme, SERVER_README);
+        return "Installed mc-spine server launcher into " + dir;
+    }
+
+    private static String versionId(String mcVersion) throws IOException {
+        if (!"1.21.1".equals(mcVersion) && !"26.3".equals(mcVersion)) {
+            throw new IOException("unsupported --mc-version: " + mcVersion);
+        }
+        return "mc-spine-" + mcVersion;
+    }
+
+    private static String isoNow() {
+        return ISO_UTC.format(java.time.Instant.now());
+    }
+
+    private static String versionJson(String versionId, String mcVersion,
+            Path pinnedBin, String clientSha256) {
+        String now = isoNow();
+        List<String> jvm = new ArrayList<>();
+        if (pinnedBin != null) {
+            jvm.add("-Dmc.spine.clientBin=" + pinnedBin);
+        }
+        if (clientSha256 != null && !clientSha256.isBlank()) {
+            jvm.add("-Dmc.spine.clientSha256=" + clientSha256.toLowerCase(Locale.ROOT));
+        }
+        StringBuilder json = new StringBuilder("{\n")
+                .append("  \"id\": \"").append(escapeJson(versionId)).append("\",\n")
+                .append("  \"inheritsFrom\": \"").append(escapeJson(mcVersion)).append("\",\n")
+                .append("  \"type\": \"release\",\n")
+                .append("  \"mainClass\": \"net.mcspine.launcher.Main\",\n")
+                .append("  \"releaseTime\": \"").append(now).append("\",\n")
+                .append("  \"time\": \"").append(now).append("\",\n");
+        if (!jvm.isEmpty()) {
+            json.append("  \"arguments\": {\n    \"jvm\": [\n");
+            for (int i = 0; i < jvm.size(); i++) {
+                json.append("      \"").append(escapeJson(jvm.get(i))).append('"')
+                        .append(i + 1 < jvm.size() ? ",\n" : "\n");
+            }
+            json.append("    ]\n  },\n");
+        }
+        return json.append("  \"libraries\": [\n    {\"name\": \"").append(LIBRARY_COORD)
+                .append("\"}\n  ]\n}\n").toString();
+    }
+
+    static Path detectMinecraftDir() {
         String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
         Path home = Path.of(System.getProperty("user.home", "."));
         if (os.contains("win")) {
@@ -258,7 +491,39 @@ public final class Main {
         if (os.contains("mac")) {
             return home.resolve("Library").resolve("Application Support").resolve("minecraft");
         }
-        return home.resolve(".minecraft");
+        Path standard = home.resolve(".minecraft");
+        if (!Files.isDirectory(standard)) {
+            Path flatpak = home.resolve(".var/app/com.mojang.Minecraft/.minecraft");
+            if (Files.isDirectory(flatpak)) {
+                return flatpak;
+            }
+        }
+        return standard;
+    }
+
+    private static void refuseSymlink(Path file) throws IOException {
+        if (Files.isSymbolicLink(file)) {
+            throw new IOException("refusing to overwrite symlink: " + file);
+        }
+    }
+
+    private static void deleteTree(Path root) throws IOException {
+        if (Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS)) {
+            try (var entries = Files.newDirectoryStream(root)) {
+                for (Path child : entries) {
+                    deleteTree(child);
+                }
+            }
+        }
+        Files.deleteIfExists(root);
+    }
+
+    private static void makeExecutable(Path file) {
+        try {
+            Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rwxr-xr-x"));
+        } catch (UnsupportedOperationException | IOException error) {
+            file.toFile().setExecutable(true, false);
+        }
     }
 
     private static Path selfJarPath() {
@@ -273,40 +538,291 @@ public final class Main {
         }
     }
 
-    private static void updateLauncherProfiles(Path profilesFile, String versionId, String displayName)
-            throws IOException {
-        String entry = "    \"" + versionId + "\": {\n"
-                + "      \"name\": \"" + displayName + "\",\n"
+    /** Edits launcher_profiles.json and launcher_profiles_microsoft_store.json when present. */
+    private static void updateProfilesFiles(Path mcDir, String versionId, String displayName,
+            boolean uninstall) throws IOException {
+        Path standard = mcDir.resolve("launcher_profiles.json");
+        Path store = mcDir.resolve("launcher_profiles_microsoft_store.json");
+        if (uninstall || Files.exists(standard) || Files.exists(store)) {
+            if (Files.exists(standard)) {
+                editProfilesFile(standard, versionId, displayName, uninstall);
+            }
+            if (Files.exists(store)) {
+                editProfilesFile(store, versionId, displayName, uninstall);
+            }
+            return;
+        }
+        editProfilesFile(standard, versionId, displayName, false);
+    }
+
+    /** Surgically adds/updates/removes our profile entry, preserving every other user profile. */
+    private static void editProfilesFile(Path file, String versionId, String displayName,
+            boolean uninstall) throws IOException {
+        String now = isoNow();
+        String text = Files.isRegularFile(file)
+                ? Files.readString(file, StandardCharsets.UTF_8) : null;
+        int root = text == null ? 0 : skipJsonWhitespace(text, 0);
+        if (text == null || root >= text.length() || text.charAt(root) != '{') {
+            if (uninstall) {
+                return;
+            }
+            backupProfiles(file, text);
+            atomicWriteString(file, freshProfilesJson(versionId, displayName, now));
+            return;
+        }
+        int[] profiles = jsonMember(text, root, "profiles");
+        String updated;
+        if (profiles == null) {
+            if (uninstall) {
+                return;
+            }
+            String member = "\"profiles\": {\n    "
+                    + profileMember(versionId, displayName, now) + "\n  }";
+            updated = insertJsonMember(text, root, member);
+        } else {
+            int objStart = skipJsonWhitespace(text, profiles[1]);
+            if (objStart >= text.length() || text.charAt(objStart) != '{') {
+                if (uninstall) {
+                    return;
+                }
+                updated = text.substring(0, objStart) + "{\n    "
+                        + profileMember(versionId, displayName, now) + "\n  }"
+                        + text.substring(profiles[2]);
+            } else {
+                int[] member = jsonMember(text, objStart, versionId);
+                if (uninstall) {
+                    if (member == null) {
+                        return;
+                    }
+                    updated = removeJsonMember(text, objStart, member);
+                } else if (member == null) {
+                    updated = insertJsonMember(text, objStart,
+                            profileMember(versionId, displayName, now));
+                } else {
+                    int valueStart = skipJsonWhitespace(text, member[1]);
+                    if (valueStart >= text.length() || text.charAt(valueStart) != '{') {
+                        updated = text.substring(0, valueStart)
+                                + profileObject(versionId, displayName, now)
+                                + text.substring(member[2]);
+                    } else {
+                        String obj = text.substring(valueStart, member[2]);
+                        obj = upsertProfileField(obj, "name", displayName, false);
+                        obj = upsertProfileField(obj, "type", "custom", false);
+                        obj = upsertProfileField(obj, "created", now, false);
+                        obj = upsertProfileField(obj, "lastUsed", now, true);
+                        obj = upsertProfileField(obj, "lastVersionId", versionId, true);
+                        obj = upsertProfileField(obj, "icon", "Furnace", false);
+                        updated = text.substring(0, valueStart) + obj + text.substring(member[2]);
+                    }
+                }
+            }
+        }
+        if (updated.equals(text)) {
+            return;
+        }
+        backupProfiles(file, text);
+        atomicWriteString(file, updated);
+    }
+
+    /** Writes <file>.bak holding the pre-edit content, only when missing or different. */
+    private static void backupProfiles(Path file, String current) throws IOException {
+        if (current == null) {
+            return;
+        }
+        Path backup = file.resolveSibling(file.getFileName() + ".bak");
+        if (Files.isRegularFile(backup)
+                && Files.readString(backup, StandardCharsets.UTF_8).equals(current)) {
+            return;
+        }
+        atomicWriteString(backup, current);
+    }
+
+    private static String profileMember(String versionId, String displayName, String now) {
+        return "\"" + escapeJson(versionId) + "\": " + profileObject(versionId, displayName, now);
+    }
+
+    private static String profileObject(String versionId, String displayName, String now) {
+        return "{\n      \"name\": \"" + escapeJson(displayName) + "\",\n"
                 + "      \"type\": \"custom\",\n"
-                + "      \"lastVersionId\": \"" + versionId + "\"\n"
-                + "    }";
-        if (!Files.isRegularFile(profilesFile)) {
-            String fresh = "{\n  \"profiles\": {\n" + entry + "\n  },\n  \"version\": 3\n}\n";
-            atomicWriteString(profilesFile, fresh);
-            return;
+                + "      \"created\": \"" + now + "\",\n"
+                + "      \"lastUsed\": \"" + now + "\",\n"
+                + "      \"lastVersionId\": \"" + escapeJson(versionId) + "\",\n"
+                + "      \"icon\": \"Furnace\"\n    }";
+    }
+
+    private static String freshProfilesJson(String versionId, String displayName, String now) {
+        return "{\n  \"profiles\": {\n    " + profileMember(versionId, displayName, now)
+                + "\n  },\n  \"version\": 3\n}\n";
+    }
+
+    /** Index just past the JSON string literal starting at {@code i} (which must be '"'). */
+    private static int skipJsonString(String text, int i) {
+        int n = text.length();
+        i++;
+        while (i < n) {
+            char c = text.charAt(i);
+            if (c == '\\') {
+                i += 2;
+            } else if (c == '"') {
+                return i + 1;
+            } else {
+                i++;
+            }
         }
-        String text = Files.readString(profilesFile, StandardCharsets.UTF_8);
-        if (text.contains("\"" + versionId + "\"")) {
-            return;
+        return n;
+    }
+
+    private static int skipJsonWhitespace(String text, int i) {
+        while (i < text.length() && Character.isWhitespace(text.charAt(i))) {
+            i++;
         }
-        int pIdx = text.indexOf("\"profiles\"");
-        if (pIdx < 0) {
-            String fresh = "{\n  \"profiles\": {\n" + entry + "\n  },\n  \"version\": 3\n}\n";
-            atomicWriteString(profilesFile, fresh);
-            return;
+        return i;
+    }
+
+    /** Index just past the JSON value starting at {@code i}; string/object/array aware. */
+    private static int skipJsonValue(String text, int i) {
+        int n = text.length();
+        i = skipJsonWhitespace(text, i);
+        if (i >= n) {
+            return n;
         }
-        int brace = text.indexOf('{', pIdx);
-        if (brace < 0) {
-            return;
+        char c = text.charAt(i);
+        if (c == '"') {
+            return skipJsonString(text, i);
         }
-        int nextNonWs = brace + 1;
-        while (nextNonWs < text.length() && Character.isWhitespace(text.charAt(nextNonWs))) {
-            nextNonWs++;
+        if (c == '{' || c == '[') {
+            int depth = 0;
+            while (i < n) {
+                c = text.charAt(i);
+                if (c == '"') {
+                    i = skipJsonString(text, i);
+                    continue;
+                }
+                if (c == '{' || c == '[') {
+                    depth++;
+                } else if ((c == '}' || c == ']') && --depth == 0) {
+                    return i + 1;
+                }
+                i++;
+            }
+            return n;
         }
-        boolean emptyProfiles = nextNonWs < text.length() && text.charAt(nextNonWs) == '}';
-        String insertion = emptyProfiles ? ("\n" + entry + "\n  ") : ("\n" + entry + ",");
-        String updated = text.substring(0, brace + 1) + insertion + text.substring(brace + 1);
-        atomicWriteString(profilesFile, updated);
+        while (i < n && !Character.isWhitespace(text.charAt(i)) && text.charAt(i) != ','
+                && text.charAt(i) != '}' && text.charAt(i) != ']') {
+            i++;
+        }
+        return i;
+    }
+
+    /** Locates the depth-1 member {@code key} of the object at {@code objStart};
+        returns {keyStart, valueStart, valueEnd} or null. */
+    private static int[] jsonMember(String text, int objStart, String key) {
+        int n = text.length();
+        int i = objStart + 1;
+        String wanted = '"' + key + '"';
+        while (true) {
+            i = skipJsonWhitespace(text, i);
+            if (i >= n || text.charAt(i) != '"') {
+                return null;
+            }
+            int keyStart = i;
+            i = skipJsonString(text, i);
+            String name = text.substring(keyStart, i);
+            i = skipJsonWhitespace(text, i);
+            if (i >= n || text.charAt(i) != ':') {
+                return null;
+            }
+            i = skipJsonWhitespace(text, i + 1);
+            int valueStart = i;
+            int valueEnd = skipJsonValue(text, i);
+            if (name.equals(wanted)) {
+                return new int[]{keyStart, valueStart, valueEnd};
+            }
+            i = skipJsonWhitespace(text, valueEnd);
+            if (i < n && text.charAt(i) == ',') {
+                i++;
+            } else {
+                return null;
+            }
+        }
+    }
+
+    /** Inserts {@code member} ("key": value text) into the object starting at {@code objStart}. */
+    private static String insertJsonMember(String text, int objStart, String member) {
+        int close = skipJsonValue(text, objStart) - 1;
+        int j = close - 1;
+        while (j > objStart && Character.isWhitespace(text.charAt(j))) {
+            j--;
+        }
+        if (j == objStart) {
+            return text.substring(0, objStart + 1) + "\n    " + member + "\n  "
+                    + text.substring(close);
+        }
+        String comma = text.charAt(j) == ',' ? "" : ",";
+        return text.substring(0, j + 1) + comma + "\n    " + member + text.substring(j + 1);
+    }
+
+    /** Removes the member described by {@code member} plus one adjacent comma. */
+    private static String removeJsonMember(String text, int objStart, int[] member) {
+        int start = member[0];
+        int end = member[2];
+        int i = skipJsonWhitespace(text, end);
+        if (i < text.length() && text.charAt(i) == ',') {
+            end = i + 1;
+        } else {
+            int j = start - 1;
+            while (j > objStart && Character.isWhitespace(text.charAt(j))) {
+                j--;
+            }
+            if (j > objStart && text.charAt(j) == ',') {
+                start = j;
+            }
+        }
+        return text.substring(0, start) + text.substring(end);
+    }
+
+    /** Sets a string field inside the {@code obj} JSON object text, inserting it when absent. */
+    private static String upsertProfileField(String obj, String key, String value,
+            boolean overwrite) {
+        int[] member = jsonMember(obj, 0, key);
+        String quoted = '"' + escapeJson(value) + '"';
+        if (member != null) {
+            return overwrite
+                    ? obj.substring(0, member[1]) + quoted + obj.substring(member[2])
+                    : obj;
+        }
+        int j = obj.length() - 2;
+        while (j > 0 && Character.isWhitespace(obj.charAt(j))) {
+            j--;
+        }
+        String field = '"' + key + "\": " + quoted;
+        if (j == 0) {
+            return "{\n      " + field + "\n    }";
+        }
+        String comma = obj.charAt(j) == ',' ? "" : ",";
+        return obj.substring(0, j + 1) + comma + "\n      " + field + obj.substring(j + 1);
+    }
+
+    private static String escapeJson(String value) {
+        StringBuilder out = new StringBuilder(value.length() + 8);
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            switch (c) {
+                case '"' -> out.append("\\\"");
+                case '\\' -> out.append("\\\\");
+                case '\n' -> out.append("\\n");
+                case '\r' -> out.append("\\r");
+                case '\t' -> out.append("\\t");
+                default -> {
+                    if (c < 0x20) {
+                        out.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        out.append(c);
+                    }
+                }
+            }
+        }
+        return out.toString();
     }
 
     private static void atomicWriteString(Path destination, String content) throws IOException {

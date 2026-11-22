@@ -528,6 +528,10 @@ with socket.socket() as listener:
                     else Path.home() / "Library" / "Application Support" / "minecraft")
         if sys.platform == "win32":
             expected = Path(os.environ.get("APPDATA", Path.home() / "AppData/Roaming")) / ".minecraft"
+        flatpak = Path.home() / ".var/app/com.mojang.Minecraft/.minecraft"
+        if (sys.platform not in ("win32", "darwin")
+                and not (Path.home() / ".minecraft").is_dir() and flatpak.is_dir()):
+            expected = flatpak
         self.assertEqual(Path(detected.stdout.strip()), expected)
         self.assertFalse((self.root / "versions").exists())
 
