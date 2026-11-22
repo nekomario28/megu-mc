@@ -86,6 +86,7 @@ python3 tests/fabric_shim_test.py
 python3 tests/client_launcher_test.py
 python3 tests/megu_start_test.py
 python3 tests/megu_mods_test.py
+python3 tests/megu_tui_test.py
 python3 tests/load_client_test.py
 python3 tools/provenance_check.py
 python3 tools/provenance_check.py --self-test
@@ -101,6 +102,7 @@ python3 tests/release_bundle_test.py
 python3 tests/release_workflow_test.py
 python3 tests/alpha_release_smoke.py --self-test
 python3 tests/multi_mod_e2e_wire.py --self-test
+python3 tests/magic_vfx_anim_live_wire.py --self-test
 python3 tests/dev_check_test.py
 python3 tests/megu_translate_test.py
 python3 tests/megu_bench_test.py
