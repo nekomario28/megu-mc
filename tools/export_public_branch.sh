@@ -29,8 +29,6 @@ case "$out/" in "$src/"*|"$common/"*) die 'destination must be outside the sourc
 git check-ref-format --branch "$branch" >/dev/null
 head=$(git rev-parse HEAD)
 short=$(git rev-parse --short "$head")
-name=$(git config --get user.name || :)
-email=$(git config --get user.email || :)
 if [[ -e $out ]]; then
     [[ -d $out ]] || die 'destination is not a directory'
     first=$(find "$out" -mindepth 1 -maxdepth 1 -print -quit)
@@ -73,10 +71,12 @@ for path in "${generated[@]}"; do rm -rf -- "$path"; done
 printf '/assets/**/*_1211*\n/tests/data/**/*_1211*\n' >> .gitignore
 
 git init -q --template= -b "$branch"
-git config --get user.name >/dev/null || git config --local user.name "${name:-Public Export}"
-git config --get user.email >/dev/null || git config --local user.email "${email:-export@localhost}"
 git -c core.hooksPath=/dev/null add -- .
-git -c core.hooksPath=/dev/null -c commit.gpgSign=false commit -q -s -m "Clean public export from $short (P0-3 D5)"
+GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-mc-spine release}" \
+GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-release@mc-spine.invalid}" \
+GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-mc-spine release}" \
+GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-release@mc-spine.invalid}" \
+    git -c core.hooksPath=/dev/null -c commit.gpgSign=false commit -q -s -m "Clean public export from $short (P0-3 D5)"
 
 count=$(git rev-list --count HEAD)
 parents=$(git show -s --format=%P HEAD)

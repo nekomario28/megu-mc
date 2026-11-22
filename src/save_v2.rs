@@ -904,6 +904,195 @@ fn split_save_footer<'a>(
     Ok((&payload[..start], Some(&payload[start..end])))
 }
 
+// Optional [granted players][core criterion progress][datapack criterion progress]
+// followed by [u64 body length][ADV1]. Names use u16 byte lengths and UTF-8;
+// core criteria carry signed big-endian i64 earned-at milliseconds.
+const ADVANCEMENTS_MAGIC: &[u8; 4] = b"ADV1";
+const ADV_MAX_PLAYERS: usize = 16_384;
+const ADV_MAX_IDS: usize = 4_096;
+const ADV_MAX_CRITERIA: usize = 256;
+const ADV_MAX_NAME_BYTES: usize = 4_096;
+
+struct SavedAdvancements {
+    granted: HashMap<String, HashSet<String>>,
+    core: AdvancementTracker,
+    datapack: Advancements,
+}
+
+fn write_advancement_string(out: &mut Vec<u8>, value: &str) {
+    assert!(!value.is_empty() && value.len() <= ADV_MAX_NAME_BYTES, "invalid advancement string length");
+    out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn read_advancement_string(input: &mut SaveInput<'_>) -> Result<String, &'static str> {
+    let len = u16::from_be_bytes(input.take()?) as usize;
+    if len == 0 || len > ADV_MAX_NAME_BYTES {
+        return Err("invalid advancement string length");
+    }
+    std::str::from_utf8(input.bytes(len)?)
+        .map(str::to_owned)
+        .map_err(|_| "invalid advancement UTF-8")
+}
+
+fn advancement_count(input: &mut SaveInput<'_>, max: usize) -> Result<usize, &'static str> {
+    let count = input.var_count(1)?;
+    if count > max {
+        return Err("invalid advancement count");
+    }
+    Ok(count)
+}
+
+fn append_advancements_footer(out: &mut Vec<u8>) {
+    let granted = adv_done().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let core = player_advancements().lock().unwrap_or_else(|e| e.into_inner()).progress.clone();
+    let datapack = adv_prog().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if granted.values().all(HashSet::is_empty)
+        && core.values().all(HashMap::is_empty)
+        && datapack.values().all(HashMap::is_empty)
+    {
+        return;
+    }
+    let start = out.len();
+    assert!(granted.len() <= ADV_MAX_PLAYERS && core.len() <= ADV_MAX_PLAYERS
+        && datapack.len() <= ADV_MAX_PLAYERS, "too many advancement players");
+    let mut players: Vec<_> = granted.iter().filter(|(_, ids)| !ids.is_empty()).collect();
+    players.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    write_varint(out, players.len() as i64);
+    for (player, ids) in players {
+        write_advancement_string(out, player);
+        assert!(ids.len() <= ADV_MAX_IDS, "too many granted advancements");
+        let mut ids: Vec<_> = ids.iter().collect();
+        ids.sort_unstable();
+        write_varint(out, ids.len() as i64);
+        for id in ids {
+            write_advancement_string(out, id);
+        }
+    }
+
+    let mut players: Vec<_> = core.iter().filter(|(_, rows)| !rows.is_empty()).collect();
+    players.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    write_varint(out, players.len() as i64);
+    for (player, rows) in players {
+        write_advancement_string(out, player);
+        assert!(rows.len() <= ADV_MAX_IDS, "too many core advancements");
+        let mut ids: Vec<_> = rows.iter().collect();
+        ids.sort_unstable_by_key(|&(id, _)| id);
+        write_varint(out, ids.len() as i64);
+        for (id, criteria) in ids {
+            write_advancement_string(out, id);
+            assert!(criteria.len() <= ADV_MAX_CRITERIA, "too many advancement criteria");
+            write_varint(out, criteria.len() as i64);
+            for (criterion, timestamp) in criteria {
+                write_advancement_string(out, criterion);
+                out.extend_from_slice(&timestamp.to_be_bytes());
+            }
+        }
+    }
+
+    let mut players: Vec<_> = datapack.iter().filter(|(_, rows)| !rows.is_empty()).collect();
+    players.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    write_varint(out, players.len() as i64);
+    for (player, rows) in players {
+        write_advancement_string(out, player);
+        assert!(rows.len() <= ADV_MAX_IDS, "too many datapack advancements");
+        let mut ids: Vec<_> = rows.iter().collect();
+        ids.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        write_varint(out, ids.len() as i64);
+        for (id, criteria) in ids {
+            write_advancement_string(out, id);
+            assert!(criteria.len() <= ADV_MAX_CRITERIA, "too many datapack criteria");
+            let mut criteria: Vec<_> = criteria.iter().collect();
+            criteria.sort_unstable();
+            write_varint(out, criteria.len() as i64);
+            for criterion in criteria {
+                write_advancement_string(out, criterion);
+            }
+        }
+    }
+    out.extend_from_slice(&((out.len() - start) as u64).to_be_bytes());
+    out.extend_from_slice(ADVANCEMENTS_MAGIC);
+}
+
+fn read_advancements_body(body: &[u8]) -> Result<SavedAdvancements, &'static str> {
+    let mut input = SaveInput(body);
+    let mut granted = HashMap::new();
+    for _ in 0..advancement_count(&mut input, ADV_MAX_PLAYERS)? {
+        let player = read_advancement_string(&mut input)?;
+        let mut ids = HashSet::new();
+        for _ in 0..advancement_count(&mut input, ADV_MAX_IDS)? {
+            if !ids.insert(read_advancement_string(&mut input)?) {
+                return Err("duplicate granted advancement");
+            }
+        }
+        if ids.is_empty() || granted.insert(player, ids).is_some() {
+            return Err("duplicate or empty advancement player");
+        }
+    }
+
+    let mut core = AdvancementTracker::default();
+    for _ in 0..advancement_count(&mut input, ADV_MAX_PLAYERS)? {
+        let player = read_advancement_string(&mut input)?;
+        if core.progress.contains_key(&player) {
+            return Err("duplicate core advancement player");
+        }
+        let count = advancement_count(&mut input, ADV_MAX_IDS)?;
+        if count == 0 {
+            return Err("empty core advancement player");
+        }
+        for _ in 0..count {
+            let id = read_advancement_string(&mut input)?;
+            if core.progress.get(&player).is_some_and(|rows| rows.contains_key(id.as_str())) {
+                return Err("duplicate core advancement");
+            }
+            let criteria = advancement_count(&mut input, ADV_MAX_CRITERIA)?;
+            if criteria == 0 {
+                return Err("empty core advancement");
+            }
+            for _ in 0..criteria {
+                let criterion = read_advancement_string(&mut input)?;
+                let timestamp = i64::from_be_bytes(input.take()?);
+                if !core.grant_criterion(&player, &id, &criterion, timestamp) {
+                    return Err("invalid or duplicate core advancement criterion");
+                }
+            }
+        }
+    }
+
+    let mut datapack = HashMap::new();
+    for _ in 0..advancement_count(&mut input, ADV_MAX_PLAYERS)? {
+        let player = read_advancement_string(&mut input)?;
+        let mut rows = HashMap::new();
+        let count = advancement_count(&mut input, ADV_MAX_IDS)?;
+        if count == 0 {
+            return Err("empty datapack advancement player");
+        }
+        for _ in 0..count {
+            let id = read_advancement_string(&mut input)?;
+            let mut criteria = HashSet::new();
+            let count = advancement_count(&mut input, ADV_MAX_CRITERIA)?;
+            if count == 0 {
+                return Err("empty datapack advancement");
+            }
+            for _ in 0..count {
+                if !criteria.insert(read_advancement_string(&mut input)?) {
+                    return Err("duplicate datapack advancement criterion");
+                }
+            }
+            if rows.insert(id, criteria).is_some() {
+                return Err("duplicate datapack advancement");
+            }
+        }
+        if datapack.insert(player, rows).is_some() {
+            return Err("duplicate datapack advancement player");
+        }
+    }
+    if !input.0.is_empty() {
+        return Err("trailing advancement data");
+    }
+    Ok(SavedAdvancements { granted, core, datapack })
+}
+
 fn append_save_state(
     out: &mut Vec<u8>,
     players: &HashMap<[u8; 16], PlayerSave>,
@@ -2168,10 +2357,18 @@ fn save_world_into(f: &mut Vec<u8>) {
             }
             let ag = adv_done().lock().unwrap_or_else(|e| e.into_inner());
             write_varint(&mut *f, ag.len() as i64);
-            for (pn, ids) in ag.iter() {
+            let mut players: Vec<_> = ag.iter().collect();
+            // Keep the original legacy layout when no IDs were earned, including
+            // worlds with empty per-player entries; ADV1 is absent there too.
+            if ag.values().any(|ids| !ids.is_empty()) {
+                players.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            }
+            for (pn, ids) in players {
                 (*f).extend_from_slice(&(pn.len() as u16).to_be_bytes());
                 (*f).extend_from_slice(pn.as_bytes());
                 write_varint(&mut *f, ids.len() as i64);
+                let mut ids: Vec<_> = ids.iter().collect();
+                ids.sort_unstable();
                 for id in ids {
                     (*f).extend_from_slice(&(id.len() as u16).to_be_bytes());
                     (*f).extend_from_slice(id.as_bytes());
@@ -2262,6 +2459,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         f.extend_from_slice(&world_spawn.3.to_be_bytes());
     }
     append_block_entities_footer(f, &mut dxt);
+    append_advancements_footer(f);
     append_save_state(f, &players, spawn_pitch, &ms, &mob_data);
     generated.append(f);
     let (sources, generated_blocks, generated_fluids) = worldgen::with_gen(|g| {
@@ -3935,6 +4133,8 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     let (before_generated, _) = split_save_footer(before_ticks, b"GEN1")?;
     let (payload, body) = split_save_footer(before_generated, SAVE_STATE_MAGIC)?;
     let mut state = body.map(SaveState::read).transpose()?;
+    let (payload, advancements) = split_save_footer(payload, ADVANCEMENTS_MAGIC)?;
+    let advancements = advancements.map(read_advancements_body).transpose()?;
     let (payload, block_entities) = split_save_footer(payload, BLOCK_ENTITIES_MAGIC)?;
     let mut block_entities = block_entities
         .map(read_block_entities_body)
@@ -3959,6 +4159,9 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     if (has_mob_dimensions || state.is_some()) && !has_meta {
         return Err("mob dimension count does not match mob records");
     }
+    // A legacy MET4 section can restore completed IDs. Clear previous-world
+    // grants before reading it, then replace them with authoritative ADV1 data.
+    adv_done().lock().unwrap_or_else(|e| e.into_inner()).clear();
     // optional META tail
     let mut restored_mobs = Vec::new();
     let mut restored_sheared = Vec::new();
@@ -5160,6 +5363,14 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
                 .chain(custom_entities)
                 .collect(),
         );
+    }
+    if let Some(saved) = advancements {
+        *adv_done().lock().unwrap_or_else(|e| e.into_inner()) = saved.granted;
+        *player_advancements().lock().unwrap_or_else(|e| e.into_inner()) = saved.core;
+        *adv_prog().lock().unwrap_or_else(|e| e.into_inner()) = saved.datapack;
+    } else {
+        *player_advancements().lock().unwrap_or_else(|e| e.into_inner()) = AdvancementTracker::default();
+        adv_prog().lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
     restore_gamerules(state.gamerules.as_deref());
     *WORLD_SPAWN_PITCH.lock().unwrap_or_else(|e| e.into_inner()) = state.spawn_pitch;

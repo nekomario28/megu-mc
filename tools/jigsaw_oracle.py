@@ -14,7 +14,10 @@ ROOT = Path(__file__).resolve().parents[1]
 HARNESS = ROOT / 'tools/structure-oracle/NativeHarness.java'
 ORACLE = ROOT / 'tools/structure-oracle/JigsawOracle.java'
 FIXTURE = ROOT / 'tests/data/jigsaw_structures_1211.tsv'
-LOCAL_JAR = Path('/home/yuu/mc-spine-local/captures/native/mc-native-overworld-20261111/server.jar')
+LOCAL_JAR = Path(os.environ.get(
+    'MC_SPINE_JIGSAW_JAR',
+    str(Path.home() / 'mc-spine-local/captures/native/mc-native-overworld-20261111/server.jar'),
+))
 
 CASES = [
     # All 10 jigsaw structures with diverse seeds, coordinates, and terrain scenes

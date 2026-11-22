@@ -28,6 +28,140 @@ fn full_state_frame(payload: &[u8]) -> std::ops::Range<usize> {
     before.len()..legacy.len()
 }
 
+fn advancement_frame(payload: &[u8]) -> std::ops::Range<usize> {
+    let end = full_state_frame(payload).start;
+    let (prefix, body) = split_save_footer(&payload[..end], ADVANCEMENTS_MAGIC).unwrap();
+    assert!(body.is_some(), "expected ADV1 footer");
+    prefix.len()..end
+}
+
+fn with_advancement_body(payload: &[u8], body: &[u8]) -> Vec<u8> {
+    let frame = advancement_frame(payload);
+    let mut edited = payload[..frame.start].to_vec();
+    edited.extend_from_slice(body);
+    edited.extend_from_slice(&(body.len() as u64).to_be_bytes());
+    edited.extend_from_slice(ADVANCEMENTS_MAGIC);
+    edited.extend_from_slice(&payload[frame.end..]);
+    edited
+}
+
+#[test]
+fn save_v2_advancements_round_trip_grants_and_criteria() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let _guard = world_guard();
+    let old_grants = std::mem::take(&mut *adv_done().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_core = std::mem::take(&mut *player_advancements().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_datapack = std::mem::take(&mut *adv_prog().lock().unwrap_or_else(|e| e.into_inner()));
+
+    let mut empty = Vec::new();
+    save_world_into(&mut empty);
+    let state_start = full_state_frame(&empty).start;
+    assert!(!empty[..state_start].ends_with(ADVANCEMENTS_MAGIC));
+
+    adv_done().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        "AdvTester".into(), ["datapack:complete".into(), "minecraft:story/root".into()].into());
+    adv_done().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        "Second".into(), ["datapack:another".into()].into());
+    {
+        let mut tracker = player_advancements().lock().unwrap_or_else(|e| e.into_inner());
+        assert!(tracker.grant_criterion("AdvTester", "minecraft:story/root", "crafting_table", 123_456));
+        assert!(tracker.grant_criterion("AdvTester", "minecraft:story/obtain_armor", "iron_boots", -7));
+    }
+    adv_prog().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        "AdvTester".into(), [("datapack:partial".into(), ["first".into(), "third".into()].into())].into());
+    let mut payload = Vec::new();
+    save_world_into(&mut payload);
+    let mut second = Vec::new();
+    save_world_into(&mut second);
+    assert_eq!(payload, second, "advancement output must be deterministic");
+
+    adv_done().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    *player_advancements().lock().unwrap_or_else(|e| e.into_inner()) = AdvancementTracker::default();
+    adv_prog().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    load_world_from(&payload).unwrap();
+    let restored_grants = adv_done().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(restored_grants["AdvTester"].len(), 2);
+    assert!(restored_grants["AdvTester"].contains("datapack:complete"));
+    assert!(restored_grants["Second"].contains("datapack:another"));
+    let tracker = player_advancements().lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(tracker.progress["AdvTester"]["minecraft:story/root"]["crafting_table"], 123_456);
+    assert_eq!(tracker.progress["AdvTester"]["minecraft:story/obtain_armor"]["iron_boots"], -7);
+    assert!(tracker.sent_progress.is_empty());
+    drop(tracker);
+    assert_eq!(adv_prog().lock().unwrap_or_else(|e| e.into_inner())["AdvTester"]["datapack:partial"],
+        ["first".to_owned(), "third".to_owned()].into());
+
+    // Old MET4 snapshots have completed IDs but no criteria footer.
+    let frame = advancement_frame(&payload);
+    payload.drain(frame);
+    adv_done().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    load_world_from(&payload).unwrap();
+    assert!(adv_done().lock().unwrap_or_else(|e| e.into_inner())["AdvTester"].contains("datapack:complete"));
+    assert!(player_advancements().lock().unwrap_or_else(|e| e.into_inner()).progress.is_empty());
+    assert!(adv_prog().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+
+    *adv_done().lock().unwrap_or_else(|e| e.into_inner()) = old_grants;
+    *player_advancements().lock().unwrap_or_else(|e| e.into_inner()) = old_core;
+    *adv_prog().lock().unwrap_or_else(|e| e.into_inner()) = old_datapack;
+}
+
+#[test]
+fn save_v2_advancements_reject_corrupted_footers_before_restoring_grants() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let _guard = world_guard();
+    let old_grants = std::mem::take(&mut *adv_done().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_core = std::mem::take(&mut *player_advancements().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_datapack = std::mem::take(&mut *adv_prog().lock().unwrap_or_else(|e| e.into_inner()));
+
+    adv_done().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        "AdvTester".into(), ["minecraft:story/root".into()].into());
+    let mut payload = Vec::new();
+    save_world_into(&mut payload);
+    let frame = advancement_frame(&payload);
+    let body = &payload[frame.start..frame.end - 12];
+
+    let mut invalid_utf8 = Vec::new();
+    write_varint(&mut invalid_utf8, 1);
+    invalid_utf8.extend_from_slice(&1u16.to_be_bytes());
+    invalid_utf8.push(0xff);
+    write_varint(&mut invalid_utf8, 1);
+    invalid_utf8.extend_from_slice(&1u16.to_be_bytes());
+    invalid_utf8.push(b'x');
+    write_varint(&mut invalid_utf8, 0);
+    write_varint(&mut invalid_utf8, 0);
+
+    let mut excessive_count = Vec::new();
+    write_varint(&mut excessive_count, (ADV_MAX_PLAYERS + 1) as i64);
+    excessive_count.resize(ADV_MAX_PLAYERS + 12, 0);
+    let mut excessive_length = Vec::new();
+    write_varint(&mut excessive_length, 1);
+    excessive_length.extend_from_slice(&((ADV_MAX_NAME_BYTES + 1) as u16).to_be_bytes());
+    let mut trailing_bytes = body.to_vec();
+    trailing_bytes.push(0);
+
+    adv_done().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    let corruptions = [
+        ("truncated", body[..body.len() - 1].to_vec()),
+        ("invalid UTF-8", invalid_utf8),
+        ("excessive count", excessive_count),
+        ("excessive string", excessive_length),
+        ("trailing bytes", trailing_bytes),
+    ];
+    for (reason, corrupted) in corruptions {
+        let edited = with_advancement_body(&payload, &corrupted);
+        assert!(load_world_from(&edited).is_err(), "{reason}");
+        assert!(adv_done().lock().unwrap_or_else(|e| e.into_inner()).is_empty(), "{reason}");
+    }
+
+    *adv_done().lock().unwrap_or_else(|e| e.into_inner()) = old_grants;
+    *player_advancements().lock().unwrap_or_else(|e| e.into_inner()) = old_core;
+    *adv_prog().lock().unwrap_or_else(|e| e.into_inner()) = old_datapack;
+}
+
 // Rebuild a historical SVP1 frame without its later SVX1 extension. The old
 // spawn, player, mob and raid records are kept verbatim.
 fn without_entity_rule_extension(payload: &[u8]) -> Vec<u8> {

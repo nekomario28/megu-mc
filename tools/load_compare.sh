@@ -140,7 +140,7 @@ mkdir -p "$WORK"
 if ! jar_ok "$JAR"; then
   # Reuse a pinned jar already on the host before reaching for the network: an
   # offline run must measure the same build, not fail because it cannot fetch.
-  for candidate in /home/yuu/tmpx/carverfresh/server.jar /tmp/idle-compare/server.jar; do
+  for candidate in "${MC_SPINE_VANILLA_JAR_CACHE:-$HOME/tmpx/carverfresh/server.jar}" /tmp/idle-compare/server.jar; do
     if jar_ok "$candidate"; then
       echo "reusing the pinned vanilla server jar from $candidate"
       cp "$candidate" "$JAR"
