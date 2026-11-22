@@ -1574,6 +1574,10 @@ fn encode_opaque_terrain<'a>(
     env_bind_group: &'a wgpu::BindGroup,
     shadow_receiver_bg: Option<&'a wgpu::BindGroup>,
     view_proj: &Mat4,
+    // `include_arenas == false` when the GPU-driven indirect path
+    // submits the arena sections — per-section fallback draws still
+    // emit here.
+    include_arenas: bool,
 ) -> (u64, u64, usize, usize) {
     // Bundle-recorded passes start with empty bind-group state, so the
     // environment (group 2) and optional shadow receiver (group 3) the
@@ -1623,7 +1627,7 @@ fn encode_opaque_terrain<'a>(
     // 8x4x8 region; seven direction-bucket record sets merge into a few
     // draws per region, all indexed positionally into the one shared
     // canonical quad index buffer.
-    if !region_arenas.is_empty() {
+    if include_arenas && !region_arenas.is_empty() {
         pass.set_pipeline(region_pipeline);
         pass.set_index_buffer(shared_index.slice(..), wgpu::IndexFormat::Uint32);
         // Front-to-back: nearest regions rasterize first so hardware
@@ -1926,6 +1930,33 @@ pub struct GpuRenderer {
     pub gpu_hiz_cull_calls: u64,
     /// Sections the GPU culler proved invisible, cumulative.
     pub gpu_hiz_culled: u64,
+    /// Opt-in GPU-driven opaque arena submission (audit
+    /// `GPU-INDIRECT-AND-OPT-WIRE`): [`LiveSession`](crate::live_session::LiveSession)
+    /// enables it once the adapter proves `INDIRECT_EXECUTION`; the
+    /// composed pass then culls arena sections into an indirect args
+    /// buffer and submits `*_indexed_indirect` with zero CPU readback.
+    pub gpu_indirect_enabled: bool,
+    /// Whether the adapter reports `DownlevelFlags::INDIRECT_EXECUTION`
+    /// — required for `draw_indexed_indirect`/`multi_draw_indexed_indirect`.
+    indirect_execution_supported: bool,
+    /// Grow-only indirect buffers, allocated on the first enabled frame.
+    gpu_indirect: Option<GpuIndirectBuffers>,
+    /// Morton Z-order tie-break inside each camera-distance ring (the
+    /// `chunk_mesh` domain plan's `use_morton_layout` projection).
+    pub morton_order_enabled: bool,
+    /// View-projection the live GPU pyramid was last built under: Hi-Z
+    /// rejects stay armed only while it matches the active camera, so a
+    /// camera cut can never false-cull through stale depth.
+    gpu_hiz_frame_vp: Option<Mat4>,
+    /// Composed frames whose opaque pass submitted GPU indirect draws.
+    pub gpu_indirect_draw_passes: u64,
+    /// Section records submitted to the GPU cull, cumulative.
+    pub gpu_indirect_sections_submitted: u64,
+    /// Frame-depth pyramid builds recorded after composed world passes.
+    pub gpu_hiz_pyramid_builds: u64,
+    /// Real frame-P95 observations fed to the upload budget through
+    /// [`Self::observe_frame_p95_ms`], cumulative.
+    pub upload_budget_p95_observations: u64,
     /// Transfer-layer sizing from the memory topology
     /// ([`MemoryTransferStrategy`] x [`MemoryFootprintClass`]) — never a
     /// quality dial.
@@ -2901,6 +2932,112 @@ pub fn region_center_dist2(origin: [i32; 3], camera: [f32; 3]) -> f32 {
 /// instead of shading it first.
 pub fn sort_regions_front_to_back(origins: &mut [[i32; 3]], camera: [f32; 3]) {
     origins.sort_by_key(|origin| region_center_dist2(*origin, camera).to_bits());
+}
+
+/// Positive-vertex (p-vertex) six-plane AABB frustum test, branchless:
+/// each plane is tested against the box corner farthest along its
+/// normal, so a box is rejected only when it lies *entirely* outside at
+/// least one plane — six dot products, zero false negatives. This is the
+/// exact contract `SECTION_CULL_WGSL`'s `aabb_in_frustum` implements on
+/// the GPU.
+pub fn aabb_in_frustum_pvertex(min: [f32; 3], max: [f32; 3], planes: &[[f32; 4]]) -> bool {
+    let mut inside = true;
+    for &[nx, ny, nz, d] in planes {
+        let pos = [
+            if nx >= 0.0 { max[0] } else { min[0] },
+            if ny >= 0.0 { max[1] } else { min[1] },
+            if nz >= 0.0 { max[2] } else { min[2] },
+        ];
+        inside &= nx * pos[0] + ny * pos[1] + nz * pos[2] + d >= 0.0;
+    }
+    inside
+}
+
+/// 21-bits-per-lane 3D Morton (Z-order) code. The sign-folded unsigned
+/// lanes preserve i32 ordering into the code's top 63 bits; interleaving
+/// keeps spatial neighbours adjacent — the locality-preserving
+/// tie-breaker inside one camera-distance ring.
+pub fn morton3d(x: u32, y: u32, z: u32) -> u64 {
+    fn spread(mut v: u64) -> u64 {
+        v &= 0x1f_ffff;
+        v = (v | (v << 32)) & 0x001f_0000_0000_ffff;
+        v = (v | (v << 16)) & 0x001f_0000_ff00_00ff;
+        v = (v | (v << 8)) & 0x100f_00f0_0f00_f00f;
+        v = (v | (v << 4)) & 0x10c3_0c30_c30c_30c3;
+        (v | (v << 2)) & 0x1249_2492_4924_9249
+    }
+    spread(u64::from(x)) | (spread(u64::from(y)) << 1) | (spread(u64::from(z)) << 2)
+}
+
+/// Morton key for a section coordinate: `x ^ 0x8000_0000` folds the
+/// sign into unsigned space, and the LOW 21 bits feed [`morton3d`] —
+/// every section coord in ±2^20 (±16.7M blocks) maps distinctly (beyond
+/// that the lane wraps; Z-order is a locality hash, not a comparator).
+pub fn section_morton_key(coord: SectionCoord) -> u64 {
+    let lane = |v: i32| ((v as u32) ^ 0x8000_0000) & 0x1f_ffff;
+    morton3d(lane(coord.0), lane(coord.1), lane(coord.2))
+}
+
+/// Opaque submission order for one section: the quantized radial
+/// distance ring (16-block bands, nearest first) then the Morton Z-order
+/// tie-breaker — front-to-back maximizes hardware Early-Z/Hi-Z rejection
+/// while Z-order keeps GPU L2 spatial locality inside each ring.
+pub fn opaque_section_sort_key(coord: SectionCoord, camera: [f32; 3]) -> (u32, u64) {
+    let half = EDGE as f32 * 0.5;
+    let center = [
+        coord.0 as f32 * EDGE as f32 + half,
+        coord.1 as f32 * EDGE as f32 + half,
+        coord.2 as f32 * EDGE as f32 + half,
+    ];
+    let dist = (0..3)
+        .map(|i| (center[i] - camera[i]) * (center[i] - camera[i]))
+        .sum::<f32>()
+        .sqrt();
+    ((dist / EDGE as f32) as u32, section_morton_key(coord))
+}
+
+/// Grow-only GPU-driven indirect opaque buffers (audit
+/// `GPU-INDIRECT-AND-OPT-WIRE`): `SectionGpuRecord` inputs plus the
+/// GPU-written `IndirectArgs` the render pass consumes — reallocated
+/// only when residency outgrows capacity, so steady-state frames cost
+/// zero `create_buffer` calls.
+struct GpuIndirectBuffers {
+    /// `SectionGpuRecord` array the cull pass reads.
+    sections: wgpu::Buffer,
+    /// `IndirectArgs` array the cull pass writes and the opaque pass
+    /// draws from (`STORAGE` for the shader, `INDIRECT` for the draw).
+    args: wgpu::Buffer,
+    /// `CullStats` atomics, zeroed before each dispatch.
+    stats: wgpu::Buffer,
+    /// Per-section kept bucket masks (reserved for masked draws).
+    masks: wgpu::Buffer,
+    /// `CullUniforms` for the frame's cull dispatch.
+    uniforms: wgpu::Buffer,
+    /// Section-record capacity every buffer was sized for.
+    capacity: usize,
+    /// Record coords in args order — the test/debug readback mapping.
+    record_coords: Vec<SectionCoord>,
+}
+
+/// One region's contiguous run inside the frame's indirect args buffer.
+struct GpuIndirectRun {
+    /// `region_arenas` key — picks the vertex buffer and bind group.
+    origin: [i32; 3],
+    /// First arg slot of the run.
+    first: u32,
+    /// Consecutive args in the run.
+    count: u32,
+}
+
+/// Everything the opaque pass needs to submit the GPU-culled arena
+/// draws: the args buffer plus one contiguous run per region, ordered
+/// front-to-back by region.
+struct GpuIndirectFrame {
+    /// GPU-written `IndirectArgs` (a clone of the persistent buffer's
+    /// handle — wgpu refcounts keep it alive for the pass).
+    args: wgpu::Buffer,
+    /// Per-region contiguous runs, front-to-back.
+    runs: Vec<GpuIndirectRun>,
 }
 
 /// Inputs that decide whether a recorded per-cascade shadow `RenderBundle`
@@ -4493,6 +4630,11 @@ impl GpuRenderer {
         let memory_footprint_class = profile.memory_class;
         let transfer_budget =
             TransferTopologyBudget::for_topology(seeded_strategy.memory, memory_footprint_class);
+        let indirect_execution_supported = ctx
+            .adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(wgpu::DownlevelFlags::INDIRECT_EXECUTION);
         let staging_ring = UploadStagingRing::new(&ctx.device, &transfer_budget);
         // The shared static quad index buffer starts at one slab of the
         // canonical `[0,1,2,0,2,3]` pattern; `flush_region_arenas` grows
@@ -4572,6 +4714,15 @@ impl GpuRenderer {
             gpu_hiz: None,
             gpu_hiz_cull_calls: 0,
             gpu_hiz_culled: 0,
+            gpu_indirect_enabled: false,
+            indirect_execution_supported,
+            gpu_indirect: None,
+            morton_order_enabled: true,
+            gpu_hiz_frame_vp: None,
+            gpu_indirect_draw_passes: 0,
+            gpu_indirect_sections_submitted: 0,
+            gpu_hiz_pyramid_builds: 0,
+            upload_budget_p95_observations: 0,
             transfer_budget,
             memory_footprint_class,
             staging_ring_uploads: 0,
@@ -6151,7 +6302,14 @@ impl GpuRenderer {
             }
         }
         self.upload_budget.begin_frame();
-        self.upload_budget.adapt(self.upload_frame_p95_us());
+        if self.upload_frame_ms.is_empty() {
+            // No measured interval yet — `adapt(0)` reads as "no
+            // evidence of stress" and lets the adaptive cap regrow.
+            self.upload_budget.adapt(0.0);
+        } else {
+            // The counted live feedback edge: real measured frame P95.
+            self.observe_frame_p95_ms(self.upload_frame_p95_us() / 1_000.0);
+        }
         self.drain_pending_uploads();
         self.flush_region_arenas();
     }
@@ -6391,25 +6549,16 @@ impl GpuRenderer {
     /// and [`Self::gpu_cull_live_sections`]. Returns `false` until a
     /// depth attachment exists.
     pub fn gpu_hiz_build_from_frame_depth(&mut self) -> bool {
-        let Some(view) = self.depth_view.as_ref() else {
+        if self.depth_view.is_none() {
             return false;
-        };
-        let (width, height) = self.depth_size;
-        let stale = self
-            .gpu_hiz
-            .as_ref()
-            .is_some_and(|hiz| hiz.resolution() != (width, height));
-        if stale || self.gpu_hiz.is_none() {
-            self.gpu_hiz = Some(GpuHizCuller::new(&self.ctx.device, width, height));
         }
         let device = &self.ctx.device;
-        let culler = self.gpu_hiz.as_mut().expect("gpu hiz created");
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("gpu-hiz-frame-build"),
         });
-        culler.build_from_depth(device, &mut encoder, view);
+        let built = self.encode_gpu_hiz_build(&mut encoder);
         self.ctx.queue.submit([encoder.finish()]);
-        true
+        built
     }
 
     /// GPU compute section cull over every drawable live section: packs
@@ -6562,6 +6711,258 @@ impl GpuRenderer {
         self.gpu_hiz_cull_calls += 1;
         self.gpu_hiz_culled += culled.len() as u64;
         culled
+    }
+
+    /// Whether the adapter proves `DownlevelFlags::INDIRECT_EXECUTION` —
+    /// required for `draw_indexed_indirect`/`multi_draw_indexed_indirect`.
+    pub fn indirect_execution_supported(&self) -> bool {
+        self.indirect_execution_supported
+    }
+
+    /// Enable/disable the GPU-driven opaque arena path. When enabled and
+    /// the adapter proves `INDIRECT_EXECUTION`, the composed pass lazily
+    /// builds `gpu_hiz`, culls every committed arena section into an
+    /// indirect args buffer, and submits the draws straight from GPU
+    /// memory — the CPU never reads the args back. Chunk fades keep the
+    /// CPU path (they need per-section uniforms).
+    pub fn set_gpu_indirect_enabled(&mut self, enabled: bool) {
+        self.gpu_indirect_enabled = enabled;
+    }
+
+    /// Feed one real frame-time P95 observation (milliseconds) into the
+    /// upload budget's adaptive controller — the render/governor loop's
+    /// live feedback edge. [`Self::begin_render_upload_frame`] calls this
+    /// with the renderer's own measured window; `GpuApp` additionally
+    /// feeds the session's `FrameTimingStats` P95 on windowed frames.
+    pub fn observe_frame_p95_ms(&mut self, p95_ms: f64) {
+        self.upload_budget.adapt(p95_ms * 1_000.0);
+        self.upload_budget_p95_observations += 1;
+    }
+
+    /// Real P95 observations fed through [`Self::observe_frame_p95_ms`].
+    pub fn upload_budget_p95_observations(&self) -> u64 {
+        self.upload_budget_p95_observations
+    }
+
+    /// Record coords in args-buffer order for the last GPU indirect
+    /// frame — the readback mapping for verification tests.
+    pub fn gpu_indirect_record_coords(&self) -> &[SectionCoord] {
+        self.gpu_indirect
+            .as_ref()
+            .map_or(&[][..], |b| b.record_coords.as_slice())
+    }
+
+    /// The persistent GPU-written indirect args buffer (`None` until the
+    /// first indirect frame) — exposed for test/verification readback.
+    pub fn gpu_indirect_args_buffer(&self) -> Option<&wgpu::Buffer> {
+        self.gpu_indirect.as_ref().map(|b| &b.args)
+    }
+
+    /// Grow the persistent indirect buffers to `capacity` section
+    /// records (powers of two; steady-state frames never reallocate).
+    fn ensure_gpu_indirect_capacity(&mut self, capacity: usize) {
+        let needs = self
+            .gpu_indirect
+            .as_ref()
+            .is_none_or(|b| b.capacity < capacity);
+        if !needs {
+            return;
+        }
+        let capacity = capacity.next_power_of_two().max(16);
+        let device = &self.ctx.device;
+        self.gpu_indirect = Some(GpuIndirectBuffers {
+            sections: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gpu-indirect-sections"),
+                size: (capacity * std::mem::size_of::<SectionGpuRecord>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            args: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gpu-indirect-args"),
+                size: (capacity * std::mem::size_of::<IndirectArgs>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::INDIRECT
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            stats: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gpu-indirect-stats"),
+                size: std::mem::size_of::<CullStats>() as u64,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            masks: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gpu-indirect-masks"),
+                size: (capacity * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            }),
+            uniforms: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gpu-indirect-uniforms"),
+                size: std::mem::size_of::<CullUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            capacity,
+            record_coords: Vec::new(),
+        });
+    }
+
+    /// Prepare this frame's GPU-driven opaque submission into `encoder`:
+    /// pack every committed arena slot into `SectionGpuRecord`s —
+    /// regions front-to-back, each region's sections ordered by
+    /// camera-distance ring + Morton Z-order — upload them, then
+    /// dispatch `SECTION_CULL_WGSL` so the GPU writes `instance_count`
+    /// 0/1 straight into the args buffer the opaque pass consumes (zero
+    /// CPU readback). Returns `None` when the path is unavailable: flag
+    /// off, no `INDIRECT_EXECUTION`, or no committed arena geometry.
+    /// Hi-Z occlusion arms only while the pyramid was built under this
+    /// exact view-projection — a camera cut or frame 0 dispatches with
+    /// `params.z == 0` and never false-culls through stale depth.
+    fn encode_gpu_indirect_cull(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view_proj: &Mat4,
+        camera_position: [f32; 3],
+    ) -> Option<GpuIndirectFrame> {
+        if !self.gpu_indirect_enabled || !self.indirect_execution_supported {
+            return None;
+        }
+        let edge = EDGE as f32;
+        let mut records: Vec<SectionGpuRecord> = Vec::new();
+        let mut record_coords: Vec<SectionCoord> = Vec::new();
+        let mut runs: Vec<GpuIndirectRun> = Vec::new();
+        let mut origins: Vec<[i32; 3]> = self.region_arenas.keys().copied().collect();
+        sort_regions_front_to_back(&mut origins, camera_position);
+        for origin in origins {
+            let arena = &self.region_arenas[&origin];
+            if arena.draw_empty() {
+                continue;
+            }
+            // `pending_vertex_writes` keys are staged but not yet on the
+            // GPU — their args would index unwritten vertex memory.
+            let mut slots: Vec<(SectionCoord, &ArenaSlot)> = arena
+                .slots
+                .iter()
+                .filter(|(coord, _)| !arena.pending_vertex_writes.contains_key(coord))
+                .map(|(&coord, slot)| (coord, slot))
+                .collect();
+            if slots.is_empty() {
+                continue;
+            }
+            if self.morton_order_enabled {
+                slots.sort_by_key(|&(coord, _)| {
+                    opaque_section_sort_key(coord, camera_position)
+                });
+            }
+            let first = records.len() as u32;
+            for (coord, slot) in slots {
+                let min = [
+                    coord.0 as f32 * edge,
+                    coord.1 as f32 * edge,
+                    coord.2 as f32 * edge,
+                ];
+                record_coords.push(coord);
+                records.push(SectionGpuRecord {
+                    aabb_min: [min[0], min[1], min[2], 0.0],
+                    aabb_max: [min[0] + edge, min[1] + edge, min[2] + edge, 0.0],
+                    index_count: slot.vertex_count / 4 * 6,
+                    first_index: slot.vertex_offset / 4 * 6,
+                    base_vertex: 0,
+                    first_instance: 0,
+                    _pad: [0; 4],
+                });
+            }
+            runs.push(GpuIndirectRun {
+                origin,
+                first,
+                count: records.len() as u32 - first,
+            });
+        }
+        if records.is_empty() {
+            return None;
+        }
+        let count = records.len() as u32;
+        self.ensure_gpu_indirect_capacity(records.len());
+        // Arm occlusion only when the pyramid is fresh for this exact
+        // view; the WGSL early-outs `hiz_occluded` on `params.z == 0`.
+        let occlusion_armed = self
+            .gpu_hiz
+            .as_ref()
+            .is_some_and(|hiz| hiz.pyramid_ready())
+            && self.gpu_hiz_frame_vp == Some(*view_proj);
+        let (depth_w, depth_h) = self.depth_size;
+        let (hiz_w, hiz_h, mip_count) = {
+            let culler = self.gpu_hiz_culler(depth_w, depth_h);
+            (
+                culler.resolution().0,
+                culler.resolution().1,
+                culler.mip_count(),
+            )
+        };
+        let uniforms = CullUniforms {
+            view_proj: *view_proj,
+            planes: frustum_planes_from_view_proj(view_proj),
+            camera_pos: [
+                camera_position[0],
+                camera_position[1],
+                camera_position[2],
+                0.0,
+            ],
+            params: [
+                hiz_w as f32,
+                hiz_h as f32,
+                if occlusion_armed { mip_count as f32 } else { 0.0 },
+                count as f32,
+            ],
+        };
+        let buffers = self.gpu_indirect.as_mut().expect("capacity ensured");
+        buffers.record_coords = record_coords;
+        self.ctx
+            .queue
+            .write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
+        self.ctx
+            .queue
+            .write_buffer(&buffers.sections, 0, bytemuck::cast_slice(&records));
+        self.ctx
+            .queue
+            .write_buffer(&buffers.stats, 0, bytemuck::bytes_of(&CullStats::default()));
+        let culler = self.gpu_hiz.as_mut().expect("created above");
+        culler.cull_sections_into_indirect_buffer(
+            &self.ctx.device,
+            encoder,
+            &buffers.uniforms,
+            &buffers.sections,
+            &buffers.args,
+            &buffers.stats,
+            &buffers.masks,
+            count,
+        );
+        self.gpu_indirect_sections_submitted += u64::from(count);
+        Some(GpuIndirectFrame {
+            args: buffers.args.clone(),
+            runs,
+        })
+    }
+
+    /// Record the Hi-Z pyramid build into `encoder` — the caller orders
+    /// it after the pass that wrote `depth_view`. Returns `false` until
+    /// a depth attachment exists.
+    fn encode_gpu_hiz_build(&mut self, encoder: &mut wgpu::CommandEncoder) -> bool {
+        if self.depth_view.is_none() {
+            return false;
+        }
+        let (width, height) = self.depth_size;
+        {
+            let _ = self.gpu_hiz_culler(width, height);
+        }
+        let culler = self.gpu_hiz.as_mut().expect("created above");
+        let view = self.depth_view.as_ref().expect("checked above");
+        culler.build_from_depth(&self.ctx.device, encoder, view);
+        self.gpu_hiz_pyramid_builds += 1;
+        true
     }
 
     /// The active per-frame chunk-upload budget.
@@ -7183,7 +7584,8 @@ impl GpuRenderer {
         // draws on the fallback path (arena records merge into fewer).
         let draws = (self.live_sections.len() + self.pending_uploads.len())
             * (DIRECTION_BUCKETS + 1)
-            + 2
+            // scene + translucent + one GPU-indirect arena slot
+            + 3
             + self.subworld_gpu.entry_count()
             + self.subworld_gpu.batch_count()
             + usize::from(self.entity_ber.is_some())
@@ -7851,7 +8253,10 @@ impl GpuRenderer {
     /// `TileBasedTbdr` adapters drop the on-chip depth tile after the
     /// pass instead of writing it back.
     fn depth_store_op(&self) -> wgpu::StoreOp {
-        select_depth_store_op(self.gpu_paradigm, false)
+        // An active GPU Hi-Z culler reads the depth attachment after the
+        // pass to build next frame's pyramid — that counts as a real
+        // depth consumer, forcing `Store` even on `TileBasedTbdr`.
+        select_depth_store_op(self.gpu_paradigm, self.gpu_hiz.is_some())
     }
 
     /// Report the negotiated [`GpuComputeParadigm`] (host detection at
@@ -8545,6 +8950,14 @@ impl GpuRenderer {
         // encodes: the finished Hi-Z pyramid lands on a later frame's
         // upload boundary.
         self.submit_hiz_job(&view_proj, camera_position);
+        // GPU-driven opaque path (audit GPU-INDIRECT-AND-OPT-WIRE): cull
+        // the committed arena sections straight into the indirect args
+        // buffer before the pass encodes draws — the compute dispatch
+        // orders ahead of the render pass inside this same encoder, and
+        // the pass below consumes the GPU-written args with zero CPU
+        // readback. `None` keeps the CPU arena path (flag off, no
+        // INDIRECT_EXECUTION, or no committed geometry yet).
+        let gpu_indirect = self.encode_gpu_indirect_cull(encoder, &view_proj, camera_position);
         // Opaque-terrain bundle key: every input the recorded commands
         // depend on. `world_revision` covers residency/graph/cull-set
         // changes (and arena buffer replacement bumps it too), the
@@ -8560,7 +8973,11 @@ impl GpuRenderer {
         for (dst, src) in view_proj_bits.iter_mut().zip(view_proj.iter().flatten()) {
             *dst = src.to_bits();
         }
-        let bundle_eligible = !chunk_fades.any_fading();
+        // Indirect draws carry no per-section uniforms, so bundles are
+        // only eligible when the CPU path owns the frame — recording an
+        // indirect-args submission would snapshot a buffer handle the
+        // next frame's record rebuild may have grown past.
+        let bundle_eligible = !chunk_fades.any_fading() && gpu_indirect.is_none();
         let terrain_bundle_key = bundle_eligible.then_some(TerrainBundleKey {
             camera_section: (camera_section.0, camera_section.1, camera_section.2),
             view_proj_bits,
@@ -8706,6 +9123,7 @@ impl GpuRenderer {
                         &gpu.env_bg,
                         shadow.map(|s| &s.receiver_bg),
                         &view_proj,
+                        true,
                     );
                     let bundle = bundle_encoder.finish(&wgpu::RenderBundleDescriptor {
                         label: Some("terrain-opaque-bundle"),
@@ -8737,6 +9155,7 @@ impl GpuRenderer {
                         &gpu.env_bg,
                         shadow.map(|s| &s.receiver_bg),
                         &view_proj,
+                        gpu_indirect.is_none(),
                     )
                 };
                 skipped_buckets += stats.0;
@@ -8750,6 +9169,50 @@ impl GpuRenderer {
             pass.set_bind_group(2, &gpu.env_bg, &[]);
             if let Some(shadow) = shadow {
                 pass.set_bind_group(3, &shadow.receiver_bg, &[]);
+            }
+            // GPU-driven arena draws: one contiguous args run per
+            // region in front-to-back order — `multi_draw_indexed_indirect`
+            // for multi-section runs, the portable per-slot
+            // `draw_indexed_indirect` for single-record runs. Culled
+            // sections carry `instance_count == 0` and cost no draws.
+            if let Some(indirect) = gpu_indirect.as_ref() {
+                pass.set_pipeline(
+                    shadow.map_or(&gpu.terrain_region_pipeline, |s| &s.terrain_region_color),
+                );
+                pass.set_index_buffer(shared_index.slice(..), wgpu::IndexFormat::Uint32);
+                let index = gpu.draw_scratch.len();
+                gpu.draw_scratch.push(CompositeDrawUniforms {
+                    mvp: view_proj,
+                    model: [
+                        [1.0, 0.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0, 0.0],
+                        [0.0, 0.0, 1.0, 0.0],
+                        [0.0, 0.0, 0.0, 1.0],
+                    ],
+                    params: [1.0, 1.0, 0.0, 0.0],
+                    params2: [0.0; 4],
+                    _stride_pad: [0.0; 24],
+                });
+                let off = index as u32 * DRAW_UNIFORM_STRIDE;
+                for run in &indirect.runs {
+                    let arena = &region_arenas[&run.origin];
+                    pass.set_bind_group(0, Some(&arena.bind_group), &[]);
+                    pass.set_bind_group(1, Some(&gpu.draw_bg), &[off]);
+                    pass.set_vertex_buffer(0, Some(arena.vertex_buffer.slice(..)));
+                    if run.count > 1 {
+                        pass.multi_draw_indexed_indirect(
+                            &indirect.args,
+                            u64::from(run.first) * 20,
+                            run.count,
+                        );
+                    } else {
+                        pass.draw_indexed_indirect(&indirect.args, u64::from(run.first) * 20);
+                    }
+                    arena_draws += 1;
+                    arena_sections += run.count as usize;
+                    arena_regions += 1;
+                }
+                self.gpu_indirect_draw_passes += 1;
             }
             // `MEGU_TERRAIN_LIT_WGSL` receiver draws — explicitly
             // uploaded decoded-vertex terrain with sky/block light in
@@ -8952,6 +9415,15 @@ impl GpuRenderer {
                 pass.draw(0..*count, 0..1);
             }
         }
+        // GPU Hi-Z: build next frame's occlusion pyramid from this
+        // frame's depth in the same encoder — the build's compute
+        // dispatches order after the render pass on the queue (an active
+        // culler already forced `depth_store_op` to Store, so the
+        // attachment is intact to read).
+        if self.gpu_hiz.is_some() {
+            self.encode_gpu_hiz_build(encoder);
+            self.gpu_hiz_frame_vp = Some(view_proj);
+        }
         self.direction_buckets_skipped += skipped_buckets;
         self.region_arena_draws += arena_draws;
         self.instanced_kinetic_draws = instanced_draws;
@@ -9008,7 +9480,8 @@ impl GpuRenderer {
         // drain + scene + subworlds + batches.
         let draw_count = (self.live_sections.len() + self.pending_uploads.len())
             * (DIRECTION_BUCKETS + 1)
-            + 2
+            // scene + translucent + one GPU-indirect arena slot
+            + 3
             + self.subworld_gpu.entry_count()
             + self.subworld_gpu.batch_count()
             + usize::from(self.entity_ber.is_some())

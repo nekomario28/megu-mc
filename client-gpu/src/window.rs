@@ -2214,6 +2214,16 @@ impl GpuApp {
             }
         }
         let stage = self.governor.observe_frame(frame_begin.elapsed());
+        // Live P95 feedback edge: the session's real measured
+        // frame-time window feeds the renderer's adaptive upload-budget
+        // controller — `upload_budget_p95_observations` counts each
+        // observation so the loop is provably live, not dead code.
+        if let (Some(live), Some(active)) = (&self.live, &mut self.active) {
+            let p95_ms = live.frame_timings.frame_ms_p95();
+            if p95_ms.is_finite() && p95_ms > 0.0 {
+                active.renderer.observe_frame_p95_ms(p95_ms);
+            }
+        }
         self.apply_governor_stage(stage);
     }
 

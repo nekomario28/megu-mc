@@ -68,9 +68,10 @@ use crate::subworld_render::{
 };
 use crate::SecretString;
 use hw_adaptive_engine::{
-    detect_host_hardware_caps, detect_universal_hardware_profile, select_compute_strategy,
-    ComputeKernelMode, ComputeStrategy, HostHardwareCaps, KernelAutotuner, PagedSectionPool,
-    SpeculativeChunkPrefetcher,
+    build_unified_optimization_plan, detect_host_hardware_caps,
+    detect_universal_hardware_profile, select_compute_strategy, ComputeKernelMode,
+    ComputeStrategy, DomainKind, DomainSpecializationPlan, HostHardwareCaps, KernelAutotuner,
+    PagedSectionPool, SpeculativeChunkPrefetcher, UnifiedOptimizationPlan,
 };
 use sys_metrics::{sample_host_metrics, CpuSampler, FrameTimingStats};
 
@@ -84,6 +85,34 @@ const PREFETCH_MAX_CHUNKS: usize = 16;
 /// 2 Hz; frame-time statistics still update every frame and the latest
 /// [`sys_metrics::HostMetricsSnapshot`] is reused between samples.
 pub const MINIHUD_SYS_SAMPLE_INTERVAL_MS: u64 = 500;
+
+/// The [`UnifiedOptimizationPlan`] domain projections `client-gpu`
+/// applies on startup and every settings/strategy push:
+/// `chunk_mesh` (`DomainKind::Meshing` — `use_morton_layout` selects the
+/// distance-ring + Z-order arena record ordering), `gpu_cull`
+/// (`DomainKind::Lighting` — `prefer_single_pass_gpu` gates the
+/// GPU-driven indirect path on TBDR/iGPU plans), and `shadow`
+/// (`DomainKind::ShadowRendering` — shadow scheduling hints).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientDomainHints {
+    /// `DomainKind::Meshing` projection — mesh/arena ordering hints.
+    pub chunk_mesh: DomainSpecializationPlan,
+    /// `DomainKind::Lighting` projection — visibility/occlusion dispatch.
+    pub gpu_cull: DomainSpecializationPlan,
+    /// `DomainKind::ShadowRendering` projection — shadow scheduling hints.
+    pub shadow: DomainSpecializationPlan,
+}
+
+impl ClientDomainHints {
+    /// Project the three client-gpu domains out of a unified plan.
+    fn for_plan(plan: &UnifiedOptimizationPlan) -> Self {
+        Self {
+            chunk_mesh: plan.for_domain(DomainKind::Meshing),
+            gpu_cull: plan.for_domain(DomainKind::Lighting),
+            shadow: plan.for_domain(DomainKind::ShadowRendering),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionStatus {
@@ -633,8 +662,20 @@ pub struct LiveSession {
     pub sys_sample_count: u64,
     /// Adaptive packed-nibble kernel autotuner seeded from
     /// `compute_strategy` and fed real frame times by
-    /// `record_frame_and_refresh_minihud`.
+    /// `record_frame_and_refresh_minihud` and real mesh-batch durations
+    /// by [`Self::poll`].
     kernel_autotuner: KernelAutotuner,
+    /// Counted `kernel_autotuner.observe_sample` feeds — proves the
+    /// feedback loop actually executes live, not just exists.
+    autotuner_sample_count: u64,
+    /// Unified optimization policy resolved from the detected profile
+    /// (refreshed by [`Self::apply_compute_strategy`]); the renderer
+    /// consumes its `chunk_mesh`/`gpu_cull`/`shadow` projections.
+    unified_plan: UnifiedOptimizationPlan,
+    /// The three domain projections client-gpu applies: `chunk_mesh`
+    /// (`Meshing` — arena record ordering), `gpu_cull` (`Lighting` —
+    /// visibility/occlusion dispatch), `shadow` (`ShadowRendering`).
+    domain_hints: ClientDomainHints,
     /// Times [`Self::apply_compute_strategy`] pushed the session strategy
     /// into a renderer.
     compute_strategy_apply_count: u64,
@@ -835,6 +876,13 @@ impl LiveSession {
             } else {
                 ComputeKernelMode::RecomputeSwar
             });
+        // The unified plan + client domain projections are resolved once
+        // at connect and refreshed on every `apply_compute_strategy` push.
+        let unified_plan = build_unified_optimization_plan(
+            &detect_universal_hardware_profile(),
+            Some(kernel_autotuner.selected_mode()),
+        );
+        let domain_hints = ClientDomainHints::for_plan(&unified_plan);
         let vfx = ClientVfxHost::new(GpuPipelineKind::Classic);
         let tactile_tier = vfx.budget_tier();
         let tactile_config = TactileEffectsConfig::default();
@@ -934,6 +982,9 @@ impl LiveSession {
             mini_hud_sys_accum_ms: 0.0,
             sys_sample_count: 0,
             kernel_autotuner,
+            autotuner_sample_count: 0,
+            unified_plan,
+            domain_hints,
             compute_strategy_apply_count: 0,
             place_recipe_requests: Vec::new(),
             cloud_mesh_key: None,
@@ -1372,6 +1423,7 @@ impl LiveSession {
         {
             self.terrain_order_sweep = true;
         }
+        let rebuild_start = Instant::now();
         match self.world.rebuild_dirty_bounded_ordered(
             self.mesh_rebuild_budget(),
             camera_position,
@@ -1380,6 +1432,17 @@ impl LiveSession {
             Ok(rebuilt) => {
                 self.terrain_dirty |= rebuilt != 0 || had_pending;
                 self.ordered_rebuilds_count += rebuilt as u64;
+                if rebuilt != 0 {
+                    // Feed the measured per-batch mesh-build duration
+                    // into the kernel autotuner — a real timed edge, not
+                    // a synthetic sample (`max(1)` guards a sub-ns clock
+                    // so `observe_sample` never discards it as empty).
+                    let elapsed_ns =
+                        (rebuild_start.elapsed().as_nanos().min(u64::MAX as u128) as u64).max(1);
+                    let mode = self.kernel_autotuner.selected_mode();
+                    self.kernel_autotuner.observe_sample(mode, elapsed_ns);
+                    self.autotuner_sample_count += 1;
+                }
             }
             Err(error) if !matches!(self.status, SessionStatus::Disconnected(_)) => {
                 self.status = SessionStatus::Disconnected(format!("mesh: {error}"));
@@ -2190,13 +2253,37 @@ impl LiveSession {
     }
 
     /// Push this session's connect-time [`ComputeStrategy`] into
-    /// `renderer`: upload-budget preset, mesh-worker hint, and the
-    /// negotiated render-scale/shadow defaults. Returns the negotiated
-    /// shadow quality.
+    /// `renderer`: upload-budget preset, mesh-worker hint, the
+    /// negotiated render-scale/shadow defaults, and the resolved
+    /// [`UnifiedOptimizationPlan`] domain hints (`chunk_mesh`, `gpu_cull`,
+    /// `shadow`). Returns the negotiated shadow quality.
     pub fn apply_compute_strategy(&mut self, renderer: &mut GpuRenderer) -> BuiltinShadowQuality {
+        // Re-resolve the unified plan on every push (startup and
+        // settings): the profile plus the autotuner's live kernel choice
+        // project into the domain hints below.
+        let profile = detect_universal_hardware_profile();
+        self.unified_plan = build_unified_optimization_plan(
+            &profile,
+            Some(self.kernel_autotuner.selected_mode()),
+        );
+        self.domain_hints = ClientDomainHints::for_plan(&self.unified_plan);
         // The universal profile's GPU paradigm drives the renderer's
         // depth-store policy (TBDR adapters drop the depth tile).
-        renderer.set_gpu_paradigm(detect_universal_hardware_profile().gpu_paradigm);
+        renderer.set_gpu_paradigm(profile.gpu_paradigm);
+        // gpu_cull domain (Lighting): TBDR and low-power iGPU plans
+        // prefer one fused pass — depth never leaves the tile — so the
+        // GPU-driven indirect arena path stays off there. Discrete
+        // adapters that prove `INDIRECT_EXECUTION` take it.
+        renderer.set_gpu_indirect_enabled(
+            renderer.indirect_execution_supported()
+                && !self.domain_hints.gpu_cull.prefer_single_pass_gpu,
+        );
+        // chunk_mesh domain (Meshing): `use_morton_layout` selects the
+        // distance-ring + Z-order tie-break for arena record ordering.
+        renderer.morton_order_enabled = self.domain_hints.chunk_mesh.use_morton_layout;
+        // shadow domain (ShadowRendering): shadow maps stay lazy on
+        // every plan — the dirty-only cache already minimizes pass
+        // count, so the negotiated quality below is untouched.
         let negotiated = renderer.apply_compute_strategy(&self.compute_strategy);
         self.compute_strategy_apply_count += 1;
         negotiated
@@ -2219,6 +2306,25 @@ impl LiveSession {
         &self.kernel_autotuner
     }
 
+    /// Counted `kernel_autotuner.observe_sample` feeds — frame-time and
+    /// measured mesh-batch samples combined. `> 0` proves the feedback
+    /// loop executes live.
+    pub fn autotuner_samples(&self) -> u64 {
+        self.autotuner_sample_count
+    }
+
+    /// The current [`UnifiedOptimizationPlan`] (refreshed by
+    /// [`Self::apply_compute_strategy`]).
+    pub fn unified_optimization_plan(&self) -> &UnifiedOptimizationPlan {
+        &self.unified_plan
+    }
+
+    /// The `chunk_mesh`/`gpu_cull`/`shadow` domain projections applied
+    /// to the renderer on the last strategy push.
+    pub fn domain_hints(&self) -> &ClientDomainHints {
+        &self.domain_hints
+    }
+
     /// Record frame timing and advance visual transitions before HUD rendering.
     pub fn record_frame_and_refresh_minihud(&mut self, frame_dt_sec: f32, ui: &mut UiState) {
         let frame_us = f64::from(frame_dt_sec) * 1_000_000.0;
@@ -2228,6 +2334,7 @@ impl LiveSession {
         let frame_ns = (f64::from(frame_dt_sec) * 1_000_000_000.0) as u64;
         let kernel_mode = self.kernel_autotuner.selected_mode();
         self.kernel_autotuner.observe_sample(kernel_mode, frame_ns);
+        self.autotuner_sample_count += 1;
         if frame_dt_sec.is_finite() && frame_dt_sec > 0.0 {
             self.mini_hud_sys_accum_ms += frame_dt_sec * 1_000.0;
         }

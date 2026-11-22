@@ -180,6 +180,12 @@ fn section_draw_mask(min_b: vec3<f32>, cam: vec3<f32>) -> u32 {
 // occluder depth in that region. Any uncertainty (near-plane clipping,
 // off-screen rect, empty pyramid texels reading 1.0) keeps the section.
 fn hiz_occluded(lo: vec3<f32>, hi: vec3<f32>) -> bool {
+    // `params.z == 0` disarms occlusion entirely (frame 0, a camera cut,
+    // or any view-projection the pyramid was not built for): stale
+    // pyramid depth must never reject a visible section.
+    if (u.params.z < 0.5) {
+        return false;
+    }
     var ndc_min = vec3<f32>(1e30, 1e30, 1e30);
     var ndc_max = vec3<f32>(-1e30, -1e30, -1e30);
     for (var i = 0u; i < 8u; i = i + 1u) {
@@ -763,5 +769,25 @@ impl GpuHizCuller {
             pass.dispatch_workgroups(count.div_ceil(64), 1, 1);
         }
         self.cull_dispatches += 1;
+    }
+
+    /// Lane `GPU-INDIRECT-AND-OPT-WIRE` entry point — identical to
+    /// [`Self::encode_cull`], named for the "cull sections straight into
+    /// the indirect args buffer" contract the composed opaque pass uses:
+    /// the GPU writes `instance_count` 0/1 per record so the following
+    /// render pass consumes `args` without any CPU readback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cull_sections_into_indirect_buffer(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        uniforms: &wgpu::Buffer,
+        sections: &wgpu::Buffer,
+        args: &wgpu::Buffer,
+        stats: &wgpu::Buffer,
+        masks: &wgpu::Buffer,
+        count: u32,
+    ) {
+        self.encode_cull(device, encoder, uniforms, sections, args, stats, masks, count);
     }
 }
