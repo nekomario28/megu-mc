@@ -928,6 +928,17 @@ pub fn auto_adapt_jar_bytes(
         }
     }
 
+    if !routing.security_advisories.is_empty() {
+        for adv in &routing.security_advisories {
+            audit_notes.push(format!(
+                "SANDBOX_NETWORK_BLOCKED: {} in {} ({}) — outbound network disabled in sandbox; data adaptation allowed",
+                adv.kind.as_str(),
+                adv.member,
+                adv.indicator
+            ));
+        }
+    }
+
     // 5. A bytecode security quarantine blocks everything below — checked
     //    only after the superseded-id resolutions above so a verified
     //    engine-replacement mod (which never executes its constant pools)
@@ -1306,7 +1317,7 @@ pub fn auto_adapt_jar_bytes(
         descriptor,
         tier,
         route: routing.decision,
-        security_threats: Vec::new(),
+        security_threats: routing.security_advisories,
         engine_compat,
         audit_notes,
         blockers,

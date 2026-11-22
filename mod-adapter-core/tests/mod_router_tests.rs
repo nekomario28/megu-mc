@@ -374,9 +374,9 @@ fn malicious_class_constants_are_quarantined_with_exact_member_and_kind() {
             SecurityThreatKind::JndiLookup,
         ),
         (
-            "java/net/Socket",
-            "java/net/Socket",
-            SecurityThreatKind::DirectNetworkAccess,
+            "java/lang/foreign/Linker",
+            "java/lang/foreign/Linker",
+            SecurityThreatKind::NativeLibraryLoad,
         ),
         (
             "sun/misc/Unsafe",
@@ -416,6 +416,35 @@ fn malicious_class_constants_are_quarantined_with_exact_member_and_kind() {
         );
         assert_eq!(result.tier, AdaptationTier::Tier3FallbackRequired);
     }
+}
+
+#[test]
+fn direct_network_and_heap_memory_segment_do_not_falsely_quarantine_mods() {
+    let lucene_class = class_with_pool(|cp| {
+        cp.class("java/lang/foreign/MemorySegment");
+    });
+    let net_class = class_with_pool(|cp| {
+        cp.class("java/net/URLConnection");
+    });
+    let bytes = jar(&[
+        ("org/apache/lucene/VectorScorer.class", &lucene_class),
+        ("example/Credits.class", &net_class),
+    ]);
+    let result = adapt(&bytes, "benign-top-mod.jar");
+    assert!(
+        !matches!(result.route, ModRouteDecision::SecurityQuarantine { .. }),
+        "MemorySegment and URLConnection must not hard-quarantine a mod: {:?}",
+        result.route
+    );
+    assert_eq!(result.security_threats.len(), 1);
+    assert_eq!(
+        result.security_threats[0].kind,
+        SecurityThreatKind::DirectNetworkAccess
+    );
+    assert!(result
+        .audit_notes
+        .iter()
+        .any(|n| n.contains("SANDBOX_NETWORK_BLOCKED")));
 }
 
 #[test]

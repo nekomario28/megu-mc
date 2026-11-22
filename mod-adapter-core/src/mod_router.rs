@@ -41,6 +41,15 @@ impl SecurityThreatKind {
             Self::JndiLookup => "jndi_lookup",
         }
     }
+
+    /// Returns `true` when this finding must hard-quarantine the entire JAR.
+    /// `DirectNetworkAccess` (update checkers, patreon credits, shaded Lucene
+    /// sockets) is instead surfaced as a sandbox-enforced advisory so benign
+    /// mods (Supplementaries, Xaero's Minimap, Ars Nouveau, etc.) remain
+    /// adaptable while outbound networking stays disabled in the sandbox.
+    pub fn is_hard_quarantine(self) -> bool {
+        !matches!(self, Self::DirectNetworkAccess)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,6 +133,7 @@ pub enum ModRouteDecision {
 pub struct JarRoutingReport {
     pub decision: ModRouteDecision,
     pub signals: CapabilitySignals,
+    pub security_advisories: Vec<SecurityThreat>,
 }
 
 /// Check archive members and every class constant pool without executing Java.
@@ -260,8 +270,12 @@ pub fn inspect_jar_security_and_capabilities(
     let render_dominant = hook_classes.render * 2 > signals.class_files_inspected;
     let light_dominant = hook_classes.light * 2 > signals.class_files_inspected;
     let server_dominant = hook_classes.server * 2 > signals.class_files_inspected;
-    let decision = if !threats.is_empty() {
-        ModRouteDecision::SecurityQuarantine { threats }
+    let (hard_threats, security_advisories): (Vec<SecurityThreat>, Vec<SecurityThreat>) =
+        threats.into_iter().partition(|t| t.kind.is_hard_quarantine());
+    let decision = if !hard_threats.is_empty() {
+        ModRouteDecision::SecurityQuarantine {
+            threats: hard_threats,
+        }
     } else if signals.has_gameplay_content && !signals.render_engine_hooks.is_empty() {
         ModRouteDecision::HybridSplit {
             client_render_fallback: NativeSubsystem::WgpuRenderBackend,
@@ -284,7 +298,11 @@ pub fn inspect_jar_security_and_capabilities(
     } else {
         ModRouteDecision::StandardPipeline
     };
-    Ok(JarRoutingReport { decision, signals })
+    Ok(JarRoutingReport {
+        decision,
+        signals,
+        security_advisories,
+    })
 }
 
 /// Known IDs are considered only after the full static security scan —
@@ -608,7 +626,14 @@ fn detect_security_threats(
             SecurityThreatKind::ProcessExecution,
         ),
         ("com/sun/jna/", SecurityThreatKind::NativeLibraryLoad),
-        ("java/lang/foreign/", SecurityThreatKind::NativeLibraryLoad),
+        (
+            "java/lang/foreign/Linker",
+            SecurityThreatKind::NativeLibraryLoad,
+        ),
+        (
+            "java/lang/foreign/SymbolLookup",
+            SecurityThreatKind::NativeLibraryLoad,
+        ),
         ("sun/misc/Unsafe", SecurityThreatKind::UnsafeMemoryAccess),
         (
             "jdk/internal/misc/Unsafe",
