@@ -31,6 +31,7 @@
 
 pub mod container_screen;
 pub mod draw;
+pub mod hud_widgets;
 pub mod layout;
 pub mod magic_hud;
 pub mod mod_menu;
