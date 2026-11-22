@@ -52,6 +52,7 @@
 //!   bridging one host tunnel to many guest TCP connections.
 
 pub mod codec;
+pub mod item_components;
 pub mod channel_router;
 mod data_v767;
 mod data_v777;
@@ -67,6 +68,7 @@ pub mod wire;
 pub use codec::{
     C2SPacket, CodecV767, EquipmentSlot, ItemStack, LoginProperty, MenuKind,
     ProtocolCodec, RawComponent, RegistryDataEntry, S2CPacket, TeamInfo, TeamOperation,
+    MAX_COOKIE_PAYLOAD_BYTES,
 };
 pub use channel_router::{
     classify_channel, decode_register_payload, encode_register_payload, validate_channel_name,

@@ -38,6 +38,8 @@ const MAX_COMPONENTS: usize = 128;
 const MAX_PASSENGERS: usize = 1 << 15;
 /// Bound on string lists in `ClientboundSetPlayerTeamPacket`.
 const MAX_TEAM_MEMBERS: usize = 1 << 15;
+/// Vanilla's hard cap for cookie payloads in every connection phase.
+pub const MAX_COOKIE_PAYLOAD_BYTES: usize = 5_120;
 
 /// A `minecraft:menu` resource, expressed semantically so codecs map it to a
 /// numeric id through their [`ProtocolTable`] — the same enum yields different
@@ -246,6 +248,20 @@ pub struct RegistryDataEntry {
 /// the same IR describes every protocol version whose table is loaded.
 #[derive(Clone, Debug, PartialEq)]
 pub enum S2CPacket {
+    /// Login-phase clientbound cookie request.
+    LoginCookieRequest { key: String },
+    /// Configuration-phase clientbound cookie request.
+    ConfigCookieRequest { key: String },
+    /// Play-phase clientbound cookie request.
+    PlayCookieRequest { key: String },
+    /// Configuration-phase cookie storage instruction.
+    ConfigStoreCookie { key: String, payload: Vec<u8> },
+    /// Play-phase cookie storage instruction.
+    PlayStoreCookie { key: String, payload: Vec<u8> },
+    /// Configuration-phase server transfer instruction.
+    ConfigTransfer { host: String, port: i32 },
+    /// Play-phase server transfer instruction.
+    PlayTransfer { host: String, port: i32 },
     // -- login phase --
     /// `login/clientbound/login_disconnect` (0x00) — reason component bytes.
     LoginDisconnect { reason: Vec<u8> },
@@ -342,6 +358,12 @@ pub enum S2CPacket {
 /// Canonical serverbound IR — same contract as [`S2CPacket`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum C2SPacket {
+    /// Login-phase client cookie response.
+    LoginCookieResponse { key: String, payload: Option<Vec<u8>> },
+    /// Configuration-phase client cookie response.
+    ConfigCookieResponse { key: String, payload: Option<Vec<u8>> },
+    /// Play-phase client cookie response.
+    PlayCookieResponse { key: String, payload: Option<Vec<u8>> },
     /// `handshake/serverbound/handshake` (0x00). `next_state` must be 1
     /// (status) or 2 (login); anything else fails closed like
     /// `handle_handshake`.
@@ -452,6 +474,105 @@ const INPUT_JUMP: u8 = 0x10;
 const INPUT_SHIFT: u8 = 0x20;
 const INPUT_SPRINT: u8 = 0x40;
 
+fn validate_cookie_key(key: &str) -> Result<(), ProtoError> {
+    let (namespace, path) = key.split_once(':').unwrap_or(("minecraft", key));
+    let valid_namespace = !namespace.is_empty()
+        && namespace.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-".contains(&b));
+    let valid_path = !path.is_empty()
+        && path.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_./-".contains(&b));
+    if !valid_namespace || !valid_path || key.len() > MAX_STRING_CHARS {
+        return Err(ProtoError::Malformed("invalid cookie resource location"));
+    }
+    Ok(())
+}
+
+fn validate_cookie_payload(payload: &[u8]) -> Result<(), ProtoError> {
+    if payload.len() > MAX_COOKIE_PAYLOAD_BYTES {
+        return Err(ProtoError::LengthOutOfBounds {
+            length: payload.len(),
+            max: MAX_COOKIE_PAYLOAD_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn validate_transfer(host: &str, port: i32) -> Result<(), ProtoError> {
+    let units = host.encode_utf16().count();
+    if units == 0 || units > 255 || host.chars().any(|c| c.is_control() || c.is_whitespace() || "/\\@?#".contains(c)) {
+        return Err(ProtoError::Malformed("invalid transfer host"));
+    }
+    if !(1..=65535).contains(&port) {
+        return Err(ProtoError::InvalidDiscriminant {
+            value: i64::from(port),
+            what: "transfer port",
+        });
+    }
+    Ok(())
+}
+
+fn write_cookie_request(w: &mut WireWriter, key: &str) -> Result<(), ProtoError> {
+    validate_cookie_key(key)?;
+    w.write_string(key);
+    Ok(())
+}
+
+fn write_store_cookie(w: &mut WireWriter, key: &str, payload: &[u8]) -> Result<(), ProtoError> {
+    validate_cookie_key(key)?;
+    validate_cookie_payload(payload)?;
+    w.write_string(key);
+    w.write_bytes(payload);
+    Ok(())
+}
+
+fn write_transfer(w: &mut WireWriter, host: &str, port: i32) -> Result<(), ProtoError> {
+    validate_transfer(host, port)?;
+    w.write_string(host);
+    w.write_varint(port);
+    Ok(())
+}
+
+fn write_cookie_response(w: &mut WireWriter, key: &str, payload: &Option<Vec<u8>>) -> Result<(), ProtoError> {
+    validate_cookie_key(key)?;
+    if let Some(bytes) = payload {
+        validate_cookie_payload(bytes)?;
+    }
+    w.write_string(key);
+    w.write_bool(payload.is_some());
+    if let Some(bytes) = payload {
+        w.write_bytes(bytes);
+    }
+    Ok(())
+}
+
+fn read_cookie_key(r: &mut WireReader<'_>) -> Result<String, ProtoError> {
+    let key = r.read_string(MAX_STRING_CHARS)?;
+    validate_cookie_key(&key)?;
+    Ok(key)
+}
+
+fn read_store_cookie(r: &mut WireReader<'_>) -> Result<(String, Vec<u8>), ProtoError> {
+    let key = read_cookie_key(r)?;
+    let payload = r.read_bytes(MAX_COOKIE_PAYLOAD_BYTES)?.to_vec();
+    Ok((key, payload))
+}
+
+fn read_transfer(r: &mut WireReader<'_>) -> Result<(String, i32), ProtoError> {
+    let host = r.read_string(255)?;
+    let port = r.read_varint()?;
+    validate_transfer(&host, port)?;
+    Ok((host, port))
+}
+
+fn read_cookie_response(r: &mut WireReader<'_>) -> Result<(String, Option<Vec<u8>>), ProtoError> {
+    let key = read_cookie_key(r)?;
+    let payload = if r.read_bool()? {
+        Some(r.read_bytes(MAX_COOKIE_PAYLOAD_BYTES)?.to_vec())
+    } else {
+        None
+    };
+    Ok((key, payload))
+}
+
 /// Quantize the pre-1.21.2 float impulses into the `Input` flag byte. The
 /// signs follow `KeyboardInput`: a positive sideways impulse is the left key,
 /// a positive forward impulse is forward. Non-finite inputs encode as 0 —
@@ -514,6 +635,7 @@ fn write_item_stack(w: &mut WireWriter, stack: &ItemStack) {
 /// decodes the same names under different ids; a name the codec has no shape
 /// for fails closed.
 fn read_item_stack(r: &mut WireReader<'_>, table: &ProtocolTable) -> Result<ItemStack, ProtoError> {
+    let is_v767 = table.protocol_version() == Some(767);
     let count = r.read_varint()?;
     if !(0..=127).contains(&count) {
         return Err(ProtoError::InvalidDiscriminant {
@@ -531,8 +653,15 @@ fn read_item_stack(r: &mut WireReader<'_>, table: &ProtocolTable) -> Result<Item
             what: "item id",
         });
     }
-    let n_add = r.read_count(MAX_COMPONENTS)?;
-    let n_rem = r.read_count(MAX_COMPONENTS)?;
+    let max_components = if is_v767 {
+        crate::item_components::MAX_LIST_ENTRIES
+    } else {
+        MAX_COMPONENTS
+    };
+    let n_add = r.read_count(max_components)?;
+    let n_rem = r.read_count(max_components)?;
+    let mut total_component_bytes = 0usize;
+    let mut seen = std::collections::HashSet::new();
     let mut added = Vec::with_capacity(n_add.min(16));
     for _ in 0..n_add {
         let type_id = r.read_varint()?;
@@ -548,12 +677,35 @@ fn read_item_stack(r: &mut WireReader<'_>, table: &ProtocolTable) -> Result<Item
                 value: i64::from(type_id),
                 what: "component type",
             })?;
-        let start = r.position();
-        skip_component_value(r, type_id as u32, type_name)?;
-        added.push(RawComponent {
-            type_id: type_id as u32,
-            data: r.buffer()[start..r.position()].to_vec(),
-        });
+        if is_v767 && !seen.insert(type_id as u32) {
+            return Err(ProtoError::Malformed("duplicate item stack component"));
+        }
+        let component = if is_v767 && crate::item_components::is_verified_component_type(type_id as u32) {
+            crate::item_components::read_component_from_wire(type_id as u32, r)?
+        } else {
+            let start = r.position();
+            skip_component_value(r, type_id as u32, type_name)?;
+            RawComponent {
+                type_id: type_id as u32,
+                data: r.buffer()[start..r.position()].to_vec(),
+            }
+        };
+        if is_v767 {
+            if component.data.len() > crate::item_components::MAX_COMPONENT_BYTES {
+                return Err(ProtoError::LengthOutOfBounds {
+                    length: component.data.len(),
+                    max: crate::item_components::MAX_COMPONENT_BYTES,
+                });
+            }
+            total_component_bytes += crate::wire::varint_len(type_id) + component.data.len();
+            if total_component_bytes > crate::item_components::MAX_STACK_COMPONENTS_BYTES {
+                return Err(ProtoError::LengthOutOfBounds {
+                    length: total_component_bytes,
+                    max: crate::item_components::MAX_STACK_COMPONENTS_BYTES,
+                });
+            }
+        }
+        added.push(component);
     }
     let mut removed = Vec::with_capacity(n_rem.min(16));
     for _ in 0..n_rem {
@@ -563,6 +715,20 @@ fn read_item_stack(r: &mut WireReader<'_>, table: &ProtocolTable) -> Result<Item
                 value: i64::from(id),
                 what: "removed component type",
             });
+        }
+        if is_v767 {
+            if table.registry_name("minecraft:data_component_type", id as u32).is_none()
+                || !seen.insert(id as u32)
+            {
+                return Err(ProtoError::Malformed("invalid or duplicate removed item component"));
+            }
+            total_component_bytes += crate::wire::varint_len(id);
+            if total_component_bytes > crate::item_components::MAX_STACK_COMPONENTS_BYTES {
+                return Err(ProtoError::LengthOutOfBounds {
+                    length: total_component_bytes,
+                    max: crate::item_components::MAX_STACK_COMPONENTS_BYTES,
+                });
+            }
         }
         removed.push(id as u32);
     }
@@ -861,6 +1027,34 @@ fn encode_s2c_body_write(
     w: &mut WireWriter,
 ) -> Result<(PacketPhase, &'static str), ProtoError> {
     let (phase, name) = match packet {
+        S2CPacket::LoginCookieRequest { key } => {
+            write_cookie_request(w, key)?;
+            (PacketPhase::Login, "cookie_request")
+        }
+        S2CPacket::ConfigCookieRequest { key } => {
+            write_cookie_request(w, key)?;
+            (PacketPhase::Configuration, "cookie_request")
+        }
+        S2CPacket::PlayCookieRequest { key } => {
+            write_cookie_request(w, key)?;
+            (PacketPhase::Play, "cookie_request")
+        }
+        S2CPacket::ConfigStoreCookie { key, payload } => {
+            write_store_cookie(w, key, payload)?;
+            (PacketPhase::Configuration, "store_cookie")
+        }
+        S2CPacket::PlayStoreCookie { key, payload } => {
+            write_store_cookie(w, key, payload)?;
+            (PacketPhase::Play, "store_cookie")
+        }
+        S2CPacket::ConfigTransfer { host, port } => {
+            write_transfer(w, host, *port)?;
+            (PacketPhase::Configuration, "transfer")
+        }
+        S2CPacket::PlayTransfer { host, port } => {
+            write_transfer(w, host, *port)?;
+            (PacketPhase::Play, "transfer")
+        }
         S2CPacket::LoginDisconnect { reason } => {
             w.raw(reason);
             (PacketPhase::Login, "login_disconnect")
@@ -1082,6 +1276,18 @@ fn encode_c2s_body_write(
     w: &mut WireWriter,
 ) -> Result<(PacketPhase, &'static str), ProtoError> {
     let (phase, name) = match packet {
+        C2SPacket::LoginCookieResponse { key, payload } => {
+            write_cookie_response(w, key, payload)?;
+            (PacketPhase::Login, "cookie_response")
+        }
+        C2SPacket::ConfigCookieResponse { key, payload } => {
+            write_cookie_response(w, key, payload)?;
+            (PacketPhase::Configuration, "cookie_response")
+        }
+        C2SPacket::PlayCookieResponse { key, payload } => {
+            write_cookie_response(w, key, payload)?;
+            (PacketPhase::Play, "cookie_response")
+        }
         C2SPacket::Handshake {
             protocol_version,
             server_address,
@@ -1205,6 +1411,31 @@ fn read_s2c(
     r: &mut WireReader<'_>,
 ) -> Result<S2CPacket, ProtoError> {
     Ok(match name {
+        "cookie_request" => {
+            let key = read_cookie_key(r)?;
+            match phase {
+                PacketPhase::Login => S2CPacket::LoginCookieRequest { key },
+                PacketPhase::Configuration => S2CPacket::ConfigCookieRequest { key },
+                PacketPhase::Play => S2CPacket::PlayCookieRequest { key },
+                _ => return Err(ProtoError::Malformed("cookie request outside connection phase")),
+            }
+        }
+        "store_cookie" => {
+            let (key, payload) = read_store_cookie(r)?;
+            match phase {
+                PacketPhase::Configuration => S2CPacket::ConfigStoreCookie { key, payload },
+                PacketPhase::Play => S2CPacket::PlayStoreCookie { key, payload },
+                _ => return Err(ProtoError::Malformed("cookie storage outside connection phase")),
+            }
+        }
+        "transfer" => {
+            let (host, port) = read_transfer(r)?;
+            match phase {
+                PacketPhase::Configuration => S2CPacket::ConfigTransfer { host, port },
+                PacketPhase::Play => S2CPacket::PlayTransfer { host, port },
+                _ => return Err(ProtoError::Malformed("transfer outside connection phase")),
+            }
+        }
         "login_disconnect" => S2CPacket::LoginDisconnect {
             reason: r.read_anonymous_nbt()?.to_vec(),
         },
@@ -1451,6 +1682,15 @@ fn read_c2s(
     r: &mut WireReader<'_>,
 ) -> Result<C2SPacket, ProtoError> {
     Ok(match name {
+        "cookie_response" => {
+            let (key, payload) = read_cookie_response(r)?;
+            match phase {
+                PacketPhase::Login => C2SPacket::LoginCookieResponse { key, payload },
+                PacketPhase::Configuration => C2SPacket::ConfigCookieResponse { key, payload },
+                PacketPhase::Play => C2SPacket::PlayCookieResponse { key, payload },
+                _ => return Err(ProtoError::Malformed("cookie response outside connection phase")),
+            }
+        }
         "handshake" => {
             let protocol_version = r.read_varint()?;
             let server_address = r.read_string(255)?;
