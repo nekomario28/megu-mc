@@ -45,7 +45,7 @@ thread_local! {
     static SPONGE_SEEN: std::cell::RefCell<HashSet<BlockPos>> =
         std::cell::RefCell::new(HashSet::new());
     static SPONGE_QUEUE: std::cell::RefCell<std::collections::VecDeque<(BlockPos, u8)>> =
-        std::cell::RefCell::new(std::collections::VecDeque::new());
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
 
 /// Per-tick scratch for [`tick_world_block_entities`]: the mob snapshot, the
@@ -2160,8 +2160,8 @@ fn eval_crop_random_tick(input: CropTickInput) -> Option<u8> {
         return None;
     }
     let grows = match input.kind {
-        CropKind::NetherWart => input.random_value % 10 == 0,
-        CropKind::Cocoa | CropKind::SweetBerryBush => input.random_value % 5 == 0,
+        CropKind::NetherWart => input.random_value.is_multiple_of(10),
+        CropKind::Cocoa | CropKind::SweetBerryBush => input.random_value.is_multiple_of(5),
         CropKind::Wheat
         | CropKind::Carrots
         | CropKind::Potatoes
@@ -2177,7 +2177,7 @@ fn eval_crop_random_tick(input: CropTickInput) -> Option<u8> {
                 input.same_crop_east_west,
             );
             let bound = (25.0_f32 / speed) as u32 + 1;
-            input.random_value % bound == 0
+            input.random_value.is_multiple_of(bound)
         }
     };
     grows.then_some(input.age + 1)
@@ -2320,11 +2320,11 @@ pub(crate) fn comparator_signal_at_be(dim: DimId, pos: BlockPos) -> Option<u8> {
             "minecraft:composter" => reg
                 .get_prop(st, "level")
                 .and_then(|value| value.parse().ok())
-                .map(|level| composter_comparator(level)),
+                .map(composter_comparator),
             "minecraft:respawn_anchor" => reg
                 .get_prop(st, "charges")
                 .and_then(|value| value.parse().ok())
-                .map(|charges| respawn_anchor_comparator(charges)),
+                .map(respawn_anchor_comparator),
             // `CommandBlock` reads its `successCount` (clamped 0..15) through
             // the live command-block records, like vanilla's
             // `getAnalogOutputSignal`.
@@ -2578,9 +2578,8 @@ pub(crate) fn tick_world_block_entities(
                     Some(*id) == kind &&
                         (0..3).all(|i| (at[i] - center[i]).abs() <= range)
                 }).count();
-                let mut admitted = existing;
                 let spawn_count = if kind.is_some() { spawner.spawn_count } else { 0 };
-                for _ in 0..spawn_count {
+                for admitted in (existing..).take(usize::from(spawn_count)) {
                     if admitted >= usize::from(spawner.max_nearby_entities) {
                         break;
                     }
@@ -2599,7 +2598,6 @@ pub(crate) fn tick_world_block_entities(
                         entity_id: spawner.entity_id.clone(),
                         location,
                     });
-                    admitted += 1;
                 }
                 let random = rng.next_bits(24) as f32 / (1 << 24) as f32;
                 spawner.reset_delay(random);
@@ -3062,7 +3060,7 @@ fn eval_fire_tick(input: FireTickInput) -> FireTickResult {
         result.spread[index] = input.flammable_neighbors[index] && input.spread_rolls[index] == 0;
     }
     result.burned_out =
-        input.burnout_roll % 4 == 0 && !input.flammable_neighbors.iter().any(|v| *v);
+        input.burnout_roll.is_multiple_of(4) && !input.flammable_neighbors.iter().any(|v| *v);
     if result.burned_out {
         result.age = None;
     }
@@ -3086,7 +3084,7 @@ fn eval_leaf_decay(input: LeafDecayInput) -> LeafDecayResult {
     let decay = !input.persistent && input.distance >= 7;
     LeafDecayResult {
         decay,
-        drop_item: decay && input.random_roll % 20 == 0,
+        drop_item: decay && input.random_roll.is_multiple_of(20),
     }
 }
 
@@ -3113,7 +3111,7 @@ fn eval_snow_accumulation(input: SnowIceTickInput) -> SnowIceTickResult {
         && input.sky_exposed
         && !input.support_is_full_solid
         && input.light < 10
-        && input.random_roll % 16 == 0
+        && input.random_roll.is_multiple_of(16)
     {
         SnowIceTickResult::AccumulateSnow
     } else {
@@ -3155,7 +3153,7 @@ enum SaplingTickResult {
 /// sapling under at least light 9 advances to stage 1 on a one-in-seven roll;
 /// a stage-1 sapling with headroom grows. Dark or crowded saplings never move.
 fn eval_sapling_random_tick(input: SaplingTickInput) -> SaplingTickResult {
-    if input.light < 9 || input.random_roll % 7 != 0 {
+    if input.light < 9 || !input.random_roll.is_multiple_of(7) {
         return SaplingTickResult::NoChange;
     }
     if input.stage == 0 {
@@ -3295,7 +3293,7 @@ enum BambooTickResult {
 /// with light 9+ above turns the sapling into a stalk or extends the column
 /// up to the vanilla 16-block cap.
 fn eval_bamboo_random_tick(input: BambooTickInput) -> BambooTickResult {
-    if input.random_roll % 3 != 0 || input.light_above < 9 {
+    if !input.random_roll.is_multiple_of(3) || input.light_above < 9 {
         return BambooTickResult::NoChange;
     }
     if input.is_sapling {
@@ -3358,7 +3356,7 @@ enum VineTickResult {
 /// `VineBlock.randomTick` under the `doVinesSpread` gate: on a one-in-four
 /// roll the vine creeps down first, else onto a neighboring face.
 fn eval_vine_random_tick(input: VineTickInput) -> VineTickResult {
-    if !input.spread_allowed || input.random_roll % 4 != 0 {
+    if !input.spread_allowed || !input.random_roll.is_multiple_of(4) {
         return VineTickResult::NoChange;
     }
     if input.space_below {
@@ -3811,13 +3809,13 @@ fn wbe_reconcile_at(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&(dim, pos.0, pos.1, pos.2))
-        .map(|be| wbe_family(be));
+        .map(wbe_family);
     match (held, wbe_default_for(name)) {
         (None, Some(default)) => {
             register_world_block_entity(dim, pos, default);
         }
         (Some(family), default)
-            if default.as_ref().map(|be| wbe_family(be)) != Some(family) =>
+            if default.as_ref().is_none_or(|entity| wbe_family(entity) != family) =>
         {
             remove_world_block_entity(dim, pos);
         }
@@ -7864,7 +7862,7 @@ impl SleepingHopperEngine {
             stats.active_scanned += 1;
             let moved = self.attempt_transfers(pos, facing);
             if moved > 0 {
-                stats.items_transferred += u64::from(moved);
+                stats.items_transferred += moved;
                 if let Some(hopper) = self.hoppers.get_mut(&pos) {
                     hopper.cooldown_ticks = HOPPER_TRANSFER_COOLDOWN;
                 }

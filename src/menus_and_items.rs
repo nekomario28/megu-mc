@@ -39,6 +39,8 @@ fn player_touch_aabb(x: f64, y: f64, z: f64, sneaking: bool, fall_fly: bool) -> 
 // ---------- item drops ----------
 // item stack components: (type_id, serialized_data) — vanilla 1.21.1
 // structured components (SlotComponent). data is the pre-encoded payload.
+#[cfg(test)]
+type TestChunkRegion = (HashSet<(i32, i32)>, HashSet<(i32, i32)>);
 type Comps = Vec<(i64, Vec<u8>)>;
 type Stack = (i64, u8, Comps);
 // component type ids (SlotComponentType mapper)
@@ -59,6 +61,7 @@ const COMP_STORED_ENCHANTMENTS: i64 = 23;
 
 /// `AttributeModifier.Operation` varint enum (Protocol 767).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)] // Shared with combat_and_health.rs; preserve existing variant names.
 enum ItemAttrOp {
     AddValue = 0,
     AddMultipliedBase = 1,
@@ -912,7 +915,7 @@ fn merge_drops(dp: &mut [Drop]) -> Vec<i32> {
     }
     __t = __prof.then(std::time::Instant::now);
     let mut merged: Vec<i32> = Vec::new();
-    let mut candidates = MERGE_CAND_SCRATCH.with(|s| scratch_take(s));
+    let mut candidates = MERGE_CAND_SCRATCH.with(scratch_take);
     for i in 0..dp.len() {
         let (cx, cy, cz) = (
             dp[i].x.floor() as i32,
@@ -971,12 +974,14 @@ fn merge_drops(dp: &mut [Drop]) -> Vec<i32> {
     merged
 }
 
+type DropPickupSnapshot = (i32, f64, f64, Option<[u8; 16]>, EntityAabb);
+
 fn furnace_tick() {
     let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
     if fs.is_empty() {
         return;
     }
-    let mut dirty_pos = FURNACE_DIRTY_SCRATCH.with(|s| scratch_take(s));
+    let mut dirty_pos = FURNACE_DIRTY_SCRATCH.with(scratch_take);
     // One region borrow for the whole loop. Acquiring the mutex per furnace was
     // what dominated this stage, not the set lookup itself.
     let region = region_guard();
@@ -1406,7 +1411,7 @@ fn hopper_probe_epoch(hx: i32, hy: i32, hz: i32, dst: (i32, i32, i32)) -> u128 {
             acc = mixv(acc, u64::from(pend.contains_key(&ow_block(pos))));
         }
     }
-    let mut snaps = SUCTION_SNAP_SCRATCH.with(|s| scratch_take(s));
+    let mut snaps = SUCTION_SNAP_SCRATCH.with(scratch_take);
     suction_snaps_into(hx, hy, hz, &mut snaps);
     for s in &snaps {
         acc = mixv(acc, s.eid as u64);
@@ -1427,8 +1432,9 @@ struct HopperSleep {
     epoch: u128,
     idle: bool,
 }
-static HOPPER_SLEEP: OnceLock<Mutex<HashMap<(i32, i32, i32), HopperSleep>>> = OnceLock::new();
-fn hopper_sleep() -> &'static Mutex<HashMap<(i32, i32, i32), HopperSleep>> {
+type HopperSleepMap = HashMap<(i32, i32, i32), HopperSleep>;
+static HOPPER_SLEEP: OnceLock<Mutex<HopperSleepMap>> = OnceLock::new();
+fn hopper_sleep() -> &'static Mutex<HopperSleepMap> {
     HOPPER_SLEEP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 /// Visit accounting the `bot_hopper_*` tests read: real scans versus
@@ -1491,15 +1497,16 @@ where
     };
 }
 
+type BrewingUpdateBatch = HashMap<DimBlockPos, (bool, [WindowPropertyUpdate; 2], bool)>;
+
 thread_local! {
     /// `furnace_tick`'s dirty-position batch.
     static FURNACE_DIRTY_SCRATCH: std::cell::RefCell<Vec<DimBlockPos>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// `live_brewing_tick`'s per-tick update batch. `HashMap::new` is not
     /// const, so this one slot skips the const-init form.
-    static BREWING_UPDATES_SCRATCH: std::cell::RefCell<
-        HashMap<DimBlockPos, (bool, [WindowPropertyUpdate; 2], bool)>,
-    > = std::cell::RefCell::new(HashMap::new());
+    static BREWING_UPDATES_SCRATCH: std::cell::RefCell<BrewingUpdateBatch> =
+        std::cell::RefCell::new(HashMap::new());
     /// `hopper_probe_epoch`'s suction-window snapshot list.
     static SUCTION_SNAP_SCRATCH: std::cell::RefCell<Vec<DropCellSnap>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -1643,11 +1650,7 @@ fn hopper_tick() {
         // `attempt_transfers` encodes the same shape: push first, then the
         // container half of `suckInItems`, then the item-entity half.
         let mut did = hopper_push(hx, hy, hz, dst);
-        if hopper_pull(hx, hy, hz) {
-            did = true;
-        } else if hopper_suck(hx, hy, hz) {
-            did = true;
-        }
+        did |= hopper_pull(hx, hy, hz) || hopper_suck(hx, hy, hz);
         {
             let mut sl = hopper_sleep().lock().unwrap_or_else(|e| e.into_inner());
             if sl.len() > HOPPER_SLEEP_MAX {
@@ -1807,7 +1810,7 @@ fn hopper_suck(hx: i32, hy: i32, hz: i32) -> bool {
     if !suction_nonempty(hx, hy, hz) {
         return false;
     }
-    let mut cell = HOPPER_CELL_SCRATCH.with(|s| scratch_take(s));
+    let mut cell = HOPPER_CELL_SCRATCH.with(scratch_take);
     {
         let dl = drops().lock().unwrap_or_else(|e| e.into_inner());
         cell.extend(
@@ -1877,7 +1880,7 @@ fn drop_tick() {
     // 1.21.1 Player.aiStep() touch box + !isSpectator() + ItemEntity.target match
     let mut taken: Vec<(i32, Arc<Client>)> = vec![];
     {
-        let ds: Vec<(i32, f64, f64, Option<[u8; 16]>, EntityAabb)> = drops()
+        let ds: Vec<DropPickupSnapshot> = drops()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
@@ -2065,7 +2068,7 @@ fn drop_tick() {
                 d.age += 1;
             }
         }
-        let mut exp = DROP_DESPAWN_SCRATCH.with(|s| scratch_take(s));
+        let mut exp = DROP_DESPAWN_SCRATCH.with(scratch_take);
         exp.extend(dp.iter().filter(|d| d.age >= life).map(|d| d.eid));
         for eid in &exp {
             dp.retain(|d| d.eid != *eid);
@@ -3057,9 +3060,9 @@ fn client_window_halves(
     }
     chest_window_halves(open)
 }
-fn client_open_window_and_anchor(
-    c: &Client,
-) -> Option<((ContainerKey, Option<ContainerKey>), Option<BlockPos>)> {
+type OpenWindowAnchor = ((ContainerKey, Option<ContainerKey>), Option<BlockPos>);
+
+fn client_open_window_and_anchor(c: &Client) -> Option<OpenWindowAnchor> {
     let open = (*c.open_chest.lock().unwrap_or_else(|e| e.into_inner()))?;
     let anchor = c
         .chest_sync
@@ -3244,7 +3247,7 @@ fn chest_viewer_tick_on(audience: &[Arc<Client>]) {
     if audience.is_empty() {
         return;
     }
-    let mut updates = CHEST_SYNC_SCRATCH.with(|s| scratch_take(s));
+    let mut updates = CHEST_SYNC_SCRATCH.with(scratch_take);
     for c in audience {
         let open = *c.open_chest.lock().unwrap_or_else(|e| e.into_inner());
         let Some(win) = open else {
@@ -4784,7 +4787,7 @@ fn name_to_item(n: &str) -> Option<i64> {
         _ => return None,
     })
 }
-const ITEM_NAMES: [&str; 1333] = [
+static ITEM_NAMES: [&str; 1333] = [
     "air", "stone", "granite", "polished_granite", "diorite", "polished_diorite",
     "andesite", "polished_andesite", "deepslate", "cobbled_deepslate", "polished_deepslate", "calcite",
     "tuff", "tuff_slab", "tuff_stairs", "tuff_wall", "chiseled_tuff", "polished_tuff",
@@ -5989,20 +5992,11 @@ impl Lectern {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ChiseledBookshelf {
     pub(crate) slots: [Option<BlockEntityItem>; 6],
     last_interacted_slot: Option<usize>,
-}
-
-impl Default for ChiseledBookshelf {
-    fn default() -> Self {
-        Self {
-            slots: Default::default(),
-            last_interacted_slot: None,
-        }
-    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -6568,7 +6562,7 @@ fn block_entity_uuid(tag: &Tag) -> Option<BlockEntityUuid> {
     };
     let parts: &[i32; 4] = parts.as_slice().try_into().ok()?;
     let mut uuid = [0; 16];
-    for (bytes, word) in uuid.chunks_exact_mut(4).zip(parts) {
+    for (bytes, word) in uuid.as_chunks_mut::<4>().0.iter_mut().zip(parts) {
         bytes.copy_from_slice(&word.to_be_bytes());
     }
     Some(uuid)
@@ -6576,8 +6570,8 @@ fn block_entity_uuid(tag: &Tag) -> Option<BlockEntityUuid> {
 
 fn block_entity_uuid_nbt(uuid: &BlockEntityUuid) -> Tag {
     Tag::IntArray(
-        uuid.chunks_exact(4)
-            .map(|bytes| i32::from_be_bytes(bytes.try_into().expect("four bytes per UUID word")))
+        uuid.as_chunks::<4>().0.iter()
+            .map(|bytes| i32::from_be_bytes(*bytes))
             .collect(),
     )
 }
@@ -7309,7 +7303,7 @@ enum LiveBlockEntity {
     Lectern(Lectern, Option<i64>),
     ChiseledBookshelf(ChiseledBookshelf),
     DecoratedPot(DecoratedPot),
-    Crafter(Crafter, Option<i64>),
+    Crafter(Box<Crafter>, Option<i64>),
     Jukebox(Jukebox),
     Banner(Banner),
     Skull(Skull),
@@ -7364,7 +7358,7 @@ impl LiveBlockEntity {
                 Self::ChiseledBookshelf(ChiseledBookshelf::from_nbt(tag))
             }
             "minecraft:decorated_pot" => Self::DecoratedPot(DecoratedPot::from_nbt(tag)),
-            "minecraft:crafter" => Self::Crafter(Crafter::from_nbt(tag), None),
+            "minecraft:crafter" => Self::Crafter(Box::new(Crafter::from_nbt(tag)), None),
             "minecraft:jukebox" => Self::Jukebox(Jukebox::from_nbt(tag, jukebox_song_for)),
             "minecraft:banner" => Self::Banner(Banner::from_nbt(tag)),
             "minecraft:skull" => Self::Skull(Skull::from_nbt(tag)),
@@ -11831,7 +11825,7 @@ fn remove_live_brewing_stand(key @ (dim, x, y, z): DimBlockPos) {
 
 fn live_brewing_tick() {
     with_save_guard(|| {
-        let mut updates = BREWING_UPDATES_SCRATCH.with(|s| scratch_map_take(s));
+        let mut updates = BREWING_UPDATES_SCRATCH.with(scratch_map_take);
         {
             let mut stands = live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner());
             let mut sleep = brewing_sleep().lock().unwrap_or_else(|e| e.into_inner());
@@ -13647,7 +13641,6 @@ mod w2_live_wire_tests {
                 book_item: Some("minecraft:written_book".to_owned()),
                 page: 7,
                 total_pages: 15,
-                ..Default::default()
             }),
         );
         assert_eq!(live_comparator_signal_at(DimId::Overworld, x, y, z + 1), Some(8));
@@ -14098,10 +14091,10 @@ mod qol_death_restore_tests {
             let mut comps: Comps = Vec::new();
             // One in four stacks carries a damage component so merges have to
             // respect component identity, not just item id.
-            if next() % 4 == 0 {
+            if next().is_multiple_of(4) {
                 comp_set_varint(&mut comps, COMP_DAMAGE, (next() % 8) as i64);
             }
-            if next() % 16 == 0 {
+            if next().is_multiple_of(16) {
                 comps.push((COMP_CUSTOM_NAME, nbt_string(&format!("stress-{picked_id}"))));
             }
             picked_id += 1;
@@ -14233,7 +14226,7 @@ mod bot_hopper_tests {
 
     /// Warm every chunk the fixture touches so `hopper_tick`'s `is_warm` gate
     /// and `drop_tick`'s hot despawn pass see the whole array.
-    fn warm_chunks(x0: i32, z0: i32, x1: i32, z1: i32) -> (HashSet<(i32, i32)>, HashSet<(i32, i32)>) {
+    fn warm_chunks(x0: i32, z0: i32, x1: i32, z1: i32) -> TestChunkRegion {
         let mut set = HashSet::new();
         for cx in x0.div_euclid(16)..=x1.div_euclid(16) {
             for cz in z0.div_euclid(16)..=z1.div_euclid(16) {
@@ -14513,7 +14506,7 @@ mod bot_hopper_tests {
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
             dp.push(drop_at(
-                90000 + i as i32,
+                90000 + i,
                 0.5 + (h % 9) as f64 + ((h >> 8) % 10) as f64 / 64.0,
                 70.0 + ((h >> 16) % 3) as f64 + ((h >> 24) % 10) as f64 / 64.0,
                 0.5 + ((h >> 32) % 9) as f64 + ((h >> 40) % 10) as f64 / 64.0,
@@ -14568,7 +14561,7 @@ mod xpoll_be_sleep_tests {
         fsteps: u64,
         bskips: u64,
         bsteps: u64,
-        region: (HashSet<(i32, i32)>, HashSet<(i32, i32)>),
+        region: TestChunkRegion,
     }
 
     fn save_be() -> SavedBe {
@@ -14735,8 +14728,10 @@ mod xpoll_be_sleep_tests {
         {
             let mut menu = BrewingMenu::default();
             menu.slots[0] = water();
-            let mut stand = BrewingStand::default();
-            stand.fuel = 20;
+            let stand = BrewingStand {
+                fuel: 20,
+                ..Default::default()
+            };
             live_brewing_stands()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

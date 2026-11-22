@@ -334,7 +334,7 @@ impl<'a> P3bReader<'a> {
     }
     fn utf(&mut self) -> Option<String> {
         let len = self.varint()?;
-        if len < 0 || len > (1 << 20) {
+        if !(0..=(1 << 20)).contains(&len) {
             return None;
         }
         let bytes = self.data.get(self.p..self.p + len as usize)?;
@@ -987,12 +987,11 @@ fn p3b_pick_structure_at(
     set: &P3bStructureSet,
     wanted: &HashSet<String>,
     dim: DimId,
-    seed: u64,
-    cx: i32,
-    cz: i32,
+    chunk: (u64, i32, i32),
     all_mineshaft: bool,
     entry_biomes: &mut HashMap<String, HashSet<String>>,
 ) -> Option<String> {
+    let (seed, cx, cz) = chunk;
     if all_mineshaft {
         let start = mineshaft::admit(g, cx, cz)?;
         let id = mineshaft::start_id(&start).to_owned();
@@ -1035,11 +1034,10 @@ fn p3b_set_locate(
     set: &P3bStructureSet,
     wanted: &HashSet<String>,
     dim: DimId,
-    origin_cx: i32,
-    origin_cz: i32,
-    max_radius_chunks: i32,
+    search: (i32, i32, i32),
     entry_biomes: &mut HashMap<String, HashSet<String>>,
 ) -> Option<(i32, i32, String)> {
+    let (origin_cx, origin_cz, max_radius_chunks) = search;
     let seed = g.wseed();
     let all_mineshaft = set
         .entries
@@ -1080,9 +1078,7 @@ fn p3b_set_locate(
                             set,
                             wanted,
                             dim,
-                            seed,
-                            cand.0,
-                            cand.1,
+                            (seed, cand.0, cand.1),
                             all_mineshaft,
                             entry_biomes,
                         ) {
@@ -1121,9 +1117,7 @@ fn p3b_set_locate(
                     set,
                     wanted,
                     dim,
-                    seed,
-                    cx,
-                    cz,
+                    (seed, cx, cz),
                     all_mineshaft,
                     entry_biomes,
                 ) {
@@ -1156,7 +1150,7 @@ fn locate_structure_spiral(
         let tag_id = p3b_ns(tag);
         let values = worldgen::Gen::dp_resource("tags/worldgen/structure", &tag_id, "json")
             .and_then(|bytes| jparse(&bytes))
-            .and_then(|j| j.get("values").map(|v| v.clone()));
+            .and_then(|j| j.get("values").cloned());
         let Some(values) = values else {
             return Err(format!("Unknown structure tag '{tag_id}'"));
         };
@@ -1199,9 +1193,7 @@ fn locate_structure_spiral(
                 set,
                 &wanted,
                 dim,
-                origin_cx,
-                origin_cz,
-                max_radius_chunks,
+                (origin_cx, origin_cz, max_radius_chunks),
                 &mut entry_biomes,
             ) {
                 let dx = f64::from(cx * 16 + 8 - x);
@@ -1260,7 +1252,7 @@ fn locate_biome_spiral(
                 while dz <= r {
                     if r == 0 || dx.abs() == r || dz.abs() == r {
                         p3b_locate_biome_column(
-                            g, leaf, x, y, z, x + dx, z + dz, qy0, qy1, &mut best,
+                            g, leaf, (x, y, z), (x + dx, z + dz), qy0, qy1, &mut best,
                         );
                     }
                     dz += 8;
@@ -1285,15 +1277,14 @@ fn locate_biome_spiral(
 fn p3b_locate_biome_column(
     g: &mut worldgen::Gen,
     leaf: u16,
-    ox: i32,
-    oy: i32,
-    oz: i32,
-    x: i32,
-    z: i32,
+    origin: (i32, i32, i32),
+    column: (i32, i32),
     qy0: i32,
     qy1: i32,
     best: &mut Option<(i32, i32, i32, f64)>,
 ) {
+    let (ox, oy, oz) = origin;
+    let (x, z) = column;
     let mut last: Option<u16> = None;
     let mut qy = qy0;
     while qy <= qy1 {
@@ -2763,10 +2754,7 @@ fn data_entity_root(entity: &ExecuteEntity) -> ExecTag {
             );
             let inv = player.inv.lock().unwrap_or_else(|e| e.into_inner());
             let held = *player.held.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(selected) = inv
-                .get(&(36 + held))
-                .and_then(|stack| data_item_nbt(stack))
-            {
+            if let Some(selected) = data_item_nbt(inv.get(&(36 + held))) {
                 put("SelectedItem", selected);
             }
             put("ArmorItems", data_armor_items(&inv));
@@ -2814,7 +2802,7 @@ fn data_entity_root(entity: &ExecuteEntity) -> ExecTag {
         .flatten()
         .map(|tag| ExecTag::String(NbtString::text(tag)))
         .collect();
-    entity_tags.sort_by(|a, b| execute_tag_snbt(a).cmp(&execute_tag_snbt(b)));
+    entity_tags.sort_by_key(execute_tag_snbt);
     put("Tags", ExecTag::List(8, entity_tags));
     if let Some(ExecTag::Compound(extra_fields)) = extras {
         for (key, value) in extra_fields {
@@ -2830,8 +2818,8 @@ fn data_empty_item() -> ExecTag {
 
 /// A live stack rendered the way vanilla writes it inside `SelectedItem` /
 /// `ArmorItems`/`HandItems`: the compound without the `Slot` index.
-fn data_item_nbt(stack: &Stack) -> Option<ExecTag> {
-    let mut tag = stack_to_nbt(0, stack)?;
+fn data_item_nbt(stack: Option<&Stack>) -> Option<ExecTag> {
+    let mut tag = stack_to_nbt(0, stack?)?;
     if let ExecTag::Compound(fields) = &mut tag {
         fields.remove(&NbtString::text("Slot"));
     }
@@ -2846,8 +2834,7 @@ fn data_armor_items(inv: &HashMap<i16, Stack>) -> ExecTag {
         [8, 7, 6, 5]
             .iter()
             .map(|slot| {
-                inv.get(slot)
-                    .and_then(data_item_nbt)
+                data_item_nbt(inv.get(slot))
                     .unwrap_or_else(data_empty_item)
             })
             .collect(),
@@ -2862,8 +2849,7 @@ fn data_hand_items(inv: &HashMap<i16, Stack>, held: i16) -> ExecTag {
         [36 + held, 45]
             .iter()
             .map(|slot| {
-                inv.get(slot)
-                    .and_then(data_item_nbt)
+                data_item_nbt(inv.get(slot))
                     .unwrap_or_else(data_empty_item)
             })
             .collect(),
@@ -3042,7 +3028,7 @@ fn data_apply_entity_field(entity: &ExecuteEntity, name: &str, value: &ExecTag) 
         }
         "Invulnerable" => {
             if let ExecuteEntity::Player(player) = entity {
-                let flag = data_nbt_f64(value).map_or(false, |n| n != 0.0);
+                let flag = data_nbt_f64(value).is_some_and(|n| n != 0.0);
                 *player.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) = if flag { i32::MAX } else { 0 };
             }
             extra(entity, name, value);
@@ -3148,10 +3134,12 @@ fn data_apply_entity_field(entity: &ExecuteEntity, name: &str, value: &ExecTag) 
 /// save produces is unaffected; the rest reset to their load defaults.
 fn data_remove_entity_field(entity: &ExecuteEntity, name: &str) {
     let drop_extra = |entity: &ExecuteEntity, name: &str| {
-        if let Some(tag) = data_entity_extras().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&entity.tag_key()) {
-            if let ExecTag::Compound(fields) = tag {
-                fields.remove(&NbtString::text(name));
-            }
+        if let Some(ExecTag::Compound(fields)) = data_entity_extras()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&entity.tag_key())
+        {
+            fields.remove(&NbtString::text(name));
         }
     };
     match name {
@@ -3218,13 +3206,10 @@ fn data_remove_entity_field(entity: &ExecuteEntity, name: &str) {
 }
 
 fn data_move_other_entity(id: i32, kind: &str, [x, y, z]: [f64; 3]) {
-    match kind {
-        "minecraft:item" => {
-            if let Some(drop) = drops().lock().unwrap_or_else(|e| e.into_inner()).iter_mut().find(|d| d.eid == id) {
-                (drop.x, drop.y, drop.z) = (x, y, z);
-            }
+    if kind == "minecraft:item" {
+        if let Some(drop) = drops().lock().unwrap_or_else(|e| e.into_inner()).iter_mut().find(|d| d.eid == id) {
+            (drop.x, drop.y, drop.z) = (x, y, z);
         }
-        _ => {}
     }
 }
 
@@ -3307,12 +3292,13 @@ fn data_nbt_remove(root: &mut ExecTag, nodes: &[ExecuteNbtNode]) -> bool {
                 entries.retain(|entry| !is_match(entry));
                 before != entries.len()
             } else {
-                entries
-                    .iter_mut()
-                    .filter(|entry| is_match(entry))
-                    .fold(false, |removed, entry| {
-                        data_nbt_remove(entry, rest) || removed
-                    })
+                {
+                    let mut removed = false;
+                    for entry in entries.iter_mut().filter(|entry| is_match(entry)) {
+                        removed |= data_nbt_remove(entry, rest);
+                    }
+                    removed
+                }
             }
         }
         (Match(pattern, false), value)
@@ -3586,7 +3572,7 @@ fn data_modify_source(
             let (target, rest) = data_parse_target(source, rest).map_err(|_| usage())?;
             let (_, root) = data_read_root(source, &target)?;
             let (values, rest) = match rest {
-                [] => (vec![root], &rest[..]),
+                [] => (vec![root], rest),
                 [path, rest @ ..] => {
                     let parsed = ExecuteNbtPath::parse(path)?;
                     let values: Vec<ExecTag> = parsed
@@ -3681,12 +3667,12 @@ fn run_data_command(ctx: &CmdCtx, args: &[&str]) -> String {
             };
             let path = ExecuteNbtPath::parse(raw_path)?;
             let (op, rest) = match rest {
-                ["set", rest @ ..] => (DataModifyOp::Set, &rest[..]),
-                ["merge", rest @ ..] => (DataModifyOp::Merge, &rest[..]),
-                ["append", rest @ ..] => (DataModifyOp::Append, &rest[..]),
-                ["prepend", rest @ ..] => (DataModifyOp::Prepend, &rest[..]),
+                ["set", rest @ ..] => (DataModifyOp::Set, rest),
+                ["merge", rest @ ..] => (DataModifyOp::Merge, rest),
+                ["append", rest @ ..] => (DataModifyOp::Append, rest),
+                ["prepend", rest @ ..] => (DataModifyOp::Prepend, rest),
                 ["insert", index, rest @ ..] => match index.parse::<i32>() {
-                    Ok(index) => (DataModifyOp::Insert(index), &rest[..]),
+                    Ok(index) => (DataModifyOp::Insert(index), rest),
                     Err(_) => return Err(format!("Invalid insert index '{index}'")),
                 },
                 _ => return Err("usage: /data modify <target> <path> <op> <source>".into()),
@@ -4256,7 +4242,7 @@ fn policy_bool(key: &str, value: &str) -> Result<bool, String> {
 }
 
 fn policy_choice<'a>(key: &str, value: &'a str, allowed: &[&str]) -> Result<&'a str, String> {
-    if allowed.iter().any(|candidate| *candidate == value) {
+    if allowed.contains(&value) {
         Ok(value)
     } else {
         Err(policy_invalid_value(key, value))
@@ -4370,7 +4356,7 @@ fn live_server_policy() -> &'static Mutex<LiveServerPolicy> {
 /// `/megu policy set` lands on the very next hit, and both are Vanilla by
 /// default: `true` means every hit connects exactly like stock, and only an
 /// explicit `false` arms the protection below.
-
+///
 /// May `attacker_uuid` damage the pet owned by `pet_owner_uuid`? With
 /// `pet_friendly_fire` on (the default) the answer is always yes. With it off
 /// the owner cannot clip their own pet and a party ally cannot either, while
@@ -5068,12 +5054,10 @@ enum AttrModOp {
 /// `/attribute`'s command-side modifier store, keyed the way `attrs()` is:
 /// `p:<name>` for players and `e:<eid>` for transient entities, then the bare
 /// attribute name, then the modifier id.
-fn attr_modifiers(
-) -> &'static Mutex<HashMap<String, HashMap<String, BTreeMap<String, (f64, AttrModOp)>>>>
-{
-    static STORE: OnceLock<
-        Mutex<HashMap<String, HashMap<String, BTreeMap<String, (f64, AttrModOp)>>>>,
-    > = OnceLock::new();
+type AttributeModifiers = HashMap<String, HashMap<String, BTreeMap<String, (f64, AttrModOp)>>>;
+
+fn attr_modifiers() -> &'static Mutex<AttributeModifiers> {
+    static STORE: OnceLock<Mutex<AttributeModifiers>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -5091,7 +5075,7 @@ fn modifier_id_valid(id: &str) -> bool {
                     || (slash && b == b'/')
             })
     };
-    ns.map_or(true, |n| part_ok(n, false)) && part_ok(path, true)
+    ns.is_none_or(|n| part_ok(n, false)) && part_ok(path, true)
 }
 
 /// The stored base (or Vanilla default) for `base get` — equipment and
@@ -5428,11 +5412,10 @@ struct CommandMinecartRecord {
 
 /// Every live command block, keyed `(dim, x, y, z)`.
 #[allow(dead_code)]
-fn live_command_blocks(
-) -> &'static Mutex<HashMap<(DimId, i32, i32, i32), CommandBlockRecord>> {
-    static BLOCKS: OnceLock<
-        Mutex<HashMap<(DimId, i32, i32, i32), CommandBlockRecord>>,
-    > = OnceLock::new();
+type CommandBlockMap = HashMap<(DimId, i32, i32, i32), CommandBlockRecord>;
+
+fn live_command_blocks() -> &'static Mutex<CommandBlockMap> {
+    static BLOCKS: OnceLock<Mutex<CommandBlockMap>> = OnceLock::new();
     BLOCKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -6978,7 +6961,7 @@ mod p5d_parity_tests {
     #[test]
     fn p5d_parity_forceload_query_chunk_and_remove_all() {
         let _world = world_guard();
-        let previous = std::mem::replace(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()), HashSet::new());
+        let previous = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
         let ctx = p5d_ctx(None);
 
         let added = p5d_run(&ctx, "/forceload add 32 48");
@@ -7311,7 +7294,7 @@ mod p5d_parity_tests {
         clients()
             .lock()
             .unwrap()
-            .retain(|p| !matches!(p.eid, 60021 | 60022 | 60023));
+            .retain(|p| !matches!(p.eid, 60021..=60023));
         mobs().lock().unwrap_or_else(|e| e.into_inner()).retain(|m| m.eid != mob.eid);
         for x in -11..=11 {
             for z in -11..=11 {
@@ -7688,7 +7671,7 @@ mod p6d_parity_tests {
         );
         assert_eq!(
             p6d_run(&ctx, &format!("/data get storage {store} missing")),
-            format!("Found no elements at 'missing'")
+            "Found no elements at 'missing'".to_string()
         );
         execute_storage().lock().unwrap_or_else(|e| e.into_inner()).remove(store);
     }
@@ -8830,8 +8813,7 @@ mod policy_cmd_tests {
             );
             let error = live_brigadier_tree()
                 .parse_command_for_level("/megu policy list", level)
-                .err()
-                .expect("megu must be permission-denied below level 4");
+                .expect_err("megu must be permission-denied below level 4");
             assert_eq!(
                 error.kind(),
                 brigadier::BrigadierErrorKind::PermissionDenied
@@ -9104,17 +9086,13 @@ mod vanilla_cmdblk_tests {
         mode: CommandBlockMode,
         facing: CommandBlockFacing,
         command: &str,
-        conditional: bool,
-        automatic: bool,
-        powered: bool,
+        flags: (bool, bool, bool),
     ) {
         let mut rec = CommandBlockRecord::new(dim, pos);
         rec.mode = mode;
         rec.facing = facing;
         rec.command = command.to_owned();
-        rec.conditional = conditional;
-        rec.automatic = automatic;
-        rec.powered = powered;
+        (rec.conditional, rec.automatic, rec.powered) = flags;
         upsert_command_block(rec);
     }
 
@@ -9151,7 +9129,7 @@ mod vanilla_cmdblk_tests {
         let _world = world_guard();
         clear_cmd_state();
         let (dim, pos) = (DimId::Overworld, (10, 64, 10));
-        put_block(dim, pos, CommandBlockMode::Redstone, CommandBlockFacing::Up, "time add 7", false, false, false);
+        put_block(dim, pos, CommandBlockMode::Redstone, CommandBlockFacing::Up, "time add 7", (false, false, false));
         let t0 = world_time();
         command_block_tick();
         assert_eq!(world_time(), t0, "unpowered impulse must not run");
@@ -9175,14 +9153,14 @@ mod vanilla_cmdblk_tests {
         let _world = world_guard();
         clear_cmd_state();
         let (dim, pos) = (DimId::Overworld, (11, 64, 10));
-        put_block(dim, pos, CommandBlockMode::Auto, CommandBlockFacing::Up, "time add 2", false, true, false);
+        put_block(dim, pos, CommandBlockMode::Auto, CommandBlockFacing::Up, "time add 2", (false, true, false));
         let t0 = world_time();
         for _ in 0..3 {
             command_block_tick();
         }
         assert_eq!(world_time(), t0 + 6, "always-active repeating runs each tick");
         // Powered (but not automatic) repeating blocks run each tick too.
-        put_block(dim, (11, 64, 11), CommandBlockMode::Auto, CommandBlockFacing::Up, "time add 3", false, false, true);
+        put_block(dim, (11, 64, 11), CommandBlockMode::Auto, CommandBlockFacing::Up, "time add 3", (false, false, true));
         command_block_tick();
         assert_eq!(world_time(), t0 + 6 + 2 + 3);
         set_command_block_powered(dim, (11, 64, 11), false);
@@ -9195,9 +9173,9 @@ mod vanilla_cmdblk_tests {
         let _world = world_guard();
         clear_cmd_state();
         let dim = DimId::Overworld;
-        put_block(dim, (0, 64, 20), CommandBlockMode::Redstone, CommandBlockFacing::East, "time add 1", false, false, true);
-        put_block(dim, (1, 64, 20), CommandBlockMode::Sequence, CommandBlockFacing::East, "time add 1", false, true, false);
-        put_block(dim, (2, 64, 20), CommandBlockMode::Sequence, CommandBlockFacing::East, "time add 1", false, true, false);
+        put_block(dim, (0, 64, 20), CommandBlockMode::Redstone, CommandBlockFacing::East, "time add 1", (false, false, true));
+        put_block(dim, (1, 64, 20), CommandBlockMode::Sequence, CommandBlockFacing::East, "time add 1", (false, true, false));
+        put_block(dim, (2, 64, 20), CommandBlockMode::Sequence, CommandBlockFacing::East, "time add 1", (false, true, false));
         let t0 = world_time();
         command_block_tick();
         assert_eq!(world_time(), t0 + 3, "trigger + two chain blocks");
@@ -9213,9 +9191,9 @@ mod vanilla_cmdblk_tests {
         let dim = DimId::Overworld;
         let chain1 = (1, 64, 30);
         let chain2 = (2, 64, 30);
-        put_block(dim, (0, 64, 30), CommandBlockMode::Redstone, CommandBlockFacing::East, "time add 1", false, false, true);
-        put_block(dim, chain1, CommandBlockMode::Sequence, CommandBlockFacing::East, "nonexistent_root_xyz", false, true, false);
-        put_block(dim, chain2, CommandBlockMode::Sequence, CommandBlockFacing::East, "time add 3", true, true, false);
+        put_block(dim, (0, 64, 30), CommandBlockMode::Redstone, CommandBlockFacing::East, "time add 1", (false, false, true));
+        put_block(dim, chain1, CommandBlockMode::Sequence, CommandBlockFacing::East, "nonexistent_root_xyz", (false, true, false));
+        put_block(dim, chain2, CommandBlockMode::Sequence, CommandBlockFacing::East, "time add 3", (true, true, false));
         let t0 = world_time();
         command_block_tick();
         assert_eq!(world_time(), t0 + 1, "only the trigger ran");
@@ -9237,9 +9215,9 @@ mod vanilla_cmdblk_tests {
         // An unpowered (needs-redstone) chain block is skipped but the trigger
         // still propagates past it, matching vanilla chain propagation.
         let dim2 = DimId::Nether;
-        put_block(dim2, (0, 64, 30), CommandBlockMode::Redstone, CommandBlockFacing::East, "time add 1", false, false, true);
-        put_block(dim2, (1, 64, 30), CommandBlockMode::Sequence, CommandBlockFacing::East, "time add 10", false, false, false);
-        put_block(dim2, (2, 64, 30), CommandBlockMode::Sequence, CommandBlockFacing::East, "time add 4", false, true, false);
+        put_block(dim2, (0, 64, 30), CommandBlockMode::Redstone, CommandBlockFacing::East, "time add 1", (false, false, true));
+        put_block(dim2, (1, 64, 30), CommandBlockMode::Sequence, CommandBlockFacing::East, "time add 10", (false, false, false));
+        put_block(dim2, (2, 64, 30), CommandBlockMode::Sequence, CommandBlockFacing::East, "time add 4", (false, true, false));
         let t1 = world_time();
         command_block_tick();
         assert_eq!(world_time(), t1 + 1 + 4, "unpowered link skipped, tail still ran");
@@ -9250,9 +9228,9 @@ mod vanilla_cmdblk_tests {
         let _world = world_guard();
         clear_cmd_state();
         let dim = DimId::End;
-        put_block(dim, (0, 64, 40), CommandBlockMode::Redstone, CommandBlockFacing::East, "time add 1", false, false, true);
-        put_block(dim, (1, 64, 40), CommandBlockMode::Sequence, CommandBlockFacing::East, "time add 1", false, true, false);
-        put_block(dim, (2, 64, 40), CommandBlockMode::Sequence, CommandBlockFacing::West, "time add 1", false, true, false);
+        put_block(dim, (0, 64, 40), CommandBlockMode::Redstone, CommandBlockFacing::East, "time add 1", (false, false, true));
+        put_block(dim, (1, 64, 40), CommandBlockMode::Sequence, CommandBlockFacing::East, "time add 1", (false, true, false));
+        put_block(dim, (2, 64, 40), CommandBlockMode::Sequence, CommandBlockFacing::West, "time add 1", (false, true, false));
         {
             let mut rules = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
             rules.insert("maxCommandChainLength", 5);
@@ -9281,7 +9259,7 @@ mod vanilla_cmdblk_tests {
         .enumerate()
         {
             let pos = (100 + i as i32, 64, 50);
-            put_block(dim, pos, CommandBlockMode::Auto, CommandBlockFacing::Up, root, false, true, false);
+            put_block(dim, pos, CommandBlockMode::Auto, CommandBlockFacing::Up, root, (false, true, false));
             command_block_tick();
             assert_eq!(
                 block_rec(dim, pos).success_count,
@@ -9291,7 +9269,7 @@ mod vanilla_cmdblk_tests {
         }
         // ...but a level-2 command still runs — the source is level 2, not 0.
         let pos = (120, 64, 50);
-        put_block(dim, pos, CommandBlockMode::Auto, CommandBlockFacing::Up, "time add 5", false, true, false);
+        put_block(dim, pos, CommandBlockMode::Auto, CommandBlockFacing::Up, "time add 5", (false, true, false));
         live_command_blocks()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -9426,7 +9404,7 @@ mod vanilla_cmdblk_tests {
         let dim = DimId::Overworld;
         let pos = (50, 64, 60);
         assert_eq!(command_block_comparator_signal(dim, pos), 0, "absent block reads 0");
-        put_block(dim, pos, CommandBlockMode::Auto, CommandBlockFacing::Up, "time add 1", false, true, false);
+        put_block(dim, pos, CommandBlockMode::Auto, CommandBlockFacing::Up, "time add 1", (false, true, false));
         command_block_tick();
         assert_eq!(command_block_comparator_signal(dim, pos), 1);
         {
@@ -9478,7 +9456,7 @@ mod vanilla_cmdblk_tests {
         std::env::set_var("MC_SPINE_ENABLE_COMMAND_BLOCK", "0");
         let pkt = update((7, 7, 7), "time add 1", CommandBlockMode::Auto, (false, false, true));
         assert!(apply_set_command_block(2, 1, true, dim, pkt).is_err(), "env-disabled edit refused");
-        put_block(dim, (7, 7, 8), CommandBlockMode::Auto, CommandBlockFacing::Up, "time add 1", false, true, false);
+        put_block(dim, (7, 7, 8), CommandBlockMode::Auto, CommandBlockFacing::Up, "time add 1", (false, true, false));
         let t0 = world_time();
         command_block_tick();
         assert_eq!(world_time(), t0, "disabled engine must not tick");
@@ -9727,17 +9705,13 @@ mod parity_51_gr_tests {
         mode: CommandBlockMode,
         facing: CommandBlockFacing,
         command: &str,
-        conditional: bool,
-        automatic: bool,
-        powered: bool,
+        flags: (bool, bool, bool),
     ) {
         let mut rec = CommandBlockRecord::new(dim, pos);
         rec.mode = mode;
         rec.facing = facing;
         rec.command = command.to_owned();
-        rec.conditional = conditional;
-        rec.automatic = automatic;
-        rec.powered = powered;
+        (rec.conditional, rec.automatic, rec.powered) = flags;
         upsert_command_block(rec);
     }
 
@@ -9770,11 +9744,7 @@ mod parity_51_gr_tests {
             pos,
             CommandBlockMode::Auto,
             CommandBlockFacing::Up,
-            "time add 1",
-            false,
-            true,
-            false,
-        );
+            "time add 1", (false, true, false));
         live_command_blocks()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -9999,31 +9969,19 @@ mod parity_51_gr_tests {
             (0, 64, 40),
             CommandBlockMode::Redstone,
             CommandBlockFacing::East,
-            "time add 1",
-            false,
-            false,
-            true,
-        );
+            "time add 1", (false, false, true));
         p51_put_block(
             dim,
             (1, 64, 40),
             CommandBlockMode::Sequence,
             CommandBlockFacing::East,
-            "time add 1",
-            false,
-            true,
-            false,
-        );
+            "time add 1", (false, true, false));
         p51_put_block(
             dim,
             (2, 64, 40),
             CommandBlockMode::Sequence,
             CommandBlockFacing::West,
-            "time add 1",
-            false,
-            true,
-            false,
-        );
+            "time add 1", (false, true, false));
         let t2 = world_time();
         command_block_tick();
         assert_eq!(

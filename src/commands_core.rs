@@ -2053,13 +2053,11 @@ fn dpc1_snapshot_of(
     content: &mut DatapackContent,
     raw_packs: &[RawDatapack],
 ) -> Dpc1Snapshot {
-    let mut snapshot = Dpc1Snapshot::default();
-    snapshot.registry = std::mem::take(&mut content.registry);
-    snapshot.loot_json = content
-        .loot_raw
-        .iter()
-        .map(|(key, body)| (key.clone(), body.clone()))
-        .collect();
+    let mut snapshot = Dpc1Snapshot {
+        registry: std::mem::take(&mut content.registry),
+        loot_json: content.loot_raw.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        ..Dpc1Snapshot::default()
+    };
     for raw in raw_packs {
         let verdict = raw.mcmeta.as_deref().map_or(
             PackFormatVerdict::Invalid,
@@ -3196,11 +3194,11 @@ fn clear_stack_matches(stack: &Stack, tests: &[ClearCompTest]) -> bool {
         ClearCompTest::Lacks(key) => !present(key),
         ClearCompTest::Equals(key, value) => match key.as_str() {
             "custom_name" => comp_get(&stack.2, COMP_CUSTOM_NAME)
-                .and_then(decode_comp_name)
-                .map(|stored| {
-                    component_literal_text(&stored) == component_literal_text(value)
-                })
-                .unwrap_or(false),
+                .is_some_and(|data| {
+                    decode_comp_name(data).is_some_and(|stored| {
+                        component_literal_text(&stored) == component_literal_text(value)
+                    })
+                }),
             "damage" | "max_damage" | "repair_cost" | "max_stack_size" => value
                 .parse::<i64>()
                 .ok()
@@ -5231,7 +5229,7 @@ fn time_argument_ticks(time: &str) -> Option<i64> {
         .or_else(|| time.strip_suffix('d').map(|n| (n, 24_000.0)))
         .unwrap_or((time, 1.0));
     let value = num.parse::<f64>().ok()?;
-    (value.is_finite() && value >= 0.0).then(|| (value * mult) as i64)
+    (value.is_finite() && value >= 0.0).then_some((value * mult) as i64)
 }
 
 fn schedule_delay_ticks(time: &str) -> u64 {
@@ -5256,7 +5254,7 @@ fn weather_time_argument(value: &str) -> Option<i64> {
         .or_else(|| value.strip_suffix('d').map(|n| (n, 24_000.0)))
         .unwrap_or((value, TICKS_PER_SECOND as f64));
     let parsed = num.parse::<f64>().ok()?;
-    (parsed.is_finite() && parsed >= 0.0).then(|| (parsed * mult) as i64)
+    (parsed.is_finite() && parsed >= 0.0).then_some((parsed * mult) as i64)
 }
 
 /// The duration vanilla rolls when `/weather` omits `<duration>`: uniform in
@@ -6504,12 +6502,12 @@ fn spreadplayers_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) 
             let mut close = 0usize;
             let mut rx = 0.0f64;
             let mut rz = 0.0f64;
-            for j in 0..piles.len() {
+            for (j, pile) in piles.iter().enumerate() {
                 if i == j {
                     continue;
                 }
-                let dx = piles[j].x - px;
-                let dz = piles[j].z - pz;
+                let dx = pile.x - px;
+                let dz = pile.z - pz;
                 if dx * dx + dz * dz < spread * spread {
                     close += 1;
                     rx += dx;
@@ -6862,7 +6860,7 @@ fn playsound_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> S
         ) else {
             return USAGE.into();
         };
-        if !(volume >= 0.0) {
+        if volume < 0.0 || volume.is_nan() {
             return "Volume must be at least 0.0".into();
         }
         if !(0.0..=2.0).contains(&pitch) {
@@ -7095,7 +7093,7 @@ fn run_teleport_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -
     // (single token) teleports the executor to that entity.
     let first_is_coord = first.parse::<f64>().is_ok() || first.starts_with('~');
     let (subject_tokens, dest): (&[&str], &[&str]) = if rest.is_empty() || first_is_coord {
-        (&[][..], &args[..])
+        (&[][..], args)
     } else {
         (&args[..1], rest)
     };
@@ -7281,7 +7279,7 @@ fn loot_give_stack(client: &Arc<Client>, stack: &Stack) {
         .find(|sl| {
             inv.get(sl).map(|(it, cn, cc)| {
                 *it == *item && *cc == *comps
-                    && (*cn as i64 + *cnt as i64) <= item_stack_max(*item, comps) as i64
+                    && (*cn as i64 + *cnt as i64) <= item_stack_max(*item, comps)
             }).unwrap_or(false)
         })
         .or_else(|| (36..=44).chain(9..=35).find(|sl| !inv.contains_key(sl)))
@@ -7480,7 +7478,7 @@ fn run_loot_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> St
                     slots.get(sl).map(|(it, cn, cc)| {
                         *it == st.0 && *cc == st.2
                             && (*cn as i64 + st.1 as i64)
-                                <= item_stack_max(st.0, &st.2) as i64
+                                <= item_stack_max(st.0, &st.2)
                     }).unwrap_or(false)
                 });
                 let slot = merge.or_else(|| (0..capacity).find(|sl| !slots.contains_key(sl)));
@@ -8955,7 +8953,7 @@ fn run_recipe_command(ctx: &CmdCtx, args: &[&str]) -> String {
     for client in &targets {
         let book = books
             .entry(client.uuid)
-            .or_insert_with(PlayerRecipeBook::new);
+            .or_default();
         let Some(outcome) = exec_recipe_command(book, verb, &universe, recipe) else {
             return format!("Unknown recipe '{recipe}'");
         };
@@ -9648,7 +9646,7 @@ mod p5f_parity_tests {
     fn p5f_parity_forceload_query_execute_store_result() {
         let _world = world_guard();
         let ctx = p5f_ctx(None);
-        let previous = std::mem::replace(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()), HashSet::new());
+        let previous = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
         assert_eq!(
             p5f_run(&ctx, "/scoreboard objectives add p5f dummy"),
             "Added objective p5f"

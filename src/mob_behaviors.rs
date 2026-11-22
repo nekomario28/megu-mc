@@ -1109,7 +1109,7 @@ impl CreeperBehavior {
             if self.fuse >= 30 {
                 return Some(self.explosion_power());
             }
-        } else if target_distance.map_or(true, |distance| distance > 7.0) {
+        } else if target_distance.is_none_or(|distance| distance > 7.0) {
             self.fuse = (self.fuse - 1).max(-1);
         }
         None
@@ -2192,7 +2192,7 @@ fn eval_entity_cramming_damage(
     const ENTITY_CRAMMING_HIT: f32 = 6.0;
     if limit > 0
         && pushable > (limit - 1) as usize
-        && roll_mod_4 % 4 == 0
+        && roll_mod_4.is_multiple_of(4)
         && non_passengers > (limit - 1) as usize
     {
         ENTITY_CRAMMING_HIT
@@ -2223,7 +2223,7 @@ fn ghast_acquires_target(distance: f64) -> bool {
 /// mid-body (`getY(0.5) + 0.5`).
 #[cfg_attr(not(test), allow(dead_code))]
 fn blaze_hover_y(target_pos: [f64; 3], target_height: f64) -> f64 {
-    target_pos[1] + f64::from(target_height) * 0.5 + 0.5
+    target_pos[1] + target_height * 0.5 + 0.5
 }
 
 // --- Phantom: circle / swoop / climb state machine ---
@@ -2584,9 +2584,7 @@ impl EvokerBehavior {
                 return None;
             }
         }
-        let Some((_, target_pos)) = target else {
-            return None;
-        };
+        let (_, target_pos) = target?;
         let [dx, _, dz] = mob_behavior_delta(pos, target_pos);
         let distance = dx.hypot(dz);
         let spell = if self.vex_cooldown == 0 {
