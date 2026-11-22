@@ -14,13 +14,12 @@ use mc_spine_client_gpu::atmosphere::{
     CLOUD_RENDER_ALPHA,
 };
 use mc_spine_client_gpu::renderer::{
-    probe_adapters, request_gpu_device, ComposedFrame, GpuRenderer, RendererError,
-    OFFSCREEN_FORMAT,
+    probe_adapters, request_gpu_device, ComposedFrame, GpuRenderer, RendererError, OFFSCREEN_FORMAT,
 };
 use mc_spine_client_gpu::subworld_render::{
-    box_mesh, quat_from_axis_angle, CompositeDrawUniforms, InstancedPartBatch,
-    InstancedPartRecord, SubWorldRenderBank, SubWorldRenderEntry, SubWorldTransform,
-    TerrainVertex, COMPOSITE_LIT_WGSL, COMPOSITE_TERRAIN_WGSL, DRAW_UNIFORM_STRIDE,
+    box_mesh, quat_from_axis_angle, CompositeDrawUniforms, InstancedPartBatch, InstancedPartRecord,
+    SubWorldRenderBank, SubWorldRenderEntry, SubWorldTransform, TerrainVertex, COMPOSITE_LIT_WGSL,
+    COMPOSITE_TERRAIN_WGSL, DRAW_UNIFORM_STRIDE,
 };
 use mc_spine_client_gpu::{build_demo_scene, mat4_mul_vec4, Camera, Mat4};
 use mc_spine_client_mesh::builtin_shadow_wgsl::{
@@ -149,10 +148,7 @@ fn subworld_rotation_cardinal_and_arbitrary() {
     );
     // 120° about the (1,1,1) diagonal cycles the axes: X->Y->Z->X.
     let t = SubWorldTransform {
-        quaternion: quat_from_axis_angle(
-            [1.0, 1.0, 1.0],
-            120.0f32.to_radians(),
-        ),
+        quaternion: quat_from_axis_angle([1.0, 1.0, 1.0], 120.0f32.to_radians()),
         ..origin_free
     };
     assert_vec3_near(
@@ -178,13 +174,13 @@ fn subworld_rotation_cardinal_and_arbitrary() {
         position: [1.0, 2.0, 3.0],
     };
     let out = rotate_point(&t.model_matrix(), [0.4, -0.3, 0.8]);
-    let d = [
-        out[0] - 1.0,
-        out[1] - 2.0,
-        out[2] - 3.0,
-    ];
+    let d = [out[0] - 1.0, out[1] - 2.0, out[2] - 3.0];
     let len: f32 = d.iter().map(|v| v * v).sum::<f32>().sqrt();
-    let src: f32 = [0.4f32, -0.3, 0.8].iter().map(|v| v * v).sum::<f32>().sqrt();
+    let src: f32 = [0.4f32, -0.3, 0.8]
+        .iter()
+        .map(|v| v * v)
+        .sum::<f32>()
+        .sqrt();
     assert!(
         (len - src * 2.5).abs() < 1e-4,
         "scaled rigid rotation preserves length: {len} vs {}",
@@ -206,11 +202,7 @@ fn subworld_invalid_quaternion_falls_back_to_identity() {
         };
         let out = rotate_point(&t.model_matrix(), [1.0, 2.0, 3.0]);
         assert_vec3_near(out, [1.0, 2.0, 3.0], 1e-6, "invalid quat -> identity");
-        assert!(t
-            .model_matrix()
-            .iter()
-            .flatten()
-            .all(|v| v.is_finite()));
+        assert!(t.model_matrix().iter().flatten().all(|v| v.is_finite()));
     }
     // Non-finite scale/position fail closed too.
     let t = SubWorldTransform {
@@ -245,25 +237,28 @@ fn subworld_bank_dirty_and_transform_semantics() {
     assert_eq!(bank.len(), 1);
     assert!(bank.get(7).expect("entry").dirty, "new entries upload");
     // A transform update alone never re-dirties a synced entry.
-    let mut clean = SubWorldRenderEntry::new(8, SubWorldTransform::IDENTITY, verts.clone(), idx.clone());
+    let mut clean =
+        SubWorldRenderEntry::new(8, SubWorldTransform::IDENTITY, verts.clone(), idx.clone());
     clean.dirty = false;
     bank.upsert(clean);
-    assert!(bank.set_transform(8, SubWorldTransform {
-        position: [1.0, 2.0, 3.0],
-        ..SubWorldTransform::IDENTITY
-    }));
+    assert!(bank.set_transform(
+        8,
+        SubWorldTransform {
+            position: [1.0, 2.0, 3.0],
+            ..SubWorldTransform::IDENTITY
+        }
+    ));
     assert!(!bank.get(8).expect("entry").dirty);
-    assert_eq!(bank.get(8).expect("entry").transform.position, [1.0, 2.0, 3.0]);
+    assert_eq!(
+        bank.get(8).expect("entry").transform.position,
+        [1.0, 2.0, 3.0]
+    );
     assert!(!bank.set_transform(999, SubWorldTransform::default()));
     // Geometry replacement dirties again.
     assert!(bank.set_geometry(7, verts, idx));
     assert!(bank.get(7).expect("entry").dirty);
     // Instanced batch bookkeeping.
-    let mut batch = InstancedPartBatch::new(
-        42,
-        vec![TerrainVertex::default()],
-        vec![0, 0, 0],
-    );
+    let mut batch = InstancedPartBatch::new(42, vec![TerrainVertex::default()], vec![0, 0, 0]);
     batch.instances.push(InstancedPartRecord {
         pos_scale: [0.0, 0.0, 0.0, 1.0],
         rot_uv_frame: [0.0; 4],
@@ -294,7 +289,11 @@ fn assert_finite(params: &AtmosphereParams, ctx: &str) {
         &params.fog_rgb,
         &params.depth_tint_rgb,
         &params.ambient_rgb,
-        &[params.fog_density, params.depth_tint_strength, params.sun_intensity],
+        &[
+            params.fog_density,
+            params.depth_tint_strength,
+            params.sun_intensity,
+        ],
     ];
     for (i, f) in fields.iter().enumerate() {
         assert!(
@@ -458,7 +457,9 @@ fn cloud_and_planet_geometry_is_finite_and_non_empty() {
     let (verts, idx) = voxel_clouds_to_geometry(&cells, &lighting);
     assert_geometry_finite(&verts, &idx, "clouds");
     // Every emitted vertex albedo comes from the cloud lighting table.
-    assert!(verts.iter().all(|v| v.albedo.iter().all(|c| (0.0..=1.05).contains(c))));
+    assert!(verts
+        .iter()
+        .all(|v| v.albedo.iter().all(|c| (0.0..=1.05).contains(c))));
 
     let planet = PlanetSkyBody {
         id: "ad_astra:earth".to_string(),
@@ -541,12 +542,18 @@ fn vacuum_policy_suppresses_clouds_but_keeps_parent_planet() {
 
 fn compile_and_validate(name: &str, source: &str) -> wgpu::naga::Module {
     let module = wgsl::parse_str(source).unwrap_or_else(|err| {
-        panic!("{name}: naga WGSL parse failed:\n{}", err.emit_to_string(source))
+        panic!(
+            "{name}: naga WGSL parse failed:\n{}",
+            err.emit_to_string(source)
+        )
     });
     Validator::new(ValidationFlags::all(), Capabilities::all())
         .validate(&module)
         .unwrap_or_else(|err| {
-            panic!("{name}: naga validation failed:\n{}", err.emit_to_string(source))
+            panic!(
+                "{name}: naga validation failed:\n{}",
+                err.emit_to_string(source)
+            )
         });
     module
 }
@@ -576,10 +583,7 @@ fn composite_wgsl_modules_validate_with_naga() {
         (ShaderStage::Vertex, "inst_vs"),
         (ShaderStage::Fragment, "lit_fs"),
     ] {
-        assert!(
-            has_entry_point(&lit, stage, name),
-            "lit module lost {name}"
-        );
+        assert!(has_entry_point(&lit, stage, name), "lit module lost {name}");
     }
 }
 
@@ -632,7 +636,9 @@ fn composed_frame_renders_on_real_gpu() {
     };
     eprintln!(
         "composed render on {:?} {} ({})",
-        ctx.report.backend, ctx.report.name, ctx.report.resolution.backend.as_str()
+        ctx.report.backend,
+        ctx.report.name,
+        ctx.report.resolution.backend.as_str()
     );
     // Capture every uncaptured wgpu error; validation errors land here.
     let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1017,4 +1023,218 @@ fn planet_subworld_transform_survives_hostile_placement() {
     );
     assert!((center[0] / len - 0.6).abs() < 1e-4);
     assert!((center[2] / len - 0.8).abs() < 1e-4);
+}
+
+#[test]
+fn high_shadows_darkens_floor_and_reuses_gpu_map() {
+    if probe_adapters(RenderBackendPreference::Auto).is_empty() {
+        eprintln!("SKIP shadow pixel readback: no GPU adapter");
+        return;
+    }
+    let ctx = request_gpu_device(RenderBackendPreference::Auto, None, None)
+        .expect("adapter exists but device request failed");
+    eprintln!("shadow pixel readback on {}", ctx.report.name);
+    let mut renderer = GpuRenderer::new(ctx, OFFSCREEN_FORMAT);
+    renderer.set_render_scale(RenderScalePreset::Native100);
+    let mut bank = SubWorldRenderBank::new();
+    let (floor_vertices, floor_indices) =
+        box_mesh([-8.0, -0.2, -8.0], [8.0, 0.0, 8.0], [0.6, 0.6, 0.6]);
+    bank.upsert(SubWorldRenderEntry::new(
+        11,
+        SubWorldTransform::IDENTITY,
+        floor_vertices,
+        floor_indices,
+    ));
+    let (box_vertices, box_indices) = box_mesh([0.0, 0.0, -2.0], [2.0, 3.0, 0.0], [0.6, 0.6, 0.6]);
+    bank.upsert(SubWorldRenderEntry::new(
+        12,
+        SubWorldTransform::IDENTITY,
+        box_vertices,
+        box_indices,
+    ));
+    let blender = BiomeAtmosphereBlender::new(AtmosphereParams::default());
+    let tracker = ChunkFadeTracker::new();
+    let camera = Camera {
+        position: [-1.0, 8.0, 14.0],
+        yaw_deg: 0.0,
+        pitch_deg: -30.0,
+        far: 96.0,
+        ..Camera::default()
+    };
+    let render = |renderer: &mut GpuRenderer,
+                  bank: &mut SubWorldRenderBank,
+                  camera: &Camera,
+                  revision: u64,
+                  time: u64,
+                  width: u32,
+                  height: u32| {
+        renderer
+            .render_offscreen_composed_frame(
+                width,
+                height,
+                camera,
+                &mut ComposedFrame {
+                    subworlds: bank,
+                    lights: &[],
+                    atmosphere: &blender,
+                    chunk_fades: &tracker,
+                    ui_rgba: None,
+                    world_revision: revision,
+                    world_time_ticks: time,
+                },
+            )
+            .expect("GPU composed frame")
+    };
+    let (width, height) = (320, 240);
+    let off = render(&mut renderer, &mut bank, &camera, 1, 4000, width, height);
+    assert_eq!(renderer.shadow_allocated_bytes(), 0);
+    let negotiated = renderer.set_shadow_quality(BuiltinShadowQuality::High);
+    assert_eq!(
+        negotiated,
+        BuiltinShadowQuality::High,
+        "adapter must support High"
+    );
+    let high = render(&mut renderer, &mut bank, &camera, 1, 4000, width, height);
+    assert_eq!(renderer.shadow_rerender_count, 1);
+    assert_eq!(
+        renderer.shadow_allocated_bytes(),
+        negotiated.config().depth_array_bytes(),
+    );
+
+    // The sun is at (0.5, 0.866, 0) at tick 4000. The box casts west,
+    // toward x=-0.65 on the floor, visible from the camera above +Z.
+    let clip = mat4_mul_vec4(
+        &camera.view_projection(width as f32 / height as f32),
+        [-0.65, 0.01, -1.0, 1.0],
+    );
+    assert!(clip[3] > 0.0);
+    let x = ((clip[0] / clip[3] * 0.5 + 0.5) * width as f32) as usize;
+    let y = ((0.5 - clip[1] / clip[3] * 0.5) * height as f32) as usize;
+    assert!(x > 2 && x < width as usize - 2 && y > 2 && y < height as usize - 2);
+    let brightness = |pixels: &[u8]| {
+        let mut sum = 0u32;
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let index =
+                    ((y as isize + dy) as usize * width as usize + (x as isize + dx) as usize) * 4;
+                sum += pixels[index..index + 3]
+                    .iter()
+                    .map(|&v| u32::from(v))
+                    .sum::<u32>();
+            }
+        }
+        sum as f32 / 27.0
+    };
+    let off_brightness = brightness(&off);
+    let high_brightness = brightness(&high);
+    eprintln!("floor shadow pixel ({x}, {y}): Off={off_brightness:.2}, High={high_brightness:.2}");
+    assert!(
+        high_brightness + 4.0 < off_brightness,
+        "shadow map did not darken the floor pixel"
+    );
+
+    render(&mut renderer, &mut bank, &camera, 1, 4000, width, height);
+    assert_eq!(renderer.shadow_rerender_count, 1);
+    assert_eq!(renderer.shadow_reuse_count, 1);
+    render(&mut renderer, &mut bank, &camera, 2, 4000, width, height);
+    assert_eq!(
+        renderer.shadow_rerender_count, 2,
+        "world edit must rerender"
+    );
+    render(&mut renderer, &mut bank, &camera, 2, 4100, width, height);
+    assert_eq!(
+        renderer.shadow_rerender_count, 3,
+        "sun movement must rerender"
+    );
+    assert!(bank.set_transform(
+        12,
+        SubWorldTransform {
+            position: [0.5, 0.0, 0.0],
+            ..SubWorldTransform::IDENTITY
+        }
+    ));
+    render(&mut renderer, &mut bank, &camera, 2, 4100, width, height);
+    assert_eq!(
+        renderer.shadow_rerender_count, 4,
+        "sub-world motion must rerender"
+    );
+    let camera_far = Camera {
+        far: 128.0,
+        ..camera
+    };
+    render(
+        &mut renderer,
+        &mut bank,
+        &camera_far,
+        2,
+        4100,
+        width,
+        height,
+    );
+    assert_eq!(
+        renderer.shadow_rerender_count, 5,
+        "far clip plane must rerender"
+    );
+    render(&mut renderer, &mut bank, &camera_far, 2, 4100, 384, 240);
+    assert_eq!(
+        renderer.shadow_rerender_count, 6,
+        "resize/aspect must rerender"
+    );
+    renderer.set_shadow_quality(BuiltinShadowQuality::Off);
+    assert_eq!(renderer.shadow_allocated_bytes(), 0);
+    render(&mut renderer, &mut bank, &camera, 2, 4100, width, height);
+    assert_eq!(renderer.shadow_allocated_bytes(), 0);
+}
+
+#[test]
+fn regular_window_render_entry_uses_shadow_pass_when_selected() {
+    if probe_adapters(RenderBackendPreference::Auto).is_empty() {
+        eprintln!("SKIP window-path shadow readback: no GPU adapter");
+        return;
+    }
+    let ctx = request_gpu_device(RenderBackendPreference::Auto, None, None)
+        .expect("adapter exists but device request failed");
+    let mut renderer = GpuRenderer::new(ctx, OFFSCREEN_FORMAT);
+    let camera = Camera {
+        position: [8.0, 14.0, 22.0],
+        yaw_deg: 0.0,
+        pitch_deg: -15.0,
+        ..Camera::default()
+    };
+    renderer
+        .upload_scene(&build_demo_scene(camera.position))
+        .expect("demo scene upload");
+    let off = renderer
+        .render_offscreen_rgba(192, 128, &camera, None)
+        .expect("Off window-path frame");
+    assert_eq!(renderer.shadow_allocated_bytes(), 0);
+
+    let preset = renderer.set_shadow_quality(BuiltinShadowQuality::High);
+    assert!(
+        preset.config().cascade_count > 0,
+        "adapter must support shadow maps"
+    );
+    let high = renderer
+        .render_offscreen_rgba(192, 128, &camera, None)
+        .expect("High window-path frame");
+    assert_eq!(renderer.shadow_rerender_count, 1);
+    assert_eq!(
+        renderer.shadow_allocated_bytes(),
+        preset.config().depth_array_bytes()
+    );
+    assert!(
+        count_diff_pixels(&off, &high) > 50,
+        "regular entry point must draw visibly different shaded terrain"
+    );
+
+    renderer
+        .render_offscreen_rgba(192, 128, &camera, None)
+        .expect("cached window-path frame");
+    assert_eq!(renderer.shadow_rerender_count, 1);
+    assert_eq!(renderer.shadow_reuse_count, 1);
+
+    renderer
+        .render_offscreen_rgba(256, 128, &camera, None)
+        .expect("resized window-path frame");
+    assert_eq!(renderer.shadow_rerender_count, 2);
 }

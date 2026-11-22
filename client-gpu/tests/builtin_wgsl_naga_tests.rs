@@ -4,9 +4,12 @@
 //! crate `wgpu` re-exports, so a syntax or type error that would reject a
 //! `wgpu::ShaderModule` at runtime is caught here.
 
+use mc_spine_client_gpu::renderer::composed_shadow_wgsl;
+use mc_spine_client_gpu::subworld_render::{COMPOSITE_LIT_WGSL, COMPOSITE_TERRAIN_WGSL};
 use mc_spine_client_mesh::builtin_shadow_wgsl::{
-    BUILTIN_SHADOW_SHADERS, MEGU_SHADOW_DEPTH_WGSL, MEGU_SKY_ATMOSPHERE_WGSL,
-    MEGU_SPATIAL_SHARPEN_WGSL, MEGU_TERRAIN_LIT_WGSL, MEGU_WATER_SURFACE_WGSL,
+    BUILTIN_SHADOW_SHADERS, MEGU_SHADOW_CASTERS_WGSL, MEGU_SHADOW_DEPTH_WGSL,
+    MEGU_SHADOW_SAMPLING_WGSL, MEGU_SKY_ATMOSPHERE_WGSL, MEGU_SPATIAL_SHARPEN_WGSL,
+    MEGU_TERRAIN_LIT_WGSL, MEGU_WATER_SURFACE_WGSL,
 };
 use wgpu::naga::front::wgsl;
 use wgpu::naga::valid::{Capabilities, ValidationFlags, Validator};
@@ -71,6 +74,42 @@ fn shader_table_matches_published_constants() {
         assert!(path.ends_with(".wgsl"));
         let module = compile_and_validate(path, source);
         assert!(!module.entry_points.is_empty());
+    }
+}
+
+#[test]
+fn every_production_shadow_shader_compiles_with_naga() {
+    let depth = format!("{MEGU_SHADOW_DEPTH_WGSL}\n{MEGU_SHADOW_CASTERS_WGSL}");
+    let module = compile_and_validate("shadow caster pipeline", &depth);
+    for entry in ["vs_terrain", "vs_lit", "vs_inst"] {
+        assert!(has_entry_point(&module, ShaderStage::Vertex, entry));
+    }
+    assert!(MEGU_SHADOW_SAMPLING_WGSL.contains("textureSampleCompareLevel"));
+
+    for (name, source, terrain, vs, fs) in [
+        (
+            "shadowed terrain",
+            COMPOSITE_TERRAIN_WGSL,
+            true,
+            "terrain_vs",
+            "terrain_fs",
+        ),
+        (
+            "shadowed lit",
+            COMPOSITE_LIT_WGSL,
+            false,
+            "lit_vs",
+            "lit_fs",
+        ),
+    ] {
+        let compiled = composed_shadow_wgsl(source, terrain);
+        assert!(
+            compiled.contains("shadow_visibility(in.world, n)"),
+            "{name} must sample shadows"
+        );
+        let module = compile_and_validate(name, &compiled);
+        assert!(has_entry_point(&module, ShaderStage::Vertex, vs));
+        assert!(has_entry_point(&module, ShaderStage::Fragment, fs));
     }
 }
 

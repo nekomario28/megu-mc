@@ -5,6 +5,7 @@
 //! to the built-in pipeline with a human-readable notice.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -14,8 +15,10 @@ use mc_spine_client::shaders::{
 };
 use mc_spine_client::world::WorldState;
 use mc_spine_client_mesh::builtin_shadow_wgsl::{
-    compute_sun_direction, negotiate_builtin_shadow_quality, pack_vfx1_lights,
-    BuiltinShadowQuality, DirtyOnlyShadowCache, RenderScalePreset, ShadowCacheDecision,
+    build_shadow_uniforms_celestial, compute_sun_direction, negotiate_builtin_shadow_quality,
+    pack_vfx1_lights, BuiltinShadowQuality, CascadeConfig, DirtyOnlyShadowCache, EclipseMode,
+    RenderScalePreset, ShadowCacheDecision, ShadowCamera, ShadowUniforms, MEGU_SHADOW_CASTERS_WGSL,
+    MEGU_SHADOW_DEPTH_WGSL, MEGU_SHADOW_SAMPLING_WGSL,
 };
 use mc_spine_client_mesh::ffi::PackedVertex;
 use mc_spine_client_mesh::vfx_engine::DynamicColoredLight;
@@ -27,7 +30,7 @@ use mc_spine_client_mesh::{
 use mc_spine_kernel::entity_interp::{evaluate_sky_and_fog, SkyFogInput, SkyFogOutput};
 use winit::event_loop::OwnedDisplayHandle;
 
-use crate::atmosphere::{BiomeAtmosphereBlender, ChunkFadeTracker};
+use crate::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
 use crate::mat4_mul;
 use crate::subworld_render::{
     CompositeDrawUniforms, CompositeEnvUniforms, SubWorldGpuCache, SubWorldRenderBank,
@@ -440,6 +443,8 @@ pub struct GpuRenderer {
     depth_texture: Option<wgpu::Texture>,
     depth_view: Option<wgpu::TextureView>,
     depth_size: (u32, u32),
+    /// Camera last submitted by the regular window/offscreen entry point.
+    window_camera: Cell<Option<Camera>>,
     scene: Option<TerrainBuffers>,
     live_sections: HashMap<SectionCoord, LiveTerrainSection>,
     composite: CompositeGpu,
@@ -452,6 +457,14 @@ pub struct GpuRenderer {
     /// world and the UI overlay both render at target resolution).
     pub render_scale: RenderScalePreset,
     shadow_cache: DirtyOnlyShadowCache,
+    shadow: Option<ShadowGpu>,
+    shadow_active: bool,
+    last_shadow_camera: Option<[f32; 9]>,
+    last_shadow_casters: Vec<u32>,
+    /// Number of shadow depth passes completed (one per cache re-render).
+    pub shadow_rerender_count: u64,
+    /// Number of composed frames that reused an existing shadow texture.
+    pub shadow_reuse_count: u64,
     /// Decision the [`DirtyOnlyShadowCache`] returned for the most recent
     /// composed frame (`FirstFrame` until one renders).
     pub last_shadow_decision: ShadowCacheDecision,
@@ -473,6 +486,8 @@ struct CompositeGpu {
     lit_alpha_pipeline: wgpu::RenderPipeline,
     instanced_pipeline: wgpu::RenderPipeline,
     lit_frame_bg: wgpu::BindGroup,
+    lit_frame_layout: wgpu::BindGroupLayout,
+    env_layout: wgpu::BindGroupLayout,
     draw_layout: wgpu::BindGroupLayout,
     draw_bg: wgpu::BindGroup,
     draw_ubo: wgpu::Buffer,
@@ -481,6 +496,457 @@ struct CompositeGpu {
     env_ubo: wgpu::Buffer,
     lights_ubo: wgpu::Buffer,
     env_bg: wgpu::BindGroup,
+}
+
+/// Shadow resources exist only while a nonzero-cascade preset is active.
+/// Depth layers and the comparison sampler have matching lifetimes, while
+/// each cascade owns an independent uniform buffer to avoid queue write
+/// aliasing between passes in the same command submission.
+struct ShadowGpu {
+    config: CascadeConfig,
+    _texture: wgpu::Texture,
+    layer_views: Vec<wgpu::TextureView>,
+    receiver_uniform: wgpu::Buffer,
+    receiver_bg: wgpu::BindGroup,
+    caster_uniforms: Vec<wgpu::Buffer>,
+    caster_bgs: Vec<wgpu::BindGroup>,
+    draw_ubo: wgpu::Buffer,
+    draw_bg: wgpu::BindGroup,
+    draw_capacity: usize,
+    terrain_depth: wgpu::RenderPipeline,
+    lit_depth: wgpu::RenderPipeline,
+    instanced_depth: wgpu::RenderPipeline,
+    terrain_color: wgpu::RenderPipeline,
+    lit_color: wgpu::RenderPipeline,
+    lit_alpha_color: wgpu::RenderPipeline,
+    instanced_color: wgpu::RenderPipeline,
+}
+
+fn shadow_uniform_bytes(value: &ShadowUniforms) -> Vec<u8> {
+    // ShadowUniforms is repr(C), but does not implement Pod in client-port.
+    // Write its documented WGSL fields explicitly, with no unsafe casting.
+    let mut floats = Vec::with_capacity(std::mem::size_of::<ShadowUniforms>() / 4);
+    for matrix in value
+        .light_view_proj
+        .iter()
+        .chain([&value.camera_view_proj])
+    {
+        for column in matrix {
+            floats.extend_from_slice(column);
+        }
+    }
+    for field in [
+        value.cascade_splits,
+        value.sun_direction,
+        value.sun_color,
+        value.moon_color,
+        value.camera_position,
+        value.camera_forward,
+        value.camera_right,
+        value.camera_up,
+        value.shadow_params,
+        value.render_params,
+        value.celestial_params,
+    ] {
+        floats.extend_from_slice(&field);
+    }
+    assert_eq!(floats.len() * 4, std::mem::size_of::<ShadowUniforms>());
+    bytemuck::cast_slice(&floats).to_vec()
+}
+
+/// Composite opaque geometry receives a distinct shader entry when shadows
+/// are active. The original shaders and layouts remain usable for Off and
+/// Feather without any shadow texture, binding, or sampling instructions.
+pub fn composed_shadow_wgsl(source: &str, terrain: bool) -> String {
+    let shader = if terrain {
+        source.replacen(
+            "var color = in.albedo;",
+            "var color = in.albedo * (0.38 + 0.62 * shadow_visibility(in.world, n));",
+            1,
+        )
+    } else {
+        source.replace(
+            "light += vec3<f32>(env.sun.w) * max(dot(n, normalize(env.sun.xyz)), 0.0);",
+            "light += vec3<f32>(env.sun.w) * max(dot(n, normalize(env.sun.xyz)), 0.0) * shadow_visibility(in.world, n);",
+        )
+    };
+    format!("{shader}\n{MEGU_SHADOW_SAMPLING_WGSL}")
+}
+
+/// Snapshot caster identities, transforms and visibility across composed
+/// frames. Geometry and instance uploads also invalidate via their dirty flags
+/// before GPU synchronization clears those flags.
+fn subworld_caster_signature(bank: &SubWorldRenderBank) -> Vec<u32> {
+    let mut signature = Vec::new();
+    for entry in bank.entries() {
+        signature.extend([entry.id as u32, (entry.id >> 32) as u32]);
+        signature.extend(entry.transform.position.map(f32::to_bits));
+        signature.extend(entry.transform.quaternion.map(f32::to_bits));
+        signature.push(entry.transform.scale.to_bits());
+        signature.push(entry.alpha.to_bits());
+        signature.extend([entry.vertices.len() as u32, entry.indices.len() as u32]);
+    }
+    for batch in bank.batches() {
+        signature.push(batch.mesh_kind);
+        signature.extend(batch.transform.position.map(f32::to_bits));
+        signature.extend(batch.transform.quaternion.map(f32::to_bits));
+        signature.push(batch.transform.scale.to_bits());
+        signature.extend([
+            batch.template_vertices.len() as u32,
+            batch.template_indices.len() as u32,
+            batch.instances.len() as u32,
+        ]);
+    }
+    signature
+}
+
+fn subworld_casters_dirty(bank: &SubWorldRenderBank) -> bool {
+    bank.entries()
+        .any(|entry| entry.dirty && entry.alpha >= 0.999)
+        || bank
+            .batches()
+            .any(|batch| batch.geometry_dirty || batch.instances_dirty)
+}
+
+impl ShadowGpu {
+    fn new(
+        ctx: &GpuDevice,
+        composite: &CompositeGpu,
+        frame_layout: &wgpu::BindGroupLayout,
+        target_format: wgpu::TextureFormat,
+        config: CascadeConfig,
+    ) -> Self {
+        let device = &ctx.device;
+        let shadow_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadow-receiver-layout"),
+            entries: &[
+                uniform_entry(0),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+            ],
+        });
+        let caster_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadow-caster-layout"),
+            entries: &[uniform_entry(0)],
+        });
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shadow-depth-array"),
+            size: wgpu::Extent3d {
+                width: config.map_resolution,
+                height: config.map_resolution,
+                depth_or_array_layers: config.cascade_count,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let array_view = texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let layer_views = (0..config.cascade_count)
+            .map(|layer| {
+                texture.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: layer,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("shadow-compare-sampler"),
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let make_uniform = |label| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: std::mem::size_of::<ShadowUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let receiver_uniform = make_uniform("shadow-receiver-uniform");
+        let receiver_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow-receiver"),
+            layout: &shadow_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: receiver_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&array_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+        let mut caster_uniforms = Vec::new();
+        let mut caster_bgs = Vec::new();
+        for _ in 0..config.cascade_count {
+            let buffer = make_uniform("shadow-caster-uniform");
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("shadow-caster"),
+                layout: &caster_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                }],
+            });
+            caster_uniforms.push(buffer);
+            caster_bgs.push(bg);
+        }
+        let draw_capacity = 64;
+        let draw_ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shadow-draw-pool"),
+            size: draw_capacity as u64 * u64::from(DRAW_UNIFORM_STRIDE),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let draw_bg = Self::draw_bind_group(device, &composite.draw_layout, &draw_ubo);
+        let caster_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("shadow-depth-pipeline-layout"),
+                bind_group_layouts: &[
+                    Some(&caster_layout),
+                    Some(frame_layout),
+                    Some(&composite.draw_layout),
+                ],
+                immediate_size: 0,
+            });
+        let caster_source = format!("{MEGU_SHADOW_DEPTH_WGSL}\n{MEGU_SHADOW_CASTERS_WGSL}");
+        let caster_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("shadow-caster-module"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(caster_source)),
+        });
+        let depth_pipeline = |label, entry, buffers: &[Option<wgpu::VertexBufferLayout<'_>>]| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&caster_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &caster_module,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    buffers,
+                },
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    bias: wgpu::DepthBiasState {
+                        constant: 1,
+                        slope_scale: 1.5,
+                        clamp: 0.0,
+                    },
+                    ..depth_state(true)
+                }),
+                multisample: Default::default(),
+                fragment: None,
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let terrain_depth = depth_pipeline(
+            "shadow-packed-terrain",
+            "vs_terrain",
+            &[Some(TERRAIN_VERTEX_LAYOUT)],
+        );
+        let lit_depth = depth_pipeline("shadow-lit", "vs_lit", &[Some(LIT_VERTEX_LAYOUT)]);
+        let instanced_depth = depth_pipeline(
+            "shadow-instanced",
+            "vs_inst",
+            &[Some(LIT_VERTEX_LAYOUT), Some(PART_INSTANCE_LAYOUT)],
+        );
+
+        let terrain_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shadowed-composite-terrain"),
+            bind_group_layouts: &[
+                Some(frame_layout),
+                Some(&composite.draw_layout),
+                Some(&composite.env_layout),
+                Some(&shadow_layout),
+            ],
+            immediate_size: 0,
+        });
+        let lit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shadowed-composite-lit"),
+            bind_group_layouts: &[
+                Some(&composite.lit_frame_layout),
+                Some(&composite.draw_layout),
+                Some(&composite.env_layout),
+                Some(&shadow_layout),
+            ],
+            immediate_size: 0,
+        });
+        let terrain_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("shadowed-terrain"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(composed_shadow_wgsl(
+                COMPOSITE_TERRAIN_WGSL,
+                true,
+            ))),
+        });
+        let lit_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("shadowed-lit"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(composed_shadow_wgsl(
+                COMPOSITE_LIT_WGSL,
+                false,
+            ))),
+        });
+        let color_pipeline = |label, layout, module, vs, fs, buffers, blend, write| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some(vs),
+                    compilation_options: Default::default(),
+                    buffers,
+                },
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(depth_state(write)),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let terrain_color = color_pipeline(
+            "shadowed-terrain-color",
+            &terrain_layout,
+            &terrain_module,
+            "terrain_vs",
+            "terrain_fs",
+            &[Some(TERRAIN_VERTEX_LAYOUT)],
+            None,
+            true,
+        );
+        let lit_color = color_pipeline(
+            "shadowed-lit-color",
+            &lit_layout,
+            &lit_module,
+            "lit_vs",
+            "lit_fs",
+            &[Some(LIT_VERTEX_LAYOUT)],
+            None,
+            true,
+        );
+        let lit_alpha_color = color_pipeline(
+            "shadowed-lit-alpha",
+            &lit_layout,
+            &lit_module,
+            "lit_vs",
+            "lit_fs",
+            &[Some(LIT_VERTEX_LAYOUT)],
+            Some(ALPHA_BLEND),
+            false,
+        );
+        let instanced_color = color_pipeline(
+            "shadowed-instanced-color",
+            &lit_layout,
+            &lit_module,
+            "inst_vs",
+            "lit_fs",
+            &[Some(LIT_VERTEX_LAYOUT), Some(PART_INSTANCE_LAYOUT)],
+            None,
+            true,
+        );
+        Self {
+            config,
+            _texture: texture,
+            layer_views,
+            receiver_uniform,
+            receiver_bg,
+            caster_uniforms,
+            caster_bgs,
+            draw_ubo,
+            draw_bg,
+            draw_capacity,
+            terrain_depth,
+            lit_depth,
+            instanced_depth,
+            terrain_color,
+            lit_color,
+            lit_alpha_color,
+            instanced_color,
+        }
+    }
+
+    fn draw_bind_group(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        buffer: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow-draw-bind-group"),
+            layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(u64::from(DRAW_UNIFORM_STRIDE)),
+                }),
+            }],
+        })
+    }
+
+    fn ensure_draw_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        needed: usize,
+    ) {
+        if needed <= self.draw_capacity {
+            return;
+        }
+        self.draw_capacity = needed.next_power_of_two();
+        self.draw_ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shadow-draw-pool"),
+            size: self.draw_capacity as u64 * u64::from(DRAW_UNIFORM_STRIDE),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.draw_bg = Self::draw_bind_group(device, layout, &self.draw_ubo);
+    }
 }
 
 /// The reduced-resolution world target + its UI-blit-style bind group used
@@ -671,6 +1137,7 @@ impl GpuRenderer {
             depth_texture: None,
             depth_view: None,
             depth_size: (0, 0),
+            window_camera: Cell::new(None),
             scene: None,
             live_sections: HashMap::new(),
             composite,
@@ -679,6 +1146,12 @@ impl GpuRenderer {
             shadow_quality: BuiltinShadowQuality::Off,
             render_scale: RenderScalePreset::default(),
             shadow_cache: DirtyOnlyShadowCache::new(),
+            shadow: None,
+            shadow_active: false,
+            last_shadow_camera: None,
+            last_shadow_casters: Vec::new(),
+            shadow_rerender_count: 0,
+            shadow_reuse_count: 0,
             last_shadow_decision: ShadowCacheDecision::Rerender(
                 mc_spine_client_mesh::builtin_shadow_wgsl::ShadowDirtyReason::FirstFrame,
             ),
@@ -719,11 +1192,10 @@ impl GpuRenderer {
             label: Some("composite-env-layout"),
             entries: &[uniform_entry(0), uniform_entry(1)],
         });
-        let lit_frame_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("lit-frame-layout"),
-                entries: &[uniform_entry(0)],
-            });
+        let lit_frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("lit-frame-layout"),
+            entries: &[uniform_entry(0)],
+        });
 
         let terrain_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("composite-terrain-layout"),
@@ -732,7 +1204,11 @@ impl GpuRenderer {
         });
         let lit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("composite-lit-layout"),
-            bind_group_layouts: &[Some(&lit_frame_layout), Some(&draw_layout), Some(&env_layout)],
+            bind_group_layouts: &[
+                Some(&lit_frame_layout),
+                Some(&draw_layout),
+                Some(&env_layout),
+            ],
             immediate_size: 0,
         });
 
@@ -890,6 +1366,8 @@ impl GpuRenderer {
             lit_alpha_pipeline,
             instanced_pipeline,
             lit_frame_bg,
+            lit_frame_layout,
+            env_layout,
             draw_layout,
             draw_bg,
             draw_ubo,
@@ -1163,6 +1641,7 @@ impl GpuRenderer {
         };
         self.scene = Some(buffers);
         self.set_section_origin(scene.section_origin);
+        self.shadow_cache.invalidate();
         Ok(())
     }
 
@@ -1170,8 +1649,10 @@ impl GpuRenderer {
     /// Unloaded sections are released as soon as the world stops exposing them.
     pub fn update_live_terrain(&mut self, world: &WorldState) -> usize {
         let mut uploaded = 0;
+        let previous_count = self.live_sections.len();
         self.live_sections
             .retain(|coord, _| world.packed_mesh(*coord).is_some());
+        let removed = self.live_sections.len() != previous_count;
         for (coord, packed) in world.packed_meshes() {
             let order = world.translucent_order(coord).unwrap_or(&[]);
             if self
@@ -1258,6 +1739,9 @@ impl GpuRenderer {
             );
             uploaded += 1;
         }
+        if uploaded > 0 || removed {
+            self.shadow_cache.invalidate();
+        }
         uploaded
     }
 
@@ -1281,6 +1765,7 @@ impl GpuRenderer {
     /// Write the `frame` uniform (camera view-proj + fog from the real
     /// `mc_spine_kernel::evaluate_sky_and_fog` at noon, clear weather).
     pub fn set_camera(&self, camera: &Camera, aspect: f32) -> SkyFogOutput {
+        self.window_camera.set(Some(*camera));
         let sky = evaluate_sky_and_fog(&SkyFogInput {
             day_time: 6000,
             rain_level: 0.0,
@@ -1429,7 +1914,9 @@ impl GpuRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
-        {
+        if self.shadow_quality != BuiltinShadowQuality::Off && self.window_camera.get().is_some() {
+            self.encode_window_composed_world(&mut encoder, view, width, height, sky);
+        } else {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("terrain"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1531,6 +2018,74 @@ impl GpuRenderer {
             pass.draw(0..3, 0..1);
         }
         self.ctx.queue.submit([encoder.finish()]);
+    }
+
+    /// The regular window and `render_offscreen_rgba` use this path when a
+    /// non-Off preset is selected. The window camera currently uses the same
+    /// fixed noon time as `set_camera`; the composed-frame API accepts live
+    /// world time, biome and light data from its caller.
+    fn encode_window_composed_world(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        sky: &SkyFogOutput,
+    ) {
+        let camera = self.window_camera.get().expect("checked by caller");
+        let aspect = width.max(1) as f32 / height.max(1) as f32;
+        const NOON: u64 = 6000;
+        self.prepare_shadow(&camera, aspect, NOON);
+        let decision = self.shadow_decision(&camera, 0, NOON);
+        if self.shadow_active {
+            if matches!(decision, ShadowCacheDecision::Rerender(_)) {
+                self.encode_shadow_map(encoder, &camera, aspect, NOON);
+            } else {
+                self.shadow_reuse_count += 1;
+            }
+        }
+
+        let atmo = AtmosphereParams::default();
+        let sun = compute_sun_direction(NOON);
+        let env = CompositeEnvUniforms {
+            sun: [sun[0], sun[1], sun[2], atmo.sun_intensity],
+            ambient: [
+                atmo.ambient_rgb[0],
+                atmo.ambient_rgb[1],
+                atmo.ambient_rgb[2],
+                1.0,
+            ],
+            atmo: [atmo.fog_density, 0.0, 0.0, 0.0],
+            depth_tint: [
+                atmo.depth_tint_rgb[0],
+                atmo.depth_tint_rgb[1],
+                atmo.depth_tint_rgb[2],
+                atmo.depth_tint_strength,
+            ],
+        };
+        self.ctx
+            .queue
+            .write_buffer(&self.composite.env_ubo, 0, bytemuck::bytes_of(&env));
+        let lights = VfxLightsGpu::from(&pack_vfx1_lights(&[], self.shadow_quality));
+        self.ctx
+            .queue
+            .write_buffer(&self.composite.lights_ubo, 0, bytemuck::bytes_of(&lights));
+        self.write_frame_uniforms(&camera, aspect, sky.fog_rgb, sky.fog_start, sky.fog_end);
+        let draws = self.live_sections.len() * 2
+            + 2
+            + self.subworld_gpu.entry_count()
+            + self.subworld_gpu.batch_count();
+        self.ensure_draw_capacity(draws.max(8));
+        self.encode_composed_world(
+            encoder,
+            &ComposedWorldTarget {
+                view,
+                size: (width, height),
+                view_proj: camera.view_projection(aspect),
+                clear_rgb: sky.fog_rgb,
+                chunk_fades: &ChunkFadeTracker::new(),
+            },
+        );
     }
 
     /// Render a frame to an offscreen RGBA target and read the pixels back.
@@ -1647,13 +2202,265 @@ impl GpuRenderer {
     /// quality the GPU actually supports; a change invalidates the
     /// dirty-only shadow cache so the next composed frame re-renders.
     pub fn set_shadow_quality(&mut self, requested: BuiltinShadowQuality) -> BuiltinShadowQuality {
-        let negotiated =
-            negotiate_builtin_shadow_quality(requested, &self.ctx.report.caps);
+        let mut negotiated = negotiate_builtin_shadow_quality(requested, &self.ctx.report.caps);
+        // The adapter report is not a device allocation guarantee. Check the
+        // actual logical-device limits before offering a map-backed preset.
+        let limits = self.ctx.device.limits();
+        while negotiated.config().cascade_count > 0
+            && (negotiated.config().map_resolution > limits.max_texture_dimension_2d
+                || negotiated.config().cascade_count > limits.max_texture_array_layers
+                || limits.max_bind_groups < 4)
+        {
+            negotiated = match negotiated {
+                BuiltinShadowQuality::High => BuiltinShadowQuality::Medium,
+                BuiltinShadowQuality::Medium | BuiltinShadowQuality::Natural => {
+                    BuiltinShadowQuality::Low
+                }
+                _ => BuiltinShadowQuality::Off,
+            };
+        }
         if negotiated != self.shadow_quality {
             self.shadow_cache.invalidate();
+            self.shadow = None;
+            self.shadow_active = false;
+            self.last_shadow_camera = None;
         }
         self.shadow_quality = negotiated;
         negotiated
+    }
+
+    /// Allocated depth-map bytes, including each depth-array layer. This
+    /// matches `CascadeConfig::depth_array_bytes()` for the active preset.
+    pub fn shadow_allocated_bytes(&self) -> u64 {
+        self.shadow
+            .as_ref()
+            .map_or(0, |s| s.config.depth_array_bytes())
+    }
+
+    fn prepare_shadow(&mut self, camera: &Camera, aspect: f32, world_time_ticks: u64) {
+        let sun = compute_sun_direction(world_time_ticks);
+        let valid_camera = camera.position.iter().all(|v| v.is_finite())
+            && [
+                camera.yaw_deg,
+                camera.pitch_deg,
+                camera.fov_deg,
+                camera.near,
+                camera.far,
+                aspect,
+            ]
+            .iter()
+            .all(|v| v.is_finite())
+            && camera.near > 0.0
+            && camera.far > camera.near
+            && camera.fov_deg > 1.0
+            && camera.fov_deg < 179.0;
+        let enabled = self.shadow_quality.config().cascade_count > 0
+            && sun.iter().all(|v| v.is_finite())
+            && sun[1] > 0.08
+            && valid_camera;
+        if !enabled {
+            if self.shadow_active {
+                self.shadow_cache.invalidate();
+            }
+            self.shadow_active = false;
+            return;
+        }
+        if self.shadow.is_none() {
+            self.shadow = Some(ShadowGpu::new(
+                &self.ctx,
+                &self.composite,
+                &self.frame_layout,
+                self.target_format,
+                self.shadow_quality.config(),
+            ));
+            self.shadow_cache.invalidate();
+        }
+        let signature = [
+            camera.position[0],
+            camera.position[1],
+            camera.position[2],
+            camera.yaw_deg,
+            camera.pitch_deg,
+            camera.fov_deg,
+            camera.near,
+            camera.far,
+            aspect,
+        ];
+        if let Some(last) = self.last_shadow_camera {
+            // The light projection depends on camera orientation, clip planes,
+            // aspect, and position. Keep stable small translations cached.
+            if signature
+                .iter()
+                .zip(last)
+                .enumerate()
+                .any(|(i, (a, b))| (a - b).abs() > if i < 3 { 0.5 } else { 0.05 })
+            {
+                self.shadow_cache.invalidate();
+            }
+        }
+        self.shadow_active = true;
+    }
+
+    fn encode_shadow_map(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        camera: &Camera,
+        aspect: f32,
+        world_time_ticks: u64,
+    ) {
+        let shadow = self.shadow.as_mut().expect("shadow resources prepared");
+        let forward = camera.forward_vector();
+        let uniform = build_shadow_uniforms_celestial(
+            ShadowCamera {
+                position: camera.position,
+                forward,
+                up: [0.0, 1.0, 0.0],
+                fov_y_radians: camera.fov_deg.to_radians(),
+                aspect_ratio: aspect,
+                near: camera.near,
+                far: camera.far,
+            },
+            shadow.config,
+            world_time_ticks,
+            ((world_time_ticks / 24_000) % 8) as u8,
+            EclipseMode::None,
+        );
+        self.ctx
+            .queue
+            .write_buffer(&shadow.receiver_uniform, 0, &shadow_uniform_bytes(&uniform));
+        for (layer, buffer) in shadow.caster_uniforms.iter().enumerate() {
+            self.ctx.queue.write_buffer(
+                buffer,
+                0,
+                &shadow_uniform_bytes(&uniform.with_active_cascade(layer as u32)),
+            );
+        }
+        let identity: Mat4 = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let mut draws = Vec::<CompositeDrawUniforms>::new();
+        let mut push_model = |model: Mat4| {
+            let index = draws.len() as u32;
+            draws.push(CompositeDrawUniforms {
+                model,
+                mvp: model,
+                params: [1.0, 1.0, 0.0, 0.0],
+                ..Default::default()
+            });
+            index * DRAW_UNIFORM_STRIDE
+        };
+        let scene_offset = self
+            .scene
+            .as_ref()
+            .filter(|scene| scene.opaque_index_count > 0)
+            .map(|_| push_model(identity));
+        let section_offsets: Vec<_> = self
+            .live_sections
+            .iter()
+            .filter(|(_, section)| section.terrain.opaque_index_count > 0)
+            .map(|(coord, _)| (*coord, push_model(identity)))
+            .collect();
+        let entry_offsets: Vec<_> = self
+            .subworld_gpu
+            .entries()
+            .filter(|entry| entry.index_count > 0 && entry.alpha >= 0.999)
+            .map(|entry| push_model(entry.transform.model_matrix()))
+            .collect();
+        let batch_offsets: Vec<_> = self
+            .subworld_gpu
+            .batches()
+            .filter(|batch| batch.index_count > 0 && batch.instance_count > 0)
+            .map(|batch| push_model(batch.transform.model_matrix()))
+            .collect();
+        shadow.ensure_draw_capacity(
+            &self.ctx.device,
+            &self.composite.draw_layout,
+            draws.len().max(1),
+        );
+        self.ctx
+            .queue
+            .write_buffer(&shadow.draw_ubo, 0, bytemuck::cast_slice(&draws));
+        for (layer, view) in shadow.layer_views.iter().enumerate() {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("cascaded-shadow-depth"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_bind_group(0, &shadow.caster_bgs[layer], &[]);
+            pass.set_pipeline(&shadow.terrain_depth);
+            if let (Some(scene), Some(offset)) = (&self.scene, scene_offset) {
+                pass.set_bind_group(1, &self.frame_bind_group, &[]);
+                pass.set_bind_group(2, &shadow.draw_bg, &[offset]);
+                pass.set_vertex_buffer(0, scene.opaque_vertices.slice(..));
+                pass.set_index_buffer(scene.opaque_indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..scene.opaque_index_count, 0, 0..1);
+            }
+            for (coord, offset) in &section_offsets {
+                let section = &self.live_sections[coord];
+                pass.set_bind_group(1, &section.bind_group, &[]);
+                pass.set_bind_group(2, &shadow.draw_bg, &[*offset]);
+                pass.set_vertex_buffer(0, section.terrain.opaque_vertices.slice(..));
+                pass.set_index_buffer(
+                    section.terrain.opaque_indices.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                pass.draw_indexed(0..section.terrain.opaque_index_count, 0, 0..1);
+            }
+            pass.set_pipeline(&shadow.lit_depth);
+            pass.set_bind_group(1, &self.frame_bind_group, &[]);
+            for (entry, offset) in self
+                .subworld_gpu
+                .entries()
+                .filter(|entry| entry.index_count > 0 && entry.alpha >= 0.999)
+                .zip(&entry_offsets)
+            {
+                pass.set_bind_group(2, &shadow.draw_bg, &[*offset]);
+                pass.set_vertex_buffer(0, entry.vertex_buffer().slice(..));
+                pass.set_index_buffer(entry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..entry.index_count, 0, 0..1);
+            }
+            pass.set_pipeline(&shadow.instanced_depth);
+            for (batch, offset) in self
+                .subworld_gpu
+                .batches()
+                .filter(|batch| batch.index_count > 0 && batch.instance_count > 0)
+                .zip(&batch_offsets)
+            {
+                pass.set_bind_group(2, &shadow.draw_bg, &[*offset]);
+                pass.set_vertex_buffer(0, batch.template_vertex_buffer().slice(..));
+                pass.set_vertex_buffer(1, batch.instance_buffer().slice(..));
+                pass.set_index_buffer(
+                    batch.template_index_buffer().slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                pass.draw_indexed(0..batch.index_count, 0, 0..batch.instance_count);
+            }
+        }
+        self.last_shadow_camera = Some([
+            camera.position[0],
+            camera.position[1],
+            camera.position[2],
+            camera.yaw_deg,
+            camera.pitch_deg,
+            camera.fov_deg,
+            camera.near,
+            camera.far,
+            aspect,
+        ]);
+        self.shadow_rerender_count += 1;
     }
 
     /// Set the render-scale preset for the composed world pass. The scaled
@@ -1692,6 +2499,11 @@ impl GpuRenderer {
     /// Mirror a [`SubWorldRenderBank`] onto the device: uploads only dirty
     /// geometry/instance payloads and clears the bank's dirty flags.
     pub fn sync_subworlds(&mut self, bank: &mut SubWorldRenderBank) {
+        if subworld_casters_dirty(bank)
+            || subworld_caster_signature(bank) != self.last_shadow_casters
+        {
+            self.shadow_cache.invalidate();
+        }
         self.subworld_gpu
             .sync(&self.ctx.device, &self.ctx.queue, bank);
     }
@@ -1756,11 +2568,9 @@ impl GpuRenderer {
             .write_buffer(&self.composite.env_ubo, 0, bytemuck::bytes_of(&env));
         let lights = pack_vfx1_lights(frame.lights, self.shadow_quality);
         let packed = VfxLightsGpu::from(&lights);
-        self.ctx.queue.write_buffer(
-            &self.composite.lights_ubo,
-            0,
-            bytemuck::bytes_of(&packed),
-        );
+        self.ctx
+            .queue
+            .write_buffer(&self.composite.lights_ubo, 0, bytemuck::bytes_of(&packed));
     }
 
     /// Grow the dynamic-offset draw-uniform pool past `needed` records
@@ -1857,6 +2667,13 @@ impl GpuRenderer {
     /// Encode the whole world pass (terrain + sub-worlds + instanced parts)
     /// into `target.view` at `target.size`, clearing to the atmosphere
     /// horizon. `target.view_proj` must already match the target aspect.
+    ///
+    /// `MEGU_SKY_ATMOSPHERE_WGSL` needs a separate fullscreen pass with its
+    /// own group-0 shadow uniform; this pass currently clears the sky and uses
+    /// group 0 for terrain frame/section data. `MEGU_WATER_SURFACE_WGSL`
+    /// requires float3 world-position and per-vertex `depth_hint` inputs,
+    /// whereas translucent terrain uploads packed block vertices without a
+    /// water-depth attribute. Both require dedicated integration work.
     fn encode_composed_world(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1873,6 +2690,7 @@ impl GpuRenderer {
         // Split disjoint field borrows so the scratch writer and the GPU
         // handles can coexist inside the render pass.
         let gpu = &mut self.composite;
+        let shadow = self.shadow.as_ref().filter(|_| self.shadow_active);
         let scene = &self.scene;
         let live_sections = &self.live_sections;
         let subworld_gpu = &self.subworld_gpu;
@@ -1927,10 +2745,13 @@ impl GpuRenderer {
                 multiview_mask: None,
             });
             pass.set_bind_group(2, &gpu.env_bg, &[]);
+            if let Some(shadow) = shadow {
+                pass.set_bind_group(3, &shadow.receiver_bg, &[]);
+            }
 
             // Opaque terrain: the demo scene plus every live section, each
             // with its chunk-column fade.
-            pass.set_pipeline(&gpu.terrain_opaque_pipeline);
+            pass.set_pipeline(shadow.map_or(&gpu.terrain_opaque_pipeline, |s| &s.terrain_color));
             if let Some(scene) = scene {
                 if scene.opaque_index_count > 0 {
                     let off = slot(identity, 1.0, 1.0);
@@ -2001,7 +2822,7 @@ impl GpuRenderer {
                     continue;
                 }
                 if !drew_opaque_subworld {
-                    pass.set_pipeline(&gpu.lit_pipeline);
+                    pass.set_pipeline(shadow.map_or(&gpu.lit_pipeline, |s| &s.lit_color));
                     pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
                     drew_opaque_subworld = true;
                 }
@@ -2018,7 +2839,9 @@ impl GpuRenderer {
                     continue;
                 }
                 if !drew_instanced {
-                    pass.set_pipeline(&gpu.instanced_pipeline);
+                    pass.set_pipeline(
+                        shadow.map_or(&gpu.instanced_pipeline, |s| &s.instanced_color),
+                    );
                     pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
                     drew_instanced = true;
                 }
@@ -2039,7 +2862,9 @@ impl GpuRenderer {
                     continue;
                 }
                 if !drew_alpha {
-                    pass.set_pipeline(&gpu.lit_alpha_pipeline);
+                    pass.set_pipeline(
+                        shadow.map_or(&gpu.lit_alpha_pipeline, |s| &s.lit_alpha_color),
+                    );
                     pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
                     drew_alpha = true;
                 }
@@ -2053,11 +2878,9 @@ impl GpuRenderer {
         }
         // Upload the recorded draw uniforms ahead of this frame's submit.
         let gpu = &self.composite;
-        self.ctx.queue.write_buffer(
-            &gpu.draw_ubo,
-            0,
-            bytemuck::cast_slice(&gpu.draw_scratch),
-        );
+        self.ctx
+            .queue
+            .write_buffer(&gpu.draw_ubo, 0, bytemuck::cast_slice(&gpu.draw_scratch));
     }
 
     /// Render a full composed frame offscreen and read the pixels back:
@@ -2074,6 +2897,11 @@ impl GpuRenderer {
     ) -> Result<Vec<u8>, RendererError> {
         let width = width.max(1);
         let height = height.max(1);
+        if subworld_casters_dirty(frame.subworlds)
+            || subworld_caster_signature(frame.subworlds) != self.last_shadow_casters
+        {
+            self.shadow_cache.invalidate();
+        }
         self.subworld_gpu
             .sync(&self.ctx.device, &self.ctx.queue, frame.subworlds);
         if let Some(rgba) = frame.ui_rgba {
@@ -2084,17 +2912,13 @@ impl GpuRenderer {
         if scaled {
             self.ensure_scaled_target(world_w, world_h);
         }
-        self.shadow_decision(camera, frame.world_revision, frame.world_time_ticks);
+        let aspect = world_w as f32 / world_h as f32;
+        self.prepare_shadow(camera, aspect, frame.world_time_ticks);
+        let decision = self.shadow_decision(camera, frame.world_revision, frame.world_time_ticks);
 
         let atmo = frame.atmosphere.current();
         let view = camera.far.clamp(16.0, 2048.0);
-        self.write_frame_uniforms(
-            camera,
-            world_w as f32 / world_h as f32,
-            atmo.fog_rgb,
-            view * 0.6,
-            view,
-        );
+        self.write_frame_uniforms(camera, aspect, atmo.fog_rgb, view * 0.6, view);
         self.write_env_uniforms(frame);
         // Worst case: one slot per live section + scene + subworlds + batches.
         let draw_count = self.live_sections.len() * 2
@@ -2132,6 +2956,14 @@ impl GpuRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("composed-frame"),
             });
+        if self.shadow_active {
+            if matches!(decision, ShadowCacheDecision::Rerender(_)) {
+                self.encode_shadow_map(&mut encoder, camera, aspect, frame.world_time_ticks);
+                self.last_shadow_casters = subworld_caster_signature(frame.subworlds);
+            } else {
+                self.shadow_reuse_count += 1;
+            }
+        }
         if scaled {
             let target_view = self
                 .scaled_target
@@ -2167,7 +2999,11 @@ impl GpuRenderer {
                     multiview_mask: None,
                 });
                 pass.set_pipeline(&self.ui_pipeline);
-                pass.set_bind_group(0, &self.scaled_target.as_ref().expect("ensured").bind_group, &[]);
+                pass.set_bind_group(
+                    0,
+                    &self.scaled_target.as_ref().expect("ensured").bind_group,
+                    &[],
+                );
                 pass.draw(0..3, 0..1);
             }
         } else {

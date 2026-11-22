@@ -954,6 +954,136 @@ fn vs_main(input: DepthInput) -> @builtin(position) vec4<f32> {
 fn fs_main() {}
 "#;
 
+/// Additional depth-only vertex inputs for packed terrain, transformed
+/// sub-world meshes and instanced parts. Appended to the built-in depth WGSL
+/// by the GPU renderer so all three draw paths share the cascade matrices.
+pub const MEGU_SHADOW_CASTERS_WGSL: &str = r#"
+struct ShadowSection {
+    origin: vec3<f32>,
+    _pad0: f32,
+    biome_tint: vec3<f32>,
+    biome_tint_strength: f32,
+};
+struct ShadowDraw {
+    mvp: mat4x4<f32>,
+    model: mat4x4<f32>,
+    params: vec4<f32>,
+    params2: vec4<f32>,
+};
+@group(1) @binding(1) var<uniform> section: ShadowSection;
+@group(2) @binding(0) var<uniform> draw: ShadowDraw;
+
+@vertex
+fn vs_terrain(@location(0) packed_pos: u32) -> @builtin(position) vec4<f32> {
+    let local = vec3<f32>(f32(packed_pos & 31u),
+        f32(packed_pos >> 10u) / 1024.0, f32((packed_pos >> 5u) & 31u));
+    let world = section.origin + local;
+    return shadow.light_view_proj[u32(shadow.shadow_params.w)] * vec4<f32>(world, 1.0);
+}
+
+@vertex
+fn vs_lit(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
+    return shadow.light_view_proj[u32(shadow.shadow_params.w)]
+        * draw.model * vec4<f32>(position, 1.0);
+}
+
+fn shadow_rotate_euler(p: vec3<f32>, rot: vec3<f32>) -> vec3<f32> {
+    let cx = cos(rot.x);
+    let sx = sin(rot.x);
+    let cy = cos(rot.y);
+    let sy = sin(rot.y);
+    let cz = cos(rot.z);
+    let sz = sin(rot.z);
+    var v = vec3<f32>(p.x, p.y * cx - p.z * sx, p.y * sx + p.z * cx);
+    v = vec3<f32>(v.x * cy + v.z * sy, v.y, v.z * cy - v.x * sy);
+    v = vec3<f32>(v.x * cz - v.y * sz, v.x * sz + v.y * cz, v.z);
+    return v;
+}
+
+@vertex
+fn vs_inst(
+    @location(0) position: vec3<f32>,
+    @location(3) pos_scale: vec4<f32>,
+    @location(4) rot: vec4<f32>,
+) -> @builtin(position) vec4<f32> {
+    let local = shadow_rotate_euler(position * pos_scale.w, rot.xyz) + pos_scale.xyz;
+    return shadow.light_view_proj[u32(shadow.shadow_params.w)]
+        * draw.model * vec4<f32>(local, 1.0);
+}
+"#;
+
+/// Added to the composed opaque terrain and lit shaders when shadow maps
+/// are enabled. Shadow bindings occupy group 3; the zero-cascade pipelines
+/// contain neither these bindings nor texture sampling instructions.
+pub const MEGU_SHADOW_SAMPLING_WGSL: &str = r#"
+struct ShadowUniforms {
+    light_view_proj: array<mat4x4<f32>, 3>,
+    camera_view_proj: mat4x4<f32>,
+    cascade_splits: vec4<f32>,
+    sun_direction: vec4<f32>,
+    sun_color: vec4<f32>,
+    moon_color: vec4<f32>,
+    camera_position: vec4<f32>,
+    camera_forward: vec4<f32>,
+    camera_right: vec4<f32>,
+    camera_up: vec4<f32>,
+    shadow_params: vec4<f32>,
+    render_params: vec4<f32>,
+    celestial_params: vec4<f32>,
+};
+@group(3) @binding(0) var<uniform> shadow: ShadowUniforms;
+@group(3) @binding(1) var shadow_depth: texture_depth_2d_array;
+@group(3) @binding(2) var shadow_compare: sampler_comparison;
+
+fn shadow_cascade_visibility(world: vec3<f32>, n: vec3<f32>, layer: u32) -> f32 {
+    let sun = normalize(shadow.sun_direction.xyz);
+    let incidence = clamp(dot(n, sun), 0.0, 1.0);
+    let receiver = world + n * (0.015 + 0.05 * (1.0 - incidence));
+    let clip = shadow.light_view_proj[layer] * vec4<f32>(receiver, 1.0);
+    let uv = clip.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0))
+        || clip.z <= 0.0 || clip.z >= 1.0) {
+        return 1.0;
+    }
+    let resolution = max(shadow.shadow_params.x, 1.0);
+    let taps = max(1u, min(u32(shadow.shadow_params.z), 16u));
+    let bias = 0.00035 + (1.0 - incidence) * 0.0015;
+    var visibility = 0.0;
+    for (var i = 0u; i < taps; i = i + 1u) {
+        let radius = sqrt((f32(i) + 0.5) / f32(taps));
+        let angle = f32(i) * 2.39996323;
+        let offset = radius * vec2<f32>(cos(angle), sin(angle)) * 1.7 / resolution;
+        visibility += textureSampleCompareLevel(shadow_depth, shadow_compare,
+            uv + offset, i32(layer), clip.z - bias);
+    }
+    return visibility / f32(taps);
+}
+
+fn shadow_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {
+    if (shadow.sun_direction.y <= 0.08) { return 1.0; }
+    let count = u32(shadow.shadow_params.y);
+    if (count == 0u) { return 1.0; }
+    let distance_along_view = dot(world - shadow.camera_position.xyz,
+                                    shadow.camera_forward.xyz);
+    var layer = 0u;
+    if (count > 1u && distance_along_view > shadow.cascade_splits.x) { layer = 1u; }
+    if (count > 2u && distance_along_view > shadow.cascade_splits.y) { layer = 2u; }
+    var visibility = shadow_cascade_visibility(world, n, layer);
+    if (layer + 1u < count) {
+        var start = 0.1;
+        if (layer > 0u) {
+            start = shadow.cascade_splits[layer - 1u];
+        }
+        let end = shadow.cascade_splits[layer];
+        let band = max((end - start) * 0.08, 0.01);
+        let blend = smoothstep(end - band, end, distance_along_view);
+        visibility = mix(visibility,
+            shadow_cascade_visibility(world, n, layer + 1u), blend);
+    }
+    return visibility;
+}
+"#;
+
 /// Lit terrain with cascaded comparison samplers, quality-dependent PCF,
 /// hemisphere and warm bounce ambient, atmospheric fog and colored VFX lights.
 pub const MEGU_TERRAIN_LIT_WGSL: &str = r#"
