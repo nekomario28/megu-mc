@@ -28,9 +28,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.98.0
-      # The eleven standalone crates each carry their own Cargo.lock; build and
-      # test them on every OS so a Unix-only assumption fails here, not on a
-      # contributor's Windows machine.
+      # The twelve standalone crates each carry their own Cargo.lock; build and
+      # test the 11 CPU crates and compile-check isolated client-gpu on every OS
+      # so a Unix-only assumption fails here, not on a contributor's Windows machine.
       - name: Standalone crate builds and tests
         shell: bash
         run: |
@@ -38,6 +38,8 @@ jobs:
             echo "=== $d ==="
             cargo test --manifest-path "$d/Cargo.toml" --locked
           done
+          echo "=== client-gpu (check) ==="
+          cargo check --manifest-path client-gpu/Cargo.toml --all-targets --locked
       # Root binary must compile everywhere: signal-hook is cfg(unix)-gated and
       # entity UUID entropy goes through os_fill_random (urandom / BCryptGenRandom).
       - name: Root binary check (locked)

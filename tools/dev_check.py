@@ -90,6 +90,8 @@ STANDALONE_CRATES = (
     "client-port",
     "client-kernel",
     "client-app",
+    "client-ui",
+    "client-gpu",
     "mod-offload",
     "mod-adapter-core",
     "create-adapter",
@@ -414,6 +416,16 @@ def check_depsgx():
                       "ran: checked MC_SPINE_DEPSGX (the tool was not executed)",
                       detail="presence only: the version is unverified, so whether it is the "
                              "pinned build is unknown until tools/layers_check.sh runs")
+    venv_env = os.environ.get("MC_SPINE_DEPSGX_VENV")
+    venv_path = (
+        Path(venv_env).expanduser()
+        if venv_env
+        else Path.home() / ".cache/mc-spine-work/gxkit-venv/bin/depsgx"
+    )
+    if venv_path.is_file() and os.access(venv_path, os.X_OK):
+        return Result("depsgx", OK, str(venv_path),
+                      "ran: checked local gxkit-venv depsgx (the tool was not executed)",
+                      detail="presence only: matches tools/layers_check.sh default venv path")
     found = shutil.which("depsgx")
     if found is None:
         return Result("depsgx", MISSING, "not on PATH",

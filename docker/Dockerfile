@@ -18,17 +18,24 @@
 FROM rust:1.98.0-bookworm AS builder
 WORKDIR /build
 
-# Everything `cargo build --release --locked` resolves, and nothing more: the
-# root manifest + lockfile, src/, the manifest+sources of the optional path
-# dependencies (Cargo resolves them even with every feature off), and the
-# four generated tables embedded via include_bytes!.
+# Everything `cargo build --release --locked` (including `--features mod-suite`
+# and the companion CLI crates) resolves, and nothing more.
+ARG CARGO_FEATURES=""
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-COPY mod-adapter-core/Cargo.toml mod-adapter-core/Cargo.toml
+COPY core/Cargo.toml core/Cargo.lock core/
+COPY core/src core/src
+COPY proto/Cargo.toml proto/Cargo.lock proto/
+COPY proto/src proto/src
+COPY state-store/Cargo.toml state-store/Cargo.lock state-store/
+COPY state-store/src state-store/src
+COPY server-files/Cargo.toml server-files/Cargo.lock server-files/
+COPY server-files/src server-files/src
+COPY mod-adapter-core/Cargo.toml mod-adapter-core/Cargo.lock mod-adapter-core/
 COPY mod-adapter-core/src mod-adapter-core/src
-COPY mod-offload/Cargo.toml mod-offload/Cargo.toml
+COPY mod-offload/Cargo.toml mod-offload/Cargo.lock mod-offload/
 COPY mod-offload/src mod-offload/src
-COPY create-adapter/Cargo.toml create-adapter/Cargo.toml
+COPY create-adapter/Cargo.toml create-adapter/Cargo.lock create-adapter/
 COPY create-adapter/src create-adapter/src
 COPY assets/feature_order_1211.json assets/feature_order_1211.json
 COPY assets/structure_state_transforms_1211.bin assets/structure_state_transforms_1211.bin
@@ -36,7 +43,14 @@ COPY datapacks/vanilla/data/minecraft/dimension_type/overworld.json \
      datapacks/vanilla/data/minecraft/dimension_type/the_nether.json \
      datapacks/vanilla/data/minecraft/dimension_type/
 
-RUN cargo build --release --locked
+RUN if [ -n "$CARGO_FEATURES" ]; then \
+      cargo build --release --locked --features "$CARGO_FEATURES"; \
+    else \
+      cargo build --release --locked; \
+    fi \
+    && cargo build --manifest-path server-files/Cargo.toml --release --locked --bin mc-spine-init \
+    && cargo build --manifest-path state-store/Cargo.toml --release --locked --bin mc-spine-world-migrate \
+    && cargo build --manifest-path mod-adapter-core/Cargo.toml --release --locked --bin mc-spine-mod-check
 
 FROM debian:bookworm-slim AS runtime
 
@@ -55,14 +69,19 @@ RUN groupadd --gid 10001 mc-spine \
     && chown mc-spine:mc-spine /data
 
 COPY --from=builder /build/target/release/mc-spine /usr/local/bin/mc-spine
+COPY --from=builder /build/server-files/target/release/mc-spine-init /usr/local/bin/mc-spine-init
+COPY --from=builder /build/state-store/target/release/mc-spine-world-migrate /usr/local/bin/mc-spine-world-migrate
+COPY --from=builder /build/mod-adapter-core/target/release/mc-spine-mod-check /usr/local/bin/mc-spine-mod-check
 
 # The same payload the release bundle ships: licence texts plus the tools a
 # public user needs (modpack pre-flight, vanilla-data regeneration).
-COPY LICENSE COPYING.LESSER COPYING.AGPL NOTICE LICENSING.md THIRD_PARTY.md /opt/mc-spine/
+COPY COPYING.LESSER NOTICE LICENSING.md THIRD_PARTY.md /opt/mc-spine/
 COPY tools/mod_launcher.py /opt/mc-spine/tools/mod_launcher.py
 COPY tools/vanilla_data/gen_vanilla_data.sh tools/vanilla_data/version_pack.py /opt/mc-spine/tools/vanilla_data/
 COPY docker/entrypoint.sh /opt/mc-spine/entrypoint.sh
-RUN chmod 0755 /usr/local/bin/mc-spine /opt/mc-spine/entrypoint.sh \
+RUN chmod 0755 /usr/local/bin/mc-spine /usr/local/bin/mc-spine-init \
+        /usr/local/bin/mc-spine-world-migrate /usr/local/bin/mc-spine-mod-check \
+        /opt/mc-spine/entrypoint.sh \
         /opt/mc-spine/tools/mod_launcher.py \
         /opt/mc-spine/tools/vanilla_data/gen_vanilla_data.sh \
         /opt/mc-spine/tools/vanilla_data/version_pack.py

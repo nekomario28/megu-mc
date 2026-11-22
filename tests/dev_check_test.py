@@ -437,13 +437,14 @@ class WorkspaceInventoryContract(unittest.TestCase):
         self.addCleanup(self.fixture.cleanup)
 
     def fill_workspace(self):
-        for crate in ("client-port", "client-kernel", "client-app", "mod-offload",
-                      "mod-adapter-core", "create-adapter", "proto", "state-store",
+        for crate in ("client-port", "client-kernel", "client-app", "client-ui",
+                      "client-gpu", "mod-offload", "mod-adapter-core",
+                      "create-adapter", "proto", "state-store",
                       "server-files", "core"):
             crate_dir = self.fixture.root / crate
             crate_dir.mkdir(exist_ok=True)
             (crate_dir / "Cargo.toml").write_text(
-                f'[package]\nname = "{crate}"\nlicense = "GPL-3.0-or-later"\n')
+                f'[package]\nname = "{crate}"\nlicense = "LGPL-3.0-or-later"\n')
         manifest = self.fixture.root / "Cargo.toml"
         manifest.write_text(manifest.read_text()
                             + '[profile.fast]\ninherits = "release"\n')
@@ -467,14 +468,14 @@ class WorkspaceInventoryContract(unittest.TestCase):
         code, output = self.fixture.run()
         self.assertEqual(code, 0, output)
         self.assertEqual(self.fixture.statuses(output)["workspace"], "OK")
-        self.assertIn("10 crates", output)
+        self.assertIn("12 crates", output)
 
-    def test_each_of_the_ten_crates_is_individually_inventoried(self):
+    def test_each_of_the_twelve_crates_is_individually_inventoried(self):
         self.fill_workspace()
         crates = ("core", "proto", "state-store", "server-files", "mod-adapter-core",
                   "create-adapter", "mod-offload", "client-kernel", "client-port",
-                  "client-app")
-        self.assertEqual(len(set(crates)), 10)
+                  "client-ui", "client-app", "client-gpu")
+        self.assertEqual(len(set(crates)), 12)
         for crate in crates:
             with self.subTest(crate=crate):
                 shutil.rmtree(self.fixture.root / crate)
