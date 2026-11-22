@@ -32,5 +32,6 @@
 pub mod draw;
 pub mod layout;
 pub mod magic_hud;
+pub mod mod_menu;
 pub mod shader_screen;
 pub mod state;
