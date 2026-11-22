@@ -274,6 +274,13 @@ enum WorkerCommand {
     SeenAdvancements {
         tab: Option<String>,
     },
+    /// `place_recipe` — the recipe-book/JEI `+` fill request: window id,
+    /// recipe id, and the shift-click fill-all flag.
+    PlaceRecipe {
+        window_id: u8,
+        recipe: String,
+        make_all: bool,
+    },
 }
 
 /// Live view of the server's open-container instruction: the decoded
@@ -631,6 +638,10 @@ pub struct LiveSession {
     /// Times [`Self::apply_compute_strategy`] pushed the session strategy
     /// into a renderer.
     compute_strategy_apply_count: u64,
+    /// Bounded `(window_id, recipe, make_all)` log of accepted
+    /// `place_recipe` requests — the observable edge between the UI's
+    /// `+` dispatch and the worker channel.
+    pub place_recipe_requests: Vec<(u8, String, bool)>,
     /// Integer-cell key the layered voxel-cloud mesh was last generated
     /// for: `(cloud_cx, cloud_cz, scroll_cell, cloud_layers,
     /// cloud_height_bits)`. Between key hits only the sub-cell X offset
@@ -924,6 +935,7 @@ impl LiveSession {
             sys_sample_count: 0,
             kernel_autotuner,
             compute_strategy_apply_count: 0,
+            place_recipe_requests: Vec::new(),
             cloud_mesh_key: None,
             cloud_mesh_lighting_key: None,
             cloud_mesh_reuses: 0,
@@ -1544,6 +1556,32 @@ impl LiveSession {
         let _ = self
             .outgoing
             .try_send(WorkerCommand::ContainerClose { window_id });
+    }
+
+    /// `place_recipe` — the JEI `+` / recipe-book grid-fill request for
+    /// `recipe` in window `window_id` (`0` is the window-0 player
+    /// inventory's 2×2 grid). `make_all` is vanilla's shift-click flag
+    /// (fill as many times as ingredients allow).
+    ///
+    /// Every request is recorded in [`Self::place_recipe_requests`] (the
+    /// bounded UI-visible log that proves the dispatch path executed);
+    /// the return value is whether the worker queue actually accepted it.
+    /// Requests while not `Playing` are refused with `false` and not logged.
+    pub fn send_place_recipe(&mut self, window_id: u8, recipe: &str, make_all: bool) -> bool {
+        if !matches!(self.status, SessionStatus::Playing) {
+            return false;
+        }
+        if self.place_recipe_requests.len() < 64 {
+            self.place_recipe_requests
+                .push((window_id, recipe.to_owned(), make_all));
+        }
+        self.outgoing
+            .try_send(WorkerCommand::PlaceRecipe {
+                window_id,
+                recipe: recipe.to_owned(),
+                make_all,
+            })
+            .is_ok()
     }
 
     /// Take the validated `transfer` reconnect target, if one arrived.
@@ -3072,6 +3110,13 @@ fn run_connection(
                 Ok(WorkerCommand::SeenAdvancements { tab }) => {
                     client.send_seen_advancements(tab.as_deref())?;
                 }
+                Ok(WorkerCommand::PlaceRecipe {
+                    window_id,
+                    recipe,
+                    make_all,
+                }) => {
+                    client.send_place_recipe(window_id, &recipe, make_all)?;
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
             }
@@ -3174,7 +3219,7 @@ fn cloud_lighting_key(lighting: &CloudLighting) -> [u32; 10] {
 /// Candidate client-JAR version ids, `--version` id first: `1.21.1` stays
 /// a fallback because a launcher that omits `--version` still keeps the
 /// JAR under the well-known release dir.
-fn jar_version_ids(paths: &SessionPaths) -> Vec<String> {
+pub(crate) fn jar_version_ids(paths: &SessionPaths) -> Vec<String> {
     let mut ids = Vec::with_capacity(2);
     if let Some(id) = paths
         .version_id

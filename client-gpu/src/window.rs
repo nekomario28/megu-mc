@@ -28,6 +28,9 @@ use mc_spine_ui::container_screen::{
 use mc_spine_ui::draw::tessellate_draw_list;
 use mc_spine_ui::draw::{UiColor, UiRect};
 use mc_spine_ui::hud_widgets::ScoreboardEntry;
+use mc_spine_ui::recipe_browser::{
+    BrowserTab, DetailMode, ItemEntry, RecipeBrowserAction, RecipeBrowserState,
+};
 use mc_spine_ui::magic_hud::build_magic_hud_draw_list;
 use mc_spine_ui::magic_hud::LookingAtBlockState;
 use mc_spine_ui::state::{invite_code_display, ScoreboardState, TitleOverlayState};
@@ -106,6 +109,17 @@ pub static PLAYER_INVENTORY_SCHEMA: MenuScreenSchema = MenuScreenSchema {
     property_bars: &[],
 };
 
+/// Which JEI-style focus the R/U/W hotkeys request on the hovered stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecipeFocus {
+    /// `R` — "recipes producing this item" detail view.
+    Recipes,
+    /// `U` — "uses consuming this item" detail view.
+    Uses,
+    /// `W` — Create-Ponder-style 3D scene for the item.
+    Ponder,
+}
+
 /// Display-independent output of the Minecraft keyboard bindings.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WindowInputEvent {
@@ -119,6 +133,10 @@ pub enum WindowInputEvent {
     SetTabListVisible(bool),
     SortInventory,
     OpenAdvancements,
+    /// JEI-style hover hotkey resolved from `R`/`U`/`W` while a container
+    /// surface is up — opens the recipe browser focused on the hovered
+    /// stack (no-op when nothing resolvable is under the cursor).
+    RecipeBrowserFocus(RecipeFocus),
 }
 
 /// Pure input router shared by the window loop and display-free tests.
@@ -523,6 +541,9 @@ pub struct GpuApp {
     /// spawns (`--gameDir`/`--assetsDir`/`--assetIndex`/`--version`/
     /// `--resourcePackDir`).
     session_paths: SessionPaths,
+    /// Boot-time recipe-browser ingest report (mod JARs + vanilla client
+    /// JAR + datapacks); empty when no `--gameDir` was supplied.
+    recipe_ingest: crate::recipe_ingest::IngestReport,
     /// Integrated `mc-spine` server guard while a singleplayer world runs.
     singleplayer_server: Option<integrated::SingleplayerServer>,
     /// Friend-relay host session while an invite code is live.
@@ -663,6 +684,7 @@ impl GpuApp {
             chat_suggestions: Vec::new(),
             inventory_sort: InventorySortState::default(),
             session_paths,
+            recipe_ingest: crate::recipe_ingest::IngestReport::default(),
             singleplayer_server,
             friend_host: None,
             friend_bridge: None,
@@ -684,6 +706,20 @@ impl GpuApp {
         };
         for message in startup_status {
             app.status_line(message);
+        }
+        // Lane GPU-JEI-PONDER-WIRE: feed `ui.recipe_browser.index` real
+        // datapack content — `<gameDir>/mods/*.jar`, the vanilla version
+        // JAR, and datapack dirs — all through the lazy ZIP index with
+        // zero extraction. The report rides `status_line` exactly like the
+        // texture/sound discovery summaries: a loaded count when sources
+        // exist, silence when no game dir was ever given.
+        app.recipe_ingest = crate::recipe_ingest::ingest_mod_recipes_into_ui(
+            &app.session_paths,
+            &mut app.ui.recipe_browser,
+        );
+        if app.recipe_ingest.any_source() {
+            let summary = app.recipe_ingest.summary_line();
+            app.status_line(summary);
         }
         app
     }
@@ -730,6 +766,27 @@ impl GpuApp {
     /// results, statistics summaries) — never silently dropped.
     pub fn status_messages(&self) -> &[String] {
         &self.debug_messages
+    }
+
+    /// The recipe/resource browser state (JEI/EMI/JER/Ponder index, tabs,
+    /// focused detail) — read-only view for host code and tests.
+    pub fn recipe_browser(&self) -> &RecipeBrowserState {
+        &self.ui.recipe_browser
+    }
+
+    /// Boot-time mod/vanilla/datapack ingest report (see
+    /// [`crate::recipe_ingest`]); `None` counters when no `--gameDir`.
+    pub fn recipe_ingest_report(&self) -> &crate::recipe_ingest::IngestReport {
+        &self.recipe_ingest
+    }
+
+    /// Set the hovered container slot — the host-side mirror of
+    /// [`ContainerScreenState::hover`] (cursor hover for mouse, and the
+    /// path gamepad-style focus movement uses).
+    pub fn set_container_hover(&mut self, slot: Option<usize>) {
+        if let Some(screen) = &mut self.container_screen {
+            screen.hover(slot);
+        }
     }
 
     /// Inject a session without a real socket — tests use the
@@ -816,7 +873,65 @@ impl GpuApp {
                     self.status_line(format!("Open link: {err}"));
                 }
             }
+            UiAction::RecipeBrowser(action) => self.dispatch_recipe_browser_action(action),
             _ => {}
+        }
+    }
+
+    /// The recipe browser's only host-facing actions today are the JEI `+`
+    /// transfer and `Close` (bookmark/toggle mutations are state-internal,
+    /// and Ponder opens through the `W` hotkey or the browser's own `P`
+    /// key — both feed `browser.ponder`, no host action is emitted).
+    /// `TransferToCraftingGrid` sends the serverbound `place_recipe`
+    /// packet on a live session or surfaces an explicit status when
+    /// offline — it is never dropped on the floor.
+    fn dispatch_recipe_browser_action(&mut self, action: &RecipeBrowserAction) {
+        match action {
+            RecipeBrowserAction::TransferToCraftingGrid {
+                recipe_id,
+                max_craft,
+            } => {
+                let window_id = self
+                    .container_screen
+                    .as_ref()
+                    .map(|screen| screen.window_id)
+                    .or_else(|| {
+                        self.live.as_ref().and_then(|live| {
+                            live.open_screen
+                                .as_ref()
+                                .map(|s| s.window_id.clamp(0, 255) as u8)
+                        })
+                    })
+                    .unwrap_or(0);
+                // `make_all` is vanilla's shift-click fill-all flag: request
+                // it whenever the inventory could run the recipe more than
+                // once, so `+` fills the grid like a shift-click.
+                let make_all = *max_craft > 1;
+                match &mut self.live {
+                    Some(live) => match live.status {
+                        SessionStatus::Playing => {
+                            if live.send_place_recipe(window_id, recipe_id, make_all) {
+                                self.status_line(format!("Placing {recipe_id} in the grid"));
+                            } else {
+                                self.status_line(format!(
+                                    "Place recipe {recipe_id}: send queue busy"
+                                ));
+                            }
+                        }
+                        SessionStatus::Connecting => {
+                            self.status_line(format!("Place recipe {recipe_id}: still connecting"))
+                        }
+                        SessionStatus::Disconnected(_) => self
+                            .status_line(format!("Place recipe {recipe_id}: not connected")),
+                    },
+                    None => self
+                        .status_line(format!("Place recipe {recipe_id}: not connected")),
+                }
+            }
+            RecipeBrowserAction::Close => {
+                self.ui
+                    .handle_input(UiInputEvent::KeyPressed(UiKey::Escape));
+            }
         }
     }
 
@@ -1552,6 +1667,51 @@ impl GpuApp {
         ))
     }
 
+    /// The hovered container stack's namespaced item id — the numeric
+    /// `minecraft:item` registry id resolved through the built-in protocol
+    /// table; empty (`0`) slots return `None`, and unknown ids degrade to
+    /// `unknown:item_<n>` so a modded stack still opens a deterministic
+    /// focus target.
+    fn hovered_item_name(&self) -> Option<String> {
+        let screen = self.container_screen.as_ref()?;
+        let stack = screen.slot(screen.hovered_slot?)?;
+        (stack.item_id != 0).then(|| crate::recipe_ingest::item_name_for_id(stack.item_id))
+    }
+
+    /// JEI-style `R`/`U`/`W` open: navigate to the recipe browser focused
+    /// on `item` (recipes/uses detail, or a Ponder scene on the Ponder
+    /// tab). A hovered stack is ground truth, so the id lands in the
+    /// catalog even when no JAR declared it.
+    fn open_recipe_browser_focused(&mut self, item: &str, focus: RecipeFocus) {
+        if self.ui.recipe_browser.index.item(item).is_none() {
+            let name = crate::recipe_ingest::humanize_id(item);
+            self.ui
+                .recipe_browser
+                .index
+                .add_item(ItemEntry::new(item, &name));
+        }
+        match focus {
+            RecipeFocus::Recipes => self
+                .ui
+                .recipe_browser
+                .open_detail(item, DetailMode::Recipes),
+            RecipeFocus::Uses => self
+                .ui
+                .recipe_browser
+                .open_detail(item, DetailMode::Uses),
+            RecipeFocus::Ponder => {
+                let scene =
+                    crate::recipe_ingest::ponder_scene_for(&self.ui.recipe_browser.index, item);
+                self.ui.recipe_browser.ponder = Some(scene);
+                self.ui.recipe_browser.tab = BrowserTab::Ponder;
+            }
+        }
+        for action in self.ui.open_recipe_browser() {
+            self.dispatch_ui_action(&action);
+        }
+        self.maybe_regrab();
+    }
+
     /// While a container screen is open: hover highlight, plus vanilla
     /// quick-craft (`mode = 5`) slot painting while the left button is held
     /// after a `DragState` has been armed.
@@ -2104,6 +2264,24 @@ impl GpuApp {
         let pressed = state == ElementState::Pressed;
         let f3_chord_pressed =
             pressed && self.input_router.f3_held && f3_chord_for_key(code).is_some();
+        // JEI hover hotkeys while a container/inventory surface is up:
+        // `R` shows recipes, `U` uses, `W` the Ponder scene — but only when
+        // a resolvable stack is under the cursor. Otherwise the key keeps
+        // its usual binding (`R` sorts, `W` moves forward).
+        if pressed
+            && !self.paused
+            && self.container_screen.is_some()
+            && matches!(code, KeyCode::KeyR | KeyCode::KeyU | KeyCode::KeyW)
+            && self.hovered_item_name().is_some()
+        {
+            let focus = match code {
+                KeyCode::KeyR => RecipeFocus::Recipes,
+                KeyCode::KeyU => RecipeFocus::Uses,
+                _ => RecipeFocus::Ponder,
+            };
+            self.apply_window_input(WindowInputEvent::RecipeBrowserFocus(focus));
+            return;
+        }
         for event in self.input_router.route_key(code, state, self.keys.sprint) {
             if !self.paused
                 || matches!(
@@ -2279,6 +2457,14 @@ impl GpuApp {
             }
             WindowInputEvent::OpenAdvancements => {
                 self.toggle_advancements();
+            }
+            WindowInputEvent::RecipeBrowserFocus(focus) => {
+                // Re-verify the hovered stack here — a stale event can
+                // never open a detail view for an item that is not under
+                // the cursor (the key path checks before emitting too).
+                if let Some(item) = self.hovered_item_name() {
+                    self.open_recipe_browser_focused(&item, focus);
+                }
             }
         }
     }
@@ -2490,6 +2676,21 @@ impl ApplicationHandler for GpuApp {
                 } else if let PhysicalKey::Code(code) = event.physical_key {
                     if !event.repeat {
                         self.handle_key(code, event.state, event_loop);
+                        // Text entry for UI screens (the recipe browser's
+                        // search field and its `r`/`u`/`p`/`+` item keys
+                        // all ride `CharTyped`, which winit reports via
+                        // `event.text`).
+                        if event.state == ElementState::Pressed && self.ui_wants_input() {
+                            if let Some(text) = &event.text {
+                                for ch in text.chars().filter(|c| !c.is_control()) {
+                                    for action in
+                                        self.ui.handle_input(UiInputEvent::CharTyped(ch))
+                                    {
+                                        self.apply_ui_action(&action, event_loop);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
