@@ -1,0 +1,47 @@
+# Minimal 3-axis label taxonomy for Megu (mc-spine).
+# Sync manually or with a label-sync tool after explicit publish approval.
+
+# Priority
+- name: P0-blocker
+  color: b60205
+  description: Release blocker — crash, data loss, security, or boot/join failure
+- name: P1-parity
+  color: d93f0b
+  description: Vanilla 1.21.1 / 26.3 or declared mod-adapter parity mismatch
+- name: P2-perf
+  color: fbca04
+  description: Startup, RAM, CPU, GPU, disk I/O, or tick/frame stutter issue
+
+# Area
+- name: area:vanilla
+  color: 0e8a16
+  description: Vanilla gameplay, protocol 767/777, worldgen, commands, persistence
+- name: area:mod
+  color: 1d76db
+  description: NeoForge/Fabric loaders, mod-adapter-core, mod-offload, create-adapter
+- name: area:jni
+  color: 5319e7
+  description: JVM/JNI bridge lifetime, EventBus, Registry, and Mixin boundaries
+- name: area:client
+  color: 006b75
+  description: Native client, wgpu/rendering, external shaderpacks, client-ui
+- name: area:web
+  color: c5def5
+  description: Website, Cloudflare Pages Functions (/api/report, /api/latest), docs
+
+# Workflow
+- name: triage
+  color: e4e669
+  description: Needs initial area/priority assignment
+- name: mod-compat
+  color: 0052cc
+  description: Third-party mod or modpack compatibility report
+- name: crash-report
+  color: e99695
+  description: Fingerprinted crash report (MEGU-E-XXXXXXXX), deduped by /api/report
+- name: enhancement
+  color: a2eeef
+  description: Accepted concrete feature or UX spec proposal
+- name: security
+  color: d73a4a
+  description: Security hardening or trust-boundary issue

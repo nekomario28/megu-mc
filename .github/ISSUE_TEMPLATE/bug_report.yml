@@ -25,6 +25,34 @@ body:
       required: false
 
   - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: "Subsystem most closely related to this bug. (最も関連する領域)"
+      options:
+        - "area:vanilla — Gameplay / protocol / worldgen / save"
+        - "area:mod — NeoForge / Fabric data-driven or offload adapter"
+        - "area:jni — JVM / JNI bridge / Mixin boundary"
+        - "area:client — Native client / wgpu / shaders / UI"
+        - "area:web — Website / /api/report / docs"
+        - "Other / unsure"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Impact / priority
+      description: "Helps triage release blockers first. (影響度)"
+      options:
+        - "P0-blocker — Crash, world corruption, or cannot start/join"
+        - "P1-parity — Vanilla or mod behavior mismatch"
+        - "P2-perf — High CPU/RAM/GPU usage or frame/tick stutter"
+        - "Normal / cosmetic"
+    validations:
+      required: true
+
+  - type: dropdown
     id: mc_version
     attributes:
       label: Minecraft version

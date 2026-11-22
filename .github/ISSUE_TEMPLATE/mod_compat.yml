@@ -10,10 +10,17 @@ body:
         `mc-spine-mod-check` output for a modpack. One mod (or one modpack)
         per report. Please redact anything sensitive before pasting output.
 
+        Note on v0.1.0 Alpha scope: Rust owns Tick/World/Save; limited S1–S4
+        Event/Registry/Offload adapters and bounded `.class` VM / lifted
+        `@Inject` Mixins are supported, while unsupported Mixins fail closed
+        and full arbitrary FML/ModLauncher JAR execution is not yet guaranteed.
+
         Megu/mc-spine 上で mod が正常に動かない場合、または modpack の
         `mc-spine-mod-check` 出力を共有したい場合に使用してください。
         1 件につき 1 mod（または 1 modpack）。貼り付け前に機密情報を
         マスクしてください。
+        （※ v0.1.0 Alpha では限定 Event/Registry/Offload 互換であり、未対応
+        Mixin は明示拒否・任意の FML/ModLauncher JAR 全実行は未保証です）
 
   - type: input
     id: mod_name

@@ -63,8 +63,9 @@
     // discordUrl     — Discord invite, when the community server exists
     // sponsorUrl     — GitHub Sponsors / donation page
     reportApiUrl: "/api/report",
+    latestApiUrl: "/api/latest",
     turnstileSiteKey: "0x4AAAAAAGNFPiu-LWbjNy5A",
-    discussionsUrl: "",
+    discussionsUrl: "https://github.com/nekomario28/mc-spine/discussions",
     discordUrl: "",
     sponsorUrl: "",
   };

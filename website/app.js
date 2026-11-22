@@ -48,6 +48,7 @@
     mcTargets: ["1.21.1", "26.3"],
     githubUrl: "https://github.com/nekomario28/mc-spine",
     reportApiUrl: "",
+    latestApiUrl: "",
     turnstileSiteKey: "",
     releasesUrl: "https://github.com/nekomario28/mc-spine/releases",
     docsBaseUrl: "https://github.com/nekomario28/mc-spine/tree/main/docs",
@@ -2661,10 +2662,48 @@
     reader.readAsArrayBuffer(file);
   }
 
+  function bindLatestRelease() {
+    var pill = $("latest-release-pill");
+    if (!pill || typeof fetch !== "function") {
+      return;
+    }
+    var cfg = siteConfig();
+    var endpoint = typeof cfg.latestApiUrl === "string" ? cfg.latestApiUrl.trim() : "";
+    if (!endpoint) {
+      return;
+    }
+    fetch(endpoint, { headers: { accept: "application/json" } })
+      .then(function (res) {
+        if (!res || !res.ok) {
+          return null;
+        }
+        return res.json();
+      })
+      .then(function (data) {
+        if (!data || data.ok !== true || typeof data.version !== "string") {
+          return;
+        }
+        var version = data.version.trim();
+        if (!version || version.length > 48) {
+          return;
+        }
+        pill.textContent = version;
+        if (typeof data.html_url === "string" &&
+            data.html_url.indexOf("https://github.com/") === 0) {
+          pill.setAttribute("href", data.html_url);
+        }
+        pill.removeAttribute("hidden");
+      })
+      .catch(function () {
+        // Stay gracefully hidden when offline or before first release.
+      });
+  }
+
   // -- Boot ------------------------------------------------------------------
 
   bindConfig();
   bindCopyButtons();
   bindChecker();
   bindFeedback();
+  bindLatestRelease();
 })(typeof window !== "undefined" ? window : globalThis);

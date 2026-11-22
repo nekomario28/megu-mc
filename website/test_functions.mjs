@@ -633,6 +633,46 @@ await test("onRequestGet /api/latest returns tiny release JSON", async () => {
   }
 });
 
+await test("onRequestGet /api/latest falls back to newest prerelease on 404", async () => {
+  const realFetch = globalThis.fetch;
+  const urls = [];
+  globalThis.fetch = async (url) => {
+    urls.push(String(url));
+    if (String(url).endsWith("/releases/latest")) {
+      return new Response("Not Found", { status: 404 });
+    }
+    return new Response(JSON.stringify([
+      { draft: true, prerelease: true, tag_name: "v0.1.0-draft" },
+      {
+        draft: false,
+        prerelease: true,
+        tag_name: "v0.1.0-alpha",
+        published_at: "2026-11-22T09:00:00Z",
+        html_url: "https://github.com/o/r/releases/tag/v0.1.0-alpha",
+      },
+    ]), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  try {
+    const res = await latest.onRequestGet({
+      request: new Request("https://megu.example/api/latest"),
+      env: { GITHUB_REPO: "o/r" },
+    });
+    assert.equal(res.status, 200);
+    const j = await res.json();
+    assert.deepEqual(j, {
+      ok: true,
+      version: "v0.1.0-alpha",
+      published_at: "2026-11-22T09:00:00Z",
+      html_url: "https://github.com/o/r/releases/tag/v0.1.0-alpha",
+      mc_targets: ["1.21.1", "26.3"],
+      prerelease: true,
+    });
+    assert.equal(urls.length, 2);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 await test("onRequestGet /api/latest fails closed on upstream errors", async () => {
   const realFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response("nope", { status: 503 });
