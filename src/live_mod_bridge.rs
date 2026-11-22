@@ -88,9 +88,11 @@ use mod_adapter_core::ecosystem_compat::{
     DualLoaderPlan,
 };
 #[cfg(feature = "mod-suite")]
-use mod_adapter_core::mod_sync as lmb_sync;
+use mod_adapter_core::magic_primitives as lmb_magic;
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::mixin_lifter::{LiftedBinding, MixinLiftVerdict, StandardEventHook};
+#[cfg(feature = "mod-suite")]
+use mod_adapter_core::mod_sync as lmb_sync;
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::unified_bundle::{DeclarativeModBundle, UnifiedModRuntime};
 #[cfg(feature = "mod-suite")]
@@ -413,7 +415,10 @@ impl LiveModSuite {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if entry.file_type().is_ok_and(|ty| ty.is_file())
-                    && path.file_name().and_then(|n| n.to_str()).is_some_and(|name| name.ends_with(".bundle.json"))
+                    && path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|name| name.ends_with(".bundle.json"))
                 {
                     root_paths.push(path);
                 }
@@ -656,8 +661,7 @@ impl LiveModSuite {
             eprintln!("[live-mods] mods dir scanned: {jars_seen} jar(s), none classified");
             return;
         }
-        let count =
-            |tier: AdaptationTier| self.reports.iter().filter(|r| r.tier == tier).count();
+        let count = |tier: AdaptationTier| self.reports.iter().filter(|r| r.tier == tier).count();
         eprintln!(
             "[live-mods] {jars_seen} jar(s): {} auto-skipped, {} native-bundle, {} tier2-shim, {} tier3",
             count(AdaptationTier::AutoSkipped),
@@ -1173,6 +1177,334 @@ fn live_mod_payload_body(channel: &str, payload: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Uncompressed protocol-767 Play packet frame: VarInt length, packet id
+/// 0x19, channel identifier, and opaque custom payload. When writing to a
+/// live socket, re-enter `send_packet` so compression/encryption are honored.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_custom_payload_frame(channel: &str, payload: &[u8]) -> Vec<u8> {
+    let body = live_mod_payload_body(channel, payload);
+    let mut packet = Vec::with_capacity(body.len() + 5);
+    write_varint(&mut packet, LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID);
+    packet.extend_from_slice(&body);
+    let mut frame = Vec::with_capacity(packet.len() + 5);
+    write_varint(&mut frame, packet.len() as i64);
+    frame.extend_from_slice(&packet);
+    frame
+}
+
+/// Each connected UUID owns one caster and status table. The spell definition
+/// remains available until its delayed completion so its declared cooldown
+/// can be armed exactly once. `last_sync` suppresses identical MAG1 snapshots.
+#[cfg(feature = "mod-suite")]
+#[derive(Clone, Debug)]
+struct LiveMagicPlayer {
+    caster: lmb_magic::SpellCaster,
+    effects: lmb_magic::ActiveStatusEffects,
+    pending_spell: Option<lmb_magic::SpellDefinition>,
+    last_sync: Option<lmb_magic::MagicSyncState>,
+}
+
+#[cfg(feature = "mod-suite")]
+impl LiveMagicPlayer {
+    fn new(attributes: lmb_magic::MagicAttributes) -> Self {
+        Self {
+            caster: lmb_magic::SpellCaster::new(lmb_magic::ManaPool::new(attributes), 0),
+            effects: lmb_magic::ActiveStatusEffects::default(),
+            pending_spell: None,
+            last_sync: None,
+        }
+    }
+
+    fn snapshot(&self) -> lmb_magic::MagicSyncState {
+        lmb_magic::MagicSyncState {
+            mana: self.caster.mana.current_mana,
+            max_mana: self.caster.mana.attributes.max_mana,
+            cast: self
+                .caster
+                .active
+                .as_ref()
+                .map(|active| lmb_magic::WireCastProgress {
+                    spell_id: active.spell_id.clone(),
+                    state: active.state.clone(),
+                }),
+            cooldowns: self.caster.cooldowns.entries().clone(),
+            statuses: self
+                .effects
+                .entries()
+                .into_iter()
+                .map(|status| lmb_magic::WireStatus {
+                    id: status.def_id,
+                    amplifier: status.amplifier,
+                    remaining_ticks: status.remaining_ticks,
+                    absorption_remaining: status.absorption_remaining,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The table is bounded even when callers attempt to initialize disconnected
+/// UUIDs. `live_mod_tick` prunes disconnected entries on each game tick.
+#[cfg(feature = "mod-suite")]
+#[derive(Default)]
+struct LiveMagicState {
+    players: HashMap<[u8; 16], LiveMagicPlayer>,
+    registry: lmb_magic::CustomStatusRegistry,
+}
+
+#[cfg(feature = "mod-suite")]
+const LIVE_MAGIC_MAX_PLAYERS: usize = 1024;
+
+#[cfg(feature = "mod-suite")]
+fn live_magic_state() -> &'static Mutex<LiveMagicState> {
+    static MAGIC: OnceLock<Mutex<LiveMagicState>> = OnceLock::new();
+    MAGIC.get_or_init(|| Mutex::new(LiveMagicState::default()))
+}
+
+#[cfg(feature = "mod-suite")]
+impl LiveMagicState {
+    fn player_mut(&mut self, uuid: [u8; 16]) -> Result<&mut LiveMagicPlayer, LiveMagicError> {
+        if !self.players.contains_key(&uuid) && self.players.len() >= LIVE_MAGIC_MAX_PLAYERS {
+            return Err(LiveMagicError::PlayerLimit);
+        }
+        Ok(self
+            .players
+            .entry(uuid)
+            .or_insert_with(|| LiveMagicPlayer::new(lmb_magic::MagicAttributes::default())))
+    }
+}
+
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+#[derive(Debug, PartialEq)]
+enum LiveMagicError {
+    PlayerLimit,
+    CooldownLimit,
+    Silenced,
+    InvalidSpell(lmb_magic::SpellValidationError),
+    Cast(lmb_magic::CastError),
+    Execute(lmb_magic::SpellExecutionError),
+    UnknownStatus,
+    ApplyStatus(lmb_magic::ApplyStatusError),
+}
+
+/// Events and effect plans are returned to the server host for application.
+/// `frame` is a complete uncompressed protocol-767 0x19 packet, if changed.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+struct LiveMagicTick {
+    cast_events: Vec<lmb_magic::CastEvent>,
+    spell_plans: Vec<lmb_magic::SpellExecutionResult>,
+    execution_errors: Vec<lmb_magic::SpellExecutionError>,
+    statuses: lmb_magic::StatusTickReport,
+    crowd_control: lmb_magic::CcFlags,
+    mana_delta: f32,
+    cooldowns_changed: bool,
+    frame: Option<Vec<u8>>,
+}
+
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+struct LiveMagicCast {
+    events: Vec<lmb_magic::CastEvent>,
+    spell_plans: Vec<lmb_magic::SpellExecutionResult>,
+}
+
+/// Configure a player without wiping casts, cooldowns, or statuses on repeat
+/// calls. Current mana is clamped to the new maximum.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_magic_set_attributes(
+    uuid: [u8; 16],
+    attributes: lmb_magic::MagicAttributes,
+) -> Result<(), LiveMagicError> {
+    let mut magic = live_magic_state().lock().unwrap_or_else(|e| e.into_inner());
+    let player = magic.player_mut(uuid)?;
+    let current = player.caster.mana.current_mana;
+    player.caster.mana = lmb_magic::ManaPool::with_mana(attributes, current);
+    Ok(())
+}
+
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_magic_register_status(
+    definition: lmb_magic::StatusEffectDefinition,
+) -> Result<(), lmb_magic::StatusDefError> {
+    live_magic_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .registry
+        .register(definition)
+}
+
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_magic_apply_status(
+    uuid: [u8; 16],
+    id: &str,
+    amplifier: u8,
+    duration_ticks: u32,
+) -> Result<(), LiveMagicError> {
+    let mut magic = live_magic_state().lock().unwrap_or_else(|e| e.into_inner());
+    let def = magic
+        .registry
+        .get(id)
+        .ok_or(LiveMagicError::UnknownStatus)?
+        .clone();
+    magic
+        .player_mut(uuid)?
+        .effects
+        .apply(&def, amplifier, duration_ticks)
+        .map_err(LiveMagicError::ApplyStatus)
+}
+
+/// Consume active absorption pools before the host applies remaining damage.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_magic_absorb_damage(uuid: [u8; 16], damage: f32) -> f32 {
+    let mut magic = live_magic_state().lock().unwrap_or_else(|e| e.into_inner());
+    magic
+        .players
+        .get_mut(&uuid)
+        .map_or(damage, |player| player.effects.absorb_damage(damage))
+}
+
+/// Refuse invalid, silenced or unaffordable casts atomically. Instants return
+/// their resolved effect plans now; timed/channeled casts resolve on ticks.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_magic_cast(
+    uuid: [u8; 16],
+    spell: &lmb_magic::SpellDefinition,
+) -> Result<LiveMagicCast, LiveMagicError> {
+    spell.validate().map_err(LiveMagicError::InvalidSpell)?;
+    let mut magic = live_magic_state().lock().unwrap_or_else(|e| e.into_inner());
+    let silenced = magic
+        .players
+        .get(&uuid)
+        .is_some_and(|player| player.effects.crowd_control(&magic.registry).silenced);
+    if silenced {
+        return Err(LiveMagicError::Silenced);
+    }
+    let player = magic.player_mut(uuid)?;
+    if !player.caster.cooldowns.entries().contains_key(&spell.id)
+        && player.caster.cooldowns.entries().len() >= lmb_magic::MAX_WIRE_COOLDOWNS
+    {
+        return Err(LiveMagicError::CooldownLimit);
+    }
+    let mut caster = player.caster.clone();
+    let events = caster.begin_cast(spell).map_err(LiveMagicError::Cast)?;
+    let completed = events
+        .iter()
+        .any(|event| matches!(event, lmb_magic::CastEvent::Completed { .. }));
+    let spell_plans = if completed {
+        vec![spell
+            .execute(&caster.mana.attributes, &lmb_magic::CastContext::default())
+            .map_err(LiveMagicError::Execute)?]
+    } else {
+        Vec::new()
+    };
+    player.caster = caster;
+    player.pending_spell = (!completed).then(|| spell.clone());
+    Ok(LiveMagicCast {
+        events,
+        spell_plans,
+    })
+}
+
+/// Advance one stored player exactly once, returning delta events and an
+/// optional MAG1 state snapshot wrapped in a protocol-767 custom packet.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_magic_tick_player(uuid: [u8; 16]) -> Option<LiveMagicTick> {
+    let mut magic = live_magic_state().lock().unwrap_or_else(|e| e.into_inner());
+    let LiveMagicState { players, registry } = &mut *magic;
+    let player = players.get_mut(&uuid)?;
+    let before_mana = player.caster.mana.current_mana;
+    let before_cooldowns = player.caster.cooldowns.clone();
+    let cast_events = player.caster.tick();
+    let mut spell_plans = Vec::new();
+    let mut execution_errors = Vec::new();
+    for event in &cast_events {
+        match event {
+            lmb_magic::CastEvent::Completed { spell_id } => {
+                if let Some(spell) = player.pending_spell.take() {
+                    if spell.id == *spell_id {
+                        player.caster.complete_cooldown(&spell);
+                        match spell.execute(
+                            &player.caster.mana.attributes,
+                            &lmb_magic::CastContext::default(),
+                        ) {
+                            Ok(plan) => spell_plans.push(plan),
+                            Err(error) => execution_errors.push(error),
+                        }
+                    }
+                }
+            }
+            lmb_magic::CastEvent::Interrupted { .. } => {
+                player.pending_spell = None;
+            }
+            lmb_magic::CastEvent::Pulse { .. } => {}
+        }
+    }
+    let statuses = player.effects.tick(registry);
+    let crowd_control = player.effects.crowd_control(registry);
+    let snapshot = player.snapshot();
+    let frame = if player.last_sync.as_ref() == Some(&snapshot) {
+        None
+    } else {
+        lmb_magic::encode_magic_sync(&snapshot)
+            .ok()
+            .map(|bytes| live_mod_custom_payload_frame(lmb_magic::MAGIC_CHANNEL, &bytes))
+    };
+    if frame.is_some() {
+        player.last_sync = Some(snapshot);
+    }
+    Some(LiveMagicTick {
+        cast_events,
+        spell_plans,
+        execution_errors,
+        statuses,
+        crowd_control,
+        mana_delta: player.caster.mana.current_mana - before_mana,
+        cooldowns_changed: player.caster.cooldowns != before_cooldowns,
+        frame,
+    })
+}
+
+/// Disconnect cleanup is safe to repeat, including for unknown UUIDs.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_magic_remove_player(uuid: [u8; 16]) -> bool {
+    live_magic_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .players
+        .remove(&uuid)
+        .is_some()
+}
+
+/// Feed a pre-framed uncompressed payload through the existing socket layer,
+/// which owns compression and encryption negotiation.
+#[cfg(feature = "mod-suite")]
+fn live_mod_magic_send_frame(client: &Client, frame: &[u8]) {
+    let mut bytes = frame;
+    let Some(len) = read_varint(&mut bytes) else {
+        return;
+    };
+    if len < 1 || len as usize != bytes.len() {
+        return;
+    }
+    if read_varint(&mut bytes) != Some(LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID) {
+        return;
+    }
+    let mut socket = client.sock.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = send_packet(&mut socket, LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID, bytes.to_vec());
+}
+
 /// Startup entry wired from `main`: scans `MC_SPINE_MODS_DIR` (if set), then
 /// arms the optional operator manifest (`MC_SPINE_MOD_SYNC`) and progression
 /// rules (`MC_SPINE_PROGRESSION`). Without any of the three the bridge stays
@@ -1245,19 +1577,28 @@ fn live_mod_appleskin_sync(client: &Client) {
 }
 
 /// Per-game-tick entry wired into `game_tick` as `run("live_mods", ...)`.
-/// Inactive suites return before touching the client list, and the `Arc`s
-/// are cloned so no lock is held across per-client socket writes.
+/// The `Arc`s are cloned before any socket write. Magic players are advanced
+/// independently of the optional AppleSkin suite and expired on disconnect.
 #[cfg(feature = "mod-suite")]
 fn live_mod_tick() {
-    if live_mod_suite()
-        .lock()
-        .map(|suite| !suite.active)
-        .unwrap_or(true)
-    {
-        return;
-    }
     let players = clients().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let connected: HashSet<[u8; 16]> = players.iter().map(|client| client.uuid).collect();
+    {
+        let mut magic = live_magic_state().lock().unwrap_or_else(|e| e.into_inner());
+        magic.players.retain(|uuid, _| connected.contains(uuid));
+    }
     for client in &players {
+        let initialized = {
+            let mut magic = live_magic_state().lock().unwrap_or_else(|e| e.into_inner());
+            magic.player_mut(client.uuid).is_ok()
+        };
+        if initialized {
+            if let Some(tick) = live_mod_magic_tick_player(client.uuid) {
+                if let Some(frame) = tick.frame {
+                    live_mod_magic_send_frame(client, &frame);
+                }
+            }
+        }
         live_mod_appleskin_sync(client);
     }
 }
@@ -1488,6 +1829,56 @@ fn live_mod_progression_rules_from_json(bytes: &[u8]) -> Result<Vec<ProgressionR
 // Default-build stubs: identical call sites, zero emitted code.
 // ===========================================================================
 
+/// Default builds do not emit mod custom payloads.
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code)]
+#[inline(always)]
+fn live_mod_custom_payload_frame(_channel: &str, _payload: &[u8]) -> Vec<u8> {
+    Vec::new()
+}
+
+/// Magic adapters are unavailable in default builds.
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code)]
+#[inline(always)]
+fn live_mod_magic_set_attributes<T>(_uuid: [u8; 16], _attributes: T) {}
+
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code)]
+#[inline(always)]
+fn live_mod_magic_register_status<T>(_definition: T) {}
+
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code)]
+#[inline(always)]
+fn live_mod_magic_apply_status(_uuid: [u8; 16], _id: &str, _amplifier: u8, _duration_ticks: u32) {}
+
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code)]
+#[inline(always)]
+fn live_mod_magic_absorb_damage(_uuid: [u8; 16], damage: f32) -> f32 {
+    damage
+}
+
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code)]
+#[inline(always)]
+fn live_mod_magic_cast<T>(_uuid: [u8; 16], _spell: &T) {}
+
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code)]
+#[inline(always)]
+fn live_mod_magic_tick_player(_uuid: [u8; 16]) -> Option<()> {
+    None
+}
+
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code)]
+#[inline(always)]
+fn live_mod_magic_remove_player(_uuid: [u8; 16]) -> bool {
+    false
+}
+
 /// No-op without `mod-suite`: no mods dir scan, no classification.
 #[cfg(not(feature = "mod-suite"))]
 #[inline(always)]
@@ -1543,6 +1934,10 @@ mod wire_mods_stub_tests {
     #[test]
     fn wire_mods_stubs_compile_and_noop() {
         live_mod_suite_boot();
+        assert!(live_mod_custom_payload_frame("mc-spine:magic_v1", b"MAG1").is_empty());
+        assert_eq!(live_mod_magic_tick_player([1; 16]), None);
+        assert!(!live_mod_magic_remove_player([1; 16]));
+        assert_eq!(live_mod_magic_absorb_damage([1; 16], 3.0), 3.0);
         let verdict = live_check_progression_barrier(
             "minecraft:overworld",
             "minecraft:plains",
@@ -1575,6 +1970,355 @@ mod wire_mods_stub_tests {
         assert_eq!(rule_id, "gate:test");
         assert!(block_break_blocked);
         assert_eq!(periodic_damage, Some((1.0, 40)));
+    }
+}
+
+#[cfg(all(test, feature = "mod-suite"))]
+mod live_mod_bridge_magic_tests {
+    use super::*;
+
+    static MAGIC_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn reset_magic() {
+        *live_magic_state().lock().unwrap_or_else(|e| e.into_inner()) = LiveMagicState::default();
+    }
+
+    fn snapshot(uuid: [u8; 16]) -> lmb_magic::MagicSyncState {
+        live_magic_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .players
+            .get(&uuid)
+            .expect("registered player")
+            .snapshot()
+    }
+
+    fn spell(id: &str, cast: lmb_magic::SpellCastState) -> lmb_magic::SpellDefinition {
+        lmb_magic::SpellDefinition {
+            id: id.into(),
+            mana_cost: 10.0,
+            base_cooldown_ticks: 4,
+            cast,
+            interrupt_on_damage: false,
+            interrupt_on_move: false,
+            steps: vec![lmb_magic::SpellNode {
+                form: lmb_magic::SpellForm::SelfCast,
+                effects: vec![lmb_magic::SpellEffect::Heal { base_amount: 5.0 }],
+            }],
+        }
+    }
+
+    fn decode_custom_frame(frame: &[u8]) -> (String, &[u8]) {
+        let mut rest = frame;
+        let declared_len = read_varint(&mut rest).expect("frame length");
+        assert_eq!(declared_len as usize, rest.len());
+        assert_eq!(read_varint(&mut rest), Some(0x19));
+        let channel_len = read_varint(&mut rest).expect("channel length") as usize;
+        let channel = std::str::from_utf8(&rest[..channel_len])
+            .expect("utf-8 channel")
+            .to_owned();
+        (channel, &rest[channel_len..])
+    }
+
+    #[test]
+    fn live_mod_bridge_mana_regen_and_sync_deltas() {
+        let _guard = MAGIC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_magic();
+        let uuid = [1; 16];
+        live_mod_magic_set_attributes(
+            uuid,
+            lmb_magic::MagicAttributes {
+                max_mana: 50.0,
+                regen_per_tick: 3.0,
+                ..lmb_magic::MagicAttributes::default()
+            },
+        )
+        .unwrap();
+        {
+            let mut state = live_magic_state().lock().unwrap_or_else(|e| e.into_inner());
+            state
+                .players
+                .get_mut(&uuid)
+                .unwrap()
+                .caster
+                .mana
+                .set_current(43.0);
+        }
+        let first = live_mod_magic_tick_player(uuid).unwrap();
+        assert_eq!(first.mana_delta, 3.0);
+        let (channel, body) = decode_custom_frame(first.frame.as_ref().unwrap());
+        assert_eq!(channel, lmb_magic::MAGIC_CHANNEL);
+        assert_eq!(lmb_magic::decode_magic_sync(body).unwrap().mana, 46.0);
+        assert_eq!(live_mod_magic_tick_player(uuid).unwrap().mana_delta, 3.0);
+        assert_eq!(live_mod_magic_tick_player(uuid).unwrap().mana_delta, 1.0);
+        let stable = live_mod_magic_tick_player(uuid).unwrap();
+        assert_eq!(stable.mana_delta, 0.0);
+        assert!(stable.frame.is_none());
+        reset_magic();
+    }
+
+    #[test]
+    fn live_mod_bridge_spell_cast_cooldown_and_silence() {
+        let _guard = MAGIC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_magic();
+        let uuid = [2; 16];
+        let mut expensive = spell("test:expensive", lmb_magic::SpellCastState::Instant);
+        expensive.mana_cost = 101.0;
+        assert_eq!(
+            live_mod_magic_cast(uuid, &expensive).unwrap_err(),
+            LiveMagicError::Cast(lmb_magic::CastError::InsufficientMana {
+                needed: 101.0,
+                available: 100.0,
+            })
+        );
+        assert_eq!(snapshot(uuid).mana, 100.0);
+        let timed = spell("test:cast", lmb_magic::SpellCastState::cast_time(2));
+        assert!(live_mod_magic_cast(uuid, &timed).unwrap().events.is_empty());
+        assert!(live_mod_magic_tick_player(uuid)
+            .unwrap()
+            .cast_events
+            .is_empty());
+        let completed = live_mod_magic_tick_player(uuid).unwrap();
+        assert_eq!(
+            completed.cast_events,
+            vec![lmb_magic::CastEvent::Completed {
+                spell_id: timed.id.clone()
+            }]
+        );
+        assert_eq!(completed.spell_plans.len(), 1);
+        assert!(completed.execution_errors.is_empty());
+        assert!(completed.cooldowns_changed);
+        assert_eq!(
+            live_mod_magic_cast(uuid, &timed).unwrap_err(),
+            LiveMagicError::Cast(lmb_magic::CastError::OnCooldown { remaining_ticks: 4 })
+        );
+        for _ in 0..4 {
+            live_mod_magic_tick_player(uuid);
+        }
+        live_mod_magic_register_status(lmb_magic::StatusEffectDefinition {
+            id: "test:silence".into(),
+            silenced: true,
+            ..lmb_magic::StatusEffectDefinition::default()
+        })
+        .unwrap();
+        live_mod_magic_apply_status(uuid, "test:silence", 0, 2).unwrap();
+        assert_eq!(
+            live_mod_magic_cast(uuid, &timed).unwrap_err(),
+            LiveMagicError::Silenced
+        );
+        live_mod_magic_tick_player(uuid);
+        assert_eq!(
+            live_mod_magic_cast(uuid, &timed).unwrap_err(),
+            LiveMagicError::Silenced
+        );
+        assert_eq!(
+            live_mod_magic_tick_player(uuid).unwrap().statuses.expired,
+            vec!["test:silence"]
+        );
+        assert!(live_mod_magic_cast(uuid, &timed).is_ok());
+        reset_magic();
+    }
+
+    #[test]
+    fn live_mod_bridge_channel_pulse_and_out_of_mana() {
+        let _guard = MAGIC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_magic();
+        let uuid = [3; 16];
+        live_mod_magic_set_attributes(
+            uuid,
+            lmb_magic::MagicAttributes {
+                max_mana: 7.0,
+                ..lmb_magic::MagicAttributes::default()
+            },
+        )
+        .unwrap();
+        let mut spell = spell(
+            "test:channel",
+            lmb_magic::SpellCastState::channeled(2, 4, 3.0),
+        );
+        spell.mana_cost = 2.0;
+        live_mod_magic_cast(uuid, &spell).unwrap();
+        live_mod_magic_tick_player(uuid);
+        let pulse = live_mod_magic_tick_player(uuid).unwrap();
+        assert_eq!(
+            pulse.cast_events,
+            vec![lmb_magic::CastEvent::Pulse {
+                spell_id: spell.id.clone()
+            }]
+        );
+        assert_eq!(pulse.mana_delta, -3.0);
+        live_mod_magic_tick_player(uuid);
+        let stopped = live_mod_magic_tick_player(uuid).unwrap();
+        assert_eq!(
+            stopped.cast_events,
+            vec![lmb_magic::CastEvent::Interrupted {
+                spell_id: spell.id,
+                reason: lmb_magic::InterruptReason::OutOfMana,
+            }]
+        );
+        assert!(stopped.spell_plans.is_empty());
+        assert_eq!(snapshot(uuid).mana, 2.0);
+
+        let sufficient_uuid = [7; 16];
+        let mut success = self::spell(
+            "test:successful_channel",
+            lmb_magic::SpellCastState::channeled(2, 4, 3.0),
+        );
+        success.mana_cost = 2.0;
+        live_mod_magic_cast(sufficient_uuid, &success).unwrap();
+        for _ in 0..3 {
+            live_mod_magic_tick_player(sufficient_uuid);
+        }
+        let finished = live_mod_magic_tick_player(sufficient_uuid).unwrap();
+        assert_eq!(
+            finished.cast_events,
+            vec![
+                lmb_magic::CastEvent::Pulse {
+                    spell_id: success.id.clone()
+                },
+                lmb_magic::CastEvent::Completed {
+                    spell_id: success.id.clone()
+                },
+            ]
+        );
+        assert_eq!(finished.spell_plans.len(), 1);
+        assert_eq!(snapshot(sufficient_uuid).cooldowns[&success.id], 4);
+        reset_magic();
+    }
+
+    #[test]
+    fn live_mod_bridge_status_dot_hot_shield_and_cc() {
+        let _guard = MAGIC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_magic();
+        let uuid = [4; 16];
+        for status in [
+            lmb_magic::StatusEffectDefinition {
+                id: "test:burn".into(),
+                max_amplifier: 1,
+                pulse_interval_ticks: 2,
+                damage_per_pulse: 2.0,
+                ..lmb_magic::StatusEffectDefinition::default()
+            },
+            lmb_magic::StatusEffectDefinition {
+                id: "test:mend".into(),
+                pulse_interval_ticks: 1,
+                heal_per_pulse: 1.5,
+                ..lmb_magic::StatusEffectDefinition::default()
+            },
+            lmb_magic::StatusEffectDefinition {
+                id: "test:ward".into(),
+                absorption_per_level: 4.0,
+                rooted: true,
+                ..lmb_magic::StatusEffectDefinition::default()
+            },
+        ] {
+            live_mod_magic_register_status(status).unwrap();
+        }
+        live_mod_magic_apply_status(uuid, "test:burn", 1, 4).unwrap();
+        live_mod_magic_apply_status(uuid, "test:mend", 0, 4).unwrap();
+        live_mod_magic_apply_status(uuid, "test:ward", 0, 4).unwrap();
+        let first = live_mod_magic_tick_player(uuid).unwrap();
+        assert_eq!(first.statuses.damage, 0.0);
+        assert_eq!(first.statuses.healing, 1.5);
+        assert_eq!(snapshot(uuid).statuses.len(), 3);
+        assert!(first.crowd_control.rooted);
+        assert_eq!(live_mod_magic_absorb_damage(uuid, 3.0), 0.0);
+        assert_eq!(
+            live_magic_state()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .players
+                .get(&uuid)
+                .unwrap()
+                .effects
+                .total_absorption(),
+            1.0
+        );
+        let second = live_mod_magic_tick_player(uuid).unwrap();
+        assert_eq!(second.statuses.damage, 4.0);
+        assert_eq!(second.statuses.healing, 1.5);
+        let decoded =
+            lmb_magic::decode_magic_sync(decode_custom_frame(second.frame.as_ref().unwrap()).1)
+                .unwrap();
+        assert_eq!(
+            decoded
+                .statuses
+                .iter()
+                .find(|s| s.id == "test:ward")
+                .unwrap()
+                .absorption_remaining,
+            1.0
+        );
+        live_mod_magic_tick_player(uuid);
+        let expired = live_mod_magic_tick_player(uuid).unwrap();
+        assert_eq!(expired.statuses.expired.len(), 3);
+        assert!(!expired.crowd_control.rooted);
+        assert!(snapshot(uuid).statuses.is_empty());
+        reset_magic();
+    }
+
+    #[test]
+    fn live_mod_bridge_mag1_and_motion_vfx_anim_wire_frames() {
+        let _guard = MAGIC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_magic();
+        let uuid = [5; 16];
+        let instant = spell("test:instant", lmb_magic::SpellCastState::Instant);
+        assert_eq!(
+            live_mod_magic_cast(uuid, &instant)
+                .unwrap()
+                .spell_plans
+                .len(),
+            1
+        );
+        let frame = live_mod_magic_tick_player(uuid).unwrap().frame.unwrap();
+        let (channel, payload) = decode_custom_frame(&frame);
+        assert_eq!(channel, "mc-spine:magic_v1");
+        assert!(payload.starts_with(b"MAG1"));
+        let decoded = lmb_magic::decode_magic_sync(payload).expect("MAG1 decode");
+        assert_eq!(decoded, snapshot(uuid));
+        assert_eq!(lmb_magic::encode_magic_sync(&decoded).unwrap(), payload);
+        assert_eq!(decoded.mana, 90.0);
+        assert_eq!(decoded.cooldowns["test:instant"], 3);
+        for channel in ["mc-spine:vfx_v1", "mc-spine:anim_v1", "mc-spine:motion_v1"] {
+            let frame = live_mod_custom_payload_frame(channel, b"\0\x01\xff");
+            let (actual_channel, body) = decode_custom_frame(&frame);
+            assert_eq!(actual_channel, channel);
+            assert_eq!(body, b"\0\x01\xff");
+        }
+        reset_magic();
+    }
+
+    #[test]
+    fn live_mod_bridge_disconnect_cleanup_and_player_limit() {
+        let _guard = MAGIC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_magic();
+        let uuid = [6; 16];
+        live_mod_magic_set_attributes(uuid, lmb_magic::MagicAttributes::default()).unwrap();
+        assert!(live_mod_magic_remove_player(uuid));
+        assert!(!live_mod_magic_remove_player(uuid));
+        assert!(live_mod_magic_tick_player(uuid).is_none());
+        for value in 0..LIVE_MAGIC_MAX_PLAYERS {
+            live_mod_magic_set_attributes(
+                (value as u128).to_be_bytes(),
+                lmb_magic::MagicAttributes::default(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            live_mod_magic_cast(
+                [255; 16],
+                &spell("test:cap", lmb_magic::SpellCastState::Instant)
+            )
+            .unwrap_err(),
+            LiveMagicError::PlayerLimit
+        );
+        assert!(live_mod_magic_remove_player([0; 16]));
+        assert!(live_mod_magic_cast(
+            [255; 16],
+            &spell("test:cap", lmb_magic::SpellCastState::Instant)
+        )
+        .is_ok());
+        reset_magic();
     }
 }
 
@@ -1989,10 +2733,8 @@ mod wire_mods_tests {
     /// mod id — without loader metadata the adapter (correctly) records a
     /// no-manifest blocker and the jar can never leave Tier 3.
     fn lmb_fabric_manifest(mod_id: &str) -> Vec<u8> {
-        format!(
-            r#"{{"schemaVersion":1,"id":"{mod_id}","version":"1.0.0","environment":"*"}}"#
-        )
-        .into_bytes()
+        format!(r#"{{"schemaVersion":1,"id":"{mod_id}","version":"1.0.0","environment":"*"}}"#)
+            .into_bytes()
     }
 
     /// A `@Mixin(target)` class with one `@Inject(method, at = HEAD,
@@ -2240,7 +2982,11 @@ mod wire_mods_tests {
         std::fs::create_dir_all(&adapted).unwrap();
         for (path, id, channel) in [
             (dir.join("first.bundle.json"), "first:mod", "first:sync"),
-            (adapted.join("second.bundle.json"), "second:mod", "second:sync"),
+            (
+                adapted.join("second.bundle.json"),
+                "second:mod",
+                "second:sync",
+            ),
         ] {
             std::fs::write(path, format!(
                 r#"{{"schema":"mc-spine-mod-bundle/1","mod_id":"{id}","mc_version_range":"[1.21.1,1.21.1]","portals":[],"progression_barriers":[],"biome_regions":[],"creatures":[],"custom_channels":["{channel}"]}}"#
@@ -2273,13 +3019,29 @@ mod wire_mods_tests {
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = lmb_temp_dir("jar-boot");
         std::fs::write(dir.join("sodium-0.6.jar"), lmb_test_jar(&[("x.bin", b"x")])).unwrap();
-        std::fs::write(dir.join("delightaddon-1.jar"), lmb_culinary_jar("delightaddon")).unwrap();
-        std::fs::write(dir.join("safemod-1.jar"), lmb_inject_jar(
-            "com/safemod", "net/minecraft/world/entity/LivingEntity", "hurt"
-        )).unwrap();
-        std::fs::write(dir.join("redirectmod-1.jar"), lmb_redirect_jar(
-            "com/redirectmod", "net/minecraft/world/entity/LivingEntity", "hurt"
-        )).unwrap();
+        std::fs::write(
+            dir.join("delightaddon-1.jar"),
+            lmb_culinary_jar("delightaddon"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("safemod-1.jar"),
+            lmb_inject_jar(
+                "com/safemod",
+                "net/minecraft/world/entity/LivingEntity",
+                "hurt",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("redirectmod-1.jar"),
+            lmb_redirect_jar(
+                "com/redirectmod",
+                "net/minecraft/world/entity/LivingEntity",
+                "hurt",
+            ),
+        )
+        .unwrap();
         let previous = std::env::var_os("MC_SPINE_MODS_DIR");
         std::env::set_var("MC_SPINE_MODS_DIR", &dir);
         live_mod_suite_boot();
@@ -2291,18 +3053,38 @@ mod wire_mods_tests {
         let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(suite.auto_adapted.len(), 3);
         assert_eq!(suite.culinary_stats.cooking_recipes, 1);
-        assert_eq!(suite.auto_adapted.iter().find(|m| m.mod_id == "delightaddon")
-            .unwrap().tag_files, 1);
-        let safe = suite.auto_adapted.iter().find(|m| m.mod_id == "safemod").unwrap();
+        assert_eq!(
+            suite
+                .auto_adapted
+                .iter()
+                .find(|m| m.mod_id == "delightaddon")
+                .unwrap()
+                .tag_files,
+            1
+        );
+        let safe = suite
+            .auto_adapted
+            .iter()
+            .find(|m| m.mod_id == "safemod")
+            .unwrap();
         assert_eq!(safe.tier, AdaptationTier::Tier2LiftedShim);
         assert_eq!(safe.lifted_hooks.len(), 1);
         assert_eq!(suite.lifted_hooks.len(), 1);
-        assert_eq!(suite.lifted_hooks[0].1.hook, StandardEventHook::EntityDamagePre);
-        let fallback = suite.auto_adapted.iter().find(|m| m.mod_id == "redirectmod").unwrap();
+        assert_eq!(
+            suite.lifted_hooks[0].1.hook,
+            StandardEventHook::EntityDamagePre
+        );
+        let fallback = suite
+            .auto_adapted
+            .iter()
+            .find(|m| m.mod_id == "redirectmod")
+            .unwrap();
         assert_eq!(fallback.tier, AdaptationTier::Tier3FallbackRequired);
         assert!(fallback.lifted_hooks.is_empty());
-        assert!(suite.reports.iter().any(|r| r.mod_id == "sodium"
-            && r.tier == AdaptationTier::AutoSkipped));
+        assert!(suite
+            .reports
+            .iter()
+            .any(|r| r.mod_id == "sodium" && r.tier == AdaptationTier::AutoSkipped));
         drop(suite);
         fresh_suite();
         std::fs::remove_dir_all(dir).unwrap();
@@ -2466,8 +3248,7 @@ mod wire_mods_tests {
         // The filename infers "harmless-tweaks" — only the manifest-declared
         // id reveals the superseded perf mod; `auto_adapt_mods_dir` still
         // skips it before a single `.class` byte is read.
-        let manifest =
-            br#"{"schemaVersion":1,"id":"lithium","version":"9.9.9","environment":"*"}"#;
+        let manifest = br#"{"schemaVersion":1,"id":"lithium","version":"9.9.9","environment":"*"}"#;
         std::fs::write(
             dir.join("harmless-tweaks-1.0.jar"),
             lmb_test_jar(&[("fabric.mod.json", manifest)]),
