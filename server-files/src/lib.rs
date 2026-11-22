@@ -21,6 +21,8 @@
 //!   [`properties::ServerProperties`] view with Vanilla defaults, including
 //!   the strictly opt-in fair-play map policy
 //!   ([`properties::ServerFairPlayPolicy`]).
+//! * [`optifine_compat`] — bounded clean-room parsers for OptiFine/EMF CEM
+//!   `.jem`/`.jpm` models and CTM/emissive `.properties` files.
 //! * [`eula`] — [`eula::check_eula`] (`Accepted`/`NotAccepted`/`Missing`) and
 //!   [`eula::write_default_eula`], which always writes `eula=false`.
 //! * [`lists`] — `ops.json` (Vanilla levels 0..=4 plus the legacy flat name
@@ -54,6 +56,7 @@ pub mod directory;
 pub mod eula;
 pub mod json;
 pub mod lists;
+pub mod optifine_compat;
 pub mod pack_router;
 pub mod perf_cache;
 pub mod properties;
