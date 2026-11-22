@@ -284,7 +284,7 @@ fn capability_route(subsystem: NativeSubsystem, evidence: &[String]) -> ModRoute
     }
 }
 
-fn validate_member_name(name: &str) -> Result<(), &'static str> {
+pub(crate) fn validate_member_name(name: &str) -> Result<(), &'static str> {
     let path = name.trim_end_matches('/');
     if path.is_empty()
         || path.starts_with('/')

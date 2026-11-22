@@ -172,6 +172,21 @@ impl SubsetVmHost for RecordingHost {
                 self.event_cancelled = true;
                 Ok(None)
             }
+            HostCallKind::EventGetPlayer
+            | HostCallKind::EventGetEntity
+            | HostCallKind::EventGetLevel
+            | HostCallKind::EventGetPos
+            | HostCallKind::EventGetBlockState
+            | HostCallKind::EventGetServer
+            | HostCallKind::EventGetDispatcher => Ok(Some(VmValue::Ref(7))),
+            HostCallKind::EventIsCanceled => Ok(Some(VmValue::Int(i32::from(self.event_cancelled)))),
+            HostCallKind::EventSetCanceled => {
+                let VmValue::Int(v) = args[1] else {
+                    panic!("setCanceled arg must be Int")
+                };
+                self.event_cancelled = v != 0;
+                Ok(None)
+            }
             HostCallKind::MathMaxFloat | HostCallKind::MathMinFloat => {
                 let (VmValue::Float(a), VmValue::Float(b)) = (&args[0], &args[1]) else {
                     panic!("Math.{:?} args must be (Float, Float)", kind)

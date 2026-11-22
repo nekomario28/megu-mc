@@ -39,7 +39,7 @@
 //! `<mod_id>.bundle.json` files plus the deterministic
 //! [`ADAPTATION_REPORT_FILE`] report.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use mc_spine_core::id::ResourceLocation;
@@ -48,6 +48,10 @@ use crate::class_mixin_scanner::{
     scan_jar_mixins_with_options, JarMixinScanReport, JarScanOptions,
 };
 use crate::culinary_adapter::{CulinaryDiscoveryStats, CulinaryRegistry};
+use crate::data_loader::{
+    parse_json, parse_mod_recipe_json, DataLoadError, ItemFluidIdTable, JsonValue,
+    ParsedModRecipe,
+};
 use crate::dimension_mod::{
     discover_dimension_mod_entries, DimensionModClassification, DimensionModData,
 };
@@ -56,8 +60,17 @@ use crate::ecosystem_compat::{
 };
 use crate::fallback::{is_builtin_superseded_mod, REASON_SUPERSEDED};
 use crate::hard_mod_primitives::{classify_perf_or_render_mod_compat, EngineCompatDisposition};
-use crate::mixin_lifter::{LiftedBinding, MixinLiftVerdict, MixinSite, UnliftableReason};
-use crate::mod_router::{route_mod_jar, ModRouteDecision, RouteMatchKind, SecurityThreat};
+use crate::loader_extensions::{
+    biome_modifier_id_for_path, data_map_key_for_path, parse_biome_modifier, BiomeModifier,
+    DataMapRegistry,
+};
+use crate::mixin_lifter::{
+    lift_accessor_sites, LiftedBinding, MixinAnnotationKind, MixinLiftVerdict, MixinSite,
+    UnliftableReason,
+};
+use crate::mod_router::{
+    route_mod_jar, validate_member_name, ModRouteDecision, RouteMatchKind, SecurityThreat,
+};
 use crate::modpack::{infer_candidate_mod_id, read_zip_member, zip_member_list};
 use crate::unified_bundle::{DeclarativeModBundle, BUNDLE_SCHEMA};
 use crate::version_compat::{McVersion, VersionRange};
@@ -77,10 +90,12 @@ pub const BUNDLE_FILE_SUFFIX: &str = ".bundle.json";
 /// admitting both first-class targets (`1.21.1` and `26.3`).
 const DEFAULT_BUNDLE_MC_RANGE: &str = "[1.21,)";
 
-/// Total decompressed bytes the generic data discovery pass may read from
-/// one JAR (the mixin scanner and culinary discovery apply the same budget
-/// independently; this bounds the adapter's own member reads).
-const MAX_DATA_SCAN_BYTES: u64 = 256 * 1024 * 1024;
+/// Generic `data/` extraction budgets: at most 4096 archive members to
+/// consider, 4 MiB of decoded payload per member, and 32 MiB of decoded
+/// `data/` payload per JAR — all enforced fail-closed.
+const MAX_DATA_MEMBERS: usize = 4096;
+const MAX_DATA_MEMBER_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_DATA_SCAN_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Longest accepted scaffold `display_name` / `version` string.
 const MAX_SCAFFOLD_FIELD_CHARS: usize = 128;
@@ -172,6 +187,56 @@ pub struct GenericDataSummary {
     pub embedded_bundle: bool,
 }
 
+/// The real parsed generic `data/` content of one mod JAR — the six
+/// 1.21.1 data families [`extract_mod_data`] lifts for ANY namespace:
+/// recipes, tags, loot tables, dimensions + dimension types, NeoForge
+/// 1.21.1 data maps, and NeoForge 1.21.1 biome modifiers. Every entry is
+/// recorded under the JAR's own `data/<ns>` namespace with zero hardcoded
+/// mod ids.
+///
+/// Extraction is fail-closed: a corrupted archive or unsafe member path
+/// aborts with a hard error, while a member that survives the bounded
+/// read but fails its family's parser is recorded in
+/// [`Self::rejected_members`] instead of being silently dropped.
+#[derive(Clone, Debug, Default)]
+pub struct ModDataBundle {
+    /// Every `data/<ns>/` namespace seen, sorted.
+    pub namespaces: Vec<String>,
+    /// `data/<ns>/recipe/**.json` and `data/<ns>/recipes/**.json`
+    /// documents that matched the generic processing recipe schema.
+    pub recipes: Vec<ParsedModRecipe>,
+    /// `data/<ns>/tags/**.json` (and singular `tag/`) → `ns:path` →
+    /// declared value ids.
+    pub tags: BTreeMap<String, Vec<String>>,
+    /// `data/<ns>/loot_table/**.json` and `data/<ns>/loot_tables/**.json`
+    /// → `ns:path` → the parsed document.
+    pub loot_tables: BTreeMap<String, JsonValue>,
+    /// `data/<ns>/dimension/**.json`, `dimension_type/**.json`, worldgen,
+    /// and `tags/block(s)` members — the semantic dimension-mod scan.
+    pub dimensions: DimensionModData,
+    /// `data/<ns>/data_maps/**.json` and
+    /// `data/<ns>/neoforge/data_maps/**.json` merged into the shared
+    /// NeoForge 1.21.1 data-map registry (furnace fuels, compostables,
+    /// oxidizables, and every other registered map).
+    pub data_maps: DataMapRegistry,
+    /// `data/<ns>/neoforge/biome_modifier/**.json` parsed documents.
+    pub biome_modifiers: Vec<BiomeModifier>,
+    /// `data/` members that matched a recognized family but failed to
+    /// parse, recorded as `"path (reason)"` — never silently dropped.
+    pub rejected_members: Vec<String>,
+}
+
+/// The artifact [`synthesize_bundle`] produces for a native JAR: the
+/// validated `mc-spine-mod-bundle/1` document packaged together with the
+/// real [`ModDataBundle`] extracted from the JAR's `data/` members.
+#[derive(Clone, Debug)]
+pub struct SynthesizedBundle {
+    /// The validated bundle document.
+    pub bundle: DeclarativeModBundle,
+    /// The extracted generic `data/` content.
+    pub data: ModDataBundle,
+}
+
 /// Complete outcome of adapting one mod JAR.
 #[derive(Clone, Debug)]
 pub struct JarAdaptationResult {
@@ -206,6 +271,10 @@ pub struct JarAdaptationResult {
     pub dimensions: Option<DimensionModData>,
     /// Generic `data/` + bytecode surface counts.
     pub data: GenericDataSummary,
+    /// The real parsed `data/` content extracted from the JAR — empty
+    /// only when the JAR was skipped before generic discovery ran or held
+    /// no `data/` members at all.
+    pub data_bundle: ModDataBundle,
     /// The validated `mc-spine-mod-bundle/1` document — `Some` iff the
     /// tier is [`AdaptationTier::NativeBundle`].
     pub bundle: Option<DeclarativeModBundle>,
@@ -411,6 +480,213 @@ fn dimension_member_wanted(name: &str) -> bool {
         .is_some_and(|t| matches!(t.split('/').next(), Some("block" | "blocks")))
 }
 
+/// Whether a `data/<ns>/**.json` member feeds one of the six extracted
+/// data families and therefore earns a bounded read in
+/// [`extract_mod_data`].
+fn data_member_wanted(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("data/") else {
+        return false;
+    };
+    if !name.ends_with(".json") {
+        return false;
+    }
+    let Some((_, rest)) = rest.split_once('/') else {
+        return false;
+    };
+    if dimension_member_wanted(name) {
+        return true;
+    }
+    if matches!(
+        rest.split('/').next(),
+        Some("recipe" | "recipes" | "tags" | "tag" | "loot_table" | "loot_tables")
+    ) {
+        return true;
+    }
+    data_map_key_for_path(name).is_some() || biome_modifier_id_for_path(name).is_some()
+}
+
+fn data_load_error_message(e: &DataLoadError) -> &str {
+    match e {
+        DataLoadError::Io(m) | DataLoadError::Json(m) | DataLoadError::Zip(m) => m,
+    }
+}
+
+fn reject_member(bundle: &mut ModDataBundle, name: &str, reason: impl std::fmt::Display) {
+    bundle.rejected_members.push(format!("{name} ({reason})"));
+}
+
+/// Extract the six 1.21.1 generic `data/` families from one mod JAR for
+/// ANY namespace — the real parsed content [`synthesize_bundle`]
+/// packages into the native artifact.
+///
+/// Every `data/<ns>/(recipe|recipes|tags|tag|loot_table|loot_tables|
+/// dimension|dimension_type|worldgen|data_maps|neoforge/data_maps|
+/// neoforge/biome_modifier)/**.json` member is read through the crate's
+/// bounded ZIP reader (Stored and Deflate members, per-member and total
+/// byte budgets) and parsed by its family's real parser — nothing is
+/// faked, nothing is keyed on a hardcoded mod id.
+///
+/// Fail-closed like the rest of the pipeline: a corrupt archive, an
+/// unsafe (traversal) member path, or a member the bounded reader
+/// rejects is a hard `Err`; a member that reads cleanly but fails its
+/// family's parser is recorded in [`ModDataBundle::rejected_members`]
+/// with the reason rather than silently dropped.
+///
+/// # Errors
+///
+/// `Err` on archive corruption, unsafe member paths, or a bounded-read
+/// rejection — never a partial silent skip.
+pub fn extract_mod_data(jar_bytes: &[u8], display: &str) -> Result<ModDataBundle, String> {
+    let entries = zip_member_list(jar_bytes, display).map_err(|e| e.reason().to_string())?;
+    if entries.len() > MAX_DATA_MEMBERS {
+        return Err(format!(
+            "{display}: data scan member count exceeds {MAX_DATA_MEMBERS}"
+        ));
+    }
+    let mut out = ModDataBundle::default();
+    let mut namespaces = BTreeSet::new();
+    let mut dim_inputs: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut ids = ItemFluidIdTable::new();
+    let mut next_recipe_id = 1u32;
+    let mut extracted = 0u64;
+
+    for entry in &entries {
+        let name = entry.name.as_str();
+        validate_member_name(name).map_err(|why| format!("{display}: {why}: {name}"))?;
+        if !data_member_wanted(name) {
+            continue;
+        }
+        let bytes = read_zip_member(jar_bytes, entry, display)
+            .map_err(|e| e.reason().to_string())?;
+        if bytes.len() as u64 > MAX_DATA_MEMBER_BYTES {
+            return Err(format!(
+                "{display}: data member {name} exceeds the {} MiB per-member budget",
+                MAX_DATA_MEMBER_BYTES / (1024 * 1024)
+            ));
+        }
+        extracted = extracted
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| format!("{display}: data scan byte budget overflow"))?;
+        if extracted > MAX_DATA_SCAN_BYTES {
+            return Err(format!("{display}: data scan byte budget exceeded"));
+        }
+        let Some((ns, rest)) = name
+            .strip_prefix("data/")
+            .and_then(|rest| rest.split_once('/'))
+        else {
+            continue;
+        };
+        if ns.is_empty() {
+            continue;
+        }
+        namespaces.insert(ns.to_string());
+        let stem = rest.strip_suffix(".json").unwrap_or(rest);
+        // `ns:path-below-the-category` — `recipes/foo/bar` → `ns:foo/bar`,
+        // `tags/items/veggies` → `ns:items/veggies`.
+        let id = format!(
+            "{ns}:{}",
+            stem.split_once('/').map(|(_, tail)| tail).unwrap_or(stem)
+        );
+        if dimension_member_wanted(name) {
+            dim_inputs.push((name.to_string(), bytes.clone()));
+        }
+        match rest.split('/').next().unwrap_or("") {
+            "recipe" | "recipes" => {
+                match parse_mod_recipe_json(&id, next_recipe_id, &bytes, &mut ids) {
+                    Ok(Some(recipe)) => {
+                        out.recipes.push(recipe);
+                        next_recipe_id = next_recipe_id.wrapping_add(1);
+                    }
+                    Ok(None) => reject_member(
+                        &mut out,
+                        name,
+                        "does not match the generic processing recipe schema",
+                    ),
+                    Err(e) => reject_member(
+                        &mut out,
+                        name,
+                        format!("unparseable: {}", data_load_error_message(&e)),
+                    ),
+                }
+            }
+            "tags" | "tag" => match parse_json(&bytes) {
+                Err(e) => reject_member(
+                    &mut out,
+                    name,
+                    format!("unparseable: {}", data_load_error_message(&e)),
+                ),
+                Ok(doc) => {
+                    let values = doc
+                        .as_object()
+                        .and_then(|obj| obj.get("values"))
+                        .and_then(JsonValue::as_array);
+                    match values {
+                        None => reject_member(&mut out, name, "tag has no 'values' array"),
+                        Some(values) => {
+                            let mut list = Vec::with_capacity(values.len());
+                            let mut bad = false;
+                            for value in values {
+                                let entry_id = value.as_str().or_else(|| {
+                                    value
+                                        .as_object()
+                                        .and_then(|v| v.get("id"))
+                                        .and_then(JsonValue::as_str)
+                                });
+                                match entry_id {
+                                    Some(entry_id) => list.push(entry_id.to_string()),
+                                    None => {
+                                        bad = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if bad {
+                                reject_member(&mut out, name, "tag 'values' holds a non-id entry");
+                            } else {
+                                out.tags.insert(id, list);
+                            }
+                        }
+                    }
+                }
+            },
+            "loot_table" | "loot_tables" => match parse_json(&bytes) {
+                Err(e) => reject_member(
+                    &mut out,
+                    name,
+                    format!("unparseable: {}", data_load_error_message(&e)),
+                ),
+                Ok(doc) => {
+                    out.loot_tables.insert(id, doc);
+                }
+            },
+            _ => {
+                if data_map_key_for_path(name).is_some() {
+                    match out.data_maps.ingest_member(name, &bytes) {
+                        Ok(_) => {}
+                        Err(e) => reject_member(&mut out, name, format!("unparseable: {}", e.reason())),
+                    }
+                } else if let Some(modifier_id) = biome_modifier_id_for_path(name) {
+                    match parse_biome_modifier(&modifier_id, &bytes, name) {
+                        Ok(modifier) => out.biome_modifiers.push(modifier),
+                        Err(e) => reject_member(&mut out, name, format!("unparseable: {}", e.reason())),
+                    }
+                }
+            }
+        }
+    }
+    out.namespaces = namespaces.into_iter().collect();
+    out.dimensions = discover_dimension_mod_entries(
+        dim_inputs.iter().map(|(p, b)| (p.as_str(), b.as_slice())),
+    )
+    .map_err(|e| {
+        format!(
+            "{display}: dimension data scan: {}",
+            data_load_error_message(&e)
+        )
+    })?;
+    Ok(out)
+}
+
 fn describe_site(site: &MixinSite) -> String {
     let at = site
         .at
@@ -460,51 +736,60 @@ fn skipped_result(
         culinary: None,
         dimensions: None,
         data,
+        data_bundle: ModDataBundle::default(),
         bundle: None,
     }
 }
 
-/// Build the `mc-spine-mod-bundle/1` document for a native JAR: the
-/// embedded bundle verbatim when present, otherwise a synthesized
-/// empty-section bundle carrying the mod id and its declared Minecraft
-/// range (or [`DEFAULT_BUNDLE_MC_RANGE`] when undeclared).
+/// Build the native adaptation artifact for a JAR: the embedded bundle
+/// verbatim when present, otherwise a synthesized empty-section
+/// `mc-spine-mod-bundle/1` document carrying the mod id and its declared
+/// Minecraft range (or [`DEFAULT_BUNDLE_MC_RANGE`] when undeclared) —
+/// either way packaged with the real [`ModDataBundle`] the generic data
+/// extraction pass lifted out of the JAR.
 fn synthesize_bundle(
     embedded: Option<DeclarativeModBundle>,
     descriptor: Option<&ModJarDescriptor>,
     inferred_mod_id: Option<&str>,
-) -> Result<DeclarativeModBundle, String> {
-    if let Some(bundle) = embedded {
-        return Ok(bundle);
-    }
-    let mod_id = descriptor
-        .map(|d| d.mod_id.as_str())
-        .filter(|id| !id.is_empty())
-        .or(inferred_mod_id)
-        .unwrap_or("unnamed_pack");
-    if !is_safe_mod_id(mod_id) {
-        return Err(format!(
-            "mod id '{mod_id}' is not a safe bare bundle id"
-        ));
-    }
-    let mc_version_range = descriptor
-        .and_then(|d| d.declared_mc_range.as_ref().map(|r| r.declared().to_string()))
-        .unwrap_or_else(|| DEFAULT_BUNDLE_MC_RANGE.to_string());
-    let bundle = DeclarativeModBundle {
-        mod_id: mod_id.to_string(),
-        mc_version_range,
-        portals: Vec::new(),
-        progression_barriers: Vec::new(),
-        biome_regions: Vec::new(),
-        creatures: Vec::new(),
-        custom_channels: Vec::new(),
-        spells: Vec::new(),
-        custom_statuses: Vec::new(),
-        rituals: Vec::new(),
+    data: &mut ModDataBundle,
+) -> Result<SynthesizedBundle, String> {
+    let bundle = if let Some(bundle) = embedded {
+        bundle
+    } else {
+        let mod_id = descriptor
+            .map(|d| d.mod_id.as_str())
+            .filter(|id| !id.is_empty())
+            .or(inferred_mod_id)
+            .unwrap_or("unnamed_pack");
+        if !is_safe_mod_id(mod_id) {
+            return Err(format!(
+                "mod id '{mod_id}' is not a safe bare bundle id"
+            ));
+        }
+        let mc_version_range = descriptor
+            .and_then(|d| d.declared_mc_range.as_ref().map(|r| r.declared().to_string()))
+            .unwrap_or_else(|| DEFAULT_BUNDLE_MC_RANGE.to_string());
+        let bundle = DeclarativeModBundle {
+            mod_id: mod_id.to_string(),
+            mc_version_range,
+            portals: Vec::new(),
+            progression_barriers: Vec::new(),
+            biome_regions: Vec::new(),
+            creatures: Vec::new(),
+            custom_channels: Vec::new(),
+            spells: Vec::new(),
+            custom_statuses: Vec::new(),
+            rituals: Vec::new(),
+        };
+        bundle
+            .validate()
+            .map_err(|e| format!("synthesized bundle failed validation: {e}"))?;
+        bundle
     };
-    bundle
-        .validate()
-        .map_err(|e| format!("synthesized bundle failed validation: {e}"))?;
-    Ok(bundle)
+    Ok(SynthesizedBundle {
+        bundle,
+        data: std::mem::take(data),
+    })
 }
 
 /// Run the full zero-JVM adaptation pipeline over one mod JAR read from
@@ -569,6 +854,7 @@ pub fn auto_adapt_jar_bytes(
             culinary: None,
             dimensions: None,
             data: GenericDataSummary::default(),
+            data_bundle: ModDataBundle::default(),
             bundle: None,
         });
     }
@@ -719,43 +1005,45 @@ pub fn auto_adapt_jar_bytes(
         ));
     }
 
-    // 6. Generic data discovery: bounded reads of the members the
-    //    dimension/datapack scanners consume plus the embedded bundle.
-    let mut dim_inputs: Vec<(String, Vec<u8>)> = Vec::new();
+    // 6. Generic data discovery: the real parsed content of every 1.21.1
+    //    `data/` family (recipes, tags, loot tables, dimensions +
+    //    dimension types, NeoForge data maps, NeoForge biome modifiers)
+    //    for ANY namespace — bounded reads, fail-closed on corrupted or
+    //    traversal entries — plus the embedded bundle member.
+    let mut data_bundle = extract_mod_data(jar_bytes, display)?;
     let mut embedded_bundle_bytes = None;
-    let mut extracted = 0u64;
     for entry in &entries {
-        let name = entry.name.as_str();
-        let wanted = name == EMBEDDED_BUNDLE_MEMBER || dimension_member_wanted(name);
-        if !wanted {
-            continue;
-        }
-        let bytes = read_zip_member(jar_bytes, entry, display)
-            .map_err(|e| e.reason().to_string())?;
-        extracted = extracted
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| format!("{display}: data scan byte budget overflow"))?;
-        if extracted > MAX_DATA_SCAN_BYTES {
-            return Err(format!("{display}: data scan byte budget exceeded"));
-        }
-        if name == EMBEDDED_BUNDLE_MEMBER {
-            embedded_bundle_bytes = Some(bytes);
-        } else {
-            dim_inputs.push((entry.name.clone(), bytes));
+        if entry.name == EMBEDDED_BUNDLE_MEMBER {
+            embedded_bundle_bytes = Some(
+                read_zip_member(jar_bytes, entry, display)
+                    .map_err(|e| e.reason().to_string())?,
+            );
+            break;
         }
     }
-
-    let dimensions = discover_dimension_mod_entries(
-        dim_inputs.iter().map(|(p, b)| (p.as_str(), b.as_slice())),
-    )
-    .map_err(|e| {
-        let msg = match e {
-            crate::data_loader::DataLoadError::Io(m)
-            | crate::data_loader::DataLoadError::Json(m)
-            | crate::data_loader::DataLoadError::Zip(m) => m,
-        };
-        format!("{display}: dimension data scan: {msg}")
-    })?;
+    let dimensions = data_bundle.dimensions.clone();
+    {
+        let extracted_families = data_bundle.recipes.len()
+            + data_bundle.tags.len()
+            + data_bundle.loot_tables.len()
+            + data_bundle.dimensions.dimensions.len()
+            + data_bundle.dimensions.dimension_types.len()
+            + data_bundle.data_maps.keys().len()
+            + data_bundle.biome_modifiers.len();
+        if extracted_families > 0 || !data_bundle.rejected_members.is_empty() {
+            audit_notes.push(format!(
+                "generic data extraction: {} recipe(s), {} tag(s), {} loot table(s), {} dimension(s), {} dimension type(s), {} NeoForge data map(s), {} biome modifier(s), {} rejected member(s)",
+                data_bundle.recipes.len(),
+                data_bundle.tags.len(),
+                data_bundle.loot_tables.len(),
+                data_bundle.dimensions.dimensions.len(),
+                data_bundle.dimensions.dimension_types.len(),
+                data_bundle.data_maps.keys().len(),
+                data_bundle.biome_modifiers.len(),
+                data_bundle.rejected_members.len(),
+            ));
+        }
+    }
     if dimensions.is_dimension_mod() || !dimensions.dimension_types.is_empty() {
         audit_notes.push(format!(
             "dimension data: {} dimension type(s), {} dimension(s), {} worldgen declaration(s){}",
@@ -890,11 +1178,39 @@ pub fn auto_adapt_jar_bytes(
             kinds.join(", ")
         ));
     }
+    // Read-only `@Accessor` analysis: safe getters lift onto native field
+    // reads; setters and anything unverifiable stay unliftable carrying
+    // their own structured reason (never a silent drop).
+    let accessor_plan = lift_accessor_sites(&mixin_scan.sites);
     for (site, reason) in unliftable_sites(&mixin_scan.verdict) {
+        if site.annotation == MixinAnnotationKind::Accessor {
+            continue;
+        }
         blockers.push(format!(
             "mixin site {} stays unliftable ({})",
             describe_site(site),
             reason
+        ));
+    }
+    for (site, reason) in &accessor_plan.rejected {
+        blockers.push(format!(
+            "@Accessor site {} cannot lift natively ({})",
+            describe_site(site),
+            reason.as_str()
+        ));
+    }
+    if !accessor_plan.bindings.is_empty() {
+        let mut fields: Vec<&str> = accessor_plan
+            .bindings
+            .iter()
+            .map(|b| b.field.as_str())
+            .collect();
+        fields.sort_unstable();
+        fields.dedup();
+        audit_notes.push(format!(
+            "read-only @Accessor lifting: {} field read(s) lifted natively ({})",
+            accessor_plan.bindings.len(),
+            fields.join(", ")
         ));
     }
 
@@ -917,20 +1233,42 @@ pub fn auto_adapt_jar_bytes(
             lifted.iter().map(|b| b.hook.as_str()).collect();
         hooks.sort_unstable();
         hooks.dedup();
-        audit_notes.push(format!(
-            "all {} mixin site(s) lifted onto standard event hooks ({})",
-            lifted.len(),
-            hooks.join(", ")
-        ));
+        if accessor_plan.bindings.is_empty() {
+            audit_notes.push(format!(
+                "all {} mixin site(s) lifted onto standard event hooks ({})",
+                lifted.len(),
+                hooks.join(", ")
+            ));
+        } else {
+            let mut detail = hooks.join(", ");
+            if !detail.is_empty() {
+                detail.push_str(", ");
+            }
+            detail.push_str(&format!(
+                "{} read-only accessor field read(s)",
+                accessor_plan.bindings.len()
+            ));
+            audit_notes.push(format!(
+                "all {} mixin site(s) lifted ({})",
+                lifted.len() + accessor_plan.bindings.len(),
+                detail
+            ));
+        }
         (AdaptationTier::Tier2LiftedShim, None)
     } else if native_surface {
-        match synthesize_bundle(embedded_bundle, descriptor.as_ref(), inferred_mod_id.as_deref()) {
-            Ok(bundle) => {
+        match synthesize_bundle(
+            embedded_bundle,
+            descriptor.as_ref(),
+            inferred_mod_id.as_deref(),
+            &mut data_bundle,
+        ) {
+            Ok(syn) => {
                 audit_notes.push(format!(
                     "synthesized {BUNDLE_SCHEMA} for mod id '{}' (mc_version_range '{}')",
-                    bundle.mod_id, bundle.mc_version_range
+                    syn.bundle.mod_id, syn.bundle.mc_version_range
                 ));
-                (AdaptationTier::NativeBundle, Some(bundle))
+                data_bundle = syn.data;
+                (AdaptationTier::NativeBundle, Some(syn.bundle))
             }
             Err(e) => {
                 blockers.push(e);
@@ -959,6 +1297,7 @@ pub fn auto_adapt_jar_bytes(
         culinary: Some(culinary),
         dimensions: Some(dimensions),
         data,
+        data_bundle,
         bundle,
     })
 }
@@ -1422,6 +1761,88 @@ fn json_data_summary(out: &mut String, level: usize, data: &GenericDataSummary) 
     let _ = writeln!(out, "{:width$}}},", "", width = level * 2);
 }
 
+/// The `"data_bundle"` section: per-family id lists for the real parsed
+/// generic `data/` content [`extract_mod_data`] lifted out of the JAR.
+fn json_data_bundle(out: &mut String, level: usize, data: &ModDataBundle) {
+    use std::fmt::Write;
+    let _ = writeln!(out, "{:width$}\"data_bundle\": {{", "", width = level * 2);
+    jf_str_list(out, level + 1, "namespaces", &data.namespaces, true);
+    jf_str_list(
+        out,
+        level + 1,
+        "recipes",
+        &data
+            .recipes
+            .iter()
+            .map(|r| r.name.clone())
+            .collect::<Vec<_>>(),
+        true,
+    );
+    jf_str_list(
+        out,
+        level + 1,
+        "tags",
+        &data.tags.keys().cloned().collect::<Vec<_>>(),
+        true,
+    );
+    jf_str_list(
+        out,
+        level + 1,
+        "loot_tables",
+        &data.loot_tables.keys().cloned().collect::<Vec<_>>(),
+        true,
+    );
+    jf_str_list(
+        out,
+        level + 1,
+        "dimensions",
+        &data
+            .dimensions
+            .dimensions
+            .iter()
+            .map(|d| d.id.clone())
+            .collect::<Vec<_>>(),
+        true,
+    );
+    jf_str_list(
+        out,
+        level + 1,
+        "dimension_types",
+        &data
+            .dimensions
+            .dimension_types
+            .iter()
+            .map(|d| d.id.clone())
+            .collect::<Vec<_>>(),
+        true,
+    );
+    jf_str_list(
+        out,
+        level + 1,
+        "data_maps",
+        &data
+            .data_maps
+            .keys()
+            .iter()
+            .map(|(registry, map)| format!("{registry}/{map}"))
+            .collect::<Vec<_>>(),
+        true,
+    );
+    jf_str_list(
+        out,
+        level + 1,
+        "biome_modifiers",
+        &data
+            .biome_modifiers
+            .iter()
+            .map(|m| m.id.clone())
+            .collect::<Vec<_>>(),
+        true,
+    );
+    jf_str_list(out, level + 1, "rejected_members", &data.rejected_members, false);
+    let _ = writeln!(out, "{:width$}}},", "", width = level * 2);
+}
+
 fn jar_result_json(result: &JarAdaptationResult) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(1024);
@@ -1543,6 +1964,7 @@ fn jar_result_json(result: &JarAdaptationResult) -> String {
     }
 
     json_data_summary(&mut out, 1, &result.data);
+    json_data_bundle(&mut out, 1, &result.data_bundle);
 
     match &result.mixin_scan {
         None => {
@@ -1739,6 +2161,27 @@ fn format_adapt_human(result: &JarAdaptationResult) -> String {
         d.loot_table_files,
         d.java_class_members,
     );
+    let db = &result.data_bundle;
+    let extracted = db.recipes.len()
+        + db.tags.len()
+        + db.loot_tables.len()
+        + db.dimensions.dimensions.len()
+        + db.dimensions.dimension_types.len()
+        + db.data_maps.keys().len()
+        + db.biome_modifiers.len();
+    if extracted > 0 || !db.rejected_members.is_empty() {
+        let _ = writeln!(
+            out,
+            "  extracted: {} recipe(s), {} tag(s), {} loot table(s), {} dimension document(s), {} data map(s), {} biome modifier(s), {} rejected member(s)",
+            db.recipes.len(),
+            db.tags.len(),
+            db.loot_tables.len(),
+            db.dimensions.dimensions.len() + db.dimensions.dimension_types.len(),
+            db.data_maps.keys().len(),
+            db.biome_modifiers.len(),
+            db.rejected_members.len(),
+        );
+    }
     match &result.route {
         ModRouteDecision::SecurityQuarantine { .. } => {
             let _ = writeln!(

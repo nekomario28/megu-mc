@@ -922,6 +922,8 @@ mod tests {
             at: Some(at),
             cancellable: false,
             captures_locals: false,
+            handler_name: "handler".into(),
+            handler_descriptor: "()V".into(),
         }
     }
 

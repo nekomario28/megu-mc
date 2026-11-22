@@ -768,13 +768,19 @@ pub fn parse_mixin_class(bytes: &[u8]) -> Result<Vec<MixinSite>, ClassScanError>
         }
     }
 
-    // Methods: name + annotation attributes (Code etc. skipped).
+    // Methods: name + descriptor + annotation attributes (Code etc.
+    // skipped). The descriptor is kept so read-only `@Accessor` getters
+    // (`()T`) can be told apart from mutating `set*` methods (`(T)V`).
     let mut methods = Vec::new();
     for _ in 0..usize::from(r.u2("methods_count")?) {
         r.skip(2, "method access_flags")?;
         let name_index = r.u2("method name_index")?;
-        let _descriptor = r.u2("method descriptor_index")?;
-        methods.push((name_index, read_annotation_attributes(&mut r, &cp)?));
+        let descriptor_index = r.u2("method descriptor_index")?;
+        methods.push((
+            name_index,
+            descriptor_index,
+            read_annotation_attributes(&mut r, &cp)?,
+        ));
     }
 
     // Class-level attributes: @Mixin itself plus anything else ignored.
@@ -796,7 +802,7 @@ pub fn parse_mixin_class(bytes: &[u8]) -> Result<Vec<MixinSite>, ClassScanError>
     }
 
     let mut sites = Vec::new();
-    for (name_index, annotations) in &methods {
+    for (name_index, descriptor_index, annotations) in &methods {
         for ann in annotations {
             let desc = cp.utf8(ann.type_index, "method annotation type")?;
             let Some(kind) = mixin_annotation_kind(desc) else {
@@ -810,6 +816,9 @@ pub fn parse_mixin_class(bytes: &[u8]) -> Result<Vec<MixinSite>, ClassScanError>
             if spec.ats.is_empty() {
                 spec.ats.push(None);
             }
+            let handler_name = cp.utf8(*name_index, "method name")?.to_string();
+            let handler_descriptor =
+                cp.utf8(*descriptor_index, "method descriptor")?.to_string();
             for target in &targets {
                 for method in &spec.methods {
                     for at in &spec.ats {
@@ -821,6 +830,8 @@ pub fn parse_mixin_class(bytes: &[u8]) -> Result<Vec<MixinSite>, ClassScanError>
                             at: at.clone(),
                             cancellable: spec.cancellable,
                             captures_locals: spec.captures_locals,
+                            handler_name: handler_name.clone(),
+                            handler_descriptor: handler_descriptor.clone(),
                         });
                     }
                 }

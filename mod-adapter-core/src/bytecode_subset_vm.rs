@@ -353,6 +353,28 @@ pub enum HostCallKind {
     EventSetDamage,
     /// `event.cancel()V`.
     EventCancel,
+    /// `event.getPlayer()L.../Player;` → `Ref` (NeoForge 1.21.1
+    /// player-causal events: `BreakEvent`, `RightClickBlock`, ...).
+    EventGetPlayer,
+    /// `event.getEntity()L.../Entity;` → `Ref` (`EntityJoinLevelEvent`,
+    /// `LivingDeathEvent`, `LivingDamageEvent$Pre`, ...).
+    EventGetEntity,
+    /// `event.getLevel()L.../Level(Accessor)?;` → `Ref`.
+    EventGetLevel,
+    /// `event.getPos()Lnet/minecraft/core/BlockPos;` → `Ref`.
+    EventGetPos,
+    /// `event.getState()L.../BlockState;` → `Ref`.
+    EventGetBlockState,
+    /// `event.getServer()Lnet/minecraft/server/MinecraftServer;` → `Ref`
+    /// (`ServerTickEvent$Pre`/`$Post`).
+    EventGetServer,
+    /// `event.getDispatcher()Lcom/mojang/brigadier/CommandDispatcher;` →
+    /// `Ref` (`RegisterCommandsEvent`).
+    EventGetDispatcher,
+    /// `event.isCanceled()Z` → `Int` (NeoForge `ICancellableEvent`).
+    EventIsCanceled,
+    /// `event.setCanceled(Z)V` (NeoForge `ICancellableEvent`).
+    EventSetCanceled,
     /// `Math.max(FF)F` / `Mth.max(FF)F` → `Float`.
     MathMaxFloat,
     /// `Math.min(FF)F` / `Mth.min(FF)F` → `Float`.
@@ -421,6 +443,27 @@ impl HostCallKind {
             Self::EventCancel => HostSig {
                 receiver: Some(RT),
                 params: &[],
+                result: None,
+            },
+            Self::EventGetPlayer
+            | Self::EventGetEntity
+            | Self::EventGetLevel
+            | Self::EventGetPos
+            | Self::EventGetBlockState
+            | Self::EventGetServer
+            | Self::EventGetDispatcher => HostSig {
+                receiver: Some(RT),
+                params: &[],
+                result: Some(RT),
+            },
+            Self::EventIsCanceled => HostSig {
+                receiver: Some(RT),
+                params: &[],
+                result: Some(IT),
+            },
+            Self::EventSetCanceled => HostSig {
+                receiver: Some(RT),
+                params: &[IT],
                 result: None,
             },
             Self::MathMaxFloat | Self::MathMinFloat => HostSig {
@@ -515,6 +558,85 @@ const EVENT_CLASSES: &[&str] = &[
     "mcspine/Event",
 ];
 
+// ---------------------------------------------------------------------------
+// Real NeoForge 1.21.1 `net.neoforged.neoforge.event.*` event classes —
+// factual class-name data only (public API names). Each list scopes one
+// accessor family to the events that actually declare it.
+// ---------------------------------------------------------------------------
+
+/// `getPlayer()` — player-causal events (`BreakEvent`, interact events).
+const NEOFORGE_PLAYER_EVENTS: &[&str] = &[
+    "net/neoforged/neoforge/event/level/BlockEvent$BreakEvent",
+    "net/neoforged/neoforge/event/entity/player/PlayerInteractEvent$RightClickBlock",
+    "net/neoforged/neoforge/event/entity/player/PlayerInteractEvent$RightClickItem",
+];
+
+/// `getEntity()` — entity-bearing events.
+const NEOFORGE_ENTITY_EVENTS: &[&str] = &[
+    "net/neoforged/neoforge/event/level/BlockEvent$EntityPlaceEvent",
+    "net/neoforged/neoforge/event/level/BlockEvent$EntityMultiPlaceEvent",
+    "net/neoforged/neoforge/event/entity/living/LivingDamageEvent",
+    "net/neoforged/neoforge/event/entity/living/LivingDamageEvent$Pre",
+    "net/neoforged/neoforge/event/entity/living/LivingDamageEvent$Post",
+    "net/neoforged/neoforge/event/entity/living/LivingDeathEvent",
+    "net/neoforged/neoforge/event/entity/EntityJoinLevelEvent",
+];
+
+/// `getLevel()`/`getWorld()` — world-scoped events.
+const NEOFORGE_LEVEL_EVENTS: &[&str] = &[
+    "net/neoforged/neoforge/event/level/BlockEvent$BreakEvent",
+    "net/neoforged/neoforge/event/level/BlockEvent$EntityPlaceEvent",
+    "net/neoforged/neoforge/event/level/BlockEvent$EntityMultiPlaceEvent",
+    "net/neoforged/neoforge/event/entity/player/PlayerInteractEvent$RightClickBlock",
+    "net/neoforged/neoforge/event/entity/player/PlayerInteractEvent$RightClickItem",
+    "net/neoforged/neoforge/event/entity/EntityJoinLevelEvent",
+];
+
+/// `getPos()`/`getBlockPos()` and `getState()`/`getBlockState()` —
+/// block-positioned events.
+const NEOFORGE_BLOCK_EVENTS: &[&str] = &[
+    "net/neoforged/neoforge/event/level/BlockEvent$BreakEvent",
+    "net/neoforged/neoforge/event/level/BlockEvent$EntityPlaceEvent",
+    "net/neoforged/neoforge/event/level/BlockEvent$EntityMultiPlaceEvent",
+    "net/neoforged/neoforge/event/entity/player/PlayerInteractEvent$RightClickBlock",
+];
+
+/// `getServer()` — server tick events.
+const NEOFORGE_SERVER_EVENTS: &[&str] = &[
+    "net/neoforged/neoforge/event/tick/ServerTickEvent$Pre",
+    "net/neoforged/neoforge/event/tick/ServerTickEvent$Post",
+];
+
+/// `getDamage()`/`setDamage()`/`getNewDamage()`/`setNewDamage()` —
+/// NeoForge 1.21.1 living-damage events.
+const NEOFORGE_DAMAGE_EVENTS: &[&str] = &[
+    "net/neoforged/neoforge/event/entity/living/LivingDamageEvent",
+    "net/neoforged/neoforge/event/entity/living/LivingDamageEvent$Pre",
+    "net/neoforged/neoforge/event/entity/living/LivingDamageEvent$Post",
+];
+
+/// `getDispatcher()` — command registration.
+const NEOFORGE_COMMAND_EVENTS: &[&str] =
+    &["net/neoforged/neoforge/event/RegisterCommandsEvent"];
+
+/// `isCanceled()`/`setCanceled(Z)V` — every recognized NeoForge 1.21.1
+/// event implements `ICancellableEvent`.
+const NEOFORGE_1211_EVENTS: &[&str] = &[
+    "net/neoforged/neoforge/event/level/BlockEvent$BreakEvent",
+    "net/neoforged/neoforge/event/level/BlockEvent$EntityPlaceEvent",
+    "net/neoforged/neoforge/event/level/BlockEvent$EntityMultiPlaceEvent",
+    "net/neoforged/neoforge/event/entity/player/PlayerInteractEvent$RightClickBlock",
+    "net/neoforged/neoforge/event/entity/player/PlayerInteractEvent$RightClickItem",
+    "net/neoforged/neoforge/event/entity/living/LivingDamageEvent",
+    "net/neoforged/neoforge/event/entity/living/LivingDamageEvent$Pre",
+    "net/neoforged/neoforge/event/entity/living/LivingDamageEvent$Post",
+    "net/neoforged/neoforge/event/entity/living/LivingDeathEvent",
+    "net/neoforged/neoforge/event/tick/ServerTickEvent$Pre",
+    "net/neoforged/neoforge/event/tick/ServerTickEvent$Post",
+    "net/neoforged/neoforge/event/entity/EntityJoinLevelEvent",
+    "net/neoforged/neoforge/event/RegisterCommandsEvent",
+];
+
 const MATH_CLASSES: &[&str] = &[
     "java/lang/Math",
     "net/minecraft/util/Mth",
@@ -588,6 +710,85 @@ const HOST_ALLOWLIST: &[HostAllow] = &[
         classes: EVENT_CLASSES,
         names: &["cancel", "setCancelled"],
         descriptors: &["()V"],
+    },
+    // Real NeoForge 1.21.1 event accessors — every row is scoped to the
+    // events that actually declare the method, so a call to e.g.
+    // `getPos` on a tick event stays `UnknownHostCall`.
+    HostAllow {
+        kind: HostCallKind::EventGetPlayer,
+        classes: NEOFORGE_PLAYER_EVENTS,
+        names: &["getPlayer"],
+        descriptors: &[
+            "()Lnet/minecraft/world/entity/player/Player;",
+            "()Lnet/minecraft/server/level/ServerPlayer;",
+        ],
+    },
+    HostAllow {
+        kind: HostCallKind::EventGetEntity,
+        classes: NEOFORGE_ENTITY_EVENTS,
+        names: &["getEntity", "getLivingEntity"],
+        descriptors: &[
+            "()Lnet/minecraft/world/entity/Entity;",
+            "()Lnet/minecraft/world/entity/LivingEntity;",
+        ],
+    },
+    HostAllow {
+        kind: HostCallKind::EventGetLevel,
+        classes: NEOFORGE_LEVEL_EVENTS,
+        names: &["getLevel", "getWorld"],
+        descriptors: &[
+            "()Lnet/minecraft/world/level/Level;",
+            "()Lnet/minecraft/world/level/LevelAccessor;",
+            "()Lnet/minecraft/server/level/ServerLevel;",
+        ],
+    },
+    HostAllow {
+        kind: HostCallKind::EventGetPos,
+        classes: NEOFORGE_BLOCK_EVENTS,
+        names: &["getPos", "getBlockPos"],
+        descriptors: &["()Lnet/minecraft/core/BlockPos;"],
+    },
+    HostAllow {
+        kind: HostCallKind::EventGetBlockState,
+        classes: NEOFORGE_BLOCK_EVENTS,
+        names: &["getState", "getBlockState"],
+        descriptors: &["()Lnet/minecraft/world/level/block/state/BlockState;"],
+    },
+    HostAllow {
+        kind: HostCallKind::EventGetServer,
+        classes: NEOFORGE_SERVER_EVENTS,
+        names: &["getServer"],
+        descriptors: &["()Lnet/minecraft/server/MinecraftServer;"],
+    },
+    HostAllow {
+        kind: HostCallKind::EventGetDispatcher,
+        classes: NEOFORGE_COMMAND_EVENTS,
+        names: &["getDispatcher"],
+        descriptors: &["()Lcom/mojang/brigadier/CommandDispatcher;"],
+    },
+    HostAllow {
+        kind: HostCallKind::EventIsCanceled,
+        classes: NEOFORGE_1211_EVENTS,
+        names: &["isCanceled", "isCancelled"],
+        descriptors: &["()Z"],
+    },
+    HostAllow {
+        kind: HostCallKind::EventSetCanceled,
+        classes: NEOFORGE_1211_EVENTS,
+        names: &["setCanceled", "setCancelled"],
+        descriptors: &["(Z)V"],
+    },
+    HostAllow {
+        kind: HostCallKind::EventGetDamage,
+        classes: NEOFORGE_DAMAGE_EVENTS,
+        names: &["getDamage", "getOriginalDamage", "getNewDamage"],
+        descriptors: &["()F"],
+    },
+    HostAllow {
+        kind: HostCallKind::EventSetDamage,
+        classes: NEOFORGE_DAMAGE_EVENTS,
+        names: &["setDamage", "setNewDamage"],
+        descriptors: &["(F)V"],
     },
     HostAllow {
         kind: HostCallKind::MathMaxFloat,

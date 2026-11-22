@@ -136,6 +136,13 @@ pub struct MixinSite {
     pub cancellable: bool,
     /// Handler captures locals (`locals = ...` or `LocalCapture`).
     pub captures_locals: bool,
+    /// Declared name of the mixin handler method itself (e.g. `getYRot`) —
+    /// the name an `@Accessor`'s shape is judged by.
+    pub handler_name: String,
+    /// JVM descriptor of the handler method (`()F` for a read-only getter,
+    /// `(F)V` for a mutating setter). Empty when the producer does not know
+    /// it; the accessor lifter treats that as unverifiable.
+    pub handler_descriptor: String,
 }
 
 /// The standard lifecycle events a lifted site binds to in the Tier 2
@@ -157,6 +164,19 @@ pub enum StandardEventHook {
     PlayerJoin,
     PlayerLeave,
     BlockInteract,
+    /// An entity used a held item in the air (NeoForge
+    /// `RightClickItem`, Fabric `UseItemCallback`).
+    ItemUse,
+    /// A player attack on an entity, before damage resolves (Fabric
+    /// `AttackEntityCallback`).
+    EntityAttack,
+    /// A living entity died (NeoForge `LivingDeathEvent`).
+    EntityDeath,
+    /// An entity was added to a level (NeoForge `EntityJoinLevelEvent`).
+    EntityJoinLevel,
+    /// The server command dispatcher is being built (NeoForge
+    /// `RegisterCommandsEvent`, Fabric `CommandRegistrationCallback`).
+    CommandRegister,
 }
 
 impl StandardEventHook {
@@ -177,6 +197,11 @@ impl StandardEventHook {
             Self::PlayerJoin => "PlayerJoin",
             Self::PlayerLeave => "PlayerLeave",
             Self::BlockInteract => "BlockInteract",
+            Self::ItemUse => "ItemUse",
+            Self::EntityAttack => "EntityAttack",
+            Self::EntityDeath => "EntityDeath",
+            Self::EntityJoinLevel => "EntityJoinLevel",
+            Self::CommandRegister => "CommandRegister",
         }
     }
 }
@@ -497,6 +522,419 @@ fn describe_site(site: &MixinSite) -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Real NeoForge 1.21.1 / Fabric API 1.21.1 event descriptors
+// ---------------------------------------------------------------------------
+
+/// One row of the real-loader event table: normalized internal names of a
+/// NeoForge 1.21.1 event or Fabric API 1.21.1 callback bound to the
+/// [`StandardEventHook`] it lowers onto.
+struct EventDescriptorRow {
+    classes: &'static [&'static str],
+    hook: StandardEventHook,
+}
+
+/// Real NeoForge 1.21.1 `net.neoforged.neoforge.event.*` events and Fabric
+/// API 1.21.1 `net.fabricmc.fabric.api.event.*` callbacks, mapped to the
+/// standard hook a subscription lowers onto. Legacy `net.minecraftforge`
+/// damage events are kept for parity with the bounded VM's host-call
+/// allowlist. Names are normalized internal names (slash form) — the
+/// dotted, `L...;` descriptor, and full method-descriptor spellings all
+/// resolve through [`event_descriptor_hook`].
+///
+/// Clean-room note: like [`STANDARD_TARGETS`], this is factual mapping data
+/// (public API class names) only.
+const EVENT_DESCRIPTOR_HOOKS: &[EventDescriptorRow] = &[
+    EventDescriptorRow {
+        classes: &[
+            "net/neoforged/neoforge/event/level/BlockEvent$BreakEvent",
+            "net/fabricmc/fabric/api/event/player/PlayerBlockBreakEvents$Before",
+        ],
+        hook: StandardEventHook::BlockBreakPre,
+    },
+    EventDescriptorRow {
+        classes: &["net/fabricmc/fabric/api/event/player/PlayerBlockBreakEvents$After"],
+        hook: StandardEventHook::BlockBreakPost,
+    },
+    EventDescriptorRow {
+        classes: &[
+            "net/neoforged/neoforge/event/level/BlockEvent$EntityPlaceEvent",
+            "net/neoforged/neoforge/event/level/BlockEvent$EntityMultiPlaceEvent",
+        ],
+        hook: StandardEventHook::BlockPlacePre,
+    },
+    EventDescriptorRow {
+        classes: &[
+            "net/neoforged/neoforge/event/entity/player/PlayerInteractEvent$RightClickBlock",
+            "net/fabricmc/fabric/api/event/player/UseBlockCallback",
+        ],
+        hook: StandardEventHook::BlockInteract,
+    },
+    EventDescriptorRow {
+        classes: &[
+            "net/neoforged/neoforge/event/entity/player/PlayerInteractEvent$RightClickItem",
+            "net/fabricmc/fabric/api/event/player/UseItemCallback",
+        ],
+        hook: StandardEventHook::ItemUse,
+    },
+    EventDescriptorRow {
+        classes: &["net/fabricmc/fabric/api/event/player/AttackEntityCallback"],
+        hook: StandardEventHook::EntityAttack,
+    },
+    EventDescriptorRow {
+        classes: &[
+            "net/neoforged/neoforge/event/entity/living/LivingDamageEvent",
+            "net/neoforged/neoforge/event/entity/living/LivingDamageEvent$Pre",
+            "net/minecraftforge/event/entity/living/LivingDamageEvent",
+            "net/minecraftforge/event/entity/living/LivingHurtEvent",
+        ],
+        hook: StandardEventHook::EntityDamagePre,
+    },
+    EventDescriptorRow {
+        classes: &["net/neoforged/neoforge/event/entity/living/LivingDamageEvent$Post"],
+        hook: StandardEventHook::EntityDamagePost,
+    },
+    EventDescriptorRow {
+        classes: &["net/neoforged/neoforge/event/entity/living/LivingDeathEvent"],
+        hook: StandardEventHook::EntityDeath,
+    },
+    EventDescriptorRow {
+        classes: &[
+            "net/neoforged/neoforge/event/tick/ServerTickEvent$Pre",
+            "net/fabricmc/fabric/api/event/lifecycle/ServerTickEvents$StartTick",
+        ],
+        hook: StandardEventHook::ServerTickPre,
+    },
+    EventDescriptorRow {
+        classes: &[
+            "net/neoforged/neoforge/event/tick/ServerTickEvent$Post",
+            "net/fabricmc/fabric/api/event/lifecycle/ServerTickEvents$EndTick",
+        ],
+        hook: StandardEventHook::ServerTickPost,
+    },
+    EventDescriptorRow {
+        classes: &["net/neoforged/neoforge/event/entity/EntityJoinLevelEvent"],
+        hook: StandardEventHook::EntityJoinLevel,
+    },
+    EventDescriptorRow {
+        classes: &[
+            "net/neoforged/neoforge/event/RegisterCommandsEvent",
+            "net/fabricmc/fabric/api/command/v2/CommandRegistrationCallback",
+        ],
+        hook: StandardEventHook::CommandRegister,
+    },
+];
+
+/// Normalize one event/callback spelling to an internal name: bare
+/// internal (`net/neoforged/.../BreakEvent`), dotted
+/// (`net.neoforged...BreakEvent`), class descriptor (`Lnet/.../X;`), or a
+/// full method descriptor whose first reference parameter is the event
+/// (`(Lnet/.../BreakEvent;)V` → `net/.../BreakEvent`). Primitive or
+/// parameterless forms yield `None` — fail-closed.
+fn normalize_event_descriptor(descriptor: &str) -> Option<String> {
+    let descriptor = descriptor.trim();
+    if let Some(rest) = descriptor.strip_prefix('(') {
+        // Method descriptor: the hookable form is a single leading
+        // reference parameter — `(Lpkg/Class;...)`.
+        let rest = rest.strip_prefix('L')?;
+        let end = rest.find(';')?;
+        return Some(rest[..end].to_string());
+    }
+    if let Some(inner) = descriptor
+        .strip_prefix('L')
+        .and_then(|s| s.strip_suffix(';'))
+    {
+        return Some(inner.to_string());
+    }
+    if descriptor.is_empty() {
+        return None;
+    }
+    Some(descriptor.replace('.', "/"))
+}
+
+/// Lower a real NeoForge 1.21.1 or Fabric API 1.21.1 event/callback JVM
+/// descriptor to its [`StandardEventHook`]. Accepts a bare internal name,
+/// a `L...;` descriptor, a dotted name, or a full method descriptor (the
+/// first `L...;` parameter is taken as the event). Anything outside the
+/// table returns `None` — fail-closed, never a guessed hook.
+pub fn event_descriptor_hook(descriptor: &str) -> Option<StandardEventHook> {
+    let internal = normalize_event_descriptor(descriptor)?;
+    EVENT_DESCRIPTOR_HOOKS
+        .iter()
+        .find(|row| row.classes.contains(&internal.as_str()))
+        .map(|row| row.hook)
+}
+
+// ---------------------------------------------------------------------------
+// Safe read-only `@Accessor` lifting
+// ---------------------------------------------------------------------------
+
+/// Why one `@Accessor` site cannot lift natively — the structured reason
+/// the shim plan and the adaptation report carry so the rejection is
+/// never a silent drop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessorRejection {
+    /// A `set*`-named method or a `(T)V` signature — mutating field writes
+    /// never lift onto a native read-only plan.
+    MutatingSetter,
+    /// The site is not an `@Accessor` method at all.
+    NotAnAccessor,
+    /// The handler shape does not prove a read-only getter — missing
+    /// `get*`/`is*` prefix, a `()V`/parametered signature, or a missing
+    /// descriptor.
+    OpaqueSignature,
+    /// `(target class, field)` is outside the verified safe read-only
+    /// table — unknown private fields stay unliftable.
+    UnknownField,
+}
+
+impl AccessorRejection {
+    /// Stable operator-facing reason.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::MutatingSetter => {
+                "mutating @Accessor setter — field writes never lift natively"
+            }
+            Self::NotAnAccessor => "not an @Accessor site",
+            Self::OpaqueSignature => {
+                "handler is not a provably read-only getter (expected a `get*`/`is*` name and a `()T` signature)"
+            }
+            Self::UnknownField => {
+                "field is outside the verified safe read-only table"
+            }
+        }
+    }
+}
+
+impl fmt::Display for AccessorRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The value kind a lifted read-only field access produces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessorValueKind {
+    Int,
+    Float,
+    /// An opaque object reference (`block`, `gameMode`, ...).
+    Ref,
+}
+
+/// One read-only `@Accessor` getter proven to read a known-safe vanilla
+/// field natively — no JVM needed for the field read itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiftedAccessorBinding {
+    /// The accessor site this binding covers.
+    pub site: MixinSite,
+    /// Canonical `Class#field` display (`Entity#yRot`).
+    pub field: String,
+    /// Kind of value the read produces.
+    pub value_kind: AccessorValueKind,
+    /// Execution tier the binding satisfies — a pure native field read.
+    pub tier: crate::fallback::ExecutionTier,
+}
+
+/// The deterministic plan [`lift_accessor_sites`] produces: every lifted
+/// read-only getter binding plus every rejected site with its structured
+/// reason. Callers fold [`Self::tier`] into the mod's execution plan —
+/// fully lifted means `UniversalNative` for the accessor surface;
+/// anything rejected forces `RequiresFallback` for it.
+#[derive(Clone, Debug, Default)]
+pub struct LiftedAccessorPlan {
+    /// Proven read-only getter bindings, in site order.
+    pub bindings: Vec<LiftedAccessorBinding>,
+    /// Sites that stay unliftable, each with its structured reason.
+    pub rejected: Vec<(MixinSite, AccessorRejection)>,
+}
+
+impl LiftedAccessorPlan {
+    /// `true` when every presented `@Accessor` site lifted.
+    pub fn is_fully_lifted(&self) -> bool {
+        self.rejected.is_empty()
+    }
+
+    /// The execution tier the accessor surface satisfies: a fully lifted
+    /// non-empty plan needs no JVM (`UniversalNative`); anything rejected
+    /// forces the accessor surface to `RequiresFallback`.
+    pub fn tier(&self) -> crate::fallback::ExecutionTier {
+        if self.rejected.is_empty() && !self.bindings.is_empty() {
+            crate::fallback::ExecutionTier::UniversalNative
+        } else {
+            crate::fallback::ExecutionTier::RequiresFallback
+        }
+    }
+}
+
+/// One verified safe read-only vanilla field an `@Accessor` getter may
+/// lift onto — a row of (normalized class names, accepted field names,
+/// canonical `Class#field`, value kind). Names are factual mapping data
+/// only.
+struct SafeAccessorField {
+    classes: &'static [&'static str],
+    fields: &'static [&'static str],
+    canonical: &'static str,
+    kind: AccessorValueKind,
+}
+
+/// The verified safe read-only field table. Each row names a vanilla
+/// field that is a plain stored value (never a derived or mutating view)
+/// safe for a native read proxy: entity pose/flags, held-item count,
+/// block-state owner, health, and the player game-mode. Mojang and Fabric
+/// Intermediary class names are accepted; the field name itself is the
+/// Mojang name mods actually write in `@Accessor("yRot")`.
+const SAFE_ACCESSOR_FIELDS: &[SafeAccessorField] = &[
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/world/entity/Entity",
+            "net/minecraft/class_1297",
+        ],
+        fields: &["yRot"],
+        canonical: "Entity#yRot",
+        kind: AccessorValueKind::Float,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/world/entity/Entity",
+            "net/minecraft/class_1297",
+        ],
+        fields: &["xRot"],
+        canonical: "Entity#xRot",
+        kind: AccessorValueKind::Float,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/world/entity/Entity",
+            "net/minecraft/class_1297",
+        ],
+        fields: &["onGround"],
+        canonical: "Entity#onGround",
+        kind: AccessorValueKind::Int,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/world/entity/LivingEntity",
+            "net/minecraft/class_1309",
+        ],
+        fields: &["health"],
+        canonical: "LivingEntity#health",
+        kind: AccessorValueKind::Float,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/world/level/block/state/BlockState",
+            "net/minecraft/world/level/block/state/BlockBehaviour$BlockStateBase",
+            "net/minecraft/class_2680",
+        ],
+        fields: &["block"],
+        canonical: "BlockState#block",
+        kind: AccessorValueKind::Ref,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/world/item/ItemStack",
+            "net/minecraft/class_1799",
+        ],
+        fields: &["count"],
+        canonical: "ItemStack#count",
+        kind: AccessorValueKind::Int,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/server/level/ServerPlayer",
+            "net/minecraft/class_3222",
+        ],
+        fields: &["gameMode"],
+        canonical: "ServerPlayer#gameMode",
+        kind: AccessorValueKind::Ref,
+    },
+];
+
+/// Mixin's own field-name inference for an `@Accessor` without a `value`
+/// element: strip the `get`/`is`/`set` prefix and lowercase the first
+/// remaining character (`getYRot` → `yRot`, `isOnGround` → `onGround`).
+fn infer_accessor_field_name(handler_name: &str) -> Option<String> {
+    let stripped = handler_name
+        .strip_prefix("get")
+        .or_else(|| handler_name.strip_prefix("is"))
+        .or_else(|| handler_name.strip_prefix("set"))?;
+    let mut chars = stripped.chars();
+    let first = chars.next()?;
+    Some(first.to_lowercase().chain(chars).collect())
+}
+
+/// Classify one `@Accessor` site: a `get*`/`is*` handler with a `()T`
+/// (non-void) signature on a table field lifts to a native read binding;
+/// `set*`/`(T)V` shapes, opaque signatures, and unknown fields fail
+/// closed with their [`AccessorRejection`].
+fn lift_accessor_site(site: &MixinSite) -> Result<LiftedAccessorBinding, AccessorRejection> {
+    if site.annotation != MixinAnnotationKind::Accessor {
+        return Err(AccessorRejection::NotAnAccessor);
+    }
+    let name = site.handler_name.as_str();
+    let descriptor = site.handler_descriptor.as_str();
+    // `set` + uppercase is the Mixin setter convention (`setYRot`); a
+    // lowercase continuation (`settings`) is just a name.
+    if name
+        .strip_prefix("set")
+        .is_some_and(|rest| rest.chars().next().is_some_and(char::is_uppercase))
+    {
+        return Err(AccessorRejection::MutatingSetter);
+    }
+    // `()T` with a non-void T is the only provably read-only shape;
+    // the shortest legal form is 3 bytes (`()F`, `()I`).
+    let getter_signature =
+        descriptor.starts_with("()") && descriptor.len() > 2 && !descriptor.ends_with('V');
+    if descriptor.ends_with("V") && !descriptor.starts_with("()") {
+        // Any parametered method returning void is a write, named or not.
+        return Err(AccessorRejection::MutatingSetter);
+    }
+    let getter_name = name.starts_with("get") || name.starts_with("is");
+    if !getter_name || !getter_signature {
+        return Err(AccessorRejection::OpaqueSignature);
+    }
+    // The field is the annotation `value` when present (the scanner then
+    // reports it as `target_method`, distinct from the handler name),
+    // otherwise Mixin's own name-based inference applies.
+    let field = if site.target_method != site.handler_name {
+        site.target_method.clone()
+    } else {
+        match infer_accessor_field_name(name) {
+            Some(field) => field,
+            None => return Err(AccessorRejection::OpaqueSignature),
+        }
+    };
+    let class = normalize_class(&site.target_class);
+    let row = SAFE_ACCESSOR_FIELDS
+        .iter()
+        .find(|r| r.classes.contains(&class.as_str()) && r.fields.contains(&field.as_str()))
+        .ok_or(AccessorRejection::UnknownField)?;
+    Ok(LiftedAccessorBinding {
+        site: site.clone(),
+        field: row.canonical.to_string(),
+        value_kind: row.kind,
+        tier: crate::fallback::ExecutionTier::UniversalNative,
+    })
+}
+
+/// Lift every `@Accessor` site in `sites` into a deterministic
+/// [`LiftedAccessorPlan`]. Non-`@Accessor` sites are ignored here — they
+/// remain [`lift_mixin_sites`]' job; the two surfaces compose in the
+/// adaptation pipeline.
+pub fn lift_accessor_sites(sites: &[MixinSite]) -> LiftedAccessorPlan {
+    let mut plan = LiftedAccessorPlan::default();
+    for site in sites {
+        if site.annotation != MixinAnnotationKind::Accessor {
+            continue;
+        }
+        match lift_accessor_site(site) {
+            Ok(binding) => plan.bindings.push(binding),
+            Err(reason) => plan.rejected.push((site.clone(), reason)),
+        }
+    }
+    plan
+}
+
 impl MixinLiftVerdict {
     /// One-line operator/diagnostic summary, e.g.
     /// `fully liftable: 2 site(s) bound (test.Mixin -> net/minecraft/.../LivingEntity#hurt @Inject @At(HEAD) => EntityDamagePre)` or
@@ -546,6 +984,8 @@ mod tests {
             at: Some(at),
             cancellable: false,
             captures_locals: false,
+            handler_name: "handler".into(),
+            handler_descriptor: "()V".into(),
         }
     }
 
