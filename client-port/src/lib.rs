@@ -5,6 +5,7 @@
 
 pub mod atlas;
 pub mod ber_instancing;
+pub mod builtin_shadow_wgsl;
 mod cache;
 mod column;
 mod cull;
