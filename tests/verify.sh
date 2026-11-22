@@ -97,6 +97,9 @@ python3 tools/vanilla_data/version_pack.py --self-test
 python3 tools/parity_cache.py --self-test
 python3 tools/release_bundle.py --self-test
 python3 tests/release_bundle_test.py
+python3 tests/release_workflow_test.py
+python3 tests/alpha_release_smoke.py --self-test
+python3 tests/multi_mod_e2e_wire.py --self-test
 python3 tests/dev_check_test.py
 python3 tests/megu_translate_test.py
 python3 tests/megu_bench_test.py
@@ -178,6 +181,7 @@ cargo build --offline --locked -j 2 --message-format=json-render-diagnostics >"$
 binary=$(python3 tools/cargo_executable.py <"$build_manifest")
 timeout 180 python3 tests/wire_smoke.py "$binary"
 timeout 180 python3 tests/protocol767.py "$binary"
+timeout 180 python3 tests/alpha_release_smoke.py "$binary"
 timeout 180 python3 tests/dimension_wire.py "$binary"
 timeout 180 python3 tests/client_settings_wire.py "$binary"
 timeout 180 python3 tests/gameplay_wire.py "$binary"
