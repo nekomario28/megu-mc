@@ -28,8 +28,11 @@
 
 use std::collections::BTreeMap;
 
+use crate::ber_instancing::VanillaBerKind;
 use crate::mesh::{DirectionBuckets, DIRECTION_BUCKETS, DIRECTION_BUCKET_UNASSIGNED};
+use crate::mesher::BerKindBatch;
 use crate::section::{Direction, ALL_FACES};
+use crate::vanilla_plus_3d::ExtrudedMesh;
 use crate::Quad;
 
 // ---------------------------------------------------------------------------
@@ -1495,6 +1498,170 @@ impl BlockEntityInstancePool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Vanilla BER instanced batches
+// ---------------------------------------------------------------------------
+
+/// Mesh-kind stride inside one [`VanillaBerKind`]: base id =
+/// `kind_base * BER_KIND_MESH_STRIDE`, then `+ state-group slot` so two
+/// batches of the same family with different `VanillaBerState`s still
+/// get distinct draw keys (256 state variants per kind is far beyond any
+/// real section).
+pub const BER_KIND_MESH_STRIDE: u32 = 256;
+/// Bytes per [`BerInstanceGpu`] GPU record (48, matching
+/// `client_gpu::subworld_render::InstancedPartRecord`).
+pub const BER_INSTANCE_RECORD_GPU_BYTES: u32 =
+    std::mem::size_of::<BerInstanceGpu>() as u32;
+
+/// Stable mesh-kind base for each [`VanillaBerKind`] — the real 12-arm
+/// dispatch every BER batch key derives from.
+fn vanilla_ber_kind_base(kind: VanillaBerKind) -> u32 {
+    match kind {
+        VanillaBerKind::Chest => 0,
+        VanillaBerKind::Sign => 1,
+        VanillaBerKind::Banner => 2,
+        VanillaBerKind::Beacon => 3,
+        VanillaBerKind::Bed => 4,
+        VanillaBerKind::Skull => 5,
+        VanillaBerKind::ItemFrame => 6,
+        VanillaBerKind::Campfire => 7,
+        VanillaBerKind::BrewingStand => 8,
+        VanillaBerKind::Lectern => 9,
+        VanillaBerKind::DecoratedPot => 10,
+        VanillaBerKind::ShulkerBox => 11,
+    }
+}
+
+/// Dense GPU instance record for one placed vanilla block entity. Exactly
+/// 48 bytes, `align(4)`, field-for-field identical to
+/// `client_gpu::subworld_render::InstancedPartRecord` so the packed stream
+/// uploads straight into the instanced-part vertex layout.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BerInstanceGpu {
+    /// `xyz` = instance origin in render-world blocks, `w` = uniform scale.
+    pub pos_scale: [f32; 4],
+    /// `xyz` = Euler rotation in radians, `w` = animation/atlas frame index.
+    pub rot_uv_frame: [f32; 4],
+    /// Packed light: block-light nibble | sky-light nibble << 4.
+    pub packed_light: u32,
+    /// RGBA tint, one byte per channel.
+    pub tint_rgba: u32,
+    /// Shared mesh template this instance draws (the batch's `mesh_kind`).
+    pub mesh_kind: u32,
+    /// Sub-world slot; `0` is the static world grid.
+    pub subworld_id: u32,
+}
+
+/// One instanced draw batch ready for renderer submission: a shared
+/// [`ExtrudedMesh`] template (block-local `0..=1` space, built by
+/// `build_ber_mesh`) plus the per-instance [`BerInstanceGpu`] records that
+/// place it in the world. The client-port analog of
+/// `client_gpu::subworld_render::InstancedPartBatch`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BerInstanceBatch {
+    /// Draw-grouping key: `kind_base * BER_KIND_MESH_STRIDE + state slot`.
+    pub mesh_kind: u32,
+    /// Shared template geometry in block-local `0..=1` space.
+    pub template: ExtrudedMesh,
+    /// Per-instance records of this batch (mirrors the flat stream slice
+    /// at `first_instance..first_instance + instance_count`).
+    pub instances: Vec<BerInstanceGpu>,
+    /// Batch-level model transform (identity for world-space sections).
+    pub transform: SubWorldTransformGpu,
+    /// Template geometry changed since last GPU sync.
+    pub geometry_dirty: bool,
+    /// Instance list changed since last GPU sync.
+    pub instances_dirty: bool,
+}
+
+impl BerInstanceBatch {
+    /// New fully-dirty batch with an empty instance list.
+    pub fn new(mesh_kind: u32, template: ExtrudedMesh) -> Self {
+        Self {
+            mesh_kind,
+            template,
+            instances: Vec::new(),
+            transform: SubWorldTransformGpu::IDENTITY,
+            geometry_dirty: true,
+            instances_dirty: true,
+        }
+    }
+}
+
+/// One run of same-`mesh_kind` instances inside
+/// [`BerInstanceUpload::instances`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BerInstanceRun {
+    /// Draw-grouping key shared by every record in the run.
+    pub mesh_kind: u32,
+    /// Offset of this run in the packed instance stream.
+    pub first_instance: u32,
+    /// Instances in the run.
+    pub instance_count: u32,
+}
+
+/// One frame's BER instancing upload: the per-kind batches (template +
+/// records), the flat packed instance stream, and the run descriptors that
+/// map each batch onto the stream — the dataflow
+/// `subworld_render::SubWorldRenderBank::batches` consumes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BerInstanceUpload {
+    /// One [`BerInstanceBatch`] per non-empty collected [`BerKindBatch`],
+    /// in input order.
+    pub batches: Vec<BerInstanceBatch>,
+    /// Instance records grouped by `mesh_kind`; each [`BerInstanceRun`]'s
+    /// `first_instance` indexes this array.
+    pub instances: Vec<BerInstanceGpu>,
+    /// One run per batch, in the same order as `batches`.
+    pub runs: Vec<BerInstanceRun>,
+}
+
+/// Pack mesher-collected [`BerKindBatch`]es into the instanced-part record
+/// stream. Each batch keeps its [`ExtrudedMesh`] template and emits one
+/// [`BerInstanceGpu`] per placement; `mesh_kind` keys are
+/// `kind_base * BER_KIND_MESH_STRIDE + per-kind state-group slot`, assigned
+/// in input order so identical input is byte-identical. Batches with empty
+/// templates or zero instances emit nothing.
+pub fn upload_ber_instances(batches: &[BerKindBatch]) -> BerInstanceUpload {
+    let mut upload = BerInstanceUpload::default();
+    let mut kind_slots: BTreeMap<u32, u32> = BTreeMap::new();
+    for batch in batches {
+        if batch.template.quads.is_empty() || batch.instances.is_empty() {
+            continue;
+        }
+        let base = vanilla_ber_kind_base(batch.kind);
+        let slot = {
+            let entry = kind_slots.entry(base).or_insert(0);
+            let slot = *entry;
+            *entry += 1;
+            slot
+        };
+        let mesh_kind = base * BER_KIND_MESH_STRIDE + slot;
+        let first_instance = upload.instances.len() as u32;
+        let mut gpu_batch = BerInstanceBatch::new(mesh_kind, batch.template.clone());
+        for instance in &batch.instances {
+            let record = BerInstanceGpu {
+                pos_scale: [instance.pos[0], instance.pos[1], instance.pos[2], 1.0],
+                rot_uv_frame: [0.0; 4],
+                packed_light: instance.packed_light,
+                tint_rgba: instance.tint_rgba,
+                mesh_kind,
+                subworld_id: 0,
+            };
+            gpu_batch.instances.push(record);
+            upload.instances.push(record);
+        }
+        upload.runs.push(BerInstanceRun {
+            mesh_kind,
+            first_instance,
+            instance_count: batch.instances.len() as u32,
+        });
+        upload.batches.push(gpu_batch);
+    }
+    upload
+}
+
 const _: () = {
     assert!(std::mem::size_of::<KineticInstanceGpu>() == 48);
     assert!(MAX_INSTANCES_PER_UBO_16KB * KINETIC_INSTANCE_GPU_BYTES as usize
@@ -1502,6 +1669,9 @@ const _: () = {
     assert!(std::mem::align_of::<KineticInstanceGpu>() == 4);
     assert!(std::mem::size_of::<BlockEntityInstanceGpu>() == 48);
     assert!(std::mem::align_of::<BlockEntityInstanceGpu>() == 4);
+    assert!(std::mem::size_of::<BerInstanceGpu>() == 48);
+    assert!(std::mem::align_of::<BerInstanceGpu>() == 4);
+    assert!(BER_INSTANCE_RECORD_GPU_BYTES == 48);
     assert!(MAX_INSTANCES_PER_UBO_16KB * BLOCK_ENTITY_INSTANCE_GPU_BYTES as usize
         <= MIN_GUARANTEED_UBO_BYTES as usize);
     assert!(std::mem::size_of::<DrawIndexedIndirectCommand>() == 20);

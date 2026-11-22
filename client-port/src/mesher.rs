@@ -28,12 +28,14 @@
 //! treated as infinitely far, and an unrecognised block id simply gets no
 //! overrides.
 
+use crate::ber_instancing::{build_ber_mesh, VanillaBerKind, VanillaBerState};
 use crate::classic_ores::{
     evaluate_ore_adaptation, ClassicOresConfig, OreAdaptationDecision, OreTextureInput,
     SynthesisPlan, CLASSIC_ORE_DIM,
 };
 use crate::crop_archetype::{self, CropInput};
-use crate::section::Direction;
+use crate::mesh::Layer;
+use crate::section::{Block, Direction, SectionView, CUTOUT, OPAQUE};
 use crate::vanilla_plus_3d::{
     build_3d_crop_mesh, build_3d_cross_mesh, build_3d_crystal_mesh, build_3d_fixture_mesh,
     build_3d_ladder_mesh, build_3d_moon_mesh, build_3d_ore_relief, build_3d_rail_mesh,
@@ -46,10 +48,11 @@ use crate::vanilla_plus_nature::{
     VanillaPlusNatureConfig, WindSwayCategory,
 };
 use crate::vanilla_plus_visuals::{
-    build_3d_relief_mesh, classify_ctm_block, evaluate_better_grass, evaluate_better_snow,
-    resolve_ctm_tile, BetterSnowResult, CtmNeighbors, CtmTile, ReliefSubject, SideFaceStyle,
-    VanillaPlusVisualsConfig,
+    build_3d_relief_mesh, build_3d_skin_layer_part, classify_ctm_block, evaluate_better_grass,
+    evaluate_better_snow, resolve_ctm_tile, BetterSnowResult, CtmNeighbors, CtmTile,
+    ReliefSubject, SideFaceStyle, SkinLayerResult, SkinOverlayPart, VanillaPlusVisualsConfig,
 };
+use crate::Quad;
 
 /// Full 16x16 opaque alpha mask used when the caller has no sprite data for a
 /// cross-plane upgrade: the extrusion then thickens the full sprite quad.
@@ -628,4 +631,298 @@ fn fixture_kind_for(path: &str) -> FixtureKind {
     } else {
         FixtureKind::Torch
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cutout layer side-list
+// ---------------------------------------------------------------------------
+
+/// Mesh output for one section: the quad stream plus the cutout side-list —
+/// indices into `quads` whose material belongs to the vanilla alpha-tested
+/// (cutout) layer, in emission order. The cutout pass draws exactly these
+/// indices with alpha testing enabled; everything else renders in the
+/// opaque/translucent passes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SectionMeshOutput {
+    /// Every quad the mesher emitted, in stable emission order.
+    pub quads: Vec<Quad>,
+    /// Indices into `quads` tagged [`Layer::Cutout`] — leaves, glass panes,
+    /// farm crops and every other `CUTOUT`-flagged material.
+    pub cutout_indices: Vec<u32>,
+}
+
+/// The render layer a section [`Block`] meshes into, mirroring the mesher's
+/// precedence: `OPAQUE` wins over `CUTOUT`, which wins over `TRANSLUCENT`.
+pub fn block_render_layer(block: &Block) -> Layer {
+    if block.flags & OPAQUE != 0 {
+        Layer::Opaque
+    } else if block.flags & CUTOUT != 0 {
+        Layer::Cutout
+    } else {
+        Layer::Translucent
+    }
+}
+
+/// Indices of every [`Layer::Cutout`] quad in `quads`, in order.
+pub fn cutout_quad_indices(quads: &[Quad]) -> Vec<u32> {
+    quads
+        .iter()
+        .enumerate()
+        .filter(|(_, quad)| quad.layer == Layer::Cutout)
+        .map(|(index, _)| index as u32)
+        .collect()
+}
+
+/// Mesh `view` like [`crate::mesh_section`] and additionally report which
+/// quads belong to the vanilla cutout layer so the renderer can submit them
+/// in a separate alpha-tested pass.
+pub fn mesh_section_with_cutout(view: &SectionView<'_>) -> SectionMeshOutput {
+    let quads = crate::mesh::mesh_section(view);
+    let cutout_indices = cutout_quad_indices(&quads);
+    SectionMeshOutput {
+        quads,
+        cutout_indices,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vanilla block-entity instanced meshing
+// ---------------------------------------------------------------------------
+
+/// All twelve vanilla BER families in stable dispatch order — the
+/// `VanillaBerKind` match arms [`ber_kind_slot`] uses to order batches.
+pub const VANILLA_BER_KINDS: [VanillaBerKind; 12] = [
+    VanillaBerKind::Chest,
+    VanillaBerKind::Sign,
+    VanillaBerKind::Banner,
+    VanillaBerKind::Beacon,
+    VanillaBerKind::Bed,
+    VanillaBerKind::Skull,
+    VanillaBerKind::ItemFrame,
+    VanillaBerKind::Campfire,
+    VanillaBerKind::BrewingStand,
+    VanillaBerKind::Lectern,
+    VanillaBerKind::DecoratedPot,
+    VanillaBerKind::ShulkerBox,
+];
+
+/// Stable dispatch slot for one [`VanillaBerKind`] — the real 12-arm match
+/// every BER batch key derives from.
+fn ber_kind_slot(kind: VanillaBerKind) -> usize {
+    match kind {
+        VanillaBerKind::Chest => 0,
+        VanillaBerKind::Sign => 1,
+        VanillaBerKind::Banner => 2,
+        VanillaBerKind::Beacon => 3,
+        VanillaBerKind::Bed => 4,
+        VanillaBerKind::Skull => 5,
+        VanillaBerKind::ItemFrame => 6,
+        VanillaBerKind::Campfire => 7,
+        VanillaBerKind::BrewingStand => 8,
+        VanillaBerKind::Lectern => 9,
+        VanillaBerKind::DecoratedPot => 10,
+        VanillaBerKind::ShulkerBox => 11,
+    }
+}
+
+/// Map a vanilla block-entity type id (`"minecraft:chest"`,
+/// `"minecraft:wall_sign"`, ...) to its [`VanillaBerKind`]. Every alias the
+/// vanilla registry reports for each renderer family is covered; unknown or
+/// modded types fail closed to `None` and are skipped by the collector.
+pub fn classify_vanilla_ber(be_type: &str) -> Option<VanillaBerKind> {
+    match block_path(be_type) {
+        "chest" | "trapped_chest" | "ender_chest" => Some(VanillaBerKind::Chest),
+        "sign" | "wall_sign" | "hanging_sign" | "wall_hanging_sign" => {
+            Some(VanillaBerKind::Sign)
+        }
+        "banner" | "standing_banner" | "wall_banner" => Some(VanillaBerKind::Banner),
+        "beacon" => Some(VanillaBerKind::Beacon),
+        "bed" => Some(VanillaBerKind::Bed),
+        "skull" | "wall_skull" | "player_head" | "player_wall_head" => {
+            Some(VanillaBerKind::Skull)
+        }
+        "item_frame" | "glow_item_frame" => Some(VanillaBerKind::ItemFrame),
+        "campfire" | "soul_campfire" => Some(VanillaBerKind::Campfire),
+        "brewing_stand" => Some(VanillaBerKind::BrewingStand),
+        "lectern" => Some(VanillaBerKind::Lectern),
+        "decorated_pot" => Some(VanillaBerKind::DecoratedPot),
+        "shulker_box" => Some(VanillaBerKind::ShulkerBox),
+        _ => None,
+    }
+}
+
+/// One block entity submitted for instanced BER meshing: its world block
+/// position, the [`VanillaBerState`] that fully describes its geometry
+/// (facing, lid angle, ...), and the packed light/tint the instance record
+/// carries to the GPU.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SectionBerInstance {
+    /// Stable id used as the deterministic tiebreak inside a batch.
+    pub entity_id: u64,
+    /// World block position (the block's min corner) in render-world blocks.
+    pub pos: [i32; 3],
+    /// Geometry state; `state.kind()` selects the [`VanillaBerKind`].
+    pub state: VanillaBerState,
+    /// Packed light: block-light nibble | sky-light nibble << 4.
+    pub packed_light: u32,
+    /// RGBA tint, one byte per channel.
+    pub tint_rgba: u32,
+}
+
+impl SectionBerInstance {
+    /// World-space instance origin in render-world blocks.
+    pub fn mesh_position(&self) -> [f32; 3] {
+        [
+            self.pos[0] as f32,
+            self.pos[1] as f32,
+            self.pos[2] as f32,
+        ]
+    }
+}
+
+/// One placed instance inside a [`BerKindBatch`]: position plus the light
+/// and tint payload the GPU instance record carries.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BerMeshInstance {
+    /// World-space origin in render-world blocks.
+    pub pos: [f32; 3],
+    /// Packed light at the instance.
+    pub packed_light: u32,
+    /// RGBA tint, one byte per channel.
+    pub tint_rgba: u32,
+}
+
+/// One instanced draw batch: every [`BerMeshInstance`] shares the same
+/// `(kind, state)`, so one [`ExtrudedMesh`] template built by
+/// [`build_ber_mesh`] serves the whole run — the client-port analog of
+/// `client_gpu::subworld_render::InstancedPartBatch`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BerKindBatch {
+    /// Vanilla BER family this batch draws.
+    pub kind: VanillaBerKind,
+    /// The exact [`VanillaBerState`] `template` was built from; all
+    /// instances in the batch share it.
+    pub state: VanillaBerState,
+    /// Shared template geometry in block-local `0..=1` space.
+    pub template: ExtrudedMesh,
+    /// World-space placements, in collection order.
+    pub instances: Vec<BerMeshInstance>,
+}
+
+/// Collects block-entity instances into per-`(kind, state)` instanced
+/// batches. Instances with identical [`VanillaBerState`] share one
+/// [`build_ber_mesh`] template and one draw call; differing states (a lit
+/// and an unlit campfire, say) split into separate batches of the same
+/// kind. [`Self::into_batches`] orders the result by
+/// [`ber_kind_slot`] so output is deterministic.
+#[derive(Default)]
+pub struct BerInstanceCollector {
+    batches: Vec<BerKindBatch>,
+}
+
+impl BerInstanceCollector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Collect `instances` into kind/state batches. An instance whose
+    /// `build_ber_mesh` template comes out empty is skipped.
+    pub fn collect(&mut self, instances: &[SectionBerInstance]) {
+        for instance in instances {
+            let kind = instance.state.kind();
+            let placement = BerMeshInstance {
+                pos: instance.mesh_position(),
+                packed_light: instance.packed_light,
+                tint_rgba: instance.tint_rgba,
+            };
+            if let Some(batch) = self
+                .batches
+                .iter_mut()
+                .find(|batch| batch.kind == kind && batch.state == instance.state)
+            {
+                batch.instances.push(placement);
+                continue;
+            }
+            let template = build_ber_mesh(kind, instance.state);
+            if template.quads.is_empty() {
+                continue;
+            }
+            self.batches.push(BerKindBatch {
+                kind,
+                state: instance.state,
+                template,
+                instances: vec![placement],
+            });
+        }
+    }
+
+    /// Collect only the instances whose `pos` lies inside the 16³ section
+    /// starting at `section_min` (world block coordinates), then mesh them.
+    pub fn collect_section(
+        &mut self,
+        section_min: [i32; 3],
+        instances: &[SectionBerInstance],
+    ) {
+        for instance in instances {
+            let inside = (0..3).all(|axis| {
+                let delta = instance.pos[axis] as i64 - section_min[axis] as i64;
+                (0..16).contains(&delta)
+            });
+            if inside {
+                self.collect(std::slice::from_ref(instance));
+            }
+        }
+    }
+
+    /// The collected batches so far, in collection order.
+    pub fn batches(&self) -> &[BerKindBatch] {
+        &self.batches
+    }
+
+    /// Consume the collector and return the batches ordered by
+    /// [`ber_kind_slot`] (stable within a kind), so two collectors fed the
+    /// same instances emit byte-identical batch lists.
+    pub fn into_batches(mut self) -> Vec<BerKindBatch> {
+        self.batches.sort_by_key(|batch| ber_kind_slot(batch.kind));
+        self.batches
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3D player skin outer layers
+// ---------------------------------------------------------------------------
+
+/// The six overlay ("second layer") parts of a standard `64x64` player skin,
+/// in hat -> jacket -> sleeves -> pants order.
+pub const HUMANOID_SKIN_OVERLAY_PARTS: [SkinOverlayPart; 6] = [
+    SkinOverlayPart::Hat,
+    SkinOverlayPart::Jacket,
+    SkinOverlayPart::LeftSleeve,
+    SkinOverlayPart::RightSleeve,
+    SkinOverlayPart::LeftPants,
+    SkinOverlayPart::RightPants,
+];
+
+/// Build the extruded 3D outer-layer geometry for every overlay part of a
+/// humanoid skin rig. Each part goes through
+/// [`build_3d_skin_layer_part`], so the pack toggle and the LOD cutoff gate
+/// every part identically: a disabled config, a beyond-cutoff distance, or
+/// a malformed skin buffer yields an empty list (the caller keeps the
+/// vanilla flat overlay). Slim (3-texel) arms are honoured per part.
+pub fn humanoid_skin_layer_parts(
+    config: &VanillaPlusVisualsConfig,
+    skin_rgba: &[u8],
+    slim_arms: bool,
+    distance_blocks: f32,
+) -> Vec<(SkinOverlayPart, ExtrudedMesh)> {
+    HUMANOID_SKIN_OVERLAY_PARTS
+        .iter()
+        .filter_map(|&part| {
+            match build_3d_skin_layer_part(config, skin_rgba, part, slim_arms, distance_blocks)
+            {
+                SkinLayerResult::Extruded(mesh) => Some((part, mesh)),
+                SkinLayerResult::UseFlatOverlay | SkinLayerResult::InvalidSkin => None,
+            }
+        })
+        .collect()
 }
