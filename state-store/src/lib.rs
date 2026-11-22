@@ -77,12 +77,22 @@
 //!   `flush_all` for `/save-all` and shutdown, plus the
 //!   [`incremental_save::PersistedFingerprints`] content-hash cache that lets
 //!   an unchanged payload skip its disk write entirely.
+//! * [`namespace_guard`] — the unknown-namespace preservation router
+//!   ([`namespace_guard::NamespaceTombstoneSidecar`]): when a mod is removed
+//!   or disabled, its `modid:block`/`modid:item`/`modid:entity` payloads are
+//!   parked verbatim in a schema-tagged sidecar and replaced with safe
+//!   vanilla placeholders instead of being silently deleted, restored
+//!   losslessly when the namespace returns — and
+//!   [`namespace_guard::guard_world_load_with_snapshot`] seals and verifies a
+//!   [`world_snapshot::WorldSnapshotStore`] rollback before any placeholder
+//!   mutation is written.
 
 pub mod anvil_inspect;
 pub mod audit_log;
 pub mod datafix;
 pub mod incremental_save;
 pub mod migrate;
+pub mod namespace_guard;
 pub mod pregen;
 pub mod region_tick;
 pub mod sharded;
@@ -109,6 +119,11 @@ pub use migrate::{
     cleanup_stale_migrate_temps, inspect_snapshot, migrate_json_document, migrate_snapshot,
     parse_data_json, to_data_json, write_file_atomic, JsonError, MigrationError,
     SnapshotMigrationReport, SnapshotSummary,
+};
+pub use namespace_guard::{
+    guard_world_load_with_snapshot, namespace_of, NamespaceGuardError, NamespaceGuardReport,
+    NamespaceTombstoneSidecar, PreservedEntry, PreservedKind, UnknownEntry, MAX_PRESERVED_ENTRIES,
+    PLACEHOLDER_BLOCK, PLACEHOLDER_ENTITY, PLACEHOLDER_ITEM,
 };
 pub use pregen::{
     spiral_order, ChunkTicketLruUnloader, FlushedChunk, PregenJob, PregenProgress, PregenShape,
