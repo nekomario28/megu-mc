@@ -135,6 +135,17 @@
 //!   `mc_spine_core::perf_kit` — O(1) dirty-fingerprint idle skips,
 //!   exact-tick wake scheduling, per-tick-budget burst slicing, and
 //!   last-write-wins coalesced outbound deltas for any machine family.
+//! - [`magic_primitives`]: clean-room magic-mod primitives engine —
+//!   NaN-safe [`magic_primitives::ManaPool`]/[`magic_primitives::MagicAttributes`]
+//!   with clamped reductions and per-school power, tick-driven instant /
+//!   cast-time / channeled casting with damage/move interrupts, per-spell
+//!   cooldowns + GCD, a composable [`magic_primitives::SpellDefinition`]
+//!   delivery graph (self/touch/projectile/beam/AoE/chain/orbit/summon)
+//!   under fail-closed caps, data-driven
+//!   [`magic_primitives::CustomStatusRegistry`] DoT/HoT/absorption/CC
+//!   statuses, multiblock [`magic_primitives::RitualRecipe`] altars with a
+//!   bounded cycle-safe [`magic_primitives::ManaNetwork`], and the `MAG1`
+//!   `mc-spine:magic_v1` sync codec.
 
 #![deny(unsafe_code)]
 
@@ -151,11 +162,12 @@ pub mod dimension_mod;
 pub mod ecosystem_compat;
 pub mod fallback;
 pub mod loader_extensions;
-pub mod mixin_lifter;
+pub mod magic_primitives;
 pub mod mine_cut_all;
-pub mod modpack;
+pub mod mixin_lifter;
 pub mod mod_sync;
 pub mod mod_tick_runtime;
+pub mod modpack;
 pub mod neoforge_wire;
 pub mod profile;
 pub mod unified_bundle;
