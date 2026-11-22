@@ -17,6 +17,7 @@ pub mod gpu_pipeline;
 pub mod hiz_culler;
 mod lod;
 mod mesh;
+pub mod mesher;
 pub mod model_baker;
 mod packed;
 mod region;
