@@ -4571,6 +4571,37 @@ fn stream_chunks(
             .filter(|&(cx, cz)| spectator_chunk_allowed(dim, cx, cz))
             .collect::<Vec<_>>()
     };
+    // MEGA-W2 §3.1 VelocityViewGovernor: under mod-suite the governor orders
+    // this tick's batch — for a fast-moving player (window centre advancing
+    // ≥ a chunk between streams ≈ elytra speed) the dead-ahead chunks send
+    // first. The batch set itself is unchanged; only send order shifts.
+    #[cfg(feature = "mod-suite")]
+    let news = {
+        let (vx, vz) = previous
+            .map(|p| {
+                (
+                    (window.center.0 - p.center.0) as f32 * 16.0,
+                    (window.center.1 - p.center.1) as f32 * 16.0,
+                )
+            })
+            .unwrap_or((0.0, 0.0));
+        let plan = live_plan_velocity_chunks(
+            window.radius.clamp(0, 32) as u8,
+            window.center.0,
+            window.center.1,
+            vx,
+            vz,
+            1.0,
+            news.len(),
+        );
+        let mut rank: HashMap<(i32, i32), usize> = HashMap::with_capacity(plan.len());
+        for (i, c) in plan.into_iter().enumerate() {
+            rank.insert(c, i);
+        }
+        let mut n = news;
+        n.sort_by_key(|c| rank.get(c).copied().unwrap_or(usize::MAX));
+        n
+    };
     // chunks leaving the window get an explicit unload — vanilla keeps
     // client memory bounded and the set now means exactly "chunks the
     // client holds" (updates must only target holders).
@@ -6263,13 +6294,9 @@ fn tick_portal(me: &Arc<Client>, view: i32) -> bool {
     let creative = *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 0;
     // `playersNetherPortalDefaultDelay` (survival, 80 GT = 4 s) and
     // `playersNetherPortalCreativeDelay` (creative/spectator, 1 GT ≈ instant)
-    // are vanilla game ticks of 50 ms; a delay of 0 disables the wait.
-    let delay_gt = gamerule_live_value(if creative {
-        "playersNetherPortalCreativeDelay"
-    } else {
-        "playersNetherPortalDefaultDelay"
-    })
-    .max(0) as u64;
+    // are vanilla game ticks of 50 ms; a delay of 0 disables the wait. The
+    // gamerule read goes through the `player_mechanisms` hook (MEGA-W2 §2.3).
+    let delay_gt = players_nether_portal_delay_ticks(creative) as u64;
     if delay_gt == 0 || (creative && delay_gt <= 1) {
         enter_portal(me, st, bx, by, bz, yaw, pitch, view);
         return true;
@@ -6355,12 +6382,14 @@ fn try_end_portal_activation(
             if !end_portal_ring_complete(reg, dim, ox, fy, oz) {
                 continue;
             }
-            for ix in 1..=3 {
-                for iz in 1..=3 {
-                    set_block_dim(dim, ox + ix, fy, oz + iz, END_PORTAL_STATE);
-                    note_block_update_dim(dim, ox + ix, fy, oz + iz, END_PORTAL_STATE);
-                }
-            }
+            // The 3x3 portal interior is one bulk write: a single
+            // SectionBlocksUpdate batch, not nine per-cell updates (T2).
+            let edits: Vec<(i32, i32, i32, u32)> = (1..=3)
+                .flat_map(|ix| {
+                    (1..=3).map(move |iz| (ox + ix, fy, oz + iz, END_PORTAL_STATE))
+                })
+                .collect();
+            set_blocks_bulk_dim(dim, &edits);
             end_portal_spawn_sound(dim, ox as f64 + 2.5, fy as f64, oz as f64 + 2.5);
             return true;
         }
@@ -6371,12 +6400,12 @@ fn try_end_portal_activation(
             if !end_portal_ring_complete(reg, dim, ox, fy, oz) {
                 continue;
             }
-            for ix in 1..=3 {
-                for iz in 1..=3 {
-                    set_block_dim(dim, ox + ix, fy, oz + iz, END_PORTAL_STATE);
-                    note_block_update_dim(dim, ox + ix, fy, oz + iz, END_PORTAL_STATE);
-                }
-            }
+            let edits: Vec<(i32, i32, i32, u32)> = (1..=3)
+                .flat_map(|ix| {
+                    (1..=3).map(move |iz| (ox + ix, fy, oz + iz, END_PORTAL_STATE))
+                })
+                .collect();
+            set_blocks_bulk_dim(dim, &edits);
             end_portal_spawn_sound(dim, ox as f64 + 2.5, fy as f64, oz as f64 + 2.5);
             return true;
         }
@@ -6914,6 +6943,7 @@ fn is_sign_block_state(state: u32) -> bool {
 }
 /// Remove legacy formatting sequences and C0/C1 controls before any sign text
 /// reaches persistent state or a block-entity broadcast. Retain normal Unicode.
+#[cfg_attr(not(test), allow(dead_code))]
 fn sanitize_sign_line(input: &str) -> String {
     let mut clean = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -10349,7 +10379,17 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         || block_registry::breg().is_some_and(|reg| {
                             adventure_stack_allows(reg, old, &held, COMP_CAN_BREAK)
                         });
-                    if in_range && old != 0 && may_destroy {
+                    // MEGA-W2 §3.1: claim/spawn protection — a non-OP dig inside
+                    // a protected chunk never mutates the world; the client
+                    // gets the authoritative block resynced instead.
+                    let can_modify = can_player_modify_block(
+                        dim,
+                        x,
+                        z,
+                        &me.name,
+                        client_permission_level(&me),
+                    );
+                    if in_range && old != 0 && may_destroy && can_modify {
                         if (gm_creative && status == 0) || req == Some(0.0) {
                             break_now = true;
                         } else if let Some(t) = req {
@@ -10384,8 +10424,19 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     if !break_now && status == 2 && old != 0 {
                         note_block_update_dim(dim, x, y, z, old); // rejected: resync truth
                     }
+                    if !can_modify && old != 0 {
+                        note_block_update_dim(dim, x, y, z, old); // denied: resync truth
+                    }
                     if break_now {
                         finish_block_break(&me, dim, x, y, z, old);
+                        record_live_block_audit(
+                            dim,
+                            (x, y, z),
+                            &me.name,
+                            old,
+                            block_at_dim(dim, x, y, z),
+                            TICK_IDX.load(Ordering::Relaxed),
+                        );
                     }
                 }
                 let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
@@ -10446,6 +10497,20 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     continue;
                 }
                 let place = |pos: BlockPos, state| {
+                    // MEGA-W2 §3.1: claim/spawn protection on the placement
+                    // target — the predicate is authoritative and a denied
+                    // place resyncs the client truth without mutating.
+                    let old_at = block_at_dim(dim, pos.0, pos.1, pos.2);
+                    if !can_player_modify_block(
+                        dim,
+                        pos.0,
+                        pos.2,
+                        &me.name,
+                        client_permission_level(&me),
+                    ) {
+                        ac_resync_block(&me, dim, pos);
+                        return false;
+                    }
                     if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 2 {
                         // Adventure `mayPlace`: the held stack's can_place_on
                         // predicates must match the clicked block.
@@ -10482,6 +10547,14 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         return true;
                     }
                     place_block_dim(dim, pos.0, pos.1, pos.2, state);
+                    record_live_block_audit(
+                        dim,
+                        pos,
+                        &me.name,
+                        old_at,
+                        block_at_dim(dim, pos.0, pos.1, pos.2),
+                        TICK_IDX.load(Ordering::Relaxed),
+                    );
                     true
                 };
                 let sneaking = *me.sneaking.lock().unwrap_or_else(|e| e.into_inner());
@@ -12047,10 +12120,14 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     let front = if b[8] != 0 { 1u8 } else { 0u8 };
                     let mut sl = &b[9..];
                     let mut lines: [String; 4] = Default::default();
+                    // MEGA-W2 §3.1: `ac_sanitize_sign_line` strips control
+                    // characters for everyone and `§` formatting for
+                    // non-operators; operators keep legitimate formatting.
+                    let perm = client_permission_level(&me);
                     for l in lines.iter_mut() {
                         let n = read_varint(&mut sl).unwrap_or(0).clamp(0, 256) as usize;
                         let m = n.min(sl.len());
-                        *l = sanitize_sign_line(&String::from_utf8_lossy(&sl[..m]));
+                        *l = ac_sanitize_sign_line(&String::from_utf8_lossy(&sl[..m]), perm).line;
                         sl = &sl[m..];
                     }
                     let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
@@ -12092,6 +12169,11 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         continue;
                     }
                     creative_slot_clamp(&mut st);
+                    // MEGA-W2 §3.1: `ac_sanitize_creative_item` clamps the
+                    // count for everyone and strips dangerous NBT-bearing
+                    // components (command/spawner/spawn data, attribute
+                    // modifiers) from non-operator submissions.
+                    ac_sanitize_creative_item(&mut st, client_permission_level(&me));
                     if st.1 > 0 {
                         me.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(slot, st.clone());
                     } else {

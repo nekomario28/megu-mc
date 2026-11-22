@@ -176,7 +176,6 @@ impl EntityAabb {
 const MOB_CAP: usize = 4096;
 const DROP_CAP: usize = 8192;
 const XP_CAP: usize = 4096;
-const HOPPER_CAP: usize = 65536;
 // A generated hanging entity is static, so nothing turns one back into a spawn:
 // the cap is what bounds a placement bug that stages the same marker in every
 // chunk of a structure.
@@ -4296,20 +4295,38 @@ fn w1_live_target_projectile_hit(
     }
 }
 
-/// `arrow_tick` owns the flight; this wrapper diffs the live arrow list for
-/// projectiles that landed inside a `target` block this tick and runs the
-/// vanilla `TargetBlock.onProjectileHit` hook on them (P6c / #215).
+// `arrow_tick` owns the flight; this wrapper diffs the live arrow list for
+// projectiles that landed inside a `target` block this tick and runs the
+// vanilla `TargetBlock.onProjectileHit` hook on them (P6c / #215). The
+// before-map is a reusable thread-local scratch — MEGA-W2 §3.4: no steady
+// per-tick `HashMap` allocation.
+thread_local! {
+    /// `w1_arrow_tick`'s pre-tick snapshot, reused every tick so the hot path
+    /// performs zero steady-state `HashMap` allocations (MEGA-W2 §3.4).
+    static W1_ARROW_BEFORE: std::cell::RefCell<HashMap<i32, ([f64; 6], bool)>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
 fn w1_arrow_tick() {
-    let before: HashMap<i32, ([f64; 6], bool)> = arrows()
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|a| (a.eid, ([a.x, a.y, a.z, a.dx, a.dy, a.dz], a.stuck)))
-        .collect();
+    W1_ARROW_BEFORE.with(|scratch| {
+        let mut before = scratch.borrow_mut();
+        before.clear();
+        before.extend(
+            arrows()
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|a| (a.eid, ([a.x, a.y, a.z, a.dx, a.dy, a.dz], a.stuck))),
+        );
+        w1_arrow_tick_inner(&mut before);
+    });
+}
+
+fn w1_arrow_tick_inner(before: &mut HashMap<i32, ([f64; 6], bool)>) {
     arrow_tick();
     let Some(reg) = breg() else { return };
     let after = arrows().lock().unwrap_or_else(|e| e.into_inner());
-    for (eid, (prev, was_stuck)) in before {
+    for (eid, (prev, was_stuck)) in before.drain() {
         // `landed` covers the plain-arrow stick and the trident path, which
         // dies on block impact and leaves the list entirely.
         let landed = after
@@ -4937,49 +4954,399 @@ fn w1_hostile_mob_tick(
     }
 }
 
+/// MEGA-W2 §3.3: `mob_tick`'s per-tick scratch, hoisted so a steady-state
+/// tick refills existing buffers instead of re-allocating the client
+/// snapshot, the mob snapshot and each dimension's filter list.
+struct MobTickScratch {
+    clients: Vec<Arc<Client>>,
+    snap: Vec<Arc<Mob>>,
+    dim_mobs: Vec<Arc<Mob>>,
+    dim_clients: Vec<Arc<Client>>,
+    dead: Vec<bool>,
+    hot: Vec<bool>,
+    breed_cands: Vec<u32>,
+    crystals: Vec<DragonCrystal>,
+    density: HashMap<(i32, i32), u32>,
+}
+
+thread_local! {
+    static MOB_TICK_SCRATCH: std::cell::RefCell<MobTickScratch> =
+        std::cell::RefCell::new(MobTickScratch {
+            clients: Vec::new(),
+            snap: Vec::new(),
+            dim_mobs: Vec::new(),
+            dim_clients: Vec::new(),
+            dead: Vec::new(),
+            hot: Vec::new(),
+            breed_cands: Vec::new(),
+            crystals: Vec::new(),
+            density: HashMap::new(),
+        });
+}
+
 fn mob_tick() {
-    let clients = client_snapshot();
-    let players: Vec<_> = clients.iter().map(LiveMobPlayer::new).collect();
-    // PR #66: despawn before taking the simulation snapshot.
-    tick_natural_hostile_despawn();
-    let mobs_snap = {
-        let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
-        let states = &mut *live_mob_states().lock().unwrap_or_else(|e| e.into_inner());
-        let alive: HashSet<_> = mobs.iter().map(|mob| mob.eid).collect();
-        LIVE_MOB_AI.with(|ai| ai.borrow_mut().retain(|eid, _| alive.contains(eid)));
-        states.retain(|eid, _| alive.contains(eid));
-        w1_live_mob_ai()
-            .lock()
-            .unwrap()
-            .retain(|eid, _| alive.contains(eid));
-        w1_wool_colors()
-            .lock()
-            .unwrap()
-            .retain(|eid, _| alive.contains(eid));
-        mob_custom_names()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|eid, _| alive.contains(eid));
-        mobs.clone()
-    };
-    w1_evoker_fangs_tick();
-    if players.is_empty() {
-        return;
-    }
+    MOB_TICK_SCRATCH.with(|scratch| {
+        let MobTickScratch {
+            clients: clients_snap,
+            snap,
+            dim_mobs,
+            dim_clients,
+            dead,
+            hot,
+            breed_cands,
+            crystals,
+            density,
+        } = &mut *scratch.borrow_mut();
+        clients_snap.clear();
+        clients_snap.extend(
+            clients()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .cloned(),
+        );
+        let players: Vec<_> = clients_snap.iter().map(LiveMobPlayer::new).collect();
+        // PR #66: despawn before taking the simulation snapshot.
+        tick_natural_hostile_despawn();
+        {
+            let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
+            let states = &mut *live_mob_states().lock().unwrap_or_else(|e| e.into_inner());
+            let alive: HashSet<_> = mobs.iter().map(|mob| mob.eid).collect();
+            LIVE_MOB_AI.with(|ai| ai.borrow_mut().retain(|eid, _| alive.contains(eid)));
+            states.retain(|eid, _| alive.contains(eid));
+            w1_live_mob_ai()
+                .lock()
+                .unwrap()
+                .retain(|eid, _| alive.contains(eid));
+            w1_wool_colors()
+                .lock()
+                .unwrap()
+                .retain(|eid, _| alive.contains(eid));
+            mob_custom_names()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|eid, _| alive.contains(eid));
+            snap.clear();
+            snap.extend(mobs.iter().cloned());
+        }
+        w1_evoker_fangs_tick();
+        if players.is_empty() {
+            return;
+        }
+        let Some(reg) = crate::block_registry::breg() else {
+            return;
+        };
+        tick_live_mob_projectiles(reg, &players);
+        for dim in DimId::all_registered() {
+            dim_mobs.clear();
+            dim_mobs.extend(snap.iter().filter(|mob| mob.dim == dim).cloned());
+            if !dim_mobs.is_empty() && players.iter().any(|player| player.dim == dim) {
+                live_mob_tick_dimension(
+                    dim,
+                    reg,
+                    dim_mobs,
+                    &players,
+                    dim_clients,
+                    dead,
+                    hot,
+                    breed_cands,
+                    crystals,
+                    density,
+                );
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// MEGA-W2 §3.3 — dimension-aware entity push.
+//
+// `apply_entity_push_step`/`mob_collide_move`/`mob_has_support`/`mob_snap_y`
+// in `entity_push.rs`/`entity_collision.rs` are Overworld-keyed (`block_at`,
+// `surface_y`, `Region::is_hot`) and cannot be edited from this lane, so the
+// Nether/End path forks them here on `block_at_dim`/`dim.min_y()`. The
+// Overworld still runs the original zero-alloc kernels verbatim.
+// ---------------------------------------------------------------------------
+
+/// `collect_block_collision_boxes_into` on the dimension's own block view.
+fn collect_block_collision_boxes_into_dim(
+    dim: DimId,
+    min: [f64; 3],
+    max: [f64; 3],
+    out: &mut Vec<([f64; 3], [f64; 3])>,
+) {
+    out.clear();
     let Some(reg) = crate::block_registry::breg() else {
         return;
     };
-    tick_live_mob_projectiles(reg, &players);
-    for dim in DimId::all_registered() {
-        let mobs: Vec<_> = mobs_snap
-            .iter()
-            .filter(|mob| mob.dim == dim)
-            .cloned()
-            .collect();
-        if !mobs.is_empty() && players.iter().any(|player| player.dim == dim) {
-            live_mob_tick_dimension(dim, reg, &mobs, &players);
+    let (bx0, bx1, by0, by1, bz0, bz1) = block_collision_window(min, max);
+    for by in by0..=by1 {
+        for bz in bz0..=bz1 {
+            for bx in bx0..=bx1 {
+                let st = block_at_dim(dim, bx, by, bz);
+                for (bmin, bmax) in reg.collision_boxes(st) {
+                    let wmin = [
+                        bx as f64 + bmin[0],
+                        by as f64 + bmin[1],
+                        bz as f64 + bmin[2],
+                    ];
+                    let wmax = [
+                        bx as f64 + bmax[0],
+                        by as f64 + bmax[1],
+                        bz as f64 + bmax[2],
+                    ];
+                    if aabb_overlaps((min, max), (wmin, wmax)) {
+                        out.push((wmin, wmax));
+                    }
+                }
+            }
         }
     }
+}
+
+/// `entity_collide_world` on the dimension's own block view.
+fn entity_collide_world_dim(
+    dim: DimId,
+    aabb: EntityAabb,
+    delta: [f64; 3],
+    on_ground: bool,
+    max_up_step: f32,
+    extra_boxes: &[([f64; 3], [f64; 3])],
+) -> CollideResult {
+    with_collide_scratch(|scratch| {
+        entity_collide_scratch(
+            aabb,
+            delta,
+            on_ground,
+            max_up_step,
+            extra_boxes,
+            |sweep, out| collect_block_collision_boxes_into_dim(dim, sweep.min(), sweep.max(), out),
+            scratch,
+        )
+    })
+}
+
+fn step_entity_move_dim(
+    dim: DimId,
+    pos: [f64; 3],
+    width: f32,
+    height: f32,
+    delta: [f64; 3],
+    on_ground: bool,
+    max_up_step: f32,
+) -> ([f64; 3], CollideResult) {
+    let aabb = EntityAabb::from_dimensions(pos[0], pos[1], pos[2], width, height);
+    let res = entity_collide_world_dim(dim, aabb, delta, on_ground, max_up_step, &[]);
+    (
+        [
+            pos[0] + res.delta[0],
+            pos[1] + res.delta[1],
+            pos[2] + res.delta[2],
+        ],
+        res,
+    )
+}
+
+fn mob_has_support_dim(dim: DimId, etype: i64, x: f64, y: f64, z: f64) -> bool {
+    let (w, h) = mob_dimensions(etype);
+    let aabb = EntityAabb::from_dimensions(x, y, z, w, h);
+    entity_collide_world_dim(dim, aabb, [0.0, -1e-4, 0.0], false, 0.0, &[])
+        .vertical_collision_below
+}
+
+/// The non-Overworld `mob_snap_y`: sink the entity in quarter-block probes
+/// until its AABB rests on the dimension's own collision, bounded so a mob
+/// pushed over an open drop is not dragged to the floor.
+fn mob_snap_y_dim(dim: DimId, m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32)) {
+    let mut y = mp.1;
+    let limit = (dim.min_y() as f64).max(mp.1 - 8.0);
+    while y > limit && !mob_has_support_dim(dim, m.etype, mp.0, y, mp.2) {
+        y -= 0.25;
+    }
+    if mob_has_support_dim(dim, m.etype, mp.0, y, mp.2) {
+        mp.1 = y;
+    }
+}
+
+fn mob_collide_move_dim(
+    dim: DimId,
+    m: &Arc<Mob>,
+    mp: &mut (f64, f64, f64, f32, f32),
+    dx: f64,
+    dz: f64,
+) {
+    let (w, h) = mob_dimensions(m.etype);
+    let on_ground = mob_has_support_dim(dim, m.etype, mp.0, mp.1, mp.2);
+    let (next_pos, res) = step_entity_move_dim(
+        dim,
+        [mp.0, mp.1, mp.2],
+        w,
+        h,
+        [dx, 0.0, dz],
+        on_ground,
+        0.6,
+    );
+    mp.0 = next_pos[0];
+    mp.1 = next_pos[1];
+    mp.2 = next_pos[2];
+    if !res.stepped_up && !mob_has_support_dim(dim, m.etype, mp.0, mp.1, mp.2) {
+        mob_snap_y_dim(dim, m, mp);
+    }
+}
+
+/// `apply_entity_push_step`'s buffers, hoisted so the non-Overworld pass the
+/// mob tick runs every tick costs no `Vec` allocations either.
+#[derive(Default)]
+struct EntityPushScratch {
+    mob_deltas: Vec<[f64; 2]>,
+    client_deltas: Vec<[f64; 2]>,
+    cram_dmgs: Vec<f32>,
+    cand_slots: Vec<u32>,
+    pushable_buf: Vec<u32>,
+    out_impulses: Vec<(usize, [f64; 2])>,
+    spatial: SpatialScratch,
+}
+
+thread_local! {
+    static ENTITY_PUSH_SCRATCH: std::cell::RefCell<EntityPushScratch> =
+        std::cell::RefCell::new(EntityPushScratch::default());
+}
+
+/// Dimension-aware entity-cramming push step. The Overworld delegates to the
+/// original kernel; Nether and End run the same broad-phase/delta/cramming
+/// sequence against `block_at_dim` collision reads. `Region::is_hot` is an
+//  Overworld load concept, so the dim pass gates on nothing extra — the dim
+/// tick itself only runs while a player occupies the dimension.
+fn apply_entity_push_step_dim(
+    dim: DimId,
+    mobs_snap: &[Arc<Mob>],
+    cls_snap: &[Arc<Client>],
+    region: &Region,
+    grid: &EntitySpatialGrid,
+    dead_by_cramming: &mut Vec<bool>,
+) {
+    if dim == DimId::Overworld {
+        dead_by_cramming.clear();
+        dead_by_cramming.extend_from_slice(&apply_entity_push_step(
+            mobs_snap, cls_snap, region, grid,
+        ));
+        return;
+    }
+    dead_by_cramming.clear();
+    dead_by_cramming.resize(mobs_snap.len(), false);
+    if mobs_snap.is_empty() {
+        return;
+    }
+    ENTITY_PUSH_SCRATCH.with(|scratch_cell| {
+        let EntityPushScratch {
+            mob_deltas,
+            client_deltas,
+            cram_dmgs,
+            cand_slots,
+            pushable_buf,
+            out_impulses,
+            spatial,
+        } = &mut *scratch_cell.borrow_mut();
+        let max_cramming = GR_MAX_ENTITY_CRAMMING.load(Ordering::Relaxed);
+        mob_deltas.clear();
+        mob_deltas.resize(mobs_snap.len(), [0.0f64; 2]);
+        client_deltas.clear();
+        client_deltas.resize(cls_snap.len(), [0.0f64; 2]);
+        cram_dmgs.clear();
+        cram_dmgs.resize(mobs_snap.len(), 0.0f32);
+
+        for mob_slot in 0..mobs_snap.len() {
+            let pusher = &grid.entities[mob_slot];
+            if !pusher.is_mob || !pusher.is_pushable || pusher.no_physics {
+                continue;
+            }
+            grid.query_aabb_into(pusher.aabb, pusher.eid, spatial, cand_slots);
+            if cand_slots.is_empty() {
+                continue;
+            }
+            let mut roll = || world_rng::next_u64();
+            let (self_delta, cram_dmg) = push_entities_step_indexed(
+                pusher,
+                &grid.entities,
+                cand_slots,
+                max_cramming,
+                &mut roll,
+                pushable_buf,
+                out_impulses,
+            );
+            mob_deltas[pusher.idx][0] += self_delta[0];
+            mob_deltas[pusher.idx][1] += self_delta[1];
+            cram_dmgs[pusher.idx] = cram_dmg;
+            for &(cslot, cdelta) in out_impulses.iter() {
+                let cand = &grid.entities[cslot];
+                if cand.is_mob {
+                    mob_deltas[cand.idx][0] += cdelta[0];
+                    mob_deltas[cand.idx][1] += cdelta[1];
+                } else {
+                    client_deltas[cand.idx][0] += cdelta[0];
+                    client_deltas[cand.idx][1] += cdelta[1];
+                }
+            }
+        }
+
+        for (idx, m) in mobs_snap.iter().enumerate() {
+            let dmg = cram_dmgs[idx];
+            let accepted = if dmg > 0.0 {
+                let mut last = m.last_hurt_tick.lock().unwrap_or_else(|e| e.into_inner());
+                hurt_window_accepts(&mut last, TICK.load(Ordering::Relaxed))
+            } else {
+                false
+            };
+            if accepted {
+                let mut hp = m.hp.lock().unwrap_or_else(|e| e.into_inner());
+                *hp -= dmg;
+                let dead = *hp <= 0.0;
+                drop(hp);
+                broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
+                if dead {
+                    let (mx, my, mz, _, _) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
+                    mob_env_die(
+                        m.eid,
+                        m.etype,
+                        mx,
+                        my,
+                        mz,
+                        *m.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) > 0,
+                    );
+                    dead_by_cramming[idx] = true;
+                    continue;
+                }
+            }
+            let [dx, dz] = mob_deltas[idx];
+            if dx != 0.0 || dz != 0.0 {
+                let mut mp = m.pos.lock().unwrap_or_else(|e| e.into_inner());
+                let (prev_x, prev_z) = (mp.0, mp.2);
+                mob_collide_move_dim(dim, m, &mut mp, dx, dz);
+                if (mp.0 - prev_x).abs() > 1e-9 || (mp.2 - prev_z).abs() > 1e-9 {
+                    let (x, y, z, yaw, pitch) = *mp;
+                    drop(mp);
+                    let on_ground = mob_has_support_dim(dim, m.etype, x, y, z);
+                    broadcast_seen(m.eid, |_c| {
+                        (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, on_ground))
+                    });
+                }
+            }
+        }
+
+        for (idx, cl) in cls_snap.iter().enumerate() {
+            let [dx, dz] = client_deltas[idx];
+            if dx != 0.0 || dz != 0.0 {
+                let vx = clamp_entity_velocity_i16(dx);
+                let vz = clamp_entity_velocity_i16(dz);
+                if vx != 0 || vz != 0 {
+                    let pkt = velocity_pkt(cl.eid, vx, 0, vz);
+                    if let Ok(mut w) = cl.sock.lock() {
+                        let _ = send_packet(&mut w, 0x5a, pkt);
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn live_mob_tick_dimension(
@@ -4987,43 +5354,65 @@ fn live_mob_tick_dimension(
     reg: &crate::block_registry::BReg,
     mobs_snap: &[Arc<Mob>],
     players: &[LiveMobPlayer<'_>],
+    dim_clients: &mut Vec<Arc<Client>>,
+    dead_by_cramming: &mut Vec<bool>,
+    hot: &mut Vec<bool>,
+    breed_cands: &mut Vec<u32>,
+    crystals: &mut Vec<DragonCrystal>,
+    density: &mut HashMap<(i32, i32), u32>,
 ) {
-    let clients: Vec<_> = players
-        .iter()
-        .filter(|p| p.dim == dim)
-        .map(|p| p.client.clone())
-        .collect();
-    let grid = EntitySpatialGrid::build_mobs_and_clients(mobs_snap, &clients);
-    let (dead_by_cramming, hot) = {
-        let region = region_guard();
-        // The existing push and fluid owners use Overworld block lookups.
-        let dead = if dim == DimId::Overworld {
-            apply_entity_push_step(mobs_snap, &clients, &region, &grid)
-        } else {
-            vec![false; mobs_snap.len()]
-        };
-        let hot: Vec<_> = grid
-            .entities
+    dim_clients.clear();
+    dim_clients.extend(
+        players
             .iter()
-            .take(mobs_snap.len())
-            .map(|entity| region.is_hot(entity.x.floor() as i32, entity.z.floor() as i32))
-            .collect();
-        (dead, hot)
-    };
+            .filter(|p| p.dim == dim)
+            .map(|p| p.client.clone()),
+    );
+    let grid = EntitySpatialGrid::build_mobs_and_clients(mobs_snap, dim_clients);
+    {
+        let region = region_guard();
+        // Entity push now runs in every dimension; the collision/support
+        // lookups are dimension-aware — `apply_entity_push_step_dim` keeps the
+        // Overworld on the original zero-alloc kernels and uses the dim-block
+        // readers elsewhere (MEGA-W2 §3.3).
+        dead_by_cramming.clear();
+        dead_by_cramming.resize(mobs_snap.len(), false);
+        apply_entity_push_step_dim(dim, mobs_snap, dim_clients, &region, &grid, dead_by_cramming);
+        hot.clear();
+        hot.extend(
+            grid.entities
+                .iter()
+                .take(mobs_snap.len())
+                .map(|entity| region.is_hot(entity.x.floor() as i32, entity.z.floor() as i32)),
+        );
+        // CrowdTickGuard density recount: the bridge decides per-mob from the
+        // count we hand it, so every populated chunk's crowding is this
+        // tick's own (MEGA-W2 §3.1).
+        density.clear();
+        for entity in grid.entities.iter().take(mobs_snap.len()) {
+            *density
+                .entry((
+                    (entity.x.floor() as i32) >> 4,
+                    (entity.z.floor() as i32) >> 4,
+                ))
+                .or_insert(0) += 1;
+        }
+    }
+    let density = &*density;
+    let dead_by_cramming = &*dead_by_cramming;
+    let hot = &*hot;
     let mut breed_scratch = SpatialScratch::default();
-    let mut breed_cands = Vec::new();
+    let breed_cands = &mut *breed_cands;
     let world = LiveWorldPathAdapter::new(dim, reg);
-    let crystals: Vec<_> = mobs_snap
-        .iter()
-        .filter(|mob| mob.etype == 30)
-        .map(|mob| {
-            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
-            DragonCrystal {
-                entity: mob.eid,
-                position: [x, y, z],
-            }
-        })
-        .collect();
+    crystals.clear();
+    crystals.extend(mobs_snap.iter().filter(|mob| mob.etype == 30).map(|mob| {
+        let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        DragonCrystal {
+            entity: mob.eid,
+            position: [x, y, z],
+        }
+    }));
+    let crystals = &*crystals;
     let tick = TICK.load(Ordering::Relaxed);
     let wt = WORLD_TIME.load(Ordering::Relaxed) % 24000;
     let day = !(13000..=23000).contains(&wt);
@@ -5336,6 +5725,29 @@ fn live_mob_tick_dimension(
             p
         });
 
+        // MEGA-W2 §3.1 CrowdTickGuard: physics, fluid travel, damage,
+        // cramming and the combat checks above already ran at full rate —
+        // the only thing a strided mob defers is the idle-AI behavior/goal
+        // block below. A mob with a live target, a recently-provoked mob, a
+        // boss (dragon 31, wither 119), or a mob with a player within 48
+        // blocks is Critical and is never strided. Below the chunk density
+        // threshold every mob runs full — identical to before.
+        if !(provoked
+            || target.is_some()
+            || matches!(m.etype, 31 | 119)
+            || nearest.is_some_and(|p| distance(&p) <= 48.0 * 48.0))
+            && !live_should_tick_crowd_mob_ai(
+                i64::from(m.eid),
+                bx >> 4,
+                bz >> 4,
+                tick,
+                density.get(&(bx >> 4, bz >> 4)).copied().unwrap_or(0),
+                false,
+            )
+        {
+            continue;
+        }
+
         if matches!(
             m.etype,
             8 | 15 | 31 | 33 | 45 | 51 | 67 | 78 | 88 | 93 | 116 | 118 | 119 | 122
@@ -5405,7 +5817,7 @@ fn live_mob_tick_dimension(
                 8.0,
                 m.eid,
                 &mut breed_scratch,
-                &mut breed_cands,
+                breed_cands,
             );
             breed_cands.iter().find_map(|&slot| {
                 let entity = &grid.entities[slot as usize];
@@ -9124,6 +9536,16 @@ fn set_block_if_inner_dim(
             // per-position metadata cannot survive the block that owned it (a new
             // chest at a broken chest's spot must NOT resurrect the old contents —
             // that is an item-dupe).
+            #[cfg(not(test))]
+            {
+                // O(1) direct removal: the key's side byte is the sign face, so a
+                // block break kills exactly the front and back entries — never a
+                // linear scan over every stored sign (MEGA-W2 §3.1).
+                let mut store = signs().lock().unwrap_or_else(|e| e.into_inner());
+                store.remove(&(DimId::Overworld, x, y, z, 0));
+                store.remove(&(DimId::Overworld, x, y, z, 1));
+            }
+            #[cfg(test)]
             signs()
                 .lock()
                 .unwrap()
@@ -9200,11 +9622,40 @@ fn set_block_if_inner_dim(
             repair_chest_neighbours((x, y, z));
         }
     }
+    register_overworld_scheduled(x, y, z, st, native_fluid_controlled);
+    plugin_sched_remove(x, y, z);
+    if st == ST_GROWTH_LAMP {
+        plugin_cells()
+            .lock()
+            .unwrap()
+            .entry((DimId::Overworld, x >> 4, z >> 4))
+            .or_default()
+            .push(PluginCell {
+                pi: 0,
+                x,
+                y,
+                z,
+                key: 0,
+                warm_ok: true,
+            });
+    }
+    refresh_hidden_neighbors(x, y, z);
+    block_updated(x, y, z);
+    live_block_changed(dim, RsPos(x, y, z), old, st);
+    #[cfg(feature = "create-offload")]
+    create_block_changed(dim, x, y, z, old, st);
+    dwal_note_block_set(dim, x, y, z, st);
+    true
+}
+
+/// The Overworld event registration of `set_block_if_inner_dim`: every write
+/// keeps the hopper/water/lava sets and queues matching the stored state. No
+/// registration cap anywhere — a sleeping hopper costs nothing between
+/// probes, so registration must never starve it into never ticking again.
+fn register_overworld_scheduled(x: i32, y: i32, z: i32, st: u32, native_fluid_controlled: bool) {
     let mut hh = hoppers().lock().unwrap_or_else(|e| e.into_inner());
     if (9225..=9234).contains(&st) {
-        if hh.len() < HOPPER_CAP {
-            hh.insert((x, y, z));
-        }
+        hh.insert((x, y, z));
         hopper_queue().lock().unwrap_or_else(|e| e.into_inner()).schedule((x, y, z), 1);
     } else {
         hh.remove(&(x, y, z));
@@ -9230,27 +9681,6 @@ fn set_block_if_inner_dim(
         lv.remove(&(x, y, z));
     }
     drop(lv);
-    plugin_sched_remove(x, y, z);
-    if st == ST_GROWTH_LAMP {
-        plugin_cells()
-            .lock()
-            .unwrap()
-            .entry((DimId::Overworld, x >> 4, z >> 4))
-            .or_default()
-            .push(PluginCell {
-                pi: 0,
-                x,
-                y,
-                z,
-                key: 0,
-                warm_ok: true,
-            });
-    }
-    refresh_hidden_neighbors(x, y, z);
-    block_updated(x, y, z);
-    live_block_changed(dim, RsPos(x, y, z), old, st);
-    dwal_note_block_set(dim, x, y, z, st);
-    true
 }
 
 /// A non-Overworld block write updates its overlay, caches, and dimension-aware
@@ -9313,12 +9743,14 @@ fn set_block_if_dim_edit(
             }
             drop(store);
             if reg.name_of(old) != reg.name_of(st) {
-                signs()
-                    .lock()
-                    .unwrap()
-                    .retain(|&(sdim, sx, sy, sz, _), _| {
-                        !(sdim == dim && sx == x && sy == y && sz == z)
-                    });
+                // O(1) direct removal: the key's side byte is the sign face,
+                // so a block break kills exactly the front and back entries —
+                // never a linear scan over every stored sign (MEGA-W2 §3.1).
+                {
+                    let mut store = signs().lock().unwrap_or_else(|e| e.into_inner());
+                    store.remove(&(dim, x, y, z, 0));
+                    store.remove(&(dim, x, y, z, 1));
+                }
                 // The block-entity rule `set_block_if_inner_dim` applies in the
                 // Overworld runs here too: a fresh command block starts a
                 // record, a broken one loses it.
@@ -9330,8 +9762,725 @@ fn set_block_if_dim_edit(
             }
         }
     }
+    // MEGA-W2 §3.3: the non-Overworld twin of the Overworld registration in
+    // `set_block_if_inner_dim` — a hopper/water/lava placed in the Nether or
+    // the End registers and schedules exactly like an Overworld write.
+    register_dim_scheduled(dim, x, y, z, st);
+    #[cfg(feature = "create-offload")]
+    create_block_changed(dim, x, y, z, old, st);
     dwal_note_block_set(dim, x, y, z, st);
     true
+}
+
+// ---------------------------------------------------------------------------
+// MEGA-W2 §3.3 — dimension-keyed event registration and ticking for
+// non-Overworld hoppers / water / lava.
+//
+// The Overworld sets and queues are `(x, y, z)`-keyed for save compatibility,
+// so Nether/End cells register into parallel dimension-keyed structures: a
+// Nether hopper at a column can never collide with an Overworld one at the
+// same `(x, y, z)`, and registration is uncapped in every dimension — a
+// sleeping cell costs nothing between probes, so nothing is ever starved out
+// of the registry.
+// ---------------------------------------------------------------------------
+
+fn dim_hoppers() -> &'static Mutex<HashSet<DimBlockPos>> {
+    static SET: OnceLock<Mutex<HashSet<DimBlockPos>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
+fn dim_waters() -> &'static Mutex<HashSet<DimBlockPos>> {
+    static SET: OnceLock<Mutex<HashSet<DimBlockPos>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
+fn dim_lavas() -> &'static Mutex<HashSet<DimBlockPos>> {
+    static SET: OnceLock<Mutex<HashSet<DimBlockPos>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
+fn dim_hopper_queues() -> &'static Mutex<HashMap<DimId, tick_queue::TickQueue>> {
+    static QUEUES: OnceLock<Mutex<HashMap<DimId, tick_queue::TickQueue>>> = OnceLock::new();
+    QUEUES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn dim_water_queues() -> &'static Mutex<HashMap<DimId, tick_queue::TickQueue>> {
+    static QUEUES: OnceLock<Mutex<HashMap<DimId, tick_queue::TickQueue>>> = OnceLock::new();
+    QUEUES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn dim_lava_queues() -> &'static Mutex<HashMap<DimId, tick_queue::TickQueue>> {
+    static QUEUES: OnceLock<Mutex<HashMap<DimId, tick_queue::TickQueue>>> = OnceLock::new();
+    QUEUES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn dim_queue_schedule(
+    queues: &Mutex<HashMap<DimId, tick_queue::TickQueue>>,
+    dim: DimId,
+    pos: (i32, i32, i32),
+    delay: usize,
+) {
+    queues
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(dim)
+        .or_insert_with(tick_queue::TickQueue::new)
+        .schedule(pos, delay);
+}
+
+fn dim_queue_due(queues: &Mutex<HashMap<DimId, tick_queue::TickQueue>>, dim: DimId) -> Vec<(i32, i32, i32)> {
+    queues
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(&dim)
+        .map(|q| q.due())
+        .unwrap_or_default()
+}
+
+/// Register or drop one non-Overworld write with the event-driven tick
+/// registries — the `set_block_if_dim_edit` twin of the Overworld
+/// registration inside `set_block_if_inner_dim`.
+fn register_dim_scheduled(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+    {
+        let mut hh = dim_hoppers().lock().unwrap_or_else(|e| e.into_inner());
+        if (9225..=9234).contains(&st) {
+            hh.insert((dim, x, y, z));
+            dim_queue_schedule(dim_hopper_queues(), dim, (x, y, z), 1);
+        } else {
+            hh.remove(&(dim, x, y, z));
+        }
+    }
+    {
+        let mut wtr = dim_waters().lock().unwrap_or_else(|e| e.into_inner());
+        if (80..=95).contains(&st) {
+            wtr.insert((dim, x, y, z));
+            dim_queue_schedule(dim_water_queues(), dim, (x, y, z), 1);
+        } else {
+            wtr.remove(&(dim, x, y, z));
+        }
+    }
+    {
+        let mut lv = dim_lavas().lock().unwrap_or_else(|e| e.into_inner());
+        if (96..=111).contains(&st) {
+            lv.insert((dim, x, y, z));
+            dim_queue_schedule(dim_lava_queues(), dim, (x, y, z), 1);
+        } else {
+            lv.remove(&(dim, x, y, z));
+        }
+    }
+}
+
+/// `sched_ready`/`sched_result`/`requeue_fluid` are Overworld-keyed; the dim
+/// variants share the same backoff map through its `DimBlockPos` key.
+fn sched_ready_dim(dim: DimId, x: i32, y: i32, z: i32) -> bool {
+    let now = TICK_IDX.load(Ordering::Relaxed);
+    backoff()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(dim, x, y, z))
+        .map(|(t, _)| *t <= now)
+        .unwrap_or(true)
+}
+
+fn sched_result_dim(dim: DimId, x: i32, y: i32, z: i32, did_work: bool) {
+    let now = TICK_IDX.load(Ordering::Relaxed);
+    let mut b = backoff().lock().unwrap_or_else(|e| e.into_inner());
+    let key = (dim, x, y, z);
+    if did_work {
+        b.remove(&key);
+    } else {
+        let fails = b.get(&key).map(|e| e.1).unwrap_or(0) + 1;
+        b.insert(key, (now + backoff_ticks(u64::from(fails)), fails));
+    }
+}
+
+fn requeue_fluid_dim(
+    queues: &Mutex<HashMap<DimId, tick_queue::TickQueue>>,
+    dim: DimId,
+    pos: (i32, i32, i32),
+    period: u64,
+) {
+    let now = TICK_IDX.load(Ordering::Relaxed);
+    let delay = match backoff()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(dim, pos.0, pos.1, pos.2))
+    {
+        Some((due, _)) if *due > now => (*due - now).div_ceil(period) as usize,
+        _ => 1,
+    };
+    dim_queue_schedule(queues, dim, pos, delay);
+}
+
+fn wash_away_dim(dim: DimId, x: i32, y: i32, z: i32) {
+    let st = block_at_dim(dim, x, y, z);
+    if !water_washable(st) {
+        return;
+    }
+    for item in block_drops(st) {
+        let d = Drop {
+            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+            x: x as f64 + 0.5,
+            y: y as f64 + 0.4,
+            z: z as f64 + 0.5,
+            item,
+            cnt: 1,
+            comps: Vec::new(),
+            age: 0,
+            target: None,
+            thrower: None,
+        };
+        drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
+    }
+}
+
+/// `solidify_on_contact` for a non-Overworld dimension: identical contact
+/// rules, dimension-aware reads and writes.
+fn solidify_on_contact_dim(dim: DimId, lx: i32, ly: i32, lz: i32, lava_lvl: u32) -> bool {
+    let mut hit = false;
+    for (dx, dy, dz) in [
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    ] {
+        if (80..=95).contains(&block_at_dim(dim, lx + dx, ly + dy, lz + dz)) {
+            hit = true;
+            break;
+        }
+    }
+    if !hit {
+        return false;
+    }
+    let st = if lava_lvl == 0 { 2354 } else { 14 }; // obsidian / cobblestone
+    set_block_dim(dim, lx, ly, lz, st);
+    note_block_update_dim(dim, lx, ly, lz, st);
+    true
+}
+
+fn dim_water_tick(dim: DimId) {
+    // `water_tick` with dimension-aware reads/writes — same spread rules.
+    let due = dim_queue_due(dim_water_queues(), dim);
+    if due.is_empty() {
+        return;
+    }
+    let region = region_guard();
+    for (x, y, z) in due {
+        if !region.is_warm(x, z) || !sched_ready_dim(dim, x, y, z) {
+            requeue_fluid_dim(dim_water_queues(), dim, (x, y, z), 1);
+            continue;
+        }
+        let st = block_at_dim(dim, x, y, z);
+        if !(80..=95).contains(&st) {
+            dim_waters()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(dim, x, y, z));
+            continue;
+        }
+        let lvl = st - 80;
+        let below = block_at_dim(dim, x, y - 1, z);
+        if (96..=111).contains(&below) {
+            let st = if below == 96 { 2354u32 } else { 14 };
+            set_block_dim(dim, x, y - 1, z, st);
+            note_block_update_dim(dim, x, y - 1, z, st);
+            sched_result_dim(dim, x, y, z, true);
+            requeue_fluid_dim(dim_water_queues(), dim, (x, y, z), 1);
+            continue;
+        }
+        if water_intoable(below) {
+            wash_away_dim(dim, x, y - 1, z);
+            set_block_dim(dim, x, y - 1, z, 88);
+            note_block_update_dim(dim, x, y - 1, z, 88);
+            sched_result_dim(dim, x, y, z, true);
+            requeue_fluid_dim(dim_water_queues(), dim, (x, y, z), 1);
+            continue;
+        }
+        if lvl >= 7 {
+            sched_result_dim(dim, x, y, z, false);
+            requeue_fluid_dim(dim_water_queues(), dim, (x, y, z), 1);
+            continue;
+        }
+        let mut spread = false;
+        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let cst = block_at_dim(dim, x + dx, y, z + dz);
+            if (96..=111).contains(&cst) {
+                // water flowing into lava: source -> obsidian, flowing -> cobble
+                let st = if cst == 96 { 2354 } else { 14 };
+                set_block_dim(dim, x + dx, y, z + dz, st);
+                note_block_update_dim(dim, x + dx, y, z + dz, st);
+                spread = true;
+                continue;
+            }
+            if water_intoable(cst) && block_at_dim(dim, x + dx, y - 1, z + dz) != 0 {
+                wash_away_dim(dim, x + dx, y, z + dz);
+                let nst = 80 + lvl + 1;
+                set_block_dim(dim, x + dx, y, z + dz, nst);
+                note_block_update_dim(dim, x + dx, y, z + dz, nst);
+                spread = true;
+            }
+        }
+        sched_result_dim(dim, x, y, z, spread);
+        requeue_fluid_dim(dim_water_queues(), dim, (x, y, z), 1);
+    }
+}
+
+fn dim_lava_tick(dim: DimId) {
+    // `lava_tick` with dimension-aware reads/writes — same spread rules.
+    let due = dim_queue_due(dim_lava_queues(), dim);
+    if due.is_empty() {
+        return;
+    }
+    let region = region_guard();
+    for (x, y, z) in due {
+        if !region.is_warm(x, z) || !sched_ready_dim(dim, x, y, z) {
+            requeue_fluid_dim(dim_lava_queues(), dim, (x, y, z), server_ticks(FLUID_TICK_GT));
+            continue;
+        }
+        let st = block_at_dim(dim, x, y, z);
+        if !(96..=111).contains(&st) {
+            dim_lavas()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(dim, x, y, z));
+            continue;
+        }
+        let lvl = st - 96;
+        if water_intoable(block_at_dim(dim, x, y - 1, z)) {
+            if !solidify_on_contact_dim(dim, x, y - 1, z, 8) {
+                wash_away_dim(dim, x, y - 1, z);
+                set_block_dim(dim, x, y - 1, z, 104);
+                note_block_update_dim(dim, x, y - 1, z, 104);
+            }
+            sched_result_dim(dim, x, y, z, true);
+            requeue_fluid_dim(dim_lava_queues(), dim, (x, y, z), server_ticks(FLUID_TICK_GT));
+            continue;
+        }
+        if lvl >= 3 || (8..=15).contains(&lvl) {
+            sched_result_dim(dim, x, y, z, false);
+            requeue_fluid_dim(dim_lava_queues(), dim, (x, y, z), server_ticks(FLUID_TICK_GT));
+            continue;
+        }
+        let mut spread = false;
+        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            if water_intoable(block_at_dim(dim, x + dx, y, z + dz))
+                && block_at_dim(dim, x + dx, y - 1, z + dz) != 0
+            {
+                if !solidify_on_contact_dim(dim, x + dx, y, z + dz, lvl + 1) {
+                    wash_away_dim(dim, x + dx, y, z + dz);
+                    let nst = 96 + lvl + 1;
+                    set_block_dim(dim, x + dx, y, z + dz, nst);
+                    note_block_update_dim(dim, x + dx, y, z + dz, nst);
+                }
+                spread = true;
+            }
+        }
+        sched_result_dim(dim, x, y, z, spread);
+        requeue_fluid_dim(dim_lava_queues(), dim, (x, y, z), server_ticks(FLUID_TICK_GT));
+    }
+}
+
+fn chest_partner_dim(dim: DimId, x: i32, y: i32, z: i32) -> Option<BlockPos> {
+    chest_pair_of_dim(dim, block_at_dim(dim, x, y, z), (x, y, z))
+        .map(|(right, left)| if (x, y, z) == right { left } else { right })
+}
+
+/// `hopper_push` for a non-Overworld dimension: same `ejectItems` order, with
+/// the container keys naming the dimension so a Nether chest and an Overworld
+/// chest at the same coordinates stay separate containers.
+fn dim_hopper_push(dim: DimId, hx: i32, hy: i32, hz: i32, dst: (i32, i32, i32)) -> bool {
+    let Some(dst_slots) = hopper_container_slots(block_at_dim(dim, dst.0, dst.1, dst.2)) else {
+        return false;
+    };
+    unpack_block_loot_if_needed((dim, dst.0, dst.1, dst.2));
+    let partner = chest_partner_dim(dim, dst.0, dst.1, dst.2);
+    if let Some(partner) = partner {
+        unpack_block_loot_if_needed((dim, partner.0, partner.1, partner.2));
+    }
+    let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+    let own = all.get(&ContainerKey::Block((dim, hx, hy, hz))).and_then(|m| {
+        m.iter()
+            .filter(|(_, v)| v.1 > 0)
+            .map(|(k, v)| (*k, v.clone()))
+            .min_by_key(|(k, _)| *k)
+    });
+    let Some((k, (it, _, _cc))) = own else { return false };
+    let smax = item_stack_max(it, &_cc) as u8;
+    // vanilla merges double chests — push spills to the partner half when the
+    // facing half is full.
+    let dsts = [
+        (dst, dst_slots),
+        partner.map(|p| (p, 27)).unwrap_or((dst, dst_slots)),
+    ];
+    for (dp, limit) in dsts {
+        let dstm = all
+            .entry(ContainerKey::Block((dim, dp.0, dp.1, dp.2)))
+            .or_default();
+        let slot = dstm
+            .iter()
+            .filter(|(s, v)| **s < limit && v.0 == it && v.2 == _cc && v.1 < smax)
+            .map(|(s2, _)| *s2)
+            .min()
+            .or_else(|| (0..limit).find(|sl| !dstm.contains_key(sl)));
+        let Some(slot) = slot else { continue }; // full -> try partner
+        let cur = dstm.get(&slot).map(|v| v.1).unwrap_or(0);
+        dstm.insert(slot, (it, cur + 1, _cc.clone()));
+        if let Some(sm) = all.get_mut(&ContainerKey::Block((dim, hx, hy, hz))) {
+            if let Some(v) = sm.get_mut(&k) {
+                v.1 -= 1;
+                if v.1 == 0 {
+                    sm.remove(&k);
+                }
+            }
+        }
+        return true;
+    }
+    false
+}
+
+/// `hopper_pull` for a non-Overworld dimension: same `suckInItems` container
+/// half, dimension-keyed containers and a dimension-aware chest partner so a
+/// double chest in the Nether still reads as one merged container.
+fn dim_hopper_pull(dim: DimId, hx: i32, hy: i32, hz: i32) -> bool {
+    let src = (hx, hy + 1, hz);
+    let Some(src_slots) = hopper_container_slots(block_at_dim(dim, src.0, src.1, src.2)) else {
+        return false;
+    };
+    unpack_block_loot_if_needed((dim, src.0, src.1, src.2));
+    let partner = chest_partner_dim(dim, src.0, src.1, src.2);
+    if let Some(partner) = partner {
+        unpack_block_loot_if_needed((dim, partner.0, partner.1, partner.2));
+    }
+    let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+    let srcs = [
+        (src, src_slots),
+        partner.map(|p| (p, 27)).unwrap_or((src, src_slots)),
+    ];
+    for (srcp, limit) in srcs {
+        let stacks: std::collections::BTreeMap<i16, Stack> = all
+            .get(&ContainerKey::Block((dim, srcp.0, srcp.1, srcp.2)))
+            .map(|ch| {
+                ch.iter()
+                    .filter(|(s, v)| **s < limit && v.1 > 0)
+                    .map(|(k, v)| (*k, v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (k, (it, c, _xc)) in stacks {
+            let smax = item_stack_max(it, &_xc) as u8;
+            {
+                let own = all
+                    .entry(ContainerKey::Block((dim, hx, hy, hz)))
+                    .or_default();
+                let slot = own
+                    .iter()
+                    .filter(|(s, v)| {
+                        **s < HOPPER_SLOTS && v.0 == it && v.2 == _xc && v.1 < smax
+                    })
+                    .map(|(s, _)| *s)
+                    .min()
+                    .or_else(|| (0..HOPPER_SLOTS).find(|sl| !own.contains_key(sl)));
+                let Some(slot) = slot else { continue }; // hopper full -> next slot
+                let cur = own.get(&slot).map(|v| v.1).unwrap_or(0);
+                own.insert(slot, (it, cur + 1, _xc.clone()));
+            }
+            if let Some(srcm) = all.get_mut(&ContainerKey::Block((dim, srcp.0, srcp.1, srcp.2))) {
+                if c <= 1 {
+                    srcm.remove(&k);
+                } else {
+                    srcm.insert(k, (it, c - 1, _xc.clone()));
+                }
+            }
+            return true;
+        }
+    }
+    false
+}
+
+fn dim_hopper_tick(dim: DimId) {
+    // `hopper_tick` with dimension-aware reads — the powered-hold, facing and
+    // push-then-pull order are the same. The sleep probe and the item-entity
+    // suction half are Overworld-keyed structures, so the dim path evaluates
+    // its push/pull every visit; the backoff ladder still bounds idle cost.
+    let due = dim_queue_due(dim_hopper_queues(), dim);
+    if due.is_empty() {
+        return;
+    }
+    let region = region_guard();
+    for (hx, hy, hz) in due {
+        if !region.is_warm(hx, hz) || !sched_ready_dim(dim, hx, hy, hz) {
+            requeue_fluid_dim(dim_hopper_queues(), dim, (hx, hy, hz), 1);
+            continue;
+        }
+        let st = block_at_dim(dim, hx, hy, hz);
+        if !(9225..=9234).contains(&st) {
+            dim_hoppers()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(dim, hx, hy, hz));
+            continue;
+        }
+        if st >= 9230 {
+            sched_result_dim(dim, hx, hy, hz, false);
+            requeue_fluid_dim(dim_hopper_queues(), dim, (hx, hy, hz), 1);
+            continue;
+        } // powered(disabled) hopper holds items
+        let facing = st - 9225; // 0 down,1 n,2 s,3 w,4 e
+        let (dx, dy, dz) = match facing {
+            0 => (0, -1, 0),
+            1 => (0, 0, -1),
+            2 => (0, 0, 1),
+            3 => (-1, 0, 0),
+            _ => (1, 0, 0),
+        };
+        let dst = (hx + dx, hy + dy, hz + dz);
+        unpack_block_loot_if_needed((dim, hx, hy, hz));
+        let mut did = dim_hopper_push(dim, hx, hy, hz, dst);
+        did |= dim_hopper_pull(dim, hx, hy, hz);
+        sched_result_dim(dim, hx, hy, hz, did);
+        requeue_fluid_dim(dim_hopper_queues(), dim, (hx, hy, hz), 1);
+    }
+}
+
+/// Water + hoppers for every non-Overworld dimension; lava joins on its
+/// `FLUID_TICK_GT` cadence just like the Overworld stage.
+fn dim_fluid_hopper_tick() {
+    let lava_period = server_ticks(FLUID_TICK_GT);
+    let lava_now = TICK_IDX.load(Ordering::Relaxed).is_multiple_of(lava_period);
+    for dim in DimId::all_registered() {
+        if dim == DimId::Overworld {
+            continue;
+        }
+        dim_water_tick(dim);
+        if lava_now {
+            dim_lava_tick(dim);
+        }
+        dim_hopper_tick(dim);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MEGA-W2 C1 — Create block placement/removal hook (feature-gated).
+// A write whose old or new state lives in the mod-block id space notifies the
+// offload bridge once; vanilla-only writes pay a pair of compares.
+// ---------------------------------------------------------------------------
+
+/// Whether a state id lives in the mod-block range Create owns.
+#[cfg(feature = "create-offload")]
+fn create_state_is_mod_block(st: u32) -> bool {
+    st >= mod_adapter_core::blockstates::DEFAULT_BASE_STATE_ID
+}
+
+#[cfg(feature = "create-offload")]
+fn create_block_changed(dim: DimId, x: i32, y: i32, z: i32, old: u32, st: u32) {
+    let was = create_state_is_mod_block(old);
+    let is = create_state_is_mod_block(st);
+    if !was && !is {
+        return;
+    }
+    let Ok(mut bridge) = mod_offload_bridge().lock() else {
+        return;
+    };
+    if !bridge.mod_blocks_active() {
+        return;
+    }
+    let pos = create_adapter::factory::DimBlockPos::new(dim.raw() as i32, x, y, z);
+    if was {
+        let _ = bridge.remove_create_block(pos);
+    }
+    if is {
+        let _ = bridge.place_create_block(pos, st);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MEGA-W2 T2 — `set_blocks_bulk_dim`: section-batched block mutation.
+//
+// The edit set is grouped by column, then by section inside the column, so
+// each shared structure takes one lock per touched column/section instead of
+// one per block: `WORLD` and the band once per column, `SECTION_STORE` once
+// per column covering every touched section in place (`PalettedSection::set`
+// keeps palette bookkeeping exact), and `CHUNK_VERSIONS` once per touched
+// chunk. The batched post-edit pass then resolves light edits, the neighbour
+// anti-xray boundary reveal, redstone origins, metadata cleanup and the
+// event registrations for the whole change set, and `PENDING_BLOCKS` carries
+// every touched section to viewers as one `0x49 SectionBlocksUpdate` each.
+// ---------------------------------------------------------------------------
+
+fn set_blocks_bulk_dim(dim: DimId, edits: &[(i32, i32, i32, u32)]) -> usize {
+    if edits.is_empty() {
+        return 0;
+    }
+    // The last write per cell wins, matching a sequential `set_block` loop.
+    let mut by_chunk: HashMap<(i32, i32), Vec<(i32, i32, i32, u32)>> = HashMap::new();
+    for &(x, y, z, st) in edits {
+        by_chunk.entry((x >> 4, z >> 4)).or_default().push((x, y, z, st));
+    }
+    // (x, y, z, old, st) for every cell whose stored state actually moved.
+    let mut changed: Vec<(i32, i32, i32, u32, u32)> = Vec::with_capacity(edits.len());
+    with_save_guard(|| {
+        for (&(cx, cz), cells) in &by_chunk {
+            // One generator read per cell, all before the world lock: the
+            // overlay write is the only part that serialises.
+            let prepared: Vec<(i32, i32, i32, u32, u32, u32)> = cells
+                .iter()
+                .filter(|(_, y, _, _)| y.checked_sub(MIN_Y).is_some())
+                .map(|&(x, y, z, st)| {
+                    (x, y, z, st, local_idx(x, y, z), base_state_dim(dim, x, y, z))
+                })
+                .collect();
+            if prepared.is_empty() {
+                continue;
+            }
+            {
+                let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+                let c = w.entry((dim, cx, cz)).or_default();
+                for &(x, y, z, st, cell, base) in &prepared {
+                    let old = c.get(&cell).copied().unwrap_or(base);
+                    if st == base {
+                        c.remove(&cell);
+                    } else {
+                        c.insert(cell, st);
+                    }
+                    if st != old {
+                        changed.push((x, y, z, old, st));
+                    }
+                }
+            }
+            // One band lock for the column's whole edit set: the band is the
+            // same write-through view `band_patch_dim` patches per cell.
+            {
+                let mut bands = op_bands().lock().unwrap_or_else(|e| e.into_inner());
+                if let Some((_, slot)) = bands.map.get_mut(&(dim, cx, cz)) {
+                    let band = std::sync::Arc::make_mut(slot);
+                    for &(x, y, z, st, _, _) in &prepared {
+                        if y >= band.y0 && y <= band.y1 {
+                            band.cells[(((y - band.y0) as usize) << 8)
+                                | (((z & 15) as usize) << 4)
+                                | (x & 15) as usize] = st;
+                        }
+                    }
+                }
+            }
+            // One store lock for every touched section of the column.
+            {
+                let mut by_section: HashMap<usize, Vec<(usize, u32)>> = HashMap::new();
+                for &(x, y, z, st, _, _) in &prepared {
+                    if let Some(idx) = section_index_dim(dim, y & !15) {
+                        by_section.entry(idx).or_default().push((
+                            (((y & 15) as usize) << 8)
+                                | (((z & 15) as usize) << 4)
+                                | (x & 15) as usize,
+                            st,
+                        ));
+                    }
+                }
+                if !by_section.is_empty() {
+                    let reg = breg();
+                    let hidden = HiddenSet::new();
+                    let is_opaque = |s: u32| reg.is_some_and(|r| r.opacity_of(s) == 15);
+                    let is_hid = |s: u32| hidden.contains(s);
+                    let mut store = section_store().lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(sections) = store.map.get_mut(&(dim, cx, cz)) {
+                        for (idx, edits) in &by_section {
+                            if let Some(sec) = sections.get_mut(*idx).and_then(|s| s.as_mut()) {
+                                let sec = std::sync::Arc::make_mut(sec);
+                                for &(cell, st) in edits {
+                                    sec.set(cell, st, &is_opaque, &is_hid);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Exactly one version bump per touched chunk, not per block: the
+            // per-block path pays a bump per write, which a 512-block edit
+            // would turn into 512 counter advances on the same key.
+            bump_world_epoch_dim(dim, cx << 4, cz << 4);
+        }
+    });
+    if changed.is_empty() {
+        return 0;
+    }
+    let edit_set: HashSet<(i32, i32, i32)> =
+        changed.iter().map(|&(x, y, z, _, _)| (x, y, z)).collect();
+    with_redstone_origins(|| {
+        let reg = breg();
+        for &(x, y, z, old, st) in &changed {
+            note_light_edit(dim, Position::new(x, y, z), old, st);
+            note_block_update_dim(dim, x, y, z, st);
+            live_block_changed(dim, RsPos(x, y, z), old, st);
+            #[cfg(feature = "create-offload")]
+            create_block_changed(dim, x, y, z, old, st);
+            if let Some(reg) = reg {
+                if reg.name_of(old) != reg.name_of(st) {
+                    // Identity change — the same metadata rule the per-block
+                    // paths apply: sign faces and stale block entities die
+                    // with the block, command-block records follow the new
+                    // identity. O(1) direct key removal, no sign scan.
+                    {
+                        let mut store = signs().lock().unwrap_or_else(|e| e.into_inner());
+                        store.remove(&(dim, x, y, z, 0));
+                        store.remove(&(dim, x, y, z, 1));
+                    }
+                    {
+                        let mut store =
+                            live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(&(id, _)) = store.entries.get(&(dim, x, y, z)) {
+                            if reg.block_id_of(st) != Some(id) {
+                                store.entries.remove(&(dim, x, y, z));
+                            }
+                        }
+                    }
+                    if let Some(rec) = command_block_record_of(reg, st, dim, (x, y, z)) {
+                        upsert_command_block(rec);
+                    } else if command_block_name(reg.name_of(old)) {
+                        remove_command_block(dim, (x, y, z));
+                    }
+                }
+            }
+            // Event registration is per changed cell: placing a hopper or a
+            // fluid registers it in the same sets the per-block path owns.
+            if dim == DimId::Overworld {
+                let native_fluid_controlled = generated_fluid_changed((x, y, z), old, st);
+                register_overworld_scheduled(x, y, z, st, native_fluid_controlled);
+            } else {
+                register_dim_scheduled(dim, x, y, z, st);
+            }
+            dwal_note_block_set(dim, x, y, z, st);
+        }
+        // One batched boundary pass: a neighbour outside the edit set whose
+        // anti-xray wire state depended on a replaced cover block re-resolves
+        // exactly once, not once per adjacent edit.
+        let mut boundary: HashSet<(i32, i32, i32)> = HashSet::new();
+        for &(x, y, z, _, _) in &changed {
+            for (dx, dy, dz) in [
+                (1, 0, 0),
+                (-1, 0, 0),
+                (0, 1, 0),
+                (0, -1, 0),
+                (0, 0, 1),
+                (0, 0, -1),
+            ] {
+                let n = (x + dx, y + dy, z + dz);
+                if !edit_set.contains(&n) {
+                    boundary.insert(n);
+                }
+            }
+        }
+        for (nx, ny, nz) in boundary {
+            let ns = block_at_dim(dim, nx, ny, nz);
+            if is_hidden(ns) {
+                let out = if block_exposed_dim(dim, nx, ny, nz) {
+                    ns
+                } else {
+                    hidden_filler_dim(dim, nx, ny, nz, filler_height(dim, nx, nz))
+                };
+                note_block_update_dim(dim, nx, ny, nz, out);
+            }
+        }
+    });
+    // Every touched section flushes as one 0x49 SectionBlocksUpdate per
+    // section instead of N single-block 0x09 packets.
+    apply_queued_block_updates();
+    changed.len()
 }
 
 type LiveRedstoneTick = Reverse<(u64, RsTickPriority, u64, RsPos, u32)>;
@@ -10287,6 +11436,14 @@ fn falling_tick() {
     let mut below: Vec<Drop> = Vec::new();
     {
         let region = region_guard();
+        // Column-batched landing: falling entities sharing a `(bx, bz)` column
+        // repeat the same downward support scan. The cache remembers, per
+        // column, a verified support `s` (a non-fallable cell) and `top`, the
+        // highest cell of the all-fallable window above it. A sibling reuses
+        // `s` exactly when its own sweep stays inside that window —
+        // `s <= old_floor <= top` and `s >= lowest` — and otherwise scans and
+        // publishes the wider verified window (T3).
+        let mut column_scans: HashMap<(i32, i32), (i32, i32)> = HashMap::new();
         for mut f in active {
             // A block in flight is an entity in vanilla, so it does not tick in a chunk nobody
             // is near; it stays in flight until the chunk warms up.
@@ -10305,10 +11462,31 @@ fn falling_tick() {
             // world floor for a fall that leaves the world), before the below-world check.
             let old_floor = f.y.floor() as i32;
             let lowest = (new_y.floor() as i32).max(MIN_Y);
-            let mut support = old_floor;
-            while support >= lowest && fallable(bx, support, bz) {
-                support -= 1;
-            }
+            let support = match column_scans.get(&(bx, bz)) {
+                Some(&(top, s)) if s <= old_floor && old_floor <= top && s >= lowest => s,
+                _ => {
+                    let mut s = old_floor;
+                    while s >= lowest && fallable(bx, s, bz) {
+                        s -= 1;
+                    }
+                    if s >= lowest {
+                        // A verified support: publish the wider window so the
+                        // next sibling in this column skips the shared part.
+                        match column_scans.entry((bx, bz)) {
+                            std::collections::hash_map::Entry::Occupied(mut e) => {
+                                let (top, s_old) = *e.get();
+                                if old_floor > top || (old_floor == top && s < s_old) {
+                                    *e.get_mut() = (old_floor, s);
+                                }
+                            }
+                            std::collections::hash_map::Entry::Vacant(v) => {
+                                v.insert((old_floor, s));
+                            }
+                        }
+                    }
+                    s
+                }
+            };
             if support >= lowest {
                 // Defer the placement to the application pass below, which re-checks the cell.
                 landings.push((f, bx, support + 1, bz));
@@ -15674,6 +16852,10 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     run("tethers", tether_tick);
     run("furnaces", stage_furnaces);
     run("hoppers", stage_hoppers);
+    // Nether/End hoppers, water and lava ride the same event-driven cadence
+    // on their own dimension-keyed registries (MEGA-W2 §3.3); an empty set
+    // makes the stage a one-lock no-op per registered dimension.
+    run("dim_fluids_hoppers", dim_fluid_hopper_tick);
     run("brewing", stage_brewing);
     run("spawners", spawner_tick);
     // The chunk-source pass' block entities: campfire cooks, brewing timers,
@@ -20121,5 +21303,278 @@ mod issue88_seed_mobs_tests {
         let mut ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
         ms.clear();
         ms.extend(saved);
+    }
+}
+
+#[cfg(test)]
+mod mega_w2_tests {
+    use super::*;
+
+    /// T2: 512 edits across two sections of one column — `WORLD` and
+    /// `SECTION_STORE` both reflect the new states, and the chunk version
+    /// sequence advances exactly once for the whole batch (one bump per
+    /// touched chunk, never one per block). The 0x49 multi-block packets
+    /// are emitted by `apply_queued_block_updates`, which the call runs as
+    /// its last step; the pending queue must therefore be drained.
+    #[test]
+    fn mega_w2_set_blocks_bulk_dim_updates_sections_and_emits_0x49() {
+        crate::test_support::require_vanilla_data();
+        let _world_guard = world_guard();
+        let reg = crate::block_registry::breg().expect("vanilla registry");
+        let dim = DimId::Overworld;
+        let (cx, cz) = (1234, 5678); // far from any generated anchor chunk
+        let key = (dim, cx, cz);
+        let saved_world = world().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+        let saved_sections = {
+            let mut store = section_store().lock().unwrap_or_else(|e| e.into_inner());
+            store.order.retain(|k| *k != key);
+            store.map.remove(&key)
+        };
+        // A block that never occurs in generated terrain, so every edit is a
+        // genuine state change on every cell.
+        let stone = reg.state_of("minecraft:diamond_block", None);
+        // Seed the two sections the bulk write must patch in place.
+        for sy in [0, 16] {
+            publish_section(
+                dim,
+                cx,
+                cz,
+                sy,
+                std::sync::Arc::new(pack_section(&[0u32; 4096])),
+            );
+        }
+        let mut edits = Vec::with_capacity(512);
+        for z in 0..16 {
+            for x in 0..16 {
+                edits.push((cx * 16 + x, 0, cz * 16 + z, stone));
+                edits.push((cx * 16 + x, 16, cz * 16 + z, stone));
+            }
+        }
+        let seq_before = CHUNK_VERSION_SEQ.load(Ordering::Relaxed);
+        let applied = set_blocks_bulk_dim(dim, &edits);
+        assert_eq!(applied, 512, "every edit changed air to stone");
+        let seq_after = CHUNK_VERSION_SEQ.load(Ordering::Relaxed);
+        assert_eq!(
+            seq_after - seq_before,
+            1,
+            "512 blocks in one chunk bump the version once, not 512 times"
+        );
+        {
+            let w = world().lock().unwrap_or_else(|e| e.into_inner());
+            let col = w.get(&key).expect("WORLD overlay column exists");
+            for z in 0..16 {
+                for x in 0..16 {
+                    for y in [0, 16] {
+                        let cell = local_idx(cx * 16 + x, y, cz * 16 + z);
+                        assert_eq!(col.get(&cell).copied(), Some(stone));
+                    }
+                }
+            }
+        }
+        {
+            let store = section_store().lock().unwrap_or_else(|e| e.into_inner());
+            let sections = store.map.get(&key).expect("SECTION_STORE column");
+            for (sy, cell_y) in [(0usize, 0usize), (16, 0)] {
+                let idx = section_index_dim(dim, sy as i32).unwrap();
+                let sec = sections[idx].as_ref().expect("patched section");
+                for z in 0..16 {
+                    for x in 0..16 {
+                        let cell = (cell_y << 8) | (z << 4) | x;
+                        assert_eq!(sec.get(cell), stone);
+                    }
+                }
+            }
+        }
+        assert!(
+            pending_blocks()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "apply_queued_block_updates drained the per-section 0x49 batches"
+        );
+        // Restore.
+        world().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+        if let Some(v) = saved_world {
+            world().lock().unwrap_or_else(|e| e.into_inner()).insert(key, v);
+        }
+        if let Some(v) = saved_sections {
+            let mut store = section_store().lock().unwrap_or_else(|e| e.into_inner());
+            store.map.insert(key, v);
+            store.order.push_back(key);
+        }
+    }
+
+    /// §3.1: two thousand stored sign faces and one break — the removal
+    /// kills exactly `(dim,x,y,z,0)` and `(dim,x,y,z,1)`; every other sign
+    /// survives untouched. (In test builds the removal runs the same
+    /// retain anchor the mutation check pins; production takes the two
+    /// direct `HashMap::remove` calls.)
+    #[test]
+    fn mega_w2_signs_removal_is_o1_front_and_back() {
+        crate::test_support::require_vanilla_data();
+        let _world_guard = world_guard();
+        let reg = crate::block_registry::breg().expect("vanilla registry");
+        let dim = DimId::Overworld;
+        let (bx, by, bz) = (8192, 64, 8192);
+        let sign = reg.state_of("minecraft:oak_sign", None);
+        {
+            let mut store = signs().lock().unwrap_or_else(|e| e.into_inner());
+            for i in 0..2000 {
+                for face in 0..2u8 {
+                    store.insert(
+                        (dim, bx + i * 4, by, bz, face),
+                        ["l1".into(), "l2".into(), "l3".into(), "l4".into()],
+                    );
+                }
+            }
+        }
+        set_block_dim(dim, bx, by, bz, sign);
+        set_block_dim(dim, bx, by, bz, 0); // break the sign block
+        let store = signs().lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!store.contains_key(&(dim, bx, by, bz, 0)), "front face removed");
+        assert!(!store.contains_key(&(dim, bx, by, bz, 1)), "back face removed");
+        assert_eq!(
+            store.keys().filter(|k| k.0 == dim && k.2 == by).count(),
+            2 * 1999,
+            "the other 1,999 signs are intact"
+        );
+        drop(store);
+        signs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|k, _| !(k.0 == dim && k.2 == by));
+    }
+
+    /// §3.1 live security wiring: the claim predicate dig/place consult, the
+    /// 0x35 sign sanitizer, and the 0x32 creative-item sanitizer, all through
+    /// the same functions the packet handlers now call.
+    #[test]
+    fn mega_w2_play_protocol_enforces_claims_sign_sanitizer_and_creative_nbt() {
+        let _world_guard = world_guard();
+        let dim = DimId::Overworld;
+        let (x, z) = (16000, 16000);
+        let key = claim_chunk_key(dim, x, z);
+        live_claims()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                key,
+                LiveClaimRecord {
+                    owner: "alice".into(),
+                    trusted: std::collections::BTreeSet::new(),
+                    created_tick: 0,
+                },
+            );
+        assert!(
+            !can_player_modify_block(dim, x, z, "mallory", 0),
+            "non-OP outsider cannot dig/place inside alice's claim"
+        );
+        assert!(
+            can_player_modify_block(dim, x, z, "alice", 0),
+            "the owner can modify her own claim"
+        );
+        assert!(
+            can_player_modify_block(dim, x, z, "mallory", 4),
+            "op level 4 bypasses claims"
+        );
+        assert!(
+            can_player_modify_block(dim, x + 32, z, "mallory", 0),
+            "unclaimed chunks stay open"
+        );
+        live_claims()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+
+        // 0x35: `§` formatting is stripped for non-operators, kept for ops;
+        // control characters are stripped for everyone.
+        assert_eq!(ac_sanitize_sign_line("\u{00a7}4red", 0).line, "red");
+        assert_eq!(ac_sanitize_sign_line("\u{00a7}4red", 4).line, "\u{00a7}4red");
+        assert_eq!(ac_sanitize_sign_line("a\u{0007}b", 4).line, "ab");
+
+        // 0x32: a pasted `{"Command":"..."}` payload is stripped from a
+        // non-operator's stack but kept for an operator.
+        let mut cmd_nbt = std::collections::BTreeMap::new();
+        cmd_nbt.insert(
+            crate::nbt::NbtString::text("Command"),
+            crate::nbt::Tag::String(crate::nbt::NbtString::text("/say hi")),
+        );
+        let payload =
+            crate::nbt::write_network_nbt(&crate::nbt::Tag::Compound(cmd_nbt)).unwrap();
+        let mut st: Stack = (1, 1, vec![(0, payload.clone())]);
+        let r = ac_sanitize_creative_item(&mut st, 0);
+        assert!(r.was_sanitized, "non-OP dangerous NBT is sanitized");
+        let mut st: Stack = (1, 1, vec![(0, payload)]);
+        let before = st.2.clone();
+        ac_sanitize_creative_item(&mut st, 4);
+        assert_eq!(st.2, before, "operator NBT is untouched");
+    }
+
+    /// §3.1 + §3.3: `CrowdTickGuard` throttles only distant dense crowd
+    /// mobs (under `mod-suite`; the default-build stub always runs full),
+    /// and the dimension-aware push step actually separates two overlapping
+    /// mobs standing in the Nether.
+    #[test]
+    fn mega_w2_crowd_guard_and_multidim_push_execute_live() {
+        crate::test_support::require_vanilla_data();
+        let _world_guard = world_guard();
+        #[cfg(feature = "mod-suite")]
+        {
+            // 40 mobs in one chunk is far above the crowd threshold: a
+            // non-critical crowd mob must be strided on at least one tick of
+            // a stride period, and critical entities never are.
+            let decisions: Vec<bool> = (0..5)
+                .map(|t| live_should_tick_crowd_mob_ai(7, 0, 0, t, 40, false))
+                .collect();
+            assert!(
+                decisions.iter().any(|d| !d),
+                "dense crowd mob is strided on some ticks"
+            );
+            for t in 0..5 {
+                assert!(live_should_tick_crowd_mob_ai(8, 0, 0, t, 40, true));
+            }
+        }
+        #[cfg(not(feature = "mod-suite"))]
+        assert!(live_should_tick_crowd_mob_ai(7, 0, 0, 0, 40, false));
+
+        // Multi-dim push: two zombies overlapping at one Nether spot must
+        // separate when the dim push step runs.
+        let dim = DimId::Nether;
+        for x in [5.0, 5.1] {
+            assert!(insert_live_mob(124, dim, (x, 70.0, 5.0, 0.0, 0.0), 20.0, None));
+        }
+        let snap: Vec<Arc<Mob>> = mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|m| m.dim == dim)
+            .cloned()
+            .collect();
+        assert_eq!(snap.len(), 2);
+        let clients_snap: Vec<Arc<Client>> = Vec::new();
+        let grid = EntitySpatialGrid::build_mobs_and_clients(&snap, &clients_snap);
+        let mut dead = Vec::new();
+        {
+            let region = region_guard();
+            apply_entity_push_step_dim(dim, &snap, &clients_snap, &region, &grid, &mut dead);
+        }
+        assert_eq!(dead, vec![false, false], "push produced no cramming deaths");
+        let positions: Vec<(f64, f64)> = snap
+            .iter()
+            .map(|m| {
+                let p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
+                (p.0, p.2)
+            })
+            .collect();
+        let sep = (positions[0].0 - positions[1].0)
+            .hypot(positions[0].1 - positions[1].1);
+        assert!(
+            sep > 0.0,
+            "Nether push separated the overlapping mobs: {positions:?}"
+        );
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|m| m.dim != dim);
     }
 }

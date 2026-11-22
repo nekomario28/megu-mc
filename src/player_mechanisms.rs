@@ -2548,7 +2548,6 @@ fn eval_spawn_offset(radius: i32, random_roll: u32) -> i32 {
 /// `playersNetherPortalDefaultDelay` / `playersNetherPortalCreativeDelay`:
 /// game ticks a player stands inside a portal before the dimension change —
 /// 80 in survival, 1 in creative by default.
-#[cfg_attr(not(test), allow(dead_code))]
 fn players_nether_portal_delay_ticks(creative: bool) -> i32 {
     gamerule_live_value(if creative {
         "playersNetherPortalCreativeDelay"
