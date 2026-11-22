@@ -4,6 +4,7 @@
 
 pub mod audio_qol;
 pub mod cli;
+pub mod crash_reporter;
 pub mod friend_client;
 pub mod frame_pacer;
 pub mod hardware_profile;
