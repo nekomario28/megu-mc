@@ -63,6 +63,48 @@ pub struct PregenProgress {
     pub state: PregenState,
 }
 
+/// Knobs for [`PregenJob::run`]: which dimension the spiral materializes its
+/// chunks in, the per-tick generation budget, and the resident-set bound the
+/// unloader enforces. `max_resident: None` leaves every generated chunk
+/// resident — the context grows with the sweep, which is what a caller that
+/// snapshots or hands the world on afterwards wants; `Some(n)` keeps at most
+/// `n` unticketed chunks after each tick's eviction pass, so arbitrarily
+/// large runs hold memory flat. `grace_ticks` is the unloader's grace
+/// window: `0` makes every generated chunk evictable on the very next pass
+/// (a pregen visits each chunk exactly once, so nothing earns a grace
+/// period); a positive window keeps the newest residents a little longer.
+#[derive(Clone, Copy, Debug)]
+pub struct PregenRunConfig<'a> {
+    /// Dimension the generated chunks are materialized in.
+    pub dimension: &'a str,
+    /// Chunks generated per tick; `0` runs no ticks at all.
+    pub budget_per_tick: usize,
+    /// Unticketed resident cap after each tick's eviction pass.
+    pub max_resident: Option<usize>,
+    /// Ticks a fresh resident is exempt from eviction.
+    pub grace_ticks: u64,
+}
+
+/// Final counters from [`PregenJob::run`] — deterministic for a given
+/// `(center, radius, shape, budget, cap)` run.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PregenRunReport {
+    /// Chunks the spiral emitted and `generate` was called for.
+    pub generated_chunks: u64,
+    /// Ticks that produced at least one chunk.
+    pub ticks_run: u64,
+    /// High-water mark of resident overlay chunks observed at any tick
+    /// boundary — the number a memory budget is checked against.
+    pub peak_resident_chunks: usize,
+    /// Chunks the unloader evicted (each handed to the `flushed` sink).
+    pub evicted_chunks: u64,
+    /// Chunks still resident when the run ended.
+    pub resident_chunks: usize,
+    /// Job state at return: `Completed` on a full sweep, otherwise whatever
+    /// `Paused`/`Cancelled` state stopped the loop.
+    pub final_state: PregenState,
+}
+
 /// The cells of spiral ring `k` (`k >= 1`): every offset with
 /// `max(|dx|, |dz|) == k`, walked clockwise starting at the northwest corner
 /// `(-k, -k)` — east along the north edge, south along the east edge, west
@@ -332,6 +374,67 @@ impl PregenJob {
         let n = batch.len();
         self.mark_done(n);
         n
+    }
+
+    /// Drive the job to completion — or until it is left `Paused` or
+    /// `Cancelled` — one bounded tick at a time. Each tick calls
+    /// [`PregenJob::drive_tick`] with `config.budget_per_tick`, so at most
+    /// that many chunks are emitted and `generate`d per tick; then, when
+    /// `config.max_resident` is `Some(cap)`, the ticket-LRU unloader evicts
+    /// unticketed residents down to `cap`, handing every removed overlay to
+    /// `flushed` in LRU order so the caller decides its persistence — an
+    /// eviction never silently drops an edit. Returns the run's
+    /// deterministic counters.
+    ///
+    /// A job that is not `Running` produces no ticks: `run` on a freshly
+    /// `pause()`d or `cancel()`lled job returns a zeroed report carrying the
+    /// unchanged `final_state`.
+    pub fn run(
+        &mut self,
+        ctx: &ServerContext,
+        config: &PregenRunConfig<'_>,
+        mut generate: impl FnMut(i32, i32),
+        mut flushed: impl FnMut(FlushedChunk),
+    ) -> PregenRunReport {
+        let mut unloader = ChunkTicketLruUnloader::new();
+        let resident = |ctx: &ServerContext| {
+            ctx.dimension(config.dimension)
+                .map_or(0, |dim| dim.overlay_count())
+        };
+        let mut report = PregenRunReport {
+            generated_chunks: 0,
+            ticks_run: 0,
+            peak_resident_chunks: 0,
+            evicted_chunks: 0,
+            resident_chunks: resident(ctx),
+            final_state: self.state,
+        };
+        loop {
+            let n = self.drive_tick(
+                ctx,
+                config.dimension,
+                config.budget_per_tick,
+                &mut generate,
+            );
+            if n == 0 {
+                break;
+            }
+            report.ticks_run += 1;
+            report.generated_chunks += n as u64;
+            report.peak_resident_chunks = report.peak_resident_chunks.max(resident(ctx));
+            if let Some(cap) = config.max_resident {
+                for chunk in
+                    unloader.evict_from_context(ctx, report.ticks_run, cap, config.grace_ticks)
+                {
+                    flushed(chunk);
+                    report.evicted_chunks += 1;
+                }
+                report.peak_resident_chunks = report.peak_resident_chunks.max(resident(ctx));
+            }
+        }
+        report.resident_chunks = resident(ctx);
+        report.final_state = self.state;
+        report
     }
 }
 
@@ -615,6 +718,78 @@ mod tests {
         assert_eq!(job.progress().total, u64::MAX);
         // The job still emits its first ring correctly.
         assert_eq!(job.take_batch(1), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn run_sweeps_the_whole_square_and_bounds_residency() {
+        let ctx = ServerContext::new();
+        let mut job = PregenJob::new(0, 0, 5, PregenShape::Square); // 121 chunks
+        let mut generated = Vec::new();
+        let mut flushed = Vec::new();
+        let report = job.run(
+            &ctx,
+            &PregenRunConfig {
+                dimension: "minecraft:overworld",
+                budget_per_tick: 10,
+                max_resident: Some(8),
+                grace_ticks: 0,
+            },
+            |cx, cz| generated.push((cx, cz)),
+            |chunk| flushed.push(chunk),
+        );
+        assert_eq!(generated, spiral_order(0, 0, 5, PregenShape::Square));
+        assert_eq!(report.generated_chunks, 121);
+        assert_eq!(report.ticks_run, 13);
+        assert_eq!(report.final_state, PregenState::Completed);
+        // The cap is enforced after every tick: nothing unticketed outlives
+        // it, and evicted + resident accounts for every generated chunk.
+        assert_eq!(report.resident_chunks, 8);
+        assert_eq!(report.evicted_chunks, 113);
+        assert!(report.peak_resident_chunks <= 8 + 10);
+        assert_eq!(
+            report.evicted_chunks as usize + report.resident_chunks,
+            generated.len()
+        );
+        assert_eq!(flushed.len() as u64, report.evicted_chunks);
+    }
+
+    #[test]
+    fn run_without_a_cap_keeps_everything_resident() {
+        let ctx = ServerContext::new();
+        let mut job = PregenJob::new(0, 0, 2, PregenShape::Circle); // 13 chunks
+        let report = job.run(
+            &ctx,
+            &PregenRunConfig {
+                dimension: "minecraft:overworld",
+                budget_per_tick: 4,
+                max_resident: None,
+                grace_ticks: 0,
+            },
+            |_, _| {},
+            |_| {},
+        );
+        assert_eq!(report.generated_chunks, 13);
+        assert_eq!(report.ticks_run, 4);
+        assert_eq!(report.evicted_chunks, 0);
+        assert_eq!(report.resident_chunks, 13);
+        assert_eq!(report.peak_resident_chunks, 13);
+        // A cancelled job runs no ticks.
+        let mut dead = PregenJob::new(0, 0, 2, PregenShape::Square);
+        dead.cancel();
+        let report = dead.run(
+            &ctx,
+            &PregenRunConfig {
+                dimension: "minecraft:overworld",
+                budget_per_tick: 4,
+                max_resident: None,
+                grace_ticks: 0,
+            },
+            |_, _| {},
+            |_| {},
+        );
+        assert_eq!(report.ticks_run, 0);
+        assert_eq!(report.generated_chunks, 0);
+        assert_eq!(report.final_state, PregenState::Cancelled);
     }
 
     #[test]

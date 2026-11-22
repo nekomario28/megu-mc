@@ -1396,3 +1396,178 @@ fn pregen_plan_square_circle_ticks_and_bad_args() {
         assert_eq!(code(&out), 2, "{args:?} -> {}", stdout(&out));
     }
 }
+
+// ------------------------------------------------------------ pregen-run
+
+#[test]
+fn pregen_run_square_and_circle_execute_the_spiral() {
+    // Square r=5, budget 10, cap 8: the whole 121-chunk square is generated
+    // over 13 ticks while the unloader holds residency at 8.
+    let out = run(&[
+        "pregen-run",
+        "--radius",
+        "5",
+        "--budget-per-tick",
+        "10",
+        "--max-resident",
+        "8",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("square radius 5"), "{text}");
+    assert!(text.contains("121 chunk(s) generated"), "{text}");
+    assert!(text.contains("13 tick(s)"), "{text}");
+    assert!(text.contains("113 evicted"), "{text}");
+    assert!(text.contains("8 still resident"), "{text}");
+
+    // Same run as JSON — every counter deterministic and cross-checked
+    // against the library's own spiral enumerator.
+    let out = run(&[
+        "pregen-run",
+        "--radius",
+        "5",
+        "--budget-per-tick",
+        "10",
+        "--max-resident",
+        "8",
+        "--json",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let doc = parse_data_json(&stdout(&out)).unwrap();
+    let m = doc.as_map().unwrap();
+    assert_eq!(
+        m["schema"],
+        DataValue::Str("mc-spine-pregen-run/1".to_string())
+    );
+    assert_eq!(m["shape"], DataValue::Str("square".to_string()));
+    assert_eq!(m["radius_chunks"], DataValue::Int(5));
+    assert_eq!(m["budget_per_tick"], DataValue::Int(10));
+    assert_eq!(m["max_resident"], DataValue::Int(8));
+    assert_eq!(
+        m["generated_chunks"],
+        DataValue::Int(spiral_order(0, 0, 5, PregenShape::Square).len() as i64)
+    );
+    assert_eq!(m["generated_chunks"], DataValue::Int(121));
+    assert_eq!(m["ticks_run"], DataValue::Int(13));
+    assert_eq!(m["resident_chunks"], DataValue::Int(8));
+    assert_eq!(m["evicted_chunks"], DataValue::Int(113));
+    assert_eq!(m["state"], DataValue::Str("completed".to_string()));
+    // Bounded RAM: the post-generation transient is at most cap + one
+    // tick's budget before the unloader runs.
+    let peak = match &m["peak_resident_chunks"] {
+        DataValue::Int(n) => *n,
+        other => panic!("peak_resident_chunks is not an int: {other:?}"),
+    };
+    assert!(peak <= 8 + 10, "peak {peak} exceeds cap + budget");
+
+    // Circle r=5 covers exactly 81 chunks; the default 1024 cap evicts
+    // nothing, so generated == resident.
+    let out = run(&[
+        "pregen-run",
+        "--radius",
+        "5",
+        "--shape",
+        "circle",
+        "--budget-per-tick",
+        "7",
+        "--json",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let doc = parse_data_json(&stdout(&out)).unwrap();
+    let m = doc.as_map().unwrap();
+    assert_eq!(m["shape"], DataValue::Str("circle".to_string()));
+    assert_eq!(m["generated_chunks"], DataValue::Int(81));
+    assert_eq!(m["ticks_run"], DataValue::Int(12)); // ceil(81 / 7)
+    assert_eq!(m["evicted_chunks"], DataValue::Int(0));
+    assert_eq!(m["resident_chunks"], DataValue::Int(81));
+    assert_eq!(m["peak_resident_chunks"], DataValue::Int(81));
+
+    // --center only shifts coordinates; the counters are translation
+    // invariant.
+    let out = run(&[
+        "pregen-run",
+        "--radius",
+        "2",
+        "--center",
+        "10,-4",
+        "--budget-per-tick",
+        "5",
+        "--json",
+    ]);
+    let doc = parse_data_json(&stdout(&out)).unwrap();
+    let m = doc.as_map().unwrap();
+    assert_eq!(m["center"], chunk_json(10, -4));
+    assert_eq!(m["generated_chunks"], DataValue::Int(25));
+    assert_eq!(m["ticks_run"], DataValue::Int(5));
+}
+
+#[test]
+fn pregen_run_eviction_cap_keeps_residency_bounded() {
+    // A tiny cap over a 25-chunk run: evicted + resident must account for
+    // every generated chunk, and the resident bound must never be exceeded
+    // at a tick boundary.
+    let out = run(&[
+        "pregen-run",
+        "--radius",
+        "2",
+        "--budget-per-tick",
+        "4",
+        "--max-resident",
+        "3",
+        "--json",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let doc = parse_data_json(&stdout(&out)).unwrap();
+    let m = doc.as_map().unwrap();
+    assert_eq!(m["generated_chunks"], DataValue::Int(25));
+    assert_eq!(m["resident_chunks"], DataValue::Int(3));
+    assert_eq!(m["evicted_chunks"], DataValue::Int(22));
+    assert_eq!(m["peak_resident_chunks"], DataValue::Int(7)); // 3 + 4
+
+    // --max-resident 0 keeps nothing resident: the run still generates all
+    // 25 chunks but flushes every one.
+    let out = run(&[
+        "pregen-run",
+        "--radius",
+        "2",
+        "--budget-per-tick",
+        "4",
+        "--max-resident",
+        "0",
+        "--json",
+    ]);
+    let doc = parse_data_json(&stdout(&out)).unwrap();
+    let m = doc.as_map().unwrap();
+    assert_eq!(m["generated_chunks"], DataValue::Int(25));
+    assert_eq!(m["resident_chunks"], DataValue::Int(0));
+    assert_eq!(m["evicted_chunks"], DataValue::Int(25));
+    assert_eq!(m["peak_resident_chunks"], DataValue::Int(4));
+}
+
+#[test]
+fn pregen_run_fails_closed_on_bad_args() {
+    for args in [
+        // Missing required flags.
+        &["pregen-run"][..],
+        &["pregen-run", "--radius", "5"][..],
+        &["pregen-run", "--budget-per-tick", "4"][..],
+        // Zero or unparseable budgets.
+        &["pregen-run", "--radius", "5", "--budget-per-tick", "0"][..],
+        &["pregen-run", "--radius", "5", "--budget-per-tick", "-1"][..],
+        &["pregen-run", "--radius", "5", "--budget-per-tick", "x"][..],
+        // Bad shape, bad radius, bad center.
+        &["pregen-run", "--radius", "5", "--budget-per-tick", "4", "--shape", "hex"][..],
+        &["pregen-run", "--radius", "-1", "--budget-per-tick", "4"][..],
+        &["pregen-run", "--radius", "2000001", "--budget-per-tick", "4"][..],
+        &["pregen-run", "--radius", "5", "--budget-per-tick", "4", "--center", "1,2,3"][..],
+        // Foreign flags and stray arguments.
+        &["pregen-run", "--radius", "5", "--budget-per-tick", "4", "--batch-size", "4"][..],
+        &["pregen-run", "--radius", "5", "--budget-per-tick", "4", "--in", "x"][..],
+        &["pregen-run", "--radius", "5", "--budget-per-tick", "4", "extra"][..],
+        &["pregen-run", "--radius", "5", "--budget-per-tick", "4", "--max-resident"][..],
+    ] {
+        let out = run(args);
+        assert_eq!(code(&out), 2, "{args:?} -> {}", stdout(&out));
+        assert!(stderr(&out).starts_with("mc-spine-world-migrate:"), "{args:?}");
+    }
+}

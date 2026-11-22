@@ -2,7 +2,7 @@
 //! `mc-spine-world-migrate`: inspect `STV1` world snapshots and migrate world
 //! data between Minecraft `1.21.1` and `26.3`, plus the pure-offline operator
 //! subcommands `audit-query` / `rollback` over `AUD1` audit logs and
-//! `pregen-plan` for spiral pregeneration sizing.
+//! `pregen-plan` / `pregen-run` for spiral pregeneration sizing and execution.
 //!
 //! Exit codes: `0` success, `2` a refused downgrade, a refused over-budget
 //! rollback or bad command line, `1` anything wrong with the files themselves
@@ -13,7 +13,8 @@ use mc_spine_state_store::{
     decode_snapshot, encode_snapshot, inspect_anvil_world_dir, inspect_snapshot,
     migrate_anvil_level_dat, migrate_json_document, migrate_snapshot, to_data_json,
     write_file_atomic, AnvilInspectError, AuditAction, AuditLog, AuditQuery, AuditRecord,
-    DataValue, MigrationError, PregenJob, PregenShape, SnapshotSummary,
+    DataValue, MigrationError, PregenJob, PregenRunConfig, PregenShape, ServerContext,
+    SnapshotSummary,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -32,6 +33,7 @@ USAGE:
     mc-spine-world-migrate audit-query --log <audit.aud1> [--actor <name>] [--dim <dim>] [--pos <x,y,z> --radius <r>] [--since-tick <t>] [--limit <n>] [--json]
     mc-spine-world-migrate rollback --log <audit.aud1> --in <world.stv1> --out <restored.stv1> [--actor <name>] [--dim <dim>] [--pos <x,y,z> --radius <r>] [--since-tick <t>] [--max-blocks <n>] [--json]
     mc-spine-world-migrate pregen-plan --radius <chunks> [--shape square|circle] [--center <cx,cz>] [--batch-size <n>] [--json]
+    mc-spine-world-migrate pregen-run --radius <chunks> --budget-per-tick <n> [--shape square|circle] [--center <cx,cz>] [--max-resident <n>] [--json]
     mc-spine-world-migrate --help
 
 COMMANDS:
@@ -72,6 +74,13 @@ COMMANDS:
                    chunk total, ring count, first/last chunk coordinates and
                    the tick count a --batch-size budget implies, for a
                    square or circular radius around --center.
+    pregen-run     Actually execute the spiral pregen: each tick generates at
+                   most --budget-per-tick chunks in a fresh overworld context
+                   and the ticket-LRU unloader then evicts unticketed
+                   residents down to --max-resident, so the resident set —
+                   and RAM — stays bounded no matter how large the radius.
+                   Reports the deterministic counters: chunks generated,
+                   ticks run, peak/evicted/resident chunk counts.
 
 OPTIONS:
     --in <path>          Input file.
@@ -91,19 +100,24 @@ OPTIONS:
     --pos <x,y,z>        Center of the spatial filter; must be given
                          together with --radius.
     --radius <r>         audit-query/rollback: Euclidean radius in blocks
-                         around --pos. pregen-plan: spiral radius in chunks
-                         (required; capped at 2000000, past the vanilla
-                         world border's ~1875000 chunks).
+                         around --pos. pregen-plan/pregen-run: spiral radius
+                         in chunks (required; capped at 2000000, past the
+                         vanilla world border's ~1875000 chunks).
     --since-tick <t>     Only records at tick >= t (inclusive).
     --limit <n>          audit-query: print at most n matching rows.
     --max-blocks <n>     rollback: refuse when more than n block mutations
                          would be rewritten (default 10000, hard cap
                          100000).
-    --shape <s>          pregen-plan footprint: \"square\" (default) covers
+    --shape <s>          pregen footprint: \"square\" (default) covers
                          (2r+1)^2 chunks; \"circle\" covers dx^2+dz^2 <= r^2.
-    --center <cx,cz>     pregen-plan spiral center chunk (default 0,0).
+    --center <cx,cz>     pregen spiral center chunk (default 0,0).
     --batch-size <n>     pregen-plan chunks per tick used for the tick-count
                          estimate (default 64).
+    --budget-per-tick <n>  pregen-run chunks generated per tick (required,
+                         at least 1).
+    --max-resident <n>   pregen-run unticketed resident-chunk cap enforced
+                         by the LRU unloader after every tick (default
+                         1024; 0 keeps nothing resident).
     --json               Print the report as JSON instead of text.
     -h, --help           Show this help.
 
@@ -190,6 +204,14 @@ enum Command {
         batch_size: usize,
         json: bool,
     },
+    PregenRun {
+        radius: u32,
+        shape: PregenShape,
+        center: (i32, i32),
+        budget_per_tick: usize,
+        max_resident: usize,
+        json: bool,
+    },
 }
 
 /// `rollback`'s safety bound: the matched-block count it tolerates without an
@@ -201,6 +223,10 @@ const MAX_BLOCKS_CAP: u64 = 100_000;
 /// real plan fits while a typo cannot spin the ring arithmetic for hours.
 const DEFAULT_BATCH_SIZE: usize = 64;
 const MAX_PREGEN_RADIUS: u32 = 2_000_000;
+/// `pregen-run`'s resident-chunk ceiling when `--max-resident` is not given:
+/// the unloader keeps at most this many unticketed chunks in memory, so the
+/// default run is already bounded.
+const DEFAULT_MAX_RESIDENT_CHUNKS: usize = 1024;
 
 /// The shared `--in`/`--out`/`--to`/`--allow-downgrade`/`--backup-old`/
 /// `--json` flag set of the three migrate subcommands (`--backup-old` is
@@ -414,6 +440,18 @@ fn build_audit_query(flags: &AuditFlags) -> AuditQuery {
     query
 }
 
+/// `--shape` for either pregen subcommand; anything but the two documented
+/// footprints is a usage error, never a silent default.
+fn parse_pregen_shape(cmd: &str, value: &str) -> Result<PregenShape, CliError> {
+    match value {
+        "square" => Ok(PregenShape::Square),
+        "circle" => Ok(PregenShape::Circle),
+        _ => Err(usage(format!(
+            "{cmd}: unknown shape {value:?}; expected \"square\" or \"circle\""
+        ))),
+    }
+}
+
 fn parse_pregen_flags(args: &[String]) -> Result<Command, CliError> {
     let mut radius = None;
     let mut shape = PregenShape::Square;
@@ -449,16 +487,7 @@ fn parse_pregen_flags(args: &[String]) -> Result<Command, CliError> {
                 })?);
             }
             "--shape" => {
-                let v = take_value("--shape")?;
-                shape = match v.as_str() {
-                    "square" => PregenShape::Square,
-                    "circle" => PregenShape::Circle,
-                    _ => {
-                        return Err(usage(format!(
-                            "pregen-plan: unknown shape {v:?}; expected \"square\" or \"circle\""
-                        )))
-                    }
-                };
+                shape = parse_pregen_shape("pregen-plan", &take_value("--shape")?)?
             }
             "--center" => center = parse_center("--center", &take_value("--center")?)?,
             "--batch-size" => {
@@ -489,6 +518,96 @@ fn parse_pregen_flags(args: &[String]) -> Result<Command, CliError> {
         shape,
         center,
         batch_size,
+        json,
+    })
+}
+
+/// `pregen-run` shares `pregen-plan`'s footprint flags but drives a real
+/// sweep, so it takes `--budget-per-tick` (required, at least 1 — a zero
+/// budget would spin forever reporting nothing) and `--max-resident` for the
+/// unloader cap instead of `--batch-size`.
+fn parse_pregen_run_flags(args: &[String]) -> Result<Command, CliError> {
+    let mut radius = None;
+    let mut shape = PregenShape::Square;
+    let mut center = (0, 0);
+    let mut budget_per_tick = None;
+    let mut max_resident = DEFAULT_MAX_RESIDENT_CHUNKS;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+            _ => (arg, None),
+        };
+        let mut take_value = |name: &str| -> Result<String, CliError> {
+            match &inline {
+                Some(v) => Ok(v.clone()),
+                None => {
+                    i += 1;
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| usage(format!("{name} needs a value")))
+                }
+            }
+        };
+        match flag {
+            "--radius" => {
+                let v = take_value("--radius")?;
+                let r = parse_u64("--radius", &v)?;
+                radius = Some(u32::try_from(r).map_err(|_| {
+                    usage(format!(
+                        "pregen-run: --radius {r} exceeds {MAX_PREGEN_RADIUS}"
+                    ))
+                })?);
+            }
+            "--shape" => {
+                shape = parse_pregen_shape("pregen-run", &take_value("--shape")?)?
+            }
+            "--center" => center = parse_center("--center", &take_value("--center")?)?,
+            "--budget-per-tick" => {
+                let v = take_value("--budget-per-tick")?;
+                let n = parse_u64("--budget-per-tick", &v)?;
+                budget_per_tick =
+                    Some(usize::try_from(n).ok().filter(|&n| n >= 1).ok_or_else(
+                        || {
+                            usage(format!(
+                                "pregen-run: --budget-per-tick must be at least 1, got {v:?}"
+                            ))
+                        },
+                    )?);
+            }
+            "--max-resident" => {
+                let v = take_value("--max-resident")?;
+                let n = parse_u64("--max-resident", &v)?;
+                max_resident = usize::try_from(n).map_err(|_| {
+                    usage(format!("pregen-run: --max-resident {n} is too large"))
+                })?;
+            }
+            "--json" => json = true,
+            other if other.starts_with('-') => {
+                return Err(usage(format!("pregen-run: unknown option {other:?}")))
+            }
+            other => {
+                return Err(usage(format!(
+                    "pregen-run: unexpected argument {other:?}"
+                )))
+            }
+        }
+        i += 1;
+    }
+    let radius = require("--radius", radius)?;
+    if radius > MAX_PREGEN_RADIUS {
+        return Err(usage(format!(
+            "pregen-run: --radius {radius} exceeds the {MAX_PREGEN_RADIUS}-chunk cap"
+        )));
+    }
+    Ok(Command::PregenRun {
+        radius,
+        shape,
+        center,
+        budget_per_tick: require("--budget-per-tick", budget_per_tick)?,
+        max_resident,
         json,
     })
 }
@@ -628,6 +747,7 @@ fn parse_args(args: &[String]) -> Result<Command, CliError> {
             })
         }
         "pregen-plan" => parse_pregen_flags(&args[1..]),
+        "pregen-run" => parse_pregen_run_flags(&args[1..]),
         other => Err(usage(format!("unknown command {other:?}; try --help"))),
     }
 }
@@ -1289,6 +1409,85 @@ fn cmd_pregen_plan(
     Ok(())
 }
 
+// ------------------------------------------------------------- pregen-run
+
+/// `pregen-run` executes the same spiral `pregen-plan` sizes, against a fresh
+/// `ServerContext`: each tick `drive_tick`s at most `budget_per_tick` chunks
+/// into `minecraft:overworld` (the CLI generates no block payload — the
+/// resident overlay and the counters are the product), then the ticket-LRU
+/// unloader evicts unticketed residents down to `max_resident` with no grace
+/// window, so the resident set — and the run's RAM — stays bounded at any
+/// radius. Evicted overlays are empty and simply dropped; on a live server
+/// the `flushed` sink is where they would be persisted.
+fn cmd_pregen_run(
+    radius: u32,
+    shape: PregenShape,
+    center: (i32, i32),
+    budget_per_tick: usize,
+    max_resident: usize,
+    json: bool,
+) -> Result<(), CliError> {
+    let ctx = ServerContext::new();
+    let mut job = PregenJob::new(center.0, center.1, radius, shape);
+    let config = PregenRunConfig {
+        dimension: "minecraft:overworld",
+        budget_per_tick,
+        max_resident: Some(max_resident),
+        grace_ticks: 0,
+    };
+    let report = job.run(&ctx, &config, |_, _| {}, |_| {});
+
+    if json {
+        println!(
+            "{}",
+            to_data_json(&map(vec![
+                ("budget_per_tick", int(budget_per_tick)),
+                ("center", chunk_value(center)),
+                ("dimension", DataValue::Str(config.dimension.to_string())),
+                ("evicted_chunks", DataValue::Int(report.evicted_chunks as i64)),
+                (
+                    "generated_chunks",
+                    DataValue::Int(report.generated_chunks as i64),
+                ),
+                ("max_resident", int(max_resident)),
+                (
+                    "peak_resident_chunks",
+                    int(report.peak_resident_chunks),
+                ),
+                ("radius_chunks", DataValue::Int(i64::from(radius))),
+                ("resident_chunks", int(report.resident_chunks)),
+                (
+                    "schema",
+                    DataValue::Str("mc-spine-pregen-run/1".to_string()),
+                ),
+                ("shape", DataValue::Str(shape_name(shape).to_string())),
+                (
+                    "state",
+                    DataValue::Str(format!("{:?}", report.final_state).to_lowercase()),
+                ),
+                ("ticks_run", DataValue::Int(report.ticks_run as i64)),
+            ]))
+        );
+        return Ok(());
+    }
+
+    println!(
+        "pregen-run: {} radius {radius} chunk(s) centered at chunk ({}, {})",
+        shape_name(shape),
+        center.0,
+        center.1
+    );
+    println!(
+        "  {} chunk(s) generated in {} over {} tick(s) at {budget_per_tick} chunk(s)/tick",
+        report.generated_chunks, config.dimension, report.ticks_run
+    );
+    println!(
+        "  peak resident {} chunk(s); {} evicted by the LRU unloader, {} still resident",
+        report.peak_resident_chunks, report.evicted_chunks, report.resident_chunks
+    );
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = match parse_args(&args) {
@@ -1348,6 +1547,14 @@ fn main() -> ExitCode {
             batch_size,
             json,
         } => cmd_pregen_plan(radius, shape, center, batch_size, json),
+        Command::PregenRun {
+            radius,
+            shape,
+            center,
+            budget_per_tick,
+            max_resident,
+            json,
+        } => cmd_pregen_run(radius, shape, center, budget_per_tick, max_resident, json),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

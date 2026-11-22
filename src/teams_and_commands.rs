@@ -4434,6 +4434,27 @@ fn run_policy_command(level: u8, args: &[&str]) -> String {
     }
 }
 
+/// MOD-SUITE bridge: the bounded pregen sweep `mc-spine-world-migrate
+/// pregen-run` drives offline, offered to the live mod suite over a real
+/// `ServerContext` — the same `PregenJob` spiral, the same ticket-LRU
+/// unloader cap, the same counters. `generate` is the mod host's real
+/// worldgen hook; `flushed` receives every evicted overlay in LRU order for
+/// persistence, so nothing evicted is silently dropped. Gated exactly like
+/// the world-snapshot bridge in `anvil_io.rs`: `mod-suite` builds get the
+/// production call site the pregen controller needs; default builds keep an
+/// unchanged dependency graph.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn modsuite_pregen_run(
+    ctx: &mc_spine_state_store::sharded::ServerContext,
+    job: &mut mc_spine_state_store::pregen::PregenJob,
+    config: &mc_spine_state_store::pregen::PregenRunConfig<'_>,
+    generate: impl FnMut(i32, i32),
+    flushed: impl FnMut(mc_spine_state_store::pregen::FlushedChunk),
+) -> mc_spine_state_store::pregen::PregenRunReport {
+    job.run(ctx, config, generate, flushed)
+}
+
 // ------------------------------------------------ #225: player/entity gaps
 
 /// The entity-effect wire packet with an explicit duration and particle
@@ -9066,6 +9087,245 @@ mod policy_cmd_tests {
             .party_friendly_fire = true;
         assert!(should_allow_party_pvp(true));
         policy_reset();
+    }
+
+    /// Save/restore for the world fixtures the live `drop_tick` reads —
+    /// clients, drops, the death-slot hint table and the hot region — plus
+    /// the `DEATH_SLOT_RESTORE` atomic the policy now drives. The death
+    /// lane's own `DeathDropWorld` guard is private to its test module, so
+    /// this mirrors it for the policy lane.
+    struct GapPolicyDeathWorld {
+        clients: Vec<Arc<Client>>,
+        drops: Vec<Drop>,
+        hints: DeathSlotHintTable,
+        region: RegionSets,
+        restore_flag: bool,
+    }
+    impl GapPolicyDeathWorld {
+        fn take() -> Self {
+            Self {
+                clients: std::mem::take(
+                    &mut *clients().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                drops: std::mem::take(
+                    &mut *drops().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                hints: std::mem::replace(
+                    &mut *death_slot_hints()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                    DeathSlotHintTable {
+                        map: HashMap::new(),
+                        order: std::collections::VecDeque::new(),
+                    },
+                ),
+                region: test_region(),
+                restore_flag: death_slot_restore_enabled(),
+            }
+        }
+    }
+    impl std::ops::Drop for GapPolicyDeathWorld {
+        fn drop(&mut self) {
+            *clients().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.clients);
+            *drops().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.drops);
+            *death_slot_hints()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) =
+                std::mem::replace(
+                    &mut self.hints,
+                    DeathSlotHintTable {
+                        map: HashMap::new(),
+                        order: std::collections::VecDeque::new(),
+                    },
+                );
+            set_test_region(self.region.0.clone(), self.region.1.clone());
+            DEATH_SLOT_RESTORE.store(self.restore_flag, Ordering::Relaxed);
+        }
+    }
+
+    /// A live client standing on the origin drop spot, wired the way the
+    /// death lane's `live_client` is: pushed into `clients()` so `drop_tick`
+    /// can see it.
+    fn gap_live_client(name: &str) -> Arc<Client> {
+        let (client, _receiver) = policy_client(name);
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(client.clone());
+        client
+    }
+
+    /// Spawn an aged death drop owned by `owner` hinted to `slot`, exactly
+    /// the entry point `drop_tick` sees after 30+ live ticks.
+    fn gap_death_drop(item: i64, cnt: u8, owner: &str, slot: i16) {
+        let eid = spawn_death_drop((0.0, 70.0, 0.0), (item, cnt, Vec::new()), owner, slot);
+        let mut ds = drops().lock().unwrap_or_else(|e| e.into_inner());
+        ds.iter_mut().find(|d| d.eid == eid).unwrap().age = 100;
+    }
+
+    /// Vanilla-faithful default: the policy key exists everywhere at `false`
+    /// and the live pickup flag agrees — the feature is strictly opt-in.
+    #[test]
+    fn gap_qol_policy_death_slot_restore_defaults_off() {
+        let _world = world_guard();
+        let _serial = policy_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        policy_reset();
+        set_death_slot_restore(false);
+        let ctx = policy_ctx(None);
+        assert_eq!(
+            policy_run(&ctx, "/megu policy get death_slot_restore"),
+            "death_slot_restore = false"
+        );
+        let list = policy_run(&ctx, "/megu policy list");
+        assert!(list.contains("death_slot_restore = false"), "{list}");
+        assert!(
+            !live_server_policy()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .death_slot_restore
+        );
+        assert!(!death_slot_restore_enabled(), "live flag on by default");
+        policy_reset();
+    }
+
+    /// OP levels 0..3 are refused the whole `/megu policy` surface; a refused
+    /// `set` must never reach the stored policy or the live flag.
+    #[test]
+    fn gap_qol_policy_death_slot_restore_refused_below_op_four() {
+        let _world = world_guard();
+        let _serial = policy_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        policy_reset();
+        set_death_slot_restore(false);
+        for level in 0..4u8 {
+            let name = format!("gap_qol_dsr_l{level}");
+            let (ctx, _recv) = policy_op_ctx(&name, level);
+            for msg in [
+                "/megu policy set death_slot_restore true",
+                "/megu policy get death_slot_restore",
+                "/megu policy list",
+            ] {
+                assert_eq!(
+                    policy_run(&ctx, msg),
+                    P8C_DENIED,
+                    "level-{level} source must be refused {msg}"
+                );
+            }
+            policy_deop(&name);
+        }
+        assert!(
+            !live_server_policy()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .death_slot_restore,
+            "a refused set mutated the stored policy"
+        );
+        assert!(!death_slot_restore_enabled(), "a refused set armed the live flag");
+        policy_reset();
+    }
+
+    /// OP level 4 `set true` lands on the very next pickup: a death-scattered
+    /// sword hinted to slot 36 comes home to slot 36 through the real
+    /// `drop_tick`, and its hint is retired with the entity.
+    #[test]
+    fn gap_qol_policy_death_slot_restore_set_true_restores_pickup_slot() {
+        let _world = world_guard();
+        let _serial = policy_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        policy_reset();
+        set_death_slot_restore(false);
+        let _snapshot = GapPolicyDeathWorld::take();
+        set_test_region(HashSet::from([(0, 0)]), HashSet::new());
+        let (op4, _recv) = policy_op_ctx("gap_qol_dsr_op", 4);
+        assert_eq!(
+            policy_run(&op4, "/megu policy set death_slot_restore true"),
+            "death_slot_restore = true"
+        );
+        assert!(
+            death_slot_restore_enabled(),
+            "policy set did not reach the live flag"
+        );
+        policy_deop("gap_qol_dsr_op");
+
+        let sword = name_to_item("diamond_sword").unwrap();
+        let cobble = name_to_item("cobblestone").unwrap();
+        let client = gap_live_client("gap_alice");
+        client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, (cobble, 32, Vec::new()));
+        gap_death_drop(sword, 1, "gap_alice", 36);
+        drop_tick();
+        let inv = client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(
+            inv.get(&36),
+            Some(&(sword, 1, Vec::new())),
+            "sword did not restore to its original slot"
+        );
+        assert_eq!(
+            inv.get(&37),
+            Some(&(cobble, 32, Vec::new())),
+            "the collider was lost instead of relocated"
+        );
+        assert!(drops().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        policy_reset();
+        set_death_slot_restore(false);
+    }
+
+    /// `reset` is the way back to Vanilla: the stored key and the live flag
+    /// both return to `false`, and the next pickup takes the vanilla
+    /// first-free-slot path even with a live hint.
+    #[test]
+    fn gap_qol_policy_death_slot_restore_reset_returns_to_vanilla() {
+        let _world = world_guard();
+        let _serial = policy_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        policy_reset();
+        set_death_slot_restore(false);
+        let _snapshot = GapPolicyDeathWorld::take();
+        set_test_region(HashSet::from([(0, 0)]), HashSet::new());
+        let (op4, _recv) = policy_op_ctx("gap_qol_dsr_op2", 4);
+        assert_eq!(
+            policy_run(&op4, "/megu policy set death_slot_restore true"),
+            "death_slot_restore = true"
+        );
+        assert!(death_slot_restore_enabled());
+        assert_eq!(
+            policy_run(&op4, "/megu policy reset"),
+            "All server policies reset to defaults"
+        );
+        assert_eq!(
+            policy_run(&op4, "/megu policy get death_slot_restore"),
+            "death_slot_restore = false"
+        );
+        assert!(
+            !death_slot_restore_enabled(),
+            "policy reset did not clear the live flag"
+        );
+        policy_deop("gap_qol_dsr_op2");
+
+        // Vanilla pickup resumes: the hinted slot 20 is ignored and the
+        // sword lands in the first free hotbar slot.
+        let sword = name_to_item("diamond_sword").unwrap();
+        let client = gap_live_client("gap_bob");
+        gap_death_drop(sword, 1, "gap_bob", 20);
+        drop_tick();
+        let inv = client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(
+            inv,
+            HashMap::from([(36i16, (sword, 1, Vec::new()))]),
+            "hint applied while the policy was reset"
+        );
+        policy_reset();
+        set_death_slot_restore(false);
     }
 }
 

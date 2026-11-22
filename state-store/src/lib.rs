@@ -128,8 +128,8 @@ pub use namespace_guard::{
     PLACEHOLDER_BLOCK, PLACEHOLDER_ENTITY, PLACEHOLDER_ITEM,
 };
 pub use pregen::{
-    spiral_order, ChunkTicketLruUnloader, FlushedChunk, PregenJob, PregenProgress, PregenShape,
-    PregenState, TicketKind,
+    spiral_order, ChunkTicketLruUnloader, FlushedChunk, PregenJob, PregenProgress,
+    PregenRunConfig, PregenRunReport, PregenShape, PregenState, TicketKind,
 };
 pub use region_tick::{
     partition_independent_regions, tick_dimension_regions_parallel, RegionCoord, RegionTickStats,
