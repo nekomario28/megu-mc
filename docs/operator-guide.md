@@ -5,12 +5,14 @@ knobs, Docker, world migration and status probing. Every command below is
 copied from the binaries in this tree — each binary's `--help` is the
 authoritative flag list.
 
-Six binaries ship in this repository:
+Six primary operator-facing binaries ship in this repository, alongside
+`mc-spine-admin` for the legacy offline administration commands:
 
 | binary | built from | job |
 |---|---|---|
 | `mc-spine` | root package ([../src/main.rs](../src/main.rs)) | the game server |
-| `mc-spine-init` | [../server-files](../server-files) | bootstrap + offline admin of a server directory |
+| `mc-spine-init` | [../server-files](../server-files) | server directory bootstrap; dispatches legacy subcommands to `mc-spine-admin` |
+| `mc-spine-admin` | [../server-files](../server-files) | offline server-file administration (`init`, `doctor`, `op`, `claims`, etc.) |
 | `mc-spine-mod-check` | [../mod-adapter-core](../mod-adapter-core) | modpack pre-flight checker |
 | `mc-spine-world-migrate` | [../state-store](../state-store) | inspect and migrate world data between 1.21.1 and 26.3 |
 | `mc-spine-client` | [../client-app](../client-app) | native client; `--ping` doubles as a status probe |
@@ -23,39 +25,52 @@ honest about today's coverage.
 
 ## 1. First-time server setup
 
-`mc-spine-init` writes the same files a Vanilla server directory carries
-(`eula.txt`, `server.properties`, `ops.json`, `whitelist.json`,
-`banned-players.json`, `banned-ips.json`, `usercache.json`) and edits them
-offline while the server is stopped. It never clobbers an existing file;
-on an existing `server.properties` only the flags you pass are applied.
+Direct `mc-spine-init --dir` creates `world/`, `mods/`, `datapacks/`,
+`backups/`, `server.toml`, `eula.txt`, `ops.json` and `whitelist.json`.
+The defaults are `--mc-version 1.21.1` and `--port 25565`; `26.3` is
+also a tooling target. The initializer preserves existing files unless
+`--force` is passed and does not write `server.properties`. Read the
+Minecraft EULA before using `--accept-eula`; without that flag, a new
+`eula.txt` contains `eula=false`.
+
+```sh
+mc-spine-init --dir /srv/spine --mc-version 1.21.1 --port 25565 --accept-eula
+mc-spine-init --dir /srv/spine-263 --mc-version 26.3 --accept-eula
+mc-spine-init --dir /srv/spine --dry-run --json
+```
+
+Direct `--dry-run` plans without writing files; `--json` emits the
+initialization report. To accept an existing `eula=false` with this
+initializer, use `--force --accept-eula` and review the overwrite plan
+first: `--force` also replaces other generated configuration files.
 
 **One-command onboarding.** The Python launcher bootstraps a local server
 directory, checks the EULA and optional modpack, and starts `mc-spine` only
 when the pre-flight succeeds. Review the Minecraft EULA before opting in.
 
 ```sh
-python3 tools/megu_start.py --dir ./server --accept-eula
+python3 tools/megu_start.py --dir ./server --mc-version 1.21.1 --accept-eula
 python3 tools/megu_start.py --dir ./server --modpack pack.mrpack \
     --accept-eula --lang auto --dry-run --json
+python3 tools/megu_start.py --dir ./server-263 --mc-version 26.3 \
+    --accept-eula --dry-run --json
 ```
 
-`--lang` accepts `auto`, `en`, or `ja`. `--json` emits a
+`megu_start.py` uses `1.21.1` by default and delegates initialization
+to a built or PATH-resolved `mc-spine-init` when available, after its
+Python EULA and `server.properties` setup. `--lang` accepts `auto`,
+`en`, or `ja`. `--json` emits a
 `megu-start-plan/1` plan; `--dry-run` avoids launching the server while
 still initializing `eula.txt` and `server.properties` in the chosen
 directory. A modpack is checked, not downloaded or installed. A plan
 with `action_items` must be resolved before starting the server.
 
+Legacy `mc-spine-init init|doctor|op|deop|ban|pardon|whitelist|claims`
+commands dispatch to the sibling `mc-spine-admin` executable. Install
+both binaries together to use these offline administration commands;
+the legacy `init` subcommand has its own options.
+
 ```sh
-# Create the directory and its files. --mc-version pins the target
-# (default: 26.3, the latest vanilla).
-mc-spine-init init --dir /srv/spine --mc-version 1.21.1 \
-    --port 25565 --motd "mc-spine" --max-players 20
-
-# init writes eula.txt with eula=false — the tool never accepts it for
-# you. Accepting the Minecraft EULA (https://aka.ms/MinecraftEULA) is the
-# operator's act: set eula=true yourself.
-$EDITOR /srv/spine/eula.txt
-
 # Read-only pre-flight. Exit 0 = READY, 2 = EULA missing/not accepted,
 # 1 = a server file is unreadable or corrupt. rcon.password is always
 # redacted in the report.
@@ -140,6 +155,26 @@ Client mixins are excluded by default on dedicated servers. For directory
 scans, exit `0` means no JAR requires Tier 3, `2` means at least one does
 (or invalid arguments), and `1` means the directory or JAR could not be
 read or parsed.
+
+**Automatic adaptation.** Inspect an individual JAR or an installed mods
+directory and optionally write native bundle candidates and a report:
+
+```sh
+mc-spine-mod-check --adapt-jar ./mods/example.jar --out ./adapted --json
+mc-spine-mod-check --adapt-mods-dir ./mods --out ./adapted --json
+mc-spine-mod-check --scaffold-native examplemod --out ./examplemod.bundle.json
+python3 tools/mod_launcher.py --mods-dir ./mods --auto-adapt --dry-run --json
+python3 tools/mod_launcher.py --adapt-mods-dir ./mods --dry-run --json
+```
+
+`--adapt-jar` and `--adapt-mods-dir` classify each JAR as an automatic
+skip, native bundle, Tier 2 shim or Tier 3 fallback with explicit
+blockers. With `--out`, adaptation writes `<mod_id>.bundle.json` and
+`adaptation-report.json`. `--scaffold-native` writes a starter
+`mc-spine-mod-bundle/1` document. The launcher uses the same scan for
+startup planning; `--adapt-mods-dir` implies `--auto-adapt`. These paths
+do not establish compatibility for every Java mod. For the bundle format
+and supported extension points, see [mod-author-guide.md](mod-author-guide.md).
 
 The same pre-flight also runs entirely in the browser: [../website](../website)
 is a zero-build static page (no bundler, no CDN) whose dropzone accepts a
@@ -445,6 +480,20 @@ mc-spine-client --gpu-backend classic-low-spec
 mc-spine-client --gpu-backend classic
 ```
 
+**External shader packs.** Supply a shaderpack ZIP or directory and,
+optionally, a named `profile.<NAME>` in its `shaders.properties`:
+
+```sh
+mc-spine-client --shader-pack ./shaderpacks/example.zip
+mc-spine-client --shader-pack ./shaderpacks/example --shader-profile quality
+```
+
+OptiFine/Iris packs, DistantHorizons LOD packs and native Megu WGSL
+packs are parsed by the shaderpack runtime and integrated with the
+client's RenderGraph. If a pack requires unavailable GPU features,
+the client reports the limitation and falls back to built-in rendering.
+No third-party shaders are bundled.
+
 ## 7. Alpha caveats and security notes
 
 - **This is Alpha.** The verified scope is what [../README.md](../README.md)
@@ -469,10 +518,10 @@ mc-spine-client --gpu-backend classic
   `MC_SPINE_RCON_PASS` are set; it binds loopback by default and has
   per-IP failure lockouts. Treat the password as a secret — the tools
   never print it.
-- **The EULA is never accepted for you** — not by `mc-spine-init`
-  (writes `eula=false`), not by the container (`EULA=TRUE` or it refuses
-  to start). The bare `mc-spine` binary does not read `eula.txt`;
-  accepting the Minecraft EULA is the operator's act either way.
+- **EULA acceptance requires an operator action.** Direct `mc-spine-init`
+  writes `eula=true` only with explicit `--accept-eula` when creating or
+  replacing `eula.txt`. The container requires `EULA=TRUE` to start.
+  The bare `mc-spine` binary does not read `eula.txt`.
 - [../SECURITY_NOTES.md](../SECURITY_NOTES.md) carries the full
   bind/allowlist posture; [../SECURITY.md](../SECURITY.md) is the
   reporting channel.
