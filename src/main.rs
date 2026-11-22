@@ -16975,6 +16975,7 @@ mod mineshaft_runtime_tests {
         tick_idx: u64,
         rng: u64,
         spawn: (f64, f64, f64, f32),
+        special_spawn: SpecialSpawnState,
     }
 
     impl RuntimeSnapshot {
@@ -16994,6 +16995,21 @@ mod mineshaft_runtime_tests {
                 tick_idx: TICK_IDX.load(Ordering::Relaxed),
                 rng: world_rng::saved_state(),
                 spawn: *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()),
+                special_spawn: {
+                    let mut state =
+                        special_spawn_state().lock().unwrap_or_else(|e| e.into_inner());
+                    let saved = std::mem::take(&mut *state);
+                    // `SpecialSpawnState::default()` leaves every timer at 0, so
+                    // the first `villager_raid` tick drains `trader_spawn_delay`
+                    // straight into a wandering-trader attempt. Park the
+                    // process-global timers out of reach for the snapshot's
+                    // lifetime; `drop` restores the saved state.
+                    state.trader_tick_delay = u32::MAX;
+                    state.trader_spawn_delay = u32::MAX;
+                    state.patrol_next = u64::MAX;
+                    state.insomnia_next = u64::MAX;
+                    saved
+                },
             }
         }
     }
@@ -17016,6 +17032,8 @@ mod mineshaft_runtime_tests {
             TICK_IDX.store(self.tick_idx, Ordering::Relaxed);
             world_rng::restore(self.rng);
             *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = self.spawn;
+            *special_spawn_state().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.special_spawn);
         }
     }
 
