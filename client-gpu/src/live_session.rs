@@ -2,16 +2,20 @@
 //! Asynchronous live Protocol 767/777 session and renderer-facing world state.
 //! Socket operations happen on a worker thread; `poll` never performs I/O.
 
+use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::time::{Duration, Instant};
 
+use mc_spine_client::audio_out::{AudioRuntime, AudioSessionConfig, AudioSinkKind};
 use mc_spine_client::protocol::{
     offline_uuid, ClientCustomChannelEvent, ClientPlayEvent, DecodedMagicCastState,
     DecodedMagicSync, DecodedMotionTrigger, DimensionMeta, PlayEvent, ProtocolClient,
-    SeasonWireSync, TeleportSync,
+    SeasonWireSync, TeleportSync, WireSoundEvent, WireStopSound,
 };
 use mc_spine_client::render::ClientVfxHost;
 use mc_spine_client::render_graph::GpuPipelineKind;
+use mc_spine_client::session::{AudioStats, WorldAcousticSnapshot};
+use mc_spine_client::spatial_audio::SpatialSubtitleCue;
 use mc_spine_client::world::{BlockTable, WorldState};
 use mc_spine_client_mesh::mesher::{
     BlockVisualEnhancementResult, BlockVisualInput, VanillaPlusPipelineConfig,
@@ -105,6 +109,8 @@ pub struct PlayerMovement {
 enum WorkerMessage {
     Connected,
     Play(ClientPlayEvent),
+    Sound(WireSoundEvent),
+    StopSound(WireStopSound),
     Closed(String),
 }
 
@@ -116,8 +122,13 @@ enum WorkerCommand {
 pub struct LiveSession {
     incoming: Receiver<WorkerMessage>,
     outgoing: SyncSender<WorkerCommand>,
+    _offline_sender: Option<SyncSender<WorkerMessage>>,
     pub status: SessionStatus,
     pub world: WorldState,
+    audio: AudioRuntime,
+    acoustic_world: WorldAcousticSnapshot,
+    entity_positions: BTreeMap<i32, [f64; 3]>,
+    player_entity_id: Option<i32>,
     pub hud: HudState,
     pub magic: MagicHudState,
     pub vfx: ClientVfxHost,
@@ -196,23 +207,58 @@ impl LiveSession {
         let (tx, incoming) = mpsc::sync_channel(256);
         let (outgoing, rx) = mpsc::sync_channel(8);
         std::thread::spawn(move || run_worker(host, port, username, version, tx, rx));
-        Self::with_channels(incoming, outgoing)
+        Self::with_channels_and_sink(incoming, outgoing, AudioSinkKind::Auto)
     }
 
     fn with_channels(
         incoming: Receiver<WorkerMessage>,
         outgoing: SyncSender<WorkerCommand>,
     ) -> Self {
+        Self::with_channels_and_sink(incoming, outgoing, AudioSinkKind::Null)
+    }
+
+    /// Offline live-session fixture with deterministic null audio output.
+    /// Accepts the same chunk, block and sound events as the network path.
+    pub fn offline_with_null_audio() -> Self {
+        let (tx, incoming) = mpsc::sync_channel(256);
+        let (outgoing, _rx) = mpsc::sync_channel(8);
+        let mut session = Self::with_channels(incoming, outgoing);
+        session._offline_sender = Some(tx);
+        session
+    }
+
+    fn with_channels_and_sink(
+        incoming: Receiver<WorkerMessage>,
+        outgoing: SyncSender<WorkerCommand>,
+        sink: AudioSinkKind,
+    ) -> Self {
         let hw_caps = detect_host_hardware_caps();
         let compute_strategy = select_compute_strategy(&hw_caps);
         let vfx = ClientVfxHost::new(GpuPipelineKind::Classic);
         let tactile_tier = vfx.budget_tier();
         let tactile_config = TactileEffectsConfig::default();
+        let world = WorldState::new(DimensionMeta::default(), BlockTable::load(None));
+        let acoustic_world = WorldAcousticSnapshot::new(&world);
+        let mut audio = AudioRuntime::new(&AudioSessionConfig {
+            sink,
+            assets_dir: std::env::var_os("MC_SPINE_ASSETS_DIR").map(Into::into),
+            asset_index: std::env::var("MC_SPINE_ASSET_INDEX").ok(),
+            max_volume_cap: 1.0,
+            max_concurrent_same_sound: 8,
+            subtitle_path: None,
+            subtitles_to_stderr: false,
+        });
+        audio.mixer.set_world(Box::new(acoustic_world.clone()));
         Self {
             incoming,
             outgoing,
+            _offline_sender: None,
             status: SessionStatus::Connecting,
-            world: WorldState::new(DimensionMeta::default(), BlockTable::load(None)),
+            world,
+            audio,
+            acoustic_world,
+            entity_positions: BTreeMap::new(),
+            player_entity_id: None,
             hud: HudState::default(),
             magic: MagicHudState::default(),
             vfx,
@@ -310,6 +356,50 @@ impl LiveSession {
         self.latest_audio_hint
     }
 
+    /// Environment values currently affecting spatial DSP.
+    pub fn audio_environment_hint(&self) -> EnvironmentAudioHint {
+        self.audio.mixer.environment_hint()
+    }
+
+    /// Drain the UI's spatial cue feed independently from audio-side logging.
+    pub fn drain_subtitle_cues(&mut self) -> Vec<SpatialSubtitleCue> {
+        self.audio.mixer.drain_spatial_subtitle_cues()
+    }
+
+    pub fn audio_stats(&self) -> &AudioStats {
+        self.audio.stats()
+    }
+
+    pub fn audio_sink_label(&self) -> &'static str {
+        self.audio.sink_label()
+    }
+
+    /// Deterministic audio pump for embedded sessions and integration tests.
+    pub fn pump_audio_frames(&mut self, frames: usize) {
+        self.audio.pump_frames(frames);
+    }
+
+    /// Update a known entity location for entity-bound sound packets.
+    pub fn set_entity_position(&mut self, entity_id: i32, position: [f64; 3]) {
+        self.entity_positions.insert(entity_id, position);
+    }
+
+    pub fn remove_entity_position(&mut self, entity_id: i32) {
+        self.entity_positions.remove(&entity_id);
+    }
+
+    /// Accept a decoded 0x68 or 0x67 sound event on the interactive client.
+    pub fn ingest_sound_event(&mut self, mut event: WireSoundEvent) {
+        if let Some(position) = event
+            .entity_id
+            .and_then(|id| self.entity_positions.get(&id))
+        {
+            event.position = Some(position.map(|coord| coord as f32));
+            event.entity_id = None;
+        }
+        self.audio.ingest(&event);
+    }
+
     /// Latest opt-in camera micro-physics offset.
     pub fn latest_camera_micro_offset(&self) -> CameraMicroOffset {
         self.latest_camera_micro_offset
@@ -358,14 +448,10 @@ impl LiveSession {
 
     /// Brief crisp sparks on an ore strike, shield block, crit or arrow
     /// flyby. Silent while the preset is `Off`.
-    pub fn on_impact_sparks(
-        &mut self,
-        pos: [f32; 3],
-        normal: [f32; 3],
-        material: ImpactMaterial,
-    ) {
+    pub fn on_impact_sparks(&mut self, pos: [f32; 3], normal: [f32; 3], material: ImpactMaterial) {
         let tick = self.next_tactile_event_tick();
-        self.tactile_sim.emit_impact_sparks(pos, normal, material, tick);
+        self.tactile_sim
+            .emit_impact_sparks(pos, normal, material, tick);
     }
 
     /// Advance the whole tactile & sky layer by one frame:
@@ -431,6 +517,9 @@ impl LiveSession {
             enclosed_wall_ratio,
             is_raining,
         );
+        self.audio
+            .mixer
+            .set_environment_hint(self.latest_audio_hint);
     }
 
     /// Seasonal canopy family for `on_tree_shake` when the caller has no
@@ -481,7 +570,10 @@ impl LiveSession {
         let dx = (pose.feet[0] - previous.feet[0]) as f32;
         let dy = (pose.feet[1] - previous.feet[1]) as f32;
         let dz = (pose.feet[2] - previous.feet[2]) as f32;
-        if !dx.is_finite() || !dy.is_finite() || !dz.is_finite() || dx * dx + dy * dy + dz * dz > 16.0
+        if !dx.is_finite()
+            || !dy.is_finite()
+            || !dz.is_finite()
+            || dx * dx + dy * dy + dz * dz > 16.0
         {
             return (0.0, 0.0);
         }
@@ -509,6 +601,8 @@ impl LiveSession {
                         break;
                     }
                 }
+                Ok(WorkerMessage::Sound(event)) => self.ingest_sound_event(event),
+                Ok(WorkerMessage::StopSound(event)) => self.audio.ingest_stop(&event),
                 Ok(WorkerMessage::Closed(reason)) => {
                     self.status = SessionStatus::Disconnected(reason);
                     break;
@@ -522,6 +616,7 @@ impl LiveSession {
                 }
             }
         }
+        self.audio.pump();
         // Preserve the last received terrain even if the peer closes immediately
         // after sending chunk data.
         let had_pending = self.world.pending_mesh_sections() > 0;
@@ -561,6 +656,7 @@ impl LiveSession {
             ];
         }
         self.pose = Some(movement.pose);
+        self.update_audio_listener();
         self.refresh_prefetcher();
         let _ = self.outgoing.try_send(WorkerCommand::Movement(movement));
     }
@@ -579,6 +675,16 @@ impl LiveSession {
             PREFETCH_MAX_CHUNKS,
             |cx, cz| columns.contains_key(&(cx, cz)),
         );
+    }
+
+    fn update_audio_listener(&mut self) {
+        if let Some(pose) = self.pose {
+            self.audio
+                .update_listener(pose.feet, Some(pose.yaw), Some(pose.pitch));
+            if let Some(entity_id) = self.player_entity_id {
+                self.entity_positions.insert(entity_id, pose.feet);
+            }
+        }
     }
 
     /// Record frame timing and advance visual transitions before HUD rendering.
@@ -620,34 +726,25 @@ impl LiveSession {
 
     fn apply_play(&mut self, event: PlayEvent) -> Result<(), String> {
         match event {
-            PlayEvent::JoinGame { dimension, .. } | PlayEvent::Respawn { dimension } => {
-                self.world.reset_dimension(dimension);
-                self.terrain_dirty = true;
-                self.pose = None;
-                self.last_motion_delta = [0.0; 2];
-                self.chunk_fades = ChunkFadeTracker::new();
-                self.prefetcher = SpeculativeChunkPrefetcher::new();
-                // A dimension change invalidates the previous dimension's
-                // season frame: restore the untinted atmosphere base instead
-                // of snapping to a possibly season-tinted target, and drop
-                // the SSN1 bookkeeping so a stale seasonal grade (or its
-                // aurora/snow ambience) cannot leak into the new dimension.
-                self.latest_season = None;
-                self.season_ambience = SeasonAmbienceInput::default();
-                self.nature_env.season = self.season_ambience;
-                self.seasoned_atmosphere_target = None;
-                self.atmosphere_blender
-                    .set_target(self.base_atmosphere_target);
-                self.atmosphere_blender.snap_to_target();
+            PlayEvent::JoinGame {
+                entity_id,
+                dimension,
+            } => {
+                self.player_entity_id = Some(entity_id);
+                self.reset_dimension(dimension);
             }
+            PlayEvent::Respawn { dimension } => self.reset_dimension(dimension),
             PlayEvent::Teleport(teleport) => {
                 let pose = PlayerPose::from_teleport(&teleport, self.pose);
                 self.pose = Some(pose);
                 self.camera_sync = Some(pose);
+                self.update_audio_listener();
             }
             PlayEvent::ChunkData(chunk) => {
                 let (cx, cz) = (chunk.cx, chunk.cz);
                 self.world.apply_chunk(*chunk)?;
+                self.acoustic_world.sync_chunk(&self.world, cx, cz);
+                self.audio.mixer.refresh_acoustics();
                 self.chunk_fades.note_chunk(cx, cz);
                 self.refresh_prefetcher();
                 self.terrain_dirty = true;
@@ -656,15 +753,21 @@ impl LiveSession {
                 self.world.apply_light_update(cx, cz, &light)?;
             }
             PlayEvent::BlockUpdate { pos, state_id } => {
-                self.world.apply_block_update(pos, state_id)?
+                self.world.apply_block_update(pos, state_id)?;
+                self.acoustic_world.sync_block(&self.world, pos);
+                self.audio.mixer.refresh_acoustics();
             }
             PlayEvent::SectionBlocksUpdate(changes) => {
                 for (pos, state_id) in changes {
                     self.world.apply_block_update(pos, state_id)?;
+                    self.acoustic_world.sync_block(&self.world, pos);
                 }
+                self.audio.mixer.refresh_acoustics();
             }
             PlayEvent::UnloadChunk { cx, cz } => {
                 self.world.unload_chunk(cx, cz);
+                self.acoustic_world.unload_chunk(cx, cz);
+                self.audio.mixer.refresh_acoustics();
                 self.chunk_fades.forget(cx, cz);
                 self.refresh_prefetcher();
                 self.terrain_dirty = true;
@@ -688,6 +791,30 @@ impl LiveSession {
             _ => {}
         }
         Ok(())
+    }
+
+    fn reset_dimension(&mut self, dimension: DimensionMeta) {
+        self.world.reset_dimension(dimension);
+        self.acoustic_world.reset_dimension(&self.world);
+        self.audio.mixer.refresh_acoustics();
+        self.entity_positions.clear();
+        self.terrain_dirty = true;
+        self.pose = None;
+        self.last_motion_delta = [0.0; 2];
+        self.chunk_fades = ChunkFadeTracker::new();
+        self.prefetcher = SpeculativeChunkPrefetcher::new();
+        // A dimension change invalidates the previous dimension's
+        // season frame: restore the untinted atmosphere base instead
+        // of snapping to a possibly season-tinted target, and drop
+        // the SSN1 bookkeeping so a stale seasonal grade (or its
+        // aurora/snow ambience) cannot leak into the new dimension.
+        self.latest_season = None;
+        self.season_ambience = SeasonAmbienceInput::default();
+        self.nature_env.season = self.season_ambience;
+        self.seasoned_atmosphere_target = None;
+        self.atmosphere_blender
+            .set_target(self.base_atmosphere_target);
+        self.atmosphere_blender.snap_to_target();
     }
 
     fn apply_custom(&mut self, channel: ClientCustomChannelEvent) -> Result<(), String> {
@@ -859,6 +986,9 @@ fn run_connection(
         Duration::from_secs(8),
         protocol,
     )?;
+    // GPU session owns the sink and spatial world. Prevent any global
+    // headless audio configuration from creating a second active playback.
+    client.audio = None;
     if tx.send(WorkerMessage::Connected).is_err() {
         return Ok(());
     }
@@ -924,6 +1054,16 @@ fn run_connection(
                 }
             }
             None => {}
+        }
+        for event in client.sound_events.drain(..) {
+            if tx.send(WorkerMessage::Sound(event)).is_err() {
+                return Ok(());
+            }
+        }
+        for event in client.stop_sound_events.drain(..) {
+            if tx.send(WorkerMessage::StopSound(event)).is_err() {
+                return Ok(());
+            }
         }
     }
 }
@@ -1511,7 +1651,8 @@ mod tests {
 
         // Mid-autumn frame with a warm crimson foliage tint.
         let autumn = ssn1_frame(7, 32_767, [255, 120, 40], [200, 160, 80], 0);
-        live.apply_event(framed(CHANNEL_SEASON_V1, &autumn)).unwrap();
+        live.apply_event(framed(CHANNEL_SEASON_V1, &autumn))
+            .unwrap();
         assert_eq!(
             live.latest_season.as_ref().unwrap().sub_season_idx,
             7,
@@ -1532,7 +1673,8 @@ mod tests {
 
         // A mid-winter frame with snow enabled: frosty haze + snow motes.
         let winter = ssn1_frame(10, 49_151, [235, 240, 255], [220, 230, 240], 0b100);
-        live.apply_event(framed(CHANNEL_SEASON_V1, &winter)).unwrap();
+        live.apply_event(framed(CHANNEL_SEASON_V1, &winter))
+            .unwrap();
         assert_eq!(live.season_ambience.season, ActiveSeasonKind::Winter);
         assert!(live.season_ambience.snow_override);
         assert!(live.season_ambience.snow_amount() > 0.5);
@@ -1666,7 +1808,8 @@ mod tests {
 
         // A mid-winter SSN1 frame with snow override.
         let winter = ssn1_frame(10, 49_151, [235, 240, 255], [220, 230, 240], 0b100);
-        live.apply_event(framed(CHANNEL_SEASON_V1, &winter)).unwrap();
+        live.apply_event(framed(CHANNEL_SEASON_V1, &winter))
+            .unwrap();
         assert_eq!(live.season_ambience.season, ActiveSeasonKind::Winter);
         assert!(live.season_ambience.snow_override);
 
@@ -1709,7 +1852,8 @@ mod tests {
 
         // Spring SSN1 -> a trunk shake sheds sakura-pink petals.
         let spring = ssn1_frame(1, 30_000, [255, 200, 220], [200, 230, 180], 0);
-        live.apply_event(framed(CHANNEL_SEASON_V1, &spring)).unwrap();
+        live.apply_event(framed(CHANNEL_SEASON_V1, &spring))
+            .unwrap();
         assert_eq!(live.season_ambience.season, ActiveSeasonKind::Spring);
         let before = live.tactile_sim().len();
         live.on_tree_shake([4.0, 70.0, 4.0], None, 1.0);
@@ -1727,7 +1871,8 @@ mod tests {
         // Autumn SSN1 -> maple-amber leaves, and the aurora is gone now
         // that the live season is no longer winter.
         let autumn = ssn1_frame(7, 32_767, [255, 120, 40], [200, 160, 80], 0);
-        live.apply_event(framed(CHANNEL_SEASON_V1, &autumn)).unwrap();
+        live.apply_event(framed(CHANNEL_SEASON_V1, &autumn))
+            .unwrap();
         assert_eq!(live.season_ambience.season, ActiveSeasonKind::Autumn);
         let before = live.tactile_sim().len();
         live.on_tree_shake([8.0, 70.0, 8.0], None, 1.0);

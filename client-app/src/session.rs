@@ -20,9 +20,9 @@
 //! fed caller-injected `tick`/millisecond values exactly like the rest of
 //! [`crate::recovery`].
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::audio_qol::{AudioLimiter, SoundAdmission, SoundKey};
 use crate::crash_reporter::ReportEnv;
@@ -34,6 +34,7 @@ use crate::spatial_audio::{
     SpatialAudioPreset, SpatialSubtitleCue, VoxelAcousticWorld,
 };
 use crate::world::WorldState;
+use mc_spine_client_mesh::tactile_effects::EnvironmentAudioHint;
 
 /// Default spatial-audio sample rate (matches the `VCR1` PCM path).
 const DEFAULT_SAMPLE_RATE: u32 = 48_000;
@@ -399,6 +400,7 @@ pub struct SubtitleCueRecord {
 /// one-voice-per-source contract), the mono PCM cursor, and mix gain.
 struct Voice {
     engine: SpatialAudioEngine,
+    position: [f32; 3],
     pcm: Arc<Vec<f32>>,
     /// Fractional read position into `pcm` (pitch stepping).
     cursor: f64,
@@ -462,6 +464,8 @@ pub struct SoundMixer {
     /// Public counters — see [`AudioStats`].
     pub stats: AudioStats,
     subtitles: VecDeque<SubtitleCueRecord>,
+    spatial_subtitles: VecDeque<SpatialSubtitleCue>,
+    environment_hint: EnvironmentAudioHint,
 }
 
 impl SoundMixer {
@@ -484,6 +488,8 @@ impl SoundMixer {
             samples_rendered: 0,
             stats: AudioStats::default(),
             subtitles: VecDeque::new(),
+            spatial_subtitles: VecDeque::new(),
+            environment_hint: EnvironmentAudioHint::default(),
         }
     }
 
@@ -496,14 +502,92 @@ impl SoundMixer {
     /// (default: [`OpenAirWorld`], i.e. clear line of sight everywhere).
     pub fn set_world(&mut self, world: Box<dyn VoxelAcousticWorld>) {
         self.world = world;
+        self.refresh_acoustics();
     }
 
     /// Update the listener pose — cheap geometry refresh on every voice.
     pub fn set_listener(&mut self, listener: ListenerPose) {
         self.listener = listener;
-        for voice in &mut self.voices {
-            voice.engine.set_listener(listener);
+        self.refresh_acoustics();
+    }
+
+    /// Apply the tactile environment's cave, submersion and rain values to
+    /// both new and currently playing spatial voices.
+    pub fn set_environment_hint(&mut self, hint: EnvironmentAudioHint) {
+        let sanitize = |value: f32| {
+            if value.is_finite() {
+                value.clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        };
+        let hint = EnvironmentAudioHint {
+            underwater_lowpass: sanitize(hint.underwater_lowpass),
+            cave_reverb_mix: sanitize(hint.cave_reverb_mix),
+            rain_eaves_occlusion: sanitize(hint.rain_eaves_occlusion),
+        };
+        if self.environment_hint != hint {
+            self.environment_hint = hint;
+            self.refresh_acoustics();
         }
+    }
+
+    /// Last environment hint actually applied to the mix.
+    pub fn environment_hint(&self) -> EnvironmentAudioHint {
+        self.environment_hint
+    }
+
+    /// Recompute traced acoustic paths after a chunk/block or listener change.
+    pub fn refresh_acoustics(&mut self) {
+        let listener = self.acoustic_listener();
+        let hint = self.environment_hint;
+        for voice in &mut self.voices {
+            Self::analyze_voice(
+                &*self.world,
+                listener,
+                hint,
+                &mut voice.engine,
+                voice.position,
+            );
+        }
+    }
+
+    fn acoustic_listener(&self) -> ListenerPose {
+        let mut listener = self.listener;
+        let head = listener.position.map(|value| value.floor() as i32);
+        listener.submerged |= self.environment_hint.underwater_lowpass > 0.0
+            || self
+                .world
+                .acoustic_material(head[0], head[1], head[2])
+                .class
+                == MaterialClass::Liquid;
+        listener
+    }
+
+    fn analyze_voice(
+        world: &dyn VoxelAcousticWorld,
+        listener: ListenerPose,
+        hint: EnvironmentAudioHint,
+        engine: &mut SpatialAudioEngine,
+        position: [f32; 3],
+    ) {
+        engine.analyze(
+            world,
+            &SoundSource {
+                position,
+                velocity: [0.0; 3],
+            },
+            &listener,
+        );
+        let mut scene = engine.scene().clone();
+        scene.wet_gain =
+            (scene.wet_gain + hint.cave_reverb_mix * (1.0 - scene.wet_gain)).clamp(0.0, 1.0);
+        scene.rt60_low_s = scene.rt60_low_s.max(hint.cave_reverb_mix * 1.5);
+        scene.rt60_mid_s = scene.rt60_mid_s.max(hint.cave_reverb_mix * 1.2);
+        scene.rt60_high_s = scene.rt60_high_s.max(hint.cave_reverb_mix * 0.8);
+        scene.occlusion.transmission_loss_db += hint.rain_eaves_occlusion * 6.0;
+        engine.set_scene(scene);
+        engine.set_listener(listener);
     }
 
     /// Per-category gain (`0..=9` vanilla sound-source ids), clamped 0..=1.
@@ -603,26 +687,31 @@ impl SoundMixer {
             .unwrap_or(1.0);
         let gain = (ev.volume * cat_gain * self.master_gain * admission_gain).clamp(0.0, 1.0);
         let mut engine = SpatialAudioEngine::new(self.sample_rate, self.preset);
-        engine.analyze(
+        Self::analyze_voice(
             &*self.world,
-            &SoundSource {
-                position,
-                velocity: [0.0; 3],
-            },
-            &self.listener,
+            self.acoustic_listener(),
+            self.environment_hint,
+            &mut engine,
+            position,
         );
+        let cue = engine.subtitle_cue();
         self.subtitles.push_back(SubtitleCueRecord {
             name: ev.label.clone(),
-            cue: engine.subtitle_cue(),
+            cue,
             at_sample: self.samples_rendered,
         });
+        self.spatial_subtitles.push_back(cue);
         self.stats.subtitle_cues += 1;
         while self.subtitles.len() > SUBTITLE_LOG_CAP {
             self.subtitles.pop_front();
         }
+        while self.spatial_subtitles.len() > SUBTITLE_LOG_CAP {
+            self.spatial_subtitles.pop_front();
+        }
         self.order += 1;
         self.voices.push(Voice {
             engine,
+            position,
             pcm: ev.pcm,
             cursor: 0.0,
             step: f64::from(ev.pitch.clamp(0.5, 2.0)),
@@ -672,6 +761,11 @@ impl SoundMixer {
     pub fn drain_subtitle(&mut self) -> Option<SubtitleCueRecord> {
         self.subtitles.pop_front()
     }
+
+    /// Drain the independent spatial cue feed for interactive UI clients.
+    pub fn drain_spatial_subtitle_cues(&mut self) -> Vec<SpatialSubtitleCue> {
+        self.spatial_subtitles.drain(..).collect()
+    }
 }
 
 /// Acoustic world with air everywhere — the default when no voxel view is
@@ -697,12 +791,151 @@ pub struct WorldAcousticView<'a> {
 impl VoxelAcousticWorld for WorldAcousticView<'_> {
     fn acoustic_material(&self, x: i32, y: i32, z: i32) -> AcousticMaterial {
         match self.world.get_block_state(x, y, z) {
-            Some(state) if self.world.blocks.is_air(state) => AcousticMaterial::AIR,
-            Some(state) if self.world.blocks.fluid_cell(state).kind.is_some() => {
-                AcousticMaterial::from_class(MaterialClass::Liquid)
-            }
-            Some(_) => AcousticMaterial::from_class(MaterialClass::StoneLike),
+            Some(state) => acoustic_material_for_state(self.world, state),
             None => AcousticMaterial::AIR,
+        }
+    }
+}
+
+fn acoustic_material_for_state(world: &WorldState, state: u32) -> AcousticMaterial {
+    if world.blocks.is_air(state) {
+        AcousticMaterial::AIR
+    } else if world.blocks.fluid_cell(state).kind.is_some() {
+        AcousticMaterial::from_class(MaterialClass::Liquid)
+    } else {
+        AcousticMaterial::from_class(MaterialClass::StoneLike)
+    }
+}
+
+/// Owned, shared acoustic cache of decoded real-world sections. One byte per
+/// occupied voxel keeps raytracing independent of mutable mesh/world state.
+#[derive(Clone)]
+pub struct WorldAcousticSnapshot {
+    inner: Arc<RwLock<AcousticSnapshotInner>>,
+}
+
+struct AcousticSnapshotInner {
+    min_y: i32,
+    height: i32,
+    columns: BTreeMap<(i32, i32), Vec<Option<Box<[u8]>>>>,
+}
+
+impl WorldAcousticSnapshot {
+    pub fn new(world: &WorldState) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(AcousticSnapshotInner {
+                min_y: world.dimension.min_y,
+                height: world.dimension.height,
+                columns: BTreeMap::new(),
+            })),
+        }
+    }
+
+    /// Clear stale chunk materials when a dimension changes.
+    pub fn reset_dimension(&self, world: &WorldState) {
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        inner.min_y = world.dimension.min_y;
+        inner.height = world.dimension.height;
+        inner.columns.clear();
+    }
+
+    /// Replace a chunk's acoustic material cells after successful decoding.
+    pub fn sync_chunk(&self, world: &WorldState, cx: i32, cz: i32) {
+        let sections = world.columns.get(&(cx, cz)).map(|column| {
+            column
+                .sections
+                .iter()
+                .map(|section| {
+                    if !section.has_non_air {
+                        return None;
+                    }
+                    let cells: Box<[u8]> = (0..4096)
+                        .map(|idx| {
+                            let state = section.palette.get(idx).unwrap_or(0);
+                            match acoustic_material_for_state(world, state).class {
+                                MaterialClass::Liquid => 1,
+                                MaterialClass::StoneLike => 2,
+                                _ => 0,
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice();
+                    Some(cells)
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(sections) = sections {
+            inner.columns.insert((cx, cz), sections);
+        } else {
+            inner.columns.remove(&(cx, cz));
+        }
+    }
+
+    /// Update one block without re-copying the entire chunk on block edits.
+    pub fn sync_block(&self, world: &WorldState, pos: [i32; 3]) {
+        let Some(state) = world.get_block_state(pos[0], pos[1], pos[2]) else {
+            return;
+        };
+        let class = match acoustic_material_for_state(world, state).class {
+            MaterialClass::Liquid => 1,
+            MaterialClass::StoneLike => 2,
+            _ => 0,
+        };
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let sy = i64::from(pos[1]) - i64::from(inner.min_y);
+        if sy < 0 || sy >= i64::from(inner.height) {
+            return;
+        }
+        let Some(sections) = inner
+            .columns
+            .get_mut(&(pos[0].div_euclid(16), pos[2].div_euclid(16)))
+        else {
+            return;
+        };
+        if let Some(section) = sections.get_mut((sy / 16) as usize) {
+            if section.is_none() && class != 0 {
+                *section = Some(vec![0; 4096].into_boxed_slice());
+            }
+            if let Some(cells) = section {
+                let idx = (sy as usize % 16) * 256
+                    + pos[2].rem_euclid(16) as usize * 16
+                    + pos[0].rem_euclid(16) as usize;
+                cells[idx] = class;
+            }
+        }
+    }
+
+    pub fn unload_chunk(&self, cx: i32, cz: i32) {
+        self.inner
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .columns
+            .remove(&(cx, cz));
+    }
+}
+
+impl VoxelAcousticWorld for WorldAcousticSnapshot {
+    fn acoustic_material(&self, x: i32, y: i32, z: i32) -> AcousticMaterial {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        let sy = i64::from(y) - i64::from(inner.min_y);
+        if sy < 0 || sy >= i64::from(inner.height) {
+            return AcousticMaterial::AIR;
+        }
+        let class = inner
+            .columns
+            .get(&(x.div_euclid(16), z.div_euclid(16)))
+            .and_then(|sections| sections.get((sy / 16) as usize))
+            .and_then(Option::as_ref)
+            .map_or(0, |cells| {
+                cells[(sy as usize % 16) * 256
+                    + z.rem_euclid(16) as usize * 16
+                    + x.rem_euclid(16) as usize]
+            });
+        match class {
+            1 => AcousticMaterial::from_class(MaterialClass::Liquid),
+            2 => AcousticMaterial::from_class(MaterialClass::StoneLike),
+            _ => AcousticMaterial::AIR,
         }
     }
 }
