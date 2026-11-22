@@ -4687,7 +4687,7 @@ fn write_shared_frame(s: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
 /// every surface reader shares one `Arc` and every underground reader another.
 fn conn_prof() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MC_SPINE_CONN_PROF").is_some())
+    *ON.get_or_init(|| std::env::var_os("MEGU_CONN_PROF").is_some())
 }
 fn cached_chunk_frame(
     compression: Option<usize>,
@@ -4722,10 +4722,25 @@ fn cached_chunk_frame(
         .unwrap()
         .frame(generation, key, revision, compression)
     {
+        if std::env::var_os("MEGU_CHUNK_PROF").is_some() {
+            static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            eprintln!("[chunk-cache] hit cx={cx} cz={cz} total={}", HITS.fetch_add(1, Ordering::Relaxed) + 1);
+        }
         // A hit restores the chunk's own emitters into `gen` exactly as a
         // rebuild would; `light_dirty_for_dim` reads them below.
         gen.insert((cx, cz), emitters);
         return frame;
+    }
+    if std::env::var_os("MEGU_CHUNK_PROF").is_some() {
+        static MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        eprintln!(
+            "[chunk-cache] miss cx={cx} cz={cz} occ={occluded} rev={revision} sig={} vers={:?} ents={} genfill={} total={}",
+            map_chunk_sig(dim, cx, cz, gen),
+            versions,
+            entities.len(),
+            gen.len(),
+            MISSES.fetch_add(1, Ordering::Relaxed) + 1,
+        );
     }
     let built = map_chunk_lane(cx, cz, dim, gen, occluded);
     let emitters = gen.get(&(cx, cz)).cloned().unwrap_or_default();
@@ -4736,6 +4751,10 @@ fn cached_chunk_frame(
     ) == revision;
     let (_, packet) = encode_play_level_chunk_with_light(built, entities, dim);
     if !still_current {
+        if std::env::var_os("MEGU_CHUNK_PROF").is_some() {
+            static STALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            eprintln!("[chunk-cache] stale cx={cx} cz={cz} rev={revision} total={}", STALE.fetch_add(1, Ordering::Relaxed) + 1);
+        }
         return connection_limits::ChunkPacketCache::frame_uncached(&packet, compression);
     }
     let mut cache = chunk_packet_cache().lock().unwrap_or_else(|e| e.into_inner());

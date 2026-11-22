@@ -9542,8 +9542,22 @@ fn set_block_if_inner_dim(
     // Only Overworld reaches this point (the early return above handles the other
     // dimensions), but pass `dim` so the patched store slot keeps its dimension key.
     store_patch(dim, x, y, z, st);
-    let light_changed = breg().map_or(true, |r| light_properties(r, old) != light_properties(r, st));
-    bump_world_epoch_dim_opts(dim, x, z, light_changed);
+    if st != old {
+        // A rewrite of the identical state must not invalidate chunk caches —
+        // the stored content is unchanged; only the version tick cost real work.
+        let light_changed =
+            breg().map_or(true, |r| light_properties(r, old) != light_properties(r, st));
+        bump_world_epoch_dim_opts(dim, x, z, light_changed);
+        if std::env::var_os("MEGU_CHUNK_PROF").is_some() {
+            static N2: AtomicU64 = AtomicU64::new(0);
+            let n = N2.fetch_add(1, Ordering::Relaxed);
+            if n % 32 == 0 {
+                eprintln!("[chunk-write] ({x},{y},{z}) {old}->{st} {} -> {}",
+                    breg().map(|r| r.name_of(old)).unwrap_or("?"),
+                    breg().map(|r| r.name_of(st)).unwrap_or("?"));
+            }
+        }
+    }
     note_light_edit(dim, Position::new(x, y, z), old, st);
     let native_fluid_controlled = generated_fluid_changed((x, y, z), old, st);
     if st != old {
@@ -9756,8 +9770,11 @@ fn set_block_if_dim_edit(
     // Overworld slot at the same `(cx, cz)`.
     band_patch_dim(dim, x, y, z, st);
     store_patch(dim, x, y, z, st);
-    let light_changed = breg().map_or(true, |r| light_properties(r, old) != light_properties(r, st));
-    bump_world_epoch_dim_opts(dim, x, z, light_changed);
+    if st != old {
+        let light_changed =
+            breg().map_or(true, |r| light_properties(r, old) != light_properties(r, st));
+        bump_world_epoch_dim_opts(dim, x, z, light_changed);
+    }
     note_light_edit(dim, Position::new(x, y, z), old, st);
     if old != st {
         // The Overworld path does this in `set_block_if_inner_dim`: a mined neighbour
@@ -11750,7 +11767,7 @@ fn try_live_block_placement(
     };
     let prof = {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("MC_SPINE_PLACE_PROF").is_some())
+        *ON.get_or_init(|| std::env::var_os("MEGU_PLACE_PROF").is_some())
     };
     let Some(ctx) = placement_target(reg, item_name, ctx) else {
         if prof {
@@ -14340,6 +14357,13 @@ fn bump_world_epoch_dim(dim: DimId, x: i32, z: i32) {
 
 fn bump_world_epoch_dim_opts(dim: DimId, x: i32, z: i32, blocking_changed: bool) {
     let seq = CHUNK_VERSION_SEQ.fetch_add(1, Ordering::Relaxed);
+    if std::env::var_os("MEGU_CHUNK_PROF").is_some() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n % 64 == 0 {
+            eprintln!("[chunk-epoch] bump #{n} at ({x},{z}) seq={seq}");
+        }
+    }
     chunk_versions()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -15418,8 +15442,9 @@ fn chunk_versions_3x3(dim: DimId, cx: i32, cz: i32) -> [u64; 9] {
 }
 
 /// Order-independent FNV-1a signature of the chunk's non-versioned payload inputs:
-/// signs in the chunk, Overworld generated spawners (pos + NBT), and the 8 neighbor
-/// chunks' generated light emitters in `gen`.
+/// signs in the chunk, Overworld generated spawners (pos + NBT), the settled
+/// light revision — or, while light is unsettled, the 8 neighbor chunks'
+/// generated emitters in `gen`, which the fallback light arrays still read.
 fn map_chunk_sig(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -15457,21 +15482,29 @@ fn map_chunk_sig(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> u64 {
         }
     }
     let mut h = OFFSET;
-    let light_revision = settled_live_light(dim, cx, cz).map_or(0, |light| light.revision);
+    let settled = settled_live_light(dim, cx, cz);
+    let light_revision = settled.as_ref().map_or(0, |light| light.revision);
     for v in [sign_acc, sign_count, spawner_acc, spawner_count, light_revision] {
         h = (h ^ v).wrapping_mul(PRIME);
     }
-    for dx in -1..=1 {
-        for dz in -1..=1 {
-            if dx == 0 && dz == 0 {
-                continue;
-            }
-            h = (h ^ ((dx + 2) as u64 * 7 + (dz + 2) as u64)).wrapping_mul(PRIME);
-            if let Some(list) = gen.get(&(cx + dx, cz + dz)) {
-                h = (h ^ list.len() as u64).wrapping_mul(PRIME);
-                for ((ex, ey, ez), lum) in list {
-                    for v in [*ex as u64, *ey as u64, *ez as u64, *lum as u64] {
-                        h = (h ^ v).wrapping_mul(PRIME);
+    // `gen` emitters only reach the emitted bytes while live light is unsettled:
+    // `block_light_sections_dim` returns the settled arrays before reading `gen`,
+    // so hashing the caller's fill state would make every shareable frame look
+    // distinct to each connection. Unsettled chunks stay connection-local —
+    // their fallback light genuinely reads `gen`.
+    if settled.is_none() {
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                if dx == 0 && dz == 0 {
+                    continue;
+                }
+                h = (h ^ ((dx + 2) as u64 * 7 + (dz + 2) as u64)).wrapping_mul(PRIME);
+                if let Some(list) = gen.get(&(cx + dx, cz + dz)) {
+                    h = (h ^ list.len() as u64).wrapping_mul(PRIME);
+                    for ((ex, ey, ez), lum) in list {
+                        for v in [*ex as u64, *ey as u64, *ez as u64, *lum as u64] {
+                            h = (h ^ v).wrapping_mul(PRIME);
+                        }
                     }
                 }
             }

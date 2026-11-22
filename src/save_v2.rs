@@ -1744,7 +1744,7 @@ thread_local! { static SAVE_GUARD: std::cell::Cell<bool> = const { std::cell::Ce
 /// and from another `spawn_fall`, and only the outermost call locks.
 fn save_lock_prof() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MC_SPINE_LOCK_PROF").is_some())
+    *ON.get_or_init(|| std::env::var_os("MEGU_LOCK_PROF").is_some())
 }
 #[track_caller]
 fn with_save_guard<R>(f: impl FnOnce() -> R) -> R {
