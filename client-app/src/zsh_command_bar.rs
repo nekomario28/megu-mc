@@ -2774,6 +2774,13 @@ fn floor_char_boundary(input: &str, mut cursor: usize) -> usize {
     cursor
 }
 
+/// Every vanilla command name the bar completes, in `COMMAND_SPECS` order —
+/// used to seed the session's `CommandDispatcher` so `complete_suggestions`
+/// answers the same names the bar highlights.
+pub fn vanilla_command_names() -> impl Iterator<Item = &'static str> {
+    COMMAND_SPECS.iter().map(|(_, name, _)| *name)
+}
+
 static COMMAND_SPECS: &[(&str, &str, &str)] = &[
     ("/help", "help", "/help [command]"),
     ("/list", "list", "/list [players]"),

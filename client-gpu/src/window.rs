@@ -14,6 +14,7 @@ use mc_spine_kernel::debug_chords::{
     DebugChordState, DebugTarget, F3Chord, PlayerDebugInfo,
 };
 use mc_spine_client::protocol::encode_slot_stack;
+use mc_spine_client::zsh_command_bar::ZshCommandBar;
 use mc_spine_ui::container_screen::{
     menu_schema, ContainerScreenState, DragState, UiItemStack,
 };
@@ -450,6 +451,9 @@ pub struct GpuApp {
     mouse_pos: (i32, i32),
     left_mouse_held: bool,
     container_screen: Option<ContainerScreenState>,
+    chat_bar: Option<ZshCommandBar>,
+    /// Latest `complete_suggestions` hit for the open chat bar's `/`-input.
+    chat_suggestions: Vec<String>,
     ui: UiState,
     ui_cache: UiUploadCache,
     render_config: RenderConfig,
@@ -514,6 +518,8 @@ impl GpuApp {
             mouse_pos: (0, 0),
             left_mouse_held: false,
             container_screen: None,
+            chat_bar: None,
+            chat_suggestions: Vec::new(),
             ui,
             ui_cache: UiUploadCache::default(),
             render_config,
@@ -900,6 +906,96 @@ impl GpuApp {
         }
     }
 
+    /// Recompute the chat bar's `/` suggestions through the session's
+    /// `CommandDispatcher` (`complete_suggestions`); plain chat gets none.
+    fn refresh_chat_suggestions(&mut self) {
+        self.chat_suggestions.clear();
+        let (Some(bar), Some(live)) = (&self.chat_bar, &self.live) else {
+            return;
+        };
+        let text = bar.text();
+        let Some(input) = text.strip_prefix('/') else {
+            return;
+        };
+        let cursor = bar.cursor().saturating_sub(1);
+        if let Ok(suggestions) = live.commands.complete_suggestions(input, cursor) {
+            for index in 0..suggestions.len() {
+                if let Some(item) = suggestions.get(index) {
+                    self.chat_suggestions.push(item.to_string());
+                }
+            }
+        }
+    }
+
+    /// Route a key event into the open chat bar: text from `event.text`,
+    /// editing keys, Tab cycles badge completions, Enter sends through
+    /// `send_chat`, Escape closes and re-grabs the pointer.
+    fn chat_bar_key(&mut self, event: &winit::event::KeyEvent) {
+        if event.state != ElementState::Pressed {
+            return;
+        }
+        let mut close = false;
+        match event.physical_key {
+            PhysicalKey::Code(KeyCode::Escape) => close = true,
+            PhysicalKey::Code(KeyCode::Enter) | PhysicalKey::Code(KeyCode::NumpadEnter) => {
+                if let Some(bar) = &mut self.chat_bar {
+                    let text = bar.text().to_string();
+                    if !text.is_empty() {
+                        bar.push_history_entry(&text);
+                        if let Some(live) = &mut self.live {
+                            live.send_chat(&text);
+                        }
+                    }
+                }
+                close = true;
+            }
+            PhysicalKey::Code(KeyCode::Backspace) => {
+                if let Some(bar) = &mut self.chat_bar {
+                    bar.delete_backward();
+                }
+                self.refresh_chat_suggestions();
+            }
+            PhysicalKey::Code(KeyCode::Delete) => {
+                if let Some(bar) = &mut self.chat_bar {
+                    bar.delete_forward();
+                }
+                self.refresh_chat_suggestions();
+            }
+            PhysicalKey::Code(KeyCode::Tab) => {
+                if let Some(bar) = &mut self.chat_bar {
+                    bar.cycle_completion(true);
+                }
+            }
+            PhysicalKey::Code(KeyCode::ArrowLeft) => {
+                if let Some(bar) = &mut self.chat_bar {
+                    bar.move_cursor_left();
+                }
+            }
+            PhysicalKey::Code(KeyCode::ArrowRight) => {
+                if let Some(bar) = &mut self.chat_bar {
+                    bar.move_cursor_right();
+                }
+            }
+            _ => {
+                if let Some(text) = &event.text {
+                    if let Some(bar) = &mut self.chat_bar {
+                        for ch in text.chars() {
+                            bar.push_char(ch);
+                        }
+                    }
+                    self.refresh_chat_suggestions();
+                }
+            }
+        }
+        if close {
+            self.chat_bar = None;
+            self.chat_suggestions.clear();
+            if self.live.is_some() && !self.paused && self.focused {
+                self.set_cursor_grab(true);
+            }
+        }
+    }
+
     fn render_frame(&mut self) {
         let frame_begin = Instant::now();
         self.frame_start = frame_begin;
@@ -1211,10 +1307,20 @@ impl GpuApp {
                     live.drop_item(entire_stack);
                 }
             }
-            // These bindings are emitted by the router. Inventory/chat screens
-            // and server-side item operations require their own runtime APIs.
+            WindowInputEvent::OpenChat { slash_prefill } => {
+                // Vanilla `T`/`/` open the chat/command bar; the pointer is
+                // released for text entry like a server screen.
+                let mut bar = ZshCommandBar::new();
+                if slash_prefill {
+                    bar.push_char('/');
+                }
+                self.chat_bar = Some(bar);
+                self.refresh_chat_suggestions();
+                self.set_cursor_grab(false);
+            }
+            // These bindings are emitted by the router. Inventory/sort/
+            // advancements screens require their own runtime APIs.
             WindowInputEvent::OpenInventory
-            | WindowInputEvent::OpenChat { .. }
             | WindowInputEvent::SortInventory
             | WindowInputEvent::OpenAdvancements => {}
         }
@@ -1357,7 +1463,9 @@ impl ApplicationHandler for GpuApp {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if let PhysicalKey::Code(code) = event.physical_key {
+                if self.chat_bar.is_some() {
+                    self.chat_bar_key(&event);
+                } else if let PhysicalKey::Code(code) = event.physical_key {
                     if !event.repeat {
                         self.handle_key(code, event.state, event_loop);
                     }

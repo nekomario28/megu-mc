@@ -13,6 +13,7 @@ use mc_spine_client::protocol::{
     DecodedMotionTrigger, DimensionMeta, ItemStackComponents, PlayEvent, PlayerInfoUpdateEntry,
     ProtocolClient, SeasonWireSync, TeleportSync, TransferTarget, WireSoundEvent, WireStopSound,
 };
+use mc_spine_kernel::CommandDispatcher;
 use mc_spine_kernel::player_physics::{
     step_player_physics, PlayerInputState, PlayerPhysicsState, SurfaceKind,
 };
@@ -256,6 +257,9 @@ pub struct LiveSession {
     /// Set when `asset_bundle` landed but `GpuRenderer::upload_block_atlas`
     /// has not consumed it yet (window.rs owns the GPU upload).
     pub asset_bundle_pending_upload: bool,
+    /// Client-side command dispatcher seeded with the vanilla command-name
+    /// set; `complete_suggestions` feeds chat autocomplete while typing.
+    pub commands: CommandDispatcher,
     player_entity_id: Option<i32>,
     pub hud: HudState,
     pub magic: MagicHudState,
@@ -403,6 +407,7 @@ impl LiveSession {
             asset_bundle: None,
             asset_bundle_tried: false,
             asset_bundle_pending_upload: false,
+            commands: seeded_command_dispatcher(),
             player_entity_id: None,
             hud: HudState::default(),
             magic: MagicHudState::default(),
@@ -1893,6 +1898,17 @@ fn run_connection(
 /// Reserved `subworlds` id for the layered voxel-cloud sheet (kept clear of
 /// contraption ids, which allocate from 1 upward).
 const CLOUD_SUBWORLD_ID: u64 = u64::MAX;
+
+/// Seed the session command dispatcher with the vanilla command-name set
+/// (`zsh_command_bar`'s `COMMAND_SPECS`) so `complete_suggestions` answers
+/// the same literals the bar highlights before any `declare_commands`.
+fn seeded_command_dispatcher() -> CommandDispatcher {
+    let mut dispatcher = CommandDispatcher::new();
+    for name in mc_spine_client::zsh_command_bar::vanilla_command_names() {
+        let _ = dispatcher.register_literal(name);
+    }
+    dispatcher
+}
 
 /// Resolve the vanilla `SurfaceKind` for the block at `pos`, consulting the
 /// version-pack registry name first and falling back to the built-in 1.21.1
