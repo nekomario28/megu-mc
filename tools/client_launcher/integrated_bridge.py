@@ -86,21 +86,31 @@ def log_server(server, endpoint, ready):
             print(line, end="", file=sys.stderr, flush=True)
 
 
-def write_manifest(client, command, endpoint):
+def handoff_json(command, endpoint):
+    return json.dumps({"mode": "integrated", "argumentCount": len(command) - 1,
+                       "endpoint": endpoint}) + "\n"
+
+
+def write_manifest(process, command, endpoint):
+    # Legacy opt-in only: the default channel is the MC_SPINE_HANDOFF_JSON
+    # environment variable, so launches create zero temporary files.
+    if os.environ.get("MC_SPINE_HANDOFF_FILE") != "1":
+        return
     destination = os.environ.get("MC_SPINE_HANDOFF_MANIFEST")
-    if destination:
-        path = Path(destination).absolute()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, name = tempfile.mkstemp(dir=path.parent, prefix=".mc-spine-handoff-")
-        temp = Path(name)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump({"mode": "integrated", "pid": client.pid,
-                           "argumentCount": len(command) - 1, "endpoint": endpoint}, stream)
-                stream.write("\n")
-            temp.replace(path)
-        finally:
-            temp.unlink(missing_ok=True)
+    if not destination:
+        return
+    path = Path(destination).absolute()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=".mc-spine-handoff-")
+    temp = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump({"mode": "integrated", "pid": process.pid,
+                       "argumentCount": len(command) - 1, "endpoint": endpoint}, stream)
+            stream.write("\n")
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def run_server(binary, world, client, stopping):
@@ -135,7 +145,9 @@ def run_server(binary, world, client, stopping):
         if server.poll() is not None:
             raise ValueError(f"server exited during startup ({server.returncode})")
         command = client_command(client, endpoint)
-        process = subprocess.Popen(command, stdin=subprocess.DEVNULL)
+        client_env = dict(os.environ,
+                          MC_SPINE_HANDOFF_JSON=handoff_json(command, endpoint))
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, env=client_env)
         try:
             write_manifest(process, command, endpoint)
             while not stopping():

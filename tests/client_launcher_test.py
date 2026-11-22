@@ -49,6 +49,7 @@ if os.environ.get('TEST_NATIVE_ENV_LOG'):
     Path(os.environ['TEST_NATIVE_ENV_LOG']).write_text(json.dumps({
         'MC_SPINE_LAUNCHER_ACCESS_TOKEN': os.environ.get('MC_SPINE_LAUNCHER_ACCESS_TOKEN'),
         'MC_SPINE_TOKEN_ENV': os.environ.get('MC_SPINE_TOKEN_ENV'),
+        'MC_SPINE_HANDOFF_JSON': os.environ.get('MC_SPINE_HANDOFF_JSON'),
     }))
 time.sleep(float(os.environ.get('TEST_NATIVE_SLEEP', '0')))
 sys.exit(int(os.environ.get('TEST_NATIVE_EXIT', '0')))
@@ -102,6 +103,7 @@ with socket.socket() as listener:
         env = dict(os.environ, MC_SPINE_CLIENT_BIN=str(self.stub), TEST_NATIVE_LOG=str(log))
         env.pop("MC_SPINE_DETACH", None)
         env.pop("MC_SPINE_HANDOFF_MANIFEST", None)
+        env.pop("MC_SPINE_HANDOFF_FILE", None)
         if extra_env:
             env.update(extra_env)
         # In detach mode the native child inherits stderr, so capturing that
@@ -161,15 +163,60 @@ with socket.socket() as listener:
                 "--quickPlayMultiplayer", "test.example:25565", "--server", "localhost",
                 "--port", "25565", "--unknownFlag", "value with spaces")
         manifest = self.root / "handoff.json"
+        env_log = self.root / "handoff-env.json"
         result, log = self.java(*args, extra_env={"MC_SPINE_HANDOFF_MANIFEST": str(manifest),
+                                                  "TEST_NATIVE_ENV_LOG": str(env_log),
                                                   "TEST_NATIVE_EXIT": "37"})
         self.assertEqual(result.returncode, 37, result.stderr)
         self.assertEqual(json.loads(log.read_text()), list(args))
+        self.assertFalse(manifest.exists())
+        handoff = json.loads(json.loads(env_log.read_text())["MC_SPINE_HANDOFF_JSON"])
+        self.assertEqual(handoff["mode"], "wait")
+        self.assertEqual(handoff["argumentCount"], len(args))
+        self.assertNotIn("private-secret", json.dumps(handoff))
+
+    def test_handoff_manifest_file_requires_explicit_legacy_flag(self):
+        args = ("--username", "Steve", "--port", "25565")
+        manifest = self.root / "legacy-handoff.json"
+        result, _ = self.java(*args, extra_env={"MC_SPINE_HANDOFF_MANIFEST": str(manifest)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(manifest.exists())
+        result, _ = self.java("--mc-spine-handoff-file", *args,
+                              extra_env={"MC_SPINE_HANDOFF_MANIFEST": str(manifest)})
+        self.assertEqual(result.returncode, 0, result.stderr)
         summary = json.loads(manifest.read_text())
         self.assertEqual(summary["mode"], "wait")
         self.assertEqual(summary["argumentCount"], len(args))
         self.assertGreater(summary["pid"], 0)
-        self.assertNotIn("private-secret", manifest.read_text())
+        manifest.unlink()
+        cli_manifest = self.root / "cli-handoff.json"
+        result, _ = self.java(f"--mc-spine-handoff-manifest={cli_manifest}", *args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(cli_manifest.read_text())["mode"], "wait")
+
+    def test_launch_leaves_zero_handoff_temp_files(self):
+        game = self.root / "handoff game dir"
+        game.mkdir()
+        env_log = self.root / "handoff-zero-env.json"
+        watched = [game, Path(tempfile.gettempdir())]
+        before = {d: set(d.glob(".mc-spine-handoff-*")) for d in watched}
+        result, log = self.java("--username", "Steve", "--gameDir", str(game),
+                                "--accessToken", "private-secret",
+                                extra_env={"TEST_NATIVE_ENV_LOG": str(env_log),
+                                           "MC_SPINE_HANDOFF_MANIFEST": str(game / "handoff.json"),
+                                           "MC_SPINE_HANDOFF_FILE": ""})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(log.read_text()),
+                         ["--username", "Steve", "--gameDir", str(game),
+                          "--accessToken", "private-secret"])
+        for directory in watched:
+            self.assertEqual(before[directory], set(directory.glob(".mc-spine-handoff-*")),
+                             f"unexpected .mc-spine-handoff-* files in {directory}")
+        self.assertFalse((game / "handoff.json").exists())
+        handoff = json.loads(json.loads(env_log.read_text())["MC_SPINE_HANDOFF_JSON"])
+        self.assertEqual(handoff["mode"], "wait")
+        self.assertEqual(handoff["argumentCount"], 6)
+        self.assertNotIn("private-secret", json.dumps(handoff))
 
     def test_detach_does_not_wait_and_removes_only_private_flag(self):
         started = time.monotonic()
@@ -209,8 +256,11 @@ with socket.socket() as listener:
     def test_integrated_injects_loopback_and_stops_on_client_exit(self):
         game, world, env = self.integrated_fixture()
         manifest = game / "handoff.json"
-        env.update(MC_SPINE_HANDOFF_MANIFEST=str(manifest), TEST_NATIVE_EXIT="37")
-        result, log = self.java("--mc-spine-integrated", "--gameDir", str(game),
+        env_log = game.parent / "handoff-env.json"
+        env.update(MC_SPINE_HANDOFF_MANIFEST=str(manifest), TEST_NATIVE_EXIT="37",
+                   TEST_NATIVE_ENV_LOG=str(env_log))
+        result, log = self.java("--mc-spine-handoff-file", "--mc-spine-integrated",
+                                "--gameDir", str(game),
                                 "--quickPlaySingleplayer=stale", "--quickPlayMultiplayer",
                                 "example.invalid:25565", "--accessToken", "private-secret",
                                 extra_env=env)
@@ -223,6 +273,11 @@ with socket.socket() as listener:
         self.assertEqual(summary["endpoint"], endpoint)
         self.assertEqual(summary["mode"], "integrated")
         self.assertNotIn("private-secret", manifest.read_text())
+        handoff = json.loads(json.loads(env_log.read_text())["MC_SPINE_HANDOFF_JSON"])
+        self.assertEqual(handoff["mode"], "integrated")
+        self.assertEqual(handoff["endpoint"], endpoint)
+        self.assertEqual(handoff["argumentCount"], 6)
+        self.assertNotIn("private-secret", json.dumps(handoff))
 
     def test_integrated_stops_when_client_spawn_fails(self):
         game, world, env = self.integrated_fixture()
@@ -239,13 +294,19 @@ with socket.socket() as listener:
 
     def test_integrated_cli_accepts_a_client_command(self):
         game, world, env = self.integrated_fixture()
+        env_log = game.parent / "bridge-handoff-env.json"
+        env["TEST_NATIVE_ENV_LOG"] = str(env_log)
         result, log = self.invocation(sys.executable, str(TOOLS / "integrated_bridge.py"),
                                       "--game-dir", str(game), "--world", world.name,
                                       "--", str(self.stub), "--username", "Alex", extra_env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
+        endpoint = self.assert_server_stopped(world)
         self.assertEqual(json.loads(log.read_text()),
-                         ["--username", "Alex", "--quickPlayMultiplayer",
-                          self.assert_server_stopped(world)])
+                         ["--username", "Alex", "--quickPlayMultiplayer", endpoint])
+        handoff = json.loads(json.loads(env_log.read_text())["MC_SPINE_HANDOFF_JSON"])
+        self.assertEqual(handoff["mode"], "integrated")
+        self.assertEqual(handoff["endpoint"], endpoint)
+        self.assertEqual(handoff["argumentCount"], 4)
 
     def test_integrated_stops_when_java_wrapper_exits_abruptly(self):
         game, world, env = self.integrated_fixture()

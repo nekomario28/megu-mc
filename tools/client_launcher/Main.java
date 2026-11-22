@@ -51,10 +51,12 @@ public final class Main {
         String launcherAccessToken = null;
         String installDir = null;
         String mcVersion = "1.21.1";
+        String handoffManifest = null;
         boolean installMode = false;
         boolean detach = "1".equals(System.getenv("MC_SPINE_DETACH"));
         boolean integrated = false;
         boolean tokenEnv = "1".equals(System.getenv("MC_SPINE_TOKEN_ENV"));
+        boolean handoffFile = "1".equals(System.getenv("MC_SPINE_HANDOFF_FILE"));
         for (int i = 0; i < args.length; i++) {
             String arg = args[i];
             if ("--install".equals(arg)) {
@@ -87,6 +89,24 @@ public final class Main {
             }
             if ("--mc-spine-token-env".equals(arg)) {
                 tokenEnv = true;
+                continue;
+            }
+            if ("--mc-spine-handoff-file".equals(arg)) {
+                handoffFile = true;
+                continue;
+            }
+            if ("--mc-spine-handoff-manifest".equals(arg)) {
+                if (i + 1 >= args.length) {
+                    System.err.println("mc-spine launcher: missing value for --mc-spine-handoff-manifest");
+                    return 2;
+                }
+                handoffManifest = args[++i];
+                handoffFile = true;
+                continue;
+            }
+            if (arg.startsWith("--mc-spine-handoff-manifest=")) {
+                handoffManifest = arg.substring("--mc-spine-handoff-manifest=".length());
+                handoffFile = true;
                 continue;
             }
             String key = arg.contains("=") ? arg.substring(0, arg.indexOf('=')) : arg;
@@ -155,15 +175,21 @@ public final class Main {
             }
             verifySha256(binary, expectedSha256);
             ensureExecutable(binary);
+            String handoffPath = handoffFile ? handoffManifestPath(handoffManifest, gameDir) : null;
             if (integrated) {
-                return runIntegratedParent(gameDir, command, launcherAccessToken);
+                return runIntegratedParent(gameDir, command, launcherAccessToken, handoffFile, handoffPath);
             }
+            String mode = detach ? "detach" : "wait";
             ProcessBuilder builder = new ProcessBuilder(command).inheritIO();
+            builder.environment().put("MC_SPINE_HANDOFF_JSON",
+                    handoffJson(mode, -1, gameArgs.size(), null));
             if (launcherAccessToken != null && !launcherAccessToken.isEmpty()) {
                 builder.environment().put("MC_SPINE_LAUNCHER_ACCESS_TOKEN", launcherAccessToken);
             }
             Process process = builder.start();
-            writeManifest("wait", detach, process.pid(), gameArgs.size(), null);
+            if (handoffPath != null) {
+                writeHandoffManifest(Path.of(handoffPath), mode, process.pid(), gameArgs.size(), null);
+            }
             if (detach) {
                 return 0;
             }
@@ -296,7 +322,8 @@ public final class Main {
     }
 
     /** Pure-Java parent wrapper: spawns a tiny Java child watching stdin EOF so even SIGKILL stops the server cleanly. */
-    private static int runIntegratedParent(String gameDir, List<String> client, String accessToken)
+    private static int runIntegratedParent(String gameDir, List<String> client, String accessToken,
+            boolean handoffFile, String handoffPath)
             throws IOException, InterruptedException {
         Path selfJar = selfJarPath();
         String javaBin = Path.of(System.getProperty("java.home"), "bin",
@@ -323,8 +350,13 @@ public final class Main {
         if (accessToken != null && !accessToken.isEmpty()) {
             builder.environment().put("MC_SPINE_LAUNCHER_ACCESS_TOKEN", accessToken);
         }
+        if (handoffFile && handoffPath != null) {
+            builder.environment().put("MC_SPINE_HANDOFF_FILE", "1");
+            builder.environment().put("MC_SPINE_HANDOFF_MANIFEST", handoffPath);
+        }
         Process bridge = builder.start();
         try (var parentPipe = bridge.getOutputStream()) {
+            parentPipe.flush();
             return bridge.waitFor();
         }
     }
@@ -437,8 +469,14 @@ public final class Main {
             }
             List<String> clientCmd = buildIntegratedClientCommand(client, endpoint);
             ProcessBuilder cb = new ProcessBuilder(clientCmd).inheritIO();
+            cb.environment().put("MC_SPINE_HANDOFF_JSON",
+                    handoffJson("integrated", -1, clientCmd.size() - 1, endpoint));
             clientProc = cb.start();
-            writeManifest("integrated", false, clientProc.pid(), clientCmd.size() - 1, endpoint);
+            String handoffPath = handoffManifestPath(null, gameDir.toString());
+            if ("1".equals(System.getenv("MC_SPINE_HANDOFF_FILE")) && handoffPath != null) {
+                writeHandoffManifest(Path.of(handoffPath), "integrated", clientProc.pid(),
+                        clientCmd.size() - 1, endpoint);
+            }
             while (clientProc.isAlive() && !stopping.get()) {
                 clientProc.waitFor(50, TimeUnit.MILLISECONDS);
             }
@@ -681,21 +719,36 @@ public final class Main {
         return message.replaceAll("(?i)\\bBearer\\s+[^\\s,;\\\"']+", "Bearer <REDACTED>");
     }
 
-    private static void writeManifest(String modeName, boolean detach, long pid, int argumentCount, String endpoint)
-            throws IOException {
-        String destination = System.getenv("MC_SPINE_HANDOFF_MANIFEST");
-        if (destination == null || destination.isBlank()) {
-            return;
-        }
-        String mode = "integrated".equals(modeName) ? "integrated" : (detach ? "detach" : "wait");
+    private static String handoffJson(String mode, long pid, int argumentCount, String endpoint) {
         StringBuilder json = new StringBuilder();
-        json.append("{\"mode\":\"").append(mode)
-                .append("\",\"pid\":").append(pid)
-                .append(",\"argumentCount\":").append(argumentCount);
+        json.append("{\"mode\":\"").append(mode).append('"');
+        if (pid > 0) {
+            json.append(",\"pid\":").append(pid);
+        }
+        json.append(",\"argumentCount\":").append(argumentCount);
         if (endpoint != null) {
             json.append(",\"endpoint\":\"").append(endpoint).append('"');
         }
-        json.append("}\n");
-        atomicWriteString(Path.of(destination).toAbsolutePath(), json.toString());
+        return json.append("}\n").toString();
+    }
+
+    private static String handoffManifestPath(String override, String gameDir) {
+        if (override != null && !override.isBlank()) {
+            return override;
+        }
+        String configured = System.getenv("MC_SPINE_HANDOFF_MANIFEST");
+        if (configured != null && !configured.isBlank()) {
+            return configured;
+        }
+        if (gameDir != null && !gameDir.isBlank()) {
+            return Path.of(gameDir).resolve(".mc-spine-handoff.json").toString();
+        }
+        return null;
+    }
+
+    private static void writeHandoffManifest(Path destination, String mode, long pid,
+            int argumentCount, String endpoint) throws IOException {
+        atomicWriteString(destination.toAbsolutePath(),
+                handoffJson(mode, pid, argumentCount, endpoint));
     }
 }
