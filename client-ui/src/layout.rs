@@ -22,6 +22,7 @@ use crate::state::{
     tr, HitRegion, HudState, HudSubtitle, MiniHudPreset, ModSyncChange, Screen, SettingKey,
     SettingsTab, SubtitleDirection, UiLang, UiModal, UiState, WidgetId, FPS_CAP_STEPS,
 };
+use crate::subtitle_hud::SubtitleHudState;
 
 /// Build the frame for the current screen: `(draw_list, hit_regions)`.
 /// `width`/`height` are physical pixels.
@@ -2102,6 +2103,276 @@ fn magic_frame(magic: &MagicHudState, vpw: u32, vph: u32, s: i32) -> Option<Magi
         statuses: to_logical(mw - 8 - status_w)..to_logical(mw),
         status_bottom: to_logical(8 + n_status * 19 - 3),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Spatial subtitle overlay (composited after the HUD layout pass)
+// ---------------------------------------------------------------------------
+
+/// Append the spatial-subtitle panel to the HUD draw list.
+///
+/// `subtitles` is the cue state an embedder feeds from audio events
+/// (`client-app`'s `SpatialSubtitleCue` → [`SubtitleHudState::push`]);
+/// `state.settings.qol.show_subtitles` is the same opt-in the legacy
+/// `hud.subtitles` rows honor. Emits nothing — and returns `false` —
+/// while the setting is off or no cue is live. `out` is appended to, so
+/// call this after [`UiState::render_into`]/[`layout_screen`]; the panel
+/// stacks above every rectangle [`hud_occupied_rects`] reports (hotbar,
+/// vitals, XP, actionbar, chat, bossbars, player list, MagicHUD, the
+/// legacy subtitle rows, and the crafting-conflict button) and never
+/// registers hit regions — subtitles are display-only.
+pub fn layout_subtitle_hud(
+    state: &UiState,
+    subtitles: &SubtitleHudState,
+    width: u32,
+    height: u32,
+    out: &mut UiDrawList,
+) -> bool {
+    if !state.settings.qol.show_subtitles || subtitles.is_empty() {
+        return false;
+    }
+    let reserved = hud_occupied_rects(state, width, height);
+    subtitles.render_avoiding(width as f32, height as f32, &reserved, out)
+}
+
+/// Every rectangle the in-game HUD occupies, in *physical* pixels, for
+/// overlays that composite after [`layout_screen`]. Mirrors the `hud()`
+/// collision model exactly — same scale, same constants, same clip math —
+/// so a later overlay can prove zero overlap against bossbars, MagicHUD,
+/// chat, the hotbar stack, and the rest. The MiniHUD box is deliberately
+/// absent: it is itself managed against the legacy subtitle stack and
+/// anchors to corners the spatial panel only reaches on degenerate
+/// layouts.
+fn hud_occupied_rects(state: &UiState, width: u32, height: u32) -> Vec<UiRect> {
+    let hud = &state.hud;
+    let s = state.effective_scale(height) as i32;
+    if s <= 0 {
+        return Vec::new();
+    }
+    let w = (width.min(i32::MAX as u32) as i32) / s;
+    let h = (height.min(i32::MAX as u32) as i32) / s;
+    if w <= 0 || h <= 0 {
+        return Vec::new();
+    }
+    let cx = w / 2;
+
+    // Logical-px accumulator; converted to physical at the end.
+    let mut rects: Vec<UiRect> = Vec::new();
+    {
+        let mut add = |x: i32, y: i32, rw: i32, rh: i32| {
+            if rw > 0 && rh > 0 {
+                rects.push(UiRect::new(x, y, rw as u32, rh as u32));
+            }
+        };
+
+        // Hotbar block (offhand + gap + 9 slots), vitals columns, XP.
+        let slot = 22;
+        let hw = 9 * slot;
+        let hx = cx - (hw + slot + 4) / 2;
+        let hy = h - slot - 4;
+        let hotbar_top = hy - 4;
+        let hx0 = hx + slot + 4;
+        let vy = hy - 12;
+        let rx = hx0 + hw;
+        let vl = hx0..(hx0 + 80);
+        let vr = (rx - 80)..rx;
+        let vtop_l = vy - if hud.absorption > 0.0 { 20 } else { 10 };
+        let vtop_r = vy - if hud.air < 300 { 10 } else { 0 };
+        add(hx, hy, slot + 4 + hw, slot);
+        add(cx - 91, hy - 4, 182, 3);
+        if hud.xp_level > 0 {
+            add(cx - 24, hy - 14, 48, 8);
+        }
+        add(vl.start, vtop_l, 80, vy + 8 - vtop_l);
+        add(vr.start, vtop_r, 80, vy + 8 - vtop_r);
+
+        // Actionbar: centered band directly above the vitals.
+        let abar = if hud.actionbar.is_empty() {
+            None
+        } else {
+            let text = hud_str(&hud.actionbar, ((w - 8) / 8).max(0) as usize);
+            let aw = text.chars().count() as i32 * 8;
+            if aw > 0 {
+                add(cx - aw / 2, hy - 44, aw, 8);
+            }
+            Some(cx - aw / 2..cx + aw / 2)
+        };
+        let abar_band = (hy - 44)..(hy - 36);
+
+        // Legacy directional subtitle rows (same opt-in + same lift
+        // math as `hud()`), remembered as `(fill_left, y)` for the chat
+        // clip below, plus the stack bottom the conflict button uses.
+        let mut subtitle_rows: Vec<(i32, i32)> = Vec::new();
+        let mut stack_bottom = hotbar_top;
+        if state.settings.qol.show_subtitles && !hud.subtitles.is_empty() {
+            let shown: Vec<&HudSubtitle> = hud.subtitles.iter().rev().take(4).collect();
+            let build_rows = |base: i32| -> Vec<(String, i32)> {
+                shown
+                    .iter()
+                    .enumerate()
+                    .map(|(i, sub)| {
+                        let label = match sub.direction {
+                            SubtitleDirection::Left => format!("< {}", sub.label),
+                            SubtitleDirection::Center => sub.label.clone(),
+                            SubtitleDirection::Right => format!("{} >", sub.label),
+                            SubtitleDirection::Behind => format!("v {}", sub.label),
+                        };
+                        let y = base - (shown.len() - i) as i32 * 10;
+                        let cells = ((w - 14) / 8).max(1) as usize;
+                        (hud_str(&label, cells), y)
+                    })
+                    .collect()
+            };
+            let mut sub_base = hotbar_top;
+            let mut rows = build_rows(sub_base);
+            for (i, (label, y)) in rows.iter().enumerate() {
+                let rw = label.chars().count() as i32 * 8 + 6;
+                if w - 4 - rw < vr.end && *y < vy + 8 && *y + 10 > vtop_r {
+                    sub_base = sub_base.min(vtop_r - 10 + (shown.len() - i) as i32 * 10);
+                }
+                if w - 4 - rw < vl.end && *y < vy + 8 && *y + 10 > vtop_l {
+                    sub_base = sub_base.min(vtop_l - 10 + (shown.len() - i) as i32 * 10);
+                }
+            }
+            rows = build_rows(sub_base);
+            if abar.is_some()
+                && rows.iter().any(|(label, y)| {
+                    let rw = label.chars().count() as i32 * 8 + 6;
+                    *y < abar_band.end
+                        && *y + 10 > abar_band.start
+                        && w - 4 - rw < abar.as_ref().map_or(i32::MAX, |ab| ab.end)
+                })
+            {
+                sub_base = (hy - 46).min(sub_base);
+                rows = build_rows(sub_base);
+            }
+            let rows: Vec<(String, i32)> = rows
+                .into_iter()
+                .filter(|(_, y)| *y >= 0 && *y + 10 <= h)
+                .collect();
+            for (label, y) in &rows {
+                let rw = label.chars().count() as i32 * 8 + 6;
+                add(w - 4 - rw, *y, rw, 10);
+            }
+            subtitle_rows = rows
+                .iter()
+                .map(|(label, y)| (w - 4 - (label.chars().count() as i32 * 8 + 6), *y))
+                .collect();
+            stack_bottom = sub_base - shown.len() as i32 * 10 - 2;
+        }
+
+        // Crafting-conflict switcher (same position math as `hud()`).
+        if hud.crafting_conflict.is_active() {
+            let label = format!(
+                "< {}/{} >",
+                hud.crafting_conflict.selected() + 1,
+                hud.crafting_conflict.total_candidates
+            );
+            let bw = (label.chars().count() as i32 * 8 + 8).min(w - 8);
+            let bx = w - 4 - bw;
+            let mut bottom = stack_bottom - 2;
+            if bx < vl.end {
+                bottom = bottom.min(vtop_l - 2);
+            }
+            if bx < vr.end {
+                bottom = bottom.min(vtop_r - 2);
+            }
+            let by = (bottom - 14).max(2);
+            add(bx, by, bw, 14);
+        }
+
+        // Chat scrollback rows, clipped exactly like `hud()`.
+        for (i, line) in hud.chat_lines.iter().rev().take(6).enumerate() {
+            let y = hy - 12 - i as i32 * 10;
+            let (band_top, band_bot) = (y - 1, y + 9);
+            let mut cells = ((w - 14) / 8).max(0) as usize;
+            if band_top < vy + 8 && band_bot > vtop_l {
+                cells = cells.min(((vl.start - 10) / 8).max(0) as usize);
+            }
+            if let Some(ab) = &abar {
+                if band_top < abar_band.end && band_bot > abar_band.start {
+                    cells = cells.min(((ab.start - 10) / 8).max(0) as usize);
+                }
+            }
+            for (sx, sy) in &subtitle_rows {
+                if band_top < *sy + 10 && band_bot > *sy {
+                    cells = cells.min(((*sx - 10) / 8).max(0) as usize);
+                }
+            }
+            if cells == 0 {
+                continue;
+            }
+            let text = hud_str(line, cells);
+            let tw = text.chars().count() as i32 * 8;
+            add(2, y - 1, tw + 6, 10);
+        }
+
+        // Bossbar stack (name text + progress bar per row).
+        let boss_count = hud.bossbars.len().min(3) as i32;
+        let boss_bottom = if boss_count == 0 {
+            4
+        } else {
+            16 * boss_count + 4
+        };
+        for (i, (name, _)) in hud.bossbars.iter().take(3).enumerate() {
+            let y = 6 + i as i32 * 16;
+            let bw = (w - 40).clamp(8, 200);
+            let clipped = hud_str(name, ((w - 8) / 8).max(0) as usize);
+            let nw = clipped.chars().count() as i32 * 8;
+            let row_w = bw.max(nw);
+            add(cx - row_w / 2, y, row_w, 14);
+        }
+
+        // Player-list overlay panel.
+        if hud.show_player_list {
+            let pw = 200.min(w - 8).max(70);
+            let px = cx - pw / 2;
+            let py = boss_bottom + 4;
+            let rows_avail = ((h - 4 - (py + 14)) / 11).max(0) as usize;
+            let (shown, extra) = if hud.players.len() <= rows_avail {
+                (hud.players.len(), 0usize)
+            } else {
+                let s = rows_avail.saturating_sub(1);
+                (s, hud.players.len() - s)
+            };
+            let ph = 14 + (shown + usize::from(extra > 0)) as i32 * 11;
+            add(px, py, pw, ph.max(14));
+        }
+
+        // MagicHUD bottom bars + top-right status column (same frame the
+        // MiniHUD collision code uses).
+        if let Some(mf) = magic_frame(
+            &hud.magic,
+            (w * s) as u32,
+            (h * s) as u32,
+            s,
+        ) {
+            add(
+                mf.panel.start,
+                mf.stack_top,
+                mf.panel.end - mf.panel.start,
+                h - mf.stack_top,
+            );
+            add(
+                mf.statuses.start,
+                0,
+                mf.statuses.end - mf.statuses.start,
+                mf.status_bottom,
+            );
+        }
+    }
+
+    rects
+        .into_iter()
+        .map(|r| {
+            UiRect::new(
+                r.x * s,
+                r.y * s,
+                (r.w as i32 * s).max(0) as u32,
+                (r.h as i32 * s).max(0) as u32,
+            )
+        })
+        .collect()
 }
 
 fn slot_cell(ctx: &mut Ctx, x: i32, y: i32, item: Option<&String>, selected: bool) {

@@ -36,3 +36,4 @@ pub mod mod_menu;
 pub mod recipe_browser;
 pub mod shader_screen;
 pub mod state;
+pub mod subtitle_hud;
