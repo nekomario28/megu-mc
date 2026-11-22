@@ -559,6 +559,9 @@ fn gamerule_atomic_store(name: &str, value: i32) -> bool {
         "doVinesSpread" => GR_DO_VINES_SPREAD.store(value as u8, Ordering::Relaxed),
         _ => return false,
     }
+    // §5.2①: gamerules are serialized world settings — a store is a save
+    // payload change the periodic autosave must not skip.
+    note_world_persist_dirty();
     true
 }
 
@@ -1139,6 +1142,21 @@ fn environment_time_tick() {
     grow_crops(t, |x, z| region.is_warm(x, z));
     let autosave = server_ticks(AUTOSAVE_GT);
     if AUTOSAVE_ENABLED.load(Ordering::Relaxed) && t % autosave == autosave - 1 {
+        // §5.2① liveness floor: persisted state whose write paths live in
+        // sibling files also changes the payload between saves — online
+        // players (position/health/inventory/commands), mobs and item
+        // entities (motion, despawn), projectiles, falling blocks and crop
+        // ages. Their mere presence means "the world is not unchanged", so
+        // the epoch bumps before the gate inside `autosave_world` reads it.
+        if !client_snapshot().is_empty()
+            || !mobs().lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            || !drops().lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            || !arrows().lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            || !falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            || !crops().lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        {
+            note_world_persist_dirty();
+        }
         // The live server hands the snapshot to the save worker; everywhere
         // else this is the same synchronous save_world it always was.
         autosave_world();
@@ -9644,6 +9662,7 @@ fn set_block_if_inner_dim(
     live_block_changed(dim, RsPos(x, y, z), old, st);
     #[cfg(feature = "create-offload")]
     create_block_changed(dim, x, y, z, old, st);
+    note_world_persist_dirty();
     dwal_note_block_set(dim, x, y, z, st);
     true
 }
@@ -9768,6 +9787,7 @@ fn set_block_if_dim_edit(
     register_dim_scheduled(dim, x, y, z, st);
     #[cfg(feature = "create-offload")]
     create_block_changed(dim, x, y, z, old, st);
+    note_world_persist_dirty();
     dwal_note_block_set(dim, x, y, z, st);
     true
 }
@@ -10444,6 +10464,7 @@ fn set_blocks_bulk_dim(dim: DimId, edits: &[(i32, i32, i32, u32)]) -> usize {
             } else {
                 register_dim_scheduled(dim, x, y, z, st);
             }
+            note_world_persist_dirty();
             dwal_note_block_set(dim, x, y, z, st);
         }
         // One batched boundary pass: a neighbour outside the edit set whose
@@ -15994,6 +16015,46 @@ fn live_save_worker() -> Option<&'static AsyncSaveWorker> {
     LIVE_SAVE_WORKER.get()
 }
 
+// ---------- §5.2① dirty-epoch autosave gate ----------
+//
+// Every mutation the save payload serializes bumps `WORLD_PERSIST_DIRTY_EPOCH`
+// once: committed overlay block writes (the three `dwal_note_block_set` call
+// sites every block path funnels through), gamerule stores
+// (`gamerule_atomic_store`), and the per-autosave liveness pass in
+// `environment_time_tick` for state whose write paths live outside this file
+// (players, mobs, item drops, projectiles, falling blocks, crop ages).
+// `LAST_SAVED_EPOCH` records the highest dirty epoch a completed (or durably
+// submitted) save covered, so the periodic `autosave_world` can prove an
+// unchanged world in two atomic loads and skip the whole snapshot+write+fsync.
+
+/// Advances on every persisted-state mutation; see the section comment above.
+/// Starts at 1 so the first periodic pass after boot always writes — a fresh
+/// world's seed must reach disk even when nobody built yet.
+static WORLD_PERSIST_DIRTY_EPOCH: AtomicU64 = AtomicU64::new(1);
+/// Highest dirty epoch a completed save is known to cover.
+static LAST_SAVED_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Highest dirty epoch handed to the async save worker and not yet confirmed.
+/// A covered-but-unconfirmed epoch still skips the pass (the queue already
+/// holds a newer snapshot than the one it would capture), while a worker
+/// write failure un-covers it so the next pass retries the save.
+static LAST_SUBMITTED_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Telemetry: periodic autosaves that wrote nothing — nothing persisted
+/// changed, or an in-flight worker job already covers the change.
+static AUTOSAVE_SKIPPED_UNCHANGED: AtomicU64 = AtomicU64::new(0);
+
+/// A mutation the save serializes just committed; the next periodic autosave
+/// must not skip it.
+fn note_world_persist_dirty() {
+    WORLD_PERSIST_DIRTY_EPOCH.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A save that observed `epoch` has finished (or been durably submitted):
+/// every dirty mark up to it is covered. `fetch_max` keeps an out-of-order
+/// completion from rewinding the high-water mark.
+fn note_world_saved_through(epoch: u64) {
+    LAST_SAVED_EPOCH.fetch_max(epoch, Ordering::Release);
+}
+
 /// `MC_SPINE_BACKUP_MAX_KEEP`: how many `backups/world-*.bak` snapshots stay
 /// after each rotation. `0` (the default, or an unparseable value) disables
 /// the directory entirely.
@@ -16004,30 +16065,134 @@ fn backup_max_keep() -> usize {
         .unwrap_or(0)
 }
 
-/// `backups/world-NNNNNNNN.bak`, pruned to `backup_max_keep()`, holding the
-/// same protected payloads as the live overlay files. Only written when the
-/// operator asked for them; errors are reported but never block the save.
-fn rotate_save_backups(dir: &std::path::Path, snapshot: &WorldSaveSnapshot) {
+/// The server tick of the last backup rotation that wrote a generation.
+static LAST_BACKUP_ROTATE_TICK: AtomicU64 = AtomicU64::new(0);
+/// Minimum server ticks between non-forced rotations; 6000 ticks = 5 minutes
+/// of game time by default, overridable for deterministic tests.
+static BACKUP_ROTATE_MIN_TICKS: AtomicU64 = AtomicU64::new(6000);
+
+fn backup_rotate_min_ticks() -> u64 {
+    BACKUP_ROTATE_MIN_TICKS.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+fn set_backup_rotate_min_ticks(ticks: u64) {
+    BACKUP_ROTATE_MIN_TICKS.store(ticks, Ordering::Relaxed);
+}
+
+/// CRC32 of the newest payload each `(backup dir, prefix)` last wrote —
+/// `None` entries mean "not written this process" and fall back to hashing
+/// the on-disk newest generation so a restart does not rewrite identical
+/// bytes either.
+fn backup_last_digests() -> &'static Mutex<HashMap<(std::path::PathBuf, String), u32>> {
+    static DIGESTS: OnceLock<Mutex<HashMap<(std::path::PathBuf, String), u32>>> = OnceLock::new();
+    DIGESTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The `{prefix}.bak[.N]` path for generation `gen` (`0` = newest).
+fn backup_gen_path(dir: &std::path::Path, prefix: &str, gen: usize) -> std::path::PathBuf {
+    match gen {
+        0 => dir.join(format!("{prefix}.bak")),
+        gen => dir.join(format!("{prefix}.bak.{gen}")),
+    }
+}
+
+/// §5.2② one backup lineage: skip a payload byte-identical to the newest
+/// generation (0 bytes written), shift older generations with atomic
+/// `fs::rename`s (metadata only — 0 payload bytes moved), then write the new
+/// payload once via the tmp+rename atomic writer. Returns whether a new
+/// newest generation landed.
+fn rotate_one_backup(dir: &std::path::Path, prefix: &str, bytes: &[u8], keep: usize) -> bool {
+    if keep == 0 {
+        return false;
+    }
+    let digest = crc32_ieee_parts(&[bytes]);
+    let key = (dir.to_path_buf(), prefix.to_string());
+    {
+        let mut digests = backup_last_digests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(&last) = digests.get(&key) {
+            if last == digest {
+                return false;
+            }
+        } else if let Ok(existing) = std::fs::read(backup_gen_path(dir, prefix, 0)) {
+            let last = crc32_ieee_parts(&[&existing]);
+            digests.insert(key.clone(), last);
+            if last == digest {
+                return false;
+            }
+        }
+    }
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        eprintln!("[spine] {prefix} backup dir failed: {error}");
+        return false;
+    }
+    // Generation shift: drop the oldest slot, then rename each survivor one
+    // step older. Renames move directory entries only — no payload bytes are
+    // copied or rewritten for any old generation.
+    let _ = std::fs::remove_file(backup_gen_path(dir, prefix, keep - 1));
+    for gen in (1..keep).rev() {
+        let from = backup_gen_path(dir, prefix, gen - 1);
+        let to = backup_gen_path(dir, prefix, gen);
+        if from.exists() {
+            if let Err(error) = std::fs::rename(&from, &to) {
+                eprintln!(
+                    "[spine] {prefix} backup rotate {} -> {} failed: {error}",
+                    from.display(),
+                    to.display()
+                );
+            }
+        }
+    }
+    match write_bytes_atomic(&backup_gen_path(dir, prefix, 0), bytes) {
+        Ok(()) => {
+            backup_last_digests()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, digest);
+            true
+        }
+        Err(error) => {
+            eprintln!("[spine] {prefix} backup write failed: {error}");
+            false
+        }
+    }
+}
+
+/// `backups/{prefix}.bak[.N]` generations — newest is the unsuffixed `.bak`,
+/// `keep` generations deep — holding the same protected payloads as the live
+/// overlay files. Only written when the operator asked for them, the payload
+/// actually changed, and (for periodic saves) the minimum rotation interval
+/// elapsed; errors are reported but never block the save.
+fn rotate_save_backups(dir: &std::path::Path, snapshot: &WorldSaveSnapshot, forced: bool) {
     let keep = backup_max_keep();
     if keep == 0 {
         return;
     }
-    let backup_dir = dir.join("backups");
-    if let Err(error) =
-        rotate_world_backups(&backup_dir, "world", &wrap_world_payload(&snapshot.overworld), keep)
+    let now_tick = TICK.load(Ordering::Relaxed);
+    if !forced
+        && now_tick.saturating_sub(LAST_BACKUP_ROTATE_TICK.load(Ordering::Relaxed))
+            < backup_rotate_min_ticks()
     {
-        eprintln!("[spine] world backup rotation failed: {error}");
+        return;
     }
+    let backup_dir = dir.join("backups");
+    let mut rotated = rotate_one_backup(
+        &backup_dir,
+        "world",
+        &wrap_world_payload(&snapshot.overworld),
+        keep,
+    );
     for (dim, payload) in &snapshot.companions {
         let Some(payload) = payload else { continue };
         let prefix = dim_overlay_name(*dim)
             .unwrap_or("world_overlay.bin")
             .trim_end_matches(".bin");
-        if let Err(error) =
-            rotate_world_backups(&backup_dir, prefix, &wrap_world_payload(payload), keep)
-        {
-            eprintln!("[spine] {prefix} backup rotation failed: {error}");
-        }
+        rotated |= rotate_one_backup(&backup_dir, prefix, &wrap_world_payload(payload), keep);
+    }
+    if rotated {
+        LAST_BACKUP_ROTATE_TICK.store(now_tick, Ordering::Relaxed);
     }
 }
 
@@ -16040,7 +16205,7 @@ fn submit_world_snapshot(
     snapshot: WorldSaveSnapshot,
     dir: &std::path::Path,
 ) -> Result<(), String> {
-    rotate_save_backups(dir, &snapshot);
+    rotate_save_backups(dir, &snapshot, false);
     let path = dim_overlay_path(dir, DimId::Overworld);
     worker.submit(path, wrap_world_payload(&snapshot.overworld).into());
     let interval = connection_limits::backup_interval();
@@ -16098,22 +16263,125 @@ fn dwal_path_from_env() -> Option<std::path::PathBuf> {
     }
 }
 
+/// §5.2③ per-tick coalesced WAL buffer: the latest committed state per
+/// `(dim, x, y, z)`. A `BTreeMap` so the tick-end drain emits records in one
+/// deterministic sorted order.
+fn per_tick_wal_buffer() -> &'static Mutex<BTreeMap<(DimId, i32, i32, i32), u32>> {
+    static BUFFER: OnceLock<Mutex<BTreeMap<(DimId, i32, i32, i32), u32>>> = OnceLock::new();
+    BUFFER.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Pending-entry cap: the buffer auto-flushes once it fills, so a /fill or
+/// explosion bigger than this still bounds coalescing memory.
+const PER_TICK_WAL_CAP: usize = 65_536;
+/// Telemetry: tick-end batch flushes issued (one contiguous write + one
+/// `sync_data` each, versus one flush per block edit before §5.2③).
+static WAL_BATCH_FLUSHES: AtomicU64 = AtomicU64::new(0);
+/// Telemetry: coalesced `BlockSet` records emitted across all batch flushes.
+static WAL_COALESCED_WRITES: AtomicU64 = AtomicU64::new(0);
+
+impl DeltaWalJournal {
+    /// §5.2③ batch append: frame every record, then land them as ONE
+    /// contiguous `write_all` + ONE `sync_data` — the tick-end coalesced
+    /// flush pays one fsync for the whole batch instead of one per edit.
+    /// The sequence counter only advances on a successful flush, matching
+    /// `append_and_flush`'s never-skip-a-seq discipline.
+    fn append_batch_and_flush(&mut self, records: &[DeltaWalRecord]) -> Result<(), String> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut batch = Vec::new();
+        let mut seq = self.next_seq;
+        for record in records {
+            let payload = record.encode();
+            if payload.len() > MAX_WAL_RECORD_BYTES {
+                return Err(format!(
+                    "delta WAL: record payload {} over cap",
+                    payload.len()
+                ));
+            }
+            batch.extend_from_slice(&dwal_frame_bytes(seq, &payload));
+            seq += 1;
+        }
+        self.file
+            .write_all(&batch)
+            .and_then(|_| self.file.sync_data())
+            .map_err(|e| format!("delta WAL: batch append {}: {e}", self.path.display()))?;
+        self.next_seq = seq;
+        Ok(())
+    }
+}
+
+/// Drain the coalesced buffer into the journal: sorted-key order, one batch
+/// frame set, one flush. Runs at the end of every dirty `game_tick`, before
+/// a checkpointed save's snapshot so pending frames precede the compaction
+/// marker, and on shutdown. No-op while disarmed or empty — the buffer can
+/// only hold records while `DWAL_ON` was set when they were noted.
+fn dwal_flush_pending() {
+    if !DWAL_ON.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut journal = live_dwal().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(wal) = journal.as_mut() else {
+        return;
+    };
+    let records: Vec<DeltaWalRecord> = {
+        let mut pending = per_tick_wal_buffer()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if pending.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *pending)
+            .into_iter()
+            .map(|((dim, x, y, z), state)| DeltaWalRecord::BlockSet { dim, x, y, z, state })
+            .collect()
+    };
+    match wal.append_batch_and_flush(&records) {
+        Ok(()) => {
+            WAL_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed);
+            WAL_COALESCED_WRITES.fetch_add(records.len() as u64, Ordering::Relaxed);
+        }
+        Err(error) => {
+            eprintln!("[spine] delta WAL batch flush failed: {error}");
+            // A failed append must not strand edits that live only in the
+            // overlay: return the frames to the buffer for the next drain.
+            // `or_insert` keeps any newer state a concurrent edit committed
+            // for the same cell while the batch was in flight.
+            let mut pending = per_tick_wal_buffer()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for record in records {
+                let DeltaWalRecord::BlockSet { dim, x, y, z, state } = record else {
+                    continue;
+                };
+                pending.entry((dim, x, y, z)).or_insert(state);
+            }
+        }
+    }
+}
+
 /// Journal one committed overlay edit. Called from `set_block_if_inner_dim`
 /// and `set_block_if_dim_edit`, so it always runs inside the caller's
 /// `SAVE_LOCK` hold — the frame order on disk is exactly the order a full
 /// save's snapshot sees the edits in. A rejected `expected` write never
 /// reaches this; append failures are reported, never fatal.
+///
+/// §5.2③: the edit only lands in the RAM `PerTickWalBuffer` — latest state
+/// per coordinate, zero disk writes during block edits. The tick end, a
+/// checkpointed save, or shutdown drains it as one batch; the cap flushes
+/// early so a huge edit pass cannot grow memory unboundedly.
 fn dwal_note_block_set(dim: DimId, x: i32, y: i32, z: i32, state: u32) {
     if !DWAL_ON.load(Ordering::Relaxed) {
         return;
     }
-    let mut journal = live_dwal().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(wal) = journal.as_mut() {
-        if let Err(error) =
-            wal.append_and_flush(&DeltaWalRecord::BlockSet { dim, x, y, z, state })
-        {
-            eprintln!("[spine] delta WAL append failed: {error}");
-        }
+    let mut pending = per_tick_wal_buffer()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    pending.insert((dim, x, y, z), state);
+    if pending.len() >= PER_TICK_WAL_CAP {
+        drop(pending);
+        dwal_flush_pending();
     }
 }
 
@@ -16137,6 +16405,10 @@ fn dwal_save_checkpointed(
     if SAVE_GUARD.with(|g| g.get()) {
         return Err("world save called inside an ownership transition".into());
     }
+    // The epoch is read before the write: an edit that lands while the
+    // snapshot serializes still counts as unsaved, so the dirty-epoch gate
+    // can only ever under-skip, never lose a change.
+    let epoch_at_start = WORLD_PERSIST_DIRTY_EPOCH.load(Ordering::Acquire);
     let _writer = SAVE_WRITER.lock().unwrap_or_else(|e| e.into_inner());
     let _save = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     SAVE_GUARD.with(|g| g.set(true));
@@ -16147,6 +16419,11 @@ fn dwal_save_checkpointed(
         }
     }
     let _reset = Reset;
+    // §5.2③: pending coalesced frames must reach the journal before the
+    // checkpoint marker — an edit buffered here is already in the overlay
+    // the snapshot is about to capture, and compacting before it lands would
+    // leave a crash with neither the frame nor a save that covers it.
+    dwal_flush_pending();
     let snapshot = persistence_boundary("world snapshot panicked", || {
         Ok(WorldSaveSnapshot::capture())
     })
@@ -16157,6 +16434,7 @@ fn dwal_save_checkpointed(
         let checkpoint_seq = wal.next_seq();
         wal.compact_after_checkpoint(checkpoint_seq)?;
     }
+    note_world_saved_through(epoch_at_start);
     Ok(())
 }
 
@@ -16187,7 +16465,7 @@ fn dwal_shutdown_save_checkpointed() {
     flush_live_saves();
     let dir = world_save_dir();
     if let Err(error) = dwal_save_checkpointed(|snapshot| {
-        rotate_save_backups(&dir, &snapshot);
+        rotate_save_backups(&dir, &snapshot, true);
         snapshot.write(&dir)
     }) {
         eprintln!("[spine] WORLD SAVE FAILED: {error}");
@@ -16251,21 +16529,58 @@ fn dwal_boot_recover_and_arm() {
 /// The autosave: identical to `save_world` until the live worker exists, then
 /// a non-blocking submit. The worker's one-slot queue coalesces slow writes so
 /// a 20 TPS loop never waits on disk.
+///
+/// §5.2① dirty-epoch gate: when nothing the snapshot serializes changed
+/// since the last completed save, the periodic pass returns with 0 snapshots
+/// captured, 0 bytes written, 0 fsyncs. Explicit saves (`save-all`, shutdown)
+/// never read this gate — they always flush and write.
 fn autosave_world() {
+    let dirty = WORLD_PERSIST_DIRTY_EPOCH.load(Ordering::Acquire);
+    if dirty == LAST_SAVED_EPOCH.load(Ordering::Acquire) {
+        AUTOSAVE_SKIPPED_UNCHANGED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     if dwal_enabled() {
         dwal_autosave_checkpointed();
         return;
     }
     let Some(worker) = live_save_worker() else {
-        save_world();
+        let dir = world_save_dir();
+        if let Err(error) = save_world_guarded(|snapshot| snapshot.write(&dir)) {
+            eprintln!("[spine] WORLD SAVE FAILED: {error}");
+            return;
+        }
         live_anvil_save_if_armed();
+        note_world_saved_through(dirty);
         return;
     };
+    // A submitted worker snapshot already covers `dirty`: confirm it landed
+    // instead of queuing a duplicate. `flush` returns at once unless the disk
+    // lags a whole save interval; a reported failure un-covers the epoch so
+    // this pass falls through and retries the save.
+    let submitted = LAST_SUBMITTED_EPOCH.load(Ordering::Acquire);
+    if dirty <= submitted {
+        match worker.flush() {
+            Ok(()) => note_world_saved_through(submitted),
+            Err(error) => {
+                eprintln!("[spine] WORLD SAVE FAILED: {error}");
+                LAST_SUBMITTED_EPOCH.store(0, Ordering::Relaxed);
+            }
+        }
+        if dirty <= LAST_SUBMITTED_EPOCH.load(Ordering::Acquire) {
+            AUTOSAVE_SKIPPED_UNCHANGED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
     let dir = world_save_dir();
-    if let Err(error) = save_world_guarded(|snapshot| submit_world_snapshot(worker, snapshot, &dir)) {
+    if let Err(error) =
+        save_world_guarded(|snapshot| submit_world_snapshot(worker, snapshot, &dir))
+    {
         eprintln!("[spine] WORLD SAVE FAILED: {error}");
+        return;
     }
     live_anvil_save_if_armed();
+    LAST_SUBMITTED_EPOCH.store(dirty, Ordering::Release);
 }
 
 /// Wait until the background writer has finished every snapshot handed to it.
@@ -16287,12 +16602,17 @@ fn shutdown_world_save() {
         return;
     }
     flush_live_saves();
+    // The epoch is read before the write: an edit that lands while the
+    // snapshot serializes still counts as unsaved, so the gate can only ever
+    // under-skip, never lose a change.
+    let epoch_at_start = WORLD_PERSIST_DIRTY_EPOCH.load(Ordering::Acquire);
     let dir = world_save_dir();
-    if let Err(error) = save_world_guarded(|snapshot| {
-        rotate_save_backups(&dir, &snapshot);
+    match save_world_guarded(|snapshot| {
+        rotate_save_backups(&dir, &snapshot, true);
         snapshot.write(&dir)
     }) {
-        eprintln!("[spine] WORLD SAVE FAILED: {error}");
+        Ok(()) => note_world_saved_through(epoch_at_start),
+        Err(error) => eprintln!("[spine] WORLD SAVE FAILED: {error}"),
     }
     live_anvil_save_if_armed();
 }
@@ -16790,6 +17110,10 @@ fn block_entity_field_uuid(field: &Tag) -> Option<BlockEntityUuid> {
 }
 
 fn game_tick(mut step: impl FnMut(&'static str, fn())) {
+    // §5.2③: drain leftover coalesced WAL frames even when this tick is
+    // frozen, so `/tick freeze` (or a skipped tick) cannot strand journaled
+    // edits in RAM past the next save boundary. No-op while empty/disarmed.
+    dwal_flush_pending();
     // `/tick freeze` skips world ticks unless `/tick step` or `/tick sprint`
     // queued budget; a sprint always runs. The default is unfrozen, so callers
     // (including tests) that never froze see no change.
@@ -16889,6 +17213,10 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
         .unwrap_or_else(|e| e.into_inner())
         .record_tick_us(wire_us);
     ac_note_server_tick_ms(wire_us / 1000);
+    // §5.2③ tick-end WAL batch: the tick's coalesced block edits land as one
+    // contiguous write + one flush instead of one fsync per edit. No-op when
+    // the tick touched no journaled blocks.
+    dwal_flush_pending();
 }
 
 fn main() {
@@ -20109,10 +20437,12 @@ mod wire_ops_tests {
 
     /// Disarm the journal: the append path returns to its zero-cost early
     /// return and the slot is emptied so a later `dwal_boot_recover_and_arm`
-    /// starts clean.
+    /// starts clean. The §5.2③ coalesced buffer drops with it — stale
+    /// pending records must not flush into the next journal.
     fn wire_ops_dwal_disarm() {
         DWAL_ON.store(false, Ordering::Relaxed);
         *wire_lock(live_dwal()) = None;
+        wire_lock(per_tick_wal_buffer()).clear();
     }
 
     /// Every real `game_tick` must land in the shared profiler and in the
@@ -20173,8 +20503,10 @@ mod wire_ops_tests {
         dwal_boot_recover_and_arm();
         assert!(dwal_enabled());
 
-        // A live edit lands in the journal immediately.
+        // A live edit lands in the journal at the tick-end coalesced flush
+        // (§5.2③): RAM-only while buffered, one batch write when drained.
         set_block_dim(dim, x, y, z, state);
+        dwal_flush_pending();
         let report = recover_after_checkpoint(&wal_path).unwrap();
         assert!(report.records.contains(&DeltaWalRecord::BlockSet {
             dim,
@@ -20201,6 +20533,7 @@ mod wire_ops_tests {
 
         // Post-checkpoint edits keep journaling on the rotated sequence.
         set_block_dim(dim, x, y, z, 0);
+        dwal_flush_pending();
         let report = recover_after_checkpoint(&wal_path).unwrap();
         assert!(report.records.contains(&DeltaWalRecord::BlockSet {
             dim,
@@ -20229,6 +20562,268 @@ mod wire_ops_tests {
             Some(v) => std::env::set_var("MC_SPINE_WAL_PATH", v),
             None => std::env::remove_var("MC_SPINE_WAL_PATH"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---------------- Lane ULTRA-DISK-5: §5.2 zero-waste persistence tests ----------------
+
+#[cfg(test)]
+mod ultra_disk_5_tests {
+    use super::*;
+
+    /// Poison-tolerant lock: the ratchet forbids growing `.lock().unwrap_or_else(|e| e.into_inner())`,
+    /// tests included.
+    fn d5_lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn d5_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("mc-spine-ultra-disk-5-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Journal off, journal slot empty, coalesced buffer empty — the clean
+    /// state every WAL test enters and leaves.
+    fn d5_dwal_disarm() {
+        DWAL_ON.store(false, Ordering::Relaxed);
+        *d5_lock(live_dwal()) = None;
+        d5_lock(per_tick_wal_buffer()).clear();
+    }
+
+    /// §5.2①: an unchanged epoch skips the periodic save (0 writes, skip
+    /// counted); a committed block edit bumps the epoch and the next periodic
+    /// pass saves again.
+    #[test]
+    fn ultra_disk_5_autosave_skips_unchanged_epoch_and_saves_when_dirty() {
+        let _guard = world_guard();
+        d5_dwal_disarm();
+        let overlay = std::path::PathBuf::from(WORLD_FILE);
+        let pre_existing = overlay.exists();
+
+        // Clean epoch pair → every periodic pass skips without a write.
+        LAST_SAVED_EPOCH.store(
+            WORLD_PERSIST_DIRTY_EPOCH.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        let skipped0 = AUTOSAVE_SKIPPED_UNCHANGED.load(Ordering::Relaxed);
+        autosave_world();
+        autosave_world();
+        assert_eq!(
+            AUTOSAVE_SKIPPED_UNCHANGED.load(Ordering::Relaxed),
+            skipped0 + 2,
+            "two unchanged autosaves must count two skips"
+        );
+        assert_eq!(
+            overlay.exists(),
+            pre_existing,
+            "an unchanged autosave must not touch the overlay file"
+        );
+
+        // A committed block edit is a persisted-state mutation: the epoch
+        // advances and the next periodic pass performs a real save.
+        let dim = DimId::Overworld;
+        let (x, y, z) = (3_100_001, 90, -3_099_997);
+        let chunk_key = (dim, x >> 4, z >> 4);
+        let state = name_to_state("stone").unwrap_or(1);
+        set_block_dim(dim, x, y, z, state);
+        let dirty = WORLD_PERSIST_DIRTY_EPOCH.load(Ordering::Acquire);
+        assert!(dirty > LAST_SAVED_EPOCH.load(Ordering::Acquire));
+        autosave_world();
+        assert_eq!(
+            LAST_SAVED_EPOCH.load(Ordering::Acquire),
+            dirty,
+            "a dirty autosave covers the epoch it observed"
+        );
+        if !pre_existing {
+            assert!(overlay.exists(), "the dirty autosave wrote the overlay");
+            remove_world_save(&overlay).unwrap();
+        }
+
+        // Covered again → the very next periodic pass skips once more.
+        let skipped1 = AUTOSAVE_SKIPPED_UNCHANGED.load(Ordering::Relaxed);
+        autosave_world();
+        assert_eq!(
+            AUTOSAVE_SKIPPED_UNCHANGED.load(Ordering::Relaxed),
+            skipped1 + 1
+        );
+
+        // Leave nothing behind: the edit's cell drops and the epoch pair is
+        // re-baselined so later tests are not forced through a save.
+        d5_lock(world()).remove(&chunk_key);
+        LAST_SAVED_EPOCH.store(
+            WORLD_PERSIST_DIRTY_EPOCH.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        if !pre_existing {
+            remove_world_save(&overlay).unwrap();
+        }
+    }
+
+    /// §5.2③: 1,000 overlapping `dwal_note_block_set` calls across 50
+    /// coordinates produce zero disk writes while buffered, then ONE batch
+    /// flush emitting exactly 50 coalesced records in sorted order carrying
+    /// the latest states — and the buffer cap auto-flushes.
+    #[test]
+    fn ultra_disk_5_wal_coalesces_1000_block_edits_into_single_batch_flush() {
+        let _guard = world_guard();
+        let dir = d5_dir("wal");
+        let wal_path = dir.join("delta.wal");
+        let save_dir = dir.join("save");
+        std::fs::create_dir_all(&save_dir).unwrap();
+        std::env::set_var("MC_SPINE_WAL_PATH", &wal_path);
+        d5_dwal_disarm();
+        dwal_boot_recover_and_arm();
+        assert!(dwal_enabled());
+
+        let flushes0 = WAL_BATCH_FLUSHES.load(Ordering::Relaxed);
+        let coalesced0 = WAL_COALESCED_WRITES.load(Ordering::Relaxed);
+        for i in 0..1000u32 {
+            let idx = i % 50;
+            dwal_note_block_set(DimId::Overworld, idx as i32, 64, -(idx as i32), i);
+        }
+        // While buffered: not one frame, not one flush reached the disk.
+        let report = recover_after_checkpoint(&wal_path).unwrap();
+        assert!(
+            report.records.is_empty(),
+            "coalesced edits must not touch the WAL before the tick end"
+        );
+        assert_eq!(WAL_BATCH_FLUSHES.load(Ordering::Relaxed), flushes0);
+
+        // Tick end: one batch flush, exactly 50 records, latest state per
+        // coordinate, deterministic sorted key order.
+        dwal_flush_pending();
+        assert_eq!(
+            WAL_BATCH_FLUSHES.load(Ordering::Relaxed),
+            flushes0 + 1,
+            "1,000 edits over 50 coords collapse into one batch flush"
+        );
+        assert_eq!(
+            WAL_COALESCED_WRITES.load(Ordering::Relaxed),
+            coalesced0 + 50
+        );
+        let report = recover_after_checkpoint(&wal_path).unwrap();
+        assert_eq!(report.records.len(), 50);
+        for (i, record) in report.records.iter().enumerate() {
+            let idx = i as u32;
+            assert_eq!(
+                *record,
+                DeltaWalRecord::BlockSet {
+                    dim: DimId::Overworld,
+                    x: idx as i32,
+                    y: 64,
+                    z: -(idx as i32),
+                    state: 950 + idx,
+                },
+                "coordinate {idx} must carry its latest committed state"
+            );
+        }
+
+        // The cap flushes a full buffer on its own — memory stays bounded
+        // even when no tick end ever arrives between edits.
+        for i in 0..PER_TICK_WAL_CAP {
+            dwal_note_block_set(DimId::Nether, 1_000_000 + i as i32, 70, -7, 42);
+        }
+        assert!(
+            d5_lock(per_tick_wal_buffer()).is_empty(),
+            "a full buffer auto-flushes at the cap"
+        );
+        assert_eq!(
+            WAL_BATCH_FLUSHES.load(Ordering::Relaxed),
+            flushes0 + 2
+        );
+
+        // A checkpointed save drains pending frames before the marker: an
+        // unflushed edit followed by a save leaves an empty post-marker log.
+        dwal_note_block_set(DimId::Overworld, 8, 80, -8, 7);
+        dwal_save_checkpointed(|snapshot| snapshot.write(&save_dir)).unwrap();
+        let report = recover_after_checkpoint(&wal_path).unwrap();
+        assert!(report.checkpoint_seq.is_some());
+        assert!(report.records.is_empty());
+
+        d5_dwal_disarm();
+        std::env::remove_var("MC_SPINE_WAL_PATH");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §5.2②: an identical payload skips the backup write entirely, the
+    /// minimum tick interval suppresses periodic rotations (but never a
+    /// forced one), and generations shift by atomic rename.
+    #[test]
+    fn ultra_disk_5_backup_rotation_skips_identical_payload_and_respects_interval() {
+        let _guard = world_guard();
+        let dir = d5_dir("backup");
+        let backup_dir = dir.join("backups");
+        let newest = backup_dir.join("world.bak");
+        let old_tick = TICK.load(Ordering::Relaxed);
+        let old_keep = std::env::var_os("MC_SPINE_BACKUP_MAX_KEEP");
+        let old_min = backup_rotate_min_ticks();
+        // Reset global rotation state so earlier tests' rotations cannot
+        // suppress this one's interval window.
+        backup_last_digests().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        LAST_BACKUP_ROTATE_TICK.store(0, Ordering::Relaxed);
+        set_backup_rotate_min_ticks(6000);
+        std::env::set_var("MC_SPINE_BACKUP_MAX_KEEP", "3");
+        TICK.store(1_000_000, Ordering::Relaxed);
+
+        let snapshot_of = |tag: u8| WorldSaveSnapshot {
+            overworld: vec![tag; 64],
+            companions: [(DimId::Nether, None), (DimId::End, None)],
+        };
+        let count_baks = |dir: &std::path::Path| {
+            std::fs::read_dir(dir).map(|rd| rd.count()).unwrap_or(0)
+        };
+
+        // First rotation lands the newest generation.
+        rotate_save_backups(&dir, &snapshot_of(1), false);
+        assert_eq!(std::fs::read_dir(&backup_dir).unwrap().count(), 1);
+        let v1 = std::fs::read(&newest).unwrap();
+
+        // Identical payload → digest skip: still one file, bytes untouched.
+        rotate_save_backups(&dir, &snapshot_of(1), true);
+        assert_eq!(count_baks(&backup_dir), 1);
+        assert_eq!(std::fs::read(&newest).unwrap(), v1);
+
+        // New payload inside the min interval → periodic rotation skipped.
+        TICK.store(1_001_000, Ordering::Relaxed); // +1000 < 6000
+        rotate_save_backups(&dir, &snapshot_of(2), false);
+        assert_eq!(std::fs::read(&newest).unwrap(), v1);
+        assert_eq!(count_baks(&backup_dir), 1);
+
+        // A forced rotation ignores the interval and shifts by rename:
+        // .bak -> .bak.1 is a metadata-only generation move.
+        rotate_save_backups(&dir, &snapshot_of(2), true);
+        let v2 = std::fs::read(&newest).unwrap();
+        assert_ne!(v2, v1);
+        assert_eq!(std::fs::read(backup_dir.join("world.bak.1")).unwrap(), v1);
+
+        // Past the interval the periodic rotation shifts generations again.
+        TICK.store(1_008_000, Ordering::Relaxed);
+        rotate_save_backups(&dir, &snapshot_of(3), false);
+        let v3 = std::fs::read(&newest).unwrap();
+        assert_ne!(v3, v2);
+        assert_eq!(std::fs::read(backup_dir.join("world.bak.1")).unwrap(), v2);
+        assert_eq!(std::fs::read(backup_dir.join("world.bak.2")).unwrap(), v1);
+
+        // keep = 3: the oldest generation is dropped, never rewritten.
+        TICK.store(1_020_000, Ordering::Relaxed);
+        rotate_save_backups(&dir, &snapshot_of(4), false);
+        assert_eq!(count_baks(&backup_dir), 3);
+        assert!(!backup_dir.join("world.bak.3").exists());
+        assert_eq!(std::fs::read(backup_dir.join("world.bak.1")).unwrap(), v3);
+
+        // Restore shared state: tick, env, rotation trackers.
+        TICK.store(old_tick, Ordering::Relaxed);
+        match old_keep {
+            Some(v) => std::env::set_var("MC_SPINE_BACKUP_MAX_KEEP", v),
+            None => std::env::remove_var("MC_SPINE_BACKUP_MAX_KEEP"),
+        }
+        set_backup_rotate_min_ticks(old_min);
+        backup_last_digests().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        LAST_BACKUP_ROTATE_TICK.store(0, Ordering::Relaxed);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
