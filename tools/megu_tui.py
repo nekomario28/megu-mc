@@ -577,11 +577,11 @@ def _card_block(entries, cols, ascii_mode):
     tops, mids, bots = [], [], []
     for title, value in entries:
         if ascii_mode:
-            tops.append("+" + fit_plain("- " + title, inner, "-") + "+")
+            tops.append("+" + fit_plain("- " + title + " ", inner, "-") + "+")
             mids.append("|" + center_vis(value, inner) + "|")
             bots.append("+" + "-" * inner + "+")
         else:
-            tops.append("┌" + fit_plain("─ " + title, inner, "─") + "┐")
+            tops.append("┌" + fit_plain("─ " + title + " ", inner, "─") + "┐")
             mids.append("│" + center_vis(value, inner) + "│")
             bots.append("└" + "─" * inner + "┘")
     return [" ".join(tops), " ".join(mids), " ".join(bots)]

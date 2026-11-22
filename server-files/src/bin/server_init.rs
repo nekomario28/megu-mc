@@ -118,6 +118,29 @@ const DEFAULT_BAN_REASON: &str = "Banned by an operator.";
 const DEFAULT_BAN_CREATED: &str = "1970-01-01T00:00:00Z";
 const DEFAULT_BAN_SOURCE: &str = "mc-spine-init";
 
+/// The name this process was invoked as: the executable's basename, so the
+/// `mc-spine-admin` build names itself correctly instead of borrowing the
+/// launcher's `mc-spine-init`. `mc-spine-init` re-execs this binary for its
+/// legacy subcommands, which is why usage text must come from argv[0] rather
+/// than a constant.
+fn prog_name() -> String {
+    std::env::args()
+        .next()
+        .as_deref()
+        .and_then(|arg0| Path::new(arg0).file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "mc-spine-init".into())
+}
+
+/// `HELP` with the invoked-as name substituted: the title line plus every
+/// `    mc-spine-init ` usage line. The `--source` default mention keeps the
+/// literal string — it names a stored value, not the program.
+fn help_text(prog: &str) -> String {
+    HELP.replacen("mc-spine-init", prog, 1)
+        .replace("    mc-spine-init ", &format!("    {prog} "))
+}
+
 /// The seven files a server directory is made of, in report order.
 const ALL_FILES: [&str; 7] = [
     EULA_FILE,
@@ -969,7 +992,8 @@ fn eula_action(dir: &Path, status: EulaStatus) -> String {
             file.display()
         ),
         EulaStatus::Missing => format!(
-            "run `mc-spine-init init --dir {}` to create eula.txt, then set eula=true to agree to the Minecraft EULA ({EULA_LINK})",
+            "run `{} init --dir {}` to create eula.txt, then set eula=true to agree to the Minecraft EULA ({EULA_LINK})",
+            prog_name(),
             dir.display()
         ),
     }
@@ -1659,17 +1683,18 @@ fn cmd_claims(dir: &Path, action: &ClaimsAction, json: bool) -> Result<(), CliEr
 // --------------------------------------------------------------------- main
 
 fn main() -> ExitCode {
+    let prog = prog_name();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = match parse_command(&args) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("mc-spine-init: {}", e.message);
+            eprintln!("{prog}: {}", e.message);
             return ExitCode::from(e.code);
         }
     };
     let result = match command {
         Command::Help => {
-            print!("{HELP}");
+            print!("{}", help_text(&prog));
             return ExitCode::SUCCESS;
         }
         Command::Init {
@@ -1733,7 +1758,7 @@ fn main() -> ExitCode {
     match result {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
-            eprintln!("mc-spine-init: {}", e.message);
+            eprintln!("{prog}: {}", e.message);
             ExitCode::from(e.code)
         }
     }

@@ -256,8 +256,12 @@ fn initialize(options: &Options, actions: &[Planned]) -> io::Result<()> {
         match entry.name {
             "server.toml" => store(
                 &path,
+                // The runtime parser (src/server_config.rs) only accepts the
+                // `[server]`/`[anticheat]` tables; top-level keys land in `[]` and
+                // warn as an unknown table. `target_mc_version` is the kept
+                // pre-Two-Target spelling of `target_version`, both known keys.
                 format!(
-                    "# mc-spine server configuration\nmc_version = \"{}\"\nport = {}\n",
+                    "# mc-spine server configuration\n\n[server]\ntarget_mc_version = \"{}\"\nport = {}\n",
                     options.version.id(),
                     options.port
                 )

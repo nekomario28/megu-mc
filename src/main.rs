@@ -13456,6 +13456,106 @@ fn bump_world_epoch_dim(dim: DimId, x: i32, z: i32) {
     }
 }
 
+/// The cell sources a `sky_floors_dim` scan needs for one chunk, snapshotted once so
+/// the per-column walk never takes `world()`, the section-store or the band lock.
+///
+/// The readers it stands in for are already per-cell memoized (`cell_source` holds the
+/// last `(chunk, section)` source across a column walk); this goes one step further and
+/// pins the whole chunk's sources for the length of the scan. The precedence mirrors
+/// `opacity_windowed_dim` exactly: a published section answers for its own cells, the
+/// write-through band answers for cells in its range, and the edit overlay answers for
+/// what neither covers — a section or band row already carries its write-through
+/// patches, so the overlay is only consulted where neither covers. A cell the snapshot
+/// cannot settle (no published section, no band row, no edit) still goes through the
+/// caller's `opacity`, which answers it the way it always has.
+struct SkyFloorCells {
+    dim: DimId,
+    reg: &'static block_registry::BReg,
+    sections: Option<PublishedColumn>,
+    band: Option<std::sync::Arc<OpBand>>,
+    overlay: HashMap<u32, u32>,
+}
+
+/// Test switches for `perf_sky_floors_fast_matches_reference_cell_for_cell`:
+/// `SKY_FLOORS_NO_SNAPSHOT` forces the per-cell path the snapshot replaces (the
+/// reference), and `SKY_FLOORS_SNAPSHOT_CELLS` counts the cells the snapshot
+/// actually settled, so the test proves the fast path ran rather than silently
+/// delegating every cell.
+#[cfg(test)]
+static SKY_FLOORS_NO_SNAPSHOT: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static SKY_FLOORS_SNAPSHOT_CELLS: AtomicU64 = AtomicU64::new(0);
+
+impl SkyFloorCells {
+    /// Snapshot the chunk's sources, or `None` when nothing cached can answer — the
+    /// caller then uses `opacity` for every cell, exactly as before. A chunk that is
+    /// neither in the section store nor the band cache has no cheaper source than the
+    /// per-cell chain, so scanning it through a snapshot would buy nothing.
+    fn snapshot(dim: DimId, cx: i32, cz: i32) -> Option<Self> {
+        #[cfg(test)]
+        if SKY_FLOORS_NO_SNAPSHOT.load(Ordering::Relaxed) {
+            return None;
+        }
+        let reg = breg()?;
+        if !worldgen::enabled() {
+            return None;
+        }
+        let sections = {
+            let store = section_store().lock().unwrap_or_else(|e| e.into_inner());
+            if store.generation == current_gen_seq() {
+                store.map.get(&(dim, cx, cz)).cloned()
+            } else {
+                None
+            }
+        };
+        let band = band_for(dim, cx, cz);
+        if sections.is_none() && band.is_none() {
+            return None;
+        }
+        let overlay = timed_world()
+            .get(&(dim, cx, cz))
+            .cloned()
+            .unwrap_or_default();
+        Some(Self {
+            dim,
+            reg,
+            sections,
+            band,
+            overlay,
+        })
+    }
+
+    /// `opacity_windowed_dim` for one cell, resolved from the snapshot. `None` means
+    /// no snapshot source covers the cell; the caller's `opacity` decides it instead,
+    /// which is the same answer the live chain would give.
+    fn opacity_at(&self, x: i32, y: i32, z: i32) -> Option<u8> {
+        if let Some(idx) = section_index_dim(self.dim, y & !15) {
+            if let Some(Some(sec)) = self.sections.as_ref().and_then(|c| c.get(idx)) {
+                let op = match sec.light_class() {
+                    SectionLightClass::Empty => 0,
+                    SectionLightClass::Opaque => 15,
+                    SectionLightClass::Mixed => self.reg.opacity_of(sec.get(
+                        (((y & 15) as usize) << 8)
+                            | (((z & 15) as usize) << 4)
+                            | (x & 15) as usize,
+                    )),
+                };
+                #[cfg(test)]
+                SKY_FLOORS_SNAPSHOT_CELLS.fetch_add(1, Ordering::Relaxed);
+                return Some(op);
+            }
+        }
+        let st = self
+            .band
+            .as_ref()
+            .and_then(|b| b.get(y, (x & 15) as usize, (z & 15) as usize))
+            .or_else(|| self.overlay.get(&local_idx(x, y, z)).copied())?;
+        #[cfg(test)]
+        SKY_FLOORS_SNAPSHOT_CELLS.fetch_add(1, Ordering::Relaxed);
+        Some(self.reg.opacity_of(st))
+    }
+}
+
 fn sky_floors(cx: i32, cz: i32, opacity: &impl Fn(i32, i32, i32) -> u8) -> [i32; 256] {
     sky_floors_dim(DimId::Overworld, cx, cz, opacity)
 }
@@ -13513,6 +13613,10 @@ fn sky_floors_dim(
         }
         starts
     };
+    // One snapshot of the chunk's published sections, band and overlay; the scan then
+    // answers from L1 instead of taking the store/band/world locks per cell. Cells the
+    // snapshot does not cover still go through `opacity`, so the floors are identical.
+    let cells = SkyFloorCells::snapshot(dim, cx, cz);
     let mut floors = [0i32; 256];
     for lz in 0..16usize {
         for lx in 0..16usize {
@@ -13524,7 +13628,11 @@ fn sky_floors_dim(
                 if chunkprof::enabled() {
                     chunkprof::FLOORS_CELLS.fetch_add(1, Ordering::Relaxed);
                 }
-                if opacity(x, y, z) > 0 {
+                let opaque = cells
+                    .as_ref()
+                    .and_then(|c| c.opacity_at(x, y, z))
+                    .unwrap_or_else(|| opacity(x, y, z));
+                if opaque > 0 {
                     break;
                 }
                 y -= 1;
@@ -17315,14 +17423,192 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     dwal_flush_pending();
 }
 
+/// The line `--version` prints: the engine name, the build tag and the vanilla
+/// release/protocol pair it speaks.
+const MEGU_VERSION_LINE: &str =
+    "Megu (mc-spine) 0.1.0-alpha.1 (Minecraft 1.21.1 / 26.3, Protocol 767)";
+
+/// `--help` output: every flag a first boot can take, and what each one does.
+/// Printed and exited before the world, the config or a socket exists.
+const MEGU_CLI_USAGE: &str = "\
+Megu v0.1.0-alpha.1 - clean-room Rust Minecraft engine (Minecraft 1.21.1 / 26.3, protocol 767)
+
+USAGE:
+    mc-spine [options]
+
+OPTIONS:
+    --dir <path>     Server directory: its eula.txt, server.toml and world/ are
+                     used (default: the current directory). Also --dir=<path>.
+    --port <u16>     Listen port (default: 25599; [server] port in server.toml
+                     or MC_SPINE_PORT can also set it).
+    --bind <addr>    Bind address (default: 127.0.0.1; MC_SPINE_BIND_ADDR).
+    --no-banner      Suppress the interactive startup banner.
+    -V, --version    Print the version and exit.
+    -h, --help       Print this help and exit.
+
+The server runs with no arguments at all. A present-but-unaccepted eula.txt
+refuses the boot (exit 2); a missing one stays a dev/first-boot run.
+";
+
+/// The interactive greeting: a big-letter MEGU in pure ASCII, so cmd.exe on
+/// Windows, Terminal.app and every Linux console draw it without tofu glyphs.
+/// It is only ever written when stdout is a TTY — pipes, CI, tests and JSON log
+/// consumers see zero extra lines.
+const MEGU_BANNER: &str = r#"
+ __  __  _____   ____   _   _
+|  \/  || ____| / ___| | | | |
+| |\/| ||  _|  | |  _  | | | |
+| |  | || |___ | |_| | | |_| |
+|_|  |_||_____| \____|  \___/
+
+Megu v0.1.0-alpha.1 - clean-room Rust Minecraft engine (1.21.1 / 26.3)
+Let's blow past 20 TPS!
+"#;
+
+/// Consume the startup flags and return the arguments left for the probe/tool
+/// dispatch below. `--help`/`--version` print and exit 0 without the server ever
+/// booting; a missing or bad value fails closed with exit 2. `--dir` relocates
+/// before any relative path is resolved, and `--port`/`--bind` land in the
+/// environment the listener already reads — set before `server_config_boot`, so a
+/// `server.toml` fill-in cannot override them.
+fn parse_startup_flags() -> Vec<String> {
+    let mut rest = Vec::new();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "-h" || arg == "--help" {
+            print!("{MEGU_CLI_USAGE}");
+            std::process::exit(0);
+        } else if arg == "-V" || arg == "--version" {
+            println!("{MEGU_VERSION_LINE}");
+            std::process::exit(0);
+        } else if arg == "--no-banner" {
+            // Set rather than returned: the banner gate reads one place, and a
+            // server the launcher spawns inherits the same suppression.
+            std::env::set_var("MC_SPINE_NO_BANNER", "1");
+        } else if arg == "--dir" || arg.starts_with("--dir=") {
+            let dir = if arg == "--dir" {
+                match args.next() {
+                    Some(dir) if !dir.is_empty() => dir,
+                    _ => {
+                        eprintln!("mc-spine: --dir requires a path (see --help)");
+                        std::process::exit(2);
+                    }
+                }
+            } else {
+                match arg.strip_prefix("--dir=") {
+                    Some(dir) if !dir.is_empty() => dir.to_owned(),
+                    _ => {
+                        eprintln!("mc-spine: --dir requires a nonempty path (see --help)");
+                        std::process::exit(2);
+                    }
+                }
+            };
+            if let Err(e) = std::env::set_current_dir(&dir) {
+                eprintln!("mc-spine: --dir {dir}: {e}");
+                std::process::exit(2);
+            }
+        } else if arg == "--port" || arg.starts_with("--port=") {
+            let value = if arg == "--port" {
+                args.next()
+            } else {
+                arg.strip_prefix("--port=").map(str::to_owned)
+            };
+            let port = value.and_then(|v| v.parse::<u16>().ok()).filter(|p| *p != 0);
+            match port {
+                Some(port) => std::env::set_var("MC_SPINE_PORT", port.to_string()),
+                None => {
+                    eprintln!("mc-spine: --port requires a port in 1..65535 (see --help)");
+                    std::process::exit(2);
+                }
+            }
+        } else if arg == "--bind" || arg.starts_with("--bind=") {
+            let value = if arg == "--bind" {
+                args.next()
+            } else {
+                arg.strip_prefix("--bind=").map(str::to_owned)
+            };
+            match value {
+                Some(bind) if !bind.is_empty() => {
+                    std::env::set_var("MC_SPINE_BIND_ADDR", bind)
+                }
+                _ => {
+                    eprintln!("mc-spine: --bind requires an address (see --help)");
+                    std::process::exit(2);
+                }
+            }
+        } else {
+            rest.push(arg);
+        }
+    }
+    rest
+}
+
+/// A present `eula.txt` must accept the EULA, like Vanilla's `DedicatedServer.eula`
+/// check: `eula=true`, parsed with the same properties rules `server.properties`
+/// gets — UTF-8 BOM tolerated, `#`/`!` comments, `=`/`:` separators, escapes, a
+/// case-insensitive `true`. `EULA=TRUE`/`true`/`1` in the environment answers for
+/// container images instead. A *missing* file is not a refusal: first boots and
+/// repository dev runs have no eula.txt, and the existing flow handles them. Runs
+/// only on the real boot path (no tool arguments), before world or socket work;
+/// a refusal exits 2.
+fn eula_direct_launch_check() {
+    if matches!(
+        std::env::var("EULA").as_deref(),
+        Ok("TRUE") | Ok("true") | Ok("1")
+    ) {
+        return;
+    }
+    let accepted = match std::fs::read("eula.txt") {
+        Ok(bytes) => {
+            // BOM like server-files' check_eula, then the same tolerant line
+            // rules — lone-CR endings folded in so old editors resolve too.
+            let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
+            let text = String::from_utf8_lossy(bytes).replace('\r', "\n");
+            server_properties_parse(&text)
+                .get("eula")
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        // An unreadable eula.txt fails closed, as server-files' check_eula does.
+        Err(_) => false,
+    };
+    if !accepted {
+        eprintln!(
+            "You need to agree to the Mojang EULA (https://aka.ms/MinecraftEULA) by setting eula=true in eula.txt"
+        );
+        std::process::exit(2);
+    }
+}
+
+/// Print the big-letter greeting — only ever to an interactive terminal.
+/// `--no-banner`, `MC_SPINE_NO_BANNER=1` or `NO_BANNER=1` suppress it, and a
+/// non-TTY stdout (pipes, CI, tests, log collectors) gets zero extra lines.
+fn megu_startup_banner() {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal()
+        || std::env::var("MC_SPINE_NO_BANNER").as_deref() == Ok("1")
+        || std::env::var("NO_BANNER").as_deref() == Ok("1")
+    {
+        return;
+    }
+    print!("{MEGU_BANNER}");
+}
+
 fn main() {
+    // Startup flags first, before anything reads the world, the config or a
+    // socket: `--help`/`--version` return inside the parser, `--dir` relocates
+    // before `server.toml`/`eula.txt`/the world are resolved.
+    let rest = parse_startup_flags();
     // `server.toml` first, while the process is single-threaded: its `[server]` keys are
     // exported as the `MC_SPINE_*` variables everything below already reads.
-    // Tool modes (probe arguments, worldgen dumps) never touch it.
-    if std::env::args().nth(1).is_none()
+    // Tool modes (probe arguments, worldgen dumps) never touch it — and neither do
+    // the EULA gate nor the banner, which belong to the real boot alone.
+    if rest.is_empty()
         && std::env::var_os("MC_SPINE_WG_DUMP").is_none()
         && std::env::var_os("MC_SPINE_WG_PROFILE").is_none()
     {
+        eula_direct_launch_check();
+        megu_startup_banner();
         let doc = server_config_boot();
         ac_install(AcConfig::from_doc(&doc, |name| std::env::var(name).ok()));
         refresh_hidden_tags_from_datapacks(std::path::Path::new(DATAPACK_DIRECTORY));
@@ -17347,7 +17633,7 @@ fn main() {
         eprintln!("[wgdump] MC_SPINE_WG_DUMP requires MC_SPINE_WG_PROFILE (use 0 for dump only)");
         std::process::exit(2);
     }
-    let probe_args: Vec<String> = std::env::args().skip(1).collect();
+    let probe_args: Vec<String> = rest.clone();
     if probe_args
         .first()
         .is_some_and(|arg| arg == "--import-anvil")

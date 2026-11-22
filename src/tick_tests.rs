@@ -9906,6 +9906,75 @@ fn m3_p5_map_chunk_cache_hit_and_invalidation() {
     assert_eq!(p5, p6, "a cleared cache rebuilds the same payload");
 }
 
+/// The section-store snapshot inside `sky_floors_dim` must answer what the per-cell
+/// `opacity` callback answered: identical `[i32; 256]` on a chunk whose sections and
+/// band were installed by a real delivery, with overlay edits spread across every
+/// read regime — inside a published section/band row (write-through), high above the
+/// surface where only the overlay answers, and a surface block carved back to air.
+#[test]
+fn perf_sky_floors_fast_matches_reference_cell_for_cell() {
+    let _guard = world_guard();
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    crate::test_support::require_vanilla_data();
+    let _gen_guard = crate::worldgen::lock_gen_for_tests();
+    assert!(worldgen::init(0, crate::name_to_state), "overworld");
+    let dim = DimId::Overworld;
+    let (cx, cz) = (0, 0);
+    clear_chunk_caches_for_tests();
+    // Deliver the chunk: the section store and the opacity band are populated the
+    // way a real stream leaves them, not hand-built.
+    let mut gen: GenSources = GenSources::new();
+    let _ = map_chunk(cx, cz, dim, &mut gen);
+
+    let stone = name_to_state("stone").expect("stone in the pinned registry");
+    let surface = height_at_dim(dim, 8, 8);
+    // A placed block above the terrain top but inside the band's reach — the
+    // write-through patch on the published section/band is what both paths read.
+    set_block_dim(dim, 8, surface + 2, 8, stone);
+    // Far above the band and above the published surface sections: only the edit
+    // overlay can answer this cell, so a snapshot that dropped it would break here.
+    set_block_dim(dim, 8, dim.min_y() + dim.height() - 3, 8, stone);
+    // A surface block carved to air: the floor must descend through the patched
+    // section, not stop at the stale generated terrain.
+    let dug_y = height_at_dim(dim, 4, 5) - 1;
+    set_block_dim(dim, 4, dug_y, 5, 0);
+
+    let op = |x: i32, y: i32, z: i32| opacity_windowed_dim(dim, x, y, z);
+
+    // Reference: the same function with the snapshot disabled — every cell resolves
+    // through the live section-store/band/overlay/worldgen chain, exactly as before
+    // this change.
+    SKY_FLOORS_SNAPSHOT_CELLS.store(0, Ordering::Relaxed);
+    SKY_FLOORS_NO_SNAPSHOT.store(true, Ordering::Relaxed);
+    let reference = sky_floors_dim(dim, cx, cz, &op);
+    SKY_FLOORS_NO_SNAPSHOT.store(false, Ordering::Relaxed);
+    assert_eq!(
+        SKY_FLOORS_SNAPSHOT_CELLS.load(Ordering::Relaxed),
+        0,
+        "the reference pass must not have read the snapshot"
+    );
+
+    // Drop only the floors memo: the section store and band the fast path reads
+    // stay exactly as the delivery and the edits left them.
+    sky_floors_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map
+        .clear();
+
+    let fast = sky_floors_dim(dim, cx, cz, &op);
+    assert_eq!(
+        fast, reference,
+        "the snapshot scan must produce the per-cell scan's floors cell for cell"
+    );
+    assert!(
+        SKY_FLOORS_SNAPSHOT_CELLS.load(Ordering::Relaxed) > 0,
+        "the snapshot must have settled cells for the fast path to be on test"
+    );
+}
+
 #[test]
 fn p2_c_uniform_sections_emitters_match_cell_by_cell() {
     let _guard = world_guard();
