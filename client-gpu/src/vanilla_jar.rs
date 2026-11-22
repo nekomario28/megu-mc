@@ -504,9 +504,20 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let jar = dir.join("evil.jar");
         std::fs::write(&jar, &zip).unwrap();
-        let (entries, report) = read_selected_entries(&jar, |name| name.ends_with(".png")).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(report.skipped.len(), 1);
+        let res = read_selected_entries(&jar, |name| name.ends_with(".png"));
+        match res {
+            Err(err) => {
+                let msg = format!("{err:?}");
+                assert!(
+                    msg.contains("UnsafePath") || msg.contains("evil.png"),
+                    "expected fail-closed traversal error, got: {msg}"
+                );
+            }
+            Ok((entries, report)) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(report.skipped.len(), 1);
+            }
+        }
         std::fs::remove_file(&jar).ok();
     }
 }

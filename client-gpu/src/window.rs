@@ -626,6 +626,7 @@ impl GpuApp {
             ..Camera::default()
         };
         let mut ui = UiState::new();
+        apply_megu_default_links(&mut ui);
         ui.settings.video.vsync = render_config.vsync;
         // Straight into gameplay when a world/server is already targeted;
         // the title screen otherwise — like a vanilla launch with no
@@ -2596,6 +2597,20 @@ impl ApplicationHandler for GpuApp {
     }
 }
 
+pub const MEGU_WEBSITE_URL: &str = "https://megu.megumin.tech/";
+pub const MEGU_SUPPORT_URL: &str = "https://megu.megumin.tech/#support";
+pub const MEGU_CONTRIBUTE_URL: &str = "https://github.com/nekomario28/mc-spine";
+pub const MEGU_REPORT_URL: &str = "https://megu.megumin.tech/";
+
+/// Populate the official Megu links on a windowed [`UiState`] without
+/// altering [`UiState::default`] (which stays URL-empty for `client-ui` tests).
+pub fn apply_megu_default_links(ui: &mut UiState) {
+    ui.website_url = MEGU_WEBSITE_URL.to_owned();
+    ui.support_url = MEGU_SUPPORT_URL.to_owned();
+    ui.contribute_url = MEGU_CONTRIBUTE_URL.to_owned();
+    ui.report_url = MEGU_REPORT_URL.to_owned();
+}
+
 /// Run the windowed client. Returns `Err` text when the event loop or GPU
 /// setup fails (e.g. no display — use `--headless-probe` there).
 pub fn run(config: GpuCliConfig) -> Result<(), String> {
@@ -2613,6 +2628,86 @@ pub fn run(config: GpuCliConfig) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn megu_default_links_wire_into_gpu_app_and_respect_show_support_links_toggle() {
+        // `UiState::default()` stays empty so `client-ui` default-URL tests stay intact.
+        let bare = UiState::default();
+        assert!(bare.website_url.is_empty());
+        assert!(bare.support_url.is_empty());
+        assert!(bare.contribute_url.is_empty());
+        assert!(bare.report_url.is_empty());
+
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        assert_eq!(app.ui.website_url, "https://megu.megumin.tech/");
+        assert_eq!(app.ui.support_url, "https://megu.megumin.tech/#support");
+        assert_eq!(
+            app.ui.contribute_url,
+            "https://github.com/nekomario28/mc-spine"
+        );
+        assert_eq!(app.ui.report_url, "https://megu.megumin.tech/");
+        assert_eq!(app.ui.screen, Screen::Title);
+        assert!(app.ui.settings.qol.show_support_links);
+
+        // With `show_support_links = true`, all 4 links render on Title and open Megu URLs.
+        let _ = app.ui.render(1280, 720);
+        for (id, expected) in [
+            (
+                mc_spine_ui::state::WidgetId::WebsiteLink,
+                "https://megu.megumin.tech/",
+            ),
+            (
+                mc_spine_ui::state::WidgetId::SupportLink,
+                "https://megu.megumin.tech/#support",
+            ),
+            (
+                mc_spine_ui::state::WidgetId::ContributeLink,
+                "https://github.com/nekomario28/mc-spine",
+            ),
+            (
+                mc_spine_ui::state::WidgetId::ReportLink,
+                "https://megu.megumin.tech/",
+            ),
+        ] {
+            let hit = app
+                .ui
+                .hit_regions
+                .iter()
+                .find(|h| h.id == id)
+                .cloned()
+                .expect("expected link hit region on Title when show_support_links=true");
+            let acts = app.ui.handle_input(mc_spine_ui::state::UiInputEvent::Click {
+                x: hit.rect.x + 2,
+                y: hit.rect.y + 2,
+            });
+            assert_eq!(acts, vec![UiAction::OpenUrl(expected.to_owned())]);
+        }
+
+        // With `show_support_links = false`, SupportLink and ContributeLink hide on Title.
+        app.ui.settings.qol.show_support_links = false;
+        let _ = app.ui.render(1280, 720);
+        assert!(
+            !app.ui
+                .hit_regions
+                .iter()
+                .any(|h| h.id == mc_spine_ui::state::WidgetId::SupportLink),
+            "SupportLink must hide when show_support_links=false"
+        );
+        assert!(
+            !app.ui
+                .hit_regions
+                .iter()
+                .any(|h| h.id == mc_spine_ui::state::WidgetId::ContributeLink),
+            "ContributeLink must hide when show_support_links=false"
+        );
+        assert!(
+            app.ui
+                .hit_regions
+                .iter()
+                .any(|h| h.id == mc_spine_ui::state::WidgetId::ReportLink),
+            "ReportLink stays accessible even when show_support_links=false"
+        );
+    }
 
     #[test]
     fn ui_upload_cache_uploads_first_frame_and_skips_identical() {
