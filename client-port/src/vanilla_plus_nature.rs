@@ -13,9 +13,14 @@
 //!   base with a stepped, puffy upper cap, and hidden faces between adjacent
 //!   cloud voxels are suppressed so quad counts stay tiny.
 //! * **Subtle nature ambience** — a strictly bounded, rate-limited particle
-//!   trickle (falling leaves incl. autumn/cherry tints, dusk fireflies, rain
-//!   ripples on exposed water, waterfall mist) whose cap follows the active
-//!   [`VfxBudgetTier`]. This is ambience, not particle spam.
+//!   trickle (falling leaves incl. autumn/cherry tints, sakura petal
+//!   spirals, dusk fireflies, drifting winter snow motes, rain ripples on
+//!   exposed water, waterfall mist) whose cap follows the active
+//!   [`VfxBudgetTier`]. This is ambience, not particle spam. An optional
+//!   live [`SeasonAmbienceInput`] (fed by an `SSN1` Season Mod sync from
+//!   Serene Seasons / Fabric Seasons / Ecliptic Seasons) modulates palette,
+//!   cadence and particle families; the default seasonless input leaves
+//!   behaviour identical to running no season mod at all.
 //! * **Gentle weather-driven wind sway** — a small vertex offset for plants,
 //!   crops, leaves and hanging lanterns. Grass and crop bases are pinned at
 //!   `local_y == 0.0` so roots never detach; lanterns pivot from their top.
@@ -95,6 +100,10 @@ const HIGH_AMBIENCE_CAP: usize = 192;
 
 const LEAF_PERIOD_MAX: u64 = 24;
 const LEAF_PERIOD_MIN: u64 = 9;
+const SAKURA_BASE_PERIOD: u64 = 16;
+const EVERGREEN_NEEDLE_PERIOD: u64 = 30;
+const SNOW_MOTE_PERIOD: u64 = 6;
+const SNOW_MOTES_PER_EVENT: usize = 3;
 const FIREFLY_PERIOD: u64 = 15;
 const FIREFLIES_PER_EVENT: usize = 3;
 const RIPPLE_PERIOD_RAIN: u64 = 5;
@@ -109,6 +118,9 @@ const WIND_TIME_WRAP_TICKS: u64 = 14_400;
 const SEED_CLOUD_A: u64 = 0x9e37_79b9_7f4a_7c15;
 const SEED_CLOUD_B: u64 = 0xc2b2_ae3d_27d4_eb4f;
 const SEED_LEAF: u64 = 0x1656_67b1_9e37_79f9;
+const SEED_PETAL: u64 = 0x3c79_a492_7bf9_2c61;
+const SEED_NEEDLE: u64 = 0x51f2_7d4b_b39f_0e97;
+const SEED_SNOW: u64 = 0x6a09_e667_f3bc_c909;
 const SEED_FIREFLY: u64 = 0x85eb_ca6b_f27d_4a3d;
 const SEED_RIPPLE: u64 = 0x27d4_eb2f_1656_67c5;
 const SEED_MIST: u64 = 0x94d0_49bb_1331_11eb;
@@ -339,6 +351,297 @@ impl WeatherKind {
 }
 
 // ---------------------------------------------------------------------------
+// Seasonal ambience input (live Season Mod / SSN1 coupling)
+// ---------------------------------------------------------------------------
+
+/// The four broad seasons the ambience engine modulates by.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ActiveSeasonKind {
+    /// 春 — sakura bloom, fresh green canopies.
+    Spring,
+    /// 夏 — lush canopy, dusk fireflies. Neutral default.
+    #[default]
+    Summer,
+    /// 秋 — 紅葉 crimson/amber foliage and boosted leaf cadence.
+    Autumn,
+    /// 冬 — dormant deciduous canopy, drifting 粉雪 motes.
+    Winter,
+}
+
+impl ActiveSeasonKind {
+    /// Broad season for a Serene-Seasons-style sub-season index (`0..=11`,
+    /// three sub-seasons per season). Out-of-range fails closed to the
+    /// neutral [`Self::Summer`].
+    pub const fn from_sub_season_index(idx: u8) -> Self {
+        match idx {
+            0..=2 => Self::Spring,
+            3..=5 => Self::Summer,
+            6..=8 => Self::Autumn,
+            9..=11 => Self::Winter,
+            _ => Self::Summer,
+        }
+    }
+}
+
+/// Seasonal ambience state pushed by a live Season Mod sync — the `SSN1`
+/// frame on `mc-spine:season_v1` produced by the Serene Seasons / Fabric
+/// Seasons / Ecliptic Seasons adapters.
+///
+/// `Default` is the neutral, seasonless vanilla fallback: every derived
+/// modulation ([`Self::autumn_ramp`], [`Self::snow_amount`], ...) reads as
+/// "no season mod installed", so callers get exactly the pre-season
+/// behaviour. All modulation methods run [`Self::sanitized`] first, so a
+/// struct-literal input with out-of-range fields still fails closed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SeasonAmbienceInput {
+    /// Broad season in effect. Ignored while `is_seasonless`.
+    pub season: ActiveSeasonKind,
+    /// Sub-season calendar index `0..=11` (EarlySpring .. LateWinter);
+    /// values `>= 12` sanitize to the seasonless fallback.
+    pub sub_season_index: u8,
+    /// Progress through the current sub-season in `0.0..=1.0`.
+    pub sub_season_progress: f32,
+    /// Wet/dry-season climate: stays lush and green, never snows and never
+    /// enters deciduous dormancy.
+    pub is_tropical: bool,
+    /// No season calendar on this dimension: every modulation is neutral.
+    pub is_seasonless: bool,
+    /// Seasonal foliage tint multiplier in `0.0..=2.0` (`1.0` = neutral).
+    pub foliage_tint: [f32; 3],
+    /// Seasonal grass tint multiplier in `0.0..=2.0` (`1.0` = neutral).
+    pub grass_tint: [f32; 3],
+    /// Server-driven seasonal snow/freeze override on this dimension.
+    pub snow_override: bool,
+}
+
+impl Default for SeasonAmbienceInput {
+    /// Neutral seasonless input: identical to running no Season Mod.
+    fn default() -> Self {
+        Self::seasonless()
+    }
+}
+
+impl SeasonAmbienceInput {
+    /// The neutral fallback: every derived modulation reports its
+    /// no-season-mod value.
+    pub const fn seasonless() -> Self {
+        Self {
+            season: ActiveSeasonKind::Summer,
+            sub_season_index: 0,
+            sub_season_progress: 0.0,
+            is_tropical: false,
+            is_seasonless: true,
+            foliage_tint: [1.0; 3],
+            grass_tint: [1.0; 3],
+            snow_override: false,
+        }
+    }
+
+    /// Builds the ambience input from one decoded `SSN1` season frame:
+    /// sub-season index `0..=11`, sub-season progress, climate flags and
+    /// quantized `255 = 1.0` tint multipliers. An out-of-range index fails
+    /// closed to the seasonless fallback.
+    pub fn from_wire_sync(
+        sub_season_idx: u8,
+        progress_in_sub_season: f32,
+        tropical_dim: bool,
+        snow_enabled: bool,
+        foliage_rgb: [u8; 3],
+        grass_rgb: [u8; 3],
+    ) -> Self {
+        if sub_season_idx >= 12 {
+            return Self::seasonless();
+        }
+        Self {
+            season: ActiveSeasonKind::from_sub_season_index(sub_season_idx),
+            sub_season_index: sub_season_idx,
+            sub_season_progress: progress_in_sub_season,
+            is_tropical: tropical_dim,
+            is_seasonless: false,
+            foliage_tint: [
+                f32::from(foliage_rgb[0]) / 255.0,
+                f32::from(foliage_rgb[1]) / 255.0,
+                f32::from(foliage_rgb[2]) / 255.0,
+            ],
+            grass_tint: [
+                f32::from(grass_rgb[0]) / 255.0,
+                f32::from(grass_rgb[1]) / 255.0,
+                f32::from(grass_rgb[2]) / 255.0,
+            ],
+            snow_override: snow_enabled,
+        }
+        .sanitized()
+    }
+
+    /// A copy with every field forced into its documented range.
+    pub fn sanitized(&self) -> Self {
+        if self.sub_season_index >= 12 {
+            return Self::seasonless();
+        }
+        let tint = |t: [f32; 3]| {
+            [
+                finite_or(t[0], 1.0).clamp(0.0, 2.0),
+                finite_or(t[1], 1.0).clamp(0.0, 2.0),
+                finite_or(t[2], 1.0).clamp(0.0, 2.0),
+            ]
+        };
+        Self {
+            season: self.season,
+            sub_season_index: self.sub_season_index,
+            sub_season_progress: clamped(self.sub_season_progress, 0.0, 1.0),
+            is_tropical: self.is_tropical,
+            is_seasonless: self.is_seasonless,
+            foliage_tint: tint(self.foliage_tint),
+            grass_tint: tint(self.grass_tint),
+            snow_override: self.snow_override,
+        }
+    }
+
+    /// Progress through the broad season in `0.0..=1.0` (the three
+    /// sub-seasons stitched together). Returns `0.5` when seasonless.
+    pub fn season_progress(&self) -> f32 {
+        let s = self.sanitized();
+        if s.is_seasonless {
+            return 0.5;
+        }
+        ((f32::from(s.sub_season_index % 3) + s.sub_season_progress) / 3.0).clamp(0.0, 1.0)
+    }
+
+    /// Autumn colour ramp in `0.0..=1.0`: `0` outside autumn (tropical and
+    /// seasonless climates never ramp), rising smoothly through the season
+    /// and easing back out across early winter so the canopy never pops.
+    pub fn autumn_ramp(&self) -> f32 {
+        let s = self.sanitized();
+        if s.is_seasonless || s.is_tropical {
+            return 0.0;
+        }
+        let sp = s.season_progress();
+        match s.season {
+            ActiveSeasonKind::Spring => 0.0,
+            // A whisper of pre-colour in late summer.
+            ActiveSeasonKind::Summer => 0.12 * smoothstep(0.55, 1.0, sp),
+            ActiveSeasonKind::Autumn => 0.25 + 0.75 * smoothstep(0.0, 0.85, sp),
+            // Last russet leaves fade out across early winter.
+            ActiveSeasonKind::Winter => 0.85 * (1.0 - smoothstep(0.0, 0.45, sp)),
+        }
+    }
+
+    /// Deciduous leaf-shed activity in `0.0..=1.0`: `1` means full cadence.
+    /// Winter sends temperate canopies dormant (bare), while tropical and
+    /// seasonless climates stay active year-round. Evergreen canopy sites
+    /// ignore this scale entirely.
+    pub fn deciduous_activity(&self) -> f32 {
+        let s = self.sanitized();
+        if s.is_seasonless || s.is_tropical {
+            return 1.0;
+        }
+        let sp = s.season_progress();
+        match s.season {
+            ActiveSeasonKind::Spring => 1.0,
+            ActiveSeasonKind::Summer => 0.9,
+            // Shedding eases off as the canopy thins into late autumn.
+            ActiveSeasonKind::Autumn => 1.0 - 0.55 * smoothstep(0.55, 1.0, sp),
+            // Bare by mid-winter.
+            ActiveSeasonKind::Winter => 0.45 * (1.0 - smoothstep(0.05, 0.55, sp)),
+        }
+    }
+
+    /// Firefly activity scale in `0.0..=1.0`: full through summer, tapering
+    /// off in late autumn, silent in winter. Tropical and seasonless
+    /// climates keep the dusk glow year-round.
+    pub fn firefly_scale(&self) -> f32 {
+        let s = self.sanitized();
+        if s.is_seasonless || s.is_tropical {
+            return 1.0;
+        }
+        let sp = s.season_progress();
+        match s.season {
+            ActiveSeasonKind::Spring => 0.65,
+            ActiveSeasonKind::Summer => 1.0,
+            ActiveSeasonKind::Autumn => 1.0 - 0.92 * smoothstep(0.45, 0.95, sp),
+            ActiveSeasonKind::Winter => 0.0,
+        }
+    }
+
+    /// Sakura bloom strength in `0.0..=1.0`: `0` outside spring, peaking at
+    /// mid-spring so petal cadence roughly doubles during the 桜吹雪 bloom.
+    pub fn sakura_bloom(&self) -> f32 {
+        let s = self.sanitized();
+        if s.is_seasonless || s.is_tropical {
+            return 0.0;
+        }
+        match s.season {
+            ActiveSeasonKind::Spring => {
+                let sp = s.season_progress();
+                let bell = smoothstep(0.10, 0.45, sp) * (1.0 - smoothstep(0.60, 0.95, sp));
+                0.35 + 0.65 * bell
+            }
+            _ => 0.0,
+        }
+    }
+
+    /// Drifting snow mote amount in `0.0..=1.0`: full under `snow_override`,
+    /// moderate and building through winter, and always `0` in tropical or
+    /// seasonless climates — never snow in a jungle or a space dimension.
+    pub fn snow_amount(&self) -> f32 {
+        let s = self.sanitized();
+        if s.is_seasonless || s.is_tropical {
+            return 0.0;
+        }
+        let mut amount: f32 = if s.snow_override { 1.0 } else { 0.0 };
+        if matches!(s.season, ActiveSeasonKind::Winter) {
+            amount = amount.max(0.45 + 0.55 * s.season_progress());
+        }
+        amount
+    }
+
+    /// Horizontal drift multiplier for falling leaves: autumn wind spreads
+    /// the flutter up to `1.6x` wider, everything else stays at `1.0`.
+    pub fn leaf_drift_scale(&self) -> f32 {
+        1.0 + 0.6 * self.autumn_ramp()
+    }
+}
+
+/// Sakura petal spawn period in ticks: baseline 16, tightened towards ~6
+/// while [`SeasonAmbienceInput::sakura_bloom`] peaks.
+fn sakura_period(bloom: f32) -> u64 {
+    let p = SAKURA_BASE_PERIOD as f32 / (1.0 + 1.6 * clamped(bloom, 0.0, 1.0));
+    (p.round() as u64).clamp(4, SAKURA_BASE_PERIOD)
+}
+
+/// Warm sakura-pink petal tint with soft per-particle variation, multiplied
+/// by the seasonal foliage tint (`[1,1,1]` = unchanged).
+fn sakura_petal_rgb(h1: f32, h2: f32, tint: [f32; 3]) -> [f32; 3] {
+    [
+        ((0.97 + 0.03 * h1) * tint[0]).clamp(0.0, 1.0),
+        ((0.62 + 0.16 * h2) * tint[1]).clamp(0.0, 1.0),
+        ((0.76 + 0.12 * h1) * tint[2]).clamp(0.0, 1.0),
+    ]
+}
+
+/// Seasonal leaf colour for a temperate canopy. `ramp` in `0..=1` walks the
+/// tint from spring green through gold and vermilion to late-autumn
+/// crimson; `h` jitters the blend per particle; `tint` is the seasonal
+/// foliage multiplier (`[1,1,1]` = unchanged).
+fn autumn_leaf_rgb(ramp: f32, h: f32, tint: [f32; 3]) -> [f32; 3] {
+    let t = clamped(ramp, 0.0, 1.0) * (0.55 + 0.45 * h);
+    const GOLD: [f32; 3] = [0.88, 0.64, 0.14];
+    const VERMILION: [f32; 3] = [0.86, 0.38, 0.10];
+    const CRIMSON: [f32; 3] = [0.70, 0.15, 0.09];
+    let target = if t < 0.5 {
+        lerp3(GOLD, VERMILION, t * 2.0)
+    } else {
+        lerp3(VERMILION, CRIMSON, (t - 0.5) * 2.0)
+    };
+    let rgb = lerp3([0.30, 0.52, 0.20], target, t);
+    [
+        (rgb[0] * tint[0]).clamp(0.0, 1.0),
+        (rgb[1] * tint[1]).clamp(0.0, 1.0),
+        (rgb[2] * tint[2]).clamp(0.0, 1.0),
+    ]
+}
+
+// ---------------------------------------------------------------------------
 // Layered voxel clouds
 // ---------------------------------------------------------------------------
 
@@ -559,14 +862,24 @@ impl NatureParticle {
     }
 }
 
-/// The four ambience particle families. Each stays deliberately quiet:
+/// The ambience particle families. Each stays deliberately quiet:
 /// small counts, soft colours, no screen-space noise.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NatureParticleKind {
     /// A leaf drifting down from an exposed canopy block. `rgb` carries the
-    /// tint: green in spring/summer, amber-red with `autumn_factor`, pink in
-    /// cherry groves. `flutter_phase` desynchronises the side-to-side sway.
-    FallingLeaf { rgb: [f32; 3], flutter_phase: f32 },
+    /// tint: green in spring/summer, gold-to-crimson with the autumn ramp.
+    /// `flutter_phase` desynchronises the side-to-side sway; `drift` scales
+    /// the horizontal wander (`1.0` normal, wider in autumn wind).
+    FallingLeaf {
+        rgb: [f32; 3],
+        flutter_phase: f32,
+        drift: f32,
+    },
+    /// A sakura petal (桜) spiralling down from a blossom canopy:
+    /// a gentle horizontal corkscrew with a slower descent than leaves and
+    /// soft warm sakura-pink tint variations. `spiral_phase` desynchronises
+    /// the swirl.
+    SakuraPetal { rgb: [f32; 3], spiral_phase: f32 },
     /// A soft-pulsing ember of light in warm/temperate biomes at night.
     Firefly {
         glow_rgb: [f32; 3],
@@ -576,6 +889,10 @@ pub enum NatureParticleKind {
     RainRipple { radius: f32, max_radius: f32 },
     /// A soft white puff at the base of a vertical water drop.
     WaterfallMist { alpha: f32 },
+    /// A powder-snow mote (粉雪) settling slowly through cold air.
+    /// `shimmer_phase` desynchronises the crisp frost glimmer the renderer
+    /// reads off the particle.
+    SnowMote { shimmer_phase: f32 },
 }
 
 /// World-sampled spawn hints for one ambience tick. Callers fill the site
@@ -590,14 +907,26 @@ pub struct NatureAmbienceEnv {
     /// `true` in warm/temperate biomes (swamp, mangrove, plains, meadow).
     /// Freezing and desert biomes must pass `false`.
     pub firefly_biome: bool,
-    /// `true` under cherry-blossom canopy: leaves fall as pink petals.
+    /// `true` under cherry-blossom canopy: `leaf_blocks` shed sakura petals
+    /// instead of tinted leaves.
     pub cherry_blossom: bool,
-    /// Seasonal autumn amount in `0..=1` (feeds the Season engine through).
+    /// Seasonal autumn amount in `0..=1` (manual override, combined with the
+    /// live [`SeasonAmbienceInput::autumn_ramp`]).
     pub autumn_factor: f32,
-    /// Camera/player anchor for free-roaming spawns (fireflies).
+    /// Live season state from an `SSN1` Season Mod sync. `seasonless` by
+    /// default — identical behaviour to running no season mod.
+    pub season: SeasonAmbienceInput,
+    /// Camera/player anchor for free-roaming spawns (fireflies, snow motes).
     pub origin: [f32; 3],
     /// Exposed leaf/canopy block centres that can shed a leaf.
     pub leaf_blocks: Vec<[f32; 3]>,
+    /// Blossom canopy centres (cherry, sakura, flowering azalea, modded
+    /// `*blossom*`/`*sakura*`/`*cherry*` canopies) that shed spiral petals —
+    /// boosted during the mid-spring bloom, dormant in deep winter.
+    pub blossom_blocks: Vec<[f32; 3]>,
+    /// Conifer/evergreen canopy centres that keep shedding needles at a
+    /// subtle constant cadence, unaffected by winter dormancy.
+    pub evergreen_blocks: Vec<[f32; 3]>,
     /// Rain-exposed water surface points (ripples only while precipitating).
     pub rain_exposed_water: Vec<[f32; 3]>,
     /// `(base position, vertical drop height)` of water columns; mist only
@@ -695,12 +1024,27 @@ pub fn tick_nature_ambience(
     for p in state.particles.iter_mut() {
         p.age_sec += dt;
         match &mut p.kind {
-            NatureParticleKind::FallingLeaf { flutter_phase, .. } => {
+            NatureParticleKind::FallingLeaf {
+                flutter_phase,
+                drift,
+                ..
+            } => {
                 let ph = *flutter_phase;
+                let d = finite_or(*drift, 1.0).clamp(0.4, 2.5);
                 p.vel = [
-                    0.28 * (p.age_sec * 2.1 + ph).sin(),
+                    0.28 * d * (p.age_sec * 2.1 + ph).sin() + 0.10 * (d - 1.0),
                     -0.5,
-                    0.28 * (p.age_sec * 1.7 + ph * 1.31).cos(),
+                    0.28 * d * (p.age_sec * 1.7 + ph * 1.31).cos(),
+                ];
+            }
+            NatureParticleKind::SakuraPetal { spiral_phase, .. } => {
+                let ph = *spiral_phase;
+                // Gentle corkscrew: the horizontal velocity rotates around
+                // the fall axis while the descent stays slower than a leaf's.
+                p.vel = [
+                    0.30 * (p.age_sec * 2.3 + ph).cos(),
+                    -0.34 + 0.07 * (p.age_sec * 1.9 + ph).sin(),
+                    -0.30 * (p.age_sec * 2.3 + ph).sin(),
                 ];
             }
             NatureParticleKind::Firefly { pulse_phase, .. } => {
@@ -719,6 +1063,15 @@ pub fn tick_nature_ambience(
                 let t = clamped(p.age_sec / p.ttl_sec, 0.0, 1.0);
                 *alpha = 0.35 * (PI * t).sin().max(0.0);
             }
+            NatureParticleKind::SnowMote { shimmer_phase } => {
+                let ph = *shimmer_phase;
+                p.vel = [
+                    0.15 * (p.age_sec * 0.8 + ph).sin()
+                        + 0.05 * (p.age_sec * 0.37 + ph * 2.0).sin(),
+                    -0.26 - 0.05 * (p.age_sec * 0.6 + ph).sin(),
+                    0.15 * (p.age_sec * 0.7 + ph).cos(),
+                ];
+            }
         }
         p.pos[0] += p.vel[0] * dt;
         p.pos[1] += p.vel[1] * dt;
@@ -731,52 +1084,158 @@ pub fn tick_nature_ambience(
     }
     let mut quota = state.tier.max_spawns_per_tick();
 
-    // Falling leaves (incl. autumn amber and cherry petals).
-    let autumn = clamped(env.autumn_factor, 0.0, 1.0);
-    if !env.leaf_blocks.is_empty() {
-        let period = (LEAF_PERIOD_MAX as f32 - (LEAF_PERIOD_MAX - LEAF_PERIOD_MIN) as f32 * autumn)
-            .round() as u64;
+    // Seasonal modulation: the sanitized env season combines with the
+    // manual `autumn_factor` override. A seasonless input leaves every
+    // scale at its neutral value.
+    let season = env.season.sanitized();
+    let autumn = clamped(env.autumn_factor, 0.0, 1.0).max(season.autumn_ramp());
+    let drift = season.leaf_drift_scale();
+    let deciduous = season.deciduous_activity();
+    let tint = season.foliage_tint;
+
+    // Falling leaves: temperate deciduous canopy. Autumn shortens the
+    // period (more leaves) through `autumn`, winter dormancy thins the
+    // spawn rate deterministically, and `cherry_blossom` swaps the family
+    // to spiral sakura petals.
+    if !env.leaf_blocks.is_empty() && deciduous > 0.0 {
+        let leaf_period =
+            (LEAF_PERIOD_MAX as f32 - (LEAF_PERIOD_MAX - LEAF_PERIOD_MIN) as f32 * autumn)
+                .round() as u64;
+        let petal_period = sakura_period(season.sakura_bloom());
+        let period = if env.cherry_blossom {
+            petal_period
+        } else {
+            leaf_period
+        };
         for (i, site) in env.leaf_blocks.iter().take(MAX_ENV_SITES).enumerate() {
             if !valid_site(site) || !(tick + i as u64 * 7).is_multiple_of(period) {
                 continue;
             }
             let h1 = hash01(i as i64, tick as i64, SEED_LEAF);
             let h2 = hash01(tick as i64, i as i64, SEED_LEAF ^ 0x5a5a);
+            // Winter dormancy thins deciduous shedding deterministically.
+            if hash01(i as i64, tick as i64, SEED_LEAF ^ 0x77dd) >= deciduous {
+                continue;
+            }
             let pos = [
                 site[0] + (h1 - 0.5) * 0.8,
                 site[1],
                 site[2] + (h2 - 0.5) * 0.8,
             ];
-            let rgb = if env.cherry_blossom {
-                [0.98, 0.68 + 0.10 * h2, 0.80]
+            let kind = if env.cherry_blossom {
+                NatureParticleKind::SakuraPetal {
+                    rgb: sakura_petal_rgb(h1, h2, tint),
+                    spiral_phase: h1 * TAU,
+                }
             } else {
-                let t = autumn * (0.6 + 0.4 * h1);
-                lerp3([0.30, 0.52, 0.20], [0.90, 0.46, 0.10], t)
+                NatureParticleKind::FallingLeaf {
+                    rgb: autumn_leaf_rgb(autumn, h1, tint),
+                    flutter_phase: h1 * TAU,
+                    drift,
+                }
             };
+            let falling = matches!(kind, NatureParticleKind::FallingLeaf { .. });
             state.try_spawn(
                 &mut quota,
                 NatureParticle {
-                    kind: NatureParticleKind::FallingLeaf {
-                        rgb,
-                        flutter_phase: h1 * TAU,
-                    },
+                    kind,
                     pos,
-                    vel: [0.0, -0.5, 0.0],
+                    vel: [0.0, if falling { -0.5 } else { -0.34 }, 0.0],
                     age_sec: 0.0,
-                    ttl_sec: 5.0 + 4.0 * h2,
+                    ttl_sec: if falling {
+                        5.0 + 4.0 * h2
+                    } else {
+                        4.5 + 3.5 * h2
+                    },
                 },
             );
         }
     }
 
-    // Fireflies: dusk/night only, warm/temperate biomes only.
-    if env.is_night && env.firefly_biome && tick.is_multiple_of(FIREFLY_PERIOD) {
+    // Sakura petals (桜吹雪): dedicated blossom canopy sites — cherry,
+    // sakura, flowering azalea and modded `*blossom*`/`*sakura*` leaves —
+    // boosted during the mid-spring bloom and dormant in deep winter.
+    if !env.blossom_blocks.is_empty() && deciduous > 0.0 {
+        let period = sakura_period(season.sakura_bloom());
+        for (i, site) in env.blossom_blocks.iter().take(MAX_ENV_SITES).enumerate() {
+            if !valid_site(site) || !(tick + i as u64 * 11).is_multiple_of(period) {
+                continue;
+            }
+            let h1 = hash01(i as i64, tick as i64, SEED_PETAL);
+            let h2 = hash01(tick as i64, i as i64, SEED_PETAL ^ 0x5a5a);
+            // Blossom canopies are deciduous too: bare in deep winter.
+            if h2 >= deciduous {
+                continue;
+            }
+            state.try_spawn(
+                &mut quota,
+                NatureParticle {
+                    kind: NatureParticleKind::SakuraPetal {
+                        rgb: sakura_petal_rgb(h1, h2, tint),
+                        spiral_phase: h1 * TAU,
+                    },
+                    pos: [
+                        site[0] + (h1 - 0.5) * 0.9,
+                        site[1],
+                        site[2] + (h2 - 0.5) * 0.9,
+                    ],
+                    vel: [0.0, -0.34, 0.0],
+                    age_sec: 0.0,
+                    ttl_sec: 4.5 + 3.5 * h2,
+                },
+            );
+        }
+    }
+
+    // Evergreen needles: a subtle constant trickle that ignores both the
+    // autumn ramp and winter dormancy — conifers keep their needles.
+    for (i, site) in env.evergreen_blocks.iter().take(MAX_ENV_SITES).enumerate() {
+        if !valid_site(site) || !(tick + i as u64 * 13).is_multiple_of(EVERGREEN_NEEDLE_PERIOD) {
+            continue;
+        }
+        let h1 = hash01(i as i64, tick as i64, SEED_NEEDLE);
+        let h2 = hash01(tick as i64, i as i64, SEED_NEEDLE ^ 0x5a5a);
+        state.try_spawn(
+            &mut quota,
+            NatureParticle {
+                kind: NatureParticleKind::FallingLeaf {
+                    rgb: [
+                        ((0.16 + 0.06 * h1) * tint[0]).clamp(0.0, 1.0),
+                        ((0.34 + 0.08 * h2) * tint[1]).clamp(0.0, 1.0),
+                        (0.18 * tint[2]).clamp(0.0, 1.0),
+                    ],
+                    flutter_phase: h1 * TAU,
+                    drift: 0.8,
+                },
+                pos: [
+                    site[0] + (h1 - 0.5) * 0.8,
+                    site[1],
+                    site[2] + (h2 - 0.5) * 0.8,
+                ],
+                vel: [0.0, -0.5, 0.0],
+                age_sec: 0.0,
+                ttl_sec: 5.0 + 4.0 * h2,
+            },
+        );
+    }
+
+    // Fireflies: dusk/night only, warm/temperate biomes only, scaled by the
+    // season (full summer, tapering late autumn, silent winter).
+    let firefly_scale = season.firefly_scale();
+    if env.is_night
+        && env.firefly_biome
+        && firefly_scale > 0.0
+        && tick.is_multiple_of(FIREFLY_PERIOD)
+    {
         let origin = [
             finite_or(env.origin[0], 0.0).clamp(-MAX_COORD, MAX_COORD),
             finite_or(env.origin[1], 64.0).clamp(-64.0, 384.0),
             finite_or(env.origin[2], 0.0).clamp(-MAX_COORD, MAX_COORD),
         ];
         for k in 0..FIREFLIES_PER_EVENT {
+            if hash01(k as i64, tick as i64, SEED_FIREFLY ^ 0x5151) >= firefly_scale {
+                continue;
+            }
             let h1 = hash01(tick as i64, k as i64, SEED_FIREFLY);
             let h2 = hash01(k as i64, tick as i64, SEED_FIREFLY ^ 0x33cc);
             let angle = h1 * TAU;
@@ -797,6 +1256,42 @@ pub fn tick_nature_ambience(
                     vel: [0.0; 3],
                     age_sec: 0.0,
                     ttl_sec: 8.0 + 6.0 * h2,
+                },
+            );
+        }
+    }
+
+    // Drifting powder snow (粉雪): only under a snow-enabled or wintry
+    // season state — never in tropical or seasonless climates.
+    let snow = season.snow_amount();
+    if snow > 0.0 && tick.is_multiple_of(SNOW_MOTE_PERIOD) {
+        let origin = [
+            finite_or(env.origin[0], 0.0).clamp(-MAX_COORD, MAX_COORD),
+            finite_or(env.origin[1], 64.0).clamp(-64.0, 384.0),
+            finite_or(env.origin[2], 0.0).clamp(-MAX_COORD, MAX_COORD),
+        ];
+        for k in 0..SNOW_MOTES_PER_EVENT {
+            let h1 = hash01(tick as i64, k as i64, SEED_SNOW);
+            let h2 = hash01(k as i64, tick as i64, SEED_SNOW ^ 0x77aa);
+            if h2 >= snow {
+                continue;
+            }
+            let angle = h1 * TAU;
+            let radius = 3.0 + 11.0 * h2;
+            state.try_spawn(
+                &mut quota,
+                NatureParticle {
+                    kind: NatureParticleKind::SnowMote {
+                        shimmer_phase: h1 * TAU,
+                    },
+                    pos: [
+                        origin[0] + angle.cos() * radius,
+                        origin[1] + 1.0 + 6.0 * h1,
+                        origin[2] + angle.sin() * radius,
+                    ],
+                    vel: [0.0, -0.26, 0.0],
+                    age_sec: 0.0,
+                    ttl_sec: 5.5 + 4.0 * h2,
                 },
             );
         }
@@ -1080,6 +1575,10 @@ pub struct LeafParticleStyle {
     /// Whether the seasonal autumn factor may blend this leaf towards amber.
     /// Evergreen, flowering and dead canopies register `false`.
     pub allow_autumn_tint: bool,
+    /// Whether this canopy sheds spiral sakura petals (桜) instead of plain
+    /// leaves: cherry, sakura, blossom, flowering-azalea and fruit-blossom
+    /// canopies — vanilla and modded — register `true`.
+    pub sakura_petals: bool,
 }
 
 /// Registry of modded blocks and entities that join the nature systems.
@@ -1114,11 +1613,13 @@ impl NatureModRegistry {
             finite_or(rgb[1], FALLBACK_LEAF_RGB[1]).clamp(0.0, 1.0),
             finite_or(rgb[2], FALLBACK_LEAF_RGB[2]).clamp(0.0, 1.0),
         ];
+        let sakura_petals = is_blossom_canopy_name(resource_path(&key));
         self.mod_leaves.insert(
             key,
             LeafParticleStyle {
                 rgb: safe,
                 allow_autumn_tint,
+                sakura_petals,
             },
         );
     }
@@ -1324,12 +1825,27 @@ const EVERGREEN_NAME_HINTS: &[&str] = &[
     "spruce", "fir", "pine", "conifer", "cedar", "redwood", "cypress", "juniper", "holly",
 ];
 
+/// Name substrings marking a blossom canopy that sheds spiral sakura
+/// petals (桜): vanilla cherry, flowering azalea and the sakura/blossom
+/// leaves shipped by Biomes O' Plenty, Oh The Biomes We've Gone, Regions
+/// Unexplored, Autumnity, Terralith and friends.
+const BLOSSOM_NAME_HINTS: &[&str] = &[
+    "cherry", "sakura", "blossom", "azalea", "flowering", "jacaranda",
+];
+
+/// `true` when the bare path names a blossom canopy that sheds sakura
+/// petals instead of plain leaves.
+fn is_blossom_canopy_name(path: &str) -> bool {
+    contains_any(path, BLOSSOM_NAME_HINTS)
+}
+
 /// Derives a leaf style for an unregistered but leaf-classified block. The
 /// tint is a deterministic keyword guess with a plain green fallback —
 /// fail-closed, never non-finite, and evergreen/flowering/dead names opt out
 /// of the autumn blend.
 fn derive_leaf_style(path: &str) -> LeafParticleStyle {
     let evergreen = contains_any(path, EVERGREEN_NAME_HINTS);
+    let blossom = is_blossom_canopy_name(path);
     let rgb = if path.contains("maple") {
         [0.85, 0.45, 0.12]
     } else if path.contains("lavender")
@@ -1339,7 +1855,10 @@ fn derive_leaf_style(path: &str) -> LeafParticleStyle {
     {
         // Checked before `blossom`: `lavender_blossom_leaves` is violet, not pink.
         [0.62, 0.52, 0.85]
-    } else if path.contains("cherry") || path.contains("sakura") || path.contains("blossom") {
+    } else if path.contains("azalea") || path.contains("flowering") {
+        // Flowering azalea and fruit-blossom canopies: a paler blush than cherry.
+        [0.90, 0.72, 0.82]
+    } else if blossom {
         [0.95, 0.70, 0.80]
     } else if path.contains("rainbow") {
         [0.80, 0.55, 0.90]
@@ -1357,9 +1876,7 @@ fn derive_leaf_style(path: &str) -> LeafParticleStyle {
         FALLBACK_LEAF_RGB
     };
     let allow_autumn_tint = !(evergreen
-        || path.contains("cherry")
-        || path.contains("sakura")
-        || path.contains("blossom")
+        || blossom
         || path.contains("palm")
         || path.contains("jungle")
         || path.contains("dead")
@@ -1367,6 +1884,7 @@ fn derive_leaf_style(path: &str) -> LeafParticleStyle {
     LeafParticleStyle {
         rgb,
         allow_autumn_tint,
+        sakura_petals: blossom,
     }
 }
 

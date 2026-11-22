@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use mc_spine_client::protocol::{
     offline_uuid, ClientCustomChannelEvent, ClientPlayEvent, DecodedMagicCastState,
-    DecodedMagicSync, DecodedMotionTrigger, DimensionMeta, PlayEvent, ProtocolClient, TeleportSync,
+    DecodedMagicSync, DecodedMotionTrigger, DimensionMeta, PlayEvent, ProtocolClient,
+    SeasonWireSync, TeleportSync,
 };
 use mc_spine_client::render::ClientVfxHost;
 use mc_spine_client::render_graph::GpuPipelineKind;
@@ -15,7 +16,10 @@ use mc_spine_client::world::{BlockTable, WorldState};
 use mc_spine_client_mesh::mesher::{
     BlockVisualEnhancementResult, BlockVisualInput, VanillaPlusPipelineConfig,
 };
-use mc_spine_client_mesh::vanilla_plus_nature::NatureModRegistry;
+use mc_spine_client_mesh::vanilla_plus_nature::{
+    tick_nature_ambience, NatureAmbienceEnv, NatureAmbienceState, NatureModRegistry,
+    SeasonAmbienceInput,
+};
 use mc_spine_ui::magic_hud::{CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState};
 use mc_spine_ui::state::{HudState, MiniHudPreset, UiState};
 
@@ -133,6 +137,25 @@ pub struct LiveSession {
     pub subworlds: SubWorldRenderBank,
     pub vanilla_plus_cfg: VanillaPlusPipelineConfig,
     pub nature_mod_registry: NatureModRegistry,
+    /// The latest decoded `SSN1` season sync, or `None` before the first
+    /// `mc-spine:season_v1` frame (and on seasonless dimensions).
+    pub latest_season: Option<SeasonWireSync>,
+    /// Live seasonal ambience input derived from `latest_season`; the
+    /// neutral seasonless fallback until a Season Mod frame arrives.
+    pub season_ambience: SeasonAmbienceInput,
+    /// Retained nature-ambience particle simulation, ticked once per world
+    /// tick inside [`Self::poll`] from `nature_env` + `season_ambience`.
+    pub nature_ambience: NatureAmbienceState,
+    /// World-sampled ambience spawn hints. The render loop refreshes the
+    /// site lists each frame; [`Self::poll`] feeds in the camera `origin`
+    /// and the live `season_ambience`.
+    pub nature_env: NatureAmbienceEnv,
+    /// Atmosphere target with the season tint stripped: the value the
+    /// blender would hold if no `SSN1` frame had ever arrived.
+    base_atmosphere_target: AtmosphereParams,
+    /// The target last installed by the season path, used to detect an
+    /// external `set_target` between two season frames.
+    seasoned_atmosphere_target: Option<AtmosphereParams>,
     last_motion_delta: [f64; 2],
     last_vfx_tick: Instant,
     last_animation_tick: Instant,
@@ -181,6 +204,12 @@ impl LiveSession {
             subworlds: SubWorldRenderBank::new(),
             vanilla_plus_cfg: VanillaPlusPipelineConfig::default(),
             nature_mod_registry: NatureModRegistry::default(),
+            latest_season: None,
+            season_ambience: SeasonAmbienceInput::default(),
+            nature_ambience: NatureAmbienceState::default(),
+            nature_env: NatureAmbienceEnv::default(),
+            base_atmosphere_target: AtmosphereParams::default(),
+            seasoned_atmosphere_target: None,
             last_motion_delta: [0.0; 2],
             last_vfx_tick: Instant::now(),
             last_animation_tick: Instant::now(),
@@ -195,6 +224,20 @@ impl LiveSession {
             &self.vanilla_plus_cfg,
             &self.nature_mod_registry,
         )
+    }
+
+    /// Advance the retained nature-ambience particle sim by `dt_sec` using
+    /// `nature_env` plus the live `season_ambience`. The pack's own
+    /// `enabled`/`nature_ambience` toggles gate spawning, so a default
+    /// (vanilla) config ticks existing particles out silently.
+    pub fn step_nature_ambience(&mut self, dt_sec: f32) {
+        self.nature_env.season = self.season_ambience;
+        tick_nature_ambience(
+            &mut self.nature_ambience,
+            &self.vanilla_plus_cfg.nature,
+            &self.nature_env,
+            dt_sec,
+        );
     }
 
     /// Limit main-thread packet work per frame. No reads, writes or DNS on this thread.
@@ -234,8 +277,10 @@ impl LiveSession {
         if !matches!(self.status, SessionStatus::Disconnected(_)) {
             let now = Instant::now();
             let elapsed_ticks = (now.duration_since(self.last_vfx_tick).as_millis() / 50).min(4);
+            self.nature_env.origin = camera_position;
             for _ in 0..elapsed_ticks {
                 self.vfx.tick();
+                self.step_nature_ambience(0.05);
             }
             self.last_vfx_tick = now;
             let animation_dt = now.duration_since(self.last_animation_tick).as_secs_f32();
@@ -394,10 +439,71 @@ impl LiveSession {
                 self.motion_packets += 1;
                 self.motion = Some(trigger);
             }
-            ClientCustomChannelEvent::Season(_) | ClientCustomChannelEvent::Unknown { .. } => {}
+            ClientCustomChannelEvent::Season(sync) => self.apply_season_sync(&sync),
+            ClientCustomChannelEvent::Unknown { .. } => {}
         }
         Ok(())
     }
+
+    /// Route one decoded `SSN1` frame into the live season state: update
+    /// `latest_season`/`season_ambience`/`nature_env.season` and retint the
+    /// atmosphere blend target with the seasonal foliage tint. Reapplying a
+    /// frame never compounds the tint — it is always recomputed from the
+    /// stored untinted base, which is itself refreshed when another path
+    /// installed a target since the last season frame.
+    fn apply_season_sync(&mut self, sync: &SeasonWireSync) {
+        self.latest_season = Some(sync.clone());
+        let ambience = SeasonAmbienceInput::from_wire_sync(
+            sync.sub_season_idx,
+            sync.progress_in_sub_season,
+            sync.tropical_dim,
+            sync.snow_enabled,
+            sync.foliage_rgb,
+            sync.grass_rgb,
+        );
+        self.season_ambience = ambience;
+        self.nature_env.season = ambience;
+
+        // If the blender target still equals what the previous season frame
+        // installed, the stored untinted base is current; otherwise another
+        // path (biome/dimension change) installed a new base to adopt.
+        let current_target = self.atmosphere_blender.target();
+        if self.seasoned_atmosphere_target != Some(current_target) {
+            self.base_atmosphere_target = current_target;
+        }
+        let tinted = seasonal_atmosphere(self.base_atmosphere_target, &ambience);
+        self.atmosphere_blender.set_target(tinted);
+        self.seasoned_atmosphere_target = Some(tinted);
+    }
+}
+
+/// Apply the seasonal ambience state to an untinted atmosphere base: the
+/// foliage multiplier leans gently on ambient/horizon/fog, and active snow
+/// adds a soft haze plus a slight crisp ambient cool-down. A seasonless
+/// input returns the base untouched.
+fn seasonal_atmosphere(base: AtmosphereParams, season: &SeasonAmbienceInput) -> AtmosphereParams {
+    let s = season.sanitized();
+    if s.is_seasonless {
+        return base;
+    }
+    let mut out = base;
+    let blend = |v: f32, t: f32, k: f32| (v * (1.0 + (t - 1.0) * k)).clamp(0.0, 4.0);
+    for i in 0..3 {
+        out.ambient_rgb[i] = blend(out.ambient_rgb[i], s.foliage_tint[i], 0.40);
+        out.sky_horizon_rgb[i] = blend(out.sky_horizon_rgb[i], s.foliage_tint[i], 0.18);
+        out.fog_rgb[i] = blend(out.fog_rgb[i], s.foliage_tint[i], 0.18);
+        out.sky_zenith_rgb[i] = blend(out.sky_zenith_rgb[i], s.foliage_tint[i], 0.10);
+        out.depth_tint_rgb[i] = blend(out.depth_tint_rgb[i], s.grass_tint[i], 0.10);
+    }
+    let snow = s.snow_amount();
+    if snow > 0.0 {
+        out.fog_density = (out.fog_density * (1.0 + 0.30 * snow)).clamp(0.0, 4.0);
+        out.sun_intensity = (out.sun_intensity * (1.0 - 0.12 * snow)).clamp(0.0, 16.0);
+        for i in 0..3 {
+            out.ambient_rgb[i] += ([0.55, 0.62, 0.75][i] - out.ambient_rgb[i]) * 0.12 * snow;
+        }
+    }
+    out.sanitized()
 }
 
 pub fn magic_hud_from_sync(sync: &DecodedMagicSync) -> MagicHudState {
@@ -563,8 +669,9 @@ mod tests {
     use mc_spine_client::protocol::{
         decode_chunk_packet, decode_custom_payload_packet, decode_packet_body, encode_packet,
         DecodedMotionPhase, WireReader, CHANNEL_ANIM_V1, CHANNEL_MAGIC_V1, CHANNEL_MOTION_V1,
-        CHANNEL_VFX_V1,
+        CHANNEL_SEASON_V1, CHANNEL_VFX_V1, SSN1_MAGIC, SSN1_VERSION,
     };
+    use mc_spine_client_mesh::vanilla_plus_nature::{ActiveSeasonKind, NatureParticleKind};
     use mc_spine_client_mesh::vfx_engine::{DynamicColoredLight, Vfx1Packet, VfxCommand};
     use mc_spine_client_mesh::RenderBackendPreference;
     use mc_spine_kernel::skeletal_anim::{encode_animation_trigger, AnimationTrigger, LoopMode};
@@ -1100,5 +1207,104 @@ mod tests {
             renderer.update_live_terrain(&live.world);
             assert_eq!(renderer.live_section_count(), 0);
         }
+    }
+
+    fn ssn1_frame(
+        sub_season_idx: u8,
+        progress_q16: u16,
+        foliage: [u8; 3],
+        grass: [u8; 3],
+        flags: u8,
+    ) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(19);
+        frame.extend_from_slice(SSN1_MAGIC);
+        frame.push(SSN1_VERSION);
+        frame.push(sub_season_idx);
+        frame.extend_from_slice(&progress_q16.to_be_bytes());
+        frame.extend_from_slice(&12u16.to_be_bytes()); // day_of_season
+        frame.extend_from_slice(&49_151u16.to_be_bytes()); // daylight q16
+        frame.extend_from_slice(&foliage);
+        frame.extend_from_slice(&grass);
+        frame.push(flags);
+        frame
+    }
+
+    #[test]
+    fn ssn1_season_frames_drive_ambience_and_atmosphere() {
+        let (mut live, _tx) = session();
+        assert!(live.latest_season.is_none());
+        assert!(live.season_ambience.is_seasonless);
+        let base_target = live.atmosphere_blender.target();
+
+        // Mid-autumn frame with a warm crimson foliage tint.
+        let autumn = ssn1_frame(7, 32_767, [255, 120, 40], [200, 160, 80], 0);
+        live.apply_event(framed(CHANNEL_SEASON_V1, &autumn)).unwrap();
+        assert_eq!(
+            live.latest_season.as_ref().unwrap().sub_season_idx,
+            7,
+            "SSN1 should reach LiveSession"
+        );
+        assert_eq!(live.season_ambience.season, ActiveSeasonKind::Autumn);
+        assert!(!live.season_ambience.is_seasonless);
+        assert_eq!(live.season_ambience.sub_season_index, 7);
+        assert!(live.season_ambience.autumn_ramp() > 0.5);
+        assert_eq!(live.nature_env.season, live.season_ambience);
+
+        // The foliage multiplier tinted the blend target: green/blue drop
+        // while the (already 1.0) red channel holds.
+        let autumn_target = live.atmosphere_blender.target();
+        assert!(autumn_target.ambient_rgb[1] < base_target.ambient_rgb[1]);
+        assert!(autumn_target.ambient_rgb[2] < base_target.ambient_rgb[2]);
+        assert!((autumn_target.ambient_rgb[0] - base_target.ambient_rgb[0]).abs() < 1e-6);
+
+        // A mid-winter frame with snow enabled: frosty haze + snow motes.
+        let winter = ssn1_frame(10, 49_151, [235, 240, 255], [220, 230, 240], 0b100);
+        live.apply_event(framed(CHANNEL_SEASON_V1, &winter)).unwrap();
+        assert_eq!(live.season_ambience.season, ActiveSeasonKind::Winter);
+        assert!(live.season_ambience.snow_override);
+        assert!(live.season_ambience.snow_amount() > 0.5);
+        let winter_target = live.atmosphere_blender.target();
+        assert!(
+            winter_target.fog_density > autumn_target.fog_density,
+            "winter snow should haze the fog"
+        );
+        assert!(winter_target.sun_intensity < autumn_target.sun_intensity);
+
+        // The ambience tick picks the live season up: snow drifts, and the
+        // pack toggle still gates spawning (default OFF stays quiet).
+        for _ in 0..40 {
+            live.step_nature_ambience(0.05);
+        }
+        assert!(
+            live.nature_ambience
+                .particles()
+                .iter()
+                .all(|p| !matches!(p.kind, NatureParticleKind::SnowMote { .. })),
+            "default-OFF pack must emit no ambience"
+        );
+        live.vanilla_plus_cfg.nature.enabled = true;
+        live.vanilla_plus_cfg.nature.nature_ambience = true;
+        for _ in 0..40 {
+            live.step_nature_ambience(0.05);
+        }
+        assert!(
+            live.nature_ambience
+                .particles()
+                .iter()
+                .any(|p| matches!(p.kind, NatureParticleKind::SnowMote { .. })),
+            "winter SSN1 should drift snow motes through NatureAmbience"
+        );
+
+        // A tropical frame keeps the same sub-season but kills the snow.
+        let tropical = ssn1_frame(10, 49_151, [200, 255, 200], [180, 240, 180], 0b101);
+        live.apply_event(framed(CHANNEL_SEASON_V1, &tropical))
+            .unwrap();
+        assert!(live.season_ambience.is_tropical);
+        assert_eq!(live.season_ambience.snow_amount(), 0.0);
+        let tropical_target = live.atmosphere_blender.target();
+        assert!(
+            tropical_target.fog_density < winter_target.fog_density,
+            "tropical dims lose the snowy haze"
+        );
     }
 }

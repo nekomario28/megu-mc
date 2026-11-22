@@ -59,8 +59,11 @@ fn rich_env(weather: WeatherKind, is_night: bool) -> NatureAmbienceEnv {
         firefly_biome: true,
         cherry_blossom: false,
         autumn_factor: 0.0,
+        season: SeasonAmbienceInput::default(),
         origin: [0.0, 65.0, 0.0],
         leaf_blocks,
+        blossom_blocks: Vec::new(),
+        evergreen_blocks: Vec::new(),
         rain_exposed_water,
         waterfall_bases,
     }
@@ -456,7 +459,7 @@ fn falling_leaves_respond_to_autumn_and_expire() {
         "autumn ({autumn_warmth}) should be warmer than spring ({spring_warmth})"
     );
 
-    // Cherry groves shed pink petals instead.
+    // Cherry groves shed pink spiral petals instead.
     let mut cherry = NatureAmbienceState::default();
     let env = NatureAmbienceEnv {
         cherry_blossom: true,
@@ -468,7 +471,7 @@ fn falling_leaves_respond_to_autumn_and_expire() {
         .particles()
         .iter()
         .filter_map(|p| match p.kind {
-            NatureParticleKind::FallingLeaf { rgb, .. } => Some(rgb),
+            NatureParticleKind::SakuraPetal { rgb, .. } => Some(rgb),
             _ => None,
         })
         .collect();
@@ -1164,4 +1167,404 @@ fn atmosphere_helpers_gate_clouds_and_wind() {
         wind_sway_params_with_atmosphere(&disabled, WeatherKind::Thunder, 5_000, 1.0).strength,
         0.0
     );
+}
+
+// ---------------------------------------------------------------------------
+// Seasonal ambience coupling (SSN1 / Season Mods)
+// ---------------------------------------------------------------------------
+
+/// Non-tropical, non-seasonless season input for tests.
+fn seasonal(season: ActiveSeasonKind, sub_idx: u8, progress: f32) -> SeasonAmbienceInput {
+    SeasonAmbienceInput {
+        season,
+        sub_season_index: sub_idx,
+        sub_season_progress: progress,
+        is_tropical: false,
+        is_seasonless: false,
+        foliage_tint: [1.0; 3],
+        grass_tint: [1.0; 3],
+        snow_override: false,
+    }
+}
+
+#[test]
+fn season_input_defaults_neutral_and_wire_mapping_fails_closed() {
+    // The default input is the neutral "no Season Mod" fallback.
+    let s = SeasonAmbienceInput::default();
+    assert!(s.is_seasonless);
+    assert_eq!(s.autumn_ramp(), 0.0);
+    assert_eq!(s.firefly_scale(), 1.0);
+    assert_eq!(s.deciduous_activity(), 1.0);
+    assert_eq!(s.snow_amount(), 0.0);
+    assert_eq!(s.sakura_bloom(), 0.0);
+    assert_eq!(s.foliage_tint, [1.0; 3]);
+    assert_eq!(s.grass_tint, [1.0; 3]);
+
+    // A valid SSN1 frame maps sub-season index -> broad season.
+    let s = SeasonAmbienceInput::from_wire_sync(
+        7,
+        0.5,
+        false,
+        false,
+        [255, 128, 64],
+        [200, 220, 180],
+    );
+    assert_eq!(s.season, ActiveSeasonKind::Autumn);
+    assert_eq!(s.sub_season_index, 7);
+    assert!(!s.is_seasonless && !s.is_tropical && !s.snow_override);
+    assert!((s.foliage_tint[1] - 128.0 / 255.0).abs() < 1e-6);
+    assert!((s.grass_tint[0] - 200.0 / 255.0).abs() < 1e-6);
+    // Mid-Autumn at half progress sits halfway through the broad season.
+    assert!((s.season_progress() - (1.0 + 0.5) / 3.0).abs() < 1e-6);
+
+    // An out-of-range wire index fails closed to the seasonless fallback,
+    // even when the flags claim snow.
+    let s = SeasonAmbienceInput::from_wire_sync(19, 0.5, false, true, [0; 3], [0; 3]);
+    assert!(s.is_seasonless);
+    assert_eq!(s.snow_amount(), 0.0);
+
+    // A struct literal with garbage fields still sanitizes fail-closed.
+    let s = SeasonAmbienceInput {
+        season: ActiveSeasonKind::Winter,
+        sub_season_index: 200,
+        sub_season_progress: f32::NAN,
+        is_tropical: false,
+        is_seasonless: false,
+        foliage_tint: [f32::NAN, 9.0, -1.0],
+        grass_tint: [1.0; 3],
+        snow_override: true,
+    };
+    assert_eq!(s.sanitized().snow_amount(), 0.0);
+}
+
+#[test]
+fn spring_sakura_petals_spiral_on_vanilla_and_modded_canopy() {
+    let reg = NatureModRegistry::new();
+    // Vanilla cherry plus the sakura/blossom canopies of the big biome mods
+    // all inherit spiral petal physics and a pink tint automatically.
+    for id in [
+        "minecraft:cherry_leaves",
+        "bop:sakura_leaves",
+        "biomesoplenty:sakura_leaves",
+        "regions_unexplored:sakura_leaves",
+        "mymod:starlit_blossom_leaves",
+        "minecraft:flowering_azalea_leaves",
+    ] {
+        let style = classify_leaf_block(id, &["#c:leaves"], &reg)
+            .unwrap_or_else(|| panic!("{id} should classify as leaves"));
+        assert!(style.sakura_petals, "{id} should shed sakura petals");
+        assert!(
+            style.rgb[0] > style.rgb[1],
+            "{id} should read pink, got {:?}",
+            style.rgb
+        );
+        assert!(!style.allow_autumn_tint, "{id} must not go autumn amber");
+    }
+    // Plain temperate and evergreen canopies never shed petals.
+    for id in ["minecraft:oak_leaves", "minecraft:spruce_leaves", "mymod:maple_leaves"] {
+        let style = classify_leaf_block(id, &["#c:leaves"], &reg).unwrap();
+        assert!(!style.sakura_petals, "{id} must not shed sakura petals");
+    }
+    // A mod-registered sakura canopy inherits petal physics by name.
+    let mut reg2 = NatureModRegistry::new();
+    reg2.register_mod_leaf("mymod:pink_sakura_canopy", [0.9, 0.6, 0.8], false);
+    assert!(
+        reg2.registered_leaf("mymod:pink_sakura_canopy").unwrap().sakura_petals
+    );
+
+    let config = enabled_config();
+    let mut state = NatureAmbienceState::default();
+    let env = NatureAmbienceEnv {
+        season: seasonal(ActiveSeasonKind::Spring, 1, 0.5),
+        blossom_blocks: vec![[10.0, 70.0, 20.0], [12.0, 71.0, 22.0]],
+        ..NatureAmbienceEnv::default()
+    };
+    run_ticks(&mut state, &config, &env, 200);
+    let petals: Vec<&NatureParticle> = state
+        .particles()
+        .iter()
+        .filter(|p| matches!(p.kind, NatureParticleKind::SakuraPetal { .. }))
+        .collect();
+    assert!(!petals.is_empty(), "spring blossom canopy must shed petals");
+
+    // 桜吹雪: the horizontal velocity rotates around the fall axis (both
+    // signs of vx appear), the horizontal speed is a constant gentle
+    // amplitude, and the descent is slower than a leaf's -0.5.
+    let (mut pos_x, mut neg_x) = (false, false);
+    for p in &petals {
+        if let NatureParticleKind::SakuraPetal { rgb, .. } = p.kind {
+            assert!(rgb[0] > 0.9 && rgb[2] > 0.7, "petal {rgb:?} not sakura-pink");
+        }
+        let horizontal = (p.vel[0] * p.vel[0] + p.vel[2] * p.vel[2]).sqrt();
+        assert!(
+            (horizontal - 0.30).abs() < 0.05,
+            "petal spiral speed {horizontal} off amplitude"
+        );
+        assert!(p.vel[1] > -0.5, "petal descent {} too fast", p.vel[1]);
+        pos_x |= p.vel[0] > 0.10;
+        neg_x |= p.vel[0] < -0.10;
+    }
+    assert!(pos_x && neg_x, "spiral sway must rotate the horizontal velocity");
+
+    // Mid-spring bloom roughly doubles the petal cadence vs. seasonless.
+    let mut bloom = NatureAmbienceState::default();
+    let mut plain = NatureAmbienceState::default();
+    let bloom_env = env.clone();
+    let plain_env = NatureAmbienceEnv {
+        blossom_blocks: env.blossom_blocks.clone(),
+        ..NatureAmbienceEnv::default()
+    };
+    run_ticks(&mut bloom, &config, &bloom_env, 300);
+    run_ticks(&mut plain, &config, &plain_env, 300);
+    let is_petal = |k: &NatureParticleKind| matches!(k, NatureParticleKind::SakuraPetal { .. });
+    assert!(
+        count_kind(&bloom, is_petal) > count_kind(&plain, is_petal),
+        "mid-spring bloom should outpace the seasonless cadence"
+    );
+}
+
+#[test]
+fn autumn_ramp_walks_green_through_crimson_and_boosts_cadence() {
+    // The ramp rises smoothly and monotonically across the whole autumn.
+    let mut prev = 0.0f32;
+    for idx in 6..=8u8 {
+        for step in 0..=10 {
+            let s = seasonal(ActiveSeasonKind::Autumn, idx, step as f32 / 10.0);
+            let ramp = s.autumn_ramp();
+            assert!(
+                ramp >= prev - 1e-6,
+                "ramp dips at sub-season {idx} progress {step}: {prev} -> {ramp}"
+            );
+            assert!(
+                ramp - prev < 0.3,
+                "ramp jumps at sub-season {idx} progress {step}: {prev} -> {ramp}"
+            );
+            prev = ramp;
+        }
+    }
+    // And eases back out smoothly through early and mid winter.
+    for idx in 9..=10u8 {
+        for step in 0..=10 {
+            let s = seasonal(ActiveSeasonKind::Winter, idx, step as f32 / 10.0);
+            let ramp = s.autumn_ramp();
+            assert!(ramp <= prev + 1e-6 && ramp >= 0.0);
+            prev = ramp;
+        }
+    }
+    assert!(prev < 0.05, "ramp must be back to ~0 by mid-winter");
+
+    // Late-autumn leaves are warm crimson; the canopy tint differs from
+    // the fresh-green spring look.
+    let config = enabled_config();
+    let leaf_blocks = vec![[10.0, 70.0, 20.0], [12.0, 71.0, 22.0]];
+    let mut late_autumn = NatureAmbienceState::default();
+    let env = NatureAmbienceEnv {
+        season: seasonal(ActiveSeasonKind::Autumn, 8, 1.0),
+        leaf_blocks: leaf_blocks.clone(),
+        ..NatureAmbienceEnv::default()
+    };
+    run_ticks(&mut late_autumn, &config, &env, 120);
+    let mut summer = NatureAmbienceState::default();
+    let env = NatureAmbienceEnv {
+        season: seasonal(ActiveSeasonKind::Summer, 4, 0.5),
+        leaf_blocks,
+        ..NatureAmbienceEnv::default()
+    };
+    run_ticks(&mut summer, &config, &env, 120);
+    let leaf_rgb = |st: &NatureAmbienceState| -> Vec<[f32; 3]> {
+        st.particles()
+            .iter()
+            .filter_map(|p| match p.kind {
+                NatureParticleKind::FallingLeaf { rgb, .. } => Some(rgb),
+                _ => None,
+            })
+            .collect()
+    };
+    let autumn_rgbs = leaf_rgb(&late_autumn);
+    let summer_rgbs = leaf_rgb(&summer);
+    assert!(!autumn_rgbs.is_empty() && !summer_rgbs.is_empty());
+    let mut ratio_sum = 0.0f32;
+    for rgb in &autumn_rgbs {
+        assert!(
+            rgb[0] > rgb[1],
+            "late-autumn leaf {rgb:?} should be warm, not green"
+        );
+        ratio_sum += rgb[0] / rgb[1].max(1e-3);
+    }
+    assert!(
+        ratio_sum / autumn_rgbs.len() as f32 > 1.5,
+        "late-autumn canopy should average crimson/gold"
+    );
+    for rgb in &summer_rgbs {
+        assert!(rgb[1] >= rgb[0] * 0.8, "summer leaf {rgb:?} should stay green");
+    }
+
+    // Autumn boosts the leaf cadence and widens the wind drift.
+    let autumn_season = seasonal(ActiveSeasonKind::Autumn, 7, 0.5);
+    let summer_season = seasonal(ActiveSeasonKind::Summer, 4, 0.5);
+    assert!(autumn_season.autumn_ramp() > summer_season.autumn_ramp());
+    assert!(autumn_season.leaf_drift_scale() > 1.4);
+    assert!((summer_season.leaf_drift_scale() - 1.0).abs() < 0.1);
+    for p in late_autumn.particles() {
+        if let NatureParticleKind::FallingLeaf { drift, .. } = p.kind {
+            assert!(drift > 1.4, "autumn leaves should drift wider");
+        }
+    }
+}
+
+#[test]
+fn winter_drifts_snow_and_deciduous_canopy_sleeps() {
+    let config = enabled_config();
+    let leaf_blocks = vec![[10.0, 70.0, 20.0], [12.0, 71.0, 22.0]];
+    let evergreen_blocks = vec![[14.0, 72.0, 24.0]];
+    let is_leaf = |k: &NatureParticleKind| matches!(k, NatureParticleKind::FallingLeaf { .. });
+    let is_snow = |k: &NatureParticleKind| matches!(k, NatureParticleKind::SnowMote { .. });
+
+    // Deep winter temperate dimension: 粉雪 drifts while the deciduous
+    // canopy goes dormant (bare).
+    let mut winter = NatureAmbienceState::default();
+    let env = NatureAmbienceEnv {
+        season: seasonal(ActiveSeasonKind::Winter, 10, 0.6),
+        origin: [0.0, 65.0, 0.0],
+        leaf_blocks: leaf_blocks.clone(),
+        evergreen_blocks: evergreen_blocks.clone(),
+        ..NatureAmbienceEnv::default()
+    };
+    run_ticks(&mut winter, &config, &env, 400);
+    assert!(count_kind(&winter, is_snow) > 0, "deep winter must drift 粉雪");
+    // Only subtle conifer needles remain: far fewer live leaves than summer.
+    let winter_leaves = count_kind(&winter, is_leaf);
+
+    let mut summer = NatureAmbienceState::default();
+    let env = NatureAmbienceEnv {
+        season: seasonal(ActiveSeasonKind::Summer, 4, 0.5),
+        origin: [0.0, 65.0, 0.0],
+        leaf_blocks: leaf_blocks.clone(),
+        evergreen_blocks,
+        ..NatureAmbienceEnv::default()
+    };
+    run_ticks(&mut summer, &config, &env, 400);
+    assert_eq!(
+        count_kind(&summer, is_snow),
+        0,
+        "summer must never drift snow"
+    );
+    let summer_leaves = count_kind(&summer, is_leaf);
+    assert!(
+        winter_leaves < summer_leaves,
+        "winter deciduous pause: {winter_leaves} vs summer {summer_leaves}"
+    );
+
+    // Same deciduous canopy, isolated: deep winter sheds (almost) nothing
+    // while summer sheds steadily.
+    let mut winter_deciduous = NatureAmbienceState::default();
+    let mut summer_deciduous = NatureAmbienceState::default();
+    let winter_env = NatureAmbienceEnv {
+        season: seasonal(ActiveSeasonKind::Winter, 10, 0.6),
+        leaf_blocks: leaf_blocks.clone(),
+        ..NatureAmbienceEnv::default()
+    };
+    let summer_env = NatureAmbienceEnv {
+        season: seasonal(ActiveSeasonKind::Summer, 4, 0.5),
+        leaf_blocks,
+        ..NatureAmbienceEnv::default()
+    };
+    run_ticks(&mut winter_deciduous, &config, &winter_env, 400);
+    run_ticks(&mut summer_deciduous, &config, &summer_env, 400);
+    assert!(
+        count_kind(&winter_deciduous, is_leaf) <= 1,
+        "deep-winter deciduous canopy should be bare"
+    );
+    assert!(
+        count_kind(&summer_deciduous, is_leaf) >= 5,
+        "summer deciduous canopy should shed steadily"
+    );
+
+    // Conifers alone still shed a subtle needle trickle in deep winter.
+    let mut winter_evergreen = NatureAmbienceState::default();
+    let env = NatureAmbienceEnv {
+        season: seasonal(ActiveSeasonKind::Winter, 10, 0.6),
+        evergreen_blocks: vec![[14.0, 72.0, 24.0], [16.0, 73.0, 26.0]],
+        ..NatureAmbienceEnv::default()
+    };
+    run_ticks(&mut winter_evergreen, &config, &env, 400);
+    assert!(
+        count_kind(&winter_evergreen, is_leaf) > 0,
+        "conifers keep a subtle needle trickle through winter"
+    );
+
+    // Snow motes settle gently and shimmer deterministically.
+    for p in winter.particles() {
+        if let NatureParticleKind::SnowMote { shimmer_phase } = p.kind {
+            assert!(shimmer_phase.is_finite());
+            assert!(p.vel[1] < 0.0, "snow motes settle downward");
+            let horizontal = (p.vel[0] * p.vel[0] + p.vel[2] * p.vel[2]).sqrt();
+            assert!(horizontal < 0.3, "snow drift should stay gentle");
+        }
+    }
+
+    // `snow_override` drifts even outside winter (a frozen dimension).
+    let mut frozen = NatureAmbienceState::default();
+    let mut snowy_autumn = seasonal(ActiveSeasonKind::Autumn, 7, 0.5);
+    snowy_autumn.snow_override = true;
+    let env = NatureAmbienceEnv {
+        season: snowy_autumn,
+        origin: [0.0, 65.0, 0.0],
+        ..NatureAmbienceEnv::default()
+    };
+    run_ticks(&mut frozen, &config, &env, 100);
+    assert!(
+        count_kind(&frozen, is_snow) > 0,
+        "snow_override should drift 粉雪 outside winter"
+    );
+}
+
+#[test]
+fn tropical_dims_stay_green_active_and_snowless() {
+    let mut tropical_winter = seasonal(ActiveSeasonKind::Winter, 10, 0.6);
+    tropical_winter.is_tropical = true;
+    assert_eq!(tropical_winter.snow_amount(), 0.0);
+    assert_eq!(tropical_winter.autumn_ramp(), 0.0);
+    assert_eq!(tropical_winter.deciduous_activity(), 1.0);
+    assert_eq!(tropical_winter.firefly_scale(), 1.0);
+
+    let config = enabled_config();
+    let mut state = NatureAmbienceState::default();
+    let env = NatureAmbienceEnv {
+        season: tropical_winter,
+        is_night: true,
+        firefly_biome: true,
+        origin: [0.0, 65.0, 0.0],
+        leaf_blocks: vec![[10.0, 70.0, 20.0], [12.0, 71.0, 22.0]],
+        ..NatureAmbienceEnv::default()
+    };
+    run_ticks(&mut state, &config, &env, 400);
+    let is_snow = |k: &NatureParticleKind| matches!(k, NatureParticleKind::SnowMote { .. });
+    let is_leaf = |k: &NatureParticleKind| matches!(k, NatureParticleKind::FallingLeaf { .. });
+    let is_firefly = |k: &NatureParticleKind| matches!(k, NatureParticleKind::Firefly { .. });
+    assert_eq!(count_kind(&state, is_snow), 0, "tropical winter never snows");
+    assert!(count_kind(&state, is_leaf) > 0, "tropical canopy stays active");
+    assert!(count_kind(&state, is_firefly) > 0, "tropical dusk keeps 蛍");
+    for p in state.particles() {
+        if let NatureParticleKind::FallingLeaf { rgb, .. } = p.kind {
+            assert!(rgb[1] >= rgb[0] * 0.7, "tropical leaf {rgb:?} stays green");
+        }
+    }
+}
+
+#[test]
+fn seasonless_env_never_emits_snow_motes() {
+    let config = enabled_config();
+    // Even a hostile-looking manual env stays snow-free without a season sync.
+    let mut state = NatureAmbienceState::default();
+    let env = NatureAmbienceEnv {
+        weather: WeatherKind::Thunder,
+        is_night: true,
+        origin: [0.0, 65.0, 0.0],
+        leaf_blocks: vec![[10.0, 70.0, 20.0]],
+        ..NatureAmbienceEnv::default()
+    };
+    run_ticks(&mut state, &config, &env, 400);
+    let is_snow = |k: &NatureParticleKind| matches!(k, NatureParticleKind::SnowMote { .. });
+    assert_eq!(count_kind(&state, is_snow), 0);
 }
