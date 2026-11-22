@@ -2,12 +2,15 @@
 
 use mc_spine_proto::item_components::{
     plain_text_component, sanitize_and_roundtrip_components, sanitize_text_component,
-    BannerPattern, BannerPatternKind, Enchantment, FireworkExplosion, Instrument, PotionContents,
-    PotionEffect, PotionEffectDetails, Profile, ProfileProperty, VerifiedComponent,
-    MAX_COMPONENT_BYTES, MAX_CONTAINER_SLOTS, MAX_LIST_ENTRIES, MAX_STACK_COMPONENTS_BYTES,
+    AttributeModifier, BannerPattern, BannerPatternKind, BeeData, BlockPredicate, BlockProperty,
+    BlockPropertyValue, BookPage, Enchantment, FireworkExplosion, Food, FoodEffect, Holder, IdSet,
+    Instrument, JukeboxPlayable, JukeboxSong, JukeboxSongRef, LodestoneTracker, PotionContents,
+    PotionEffect, PotionEffectDetails, Profile, ProfileProperty, SoundEvent, Tool, ToolRule, Trim,
+    TrimMaterial, TrimPattern, VerifiedComponent, WrittenBook, WrittenPage, MAX_COMPONENT_BYTES,
+    MAX_CONTAINER_SLOTS, MAX_LIST_ENTRIES, MAX_STACK_COMPONENTS_BYTES,
 };
 use mc_spine_proto::table::{PacketDir, PacketPhase, ProtocolTable};
-use mc_spine_proto::wire::{read_frame, write_frame, WireReader, WireWriter};
+use mc_spine_proto::wire::{read_frame, write_frame, BlockPos, WireReader, WireWriter};
 use mc_spine_proto::{
     C2SPacket, CodecV767, EquipmentSlot, ItemStack, ProtocolCodec, RawComponent, S2CPacket,
     MAX_COOKIE_PAYLOAD_BYTES,
@@ -337,6 +340,332 @@ fn example_components() -> Vec<VerifiedComponent> {
     ]
 }
 
+fn additional_v767_components() -> Vec<VerifiedComponent> {
+    let empty_compound = vec![10, 0];
+    let text = plain_text_component("Hello").unwrap();
+    let nested = ItemStack {
+        item_id: 1,
+        count: 1,
+        added: vec![VerifiedComponent::RepairCost(1).to_raw().unwrap()],
+        removed: vec![],
+    };
+    let predicate = BlockPredicate {
+        blocks: Some(IdSet::Ids(vec![1, 2])),
+        properties: Some(vec![BlockProperty {
+            name: "facing".into(),
+            value: BlockPropertyValue::Exact("north".into()),
+        }]),
+        nbt: Some(empty_compound.clone()),
+    };
+    vec![
+        VerifiedComponent::CustomData(empty_compound.clone()),
+        VerifiedComponent::MaxStackSize(99),
+        VerifiedComponent::MaxDamage(250),
+        VerifiedComponent::CanPlaceOn {
+            predicates: vec![predicate.clone()],
+            show_in_tooltip: true,
+        },
+        VerifiedComponent::CanBreak {
+            predicates: vec![predicate],
+            show_in_tooltip: false,
+        },
+        VerifiedComponent::AttributeModifiers {
+            entries: vec![AttributeModifier {
+                attribute: 2,
+                id: "minecraft:attack_speed".into(),
+                amount: 1.5,
+                operation: 1,
+                slot: 3,
+            }],
+            show_in_tooltip: true,
+        },
+        VerifiedComponent::CustomModelData(1),
+        VerifiedComponent::CreativeSlotLock,
+        VerifiedComponent::IntangibleProjectile(empty_compound.clone()),
+        VerifiedComponent::Food(Food {
+            nutrition: 4,
+            saturation: 0.5,
+            can_always_eat: true,
+            seconds_to_eat: 1.6,
+            converts_to: ItemStack::empty(),
+            effects: vec![FoodEffect {
+                effect: 1,
+                probability: 0.25,
+            }],
+        }),
+        VerifiedComponent::FireResistant,
+        VerifiedComponent::Tool(Tool {
+            rules: vec![ToolRule {
+                blocks: IdSet::Tag("minecraft:mineable/pickaxe".into()),
+                speed: Some(6.0),
+                correct_drop_for_blocks: Some(true),
+            }],
+            default_mining_speed: 1.0,
+            damage_per_block: 1,
+        }),
+        VerifiedComponent::MapColor(0xff0055aa),
+        VerifiedComponent::MapId(25),
+        VerifiedComponent::MapDecorations(empty_compound.clone()),
+        VerifiedComponent::MapPostProcessing(1),
+        VerifiedComponent::ChargedProjectiles(vec![nested.clone()]),
+        VerifiedComponent::BundleContents(vec![nested]),
+        VerifiedComponent::WritableBookContent(vec![BookPage {
+            text: "Sample page".into(),
+            filtered: Some("Filtered page".into()),
+        }]),
+        VerifiedComponent::WrittenBookContent(WrittenBook {
+            title: "Test book".into(),
+            filtered_title: None,
+            author: "Author".into(),
+            generation: 1,
+            pages: vec![WrittenPage {
+                text: text.clone(),
+                filtered: Some(text.clone()),
+            }],
+            resolved: true,
+        }),
+        VerifiedComponent::Trim(Trim {
+            material: Holder::Inline(TrimMaterial {
+                asset_name: "quartz".into(),
+                ingredient: 1,
+                overrides: vec![("minecraft:iron".into(), "iron".into())],
+                description: text.clone(),
+            }),
+            pattern: Holder::Inline(TrimPattern {
+                asset_id: "minecraft:spire".into(),
+                template: 1,
+                description: text.clone(),
+                decal: false,
+            }),
+            show_in_tooltip: true,
+        }),
+        VerifiedComponent::DebugStickState(empty_compound.clone()),
+        VerifiedComponent::EntityData(empty_compound.clone()),
+        VerifiedComponent::BucketEntityData(empty_compound.clone()),
+        VerifiedComponent::BlockEntityData(empty_compound.clone()),
+        VerifiedComponent::JukeboxPlayable(JukeboxPlayable {
+            song: JukeboxSongRef::Holder(Holder::Inline(JukeboxSong {
+                sound: Holder::Inline(SoundEvent {
+                    name: "minecraft:music_disc.13".into(),
+                    fixed_range: Some(16.0),
+                }),
+                description: text.clone(),
+                duration: 5.0,
+                comparator_output: 2,
+            })),
+            show_in_tooltip: true,
+        }),
+        VerifiedComponent::Recipes(empty_compound.clone()),
+        VerifiedComponent::LodestoneTracker(LodestoneTracker {
+            position: Some(("minecraft:overworld".into(), BlockPos::new(12, 80, 13))),
+            tracked: true,
+        }),
+        VerifiedComponent::NoteBlockSound("minecraft:block.note_block.harp".into()),
+        VerifiedComponent::PotDecorations(vec![1, 2, 3, 4]),
+        VerifiedComponent::Bees(vec![BeeData {
+            nbt: empty_compound.clone(),
+            ticks_in_hive: 40,
+            min_ticks_in_hive: 80,
+        }]),
+        VerifiedComponent::Lock(empty_compound.clone()),
+        VerifiedComponent::ContainerLoot(empty_compound),
+    ]
+}
+
+#[test]
+fn all_57_v767_component_ids_roundtrip_and_fail_closed() {
+    let mut cases = example_components();
+    cases.extend(additional_v767_components());
+    assert_eq!(cases.len(), 57, "one sample per registry entry");
+    let mut seen = [false; 57];
+    let table = ProtocolTable::v767_builtin();
+    for value in cases {
+        let raw = value.to_raw().unwrap();
+        assert!((raw.type_id as usize) < seen.len());
+        assert!(
+            !std::mem::replace(&mut seen[raw.type_id as usize], true),
+            "duplicate ID {}",
+            raw.type_id
+        );
+        assert!(table
+            .registry_name("minecraft:data_component_type", raw.type_id)
+            .is_some());
+        assert_eq!(
+            VerifiedComponent::decode(&raw).unwrap(),
+            value,
+            "ID {}",
+            raw.type_id
+        );
+        assert_eq!(
+            VerifiedComponent::decode(&raw).unwrap().to_raw().unwrap(),
+            raw
+        );
+        let sanitized = sanitize_and_roundtrip_components(std::slice::from_ref(&raw));
+        assert_eq!(
+            sanitized.components,
+            vec![raw.clone()],
+            "ID {}",
+            raw.type_id
+        );
+        let mut oversized = raw.clone();
+        oversized.data.resize(MAX_COMPONENT_BYTES + 1, 0);
+        assert!(
+            VerifiedComponent::decode(&oversized).is_err(),
+            "oversized ID {}",
+            raw.type_id
+        );
+        assert_eq!(
+            sanitize_and_roundtrip_components(&[oversized]).dropped_oversized,
+            1
+        );
+        if raw.data.is_empty() {
+            let mut extra = raw.clone();
+            extra.data.push(0);
+            assert!(
+                VerifiedComponent::decode(&extra).is_err(),
+                "trailing byte ID {}",
+                raw.type_id
+            );
+        } else {
+            let mut truncated = raw.clone();
+            truncated.data.pop();
+            assert!(
+                VerifiedComponent::decode(&truncated).is_err(),
+                "truncated ID {}",
+                raw.type_id
+            );
+            assert_eq!(
+                sanitize_and_roundtrip_components(&[truncated]).dropped_invalid,
+                1
+            );
+        }
+    }
+    assert!(
+        seen.into_iter().all(|value| value),
+        "all 57 component IDs must be covered"
+    );
+}
+
+#[test]
+fn expanded_components_reject_malformed_bounds_and_nested_stacks() {
+    for value in [0, 100, i32::MAX as u32] {
+        assert!(VerifiedComponent::MaxStackSize(value).to_raw().is_err());
+        let mut writer = WireWriter::new();
+        writer.write_varint(value as i32);
+        assert!(VerifiedComponent::decode(&RawComponent {
+            type_id: 1,
+            data: writer.into_vec(),
+        })
+        .is_err());
+    }
+    assert!(
+        VerifiedComponent::ChargedProjectiles(vec![ItemStack::empty(); 4])
+            .to_raw()
+            .is_err()
+    );
+    assert!(
+        VerifiedComponent::BundleContents(vec![ItemStack::empty(); MAX_LIST_ENTRIES + 1])
+            .to_raw()
+            .is_err()
+    );
+    assert!(VerifiedComponent::WritableBookContent(vec![
+        BookPage {
+            text: "ok".into(),
+            filtered: None,
+        };
+        MAX_LIST_ENTRIES + 1
+    ])
+    .to_raw()
+    .is_err());
+    assert!(VerifiedComponent::WritableBookContent(vec![BookPage {
+        text: "\u{1b}unsafe".into(),
+        filtered: None,
+    }])
+    .to_raw()
+    .is_err());
+    assert!(VerifiedComponent::MapPostProcessing(2).to_raw().is_err());
+    assert!(VerifiedComponent::AttributeModifiers {
+        entries: vec![AttributeModifier {
+            attribute: 1,
+            id: "example".into(),
+            amount: f64::NAN,
+            operation: 0,
+            slot: 0,
+        }],
+        show_in_tooltip: true,
+    }
+    .to_raw()
+    .is_err());
+    assert!(VerifiedComponent::Food(Food {
+        nutrition: 1,
+        saturation: 1.0,
+        can_always_eat: false,
+        seconds_to_eat: 1.0,
+        converts_to: ItemStack::empty(),
+        effects: vec![FoodEffect {
+            effect: 1,
+            probability: 1.1
+        }],
+    })
+    .to_raw()
+    .is_err());
+
+    // Nesting a stack-bearing component inside any other stack-bearing
+    // component exceeds the single permitted layer.
+    let nested_container = VerifiedComponent::Container(vec![]).to_raw().unwrap();
+    let inner = ItemStack {
+        item_id: 1,
+        count: 1,
+        added: vec![nested_container],
+        removed: vec![],
+    };
+    assert!(VerifiedComponent::Container(vec![inner.clone()])
+        .to_raw()
+        .is_err());
+    assert!(VerifiedComponent::ChargedProjectiles(vec![inner.clone()])
+        .to_raw()
+        .is_err());
+    assert!(VerifiedComponent::BundleContents(vec![inner.clone()])
+        .to_raw()
+        .is_err());
+    assert!(VerifiedComponent::Food(Food {
+        nutrition: 1,
+        saturation: 1.0,
+        can_always_eat: false,
+        seconds_to_eat: 1.0,
+        converts_to: inner,
+        effects: vec![],
+    })
+    .to_raw()
+    .is_err());
+
+    // A 33-level nested compound is within the byte budget but exceeds the
+    // NBT depth limit. The same guard applies to direct and wire inputs.
+    let mut deep_nbt = vec![10];
+    for _ in 0..33 {
+        deep_nbt.extend_from_slice(&[10, 0, 1, b'x']);
+    }
+    deep_nbt.extend(std::iter::repeat_n(0, 34));
+    assert!(VerifiedComponent::CustomData(deep_nbt.clone())
+        .to_raw()
+        .is_err());
+    assert!(VerifiedComponent::decode(&RawComponent {
+        type_id: 0,
+        data: deep_nbt,
+    })
+    .is_err());
+
+    // NBT array elements also obey MAX_LIST_ENTRIES even when the total
+    // encoded data is smaller than MAX_COMPONENT_BYTES.
+    let mut oversized_array = vec![10, 7, 0, 1, b'a'];
+    oversized_array.extend_from_slice(&((MAX_LIST_ENTRIES + 1) as i32).to_be_bytes());
+    oversized_array.resize(oversized_array.len() + MAX_LIST_ENTRIES + 1, 0);
+    oversized_array.push(0);
+    assert!(VerifiedComponent::CustomData(oversized_array)
+        .to_raw()
+        .is_err());
+}
+
 #[test]
 fn all_named_creative_components_typed_wire_and_sanitizer_roundtrip() {
     let components = example_components();
@@ -369,9 +698,11 @@ fn all_named_creative_components_typed_wire_and_sanitizer_roundtrip() {
 }
 
 #[test]
-fn set_equipment_decodes_all_creative_components_through_normal_packet_path() {
+fn set_equipment_decodes_all_57_components_through_normal_packet_path() {
     let codec = CodecV767::new();
-    let raw = example_components()
+    let mut values = example_components();
+    values.extend(additional_v767_components());
+    let raw = values
         .into_iter()
         .map(|value| value.to_raw().unwrap())
         .collect();
