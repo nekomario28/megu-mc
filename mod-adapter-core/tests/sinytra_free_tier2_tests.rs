@@ -509,7 +509,7 @@ fn tiny_v2_parser_maps_intermediary_class_and_method_to_canonical_hook() {
         empty.canonical_class("net/minecraft/class_2344"),
         "net/minecraft/world/level/block/FarmBlock"
     );
-    assert_eq!(empty.canonical_method("method_10125"), "fallOn");
+    assert_eq!(empty.canonical_method("method_10125"), "turnToDirt");
 
     // Fail-closed parsing: bad headers, wrong column counts, member
     // rows outside a class, and the 16 MiB bound all reject.

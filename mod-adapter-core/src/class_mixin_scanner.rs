@@ -46,7 +46,8 @@ use std::path::Path;
 use crate::data_loader::{parse_json, DataLoadError, JsonValue};
 use crate::intermediary_map::{parse_tiny_v2, TinyV2MappingTable};
 use crate::mixin_lifter::{
-    lift_mixin_sites_with_mappings, InjectPoint, MixinAnnotationKind, MixinLiftVerdict,
+    classify_mixin_target, lift_mixin_sites_with_mappings, InjectPoint, MixinAnnotationKind,
+    MixinLiftVerdict, MixinTargetScope,
     MixinMemberKind, MixinSite,
 };
 use crate::modpack::{self, ModpackError};
@@ -186,9 +187,21 @@ pub struct JarMixinScanReport {
     pub classes_scanned: usize,
     /// `client`-array entries skipped by a server-side scan.
     pub skipped_client_mixins: usize,
-    /// Every [`MixinSite`] extracted, in member order. `@Shadow`/`@Unique`
-    /// members are [`MixinDeclaration`]s, not sites.
+    /// Every [`MixinSite`] extracted whose target is a live-gameplay
+    /// class, in member order — these feed `verdict`.
+    /// `@Shadow`/`@Unique` members are [`MixinDeclaration`]s, not sites,
+    /// and `net/minecraft/util/datafix/*` targets are partitioned into
+    /// `legacy_datafix_sites` instead: they run only inside pre-1.21.1
+    /// save upgrades, never during live 1.21.1 gameplay.
     pub sites: Vec<MixinSite>,
+    /// Sites targeting legacy `net/minecraft/util/datafix/*` (yarn
+    /// `net/minecraft/datafixer/*`) classes — recorded verbatim, counted
+    /// `legacy_datafix_skipped`, and never a blocker because that code
+    /// path only executes during legacy save migration.
+    pub legacy_datafix_sites: Vec<MixinSite>,
+    /// Count of `legacy_datafix_sites` — scan telemetry reported as
+    /// `legacy_datafix_skipped`.
+    pub legacy_datafix_skipped: usize,
     /// Every non-mutating `@Shadow`/`@Unique` declaration found, in member
     /// order — recorded, never silently erased, never a blocker.
     pub declarations: Vec<MixinDeclaration>,
@@ -1145,12 +1158,34 @@ fn scan_jar(
         }
     }
 
+    // Partition legacy save-upgrade-only targets out before the lift
+    // verdict: `net/minecraft/util/datafix/*` (and the identical yarn
+    // `net/minecraft/datafixer/` tree) execute exclusively inside
+    // DataFixerUpper migrations of pre-1.21.1 saves — never during live
+    // gameplay — so they are recorded as `legacy_datafix_skipped` instead
+    // of vetoing the mod's live surface. Classification judges the
+    // canonical class name (so Intermediary spellings resolve first) and
+    // is fail-closed: any unrecognized target is `LiveGameplay`.
+    let mut live_sites = Vec::with_capacity(sites.len());
+    let mut legacy_datafix_sites = Vec::new();
+    for site in sites {
+        let canonical = mappings.canonical_class(&site.target_class);
+        if classify_mixin_target(canonical.as_ref()) == MixinTargetScope::LegacyDataFixOnly {
+            legacy_datafix_sites.push(site);
+        } else {
+            live_sites.push(site);
+        }
+    }
+    let sites = live_sites;
+
     let verdict = lift_mixin_sites_with_mappings(&sites, &mappings);
     Ok(JarMixinScanReport {
         mixin_configs_found: configs_found,
         classes_scanned,
         skipped_client_mixins: skipped_client,
         sites,
+        legacy_datafix_skipped: legacy_datafix_sites.len(),
+        legacy_datafix_sites,
         declarations_skipped: declarations.len(),
         declarations,
         tiny_mappings_loaded,

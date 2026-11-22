@@ -131,11 +131,133 @@ const BUILTIN_CLASS_ANCHORS: &[BuiltinAnchor] = &[
         intermediary: "net/minecraft/class_4970$class_4971",
         canonical: "net/minecraft/world/level/block/state/BlockBehaviour$BlockStateBase",
     },
+    // Universal 1.21.1 hook/accessor/invoker classes.
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_22",
+        canonical: "net/minecraft/world/level/saveddata/maps/MapItemSavedData",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_1293",
+        canonical: "net/minecraft/world/effect/MobEffectInstance",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_1533",
+        canonical: "net/minecraft/world/entity/decoration/ItemFrame",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_1542",
+        canonical: "net/minecraft/world/entity/item/ItemEntity",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_1696",
+        canonical: "net/minecraft/world/entity/vehicle/MinecartFurnace",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_1735",
+        canonical: "net/minecraft/world/inventory/Slot",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_1838",
+        canonical: "net/minecraft/world/item/context/UseOnContext",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_1845",
+        canonical: "net/minecraft/world/item/alchemy/PotionBrewing",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_1869",
+        canonical: "net/minecraft/world/item/crafting/ShapedRecipe",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_2292",
+        canonical: "net/minecraft/world/level/block/ConcretePowderBlock",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_2302",
+        canonical: "net/minecraft/world/level/block/CropBlock",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_2315",
+        canonical: "net/minecraft/world/level/block/DispenserBlock",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_2354",
+        canonical: "net/minecraft/world/level/block/FenceBlock",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_2370",
+        canonical: "net/minecraft/core/MappedRegistry",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_2505",
+        canonical: "net/minecraft/nbt/NbtAccounter",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_2513",
+        canonical: "net/minecraft/world/level/block/StemBlock",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_2965",
+        canonical: "net/minecraft/core/dispenser/ProjectileDispenseBehavior",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_2995",
+        canonical: "net/minecraft/server/ServerScoreboard",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_3031",
+        canonical: "net/minecraft/world/level/levelgen/feature/Feature",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_3609",
+        canonical: "net/minecraft/world/level/material/FlowingFluid",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_3781",
+        canonical: "net/minecraft/world/level/levelgen/structure/pools/SinglePoolElement",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_3785",
+        canonical: "net/minecraft/world/level/levelgen/structure/pools/StructureTemplatePool",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_3898",
+        canonical: "net/minecraft/server/level/ChunkMap",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_3898$class_3208",
+        canonical: "net/minecraft/server/level/ChunkMap$TrackedEntity",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_3922",
+        canonical: "net/minecraft/world/level/block/CampfireBlock",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_4516",
+        canonical: "net/minecraft/gametest/framework/GameTestHelper",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_4915",
+        canonical: "net/minecraft/data/models/ItemModelGenerators",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_5141",
+        canonical: "net/minecraft/world/level/levelgen/feature/trunkplacers/TrunkPlacer",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_5350",
+        canonical: "net/minecraft/server/ReloadableServerResources",
+    },
+    BuiltinAnchor {
+        intermediary: "net/minecraft/class_7788",
+        canonical: "net/minecraft/data/loot/BlockLootSubProvider",
+    },
 ];
 
 /// Clean-room canonical method anchors covering every lifecycle method
-/// `mixin_lifter`'s `STANDARD_TARGETS` lifts, plus `FarmBlock` trample
-/// (`fallOn`) as a standard Farm/Farmer's-Delight-style hook anchor.
+/// `mixin_lifter`'s `STANDARD_TARGETS` lifts — including `FarmBlock`
+/// trample (`turnToDirt`, yarn `setToDirt`) — plus the verified
+/// pure/read-only `@Invoker` query methods.
 /// Intermediary `method_NNNN` → canonical Mojmap name. Intermediary
 /// method numbers are globally unique and hierarchy-shared, so a flat
 /// name map is exact.
@@ -206,10 +328,145 @@ const BUILTIN_METHOD_ANCHORS: &[BuiltinAnchor] = &[
         intermediary: "method_55780",
         canonical: "useItemOn",
     },
-    // FarmBlock trample — `fallOn` (`onBrokenAfterFall` path).
+    // FarmBlock trample — `turnToDirt` (yarn `setToDirt`; Mojmap 1.21.1
+    // static `FarmBlock.turnToDirt`). `fallOn` is the separate
+    // `method_9554`/`onLandedUpon` below.
     BuiltinAnchor {
         intermediary: "method_10125",
+        canonical: "turnToDirt",
+    },
+    // FarmBlock/BlockBehaviour `fallOn` (yarn `onLandedUpon`) — named for
+    // completeness; no standard hook binds it today.
+    BuiltinAnchor {
+        intermediary: "method_9554",
         canonical: "fallOn",
+    },
+    // Entity load/save (yarn `readNbt`/`writeNbt` — Mojmap `load`/`save`).
+    BuiltinAnchor {
+        intermediary: "method_5651",
+        canonical: "load",
+    },
+    BuiltinAnchor {
+        intermediary: "method_5647",
+        canonical: "save",
+    },
+    // Player canEat (yarn `canConsume`).
+    BuiltinAnchor {
+        intermediary: "method_7332",
+        canonical: "canEat",
+    },
+    // Item useOn (yarn `useOnBlock`).
+    BuiltinAnchor {
+        intermediary: "method_7884",
+        canonical: "useOn",
+    },
+    // FenceBlock connectsTo / isSameFence (yarn `canConnect` /
+    // `canConnectToFence`).
+    BuiltinAnchor {
+        intermediary: "method_10184",
+        canonical: "connectsTo",
+    },
+    BuiltinAnchor {
+        intermediary: "method_26375",
+        canonical: "isSameFence",
+    },
+    // CampfireBlock isSmokeSource (yarn `isLitCampfire` — the hay-bale
+    // smoke-height query).
+    BuiltinAnchor {
+        intermediary: "method_23896",
+        canonical: "isSmokeSource",
+    },
+    // CropBlock/StemBlock mayPlaceOn (yarn `canPlantOnTop`, declared on
+    // the shared BushBlock parent).
+    BuiltinAnchor {
+        intermediary: "method_9695",
+        canonical: "mayPlaceOn",
+    },
+    // FlowingFluid canPassThrough (yarn `canFlowThrough`).
+    BuiltinAnchor {
+        intermediary: "method_15746",
+        canonical: "canPassThrough",
+    },
+    // Scoreboard team change, inherited by ServerScoreboard (yarn
+    // `addScoreHolderToTeam` / `removeScoreHolderFromTeam` on `Scoreboard`
+    // class_269 — numbers are hierarchy-shared).
+    BuiltinAnchor {
+        intermediary: "method_1172",
+        canonical: "addPlayerToTeam",
+    },
+    BuiltinAnchor {
+        intermediary: "method_1157",
+        canonical: "removePlayerFromTeam",
+    },
+    // MinecraftServer reloadResources / ReloadableServerResources
+    // loadResources (yarn `DataPackContents.reload`).
+    BuiltinAnchor {
+        intermediary: "method_29439",
+        canonical: "reloadResources",
+    },
+    BuiltinAnchor {
+        intermediary: "method_29466",
+        canonical: "loadResources",
+    },
+    // MapItemSavedData load / save (yarn `MapState.fromNbt`;
+    // `PersistentState.save` is inherited).
+    BuiltinAnchor {
+        intermediary: "method_32371",
+        canonical: "load",
+    },
+    BuiltinAnchor {
+        intermediary: "method_17919",
+        canonical: "save",
+    },
+    // Feature isGrassOrDirt / TrunkPlacer setDirtAt (yarn `isSoil`
+    // overloads / `setToDirt`).
+    BuiltinAnchor {
+        intermediary: "method_23396",
+        canonical: "isGrassOrDirt",
+    },
+    BuiltinAnchor {
+        intermediary: "method_27368",
+        canonical: "isGrassOrDirt",
+    },
+    BuiltinAnchor {
+        intermediary: "method_27400",
+        canonical: "setDirtAt",
+    },
+    // Verified pure/read-only `@Invoker` query methods (yarn names:
+    // `getOutlineShape`, `getAgeProperty`, `getHeldItemStack`,
+    // `isItemRecipeIngredient`, `getHitResult`, `createSilkTouchCondition`,
+    // `getBehaviorForItem`, `getUpdatedState`).
+    BuiltinAnchor {
+        intermediary: "method_9530",
+        canonical: "getShape",
+    },
+    BuiltinAnchor {
+        intermediary: "method_9824",
+        canonical: "getAgeProperty",
+    },
+    BuiltinAnchor {
+        intermediary: "method_6940",
+        canonical: "getFrameItemStack",
+    },
+    BuiltinAnchor {
+        intermediary: "method_8079",
+        canonical: "isContainer",
+    },
+    BuiltinAnchor {
+        intermediary: "method_30344",
+        canonical: "getHitResult",
+    },
+    BuiltinAnchor {
+        intermediary: "method_60390",
+        canonical: "hasSilkTouch",
+    },
+    BuiltinAnchor {
+        intermediary: "method_10011",
+        canonical: "getDispenseMethod",
+    },
+    BuiltinAnchor {
+        intermediary: "method_15727",
+        canonical: "getNewLiquid",
     },
 ];
 
@@ -500,7 +757,8 @@ mod tests {
             "net/minecraft/server/level/ServerLevel"
         );
         assert_eq!(table.canonical_method("method_18765"), "tick");
-        assert_eq!(table.canonical_method("method_10125"), "fallOn");
+        assert_eq!(table.canonical_method("method_10125"), "turnToDirt");
+        assert_eq!(table.canonical_method("method_9554"), "fallOn");
     }
 
     #[test]

@@ -65,8 +65,8 @@ use crate::loader_extensions::{
     DataMapRegistry,
 };
 use crate::mixin_lifter::{
-    lift_accessor_sites, LiftedBinding, MixinAnnotationKind, MixinLiftVerdict, MixinSite,
-    UnliftableReason,
+    lift_accessor_sites, lift_invoker_sites, LiftedBinding, MixinAnnotationKind,
+    MixinLiftVerdict, MixinSite, UnliftableReason,
 };
 use crate::mod_router::{
     route_mod_jar, validate_member_name, ModRouteDecision, RouteMatchKind, SecurityThreat,
@@ -1152,6 +1152,12 @@ pub fn auto_adapt_jar_bytes(
         mixin_scan.tiny_mappings_loaded,
         mixin_scan.tiny_mappings_skipped,
     ));
+    if mixin_scan.legacy_datafix_skipped > 0 {
+        audit_notes.push(format!(
+            "legacy_datafix_skipped: {} mixin site(s) target net/minecraft/util/datafix/* classes and only execute during pre-1.21.1 save upgrades — recorded, not a live-gameplay blocker",
+            mixin_scan.legacy_datafix_skipped
+        ));
+    }
 
     // 11. Tier synthesis.
     let mut blockers = Vec::new();
@@ -1206,12 +1212,17 @@ pub fn auto_adapt_jar_bytes(
             kinds.join(", ")
         ));
     }
-    // Read-only `@Accessor` analysis: safe getters lift onto native field
-    // reads; setters and anything unverifiable stay unliftable carrying
-    // their own structured reason (never a silent drop).
+    // Read-only `@Accessor`/`@Invoker` analysis: safe getters lift onto
+    // native field reads and safe query invokers lift onto native method
+    // calls; setters, constructors, mutating methods, and anything
+    // unverifiable stay unliftable carrying their own structured reason
+    // (never a silent drop).
     let accessor_plan = lift_accessor_sites(&mixin_scan.sites);
+    let invoker_plan = lift_invoker_sites(&mixin_scan.sites);
     for (site, reason) in unliftable_sites(&mixin_scan.verdict) {
-        if site.annotation == MixinAnnotationKind::Accessor {
+        if site.annotation == MixinAnnotationKind::Accessor
+            || site.annotation == MixinAnnotationKind::Invoker
+        {
             continue;
         }
         blockers.push(format!(
@@ -1223,6 +1234,13 @@ pub fn auto_adapt_jar_bytes(
     for (site, reason) in &accessor_plan.rejected {
         blockers.push(format!(
             "@Accessor site {} cannot lift natively ({})",
+            describe_site(site),
+            reason.as_str()
+        ));
+    }
+    for (site, reason) in &invoker_plan.rejected {
+        blockers.push(format!(
+            "@Invoker site {} cannot lift natively ({})",
             describe_site(site),
             reason.as_str()
         ));
@@ -1239,6 +1257,20 @@ pub fn auto_adapt_jar_bytes(
             "read-only @Accessor lifting: {} field read(s) lifted natively ({})",
             accessor_plan.bindings.len(),
             fields.join(", ")
+        ));
+    }
+    if !invoker_plan.bindings.is_empty() {
+        let mut methods: Vec<&str> = invoker_plan
+            .bindings
+            .iter()
+            .map(|b| b.method.as_str())
+            .collect();
+        methods.sort_unstable();
+        methods.dedup();
+        audit_notes.push(format!(
+            "read-only @Invoker lifting: {} method call(s) lifted natively ({})",
+            invoker_plan.bindings.len(),
+            methods.join(", ")
         ));
     }
 
@@ -1261,7 +1293,9 @@ pub fn auto_adapt_jar_bytes(
             lifted.iter().map(|b| b.hook.as_str()).collect();
         hooks.sort_unstable();
         hooks.dedup();
-        if accessor_plan.bindings.is_empty() {
+        let member_bindings =
+            accessor_plan.bindings.len() + invoker_plan.bindings.len();
+        if member_bindings == 0 {
             audit_notes.push(format!(
                 "all {} mixin site(s) lifted onto standard event hooks ({})",
                 lifted.len(),
@@ -1272,13 +1306,24 @@ pub fn auto_adapt_jar_bytes(
             if !detail.is_empty() {
                 detail.push_str(", ");
             }
-            detail.push_str(&format!(
-                "{} read-only accessor field read(s)",
-                accessor_plan.bindings.len()
-            ));
+            if !accessor_plan.bindings.is_empty() {
+                detail.push_str(&format!(
+                    "{} read-only accessor field read(s)",
+                    accessor_plan.bindings.len()
+                ));
+            }
+            if !invoker_plan.bindings.is_empty() {
+                if !accessor_plan.bindings.is_empty() {
+                    detail.push_str(", ");
+                }
+                detail.push_str(&format!(
+                    "{} read-only invoker method call(s)",
+                    invoker_plan.bindings.len()
+                ));
+            }
             audit_notes.push(format!(
                 "all {} mixin site(s) lifted ({})",
-                lifted.len() + accessor_plan.bindings.len(),
+                lifted.len() + member_bindings,
                 detail
             ));
         }
@@ -1674,6 +1719,13 @@ fn json_mixin_scan(out: &mut String, level: usize, scan: &JarMixinScanReport, co
         level + 1,
         "declarations_skipped",
         scan.declarations_skipped as u64,
+        true,
+    );
+    jf_u64(
+        out,
+        level + 1,
+        "legacy_datafix_skipped",
+        scan.legacy_datafix_skipped as u64,
         true,
     );
     jf_u64(

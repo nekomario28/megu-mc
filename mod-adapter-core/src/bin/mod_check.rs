@@ -537,6 +537,13 @@ fn format_scan_human(path: &Path, report: &JarMixinScanReport) -> String {
     if report.sites.is_empty() {
         let _ = writeln!(out, "No mixin injection sites found.");
     }
+    if report.legacy_datafix_skipped > 0 {
+        let _ = writeln!(
+            out,
+            "Skipped {} legacy save-upgrade-only site(s) targeting net/minecraft/util/datafix/* (not live-gameplay blockers).",
+            report.legacy_datafix_skipped
+        );
+    }
     let lifted = lifted_bindings(&report.verdict);
     if !lifted.is_empty() {
         let _ = writeln!(
@@ -687,6 +694,11 @@ fn scan_report_json(path: &Path, report: &JarMixinScanReport) -> String {
         report.skipped_client_mixins
     );
     let _ = writeln!(out, "  \"sites_found\": {},", report.sites.len());
+    let _ = writeln!(
+        out,
+        "  \"legacy_datafix_skipped\": {},",
+        report.legacy_datafix_skipped
+    );
     json_field_str(
         &mut out,
         1,
@@ -1049,6 +1061,13 @@ fn mods_dir_jar_json(out: &mut String, jar: &ModsDirJar, last: bool) {
                 true,
             );
             json_field_u64(out, 3, "sites_found", scan.sites.len() as u64, true);
+            json_field_u64(
+                out,
+                3,
+                "legacy_datafix_skipped",
+                scan.legacy_datafix_skipped as u64,
+                true,
+            );
 
             let lifted = lifted_bindings(&scan.verdict);
             if lifted.is_empty() {

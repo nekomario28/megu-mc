@@ -14,7 +14,7 @@
 //!
 //! The lifter is strictly fail-closed. Anything it cannot prove safe —
 //! `@Overwrite` / `@Redirect` / `@ModifyVariable` / `@ModifyArg` /
-//! `@ModifyConstant` / `@Accessor` / `@Invoker` / unknown annotations,
+//! `@ModifyConstant` / unknown annotations,
 //! `locals` capture, `@At("INVOKE")` / `@At("FIELD")` or any non-trivial
 //! injection point, a cancellable injection at a point where the vanilla
 //! work is already done, and any target class or method outside the standard
@@ -23,6 +23,18 @@
 //! member *declarations* are not injection sites at all and never reach the
 //! lifter (see [`MixinMemberKind`]); a manually constructed site carrying
 //! one still fails closed here.
+//!
+//! Two narrowly verified surfaces lift alongside `@Inject` sites instead of
+//! blocking: read-only `@Accessor` getters (`get*`/`is*` shape on a
+//! allowlisted plain stored vanilla field — [`lift_accessor_sites`]) and
+//! read-only `@Invoker` calls (a verified pure query method —
+//! [`lift_invoker_sites`]). Mutating accessors (`set*`), constructor or
+//! mutating invokers (`<init>`, `spawnItemParticles`, `set*`), and any
+//! member outside those tables stay strictly fail-closed. Finally,
+//! `net/minecraft/util/datafix/*` targets execute only inside pre-1.21.1
+//! save upgrades — never live gameplay — so [`classify_mixin_target`]
+//! records them `legacy_datafix_skipped` instead of letting them veto a
+//! mod's live-gameplay surface.
 //!
 //! The target table below covers the 1.21.1 vanilla lifecycle in three naming
 //! dialects, normalized by [`lift_mixin_sites`]:
@@ -211,6 +223,41 @@ pub enum StandardEventHook {
     /// The server command dispatcher is being built (NeoForge
     /// `RegisterCommandsEvent`, Fabric `CommandRegistrationCallback`).
     CommandRegister,
+    /// A farmland block was trampled into dirt (`FarmBlock.turnToDirt`).
+    FarmlandTrample,
+    /// A player's ability to eat was queried (`Player.canEat`).
+    PlayerCanEatQuery,
+    /// An item was used on a block (`Item.useOn`, Fabric `useOnBlock`).
+    ItemUseOnBlock,
+    /// Any entity ticked (`Entity.tick` — every entity, not just players).
+    EntityTick,
+    /// An entity's persistent data was loaded or saved
+    /// (`Entity.load` / `Entity.save`).
+    EntityDataSync,
+    /// A fence block's connection query ran (`FenceBlock.connectsTo` /
+    /// `FenceBlock.isSameFence`).
+    BlockConnectQuery,
+    /// A campfire's smoke-source query ran (`CampfireBlock.isSmokeSource`).
+    CampfireSmokeQuery,
+    /// A crop/stem block's soil-suitability query ran
+    /// (`CropBlock.mayPlaceOn` / `StemBlock.mayPlaceOn`).
+    PlantPlaceQuery,
+    /// A flowing fluid's pass-through query ran
+    /// (`FlowingFluid.canPassThrough`).
+    FluidPassQuery,
+    /// A scoreboard team membership changed
+    /// (`ServerScoreboard.addPlayerToTeam` / `removePlayerFromTeam`).
+    ScoreboardTeamChange,
+    /// Server datapack resources reloaded
+    /// (`MinecraftServer.reloadResources` /
+    /// `ReloadableServerResources.loadResources`).
+    ResourceReload,
+    /// Map data was loaded, saved, or banner-checked
+    /// (`MapItemSavedData.load` / `save` / `checkBanners`).
+    MapDataSync,
+    /// A tree/soil suitability query ran (`Feature.isGrassOrDirt` /
+    /// `TrunkPlacer.setDirtAt`).
+    TreeSoilQuery,
 }
 
 impl StandardEventHook {
@@ -236,6 +283,19 @@ impl StandardEventHook {
             Self::EntityDeath => "EntityDeath",
             Self::EntityJoinLevel => "EntityJoinLevel",
             Self::CommandRegister => "CommandRegister",
+            Self::FarmlandTrample => "FarmlandTrample",
+            Self::PlayerCanEatQuery => "PlayerCanEatQuery",
+            Self::ItemUseOnBlock => "ItemUseOnBlock",
+            Self::EntityTick => "EntityTick",
+            Self::EntityDataSync => "EntityDataSync",
+            Self::BlockConnectQuery => "BlockConnectQuery",
+            Self::CampfireSmokeQuery => "CampfireSmokeQuery",
+            Self::PlantPlaceQuery => "PlantPlaceQuery",
+            Self::FluidPassQuery => "FluidPassQuery",
+            Self::ScoreboardTeamChange => "ScoreboardTeamChange",
+            Self::ResourceReload => "ResourceReload",
+            Self::MapDataSync => "MapDataSync",
+            Self::TreeSoilQuery => "TreeSoilQuery",
         }
     }
 }
@@ -455,6 +515,246 @@ const STANDARD_TARGETS: &[StandardTarget] = &[
         ],
         pre: StandardEventHook::BlockInteract,
         post: StandardEventHook::BlockInteract,
+    },
+    // -------------------------------------------------------------------
+    // Universal 1.21.1 single-phase hooks: generic vanilla gameplay query
+    // and lifecycle methods every loader ecosystem mixins into. Like
+    // `ServerChat`, `HEAD` and `TAIL`/`RETURN` bind the same hook — the
+    // event describes the call, and only a `HEAD` site may cancel it.
+    // -------------------------------------------------------------------
+    // Farmland trample: `FarmBlock.turnToDirt` (yarn `setToDirt` =
+    // class_2344.method_10125). `fallOn` deliberately stays unmapped: it
+    // covers every fall onto farmland, not just the trample decision.
+    StandardTarget {
+        classes: &[
+            "net/minecraft/world/level/block/FarmBlock",
+            "net/minecraft/class_2344",
+        ],
+        methods: &[
+            "turnToDirt",
+            "setToDirt",
+            "method_10125",
+            "turnToDirt(Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/level/block/state/BlockState;Lnet/minecraft/world/level/Level;Lnet/minecraft/core/BlockPos;)V",
+        ],
+        pre: StandardEventHook::FarmlandTrample,
+        post: StandardEventHook::FarmlandTrample,
+    },
+    // Eat check: `Player.canEat` (yarn `canConsume` = method_7332).
+    StandardTarget {
+        classes: &[
+            "net/minecraft/world/entity/player/Player",
+            "net/minecraft/class_1657",
+        ],
+        methods: &["canEat", "canConsume", "method_7332", "canEat(Z)Z"],
+        pre: StandardEventHook::PlayerCanEatQuery,
+        post: StandardEventHook::PlayerCanEatQuery,
+    },
+    // Item used on a block: `Item.useOn` (yarn `useOnBlock` =
+    // method_7884). Distinct from `BlockInteract` (`Block.useItemOn`): this
+    // is the item-side entry point every item inherits.
+    StandardTarget {
+        classes: &["net/minecraft/world/item/Item", "net/minecraft/class_1792"],
+        methods: &[
+            "useOn",
+            "useOnBlock",
+            "method_7884",
+            "useOn(Lnet/minecraft/world/item/context/UseOnContext;)Lnet/minecraft/world/InteractionResult;",
+        ],
+        pre: StandardEventHook::ItemUseOnBlock,
+        post: StandardEventHook::ItemUseOnBlock,
+    },
+    // Entity tick: `Entity.tick` (class_1297.method_5773). This is the
+    // whole-entity tick — `LivingEntity.tick` stays unmapped (it runs for
+    // a materially different population than the shim can narrow), while
+    // `Player`/`ServerPlayer` `tick` keeps binding `PlayerTick*` from the
+    // row above.
+    StandardTarget {
+        classes: &[
+            "net/minecraft/world/entity/Entity",
+            "net/minecraft/class_1297",
+        ],
+        methods: &["tick", "method_5773", "tick()V"],
+        pre: StandardEventHook::EntityTick,
+        post: StandardEventHook::EntityTick,
+    },
+    // Entity persistence: `Entity.load` / `Entity.save` (yarn `readNbt` /
+    // `writeNbt` = method_5651 / method_5647).
+    StandardTarget {
+        classes: &[
+            "net/minecraft/world/entity/Entity",
+            "net/minecraft/class_1297",
+        ],
+        methods: &[
+            "load",
+            "save",
+            "readNbt",
+            "writeNbt",
+            "method_5651",
+            "method_5647",
+            "load(Lnet/minecraft/nbt/CompoundTag;)V",
+            "save(Lnet/minecraft/nbt/CompoundTag;)Z",
+        ],
+        pre: StandardEventHook::EntityDataSync,
+        post: StandardEventHook::EntityDataSync,
+    },
+    // Fence connection query: `FenceBlock.connectsTo` / `isSameFence`
+    // (yarn `canConnect` / `canConnectToFence` = method_10184 /
+    // method_26375).
+    StandardTarget {
+        classes: &[
+            "net/minecraft/world/level/block/FenceBlock",
+            "net/minecraft/class_2354",
+        ],
+        methods: &[
+            "connectsTo",
+            "isSameFence",
+            "canConnect",
+            "canConnectToFence",
+            "method_10184",
+            "method_26375",
+            "connectsTo(Lnet/minecraft/world/level/block/state/BlockState;ZLnet/minecraft/core/Direction;)Z",
+        ],
+        pre: StandardEventHook::BlockConnectQuery,
+        post: StandardEventHook::BlockConnectQuery,
+    },
+    // Campfire smoke query: `CampfireBlock.isSmokeSource` (yarn
+    // `isLitCampfire` = method_23896 — the hay-bale smoke-height check).
+    StandardTarget {
+        classes: &[
+            "net/minecraft/world/level/block/CampfireBlock",
+            "net/minecraft/class_3922",
+        ],
+        methods: &[
+            "isSmokeSource",
+            "isLitCampfire",
+            "method_23896",
+            "isSmokeSource(Lnet/minecraft/world/level/block/state/BlockState;)Z",
+        ],
+        pre: StandardEventHook::CampfireSmokeQuery,
+        post: StandardEventHook::CampfireSmokeQuery,
+    },
+    // Plant soil query: `CropBlock.mayPlaceOn` / `StemBlock.mayPlaceOn`
+    // (yarn `canPlantOnTop` = method_9695, declared on the shared
+    // BushBlock/PlantBlock parent so both overrides share the number).
+    StandardTarget {
+        classes: &[
+            "net/minecraft/world/level/block/CropBlock",
+            "net/minecraft/world/level/block/StemBlock",
+            "net/minecraft/class_2302",
+            "net/minecraft/class_2513",
+        ],
+        methods: &[
+            "mayPlaceOn",
+            "canPlantOnTop",
+            "method_9695",
+            "mayPlaceOn(Lnet/minecraft/world/level/block/state/BlockState;Lnet/minecraft/world/level/BlockGetter;Lnet/minecraft/core/BlockPos;)Z",
+        ],
+        pre: StandardEventHook::PlantPlaceQuery,
+        post: StandardEventHook::PlantPlaceQuery,
+    },
+    // Fluid spread query: `FlowingFluid.canPassThrough` (yarn
+    // `canFlowThrough` = method_15746).
+    StandardTarget {
+        classes: &[
+            "net/minecraft/world/level/material/FlowingFluid",
+            "net/minecraft/class_3609",
+        ],
+        methods: &[
+            "canPassThrough",
+            "canFlowThrough",
+            "method_15746",
+            "canPassThrough(Lnet/minecraft/world/level/BlockGetter;Lnet/minecraft/world/level/material/Fluid;Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/level/block/state/BlockState;Lnet/minecraft/core/Direction;Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/level/block/state/BlockState;Lnet/minecraft/world/level/material/FluidState;)Z",
+        ],
+        pre: StandardEventHook::FluidPassQuery,
+        post: StandardEventHook::FluidPassQuery,
+    },
+    // Scoreboard team change: `ServerScoreboard.addPlayerToTeam` /
+    // `removePlayerFromTeam` (inherited from `Scoreboard`; yarn
+    // `addScoreHolderToTeam` / `removeScoreHolderFromTeam` =
+    // method_1172 / method_1157).
+    StandardTarget {
+        classes: &[
+            "net/minecraft/server/ServerScoreboard",
+            "net/minecraft/class_2995",
+        ],
+        methods: &[
+            "addPlayerToTeam",
+            "removePlayerFromTeam",
+            "addScoreHolderToTeam",
+            "removeScoreHolderFromTeam",
+            "method_1172",
+            "method_1157",
+            "addPlayerToTeam(Ljava/lang/String;Lnet/minecraft/world/scores/PlayerTeam;)V",
+            "removePlayerFromTeam(Ljava/lang/String;Lnet/minecraft/world/scores/PlayerTeam;)V",
+        ],
+        pre: StandardEventHook::ScoreboardTeamChange,
+        post: StandardEventHook::ScoreboardTeamChange,
+    },
+    // Resource reload: `MinecraftServer.reloadResources` (method_29439;
+    // `MinecraftServer` keeps its own name under intermediary) and
+    // `ReloadableServerResources.loadResources` (yarn `DataPackContents`
+    // `reload` = class_5350.method_29466).
+    StandardTarget {
+        classes: &[
+            "net/minecraft/server/MinecraftServer",
+            "net/minecraft/server/ReloadableServerResources",
+            "net/minecraft/class_5350",
+        ],
+        methods: &[
+            "reloadResources",
+            "loadResources",
+            "reload",
+            "method_29439",
+            "method_29466",
+            "reloadResources(Ljava/util/Collection;)Ljava/util/concurrent/CompletableFuture;",
+            "loadResources(Lnet/minecraft/server/packs/resources/ResourceManager;Lnet/minecraft/core/LayeredRegistryAccess;Lnet/minecraft/world/flag/FeatureFlagSet;Lnet/minecraft/commands/Commands$CommandSelection;ILjava/util/concurrent/Executor;Ljava/util/concurrent/Executor;)Ljava/util/concurrent/CompletableFuture;",
+        ],
+        pre: StandardEventHook::ResourceReload,
+        post: StandardEventHook::ResourceReload,
+    },
+    // Map data sync: `MapItemSavedData.load` / `save` / `checkBanners`
+    // (yarn `MapState` `fromNbt` = method_32371; `save` is inherited from
+    // `SavedData`/`PersistentState` = method_17919).
+    StandardTarget {
+        classes: &[
+            "net/minecraft/world/level/saveddata/maps/MapItemSavedData",
+            "net/minecraft/class_22",
+        ],
+        methods: &[
+            "load",
+            "save",
+            "checkBanners",
+            "fromNbt",
+            "method_32371",
+            "method_17919",
+            "load(Lnet/minecraft/nbt/CompoundTag;Lnet/minecraft/core/HolderLookup$Provider;)Lnet/minecraft/world/level/saveddata/maps/MapItemSavedData;",
+            "save(Lnet/minecraft/nbt/CompoundTag;Lnet/minecraft/core/HolderLookup$Provider;)V",
+            "checkBanners(Lnet/minecraft/world/level/BlockGetter;II)V",
+        ],
+        pre: StandardEventHook::MapDataSync,
+        post: StandardEventHook::MapDataSync,
+    },
+    // Tree soil query: `Feature.isGrassOrDirt` (yarn `isSoil` =
+    // method_23396 / method_27368 — both overloads) and
+    // `TrunkPlacer.setDirtAt` (yarn `setToDirt` = method_27400).
+    StandardTarget {
+        classes: &[
+            "net/minecraft/world/level/levelgen/feature/Feature",
+            "net/minecraft/world/level/levelgen/feature/trunkplacers/TrunkPlacer",
+            "net/minecraft/class_3031",
+            "net/minecraft/class_5141",
+        ],
+        methods: &[
+            "isGrassOrDirt",
+            "isSoil",
+            "setDirtAt",
+            "setToDirt",
+            "method_23396",
+            "method_27368",
+            "method_27400",
+        ],
+        pre: StandardEventHook::TreeSoilQuery,
+        post: StandardEventHook::TreeSoilQuery,
     },
 ];
 
@@ -908,7 +1208,246 @@ const SAFE_ACCESSOR_FIELDS: &[SafeAccessorField] = &[
         canonical: "ServerPlayer#gameMode",
         kind: AccessorValueKind::Ref,
     },
+    // -------------------------------------------------------------------
+    // Additional plain stored fields real production mods read through
+    // read-only accessors. Every row is a stored field — never a derived
+    // or mutating view — so the native read proxy is exact. `set*`
+    // handlers on any of these still fail closed as `MutatingSetter`.
+    // -------------------------------------------------------------------
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/world/level/block/ConcretePowderBlock",
+            "net/minecraft/class_2292",
+        ],
+        fields: &["concrete"],
+        canonical: "ConcretePowderBlock#concrete",
+        kind: AccessorValueKind::Ref,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/world/inventory/Slot",
+            "net/minecraft/class_1735",
+        ],
+        fields: &["x"],
+        canonical: "Slot#x",
+        kind: AccessorValueKind::Int,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/world/inventory/Slot",
+            "net/minecraft/class_1735",
+        ],
+        fields: &["y"],
+        canonical: "Slot#y",
+        kind: AccessorValueKind::Int,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/world/entity/vehicle/MinecartFurnace",
+            "net/minecraft/class_1696",
+        ],
+        fields: &["fuel"],
+        canonical: "MinecartFurnace#fuel",
+        kind: AccessorValueKind::Int,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/world/entity/item/ItemEntity",
+            "net/minecraft/class_1542",
+        ],
+        fields: &["health"],
+        canonical: "ItemEntity#health",
+        kind: AccessorValueKind::Int,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/world/effect/MobEffectInstance",
+            "net/minecraft/class_1293",
+        ],
+        fields: &["hiddenEffect"],
+        canonical: "MobEffectInstance#hiddenEffect",
+        kind: AccessorValueKind::Ref,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/nbt/NbtAccounter",
+            "net/minecraft/class_2505",
+        ],
+        fields: &["usage"],
+        canonical: "NbtAccounter#usage",
+        kind: AccessorValueKind::Int,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/world/item/alchemy/PotionBrewing",
+            "net/minecraft/class_1845",
+        ],
+        fields: &["potionMixes"],
+        canonical: "PotionBrewing#potionMixes",
+        kind: AccessorValueKind::Ref,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/world/item/alchemy/PotionBrewing",
+            "net/minecraft/class_1845",
+        ],
+        fields: &["containerMixes"],
+        canonical: "PotionBrewing#containerMixes",
+        kind: AccessorValueKind::Ref,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/core/MappedRegistry",
+            "net/minecraft/class_2370",
+        ],
+        fields: &["toId"],
+        canonical: "MappedRegistry#toId",
+        kind: AccessorValueKind::Ref,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/core/MappedRegistry",
+            "net/minecraft/class_2370",
+        ],
+        fields: &["byValue"],
+        canonical: "MappedRegistry#byValue",
+        kind: AccessorValueKind::Ref,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/server/level/ServerLevel",
+            "net/minecraft/class_3218",
+        ],
+        fields: &["entityTickList"],
+        canonical: "ServerLevel#entityTickList",
+        kind: AccessorValueKind::Ref,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/server/level/ChunkMap",
+            "net/minecraft/class_3898",
+        ],
+        fields: &["entityMap"],
+        canonical: "ChunkMap#entityMap",
+        kind: AccessorValueKind::Ref,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/server/level/ChunkMap$TrackedEntity",
+            "net/minecraft/class_3898$class_3208",
+        ],
+        fields: &["seenBy"],
+        canonical: "ChunkMap$TrackedEntity#seenBy",
+        kind: AccessorValueKind::Ref,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/core/dispenser/ProjectileDispenseBehavior",
+            "net/minecraft/class_2965",
+        ],
+        fields: &["projectileItem"],
+        canonical: "ProjectileDispenseBehavior#projectileItem",
+        kind: AccessorValueKind::Ref,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/core/dispenser/ProjectileDispenseBehavior",
+            "net/minecraft/class_2965",
+        ],
+        fields: &["dispenseConfig"],
+        canonical: "ProjectileDispenseBehavior#dispenseConfig",
+        kind: AccessorValueKind::Ref,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/world/item/crafting/ShapedRecipe",
+            "net/minecraft/class_1869",
+        ],
+        fields: &["pattern"],
+        canonical: "ShapedRecipe#pattern",
+        kind: AccessorValueKind::Ref,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/gametest/framework/GameTestHelper",
+            "net/minecraft/class_4516",
+        ],
+        fields: &["testInfo"],
+        canonical: "GameTestHelper#testInfo",
+        kind: AccessorValueKind::Ref,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/gametest/framework/GameTestHelper",
+            "net/minecraft/class_4516",
+        ],
+        fields: &["finalCheckAdded"],
+        canonical: "GameTestHelper#finalCheckAdded",
+        kind: AccessorValueKind::Int,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/data/models/ItemModelGenerators",
+            "net/minecraft/class_4915",
+        ],
+        fields: &["GENERATED_TRIM_MODELS"],
+        canonical: "ItemModelGenerators#GENERATED_TRIM_MODELS",
+        kind: AccessorValueKind::Ref,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/world/level/levelgen/structure/pools/SinglePoolElement",
+            "net/minecraft/class_3781",
+        ],
+        fields: &["template"],
+        canonical: "SinglePoolElement#template",
+        kind: AccessorValueKind::Ref,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/world/level/levelgen/structure/pools/StructureTemplatePool",
+            "net/minecraft/class_3785",
+        ],
+        fields: &["rawTemplates"],
+        canonical: "StructureTemplatePool#rawTemplates",
+        kind: AccessorValueKind::Ref,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/world/level/levelgen/structure/pools/StructureTemplatePool",
+            "net/minecraft/class_3785",
+        ],
+        fields: &["templates"],
+        canonical: "StructureTemplatePool#templates",
+        kind: AccessorValueKind::Ref,
+    },
 ];
+
+/// Mixin's member-name prefix convention: real mods namespace their
+/// generated accessor/invoker handlers as `<modid>$<name>`
+/// (`create$getConcrete()`, `my_mod$isActive()`). The `<ident>$` portion
+/// is a uniqueness prefix for the mixin — not part of the referenced
+/// member name — so it is stripped before the handler shape is judged.
+/// Only a well-formed leading identifier is stripped; anything else
+/// (`$getX`, `9foo$getX`, a bare name) is returned unchanged and judged
+/// on its own merits — fail closed.
+fn strip_mixin_member_prefix(name: &str) -> &str {
+    let Some((prefix, rest)) = name.split_once('$') else {
+        return name;
+    };
+    let valid = !prefix.is_empty()
+        && prefix
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !rest.is_empty();
+    if valid {
+        rest
+    } else {
+        name
+    }
+}
 
 /// Mixin's own field-name inference for an `@Accessor` without a `value`
 /// element: strip the `get`/`is`/`set` prefix and lowercase the first
@@ -931,7 +1470,10 @@ fn lift_accessor_site(site: &MixinSite) -> Result<LiftedAccessorBinding, Accesso
     if site.annotation != MixinAnnotationKind::Accessor {
         return Err(AccessorRejection::NotAnAccessor);
     }
-    let name = site.handler_name.as_str();
+    // Real mods name generated accessors `<modid>$get*` — strip the
+    // namespace prefix so `create$getConcrete` is judged by its `get` +
+    // `()T` getter shape exactly like `getConcrete`.
+    let name = strip_mixin_member_prefix(site.handler_name.as_str());
     let descriptor = site.handler_descriptor.as_str();
     // `set` + uppercase is the Mixin setter convention (`setYRot`); a
     // lowercase continuation (`settings`) is just a name.
@@ -993,6 +1535,400 @@ pub fn lift_accessor_sites(sites: &[MixinSite]) -> LiftedAccessorPlan {
         }
     }
     plan
+}
+
+// ---------------------------------------------------------------------------
+// Safe read-only `@Invoker` lifting
+// ---------------------------------------------------------------------------
+
+/// Why one `@Invoker` site cannot lift natively — the structured reason
+/// the shim plan and the adaptation report carry so the rejection is
+/// never a silent drop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvokerRejection {
+    /// The site is not an `@Invoker` method at all.
+    NotAnInvoker,
+    /// `<init>`/`<clinit>` — constructors never lift natively; they
+    /// allocate and initialize vanilla objects, never a pure query.
+    ConstructorTarget,
+    /// A known mutating vanilla method — state changes never lift onto a
+    /// native read-only plan.
+    MutatingTarget,
+    /// No `value` element and the handler name gives no usable target
+    /// method name (even after `<prefix>$` and verb-prefix stripping).
+    OpaqueSignature,
+    /// `(target class, method)` is outside the verified pure/read-only
+    /// query table — unknown methods stay unliftable.
+    UnknownMethod,
+}
+
+impl InvokerRejection {
+    /// Stable operator-facing reason.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotAnInvoker => "not an @Invoker site",
+            Self::ConstructorTarget => {
+                "@Invoker targets a constructor (<init>/<clinit>) — constructors never lift natively"
+            }
+            Self::MutatingTarget => {
+                "@Invoker targets a mutating vanilla method — state changes never lift natively"
+            }
+            Self::OpaqueSignature => {
+                "handler gives no usable @Invoker target method name"
+            }
+            Self::UnknownMethod => {
+                "method is outside the verified pure/read-only query table"
+            }
+        }
+    }
+}
+
+impl fmt::Display for InvokerRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One `@Invoker` site proven to call a verified pure/read-only vanilla
+/// query method — the call itself lowers onto a native host query.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiftedInvokerBinding {
+    /// The invoker site this binding covers.
+    pub site: MixinSite,
+    /// Canonical `Class#method` display (`BlockBehaviour#getShape`).
+    pub method: String,
+    /// Execution tier the binding satisfies — a pure native method call.
+    pub tier: crate::fallback::ExecutionTier,
+}
+
+/// The deterministic plan [`lift_invoker_sites`] produces, mirroring
+/// [`LiftedAccessorPlan`]: lifted read-only call bindings plus every
+/// rejected site with its structured reason.
+#[derive(Clone, Debug, Default)]
+pub struct LiftedInvokerPlan {
+    /// Proven read-only query-call bindings, in site order.
+    pub bindings: Vec<LiftedInvokerBinding>,
+    /// Sites that stay unliftable, each with its structured reason.
+    pub rejected: Vec<(MixinSite, InvokerRejection)>,
+}
+
+impl LiftedInvokerPlan {
+    /// `true` when every presented `@Invoker` site lifted.
+    pub fn is_fully_lifted(&self) -> bool {
+        self.rejected.is_empty()
+    }
+
+    /// The execution tier the invoker surface satisfies: a fully lifted
+    /// non-empty plan needs no JVM (`UniversalNative`); anything rejected
+    /// forces `RequiresFallback`.
+    pub fn tier(&self) -> crate::fallback::ExecutionTier {
+        if self.rejected.is_empty() && !self.bindings.is_empty() {
+            crate::fallback::ExecutionTier::UniversalNative
+        } else {
+            crate::fallback::ExecutionTier::RequiresFallback
+        }
+    }
+}
+
+/// One verified pure/read-only vanilla query method an `@Invoker` may
+/// lift onto — (normalized class names, accepted method names, canonical
+/// `Class#method` display). Names are factual mapping data only.
+struct SafeInvokerMethod {
+    classes: &'static [&'static str],
+    methods: &'static [&'static str],
+    canonical: &'static str,
+}
+
+/// The verified pure/read-only query table. Every row names a vanilla
+/// method that only reads state and returns a value — it allocates no
+/// object graph, mutates no world/entity state, and schedules no work.
+/// Mojang names, Fabric Intermediary (`class_NNNN`/`method_NNNN`), and
+/// Yarn named aliases are all accepted for the same canonical method.
+/// Anything mutating (`spawnItemParticles`), a constructor (`<init>`),
+/// or not listed here fails closed.
+const SAFE_INVOKER_METHODS: &[SafeInvokerMethod] = &[
+    SafeInvokerMethod {
+        classes: &[
+            "net/minecraft/world/level/block/state/BlockBehaviour",
+            "net/minecraft/world/level/block/state/BlockBehaviour$BlockStateBase",
+            "net/minecraft/class_4970",
+            "net/minecraft/class_4970$class_4971",
+        ],
+        methods: &["getShape", "getOutlineShape", "method_9530"],
+        canonical: "BlockBehaviour#getShape",
+    },
+    SafeInvokerMethod {
+        classes: &[
+            "net/minecraft/world/level/block/CropBlock",
+            "net/minecraft/class_2302",
+        ],
+        methods: &["getAgeProperty", "method_9824"],
+        canonical: "CropBlock#getAgeProperty",
+    },
+    SafeInvokerMethod {
+        classes: &[
+            "net/minecraft/world/entity/decoration/ItemFrame",
+            "net/minecraft/class_1533",
+        ],
+        methods: &[
+            "getFrameItemStack",
+            "getFramedItemStack",
+            "getHeldItemStack",
+            "method_6940",
+        ],
+        canonical: "ItemFrame#getFrameItemStack",
+    },
+    SafeInvokerMethod {
+        classes: &[
+            "net/minecraft/world/item/alchemy/PotionBrewing",
+            "net/minecraft/class_1845",
+        ],
+        methods: &["isContainer", "isItemRecipeIngredient", "method_8079"],
+        canonical: "PotionBrewing#isContainer",
+    },
+    SafeInvokerMethod {
+        classes: &[
+            "net/minecraft/world/item/context/UseOnContext",
+            "net/minecraft/class_1838",
+        ],
+        methods: &["getHitResult", "method_30344"],
+        canonical: "UseOnContext#getHitResult",
+    },
+    SafeInvokerMethod {
+        classes: &[
+            "net/minecraft/data/loot/BlockLootSubProvider",
+            "net/minecraft/class_7788",
+        ],
+        methods: &["hasSilkTouch", "createSilkTouchCondition", "method_60390"],
+        canonical: "BlockLootSubProvider#hasSilkTouch",
+    },
+    SafeInvokerMethod {
+        classes: &[
+            "net/minecraft/world/level/block/DispenserBlock",
+            "net/minecraft/class_2315",
+        ],
+        methods: &["getDispenseMethod", "getBehaviorForItem", "method_10011"],
+        canonical: "DispenserBlock#getDispenseMethod",
+    },
+    SafeInvokerMethod {
+        classes: &[
+            "net/minecraft/world/level/material/FlowingFluid",
+            "net/minecraft/class_3609",
+        ],
+        methods: &["getNewLiquid", "getUpdatedState", "method_15727"],
+        canonical: "FlowingFluid#getNewLiquid",
+    },
+];
+
+/// Vanilla methods a mod may write an `@Invoker` for that are *known*
+/// mutators or lifecycle/allocating calls — named here only so the
+/// rejection diagnostic can say `MutatingTarget` instead of the generic
+/// `UnknownMethod`. The fail-closed outcome is identical either way; an
+/// unlisted mutator simply reports `UnknownMethod`.
+const KNOWN_MUTATING_INVOKER_NAMES: &[&str] = &[
+    "spawnItemParticles",
+    "discard",
+    "die",
+    "kill",
+    "hurt",
+    "heal",
+    "moveTo",
+    "setPos",
+    "teleport",
+    "teleportTo",
+    "setDeltaMovement",
+    "push",
+    "setRot",
+    "setYRot",
+    "setXRot",
+    "setOnGround",
+    "setAirSupply",
+    "setTicksFrozen",
+    "setSecondsOnFire",
+    "igniteForSeconds",
+    "extinguishFire",
+    "setInvisible",
+    "setSilent",
+    "setNoGravity",
+    "setInvulnerable",
+    "setGlowingTag",
+    "setCustomName",
+    "startRiding",
+    "stopRiding",
+    "dismount",
+    "ejectPassengers",
+    "setBaby",
+    "setAggressive",
+    "setTarget",
+    "tame",
+    "setSitting",
+    "setItemSlot",
+    "setItemInHand",
+    "removeAllEffects",
+    "addEffect",
+    "setFuel",
+    "setPlacedBy",
+    "setBlock",
+    "spawnAnim",
+    "broadcastDamageEvent",
+];
+
+/// `true` for method names that are mutating by construction: the `set*`
+/// convention every field writer follows, plus [`KNOWN_MUTATING_INVOKER_NAMES`].
+fn is_known_mutating_invoker_name(method: &str) -> bool {
+    if method
+        .strip_prefix("set")
+        .is_some_and(|rest| rest.chars().next().is_some_and(char::is_uppercase))
+    {
+        return true;
+    }
+    KNOWN_MUTATING_INVOKER_NAMES.contains(&method)
+}
+
+/// Mixin's own `@Invoker` target-name inference when the annotation has
+/// no `value`: strip the `<prefix>$` namespace, then the leading invoker
+/// verb (`call`, `invoke`, `new`, `create`, `spawn`, `make` followed by
+/// an uppercase letter) and lowercase the first remaining character —
+/// `callGetShape` → `getShape`. A handler that is already a plain name
+/// (`getShape`) is its own target name.
+fn infer_invoker_target_name(handler_name: &str) -> Option<String> {
+    let name = strip_mixin_member_prefix(handler_name);
+    for verb in ["call", "invoke", "new", "create", "spawn", "make"] {
+        if let Some(rest) = name.strip_prefix(verb) {
+            let mut chars = rest.chars();
+            if let Some(first) = chars.next() {
+                if first.is_uppercase() {
+                    return Some(first.to_lowercase().chain(chars).collect());
+                }
+            }
+        }
+    }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Classify one `@Invoker` site: the resolved target method (explicit
+/// `value`, else the handler's inferred name) is checked against the
+/// verified pure/read-only table after `<init>`/mutating fail-closed
+/// gates. Constructor, mutating, opaque, and unknown targets all fail
+/// closed with their [`InvokerRejection`].
+fn lift_invoker_site(
+    site: &MixinSite,
+    mappings: &TinyV2MappingTable,
+) -> Result<LiftedInvokerBinding, InvokerRejection> {
+    if site.annotation != MixinAnnotationKind::Invoker {
+        return Err(InvokerRejection::NotAnInvoker);
+    }
+    // The `@Invoker` `value` names the target method (the scanner then
+    // reports it as `target_method`); without one, Mixin infers the
+    // target name from the handler's own name.
+    let target_method = if site.target_method != site.handler_name {
+        site.target_method.clone()
+    } else {
+        match infer_invoker_target_name(site.handler_name.as_str()) {
+            Some(name) => name,
+            None => return Err(InvokerRejection::OpaqueSignature),
+        }
+    };
+    if target_method == "<init>" || target_method == "<clinit>" {
+        return Err(InvokerRejection::ConstructorTarget);
+    }
+    if is_known_mutating_invoker_name(&target_method) {
+        return Err(InvokerRejection::MutatingTarget);
+    }
+    let (canonical_class, canonical_method) =
+        mappings.canonical_target(&site.target_class, &target_method);
+    let class = normalize_class(canonical_class.as_ref());
+    let row = SAFE_INVOKER_METHODS
+        .iter()
+        .find(|r| {
+            r.classes.contains(&class.as_str()) && r.methods.contains(&canonical_method)
+        })
+        .ok_or(InvokerRejection::UnknownMethod)?;
+    Ok(LiftedInvokerBinding {
+        site: site.clone(),
+        method: row.canonical.to_string(),
+        tier: crate::fallback::ExecutionTier::UniversalNative,
+    })
+}
+
+/// Lift every `@Invoker` site in `sites` into a deterministic
+/// [`LiftedInvokerPlan`] using the built-in canonical hook anchors.
+/// Non-`@Invoker` sites are ignored — they remain
+/// [`lift_mixin_sites`]/[`lift_accessor_sites`]' job.
+pub fn lift_invoker_sites(sites: &[MixinSite]) -> LiftedInvokerPlan {
+    lift_invoker_sites_with_mappings(sites, &TinyV2MappingTable::default())
+}
+
+/// [`lift_invoker_sites`] with an explicit Intermediary→canonical mapping
+/// table merged in (e.g. a `*.tiny` document found inside the mod JAR).
+/// The table only *renames* lookup keys — the fail-closed
+/// `SAFE_INVOKER_METHODS` table still decides every outcome.
+pub fn lift_invoker_sites_with_mappings(
+    sites: &[MixinSite],
+    mappings: &TinyV2MappingTable,
+) -> LiftedInvokerPlan {
+    let mut plan = LiftedInvokerPlan::default();
+    for site in sites {
+        if site.annotation != MixinAnnotationKind::Invoker {
+            continue;
+        }
+        match lift_invoker_site(site, mappings) {
+            Ok(binding) => plan.bindings.push(binding),
+            Err(reason) => plan.rejected.push((site.clone(), reason)),
+        }
+    }
+    plan
+}
+
+// ---------------------------------------------------------------------------
+// Legacy datafix-only mixin targets
+// ---------------------------------------------------------------------------
+
+/// Where a mixin `target_class` executes relative to live 1.21.1
+/// gameplay, for lift gating.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MixinTargetScope {
+    /// A normal live-gameplay vanilla class — standard lift rules apply.
+    LiveGameplay,
+    /// A `net/minecraft/util/datafix/*` (yarn `net/minecraft/datafixer/*`)
+    /// class. These run exclusively inside DataFixerUpper migrations when
+    /// a pre-1.21.1 saved world is upgraded — never during live 1.21.1
+    /// gameplay — so a mixin on one is recorded as
+    /// `legacy_datafix_skipped`, not a Tier-3 blocker.
+    LegacyDataFixOnly,
+}
+
+/// Class-name prefixes (normalized internal form) whose members only run
+/// during legacy save upgrades: the Mojmap `net/minecraft/util/datafix/`
+/// tree and the identical yarn `net/minecraft/datafixer/` tree.
+const LEGACY_DATAFIX_PREFIXES: &[&str] = &[
+    "net/minecraft/util/datafix/",
+    "net/minecraft/datafixer/",
+];
+
+/// `true` when `target_class` names a legacy datafix-only class in any
+/// accepted spelling (dot, slash, `L...;`, or canonical yarn name).
+pub fn is_legacy_datafix_target(target_class: &str) -> bool {
+    let class = normalize_class(target_class);
+    LEGACY_DATAFIX_PREFIXES
+        .iter()
+        .any(|prefix| class.starts_with(prefix))
+}
+
+/// Classify a mixin `target_class` as [`MixinTargetScope::LiveGameplay`]
+/// or [`MixinTargetScope::LegacyDataFixOnly`]. Fail-closed by
+/// construction: anything outside the two verified legacy prefixes —
+/// including unrecognized names — is `LiveGameplay`.
+pub fn classify_mixin_target(target_class: &str) -> MixinTargetScope {
+    if is_legacy_datafix_target(target_class) {
+        MixinTargetScope::LegacyDataFixOnly
+    } else {
+        MixinTargetScope::LiveGameplay
+    }
 }
 
 impl MixinLiftVerdict {
@@ -1432,10 +2368,9 @@ mod tests {
             ("net/minecraft/server/level/ServerLevel", "addPlayer"),
             ("net/minecraft/world/entity/LivingEntity", "method_6007"),
             // Broad vanilla methods deliberately outside the hook scope:
-            // Entity.tick / LivingEntity.tick cover all entities, not just
-            // players, so they must never lift to PlayerTick*.
-            ("net/minecraft/class_1297", "method_5773"),
-            ("net/minecraft/world/entity/Entity", "tick"),
+            // LivingEntity.tick is neither `Entity.tick` (all entities →
+            // EntityTick) nor `Player.tick` (PlayerTick*) — the shim can
+            // narrow neither population, so it must never lift.
             ("net/minecraft/world/entity/LivingEntity", "tick"),
             ("net/minecraft/class_1309", "method_5773"),
             // Player.hurt / ServerPlayer.hurt stay unmapped (narrow dispatch).
