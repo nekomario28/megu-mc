@@ -1327,7 +1327,7 @@ fn execute_tag_snbt(tag: &ExecTag) -> String {
             tags.iter()
                 .map(execute_tag_snbt)
                 .collect::<Vec<_>>()
-                .join(",")
+                .join(", ")
         ),
         ExecTag::ByteArray(values) => format!(
             "[B;{}]",
@@ -1335,7 +1335,7 @@ fn execute_tag_snbt(tag: &ExecTag) -> String {
                 .iter()
                 .map(|n| format!("{}b", *n as i8))
                 .collect::<Vec<_>>()
-                .join(",")
+                .join(", ")
         ),
         ExecTag::IntArray(values) => format!(
             "[I;{}]",
@@ -1343,7 +1343,7 @@ fn execute_tag_snbt(tag: &ExecTag) -> String {
                 .iter()
                 .map(i32::to_string)
                 .collect::<Vec<_>>()
-                .join(",")
+                .join(", ")
         ),
         ExecTag::LongArray(values) => format!(
             "[L;{}]",
@@ -1351,16 +1351,49 @@ fn execute_tag_snbt(tag: &ExecTag) -> String {
                 .iter()
                 .map(|n| format!("{n}l"))
                 .collect::<Vec<_>>()
-                .join(",")
+                .join(", ")
         ),
-        ExecTag::Compound(fields) => format!(
-            "{{{}}}",
-            fields
-                .iter()
-                .map(|(key, value)| { format!("{}:{}", quoted(key), execute_tag_snbt(value)) })
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
+        ExecTag::Compound(fields) => {
+            // The map is sorted, but vanilla's container items print
+            // `count, Slot, id` — `ItemStack` merges its CODEC fields into a
+            // tag that already holds `Slot`, and 1.21.1's key order shakes
+            // out to `count, Slot, id` (then any extras such as `components`).
+            let slot_key = NbtString::text("Slot");
+            let id_key = NbtString::text("id");
+            let count_key = NbtString::text("count");
+            let item_stack = matches!(fields.get(&slot_key), Some(ExecTag::Byte(_)))
+                && matches!(fields.get(&id_key), Some(ExecTag::String(_)))
+                && fields
+                    .get(&count_key)
+                    .is_some_and(|v| matches!(v, ExecTag::Int(_) | ExecTag::Byte(_) | ExecTag::Short(_)));
+            let emit = |key: &NbtString, value: &ExecTag| {
+                // Vanilla `SnbtPrinter`: keys stay bare when every char is a
+                // legal unquoted-string char, and are quoted only when needed.
+                let raw = String::from_utf16_lossy(&key.0);
+                let bare = !raw.is_empty()
+                    && raw
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '/'));
+                format!(
+                    "{}: {}",
+                    if bare { raw } else { quoted(key) },
+                    execute_tag_snbt(value)
+                )
+            };
+            let mut parts: Vec<String> = Vec::with_capacity(fields.len());
+            if item_stack {
+                parts.push(emit(&count_key, &fields[&count_key]));
+                parts.push(emit(&slot_key, &fields[&slot_key]));
+                parts.push(emit(&id_key, &fields[&id_key]));
+            }
+            for (key, value) in fields {
+                if item_stack && (key == &count_key || key == &slot_key || key == &id_key) {
+                    continue;
+                }
+                parts.push(emit(key, value));
+            }
+            format!("{{{}}}", parts.join(", "))
+        }
     }
 }
 

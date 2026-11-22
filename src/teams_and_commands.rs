@@ -2913,7 +2913,7 @@ fn data_read_root(source: &ExecuteSource, target: &DataTarget) -> Result<(String
                     fields.insert(NbtString::text(name), ExecTag::Int(*value));
                 }
             }
-            Ok((format!("Storage at {x}, {y}, {z}"), root.clone()))
+            Ok((format!("{x}, {y}, {z}"), root.clone()))
         }
         DataTarget::Entity(selector) => {
             let selected = source.select(selector)?;
@@ -3448,7 +3448,7 @@ fn data_get(
         None => execute_tag_snbt(&values[0]),
     };
     let head = match target {
-        DataTarget::Block(..) => "Storage has the following contents".to_owned(),
+        DataTarget::Block(..) => format!("{label} has the following block data"),
         DataTarget::Entity(_) => format!("{label} has the following entity data"),
         DataTarget::Storage(_) => format!("{label} has the following contents"),
     };
@@ -8054,7 +8054,7 @@ mod p6d_parity_tests {
         );
         assert_eq!(
             p6d_run(&ctx, &format!("/data get storage {store} list")),
-            format!("Storage '{store}' has the following contents: [1,2]")
+            format!("Storage '{store}' has the following contents: [1, 2]")
         );
         // merge merges deep, not whole-compound replace.
         assert_eq!(
@@ -8063,7 +8063,7 @@ mod p6d_parity_tests {
         );
         assert_eq!(
             p6d_run(&ctx, &format!("/data get storage {store} nested")),
-            format!("Storage '{store}' has the following contents: {{\"x\":5,\"y\":7}}")
+            format!("Storage '{store}' has the following contents: {{x: 5, y: 7}}")
         );
         // modify set / append / insert / merge.
         assert_eq!(
@@ -8084,7 +8084,7 @@ mod p6d_parity_tests {
         );
         assert_eq!(
             p6d_run(&ctx, &format!("/data get storage {store} list")),
-            format!("Storage '{store}' has the following contents: [0,1,2,3]")
+            format!("Storage '{store}' has the following contents: [0, 1, 2, 3]")
         );
         // from-source modify copies a live value.
         assert_eq!(
@@ -8105,7 +8105,7 @@ mod p6d_parity_tests {
         );
         assert_eq!(
             p6d_run(&ctx, &format!("/data get storage {store} nested")),
-            format!("Storage '{store}' has the following contents: {{\"y\":7}}")
+            format!("Storage '{store}' has the following contents: {{y: 7}}")
         );
         assert_eq!(
             p6d_run(&ctx, &format!("/data get storage {store} missing")),
@@ -8135,7 +8135,7 @@ mod p6d_parity_tests {
         );
         assert_eq!(
             p6d_run(&ctx, "/data get entity p6d_data Motion"),
-            "p6d_data has the following entity data: [0d,0d,0d]"
+            "p6d_data has the following entity data: [0d, 0d, 0d]"
         );
         // merge writes reach the live model: Health lands in the hp mutex.
         assert_eq!(
