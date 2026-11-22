@@ -22,6 +22,13 @@ use mc_spine_client_mesh::{
 };
 
 use mc_spine_client_mesh::{PackDimension, ShaderOptionOverrides, ShaderPackSource};
+use mc_spine_client_mesh::ber_instancing::{
+    build_ber_mesh, VanillaBerFacing, VanillaBerKind, VanillaBerState, VanillaParticleQuad,
+    VanillaParticleWorld,
+};
+use mc_spine_client_mesh::entity_rig::{build_entity_rig_mesh, classify_entity_rig, EntityPose};
+use mc_spine_client_mesh::vanilla_plus_3d::ExtrudedMesh;
+use mc_spine_kernel::debug_chords::DebugLine;
 
 use crate::audio_qol::ZoomState;
 use crate::lod::LodConfig;
@@ -1714,6 +1721,604 @@ fn render_frame_impl(
         rgb: raster.rgb,
         stats: raster.stats,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Additive overlay renderers: entity rigs, block entities, particles,
+// debug wireframes
+// ---------------------------------------------------------------------------
+
+/// Camera pose for the additive overlay renderers ([`render_entity_rig`],
+/// [`render_vanilla_ber`], [`render_debug_lines`], [`render_particle_quads`]).
+/// `eye`/`yaw`/`pitch` match [`render_frame`]: eye is the world-space
+/// camera position and yaw/pitch are degrees in the server convention.
+/// The projection itself lives on [`FrameBuffer::new`]'s `fov_deg`, so a
+/// caller resolving zoom through [`ZoomState`] constructs the framebuffer
+/// with the effective FOV once and passes only the pose per call.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OverlayCamera {
+    /// World-space camera position.
+    pub eye: [f64; 3],
+    /// Horizontal look angle, degrees.
+    pub yaw: f32,
+    /// Vertical look angle, degrees.
+    pub pitch: f32,
+}
+
+/// An offscreen RGB framebuffer with the same perspective projection,
+/// near-plane clipping, and depth test as [`render_frame`], plus the sky
+/// gradient background. The additive overlay renderers draw into it;
+/// [`FrameBuffer::into_rendered_frame`] / [`FrameBuffer::encode_png`] hand
+/// the result to the existing PNG path. Overlay calls are purely additive:
+/// they never touch [`render_frame`] outputs.
+pub struct FrameBuffer {
+    raster: Rasterizer,
+}
+
+impl FrameBuffer {
+    /// Framebuffer `width`x`height` pixels at vertical FOV `fov_deg`
+    /// degrees. Zero dimensions and non-finite/out-of-range FOV values are
+    /// sanitized so overlay calls can never panic or poison the depth
+    /// buffer.
+    pub fn new(width: u32, height: u32, fov_deg: f64) -> Self {
+        let fov_deg = if fov_deg.is_finite() && (1.0..179.0).contains(&fov_deg) {
+            fov_deg
+        } else {
+            DEFAULT_FOV_DEG
+        };
+        Self {
+            raster: Rasterizer::new(width.max(1), height.max(1), fov_deg),
+        }
+    }
+
+    /// Framebuffer width in pixels.
+    pub fn width(&self) -> u32 {
+        self.raster.width as u32
+    }
+
+    /// Framebuffer height in pixels.
+    pub fn height(&self) -> u32 {
+        self.raster.height as u32
+    }
+
+    /// Tightly packed RGB8 pixels, row-major — the same layout as
+    /// [`RenderedFrame::rgb`].
+    pub fn rgb(&self) -> &[u8] {
+        &self.raster.rgb
+    }
+
+    /// Rasterizer accounting accumulated by the overlay passes.
+    pub fn stats(&self) -> RenderStats {
+        self.raster.stats
+    }
+
+    /// Consume the framebuffer into a [`RenderedFrame`] for the existing
+    /// PNG encoder and stats surface.
+    pub fn into_rendered_frame(self) -> RenderedFrame {
+        RenderedFrame {
+            width: self.width(),
+            height: self.height(),
+            rgb: self.raster.rgb,
+            stats: self.raster.stats,
+        }
+    }
+
+    /// Encode the current pixels as a PNG (RFC 2083). Deterministic:
+    /// identical pixels always produce identical bytes.
+    pub fn encode_png(&self) -> Vec<u8> {
+        encode_png_rgb(self.width(), self.height(), &self.raster.rgb)
+    }
+}
+
+/// World→camera transform shared by every overlay pass: camera-space
+/// `x` right, `y` up, `z` forward (positive = in front), exactly like the
+/// terrain path's `to_camera` closure.
+struct OverlayView {
+    eye: [f64; 3],
+    right: [f64; 3],
+    up: [f64; 3],
+    fwd: [f64; 3],
+}
+
+impl OverlayView {
+    fn new(camera: &OverlayCamera) -> Self {
+        let (fwd, right, up) = camera_basis(camera.yaw, camera.pitch);
+        Self {
+            eye: camera.eye,
+            right,
+            up,
+            fwd,
+        }
+    }
+
+    #[inline]
+    fn to_camera(&self, p: [f64; 3]) -> [f64; 3] {
+        let d = [p[0] - self.eye[0], p[1] - self.eye[1], p[2] - self.eye[2]];
+        [
+            d[0] * self.right[0] + d[1] * self.right[1] + d[2] * self.right[2],
+            d[0] * self.up[0] + d[1] * self.up[1] + d[2] * self.up[2],
+            d[0] * self.fwd[0] + d[1] * self.fwd[1] + d[2] * self.fwd[2],
+        ]
+    }
+}
+
+/// Rotate a mesh-local position or normal about the Y axis by `yaw_rad`
+/// (right-handed, the `ber_rotate_y` convention: `x' = x·cos + z·sin`,
+/// `z' = −x·sin + z·cos`).
+#[inline]
+fn rotate_yaw(p: [f32; 3], sin: f32, cos: f32) -> [f32; 3] {
+    [
+        p[0] * cos + p[2] * sin,
+        p[1],
+        -p[0] * sin + p[2] * cos,
+    ]
+}
+
+/// Resolve an [`ExtrudedQuad::tint_index`] to a linear `0..=1` albedo:
+/// `None` keeps the caller's `base_rgb`, packed 24-bit values (the beacon
+/// beam convention) decode as sRGB, and small non-negative indices are
+/// material tags resolved to a deterministic hue.
+fn extruded_tint_albedo(tint_index: i32) -> Option<[f32; 3]> {
+    if tint_index < 0 {
+        return None;
+    }
+    if tint_index > 0xFF {
+        return Some([
+            ((tint_index >> 16) & 0xFF) as f32 / 255.0,
+            ((tint_index >> 8) & 0xFF) as f32 / 255.0,
+            (tint_index & 0xFF) as f32 / 255.0,
+        ]);
+    }
+    Some(hsv_to_rgb(
+        (f64::from(tint_index) * 0.618_033_988_749_895 + 0.13).fract(),
+        0.55,
+        0.95,
+    ))
+}
+
+/// Shared body of [`render_extruded_mesh_at`]: mesh positions are block
+/// units in a Y-up local space, rotated `yaw_rad` about the Y axis through
+/// `world_offset` and depth-tested like terrain. `translucent` blends at
+/// 60% alpha without depth writes (the slime translucent shell).
+#[allow(clippy::too_many_arguments)]
+fn render_extruded_mesh_pass(
+    framebuffer: &mut FrameBuffer,
+    camera: OverlayCamera,
+    mesh: &ExtrudedMesh,
+    world_offset: [f32; 3],
+    yaw_rad: f32,
+    base_rgb: [u8; 3],
+    translucent: bool,
+) {
+    let view = OverlayView::new(&camera);
+    let (sin, cos) = yaw_rad.sin_cos();
+    let offset = [
+        f64::from(world_offset[0]),
+        f64::from(world_offset[1]),
+        f64::from(world_offset[2]),
+    ];
+    let base = [
+        f32::from(base_rgb[0]) / 255.0,
+        f32::from(base_rgb[1]) / 255.0,
+        f32::from(base_rgb[2]) / 255.0,
+    ];
+    let alpha = if translucent { 0.6 } else { 1.0 };
+    let raster = &mut framebuffer.raster;
+    for quad in &mesh.quads {
+        // Fail closed on non-finite geometry: a NaN vertex would slip past
+        // every screen-space rejection and poison the depth buffer.
+        if !quad.positions.iter().flatten().all(|v| v.is_finite())
+            || !quad.normal.iter().all(|v| v.is_finite())
+        {
+            continue;
+        }
+        let shade = FACE_SHADE[normal_face_index(rotate_yaw(quad.normal, sin, cos))];
+        let albedo = extruded_tint_albedo(quad.tint_index).unwrap_or(base);
+        let color = [albedo[0] * shade, albedo[1] * shade, albedo[2] * shade];
+        let mut verts = [CamVertex::default(); 4];
+        let mut finite = true;
+        for (vertex, p) in verts.iter_mut().zip(quad.positions.iter()) {
+            let local = rotate_yaw(*p, sin, cos);
+            vertex.pos = view.to_camera([
+                offset[0] + f64::from(local[0]),
+                offset[1] + f64::from(local[1]),
+                offset[2] + f64::from(local[2]),
+            ]);
+            vertex.color = color;
+            finite &= vertex.pos.iter().all(|v| v.is_finite());
+        }
+        if !finite {
+            continue;
+        }
+        for tri in [[0usize, 1, 2], [0, 2, 3]] {
+            raster.clipped_triangle(
+                &[verts[tri[0]], verts[tri[1]], verts[tri[2]]],
+                translucent,
+                alpha,
+            );
+        }
+    }
+}
+
+/// Project and depth-test every quad of `mesh` into `framebuffer`.
+///
+/// Mesh positions are block units in a Y-up local space — entity rigs
+/// have feet at `y = 0` and are horizontally centered, BER meshes and 3D
+/// crops/ores fill the `0..=1` block volume — placed at `world_offset`
+/// and rotated `yaw_rad` about the Y axis through `world_offset`.
+/// `base_rgb` shades untinted quads; `tint_index >= 0` quads resolve
+/// through [`extruded_tint_albedo`]. Non-finite mesh data, offsets, or
+/// camera poses draw nothing.
+pub fn render_extruded_mesh_at(
+    framebuffer: &mut FrameBuffer,
+    camera: OverlayCamera,
+    mesh: &ExtrudedMesh,
+    world_offset: [f32; 3],
+    yaw_rad: f32,
+    base_rgb: [u8; 3],
+) {
+    render_extruded_mesh_pass(framebuffer, camera, mesh, world_offset, yaw_rad, base_rgb, false);
+}
+
+/// Deterministic per-entity-type albedo so captures tell rigs apart: the
+/// same golden-ratio hue palette terrain state ids use.
+fn entity_base_color(entity_type_id: u16) -> [u8; 3] {
+    palette_color(u32::from(entity_type_id)).map(|c| (c * 255.0).round() as u8)
+}
+
+/// Render one protocol-767 entity as its procedural articulated rig —
+/// [`classify_entity_rig`] + [`build_entity_rig_mesh`] into
+/// [`render_extruded_mesh_at`]. Unknown ids draw nothing; `pos` is the
+/// entity's feet position and `yaw_rad` its facing in radians (0 = the
+/// rig's authored forward). Non-finite poses are sanitized by the rig
+/// builder; non-finite positions draw nothing.
+pub fn render_entity_rig_facing(
+    framebuffer: &mut FrameBuffer,
+    camera: OverlayCamera,
+    entity_type_id: u16,
+    pos: [f32; 3],
+    pose: &EntityPose,
+    yaw_rad: f32,
+) {
+    let Some(spec) = classify_entity_rig(entity_type_id) else {
+        return;
+    };
+    let mesh = build_entity_rig_mesh(spec, *pose);
+    render_extruded_mesh_pass(
+        framebuffer,
+        camera,
+        &mesh,
+        pos,
+        yaw_rad,
+        entity_base_color(entity_type_id),
+        spec.translucent_shell,
+    );
+}
+
+/// [`render_entity_rig_facing`] with `yaw_rad = 0`.
+pub fn render_entity_rig(
+    framebuffer: &mut FrameBuffer,
+    camera: OverlayCamera,
+    entity_type_id: u16,
+    pos: [f32; 3],
+    pose: &EntityPose,
+) {
+    render_entity_rig_facing(framebuffer, camera, entity_type_id, pos, pose, 0.0);
+}
+
+/// Canonical default [`VanillaBerState`] per family for
+/// [`render_vanilla_ber`]: closed south-facing chest, idle sign and
+/// banner, lit beacon, foot of a bed, floor skull, dark item frame,
+/// lit campfire, full brewing stand, bookless lectern, still decorated
+/// pot, and closed shulker box.
+fn default_vanilla_ber_state(kind: VanillaBerKind) -> VanillaBerState {
+    use VanillaBerFacing::*;
+    match kind {
+        VanillaBerKind::Chest => VanillaBerState::Chest {
+            lid_open: 0.0,
+            double: false,
+            facing: South,
+        },
+        VanillaBerKind::Sign => VanillaBerState::Sign {
+            wall: false,
+            hanging: false,
+            glowing: false,
+            facing_yaw: 0.0,
+        },
+        VanillaBerKind::Banner => VanillaBerState::Banner {
+            wall: false,
+            sway_rad: 0.0,
+            facing_yaw: 0.0,
+        },
+        VanillaBerKind::Beacon => VanillaBerState::Beacon {
+            beam_height: 8.0,
+            active: true,
+            rgb: [0.35, 0.6, 1.0],
+        },
+        VanillaBerKind::Bed => VanillaBerState::Bed {
+            is_head: false,
+            facing: South,
+        },
+        VanillaBerKind::Skull => VanillaBerState::Skull {
+            wall: false,
+            yaw_deg: 0.0,
+        },
+        VanillaBerKind::ItemFrame => VanillaBerState::ItemFrame {
+            facing: South,
+            glow: false,
+            rotation: 0,
+        },
+        VanillaBerKind::Campfire => VanillaBerState::Campfire {
+            lit: true,
+            item_count: 2,
+        },
+        VanillaBerKind::BrewingStand => VanillaBerState::BrewingStand { bottle_mask: 0b111 },
+        VanillaBerKind::Lectern => VanillaBerState::Lectern {
+            has_book: false,
+            facing: South,
+        },
+        VanillaBerKind::DecoratedPot => VanillaBerState::DecoratedPot {
+            facing: South,
+            wobble: 0.0,
+        },
+        VanillaBerKind::ShulkerBox => VanillaBerState::ShulkerBox {
+            open_progress: 0.0,
+            facing: South,
+        },
+    }
+}
+
+/// Deterministic albedo per BER family; `tint_index` quads (beam,
+/// fittings, contents) override it through [`extruded_tint_albedo`].
+fn vanilla_ber_base_color(kind: VanillaBerKind) -> [u8; 3] {
+    match kind {
+        VanillaBerKind::Chest => [162, 116, 63],
+        VanillaBerKind::Sign => [172, 134, 82],
+        VanillaBerKind::Banner => [196, 62, 62],
+        VanillaBerKind::Beacon => [214, 214, 214],
+        VanillaBerKind::Bed => [178, 58, 58],
+        VanillaBerKind::Skull => [216, 216, 208],
+        VanillaBerKind::ItemFrame => [146, 104, 58],
+        VanillaBerKind::Campfire => [104, 72, 48],
+        VanillaBerKind::BrewingStand => [88, 70, 108],
+        VanillaBerKind::Lectern => [138, 98, 58],
+        VanillaBerKind::DecoratedPot => [168, 138, 108],
+        VanillaBerKind::ShulkerBox => [138, 92, 158],
+    }
+}
+
+/// Render one vanilla block entity family at `pos` (the block's min
+/// corner) using the canonical default [`VanillaBerState`]. For animated
+/// or directional states use [`render_vanilla_ber_state`].
+pub fn render_vanilla_ber(
+    framebuffer: &mut FrameBuffer,
+    camera: OverlayCamera,
+    kind: &VanillaBerKind,
+    pos: [f32; 3],
+) {
+    render_vanilla_ber_state(
+        framebuffer,
+        camera,
+        default_vanilla_ber_state(*kind),
+        pos,
+        vanilla_ber_base_color(*kind),
+    );
+}
+
+/// [`render_vanilla_ber`] with an explicit [`VanillaBerState`] (lid angle,
+/// facing, beam, contents) and albedo. [`build_ber_mesh`] derives the kind
+/// from the state so a mismatched pair cannot occur; an empty mesh draws
+/// nothing.
+pub fn render_vanilla_ber_state(
+    framebuffer: &mut FrameBuffer,
+    camera: OverlayCamera,
+    state: VanillaBerState,
+    pos: [f32; 3],
+    base_rgb: [u8; 3],
+) {
+    let mesh = build_ber_mesh(state.kind(), state);
+    render_extruded_mesh_at(framebuffer, camera, &mesh, pos, 0.0, base_rgb);
+}
+
+/// Clip a camera-space segment to the `NEAR_Z..=FAR_Z` depth slab,
+/// returning the surviving sub-segment (`None` when fully outside).
+fn clip_depth_slab(a: [f64; 3], b: [f64; 3]) -> Option<([f64; 3], [f64; 3])> {
+    let dz = b[2] - a[2];
+    if dz.abs() < 1e-12 {
+        return (NEAR_Z..=FAR_Z).contains(&a[2]).then_some((a, b));
+    }
+    let t_near = (NEAR_Z - a[2]) / dz;
+    let t_far = (FAR_Z - a[2]) / dz;
+    let (t_enter, t_exit) = if dz > 0.0 {
+        (t_near, t_far)
+    } else {
+        (t_far, t_near)
+    };
+    let t0 = t_enter.max(0.0);
+    let t1 = t_exit.min(1.0);
+    if t0 >= t1 {
+        return None;
+    }
+    let at = |t: f64| {
+        [
+            a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+            a[2] + (b[2] - a[2]) * t,
+        ]
+    };
+    Some((at(t0), at(t1)))
+}
+
+/// Render world-space [`DebugLine`] wireframes — the F3+G chunk-border
+/// grid from [`mc_spine_kernel::debug_chords::build_chunk_border_lines`]
+/// and the F3+B hitboxes from `build_entity_hitbox_lines` — into
+/// `framebuffer`.
+///
+/// Each segment is clipped to the `[NEAR_Z, FAR_Z]` depth slab, sampled
+/// in camera space, projected, and blended at its `rgba` alpha wherever
+/// it passes the depth test. Lines never write depth, so wireframes stay
+/// visible through each other while terrain and meshes still occlude
+/// them. Non-finite endpoints, zero-alpha lines, and non-finite camera
+/// poses draw nothing.
+pub fn render_debug_lines(
+    framebuffer: &mut FrameBuffer,
+    camera: OverlayCamera,
+    lines: &[DebugLine],
+) {
+    let view = OverlayView::new(&camera);
+    let raster = &mut framebuffer.raster;
+    let (width, height, focal) = (raster.width, raster.height, raster.focal);
+    let step_cap = 8 * (width + height).max(1);
+    for line in lines {
+        if line.rgba[3] == 0 {
+            continue;
+        }
+        let start = [
+            f64::from(line.start[0]),
+            f64::from(line.start[1]),
+            f64::from(line.start[2]),
+        ];
+        let end = [
+            f64::from(line.end[0]),
+            f64::from(line.end[1]),
+            f64::from(line.end[2]),
+        ];
+        if !start.iter().chain(end.iter()).all(|v| v.is_finite()) {
+            continue;
+        }
+        let a = view.to_camera(start);
+        let b = view.to_camera(end);
+        if !a.iter().chain(b.iter()).all(|v| v.is_finite()) {
+            continue;
+        }
+        let Some((a, b)) = clip_depth_slab(a, b) else {
+            continue;
+        };
+        let project = |p: [f64; 3]| -> (f64, f64) {
+            let scale = focal / p[2];
+            (
+                width as f64 * 0.5 + p[0] * scale,
+                height as f64 * 0.5 - p[1] * scale,
+            )
+        };
+        let (sx0, sy0) = project(a);
+        let (sx1, sy1) = project(b);
+        if !(sx0.is_finite() && sy0.is_finite() && sx1.is_finite() && sy1.is_finite()) {
+            continue;
+        }
+        // Sample count follows the screen-space span, clamped to a margin
+        // so endpoints far off-screen still yield dense on-screen sampling.
+        let margin = |v: f64, dim: usize| v.clamp(-(dim as f64), 2.0 * dim as f64);
+        let span = (margin(sx1, width) - margin(sx0, width))
+            .abs()
+            .max((margin(sy1, height) - margin(sy0, height)).abs());
+        let steps = ((span * 2.0).ceil() as usize + 1).clamp(1, step_cap);
+        let alpha = f64::from(line.rgba[3]) / 255.0;
+        for i in 0..=steps {
+            let t = i as f64 / steps as f64;
+            let p = [
+                a[0] + (b[0] - a[0]) * t,
+                a[1] + (b[1] - a[1]) * t,
+                a[2] + (b[2] - a[2]) * t,
+            ];
+            let scale = focal / p[2];
+            let sx = width as f64 * 0.5 + p[0] * scale;
+            let sy = height as f64 * 0.5 - p[1] * scale;
+            if !(sx.is_finite() && sy.is_finite()) {
+                continue;
+            }
+            let ix = sx.floor() as isize;
+            let iy = sy.floor() as isize;
+            if ix < 0 || iy < 0 || ix >= width as isize || iy >= height as isize {
+                continue;
+            }
+            let idx = iy as usize * width + ix as usize;
+            if !(p[2] < f64::from(raster.depth[idx])) {
+                continue;
+            }
+            let dst = idx * 3;
+            if alpha >= 1.0 {
+                raster.rgb[dst] = line.rgba[0];
+                raster.rgb[dst + 1] = line.rgba[1];
+                raster.rgb[dst + 2] = line.rgba[2];
+            } else {
+                for (channel, &src) in line.rgba[..3].iter().enumerate() {
+                    let d = f64::from(raster.rgb[dst + channel]);
+                    raster.rgb[dst + channel] =
+                        (f64::from(src) * alpha + d * (1.0 - alpha)).clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    }
+}
+
+/// Render camera-facing particle quads — [`VanillaParticleQuad`]s from
+/// [`VanillaParticleWorld::billboard_quads`] — as translucent billboards,
+/// far-to-near so alpha blending composites in the right order. Quads
+/// with non-finite vertices or zero alpha draw nothing.
+pub fn render_particle_quads(
+    framebuffer: &mut FrameBuffer,
+    camera: OverlayCamera,
+    quads: &[VanillaParticleQuad],
+) {
+    let view = OverlayView::new(&camera);
+    let mut sorted: Vec<([CamVertex; 4], f32, f32)> = Vec::with_capacity(quads.len());
+    for quad in quads {
+        let alpha = quad.color[3].clamp(0.0, 1.0);
+        if alpha <= 0.0 || !quad.positions.iter().flatten().all(|v| v.is_finite()) {
+            continue;
+        }
+        let color = [
+            quad.color[0].clamp(0.0, 1.0),
+            quad.color[1].clamp(0.0, 1.0),
+            quad.color[2].clamp(0.0, 1.0),
+        ];
+        let mut verts = [CamVertex::default(); 4];
+        let mut depth_sum = 0.0f64;
+        let mut finite = true;
+        for (vertex, p) in verts.iter_mut().zip(quad.positions.iter()) {
+            vertex.pos = view.to_camera([
+                f64::from(p[0]),
+                f64::from(p[1]),
+                f64::from(p[2]),
+            ]);
+            vertex.color = color;
+            finite &= vertex.pos.iter().all(|v| v.is_finite());
+            depth_sum += vertex.pos[2];
+        }
+        if finite {
+            sorted.push((verts, (depth_sum * 0.25) as f32, alpha));
+        }
+    }
+    // Far-to-near: translucent blending composites in draw order.
+    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let raster = &mut framebuffer.raster;
+    for (verts, _, alpha) in sorted {
+        for tri in [[0usize, 1, 2], [0, 2, 3]] {
+            raster.clipped_triangle(
+                &[verts[tri[0]], verts[tri[1]], verts[tri[2]]],
+                true,
+                alpha,
+            );
+        }
+    }
+}
+
+/// Advance-free convenience for [`render_particle_quads`]: billboard
+/// `particles` against the camera basis and render them — equivalent to
+/// calling [`VanillaParticleWorld::billboard_quads`] followed by
+/// [`render_particle_quads`].
+pub fn render_vanilla_particles(
+    framebuffer: &mut FrameBuffer,
+    camera: OverlayCamera,
+    particles: &VanillaParticleWorld,
+) {
+    let (_, right, up) = camera_basis(camera.yaw, camera.pitch);
+    let quads = particles.billboard_quads(
+        [right[0] as f32, right[1] as f32, right[2] as f32],
+        [up[0] as f32, up[1] as f32, up[2] as f32],
+    );
+    render_particle_quads(framebuffer, camera, &quads);
 }
 
 // ---------------------------------------------------------------------------

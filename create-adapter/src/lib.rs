@@ -24,5 +24,6 @@ pub mod contraption_adapter;
 pub mod data_loader;
 pub mod factory;
 pub mod neoforge_wire;
+pub mod offload_bridge;
 pub mod orbital;
 pub mod rail_network;
