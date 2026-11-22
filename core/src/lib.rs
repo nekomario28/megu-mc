@@ -25,6 +25,14 @@
 //! * [`crash_report`] — [`crash_report::CrashContext`]: deterministic
 //!   `MEGU-E-XXXXXXXX` fingerprints and privacy-redacted bilingual blame
 //!   reports for operator-facing crash triage.
+//! * [`fault_isolation`] — [`fault_isolation::FaultIsolationRouter`]: a
+//!   per-subsystem runtime fault-isolation circuit breaker
+//!   (Closed / Throttled / OpenIsolated / HalfOpenProbe) that strides
+//!   sustained tick-budget overruns, isolates runaway mods, chunk
+//!   regions, contraptions, and builtin subsystems with deterministic
+//!   `MEGU-E-XXXXXXXX` blame fingerprints, probes recovery with
+//!   exponential backoff, and bounds tracked state so scope floods can
+//!   never evict a live isolation or exhaust memory.
 //! * [`perf_kit`] — universal zero-overhead performance primitives: a
 //!   [`perf_kit::DirtyFingerprintGate`] for O(1) idle skipping,
 //!   [`perf_kit::BoundedScratchVec`] reusable scratch storage with bounded
@@ -53,6 +61,7 @@
 #![deny(unsafe_code)]
 
 pub mod crash_report;
+pub mod fault_isolation;
 pub mod hw_adaptive_engine;
 pub mod id;
 pub mod math;
