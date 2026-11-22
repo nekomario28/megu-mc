@@ -889,6 +889,7 @@ struct PlayerAc {
     alert_at: [Option<Instant>; 4],
     flags: [u64; 4],
     attack_clicks: std::collections::VecDeque<Instant>,
+    killaura: AcKillAuraState,
     moves: AcMoveState,
     nofall_reported: bool,
     last_game_mode: Option<u8>,
@@ -904,6 +905,7 @@ impl PlayerAc {
             alert_at: [None; 4],
             flags: [0; 4],
             attack_clicks: std::collections::VecDeque::new(),
+            killaura: AcKillAuraState::default(),
             moves: AcMoveState::default(),
             nofall_reported: false,
             last_game_mode: None,
@@ -1239,6 +1241,18 @@ fn ac_player_rtt_ms(eid: i32) -> u32 {
 
 // ---------- flags, VL, alerts ----------
 
+/// Send one alert line to every operator except the flagged player.
+fn ac_notify_ops(me: &Client, line: &str) {
+    let packet = system_chat(line);
+    for op in client_snapshot() {
+        if op.eid != me.eid && player_is_admin(&op.name) {
+            if let Ok(mut sock) = op.sock.lock() {
+                let _ = send_packet(&mut sock, 0x6c, packet.clone());
+            }
+        }
+    }
+}
+
 /// Record a failed check. Returns `true` when the server should correct the action.
 fn ac_flag(me: &Client, check: AcCheckId, amount: f64, detail: &str) -> bool {
     let preset = ac_preset_for(&me.name);
@@ -1270,14 +1284,7 @@ fn ac_flag(me: &Client, check: AcCheckId, amount: f64, detail: &str) -> bool {
         );
         eprintln!("[anticheat] {line}");
         if config.alerts {
-            let packet = system_chat(&line);
-            for op in client_snapshot() {
-                if op.eid != me.eid && player_is_admin(&op.name) {
-                    if let Ok(mut sock) = op.sock.lock() {
-                        let _ = send_packet(&mut sock, 0x6c, packet.clone());
-                    }
-                }
-            }
+            ac_notify_ops(me, &line);
         }
     }
     true
@@ -1375,8 +1382,26 @@ fn ac_check_attack(me: &Client, dim: DimId, target: [f64; 3]) -> bool {
     }
     let (x, y, z, yaw, pitch, _) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
     let eye = [x, y + 1.62, z];
-    if attack_angle_off_axis(yaw, pitch, eye, target).is_some_and(|angle| angle > 85.0) {
+    let angle = attack_angle_off_axis(yaw, pitch, eye, target);
+    if angle.is_some_and(|angle| angle > 85.0) {
         ac_flag(me, AcCheckId::Attack, 1.0, "attack outside view angle");
+    }
+    // OPS-ANTICHEAT-5: notify-first kill-aura heuristic. It observes cadence,
+    // yaw snaps, target switching and view-angle misses, but its verdict only
+    // ever reaches operators — it never feeds the cancel decision above.
+    let target_key = (
+        (target[0] * 4.0).round() as i64,
+        (target[1] * 4.0).round() as i64,
+        (target[2] * 4.0).round() as i64,
+    );
+    if let Some(alert) =
+        ac_with_player(me, |p| p.killaura.record_attack(now, yaw, target_key, angle))
+    {
+        let line = format!("[AC] {} {alert}", me.name);
+        eprintln!("[anticheat] {line}");
+        if ac_config().alerts {
+            ac_notify_ops(me, &line);
+        }
     }
     if let Some(reg) = crate::block_registry::breg() {
         if attack_segment_obstructed(eye, target, |x, y, z| {
@@ -1386,6 +1411,136 @@ fn ac_check_attack(me: &Client, dim: DimId, target: [f64; 3]) -> bool {
         }
     }
     ac_violation_level(me.eid, AcCheckId::Attack) < 6.0
+}
+
+// ---------- OPS-ANTICHEAT-5: notify-first kill-aura heuristic ----------
+
+/// One observed attack inside the sliding cadence window.
+#[derive(Clone, Copy, Debug)]
+struct AcAttackSample {
+    at: Instant,
+    yaw: f32,
+    /// Quarter-block-quantized target position: the same entity keeps the
+    /// same key while it moves, a different entity almost never collides.
+    target: (i64, i64, i64),
+}
+
+/// Samples older than this leave the cadence window.
+const KA_WINDOW: Duration = Duration::from_secs(1);
+/// Hard cap so a packet flood cannot grow the window without bound.
+const KA_WINDOW_CAP: usize = 64;
+/// Two attacks closer than this with a >120° yaw snap is the aura signature;
+/// a single one is normal flick-aim PvP.
+const KA_SNAP_WINDOW: Duration = Duration::from_millis(150);
+const KA_SNAP_DEG: f64 = 120.0;
+const KA_SNAP_VL: f64 = 1.5;
+/// Switching targets at the same pace is weaker evidence than a snap.
+const KA_SWITCH_VL: f64 = 0.75;
+/// Hits landing outside this view angle are weak evidence on their own.
+const KA_FOV_DEG: f64 = 75.0;
+const KA_FOV_VL: f64 = 0.75;
+/// Sustained >10 attacks/second is inhuman for a legitimate client; a short
+/// burst stays under the VL alert threshold on its own.
+const KA_CPS_LIMIT: usize = 10;
+const KA_CPS_VL: f64 = 0.5;
+/// VL decays fast: the alert threshold needs several stacked signals, so one
+/// snap, one lag burst or one odd hit can never page an operator.
+const KA_DECAY_PER_SEC: f64 = 1.5;
+const KA_ALERT_VL: f64 = 4.0;
+const KA_ALERT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Per-player kill-aura suspicion. Notify-first by contract: `record_attack`
+/// returns `Some(alert)` for operators and nothing here ever cancels a hit or
+/// disconnects a player.
+#[derive(Debug, Default)]
+struct AcKillAuraState {
+    window: std::collections::VecDeque<AcAttackSample>,
+    vl: f64,
+    vl_at: Option<Instant>,
+    last_alert_at: Option<Instant>,
+}
+
+/// Smallest angle between two protocol yaws, in degrees (0..=180). Callers
+/// guard non-finite input; NaN would poison every comparison below.
+fn ac_yaw_delta_deg(a: f32, b: f32) -> f64 {
+    let d = (a - b).abs().rem_euclid(360.0);
+    let d = if d > 180.0 { 360.0 - d } else { d };
+    f64::from(d)
+}
+
+impl AcKillAuraState {
+    /// Record one melee attack. `yaw` is the attacker's view yaw, `target` the
+    /// quantized target key and `angle_deg` the server-measured angle between
+    /// view and target (`None` when it cannot be computed). Returns the
+    /// operator alert once sustained multi-signal suspicion crosses the VL
+    /// threshold, at most once per `KA_ALERT_INTERVAL`.
+    fn record_attack(
+        &mut self,
+        now: Instant,
+        yaw: f32,
+        target: (i64, i64, i64),
+        angle_deg: Option<f64>,
+    ) -> Option<String> {
+        while self
+            .window
+            .front()
+            .is_some_and(|s| now.saturating_duration_since(s.at) >= KA_WINDOW)
+        {
+            self.window.pop_front();
+        }
+        let prev = self.window.back().copied();
+        let mut gain = 0.0;
+        let mut signals: Vec<&'static str> = Vec::new();
+        if let Some(p) = prev {
+            if now.saturating_duration_since(p.at) < KA_SNAP_WINDOW {
+                if yaw.is_finite() && p.yaw.is_finite() && ac_yaw_delta_deg(yaw, p.yaw) > KA_SNAP_DEG
+                {
+                    gain += KA_SNAP_VL;
+                    signals.push("yaw snap");
+                }
+                if target != p.target {
+                    gain += KA_SWITCH_VL;
+                    signals.push("target switch");
+                }
+            }
+        }
+        self.window.push_back(AcAttackSample { at: now, yaw, target });
+        if self.window.len() > KA_WINDOW_CAP {
+            self.window.pop_front();
+        }
+        if self.window.len() > KA_CPS_LIMIT {
+            gain += KA_CPS_VL;
+            signals.push("attack cadence");
+        }
+        if angle_deg.is_some_and(|a| a > KA_FOV_DEG) {
+            gain += KA_FOV_VL;
+            signals.push("out-of-FOV hit");
+        }
+        if gain <= 0.0 {
+            return None;
+        }
+        let elapsed = self
+            .vl_at
+            .map(|t| now.saturating_duration_since(t).as_secs_f64())
+            .unwrap_or(0.0);
+        let vl = (self.vl - elapsed * KA_DECAY_PER_SEC).max(0.0) + gain;
+        self.vl = vl;
+        self.vl_at = Some(now);
+        let alert_due = self
+            .last_alert_at
+            .is_none_or(|t| now.saturating_duration_since(t) >= KA_ALERT_INTERVAL);
+        if vl >= KA_ALERT_VL && alert_due {
+            self.last_alert_at = Some(now);
+            // Re-arm: the next alert has to be re-earned by fresh anomalies
+            // instead of riding one sustained burst forever.
+            self.vl = KA_ALERT_VL;
+            return Some(format!(
+                "suspected kill-aura VL {vl:.1}: {}",
+                signals.join(", ")
+            ));
+        }
+        None
+    }
 }
 
 // ---------- placement ----------
@@ -1639,6 +1794,284 @@ fn ac_reload_quiet() {
     }
     let config = AcConfig::from_doc(&doc, |name| std::env::var(name).ok());
     ac_install(config);
+}
+
+// ---------- OPS-ANTICHEAT-5: sign text & creative item sanitizers ----------
+//
+// Pure policy helpers for the sign-edit/chat and creative-inventory packet
+// lanes. They sit next to the checks they extend; the packet handlers call
+// them when those lanes land, so in non-test builds they are dead code
+// and the `ops_ac5_*` tests below are what keep them honest.
+
+/// Vanilla caps one sign line at 384 characters.
+#[allow(dead_code)]
+const AC_SIGN_MAX_CHARS: usize = 384;
+
+/// `§` formatting codes vanilla recognises: 0-9/a-f colours, k l m n o r.
+#[allow(dead_code)]
+fn ac_is_format_code(c: char) -> bool {
+    matches!(c, '0'..='9' | 'a'..='f' | 'k' | 'l' | 'm' | 'n' | 'o' | 'r')
+}
+
+/// The sanitized line plus whether anything had to change, so the packet
+/// lane can tell the player (or an operator) cleanly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct AcSignLine {
+    pub line: String,
+    pub was_sanitized: bool,
+}
+
+/// Sign/chat line hardening. ASCII control characters (`< 0x20`, `0x7f`)
+/// are always stripped and the line is capped at the vanilla 384 chars.
+/// Non-operators (`perm_level < 2`) additionally lose every `§` formatting
+/// code — `§` plus its format character — while operators keep legitimate
+/// formatting.
+#[allow(dead_code)]
+pub(crate) fn ac_sanitize_sign_line(line: &str, perm_level: u8) -> AcSignLine {
+    let op = perm_level >= 2;
+    let mut out = String::with_capacity(line.len().min(AC_SIGN_MAX_CHARS * 4));
+    let mut sanitized = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        let code = c as u32;
+        if code < 0x20 || code == 0x7f {
+            sanitized = true;
+            continue;
+        }
+        if c == '§' {
+            if op {
+                // Operators keep `§` and whatever follows it verbatim.
+                out.push(c);
+                continue;
+            }
+            sanitized = true;
+            // Swallow the format character too so "§4red" cannot leave a
+            // stray "4red" behind; a `§` before ordinary text only loses
+            // the `§` itself.
+            if chars.peek().is_some_and(|n| ac_is_format_code(*n)) {
+                chars.next();
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    if out.chars().count() > AC_SIGN_MAX_CHARS {
+        out = out.chars().take(AC_SIGN_MAX_CHARS).collect();
+        sanitized = true;
+    }
+    // A truncation boundary can strand a `§` whose code was cut off.
+    if out.ends_with('§') {
+        out.pop();
+        sanitized = true;
+    }
+    AcSignLine {
+        line: out,
+        was_sanitized: sanitized,
+    }
+}
+
+/// Component payloads that are a single unnamed NBT tag — mirrors the
+/// `slot_read_nbt` arms of `slot_read_component`. `54`
+/// (`minecraft:bees`) trails two VarInts after the tag; any bytes past the
+/// parsed tag are preserved verbatim on rewrite.
+#[allow(dead_code)]
+const AC_NBT_COMPONENTS: [i64; 11] = [0, 19, 27, 36, 37, 38, 39, 43, 54, 55, 56];
+/// Nesting deeper than this is a payload bomb, not data.
+#[allow(dead_code)]
+const AC_NBT_MAX_DEPTH: usize = 16;
+/// One component payload larger than this is refused before parsing.
+#[allow(dead_code)]
+const AC_NBT_MAX_PAYLOAD: usize = 32 * 1024;
+/// `|Amount|` beyond this on an AttributeModifiers entry is a hacked item
+/// (the 100k-damage sword lives here), not a modifier.
+#[allow(dead_code)]
+const AC_ATTR_AMOUNT_MAX: f64 = 10_000.0;
+
+/// NBT keys that hand a pasted item server-side power: command blocks,
+/// entity spawners and spawn-egg data. Matched at every depth,
+/// case-sensitively — the vanilla keys are exact and lookalikes are inert.
+#[allow(dead_code)]
+fn ac_nbt_key_banned(key: &str) -> bool {
+    matches!(key, "Command" | "auto" | "SpawnData" | "SpawnPotentials")
+}
+
+/// Whether an AttributeModifiers entry's `Amount` is a finite, sane
+/// number. Entries without a numeric amount are left to the recursion.
+#[allow(dead_code)]
+fn ac_attr_amount_ok(entry: &Tag) -> bool {
+    let Tag::Compound(map) = entry else {
+        return true;
+    };
+    for key in ["Amount", "amount"] {
+        let Some(tag) = map.get(&NbtString::text(key)) else {
+            continue;
+        };
+        let v = match tag {
+            Tag::Double(bits) => f64::from_bits(*bits),
+            Tag::Float(bits) => f64::from(f32::from_bits(*bits)),
+            Tag::Int(v) => f64::from(*v),
+            Tag::Long(v) => *v as f64,
+            Tag::Short(v) => f64::from(*v),
+            Tag::Byte(v) => f64::from(*v),
+            _ => continue,
+        };
+        return v.is_finite() && v.abs() <= AC_ATTR_AMOUNT_MAX;
+    }
+    true
+}
+
+/// `AttributeModifiers` list: drop entries with non-finite/extreme amounts
+/// and sanitize whatever survives like any other node.
+#[allow(dead_code)]
+fn ac_sanitize_attr_list(tag: &mut Tag, depth: usize, changed: &mut bool) {
+    let Tag::List(_, entries) = tag else {
+        return;
+    };
+    let changed = &mut *changed;
+    entries.retain_mut(|entry| {
+        if !ac_attr_amount_ok(entry) {
+            *changed = true;
+            return false;
+        }
+        ac_sanitize_nbt(entry, depth + 1, &mut *changed)
+    });
+}
+
+/// Strip banned keys, extreme attribute amounts and over-deep subtrees in
+/// place. Returns `false` when the node itself must be dropped (it sits
+/// deeper than `AC_NBT_MAX_DEPTH`); `changed` records whether the tree
+/// actually differs afterwards so clean payloads keep their bytes.
+#[allow(dead_code)]
+fn ac_sanitize_nbt(tag: &mut Tag, depth: usize, changed: &mut bool) -> bool {
+    if depth > AC_NBT_MAX_DEPTH {
+        *changed = true;
+        return false;
+    }
+    match tag {
+        Tag::Compound(map) => {
+            let keys: Vec<NbtString> = map.keys().cloned().collect();
+            for key in keys {
+                let name = key.to_utf8().ok();
+                if name.as_deref().is_some_and(ac_nbt_key_banned) {
+                    map.remove(&key);
+                    *changed = true;
+                    continue;
+                }
+                let is_attr = name.is_some_and(|k| k == "AttributeModifiers");
+                let drop = match map.get_mut(&key) {
+                    Some(v @ Tag::List(_, _)) if is_attr => {
+                        ac_sanitize_attr_list(v, depth, changed);
+                        false
+                    }
+                    Some(v) => !ac_sanitize_nbt(v, depth + 1, changed),
+                    None => false,
+                };
+                if drop {
+                    map.remove(&key);
+                }
+            }
+            true
+        }
+        Tag::List(_, values) => {
+            let changed = &mut *changed;
+            values.retain_mut(|v| ac_sanitize_nbt(v, depth + 1, &mut *changed));
+            true
+        }
+        _ => true,
+    }
+}
+
+/// Sanitize one NBT-bearing component payload. `None` = drop the component
+/// outright: oversized, unparseable, or a non-compound root a non-OP
+/// creative client has no business sending (fail closed — nested danger
+/// cannot be ruled out without a parse).
+#[allow(dead_code)]
+fn ac_sanitize_nbt_payload(data: &[u8]) -> Option<Vec<u8>> {
+    if data.is_empty() || data.len() > AC_NBT_MAX_PAYLOAD {
+        return None;
+    }
+    let mut rest = data;
+    let mut tag = nbt::read_network_nbt(&mut rest).ok()?;
+    let mut changed = false;
+    ac_sanitize_nbt(&mut tag, 0, &mut changed);
+    if !changed {
+        return Some(data.to_vec());
+    }
+    let mut out = nbt::write_network_nbt(&tag).ok()?;
+    // `minecraft:bees` (54) and friends trail bytes after the NBT tag.
+    out.extend_from_slice(&data[data.len() - rest.len()..]);
+    Some(out)
+}
+
+/// Clamp a creative-submitted count into `0..=max_stack_size.clamp(1, 99)`.
+/// `None` rejects impossible submissions (negative or above the absolute
+/// 99 ceiling) outright instead of repairing them into legal-looking
+/// stacks.
+#[allow(dead_code)]
+pub(crate) fn ac_sanitize_creative_count(count: i64, max_stack_size: i64) -> Option<i64> {
+    if !(0..=99).contains(&count) {
+        return None;
+    }
+    Some(count.min(max_stack_size.clamp(1, 99)))
+}
+
+/// What [`ac_sanitize_creative_item`] changed, for operator notification.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct AcCreativeSanitize {
+    /// Anything was stripped, clamped or dropped.
+    pub was_sanitized: bool,
+    /// NBT-bearing components removed outright.
+    pub components_removed: usize,
+}
+
+/// Creative `set_creative_slot` hardening. The count clamp applies to
+/// every submitter; the NBT strip applies only to non-operators
+/// (`perm_level < 2`), so creative clients cannot paste command blocks,
+/// spawners, spawn data or 100k-damage attribute modifiers into items.
+#[allow(dead_code)]
+pub(crate) fn ac_sanitize_creative_item(st: &mut Stack, perm_level: u8) -> AcCreativeSanitize {
+    let mut out = AcCreativeSanitize::default();
+    let max = item_stack_max(st.0, &st.2);
+    match ac_sanitize_creative_count(i64::from(st.1), max) {
+        Some(c) => {
+            let c = c as u8;
+            if c != st.1 {
+                st.1 = c;
+                out.was_sanitized = true;
+            }
+        }
+        None => {
+            // Impossible count: empty the stack rather than guess a fix.
+            st.1 = 0;
+            out.was_sanitized = true;
+        }
+    }
+    if perm_level >= 2 || st.2.is_empty() {
+        return out;
+    }
+    let mut kept: Comps = Vec::with_capacity(st.2.len());
+    for (ty, data) in std::mem::take(&mut st.2) {
+        if AC_NBT_COMPONENTS.contains(&ty) {
+            match ac_sanitize_nbt_payload(&data) {
+                Some(clean) => {
+                    if clean != data {
+                        out.was_sanitized = true;
+                    }
+                    kept.push((ty, clean));
+                }
+                None => {
+                    out.components_removed += 1;
+                    out.was_sanitized = true;
+                }
+            }
+        } else {
+            kept.push((ty, data));
+        }
+    }
+    st.2 = kept;
+    out
 }
 
 #[cfg(test)]
@@ -2050,5 +2483,213 @@ mod anticheat_unit_tests {
         }
         assert!(caught, "4x sustained hack must flag even at max lag comp");
         ops2_reset_lag();
+    }
+
+    // ---------- OPS-ANTICHEAT-5: sign/creative sanitizers + kill-aura ----------
+
+    #[test]
+    fn ops_ac5_sign_strips_section_codes_for_non_op_and_allows_op() {
+        use super::{ac_sanitize_sign_line, AcSignLine};
+        // Non-OP: `§` plus its format char is gone, literal text survives.
+        let r = ac_sanitize_sign_line("§4red §lbold\u{7}bell", 0);
+        assert_eq!(r.line, "red boldbell");
+        assert!(r.was_sanitized);
+        // A `§` before ordinary text loses only the `§` itself.
+        let r = ac_sanitize_sign_line("costs §5 gold", 1);
+        assert_eq!(r.line, "costs  gold");
+        assert!(r.was_sanitized);
+        // Control chars are stripped for everyone; OP keeps `§` formatting.
+        let r = ac_sanitize_sign_line("§4red\u{1}§l!", 2);
+        assert_eq!(r.line, "§4red§l!");
+        assert!(r.was_sanitized);
+        let r = ac_sanitize_sign_line("plain §akill\u{7f}", 4);
+        assert_eq!(r.line, "plain §akill");
+        assert!(r.was_sanitized);
+        // Vanilla's 384-char cap applies to both permission levels.
+        let long = "x".repeat(500);
+        for level in [0, 3] {
+            let r = ac_sanitize_sign_line(&long, level);
+            assert_eq!(r.line.chars().count(), 384, "level {level}");
+            assert!(r.was_sanitized);
+        }
+        // Truncation can strand a `§`; it must not survive the cap.
+        let mut edge = "y".repeat(383);
+        edge.push('§');
+        edge.push('4');
+        edge.push('z');
+        let r = ac_sanitize_sign_line(&edge, 2);
+        assert_eq!(r.line.chars().count(), 383);
+        assert!(!r.line.ends_with('§'));
+        assert!(r.was_sanitized);
+        // A clean line is reported untouched.
+        assert_eq!(
+            ac_sanitize_sign_line("hello", 0),
+            AcSignLine {
+                line: "hello".to_owned(),
+                was_sanitized: false
+            }
+        );
+    }
+
+    /// Build an unnamed-compound NBT payload the way a component carries it.
+    fn ops5_nbt_compound(entries: &[(&str, crate::nbt::Tag)]) -> Vec<u8> {
+        let mut map = std::collections::BTreeMap::new();
+        for (k, v) in entries {
+            map.insert(crate::nbt::NbtString::text(k), v.clone());
+        }
+        crate::nbt::write_network_nbt(&crate::nbt::Tag::Compound(map)).unwrap()
+    }
+
+    #[test]
+    fn ops_ac5_creative_clamps_stack_count_and_strips_dangerous_nbt() {
+        use super::{ac_sanitize_creative_count, ac_sanitize_creative_item};
+        // Count policy: legal counts clamp to the stack max; impossible ones
+        // (negative, >99) are rejected outright.
+        assert_eq!(ac_sanitize_creative_count(50, 64), Some(50));
+        assert_eq!(ac_sanitize_creative_count(50, 1), Some(1));
+        assert_eq!(ac_sanitize_creative_count(0, 64), Some(0));
+        assert_eq!(ac_sanitize_creative_count(-1, 64), None);
+        assert_eq!(ac_sanitize_creative_count(100, 64), None);
+        assert_eq!(ac_sanitize_creative_count(99, 0), Some(1));
+        // On a real stack the wire count is u8; >99 empties the stack.
+        let stone = name_to_item("stone").unwrap();
+        let mut st: Stack = (stone, 100, Vec::new());
+        let r = ac_sanitize_creative_item(&mut st, 0);
+        assert_eq!(st.1, 0);
+        assert!(r.was_sanitized);
+        // Non-OP: banned keys are stripped at any depth, safe data survives.
+        let mut data_map = std::collections::BTreeMap::new();
+        data_map.insert(
+            crate::nbt::NbtString::text("Command"),
+            crate::nbt::Tag::String(crate::nbt::NbtString::text("op attacker")),
+        );
+        data_map.insert(
+            crate::nbt::NbtString::text("safe"),
+            crate::nbt::Tag::Int(7),
+        );
+        let inner = crate::nbt::Tag::Compound(data_map);
+        let payload = ops5_nbt_compound(&[
+            ("wrapper", crate::nbt::Tag::Compound(
+                [(crate::nbt::NbtString::text("deep"), inner.clone())]
+                    .into_iter()
+                    .collect(),
+            )),
+            ("SpawnPotentials", crate::nbt::Tag::List(10, vec![inner.clone()])),
+        ]);
+        let mut st: Stack = (stone, 5, vec![(0, payload.clone())]);
+        let r = ac_sanitize_creative_item(&mut st, 0);
+        assert!(r.was_sanitized);
+        assert_eq!(r.components_removed, 0);
+        let mut rest = st.2[0].1.as_slice();
+        let tag = crate::nbt::read_network_nbt(&mut rest).unwrap();
+        let root = tag.get("wrapper").unwrap();
+        // "deep" -> {Command, safe}: Command gone even two levels down.
+        let deep = root.get("deep").unwrap();
+        assert!(deep.get("Command").is_none());
+        assert_eq!(deep.get("safe").and_then(|t| t.int()), Some(7));
+        // SpawnPotentials removed at the root.
+        assert!(tag.get("SpawnPotentials").is_none());
+        // Extreme attribute amounts are dropped, sane ones kept.
+        let mut mod_ok = std::collections::BTreeMap::new();
+        mod_ok.insert(
+            crate::nbt::NbtString::text("Amount"),
+            crate::nbt::Tag::Double(2.5f64.to_bits()),
+        );
+        let mut mod_bad = std::collections::BTreeMap::new();
+        mod_bad.insert(
+            crate::nbt::NbtString::text("Amount"),
+            crate::nbt::Tag::Double(100_000_000.0f64.to_bits()),
+        );
+        let attr = ops5_nbt_compound(&[(
+            "AttributeModifiers",
+            crate::nbt::Tag::List(
+                10,
+                vec![
+                    crate::nbt::Tag::Compound(mod_ok),
+                    crate::nbt::Tag::Compound(mod_bad),
+                ],
+            ),
+        )]);
+        let mut st: Stack = (stone, 1, vec![(0, attr)]);
+        let r = ac_sanitize_creative_item(&mut st, 1);
+        assert!(r.was_sanitized);
+        let mut rest = st.2[0].1.as_slice();
+        let tag = crate::nbt::read_network_nbt(&mut rest).unwrap();
+        let list = tag.get("AttributeModifiers").unwrap().list().unwrap();
+        assert_eq!(list.len(), 1, "only the sane modifier survives");
+        // Non-compound or oversized NBT payloads are dropped fail-closed.
+        let string_root = vec![8u8, 0, 3, b'f', b'o', b'o'];
+        let mut st: Stack = (stone, 1, vec![(0, string_root)]);
+        let r = ac_sanitize_creative_item(&mut st, 0);
+        assert_eq!(r.components_removed, 1);
+        assert!(st.2.is_empty());
+        let huge = vec![10u8; 40 * 1024];
+        let mut st: Stack = (stone, 1, vec![(0, huge)]);
+        let r = ac_sanitize_creative_item(&mut st, 0);
+        assert_eq!(r.components_removed, 1);
+        // OP keeps the dangerous NBT untouched (count clamp still applies).
+        let mut st: Stack = (stone, 1, vec![(0, payload)]);
+        let before = st.2.clone();
+        let r = ac_sanitize_creative_item(&mut st, 4);
+        assert!(!r.was_sanitized);
+        assert_eq!(st.2, before);
+    }
+
+    #[test]
+    fn ops_ac5_killaura_ignores_normal_pvp_and_alerts_sustained_snap_switch() {
+        let t0 = Instant::now();
+        // Normal PvP: ~2 attacks/second, small yaw drift, one target, hits in
+        // view — no signal ever accumulates.
+        let mut ka = AcKillAuraState::default();
+        for i in 0..20 {
+            let now = t0 + Duration::from_millis(500 * i);
+            assert_eq!(
+                ka.record_attack(now, 10.0 + i as f32 * 0.5, (4, 8, 12), Some(5.0)),
+                None,
+                "attack {i}"
+            );
+        }
+        // A lag burst of identical attacks is cadence noise, not an aura.
+        // (Well past the PvP samples above so the 1 s window starts empty.)
+        for i in 0..8 {
+            assert_eq!(
+                ka.record_attack(t0 + Duration::from_secs(20), 10.0, (4, 8, 12), None),
+                None,
+                "burst {i}"
+            );
+        }
+        // One yaw snap plus one target switch plus one out-of-FOV hit is
+        // evidence — annoying but never an alert on its own.
+        let mut odd = AcKillAuraState::default();
+        assert_eq!(odd.record_attack(t0, 0.0, (1, 1, 1), None), None);
+        assert_eq!(
+            odd.record_attack(t0 + Duration::from_millis(100), 200.0, (9, 9, 9), Some(80.0)),
+            None
+        );
+        // Sustained aura cadence: snap + switch + out-of-FOV every 80 ms.
+        // VL crosses the alert threshold within a few hits and pages once.
+        let mut aura = AcKillAuraState::default();
+        let mut alerts = Vec::new();
+        for i in 0..12 {
+            let now = t0 + Duration::from_millis(80 * i);
+            let (yaw, target) = if i % 2 == 0 { (0.0, (1, 1, 1)) } else { (200.0, (9, 9, 9)) };
+            if let Some(alert) = aura.record_attack(now, yaw, target, Some(80.0)) {
+                alerts.push((i, alert));
+            }
+        }
+        assert_eq!(alerts.len(), 1, "exactly one alert inside 12 hits: {alerts:?}");
+        assert!(alerts[0].1.contains("kill-aura"));
+        assert!(alerts[0].0 >= 2, "single/double hits must not alert: {alerts:?}");
+        // The 5 s re-arm means a continuing burst cannot spam operators.
+        let mut spam = AcKillAuraState::default();
+        let mut count = 0;
+        for i in 0..40 {
+            let now = t0 + Duration::from_millis(80 * i);
+            let (yaw, target) = if i % 2 == 0 { (0.0, (1, 1, 1)) } else { (200.0, (9, 9, 9)) };
+            if spam.record_attack(now, yaw, target, Some(80.0)).is_some() {
+                count += 1;
+            }
+        }
+        assert!(count <= 2, "40 hits in 3.2 s may page at most twice: {count}");
     }
 }
