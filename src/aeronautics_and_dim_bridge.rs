@@ -627,6 +627,35 @@ impl DimensionModRuntimeBridge {
         Ok(report)
     }
 
+    /// Environment profiles of every *discovered* dimension, in canonical
+    /// `registered_dims` order — the state `AER1` carries. Builtin profiles are
+    /// skipped: they re-derive at boot like `dim_types` and the portal table.
+    fn persistent_env_records(&self) -> Vec<dim_mod::DimensionEnvProfile> {
+        self.registered_dims
+            .iter()
+            .filter_map(|(name, dim)| {
+                self.env_by_dim
+                    .get(dim)
+                    .or_else(|| self.env_by_name.get(name))
+                    .cloned()
+            })
+            .collect()
+    }
+
+    /// Reinstall `AER1` environment records: profiles whose dimension still
+    /// exists relink their `DimId`/`registered_dims` entry; profiles for a dim
+    /// whose JAR vanished still answer through `env_by_name` so gravity and
+    /// occlusion queries keep their last-known values.
+    fn restore_env_records(&mut self, records: Vec<dim_mod::DimensionEnvProfile>) {
+        for env in records {
+            if let Some(dim) = DimId::parse_dimension_id(&env.dimension_id) {
+                self.registered_dims.insert(env.dimension_id.clone(), dim);
+                self.env_by_dim.insert(dim, env.clone());
+            }
+            self.env_by_name.insert(env.dimension_id.clone(), env);
+        }
+    }
+
     /// Convert a validated `PortalTransition` into the `TeleportIntent` the
     /// server should execute, then grant `eid` `ac_expect_teleport` +
     /// `ac_grant_grace` for the rule's grace window so the portal hop cannot
@@ -792,6 +821,127 @@ fn aeronautics_bridge_load_bytes(bytes: &[u8]) -> bool {
         .lock()
         .map(|mut b| b.load_bytes(bytes).is_ok())
         .unwrap_or(false)
+}
+
+/// Whether the aeronautics + dimension-mod bridges hold state Save v2 must
+/// persist: a live airship, or at least one discovered (non-builtin) dimension
+/// environment. Both empty means zero `AER1` bytes — vanilla saves untouched.
+#[allow(dead_code)]
+fn aeronautics_bridge_has_state() -> bool {
+    let ships = aeronautics_bridge()
+        .lock()
+        .map(|b| !b.airships.is_empty())
+        .unwrap_or(false);
+    ships
+        || dimension_mod_bridge()
+            .lock()
+            .map(|b| !b.registered_dims.is_empty())
+            .unwrap_or(false)
+}
+
+/// Inner body of the `AER1` trailer: the `MSAE` fleet blob plus the
+/// environment profiles of every discovered dimension. Dimension/type/portal
+/// registrations re-derive from the dimension JARs at boot; what a restart
+/// cannot re-derive — the live fleet and the discovered env overrides — is
+/// what rides the trailer.
+#[allow(dead_code)]
+fn aeronautics_state_save_bytes() -> Vec<u8> {
+    let msae = aeronautics_bridge_save_bytes();
+    let records = dimension_mod_bridge()
+        .lock()
+        .map(|b| b.persistent_env_records())
+        .unwrap_or_default();
+    let mut out = Vec::with_capacity(msae.len() + 8 + records.len() * 96);
+    mod_wire::write_varint(&mut out, msae.len() as u32);
+    out.extend_from_slice(&msae);
+    mod_wire::write_varint(&mut out, records.len() as u32);
+    for env in &records {
+        mod_wire::write_mc_string(&mut out, &env.dimension_id);
+        out.extend_from_slice(&env.gravity_multiplier.to_be_bytes());
+        out.push(env.requires_oxygen as u8);
+        out.push(env.has_skylight as u8);
+        out.push(env.has_ceiling as u8);
+        out.push(env.supports_underground_occlusion as u8);
+        mod_wire::write_mc_string(&mut out, &env.sky_effects);
+    }
+    out
+}
+
+/// Restore `aeronautics_state_save_bytes`; `false` on a corrupt buffer or a
+/// lock failure — the fleet and env tables are left untouched either way.
+#[allow(dead_code)]
+fn aeronautics_state_load_bytes(bytes: &[u8]) -> bool {
+    /// Bound on the embedded `MSAE` blob and the env-record count — real
+    /// trailers are nowhere near either.
+    const AER1_MAX_MSAE: usize = 1 << 26;
+    const AER1_MAX_DIMS: usize = 4_096;
+    let mut cursor = 0usize;
+    let Some(msae_len) = mod_wire::read_varint(bytes, &mut cursor)
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|&n| n <= AER1_MAX_MSAE)
+    else {
+        return false;
+    };
+    let Some(msae) = bytes.get(cursor..cursor + msae_len) else {
+        return false;
+    };
+    cursor += msae_len;
+    let Some(env_count) = mod_wire::read_varint(bytes, &mut cursor)
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|&n| n <= AER1_MAX_DIMS)
+    else {
+        return false;
+    };
+    let mut records = Vec::with_capacity(env_count);
+    for _ in 0..env_count {
+        let Some(dimension_id) = mod_wire::read_mc_string(
+            bytes,
+            &mut cursor,
+            mod_wire::MAX_REGISTRY_DATA_NAME_LEN,
+        ) else {
+            return false;
+        };
+        let Some(gravity_raw) = bytes.get(cursor..cursor + 8) else {
+            return false;
+        };
+        cursor += 8;
+        let gravity_multiplier = f64::from_be_bytes(gravity_raw.try_into().unwrap_or_default());
+        if !gravity_multiplier.is_finite() {
+            return false;
+        }
+        let Some(&[requires_oxygen, has_skylight, has_ceiling, occlusion]) =
+            bytes.get(cursor..cursor + 4)
+        else {
+            return false;
+        };
+        cursor += 4;
+        let Some(sky_effects) = mod_wire::read_mc_string(
+            bytes,
+            &mut cursor,
+            mod_wire::MAX_REGISTRY_DATA_NAME_LEN,
+        ) else {
+            return false;
+        };
+        records.push(dim_mod::DimensionEnvProfile {
+            dimension_id,
+            gravity_multiplier,
+            requires_oxygen: requires_oxygen != 0,
+            has_skylight: has_skylight != 0,
+            has_ceiling: has_ceiling != 0,
+            supports_underground_occlusion: occlusion != 0,
+            sky_effects,
+        });
+    }
+    if cursor != bytes.len() {
+        return false;
+    }
+    if !aeronautics_bridge_load_bytes(msae) {
+        return false;
+    }
+    dimension_mod_bridge()
+        .lock()
+        .map(|mut b| b.restore_env_records(records))
+        .is_ok()
 }
 
 /// Discover an arbitrary Create addon JAR's profiles and forward its `#c:ores`

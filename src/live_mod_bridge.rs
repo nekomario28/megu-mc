@@ -4464,4 +4464,219 @@ version="3.0.0"
         assert!(live_mod_sync_manifest_for_client_probe(None).is_some());
         let _ = std::fs::remove_dir_all(dir);
     }
+    #[cfg(feature = "create-offload")]
+    #[test]
+    fn mega_w3_live_mod_bridge_culinary_season_magic_and_harvest_execute() {
+        use mod_adapter_core::dimension_mod as dim_mod;
+
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        *live_magic_state().lock().unwrap_or_else(|e| e.into_inner()) =
+            LiveMagicState::default();
+        *dimension_mod_bridge().lock().unwrap_or_else(|e| e.into_inner()) =
+            DimensionModRuntimeBridge::new();
+
+        // ---- culinary: a real JAR scan feeds the live dispatchers ----
+        let dir = lmb_temp_dir("mega-w3");
+        std::fs::write(
+            dir.join("farmersdelight.jar"),
+            lmb_culinary_jar("farmersdelight"),
+        )
+        .unwrap();
+        let addon_manifest = br#"{"schemaVersion":1,"id":"unknownaddon","version":"1.0.0"}"#;
+        let cutting = br#"{"type":"unknownaddon:cutting",
+            "ingredients":[{"item":"minecraft:carrot"}],
+            "tool":{"item":"unknownaddon:knife"},
+            "result":[{"item":"unknownaddon:carrot_slices","count":3}]}"#;
+        std::fs::write(
+            dir.join("unknownaddon.jar"),
+            lmb_test_jar(&[
+                ("fabric.mod.json", addon_manifest),
+                ("data/unknownaddon/recipes/carrot_slices.json", cutting),
+            ]),
+        )
+        .unwrap();
+        let mut suite = LiveModSuite::new();
+        suite.scan_mods_dir(&dir);
+        suite.active = true;
+        *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = suite;
+
+        // Heated pot with carrot + bowl completes the scanned recipe on its deadline.
+        let key = (DimId::Overworld, 30, 64, 30);
+        let mut pot = CookingPotState::new();
+        assert!(pot.insert_input("minecraft:carrot", 1));
+        pot.container = Some(("minecraft:bowl".into(), 1));
+        pot.heated = true;
+        live_mod_set_cooking_pot(key.0, key.1, key.2, key.3, pot, 500_000);
+        assert!(live_mod_tick_cooking_pots(500_199).is_empty());
+        let completed = live_mod_tick_cooking_pots(500_200);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].0, key);
+        assert_eq!(completed[0].1.result_item, "farmersdelight:test_soup");
+        assert_eq!(completed[0].1.completed_tick, 500_200);
+        // The unknown addon's cutting recipe resolves through the same registry.
+        let cut = live_mod_cutting_board_use("minecraft:carrot", "unknownaddon:knife", 7)
+            .expect("addon cutting recipe");
+        assert_eq!(cut.outputs, [("unknownaddon:carrot_slices".to_string(), 3)]);
+        live_mod_remove_cooking_pot(key.0, key.1, key.2, key.3);
+
+        // ---- SSN1 season sync on a real socket, deduplicated per player ----
+        let (season_player, mut season_peer) = lmb_client("mega_w3_season", 977_300);
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::clone(&season_player));
+        assert!(live_mod_emit_season_sync(977_300, 0, 0.8));
+        let mut stash = Vec::new();
+        let (id, body) = lmb_read_frame(&mut season_peer, &mut stash).unwrap();
+        assert_eq!(id, LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID);
+        let (channel, payload) = lmb_decode_payload(&body);
+        assert_eq!(channel, "megu:season");
+        assert!(payload.starts_with(b"SSN1"));
+        assert!(!live_mod_emit_season_sync(977_300, 0, 0.8));
+        assert!(lmb_silent(&mut season_peer));
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|c| c.eid != 977_300);
+
+        // ---- right-click harvest: seed deducted from the loot, crop replanted ----
+        assert_eq!(
+            live_mod_try_qol_right_click_harvest(
+                true, "minecraft:wheat", 7, 7, "minecraft:wheat", "minecraft:wheat_seeds", 3, 2
+            ),
+            Some((0, 3, 1))
+        );
+        assert!(live_mod_try_qol_right_click_harvest(
+            true, "minecraft:wheat", 7, 7, "minecraft:wheat", "minecraft:wheat_seeds", 3, 0
+        )
+        .is_none());
+
+        // ---- accessories: per-player slots + attribute aggregation ----
+        let attr = "minecraft:generic.movement_speed";
+        let ring = AccessoryItem::new("mega:ring", ["ring"]).with_modifiers(vec![
+            mod_adapter_core::ecosystem_compat::AttributeModifier {
+                attribute: attr.into(),
+                operation: mod_adapter_core::ecosystem_compat::ModifierOperation::AddValue,
+                amount: 0.05,
+            },
+        ]);
+        live_mod_equip_accessory("mega_w3", "ring", 0, ring).unwrap();
+        assert!(matches!(
+            live_mod_equip_accessory(
+                "mega_w3",
+                "ring",
+                0,
+                AccessoryItem::new("mega:ring2", ["ring"])
+            ),
+            Err(AccessoryError::SlotOccupied { .. })
+        ));
+        assert_eq!(
+            live_mod_accessory_attributes("mega_w3")[attr].apply(1.0),
+            1.05
+        );
+        assert!(live_mod_accessory_attributes("mega_w3_stranger").is_empty());
+
+        // ---- MAG1: mana shield absorbs, cast lands, sync frame encodes ----
+        let uuid = [0x77; 16];
+        live_mod_magic_set_attributes(uuid, lmb_magic::MagicAttributes::default()).unwrap();
+        live_mod_magic_register_status(lmb_magic::StatusEffectDefinition {
+            id: "mega:ward".into(),
+            absorption_per_level: 4.0,
+            ..lmb_magic::StatusEffectDefinition::default()
+        })
+        .unwrap();
+        live_mod_magic_apply_status(uuid, "mega:ward", 0, 40).unwrap();
+        assert_eq!(live_mod_magic_absorb_damage(uuid, 3.0), 0.0);
+        assert_eq!(live_mod_magic_absorb_damage(uuid, 5.0), 4.0);
+        let instant = lmb_magic::SpellDefinition {
+            id: "mega:zap".into(),
+            mana_cost: 10.0,
+            base_cooldown_ticks: 4,
+            cast: lmb_magic::SpellCastState::Instant,
+            interrupt_on_damage: false,
+            interrupt_on_move: false,
+            steps: vec![lmb_magic::SpellNode {
+                form: lmb_magic::SpellForm::SelfCast,
+                effects: vec![lmb_magic::SpellEffect::Heal { base_amount: 5.0 }],
+            }],
+        };
+        assert!(live_mod_magic_cast(uuid, &instant).is_ok());
+        assert!(matches!(
+            live_mod_magic_cast(uuid, &instant),
+            Err(LiveMagicError::Cast(lmb_magic::CastError::OnCooldown { .. }))
+        ));
+        let tick = live_mod_magic_tick_player(uuid).unwrap();
+        let frame = tick.frame.expect("MAG1 sync frame");
+        assert!(frame.windows(4).any(|w| w == b"MAG1"));
+
+        // ---- dimension portal: transition -> intent -> anti-cheat grace ----
+        {
+            let mut b = dimension_mod_bridge().lock().unwrap_or_else(|e| e.into_inner());
+            b.register_portal_rule(dim_mod::PortalRule::new(
+                "megaw3:nether_portal",
+                dim_mod::PortalTrigger::VerticalFrame {
+                    frame_block: "minecraft:obsidian".into(),
+                    min_width: 2,
+                    min_height: 3,
+                    max_width: 4,
+                    max_height: 5,
+                    igniter_item: "minecraft:flint_and_steel".into(),
+                    portal_block: "minecraft:nether_portal".into(),
+                },
+                "minecraft:the_nether",
+            ));
+        }
+        let transition = dim_mod::PortalTransition {
+            rule_name: "megaw3:nether_portal".into(),
+            target_dim: "minecraft:the_nether".into(),
+            anchor: [0, 60, 0],
+            cell_count: 6,
+        };
+        let (traveller, _tp) = lmb_client("mega_w3_travel", 977_301);
+        let (control, _cp) = lmb_client("mega_w3_control", 977_302);
+        for c in [&traveller, &control] {
+            ac_test_set_player_preset(&c.name, AcPreset::Standard);
+            let v = ac_check_move(c, (0.5, 80.0, 0.5), (0.6, 80.0, 0.5), false);
+            assert!(matches!(v, AcMoveVerdict::Accept { .. }));
+        }
+        let source_pos = [4000.5, 70.0, -2000.5];
+        let intent = {
+            let b = dimension_mod_bridge().lock().unwrap_or_else(|e| e.into_inner());
+            b.try_mod_portal_teleport(
+                traveller.eid,
+                DimId::Overworld,
+                DimId::Nether,
+                source_pos,
+                &transition,
+            )
+            .expect("nether transition must produce a teleport intent")
+        };
+        assert_eq!(intent.target_dim, "minecraft:the_nether");
+        assert_eq!(intent.expect_teleport_grace_ticks, 20);
+        // Nether coordinate scale 8.0 maps x/z by source_scale / target_scale.
+        assert!((intent.target_pos[0] - 500.0625).abs() < 1e-9);
+        assert!((intent.target_pos[1] - 70.0).abs() < 1e-9);
+        assert!((intent.target_pos[2] - (-250.0625)).abs() < 1e-9);
+        let to = (intent.target_pos[0], intent.target_pos[1], intent.target_pos[2]);
+        let v = ac_check_move(&traveller, (4000.5, 70.0, -2000.5), to, false);
+        assert!(
+            matches!(v, AcMoveVerdict::Accept { .. }),
+            "portal grace must absorb the dimensional jump"
+        );
+        let v = ac_check_move(&control, (0.6, 80.0, 0.5), (4000.6, 80.0, -2000.5), false);
+        assert!(
+            matches!(v, AcMoveVerdict::Setback),
+            "a non-portal jump of the same distance must still flag"
+        );
+
+        // Leave every global clean for the next test.
+        *dimension_mod_bridge().lock().unwrap_or_else(|e| e.into_inner()) =
+            DimensionModRuntimeBridge::new();
+        *live_magic_state().lock().unwrap_or_else(|e| e.into_inner()) =
+            LiveMagicState::default();
+        fresh_suite();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
 }

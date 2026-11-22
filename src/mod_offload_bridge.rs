@@ -21,12 +21,15 @@
 
 use create_adapter::blockstates::{core_create_registry, CreateBlockRegistry};
 use create_adapter::contraption_adapter::{
-    is_immovable_block_id, ActorTickReport, ContraptionActor, ContraptionActorKind,
-    ContraptionError, ContraptionKind, ContraptionSnapshot, ContraptionStorage,
-    ContraptionWorldQuery, LiveContraption, SuperGlueVolume, WorldBlockEdit,
-    DEFAULT_MAX_CONTRAPTION_BLOCKS,
+    is_immovable_block_id, ActorCell, ActorTickReport, ActorWorldEdit, ContraptionActor,
+    ContraptionActorKind, ContraptionError, ContraptionKind, ContraptionSnapshot,
+    ContraptionStorage, ContraptionWorldQuery, CropCell, LiveContraption, SuperGlueVolume,
+    WorldBlockEdit, WorldItemDrop, DEFAULT_MAX_CONTRAPTION_BLOCKS,
 };
-use create_adapter::factory::{CreateFactory, DimBlockPos as ModBlockPos};
+use create_adapter::factory::{CreateFactory, DimBlockPos as ModBlockPos, KineticUpdateTag};
+use create_adapter::offload_bridge::{
+    AssemblyStress, OffloadBridge, OffloadBudget, OffloadError,
+};
 use create_adapter::neoforge_wire as create_wire;
 use mod_adapter_core::blockstates::DEFAULT_BASE_STATE_ID;
 use mod_adapter_core::neoforge_wire as mod_wire;
@@ -41,6 +44,14 @@ const CONFIG_CUSTOM_PAYLOAD_ID: u8 = 0x01;
 /// bound only bites on genuinely busy modded factories.
 const MOD_OFFLOAD_REGION_STEPS: usize = 1_024;
 const MOD_OFFLOAD_REGION_US: u64 = 500;
+/// Total block-visit work units one `mod_offload` tick may spend across
+/// factory regions and contraption assemblies — a single shared budget so a
+/// runaway modded factory can never starve the actor passes below it.
+const MOD_OFFLOAD_MAX_WORK_UNITS: usize = 16_384;
+/// Default contraption partition workers for the offload engine. The
+/// deterministic fold is bit-identical for every worker count — this only
+/// changes where the motion work executes, never what it produces.
+const MOD_OFFLOAD_DEFAULT_WORKERS: usize = 4;
 
 /// Save v2 bridge codec: `"MSMO"` + version byte, then create-adapter-style
 /// deterministic fields (BE scalars, VarInt counts, MC strings).
@@ -63,9 +74,10 @@ struct ContraptionRider {
 /// literally zero bridge cost.
 #[allow(dead_code)]
 struct ModOffloadBridge {
-    /// Flagship Create adapter: built on `enable_create` so an empty bridge
-    /// carries no registry.
-    create: Option<CreateFactory>,
+    /// Parallel offload engine: owns the flagship `CreateFactory` (built on
+    /// `enable_create`, so an empty bridge carries no registry) and the
+    /// region-partitioned contraption assemblies its parallel scheduler steps.
+    offload: OffloadBridge,
     /// Declarative universal runtime, present iff profiles loaded cleanly.
     universal: Option<UniversalModRuntime>,
     /// Profiles `load_profiles` accepted (kept for config payload parity).
@@ -77,7 +89,9 @@ struct ModOffloadBridge {
     /// network: `pos -> state_id` in the *current* runtime's IDs; persisted as
     /// canonical strings so a reordered registry remaps cleanly.
     placed_create: BTreeMap<ModBlockPos, u32>,
-    contraptions: BTreeMap<u32, LiveContraption>,
+    /// Stress spec per registered assembly, preserved across the
+    /// unregister/re-register cycle every mutable contraption access performs.
+    assembly_stress: BTreeMap<u32, AssemblyStress>,
     next_contraption_id: u32,
     contraption_riders: BTreeMap<i32, ContraptionRider>,
     /// eid -> exact per-tick carry velocity while riding a belt/conveyor.
@@ -86,26 +100,107 @@ struct ModOffloadBridge {
     tag_members: BTreeMap<String, BTreeSet<String>>,
     /// Custom (non-vanilla) state IDs the anti-xray sync decided to hide.
     mod_state_ids: BTreeSet<u32>,
+    /// Partition workers handed to `OffloadBudget::with_workers`; the fold is
+    /// bit-identical for every count.
+    offload_workers: usize,
     /// Ticks actually stepped — the empty bridge must never tick (test evidence).
     ticks_stepped: u64,
+    /// Actor world edits committed through the CAS write path — live proof the
+    /// returned `WorldBlockEdit`s are applied, never discarded.
+    world_block_edits_applied: u64,
+    /// Coalesced kinetic UpdateTag deltas emitted since boot.
+    kinetic_updates_emitted: u64,
+    /// Ticks that produced no step output at all.
+    idle_ticks_skipped: u64,
+}
+
+/// Deterministic summary of one [`ModOffloadBridge::step_tick`]: every output
+/// the engine produced this tick folded into one value so nothing the factory,
+/// the universal runtime, or the contraption actors computed is silently
+/// discarded.
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default)]
+struct BridgeTickOutput {
+    /// Factory regions that produced step output this tick.
+    factory_regions: usize,
+    /// Factory batch records exported this tick (S5-frame payloads).
+    factory_records: usize,
+    /// Universal-runtime regions that produced step output this tick.
+    universal_regions: usize,
+    /// Coalesced kinetic RPM/stress UpdateTag deltas drained after the step,
+    /// in canonical `DimBlockPos` order.
+    kinetic_updates: Vec<(ModBlockPos, KineticUpdateTag)>,
+    /// Assemblies the budget scan actually stepped this tick.
+    assemblies_stepped: usize,
+    /// Eligible assemblies deferred by the work-unit budget (retried later).
+    assemblies_deferred: usize,
+    /// Assemblies frozen by overstress, halt latch, or over-budget cost.
+    assemblies_stopped: usize,
+    /// Work units the engine consumed this tick.
+    work_units_used: usize,
+    /// Actor edits committed into the live world this tick.
+    world_block_edits: Vec<WorldBlockEdit>,
+    /// Items ejected by full onboard storage — reported, never silently lost.
+    item_drops: Vec<WorldItemDrop>,
+    /// The engine's deterministic post-tick digest.
+    digest: u64,
+    /// Fail-closed step error, if the engine refused the tick.
+    error: Option<String>,
+}
+
+#[allow(dead_code)]
+impl BridgeTickOutput {
+    /// Whether this tick produced any observable work at all.
+    fn did_any_work(&self) -> bool {
+        self.factory_regions > 0
+            || self.factory_records > 0
+            || self.universal_regions > 0
+            || self.assemblies_stepped > 0
+            || !self.kinetic_updates.is_empty()
+            || !self.world_block_edits.is_empty()
+            || !self.item_drops.is_empty()
+    }
+}
+
+/// Zero-stress spec for assemblies registered without an explicit budget.
+fn mob_zero_stress() -> AssemblyStress {
+    AssemblyStress {
+        capacity: 0.0,
+        consumption: 0.0,
+    }
+}
+
+/// Map an offload-engine registration failure onto the public contraption
+/// error surface — fail closed, never a half-registered assembly.
+fn mob_offload_err(err: OffloadError) -> ContraptionError {
+    match err {
+        OffloadError::AssemblyTooLarge { count, limit, .. } => {
+            ContraptionError::TooLarge { count, limit }
+        }
+        other => ContraptionError::CorruptSnapshot(format!("offload register: {other:?}")),
+    }
 }
 
 #[allow(dead_code)]
 impl ModOffloadBridge {
     fn new() -> Self {
         Self {
-            create: None,
+            offload: OffloadBridge::new(),
             universal: None,
             profiles: Vec::new(),
             create_state_count: None,
             placed_create: BTreeMap::new(),
-            contraptions: BTreeMap::new(),
+            assembly_stress: BTreeMap::new(),
             next_contraption_id: 1,
             contraption_riders: BTreeMap::new(),
             belt_riders: BTreeMap::new(),
             tag_members: BTreeMap::new(),
             mod_state_ids: BTreeSet::new(),
+            offload_workers: MOD_OFFLOAD_DEFAULT_WORKERS,
             ticks_stepped: 0,
+            world_block_edits_applied: 0,
+            kinetic_updates_emitted: 0,
+            idle_ticks_skipped: 0,
         }
     }
 
@@ -138,14 +233,54 @@ impl ModOffloadBridge {
     }
 
     fn create_registry(&self) -> Option<&CreateBlockRegistry> {
-        self.create.as_ref().map(CreateFactory::registry)
+        self.offload.factory().map(CreateFactory::registry)
     }
 
     /// Build the flagship Create registry + factory if not already present.
+    /// Assemblies only register after the factory arms the engine, so the swap
+    /// below can never drop a live contraption — the drain is belt-and-braces
+    /// in case a future caller ever violates that invariant.
     fn enable_create(&mut self) {
-        self.create.get_or_insert_with(|| {
-            CreateFactory::new(core_create_registry(DEFAULT_BASE_STATE_ID))
-        });
+        if self.offload.factory().is_some() {
+            return;
+        }
+        let parked: Vec<LiveContraption> = self
+            .offload
+            .assembly_ids()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|id| self.offload.unregister_contraption(id))
+            .collect();
+        self.offload = OffloadBridge::with_factory(CreateFactory::new(
+            core_create_registry(DEFAULT_BASE_STATE_ID),
+        ));
+        for contraption in parked {
+            let stress = self
+                .assembly_stress
+                .get(&contraption.id)
+                .copied()
+                .unwrap_or_else(mob_zero_stress);
+            let _ = self.offload.register_contraption(contraption, stress);
+        }
+    }
+
+    /// Run `f` on the live assembly `id`, preserving its stress budget across
+    /// the unregister/re-register cycle the engine requires for `&mut` access.
+    /// `None` when `id` is unknown.
+    fn with_contraption<R>(
+        &mut self,
+        id: u32,
+        f: impl FnOnce(&mut LiveContraption) -> R,
+    ) -> Option<R> {
+        let mut contraption = self.offload.unregister_contraption(id)?;
+        let out = f(&mut contraption);
+        let stress = self
+            .assembly_stress
+            .get(&id)
+            .copied()
+            .unwrap_or_else(mob_zero_stress);
+        let _ = self.offload.register_contraption(contraption, stress);
+        Some(out)
     }
 
     /// State ID space after the (always reserved) Create block states, so the
@@ -176,37 +311,42 @@ impl ModOffloadBridge {
 
     /// Anything worth ticking or syncing. The empty bridge is a zero-cost no-op.
     fn has_work(&self) -> bool {
-        self.create.is_some()
+        self.offload.factory().is_some()
             || self.universal.is_some()
-            || !self.contraptions.is_empty()
+            || self.offload.assembly_count() > 0
             || !self.contraption_riders.is_empty()
             || !self.belt_riders.is_empty()
     }
 
     /// Custom mod block space is live: config-phase payloads exist only now.
     fn mod_blocks_active(&self) -> bool {
-        self.create.is_some() || self.universal.is_some()
+        self.offload.factory().is_some() || self.universal.is_some()
+    }
+
+    /// State Save v2 must carry: placed Create blocks and live contraptions.
+    /// Riders, tag caches and the universal runtime are re-derived at boot or
+    /// next tick, so an otherwise-empty bridge still emits zero trailer bytes.
+    fn has_persistent_state(&self) -> bool {
+        !self.placed_create.is_empty() || self.offload.assembly_count() > 0
     }
 
     /// Place a Create block through the bridge so Save v2 can rebuild the same
-    /// kinetic network after a reload.
+    /// kinetic network after a reload. The returned UpdateTags wake exactly the
+    /// regions whose topology changed; untouched regions stay fingerprint-gated.
     fn place_create_block(
         &mut self,
         pos: ModBlockPos,
         state_id: u32,
-    ) -> Vec<create_adapter::factory::KineticUpdateTag> {
+    ) -> Vec<KineticUpdateTag> {
         self.enable_create();
-        let factory = self.create.as_mut().expect("enable_create just ran");
+        let factory = self.offload.factory_mut().expect("enable_create just ran");
         self.placed_create.insert(pos, state_id);
         factory.place_block(pos, state_id)
     }
 
-    fn remove_create_block(
-        &mut self,
-        pos: ModBlockPos,
-    ) -> Vec<create_adapter::factory::KineticUpdateTag> {
+    fn remove_create_block(&mut self, pos: ModBlockPos) -> Vec<KineticUpdateTag> {
         self.placed_create.remove(&pos);
-        match self.create.as_mut() {
+        match self.offload.factory_mut() {
             Some(factory) => factory.remove_block(pos),
             None => Vec::new(),
         }
@@ -234,7 +374,9 @@ impl ModOffloadBridge {
             kind,
             DEFAULT_MAX_CONTRAPTION_BLOCKS,
         )?;
-        self.contraptions.insert(id, contraption);
+        self.offload
+            .register_contraption(contraption, mob_zero_stress())
+            .map_err(mob_offload_err)?;
         Ok((id, edits))
     }
 
@@ -285,8 +427,17 @@ impl ModOffloadBridge {
         )?;
         self.enable_create();
         self.next_contraption_id = next_id;
-        self.contraptions.insert(id, contraption);
+        self.offload
+            .register_contraption(contraption, mob_zero_stress())
+            .map_err(mob_offload_err)?;
         Ok((id, edits))
+    }
+
+    /// Mount an onboard actor (drill, harvester, deployer...) at a local cell
+    /// of the live assembly `id`. Returns false when `id` is unknown.
+    fn mount_contraption_actor(&mut self, id: u32, actor: ContraptionActor) -> bool {
+        self.with_contraption(id, |contraption| contraption.actors.push(actor))
+            .is_some()
     }
 
     /// Advance mounted Create actors and return their proposed world edits.
@@ -295,11 +446,12 @@ impl ModOffloadBridge {
         id: u32,
         query: &dyn ContraptionWorldQuery,
     ) -> Option<ActorTickReport> {
-        Some(self.contraptions.get_mut(&id)?.step_actors(query))
+        self.with_contraption(id, |contraption| contraption.step_actors(query))
     }
 
     /// Unmount a contraption only when every placement target is available.
-    /// An unknown id returns an empty conflict list and preserves the bridge.
+    /// An unknown id returns an empty conflict list and preserves the bridge;
+    /// a conflict puts the contraption back exactly where the scan found it.
     fn disassemble_contraption_checked<F>(
         &mut self,
         id: u32,
@@ -308,20 +460,32 @@ impl ModOffloadBridge {
     where
         F: Fn(ModBlockPos) -> bool,
     {
-        let Some(contraption) = self.contraptions.get(&id) else {
+        let Some(contraption) = self.offload.unregister_contraption(id) else {
             return Err(Vec::new());
         };
-        let edits = contraption.disassemble_to_world_checked(is_occupied)?;
-        self.contraptions.remove(&id);
-        self.contraption_riders
-            .retain(|_, rider| rider.contraption != id);
-        Ok(edits)
+        match contraption.disassemble_to_world_checked(is_occupied) {
+            Ok(edits) => {
+                self.assembly_stress.remove(&id);
+                self.contraption_riders
+                    .retain(|_, rider| rider.contraption != id);
+                Ok(edits)
+            }
+            Err(conflicts) => {
+                let stress = self
+                    .assembly_stress
+                    .get(&id)
+                    .copied()
+                    .unwrap_or_else(mob_zero_stress);
+                let _ = self.offload.register_contraption(contraption, stress);
+                Err(conflicts)
+            }
+        }
     }
 
     /// Attach player `eid` to a live contraption at world `anchor`. Each tick the
     /// rigid pose delta is granted to anti-cheat exactly.
     fn note_contraption_rider(&mut self, eid: i32, contraption: u32, anchor: [f64; 3]) -> bool {
-        if !self.contraptions.contains_key(&contraption) {
+        if self.offload.assembly(contraption).is_none() {
             return false;
         }
         self.contraption_riders
@@ -477,26 +641,81 @@ impl ModOffloadBridge {
         out
     }
 
-    /// Advance the whole bridge by one server tick: region budgets for both
-    /// adapter tiers, contraption poses, then exact carry grants into anti-cheat.
-    fn step_tick(&mut self, tick: u64) {
+    /// Advance the whole bridge by one server tick and return every output the
+    /// engine produced: parallel factory region + contraption motion step, the
+    /// coalesced kinetic UpdateTag deltas, the universal runtime step, actor
+    /// world edits committed into the live world through the CAS path, and the
+    /// exact carry grants into anti-cheat.
+    fn step_tick(&mut self, tick: u64) -> BridgeTickOutput {
         self.ticks_stepped += 1;
-        if let Some(factory) = &mut self.create {
-            let _ = factory.step_tick(tick, MOD_OFFLOAD_REGION_STEPS, Some(MOD_OFFLOAD_REGION_US));
+        let mut out = BridgeTickOutput::default();
+
+        // One deterministic engine step: factory regions and contraption
+        // assemblies partitioned across `offload_workers`, folded in canonical
+        // order — bit-identical for every worker count.
+        let mut budget =
+            OffloadBudget::new(MOD_OFFLOAD_MAX_WORK_UNITS).with_workers(self.offload_workers);
+        budget.factory_region_steps = MOD_OFFLOAD_REGION_STEPS;
+        budget.factory_region_micros = Some(MOD_OFFLOAD_REGION_US);
+        match self.offload.step_tick(tick, budget) {
+            Ok(report) => {
+                out.factory_regions = report.factory_regions;
+                out.factory_records = report.factory_records;
+                out.work_units_used = report.work_units_used;
+                out.assemblies_stepped = report.stepped;
+                out.assemblies_deferred = report.deferred;
+                out.assemblies_stopped =
+                    report.overstressed + report.halted + report.over_budget;
+                out.digest = report.digest;
+            }
+            Err(err) => {
+                self.idle_ticks_skipped += 1;
+                out.error = Some(format!("offload step refused: {err:?}"));
+                return out;
+            }
         }
         if let Some(universal) = &mut self.universal {
-            let _ = universal.step_tick(tick, MOD_OFFLOAD_REGION_STEPS, Some(MOD_OFFLOAD_REGION_US));
+            out.universal_regions = universal
+                .step_tick(tick, MOD_OFFLOAD_REGION_STEPS, Some(MOD_OFFLOAD_REGION_US))
+                .len();
         }
-        for contraption in self.contraptions.values_mut() {
-            let _ = contraption.step_tick();
+        // Kinetic deltas are real output, not noise: drain the coalesced
+        // UpdateTag batch so RPM/stress changes reach the wire.
+        if let Some(factory) = self.offload.factory_mut() {
+            factory.drain_update_batch_into(&mut out.kinetic_updates);
         }
+        self.kinetic_updates_emitted += out.kinetic_updates.len() as u64;
+
+        // Actor pass: every mounted actor acts on its swept cell of the live
+        // world. `step_actors` reports edits instead of applying them; the
+        // loop below commits each through the dimension-aware CAS write, so
+        // immovable or out-of-bounds cells fail closed.
+        for id in self.offload.assembly_ids().collect::<Vec<_>>() {
+            let Some(report) = self.with_contraption(id, |contraption| {
+                let dim = contraption.dim;
+                contraption.step_actors(&LiveModWorldQuery { dim })
+            }) else {
+                continue;
+            };
+            for edit in &report.edits {
+                let Some(edit) = mob_actor_world_edit(edit) else {
+                    continue;
+                };
+                if mob_commit_world_block_edit(&edit) {
+                    self.world_block_edits_applied += 1;
+                }
+                out.world_block_edits.push(edit);
+            }
+            out.item_drops.extend(report.drops);
+        }
+
         // Exact rigid-carry deltas: `passenger_delta` is the displacement the
         // contraption just applied to the rider's attached point; belts carry a
         // fixed per-tick velocity. Both go through `ac_note_carried_motion`, so
         // the move is granted exactly and NoFall treats the rider as supported —
         // no rubber-banding, no false fall damage, real teleports still flag.
         for (eid, rider) in self.contraption_riders.iter_mut() {
-            let Some(contraption) = self.contraptions.get(&rider.contraption) else {
+            let Some(contraption) = self.offload.assembly(rider.contraption) else {
                 continue;
             };
             let Some(delta) = contraption.passenger_delta(rider.anchor) else {
@@ -510,6 +729,11 @@ impl ModOffloadBridge {
         for (&eid, &delta) in &self.belt_riders {
             ac_note_carried_motion(eid, delta);
         }
+
+        if !out.did_any_work() {
+            self.idle_ticks_skipped += 1;
+        }
+        out
     }
 
     /// Deterministic Save v2 binary snapshot: placed Create blocks as canonical
@@ -535,7 +759,13 @@ impl ModOffloadBridge {
 
         let snapshots: Vec<ContraptionSnapshot> = self
             .create_registry()
-            .map(|reg| self.contraptions.values().map(|c| c.snapshot(reg)).collect())
+            .map(|reg| {
+                self.offload
+                    .assembly_ids()
+                    .filter_map(|id| self.offload.assembly(id))
+                    .map(|c| c.snapshot(reg))
+                    .collect()
+            })
             .unwrap_or_default();
         mod_wire::write_varint(&mut out, snapshots.len() as u32);
         for snap in &snapshots {
@@ -608,11 +838,14 @@ impl ModOffloadBridge {
         for (pos, state_id) in pending {
             self.place_create_block(pos, state_id);
         }
-        self.contraptions.clear();
+        for id in self.offload.assembly_ids().collect::<Vec<_>>() {
+            let _ = self.offload.unregister_contraption(id);
+        }
+        self.assembly_stress.clear();
         let mut max_id = 0u32;
         for c in restored {
             max_id = max_id.max(c.id);
-            self.contraptions.insert(c.id, c);
+            let _ = self.offload.register_contraption(c, mob_zero_stress());
         }
         self.next_contraption_id = self.next_contraption_id.max(max_id + 1);
         Ok(())
@@ -631,6 +864,126 @@ fn ns_rl(name: &str) -> String {
     } else {
         format!("minecraft:{name}")
     }
+}
+
+/// Live-world view handed to `LiveContraption::step_actors`: reads real chunk
+/// cells through `block_at_dim` and resolves names, hardness and crop ages
+/// from the vanilla registry. A cell the registry cannot name — an out-of-range
+/// mod state, an absent registry — reports as air, a fail-closed skip rather
+/// than a guess.
+#[allow(dead_code)]
+struct LiveModWorldQuery {
+    dim: i32,
+}
+
+#[allow(dead_code)]
+impl ContraptionWorldQuery for LiveModWorldQuery {
+    fn cell_at(&self, pos: [i32; 3]) -> ActorCell {
+        let Ok(raw) = u32::try_from(self.dim) else {
+            return ActorCell::air();
+        };
+        let st = block_at_dim(DimId::from_raw(raw), pos[0], pos[1], pos[2]);
+        let Some(reg) = breg() else {
+            return ActorCell::air();
+        };
+        if (st as usize) >= reg.state_count() || reg.is_air(st) {
+            return ActorCell::air();
+        }
+        let name = reg.name_of(st).to_string();
+        let mut cell = ActorCell::block(
+            name.clone(),
+            !is_immovable_block_id(&name) && reg.hardness_of(st) >= 0.0,
+        );
+        cell.crop = mob_crop_cell(reg, st, &name);
+        cell
+    }
+
+    fn place_state_for(&self, item_id: &str) -> Option<u32> {
+        name_to_state(item_id)
+    }
+}
+
+/// Map a live crop state onto the harvester's `CropCell`: growth stage from the
+/// real `age` property plus the drop table a Create harvester yields. Returns
+/// `None` for non-crops — the harvester skips the cell entirely then.
+#[allow(dead_code)]
+fn mob_crop_cell(reg: &BReg, st: u32, name: &str) -> Option<CropCell> {
+    let (max_age, drop_item, drop_count): (u8, &str, u32) = match name {
+        "minecraft:wheat" => (7, "minecraft:wheat", 1),
+        "minecraft:carrots" => (7, "minecraft:carrot", 2),
+        "minecraft:potatoes" => (7, "minecraft:potato", 2),
+        "minecraft:beetroots" => (3, "minecraft:beetroot", 1),
+        "minecraft:nether_wart" => (3, "minecraft:nether_wart", 2),
+        "minecraft:cocoa" => (2, "minecraft:cocoa_beans", 2),
+        _ => return None,
+    };
+    let age: u8 = reg
+        .properties_of(st)?
+        .into_iter()
+        .find(|(prop, _)| prop == "age")?
+        .1
+        .parse()
+        .ok()?;
+    Some(CropCell {
+        age,
+        max_age,
+        drop_item: drop_item.to_string(),
+        drop_count,
+    })
+}
+
+/// Translate one reported `ActorWorldEdit` into the world-space `WorldBlockEdit`
+/// the commit queue applies. `ResetCrop` re-resolves the live crop to its age-0
+/// state; an edit that cannot resolve a target state is dropped, never guessed.
+#[allow(dead_code)]
+fn mob_actor_world_edit(edit: &ActorWorldEdit) -> Option<WorldBlockEdit> {
+    match edit {
+        ActorWorldEdit::BreakBlock { pos } => Some(WorldBlockEdit {
+            pos: *pos,
+            state_id: None,
+        }),
+        ActorWorldEdit::PlaceBlock { pos, state_id, .. } => Some(WorldBlockEdit {
+            pos: *pos,
+            state_id: Some(*state_id),
+        }),
+        ActorWorldEdit::ResetCrop { pos } => {
+            let raw = u32::try_from(pos.dim).ok()?;
+            let st = block_at_dim(DimId::from_raw(raw), pos.x, pos.y, pos.z);
+            let reset = breg().map(|reg| reg.with_prop(st, "age", "0"))?;
+            (reset != st).then_some(WorldBlockEdit {
+                pos: *pos,
+                state_id: Some(reset),
+            })
+        }
+    }
+}
+
+/// Commit one bridge-produced world edit through the same CAS write path the
+/// server uses, preserving dimension awareness and every side effect (lighting,
+/// anti-xray, block entities, redstone, persistence notes). Fails closed on
+/// out-of-bounds cells, immovable targets, and cells another writer already
+/// raced past; returns whether the edit landed.
+#[allow(dead_code)]
+fn mob_commit_world_block_edit(edit: &WorldBlockEdit) -> bool {
+    let Ok(raw) = u32::try_from(edit.pos.dim) else {
+        return false;
+    };
+    let dim = DimId::from_raw(raw);
+    let (x, y, z) = (edit.pos.x, edit.pos.y, edit.pos.z);
+    if y < MIN_Y || y >= MIN_Y + 384 {
+        return false;
+    }
+    let target = edit.state_id.unwrap_or(0);
+    let old = block_at_dim(dim, x, y, z);
+    if old == target {
+        return false;
+    }
+    if let Some(reg) = breg() {
+        if (old as usize) < reg.state_count() && is_immovable_block_id(reg.name_of(old)) {
+            return false;
+        }
+    }
+    set_block_if_dim(dim, x, y, z, target, Some(old))
 }
 
 /// Path component of a resource location (`"create:zinc_ore"` -> `"zinc_ore"`).
@@ -980,6 +1333,16 @@ fn mod_offload_sync_antixray_tags() -> usize {
         .unwrap_or(0)
 }
 
+/// Whether the bridge holds state Save v2 must persist — the `MOF1` trailer is
+/// emitted only then, keeping untouched vanilla saves byte-identical.
+#[allow(dead_code)]
+fn mod_offload_has_state() -> bool {
+    mod_offload_bridge()
+        .lock()
+        .map(|b| b.has_persistent_state())
+        .unwrap_or(false)
+}
+
 /// Save v2 bytes for the whole offload state (placed blocks + contraptions).
 #[allow(dead_code)]
 fn mod_offload_save_bytes() -> Vec<u8> {
@@ -1045,7 +1408,7 @@ mod mod_offload_bridge_tests {
             Err(ContraptionError::ImmovableBlock { pos: attached })
         );
         assert_eq!(bridge.next_contraption_id, 1);
-        assert!(bridge.contraptions.is_empty());
+        assert_eq!(bridge.offload.assembly_count(), 0);
         world.insert(attached, (101, "minecraft:oak_planks".to_string()));
 
         let (id, removals) = bridge
@@ -1056,11 +1419,14 @@ mod mod_offload_bridge_tests {
         assert!(removals.iter().all(|edit| edit.state_id.is_none()));
         assert!(!removals.iter().any(|edit| edit.pos.x == unglued[0]));
 
-        bridge.contraptions.get_mut(&id).unwrap().actors.push(ContraptionActor {
-            local: [1, 0, 0],
-            facing: [1, 0, 0],
-            kind: ContraptionActorKind::MechanicalDrill,
-        });
+        assert!(bridge.mount_contraption_actor(
+            id,
+            ContraptionActor {
+                local: [1, 0, 0],
+                facing: [1, 0, 0],
+                kind: ContraptionActorKind::MechanicalDrill,
+            },
+        ));
         let report = bridge.step_contraption_actors(id, &StoneAt(unglued)).unwrap();
         assert_eq!(report.edits, vec![ActorWorldEdit::BreakBlock {
             pos: ModBlockPos::new(dim.raw() as i32, unglued[0], unglued[1], unglued[2])
@@ -1073,7 +1439,7 @@ mod mod_offload_bridge_tests {
             bridge.disassemble_contraption_checked(id, |pos| pos == conflict),
             Err(vec![conflict])
         );
-        assert!(bridge.contraptions.contains_key(&id));
+        assert!(bridge.offload.assembly(id).is_some());
         assert!(bridge.contraption_riders.contains_key(&900));
 
         let edits = bridge.disassemble_contraption_checked(id, |_| false).unwrap();
@@ -1082,7 +1448,7 @@ mod mod_offload_bridge_tests {
             edits.iter().filter_map(|edit| edit.state_id).collect::<Vec<_>>(),
             vec![100, 101]
         );
-        assert!(!bridge.contraptions.contains_key(&id));
+        assert!(bridge.offload.assembly(id).is_none());
         assert!(!bridge.contraption_riders.contains_key(&900));
         assert_eq!(bridge.disassemble_contraption_checked(id, |_| false), Err(Vec::new()));
     }
@@ -1439,8 +1805,8 @@ mod mod_offload_bridge_tests {
         src.place_create_block(p_wheel, wheel_x);
         src.place_create_block(p_shaft, shaft_x);
         let sol = src
-            .create
-            .as_ref()
+            .offload
+            .factory()
             .unwrap()
             .kinetic_solution(p_shaft)
             .unwrap();
@@ -1479,24 +1845,117 @@ mod mod_offload_bridge_tests {
         dst.load_bytes(&bytes).unwrap();
         // The kinetic network rebuilt: wheel + shaft re-placed and driving.
         let sol = dst
-            .create
-            .as_ref()
+            .offload
+            .factory()
             .unwrap()
             .kinetic_solution(p_shaft)
             .unwrap();
         assert!(sol.speed.abs() > 0.0);
         // The contraption came back with pose, kind and blocks intact.
-        let restored = dst.contraptions.get(&cid).unwrap();
+        let restored = dst.offload.assembly(cid).unwrap();
         assert_eq!(restored.block_count(), 3);
         assert!((restored.yaw_deg - 30.0).abs() < 1e-6);
         let snap_src = src
-            .contraptions
-            .get(&cid)
+            .offload
+            .assembly(cid)
             .unwrap()
             .snapshot(src.create_registry().unwrap());
         let snap_dst = restored.snapshot(dst.create_registry().unwrap());
         assert_eq!(snap_src, snap_dst);
         // And the loaded bridge serializes back to identical bytes.
         assert_eq!(dst.save_bytes(), bytes);
+    }
+
+    #[test]
+    fn mega_w3_offload_bridge_applies_contraption_world_edits_and_steps_parallel_deterministically()
+    {
+        let _w = world_guard();
+        let reg = core_create_registry(DEFAULT_BASE_STATE_ID);
+        let shaft = reg.default_state("create:shaft").unwrap();
+        let wheel = reg.default_state("create:water_wheel").unwrap();
+        let stone = name_to_state("minecraft:stone").unwrap();
+        let dim = DimId::Overworld;
+
+        // Three drill contraptions in far-apart regions; each drill's swept
+        // cell sits one block -X of its anchor and holds real stone written
+        // into the live world through the CAS path.
+        let anchors = [
+            [5_000, 200, 5_000],
+            [20_000, 200, 20_000],
+            [-15_000, 200, -15_000],
+        ];
+        let targets: Vec<[i32; 3]> =
+            anchors.iter().map(|a| [a[0] - 1, a[1], a[2]]).collect();
+        let plant = |targets: &[[i32; 3]]| {
+            for &t in targets {
+                let old = block_at_dim(dim, t[0], t[1], t[2]);
+                assert!(set_block_if_dim(dim, t[0], t[1], t[2], stone, Some(old)));
+            }
+        };
+        plant(&targets);
+
+        let build = |workers: usize| {
+            let mut bridge = ModOffloadBridge::new();
+            bridge.offload_workers = workers;
+            // A placed Create block exercises the factory tier too.
+            bridge.place_create_block(ModBlockPos::new(0, 6_000, 64, 6_000), wheel);
+            for anchor in anchors {
+                let mut blocks = BTreeMap::new();
+                blocks.insert(anchor, shaft);
+                let (cid, _) = bridge
+                    .assemble_contraption(
+                        dim,
+                        anchor,
+                        anchor,
+                        &blocks,
+                        ContraptionKind::Linear {
+                            velocity_per_tick: [0.0, 0.0, 0.0],
+                        },
+                    )
+                    .unwrap();
+                assert!(bridge.mount_contraption_actor(
+                    cid,
+                    ContraptionActor {
+                        local: [0, 0, 0],
+                        facing: [-1, 0, 0],
+                        kind: ContraptionActorKind::MechanicalDrill,
+                    },
+                ));
+            }
+            bridge
+        };
+
+        // Serial pass: the drill edits must reach the live world — nothing is
+        // discarded any more.
+        let mut serial = build(1);
+        let out = serial.step_tick(1);
+        assert!(out.error.is_none(), "offload step refused: {:?}", out.error);
+        assert_eq!(out.world_block_edits.len(), 3);
+        assert_eq!(serial.world_block_edits_applied, 3);
+        for &t in &targets {
+            assert_eq!(
+                block_at_dim(dim, t[0], t[1], t[2]),
+                0,
+                "drill must have broken the stone at {t:?}"
+            );
+        }
+
+        // Restore the broken cells, then the parallel pass must produce the
+        // exact same edit stream and digest.
+        plant(&targets);
+        let mut parallel = build(8);
+        let par_out = parallel.step_tick(1);
+        assert!(par_out.error.is_none(), "offload step refused: {:?}", par_out.error);
+        assert_eq!(par_out.world_block_edits, out.world_block_edits);
+        assert_eq!(par_out.digest, out.digest);
+        assert_eq!(parallel.offload.state_digest(), serial.offload.state_digest());
+        assert_eq!(parallel.save_bytes(), serial.save_bytes());
+        assert_eq!(
+            parallel.world_block_edits_applied,
+            serial.world_block_edits_applied
+        );
+        for &t in &targets {
+            assert_eq!(block_at_dim(dim, t[0], t[1], t[2]), 0);
+        }
     }
 }

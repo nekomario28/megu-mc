@@ -2556,6 +2556,10 @@ fn save_world_into(f: &mut Vec<u8>) {
     // WBE1 tucks beneath WBD1: a registry with nothing in it emits not one
     // byte, so an untouched world keeps the exact pre-record tail.
     append_wbe_footer(f);
+    // MOF1/AER1 tuck between WBE1 and WBD1: each is emitted only while its
+    // mod bridge holds state, so an untouched vanilla save keeps the exact
+    // pre-record tail byte-for-byte.
+    append_mod_bridge_trailers(f);
     // WBD1 rides alongside VER1 beneath the seed trailer and, like every other
     // additive footer, is emitted only when it would say something a default
     // save does not already imply.
@@ -4121,6 +4125,9 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     if let Some(border) = world_border_save {
         apply_saved_world_border(&border);
     }
+    // MOF1/AER1 tuck between WBE1 and WBD1; footers strip last-written-first.
+    let (payload, aer1) = read_mod_bridge_trailer(payload, AERONAUTICS_TRAILER_MAGIC)?;
+    let (payload, mof1) = read_mod_bridge_trailer(payload, MOD_OFFLOAD_TRAILER_MAGIC)?;
     let (payload, wbe_entries) = read_wbe_footer(payload)?;
     let (payload, sign_meta_records) = read_sign_meta_footer(payload)?;
     let (payload, dxt) = read_dxt_footer(payload)?;
@@ -5393,6 +5400,11 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     *live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner()) = brewing;
     restore_wbe_entries(wbe_entries);
     restore_saved_block_entities(block_entities);
+    // The mod-bridge trailers apply last: their codecs validate the whole blob
+    // before touching live state, and running them after the core world is
+    // fully restored means a corrupt trailer can never observe — or leave —
+    // half-loaded core state.
+    apply_mod_bridge_trailers(mof1, aer1)?;
     eprintln!(
         "[spine] loaded {} dirty chunks",
         world().lock().unwrap_or_else(|e| e.into_inner()).len()
@@ -6048,6 +6060,117 @@ fn restore_wbe_entries(entries: Vec<(DimBlockPos, VanillaBlockEntity)>) {
     for (key, entity) in entries {
         registry.insert(key, entity);
     }
+}
+
+// ---------- mod-bridge trailers (MOF1 / AER1) ----------
+//
+// Optional trailing records for the mod bridges: `MOF1` carries the
+// Create/mod-offload state (placed Create blocks + live contraptions) and
+// `AER1` the aeronautics fleet plus discovered dimension environments. Each
+// body is `[u8 schema][u32 inner len][u32 crc32(inner)][inner]`, framed
+// `[body][u64 body size][magic]` like every other optional trailer — and each
+// is emitted only while its bridge holds state, so a vanilla save keeps the
+// exact pre-record tail byte-for-byte.
+
+const MOD_OFFLOAD_TRAILER_MAGIC: &[u8; 4] = b"MOF1";
+const AERONAUTICS_TRAILER_MAGIC: &[u8; 4] = b"AER1";
+/// Sanity bound on a mod trailer body; a real fleet/factory is nowhere near.
+const MOD_TRAILER_MAX_BODY: usize = 1 << 26;
+const MOD_TRAILER_SCHEMA: u8 = 1;
+
+/// Emit the optional `MOF1`/`AER1` trailers for any bridge holding state.
+/// With the `create-offload` feature off — or both bridges empty — this
+/// appends zero bytes.
+fn append_mod_bridge_trailers(out: &mut Vec<u8>) {
+    #[cfg(feature = "create-offload")]
+    {
+        if mod_offload_has_state() {
+            append_mod_bridge_trailer(out, MOD_OFFLOAD_TRAILER_MAGIC, &mod_offload_save_bytes());
+        }
+        if aeronautics_bridge_has_state() {
+            append_mod_bridge_trailer(
+                out,
+                AERONAUTICS_TRAILER_MAGIC,
+                &aeronautics_state_save_bytes(),
+            );
+        }
+    }
+    let _ = out;
+}
+
+/// Frame `inner` as one mod trailer: schema + declared length + CRC32 of the
+/// inner bytes, then the `[body][u64 body size][magic]` wrapper every optional
+/// footer uses.
+#[allow(dead_code)]
+fn append_mod_bridge_trailer(out: &mut Vec<u8>, magic: &[u8; 4], inner: &[u8]) {
+    let start = out.len();
+    out.push(MOD_TRAILER_SCHEMA);
+    save_numbers!(out, inner.len() as u32, persist_crc32(inner));
+    out.extend_from_slice(inner);
+    save_numbers!(out, (out.len() - start) as u64);
+    out.extend_from_slice(magic);
+}
+
+/// Peel one optional mod trailer: returns the payload minus the trailer plus
+/// the CRC-validated inner bytes, `None` when the trailer is absent. Bad
+/// framing, a mismatched length, or a checksum failure all fail closed.
+fn read_mod_bridge_trailer<'a>(
+    payload: &'a [u8],
+    magic: &[u8; 4],
+) -> Result<(&'a [u8], Option<&'a [u8]>), &'static str> {
+    let (payload, body) = split_save_footer(payload, magic)?;
+    let Some(body) = body else {
+        return Ok((payload, None));
+    };
+    if body.len() > MOD_TRAILER_MAX_BODY {
+        return Err("mod bridge trailer out of range");
+    }
+    let mut input = SaveInput(body);
+    if input.byte()? != MOD_TRAILER_SCHEMA {
+        return Err("unsupported mod bridge trailer");
+    }
+    let inner_len = usize::try_from(u32::from_be_bytes(input.take()?))
+        .map_err(|_| "invalid mod bridge trailer")?;
+    let crc = u32::from_be_bytes(input.take()?);
+    let inner = input.bytes(inner_len)?;
+    if persist_crc32(inner) != crc {
+        return Err("mod bridge trailer checksum mismatch");
+    }
+    if !input.0.is_empty() {
+        return Err("trailing bytes in mod bridge trailer");
+    }
+    Ok((payload, Some(inner)))
+}
+
+/// Restore the mod-bridge trailers after the core world decoded cleanly.
+/// Each bridge codec itself is all-or-nothing; a save carrying mod state on a
+/// build that cannot restore it fails closed rather than silently dropping
+/// the contraptions and airships it stored.
+#[cfg(feature = "create-offload")]
+fn apply_mod_bridge_trailers(
+    mof1: Option<&[u8]>,
+    aer1: Option<&[u8]>,
+) -> Result<(), &'static str> {
+    if mof1.is_some_and(|inner| !mod_offload_load_bytes(inner)) {
+        return Err("corrupt mod offload trailer");
+    }
+    if aer1.is_some_and(|inner| !aeronautics_state_load_bytes(inner)) {
+        return Err("corrupt aeronautics trailer");
+    }
+    Ok(())
+}
+
+/// Default builds carry no mod bridge: a `MOF1`/`AER1` trailer must be an
+/// error, not a silent drop of the state it stored.
+#[cfg(not(feature = "create-offload"))]
+fn apply_mod_bridge_trailers(
+    mof1: Option<&[u8]>,
+    aer1: Option<&[u8]>,
+) -> Result<(), &'static str> {
+    if mof1.is_some() || aer1.is_some() {
+        return Err("world snapshot carries mod bridge state this build cannot load");
+    }
+    Ok(())
 }
 
 // Live block-entity snapshots (#216): beacon, campfire, lectern, chiseled

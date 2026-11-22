@@ -2946,3 +2946,238 @@ fn save_v2_autosave_preserves_bed_and_anchor_spawn_target_kinds() {
         })
     );
 }
+
+// ---------- Wave M3: MOF1 / AER1 mod-bridge trailers ----------
+
+#[cfg(feature = "create-offload")]
+#[test]
+fn mega_w3_save_v2_roundtrips_mof1_and_aer1_while_empty_vanilla_stays_identical() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let _guard = world_guard();
+
+    // ---- 1. Empty bridges: zero extra bytes, deterministic byte-identical saves. ----
+    {
+        *mod_offload_bridge().lock().unwrap_or_else(|e| e.into_inner()) =
+            ModOffloadBridge::new();
+        *aeronautics_bridge().lock().unwrap_or_else(|e| e.into_inner()) =
+            AeronauticsRuntimeBridge::new();
+        *dimension_mod_bridge().lock().unwrap_or_else(|e| e.into_inner()) =
+            DimensionModRuntimeBridge::new();
+    }
+    let mut empty_a = Vec::new();
+    save_world_into(&mut empty_a);
+    let mut empty_b = Vec::new();
+    save_world_into(&mut empty_b);
+    assert_eq!(empty_a, empty_b, "empty vanilla save must be deterministic");
+    {
+        let (rest, _) = read_world_seed_footer(&empty_a).unwrap();
+        let (rest, aer) = split_save_footer(rest, b"AER1").unwrap();
+        assert!(aer.is_none(), "empty aeronautics bridge must emit no AER1");
+        let (_, mof) = split_save_footer(rest, b"MOF1").unwrap();
+        assert!(mof.is_none(), "empty offload bridge must emit no MOF1");
+    }
+
+    // ---- 2. Populate both bridges and save: both trailers must ride the tail. ----
+    {
+        let mut bridge = mod_offload_bridge().lock().unwrap_or_else(|e| e.into_inner());
+        let reg = create_adapter::blockstates::core_create_registry(
+            mod_adapter_core::blockstates::DEFAULT_BASE_STATE_ID,
+        );
+        let shaft = reg.default_state("create:shaft").unwrap();
+        bridge.place_create_block(
+            create_adapter::factory::DimBlockPos::new(0, 100, 64, 100),
+            shaft,
+        );
+        let mut blocks = BTreeMap::new();
+        blocks.insert([300, 64, 300], shaft);
+        bridge
+            .assemble_contraption(
+                DimId::Overworld,
+                [300, 64, 300],
+                [300, 64, 300],
+                &blocks,
+                create_adapter::contraption_adapter::ContraptionKind::Linear {
+                    velocity_per_tick: [0.0, 0.0, 0.0],
+                },
+            )
+            .unwrap();
+    }
+    {
+        let mut b = aeronautics_bridge().lock().unwrap_or_else(|e| e.into_inner());
+        b.ensure_registry().unwrap();
+        let reg = b.registry.as_ref().unwrap().clone();
+        let st = reg.default_state("create:shaft").unwrap();
+        let canon = reg.encode_canonical(st).unwrap().to_string();
+        let mut cells = BTreeMap::new();
+        cells.insert([0, 0, 0], canon);
+        b.assemble_airship(3, 0, cells, None, create_adapter::aeronautics::DEFAULT_BLOCK_MASS)
+            .unwrap();
+    }
+    {
+        let mut b = dimension_mod_bridge().lock().unwrap_or_else(|e| e.into_inner());
+        b.registered_dims
+            .insert("testdim:moon".to_string(), DimId::from_raw(9));
+        b.env_by_name.insert(
+            "testdim:moon".to_string(),
+            mod_adapter_core::dimension_mod::DimensionEnvProfile {
+                dimension_id: "testdim:moon".to_string(),
+                gravity_multiplier: 0.5,
+                requires_oxygen: true,
+                has_skylight: false,
+                has_ceiling: true,
+                supports_underground_occlusion: false,
+                sky_effects: "testdim:sky".to_string(),
+            },
+        );
+    }
+    assert!(mod_offload_has_state());
+    assert!(aeronautics_bridge_has_state());
+    let mut payload = Vec::new();
+    save_world_into(&mut payload);
+    let mut second = Vec::new();
+    save_world_into(&mut second);
+    assert_eq!(payload, second, "populated save must be deterministic");
+
+    // Both trailers must be present, AER1 outermost (written last before WBD1).
+    let mof_magic_at = payload
+        .windows(4)
+        .rposition(|w| w == b"MOF1")
+        .expect("MOF1 trailer must be emitted");
+    let aer_magic_at = payload
+        .windows(4)
+        .rposition(|w| w == b"AER1")
+        .expect("AER1 trailer must be emitted");
+    assert!(aer_magic_at > mof_magic_at, "AER1 wraps MOF1 in write order");
+    let (rest, _) = read_world_seed_footer(&payload).unwrap();
+    let (rest, aer_body) = read_mod_bridge_trailer(rest, b"AER1").unwrap();
+    let aer_body = aer_body.expect("AER1 trailer present").to_vec();
+    let (_, mof_body) = read_mod_bridge_trailer(rest, b"MOF1").unwrap();
+    let mof_body = mof_body.expect("MOF1 trailer present").to_vec();
+
+    // The trailer bodies alone must feed the bridge codecs: clear, decode,
+    // confirm, and clear again for the whole-payload path below.
+    {
+        *mod_offload_bridge().lock().unwrap_or_else(|e| e.into_inner()) =
+            ModOffloadBridge::new();
+        *aeronautics_bridge().lock().unwrap_or_else(|e| e.into_inner()) =
+            AeronauticsRuntimeBridge::new();
+        *dimension_mod_bridge().lock().unwrap_or_else(|e| e.into_inner()) =
+            DimensionModRuntimeBridge::new();
+    }
+    assert!(mod_offload_load_bytes(&mof_body), "MOF1 body must decode");
+    assert!(aeronautics_state_load_bytes(&aer_body), "AER1 body must decode");
+    {
+        let bridge = mod_offload_bridge().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(bridge.placed_create.len(), 1);
+        assert_eq!(bridge.offload.assembly_count(), 1);
+    }
+    {
+        let b = dimension_mod_bridge().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            b.env_by_name["testdim:moon"].gravity_multiplier,
+            0.5,
+            "env record survives the codec even with no live DimId"
+        );
+    }
+
+    // ---- 3. Reload into cleared bridges: the whole state comes back. ----
+    {
+        *mod_offload_bridge().lock().unwrap_or_else(|e| e.into_inner()) =
+            ModOffloadBridge::new();
+        *aeronautics_bridge().lock().unwrap_or_else(|e| e.into_inner()) =
+            AeronauticsRuntimeBridge::new();
+        *dimension_mod_bridge().lock().unwrap_or_else(|e| e.into_inner()) =
+            DimensionModRuntimeBridge::new();
+    }
+    load_world_from(&payload).unwrap();
+    {
+        let bridge = mod_offload_bridge().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(bridge.placed_create.len(), 1, "placed Create block restored");
+        assert_eq!(bridge.offload.assembly_count(), 1, "contraption restored");
+    }
+    {
+        let b = aeronautics_bridge().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(b.airships.len(), 1, "airship restored");
+        assert!(b.airships.contains_key(&3));
+    }
+    {
+        let b = dimension_mod_bridge().lock().unwrap_or_else(|e| e.into_inner());
+        let env = b
+            .env_by_name
+            .get("testdim:moon")
+            .expect("dim env profile restored");
+        assert_eq!(env.gravity_multiplier, 0.5);
+        assert!(env.requires_oxygen);
+    }
+
+    // ---- 4. Corrupted/truncated trailers fail closed. ----
+    let reset_bridges = || {
+        *mod_offload_bridge().lock().unwrap_or_else(|e| e.into_inner()) =
+            ModOffloadBridge::new();
+        *aeronautics_bridge().lock().unwrap_or_else(|e| e.into_inner()) =
+            AeronauticsRuntimeBridge::new();
+        *dimension_mod_bridge().lock().unwrap_or_else(|e| e.into_inner()) =
+            DimensionModRuntimeBridge::new();
+    };
+
+    // A flipped byte inside the MOF1 body trips the CRC — the load fails.
+    let mut corrupt_mof = payload.clone();
+    corrupt_mof[mof_magic_at - 9] ^= 0xFF;
+    reset_bridges();
+    assert!(
+        load_world_from(&corrupt_mof).is_err(),
+        "corrupt MOF1 body must fail closed"
+    );
+    assert!(!mod_offload_has_state(), "rejected trailer left bridge state");
+
+    // A corrupted trailer size field is rejected by the footer framing itself.
+    let mut corrupt_size = payload.clone();
+    corrupt_size[mof_magic_at - 1] ^= 0xFF;
+    reset_bridges();
+    assert!(
+        load_world_from(&corrupt_size).is_err(),
+        "corrupt trailer size must fail closed"
+    );
+
+    // A flipped byte inside the AER1 body trips its CRC the same way.
+    let mut corrupt_aer = payload.clone();
+    corrupt_aer[aer_magic_at - 9] ^= 0xFF;
+    reset_bridges();
+    assert!(
+        load_world_from(&corrupt_aer).is_err(),
+        "corrupt AER1 body must fail closed"
+    );
+
+    // A corrupted AER1 size field is rejected by the footer framing.
+    let mut corrupt_aer_size = payload.clone();
+    corrupt_aer_size[aer_magic_at - 1] ^= 0xFF;
+    reset_bridges();
+    assert!(
+        load_world_from(&corrupt_aer_size).is_err(),
+        "corrupt AER1 size must fail closed"
+    );
+
+    // A schema byte the reader does not know is rejected before the inner
+    // body is even length-checked.
+    let aer_body_size = u64::from_be_bytes(
+        payload[aer_magic_at - 8..aer_magic_at].try_into().unwrap(),
+    ) as usize;
+    let mut corrupt_schema = payload.clone();
+    corrupt_schema[aer_magic_at - 8 - aer_body_size] ^= 0xFF;
+    reset_bridges();
+    assert!(
+        load_world_from(&corrupt_schema).is_err(),
+        "unknown trailer schema must fail closed"
+    );
+
+    // The untouched payload still loads cleanly after every rejection.
+    reset_bridges();
+    load_world_from(&payload).unwrap();
+    assert!(mod_offload_has_state());
+    assert!(aeronautics_bridge_has_state());
+
+    // Clean up the live bridges so no later test inherits mod state.
+    reset_bridges();
+}
