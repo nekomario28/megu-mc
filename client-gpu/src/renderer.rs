@@ -6,8 +6,9 @@
 
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use mc_spine_client::shaders::{
@@ -25,7 +26,9 @@ use mc_spine_client_mesh::builtin_shadow_wgsl::{
 use mc_spine_client_mesh::ffi::PackedVertex;
 use mc_spine_client_mesh::vanilla_plus_3d::ExtrudedMesh;
 use mc_spine_client_mesh::vfx_engine::DynamicColoredLight;
-use mc_spine_client_mesh::SectionCoord;
+use mc_spine_client_mesh::{
+    box_in_frustum, ChunkUploadBudget, GraphCuller, HiZPyramid, SectionCoord, SectionGraph, EDGE,
+};
 use mc_spine_client_mesh::{
     is_megu_wgsl_pack, BackendResolution, GpuCapabilities, GpuShaderCaps, MeguWgslPack, PassKind,
     PipelineStage, RenderBackendPreference, ShaderPackSource,
@@ -35,6 +38,9 @@ use mc_spine_kernel::entity_interp::{evaluate_sky_and_fog, SkyFogInput, SkyFogOu
 use winit::event_loop::OwnedDisplayHandle;
 
 use crate::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
+use crate::live_session::hw_adaptive_engine::{
+    detect_host_hardware_caps, select_compute_strategy, ComputeStrategy, MemoryTransferStrategy,
+};
 use crate::mat4_mul;
 use crate::subworld_render::{
     CompositeDrawUniforms, CompositeEnvUniforms, DebugLineVertex, SubWorldGpuCache,
@@ -424,6 +430,98 @@ struct LiveTerrainSection {
     bind_group: wgpu::BindGroup,
 }
 
+/// CPU-side record of a section mesh queued for GPU upload. The render
+/// loop's [`ChunkUploadBudget`] admits a bounded number per frame; the
+/// packed payload is cloned once at queue time so the `WorldState` borrow
+/// ends before the deferred GPU work runs.
+struct PendingSectionUpload {
+    packed: Vec<PackedVertex>,
+    order: Vec<u32>,
+    /// Estimated GPU payload bytes charged against the budget.
+    upload_bytes: usize,
+    /// Estimated upload-side CPU cost in microseconds.
+    cost_us: u64,
+}
+
+impl PendingSectionUpload {
+    fn new(packed: &[PackedVertex], order: &[u32]) -> Self {
+        // `section_geometry` emits at most one output vertex per packed
+        // vertex (16 B each) and six u32 indices per quad (~6 B per packed
+        // vertex); the slack covers the section uniform/bind-group work.
+        let upload_bytes = packed.len() * (std::mem::size_of::<PackedVertex>() + 6) + 256;
+        let cost_us = 32 + upload_bytes as u64 / 256;
+        Self {
+            packed: packed.to_vec(),
+            order: order.to_vec(),
+            upload_bytes,
+            cost_us,
+        }
+    }
+
+    fn matches(&self, packed: &[PackedVertex], order: &[u32]) -> bool {
+        self.packed == packed && self.order == order
+    }
+}
+
+/// Rendered-frame intervals kept for the upload budget's P95 adaptation.
+const UPLOAD_P95_WINDOW: usize = 120;
+
+/// The non-visual halves of a [`ComputeStrategy`]: which
+/// [`ChunkUploadBudget`] preset the memory topology warrants and how many
+/// mesh-worker threads the worker split reserves for the foreground path.
+fn strategy_upload_defaults(strategy: &ComputeStrategy) -> (ChunkUploadBudget, u32) {
+    let budget = match strategy.memory {
+        // UMA/shared-RAM hosts stream world data through the low-spec
+        // budget: less PCIe headroom, smoother frames.
+        MemoryTransferStrategy::UnifiedZeroCopy => ChunkUploadBudget::low_spec(),
+        // Discrete VRAM behind a staged arena keeps the full default budget.
+        MemoryTransferStrategy::DiscreteStagedArena => ChunkUploadBudget::new(),
+    };
+    (budget, strategy.workers.foreground_threads)
+}
+
+/// Six view-frustum planes in [`box_in_frustum`] form extracted from the
+/// column-major `view_proj`: each entry is `[nx, ny, nz, d]` with the
+/// inside half-space `dot(n, p) + d >= 0`. Covers NDC x/y in `[-1, 1]`
+/// and z in `[0, 1]` — the wgpu clip convention `Camera::view_projection`
+/// produces.
+fn frustum_planes_from_view_proj(view_proj: &Mat4) -> [[f32; 4]; 6] {
+    // clip = view_proj * [x, y, z, 1]; with `m[col][row]` storage the
+    // coefficients of clip component `i` over world (x, y, z, 1) are
+    // `[m[0][i], m[1][i], m[2][i], m[3][i]]`.
+    let clip = |component: usize| -> [f32; 4] {
+        [
+            view_proj[0][component],
+            view_proj[1][component],
+            view_proj[2][component],
+            view_proj[3][component],
+        ]
+    };
+    let combine = |a: [f32; 4], b: [f32; 4], sa: f32, sb: f32| -> [f32; 4] {
+        [
+            sa * a[0] + sb * b[0],
+            sa * a[1] + sb * b[1],
+            sa * a[2] + sb * b[2],
+            sa * a[3] + sb * b[3],
+        ]
+    };
+    let (cx, cy, cz, cw) = (clip(0), clip(1), clip(2), clip(3));
+    [
+        combine(cx, cw, 1.0, 1.0),  // left:   clip_x + clip_w >= 0
+        combine(cx, cw, -1.0, 1.0), // right:  clip_w - clip_x >= 0
+        combine(cy, cw, 1.0, 1.0),  // bottom: clip_y + clip_w >= 0
+        combine(cy, cw, -1.0, 1.0), // top:    clip_w - clip_y >= 0
+        cz,                         // near:   clip_z >= 0
+        combine(cz, cw, -1.0, 1.0), // far:    clip_w - clip_z >= 0
+    ]
+}
+
+/// Transpose the column-major `Mat4` into the row-major `[[f32; 4]; 4]`
+/// layout [`HiZPyramid::cull_world_aabb`] expects (`clip = vp * corner`).
+fn view_proj_row_major(view_proj: &Mat4) -> [[f32; 4]; 4] {
+    std::array::from_fn(|row| std::array::from_fn(|col| view_proj[col][row]))
+}
+
 /// The real `wgpu` renderer: terrain (opaque + translucent), UI blit, depth.
 ///
 /// Owns device-independent state for one color format (`target_format`):
@@ -452,6 +550,40 @@ pub struct GpuRenderer {
     window_camera: Cell<Option<Camera>>,
     scene: Option<TerrainBuffers>,
     live_sections: HashMap<SectionCoord, LiveTerrainSection>,
+    /// Per-frame admission controller for live-section GPU uploads, seeded
+    /// from the adaptive compute strategy in [`Self::new`] and replaceable
+    /// via [`Self::apply_compute_strategy`]/[`Self::set_upload_budget`].
+    upload_budget: ChunkUploadBudget,
+    /// Section meshes queued by [`Self::update_live_terrain`] awaiting
+    /// budget admission on a rendered frame. `BTreeMap` keeps the drain
+    /// order deterministic.
+    pending_uploads: BTreeMap<SectionCoord, PendingSectionUpload>,
+    /// Visibility graphs mirrored from the world on the last
+    /// [`Self::update_live_terrain`] pass; feeds the composed frame's
+    /// [`GraphCuller`] search. Empty until the first terrain sync.
+    section_graphs: HashMap<SectionCoord, SectionGraph>,
+    /// Optional Hi-Z occlusion pyramid an embedder installs from a previous
+    /// frame's depth buffer; consulted after the graph/frustum test in the
+    /// composed pass. `None` keeps the conservative graph/frustum path.
+    hiz_pyramid: Option<HiZPyramid>,
+    /// Rendered-frame intervals (ms) feeding [`ChunkUploadBudget::adapt`].
+    upload_frame_ms: VecDeque<f64>,
+    /// Instant of the previous rendered frame for interval measurement.
+    last_render_instant: Option<Instant>,
+    /// Mesh-worker concurrency hint from the last applied compute
+    /// strategy: foreground threads reserved for the meshing critical path.
+    pub mesh_worker_threads: u32,
+    /// Times [`Self::apply_compute_strategy`] configured the renderer.
+    compute_strategy_apply_count: u64,
+    /// Live-section uploads admitted through the budget, cumulative.
+    pub admitted_uploads: u64,
+    /// Upload admissions the budget rejected and deferred, cumulative.
+    pub deferred_uploads: u64,
+    /// Sections skipped by the composed pass's visibility checks on the
+    /// most recent frame.
+    pub last_frame_culled_sections: usize,
+    /// Lifetime total of sections skipped before GPU draw submission.
+    pub culled_sections: u64,
     composite: CompositeGpu,
     debug_line_pipeline: wgpu::RenderPipeline,
     debug_lines: Option<(wgpu::Buffer, u32)>,
@@ -1093,6 +1225,8 @@ struct ComposedWorldTarget<'a> {
     view_proj: Mat4,
     clear_rgb: [f32; 3],
     chunk_fades: &'a ChunkFadeTracker,
+    /// Camera position — seeds the [`GraphCuller`] search's camera section.
+    camera_position: [f32; 3],
 }
 
 /// Everything [`GpuRenderer::render_offscreen_composed_frame`] needs beyond
@@ -1457,6 +1591,12 @@ impl GpuRenderer {
                     multiview_mask: None,
                     cache: None,
                 });
+        // Seed the non-visual strategy outputs at construction: the same
+        // pure `select_compute_strategy` the live session runs, so the
+        // upload-budget preset and mesh-worker hint match the session's
+        // `compute_strategy` without a window-loop call site.
+        let (upload_budget, mesh_worker_threads) =
+            strategy_upload_defaults(&select_compute_strategy(&detect_host_hardware_caps()));
         Self {
             ctx,
             target_format,
@@ -1479,6 +1619,18 @@ impl GpuRenderer {
             window_camera: Cell::new(None),
             scene: None,
             live_sections: HashMap::new(),
+            upload_budget,
+            pending_uploads: BTreeMap::new(),
+            section_graphs: HashMap::new(),
+            hiz_pyramid: None,
+            upload_frame_ms: VecDeque::new(),
+            last_render_instant: None,
+            mesh_worker_threads,
+            compute_strategy_apply_count: 0,
+            admitted_uploads: 0,
+            deferred_uploads: 0,
+            last_frame_culled_sections: 0,
+            culled_sections: 0,
             composite,
             debug_line_pipeline,
             debug_lines: None,
@@ -2238,104 +2390,328 @@ impl GpuRenderer {
         Ok(())
     }
 
-    /// Synchronize real chunk sections. Unchanged sections reuse their existing buffers.
-    /// Unloaded sections are released as soon as the world stops exposing them.
+    /// Reconcile the resident section set with `world` and queue changed
+    /// sections for upload. GPU buffer creation is deferred to the render
+    /// loop's [`ChunkUploadBudget`]-gated drain so a chunk burst spreads
+    /// across frames instead of spiking one submit. Also refreshes the
+    /// visibility-graph snapshot the composed pass culls with — this
+    /// method only runs on terrain-dirty frames, so the collect stays off
+    /// the steady-state render path. Returns the number of sections whose
+    /// queued mesh data changed.
     pub fn update_live_terrain(&mut self, world: &WorldState) -> usize {
-        let mut uploaded = 0;
+        let mut scheduled = 0;
         let previous_count = self.live_sections.len();
         self.live_sections
             .retain(|coord, _| world.packed_mesh(*coord).is_some());
+        self.pending_uploads
+            .retain(|coord, _| world.packed_mesh(*coord).is_some());
         let removed = self.live_sections.len() != previous_count;
+        self.section_graphs.clear();
+        self.section_graphs.extend(world.section_graphs());
         for (coord, packed) in world.packed_meshes() {
             let order = world.translucent_order(coord).unwrap_or(&[]);
-            if self
-                .live_sections
-                .get(&coord)
-                .is_some_and(|existing| existing.packed == packed && existing.order == order)
+            let up_to_date = match self.pending_uploads.get(&coord) {
+                Some(pending) => pending.matches(packed, order),
+                None => self
+                    .live_sections
+                    .get(&coord)
+                    .is_some_and(|existing| existing.packed == packed && existing.order == order),
+            };
+            if up_to_date {
+                continue;
+            }
+            self.pending_uploads
+                .insert(coord, PendingSectionUpload::new(packed, order));
+            scheduled += 1;
+        }
+        if removed {
+            self.shadow_cache.invalidate();
+        }
+        scheduled
+    }
+
+    /// Build the GPU buffers, section uniform and bind group for one
+    /// section and make it resident, replacing any previous upload for
+    /// `coord`.
+    fn install_live_section(
+        &mut self,
+        coord: SectionCoord,
+        packed: &[PackedVertex],
+        order: &[u32],
+    ) {
+        let geometry = section_geometry(packed, order);
+        let terrain = TerrainBuffers {
+            opaque_index_count: geometry.opaque_indices.len() as u32,
+            translucent_index_count: geometry.translucent_indices.len() as u32,
+            opaque_vertices: vertex_buffer(
+                &self.ctx.device,
+                &self.ctx.queue,
+                "live-opaque-verts",
+                &geometry.opaque,
+            ),
+            opaque_indices: index_buffer(
+                &self.ctx.device,
+                &self.ctx.queue,
+                "live-opaque-indices",
+                &geometry.opaque_indices,
+            ),
+            translucent_vertices: vertex_buffer(
+                &self.ctx.device,
+                &self.ctx.queue,
+                "live-translucent-verts",
+                &geometry.translucent,
+            ),
+            translucent_indices: index_buffer(
+                &self.ctx.device,
+                &self.ctx.queue,
+                "live-translucent-indices",
+                &geometry.translucent_indices,
+            ),
+        };
+        let uniform = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("live-section-uniform"),
+            size: std::mem::size_of::<SectionUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let section_uniform = SectionUniforms {
+            origin: [
+                coord.0 as f32 * 16.0,
+                coord.1 as f32 * 16.0,
+                coord.2 as f32 * 16.0,
+            ],
+            _pad0: 0.0,
+            biome_tint: [1.0; 3],
+            biome_tint_strength: 0.0,
+        };
+        self.ctx
+            .queue
+            .write_buffer(&uniform, 0, bytemuck::bytes_of(&section_uniform));
+        let bind_group = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("live-section-bind-group"),
+                layout: &self.frame_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.frame_ubo.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: uniform.as_entire_binding(),
+                    },
+                ],
+            });
+        self.live_sections.insert(
+            coord,
+            LiveTerrainSection {
+                packed: packed.to_vec(),
+                order: order.to_vec(),
+                terrain,
+                _uniform: uniform,
+                bind_group,
+            },
+        );
+    }
+
+    /// Per-rendered-frame upload boundary: measure the frame interval for
+    /// the budget's adaptive controller, open a fresh
+    /// [`ChunkUploadBudget`] frame, adapt the per-frame cap to the windowed
+    /// P95, then drain queued section uploads through it. Runs once per
+    /// composed or plain world pass.
+    fn begin_render_upload_frame(&mut self) {
+        let now = Instant::now();
+        if let Some(last) = self.last_render_instant.replace(now) {
+            let ms = now.duration_since(last).as_secs_f64() * 1_000.0;
+            if ms.is_finite() && ms > 0.0 {
+                self.upload_frame_ms.push_back(ms);
+                while self.upload_frame_ms.len() > UPLOAD_P95_WINDOW {
+                    self.upload_frame_ms.pop_front();
+                }
+            }
+        }
+        self.upload_budget.begin_frame();
+        self.upload_budget.adapt(self.upload_frame_p95_us());
+        self.drain_pending_uploads();
+    }
+
+    /// Windowed P95 of recent rendered-frame intervals, in microseconds —
+    /// the input [`ChunkUploadBudget::adapt`] expects. `0.0` on an empty
+    /// window reads as "no evidence of stress" and lets the cap regrow.
+    fn upload_frame_p95_us(&self) -> f64 {
+        if self.upload_frame_ms.is_empty() {
+            return 0.0;
+        }
+        let mut sorted: Vec<f64> = self.upload_frame_ms.iter().copied().collect();
+        sorted.sort_by(f64::total_cmp);
+        let rank = (sorted.len() * 95).div_ceil(100).max(1) - 1;
+        sorted[rank.min(sorted.len() - 1)] * 1_000.0
+    }
+
+    /// Admit queued section uploads through the open [`ChunkUploadBudget`]
+    /// frame and install the ones that fit; the rest stay queued for later
+    /// frames. Returns the number of sections installed this frame.
+    fn drain_pending_uploads(&mut self) -> usize {
+        if self.pending_uploads.is_empty() {
+            return 0;
+        }
+        let mut admitted = 0;
+        let coords: Vec<SectionCoord> = self.pending_uploads.keys().copied().collect();
+        for coord in coords {
+            let Some(pending) = self.pending_uploads.get(&coord) else {
+                continue;
+            };
+            let (bytes, cost_us) = (pending.upload_bytes, pending.cost_us);
+            if !self.upload_budget.try_schedule(bytes, cost_us) {
+                self.deferred_uploads += 1;
+                continue;
+            }
+            let pending = self
+                .pending_uploads
+                .remove(&coord)
+                .expect("pending checked");
+            self.admitted_uploads += 1;
+            self.install_live_section(coord, &pending.packed, &pending.order);
+            admitted += 1;
+        }
+        if admitted > 0 {
+            self.shadow_cache.invalidate();
+        }
+        admitted
+    }
+
+    /// Sections the composed pass will skip this frame: the
+    /// [`GraphCuller`]'s frustum+occlusion result for graph-covered coords,
+    /// the plain six-plane frustum test for coords the world never
+    /// published a visibility graph for, and — when a Hi-Z pyramid is
+    /// installed — the conservative depth test on top of both. Only
+    /// sections with drawable indices are considered.
+    fn cull_live_sections(
+        &self,
+        view_proj: &Mat4,
+        camera_position: [f32; 3],
+    ) -> HashSet<SectionCoord> {
+        let mut culled = HashSet::new();
+        if self.live_sections.is_empty() {
+            return culled;
+        }
+        let planes = frustum_planes_from_view_proj(view_proj);
+        // One graph-culler BFS per frame over the mirrored visibility set.
+        // Coords absent from the snapshot (mesh-only worlds) fall back to
+        // the frustum test rather than being treated as unreachable.
+        let graph_visible = (!self.section_graphs.is_empty()).then(|| {
+            let camera_section = SectionCoord(
+                (camera_position[0] / EDGE as f32).floor() as i32,
+                (camera_position[1] / EDGE as f32).floor() as i32,
+                (camera_position[2] / EDGE as f32).floor() as i32,
+            );
+            GraphCuller::new(camera_section, &planes)
+                .search(self.section_graphs.iter().map(|(&c, &g)| (c, g)))
+                .visible
+                .into_iter()
+                .collect::<HashSet<_>>()
+        });
+        let hiz_rows = self
+            .hiz_pyramid
+            .as_ref()
+            .map(|_| view_proj_row_major(view_proj));
+        for (coord, section) in self.live_sections.iter() {
+            if section.terrain.opaque_index_count == 0
+                && section.terrain.translucent_index_count == 0
             {
                 continue;
             }
-            let geometry = section_geometry(packed, order);
-            let terrain = TerrainBuffers {
-                opaque_index_count: geometry.opaque_indices.len() as u32,
-                translucent_index_count: geometry.translucent_indices.len() as u32,
-                opaque_vertices: vertex_buffer(
-                    &self.ctx.device,
-                    &self.ctx.queue,
-                    "live-opaque-verts",
-                    &geometry.opaque,
-                ),
-                opaque_indices: index_buffer(
-                    &self.ctx.device,
-                    &self.ctx.queue,
-                    "live-opaque-indices",
-                    &geometry.opaque_indices,
-                ),
-                translucent_vertices: vertex_buffer(
-                    &self.ctx.device,
-                    &self.ctx.queue,
-                    "live-translucent-verts",
-                    &geometry.translucent,
-                ),
-                translucent_indices: index_buffer(
-                    &self.ctx.device,
-                    &self.ctx.queue,
-                    "live-translucent-indices",
-                    &geometry.translucent_indices,
-                ),
+            let min = [
+                coord.0 as f32 * EDGE as f32,
+                coord.1 as f32 * EDGE as f32,
+                coord.2 as f32 * EDGE as f32,
+            ];
+            let visible = if self.section_graphs.contains_key(coord) {
+                graph_visible
+                    .as_ref()
+                    .is_some_and(|set| set.contains(coord))
+            } else {
+                box_in_frustum(min, &planes)
             };
-            let uniform = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("live-section-uniform"),
-                size: std::mem::size_of::<SectionUniforms>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let section_uniform = SectionUniforms {
-                origin: [
-                    coord.0 as f32 * 16.0,
-                    coord.1 as f32 * 16.0,
-                    coord.2 as f32 * 16.0,
-                ],
-                _pad0: 0.0,
-                biome_tint: [1.0; 3],
-                biome_tint_strength: 0.0,
-            };
-            self.ctx
-                .queue
-                .write_buffer(&uniform, 0, bytemuck::bytes_of(&section_uniform));
-            let bind_group = self
-                .ctx
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("live-section-bind-group"),
-                    layout: &self.frame_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: self.frame_ubo.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: uniform.as_entire_binding(),
-                        },
-                    ],
-                });
-            self.live_sections.insert(
-                coord,
-                LiveTerrainSection {
-                    packed: packed.to_vec(),
-                    order: order.to_vec(),
-                    terrain,
-                    _uniform: uniform,
-                    bind_group,
-                },
-            );
-            uploaded += 1;
+            if !visible {
+                culled.insert(*coord);
+                continue;
+            }
+            if let (Some(hiz), Some(rows)) = (&self.hiz_pyramid, &hiz_rows) {
+                let max = [
+                    min[0] + EDGE as f32,
+                    min[1] + EDGE as f32,
+                    min[2] + EDGE as f32,
+                ];
+                if hiz.cull_world_aabb(rows, min, max) {
+                    culled.insert(*coord);
+                }
+            }
         }
-        if uploaded > 0 || removed {
-            self.shadow_cache.invalidate();
-        }
-        uploaded
+        culled
+    }
+
+    /// The active per-frame chunk-upload budget.
+    pub fn upload_budget(&self) -> &ChunkUploadBudget {
+        &self.upload_budget
+    }
+
+    /// Replace the upload budget outright (tests/embedders tuning caps).
+    pub fn set_upload_budget(&mut self, budget: ChunkUploadBudget) {
+        self.upload_budget = budget;
+    }
+
+    /// Section uploads currently queued awaiting budget admission.
+    pub fn pending_upload_count(&self) -> usize {
+        self.pending_uploads.len()
+    }
+
+    /// Install or clear the Hi-Z occlusion pyramid consulted by the
+    /// composed world pass (`None` keeps the conservative graph/frustum
+    /// path).
+    pub fn set_hiz_pyramid(&mut self, pyramid: Option<HiZPyramid>) {
+        self.hiz_pyramid = pyramid;
+    }
+
+    /// The installed Hi-Z pyramid, if any.
+    pub fn hiz_pyramid(&self) -> Option<&HiZPyramid> {
+        self.hiz_pyramid.as_ref()
+    }
+
+    /// Push an adaptive [`ComputeStrategy`] into the renderer: the memory
+    /// topology selects the chunk-upload budget preset and mesh-worker
+    /// concurrency hint, while the cache/SIMD tiers pick conservative
+    /// initial render-scale and shadow-negotiation requests (device caps
+    /// still negotiate down inside [`Self::set_shadow_quality`]). Returns
+    /// the negotiated shadow quality.
+    pub fn apply_compute_strategy(&mut self, strategy: &ComputeStrategy) -> BuiltinShadowQuality {
+        let (budget, workers) = strategy_upload_defaults(strategy);
+        self.upload_budget = budget;
+        self.mesh_worker_threads = workers;
+        self.set_render_scale(match strategy.memory {
+            MemoryTransferStrategy::UnifiedZeroCopy => RenderScalePreset::Balanced75,
+            MemoryTransferStrategy::DiscreteStagedArena => RenderScalePreset::Native100,
+        });
+        let negotiated = self.set_shadow_quality(match strategy.memory {
+            MemoryTransferStrategy::UnifiedZeroCopy => BuiltinShadowQuality::Low,
+            MemoryTransferStrategy::DiscreteStagedArena => BuiltinShadowQuality::Natural,
+        });
+        self.compute_strategy_apply_count += 1;
+        negotiated
+    }
+
+    /// Times [`Self::apply_compute_strategy`] has configured the renderer.
+    pub fn compute_strategy_apply_count(&self) -> u64 {
+        self.compute_strategy_apply_count
+    }
+
+    /// Whether a full compute strategy has been applied at least once.
+    /// Construction seeds only the non-visual halves (upload budget,
+    /// mesh-worker hint); this reports explicit full applications.
+    pub fn compute_strategy_applied(&self) -> bool {
+        self.compute_strategy_apply_count > 0
     }
 
     pub fn live_section_count(&self) -> usize {
@@ -2543,6 +2919,9 @@ impl GpuRenderer {
                 chunk_fades,
             );
         } else {
+            // No camera => no composed pass; still run the per-frame upload
+            // boundary so queued section uploads keep draining.
+            self.begin_render_upload_frame();
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("terrain"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2697,7 +3076,9 @@ impl GpuRenderer {
             .queue
             .write_buffer(&self.composite.lights_ubo, 0, bytemuck::bytes_of(&lights));
         self.write_frame_uniforms(&camera, aspect, atmo.fog_rgb, sky.fog_start, sky.fog_end);
-        let draws = self.live_sections.len() * 2
+        // Pending uploads may all be admitted by this frame's drain inside
+        // `encode_composed_world`, so reserve draw slots for them too.
+        let draws = (self.live_sections.len() + self.pending_uploads.len()) * 2
             + 2
             + self.subworld_gpu.entry_count()
             + self.subworld_gpu.batch_count()
@@ -2716,6 +3097,7 @@ impl GpuRenderer {
                     atmo.sky_horizon_rgb[2].max(atmo.fog_rgb[2] * 0.8),
                 ],
                 chunk_fades,
+                camera_position: camera.position,
             },
         );
     }
@@ -3317,8 +3699,13 @@ impl GpuRenderer {
             view_proj,
             clear_rgb,
             chunk_fades,
+            camera_position,
         } = *target;
         self.ensure_depth(width, height);
+        self.begin_render_upload_frame();
+        let culled_sections = self.cull_live_sections(&view_proj, camera_position);
+        self.culled_sections += culled_sections.len() as u64;
+        self.last_frame_culled_sections = culled_sections.len();
         // Split disjoint field borrows so the scratch writer and the GPU
         // handles can coexist inside the render pass.
         let gpu = &mut self.composite;
@@ -3403,7 +3790,7 @@ impl GpuRenderer {
                 }
             }
             for (coord, section) in live_sections.iter() {
-                if section.terrain.opaque_index_count == 0 {
+                if culled_sections.contains(coord) || section.terrain.opaque_index_count == 0 {
                     continue;
                 }
                 let fade = chunk_fades.fade_alpha(coord.0, coord.2);
@@ -3435,7 +3822,7 @@ impl GpuRenderer {
                 }
             }
             for (coord, section) in live_sections.iter() {
-                if section.terrain.translucent_index_count == 0 {
+                if culled_sections.contains(coord) || section.terrain.translucent_index_count == 0 {
                     continue;
                 }
                 let fade = chunk_fades.fade_alpha(coord.0, coord.2);
@@ -3585,8 +3972,9 @@ impl GpuRenderer {
         let view = camera.far.clamp(16.0, 2048.0);
         self.write_frame_uniforms(camera, aspect, atmo.fog_rgb, view * 0.6, view);
         self.write_env_uniforms(frame);
-        // Worst case: one slot per live section + scene + subworlds + batches.
-        let draw_count = self.live_sections.len() * 2
+        // Worst case: one slot per live section + pending uploads admitted
+        // by this frame's drain + scene + subworlds + batches.
+        let draw_count = (self.live_sections.len() + self.pending_uploads.len()) * 2
             + 2
             + self.subworld_gpu.entry_count()
             + self.subworld_gpu.batch_count()
@@ -3645,6 +4033,7 @@ impl GpuRenderer {
                     view_proj,
                     clear_rgb,
                     chunk_fades: frame.chunk_fades,
+                    camera_position: camera.position,
                 },
             );
             // Upscale the reduced-res world to native before the UI pass.
@@ -3682,6 +4071,7 @@ impl GpuRenderer {
                     view_proj,
                     clear_rgb,
                     chunk_fades: frame.chunk_fades,
+                    camera_position: camera.position,
                 },
             );
         }

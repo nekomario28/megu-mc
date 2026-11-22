@@ -28,6 +28,7 @@ use mc_spine_client::session::{AudioStats, WorldAcousticSnapshot};
 use mc_spine_client::spatial_audio::{SpatialSubtitleCue, SubtitleDirection};
 use mc_spine_client::world::{BlockTable, WorldState};
 use mc_spine_client_mesh::asset_pipeline::{CompiledAssetBundle, ResourcePackLayer};
+use mc_spine_client_mesh::builtin_shadow_wgsl::BuiltinShadowQuality;
 use mc_spine_client_mesh::entity_rig::{classify_entity_rig, EntityRigSpec};
 use mc_spine_client_mesh::mesher::{
     BlockVisualEnhancementResult, BlockVisualInput, VanillaPlusPipelineConfig,
@@ -61,13 +62,21 @@ use crate::atmosphere::{
 };
 use crate::subworld_render::{SubWorldRenderBank, SubWorldRenderEntry, SubWorldTransform};
 use hw_adaptive_engine::{
-    detect_host_hardware_caps, select_compute_strategy, ComputeStrategy, HostHardwareCaps,
-    PagedSectionPool, SpeculativeChunkPrefetcher,
+    detect_host_hardware_caps, select_compute_strategy, ComputeKernelMode, ComputeStrategy,
+    HostHardwareCaps, KernelAutotuner, PagedSectionPool, SpeculativeChunkPrefetcher,
 };
 use sys_metrics::{sample_host_metrics, CpuSampler, FrameTimingStats};
 
+use crate::renderer::GpuRenderer;
+
 const PREFETCH_VIEW_DISTANCE: u32 = 8;
 const PREFETCH_MAX_CHUNKS: usize = 16;
+
+/// Minimum accumulated frame time between `sample_host_metrics` calls while
+/// the mini-HUD is enabled. The `/proc` + DRM sysfs reads are throttled to
+/// 2 Hz; frame-time statistics still update every frame and the latest
+/// [`sys_metrics::HostMetricsSnapshot`] is reused between samples.
+pub const MINIHUD_SYS_SAMPLE_INTERVAL_MS: u64 = 500;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionStatus {
@@ -305,6 +314,22 @@ pub struct LiveSession {
     pub prefetcher: SpeculativeChunkPrefetcher,
     pub metrics_probe: CpuSampler,
     pub frame_timings: FrameTimingStats,
+    /// Latest cached `/proc` + DRM host snapshot; refreshed at most every
+    /// [`MINIHUD_SYS_SAMPLE_INTERVAL_MS`] of accumulated frame time while
+    /// the mini-HUD is enabled.
+    mini_hud_host: Option<sys_metrics::HostMetricsSnapshot>,
+    /// Frame milliseconds accumulated since the last host-metric sample.
+    mini_hud_sys_accum_ms: f32,
+    /// Lifetime count of `sample_host_metrics` calls — the throttled
+    /// `/proc`/DRM reads the mini-HUD would otherwise do every frame.
+    pub sys_sample_count: u64,
+    /// Adaptive packed-nibble kernel autotuner seeded from
+    /// `compute_strategy` and fed real frame times by
+    /// `record_frame_and_refresh_minihud`.
+    kernel_autotuner: KernelAutotuner,
+    /// Times [`Self::apply_compute_strategy`] pushed the session strategy
+    /// into a renderer.
+    compute_strategy_apply_count: u64,
     pub atmosphere_blender: BiomeAtmosphereBlender,
     pub chunk_fades: ChunkFadeTracker,
     pub subworlds: SubWorldRenderBank,
@@ -391,6 +416,14 @@ impl LiveSession {
     ) -> Self {
         let hw_caps = detect_host_hardware_caps();
         let compute_strategy = select_compute_strategy(&hw_caps);
+        // Seed the autotuner with the strategy's static kernel preference;
+        // `record_frame_and_refresh_minihud` feeds it real frame times.
+        let kernel_autotuner =
+            KernelAutotuner::new(if compute_strategy.prefer_lut_over_recompute() {
+                ComputeKernelMode::LutBatch
+            } else {
+                ComputeKernelMode::RecomputeSwar
+            });
         let vfx = ClientVfxHost::new(GpuPipelineKind::Classic);
         let tactile_tier = vfx.budget_tier();
         let tactile_config = TactileEffectsConfig::default();
@@ -457,6 +490,11 @@ impl LiveSession {
             prefetcher: SpeculativeChunkPrefetcher::new(),
             metrics_probe: CpuSampler::new(),
             frame_timings: FrameTimingStats::new(),
+            mini_hud_host: None,
+            mini_hud_sys_accum_ms: 0.0,
+            sys_sample_count: 0,
+            kernel_autotuner,
+            compute_strategy_apply_count: 0,
             atmosphere_blender: BiomeAtmosphereBlender::new(AtmosphereParams::default()),
             chunk_fades: ChunkFadeTracker::new(),
             subworlds: SubWorldRenderBank::new(),
@@ -799,7 +837,10 @@ impl LiveSession {
         // Preserve the last received terrain even if the peer closes immediately
         // after sending chunk data.
         let had_pending = self.world.pending_mesh_sections() > 0;
-        match self.world.rebuild_dirty_bounded(24, camera_position) {
+        match self
+            .world
+            .rebuild_dirty_bounded(self.mesh_rebuild_budget(), camera_position)
+        {
             Ok(rebuilt) => self.terrain_dirty |= rebuilt != 0 || had_pending,
             Err(error) if !matches!(self.status, SessionStatus::Disconnected(_)) => {
                 self.status = SessionStatus::Disconnected(format!("mesh: {error}"));
@@ -1278,10 +1319,59 @@ impl LiveSession {
         self.subworlds.upsert(entry);
     }
 
+    /// Per-poll dirty-mesh rebuild budget: the base slice scaled by the
+    /// adaptive strategy's foreground worker count — the meshing critical
+    /// path — clamped so a many-core host cannot spike one poll.
+    pub fn mesh_rebuild_budget(&self) -> usize {
+        const BASE_POLL_MESH_BUDGET: usize = 24;
+        const MAX_FOREGROUND_SCALE: u32 = 2;
+        BASE_POLL_MESH_BUDGET
+            * self
+                .compute_strategy
+                .workers
+                .foreground_threads
+                .clamp(1, MAX_FOREGROUND_SCALE) as usize
+    }
+
+    /// Push this session's connect-time [`ComputeStrategy`] into
+    /// `renderer`: upload-budget preset, mesh-worker hint, and the
+    /// negotiated render-scale/shadow defaults. Returns the negotiated
+    /// shadow quality.
+    pub fn apply_compute_strategy(&mut self, renderer: &mut GpuRenderer) -> BuiltinShadowQuality {
+        let negotiated = renderer.apply_compute_strategy(&self.compute_strategy);
+        self.compute_strategy_apply_count += 1;
+        negotiated
+    }
+
+    /// How many times the adaptive strategy has been pushed into a
+    /// renderer via [`Self::apply_compute_strategy`].
+    pub fn active_compute_strategy_applied(&self) -> u64 {
+        self.compute_strategy_apply_count
+    }
+
+    /// The kernel mode the adaptive autotuner currently dispatches,
+    /// seeded from `compute_strategy` and updated by frame-time feedback.
+    pub fn active_kernel_mode(&self) -> ComputeKernelMode {
+        self.kernel_autotuner.selected_mode()
+    }
+
+    /// Autotuner state for diagnostics/tests.
+    pub fn kernel_autotuner(&self) -> &KernelAutotuner {
+        &self.kernel_autotuner
+    }
+
     /// Record frame timing and advance visual transitions before HUD rendering.
     pub fn record_frame_and_refresh_minihud(&mut self, frame_dt_sec: f32, ui: &mut UiState) {
         let frame_us = f64::from(frame_dt_sec) * 1_000_000.0;
         self.frame_timings.push_frame_ms(frame_us / 1_000.0);
+        // Feed the adaptive kernel autotuner real frame-time feedback; the
+        // controller discards out-of-range samples itself.
+        let frame_ns = (f64::from(frame_dt_sec) * 1_000_000_000.0) as u64;
+        let kernel_mode = self.kernel_autotuner.selected_mode();
+        self.kernel_autotuner.observe_sample(kernel_mode, frame_ns);
+        if frame_dt_sec.is_finite() && frame_dt_sec > 0.0 {
+            self.mini_hud_sys_accum_ms += frame_dt_sec * 1_000.0;
+        }
         self.chunk_fades.tick(frame_dt_sec);
         self.atmosphere_blender.advance(frame_dt_sec);
         self.refresh_subtitle_hud(frame_dt_sec, &mut ui.hud);
@@ -1296,8 +1386,21 @@ impl LiveSession {
             return;
         }
 
-        let host = sample_host_metrics(&mut self.metrics_probe);
-        let telemetry = sys_metrics::MiniHudData::from_telemetry(&host, &self.frame_timings);
+        // `/proc` + DRM sysfs reads are throttled to
+        // `MINIHUD_SYS_SAMPLE_INTERVAL_MS` of accumulated frame time; the
+        // cached snapshot feeds every frame's telemetry below.
+        if self.mini_hud_host.is_none()
+            || self.mini_hud_sys_accum_ms >= MINIHUD_SYS_SAMPLE_INTERVAL_MS as f32
+        {
+            self.mini_hud_host = Some(sample_host_metrics(&mut self.metrics_probe));
+            self.sys_sample_count += 1;
+            self.mini_hud_sys_accum_ms = 0.0;
+        }
+        let host = self
+            .mini_hud_host
+            .as_ref()
+            .expect("host metrics sampled above");
+        let telemetry = sys_metrics::MiniHudData::from_telemetry(host, &self.frame_timings);
         let hud = &mut ui.hud.mini_hud_data;
         hud.fps = telemetry.fps;
         hud.fps_one_percent_low = telemetry.fps_one_percent_low;
@@ -2309,10 +2412,14 @@ mod tests {
             .render_offscreen_rgba(128, 128, &camera, None)
             .unwrap();
         assert_eq!(renderer.update_live_terrain(world), 1);
-        assert_eq!(renderer.live_section_count(), 1);
+        // Uploads are budget-deferred: the section becomes GPU-resident on
+        // the next rendered frame's drain, not inside `update_live_terrain`.
+        assert_eq!(renderer.pending_upload_count(), 1);
+        assert_eq!(renderer.live_section_count(), 0);
         let rendered = renderer
             .render_offscreen_rgba(128, 128, &camera, None)
             .unwrap();
+        assert_eq!(renderer.live_section_count(), 1);
         assert!(
             rendered
                 .iter()
