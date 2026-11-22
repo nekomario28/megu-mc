@@ -827,38 +827,11 @@ pub fn auto_adapt_jar_bytes(
 
     // 1. Every valid archive is statically security-scanned before any
     //    filename/manifest shortcut. A corrupt archive fails closed even
-    //    when named after a known superseded mod.
+    //    when named after a known superseded mod, and inside
+    //    `route_mod_jar` a verified superseded id resolves to a native
+    //    subsystem before the bytecode quarantine verdict — those mods
+    //    never execute a single byte of Java.
     let mut routing = route_mod_jar(jar_bytes, display, inferred_mod_id.as_deref())?;
-    if let ModRouteDecision::SecurityQuarantine { threats } = &routing.decision {
-        let blockers = threats
-            .iter()
-            .map(|t| {
-                format!(
-                    "SECURITY_QUARANTINE: {} in {} ({}) — execution and delegation prohibited",
-                    t.kind.as_str(),
-                    t.member,
-                    t.indicator
-                )
-            })
-            .collect();
-        return Ok(JarAdaptationResult {
-            jar: display.to_string(),
-            inferred_mod_id,
-            descriptor: None,
-            tier: AdaptationTier::Tier3FallbackRequired,
-            route: routing.decision.clone(),
-            security_threats: threats.clone(),
-            engine_compat: EngineCompatDisposition::StandardModAdapter,
-            audit_notes: vec!["SECURITY_QUARANTINE: static security scan blocked execution, native adaptation, and JVM fallback".to_string()],
-            blockers,
-            mixin_scan: None,
-            culinary: None,
-            dimensions: None,
-            data: GenericDataSummary::default(),
-            data_bundle: ModDataBundle::default(),
-            bundle: None,
-        });
-    }
     if let ModRouteDecision::RouteToNativeSubsystem {
         subsystem,
         matched_by: RouteMatchKind::KnownCatalogId,
@@ -875,7 +848,7 @@ pub fn auto_adapt_jar_bytes(
             existing
         };
         audit_notes.push(format!(
-            "filename-inferred mod id matches BUILTIN_SUPERSEDED_PERF_MODS ({REASON_SUPERSEDED}); static security scan passed before superseded skip"
+            "filename-inferred mod id matches BUILTIN_SUPERSEDED_PERF_MODS ({REASON_SUPERSEDED}); superseded engine mods never execute bytecode, so the catalog route resolves before the bytecode quarantine verdict"
         ));
         return Ok(skipped_result(
             display.to_string(),
@@ -924,13 +897,15 @@ pub fn auto_adapt_jar_bytes(
         classify_adapted_mod_compat(descriptor.as_ref(), inferred_mod_id.as_deref(), &mut audit_notes);
 
     // 4. Resolve renamed known mods from their declared IDs. The security
-    //    scan was already completed before inspecting loader metadata.
+    //    scan was already completed before inspecting loader metadata, and
+    //    the verified manifest id wins over the bytecode quarantine verdict
+    //    for the same reason: a superseded JAR's constant pools never run.
     if let Some(d) = &descriptor {
         if let Some(hit) = d.declared_mod_ids.iter().find(|id| superseded_id(id)) {
             routing = route_mod_jar(jar_bytes, display, Some(hit))?;
             if let ModRouteDecision::RouteToNativeSubsystem { subsystem, .. } = &routing.decision {
                 audit_notes.push(format!(
-                    "declared mod id '{hit}' matches BUILTIN_SUPERSEDED_PERF_MODS ({REASON_SUPERSEDED}); security scan passed before superseded skip"
+                    "declared mod id '{hit}' matches BUILTIN_SUPERSEDED_PERF_MODS ({REASON_SUPERSEDED}); superseded engine mods never execute bytecode, so the catalog route resolves before the bytecode quarantine verdict"
                 ));
                 let declared_strategy = classify_perf_or_render_mod_compat(hit);
                 let strategy = if declared_strategy == EngineCompatDisposition::StandardModAdapter {
@@ -951,6 +926,44 @@ pub fn auto_adapt_jar_bytes(
                 ));
             }
         }
+    }
+
+    // 5. A bytecode security quarantine blocks everything below — checked
+    //    only after the superseded-id resolutions above so a verified
+    //    engine-replacement mod (which never executes its constant pools)
+    //    can still auto-skip instead of blocking the whole pack.
+    if let ModRouteDecision::SecurityQuarantine { threats } = &routing.decision {
+        audit_notes.push(
+            "SECURITY_QUARANTINE: static security scan blocked execution, native adaptation, and JVM fallback".to_string(),
+        );
+        let blockers = threats
+            .iter()
+            .map(|t| {
+                format!(
+                    "SECURITY_QUARANTINE: {} in {} ({}) — execution and delegation prohibited",
+                    t.kind.as_str(),
+                    t.member,
+                    t.indicator
+                )
+            })
+            .collect();
+        return Ok(JarAdaptationResult {
+            jar: display.to_string(),
+            inferred_mod_id,
+            descriptor,
+            tier: AdaptationTier::Tier3FallbackRequired,
+            route: routing.decision.clone(),
+            security_threats: threats.clone(),
+            engine_compat,
+            audit_notes,
+            blockers,
+            mixin_scan: None,
+            culinary: None,
+            dimensions: None,
+            data,
+            data_bundle: ModDataBundle::default(),
+            bundle: None,
+        });
     }
 
     if let ModRouteDecision::RouteToNativeSubsystem {
@@ -987,7 +1000,7 @@ pub fn auto_adapt_jar_bytes(
         ));
     }
 
-    // 5. Client-only manifests never stage on a dedicated server.
+    // 6. Client-only manifests never stage on a dedicated server.
     if matches!(
         descriptor.as_ref().map(|d| d.environment),
         Some(ModEnvironment::Client)
@@ -1006,7 +1019,7 @@ pub fn auto_adapt_jar_bytes(
         ));
     }
 
-    // 6. Generic data discovery: the real parsed content of every 1.21.1
+    // 7. Generic data discovery: the real parsed content of every 1.21.1
     //    `data/` family (recipes, tags, loot tables, dimensions +
     //    dimension types, NeoForge data maps, NeoForge biome modifiers)
     //    for ANY namespace — bounded reads, fail-closed on corrupted or
@@ -1066,7 +1079,7 @@ pub fn auto_adapt_jar_bytes(
         ));
     }
 
-    // 7. Embedded native bundle validation.
+    // 8. Embedded native bundle validation.
     let mut embedded_bundle = None;
     let mut embedded_bundle_error = None;
     if let Some(bytes) = embedded_bundle_bytes {
@@ -1087,7 +1100,7 @@ pub fn auto_adapt_jar_bytes(
         }
     }
 
-    // 8. Generic culinary discovery (cooking/cutting recipes, tags, loot
+    // 9. Generic culinary discovery (cooking/cutting recipes, tags, loot
     //    modifiers, food specs) — one registry per JAR keeps the stats
     //    strictly per-mod.
     let culinary = {
@@ -1110,7 +1123,7 @@ pub fn auto_adapt_jar_bytes(
         ));
     }
 
-    // 9. `.class` mixin bytecode scan + lift.
+    // 10. `.class` mixin bytecode scan + lift.
     let mixin_scan = scan_jar_mixins_with_options(
         jar_bytes,
         JarScanOptions {
@@ -1129,7 +1142,7 @@ pub fn auto_adapt_jar_bytes(
         mixin_scan.tiny_mappings_skipped,
     ));
 
-    // 10. Tier synthesis.
+    // 11. Tier synthesis.
     let mut blockers = Vec::new();
     if let Some(e) = manifest_error {
         if embedded_bundle.is_none() {

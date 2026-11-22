@@ -91,6 +91,92 @@ fn class_with_utf8(strings: &[&str]) -> Vec<u8> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Structured constant-pool builder: real CONSTANT_Class /
+// CONSTANT_NameAndType / CONSTANT_Methodref entries — security fixtures
+// must carry the same resolved references a javac-compiled class
+// carries, not bare UTF-8 strings.
+// ---------------------------------------------------------------------------
+
+enum CpItem {
+    Utf8(String),
+    Class(u16),
+    NameAndType(u16, u16),
+    MethodRef(u16, u16),
+}
+
+#[derive(Default)]
+struct Cp(Vec<CpItem>);
+
+impl Cp {
+    fn push(&mut self, item: CpItem) -> u16 {
+        self.0.push(item);
+        self.0.len() as u16
+    }
+    fn utf8(&mut self, s: &str) -> u16 {
+        self.push(CpItem::Utf8(s.to_string()))
+    }
+    fn class(&mut self, internal_name: &str) -> u16 {
+        let name_index = self.utf8(internal_name);
+        self.push(CpItem::Class(name_index))
+    }
+    fn method_ref(&mut self, owner: &str, name: &str, desc: &str) -> u16 {
+        let class_index = self.class(owner);
+        let name_index = self.utf8(name);
+        let desc_index = self.utf8(desc);
+        let nat_index = self.push(CpItem::NameAndType(name_index, desc_index));
+        self.push(CpItem::MethodRef(class_index, nat_index))
+    }
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for item in &self.0 {
+            match item {
+                CpItem::Utf8(s) => {
+                    out.push(1);
+                    out.extend((s.len() as u16).to_be_bytes());
+                    out.extend(s.as_bytes());
+                }
+                CpItem::Class(name_index) => {
+                    out.push(7);
+                    out.extend(name_index.to_be_bytes());
+                }
+                CpItem::NameAndType(name_index, desc_index) => {
+                    out.push(12);
+                    out.extend(name_index.to_be_bytes());
+                    out.extend(desc_index.to_be_bytes());
+                }
+                CpItem::MethodRef(class_index, nat_index) => {
+                    out.push(10);
+                    out.extend(class_index.to_be_bytes());
+                    out.extend(nat_index.to_be_bytes());
+                }
+            }
+        }
+        out
+    }
+}
+
+/// A minimal structurally-valid `.class` whose constant pool carries
+/// exactly the entries `fill` adds (on top of the `sample/Mod` /
+/// `java/lang/Object` class constants every class needs).
+fn class_with_pool(fill: impl FnOnce(&mut Cp)) -> Vec<u8> {
+    let mut cp = Cp::default();
+    let this_idx = cp.class("sample/Mod");
+    let super_idx = cp.class("java/lang/Object");
+    fill(&mut cp);
+    let mut out = Vec::new();
+    out.extend(0xcafe_babeu32.to_be_bytes());
+    out.extend(0u16.to_be_bytes());
+    out.extend(61u16.to_be_bytes());
+    out.extend(((cp.0.len() + 1) as u16).to_be_bytes());
+    out.extend(cp.encode());
+    out.extend(0x0021u16.to_be_bytes()); // public, super
+    out.extend(this_idx.to_be_bytes()); // this_class
+    out.extend(super_idx.to_be_bytes()); // super_class
+    out.extend([0u8; 8]); // interfaces, fields, methods, class attributes
+    out
+}
+
 fn adapt(bytes: &[u8], name: &str) -> mod_adapter_core::auto_adapter::JarAdaptationResult {
     auto_adapt_jar_bytes(bytes, name, &AutoAdaptOptions::default()).unwrap()
 }
@@ -308,9 +394,15 @@ fn malicious_class_constants_are_quarantined_with_exact_member_and_kind() {
             SecurityThreatKind::NativeLibraryLoad,
         ),
     ] {
-        let class = class_with_utf8(&[reference]);
+        let class = class_with_pool(|cp| {
+            cp.class(reference);
+        });
         let bytes = jar(&[("hidden/Evil.class", &class)]);
-        let result = adapt(&bytes, "sodium-0.6.13.jar");
+        // Unknown display name: superseded ids resolve to a native
+        // subsystem before the *bytecode* quarantine verdict (their
+        // constant pools never execute), so a detection pin must use an
+        // id the catalog does not know.
+        let result = adapt(&bytes, "totally-unknown-mod.jar");
         assert!(matches!(
             result.route,
             ModRouteDecision::SecurityQuarantine { .. }
@@ -345,10 +437,14 @@ fn combined_security_indicators_require_both_owner_and_method() {
             SecurityThreatKind::DynamicCodeLoading,
         ),
     ] {
-        let malicious = class_with_utf8(&[owner, method]);
+        let malicious = class_with_pool(|cp| {
+            cp.method_ref(owner, method, "()V");
+        });
         let result = adapt(&jar(&[("test/E.class", &malicious)]), "unknown.jar");
         assert!(result.security_threats.iter().any(|t| t.kind == kind));
-        let owner_only = class_with_utf8(&[owner]);
+        let owner_only = class_with_pool(|cp| {
+            cp.class(owner);
+        });
         let report =
             route_mod_jar(&jar(&[("test/E.class", &owner_only)]), "unknown.jar", None).unwrap();
         assert!(!matches!(

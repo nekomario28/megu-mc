@@ -221,11 +221,11 @@ pub fn inspect_jar_security_and_capabilities(
             ));
         }
         signals.class_files_inspected += 1;
-        let strings = constant_pool_utf8(&member_bytes)
+        let pool = constant_pool_report(&member_bytes)
             .map_err(|reason| format!("{display}: malformed class {name}: {reason}"))?;
-        detect_security_threats(&strings, name, &mut threats);
+        detect_security_threats(&pool, name, &mut threats);
         let mut class_hits = HookHits::default();
-        for text in &strings {
+        for text in &pool.utf8 {
             collect_signals(
                 text,
                 &mut render_hooks,
@@ -287,34 +287,48 @@ pub fn inspect_jar_security_and_capabilities(
     Ok(JarRoutingReport { decision, signals })
 }
 
-/// Known IDs are considered only after the full static security scan.
+/// Known IDs are considered only after the full static security scan —
+/// the archive is always fail-closed validated first — but a verified
+/// superseded id resolves its route before the *bytecode* quarantine
+/// verdict: `mc-spine` never executes a single byte of these
+/// engine-replacement mods, so their constant pools can never run.
+/// Embedded native/executable *members* still quarantine regardless: a
+/// hostile archive renamed after a known mod must stay reported.
 pub fn route_mod_jar(
     jar_bytes: &[u8],
     display: &str,
     declared_or_inferred_id: Option<&str>,
 ) -> Result<JarRoutingReport, String> {
     let mut report = inspect_jar_security_and_capabilities(jar_bytes, display)?;
-    if matches!(report.decision, ModRouteDecision::SecurityQuarantine { .. }) {
-        return Ok(report);
-    }
     if let Some(id) = declared_or_inferred_id {
         if let Some(known) = BUILTIN_SUPERSEDED_PERF_MODS
             .iter()
             .find(|known| canonical_id(known) == canonical_id(id))
         {
-            let subsystem = match *known {
-                "starlight" | "scalablelux" | "phosphor" => NativeSubsystem::LightEngine,
-                "c2me" | "krypton" | "servercore" => NativeSubsystem::ServerChunkAndNetEngine,
-                "ferritecore" | "modernfix" | "memoryleakfix" => {
-                    NativeSubsystem::CompactRegistryAndMemory
-                }
-                _ => NativeSubsystem::WgpuRenderBackend,
-            };
-            report.decision = ModRouteDecision::RouteToNativeSubsystem {
-                subsystem,
-                matched_by: RouteMatchKind::KnownCatalogId,
-                evidence: vec![format!("BUILTIN_SUPERSEDED_PERF_MODS:{known}")],
-            };
+            let hostile_archive = matches!(
+                &report.decision,
+                ModRouteDecision::SecurityQuarantine { threats }
+                    if threats
+                        .iter()
+                        .any(|t| t.kind == SecurityThreatKind::EmbeddedNativeOrExecutable)
+            );
+            if !hostile_archive {
+                let subsystem = match *known {
+                    "starlight" | "scalablelux" | "phosphor" => NativeSubsystem::LightEngine,
+                    "c2me" | "krypton" | "servercore" => {
+                        NativeSubsystem::ServerChunkAndNetEngine
+                    }
+                    "ferritecore" | "modernfix" | "memoryleakfix" => {
+                        NativeSubsystem::CompactRegistryAndMemory
+                    }
+                    _ => NativeSubsystem::WgpuRenderBackend,
+                };
+                report.decision = ModRouteDecision::RouteToNativeSubsystem {
+                    subsystem,
+                    matched_by: RouteMatchKind::KnownCatalogId,
+                    evidence: vec![format!("BUILTIN_SUPERSEDED_PERF_MODS:{known}")],
+                };
+            }
         }
     }
     Ok(report)
@@ -386,10 +400,49 @@ impl<'a> ClassReader<'a> {
     }
 }
 
-/// Parse JVMS 4.4 constant-pool structures, including two-slot constants.
-/// UTF8 values remain raw bytes so legal modified-UTF8 (NUL/surrogates) does
-/// not hide ASCII references or get mistaken for invalid UTF-8.
-fn constant_pool_utf8(class: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
+/// The constant-pool structures one `.class` resolved for the scan.
+/// [`ConstantPoolReport::utf8`] feeds the capability-signal substring
+/// scan; security matching uses only structurally resolved entries —
+/// [`ConstantPoolReport::class_names`] (real `CONSTANT_Class` names) and
+/// [`ConstantPoolReport::method_pairs`] (owner + method name from real
+/// `CONSTANT_Methodref`/`CONSTANT_InterfaceMethodref` entries) — so a
+/// string literal, type descriptor, or unrelated method name can never
+/// fabricate a threat reference.
+#[derive(Default)]
+struct ConstantPoolReport {
+    /// Every `CONSTANT_Utf8` payload, raw bytes.
+    utf8: Vec<Vec<u8>>,
+    /// Internal names resolved from `CONSTANT_Class` entries.
+    class_names: Vec<Vec<u8>>,
+    /// `(owner, name)` resolved from `CONSTANT_Methodref` (tag 10) and
+    /// `CONSTANT_InterfaceMethodref` (tag 11). `invokedynamic`/`ldc`
+    /// method handles are covered too: a `CONSTANT_MethodHandle`'s
+    /// `reference_index` always points at one of these entries.
+    method_pairs: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// One parsed constant-pool slot, keeping the indexes later entries
+/// resolve through.
+enum CpEntry {
+    /// `CONSTANT_Utf8` raw bytes.
+    Utf8(Vec<u8>),
+    /// `CONSTANT_Class` — `name_index` of a `CONSTANT_Utf8`.
+    Class(u16),
+    /// `CONSTANT_NameAndType` — `name_index` of a `CONSTANT_Utf8`.
+    NameAndType(u16),
+    /// `CONSTANT_Methodref`/`CONSTANT_InterfaceMethodref` —
+    /// `class_index` + `name_and_type_index`.
+    MethodRef(u16, u16),
+    /// Every other constant kind (numbers, strings, handles, dynamics).
+    Other,
+}
+
+/// Parse JVMS 4.4 constant-pool structures, including two-slot constants,
+/// then resolve `CONSTANT_Class` names and method-reference owner/name
+/// pairs. UTF8 values remain raw bytes so legal modified-UTF8
+/// (NUL/surrogates) does not hide ASCII references or get mistaken for
+/// invalid UTF-8.
+fn constant_pool_report(class: &[u8]) -> Result<ConstantPoolReport, &'static str> {
     let mut reader = ClassReader { bytes: class };
     if reader.u32()? != 0xcafe_babe {
         return Err("invalid class magic");
@@ -400,17 +453,19 @@ fn constant_pool_utf8(class: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
     if count == 0 {
         return Err("invalid constant-pool count");
     }
-    let mut utf8 = Vec::new();
+    let mut entries: Vec<CpEntry> = Vec::with_capacity(usize::from(count));
+    entries.push(CpEntry::Other); // pool indexes are 1-based
     let mut index = 1u32;
     while index < u32::from(count) {
         let tag = reader.u8()?;
-        match tag {
+        let entry = match tag {
             1 => {
                 let len = reader.u16()? as usize;
-                utf8.push(reader.take(len)?.to_vec());
+                CpEntry::Utf8(reader.take(len)?.to_vec())
             }
             3 | 4 => {
                 reader.take(4)?;
+                CpEntry::Other
             }
             5 | 6 => {
                 if index + 1 >= u32::from(count) {
@@ -418,17 +473,40 @@ fn constant_pool_utf8(class: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
                 }
                 reader.take(8)?;
                 index += 1;
+                CpEntry::Other
             }
-            7 | 8 | 16 | 19 | 20 => {
+            7 => CpEntry::Class(reader.u16()?),
+            8 | 16 | 19 | 20 => {
                 reader.take(2)?;
+                CpEntry::Other
             }
-            9 | 10 | 11 | 12 | 17 | 18 => {
+            9 => {
                 reader.take(4)?;
+                CpEntry::Other
+            }
+            10 | 11 => {
+                let class_index = reader.u16()?;
+                let name_and_type_index = reader.u16()?;
+                CpEntry::MethodRef(class_index, name_and_type_index)
+            }
+            12 => {
+                let name_index = reader.u16()?;
+                reader.u16()?; // descriptor_index
+                CpEntry::NameAndType(name_index)
             }
             15 => {
                 reader.take(3)?;
+                CpEntry::Other
+            }
+            17 | 18 => {
+                reader.take(4)?;
+                CpEntry::Other
             }
             _ => return Err("unknown constant-pool tag"),
+        };
+        entries.push(entry);
+        if matches!(tag, 5 | 6) {
+            entries.push(CpEntry::Other); // long/double occupy two slots
         }
         index += 1;
     }
@@ -450,7 +528,41 @@ fn constant_pool_utf8(class: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
     if !reader.bytes.is_empty() {
         return Err("trailing bytes after class file");
     }
-    Ok(utf8)
+    resolve_constant_pool(&entries)
+}
+
+/// Resolve `CONSTANT_Class` names and method-reference owner/name pairs
+/// through the parsed pool. A dangling or mistyped index means a
+/// malformed class and fails closed like every other structural defect.
+fn resolve_constant_pool(entries: &[CpEntry]) -> Result<ConstantPoolReport, &'static str> {
+    let utf8_at = |index: u16| -> Result<&[u8], &'static str> {
+        match entries.get(usize::from(index)) {
+            Some(CpEntry::Utf8(bytes)) => Ok(bytes.as_slice()),
+            _ => Err("invalid constant-pool UTF-8 reference"),
+        }
+    };
+    let mut report = ConstantPoolReport::default();
+    for entry in entries {
+        match entry {
+            CpEntry::Utf8(bytes) => report.utf8.push(bytes.clone()),
+            CpEntry::Class(name_index) => {
+                report.class_names.push(utf8_at(*name_index)?.to_vec());
+            }
+            CpEntry::MethodRef(class_index, name_and_type_index) => {
+                let owner = match entries.get(usize::from(*class_index)) {
+                    Some(CpEntry::Class(name_index)) => utf8_at(*name_index)?,
+                    _ => return Err("invalid constant-pool method reference"),
+                };
+                let name = match entries.get(usize::from(*name_and_type_index)) {
+                    Some(CpEntry::NameAndType(name_index)) => utf8_at(*name_index)?,
+                    _ => return Err("invalid constant-pool method reference"),
+                };
+                report.method_pairs.push((owner.to_vec(), name.to_vec()));
+            }
+            _ => {}
+        }
+    }
+    Ok(report)
 }
 
 fn contains(text: &[u8], needle: &str) -> bool {
@@ -458,8 +570,18 @@ fn contains(text: &[u8], needle: &str) -> bool {
         .any(|window| window == needle.as_bytes())
 }
 
-fn has(strings: &[Vec<u8>], needle: &str) -> bool {
-    strings.iter().any(|value| contains(value, needle))
+/// Whether a real `CONSTANT_Class` internal name matches a class
+/// indicator: exactly, as a nested class (`Indicator$Inner`), or — for
+/// `/`-terminated indicators — as a package prefix (`com/sun/jna/`).
+/// String literals, descriptors, and annotations never reach this
+/// matcher; array-type class constants (`[Ljava/net/Socket;`) do not
+/// collide with the plain-name indicators either.
+fn class_name_indicates(class_name: &[u8], indicator: &str) -> bool {
+    let needle = indicator.as_bytes();
+    if needle.ends_with(b"/") {
+        return class_name.starts_with(needle);
+    }
+    class_name == needle || class_name.strip_prefix(needle).is_some_and(|rest| rest.starts_with(b"$"))
 }
 
 fn add_threat(
@@ -475,7 +597,11 @@ fn add_threat(
     });
 }
 
-fn detect_security_threats(strings: &[Vec<u8>], member: &str, threats: &mut Vec<SecurityThreat>) {
+fn detect_security_threats(
+    pool: &ConstantPoolReport,
+    member: &str,
+    threats: &mut Vec<SecurityThreat>,
+) {
     let singles = [
         (
             "java/lang/ProcessBuilder",
@@ -527,7 +653,11 @@ fn detect_security_threats(strings: &[Vec<u8>], member: &str, threats: &mut Vec<
         ),
     ];
     for (indicator, kind) in singles {
-        if has(strings, indicator) {
+        if pool
+            .class_names
+            .iter()
+            .any(|name| class_name_indicates(name, indicator))
+        {
             add_threat(threats, kind, member, indicator);
         }
     }
@@ -559,7 +689,9 @@ fn detect_security_threats(strings: &[Vec<u8>], member: &str, threats: &mut Vec<
         ),
     ];
     for (owner, method, kind) in combined {
-        if has(strings, owner) && strings.iter().any(|s| s.as_slice() == method.as_bytes()) {
+        if pool.method_pairs.iter().any(|(ref_owner, ref_name)| {
+            ref_owner.as_slice() == owner.as_bytes() && ref_name.as_slice() == method.as_bytes()
+        }) {
             add_threat(threats, kind, member, &format!("{owner}#{method}"));
         }
     }

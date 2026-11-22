@@ -84,6 +84,12 @@ pub const BUILTIN_SUPERSEDED_PERF_MODS: &[&str] = &[
     "enhancedblockentities",
     "cullleaves",
     "cull-less-leaves",
+    // Shader pipeline — superseded by mc-spine's native shaderpack
+    // subsystem; user shaderpacks reach it through the
+    // `shader_pipeline_bridge` resource bridge, the JAR itself is never
+    // loaded (same shape as the `distanthorizons`/`voxy` LOD bridges).
+    "iris",
+    "oculus",
     // Server tick / lighting / memory / startup.
     "lithium",
     "radium",
