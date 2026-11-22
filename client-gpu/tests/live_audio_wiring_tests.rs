@@ -55,7 +55,7 @@ fn sound_event() -> WireSoundEvent {
         category: 1,
         position: Some([18.0, 3.62, 8.0]),
         entity_id: None,
-        volume: 1.0,
+        volume: 2.0,
         pitch: 1.0,
         seed: 0,
         fixed_range: None,
