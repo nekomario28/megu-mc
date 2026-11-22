@@ -11,6 +11,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use mc_spine_client_mesh::ffi::PackedVertex;
+use mc_spine_client_mesh::vfx_engine::{
+    Vfx1Packet, VfxBudget, VfxCodecError, VfxFrameOutput, VfxHardwareTier, VfxWorld,
+};
 use mc_spine_client_mesh::{
     aabb_distance_sq, box_facing_mask, bucket_draw_mask, depth_key, BakedModelQuad,
     DirectionBuckets, DrawOrder, GraphCuller, HiZPyramid, MultidrawScratch,
@@ -24,7 +27,8 @@ use crate::audio_qol::ZoomState;
 use crate::lod::LodConfig;
 use crate::protocol::zlib_compress_stored;
 use crate::render_graph::{
-    plan_frame, plan_frame_with_shaderpack, FramePlanInput, GpuPipelineKind, RenderGraphPlan,
+    plan_frame, plan_frame_with_shaderpack, plan_frame_with_vfx_tier,
+    vfx_tier_for_pipeline, FramePlanInput, GpuPipelineKind, RenderGraphPlan,
 };
 use crate::settings::{ClientSettings, CloudMode, ParticleLevel};
 use crate::shaderpack_runtime::{
@@ -467,6 +471,101 @@ impl FrameBudgetGovernor {
                 effective_view_distance: base_view_distance.saturating_sub(4).max(2),
             },
         }
+    }
+}
+
+/// Client-side owner of the bounded fixed-tick VFX simulation. The caller
+/// routes `mc-spine:vfx_v1` custom payload bytes here and submits the
+/// resulting [`VfxFrameOutput`] alongside the terrain frame plan.
+pub struct ClientVfxHost {
+    pipeline: GpuPipelineKind,
+    tier: VfxHardwareTier,
+    world: VfxWorld,
+}
+
+impl ClientVfxHost {
+    pub fn new(pipeline: GpuPipelineKind) -> Self {
+        let tier = vfx_tier_for_pipeline(pipeline);
+        Self {
+            pipeline,
+            tier,
+            world: VfxWorld::new(tier),
+        }
+    }
+
+    pub fn budget(&self) -> VfxBudget {
+        self.world.budget()
+    }
+
+    pub fn budget_tier(&self) -> VfxHardwareTier {
+        self.tier
+    }
+
+    /// Decode one complete VFX1 payload before applying commands. Returns
+    /// the number admitted under the current effect caps.
+    pub fn ingest_vfx1_payload(&mut self, bytes: &[u8]) -> Result<usize, VfxCodecError> {
+        let packet = Vfx1Packet::decode(bytes)?;
+        let mut admitted = 0;
+        for command in packet.commands {
+            if self.world.apply(command).map_err(VfxCodecError::from)? {
+                admitted += 1;
+            }
+        }
+        Ok(admitted)
+    }
+
+    /// Advance one fixed simulation tick. Use `frame_output` when a render
+    /// frame arrives without another simulation tick.
+    pub fn tick(&mut self) {
+        self.world.tick();
+    }
+
+    pub fn frame_output(&self, camera_forward: [f32; 3]) -> VfxFrameOutput {
+        self.world.frame_output(camera_forward)
+    }
+
+    pub fn step(&mut self, camera_forward: [f32; 3]) -> VfxFrameOutput {
+        self.tick();
+        self.frame_output(camera_forward)
+    }
+
+    /// Plan an opt-in translucent VFX pass using the active governor tier.
+    pub fn plan_frame_with_vfx(
+        &self,
+        input: &FramePlanInput,
+        output: &VfxFrameOutput,
+    ) -> RenderGraphPlan {
+        plan_frame_with_vfx_tier(self.pipeline, input, output, self.tier)
+    }
+
+    /// Adjust effect caps to the current frame governor stage. The VFX
+    /// engine exposes immutable budgets, so changing tiers clears the
+    /// previous tier's transient effects. New payloads use the new cap.
+    pub fn sync_governor(&mut self, governor: &FrameBudgetGovernor) {
+        let base = vfx_tier_for_pipeline(self.pipeline);
+        let tier = match governor.stage() {
+            ThrottleStage::Full | ThrottleStage::TrimRebuilds => base,
+            ThrottleStage::TrimLod => match base {
+                VfxHardwareTier::High => VfxHardwareTier::Balanced,
+                VfxHardwareTier::Balanced | VfxHardwareTier::LowSpec => VfxHardwareTier::LowSpec,
+            },
+            ThrottleStage::MinBudget => VfxHardwareTier::LowSpec,
+        };
+        if self.tier != tier {
+            self.tier = tier;
+            self.world = VfxWorld::new(tier);
+        }
+    }
+
+    /// Record frame time and apply the resulting quality stage immediately.
+    pub fn observe_frame(
+        &mut self,
+        governor: &mut FrameBudgetGovernor,
+        frame_time: Duration,
+    ) -> ThrottleStage {
+        let stage = governor.observe_frame(frame_time);
+        self.sync_governor(governor);
+        stage
     }
 }
 

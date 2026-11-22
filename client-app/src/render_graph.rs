@@ -15,6 +15,7 @@
 //! UBOs; `Classic` keeps the Hi-Z chain for CPU-side occlusion queries but
 //! submits plain per-section draws.
 
+use mc_spine_client_mesh::vfx_engine::{VfxBudget, VfxFrameOutput, VfxHardwareTier};
 use mc_spine_client_mesh::{
     ActiveRenderBackend, PassKind, PipelineStage, BLOCK_ENTITY_INSTANCE_GPU_BYTES,
     KINETIC_INSTANCE_GPU_BYTES, MAX_INSTANCES_PER_UBO_16KB,
@@ -335,6 +336,31 @@ pub struct ShaderpackPlannedPass {
     pub estimated_vram_bytes: u64,
 }
 
+/// Bounded VFX work submitted after translucent terrain and before the HUD.
+/// Kept separate from the fixed [`RenderPassId`] taxonomy so render backends
+/// compiled against the existing pass IDs remain compatible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VfxPassSummary {
+    pub active_particles: usize,
+    pub beam_count: usize,
+    pub ribbon_quad_count: usize,
+    pub aura_count: usize,
+    pub dynamic_light_count: usize,
+    pub budget_preset: VfxHardwareTier,
+}
+
+/// A translucent VFX pass and its per-frame draw/upload estimates. Dynamic
+/// lights are forwarded in `summary` for the lighting stage to consume.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VfxPlannedPass {
+    pub label: &'static str,
+    pub after_pass: RenderPassId,
+    pub submission: PassSubmission,
+    pub estimated_draw_calls: u32,
+    pub estimated_vram_bytes: u64,
+    pub summary: VfxPassSummary,
+}
+
 /// A complete deterministic frame plan.
 #[derive(Clone, Debug)]
 pub struct RenderGraphPlan {
@@ -350,6 +376,8 @@ pub struct RenderGraphPlan {
     /// Display name of the active shaderpack when `shaderpack_passes` is
     /// populated; `None` for built-in rendering.
     pub active_shaderpack: Option<String>,
+    /// Optional translucent VFX work between terrain transparency and HUD.
+    pub vfx_pass: Option<Box<VfxPlannedPass>>,
 }
 
 impl RenderGraphPlan {
@@ -365,6 +393,7 @@ impl RenderGraphPlan {
             .iter()
             .map(|p| p.estimated_draw_calls)
             .chain(self.shaderpack_passes.iter().map(|p| p.estimated_draw_calls))
+            .chain(self.vfx_pass.iter().map(|p| p.estimated_draw_calls))
             .sum()
     }
 
@@ -375,6 +404,7 @@ impl RenderGraphPlan {
             .iter()
             .map(|p| p.estimated_vram_bytes)
             .chain(self.shaderpack_passes.iter().map(|p| p.estimated_vram_bytes))
+            .chain(self.vfx_pass.iter().map(|p| p.estimated_vram_bytes))
             .sum()
     }
 
@@ -699,7 +729,76 @@ pub fn plan_frame(pipeline: GpuPipelineKind, input: &FramePlanInput) -> RenderGr
         passes,
         shaderpack_passes: Vec::new(),
         active_shaderpack: None,
+        vfx_pass: None,
     }
+}
+
+/// Map the active GPU pipeline to the VFX simulation and draw cap. The
+/// mesh-shader and classic paths share the balanced cap, while the
+/// compute-indirect path has the high cap.
+pub const fn vfx_tier_for_pipeline(pipeline: GpuPipelineKind) -> VfxHardwareTier {
+    match pipeline {
+        GpuPipelineKind::ClassicLowSpec => VfxHardwareTier::LowSpec,
+        GpuPipelineKind::MeshShader | GpuPipelineKind::Classic => VfxHardwareTier::Balanced,
+        GpuPipelineKind::ComputeIndirect => VfxHardwareTier::High,
+    }
+}
+
+pub const fn vfx_budget_for_pipeline(pipeline: GpuPipelineKind) -> VfxBudget {
+    VfxBudget::for_tier(vfx_tier_for_pipeline(pipeline))
+}
+
+/// Plan translucent VFX work with the pipeline's default budget.
+pub fn plan_frame_with_vfx(
+    pipeline: GpuPipelineKind,
+    input: &FramePlanInput,
+    vfx: &VfxFrameOutput,
+) -> RenderGraphPlan {
+    plan_frame_with_vfx_tier(pipeline, input, vfx, vfx_tier_for_pipeline(pipeline))
+}
+
+/// Plan VFX with a governor-adjusted tier, limiting even caller-supplied
+/// frame data to the selected budget before it reaches GPU consumers.
+pub fn plan_frame_with_vfx_tier(
+    pipeline: GpuPipelineKind,
+    input: &FramePlanInput,
+    vfx: &VfxFrameOutput,
+    tier: VfxHardwareTier,
+) -> RenderGraphPlan {
+    let budget = VfxBudget::for_tier(tier);
+    let ribbon_quad_count = vfx
+        .ribbons
+        .iter()
+        .take(budget.max_ribbons)
+        .map(|ribbon| ribbon.vertices.len() / 2)
+        .map(|pairs| pairs.saturating_sub(1))
+        .sum::<usize>()
+        .min(budget.max_ribbon_segments);
+    let summary = VfxPassSummary {
+        active_particles: vfx.particles.len().min(budget.max_active_particles),
+        beam_count: vfx.beams.len().min(budget.max_beams),
+        ribbon_quad_count,
+        aura_count: vfx.auras.len().min(budget.max_auras),
+        dynamic_light_count: vfx.lights.len().min(budget.max_dynamic_lights),
+        budget_preset: tier,
+    };
+    // A particle, ribbon segment, or aura uses one quad, while beams use
+    // core and glow quads. 36 bytes per vertex (position, RGBA, UV) and
+    // 32 bytes per dynamic colored light (position, RGB, radius, intensity).
+    let quads = summary.active_particles as u64
+        + summary.beam_count as u64 * 2
+        + summary.ribbon_quad_count as u64
+        + summary.aura_count as u64;
+    let mut plan = plan_frame(pipeline, input);
+    plan.vfx_pass = Some(Box::new(VfxPlannedPass {
+        label: "vfx_particles_beams_ribbons",
+        after_pass: RenderPassId::TranslucentTerrain,
+        submission: PassSubmission::DirectDraws,
+        estimated_draw_calls: quads as u32,
+        estimated_vram_bytes: quads * 4 * 36 + summary.dynamic_light_count as u64 * 32,
+        summary,
+    }));
+    plan
 }
 
 /// Deterministic plan entry for one shaderpack pass. Compute passes report
