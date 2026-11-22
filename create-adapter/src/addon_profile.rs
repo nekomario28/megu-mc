@@ -21,7 +21,7 @@ use mod_adapter_core::blockstates::{
     BlockDef, BlockRegistry, PropertyDef, RegistryError, UniversalBlockRole,
 };
 use mod_adapter_core::data_loader::{
-    load_from_stored_zip, parse_json, DataLoadError, ItemFluidIdTable, JsonValue, LoadedModData,
+    parse_json, DataLoadError, ItemFluidIdTable, JsonValue, LoadedModData,
 };
 use mod_adapter_core::profile::ModOffloadProfile;
 use mod_adapter_core::version_compat::{
@@ -55,8 +55,70 @@ pub struct SequencedAssemblyRecipe {
     pub results: Vec<(String, u32, f32)>,
 }
 
+/// One resolved machine ingredient: a concrete item or a `#`-tag reference
+/// plus the count consumed per operation. Real 1.21.1 mod JARs declare both
+/// (`{"item": "..."}`, `{"id": "..."}`, `{"tag": "c:ingots/iron"}`,
+/// `neoforge:block_tag`, compound `neoforge:compound` alternatives).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessingIngredient {
+    /// Item id (`ns:path`) or tag id (`ns:path`); `is_tag` distinguishes.
+    pub id: String,
+    /// Whether `id` names a `#`-tag rather than a concrete item.
+    pub is_tag: bool,
+    /// Item count consumed per operation (>= 1).
+    pub count: u32,
+}
+
+impl ProcessingIngredient {
+    fn item(id: &str) -> Self {
+        Self {
+            id: id.into(),
+            is_tag: false,
+            count: 1,
+        }
+    }
+
+    /// Interning/display key: `"#<id>"` for tags, the bare id for items.
+    /// The `#`-prefix matches Minecraft's tag-reference convention and can
+    /// never collide with a namespaced item id.
+    pub fn resource_key(&self) -> String {
+        if self.is_tag {
+            format!("#{}", self.id)
+        } else {
+            self.id.clone()
+        }
+    }
+}
+
+/// A single machine recipe decoded straight from `data/<ns>/recipe(s)/**`
+/// JSON: every item/tag ingredient and fluid input in declaration order
+/// (compound `neoforge:*` wrappers flattened to their first operand), the
+/// chance-weighted item results, and any fluid outputs (`create:emptying`,
+/// fluid-producing `create:mixing`). `recipe_type` is preserved verbatim so
+/// unknown `<ns>:<machine>` serializers stay data-driven.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MachineProcessingRecipe {
+    pub id: String,
+    /// Fully-namespaced recipe type (e.g. `"create:compacting"`,
+    /// `"my_mod:pulverizing"`).
+    pub recipe_type: String,
+    /// Item & tag ingredients in declaration order.
+    pub ingredients: Vec<ProcessingIngredient>,
+    /// Fluid inputs `(fluid id or #tag, amount_mb)` in declaration order.
+    pub fluid_inputs: Vec<(String, u32)>,
+    /// Chance-weighted item results `(item id or #tag, count, weight)`.
+    pub results: Vec<(String, u32, f32)>,
+    /// Fluid outputs `(fluid id or #tag, amount_mb)` in declaration order.
+    pub fluid_results: Vec<(String, u32)>,
+}
+
 /// Standalone pressing and fluid-spouting recipes share the assembly result
-/// representation, including deterministic weighted output selection.
+/// representation, including deterministic weighted output selection. The
+/// machine families (real Create 1.21.1 `compacting`, `splashing`,
+/// `haunting`, `deploying`, `emptying`, `item_application`,
+/// `sandpaper_polishing`, `mechanical_crafting`, plus the generic
+/// `<ns>:<machine>` fallback) carry the richer [`MachineProcessingRecipe`]
+/// payload.
 #[derive(Clone, Debug, PartialEq)]
 pub enum AddonProcessingRecipe {
     SequencedAssembly(SequencedAssemblyRecipe),
@@ -68,7 +130,14 @@ pub enum AddonProcessingRecipe {
     Mixing {
         id: String,
         ingredient_item: String,
+        /// Fluid inputs `(fluid id or #tag, amount_mb)` declared via
+        /// `fluid_stack`/`fluid`/`neoforge:*` operand shapes.
+        fluid_inputs: Vec<(String, u32)>,
         results: Vec<(String, u32, f32)>,
+        /// Fluid outputs `(fluid id or #tag, amount_mb)` — real 1.21.1
+        /// mixing recipes produce `create:honey`/`create:tea`/`minecraft:lava`
+        /// with no item result at all.
+        fluid_results: Vec<(String, u32)>,
     },
     Milling {
         id: String,
@@ -92,6 +161,103 @@ pub enum AddonProcessingRecipe {
         amount_mb: u32,
         results: Vec<(String, u32, f32)>,
     },
+    /// Basin compaction (`create:compacting`), often with a fluid input.
+    Compacting(MachineProcessingRecipe),
+    /// Encased-fan bulk washing (`create:splashing`).
+    Splashing(MachineProcessingRecipe),
+    /// Encased-fan bulk haunting (`create:haunting`).
+    Haunting(MachineProcessingRecipe),
+    /// Deployer item application (`create:deploying`); the second
+    /// `ingredients` entry is the held item.
+    Deploying(MachineProcessingRecipe),
+    /// Item drain (`create:emptying`); recovered fluid lands in
+    /// [`MachineProcessingRecipe::fluid_results`].
+    Emptying(MachineProcessingRecipe),
+    /// Right-click item application (`create:item_application`).
+    ItemApplication(MachineProcessingRecipe),
+    /// Sandpaper polishing (`create:sandpaper_polishing`).
+    SandpaperPolishing(MachineProcessingRecipe),
+    /// Mechanical-crafter grid (`create:mechanical_crafting`): `key`/`pattern`
+    /// usage counts are folded into [`MachineProcessingRecipe::ingredients`].
+    MechanicalCrafting(MachineProcessingRecipe),
+    /// Data-driven fallback for ANY other `<ns>:<machine>` recipe declaring
+    /// standard `ingredients` + `results`/`result` fields.
+    GenericMachine(MachineProcessingRecipe),
+}
+
+fn item_stack(ids: &mut ItemFluidIdTable, item_id: &str, amount: u32) -> Stack {
+    Stack {
+        resource: Resource {
+            kind: ResourceKind::Item,
+            id: ids.intern_item(item_id),
+        },
+        amount,
+    }
+}
+
+fn fluid_stack(ids: &mut ItemFluidIdTable, fluid_id: &str, amount: u32) -> Stack {
+    Stack {
+        resource: Resource {
+            kind: ResourceKind::Fluid,
+            id: ids.intern_fluid(fluid_id),
+        },
+        amount,
+    }
+}
+
+/// Merge a stack into a flat input/output list, summing amounts for repeats
+/// of the same resource id (mirrors the generic loader's input folding).
+fn merge_processor_stack(list: &mut Vec<Stack>, stack: Stack) {
+    if let Some(existing) = list.iter_mut().find(|s| s.resource == stack.resource) {
+        existing.amount = existing.amount.saturating_add(stack.amount);
+    } else {
+        list.push(stack);
+    }
+}
+
+impl MachineProcessingRecipe {
+    /// Flatten this machine recipe into the numeric [`Recipe`] consumed by
+    /// `CreateFactory::add_processor`: every item/tag ingredient and fluid
+    /// input becomes an input stack (repeat resources merged), chance-
+    /// weighted item results collapse deterministically to the dominant one
+    /// via [`dominant_result`], and fluid outputs are emitted as fluid
+    /// stacks. Returns `None` when the recipe declares no usable outputs.
+    pub fn to_processor_recipe(
+        &self,
+        ids: &mut ItemFluidIdTable,
+        recipe_id: u32,
+        base_ticks: u32,
+    ) -> Option<Recipe> {
+        if self.ingredients.is_empty() && self.fluid_inputs.is_empty() {
+            return None;
+        }
+        let mut inputs = Vec::with_capacity(self.ingredients.len() + self.fluid_inputs.len());
+        for ingredient in &self.ingredients {
+            merge_processor_stack(
+                &mut inputs,
+                item_stack(ids, &ingredient.resource_key(), ingredient.count),
+            );
+        }
+        for (fluid_id, amount_mb) in &self.fluid_inputs {
+            merge_processor_stack(&mut inputs, fluid_stack(ids, fluid_id, *amount_mb));
+        }
+        let mut outputs = Vec::new();
+        if let Some((result_item, result_count, _)) = dominant_result(&self.results) {
+            outputs.push(item_stack(ids, result_item, result_count));
+        }
+        for (fluid_id, amount_mb) in &self.fluid_results {
+            merge_processor_stack(&mut outputs, fluid_stack(ids, fluid_id, *amount_mb));
+        }
+        if outputs.is_empty() {
+            return None;
+        }
+        Some(Recipe {
+            id: recipe_id,
+            base_ticks,
+            inputs,
+            outputs,
+        })
+    }
 }
 
 impl AddonProcessingRecipe {
@@ -109,14 +275,52 @@ impl AddonProcessingRecipe {
         recipe_id: u32,
         base_ticks: u32,
     ) -> Option<Recipe> {
+        match self {
+            Self::Compacting(recipe)
+            | Self::Splashing(recipe)
+            | Self::Haunting(recipe)
+            | Self::Deploying(recipe)
+            | Self::Emptying(recipe)
+            | Self::ItemApplication(recipe)
+            | Self::SandpaperPolishing(recipe)
+            | Self::MechanicalCrafting(recipe)
+            | Self::GenericMachine(recipe) => {
+                return recipe.to_processor_recipe(ids, recipe_id, base_ticks);
+            }
+            Self::Mixing {
+                ingredient_item,
+                fluid_inputs,
+                results,
+                fluid_results,
+                ..
+            } => {
+                let mut inputs = Vec::with_capacity(1 + fluid_inputs.len());
+                merge_processor_stack(&mut inputs, item_stack(ids, ingredient_item, 1));
+                for (fluid_id, amount_mb) in fluid_inputs {
+                    merge_processor_stack(&mut inputs, fluid_stack(ids, fluid_id, *amount_mb));
+                }
+                let mut outputs = Vec::new();
+                if let Some((result_item, result_count, _)) = dominant_result(results) {
+                    outputs.push(item_stack(ids, result_item, result_count));
+                }
+                for (fluid_id, amount_mb) in fluid_results {
+                    merge_processor_stack(&mut outputs, fluid_stack(ids, fluid_id, *amount_mb));
+                }
+                if outputs.is_empty() {
+                    return None;
+                }
+                return Some(Recipe {
+                    id: recipe_id,
+                    base_ticks,
+                    inputs,
+                    outputs,
+                });
+            }
+            _ => {}
+        }
         let (ingredient_item, fluid_id, amount_mb, results) = match self {
             Self::SequencedAssembly(_) => return None,
             Self::Pressing {
-                ingredient_item,
-                results,
-                ..
-            }
-            | Self::Mixing {
                 ingredient_item,
                 results,
                 ..
@@ -153,6 +357,7 @@ impl AddonProcessingRecipe {
                 *amount_mb,
                 results.as_slice(),
             ),
+            _ => return None,
         };
         let (result_item, result_count, _) = dominant_result(results)?;
         let mut inputs = vec![Stack {
@@ -362,13 +567,22 @@ fn parse_assembly_object(
     let ingredient = obj
         .get("ingredient")
         .ok_or("assembly ingredient is missing")?;
-    let ingredient_item = parse_item_id(ingredient)?;
+    // Real 1.21.1 assemblies may start from a tag (`{"tag": "c:plates/gold"}`),
+    // stored in `#tag` resource-key form.
+    let ingredient_item = match parse_ingredient_operand(ingredient)? {
+        Some(RecipeOperand::Item(ingredient)) => ingredient.resource_key(),
+        _ => return Err("assembly ingredient must be an item or tag".into()),
+    };
     let transitional_item = parse_item_id(
         obj.get("transitionalItem")
             .or_else(|| obj.get("transitional_item"))
             .ok_or("assembly transitional item is missing")?,
     )?;
-    let loops = bounded_integer(obj.get("loops"), "loops", 1, 64)?;
+    // `loops` is optional in 1.21.1 (e.g. create:sturdy_sheet omits it).
+    let loops = match obj.get("loops") {
+        Some(value) => bounded_integer(Some(value), "loops", 1, 64)?,
+        None => 1,
+    };
     let sequence = obj
         .get("sequence")
         .and_then(JsonValue::as_array)
@@ -448,9 +662,12 @@ fn parse_assembly_step(value: &JsonValue) -> Result<AssemblyStepKind, String> {
                 .or_else(|| obj.get("heldItem"))
                 .or_else(|| obj.get("ingredients")?.as_array()?.get(1))
                 .ok_or("deploying step is missing held item")?;
-            Ok(AssemblyStepKind::Deploying {
-                held_item: parse_item_id(held)?,
-            })
+            match parse_ingredient_operand(held)? {
+                Some(RecipeOperand::Item(held)) => Ok(AssemblyStepKind::Deploying {
+                    held_item: held.resource_key(),
+                }),
+                _ => Err("deploying held item must be a concrete item or tag".into()),
+            }
         }
         "pressing" => Ok(AssemblyStepKind::Pressing),
         "filling" => {
@@ -468,46 +685,466 @@ fn parse_assembly_step(value: &JsonValue) -> Result<AssemblyStepKind, String> {
 }
 
 fn parse_fluid_operand(obj: &BTreeMap<String, JsonValue>) -> Result<(String, u32), String> {
-    let candidate = obj
-        .get("fluid_id")
-        .or_else(|| obj.get("fluid"))
-        .or_else(|| {
-            obj.get("ingredients")?
-                .as_array()?
-                .iter()
-                .find(|ingredient| {
-                    ingredient
-                        .as_object()
-                        .is_some_and(|part| part.contains_key("fluid"))
-                })
-        })
-        .ok_or("filling recipe is missing a fluid")?;
-    let (fluid_id, count_obj) = match candidate {
-        JsonValue::String(id) => (id.as_str(), obj),
-        JsonValue::Object(o) => {
-            let id = o
-                .get("fluid")
-                .or_else(|| o.get("id"))
-                .and_then(JsonValue::as_str)
-                .ok_or("filling fluid id must be a string")?;
-            (id, o)
+    // Object-level fluid keys (declarative shorthand schemas).
+    if let Some(candidate) = obj.get("fluid_id").or_else(|| obj.get("fluid")) {
+        let (fluid_id, count_obj) = match candidate {
+            JsonValue::String(id) => (id.as_str(), obj),
+            JsonValue::Object(o) => {
+                let id = o
+                    .get("fluid")
+                    .or_else(|| o.get("id"))
+                    .and_then(JsonValue::as_str)
+                    .ok_or("filling fluid id must be a string")?;
+                (id, o)
+            }
+            _ => return Err("filling fluid must be a string or object".into()),
+        };
+        if fluid_id.trim().is_empty() {
+            return Err("filling fluid id must be nonempty".into());
         }
-        _ => return Err("filling fluid must be a string or object".into()),
-    };
-    if fluid_id.trim().is_empty() {
-        return Err("filling fluid id must be nonempty".into());
+        let amount = bounded_integer(
+            count_obj
+                .get("amount_mb")
+                .or_else(|| count_obj.get("amount"))
+                .or_else(|| obj.get("amount_mb"))
+                .or_else(|| obj.get("amount")),
+            "fluid amount",
+            1,
+            u32::MAX,
+        )?;
+        return Ok((fluid_id.into(), amount));
     }
-    let amount = bounded_integer(
-        count_obj
-            .get("amount_mb")
-            .or_else(|| count_obj.get("amount"))
-            .or_else(|| obj.get("amount_mb"))
-            .or_else(|| obj.get("amount")),
-        "fluid amount",
-        1,
-        u32::MAX,
-    )?;
-    Ok((fluid_id.into(), amount))
+    // Ingredient-list fluid operands: legacy `{"fluid": ...}` plus the 1.21.1
+    // `{"type": "fluid_stack"}` / `neoforge:single|tag|components|any` forms.
+    if let Some(arr) = obj.get("ingredients").and_then(JsonValue::as_array) {
+        for ingredient in arr {
+            if let Some(RecipeOperand::Fluid(fluid_id, amount_mb)) =
+                parse_ingredient_operand(ingredient)?
+            {
+                return Ok((fluid_id, amount_mb));
+            }
+        }
+    }
+    Err("filling recipe is missing a fluid".into())
+}
+
+/// Fluid input/output list `(fluid id or #tag, amount_mb)` in
+/// declaration order.
+type FluidStackList = Vec<(String, u32)>;
+/// Chance-weighted item result list `(item id, count, weight)` in
+/// declaration order.
+type WeightedItemResults = Vec<(String, u32, f32)>;
+
+/// One resolved recipe operand: an item/tag ingredient or a fluid input.
+enum RecipeOperand {
+    Item(ProcessingIngredient),
+    /// `(fluid id or #tag, amount_mb)`.
+    Fluid(String, u32),
+}
+
+fn non_empty_str(value: &str) -> Option<&str> {
+    (!value.trim().is_empty()).then_some(value)
+}
+
+/// Extract a fluid id (`ns:path`) or `#`-tag reference from an operand
+/// object, covering the real 1.21.1 shapes: `{"fluid": ...}`,
+/// `{"fluids": ...}` (string or list), `{"fluid_tag": ...}`,
+/// `{"type": "fluid_stack", "id"/"fluid": ...}`,
+/// `{"type": "fluid_tag", "tag": ...}`, `neoforge:single` (`fluid`),
+/// `neoforge:tag` (`tag` + `amount`), `neoforge:components` (`fluids`) and
+/// `neoforge:any`.
+fn fluid_operand_id(obj: &BTreeMap<String, JsonValue>) -> Option<String> {
+    if let Some(id) = obj.get("fluid").and_then(JsonValue::as_str) {
+        return non_empty_str(id).map(str::to_string);
+    }
+    if let Some(id) = obj.get("fluid_tag").and_then(JsonValue::as_str) {
+        return non_empty_str(id).map(|id| format!("#{id}"));
+    }
+    if let Some(fluids) = obj.get("fluids") {
+        match fluids {
+            JsonValue::String(id) => return non_empty_str(id).map(str::to_string),
+            JsonValue::Array(list) => {
+                if let Some(id) = list.iter().find_map(JsonValue::as_str) {
+                    return non_empty_str(id).map(str::to_string);
+                }
+            }
+            _ => {}
+        }
+    }
+    let type_name = obj
+        .get("type")
+        .and_then(JsonValue::as_str)
+        .map(|t| t.rsplit(':').next().unwrap_or(t));
+    match type_name {
+        Some("fluid_tag") => obj
+            .get("tag")
+            .or_else(|| obj.get("fluid"))
+            .and_then(JsonValue::as_str)
+            .and_then(non_empty_str)
+            .map(|id| format!("#{id}")),
+        Some("fluid_stack") | Some("single") | Some("components") | Some("any") => obj
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .and_then(non_empty_str)
+            .map(str::to_string)
+            .or_else(|| {
+                obj.get("tag")
+                    .and_then(JsonValue::as_str)
+                    .and_then(non_empty_str)
+                    .map(|id| format!("#{id}"))
+            }),
+        // `{"type": "neoforge:tag", "tag": "c:milk", "amount": N}` names a
+        // fluid tag; without `amount` it is just an item tag ingredient.
+        Some("tag") if obj.contains_key("amount") => obj
+            .get("tag")
+            .and_then(JsonValue::as_str)
+            .and_then(non_empty_str)
+            .map(|id| format!("#{id}")),
+        _ => None,
+    }
+}
+
+/// Item count on an operand object (`{"item": ..., "count": N}`); absent or
+/// invalid counts default to 1, keeping unparseable extras non-fatal.
+fn operand_item_count(obj: &BTreeMap<String, JsonValue>) -> u32 {
+    obj.get("count")
+        .and_then(JsonValue::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .filter(|&v| v >= 1)
+        .unwrap_or(1)
+}
+
+/// Resolve one operand value to an item/tag [`RecipeOperand::Item`] or a
+/// [`RecipeOperand::Fluid`]: plain strings, `{"item"|"id"}`, `{"tag"}`,
+/// `{"fluid"|"fluids"|"fluid_tag"}`, `fluid_stack`/`neoforge:*` typed
+/// operands, `neoforge:block_tag`, nested alternative lists
+/// (`ingredients: [[...]]`) and compound wrappers (`neoforge:compound`,
+/// `difference`, `intersection`, component matchers) — the latter resolving
+/// to their first resolvable sub-operand.
+/// Unresolvable operand shapes return `Ok(None)`; explicitly malformed
+/// values (e.g. a fluid `amount` outside `1..=u32::MAX`) fail closed so a
+/// corrupt recognized recipe still aborts discovery instead of being
+/// silently reinterpreted.
+fn parse_ingredient_operand(value: &JsonValue) -> Result<Option<RecipeOperand>, String> {
+    match value {
+        JsonValue::String(id) => Ok(non_empty_str(id)
+            .map(|id| RecipeOperand::Item(ProcessingIngredient::item(id)))),
+        JsonValue::Array(list) => {
+            for element in list {
+                if let Some(operand) = parse_ingredient_operand(element)? {
+                    return Ok(Some(operand));
+                }
+            }
+            Ok(None)
+        }
+        JsonValue::Object(obj) => {
+            if let Some(fluid_id) = fluid_operand_id(obj) {
+                let amount_value = obj.get("amount").or_else(|| obj.get("amount_mb"));
+                let amount_mb = if amount_value.is_some() {
+                    bounded_integer(amount_value, "fluid amount", 1, u32::MAX)?
+                } else {
+                    1000
+                };
+                return Ok(Some(RecipeOperand::Fluid(fluid_id, amount_mb)));
+            }
+            if let Some(id) = obj
+                .get("item")
+                .or_else(|| obj.get("id"))
+                .and_then(|v| match v {
+                    JsonValue::String(id) => Some(id.as_str()),
+                    JsonValue::Object(inner) => inner.get("id").and_then(JsonValue::as_str),
+                    _ => None,
+                })
+                .and_then(non_empty_str)
+            {
+                return Ok(Some(RecipeOperand::Item(ProcessingIngredient {
+                    id: id.into(),
+                    is_tag: false,
+                    count: operand_item_count(obj),
+                })));
+            }
+            if let Some(id) = obj
+                .get("tag")
+                .and_then(JsonValue::as_str)
+                .and_then(non_empty_str)
+            {
+                return Ok(Some(RecipeOperand::Item(ProcessingIngredient {
+                    id: id.into(),
+                    is_tag: true,
+                    count: operand_item_count(obj),
+                })));
+            }
+            // Compound/wrapper ingredient (`neoforge:compound`, `difference`,
+            // `intersection`, `any`, component/data matchers): first
+            // resolvable sub-operand wins, deterministically.
+            for key in ["ingredients", "children", "entries", "base", "items"] {
+                if let Some(operand) = obj
+                    .get(key)
+                    .map(parse_ingredient_operand)
+                    .transpose()?
+                    .flatten()
+                {
+                    return Ok(Some(operand));
+                }
+            }
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Collect the full operand list of a processing recipe: `ingredients`
+/// (array or nested alternative lists) plus the singular `ingredient`,
+/// `input`, `item_input`, `fluid_input` keys, split into item/tag
+/// ingredients and fluid inputs, declaration order preserved.
+fn parse_ingredient_list(
+    obj: &BTreeMap<String, JsonValue>,
+) -> Result<(Vec<ProcessingIngredient>, FluidStackList), String> {
+    let mut items = Vec::new();
+    let mut fluids = Vec::new();
+    let push = |operand: RecipeOperand,
+                    items: &mut Vec<ProcessingIngredient>,
+                    fluids: &mut Vec<(String, u32)>| match operand {
+        RecipeOperand::Item(ingredient) => items.push(ingredient),
+        RecipeOperand::Fluid(fluid_id, amount_mb) => fluids.push((fluid_id, amount_mb)),
+    };
+    if let Some(value) = obj.get("ingredients") {
+        match value {
+            JsonValue::Array(list) => {
+                for element in list {
+                    if let Some(operand) = parse_ingredient_operand(element)? {
+                        push(operand, &mut items, &mut fluids);
+                    }
+                }
+            }
+            _ => return Err("processing ingredients must be an array".into()),
+        }
+    }
+    for key in ["ingredient", "input", "item_input", "fluid_input"] {
+        if let Some(operand) = obj
+            .get(key)
+            .map(parse_ingredient_operand)
+            .transpose()?
+            .flatten()
+        {
+            push(operand, &mut items, &mut fluids);
+        }
+    }
+    Ok((items, fluids))
+}
+
+/// First declared item/tag ingredient as a resource key (`id` or `#tag`),
+/// matching the legacy single-`ingredient_item` view.
+fn first_item_key(
+    id: &str,
+    items: &[ProcessingIngredient],
+) -> Result<String, String> {
+    items
+        .first()
+        .map(ProcessingIngredient::resource_key)
+        .ok_or_else(|| format!("{id}: processing input item is missing"))
+}
+
+/// Whether a result object is a fluid output (`{"amount": N, "id": fluid}`,
+/// `{"fluid": ...}`, `fluid_stack`-typed). Fluid results carry `(fluid id or
+/// #tag, amount_mb)`; everything else stays an item result.
+fn parse_fluid_result(value: &JsonValue) -> Result<Option<(String, u32)>, String> {
+    let Some(obj) = value.as_object() else {
+        return Ok(None);
+    };
+    let type_name = obj
+        .get("type")
+        .and_then(JsonValue::as_str)
+        .map(|t| t.rsplit(':').next().unwrap_or(t));
+    let is_fluid = obj.contains_key("fluid")
+        || obj.contains_key("fluids")
+        || obj.contains_key("fluid_tag")
+        || matches!(
+            type_name,
+            Some("fluid" | "fluid_stack" | "fluid_tag" | "single" | "components" | "any")
+        )
+        // Real 1.21.1 fluid results are `{"amount": N, "id": "ns:fluid"}` —
+        // `amount` (not `count`) marks a fluid stack.
+        || (obj.contains_key("amount")
+            && !obj.contains_key("count")
+            && obj.contains_key("id"));
+    if !is_fluid {
+        return Ok(None);
+    }
+    let fluid_id = fluid_operand_id(obj)
+        .or_else(|| {
+            obj.get("id")
+                .and_then(JsonValue::as_str)
+                .and_then(non_empty_str)
+                .map(str::to_string)
+        })
+        .ok_or("fluid result is missing a fluid id")?;
+    let amount_mb = match obj.get("amount").or_else(|| obj.get("amount_mb")) {
+        Some(value) => bounded_integer(Some(value), "fluid amount", 1, u32::MAX)?,
+        None => 1000,
+    };
+    Ok(Some((fluid_id, amount_mb)))
+}
+
+/// Item-id resolver for result entries (`{"item"}`, `{"id"}`, nested
+/// `{"item": {"id"}}`); `{"tag"}` results resolve to `#tag`.
+fn parse_result_item(value: &JsonValue) -> Result<String, String> {
+    if let Ok(id) = parse_item_id(value) {
+        return Ok(id);
+    }
+    if let Some(tag) = value
+        .as_object()
+        .and_then(|o| o.get("tag"))
+        .and_then(JsonValue::as_str)
+        .and_then(non_empty_str)
+    {
+        return Ok(format!("#{tag}"));
+    }
+    Err("expected a concrete item id".into())
+}
+
+/// Split a recipe's `results`/`result`/`output`/`main_output` into
+/// chance-weighted item results and fluid outputs. Same bounds as
+/// [`parse_assembly_results`]: 1..=32 total entries, item counts
+/// 1..=u32::MAX, finite nonnegative weights — but at least one positive-
+/// weight item result *or* one fluid result (fluid-producing machines like
+/// `create:emptying`/`create:mixing` have no item results at all).
+fn parse_machine_results(
+    obj: &BTreeMap<String, JsonValue>,
+) -> Result<(WeightedItemResults, FluidStackList), String> {
+    let result_value = obj
+        .get("results")
+        .or_else(|| obj.get("result"))
+        .or_else(|| obj.get("output"))
+        .or_else(|| obj.get("main_output"))
+        .ok_or("recipe results are missing")?;
+    let results = match result_value {
+        JsonValue::Array(items) => items.as_slice(),
+        JsonValue::Object(_) => std::slice::from_ref(result_value),
+        _ => return Err("recipe results must be an array or object".into()),
+    };
+    if !(1..=32).contains(&results.len()) {
+        return Err("recipe result count must be in 1..=32".into());
+    }
+    let mut items = Vec::new();
+    let mut fluids = Vec::new();
+    for result in results {
+        if let Some(fluid) = parse_fluid_result(result)? {
+            fluids.push(fluid);
+            continue;
+        }
+        let item = parse_result_item(result)?;
+        let entry = result
+            .as_object()
+            .ok_or("recipe result must be an object")?;
+        let nested_count = entry
+            .get("item")
+            .and_then(JsonValue::as_object)
+            .and_then(|inner| inner.get("count"));
+        let count = match entry.get("count").or(nested_count) {
+            Some(value) => bounded_integer(Some(value), "item count", 1, u32::MAX)?,
+            None => 1,
+        };
+        let weight = match entry.get("chance").or_else(|| entry.get("weight")) {
+            Some(value) => value.as_f64().ok_or("result weight must be finite")?,
+            None => 1.0,
+        };
+        if !(0.0..=f64::from(f32::MAX)).contains(&weight) {
+            return Err("result weight must be nonnegative and finite".into());
+        }
+        items.push((item, count, weight as f32));
+    }
+    if items.iter().all(|(_, _, weight)| *weight <= 0.0) && fluids.is_empty() {
+        return Err("at least one result must have a positive weight".into());
+    }
+    Ok((items, fluids))
+}
+
+/// Decode the standard machine-recipe shape shared by the Create 1.21.1
+/// processing families and the generic `<ns>:<machine>` fallback:
+/// `ingredients` + `results`/`result`, fluids and tags included.
+fn parse_machine_object(
+    id: &str,
+    recipe_type: String,
+    obj: &BTreeMap<String, JsonValue>,
+) -> Result<MachineProcessingRecipe, String> {
+    let (ingredients, fluid_inputs) =
+        parse_ingredient_list(obj).map_err(|e| format!("{id}: {e}"))?;
+    if ingredients.is_empty() && fluid_inputs.is_empty() {
+        return Err(format!("{id}: processing input item is missing"));
+    }
+    let (results, fluid_results) =
+        parse_machine_results(obj).map_err(|e| format!("{id}: {e}"))?;
+    Ok(MachineProcessingRecipe {
+        id: id.into(),
+        recipe_type,
+        ingredients,
+        fluid_inputs,
+        results,
+        fluid_results,
+    })
+}
+
+/// Decode `create:mechanical_crafting`'s shaped-grid schema: each `key`
+/// symbol's operand is consumed once per occurrence in `pattern`.
+fn parse_mechanical_crafting_object(
+    id: &str,
+    recipe_type: String,
+    obj: &BTreeMap<String, JsonValue>,
+) -> Result<MachineProcessingRecipe, String> {
+    let key = obj
+        .get("key")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{id}: mechanical_crafting key table is missing"))?;
+    let pattern = obj
+        .get("pattern")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| format!("{id}: mechanical_crafting pattern is missing"))?;
+    if !(1..=9).contains(&pattern.len()) {
+        return Err(format!("{id}: mechanical_crafting pattern must be 1..=9 rows"));
+    }
+    let mut usage: BTreeMap<String, u32> = BTreeMap::new();
+    for row in pattern {
+        let Some(row) = row.as_str() else {
+            return Err(format!("{id}: mechanical_crafting pattern rows must be strings"));
+        };
+        for symbol in row.chars() {
+            if symbol != ' ' {
+                *usage.entry(symbol.to_string()).or_default() += 1;
+            }
+        }
+    }
+    let mut ingredients = Vec::new();
+    let mut fluid_inputs = Vec::new();
+    for (symbol, count) in &usage {
+        let operand = key
+            .get(symbol)
+            .map(parse_ingredient_operand)
+            .transpose()?
+            .flatten()
+            .ok_or_else(|| {
+                format!("{id}: mechanical_crafting key '{symbol}' is missing or unresolvable")
+            })?;
+        match operand {
+            RecipeOperand::Item(mut ingredient) => {
+                ingredient.count = ingredient.count.saturating_mul(*count);
+                ingredients.push(ingredient);
+            }
+            RecipeOperand::Fluid(fluid_id, amount_mb) => {
+                fluid_inputs.push((fluid_id, amount_mb));
+            }
+        }
+    }
+    let (results, fluid_results) =
+        parse_machine_results(obj).map_err(|e| format!("{id}: {e}"))?;
+    Ok(MachineProcessingRecipe {
+        id: id.into(),
+        recipe_type,
+        ingredients,
+        fluid_inputs,
+        results,
+        fluid_results,
+    })
 }
 
 fn parse_assembly_results(
@@ -554,9 +1191,13 @@ fn parse_assembly_results(
     Ok(output)
 }
 
-/// Discover assembly, pressing, and filling recipes from both singular and
-/// plural recipe directories under every namespace, including nested paths.
-/// Invalid recipe JSON or invalid recognized recipes abort the scan.
+/// Discover assembly, pressing, filling, and the full Create 1.21.1 machine
+/// family (compacting, splashing, haunting, deploying, emptying,
+/// item_application, sandpaper_polishing, mechanical_crafting) plus any
+/// generic `<ns>:<machine>` recipe from both singular and plural recipe
+/// directories under every namespace, including nested paths. Invalid
+/// recipe JSON or invalid recognized recipes abort the scan; non-machine
+/// serializers (vanilla crafting, smelting, ...) are skipped gracefully.
 pub fn discover_addon_processing_recipes(
     root: &Path,
 ) -> Result<Vec<AddonProcessingRecipe>, String> {
@@ -623,9 +1264,11 @@ pub fn discover_addon_processing_recipes(
 }
 
 /// Classify one recipe JSON object into an [`AddonProcessingRecipe`].
-/// Returns `Ok(None)` for recipe types outside the Create processing family
-/// (vanilla smelting, mod-specific logistics, ...); recognized-but-malformed
-/// recipes fail closed with `Err`.
+/// Returns `Ok(None)` for recipe types outside the processing family —
+/// vanilla/shared-namespace serializers (`minecraft:*`, `forge:*`, `c:*`,
+/// `neoforge:*`, `fabric:*`) and any `<ns>:<type>` that does not declare a
+/// standard `ingredients` + `results`/`result` machine shape; recognized-
+/// but-malformed recipes fail closed with `Err`.
 fn parse_addon_processing_object(
     id: &str,
     obj: &BTreeMap<String, JsonValue>,
@@ -640,31 +1283,21 @@ fn parse_addon_processing_object(
     if namespace.is_empty() {
         return Ok(None);
     }
+    let recipe_type = || format!("{namespace}:{kind}");
+    let machine = |id: &str, variant: fn(MachineProcessingRecipe) -> AddonProcessingRecipe| {
+        parse_machine_object(id, recipe_type(), obj).map(|recipe| Some(variant(recipe)))
+    };
     match kind {
         "sequenced_assembly" => Ok(Some(AddonProcessingRecipe::SequencedAssembly(
             parse_assembly_object(id, obj).map_err(|e| format!("{id}: {e}"))?,
         ))),
-        "pressing" | "mixing" | "milling" | "crushing" | "cutting" | "filling" => {
-            let item = if let Some(ingredients) = obj.get("ingredients") {
-                ingredients
-                    .as_array()
-                    .ok_or_else(|| format!("{id}: processing ingredients must be an array"))?
-                    .iter()
-                    .find(|input| parse_item_id(input).is_ok())
-            } else {
-                obj.get("ingredient")
-            }
-            .ok_or_else(|| format!("{id}: processing input item is missing"))?;
-            let ingredient_item = parse_item_id(item)?;
+        "pressing" | "milling" | "crushing" | "cutting" => {
+            let (items, _) = parse_ingredient_list(obj).map_err(|e| format!("{id}: {e}"))?;
+            let ingredient_item = first_item_key(id, &items)?;
             let results = parse_assembly_results(obj).map_err(|e| format!("{id}: {e}"))?;
             let fields = (id.to_string(), ingredient_item, results);
             Ok(Some(match kind {
                 "pressing" => AddonProcessingRecipe::Pressing {
-                    id: fields.0,
-                    ingredient_item: fields.1,
-                    results: fields.2,
-                },
-                "mixing" => AddonProcessingRecipe::Mixing {
                     id: fields.0,
                     ingredient_item: fields.1,
                     results: fields.2,
@@ -679,25 +1312,70 @@ fn parse_addon_processing_object(
                     ingredient_item: fields.1,
                     results: fields.2,
                 },
-                "cutting" => AddonProcessingRecipe::Cutting {
+                _ => AddonProcessingRecipe::Cutting {
                     id: fields.0,
                     ingredient_item: fields.1,
                     results: fields.2,
                 },
-                _ => {
-                    let (fluid_id, amount_mb) =
-                        parse_fluid_operand(obj).map_err(|e| format!("{id}: {e}"))?;
-                    AddonProcessingRecipe::Filling {
-                        id: fields.0,
-                        ingredient_item: fields.1,
-                        fluid_id,
-                        amount_mb,
-                        results: fields.2,
-                    }
-                }
             }))
         }
-        _ => Ok(None),
+        "mixing" => {
+            let (items, fluid_inputs) =
+                parse_ingredient_list(obj).map_err(|e| format!("{id}: {e}"))?;
+            let ingredient_item = first_item_key(id, &items)?;
+            let (results, fluid_results) =
+                parse_machine_results(obj).map_err(|e| format!("{id}: {e}"))?;
+            Ok(Some(AddonProcessingRecipe::Mixing {
+                id: id.to_string(),
+                ingredient_item,
+                fluid_inputs,
+                results,
+                fluid_results,
+            }))
+        }
+        "filling" => {
+            let (items, fluids) = parse_ingredient_list(obj).map_err(|e| format!("{id}: {e}"))?;
+            let ingredient_item = first_item_key(id, &items)?;
+            let results = parse_assembly_results(obj).map_err(|e| format!("{id}: {e}"))?;
+            let (fluid_id, amount_mb) = fluids
+                .first()
+                .cloned()
+                .map(Ok)
+                .unwrap_or_else(|| parse_fluid_operand(obj))
+                .map_err(|e| format!("{id}: {e}"))?;
+            Ok(Some(AddonProcessingRecipe::Filling {
+                id: id.to_string(),
+                ingredient_item,
+                fluid_id,
+                amount_mb,
+                results,
+            }))
+        }
+        "compacting" => machine(id, AddonProcessingRecipe::Compacting),
+        "splashing" => machine(id, AddonProcessingRecipe::Splashing),
+        "haunting" => machine(id, AddonProcessingRecipe::Haunting),
+        "deploying" => machine(id, AddonProcessingRecipe::Deploying),
+        "emptying" => machine(id, AddonProcessingRecipe::Emptying),
+        "item_application" => machine(id, AddonProcessingRecipe::ItemApplication),
+        "sandpaper_polishing" => machine(id, AddonProcessingRecipe::SandpaperPolishing),
+        "mechanical_crafting" => parse_mechanical_crafting_object(id, recipe_type(), obj)
+            .map(|recipe| Some(AddonProcessingRecipe::MechanicalCrafting(recipe))),
+        _ => {
+            // Generic `<ns>:<machine>` fallback: any non-shared namespace
+            // declaring standard `ingredients` + `results`/`result` fields.
+            // Anything else (`minecraft:crafting_shaped`, `neoforge:*`
+            // wrappers, serializers without the standard shape) is skipped
+            // gracefully instead of aborting the JAR scan.
+            const SHARED_NAMESPACES: [&str; 5] =
+                ["minecraft", "c", "forge", "neoforge", "fabric"];
+            if SHARED_NAMESPACES.contains(&namespace) {
+                return Ok(None);
+            }
+            match parse_machine_object(id, recipe_type(), obj) {
+                Ok(recipe) => Ok(Some(AddonProcessingRecipe::GenericMachine(recipe))),
+                Err(_) => Ok(None),
+            }
+        }
     }
 }
 
@@ -888,7 +1566,8 @@ pub struct CreateAddonProfile {
     pub mc_version_range: Option<String>,
     /// Processing recipes discovered from the addon's own
     /// `data/<ns>/recipe(s)/*.json` (sequenced assemblies, pressing, mixing,
-    /// milling, crushing, cutting, filling). Populated by
+    /// milling, crushing, cutting, filling, the Create 1.21.1 machine
+    /// families, and generic `<ns>:<machine>` fallbacks). Populated by
     /// [`discover_addon_from_jar`]; empty for hand-authored profiles.
     pub processing_recipes: Vec<AddonProcessingRecipe>,
 }
@@ -1634,14 +2313,14 @@ fn hidden_root_tag(tag: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Result of [`discover_addon_from_jar`]: the discovered profile plus the
-/// count of compressed ZIP entries the stored-entry scanner skipped.
+/// count of matching ZIP entries the scanner could not decode.
 #[derive(Clone, Debug)]
 pub struct DiscoveredAddonJar {
     pub profile: CreateAddonProfile,
-    /// JAR entries under `data/`/`assets/` that used a compression method the
-    /// zero-dependency scanner cannot read (method != stored). A nonzero
-    /// count means the profile may be incomplete — callers should treat it
-    /// as a soft warning, never a hard failure.
+    /// `data/`/`assets/` JAR entries using a compression method other than
+    /// Stored (0) or Deflate (8). A nonzero count means the profile may be
+    /// incomplete — callers should treat it as a soft warning, never a hard
+    /// failure. Production mod JARs (all-Deflate) report `0`.
     pub skipped_compressed_entries: usize,
 }
 
@@ -1675,20 +2354,16 @@ pub fn discover_addon_namespaces(data: &LoadedModData) -> BTreeSet<String> {
     out
 }
 
-/// Hard bounds for the raw-entry JAR scan backing [`discover_addon_from_jar`]:
-/// at most this many matching entries, this many total payload bytes, and
-/// this size per entry (the JSON parser's own 4 MiB cap applies again later).
-const MAX_JAR_SCAN_ENTRIES: usize = 4096;
-const MAX_JAR_SCAN_PAYLOAD: usize = 32 * 1024 * 1024;
-const MAX_JAR_ENTRY_BYTES: usize = 4 * 1024 * 1024;
-
-/// Discover a [`CreateAddonProfile`] for `mod_id` directly from a stored
-/// (uncompressed-method) JAR/ZIP byte slice — no intermediate directory, no
-/// hardcoded addon names.
+/// Discover a [`CreateAddonProfile`] for `mod_id` directly from a JAR/ZIP
+/// byte slice — Stored *and* Deflate (`method == 8`) entries, no
+/// intermediate directory, no hardcoded addon names.
 ///
 /// Sources, all under `data/<mod_id>/`:
 /// - `recipe/` + `recipes/` (recursive): sequenced-assembly, pressing,
-///   mixing, milling, crushing, cutting, and filling recipes land in
+///   mixing, milling, crushing, cutting, filling, and every Create 1.21.1
+///   machine family (compacting, splashing, haunting, deploying, emptying,
+///   item_application, sandpaper_polishing, mechanical_crafting) plus the
+///   generic `<ns>:<machine>` fallback land in
 ///   [`CreateAddonProfile::processing_recipes`] via the same fail-closed
 ///   parser as [`discover_addon_processing_recipes`].
 /// - `create_kinetics/` (or `create_kinetics.json`): partial
@@ -1698,8 +2373,8 @@ const MAX_JAR_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 ///   sorted-path order, last write wins per block id.
 ///
 /// Blockstates (`assets/<ns>/blockstates/*.json`), tags, and generic recipes
-/// flow through [`mod_adapter_core::data_loader::load_from_stored_zip`] —
-/// the same bounded scanner used for datapacks — into
+/// flow through [`crate::data_loader::load_mod_data_from_zip`] — the bounded
+/// Stored+Deflate scanner shared with the datapack loader — into
 /// [`discover_create_addon_profile`], so directional `axis`/`facing` (and
 /// every other declared blockstate property) drives real registry expansion.
 /// Malformed JSON, oversized entries, or an invalid namespace fail closed.
@@ -1716,15 +2391,13 @@ pub fn discover_addon_from_jar(
             "invalid addon namespace '{mod_id}'"
         )));
     }
-    let (entries, mut skipped_compressed) = scan_addon_jar_entries(jar, mod_id)?;
-
     let mut ids = ItemFluidIdTable::new();
-    let data = load_from_stored_zip(jar, &mut ids)?;
-    skipped_compressed += data.skipped_compressed_zip_entries;
+    let (data, scanned) = crate::data_loader::load_mod_data_from_zip(jar, &mut ids)?;
+    let skipped_compressed = scanned.skipped_compressed;
     let mut profile = discover_create_addon_profile(mod_id, &data);
 
     let mut processing = Vec::new();
-    for (path, bytes) in &entries {
+    for (path, bytes) in &scanned.entries {
         if is_addon_recipe_entry(path, mod_id) {
             let recipe_path = path
                 .split_once("/recipe/")
@@ -1834,92 +2507,6 @@ fn merge_kinetic_overrides(profile: &mut CreateAddonProfile, over: CreateAddonPr
     if over.mc_version_range.is_some() {
         profile.mc_version_range = over.mc_version_range;
     }
-}
-
-type AddonJarEntries = Vec<(String, Vec<u8>)>;
-
-/// Bounded stored-ZIP scan collecting the raw JSON payloads the generic
-/// loader discards: `data/<ns>/recipe*/**` and `data/<ns>/create_kinetics*`
-/// for the target namespace only. Mirrors `load_from_stored_zip`'s
-/// local-header parsing; compressed matching entries are counted, not
-/// decoded; oversized or over-budget scans fail closed.
-fn scan_addon_jar_entries(
-    jar: &[u8],
-    mod_id: &str,
-) -> Result<(AddonJarEntries, usize), DataLoadError> {
-    let mut entries = Vec::new();
-    let mut skipped_compressed = 0usize;
-    let mut payload_bytes = 0usize;
-    let mut cursor = 0usize;
-
-    while cursor + 4 <= jar.len() {
-        let sig = u32::from_le_bytes([
-            jar[cursor],
-            jar[cursor + 1],
-            jar[cursor + 2],
-            jar[cursor + 3],
-        ]);
-        if sig != 0x0403_4b50 {
-            break;
-        }
-        if cursor + 30 > jar.len() {
-            return Err(DataLoadError::Zip("truncated local file header".into()));
-        }
-        let flags = u16::from_le_bytes([jar[cursor + 6], jar[cursor + 7]]);
-        if flags & 0x08 != 0 {
-            return Err(DataLoadError::Zip(
-                "data-descriptor streaming ZIP entries are unsupported in stored scanner".into(),
-            ));
-        }
-        let method = u16::from_le_bytes([jar[cursor + 8], jar[cursor + 9]]);
-        let comp_size = u32::from_le_bytes([
-            jar[cursor + 18],
-            jar[cursor + 19],
-            jar[cursor + 20],
-            jar[cursor + 21],
-        ]) as usize;
-        let name_len = u16::from_le_bytes([jar[cursor + 26], jar[cursor + 27]]) as usize;
-        let extra_len = u16::from_le_bytes([jar[cursor + 28], jar[cursor + 29]]) as usize;
-
-        let name_start = cursor + 30;
-        let data_start = name_start
-            .checked_add(name_len)
-            .and_then(|v| v.checked_add(extra_len))
-            .ok_or_else(|| DataLoadError::Zip("header length overflow".into()))?;
-        let data_end = data_start
-            .checked_add(comp_size)
-            .ok_or_else(|| DataLoadError::Zip("entry payload overflow".into()))?;
-        if data_end > jar.len() {
-            return Err(DataLoadError::Zip("truncated ZIP entry payload".into()));
-        }
-        let name = std::str::from_utf8(&jar[name_start..name_start + name_len])
-            .map_err(|_| DataLoadError::Zip("non-UTF8 ZIP entry path".into()))?;
-        let wanted = name.ends_with(".json")
-            && (is_addon_recipe_entry(name, mod_id) || is_addon_kinetics_entry(name, mod_id));
-        if wanted {
-            if method != 0 {
-                skipped_compressed += 1;
-            } else {
-                if comp_size > MAX_JAR_ENTRY_BYTES {
-                    return Err(DataLoadError::Zip(format!(
-                        "{name}: entry exceeds {MAX_JAR_ENTRY_BYTES} byte scan limit"
-                    )));
-                }
-                if entries.len() >= MAX_JAR_SCAN_ENTRIES
-                    || payload_bytes + comp_size > MAX_JAR_SCAN_PAYLOAD
-                {
-                    return Err(DataLoadError::Zip(
-                        "addon JAR scan exceeds entry/byte budget".into(),
-                    ));
-                }
-                payload_bytes += comp_size;
-                entries.push((name.to_string(), jar[data_start..data_end].to_vec()));
-            }
-        }
-        cursor = data_end;
-    }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok((entries, skipped_compressed))
 }
 
 // ---------------------------------------------------------------------------

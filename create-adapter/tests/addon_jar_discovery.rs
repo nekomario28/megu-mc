@@ -193,6 +193,15 @@ fn unknown_addon_jar_yields_full_profile_without_builtin_names() {
             AddonProcessingRecipe::Crushing { .. } => "crushing",
             AddonProcessingRecipe::Cutting { .. } => "cutting",
             AddonProcessingRecipe::Filling { .. } => "filling",
+            AddonProcessingRecipe::Compacting(_) => "compacting",
+            AddonProcessingRecipe::Splashing(_) => "splashing",
+            AddonProcessingRecipe::Haunting(_) => "haunting",
+            AddonProcessingRecipe::Deploying(_) => "deploying",
+            AddonProcessingRecipe::Emptying(_) => "emptying",
+            AddonProcessingRecipe::ItemApplication(_) => "item_application",
+            AddonProcessingRecipe::SandpaperPolishing(_) => "sandpaper_polishing",
+            AddonProcessingRecipe::MechanicalCrafting(_) => "mechanical_crafting",
+            AddonProcessingRecipe::GenericMachine(_) => "generic_machine",
         })
         .collect();
     for expected in ["assembly", "pressing", "mixing", "cutting", "filling"] {
