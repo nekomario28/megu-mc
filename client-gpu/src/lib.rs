@@ -574,15 +574,15 @@ pub fn gpu_shader_caps_for(
 
 /// Backend bitflags a [`RenderBackendPreference`] asks `wgpu` for.
 ///
-/// `Auto`/`MeshShader`/`ComputeIndirect`/`Classic` all want the primary
-/// modern APIs first (Vulkan/Metal/DX12) with GL kept as the fallback
-/// wgpu itself offers; `ClassicLowSpec` deliberately drops to the GL-only
-/// downlevel path the legacy-Intel profile was built for.
+/// Delegates to [`select_display_presentation_policy`] for the detected
+/// display server so the OS-aware mask reaches `request_gpu_device` and
+/// `probe_adapters`: `Auto`/`MeshShader`/`ComputeIndirect`/`Classic` get
+/// the native modern API first (Vulkan on Linux, DX12 on Windows, Metal
+/// on macOS) with GL kept as the fallback wgpu itself offers;
+/// `ClassicLowSpec` deliberately drops to the GL-only downlevel path the
+/// legacy-Intel profile was built for.
 pub fn wgpu_backends_for(pref: RenderBackendPreference) -> wgpu::Backends {
-    match pref {
-        RenderBackendPreference::ClassicLowSpec => wgpu::Backends::GL,
-        _ => wgpu::Backends::PRIMARY | wgpu::Backends::SECONDARY,
-    }
+    select_display_presentation_policy(detect_display_server_kind(), pref).preferred_backends
 }
 
 /// Present mode a `vsync` toggle should use, preferring the exact mode the
@@ -620,6 +620,151 @@ pub fn preferred_frame_latency(vsync: bool) -> u32 {
         2
     } else {
         1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Universal cross-OS display & presentation policy
+// ---------------------------------------------------------------------------
+
+/// Display server / OS presentation family the windowed client runs on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisplayServerKind {
+    /// Linux Wayland (`WAYLAND_DISPLAY` set): `wl_surface.frame` pacing,
+    /// `zwp_locked_pointer_v1`, compositor direct scanout.
+    Wayland,
+    /// Linux/Unix X11 (`DISPLAY` set, no Wayland): XI2 raw deltas.
+    X11,
+    /// Windows 10/11: DXGI swapchain, Independent Flip / MPO.
+    Windows,
+    /// macOS: `CAMetalLayer` presentation.
+    MacOs,
+    /// No display server detected (offscreen / `--headless-probe`).
+    Headless,
+}
+
+/// Detect the display server this process presents through — pure `cfg` +
+/// `std::env::var_os`, no display connection. On Unix `WAYLAND_DISPLAY` wins
+/// over `DISPLAY` (an XWayland-only session still prefers native Wayland);
+/// Windows and macOS are fixed by `target_os`; anything else is headless.
+pub fn detect_display_server_kind() -> DisplayServerKind {
+    #[cfg(target_os = "windows")]
+    {
+        DisplayServerKind::Windows
+    }
+    #[cfg(target_os = "macos")]
+    {
+        DisplayServerKind::MacOs
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            DisplayServerKind::Wayland
+        } else if std::env::var_os("DISPLAY").is_some() {
+            DisplayServerKind::X11
+        } else {
+            DisplayServerKind::Headless
+        }
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        DisplayServerKind::Headless
+    }
+}
+
+/// The presentation/backend negotiation policy for one display server:
+/// which `wgpu` backends to enumerate, which cursor-grab order is safe,
+/// whether to send the compositor pre-present notify, the swapchain
+/// frame-latency targets, and the zero-extent present guard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayPresentationPolicy {
+    /// Detected display server / OS family.
+    pub display: DisplayServerKind,
+    /// `wgpu` backends to enumerate, in wgpu's own preference order.
+    pub preferred_backends: wgpu::Backends,
+    /// `true` tries `CursorGrabMode::Locked` before `Confined` (Wayland
+    /// `zwp_locked_pointer_v1` + `zwp_relative_pointer_v1`, macOS, Windows
+    /// raw input); `false` tries `Confined` first — X11, where XI2
+    /// `DeviceEvent::MouseMotion` already delivers unaccelerated raw deltas
+    /// and pointer lock trips X11/RDP cursor quirks.
+    pub prefer_locked_pointer_first: bool,
+    /// `true` calls `Window::pre_present_notify` right before present —
+    /// Wayland `wl_surface.frame` pacing; a safe no-op everywhere else.
+    pub call_pre_present_notify: bool,
+    /// `true` prefers `CompositeAlphaMode::Opaque` so the compositor can
+    /// place the swapchain on a zero-copy direct-scanout plane.
+    pub prefer_opaque_direct_scanout: bool,
+    /// `desired_maximum_frame_latency` when vsync is off.
+    pub uncapped_frame_latency: u32,
+    /// `desired_maximum_frame_latency` under `Fifo` vsync.
+    pub vsync_frame_latency: u32,
+    /// `true` skips surface acquire/present while either extent is `0` —
+    /// a minimized Windows `0x0` swapchain panics inside DXGI
+    /// `ResizeBuffers`, so zero GPU work is the only safe answer.
+    pub skip_zero_extent_present: bool,
+    /// Concise F3 diagnostics tag (`"wayland/vulkan"`, `"x11/vulkan"`,
+    /// `"windows/dx12-flip"`, `"macos/metal"`).
+    pub description: &'static str,
+}
+
+impl DisplayPresentationPolicy {
+    /// `desired_maximum_frame_latency` for the given vsync mode.
+    pub fn frame_latency(&self, vsync: bool) -> u32 {
+        if vsync {
+            self.vsync_frame_latency
+        } else {
+            self.uncapped_frame_latency
+        }
+    }
+}
+
+/// Select the presentation policy for `display` under backend preference
+/// `pref`. `ClassicLowSpec` is GL-only on every platform — the whole point
+/// of the profile is a pipeline GL 3.3-class hardware can drive. Otherwise
+/// the native modern API leads: Vulkan on Linux, DX12 on Windows (native
+/// DXGI Independent Flip / Multi-Plane Overlay, zero-flicker Alt+Tab),
+/// Metal on macOS.
+pub fn select_display_presentation_policy(
+    display: DisplayServerKind,
+    pref: RenderBackendPreference,
+) -> DisplayPresentationPolicy {
+    let preferred_backends = if pref == RenderBackendPreference::ClassicLowSpec {
+        wgpu::Backends::GL
+    } else {
+        match display {
+            DisplayServerKind::Wayland | DisplayServerKind::X11 => {
+                wgpu::Backends::VULKAN | wgpu::Backends::GL
+            }
+            DisplayServerKind::Windows => {
+                wgpu::Backends::DX12 | wgpu::Backends::VULKAN | wgpu::Backends::GL
+            }
+            DisplayServerKind::MacOs => wgpu::Backends::METAL,
+            DisplayServerKind::Headless => {
+                wgpu::Backends::PRIMARY | wgpu::Backends::SECONDARY
+            }
+        }
+    };
+    DisplayPresentationPolicy {
+        display,
+        preferred_backends,
+        prefer_locked_pointer_first: display != DisplayServerKind::X11,
+        call_pre_present_notify: true,
+        prefer_opaque_direct_scanout: true,
+        // Metal triple-buffers: latency 2 keeps a frame in flight so
+        // `Immediate`-style present never stalls the pipeline.
+        uncapped_frame_latency: match display {
+            DisplayServerKind::MacOs => 2,
+            _ => 1,
+        },
+        vsync_frame_latency: 2,
+        skip_zero_extent_present: true,
+        description: match display {
+            DisplayServerKind::Wayland => "wayland/vulkan",
+            DisplayServerKind::X11 => "x11/vulkan",
+            DisplayServerKind::Windows => "windows/dx12-flip",
+            DisplayServerKind::MacOs => "macos/metal",
+            DisplayServerKind::Headless => "headless/auto",
+        },
     }
 }
 
@@ -946,6 +1091,111 @@ mod tests {
     fn frame_latency_is_one_uncapped_two_vsynced() {
         assert_eq!(preferred_frame_latency(false), 1);
         assert_eq!(preferred_frame_latency(true), 2);
+    }
+
+    #[test]
+    fn detect_display_server_kind_matches_env_and_target() {
+        let kind = detect_display_server_kind();
+        #[cfg(target_os = "windows")]
+        assert_eq!(kind, DisplayServerKind::Windows);
+        #[cfg(target_os = "macos")]
+        assert_eq!(kind, DisplayServerKind::MacOs);
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let expected = if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                DisplayServerKind::Wayland
+            } else if std::env::var_os("DISPLAY").is_some() {
+                DisplayServerKind::X11
+            } else {
+                DisplayServerKind::Headless
+            };
+            assert_eq!(kind, expected);
+        }
+        #[cfg(not(any(unix, target_os = "windows")))]
+        assert_eq!(kind, DisplayServerKind::Headless);
+    }
+
+    #[test]
+    fn wayland_policy_prefers_vulkan_locked_pointer_and_low_latency() {
+        let policy = select_display_presentation_policy(
+            DisplayServerKind::Wayland,
+            RenderBackendPreference::Auto,
+        );
+        assert_eq!(policy.display, DisplayServerKind::Wayland);
+        assert_eq!(
+            policy.preferred_backends,
+            wgpu::Backends::VULKAN | wgpu::Backends::GL
+        );
+        assert!(policy.prefer_locked_pointer_first);
+        assert!(policy.call_pre_present_notify);
+        assert!(policy.prefer_opaque_direct_scanout);
+        assert_eq!(policy.uncapped_frame_latency, 1);
+        assert_eq!(policy.vsync_frame_latency, 2);
+        assert!(policy.skip_zero_extent_present);
+        assert_eq!(policy.description, "wayland/vulkan");
+    }
+
+    #[test]
+    fn x11_policy_prefers_vulkan_and_confined_pointer_first() {
+        let policy = select_display_presentation_policy(
+            DisplayServerKind::X11,
+            RenderBackendPreference::Auto,
+        );
+        assert_eq!(
+            policy.preferred_backends,
+            wgpu::Backends::VULKAN | wgpu::Backends::GL
+        );
+        assert!(!policy.prefer_locked_pointer_first);
+        assert_eq!(policy.uncapped_frame_latency, 1);
+        assert_eq!(policy.description, "x11/vulkan");
+    }
+
+    #[test]
+    fn windows_policy_prefers_dx12_and_guards_zero_extent_present() {
+        let policy = select_display_presentation_policy(
+            DisplayServerKind::Windows,
+            RenderBackendPreference::Auto,
+        );
+        assert!(policy.preferred_backends.contains(wgpu::Backends::DX12));
+        assert!(policy.preferred_backends.contains(wgpu::Backends::VULKAN));
+        assert!(policy.prefer_locked_pointer_first);
+        assert!(policy.skip_zero_extent_present);
+        assert_eq!(policy.uncapped_frame_latency, 1);
+        assert_eq!(policy.description, "windows/dx12-flip");
+    }
+
+    #[test]
+    fn macos_policy_selects_metal_and_triple_buffer_latency() {
+        let policy = select_display_presentation_policy(
+            DisplayServerKind::MacOs,
+            RenderBackendPreference::Auto,
+        );
+        assert_eq!(policy.preferred_backends, wgpu::Backends::METAL);
+        assert_eq!(policy.uncapped_frame_latency, 2);
+        assert_eq!(policy.vsync_frame_latency, 2);
+        assert!(policy.prefer_locked_pointer_first);
+        assert_eq!(policy.description, "macos/metal");
+    }
+
+    #[test]
+    fn classic_low_spec_is_gl_on_every_display_server() {
+        for display in [
+            DisplayServerKind::Wayland,
+            DisplayServerKind::X11,
+            DisplayServerKind::Windows,
+            DisplayServerKind::MacOs,
+            DisplayServerKind::Headless,
+        ] {
+            let policy = select_display_presentation_policy(
+                display,
+                RenderBackendPreference::ClassicLowSpec,
+            );
+            assert_eq!(
+                policy.preferred_backends,
+                wgpu::Backends::GL,
+                "{display:?}"
+            );
+        }
     }
 
     fn hud_draw_list(text: &str) -> UiDrawList {

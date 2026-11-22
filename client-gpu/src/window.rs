@@ -20,8 +20,9 @@ use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 use crate::live_session::{LiveSession, PlayerMovement, PlayerPose, SessionStatus};
 use crate::renderer::{request_gpu_device, GpuRenderer};
 use crate::{
-    build_demo_scene, fingerprint_draw_list, preferred_alpha_mode, preferred_frame_latency,
-    present_mode_for, Camera, GpuCliConfig, MoveInput,
+    build_demo_scene, detect_display_server_kind, fingerprint_draw_list, preferred_alpha_mode,
+    present_mode_for, select_display_presentation_policy, Camera, DisplayPresentationPolicy,
+    GpuCliConfig, MoveInput,
 };
 
 /// Window title.
@@ -115,6 +116,7 @@ pub struct GpuApp {
     ui: UiState,
     ui_cache: UiUploadCache,
     render_config: RenderConfig,
+    policy: DisplayPresentationPolicy,
     governor: FrameBudgetGovernor,
     last_frame: Instant,
     frame_start: Instant,
@@ -142,6 +144,10 @@ impl GpuApp {
             shader_pack: config.shader_pack.as_ref().map(|p| p.display().to_string()),
             ..RenderConfig::default()
         };
+        let policy = select_display_presentation_policy(
+            detect_display_server_kind(),
+            render_config.gpu_backend,
+        );
         let governor = FrameBudgetGovernor::new(render_config.max_fps);
         let camera = Camera {
             position: [8.0, 18.0, 26.0],
@@ -168,6 +174,7 @@ impl GpuApp {
             ui,
             ui_cache: UiUploadCache::default(),
             render_config,
+            policy,
             governor,
             last_frame: Instant::now(),
             frame_start: Instant::now(),
@@ -185,14 +192,22 @@ impl GpuApp {
             return;
         };
         if grab && !self.cursor_grabbed {
-            // `Locked` first: on Wayland it activates `zwp_locked_pointer_v1`
-            // + `zwp_relative_pointer_v1` unaccelerated raw deltas, so the
-            // invisible cursor can never hit the window borders. `Confined`
-            // is the fallback for platforms without pointer lock.
+            // The display policy picks the grab order: `Locked` first on
+            // Wayland (`zwp_locked_pointer_v1` + `zwp_relative_pointer_v1`
+            // unaccelerated raw deltas, so the invisible cursor can never
+            // hit the window borders), macOS and Windows; `Confined` first
+            // on X11, where XI2 `DeviceEvent::MouseMotion` already delivers
+            // unaccelerated raw deltas and `Locked` hits X11/RDP cursor
+            // lock quirks. The other mode is always the fallback.
+            let (first, second) = if self.policy.prefer_locked_pointer_first {
+                (CursorGrabMode::Locked, CursorGrabMode::Confined)
+            } else {
+                (CursorGrabMode::Confined, CursorGrabMode::Locked)
+            };
             active
                 .window
-                .set_cursor_grab(CursorGrabMode::Locked)
-                .or_else(|_| active.window.set_cursor_grab(CursorGrabMode::Confined))
+                .set_cursor_grab(first)
+                .or_else(|_| active.window.set_cursor_grab(second))
                 .ok();
             active.window.set_cursor_visible(false);
             self.cursor_grabbed = true;
@@ -248,6 +263,7 @@ impl GpuApp {
         };
         let config = surface_config_for(
             self.render_config.vsync,
+            &self.policy,
             active.surface_format,
             active.size,
             &caps,
@@ -321,6 +337,15 @@ impl GpuApp {
         let Some(active) = self.active.as_mut() else {
             return;
         };
+        // Zero extent means a minimized window (Windows reports `0x0`):
+        // acquiring or presenting a zero-sized swapchain panics inside
+        // DXGI `ResizeBuffers`/`vkCreateSwapchainKHR`, so the policy skips
+        // all GPU work here — the live-session poll above stays alive.
+        if self.policy.skip_zero_extent_present
+            && (active.size.width == 0 || active.size.height == 0)
+        {
+            return;
+        }
         let (w, h) = (active.size.width.max(1), active.size.height.max(1));
 
         if let Some(live) = &mut self.live {
@@ -335,8 +360,9 @@ impl GpuApp {
         // HUD/diagnostics through the real client-ui state machine.
         self.ui.hud.actionbar = if self.show_diagnostics {
             format!(
-                "F3 | {} | {} | {:.1} ms | x{:.2}{}",
+                "F3 | {} | {} | {} | {:.1} ms | x{:.2}{}",
                 active.renderer.gpu().report.resolution.backend.as_str(),
+                self.policy.description,
                 active.renderer.gpu().report.name,
                 self.governor.frame_ms(),
                 self.scale_factor,
@@ -392,8 +418,10 @@ impl GpuApp {
                 active.renderer.render_to_view(&view, w, h, &sky);
                 // Wayland `wl_surface.frame` pacing: notify the compositor
                 // right before present so frame callbacks align with the
-                // actual swap.
-                active.window.pre_present_notify();
+                // actual swap (a no-op everywhere else; the policy gates it).
+                if self.policy.call_pre_present_notify {
+                    active.window.pre_present_notify();
+                }
                 active.renderer.gpu().queue.present(frame);
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {}
@@ -405,6 +433,7 @@ impl GpuApp {
                     .get_capabilities(&active.renderer.gpu().adapter);
                 let cfg = surface_config_for(
                     self.render_config.vsync,
+                    &self.policy,
                     active.surface_format,
                     active.size,
                     &caps,
@@ -480,6 +509,7 @@ impl GpuApp {
             .get_capabilities(&active.renderer.gpu().adapter);
         let cfg = surface_config_for(
             self.render_config.vsync,
+            &self.policy,
             active.surface_format,
             active.size,
             &caps,
@@ -490,9 +520,11 @@ impl GpuApp {
     }
 }
 
-/// The effective surface configuration for the current size/caps.
+/// The effective surface configuration for the current size/caps under the
+/// detected display server's [`DisplayPresentationPolicy`].
 fn surface_config_for(
     vsync: bool,
+    policy: &DisplayPresentationPolicy,
     surface_format: wgpu::TextureFormat,
     size: PhysicalSize<u32>,
     caps: &wgpu::SurfaceCapabilities,
@@ -504,10 +536,22 @@ fn surface_config_for(
         width: size.width.max(1),
         height: size.height.max(1),
         present_mode: present_mode_for(vsync, &caps.present_modes),
-        // `Opaque` unlocks direct scanout + VRR on Wayland compositors;
-        // latency 1 keeps `Mailbox`/`Immediate` input->photon time minimal.
-        desired_maximum_frame_latency: preferred_frame_latency(vsync),
-        alpha_mode: preferred_alpha_mode(&caps.alpha_modes),
+        // Policy frame latency: `1` uncapped on Wayland/X11/Windows DX12
+        // keeps `Mailbox`/`Immediate` input->photon time minimal; `2`
+        // under vsync and on macOS Metal, where the extra buffered frame
+        // avoids present stalls.
+        desired_maximum_frame_latency: policy.frame_latency(vsync),
+        // `Opaque` unlocks direct scanout + VRR wherever the policy asks
+        // for it (Wayland, X11, Windows, macOS all do); otherwise honor
+        // the surface's own first choice.
+        alpha_mode: if policy.prefer_opaque_direct_scanout {
+            preferred_alpha_mode(&caps.alpha_modes)
+        } else {
+            caps.alpha_modes
+                .first()
+                .copied()
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto)
+        },
         view_formats: vec![],
     }
 }
