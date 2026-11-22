@@ -29,6 +29,7 @@
 //! # assert_eq!(rgba.len(), 1280 * 720 * 4);
 //! ```
 
+pub mod container_screen;
 pub mod draw;
 pub mod layout;
 pub mod magic_hud;
