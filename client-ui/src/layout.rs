@@ -13,7 +13,7 @@
 //! modal is composited on top and — critically — only the modal's hit
 //! regions are returned, so the dimmed screen is truly inert.
 
-use crate::draw::{palette as pal, text_width, UiColor, UiDrawList, UiRect};
+use crate::draw::{palette as pal, text_width, UiColor, UiCommand, UiDrawList, UiRect};
 use crate::state::{
     tr, HitRegion, HudState, ModSyncChange, Screen, SettingsTab, UiLang, UiModal, UiState,
     WidgetId, FPS_CAP_STEPS,
@@ -330,18 +330,19 @@ fn title(ctx: &mut Ctx) {
         tr(lang, "Quit", "終了"),
     );
 
-    ctx.text(
-        4,
-        ctx.h - 12,
-        1,
-        pal::TEXT_DIM,
-        "mc-spine client-ui 0.1.0 - zero-dep pure Rust",
-    );
-
-    // Quiet optional corner links — rendered only when a URL is set.
+    // Quiet optional links, anchored to the right and independent of the
+    // bottom-left version label even on narrower auto-scaled viewports.
     let ly = ctx.h - 20;
     let mut lx = ctx.w - 4;
-    if !ctx.state.contribute_url.is_empty() {
+    if !ctx.state.report_url.is_empty() {
+        lx -= 84;
+        ctx.btn(
+            WidgetId::ReportLink,
+            lr(lx, ly, 80, 16),
+            tr(lang, "Report Bug", "バグ報告"),
+        );
+    }
+    if ctx.state.settings.qol.show_support_links && !ctx.state.contribute_url.is_empty() {
         lx -= 76;
         ctx.btn(
             WidgetId::ContributeLink,
@@ -349,7 +350,7 @@ fn title(ctx: &mut Ctx) {
             tr(lang, "Contribute", "貢献する"),
         );
     }
-    if !ctx.state.support_url.is_empty() {
+    if ctx.state.settings.qol.show_support_links && !ctx.state.support_url.is_empty() {
         lx -= 64 + 4;
         ctx.btn(
             WidgetId::SupportLink,
@@ -357,6 +358,14 @@ fn title(ctx: &mut Ctx) {
             tr(lang, "Support", "支援する"),
         );
     }
+    let full_version = "mc-spine client-ui 0.1.0 - zero-dep pure Rust";
+    let short_version = "mc-spine client-ui 0.1.0";
+    let version = if text_width(full_version, 1) as i32 + 12 <= lx {
+        full_version
+    } else {
+        short_version
+    };
+    ctx.text(4, ctx.h - 12, 1, pal::TEXT_DIM, version);
 }
 
 // ---------------------------------------------------------------------------
@@ -371,14 +380,15 @@ fn settings(ctx: &mut Ctx, active: SettingsTab) {
     ctx.ctext(cx, 8, 2, pal::TEXT, tr(lang, "Settings", "設定"));
 
     // Tab strip.
-    let tw = 88;
+    let tw = 76;
     let gap = 4;
-    let total = 5 * tw + 4 * gap;
+    let total = SettingsTab::ALL.len() as i32 * (tw + gap) - gap;
     let mut tx = cx - total / 2;
     for tab in SettingsTab::ALL {
         let id = match tab {
             SettingsTab::Video => WidgetId::TabVideo,
             SettingsTab::Audio => WidgetId::TabAudio,
+            SettingsTab::Shaders => WidgetId::TabShaders,
             SettingsTab::Qol => WidgetId::TabQol,
             SettingsTab::FairPlay => WidgetId::TabFairPlay,
             SettingsTab::Language => WidgetId::TabLanguage,
@@ -409,10 +419,31 @@ fn settings(ctx: &mut Ctx, active: SettingsTab) {
         tx += tw + gap;
     }
 
-    let y0 = 56;
+    let modern = matches!(
+        active,
+        SettingsTab::Shaders | SettingsTab::Qol | SettingsTab::FairPlay
+    );
+    if modern {
+        let panel_w = 348;
+        let panel_x = cx - panel_w / 2;
+        ctx.panel(panel_x, 54, panel_w, ctx.h - 92);
+        ctx.fill(panel_x + 1, 55, panel_w - 2, 2, pal::ACCENT);
+        ctx.text(panel_x + 12, 62, 1, pal::ACCENT, "MEGU ENHANCED");
+    }
+
+    let y0 = if modern {
+        if ctx.h < 300 {
+            76
+        } else {
+            82
+        }
+    } else {
+        56
+    };
     match active {
         SettingsTab::Video => video_tab(ctx, y0),
         SettingsTab::Audio => audio_tab(ctx, y0),
+        SettingsTab::Shaders => shaders_tab(ctx, y0),
         SettingsTab::Qol => qol_tab(ctx, y0),
         SettingsTab::FairPlay => fairplay_tab(ctx, y0),
         SettingsTab::Language => language_tab(ctx, y0),
@@ -427,8 +458,58 @@ fn settings(ctx: &mut Ctx, active: SettingsTab) {
 }
 
 /// Row geometry for settings pages: a `320`-wide control column.
+/// Compact auto-scaled screens still leave room for the Done button.
 fn row(ctx: &Ctx, i: i32, y0: i32) -> (i32, i32) {
-    (ctx.w / 2 - 160, y0 + i * 24)
+    let step = if ctx.h < 300 { 22 } else { 24 };
+    (ctx.w / 2 - 160, y0 + i * step)
+}
+
+fn first_chars(text: &str, limit: usize) -> &str {
+    text.char_indices()
+        .nth(limit)
+        .map_or(text, |(end, _)| &text[..end])
+}
+
+fn shaders_tab(ctx: &mut Ctx, y0: i32) {
+    let lang = ctx.lang;
+    let cx = ctx.w / 2;
+    let name = if ctx.state.active_shaderpack_name.is_empty() {
+        "Vanilla (Off)"
+    } else {
+        &ctx.state.active_shaderpack_name
+    };
+    ctx.ctext(
+        cx,
+        y0,
+        1,
+        pal::TEXT_DIM,
+        tr(lang, "Current Shaderpack", "現在のシェーダーパック"),
+    );
+    ctx.ctext(cx, y0 + 12, 1, pal::TEXT, first_chars(name, 38));
+    if !ctx.state.active_shaderpack_profile.is_empty() {
+        ctx.ctext(
+            cx,
+            y0 + 24,
+            1,
+            pal::TEXT_DIM,
+            first_chars(&ctx.state.active_shaderpack_profile, 38),
+        );
+    }
+    let x = cx - 160;
+    ctx.btn(
+        WidgetId::ShadersEnabled,
+        lr(x, y0 + 44, 320, 20),
+        if ctx.state.settings.shader_quick.shaders_enabled {
+            tr(lang, "Shaders: ON", "シェーダー: ON")
+        } else {
+            tr(lang, "Shaders: OFF", "シェーダー: OFF")
+        },
+    );
+    ctx.btn(
+        WidgetId::ShadersOpenOptions,
+        lr(x, y0 + 68, 320, 20),
+        tr(lang, "Open Shader Options...", "シェーダー設定を開く..."),
+    );
 }
 
 fn video_tab(ctx: &mut Ctx, y0: i32) {
@@ -658,17 +739,38 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
         ),
     );
 
-    ctx.ctext(
-        ctx.w / 2,
-        y0 + 6 * 24 + 4,
-        1,
-        pal::TEXT_DIM,
-        tr(
-            lang,
-            "Crash reports only - zero gameplay telemetry",
-            "クラッシュレポートのみ — ゲームプレイのテレメトリなし",
-        ),
+    let (x, y) = row(ctx, 6, y0);
+    ctx.btn(
+        WidgetId::QolShowSupportLinks,
+        lr(x, y, 320, 20),
+        if q.show_support_links {
+            tr(
+                lang,
+                "Show Title Support Links: ON",
+                "タイトルの支援リンクを表示: ON",
+            )
+        } else {
+            tr(
+                lang,
+                "Show Title Support Links: OFF",
+                "タイトルの支援リンクを表示: OFF",
+            )
+        },
     );
+
+    if ctx.h >= 300 {
+        ctx.ctext(
+            ctx.w / 2,
+            row(ctx, 7, y0).1 + 4,
+            1,
+            pal::TEXT_DIM,
+            tr(
+                lang,
+                "Crash reports only - zero gameplay telemetry",
+                "クラッシュレポートのみ — ゲームプレイのテレメトリなし",
+            ),
+        );
+    }
 }
 
 fn fairplay_tab(ctx: &mut Ctx, y0: i32) {
@@ -732,7 +834,7 @@ fn fairplay_tab(ctx: &mut Ctx, y0: i32) {
 
     ctx.ctext(
         ctx.w / 2,
-        y0 + 5 * 24 + 4,
+        row(ctx, 5, y0).1 + 4,
         1,
         pal::TEXT_DIM,
         tr(
@@ -1079,6 +1181,28 @@ fn hud(ctx: &mut Ctx) {
     }
 
     ctx.text(4, 4, 1, pal::TEXT_DIM, "mc-spine HUD");
+
+    if !hud.magic.is_empty() {
+        let overlay = crate::magic_hud::build_magic_hud_draw_list(
+            &hud.magic,
+            (ctx.w * ctx.s) as u32,
+            (ctx.h * ctx.s) as u32,
+        );
+        for command in overlay.commands {
+            if let UiCommand::Text {
+                x,
+                y,
+                scale,
+                color,
+                ref text,
+            } = command
+            {
+                ctx.list.text_str(x, y, scale, color, text);
+            } else {
+                ctx.list.push(command);
+            }
+        }
+    }
 }
 
 fn slot_cell(ctx: &mut Ctx, x: i32, y: i32, item: Option<&String>, selected: bool) {
@@ -1192,6 +1316,13 @@ fn pause(ctx: &mut Ctx) {
         lr(x, y, bw, 20),
         tr(lang, "Save & Quit to Title", "保存してタイトルへ"),
     );
+    if !ctx.state.report_url.is_empty() {
+        ctx.btn(
+            WidgetId::PauseReportBug,
+            lr(ctx.w - 96, ctx.h - 26, 92, 18),
+            tr(lang, "Report Bug", "バグ報告"),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -9,6 +9,9 @@ use mc_spine_client_ui::draw::{
     encode_png_rgba, font_atlas_rgba, glyph_for, rasterize_draw_list, tessellate_draw_list,
     text_width, UiCommand, UiDrawList, UiRect, FONT_ATLAS_HEIGHT, FONT_ATLAS_WIDTH,
 };
+use mc_spine_client_ui::magic_hud::{
+    CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState,
+};
 use mc_spine_client_ui::state::{
     invite_code_display, invite_code_parse, CrashReportMode, GamepadButton, HitRegion,
     LanguageSetting, MinimapMode, ModSyncEntry, PlayerRadarScope, Screen, SettingsTab, UiAction,
@@ -17,6 +20,7 @@ use mc_spine_client_ui::state::{
 use mc_spine_core::crash_report::CrashContext;
 
 const SIZES: [(u32, u32); 2] = [(1280, 720), (640, 360)];
+const HIT_SIZES: [(u32, u32); 4] = [(640, 360), (1280, 720), (1920, 1080), (3840, 2160)];
 
 /// Every screen the UI can show, with the state needed to render it.
 fn all_screens(ui: &mut UiState) -> Vec<Screen> {
@@ -45,6 +49,7 @@ fn all_screens(ui: &mut UiState) -> Vec<Screen> {
         Screen::Title,
         Screen::Settings(SettingsTab::Video),
         Screen::Settings(SettingsTab::Audio),
+        Screen::Settings(SettingsTab::Shaders),
         Screen::Settings(SettingsTab::Qol),
         Screen::Settings(SettingsTab::FairPlay),
         Screen::Settings(SettingsTab::Language),
@@ -67,6 +72,19 @@ fn assert_no_overlaps(regions: &[HitRegion]) {
                 "hit regions overlap: {a:?} vs {b:?}"
             );
         }
+    }
+}
+
+fn assert_hit_regions_within_viewport(regions: &[HitRegion], w: u32, h: u32) {
+    assert_no_overlaps(regions);
+    for region in regions {
+        assert!(
+            region.rect.x >= 0
+                && region.rect.y >= 0
+                && region.rect.right() <= w as i32
+                && region.rect.bottom() <= h as i32,
+            "hit region outside {w}x{h}: {region:?}"
+        );
     }
 }
 
@@ -94,6 +112,22 @@ fn every_screen_lays_out_clean_and_rasterizes() {
             let rgba = rasterize_draw_list(w, h, &list);
             assert_eq!(rgba.len(), (w * h * 4) as usize);
             assert_non_blank(&rgba);
+        }
+    }
+}
+
+#[test]
+fn every_screen_has_separate_in_bounds_hit_regions_at_four_resolutions() {
+    for &(w, h) in &HIT_SIZES {
+        let mut ui = UiState::new();
+        ui.support_url = "https://example.invalid/support".into();
+        ui.contribute_url = "https://example.invalid/contribute".into();
+        ui.report_url = "https://example.invalid/report".into();
+        for screen in all_screens(&mut ui) {
+            ui.screen = screen;
+            ui.modal = None;
+            ui.render(w, h);
+            assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
         }
     }
 }
@@ -152,6 +186,246 @@ fn title_flow_and_support_links() {
     ui.render(w, h);
     let acts = click(&mut ui, WidgetId::TitleQuit, w, h);
     assert_eq!(acts, vec![UiAction::QuitGame]);
+}
+
+#[test]
+fn title_links_respect_support_preference_and_report_is_always_accessible() {
+    let mut ui = UiState::new();
+    ui.support_url = "https://example.invalid/support".into();
+    ui.contribute_url = "https://example.invalid/contribute".into();
+    ui.report_url = "https://example.invalid/issues".into();
+    assert!(ui.settings.qol.show_support_links);
+
+    for &(w, h) in &HIT_SIZES {
+        ui.screen = Screen::Title;
+        let commands = ui.render(w, h);
+        assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
+        for (id, url) in [
+            (WidgetId::ReportLink, ui.report_url.clone()),
+            (WidgetId::SupportLink, ui.support_url.clone()),
+            (WidgetId::ContributeLink, ui.contribute_url.clone()),
+        ] {
+            assert!(ui.hit_regions.iter().any(|r| r.id == id));
+            assert_eq!(click(&mut ui, id, w, h), vec![UiAction::OpenUrl(url)]);
+        }
+        // The version text and quiet links occupy separate horizontal ranges.
+        let version = commands
+            .commands
+            .iter()
+            .find_map(|cmd| match cmd {
+                UiCommand::Text { x, scale, text, .. }
+                    if text.starts_with("mc-spine client-ui") =>
+                {
+                    Some((*x, text_width(text, *scale) as i32))
+                }
+                _ => None,
+            })
+            .expect("version label");
+        let leftmost_link = ui
+            .hit_regions
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.id,
+                    WidgetId::ReportLink | WidgetId::SupportLink | WidgetId::ContributeLink
+                )
+            })
+            .map(|r| r.rect.x)
+            .min()
+            .unwrap();
+        assert!(
+            version.0 + version.1 < leftmost_link,
+            "version overlaps link bar at {w}x{h}"
+        );
+    }
+
+    ui.settings.qol.show_support_links = false;
+    for &(w, h) in &HIT_SIZES {
+        ui.render(w, h);
+        assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
+        assert!(!ui
+            .hit_regions
+            .iter()
+            .any(|r| matches!(r.id, WidgetId::SupportLink | WidgetId::ContributeLink)));
+        assert_eq!(
+            click(&mut ui, WidgetId::ReportLink, w, h),
+            vec![UiAction::OpenUrl(ui.report_url.clone())]
+        );
+    }
+    ui.settings.language = LanguageSetting::Japanese;
+    let commands = ui.render(640, 360);
+    assert!(commands
+        .commands
+        .iter()
+        .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text == "バグ報告")));
+
+    ui.report_url.clear();
+    ui.render(640, 360);
+    assert!(!ui.hit_regions.iter().any(|r| r.id == WidgetId::ReportLink));
+}
+
+#[test]
+fn pause_report_bug_is_optional_and_never_advertises_support() {
+    let mut ui = UiState::new();
+    ui.screen = Screen::Pause;
+    ui.support_url = "https://example.invalid/support".into();
+    ui.contribute_url = "https://example.invalid/contribute".into();
+    for &(w, h) in &HIT_SIZES {
+        ui.render(w, h);
+        assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
+        assert!(!ui.hit_regions.iter().any(|r| matches!(
+            r.id,
+            WidgetId::PauseReportBug | WidgetId::SupportLink | WidgetId::ContributeLink
+        )));
+    }
+    ui.report_url = "https://example.invalid/issues".into();
+    for &(w, h) in &HIT_SIZES {
+        ui.render(w, h);
+        assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
+        assert!(ui
+            .hit_regions
+            .iter()
+            .any(|r| r.id == WidgetId::PauseReportBug));
+        assert!(!ui
+            .hit_regions
+            .iter()
+            .any(|r| matches!(r.id, WidgetId::SupportLink | WidgetId::ContributeLink)));
+        assert_eq!(
+            click(&mut ui, WidgetId::PauseReportBug, w, h),
+            vec![UiAction::OpenUrl(ui.report_url.clone())]
+        );
+    }
+}
+
+#[test]
+fn six_settings_tabs_fit_with_modern_extension_controls() {
+    let mut ui = UiState::new();
+    assert_eq!(SettingsTab::ALL.len(), 6);
+    for &(w, h) in &HIT_SIZES {
+        for tab in SettingsTab::ALL {
+            ui.screen = Screen::Settings(tab);
+            let list = ui.render(w, h);
+            assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
+            assert!(ui
+                .hit_regions
+                .iter()
+                .any(|r| r.id == WidgetId::SettingsDone));
+            let extension = matches!(
+                tab,
+                SettingsTab::Shaders | SettingsTab::Qol | SettingsTab::FairPlay
+            );
+            assert_eq!(
+                list.commands.iter().any(
+                    |cmd| matches!(cmd, UiCommand::Text { text, .. } if text == "MEGU ENHANCED")
+                ),
+                extension
+            );
+            for id in [
+                WidgetId::TabVideo,
+                WidgetId::TabAudio,
+                WidgetId::TabShaders,
+                WidgetId::TabQol,
+                WidgetId::TabFairPlay,
+                WidgetId::TabLanguage,
+            ] {
+                assert!(ui.hit_regions.iter().any(|r| r.id == id));
+            }
+        }
+    }
+
+    ui.screen = Screen::Settings(SettingsTab::Video);
+    assert!(click(&mut ui, WidgetId::TabShaders, 640, 360).is_empty());
+    assert_eq!(ui.screen, Screen::Settings(SettingsTab::Shaders));
+    assert_eq!(
+        click(&mut ui, WidgetId::ShadersOpenOptions, 640, 360),
+        vec![UiAction::OpenShaderOptions]
+    );
+    assert!(!ui.settings.shader_quick.shaders_enabled);
+    assert_eq!(
+        click(&mut ui, WidgetId::ShadersEnabled, 640, 360),
+        vec![UiAction::SettingsChanged]
+    );
+    assert!(ui.settings.shader_quick.shaders_enabled);
+    ui.active_shaderpack_name = "Example shaderpack".into();
+    ui.active_shaderpack_profile = "High Quality".into();
+    let list = ui.render(640, 360);
+    for label in ["Example shaderpack", "High Quality"] {
+        assert!(list
+            .commands
+            .iter()
+            .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text == label)));
+    }
+    ui.active_shaderpack_name.clear();
+    let list = ui.render(640, 360);
+    assert!(list
+        .commands
+        .iter()
+        .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text == "Vanilla (Off)")));
+
+    click(&mut ui, WidgetId::TabQol, 640, 360);
+    assert_eq!(
+        click(&mut ui, WidgetId::QolShowSupportLinks, 640, 360),
+        vec![UiAction::SettingsChanged]
+    );
+    assert!(!ui.settings.qol.show_support_links);
+    ui.settings.language = LanguageSetting::Japanese;
+    let list = ui.render(640, 360);
+    assert!(list.commands.iter().any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text == "タイトルの支援リンクを表示: OFF")));
+}
+
+#[test]
+fn magic_hud_only_adds_overlay_when_active() {
+    let mut ui = UiState::new();
+    ui.screen = Screen::InGameHud;
+    let baseline = ui.render(640, 360);
+    assert!(ui.hud.magic.is_empty());
+    assert_eq!(ui.render(640, 360), baseline);
+    ui.hud.magic = MagicHudState {
+        mana: 45.0,
+        max_mana: 100.0,
+        active_cast: Some(CastBarState {
+            spell_label: "Fireball".into(),
+            progress: 0.5,
+            ..Default::default()
+        }),
+        cooldowns: vec![CooldownSlotState {
+            spell_label: "Frost".into(),
+            remaining_ticks: 20,
+            total_ticks: 60,
+        }],
+        custom_statuses: vec![StatusBadgeState {
+            label: "Ward".into(),
+            remaining_ticks: 80,
+            ..Default::default()
+        }],
+    };
+    let overlay = ui.render(640, 360);
+    assert!(overlay.len() > baseline.len());
+    assert!(overlay
+        .commands
+        .iter()
+        .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text.contains("Mana"))));
+    assert!(overlay
+        .commands
+        .iter()
+        .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text.contains("Fireball"))));
+    assert!(overlay
+        .commands
+        .iter()
+        .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text.contains("Frost"))));
+    assert!(overlay
+        .commands
+        .iter()
+        .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text.contains("Ward"))));
+    assert!(ui.hit_regions.is_empty());
+
+    let mut reused = UiDrawList::new();
+    ui.render_into(640, 360, &mut reused);
+    assert_eq!(reused, overlay);
+    ui.render_into(640, 360, &mut reused);
+    assert_eq!(reused, overlay);
+    ui.hud.magic = MagicHudState::default();
+    assert_eq!(ui.render(640, 360), baseline);
 }
 
 /// Render then click the center of `id`'s hit region.
@@ -677,7 +951,13 @@ fn render_into_reuses_draw_list_buffers_and_recycles_text_heaps() {
     assert!(list.commands.is_empty());
     assert_eq!(list.commands.capacity(), cap_before);
     assert_eq!(list.recycled_text_buffer_count(), text_count);
-    list.text_str(0, 0, 1, mc_spine_client_ui::draw::UiColor::rgb(1, 2, 3), "hud");
+    list.text_str(
+        0,
+        0,
+        1,
+        mc_spine_client_ui::draw::UiColor::rgb(1, 2, 3),
+        "hud",
+    );
     assert_eq!(list.recycled_text_buffer_count(), text_count - 1);
     match &list.commands[0] {
         UiCommand::Text { text, .. } => assert_eq!(text, "hud"),
@@ -694,10 +974,7 @@ fn render_into_matches_render_output_on_every_screen() {
             let allocated = ui.render(w, h);
             let mut reused = UiDrawList::new();
             ui.render_into(w, h, &mut reused);
-            assert_eq!(
-                reused.commands, allocated.commands,
-                "{screen:?} at {w}x{h}"
-            );
+            assert_eq!(reused.commands, allocated.commands, "{screen:?} at {w}x{h}");
         }
     }
 }

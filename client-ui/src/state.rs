@@ -111,6 +111,8 @@ pub enum SettingsTab {
     /// Per-source volumes plus the max-volume limiter and sound
     /// coalescing caps.
     Audio,
+    /// Shaderpack controls and the host shader options editor.
+    Shaders,
     /// Quality-of-life: zoom, tool-durability warnings, chat history,
     /// crash-report mode.
     Qol,
@@ -122,9 +124,10 @@ pub enum SettingsTab {
 
 impl SettingsTab {
     /// All tabs, left to right.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Video,
         Self::Audio,
+        Self::Shaders,
         Self::Qol,
         Self::FairPlay,
         Self::Language,
@@ -134,6 +137,7 @@ impl SettingsTab {
         match self {
             Self::Video => tr(lang, "Video", "ビデオ"),
             Self::Audio => tr(lang, "Audio", "オーディオ"),
+            Self::Shaders => tr(lang, "Shaders", "シェーダー"),
             Self::Qol => tr(lang, "QoL", "QoL"),
             Self::FairPlay => tr(lang, "Fair-Play", "フェアプレイ"),
             Self::Language => tr(lang, "Language", "言語"),
@@ -425,6 +429,8 @@ pub struct QolSettings {
     /// Keep chat history across disconnects/reconnects.
     pub retain_chat_on_reconnect: bool,
     pub crash_report_mode: CrashReportMode,
+    /// Whether optional Support/Contribute links appear on the title screen.
+    pub show_support_links: bool,
 }
 
 impl Default for QolSettings {
@@ -436,6 +442,7 @@ impl Default for QolSettings {
             chat_history_lines: 1000,
             retain_chat_on_reconnect: true,
             crash_report_mode: CrashReportMode::Ask,
+            show_support_links: true,
         }
     }
 }
@@ -524,11 +531,18 @@ impl Default for FairPlaySettings {
     }
 }
 
+/// Quick shader controls. The host owns the full shaderpack option editor.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShaderQuickSettings {
+    pub shaders_enabled: bool,
+}
+
 /// Everything the settings screens can change.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UiSettings {
     pub video: VideoSettings,
     pub audio: AudioSettings,
+    pub shader_quick: ShaderQuickSettings,
     pub qol: QolSettings,
     pub fair_play: FairPlaySettings,
     pub language: LanguageSetting,
@@ -675,6 +689,8 @@ pub struct HudState {
     pub show_player_list: bool,
     /// `(name, ping_ms)` for the tab list.
     pub players: Vec<(String, u16)>,
+    /// Optional mana, casting, cooldown, and custom status overlays.
+    pub magic: crate::magic_hud::MagicHudState,
 }
 
 impl Default for HudState {
@@ -695,6 +711,7 @@ impl Default for HudState {
             chat_lines: Vec::new(),
             show_player_list: false,
             players: Vec::new(),
+            magic: crate::magic_hud::MagicHudState::default(),
         }
     }
 }
@@ -728,6 +745,7 @@ impl HudState {
                 ("Alex".to_string(), 34),
                 ("Megu".to_string(), 88),
             ],
+            magic: crate::magic_hud::MagicHudState::default(),
         }
     }
 }
@@ -801,6 +819,8 @@ pub enum UiAction {
     ShowStatistics,
     /// Open a URL in the system browser (Support / Contribute links).
     OpenUrl(String),
+    /// Open the host application's full shader option editor.
+    OpenShaderOptions,
     /// Mint a new host invite code (result appears as `active_invite`).
     GenerateInvite,
     /// Copy `0`'s rendered code to the system clipboard.
@@ -831,10 +851,12 @@ pub enum WidgetId {
     TitleQuit,
     SupportLink,
     ContributeLink,
+    ReportLink,
     // Settings chrome
     SettingsDone,
     TabVideo,
     TabAudio,
+    TabShaders,
     TabQol,
     TabFairPlay,
     TabLanguage,
@@ -848,6 +870,9 @@ pub enum WidgetId {
     VideoBackgroundFps,
     VideoVsync,
     VideoSmoothLighting,
+    // Shaders tab
+    ShadersEnabled,
+    ShadersOpenOptions,
     // Audio tab
     AudioMaster,
     AudioMusic,
@@ -863,6 +888,7 @@ pub enum WidgetId {
     QolChatHistory,
     QolRetainChat,
     QolCrashMode,
+    QolShowSupportLinks,
     // Fair-Play tab
     FpMinimapMode,
     FpCaveMap,
@@ -887,6 +913,7 @@ pub enum WidgetId {
     PauseStatistics,
     PauseInvite,
     PauseSaveQuit,
+    PauseReportBug,
     // Crash recovery (+ confirmation modal)
     CrashSendReport,
     CrashReturnTitle,
@@ -908,6 +935,7 @@ impl WidgetId {
                 | Self::VideoBackgroundFps
                 | Self::VideoVsync
                 | Self::VideoSmoothLighting
+                | Self::ShadersEnabled
                 | Self::AudioMaster
                 | Self::AudioMusic
                 | Self::AudioBlocks
@@ -921,6 +949,7 @@ impl WidgetId {
                 | Self::QolChatHistory
                 | Self::QolRetainChat
                 | Self::QolCrashMode
+                | Self::QolShowSupportLinks
                 | Self::FpMinimapMode
                 | Self::FpCaveMap
                 | Self::FpMobRadar
@@ -1032,6 +1061,12 @@ pub struct UiState {
     pub support_url: String,
     /// Optional quiet corner link on the title screen — hidden when empty.
     pub contribute_url: String,
+    /// Optional bug report URL on Title and Pause, hidden while empty.
+    pub report_url: String,
+    /// Current shaderpack display name, or empty for vanilla rendering.
+    pub active_shaderpack_name: String,
+    /// Current shaderpack profile label, if provided by the host.
+    pub active_shaderpack_profile: String,
 
     invite_counter: u64,
     fps_field_focused: bool,
@@ -1062,6 +1097,9 @@ impl Default for UiState {
             crash_sent: false,
             support_url: String::new(),
             contribute_url: String::new(),
+            report_url: String::new(),
+            active_shaderpack_name: String::new(),
+            active_shaderpack_profile: String::new(),
             invite_counter: 0,
             fps_field_focused: false,
             fps_field_text: String::new(),
@@ -1426,17 +1464,24 @@ impl UiState {
             }
             WidgetId::TitleQuit => vec![UiAction::QuitGame],
             WidgetId::SupportLink => {
-                if self.support_url.is_empty() {
+                if !self.settings.qol.show_support_links || self.support_url.is_empty() {
                     Vec::new()
                 } else {
                     vec![UiAction::OpenUrl(self.support_url.clone())]
                 }
             }
             WidgetId::ContributeLink => {
-                if self.contribute_url.is_empty() {
+                if !self.settings.qol.show_support_links || self.contribute_url.is_empty() {
                     Vec::new()
                 } else {
                     vec![UiAction::OpenUrl(self.contribute_url.clone())]
+                }
+            }
+            WidgetId::ReportLink | WidgetId::PauseReportBug => {
+                if self.report_url.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![UiAction::OpenUrl(self.report_url.clone())]
                 }
             }
 
@@ -1446,9 +1491,11 @@ impl UiState {
             }
             WidgetId::TabVideo => self.select_tab(SettingsTab::Video),
             WidgetId::TabAudio => self.select_tab(SettingsTab::Audio),
+            WidgetId::TabShaders => self.select_tab(SettingsTab::Shaders),
             WidgetId::TabQol => self.select_tab(SettingsTab::Qol),
             WidgetId::TabFairPlay => self.select_tab(SettingsTab::FairPlay),
             WidgetId::TabLanguage => self.select_tab(SettingsTab::Language),
+            WidgetId::ShadersOpenOptions => vec![UiAction::OpenShaderOptions],
 
             WidgetId::VideoFpsSlider => {
                 // Map click x to the nearest slider stop.
@@ -1600,6 +1647,11 @@ impl UiState {
                 v.preset = VideoPreset::Custom;
                 true
             }
+            WidgetId::ShadersEnabled => {
+                self.settings.shader_quick.shaders_enabled =
+                    !self.settings.shader_quick.shaders_enabled;
+                true
+            }
             WidgetId::AudioMaster => {
                 a.master = clamp_i(a.master as i32 + 5 * dir, 0, 100);
                 true
@@ -1657,6 +1709,10 @@ impl UiState {
             }
             WidgetId::QolCrashMode => {
                 q.crash_report_mode = q.crash_report_mode.next();
+                true
+            }
+            WidgetId::QolShowSupportLinks => {
+                q.show_support_links = !q.show_support_links;
                 true
             }
             WidgetId::FpMinimapMode => {
