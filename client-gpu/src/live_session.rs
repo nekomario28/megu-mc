@@ -16,9 +16,14 @@ use mc_spine_client::world::{BlockTable, WorldState};
 use mc_spine_client_mesh::mesher::{
     BlockVisualEnhancementResult, BlockVisualInput, VanillaPlusPipelineConfig,
 };
+use mc_spine_client_mesh::tactile_effects::{
+    compute_environment_audio_hint, evaluate_night_sky_drama, CameraMicroOffset,
+    EnvironmentAudioHint, FluidEntryEvent, GroundSurfaceKind, ImpactMaterial, LeafCanopyKind,
+    NightSkyDrama, TactileEffectsConfig, TactileEffectsSim,
+};
 use mc_spine_client_mesh::vanilla_plus_nature::{
-    tick_nature_ambience, NatureAmbienceEnv, NatureAmbienceState, NatureModRegistry,
-    SeasonAmbienceInput,
+    tick_nature_ambience, ActiveSeasonKind, NatureAmbienceEnv, NatureAmbienceState,
+    NatureModRegistry, SeasonAmbienceInput,
 };
 use mc_spine_ui::magic_hud::{CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState};
 use mc_spine_ui::state::{HudState, MiniHudPreset, UiState};
@@ -156,6 +161,31 @@ pub struct LiveSession {
     /// The target last installed by the season path, used to detect an
     /// external `set_target` between two season frames.
     seasoned_atmosphere_target: Option<AtmosphereParams>,
+    /// Opt-in tactile & sky micro-effect configuration. The default is
+    /// `TactilePreset::Off`, which keeps the engine completely silent
+    /// until `set_tactile_config` installs `Subtle`/`Fancy`.
+    tactile_config: TactileEffectsConfig,
+    /// Retained tactile-effect particle sim seeded with the session's
+    /// VFX hardware tier; ticked once per world tick inside
+    /// [`Self::poll`] and stepped per frame by `step_tactile_frame`.
+    tactile_sim: TactileEffectsSim,
+    /// Latest deterministic night-sky layer (shooting stars + aurora
+    /// bands) evaluated in `step_tactile_frame` from the live season.
+    latest_night_sky_drama: NightSkyDrama,
+    /// Latest opt-in camera micro-physics offset; exact zero while the
+    /// preset is `Off` or `subtle_camera_motion` is disabled.
+    latest_camera_micro_offset: CameraMicroOffset,
+    /// Latest environment audio occlusion/reverb/muffle hint.
+    latest_audio_hint: EnvironmentAudioHint,
+    /// Monotonic event counter seeding deterministic effect hashing for
+    /// the `on_*` emit entry points.
+    tactile_event_tick: u64,
+    /// Pose captured by the previous `step_tactile_frame`, used to derive
+    /// camera micro-physics velocities from the live pose stream.
+    tactile_last_pose: Option<PlayerPose>,
+    /// Landing impulse queued by `on_footstep_or_landing`, consumed by
+    /// the next `step_tactile_frame` camera-dip step.
+    tactile_landing_impulse: f32,
     last_motion_delta: [f64; 2],
     last_vfx_tick: Instant,
     last_animation_tick: Instant,
@@ -175,6 +205,9 @@ impl LiveSession {
     ) -> Self {
         let hw_caps = detect_host_hardware_caps();
         let compute_strategy = select_compute_strategy(&hw_caps);
+        let vfx = ClientVfxHost::new(GpuPipelineKind::Classic);
+        let tactile_tier = vfx.budget_tier();
+        let tactile_config = TactileEffectsConfig::default();
         Self {
             incoming,
             outgoing,
@@ -182,7 +215,7 @@ impl LiveSession {
             world: WorldState::new(DimensionMeta::default(), BlockTable::load(None)),
             hud: HudState::default(),
             magic: MagicHudState::default(),
-            vfx: ClientVfxHost::new(GpuPipelineKind::Classic),
+            vfx,
             motion: None,
             pose: None,
             camera_sync: None,
@@ -210,6 +243,14 @@ impl LiveSession {
             nature_env: NatureAmbienceEnv::default(),
             base_atmosphere_target: AtmosphereParams::default(),
             seasoned_atmosphere_target: None,
+            tactile_sim: TactileEffectsSim::new(tactile_config.clone(), tactile_tier),
+            tactile_config,
+            latest_night_sky_drama: NightSkyDrama::default(),
+            latest_camera_micro_offset: CameraMicroOffset::default(),
+            latest_audio_hint: EnvironmentAudioHint::default(),
+            tactile_event_tick: 0,
+            tactile_last_pose: None,
+            tactile_landing_impulse: 0.0,
             last_motion_delta: [0.0; 2],
             last_vfx_tick: Instant::now(),
             last_animation_tick: Instant::now(),
@@ -238,6 +279,223 @@ impl LiveSession {
             &self.nature_env,
             dt_sec,
         );
+    }
+
+    /// Install a new tactile-effects configuration, propagating it into
+    /// the retained sim. `TactilePreset::Off` (the default) keeps every
+    /// emit path and the camera micro-physics completely silent.
+    pub fn set_tactile_config(&mut self, config: TactileEffectsConfig) {
+        self.tactile_sim.set_config(config.clone());
+        self.tactile_config = config;
+    }
+
+    /// The retained tactile-effect particle sim (read-only view for the
+    /// renderer's particle pass).
+    pub fn tactile_sim(&self) -> &TactileEffectsSim {
+        &self.tactile_sim
+    }
+
+    /// The active tactile-effects configuration.
+    pub fn tactile_config(&self) -> &TactileEffectsConfig {
+        &self.tactile_config
+    }
+
+    /// Latest deterministic night-sky layer from `step_tactile_frame`.
+    pub fn latest_night_sky_drama(&self) -> &NightSkyDrama {
+        &self.latest_night_sky_drama
+    }
+
+    /// Latest environment audio occlusion/reverb/muffle hint.
+    pub fn latest_audio_hint(&self) -> EnvironmentAudioHint {
+        self.latest_audio_hint
+    }
+
+    /// Latest opt-in camera micro-physics offset.
+    pub fn latest_camera_micro_offset(&self) -> CameraMicroOffset {
+        self.latest_camera_micro_offset
+    }
+
+    /// A body broke a fluid surface: mass/speed-scaled water droplets and
+    /// concentric [`WaterRippleRing`]s, or lava sizzle sparks and steam.
+    /// Silent while the preset is `Off`.
+    pub fn on_fluid_entry(&mut self, event: FluidEntryEvent) {
+        self.tactile_sim.emit_fluid_entry(&event);
+    }
+
+    /// A trunk punch/chop or gust: a downward-spiralling canopy burst.
+    /// `kind == None` picks the canopy family from the live
+    /// `season_ambience` (Spring -> `CherrySakura`, Autumn ->
+    /// `AutumnMaple`, Winter -> `SpruceNeedle`, Summer/seasonless ->
+    /// `OakGreen`). Silent while the preset is `Off`.
+    pub fn on_tree_shake(
+        &mut self,
+        canopy_pos: [f32; 3],
+        kind: Option<LeafCanopyKind>,
+        intensity: f32,
+    ) {
+        let kind = kind.unwrap_or_else(|| self.seasonal_canopy_kind());
+        let tick = self.next_tactile_event_tick();
+        self.tactile_sim
+            .emit_tree_shake_burst(canopy_pos, kind, intensity, tick);
+    }
+
+    /// Footstep or landing dust for `surface`; heavy landings also feed
+    /// the camera micro-physics dip impulse on the next
+    /// `step_tactile_frame`. Silent while the preset is `Off`.
+    pub fn on_footstep_or_landing(
+        &mut self,
+        pos: [f32; 3],
+        surface: GroundSurfaceKind,
+        landing_speed: f32,
+    ) {
+        if landing_speed.is_finite() && landing_speed > 0.0 {
+            self.tactile_landing_impulse = self.tactile_landing_impulse.max(landing_speed);
+        }
+        let tick = self.next_tactile_event_tick();
+        self.tactile_sim
+            .emit_footstep_or_landing(pos, surface, landing_speed, tick);
+    }
+
+    /// Brief crisp sparks on an ore strike, shield block, crit or arrow
+    /// flyby. Silent while the preset is `Off`.
+    pub fn on_impact_sparks(
+        &mut self,
+        pos: [f32; 3],
+        normal: [f32; 3],
+        material: ImpactMaterial,
+    ) {
+        let tick = self.next_tactile_event_tick();
+        self.tactile_sim.emit_impact_sparks(pos, normal, material, tick);
+    }
+
+    /// Advance the whole tactile & sky layer by one frame:
+    ///
+    /// * steps the particle sim and the wetness tracker (soaked while
+    ///   `is_submerged || is_raining`, drip anchor at the live pose),
+    /// * steps the opt-in camera micro-physics with velocities derived
+    ///   from the live pose stream plus the queued landing impulse,
+    /// * evaluates the deterministic night sky with the live
+    ///   `season_ambience` (winter season or `snow_override` -> polar
+    ///   aurora) and the session's atmosphere density,
+    /// * refreshes the environment audio hint.
+    ///
+    /// Completely silent (zero particles, zero sky drama, zero offsets)
+    /// while `tactile_config.preset == TactilePreset::Off`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_tactile_frame(
+        &mut self,
+        dt_sec: f32,
+        world_time_ticks: u64,
+        is_clear_sky: bool,
+        is_submerged: bool,
+        sky_light: u8,
+        enclosed_wall_ratio: f32,
+        is_raining: bool,
+    ) {
+        if let Some(pose) = self.pose {
+            self.tactile_sim.wetness_mut().set_position([
+                pose.feet[0] as f32,
+                pose.feet[1] as f32,
+                pose.feet[2] as f32,
+            ]);
+        }
+        self.tactile_sim
+            .step_with_wetness(dt_sec, is_submerged || is_raining);
+
+        let (strafe_vel, vertical_vel) = self.tactile_camera_velocities(dt_sec);
+        let landing = self.tactile_landing_impulse;
+        self.tactile_landing_impulse = 0.0;
+        self.latest_camera_micro_offset = self.tactile_sim.camera_mut().step(
+            strafe_vel,
+            vertical_vel,
+            landing,
+            0.0,
+            dt_sec,
+            &self.tactile_config,
+        );
+
+        let season = self.season_ambience.sanitized();
+        let is_cold_or_winter = !season.is_seasonless
+            && !season.is_tropical
+            && (matches!(season.season, ActiveSeasonKind::Winter) || season.snow_override);
+        self.latest_night_sky_drama = evaluate_night_sky_drama(
+            world_time_ticks,
+            is_clear_sky && !is_raining,
+            is_cold_or_winter,
+            self.tactile_atmosphere_density(),
+            &self.tactile_config,
+        );
+        self.latest_audio_hint = compute_environment_audio_hint(
+            is_submerged,
+            sky_light,
+            enclosed_wall_ratio,
+            is_raining,
+        );
+    }
+
+    /// Seasonal canopy family for `on_tree_shake` when the caller has no
+    /// concrete `LeafCanopyKind`: sakura bloom in spring, crimson maple
+    /// in autumn, evergreen spruce through the dormant winter and plain
+    /// oak otherwise (including the seasonless fallback).
+    fn seasonal_canopy_kind(&self) -> LeafCanopyKind {
+        match self.season_ambience.sanitized().season {
+            ActiveSeasonKind::Spring => LeafCanopyKind::CherrySakura,
+            ActiveSeasonKind::Summer => LeafCanopyKind::OakGreen,
+            ActiveSeasonKind::Autumn => LeafCanopyKind::AutumnMaple,
+            ActiveSeasonKind::Winter => LeafCanopyKind::SpruceNeedle,
+        }
+    }
+
+    /// Normalized `0..=1` air density for the night-sky layer: `0` on
+    /// skylight-less dimensions (nether/end) and vacuum-thin air, `1` at
+    /// the overworld reference. The blender's `fog_density` is the
+    /// session's air-transmission proxy — `AtmosphereParams::for_policy`
+    /// scales it by the dimension's acoustic air transmission and
+    /// `vacuum_orbit` keeps it at `0`.
+    fn tactile_atmosphere_density(&self) -> f32 {
+        if !self.world.dimension.has_skylight {
+            return 0.0;
+        }
+        let reference = AtmosphereParams::default().fog_density;
+        if reference <= 0.0 {
+            return 0.0;
+        }
+        (self.atmosphere_blender.current().fog_density / reference).clamp(0.0, 1.0)
+    }
+
+    /// Sideways/vertical camera velocity (blocks/sec) derived from the
+    /// live pose stream: sideways is the horizontal delta projected onto
+    /// the camera-right axis, vertical is `dy/dt`. `(0, 0)` on the first
+    /// frame, a degenerate `dt`, or a teleport-pop delta (> 4 blocks).
+    fn tactile_camera_velocities(&mut self, dt_sec: f32) -> (f32, f32) {
+        let pose = self.pose;
+        let previous = self.tactile_last_pose;
+        self.tactile_last_pose = pose;
+        let (Some(pose), Some(previous)) = (pose, previous) else {
+            return (0.0, 0.0);
+        };
+        if !dt_sec.is_finite() || dt_sec <= 1.0e-3 {
+            return (0.0, 0.0);
+        }
+        let dt = dt_sec.min(0.25);
+        let dx = (pose.feet[0] - previous.feet[0]) as f32;
+        let dy = (pose.feet[1] - previous.feet[1]) as f32;
+        let dz = (pose.feet[2] - previous.feet[2]) as f32;
+        if !dx.is_finite() || !dy.is_finite() || !dz.is_finite() || dx * dx + dy * dy + dz * dz > 16.0
+        {
+            return (0.0, 0.0);
+        }
+        // MC yaw 0 faces +Z; the camera-right axis is (-cos(yaw), -sin(yaw)).
+        let yaw = pose.yaw.to_radians();
+        let strafe_vel = -(dx * yaw.cos() + dz * yaw.sin()) / dt;
+        (strafe_vel, dy / dt)
+    }
+
+    /// Deterministic event-seed counter for the `on_*` emit paths: same
+    /// session event order -> same spread/phase hashing, no RNG, no clock.
+    fn next_tactile_event_tick(&mut self) -> u64 {
+        self.tactile_event_tick = self.tactile_event_tick.wrapping_add(1);
+        self.tactile_event_tick
     }
 
     /// Limit main-thread packet work per frame. No reads, writes or DNS on this thread.
@@ -281,6 +539,7 @@ impl LiveSession {
             for _ in 0..elapsed_ticks {
                 self.vfx.tick();
                 self.step_nature_ambience(0.05);
+                self.tactile_sim.step(0.05);
             }
             self.last_vfx_tick = now;
             let animation_dt = now.duration_since(self.last_animation_tick).as_secs_f32();
@@ -670,6 +929,9 @@ mod tests {
         decode_chunk_packet, decode_custom_payload_packet, decode_packet_body, encode_packet,
         DecodedMotionPhase, WireReader, CHANNEL_ANIM_V1, CHANNEL_MAGIC_V1, CHANNEL_MOTION_V1,
         CHANNEL_SEASON_V1, CHANNEL_VFX_V1, SSN1_MAGIC, SSN1_VERSION,
+    };
+    use mc_spine_client_mesh::tactile_effects::{
+        FluidEntryBody, TactileParticleKind, TactilePreset,
     };
     use mc_spine_client_mesh::vanilla_plus_nature::{ActiveSeasonKind, NatureParticleKind};
     use mc_spine_client_mesh::vfx_engine::{DynamicColoredLight, Vfx1Packet, VfxCommand};
@@ -1306,5 +1568,146 @@ mod tests {
             tropical_target.fog_density < winter_target.fog_density,
             "tropical dims lose the snowy haze"
         );
+    }
+
+    #[test]
+    fn tactile_effects_default_off_stays_silent() {
+        let (mut live, _tx) = session();
+        assert_eq!(live.tactile_config().preset, TactilePreset::Off);
+        assert_eq!(live.tactile_sim().len(), 0);
+        assert_eq!(live.tactile_sim().tier(), live.vfx.budget_tier());
+
+        live.on_fluid_entry(FluidEntryEvent {
+            pos: [0.0, 64.0, 0.0],
+            impact_speed: 6.0,
+            body: FluidEntryBody::PlayerOrMediumMob,
+            is_lava: false,
+            seed_tick: 42,
+        });
+        live.on_tree_shake([0.0, 70.0, 0.0], None, 1.0);
+        live.on_footstep_or_landing([0.0, 64.0, 0.0], GroundSurfaceKind::Snow, 5.0);
+        live.on_impact_sparks(
+            [0.0, 64.0, 0.0],
+            [0.0, 1.0, 0.0],
+            ImpactMaterial::CriticalHit,
+        );
+        live.step_tactile_frame(0.05, 18_000, true, true, 0, 0.9, true);
+        assert_eq!(live.tactile_sim().len(), 0, "Off preset emits no particles");
+        assert!(live.latest_night_sky_drama().is_empty());
+        assert_eq!(
+            live.latest_camera_micro_offset(),
+            CameraMicroOffset::default()
+        );
+
+        // Even with the camera opt-in flag set, the Off preset pins the
+        // micro-physics output to an exact zero offset.
+        live.set_tactile_config(TactileEffectsConfig {
+            subtle_camera_motion: true,
+            ..TactileEffectsConfig::default()
+        });
+        live.on_footstep_or_landing([0.0, 64.0, 0.0], GroundSurfaceKind::StoneOrWood, 8.0);
+        live.step_tactile_frame(0.05, 18_100, true, false, 15, 0.0, false);
+        assert_eq!(
+            live.latest_camera_micro_offset(),
+            CameraMicroOffset::default(),
+            "Off preset must zero the camera offset even when opted in"
+        );
+        assert_eq!(live.tactile_sim().len(), 0);
+    }
+
+    #[test]
+    fn tactile_effects_fancy_and_live_seasons_drive_sky_splash_leaves_audio() {
+        let (mut live, _tx) = session();
+
+        // A mid-winter SSN1 frame with snow override.
+        let winter = ssn1_frame(10, 49_151, [235, 240, 255], [220, 230, 240], 0b100);
+        live.apply_event(framed(CHANNEL_SEASON_V1, &winter)).unwrap();
+        assert_eq!(live.season_ambience.season, ActiveSeasonKind::Winter);
+        assert!(live.season_ambience.snow_override);
+
+        live.set_tactile_config(TactileEffectsConfig {
+            preset: TactilePreset::Fancy,
+            ..TactileEffectsConfig::default()
+        });
+        assert_eq!(live.tactile_config().preset, TactilePreset::Fancy);
+        assert_eq!(live.tactile_sim().config().preset, TactilePreset::Fancy);
+
+        // Winter clear night -> polar aurora bands in the sky layer.
+        live.step_tactile_frame(0.05, 18_000, true, false, 4, 0.0, false);
+        assert!(
+            !live.latest_night_sky_drama().aurora_bands.is_empty(),
+            "winter SSN1 + Fancy should drive polar aurora bands"
+        );
+
+        // Water entry -> droplets plus a concentric ripple ring.
+        let before = live.tactile_sim().len();
+        live.on_fluid_entry(FluidEntryEvent {
+            pos: [2.0, 63.0, 2.0],
+            impact_speed: 8.0,
+            body: FluidEntryBody::PlayerOrMediumMob,
+            is_lava: false,
+            seed_tick: 7,
+        });
+        let spawned = &live.tactile_sim().particles()[before..];
+        assert!(
+            spawned
+                .iter()
+                .any(|p| matches!(p.kind, TactileParticleKind::SplashDroplet)),
+            "water entry must spawn splash droplets"
+        );
+        assert!(
+            spawned
+                .iter()
+                .any(|p| matches!(p.kind, TactileParticleKind::WaterRippleRing { .. })),
+            "water entry must spawn a concentric ripple ring"
+        );
+
+        // Spring SSN1 -> a trunk shake sheds sakura-pink petals.
+        let spring = ssn1_frame(1, 30_000, [255, 200, 220], [200, 230, 180], 0);
+        live.apply_event(framed(CHANNEL_SEASON_V1, &spring)).unwrap();
+        assert_eq!(live.season_ambience.season, ActiveSeasonKind::Spring);
+        let before = live.tactile_sim().len();
+        live.on_tree_shake([4.0, 70.0, 4.0], None, 1.0);
+        let petals = &live.tactile_sim().particles()[before..];
+        assert!(!petals.is_empty(), "spring shake must shed petals");
+        assert!(
+            petals
+                .iter()
+                .all(|p| matches!(p.kind, TactileParticleKind::LeafPetal)
+                    && p.rgba[0] > 0.9
+                    && p.rgba[2] > p.rgba[1]),
+            "spring seasonal pick must tint petals sakura pink"
+        );
+
+        // Autumn SSN1 -> maple-amber leaves, and the aurora is gone now
+        // that the live season is no longer winter.
+        let autumn = ssn1_frame(7, 32_767, [255, 120, 40], [200, 160, 80], 0);
+        live.apply_event(framed(CHANNEL_SEASON_V1, &autumn)).unwrap();
+        assert_eq!(live.season_ambience.season, ActiveSeasonKind::Autumn);
+        let before = live.tactile_sim().len();
+        live.on_tree_shake([8.0, 70.0, 8.0], None, 1.0);
+        let petals = &live.tactile_sim().particles()[before..];
+        assert!(!petals.is_empty(), "autumn shake must shed leaves");
+        assert!(
+            petals
+                .iter()
+                .all(|p| matches!(p.kind, TactileParticleKind::LeafPetal)
+                    && p.rgba[0] > p.rgba[1]
+                    && p.rgba[1] > p.rgba[2] + 0.1),
+            "autumn seasonal pick must tint leaves maple amber"
+        );
+        live.step_tactile_frame(0.05, 18_000, true, false, 4, 0.0, false);
+        assert!(
+            live.latest_night_sky_drama().aurora_bands.is_empty(),
+            "autumn nights get no polar aurora: live seasonal coupling"
+        );
+
+        // Submerged in a dark enclosed cave while it rains: underwater
+        // low-pass, cave reverb and rain-eaves occlusion all engage.
+        live.step_tactile_frame(0.05, 18_100, true, true, 0, 0.9, true);
+        let hint = live.latest_audio_hint();
+        assert!(hint.underwater_lowpass > 0.0, "submerged -> low-pass");
+        assert!(hint.cave_reverb_mix > 0.0, "dark enclosed -> reverb");
+        assert!(hint.rain_eaves_occlusion > 0.0, "rain + cover -> occlusion");
     }
 }
