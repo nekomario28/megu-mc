@@ -1484,6 +1484,115 @@ fn live_permission_levels_gate_commands_and_function_return_stops_execution() {
     clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|c| !(8411..=8414).contains(&c.eid));
 }
 
+#[test]
+fn execute_non_player_sources_keep_dispatcher_permission_level() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    let _world = world_guard();
+    let _directory = CommandDirectory::enter();
+    std::env::remove_var("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS");
+
+    let fixture = |name: &str, eid: i32| {
+        let (mut client, _hold) = crate::effect_tests::client_pair();
+        client.name = name.to_owned();
+        client.eid = eid;
+        command_context(Some(Arc::new(client)))
+    };
+    let level2 = fixture("perm_two", 8611);
+    let level3 = fixture("perm_three", 8612);
+    let console = command_context(None);
+    {
+        let mut ops = ops_registry().lock().unwrap_or_else(|e| e.into_inner());
+        ops.entries.clear();
+        ops.set("perm_two", 2, false);
+        ops.set("perm_three", 3, false);
+    }
+
+    let zombie = new_live_mob(
+        name_to_etype("zombie").unwrap(),
+        DimId::Overworld,
+        (0.5, 16.0, 0.5, 0.0, 0.0),
+        20.0,
+        None,
+    );
+    let zombie_eid = zombie.eid;
+    mobs().lock().unwrap_or_else(|e| e.into_inner()).push(zombie);
+    let mob_eids = || {
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|mob| mob.eid)
+            .collect::<HashSet<_>>()
+    };
+    let run = |ctx: &CmdCtx, msg: &str| run_command_ctx(ctx, msg, &mut None);
+    let summon_and_run = |ctx: &CmdCtx, msg: &str| {
+        let before = mob_eids();
+        let reply = run(ctx, msg);
+        for eid in mob_eids().difference(&before) {
+            remove_live_mob(*eid);
+        }
+        reply
+    };
+
+    let denied = run(
+        &level2,
+        "/execute as @e[type=zombie,limit=1] run op ExecVictim",
+    );
+    assert!(denied.contains("permission"), "{denied}");
+    assert!(!player_is_admin("ExecVictim"));
+    let denied = run(
+        &level2,
+        "/execute as @e[type=zombie,limit=1] run ban ExecVictim",
+    );
+    assert!(denied.contains("permission"), "{denied}");
+    assert!(
+        ban_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .players
+            .iter()
+            .all(|entry| !entry.name.eq_ignore_ascii_case("ExecVictim"))
+    );
+
+    let denied = summon_and_run(&level2, "/execute summon minecraft:pig run stop");
+    if !denied.contains("permission") {
+        crate::test_support::child_note(&format!("execute stop escaped: {denied}"));
+    }
+    assert!(denied.contains("permission"), "{denied}");
+    let denied = summon_and_run(
+        &level2,
+        "/execute summon minecraft:pig run ban ExecVictim",
+    );
+    assert!(denied.contains("permission"), "{denied}");
+    let denied = summon_and_run(
+        &level2,
+        "/execute summon minecraft:pig run megu policy set max_frame_mib 32",
+    );
+    assert!(denied.contains("permission"), "{denied}");
+
+    let reply = run(
+        &level2,
+        "/execute as @e[type=zombie,limit=1] run time set 1000",
+    );
+    assert_eq!(reply, "executed 1 command(s)", "{reply}");
+    let reply = run(
+        &level3,
+        "/execute as @e[type=zombie,limit=1] run op LevelThreeOp",
+    );
+    assert_eq!(reply, "executed 1 command(s)", "{reply}");
+    assert!(player_is_admin("LevelThreeOp"));
+    let reply = run(
+        &console,
+        "/execute as @e[type=zombie,limit=1] run op ConsoleVictim",
+    );
+    assert_eq!(reply, "executed 1 command(s)", "{reply}");
+    assert!(player_is_admin("ConsoleVictim"));
+
+    remove_live_mob(zombie_eid);
+}
+
 /// W5: the console/RCON `status` diagnostic. A console source (me = None,
 /// always level 4) gets the plain-language `format_operator_status` report;
 /// a player never does — the non-Vanilla literal is absent from the advertised

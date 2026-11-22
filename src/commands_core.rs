@@ -7659,6 +7659,15 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// The permission level a command source carries into dispatch: a pinned level
+/// wins, the console is level 4, and players use their ops.json level.
+fn command_permission_level(me: Option<&Arc<Client>>) -> u8 {
+    PINNED_COMMAND_LEVEL
+        .with(std::cell::Cell::get)
+        .map(|pinned| pinned.min(4))
+        .unwrap_or_else(|| me.map_or(4, |player| client_permission_level(player)))
+}
+
 /// Vanilla `TimeCommand` routes through `ServerLevel.setDayTime`, and the
 /// clients see the new clock right away (a `set_time` update, not only the
 /// next periodic sync). Emitting `0x64` on the command path keeps clients
@@ -7693,10 +7702,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
     // Vanilla `CommandSourceStack.hasPermission`: the console runs at level 4,
     // players at their ops.json level. `command_allowed_for_player` keeps the
     // argument-aware level-0 exceptions (e.g. `/time query`) on top.
-    let level = PINNED_COMMAND_LEVEL
-        .with(std::cell::Cell::get)
-        .map(|pinned| pinned.min(4))
-        .unwrap_or_else(|| me.map_or(4, |player| client_permission_level(player)));
+    let level = command_permission_level(me);
     if !command_allowed_for_source(cmd, level)
         && !command_allowed_for_player(cmd, &args)
         && !mod_command_permitted(cmd, level)

@@ -312,6 +312,7 @@ struct ExecuteSource {
     dimension: DimId,
     rotation: [f64; 2],
     anchor: ExecuteAnchor,
+    permission_level: u8,
 }
 
 impl ExecuteSource {
@@ -326,6 +327,7 @@ impl ExecuteSource {
             rotation,
             dimension: cmd_dim(ctx),
             anchor: ExecuteAnchor::Feet,
+            permission_level: command_permission_level(ctx.me.as_ref()),
         }
     }
 
@@ -2299,7 +2301,7 @@ fn execute_run(
     } else {
         format!("/{name} {}", args.join(" "))
     };
-    let reply = run_command_ctx(&ctx, &command, s);
+    let reply = run_command_ctx_level(&ctx, &command, s, Some(source.permission_level));
     execute_legacy_result(name, &reply).ok_or(reply)
 }
 
