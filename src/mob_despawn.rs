@@ -191,6 +191,150 @@ pub(crate) fn vindicator_is_johnny(eid: i32, etype: i64) -> bool {
         })
 }
 
+/// Vanilla ground-item reach for `Mob.aiStep`/`Fox`/`Allay` pickup scans: the
+/// search box extends about this far horizontally and vertically past the mob.
+#[cfg_attr(not(test), allow(dead_code))]
+const MOB_ITEM_PICKUP_RADIUS: f64 = 1.45;
+
+/// A "Johnny" vindicator sweeps targets inside the standard monster follow
+/// range (`Monster.createMonsterAttributes` registers 16.0 blocks).
+#[cfg_attr(not(test), allow(dead_code))]
+const JOHNNY_VINDICATOR_FOLLOW_RANGE: f64 = 16.0;
+
+/// One dropped-item entity as a pickup candidate: its entity id, the carried
+/// item's protocol id and its world position for the distance check.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DroppedItemCandidate {
+    pub item_eid: i32,
+    pub item_id: i32,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+/// A mob/dropped-item pair the tick accepted: the caller applies the held
+/// item, removes the item entity and broadcasts the equipment update.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MobPickupAccepted {
+    pub mob_eid: i32,
+    pub item_eid: i32,
+    pub item_id: i32,
+}
+
+/// Tick-level pass over the vanilla ground-item pickup rule: each alive,
+/// empty-handed pickup-capable mob takes the nearest unclaimed dropped item
+/// inside `pickup_radius`. A claimed `item_eid` leaves the candidacy pool
+/// immediately, so two mobs can never pick the same item in one tick.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn evaluate_mob_item_pickups(
+    mobs: &mut [Mob],
+    dropped_items: &[DroppedItemCandidate],
+    pickup_radius: f64,
+) -> Vec<MobPickupAccepted> {
+    let mut accepted = Vec::new();
+    if !(pickup_radius.is_finite() && pickup_radius > 0.0) {
+        return accepted;
+    }
+    let reach_sq = pickup_radius * pickup_radius;
+    let mut claimed = std::collections::HashSet::new();
+    for mob in mobs.iter_mut() {
+        if !mob_can_pick_up_dropped_item(mob.etype)
+            || *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0
+            || mob_picked_up_items()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&mob.eid)
+        {
+            continue;
+        }
+        let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let nearest = dropped_items
+            .iter()
+            .filter(|item| !claimed.contains(&item.item_eid))
+            .filter_map(|item| {
+                let dist_sq =
+                    (item.x - mx).powi(2) + (item.y - my).powi(2) + (item.z - mz).powi(2);
+                (dist_sq.is_finite() && dist_sq <= reach_sq).then_some((dist_sq, item))
+            })
+            .min_by(|(a_dist, a_item), (b_dist, b_item)| {
+                a_dist
+                    .total_cmp(b_dist)
+                    .then(a_item.item_eid.cmp(&b_item.item_eid))
+            });
+        let Some((_, item)) = nearest else {
+            continue;
+        };
+        let Ok(item_id) = u32::try_from(item.item_id) else {
+            continue;
+        };
+        if try_mob_pickup_item(mob, item_id) {
+            claimed.insert(item.item_eid);
+            accepted.push(MobPickupAccepted {
+                mob_eid: mob.eid,
+                item_eid: item.item_eid,
+                item_id: item.item_id,
+            });
+        }
+    }
+    accepted
+}
+
+/// The nearest legal target of a "Johnny" vindicator's hostile sweep: any
+/// alive non-vindicator mob inside `max_range`, with the entity id breaking
+/// exact distance ties so the pick is deterministic across calls.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn select_johnny_vindicator_target(
+    vindicator: &Mob,
+    candidates: &[Mob],
+    max_range: f64,
+) -> Option<i32> {
+    if !vindicator_is_johnny(vindicator.eid, vindicator.etype)
+        || *vindicator.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0
+        || !(max_range.is_finite() && max_range > 0.0)
+    {
+        return None;
+    }
+    let (vx, vy, vz, ..) = *vindicator.pos.lock().unwrap_or_else(|e| e.into_inner());
+    let range_sq = max_range * max_range;
+    candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.eid != vindicator.eid
+                && entity_spec_by_id(candidate.etype).map(|spec| spec.name)
+                    != Some("minecraft:vindicator")
+                && *candidate.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0
+        })
+        .filter_map(|candidate| {
+            let (cx, cy, cz, ..) = *candidate.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let dist_sq = (cx - vx).powi(2) + (cy - vy).powi(2) + (cz - vz).powi(2);
+            (dist_sq.is_finite() && dist_sq <= range_sq).then_some((dist_sq, candidate.eid))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
+        .map(|(_, eid)| eid)
+}
+
+/// Single tick entry point for this lane: ground-item pickup (which writes
+/// `PersistenceRequired` per accepted pair) and every Johnny vindicator's
+/// hostile target sweep. Returns the accepted pickups and the
+/// attacker -> target eid pairs for the caller to apply.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn tick_mob_persistence_and_easter_egg_ai(
+    mobs: &mut [Mob],
+    dropped_items: &[DroppedItemCandidate],
+) -> (Vec<MobPickupAccepted>, Vec<(i32, i32)>) {
+    let pickups = evaluate_mob_item_pickups(mobs, dropped_items, MOB_ITEM_PICKUP_RADIUS);
+    let johnny_targets = mobs
+        .iter()
+        .filter_map(|mob| {
+            select_johnny_vindicator_target(mob, mobs, JOHNNY_VINDICATOR_FOLLOW_RANGE)
+                .map(|target| (mob.eid, target))
+        })
+        .collect();
+    (pickups, johnny_targets)
+}
+
 fn live_despawn_exempt(mob: &Mob) -> bool {
     let mut flags = mob_persistence_flags()
         .lock()
@@ -513,8 +657,12 @@ mod mob_despawn_tests {
     }
 
     fn mob_named(eid: i32, pos: (f64, f64, f64), dim: DimId, name: &str) -> Arc<Mob> {
+        Arc::new(mob_at(eid, pos, dim, name))
+    }
+
+    fn mob_at(eid: i32, pos: (f64, f64, f64), dim: DimId, name: &str) -> Mob {
         let past = Instant::now() - Duration::from_secs(10);
-        Arc::new(Mob {
+        Mob {
             dim,
             eid,
             etype: name_to_etype(name).unwrap(),
@@ -529,7 +677,7 @@ mod mob_despawn_tests {
             fire_ticks: Mutex::new(0),
             love: Mutex::new(0),
             air: Mutex::new(300),
-        })
+        }
     }
 
     #[test]
@@ -928,5 +1076,224 @@ mod mob_despawn_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&77_007);
+    }
+
+    #[test]
+    fn tick_item_pickup_claims_the_nearest_drop_for_one_mob_only() {
+        // Two pickup-capable zombies share one spot; only the first in tick
+        // order can take the single dropped sword. Creeper and cow types never
+        // pick items up even inside the reach.
+        let mut mobs = vec![
+            mob_at(78_001, (0.0, 70.0, 0.0), DimId::Overworld, "zombie"),
+            mob_at(78_002, (0.0, 70.0, 0.0), DimId::Overworld, "zombie"),
+            mob_at(78_003, (0.0, 70.0, 0.0), DimId::Overworld, "creeper"),
+            mob_at(78_004, (0.0, 70.0, 0.0), DimId::Overworld, "cow"),
+        ];
+        let sword = DroppedItemCandidate {
+            item_eid: 78_101,
+            item_id: 276,
+            x: 0.5,
+            y: 70.0,
+            z: 0.5,
+        };
+        let out_of_reach = DroppedItemCandidate {
+            item_eid: 78_102,
+            item_id: 1,
+            x: 3.0,
+            y: 70.0,
+            z: 0.0,
+        };
+        let accepted =
+            evaluate_mob_item_pickups(&mut mobs, &[sword, out_of_reach], MOB_ITEM_PICKUP_RADIUS);
+        assert_eq!(
+            accepted,
+            [MobPickupAccepted {
+                mob_eid: 78_001,
+                item_eid: 78_101,
+                item_id: 276,
+            }],
+            "the second zombie at the same spot cannot duplicate-pick 78_101"
+        );
+
+        // The found item writes PersistenceRequired the moment it is claimed:
+        // the holder is exempt from the 200-block instant-despawn radius.
+        let holder = zombie(78_001, (0.0, 70.0, 0.0));
+        let mut hostile = NaturalHostile::new(&holder, ZERO_ROLL_SEED);
+        hostile.no_action_time = 2000;
+        assert!(!hostile.check_despawn(false, Some(200.0_f64.powi(2))));
+
+        clear_mob_persistence_state(78_001);
+    }
+
+    #[test]
+    fn tick_item_pickup_rejects_bad_reach_non_finite_items_and_full_hands() {
+        let mut mobs = vec![mob_at(78_010, (0.0, 70.0, 0.0), DimId::Overworld, "zombie")];
+        let item = DroppedItemCandidate {
+            item_eid: 78_110,
+            item_id: 276,
+            x: 0.0,
+            y: 70.0,
+            z: 0.0,
+        };
+        for radius in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(evaluate_mob_item_pickups(&mut mobs, &[item], radius).is_empty());
+        }
+        // A dead mob picks nothing up.
+        *mobs[0].hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+        assert!(evaluate_mob_item_pickups(&mut mobs, &[item], 1.45).is_empty());
+        *mobs[0].hp.lock().unwrap_or_else(|e| e.into_inner()) = 20.0;
+
+        // Non-finite item coordinates never enter a claim.
+        let nan_item = DroppedItemCandidate {
+            item_eid: 78_111,
+            item_id: 1,
+            x: f64::NAN,
+            y: 70.0,
+            z: 0.0,
+        };
+        assert!(evaluate_mob_item_pickups(&mut mobs, &[nan_item], 1.45).is_empty());
+
+        // A mob already holding a found item takes no second one.
+        assert!(try_mob_pickup_item(&mobs[0], 1));
+        let second = DroppedItemCandidate {
+            item_eid: 78_112,
+            item_id: 2,
+            x: 0.0,
+            y: 70.0,
+            z: 0.0,
+        };
+        assert!(evaluate_mob_item_pickups(&mut mobs, &[second], 1.45).is_empty());
+        clear_mob_persistence_state(78_010);
+    }
+
+    #[test]
+    fn johnny_vindicator_targets_the_nearest_non_vindicator_mob() {
+        mob_custom_names()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(78_020, "Johnny".to_string());
+        let johnny = mob_at(78_020, (0.0, 70.0, 0.0), DimId::Overworld, "vindicator");
+        let sheep_far = mob_at(78_021, (10.0, 70.0, 0.0), DimId::Overworld, "sheep");
+        let cow_near = mob_at(78_022, (2.0, 70.0, 0.0), DimId::Overworld, "cow");
+        let vindicator_other =
+            mob_at(78_023, (1.0, 70.0, 0.0), DimId::Overworld, "vindicator");
+        let zombie_out = mob_at(78_024, (17.0, 70.0, 0.0), DimId::Overworld, "zombie");
+        let sheep_dead = mob_at(78_025, (0.5, 70.0, 0.0), DimId::Overworld, "sheep");
+        *sheep_dead.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+        let candidates = [sheep_far, cow_near, vindicator_other, zombie_out, sheep_dead];
+        assert_eq!(
+            select_johnny_vindicator_target(&johnny, &candidates, 16.0),
+            Some(78_022),
+            "nearest alive non-vindicator wins; vindicators, the dead and out-of-range are skipped"
+        );
+        // Everything legal but out of reach sweeps nothing.
+        let far_only = [mob_at(78_026, (16.1, 70.0, 0.0), DimId::Overworld, "zombie")];
+        assert_eq!(
+            select_johnny_vindicator_target(&johnny, &far_only, 16.0),
+            None
+        );
+        // An invalid follow range disables the sweep.
+        for range in [0.0, -4.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                select_johnny_vindicator_target(&johnny, &candidates, range),
+                None
+            );
+        }
+        // A dead Johnny sweeps nothing.
+        *johnny.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+        assert_eq!(
+            select_johnny_vindicator_target(&johnny, &candidates, 16.0),
+            None
+        );
+        *johnny.hp.lock().unwrap_or_else(|e| e.into_inner()) = 20.0;
+
+        // An unnamed vindicator never sweeps, and vanilla compares the name
+        // exactly: lowercase "johnny" is not the egg.
+        mob_custom_names()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&78_020);
+        assert_eq!(
+            select_johnny_vindicator_target(&johnny, &candidates, 16.0),
+            None
+        );
+        mob_custom_names()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(78_020, "johnny".to_string());
+        assert_eq!(
+            select_johnny_vindicator_target(&johnny, &candidates, 16.0),
+            None
+        );
+        mob_custom_names()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&78_020);
+    }
+
+    #[test]
+    fn johnny_target_ties_break_on_entity_id() {
+        mob_custom_names()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(78_030, "Johnny".to_string());
+        let johnny = mob_at(78_030, (0.0, 70.0, 0.0), DimId::Overworld, "vindicator");
+        // Two candidates at the exact same distance: the lower eid wins.
+        let candidates = [
+            mob_at(78_032, (2.0, 70.0, 0.0), DimId::Overworld, "pig"),
+            mob_at(78_031, (-2.0, 70.0, 0.0), DimId::Overworld, "pig"),
+        ];
+        assert_eq!(
+            select_johnny_vindicator_target(&johnny, &candidates, 16.0),
+            Some(78_031)
+        );
+        mob_custom_names()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&78_030);
+    }
+
+    #[test]
+    fn tick_entry_runs_pickup_and_johnny_sweep_deterministically() {
+        mob_custom_names()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(78_040, "Johnny".to_string());
+        let mut mobs = vec![
+            mob_at(78_040, (0.0, 70.0, 0.0), DimId::Overworld, "vindicator"),
+            mob_at(78_041, (0.0, 70.0, 0.0), DimId::Overworld, "zombie"),
+            mob_at(78_042, (3.0, 70.0, 0.0), DimId::Overworld, "sheep"),
+        ];
+        let items = [DroppedItemCandidate {
+            item_eid: 78_140,
+            item_id: 276,
+            x: 0.0,
+            y: 70.0,
+            z: 0.0,
+        }];
+        let (pickups, pairs) = tick_mob_persistence_and_easter_egg_ai(&mut mobs, &items);
+        assert_eq!(
+            pickups,
+            [MobPickupAccepted {
+                mob_eid: 78_041,
+                item_eid: 78_140,
+                item_id: 276,
+            }]
+        );
+        // Johnny attacks the closest non-vindicator: the zombie sharing his
+        // spot, not the sheep farther out.
+        assert_eq!(pairs, [(78_040, 78_041)]);
+
+        // A second call is stable: the holder takes no second item, and the
+        // same target pair comes back.
+        let (pickups, pairs) = tick_mob_persistence_and_easter_egg_ai(&mut mobs, &items);
+        assert!(pickups.is_empty());
+        assert_eq!(pairs, [(78_040, 78_041)]);
+
+        mob_custom_names()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&78_040);
+        clear_mob_persistence_state(78_041);
     }
 }
