@@ -6,7 +6,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Megu — Experimental Rust Minecraft runtime and tools</title>
   <meta name="description"
-        content="Megu (codename mc-spine) is an experimental Rust Minecraft runtime with five standalone tools, bounded NeoForge/Fabric mod adaptation, and external shaderpack specifications for 1.21.1 and 26.3.">
+        content="Megu (codename mc-spine) is an experimental Rust Minecraft runtime for 1.21.1 and 26.3, with 12 standalone crates including client-gpu, bounded JVM-free mod adaptation, external shaderpack formats, and declarative Magic/VFX/Animation/Combat-Motion engines.">
   <link rel="stylesheet" href="style.css">
   <script src="site-config.js"></script>
   <script src="app.js" defer></script>
@@ -52,8 +52,7 @@
         </h1>
 
         <p class="lead" data-i18n="hero_lead">
-          Experimental Minecraft: Java Edition runtime targeting 1.21.1 and 26.3. The Alpha includes five standalone CLI binaries,
-          automatic analysis and partial native adaptation of NeoForge/Fabric JARs, and external shaderpack parsing. Full vanilla/mod parity and windowed GPU rendering remain in progress.
+          Experimental Minecraft: Java Edition runtime for 1.21.1 and 26.3. Twelve standalone crates include an isolated winit/wgpu GPU client alongside five CLI tools. Bounded JVM-free NeoForge/Fabric JAR adaptation, external shaderpack planning, and declarative Magic/VFX/Animation/Combat-Motion engines are implemented. Whole-world Vanilla parity and third-party modpack/shader fidelity remain unverified.
         </p>
 
         <div class="hero-actions">
@@ -206,7 +205,7 @@
           <article class="pillar">
             <h3 data-i18n="p2_title">Client and rendering work</h3>
             <p data-i18n="p2_body">
-              The client implements protocol probing and shaderpack capability planning, including conservative fallback selection. Real winit + wgpu windowed rendering and hardware validation are post-Alpha work.
+              The client implements protocol probing, Magic/VFX/Animation/Combat-Motion handling, and shaderpack capability planning with conservative fallback. The isolated client-gpu crate has a real winit + wgpu window and offscreen rendering, with a recorded non-blank Vulkan offscreen frame on AMD RX 7800 XT (RADV).
             </p>
           </article>
           <article class="pillar">
@@ -270,7 +269,7 @@
           </article>
         </div>
         <p class="feature-note" data-i18n="shader_boundary">
-          These are parser/specification and fallback-planning capabilities. Real winit + wgpu windowed GPU execution and shader compatibility testing remain post-Alpha.
+          Shaderpack support currently covers parsing and fallback planning. A real winit + wgpu GPU client exists; live third-party shaderpack visual fidelity and server/modpack interoperability remain unverified.
         </p>
       </div>
     </section>
@@ -341,15 +340,15 @@ mc-spine-client --ping localhost:25565</code></pre>
             <ul>
               <li data-i18n="scope_now_1">Vanilla 1.21.1 protocol, online-mode AES-CFB8 auth, and Velocity modern forwarding</li>
               <li data-i18n="scope_now_2">Deterministic worldgen, random ticks, villagers, commands, ops/bans/whitelist, RCON, and async backups</li>
-              <li data-i18n="scope_now_3">Five standalone binaries: server, client utility, mod checker/adaptor/scaffolder, 1.21.1 ↔ 26.3 world migrator, and EULA-aware initializer</li>
+              <li data-i18n="scope_now_3">Twelve standalone crates (eleven without third-party dependencies and isolated client-gpu), plus five CLI tools for server, client, mod inspection/adaptation, world migration, and setup</li>
             </ul>
           </div>
           <div class="scope-col">
             <h3 data-i18n="scope_wip_h">Still in progress</h3>
             <ul>
-              <li data-i18n="scope_wip_1">Full vanilla parity across combat, remaining gamerules, and general-seed worldgen</li>
+              <li data-i18n="scope_wip_1">Full Vanilla parity across general-seed worldgen and gameplay interactions</li>
               <li data-i18n="scope_wip_2">Native Anvil live world storage and broader live modpack execution</li>
-              <li data-i18n="scope_wip_3">Windowed winit + wgpu GPU execution, shaderpack hardware validation, and wider mod compatibility</li>
+              <li data-i18n="scope_wip_3">Third-party shaderpack visual fidelity, live modpack E2E, and wider GPU hardware/platform coverage</li>
             </ul>
           </div>
         </div>
@@ -473,7 +472,7 @@ mc-spine-client --ping localhost:25565</code></pre>
       nav_quickstart: "起動手順",
       nav_scope: "対応状況",
       hero_headline: "Rust ランタイム・Mod 自動適応・CLI ツール。",
-      hero_lead: "Minecraft: Java Edition 1.21.1 / 26.3 を対象とする実験的 Rust ランタイム。Alpha には独立した 5 個の CLI、NeoForge/Fabric JAR の自動解析と一部ネイティブ適応、外部シェーダーパックの解析機能があります。Vanilla / Mod の完全互換性とウィンドウ表示の GPU 描画は開発中です。",
+      hero_lead: "Minecraft: Java Edition 1.21.1 / 26.3 向けの実験的 Rust ランタイム。独立した 12 クレートに winit/wgpu の GPU クライアントを分離し、5 個の CLI ツールを備えます。NeoForge/Fabric JAR の JVM 不要な限定的自動適応、外部シェーダーパック解析・計画、宣言型 Magic/VFX/Animation/Combat-Motion エンジンを実装済みです。全ワールドの Vanilla 同等性や第三者 Mod／シェーダーの実動作互換性は未検証です。",
       cta_start: "起動手順へ",
       cta_check: "Modpackを診断",
       cta_github: "GitHub を見る",
@@ -508,7 +507,7 @@ mc-spine-client --ping localhost:25565</code></pre>
       p1_title: "ネイティブなシミュレーション処理",
       p1_body: "Rust 実装は Create の一部の動力・ベルト・流体や調理データに対応しています。対応する動作・負荷条件について、Minecraft と Mod の実装との比較検証を継続しています。",
       p2_title: "クライアントと描画の実装状況",
-      p2_body: "クライアントにはプロトコル Ping と、保守的なフォールバック選択を含むシェーダーパックの GPU 機能計画があります。winit + wgpu による実ウィンドウ描画と実機検証は Alpha 後の作業です。",
+      p2_body: "クライアントにはプロトコル Ping、Magic/VFX/Animation/Combat-Motion 処理、保守的なシェーダーパック機能計画があります。独立した client-gpu には winit + wgpu の実ウィンドウ／オフスクリーン描画があり、AMD RX 7800 XT（RADV）で非空の Vulkan オフスクリーン描画を確認した記録があります。",
       p3_title: "起動時の Mod 自動適応",
       p3_body: "mods/ の起動時スキャンで、置き換え済みの軽量化 Mod 36 種をスキップし、live_mod_bridge / auto_adapter によりデータ・調理・Mixin の対応範囲を適応します。未対応コードはフォールバック・隔離の必要性を分類します。",
       p4_title: "独立した 5 個の CLI バイナリ",
@@ -526,7 +525,7 @@ mc-spine-client --ping localhost:25565</code></pre>
       shader_classic_body: "Classic OptiFine の GLSL 120–330 パスに対応する解析機構があります。Iris 1.7–1.11+ 仕様は GLSL 430–460 の compute・SSBO・image・両手照明 uniform を扱います。",
       shader_dh_title: "DistantHorizons LOD と Megu WGSL",
       shader_dh_body: "DistantHorizons LOD の dh_shadow・dh_terrain・dh_water パスを扱います。ネイティブ WGSL パックは megu-shader.toml のパス宣言と .wgsl ファイルを使用します。",
-      shader_boundary: "現時点では解析・仕様とフォールバック計画の機能です。winit + wgpu の実ウィンドウ GPU 描画とシェーダーの実機互換性試験は Alpha 後を予定しています。",
+      shader_boundary: "シェーダーパックの対応範囲は現時点で解析・フォールバック計画です。winit + wgpu の GPU クライアントは実装済みですが、第三者シェーダーの描画再現度とサーバー／Modpack での相互運用は未検証です。",
       qs_title: "EULA に明示同意してサーバーを開始",
       qs_1: "1. 1.21.1 用のサーバーを初期化し、EULA に明示同意",
       qs_2: "2. 必要なら mods/ を JVM 不要でスキャン",
@@ -536,11 +535,11 @@ mc-spine-client --ping localhost:25565</code></pre>
       scope_now_h: "Alpha で動作するもの",
       scope_now_1: "Vanilla 1.21.1 プロトコル、online-mode AES-CFB8 認証、Velocity Modern Forwarding",
       scope_now_2: "決定論的ワールド生成、ランダムティック、村人・取引、管理コマンド、ops/BAN/ホワイトリスト、RCON、非同期バックアップ",
-      scope_now_3: "独立した 5 個のバイナリ（サーバー、クライアント補助、Mod 検査・適応・雛形生成、1.21.1 ↔ 26.3 ワールド移行、EULA 同意付き初期化）",
+      scope_now_3: "独立した 12 クレート（外部依存ゼロの 11 クレート＋分離した client-gpu）と、サーバー・クライアント補助・Mod 検査／適応・ワールド移行・初期化の 5 個の CLI",
       scope_wip_h: "開発中・対象外",
-      scope_wip_1: "戦闘・残りゲームルール・一般シード地形の完全 Vanilla パリティ",
+      scope_wip_1: "一般シードの地形生成とゲームプレイ全体の完全 Vanilla パリティ",
       scope_wip_2: "ライブサーバーのネイティブ Anvil 保存と実 Mod 実行範囲の拡大",
-      scope_wip_3: "winit + wgpu ウィンドウ GPU 描画、シェーダーパックの実機検証、Mod 互換範囲の拡大",
+      scope_wip_3: "第三者シェーダーパックの描画再現度、実 Modpack E2E、GPU 実機・OS 検証範囲の拡大",
       footer_legal: "独立したクリーンルーム OSS プロジェクトです。Mojang・Microsoft および記載の各 Mod 作者とは一切関係ありません。",
       feedback_open: "不具合報告・要望",
       feedback_title: "クラッシュ・不具合・要望を送る",

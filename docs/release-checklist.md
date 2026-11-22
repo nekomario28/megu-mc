@@ -27,11 +27,14 @@ The pre-release gate also runs [tests/verify_gate_coverage_test.py](../tests/ver
 offline self-test and against the built server. It checks the `mod-suite`
 feature as well.
 
-The gate invokes `cargo test --offline --locked` for all **11 standalone
-crates**: `core`, `proto`, `state-store`, `server-files`, `mod-offload`,
+The gate invokes `cargo test --offline --locked` for the **11 zero-third-party-dependency
+standalone crates**: `core`, `proto`, `state-store`, `server-files`, `mod-offload`,
 `mod-adapter-core`, `create-adapter`, `client-port`, `client-kernel`,
-`client-app`, and `client-ui`. Clippy is a separate release check for the
-same set; `tests/verify.sh` does not run it:
+`client-app`, and `client-ui`. The twelfth standalone crate, `client-gpu`,
+uses an isolated `client-gpu/Cargo.toml` and `client-gpu/Cargo.lock` for
+`winit`/`wgpu` and their dependencies. Test it separately with
+`cargo test --manifest-path client-gpu/Cargo.toml --locked`.
+Clippy is a separate release check; `tests/verify.sh` does not run it:
 
 ```sh
 for crate in core proto state-store server-files mod-offload mod-adapter-core \
@@ -39,6 +42,8 @@ for crate in core proto state-store server-files mod-offload mod-adapter-core \
     cargo clippy --manifest-path "$crate/Cargo.toml" --offline --locked \
         --all-targets -- -D warnings || exit 1
 done
+cargo clippy --manifest-path client-gpu/Cargo.toml --locked \
+    --all-targets -- -D warnings
 ```
 
 ## 2. Clean public export
@@ -175,6 +180,11 @@ client each:
 - [ ] die, respawn, disconnect, reconnect
 - [ ] `stop`, restart: world, inventory and position restore
 
+The automated two-client [Alpha smoke harness](../tests/alpha_release_smoke.py)
+covers these seven steps, including `stop` → restart persistence. Its recorded
+run passed 7/7 checks. The boxes above remain open for a fresh run against
+the final candidate SHA.
+
 ## 7. Alpha scope and clean-room communication
 
 - Say what the Alpha is in the words of [README.md](../README.md) and
@@ -194,8 +204,9 @@ client each:
 - State the bounded strict Vanilla parity audit results (`ceaf3849`) explicitly:
   58/58 C2S Play, 51/51 GameRules, 89/89 command roots, 30/30 behavioral
   matrix; `eddeea93` records 12/12 MATCH against live Vanilla 1.21.1 cases.
-  Static S2C Play emissions remain 83/124, with 41 unemitted packets and
-  16 unresolved send sites. Whole-world M2 parity remains open.
+  The updated live S2C Play emissions audit reports **107/124 (86.3%)** and
+  **0 dead mechanisms**. The remaining S2C surface and whole-world M2 parity
+  remain open.
 - State that the strict NeoForge 1.21.1 / Fabric 1.21.1 repository self-audit
   is 53/53 overall (50/50 per loader, `ceaf3849`), while Wave 3 real
   third-party modpack E2E remains unverified. The debt ratchet is at its
@@ -205,8 +216,16 @@ client each:
   DistantHorizons `dh_shadow`/`dh_terrain`/`dh_water`, `megu-shader.toml`,
   a GLSL 120–460 reflector, CLI/TOML/RenderGraph and a `client-ui` shader
   screen (`469a15f5`, `11e82fb8`, `001de852`, `a079e1d6`). The native
-  WGSL path has a legacy-GPU-safe fallback. No third-party shaders are
-  bundled; shader visual fidelity and a real GPU-windowed client are pending.
+  WGSL path has a legacy-GPU-safe fallback. `client-gpu` implements a real
+  `winit` + `wgpu` window and offscreen rendering, with a recorded non-blank
+  Vulkan offscreen render on AMD Radeon RX 7800 XT (RADV). No third-party
+  shaders are bundled; live third-party server/modpack shader visual fidelity
+  and end-to-end compatibility remain unverified.
+- The [release workflow](../.github/workflows/release.yml) builds and verifies
+  six release binaries across Linux, macOS and Windows, including archive
+  manifest/checksum verification. The `client-gpu` binary is separate from
+  that six-binary release matrix. A passing workflow definition does not
+  replace same-SHA release-candidate execution evidence.
 
 ## 8. Phase 2 / 3 / 4 Alpha ship gates
 
@@ -217,14 +236,15 @@ a live interoperability gate.
 **Phase 2 — documentation and implementation surface**
 
 - [ ] `README.md`, `docs/architecture.md`, `docs/operator-guide.md`, and this
-  checklist agree with the 11 standalone crates and their actual entry points.
+  checklist agree with the 12 standalone crates and their actual entry points.
 - [ ] Full `tests/verify.sh`, standalone Clippy loop above, provenance check,
   and `tools/release_bundle.py --self-test` pass on the candidate SHA.
 - [ ] Document the boundaries of the bounded `.class` subset VM, optional
   mini-JRE/Tier 3 delegation, in-memory OP4 `/megu policy`, optional MineAll/
   CutAll, and death-slot restore's currently unconnected live toggle.
 - [ ] Document the headless software rasterizer, WGSL/RenderGraph, and
-  `client-ui`; the real `winit` + `wgpu` window backend remains post-Alpha.
+  `client-ui`, and the separate `client-gpu` `winit` + `wgpu` window backend,
+  including the limits of the available Vulkan offscreen hardware proof.
 
 **Phase 3 — integration and portability**
 

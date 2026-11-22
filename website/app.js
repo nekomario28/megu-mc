@@ -41,9 +41,10 @@
     tagline: "Experimental Rust Minecraft runtime and standalone CLI tools",
     statusBadge: "Experimental Alpha",
     valueProp:
-      "An experimental Rust Minecraft runtime with a five-binary CLI suite, " +
-      "bounded NeoForge/Fabric JAR adaptation and external shaderpack parsing. " +
-      "Windowed GPU rendering remains post-Alpha.",
+      "An experimental Rust Minecraft runtime with 12 standalone crates " +
+      "(including isolated winit/wgpu client-gpu), five CLI tools, bounded JVM-free " +
+      "NeoForge/Fabric JAR adaptation, external shaderpack planning, and declarative " +
+      "Magic/VFX/Animation/Combat-Motion engines. Full parity remains unverified.",
     mcTargets: ["1.21.1", "26.3"],
     githubUrl: "https://github.com/nekomario28/mc-spine",
     reportApiUrl: "",

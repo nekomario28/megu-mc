@@ -1,9 +1,12 @@
 # Crate architecture
 
-The dependency map of the eleven standalone crates plus the root `mc-spine`
+The dependency map of the twelve standalone crates plus the root `mc-spine`
 package, the license model, and the fast-iteration commands. The
 manifests are the source of truth — this page is the map, and every edge
 below is read out of the `*/Cargo.toml` `[dependencies]` tables.
+Eleven crates have no third-party dependencies. The twelfth, `client-gpu`,
+isolates `winit`/`wgpu` and their external dependencies in its own
+manifest and `client-gpu/Cargo.lock`.
 
 ## Packages
 
@@ -13,13 +16,14 @@ below is read out of the `*/Cargo.toml` `[dependencies]` tables.
 | [../proto](../proto/Cargo.toml) | `mc-spine-proto` | canonical protocol IR, versioned packet tables (767 and 777), the protocol-767 codec, the `VCR1` UDP proximity voice relay ([src/voice_relay.rs](../proto/src/voice_relay.rs)) |
 | [../state-store](../state-store/Cargo.toml) | `mc-spine-state-store` | 64-shard `DimensionState`/`ServerContext` runtime store, the `STV1` snapshot codec, the declarative `1.21.1 ↔ 26.3` DataFixer pipeline, the pure-`std` vanilla `level.dat`/`.mca` inspector with its own gzip + binary-NBT codecs ([src/anvil_inspect.rs](../state-store/src/anvil_inspect.rs)) |
 | [../server-files](../server-files/Cargo.toml) | `mc-spine-server-files` | Vanilla server files (`server.properties`, `eula.txt`, ops/whitelist/bans, `usercache.json`) with atomic persistence; `mc-spine-init` directory bootstrap and `mc-spine-admin` offline commands; OpenPAC/FTB-Chunks-style claims + parties + forceload engine ([src/claims.rs](../server-files/src/claims.rs)) and `CustomPacketPayload` sync codec ([src/claims_wire.rs](../server-files/src/claims_wire.rs)) |
-| [../mod-offload](../mod-offload/Cargo.toml) | `mod-offload` | factory simulation kernel prototypes (`rlib` + `cdylib`) |
-| [../mod-adapter-core](../mod-adapter-core/Cargo.toml) | `mod-adapter-core` | zero-JVM mod classification, declarative offload profiles, 4-tier fallback planner, Mixin-to-Event lifter ([src/mixin_lifter.rs](../mod-adapter-core/src/mixin_lifter.rs)), and automatic bundle/report generation ([src/auto_adapter.rs](../mod-adapter-core/src/auto_adapter.rs)) via `mc-spine-mod-check --adapt-jar`, `--adapt-mods-dir`, `--scaffold-native` |
+| [../mod-offload](../mod-offload/Cargo.toml) | `mod-offload` | factory simulation kernels and server-authoritative combat/cast timelines, combo windows, four hitbox types, invulnerability frames and `MOT1` wire ([src/combat_motion.rs](../mod-offload/src/combat_motion.rs)); `rlib` + `cdylib` |
+| [../mod-adapter-core](../mod-adapter-core/Cargo.toml) | `mod-adapter-core` | zero-JVM mod classification, declarative offload profiles, 4-tier fallback planner, Mixin-to-Event lifter ([src/mixin_lifter.rs](../mod-adapter-core/src/mixin_lifter.rs)), mana/spell casts/statuses/rituals and `MAG1` wire ([src/magic_primitives.rs](../mod-adapter-core/src/magic_primitives.rs)), declarative magic bundles ([src/unified_bundle.rs](../mod-adapter-core/src/unified_bundle.rs)), and automatic bundle/report generation ([src/auto_adapter.rs](../mod-adapter-core/src/auto_adapter.rs)) via `mc-spine-mod-check --adapt-jar`, `--adapt-mods-dir`, `--scaffold-native` |
 | [../create-adapter](../create-adapter/Cargo.toml) | `create-adapter` | flagship zero-JVM Create-mod special-case optimizer, 6-DOF `aeronautics` rigid-body sub-worlds and altitude-trigger (`Y >= 560`) space/planet dimension transitions with variable gravity ([src/orbital.rs](../create-adapter/src/orbital.rs)) |
-| [../client-kernel](../client-kernel/Cargo.toml) | `mc-spine-kernel` | protocol-767 kernel, versioned C ABI, and 128-payload-section multi-word light masks ([src/light.rs](../client-kernel/src/light.rs)) |
-| [../client-port](../client-port/Cargo.toml) | `mc-spine-client-mesh` | protocol-767 voxel mesher (`rlib` + `cdylib`), shaderpack processing ([src/shaderpack.rs](../client-port/src/shaderpack.rs)), shader binding reflection ([src/shaderpack_reflect.rs](../client-port/src/shaderpack_reflect.rs)) and `cull_region_bench` benchmark binary |
-| [../client-ui](../client-ui/Cargo.toml) | `mc-spine-client-ui` | independent pure-Rust client UI drawing/screens, including shaderpack selection ([src/shader_screen.rs](../client-ui/src/shader_screen.rs)) |
-| [../client-app](../client-app/Cargo.toml) | `mc-spine-client` | native client executable; `--shader-pack`/`--shader-profile` CLI ([src/cli.rs](../client-app/src/cli.rs)), shaderpack activation and GPU fallback ([src/shaderpack_runtime.rs](../client-app/src/shaderpack_runtime.rs)), RenderGraph integration |
+| [../client-kernel](../client-kernel/Cargo.toml) | `mc-spine-kernel` | protocol-767 kernel, versioned C ABI, 128-payload-section multi-word light masks ([src/light.rs](../client-kernel/src/light.rs)), and FK skeletal animation with Step/Linear/CatmullRom interpolation, Bedrock/GeckoLib JSON loading, crossfade layers and `ANM1` wire ([src/skeletal_anim.rs](../client-kernel/src/skeletal_anim.rs)) |
+| [../client-port](../client-port/Cargo.toml) | `mc-spine-client-mesh` | protocol-767 voxel mesher (`rlib` + `cdylib`), shaderpack processing ([src/shaderpack.rs](../client-port/src/shaderpack.rs)), shader binding reflection ([src/shaderpack_reflect.rs](../client-port/src/shaderpack_reflect.rs)), RGBA/scalar VFX curves, particles, beams/ribbons, auras, dynamic colored lights, GPU budget tiers and `VFX1` wire ([src/vfx_engine.rs](../client-port/src/vfx_engine.rs)), and `cull_region_bench` benchmark binary |
+| [../client-ui](../client-ui/Cargo.toml) | `mc-spine-client-ui` | independent pure-Rust client UI drawing/screens, including shaderpack selection ([src/shader_screen.rs](../client-ui/src/shader_screen.rs)) and mana/cast/cooldown/status HUD overlay ([src/magic_hud.rs](../client-ui/src/magic_hud.rs)) |
+| [../client-app](../client-app/Cargo.toml) | `mc-spine-client` | native client executable; `--shader-pack`/`--shader-profile` CLI ([src/cli.rs](../client-app/src/cli.rs)), shaderpack activation and GPU fallback ([src/shaderpack_runtime.rs](../client-app/src/shaderpack_runtime.rs)), RenderGraph integration, `ClientVfxHost` ([src/render.rs](../client-app/src/render.rs)), `WorldAnimationHost` ([src/world.rs](../client-app/src/world.rs)) and `recv_play_with_custom_channels` for `MAG1`/`VFX1`/`ANM1`/`MOT1` ([src/protocol.rs](../client-app/src/protocol.rs)) |
+| [../client-gpu](../client-gpu/Cargo.toml) | `mc-spine-client-gpu` | isolated windowed `winit` 0.30.13 + `wgpu` 30.0.1 GPU client, `pollster` and `bytemuck`; `--headless-probe`, real GPU window/surface and offscreen rendering ([src/main.rs](../client-gpu/src/main.rs), [src/renderer.rs](../client-gpu/src/renderer.rs)) |
 | [../Cargo.toml](../Cargo.toml) | `mc-spine` | the root server package ([../src/main.rs](../src/main.rs)) |
 
 Six primary operator-facing binaries come out of the tree: `mc-spine` (root),
@@ -52,6 +56,8 @@ mc-spine-kernel          → mc-spine-core
 mc-spine-client-mesh     (no in-tree deps)                [bin: cull_region_bench]
 mc-spine-client-ui       → mc-spine-core
 mc-spine-client          → mc-spine-kernel, mc-spine-client-mesh, mc-spine-proto
+mc-spine-client-gpu      → mc-spine-client, mc-spine-client-mesh,
+                           mc-spine-kernel, mc-spine-client-ui   [bin: mc-spine-client-gpu]
 mc-spine (root)          → mod-adapter-core?, create-adapter?   (optional deps)
 ```
 
@@ -65,6 +71,8 @@ independent package — its own `Cargo.toml`, version and build directory —
 held together by `path` dependencies. `cargo build` in a crate directory
 builds that crate and its path deps without touching the root; `cargo
 build` at the repository root builds the `mc-spine` package only. Cargo
+builds of the eleven dependency-free crates use their own lockfiles;
+`client-gpu/Cargo.lock` pins the separate third-party GPU stack. Cargo
 profiles are read from the package being built, so
 `cargo build --profile fast` refers to the `fast` profile defined in the
 root [../Cargo.toml](../Cargo.toml) (inherits `release`, `lto = false`,
@@ -83,7 +91,8 @@ The toolchain is pinned — `channel = "1.98.0"` in
 | package | license |
 |---|---|
 | `mc-spine` (root) | `GPL-3.0-or-later` |
-| all eleven subcrates | `LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later` |
+| all twelve subcrates, including `mc-spine-client-gpu` | `LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later` |
+| `client-gpu` direct third-party crates (`wgpu`, `winit`, `pollster`, `bytemuck`) | `MIT OR Apache-2.0` |
 
 Every subcrate manifest declares the triple license in its `[package]`
 table and every source file carries the matching SPDX header. The texts
