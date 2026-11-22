@@ -791,7 +791,15 @@ mod tests {
             |cx, cz| generated.push((cx, cz)),
             |chunk| flushed.push(chunk),
         );
-        assert_eq!(generated, spiral_order(0, 0, 5, PregenShape::Square));
+        let expected = spiral_order(0, 0, 5, PregenShape::Square);
+        assert_eq!(generated.len(), expected.len());
+        // Each tick's batch executes in region-wave order while visiting the
+        // exact same chunk set as the corresponding spiral slice.
+        for (gen_chunk, exp_chunk) in generated.chunks(10).zip(expected.chunks(10)) {
+            let gen_set: HashSet<_> = gen_chunk.iter().copied().collect();
+            let exp_set: HashSet<_> = exp_chunk.iter().copied().collect();
+            assert_eq!(gen_set, exp_set);
+        }
         assert_eq!(report.generated_chunks, 121);
         assert_eq!(report.ticks_run, 13);
         assert_eq!(report.final_state, PregenState::Completed);
