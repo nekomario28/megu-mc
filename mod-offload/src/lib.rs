@@ -14,6 +14,7 @@ pub mod party_storage;
 pub mod recipe_processor;
 pub mod region_scheduler;
 pub mod sleeping_transport;
+pub mod sync_bridge;
 
 pub use entity_spatial::{
     evaluate_mob_targets_uncached, merge_item_stacks, merge_xp_orbs, solve_collisions_spatial,
@@ -29,6 +30,10 @@ pub use explosion_batch::{
     BLAST_BOUNDS_MARGIN, BLAST_REACH_FACTOR, BLOCK_COST_BASE, FLAG_INDESTRUCTIBLE,
     MAX_BLAST_POWER, MAX_CACHE_CELLS, MAX_RAY_STEPS, MAX_STACK_SIZE, RAY_GRID, RAY_POWER_MIN,
     RAY_POWER_RANGE, RAY_STEP, RAY_SURFACE_CELLS, STEP_DRAIN, TNT_POWER,
+};
+pub use sync_bridge::{
+    BridgeError, BridgeFailure, BridgeSyncReport, ExternalGraphDelta, GraphDeltaSink,
+    MeGraphTarget, OffloadSyncBridge, MAX_INGEST_DELTAS,
 };
 pub use party_storage::{
     award_experience, decode_storage, eligible_evolutions, encode_storage,

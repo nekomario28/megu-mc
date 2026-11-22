@@ -20,11 +20,14 @@ use std::path::{Path, PathBuf};
 use mod_adapter_core::blockstates::{
     BlockDef, BlockRegistry, PropertyDef, RegistryError, UniversalBlockRole,
 };
-use mod_adapter_core::data_loader::{parse_json, DataLoadError, JsonValue, LoadedModData};
+use mod_adapter_core::data_loader::{
+    load_from_stored_zip, parse_json, DataLoadError, ItemFluidIdTable, JsonValue, LoadedModData,
+};
 use mod_adapter_core::profile::ModOffloadProfile;
 use mod_adapter_core::version_compat::{
     check_mod_mc_version, McVersion, VersionCompatVerdict, VersionRange, VersionRangeError,
 };
+use mod_offload::recipe_processor::{Recipe, Resource, ResourceKind, Stack};
 
 use crate::blockstates::{core_create_block_defs, CreateBlockRegistry, CreateBlockRole};
 use crate::factory::Axis;
@@ -62,6 +65,26 @@ pub enum AddonProcessingRecipe {
         ingredient_item: String,
         results: Vec<(String, u32, f32)>,
     },
+    Mixing {
+        id: String,
+        ingredient_item: String,
+        results: Vec<(String, u32, f32)>,
+    },
+    Milling {
+        id: String,
+        ingredient_item: String,
+        results: Vec<(String, u32, f32)>,
+    },
+    Crushing {
+        id: String,
+        ingredient_item: String,
+        results: Vec<(String, u32, f32)>,
+    },
+    Cutting {
+        id: String,
+        ingredient_item: String,
+        results: Vec<(String, u32, f32)>,
+    },
     Filling {
         id: String,
         ingredient_item: String,
@@ -69,6 +92,108 @@ pub enum AddonProcessingRecipe {
         amount_mb: u32,
         results: Vec<(String, u32, f32)>,
     },
+}
+
+impl AddonProcessingRecipe {
+    /// Convert a single-step processing recipe into the numeric [`Recipe`]
+    /// consumed by `CreateFactory::add_processor`, interning item/fluid ids
+    /// through `ids`. Weighted alternative results collapse deterministically
+    /// to the highest-weight entry (last declared wins ties; the parsers
+    /// already guarantee at least one positive weight). Returns `None` for
+    /// [`Self::SequencedAssembly`]: its transitional multi-step semantics are
+    /// driven by [`SequencedAssemblyState`] / [`advance_assembly_step`], not
+    /// by the flat recipe processor.
+    pub fn to_processor_recipe(
+        &self,
+        ids: &mut ItemFluidIdTable,
+        recipe_id: u32,
+        base_ticks: u32,
+    ) -> Option<Recipe> {
+        let (ingredient_item, fluid_id, amount_mb, results) = match self {
+            Self::SequencedAssembly(_) => return None,
+            Self::Pressing {
+                ingredient_item,
+                results,
+                ..
+            }
+            | Self::Mixing {
+                ingredient_item,
+                results,
+                ..
+            }
+            | Self::Milling {
+                ingredient_item,
+                results,
+                ..
+            }
+            | Self::Crushing {
+                ingredient_item,
+                results,
+                ..
+            }
+            | Self::Cutting {
+                ingredient_item,
+                results,
+                ..
+            } => (
+                ingredient_item.as_str(),
+                None,
+                0,
+                results.as_slice(),
+            ),
+            Self::Filling {
+                ingredient_item,
+                fluid_id,
+                amount_mb,
+                results,
+                ..
+            } => (
+                ingredient_item.as_str(),
+                Some(fluid_id.as_str()),
+                *amount_mb,
+                results.as_slice(),
+            ),
+        };
+        let (result_item, result_count, _) = dominant_result(results)?;
+        let mut inputs = vec![Stack {
+            resource: Resource {
+                kind: ResourceKind::Item,
+                id: ids.intern_item(ingredient_item),
+            },
+            amount: 1,
+        }];
+        if let Some(fluid_id) = fluid_id {
+            inputs.push(Stack {
+                resource: Resource {
+                    kind: ResourceKind::Fluid,
+                    id: ids.intern_fluid(fluid_id),
+                },
+                amount: amount_mb,
+            });
+        }
+        Some(Recipe {
+            id: recipe_id,
+            base_ticks,
+            inputs,
+            outputs: vec![Stack {
+                resource: Resource {
+                    kind: ResourceKind::Item,
+                    id: ids.intern_item(result_item),
+                },
+                amount: result_count,
+            }],
+        })
+    }
+}
+
+/// Highest-weight result entry; `None` when the list is empty or carries no
+/// positive weight (parsers reject that shape already — this is a guard).
+fn dominant_result(results: &[(String, u32, f32)]) -> Option<(&str, u32, f32)> {
+    results
+        .iter()
+        .filter(|(_, _, weight)| weight.is_finite() && *weight > 0.0)
+        .max_by(|a, b| a.2.total_cmp(&b.2))
+        .map(|(item, count, weight)| (item.as_str(), *count, *weight))
 }
 
 /// Resumable position in one assembly. The item changes to the transitional
@@ -484,51 +609,96 @@ pub fn discover_addon_processing_recipes(
         let Some(kind) = obj.get("type").and_then(JsonValue::as_str) else {
             continue;
         };
-        let Some((namespace, kind)) = kind.split_once(':') else {
+        let Some((namespace, _)) = kind.split_once(':') else {
             continue;
         };
         if namespace.is_empty() {
             continue;
         }
-        match kind {
-            "sequenced_assembly" => found.push(AddonProcessingRecipe::SequencedAssembly(
-                parse_assembly_object(&id, obj).map_err(|e| format!("{id}: {e}"))?,
-            )),
-            "pressing" | "filling" => {
-                let item = if let Some(ingredients) = obj.get("ingredients") {
-                    ingredients
-                        .as_array()
-                        .ok_or_else(|| format!("{id}: processing ingredients must be an array"))?
-                        .iter()
-                        .find(|input| parse_item_id(input).is_ok())
-                } else {
-                    obj.get("ingredient")
-                }
-                .ok_or_else(|| format!("{id}: processing input item is missing"))?;
-                let ingredient_item = parse_item_id(item)?;
-                let results = parse_assembly_results(obj).map_err(|e| format!("{id}: {e}"))?;
-                if kind == "pressing" {
-                    found.push(AddonProcessingRecipe::Pressing {
-                        id,
-                        ingredient_item,
-                        results,
-                    });
-                } else {
-                    let (fluid_id, amount_mb) =
-                        parse_fluid_operand(obj).map_err(|e| format!("{id}: {e}"))?;
-                    found.push(AddonProcessingRecipe::Filling {
-                        id,
-                        ingredient_item,
-                        fluid_id,
-                        amount_mb,
-                        results,
-                    });
-                }
-            }
-            _ => {}
+        if let Some(recipe) = parse_addon_processing_object(&id, obj)? {
+            found.push(recipe);
         }
     }
     Ok(found)
+}
+
+/// Classify one recipe JSON object into an [`AddonProcessingRecipe`].
+/// Returns `Ok(None)` for recipe types outside the Create processing family
+/// (vanilla smelting, mod-specific logistics, ...); recognized-but-malformed
+/// recipes fail closed with `Err`.
+fn parse_addon_processing_object(
+    id: &str,
+    obj: &BTreeMap<String, JsonValue>,
+) -> Result<Option<AddonProcessingRecipe>, String> {
+    let kind = match obj.get("type").and_then(JsonValue::as_str) {
+        Some(kind) => kind,
+        None => return Ok(None),
+    };
+    let Some((namespace, kind)) = kind.split_once(':') else {
+        return Ok(None);
+    };
+    if namespace.is_empty() {
+        return Ok(None);
+    }
+    match kind {
+        "sequenced_assembly" => Ok(Some(AddonProcessingRecipe::SequencedAssembly(
+            parse_assembly_object(id, obj).map_err(|e| format!("{id}: {e}"))?,
+        ))),
+        "pressing" | "mixing" | "milling" | "crushing" | "cutting" | "filling" => {
+            let item = if let Some(ingredients) = obj.get("ingredients") {
+                ingredients
+                    .as_array()
+                    .ok_or_else(|| format!("{id}: processing ingredients must be an array"))?
+                    .iter()
+                    .find(|input| parse_item_id(input).is_ok())
+            } else {
+                obj.get("ingredient")
+            }
+            .ok_or_else(|| format!("{id}: processing input item is missing"))?;
+            let ingredient_item = parse_item_id(item)?;
+            let results = parse_assembly_results(obj).map_err(|e| format!("{id}: {e}"))?;
+            let fields = (id.to_string(), ingredient_item, results);
+            Ok(Some(match kind {
+                "pressing" => AddonProcessingRecipe::Pressing {
+                    id: fields.0,
+                    ingredient_item: fields.1,
+                    results: fields.2,
+                },
+                "mixing" => AddonProcessingRecipe::Mixing {
+                    id: fields.0,
+                    ingredient_item: fields.1,
+                    results: fields.2,
+                },
+                "milling" => AddonProcessingRecipe::Milling {
+                    id: fields.0,
+                    ingredient_item: fields.1,
+                    results: fields.2,
+                },
+                "crushing" => AddonProcessingRecipe::Crushing {
+                    id: fields.0,
+                    ingredient_item: fields.1,
+                    results: fields.2,
+                },
+                "cutting" => AddonProcessingRecipe::Cutting {
+                    id: fields.0,
+                    ingredient_item: fields.1,
+                    results: fields.2,
+                },
+                _ => {
+                    let (fluid_id, amount_mb) =
+                        parse_fluid_operand(obj).map_err(|e| format!("{id}: {e}"))?;
+                    AddonProcessingRecipe::Filling {
+                        id: fields.0,
+                        ingredient_item: fields.1,
+                        fluid_id,
+                        amount_mb,
+                        results: fields.2,
+                    }
+                }
+            }))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn collect_addon_recipe_paths(folder: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -716,6 +886,11 @@ pub struct CreateAddonProfile {
     /// [`VersionRange`]. `None` means the profile makes no version claim and
     /// [`Self::supports_mc_version`] returns `true` for every target.
     pub mc_version_range: Option<String>,
+    /// Processing recipes discovered from the addon's own
+    /// `data/<ns>/recipe(s)/*.json` (sequenced assemblies, pressing, mixing,
+    /// milling, crushing, cutting, filling). Populated by
+    /// [`discover_addon_from_jar`]; empty for hand-authored profiles.
+    pub processing_recipes: Vec<AddonProcessingRecipe>,
 }
 
 impl CreateAddonProfile {
@@ -741,6 +916,7 @@ impl CreateAddonProfile {
             hidden_blocks: Vec::new(),
             block_properties: BTreeMap::new(),
             mc_version_range: None,
+            processing_recipes: Vec::new(),
         }
     }
 
@@ -1451,6 +1627,299 @@ fn hidden_root_tag(tag: &str) -> bool {
     let leaf = path.rsplit('/').next().unwrap_or(path);
     (path.starts_with("block/") || path.starts_with("blocks/"))
         && matches!(leaf, "ores" | "chests" | "barrels")
+}
+
+// ---------------------------------------------------------------------------
+// Stored-JAR auto-discovery
+// ---------------------------------------------------------------------------
+
+/// Result of [`discover_addon_from_jar`]: the discovered profile plus the
+/// count of compressed ZIP entries the stored-entry scanner skipped.
+#[derive(Clone, Debug)]
+pub struct DiscoveredAddonJar {
+    pub profile: CreateAddonProfile,
+    /// JAR entries under `data/`/`assets/` that used a compression method the
+    /// zero-dependency scanner cannot read (method != stored). A nonzero
+    /// count means the profile may be incomplete — callers should treat it
+    /// as a soft warning, never a hard failure.
+    pub skipped_compressed_entries: usize,
+}
+
+/// Namespaces a [`LoadedModData`] scan should treat as addon candidates:
+/// every namespace owning blockstates, tag files or tag members, or recipe
+/// types — minus the conventional shared namespaces (`c`, `forge`,
+/// `neoforge`, `fabric`, `minecraft`) that hold tag registries rather than
+/// block inventories, and `create` itself (already in the core registry).
+pub fn discover_addon_namespaces(data: &LoadedModData) -> BTreeSet<String> {
+    const SHARED: [&str; 6] = ["minecraft", "c", "forge", "neoforge", "fabric", "create"];
+    let mut out = BTreeSet::new();
+    let mut push_ns = |id: &str| {
+        if let Some(ns) = id.split(':').next() {
+            if !SHARED.contains(&ns) {
+                out.insert(ns.to_string());
+            }
+        }
+    };
+    for id in data.blockstates.keys() {
+        push_ns(id);
+    }
+    for (tag, members) in &data.tags {
+        push_ns(tag);
+        for member in members {
+            push_ns(member.strip_prefix('#').unwrap_or(member));
+        }
+    }
+    for recipe in &data.recipes {
+        push_ns(&recipe.recipe_type);
+    }
+    out
+}
+
+/// Hard bounds for the raw-entry JAR scan backing [`discover_addon_from_jar`]:
+/// at most this many matching entries, this many total payload bytes, and
+/// this size per entry (the JSON parser's own 4 MiB cap applies again later).
+const MAX_JAR_SCAN_ENTRIES: usize = 4096;
+const MAX_JAR_SCAN_PAYLOAD: usize = 32 * 1024 * 1024;
+const MAX_JAR_ENTRY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Discover a [`CreateAddonProfile`] for `mod_id` directly from a stored
+/// (uncompressed-method) JAR/ZIP byte slice — no intermediate directory, no
+/// hardcoded addon names.
+///
+/// Sources, all under `data/<mod_id>/`:
+/// - `recipe/` + `recipes/` (recursive): sequenced-assembly, pressing,
+///   mixing, milling, crushing, cutting, and filling recipes land in
+///   [`CreateAddonProfile::processing_recipes`] via the same fail-closed
+///   parser as [`discover_addon_processing_recipes`].
+/// - `create_kinetics/` (or `create_kinetics.json`): partial
+///   [`CreateAddonProfile::from_json`] documents supplying real per-block
+///   kinetic stress/capacity specs (`kinetic_sources`, `kinetic_consumers`,
+///   `connectors`, `block_properties`, `propulsion` lists). Applied in
+///   sorted-path order, last write wins per block id.
+///
+/// Blockstates (`assets/<ns>/blockstates/*.json`), tags, and generic recipes
+/// flow through [`mod_adapter_core::data_loader::load_from_stored_zip`] —
+/// the same bounded scanner used for datapacks — into
+/// [`discover_create_addon_profile`], so directional `axis`/`facing` (and
+/// every other declared blockstate property) drives real registry expansion.
+/// Malformed JSON, oversized entries, or an invalid namespace fail closed.
+pub fn discover_addon_from_jar(
+    jar: &[u8],
+    mod_id: &str,
+) -> Result<DiscoveredAddonJar, DataLoadError> {
+    if mod_id.is_empty()
+        || mod_id.contains(':')
+        || mod_id.contains('/')
+        || mod_id.chars().any(char::is_whitespace)
+    {
+        return Err(DataLoadError::Json(format!(
+            "invalid addon namespace '{mod_id}'"
+        )));
+    }
+    let (entries, mut skipped_compressed) = scan_addon_jar_entries(jar, mod_id)?;
+
+    let mut ids = ItemFluidIdTable::new();
+    let data = load_from_stored_zip(jar, &mut ids)?;
+    skipped_compressed += data.skipped_compressed_zip_entries;
+    let mut profile = discover_create_addon_profile(mod_id, &data);
+
+    let mut processing = Vec::new();
+    for (path, bytes) in &entries {
+        if is_addon_recipe_entry(path, mod_id) {
+            let recipe_path = path
+                .split_once("/recipe/")
+                .or_else(|| path.split_once("/recipes/"))
+                .map(|(_, rest)| rest)
+                .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path));
+            let stem = recipe_path.strip_suffix(".json").unwrap_or(recipe_path);
+            let id = format!("{mod_id}:{stem}");
+            let json = parse_json(bytes)
+                .map_err(|e| DataLoadError::Json(format!("{path}: {e:?}")))?;
+            let obj = json
+                .as_object()
+                .ok_or_else(|| DataLoadError::Json(format!("{path}: recipe root must be object")))?;
+            if let Some(recipe) = parse_addon_processing_object(&id, obj)
+                .map_err(|e| DataLoadError::Json(format!("{path}: {e}")))?
+            {
+                processing.push(recipe);
+            }
+        } else if is_addon_kinetics_entry(path, mod_id) {
+            let overrides = CreateAddonProfile::from_json(bytes)
+                .map_err(|e| DataLoadError::Json(format!("{path}: {e:?}")))?;
+            if overrides.mod_id != mod_id {
+                return Err(DataLoadError::Json(format!(
+                    "{path}: kinetics document declares mod_id '{}' for namespace '{mod_id}'",
+                    overrides.mod_id
+                )));
+            }
+            merge_kinetic_overrides(&mut profile, overrides);
+        }
+    }
+    profile.processing_recipes = processing;
+    profile.finalize();
+    Ok(DiscoveredAddonJar {
+        profile,
+        skipped_compressed_entries: skipped_compressed,
+    })
+}
+
+/// Whether a JAR entry path is a recipe JSON for `mod_id`
+/// (`data/<ns>/recipe/**` or `data/<ns>/recipes/**`, any depth).
+fn is_addon_recipe_entry(path: &str, mod_id: &str) -> bool {
+    path.starts_with(&format!("data/{mod_id}/recipe/"))
+        || path.starts_with(&format!("data/{mod_id}/recipes/"))
+}
+
+/// Whether a JAR entry path carries kinetic stress/capacity config for
+/// `mod_id` (`data/<ns>/create_kinetics.json` or anything under
+/// `data/<ns>/create_kinetics/`).
+fn is_addon_kinetics_entry(path: &str, mod_id: &str) -> bool {
+    path == format!("data/{mod_id}/create_kinetics.json")
+        || path.starts_with(&format!("data/{mod_id}/create_kinetics/"))
+}
+
+/// Merge one `create_kinetics` override document into a discovered profile:
+/// per-id last-wins for kinetic sources/consumers/connectors, union for
+/// propulsion block lists and decorative/anchor/hidden sets, and
+/// `block_properties`/`mc_version_range` override wholesale.
+fn merge_kinetic_overrides(profile: &mut CreateAddonProfile, over: CreateAddonProfile) {
+    fn upsert_by_id<T>(list: &mut Vec<T>, item: T, id: &str, get: impl Fn(&T) -> &str) {
+        match list.iter_mut().find(|e| get(e) == id) {
+            Some(slot) => *slot = item,
+            None => list.push(item),
+        }
+    }
+    for spec in over.kinetic_sources {
+        let id = spec.id.clone();
+        upsert_by_id(&mut profile.kinetic_sources, spec, &id, |s| &s.id);
+    }
+    for spec in over.kinetic_consumers {
+        let id = spec.id.clone();
+        upsert_by_id(&mut profile.kinetic_consumers, spec, &id, |s| &s.id);
+    }
+    for spec in over.connectors {
+        let id = spec.id.clone();
+        upsert_by_id(&mut profile.connectors, spec, &id, |s| &s.id);
+    }
+    profile.block_properties.extend(over.block_properties);
+    if let Some(p) = over.propulsion {
+        match &mut profile.propulsion {
+            Some(existing) => {
+                for (src, dst) in [
+                    (&p.propeller_blocks, &mut existing.propeller_blocks),
+                    (&p.buoyancy_blocks, &mut existing.buoyancy_blocks),
+                    (&p.rudder_blocks, &mut existing.rudder_blocks),
+                ] {
+                    for id in src {
+                        if !dst.contains(id) {
+                            dst.push(id.clone());
+                        }
+                    }
+                }
+            }
+            None => profile.propulsion = Some(p),
+        }
+    }
+    for (src, dst) in [
+        (&over.assembly_anchors, &mut profile.assembly_anchors),
+        (&over.decorative_blocks, &mut profile.decorative_blocks),
+        (&over.hidden_blocks, &mut profile.hidden_blocks),
+    ] {
+        for id in src {
+            if !dst.contains(id) {
+                dst.push(id.clone());
+            }
+        }
+    }
+    if over.mc_version_range.is_some() {
+        profile.mc_version_range = over.mc_version_range;
+    }
+}
+
+type AddonJarEntries = Vec<(String, Vec<u8>)>;
+
+/// Bounded stored-ZIP scan collecting the raw JSON payloads the generic
+/// loader discards: `data/<ns>/recipe*/**` and `data/<ns>/create_kinetics*`
+/// for the target namespace only. Mirrors `load_from_stored_zip`'s
+/// local-header parsing; compressed matching entries are counted, not
+/// decoded; oversized or over-budget scans fail closed.
+fn scan_addon_jar_entries(
+    jar: &[u8],
+    mod_id: &str,
+) -> Result<(AddonJarEntries, usize), DataLoadError> {
+    let mut entries = Vec::new();
+    let mut skipped_compressed = 0usize;
+    let mut payload_bytes = 0usize;
+    let mut cursor = 0usize;
+
+    while cursor + 4 <= jar.len() {
+        let sig = u32::from_le_bytes([
+            jar[cursor],
+            jar[cursor + 1],
+            jar[cursor + 2],
+            jar[cursor + 3],
+        ]);
+        if sig != 0x0403_4b50 {
+            break;
+        }
+        if cursor + 30 > jar.len() {
+            return Err(DataLoadError::Zip("truncated local file header".into()));
+        }
+        let flags = u16::from_le_bytes([jar[cursor + 6], jar[cursor + 7]]);
+        if flags & 0x08 != 0 {
+            return Err(DataLoadError::Zip(
+                "data-descriptor streaming ZIP entries are unsupported in stored scanner".into(),
+            ));
+        }
+        let method = u16::from_le_bytes([jar[cursor + 8], jar[cursor + 9]]);
+        let comp_size = u32::from_le_bytes([
+            jar[cursor + 18],
+            jar[cursor + 19],
+            jar[cursor + 20],
+            jar[cursor + 21],
+        ]) as usize;
+        let name_len = u16::from_le_bytes([jar[cursor + 26], jar[cursor + 27]]) as usize;
+        let extra_len = u16::from_le_bytes([jar[cursor + 28], jar[cursor + 29]]) as usize;
+
+        let name_start = cursor + 30;
+        let data_start = name_start
+            .checked_add(name_len)
+            .and_then(|v| v.checked_add(extra_len))
+            .ok_or_else(|| DataLoadError::Zip("header length overflow".into()))?;
+        let data_end = data_start
+            .checked_add(comp_size)
+            .ok_or_else(|| DataLoadError::Zip("entry payload overflow".into()))?;
+        if data_end > jar.len() {
+            return Err(DataLoadError::Zip("truncated ZIP entry payload".into()));
+        }
+        let name = std::str::from_utf8(&jar[name_start..name_start + name_len])
+            .map_err(|_| DataLoadError::Zip("non-UTF8 ZIP entry path".into()))?;
+        let wanted = name.ends_with(".json")
+            && (is_addon_recipe_entry(name, mod_id) || is_addon_kinetics_entry(name, mod_id));
+        if wanted {
+            if method != 0 {
+                skipped_compressed += 1;
+            } else {
+                if comp_size > MAX_JAR_ENTRY_BYTES {
+                    return Err(DataLoadError::Zip(format!(
+                        "{name}: entry exceeds {MAX_JAR_ENTRY_BYTES} byte scan limit"
+                    )));
+                }
+                if entries.len() >= MAX_JAR_SCAN_ENTRIES
+                    || payload_bytes + comp_size > MAX_JAR_SCAN_PAYLOAD
+                {
+                    return Err(DataLoadError::Zip(
+                        "addon JAR scan exceeds entry/byte budget".into(),
+                    ));
+                }
+                payload_bytes += comp_size;
+                entries.push((name.to_string(), jar[data_start..data_end].to_vec()));
+            }
+        }
+        cursor = data_end;
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok((entries, skipped_compressed))
 }
 
 // ---------------------------------------------------------------------------

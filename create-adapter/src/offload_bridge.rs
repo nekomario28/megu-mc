@@ -175,8 +175,8 @@ impl ContraptionOffloadPlan {
         for (region, members) in by_region {
             let start = order.len();
             order.extend(members.into_keys());
-            for pos in start..order.len() {
-                position_of.insert(order[pos], pos);
+            for (pos, id) in order.iter().enumerate().skip(start) {
+                position_of.insert(*id, pos);
                 batch_of_pos.push(batches.len());
             }
             batches.push(RegionBatch {
@@ -680,7 +680,7 @@ impl OffloadBridge {
         let mut per_worker: Vec<Vec<&mut OffloadedAssembly>> =
             (0..workers).map(|_| Vec::new()).collect();
         for (id, asm) in self.assemblies.iter_mut() {
-            if !approved_ids.contains(&id) {
+            if !approved_ids.contains(id) {
                 continue;
             }
             let pos = self.plan.position_of(*id).expect("plan mirrors map");
