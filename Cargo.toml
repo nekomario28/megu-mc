@@ -60,6 +60,8 @@ mc-spine-core = { path = "core", optional = true }
 mc-spine-state-store = { path = "state-store", optional = true }
 mod-offload = { path = "mod-offload", optional = true }
 ureq = { version = "3.4.2", features = ["rustls"] }
+rsa = "=0.9.10"
+rand = "=0.8.8"
 
 # Unix-only: `src/main.rs` arms the SIGTERM/SIGINT save handler through
 # signal-hook's `Signals` iterator. Windows exits through the stdin `/stop`

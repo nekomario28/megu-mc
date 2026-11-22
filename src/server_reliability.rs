@@ -1,7 +1,7 @@
 // ---------- real-world server must-haves ----------
 //
-// The four pieces a public server cannot ship without, kept dependency-free so the
-// audited crate set in `Cargo.toml` does not change:
+// Core public-server security and recovery mechanisms. Online-mode RSA uses
+// the pinned rsa/rand dependencies; the remaining primitives live here.
 //
 // * online-mode login cryptography: FIPS-197 AES-128 in the CFB8 stream mode the
 //   Java protocol uses, the signed SHA-1 "server hash" Mojang's session server
@@ -727,13 +727,9 @@ impl Write for ConnStream {
 
 // ================= online-mode provider slot =================
 //
-// The login handshake needs two things the audited dependency set cannot grow
-// into this file: an RSA keypair (the Encryption Request's public key, and the
-// private key that unwraps the client's answer) and the session-server check.
-// Both sit behind this installed-at-startup provider so the handshake stays
-// testable offline and the keypair can arrive as a later lane without a
-// signature change. `None` (the shipping default) fails every online-mode
-// login closed rather than pretending to verify.
+// The login handshake keeps RSA key handling and Mojang's session check behind
+// a startup-installed provider so tests can substitute a deterministic one.
+// Missing providers fail every online-mode login closed.
 
 /// The keypair and session-verification half of online-mode login.
 #[allow(dead_code)]
@@ -752,6 +748,84 @@ pub(crate) trait OnlineAuth: Send + Sync {
         server_hash: &str,
         client_ip: Option<&str>,
     ) -> Result<MojangJoinedProfile, String>;
+}
+
+/// One process-wide vanilla RSA-1024 keypair, shared by online-mode logins.
+/// Creating it at startup avoids expensive key generation for each handshake.
+pub(crate) struct RsaOnlineAuth {
+    private_key: rsa::RsaPrivateKey,
+    public_der: Vec<u8>,
+}
+
+impl RsaOnlineAuth {
+    pub(crate) fn new() -> Result<Self, String> {
+        use rsa::pkcs8::EncodePublicKey;
+
+        let private_key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 1024)
+            .map_err(|e| format!("online-mode RSA key generation failed: {e}"))?;
+        let public_der = rsa::RsaPublicKey::from(&private_key)
+            .to_public_key_der()
+            .map_err(|e| format!("online-mode RSA public key encoding failed: {e}"))?
+            .as_ref()
+            .to_vec();
+        Ok(Self {
+            private_key,
+            public_der,
+        })
+    }
+}
+
+impl OnlineAuth for RsaOnlineAuth {
+    fn public_key_der(&self) -> Vec<u8> {
+        self.public_der.clone()
+    }
+
+    fn decrypt_login_field(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
+        self.private_key.decrypt(rsa::Pkcs1v15Encrypt, ciphertext).ok()
+    }
+
+    fn verify_token(&self) -> Vec<u8> {
+        use rand::RngCore;
+
+        // Each client receives its own unpredictable challenge to prevent replay.
+        let mut token = [0u8; 4];
+        rand::rngs::OsRng.fill_bytes(&mut token);
+        token.to_vec()
+    }
+
+    fn has_joined(
+        &self,
+        username: &str,
+        server_hash: &str,
+        client_ip: Option<&str>,
+    ) -> Result<MojangJoinedProfile, String> {
+        verify_mojang_has_joined(username, server_hash, client_ip)
+    }
+}
+
+#[cfg(test)]
+mod rsa_online_auth_tests {
+    use super::{OnlineAuth, RsaOnlineAuth};
+    use rsa::pkcs8::DecodePublicKey;
+    use rsa::traits::PublicKeyParts;
+
+    #[test]
+    fn rsa_online_auth_roundtrips_vanilla_encryption_fields() {
+        let auth = RsaOnlineAuth::new().expect("create server keypair");
+        let public_key = rsa::RsaPublicKey::from_public_key_der(&auth.public_key_der())
+            .expect("decode vanilla public key DER");
+        assert_eq!(public_key.size(), 128);
+
+        let token = auth.verify_token();
+        assert_eq!(token.len(), 4);
+        for payload in [token.as_slice(), b"0123456789abcdef".as_slice()] {
+            let ciphertext = public_key
+                .encrypt(&mut rand::rngs::OsRng, rsa::Pkcs1v15Encrypt, payload)
+                .expect("encrypt client payload");
+            assert_eq!(auth.decrypt_login_field(&ciphertext).as_deref(), Some(payload));
+        }
+        assert!(auth.decrypt_login_field(&[]).is_none());
+    }
 }
 
 fn online_auth_slot() -> &'static Mutex<Option<Arc<dyn OnlineAuth>>> {

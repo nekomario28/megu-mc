@@ -10645,10 +10645,98 @@ fn load_pack_info() -> Option<(String, String)> {
     Some((url, hex(&sha1(&data))))
 }
 
-fn http_server() {
-    if pack_info().is_none() {
-        return;
+/// Only the advertised resource-pack URL's request target is served. Keeping
+/// the query string permits signed external URLs with a path-specific token.
+fn resource_pack_http_target(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let first_delimiter = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let suffix = rest[first_delimiter..].split('#').next().unwrap_or("");
+    if suffix.starts_with('/') {
+        suffix.to_owned()
+    } else if suffix.starts_with('?') {
+        format!("/{suffix}")
+    } else {
+        "/".to_owned()
     }
+}
+
+/// Decide a resource-pack response from only the first HTTP request line.
+/// Invalid requests cannot obtain the pack or claim any other route.
+fn resource_pack_http_action(line: &[u8], target: &str) -> (u16, &'static str, bool) {
+    let Ok(line) = std::str::from_utf8(line) else {
+        return (400, "Bad Request", false);
+    };
+    let mut fields = line.split_ascii_whitespace();
+    let (Some(method), Some(path), Some(version), None) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return (400, "Bad Request", false);
+    };
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return (400, "Bad Request", false);
+    }
+    if !matches!(method, "GET" | "HEAD") {
+        return (405, "Method Not Allowed", false);
+    }
+    if path != target {
+        return (404, "Not Found", false);
+    }
+    (200, "OK", method == "GET")
+}
+
+fn serve_resource_pack_http(
+    stream: &mut TcpStream,
+    data: &[u8],
+    canonical_target: &str,
+) -> std::io::Result<()> {
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let started = Instant::now();
+    let mut request = [0u8; 1024];
+    let mut used = 0;
+    // A single 5s deadline bounds fragmented request lines as well as clients
+    // that send one byte at a time, freeing a pool worker for the next fetch.
+    let line_end = loop {
+        if let Some(index) = request[..used].iter().position(|byte| *byte == b'\n') {
+            break Some(index);
+        }
+        if used == request.len() {
+            break None;
+        }
+        let remaining = Duration::from_secs(5).saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        stream.set_read_timeout(Some(remaining))?;
+        let read = stream.read(&mut request[used..])?;
+        if read == 0 {
+            return Ok(());
+        }
+        used += read;
+    };
+    let (status, reason, send_body) = line_end.map_or(
+        (400, "Bad Request", false),
+        |end| resource_pack_http_action(&request[..end], canonical_target),
+    );
+    let content_length = if status == 200 { data.len() } else { 0 };
+    let allow = if status == 405 { "Allow: GET, HEAD\r\n" } else { "" };
+    let headers = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/zip\r\nContent-Length: {content_length}\r\n{allow}Connection: close\r\n\r\n"
+    );
+    stream.write_all(headers.as_bytes())?;
+    if send_body {
+        stream.write_all(data)?;
+    }
+    Ok(())
+}
+
+fn http_server() {
+    let Some((url, _)) = pack_info() else {
+        return;
+    };
+    let canonical_target = resource_pack_http_target(url);
     let Ok(data) = std::fs::read("resourcepack.zip") else {
         return;
     };
@@ -10672,23 +10760,30 @@ fn http_server() {
         data.len()
     );
     thread::spawn(move || {
-        for st in l.incoming().flatten() {
-            let mut st = st;
-            st.set_read_timeout(Some(Duration::from_secs(5))).ok();
-            st.set_write_timeout(Some(Duration::from_secs(10))).ok();
-            let mut buf = [0u8; 1024];
-            let _ = st.read(&mut buf);
-            let head = format!(
-                "HTTP/1.1 200 OK
-Content-Type: application/zip
-Content-Length: {}
-Connection: close
-
-",
-                data.len()
-            );
-            let _ = st.write_all(head.as_bytes());
-            let _ = st.write_all(&data);
+        // Four workers bound simultaneous slow readers and zip writers; four
+        // additional sockets may wait in the bounded queue for a free worker.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<TcpStream>(4);
+        let rx = Arc::new(Mutex::new(rx));
+        let data = Arc::new(data);
+        let canonical_target = Arc::new(canonical_target);
+        for _ in 0..4 {
+            let rx = Arc::clone(&rx);
+            let data = Arc::clone(&data);
+            let canonical_target = Arc::clone(&canonical_target);
+            thread::spawn(move || loop {
+                let next = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                let Ok(mut stream) = next else {
+                    break;
+                };
+                let _ = serve_resource_pack_http(&mut stream, &data, &canonical_target);
+            });
+        }
+        for stream in l.incoming().flatten() {
+            // Overflowed pack fetches can retry; dropping the socket keeps the
+            // accept loop available to every other client immediately.
+            if tx.try_send(stream).is_err() {
+                continue;
+            }
         }
     });
 }
@@ -16679,6 +16774,15 @@ fn main() {
         eprintln!("[security] {why}");
         std::process::exit(2);
     }
+    if online_mode_enabled() {
+        // One RSA keypair serves the process lifetime, before accepting any
+        // connection whose identity must be verified by Mojang.
+        let provider = RsaOnlineAuth::new().unwrap_or_else(|error| {
+            eprintln!("[security] {error}");
+            std::process::exit(2);
+        });
+        set_online_auth_provider(Some(Arc::new(provider)));
+    }
     // A public bind without an identity layer fails closed too: offline mode
     // trusts the claimed name for every privilege check, so a reachable
     // listener must run online-mode or Velocity forwarding — or carry the
@@ -16804,9 +16908,14 @@ fn main() {
     // The GS4 query responder follows the same rule: it is armed only once
     // the game listener owns its port, and only when opted into.
     start_gs4_query(&bind, l.local_addr().map(|a| a.port()).unwrap_or(port));
-    eprintln!(
-        "mc-spine v0.6 listening {bind}:{port} (offline identities; no Mojang authentication)"
-    );
+    let identity_mode = if velocity_forwarding_enabled() {
+        "Velocity-forwarded identities"
+    } else if online_mode_enabled() {
+        "Mojang-authenticated online identities"
+    } else {
+        "offline identities; no Mojang authentication"
+    };
+    eprintln!("mc-spine v0.6 listening {bind}:{port} ({identity_mode})");
     if !connection_limits::is_loopback_bind(&bind) {
         eprintln!("[security] non-loopback bind (MC_SPINE_ALLOW_PUBLIC_BIND set): restrict access with a firewall/private network");
     }
@@ -16939,7 +17048,7 @@ mod voxel_faces;
 
 #[cfg(test)]
 mod resource_pack_url_tests {
-    use super::resource_pack_url;
+    use super::{resource_pack_http_action, resource_pack_http_target, resource_pack_url};
     #[test]
     fn loopback_only_by_default_and_explicit_external_url() {
         assert_eq!(
@@ -16952,6 +17061,26 @@ mod resource_pack_url_tests {
             Some("https://example.org/pack.zip")
         );
         assert!(resource_pack_url("0.0.0.0", Some("javascript:alert(1)")).is_none());
+    }
+
+    #[test]
+    fn resource_pack_http_target_matches_advertised_url() {
+        assert_eq!(resource_pack_http_target("http://127.0.0.1:25598/pack.zip"), "/pack.zip");
+        assert_eq!(resource_pack_http_target("https://packs.example.org/a.zip?key=1"), "/a.zip?key=1");
+        assert_eq!(resource_pack_http_target("https://packs.example.org?key=1"), "/?key=1");
+        assert_eq!(resource_pack_http_target("https://packs.example.org"), "/");
+    }
+
+    #[test]
+    fn resource_pack_http_allows_only_get_head_and_advertised_path() {
+        let target = "/pack.zip";
+        assert_eq!(resource_pack_http_action(b"GET /pack.zip HTTP/1.1\r", target), (200, "OK", true));
+        assert_eq!(resource_pack_http_action(b"HEAD /pack.zip HTTP/1.1\r", target), (200, "OK", false));
+        assert_eq!(resource_pack_http_action(b"POST /pack.zip HTTP/1.1", target).0, 405);
+        assert_eq!(resource_pack_http_action(b"GET / HTTP/1.1", target).0, 404);
+        assert_eq!(resource_pack_http_action(b"GET /pack.zip?extra=1 HTTP/1.1", target).0, 404);
+        assert_eq!(resource_pack_http_action(b"GET /pack.zip", target).0, 400);
+        assert_eq!(resource_pack_http_action(b"GET /pack.zip HTTP/2", target).0, 400);
     }
 }
 
