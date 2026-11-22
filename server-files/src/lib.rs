@@ -57,6 +57,7 @@ pub mod eula;
 pub mod json;
 pub mod lists;
 pub mod optifine_compat;
+pub mod pack_loader;
 pub mod pack_router;
 pub mod perf_cache;
 pub mod properties;
