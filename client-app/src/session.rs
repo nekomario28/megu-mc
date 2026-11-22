@@ -816,8 +816,13 @@ impl SoundMixer {
     /// sounds, and non-positioned non-entity events never see the
     /// spatializer (no cave reverb, no underwater LP, no mono squash).
     fn is_2d_bypass(ev: &PlaySoundEvent) -> bool {
-        ev.category == 1 // Music
-            || normalize_sound_name(&ev.label).starts_with("ui.")
+        let norm = normalize_sound_name(&ev.label);
+        let is_music = ev.category == 1
+            && (norm.starts_with("music.")
+                || ev.stereo_pcm.is_some()
+                || (ev.position.is_none() && ev.entity_id.is_none()));
+        is_music
+            || norm.starts_with("ui.")
             || (ev.position.is_none() && ev.entity_id.is_none())
             || (ev.volume.is_finite() && ev.volume >= 100.0)
     }
