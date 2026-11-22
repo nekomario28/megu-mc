@@ -720,18 +720,10 @@ impl UiMesh {
             uv,
             color,
         );
+        let inner_h = rect.h.saturating_sub(2 * t as u32);
+        self.quad(UiRect::new(rect.x, rect.y + t, t as u32, inner_h), uv, color);
         self.quad(
-            UiRect::new(rect.x, rect.y + t, t as u32, rect.h - 2 * t as u32),
-            uv,
-            color,
-        );
-        self.quad(
-            UiRect::new(
-                rect.right() - t,
-                rect.y + t,
-                t as u32,
-                rect.h - 2 * t as u32,
-            ),
+            UiRect::new(rect.right() - t, rect.y + t, t as u32, inner_h),
             uv,
             color,
         );
@@ -871,17 +863,13 @@ impl Frame<'_> {
             UiRect::new(rect.x, rect.bottom() - t as i32, rect.w, t),
             color,
         );
+        let inner_h = rect.h.saturating_sub(2 * t);
         self.fill(
-            UiRect::new(rect.x, rect.y + t as i32, t, rect.h - 2 * t),
+            UiRect::new(rect.x, rect.y + t as i32, t, inner_h),
             color,
         );
         self.fill(
-            UiRect::new(
-                rect.right() - t as i32,
-                rect.y + t as i32,
-                t,
-                rect.h - 2 * t,
-            ),
+            UiRect::new(rect.right() - t as i32, rect.y + t as i32, t, inner_h),
             color,
         );
     }

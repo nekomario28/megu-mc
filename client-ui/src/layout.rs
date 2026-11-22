@@ -16,6 +16,7 @@
 use mc_spine_core::sys_metrics::{format_mini_hud_lines, MiniHudAnchor};
 
 use crate::draw::{palette as pal, text_width, UiColor, UiCommand, UiDrawList, UiRect};
+use crate::magic_hud::MagicHudState;
 use crate::state::{
     tr, HitRegion, HudState, HudSubtitle, MiniHudPreset, ModSyncChange, Screen, SettingsTab,
     SubtitleDirection, UiLang, UiModal, UiState, WidgetId, FPS_CAP_STEPS,
@@ -47,13 +48,14 @@ pub fn layout_screen_into(
     let mut ctx = Ctx {
         list: std::mem::take(out),
         regions: std::mem::take(regions),
-        w: (width as i32) / s,
-        h: (height as i32) / s,
+        w: (width.min(i32::MAX as u32) as i32) / s,
+        h: (height.min(i32::MAX as u32) as i32) / s,
         pw: width,
         ph: height,
         s,
         lang: state.lang(),
         state,
+        band_top: i32::MAX,
     };
     match state.screen {
         Screen::Title => title(&mut ctx),
@@ -91,11 +93,20 @@ struct Ctx<'a> {
     s: i32,
     lang: UiLang,
     state: &'a UiState,
+    /// Reserved band top (logical px): content widgets that would cross
+    /// it are dropped entirely so they can never collide with footer
+    /// chrome. `i32::MAX` disables the band.
+    band_top: i32,
 }
 
 /// Logical-px rect shorthand for widget call sites.
 const fn lr(x: i32, y: i32, w: i32, h: i32) -> UiRect {
-    UiRect::new(x, y, w as u32, h as u32)
+    UiRect::new(
+        x,
+        y,
+        if w < 0 { 0 } else { w as u32 },
+        if h < 0 { 0 } else { h as u32 },
+    )
 }
 
 impl Ctx<'_> {
@@ -109,34 +120,54 @@ impl Ctx<'_> {
         )
     }
 
-    fn rect(&self, x: i32, y: i32, w: i32, h: i32) -> UiRect {
-        UiRect::new(
-            x * self.s,
-            y * self.s,
-            (w * self.s) as u32,
-            (h * self.s) as u32,
-        )
+    /// Intersect a logical rect with the viewport; `None` when nothing
+    /// is left. Every rect-emitting helper routes through this so no
+    /// command can land outside the framebuffer.
+    fn vis(&self, r: UiRect) -> Option<UiRect> {
+        let (x0, y0) = (r.x.max(0), r.y.max(0));
+        let (x1, y1) = (r.right().min(self.w), r.bottom().min(self.h));
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        Some(UiRect::new(x0, y0, (x1 - x0) as u32, (y1 - y0) as u32))
     }
 
     fn fill(&mut self, x: i32, y: i32, w: i32, h: i32, color: UiColor) {
-        self.list.fill_rect(self.rect(x, y, w, h), color);
+        if let Some(r) = self.vis(lr(x, y, w, h)) {
+            self.list.fill_rect(self.phys(r), color);
+        }
     }
 
     fn border(&mut self, x: i32, y: i32, w: i32, h: i32, color: UiColor) {
-        self.list
-            .border_rect(self.rect(x, y, w, h), color, self.s.max(1) as u32);
+        if let Some(r) = self.vis(lr(x, y, w, h)) {
+            self.list
+                .border_rect(self.phys(r), color, self.s.max(1) as u32);
+        }
     }
 
     fn text(&mut self, x: i32, y: i32, mult: u32, color: UiColor, s: &str) {
+        if x < 0 || x >= self.w || y < 0 || y + 8 * mult as i32 > self.h {
+            return;
+        }
+        // Clip to whatever width remains in the viewport so a long label
+        // can never spill past the right edge.
+        let cells = ((self.w - x) / (8 * mult as i32)).max(0) as usize;
+        let s = first_chars(s, cells);
         self.list
             .text_str(x * self.s, y * self.s, mult * self.s as u32, color, s);
     }
 
-    /// Centered text: `cx` is the logical center x.
+    /// Centered text: `cx` is the logical center x. Strings wider than
+    /// the viewport are clipped so they still fit.
     fn ctext(&mut self, cx: i32, y: i32, mult: u32, color: UiColor, s: &str) {
+        if y < 0 || y + 8 * mult as i32 > self.h {
+            return;
+        }
+        let cells = ((self.w - 8) / (8 * mult as i32)).max(0) as usize;
+        let s = first_chars(s, cells);
         let w = text_width(s, mult * self.s as u32) as i32;
         self.list.text_str(
-            cx * self.s - w / 2,
+            (cx * self.s - w / 2).max(0),
             y * self.s,
             mult * self.s as u32,
             color,
@@ -156,14 +187,41 @@ impl Ctx<'_> {
         self.state.hover == Some(id) || self.state.focused() == Some(id)
     }
 
-    /// Register `r` (logical px) as `id`'s interactive region.
+    /// Register `r` (logical px) as `id`'s interactive region. The
+    /// physical rect is clamped to the viewport and dropped when nothing
+    /// is left, so degenerate viewports never emit dead hitboxes.
     fn region(&mut self, id: WidgetId, r: UiRect) {
-        self.regions.push(HitRegion::new(id, self.phys(r)));
+        let p = self.phys(r);
+        let (x0, y0) = (p.x.max(0), p.y.max(0));
+        let (x1, y1) = (p.right().min(self.pw as i32), p.bottom().min(self.ph as i32));
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        self.regions.push(HitRegion::new(
+            id,
+            UiRect::new(x0, y0, (x1 - x0) as u32, (y1 - y0) as u32),
+        ));
     }
 
-    /// A clickable button with label; `r` is in logical px.
+    /// A clickable button with label; `r` is in logical px. Buttons
+    /// crossing the reserved band (settings footer) are not emitted.
     fn button(&mut self, id: WidgetId, r: UiRect, label: &str, enabled: bool) {
-        let (x, y, w, h) = (r.x, r.y, r.w as i32, r.h as i32);
+        if r.bottom() > self.band_top {
+            return;
+        }
+        self.button_unchecked(id, r, label, enabled);
+    }
+
+    /// Button emission without the reserved-band check — footer chrome.
+    /// The rect is clipped to the logical viewport first so degenerate
+    /// heights can never emit off-screen commands or dead regions.
+    fn button_unchecked(&mut self, id: WidgetId, r: UiRect, label: &str, enabled: bool) {
+        let (x0, y0) = (r.x.max(0), r.y.max(0));
+        let (x1, y1) = (r.right().min(self.w), r.bottom().min(self.h));
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let (x, y, w, h) = (x0, y0, x1 - x0, y1 - y0);
         let hot = enabled && self.hovered(id);
         let bg = if !enabled {
             pal::BUTTON_DISABLED
@@ -180,6 +238,7 @@ impl Ctx<'_> {
         };
         self.border(x, y, w, h, edge);
         let fg = if enabled { pal::TEXT } else { pal::TEXT_DIM };
+        let label = first_chars(label, ((w - 6) / 8).max(0) as usize);
         let (tx, ty) = self.centered_in(x + w / 2, y, h, label, 1);
         self.text(tx, ty, 1, fg, label);
         if enabled {
@@ -194,12 +253,14 @@ impl Ctx<'_> {
 
     /// Horizontal slider with a centered "Label: value" caption.
     fn slider(&mut self, id: WidgetId, r: UiRect, frac: f32, label: &str) {
+        if r.bottom() > self.band_top {
+            return;
+        }
         let (x, y, w, h) = (r.x, r.y, r.w as i32, r.h as i32);
         let hot = self.hovered(id);
         self.fill(x, y, w, h, pal::BUTTON);
-        let inner = self.rect(x + 1, y + 1, w - 2, h - 2);
-        self.list.progress_bar(
-            inner,
+        self.progress(
+            lr(x + 1, y + 1, w - 2, h - 2),
             frac,
             pal::ACCENT.with_alpha(160),
             UiColor::rgba(0, 0, 0, 60),
@@ -209,6 +270,7 @@ impl Ctx<'_> {
                 pal::BUTTON_BORDER
             },
         );
+        let label = first_chars(label, ((w - 6) / 8).max(0) as usize);
         let (tx, ty) = self.centered_in(x + w / 2, y, h, label, 1);
         self.text(tx, ty, 1, pal::TEXT, label);
         self.region(id, r);
@@ -223,6 +285,9 @@ impl Ctx<'_> {
         focused: bool,
         placeholder: &str,
     ) {
+        if r.bottom() > self.band_top {
+            return;
+        }
         let (x, y, w, h) = (r.x, r.y, r.w as i32, r.h as i32);
         self.fill(x, y, w, h, UiColor::rgb(10, 11, 14));
         self.border(
@@ -269,6 +334,14 @@ impl Ctx<'_> {
         self.fill(x, y, w, h, pal::PANEL);
         self.border(x, y, w, h, pal::PANEL_BORDER);
     }
+
+    /// Progress bar clipped to the viewport like `fill`/`border`.
+    fn progress(&mut self, r: UiRect, frac: f32, fill: UiColor, back: UiColor, border: UiColor) {
+        if let Some(r) = self.vis(r) {
+            self.list
+                .progress_bar(self.phys(r), frac, fill, back, border);
+        }
+    }
 }
 
 fn onoff(v: bool) -> &'static str {
@@ -301,43 +374,46 @@ fn title(ctx: &mut Ctx) {
         ),
     );
 
-    let bw = 200;
+    let bw = 200.min(ctx.w - 8).max(24);
     let x = cx - bw / 2;
-    let mut y = 92;
-    let step = 24;
+    // Buttons must end above the version line (h-12); tighten the
+    // 92px/24px grid before they ever reach it.
+    let step = 24.min((ctx.h - 14 - 20 - 92) / 5).max(4);
+    let bh = 20.min(step);
+    let mut y = 92.min(ctx.h - 14 - 5 * step - bh).max(34);
     ctx.btn(
         WidgetId::TitleSingleplayer,
-        lr(x, y, bw, 20),
+        lr(x, y, bw, bh),
         tr(lang, "Singleplayer", "シングルプレイ"),
     );
     y += step;
     ctx.btn(
         WidgetId::TitleMultiplayer,
-        lr(x, y, bw, 20),
+        lr(x, y, bw, bh),
         tr(lang, "Multiplayer", "マルチプレイ"),
     );
     y += step;
     ctx.btn(
         WidgetId::TitleFriends,
-        lr(x, y, bw, 20),
+        lr(x, y, bw, bh),
         tr(lang, "Play with Friends", "フレンドと遊ぶ"),
     );
     y += step;
     ctx.btn(
         WidgetId::TitleMods,
-        lr(x, y, bw, 20),
+        lr(x, y, bw, bh),
         tr(lang, "Mods & Packs", "Modとパック"),
     );
     y += step;
     ctx.btn(
         WidgetId::TitleSettings,
-        lr(x, y, bw, 20),
+        lr(x, y, bw, bh),
         tr(lang, "Settings", "設定"),
     );
     y += step;
     ctx.btn(
         WidgetId::TitleQuit,
-        lr(x, y, bw, 20),
+        lr(x, y, bw, bh),
         tr(lang, "Quit", "終了"),
     );
 
@@ -397,12 +473,26 @@ fn settings(ctx: &mut Ctx, active: SettingsTab) {
 
     ctx.ctext(cx, 8, 2, pal::TEXT, tr(lang, "Settings", "設定"));
 
-    // Tab strip.
-    let tw = 76;
+    // Tab strip: tabs shrink (never overflow) below ~480 logical px, and
+    // the strip hugs the top edge when the window is too short to leave
+    // the footer its own band.
     let gap = 4;
+    let tw = 76.min((ctx.w - 4 - gap * (SettingsTab::ALL.len() as i32 - 1))
+        / SettingsTab::ALL.len() as i32)
+        .max(10);
+    // `None` below ~56px: the strip and the footer cannot coexist, and
+    // the footer (Done) wins — tabs stay reachable via keyboard.
+    let tab_y = if ctx.h < 56 {
+        None
+    } else if ctx.h < 96 {
+        Some(4)
+    } else {
+        Some(30)
+    };
     let total = SettingsTab::ALL.len() as i32 * (tw + gap) - gap;
     let mut tx = cx - total / 2;
     for tab in SettingsTab::ALL {
+        let Some(tab_y) = tab_y else { break };
         let id = match tab {
             SettingsTab::Video => WidgetId::TabVideo,
             SettingsTab::Audio => WidgetId::TabAudio,
@@ -415,7 +505,7 @@ fn settings(ctx: &mut Ctx, active: SettingsTab) {
         let hot = ctx.hovered(id);
         ctx.fill(
             tx,
-            30,
+            tab_y,
             tw,
             18,
             if is_active {
@@ -426,14 +516,14 @@ fn settings(ctx: &mut Ctx, active: SettingsTab) {
                 pal::BUTTON_DISABLED
             },
         );
-        ctx.border(tx, 30, tw, 18, pal::BUTTON_BORDER);
+        ctx.border(tx, tab_y, tw, 18, pal::BUTTON_BORDER);
         if is_active {
-            ctx.fill(tx, 30 + 17, tw, 1, pal::ACCENT);
+            ctx.fill(tx, tab_y + 17, tw, 1, pal::ACCENT);
         }
-        let label = tab.label(lang);
-        let (lx, ly) = ctx.centered_in(tx + tw / 2, 30, 18, label, 1);
+        let label = first_chars(tab.label(lang), ((tw - 4) / 8).max(1) as usize);
+        let (lx, ly) = ctx.centered_in(tx + tw / 2, tab_y, 18, label, 1);
         ctx.text(lx, ly, 1, pal::TEXT, label);
-        ctx.region(id, lr(tx, 30, tw, 18));
+        ctx.region(id, lr(tx, tab_y, tw, 18));
         tx += tw + gap;
     }
 
@@ -442,13 +532,16 @@ fn settings(ctx: &mut Ctx, active: SettingsTab) {
         SettingsTab::Shaders | SettingsTab::Qol | SettingsTab::FairPlay
     );
     if modern {
-        let panel_w = 348;
+        let panel_w = 348.min(ctx.w - 8).max(8);
         let panel_x = cx - panel_w / 2;
-        ctx.panel(panel_x, 54, panel_w, ctx.h - 92);
+        ctx.panel(panel_x, 54, panel_w, (ctx.h - 92).max(8));
         ctx.fill(panel_x + 1, 55, panel_w - 2, 2, pal::ACCENT);
         ctx.text(panel_x + 12, 62, 1, pal::ACCENT, "MEGU ENHANCED");
     }
 
+    // Reserve the footer strip: any tab content that would reach it is
+    // dropped by the widget helpers rather than painted under Done.
+    ctx.band_top = ctx.h - 32;
     let y0 = if modern {
         if ctx.h < 300 {
             76
@@ -466,22 +559,58 @@ fn settings(ctx: &mut Ctx, active: SettingsTab) {
         SettingsTab::FairPlay => fairplay_tab(ctx, y0),
         SettingsTab::Language => language_tab(ctx, y0),
     }
+    ctx.band_top = i32::MAX;
 
-    ctx.btn(
-        WidgetId::SettingsDone,
-        lr(cx - 154, ctx.h - 30, 100, 20),
-        tr(lang, "Done", "完了"),
-    );
-    ctx.btn(
-        WidgetId::SettingsMods,
-        lr(cx - 50, ctx.h - 30, 100, 20),
-        tr(lang, "Mods & Packs", "Modとパック"),
-    );
-    ctx.btn(
-        WidgetId::SettingsAboutMegu,
-        lr(cx + 54, ctx.h - 30, 100, 20),
-        tr(lang, "About Megu", "Meguについて"),
-    );
+    // Footer buttons: adaptive row that compresses (then stacks) on
+    // narrow logical widths instead of clipping off the left edge.
+    let labels = [
+        (WidgetId::SettingsDone, tr(lang, "Done", "完了")),
+        (
+            WidgetId::SettingsMods,
+            tr(lang, "Mods & Packs", "Modとパック"),
+        ),
+        (
+            WidgetId::SettingsAboutMegu,
+            tr(lang, "About Megu", "Meguについて"),
+        ),
+    ];
+    let gap = 4;
+    let bw = 100.min((ctx.w - 16 - gap * 2) / 3);
+    let total = bw * 3 + gap * 2;
+    if total <= ctx.w - 4 {
+        let mut bx = cx - total / 2;
+        for (id, label) in labels {
+            ctx.button_unchecked(id, lr(bx, ctx.h - 30, bw, 20), label, true);
+            bx += bw + gap;
+        }
+    } else if ctx.h >= 96 {
+        // Two rows: Done on top, Mods/About below. Only used when the
+        // window has room for both rows to stay clear of the tab strip.
+        let bw2 = 100.min((ctx.w - 16 - gap) / 2).max(6);
+        let half = bw2 * 2 + gap;
+        let y1 = ctx.h - 52;
+        ctx.button_unchecked(
+            WidgetId::SettingsDone,
+            lr(cx - bw2 / 2, y1, bw2, 20),
+            labels[0].1,
+            true,
+        );
+        let mut bx = cx - half / 2;
+        for (id, label) in &labels[1..] {
+            ctx.button_unchecked(*id, lr(bx, y1 + 24, bw2, 20), label, true);
+            bx += bw2 + gap;
+        }
+    } else {
+        // Too short and too narrow for all three: Done alone remains
+        // the exit path (Escape still navigates back as well).
+        let bw = 100.min(ctx.w - 8).max(8);
+        ctx.button_unchecked(
+            WidgetId::SettingsDone,
+            lr(cx - bw / 2, ctx.h - 30, bw, 20),
+            labels[0].1,
+            true,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -494,7 +623,8 @@ fn about_megu(ctx: &mut Ctx) {
     let lang = ctx.lang;
 
     ctx.ctext(cx, 10, 2, pal::TEXT, tr(lang, "About Megu", "Meguについて"));
-    ctx.panel(cx - 180, 40, 360, ctx.h - 78);
+    let panel_w = 360.min(ctx.w - 8).max(8);
+    ctx.panel(cx - panel_w / 2, 40, panel_w, (ctx.h - 78).max(8));
     ctx.fill(cx - 179, 41, 358, 2, pal::ACCENT);
     ctx.ctext(
         cx,
@@ -531,30 +661,33 @@ fn about_megu(ctx: &mut Ctx) {
     );
     ctx.ctext(cx, 141, 1, pal::TEXT, "AGPL-3.0-or-later");
 
+    // The two link rows need the Back button at h-30 to clear them;
+    // below ~216 logical px the screen collapses to text + Back only.
+    let show_links = ctx.h >= 216;
     let left = cx - 144;
     let right = cx + 8;
-    if !ctx.state.website_url.is_empty() {
+    if show_links && !ctx.state.website_url.is_empty() {
         ctx.btn(
             WidgetId::WebsiteLink,
             lr(left, 160, 136, 20),
             tr(lang, "Website", "公式サイト"),
         );
     }
-    if !ctx.state.support_url.is_empty() {
+    if show_links && !ctx.state.support_url.is_empty() {
         ctx.btn(
             WidgetId::SupportLink,
             lr(right, 160, 136, 20),
             tr(lang, "Support", "支援する"),
         );
     }
-    if !ctx.state.contribute_url.is_empty() {
+    if show_links && !ctx.state.contribute_url.is_empty() {
         ctx.btn(
             WidgetId::ContributeLink,
             lr(left, 186, 136, 20),
             tr(lang, "Contribute", "貢献する"),
         );
     }
-    if !ctx.state.report_url.is_empty() {
+    if show_links && !ctx.state.report_url.is_empty() {
         ctx.btn(
             WidgetId::ReportLink,
             lr(right, 186, 136, 20),
@@ -581,6 +714,16 @@ fn first_chars(text: &str, limit: usize) -> &str {
         .map_or(text, |(end, _)| &text[..end])
 }
 
+/// Host-supplied text (boss names, chat, actionbar, mod names, player
+/// names): flatten control characters — a `\n` inside a hostile packet
+/// string must never wrap the HUD — then clip to `limit` glyph cells.
+fn hud_str(text: &str, limit: usize) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(limit)
+        .collect()
+}
+
 fn shaders_tab(ctx: &mut Ctx, y0: i32) {
     let lang = ctx.lang;
     let cx = ctx.w / 2;
@@ -596,14 +739,14 @@ fn shaders_tab(ctx: &mut Ctx, y0: i32) {
         pal::TEXT_DIM,
         tr(lang, "Current Shaderpack", "現在のシェーダーパック"),
     );
-    ctx.ctext(cx, y0 + 12, 1, pal::TEXT, first_chars(name, 38));
+    ctx.ctext(cx, y0 + 12, 1, pal::TEXT, &hud_str(name, 38));
     if !ctx.state.active_shaderpack_profile.is_empty() {
         ctx.ctext(
             cx,
             y0 + 24,
             1,
             pal::TEXT_DIM,
-            first_chars(&ctx.state.active_shaderpack_profile, 38),
+            &hud_str(&ctx.state.active_shaderpack_profile, 38),
         );
     }
     let x = cx - 160;
@@ -634,7 +777,7 @@ fn shaders_tab(ctx: &mut Ctx, y0: i32) {
             pal::TEXT_DIM,
             tr(lang, "Selected Shaderpack", "選択中のシェーダーパック"),
         );
-        ctx.ctext(cx, y0 + 108, 1, pal::TEXT, first_chars(label, 38));
+        ctx.ctext(cx, y0 + 108, 1, pal::TEXT, &hud_str(label, 38));
     }
 }
 
@@ -650,7 +793,7 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
     );
 
     let (x, y) = row(ctx, 1, y0);
-    let frac = (v.view_distance - 6) as f32 / 26.0;
+    let frac = v.view_distance.saturating_sub(6) as f32 / 26.0;
     ctx.slider(
         WidgetId::VideoViewDistance,
         lr(x, y, 320, 20),
@@ -1032,8 +1175,13 @@ fn friends(ctx: &mut Ctx) {
         tr(lang, "Play with Friends", "フレンドと遊ぶ"),
     );
 
+    // Reserve the Back strip: content widgets that would reach it are
+    // dropped by the helpers rather than painted under Back.
+    ctx.band_top = ctx.h - 32;
+
     // Host panel.
-    let (pw, px) = (340, cx - 170);
+    let pw = 340.min(ctx.w - 8).max(40);
+    let px = cx - pw / 2;
     ctx.panel(px, 40, pw, 100);
     ctx.ctext(
         cx,
@@ -1049,24 +1197,24 @@ fn friends(ctx: &mut Ctx) {
     let code = ctx.state.invite_display();
     ctx.ctext(cx, 60, 2, pal::TEXT, &code);
     let by = 92;
-    ctx.btn(
-        WidgetId::FriendsGenerate,
-        lr(cx - 126, by, 90, 18),
-        tr(lang, "Generate", "生成"),
-    );
-    ctx.btn(
-        WidgetId::FriendsCopy,
-        lr(cx - 30, by, 60, 18),
-        tr(lang, "Copy", "コピー"),
-    );
-    ctx.btn(
-        WidgetId::FriendsRevoke,
-        lr(cx + 36, by, 90, 18),
-        tr(lang, "Revoke", "無効化"),
-    );
+    // Generate / Copy / Revoke share one adaptive row; below ~260px the
+    // buttons compress (labels elide) instead of running off the left
+    // edge, and below ~140px the band check drops the row entirely.
+    let bw3 = ((ctx.w - 8 - 12) / 3).clamp(0, 90);
+    let trio = bw3 * 3 + 12;
+    let mut bx = cx - trio / 2;
+    for (id, label) in [
+        (WidgetId::FriendsGenerate, tr(lang, "Generate", "生成")),
+        (WidgetId::FriendsCopy, tr(lang, "Copy", "コピー")),
+        (WidgetId::FriendsRevoke, tr(lang, "Revoke", "無効化")),
+    ] {
+        ctx.btn(id, lr(bx, by, bw3, 18), label);
+        bx += bw3 + 6;
+    }
 
-    // Guest panel.
-    ctx.panel(px, 152, pw, 96);
+    // Guest panel: shrink it before it ever reaches the Back button.
+    let guest_h = (ctx.h - 30 - 6 - 152).clamp(56, 96);
+    ctx.panel(px, 152, pw, guest_h);
     ctx.ctext(
         cx,
         158,
@@ -1074,16 +1222,19 @@ fn friends(ctx: &mut Ctx) {
         pal::TEXT_DIM,
         tr(lang, "Join a friend's world", "フレンドのワールドに参加"),
     );
+    // Join field + button split whatever width the panel offers.
+    let join_btn_w = 70.min(pw / 3);
+    let field_w = pw - 24 - join_btn_w - 6;
     ctx.textfield(
         WidgetId::FriendsJoinField,
-        lr(cx - 120, 176, 164, 20),
+        lr(px + 12, 176, field_w, 20),
         &ctx.state.join_code_text,
         ctx.state.join_field_active(),
         "MEGU-XXXX-XXXX",
     );
     ctx.btn(
         WidgetId::FriendsJoin,
-        lr(cx + 50, 176, 70, 20),
+        lr(px + 12 + field_w + 6, 176, join_btn_w, 20),
         tr(lang, "Join", "参加"),
     );
     if ctx.state.join_error {
@@ -1100,11 +1251,13 @@ fn friends(ctx: &mut Ctx) {
         );
     }
 
-    let bw = 90;
-    ctx.btn(
+    ctx.band_top = i32::MAX;
+    let bw = 90.min(ctx.w - 8).max(24);
+    ctx.button_unchecked(
         WidgetId::FriendsBack,
         lr(cx - bw / 2, ctx.h - 30, bw, 20),
         tr(lang, "Back", "戻る"),
+        true,
     );
 }
 
@@ -1136,7 +1289,8 @@ fn mod_sync(ctx: &mut Ctx) {
         ),
     );
 
-    let (pw, px) = (400, cx - 200);
+    let pw = 400.min(ctx.w - 8).max(40);
+    let px = cx - pw / 2;
     ctx.panel(px, 44, pw, 132);
     let entries = &ctx.state.pending_mod_sync;
     if entries.is_empty() {
@@ -1156,8 +1310,11 @@ fn mod_sync(ctx: &mut Ctx) {
                 ModSyncChange::Removed => ("-", pal::DANGER),
             };
             ctx.text(px + 8, y, 1, color, marker);
-            ctx.text(px + 20, y, 1, pal::TEXT, &e.name);
+            // Mod names come from the host: sanitize control chars and
+            // clip so they can't overrun the SHA column or the panel edge.
             let sha = e.short_sha().to_string();
+            let name_cells = ((pw - 28 - 8 * sha.chars().count() as i32 - 8) / 8).max(1) as usize;
+            ctx.text(px + 20, y, 1, pal::TEXT, &hud_str(&e.name, name_cells));
             let sw = text_width(&sha, ctx.s as u32) as i32;
             ctx.text(px + pw - 8 - sw / ctx.s, y, 1, pal::TEXT_DIM, &sha);
         }
@@ -1207,20 +1364,24 @@ fn mod_sync(ctx: &mut Ctx) {
         ),
     );
 
+    // Buttons anchor to the bottom of the viewport so they never slide
+    // off-screen on short windows (the list panel above is static).
+    let missing = !ctx.state.missing_mod_deps.is_empty();
+    let by = 214.min(ctx.h - 26 - if missing { 28 } else { 0 }).max(44);
     ctx.btn(
         WidgetId::ModSyncAccept,
-        lr(cx - 150, 214, 140, 20),
+        lr(cx - 150, by, 140, 20),
         tr(lang, "Accept & Install", "承認してインストール"),
     );
     ctx.btn(
         WidgetId::ModSyncDecline,
-        lr(cx + 10, 214, 140, 20),
+        lr(cx + 10, by, 140, 20),
         tr(lang, "Decline", "拒否"),
     );
-    if !ctx.state.missing_mod_deps.is_empty() {
+    if missing {
         ctx.btn(
             WidgetId::ModSyncDownloadMissing,
-            lr(cx - 120, 242, 240, 20),
+            lr(cx - 120, by + 28, 240, 20),
             tr(lang, "Get Missing (Modrinth)", "不足ModをModrinthから取得"),
         );
     }
@@ -1280,20 +1441,26 @@ fn hud(ctx: &mut Ctx) {
         Vec::new()
     };
 
-    // Bossbars, stacked from the top.
+    // Bossbars, stacked from the top (host names: sanitized + clipped).
+    let boss_count = hud.bossbars.len().min(3) as i32;
     for (i, (name, frac)) in hud.bossbars.iter().take(3).enumerate() {
         let y = 6 + i as i32 * 16;
-        let bw = 200.min(w - 40);
-        ctx.ctext(cx, y, 1, pal::TEXT, name);
-        let r = ctx.rect(cx - bw / 2, y + 9, bw, 5);
-        ctx.list.progress_bar(
-            r,
+        let bw = (w - 40).clamp(8, 200);
+        ctx.ctext(cx, y, 1, pal::TEXT, &hud_str(name, ((w - 8) / 8).max(0) as usize));
+        ctx.progress(
+            lr(cx - bw / 2, y + 9, bw, 5),
             frac.clamp(0.0, 1.0),
             UiColor::rgb(170, 60, 200),
             UiColor::rgb(30, 20, 34),
             pal::BUTTON_BORDER,
         );
     }
+    // Bottom edge of the bossbar stack (empty stack => just the top margin).
+    let boss_bottom = if boss_count == 0 {
+        4
+    } else {
+        16 * boss_count + 4
+    };
 
     // Crosshair.
     let cc = UiColor::rgba(230, 230, 230, 190);
@@ -1333,9 +1500,8 @@ fn hud(ctx: &mut Ctx) {
     }
 
     // XP bar + level.
-    let xr = ctx.rect(cx - 91, hy - 4, 182, 3);
-    ctx.list.progress_bar(
-        xr,
+    ctx.progress(
+        lr(cx - 91, hy - 4, 182, 3),
         hud.xp_progress.clamp(0.0, 1.0),
         pal::XP,
         UiColor::rgb(20, 30, 14),
@@ -1345,44 +1511,193 @@ fn hud(ctx: &mut Ctx) {
         ctx.ctext(cx, hy - 14, 1, pal::XP, &hud.xp_level.to_string());
     }
 
+    // ------------------------------------------------------------------
+    // Lower-screen stacking. Everything bottom-anchored shares one
+    // collision model so overlays can never overlap:
+    //   * the vitals icon columns flank the hotbar (always drawn),
+    //   * the actionbar sits centered at a fixed band above them,
+    //   * subtitles stack upward from the hotbar on the right, and
+    //   * the crafting-conflict button and the MiniHUD box stack above
+    //     whatever came before (or drop lines that cannot fit).
+    // ------------------------------------------------------------------
+    let hotbar_top = hy - 4;
+    // Hearts/armor/(absorption) column left, hunger/(air) column right.
+    let vl = hx0..(hx0 + 80);
+    let vr = (rx - 80)..rx;
+    let vtop_l = vy - if hud.absorption > 0.0 { 20 } else { 10 };
+    let vtop_r = vy - if hud.air < 300 { 10 } else { 0 };
+
+    // Actionbar: one centered line in the band directly above the vitals.
+    let abar = if hud.actionbar.is_empty() {
+        None
+    } else {
+        let text = hud_str(&hud.actionbar, ((w - 8) / 8).max(0) as usize);
+        let aw = text.chars().count() as i32 * 8;
+        ctx.ctext(cx, hy - 44, 1, pal::TEXT, &text);
+        Some(cx - aw / 2..cx + aw / 2)
+    };
+    // Band the actionbar text occupies (used to clip colliding rows).
+    let abar_band = (hy - 44)..(hy - 36);
+    // Drawn subtitle rows as `(fill_left, y)` — chat clips around them.
+    let mut subtitle_rows: Vec<(i32, i32)> = Vec::new();
+    // Leftmost x of the right-hand stack (subtitles, conflict button):
+    // corner boxes reaching into it must stay above `stack_bottom`.
+    let mut stack_left = w;
+
+    // Directional accessibility subtitles (opt-in): up to 4 compact
+    // right-aligned rows stacked above the hotbar — "< sound" left,
+    // "sound >" right, "v sound" behind, no marker when centered.
+    // The stack lifts above the right vitals column when a row reaches
+    // it, and again above the actionbar when it shares that band; rows
+    // still outside the viewport are dropped, never drawn off-screen.
+    let mut stack_bottom = hotbar_top;
+    if qol.show_subtitles && !hud.subtitles.is_empty() {
+        let shown: Vec<&HudSubtitle> = hud.subtitles.iter().rev().take(4).collect();
+        let build_rows = |base: i32| -> Vec<(String, i32)> {
+            shown
+                .iter()
+                .enumerate()
+                .map(|(i, sub)| {
+                    let label = match sub.direction {
+                        SubtitleDirection::Left => format!("< {}", sub.label),
+                        SubtitleDirection::Center => sub.label.clone(),
+                        SubtitleDirection::Right => format!("{} >", sub.label),
+                        SubtitleDirection::Behind => format!("v {}", sub.label),
+                    };
+                    // Newest row at the bottom.
+                    let y = base - (shown.len() - i) as i32 * 10;
+                    let cells = ((w - 14) / 8).max(1) as usize;
+                    (hud_str(&label, cells), y)
+                })
+                .collect()
+        };
+        let mut sub_base = hotbar_top;
+        let mut rows = build_rows(sub_base);
+        // A row whose left edge reaches into either vitals column
+        // (hearts/armor left, hunger/air right) lifts the whole stack
+        // above that column — the label is never cut by an icon.
+        for (i, (label, y)) in rows.iter().enumerate() {
+            let rw = label.chars().count() as i32 * 8 + 6;
+            if w - 4 - rw < vr.end && *y < vy + 8 && *y + 10 > vtop_r {
+                sub_base = sub_base.min(vtop_r - 10 + (shown.len() - i) as i32 * 10);
+            }
+            if w - 4 - rw < vl.end && *y < vy + 8 && *y + 10 > vtop_l {
+                sub_base = sub_base.min(vtop_l - 10 + (shown.len() - i) as i32 * 10);
+            }
+        }
+        rows = build_rows(sub_base);
+        if abar.is_some()
+            && rows.iter().any(|(label, y)| {
+                let rw = label.chars().count() as i32 * 8 + 6;
+                *y < abar_band.end
+                    && *y + 10 > abar_band.start
+                    && w - 4 - rw < abar.as_ref().map_or(i32::MAX, |ab| ab.end)
+            })
+        {
+            sub_base = (hy - 46).min(sub_base);
+            rows = build_rows(sub_base);
+        }
+        // Drop rows that still cannot fit inside the viewport rather
+        // than emitting off-screen commands.
+        let rows: Vec<(String, i32)> = rows
+            .into_iter()
+            .filter(|(_, y)| *y >= 0 && *y + 10 <= h)
+            .collect();
+        for (label, y) in &rows {
+            let rw = label.chars().count() as i32 * 8 + 6;
+            ctx.fill(w - 4 - rw, *y, rw, 10, UiColor::rgba(0, 0, 0, 110));
+            ctx.text(w - 4 - rw + 3, *y + 1, 1, pal::TEXT, label);
+        }
+        // Rows' x ranges for the chat clip below.
+        subtitle_rows = rows
+            .iter()
+            .map(|(label, y)| (w - 4 - (label.chars().count() as i32 * 8 + 6), *y))
+            .collect();
+        for (sx, _) in &subtitle_rows {
+            stack_left = stack_left.min(*sx);
+        }
+        // Anything else bottom-right stacks above the subtitle block.
+        stack_bottom = sub_base - shown.len() as i32 * 10 - 2;
+    }
+
     // Crafting-conflict switcher: exactly one compact `< k/N >` cycle
-    // button while the game reports two or more candidate recipes.
-    // `total_candidates <= 1` emits no commands and no region at all.
+    // button while the game reports two or more candidate recipes —
+    // right-aligned above the subtitle stack, lifted clear of the right
+    // vitals column when it reaches it. `total_candidates <= 1` emits
+    // no commands and no region at all.
     if hud.crafting_conflict.is_active() {
         let label = format!(
             "< {}/{} >",
             hud.crafting_conflict.selected() + 1,
             hud.crafting_conflict.total_candidates
         );
-        let bw = label.chars().count() as i32 * 8 + 8;
-        ctx.btn(
-            WidgetId::CraftConflictNext,
-            lr(cx - bw / 2, hy - 18, bw, 14),
-            &label,
-        );
+        let bw = (label.chars().count() as i32 * 8 + 8).min(w - 8);
+        let bx = w - 4 - bw;
+        let mut bottom = stack_bottom - 2;
+        if bx < vl.end {
+            bottom = bottom.min(vtop_l - 2);
+        }
+        if bx < vr.end {
+            bottom = bottom.min(vtop_r - 2);
+        }
+        let by = (bottom - 14).max(2);
+        ctx.btn(WidgetId::CraftConflictNext, lr(bx, by, bw, 14), &label);
+        stack_left = stack_left.min(bx);
+        stack_bottom = by - 2;
     }
 
-    if !hud.actionbar.is_empty() {
-        ctx.ctext(cx, hy - 44, 1, pal::TEXT, &hud.actionbar);
-    }
-
-    // Chat scrollback, bottom-left.
+    // Chat scrollback, bottom-left. Lines clip to the viewport, to the
+    // left vitals column, to the actionbar, and to whatever subtitle row
+    // shares their band.
+    let mut chat_top = i32::MAX;
+    let mut chat_right = 0i32;
     for (i, line) in hud.chat_lines.iter().rev().take(6).enumerate() {
         let y = hy - 12 - i as i32 * 10;
-        let tw = text_width(line, ctx.s as u32) as i32 / ctx.s;
+        let (band_top, band_bot) = (y - 1, y + 9);
+        let mut cells = ((w - 14) / 8).max(0) as usize;
+        if band_top < vy + 8 && band_bot > vtop_l {
+            cells = cells.min(((vl.start - 10) / 8).max(0) as usize);
+        }
+        if let Some(ab) = &abar {
+            if band_top < abar_band.end && band_bot > abar_band.start {
+                cells = cells.min(((ab.start - 10) / 8).max(0) as usize);
+            }
+        }
+        for (sx, sy) in &subtitle_rows {
+            if band_top < *sy + 10 && band_bot > *sy {
+                cells = cells.min(((*sx - 10) / 8).max(0) as usize);
+            }
+        }
+        if cells == 0 {
+            continue;
+        }
+        let text = hud_str(line, cells);
+        let tw = text.chars().count() as i32 * 8;
         ctx.fill(2, y - 1, tw + 6, 10, UiColor::rgba(0, 0, 0, 110));
-        ctx.text(4, y, 1, pal::TEXT, line);
+        ctx.text(4, y, 1, pal::TEXT, &text);
+        chat_top = chat_top.min(y - 1);
+        chat_right = chat_right.max(8 + tw);
     }
 
-    // Player list overlay (hold-Tab).
+    // Player list overlay (hold-Tab): stacked below the bossbars and
+    // height-capped to the viewport with a "+N more" tail.
     if hud.show_player_list {
-        let pw = 200;
+        let pw = 200.min(w - 8).max(70);
         let px = cx - pw / 2;
-        let ph = 14 + hud.players.len() as i32 * 11;
-        ctx.panel(px, 24, pw, ph);
+        let py = boss_bottom + 4;
+        let name_cells = ((pw - 60) / 8).max(1) as usize;
+        let rows_avail = ((h - 4 - (py + 14)) / 11).max(0) as usize;
+        let (shown, extra) = if hud.players.len() <= rows_avail {
+            (hud.players.len(), 0usize)
+        } else {
+            let s = rows_avail.saturating_sub(1);
+            (s, hud.players.len() - s)
+        };
+        let ph = 14 + (shown + usize::from(extra > 0)) as i32 * 11;
+        ctx.panel(px, py, pw, ph.max(14));
         ctx.ctext(
             cx,
-            28,
+            py + 4,
             1,
             pal::TEXT,
             &format!(
@@ -1391,70 +1706,133 @@ fn hud(ctx: &mut Ctx) {
                 hud.players.len()
             ),
         );
-        for (i, (name, ping)) in hud.players.iter().enumerate() {
-            let y = 38 + i as i32 * 11;
-            ctx.text(px + 6, y, 1, pal::TEXT, name);
+        for (i, (name, ping)) in hud.players.iter().take(shown).enumerate() {
+            let y = py + 14 + i as i32 * 11;
+            ctx.text(px + 6, y, 1, pal::TEXT, &hud_str(name, name_cells));
             ping_bars(ctx, px + pw - 30, y, *ping);
             ctx.text(px + pw - 52, y, 1, pal::TEXT_DIM, &format!("{ping}ms"));
         }
+        if extra > 0 {
+            ctx.text(
+                px + 6,
+                py + 14 + shown as i32 * 11,
+                1,
+                pal::TEXT_DIM,
+                &format!("+{extra} more"),
+            );
+        }
     }
 
-    if !(qol.mini_hud.anchor == MiniHudAnchor::TopLeft && !mini_lines.is_empty()) {
+    if mini_lines.is_empty() {
         ctx.text(4, 4, 1, pal::TEXT_DIM, "mc-spine HUD");
     }
 
-    // Directional accessibility subtitles (opt-in): up to 4 compact
-    // right-aligned rows above the hotbar — "< sound" left,
-    // "sound >" right, "v sound" behind, no marker when centered.
-    let hotbar_top = hy - 4;
-    let mut stack_bottom = hotbar_top;
-    if qol.show_subtitles && !hud.subtitles.is_empty() {
-        let shown: Vec<&HudSubtitle> = hud.subtitles.iter().rev().take(4).collect();
-        let max_chars = ((w - 14) / 8).max(1) as usize;
-        for (i, sub) in shown.iter().rev().enumerate() {
-            let label = match sub.direction {
-                SubtitleDirection::Left => format!("< {}", sub.label),
-                SubtitleDirection::Center => sub.label.clone(),
-                SubtitleDirection::Right => format!("{} >", sub.label),
-                SubtitleDirection::Behind => format!("v {}", sub.label),
-            };
-            let label = first_chars(&label, max_chars);
-            let rw = label.chars().count() as i32 * 8 + 6;
-            let y = hotbar_top - (shown.len() - i) as i32 * 10;
-            ctx.fill(w - 4 - rw, y, rw, 10, UiColor::rgba(0, 0, 0, 110));
-            ctx.text(w - 4 - rw + 3, y + 1, 1, pal::TEXT, label);
-        }
-        // A bottom-right MiniHUD stacks above the subtitle block.
-        stack_bottom = hotbar_top - shown.len() as i32 * 10 - 2;
-    }
+    // MagicHUD occupies the centered bottom stack and the top-right
+    // status column at its own internal scale; convert to logical px so
+    // the MiniHUD box can stack around it.
+    let magic_frame = magic_frame(
+        &hud.magic,
+        (ctx.w * ctx.s) as u32,
+        (ctx.h * ctx.s) as u32,
+        ctx.s,
+    );
 
-    // MiniHUD: translucent backing + up to 4 clipped lines anchored to
-    // the configured corner, always inside the viewport.
+    // MiniHUD: translucent backing + clipped lines anchored to the
+    // configured corner. The box is width-capped against the centered
+    // player list and height-capped against the top stacks (bossbars,
+    // magic statuses) and bottom stacks (chat, subtitles, conflict
+    // button, vitals, hotbar, magic bars); lines that cannot fit are
+    // dropped rather than drawn on top of another element.
     if !mini_lines.is_empty() {
         let pad = 3;
-        let max_box_w = (w - 8).max(8);
+        let anchor = qol.mini_hud.anchor;
+        let mut max_box_w = (w - 8).max(8);
+        if hud.show_player_list {
+            max_box_w = max_box_w.min(cx - 106).max(8);
+        }
         let max_chars = ((max_box_w - 2 * pad) / 8).max(1) as usize;
-        let clipped: Vec<&str> = mini_lines
+        let clipped: Vec<String> = mini_lines
             .iter()
-            .map(|line| first_chars(line, max_chars))
+            .map(|line| hud_str(line, max_chars))
             .collect();
         let text_w = clipped
             .iter()
             .map(|line| line.chars().count() as i32 * 8)
             .max()
             .unwrap_or(0);
-        let box_w = text_w + 2 * pad;
-        let box_h = 2 * pad + clipped.len() as i32 * 10 - 2;
-        let bottom_edge = stack_bottom;
-        let (bx, by) = match qol.mini_hud.anchor {
-            MiniHudAnchor::TopLeft => (4, 4),
-            MiniHudAnchor::TopRight => (w - 4 - box_w, 4),
-            MiniHudAnchor::BottomLeft => (4, (bottom_edge - box_h).max(4)),
-            MiniHudAnchor::BottomRight => (w - 4 - box_w, (bottom_edge - box_h).max(4)),
+        let box_w = (text_w + 2 * pad).min(max_box_w);
+        let bx = match anchor {
+            MiniHudAnchor::TopLeft | MiniHudAnchor::BottomLeft => 4,
+            MiniHudAnchor::TopRight | MiniHudAnchor::BottomRight => (w - 4 - box_w).max(4),
         };
-        ctx.fill(bx, by, box_w, box_h, UiColor::rgba(0, 0, 0, 110));
-        for (i, line) in clipped.iter().enumerate() {
-            ctx.text(bx + pad, by + pad + i as i32 * 10, 1, pal::TEXT, line);
+        let box_x = bx..(bx + box_w);
+
+        // Nothing may cross below these elements:
+        let mut top_edge = 4;
+        // Bossbars sit centered at the top.
+        if box_x.start < cx + 104 && box_x.end > cx - 104 {
+            top_edge = top_edge.max(boss_bottom + 2);
+        }
+        let mut bottom_edge = match anchor {
+            MiniHudAnchor::TopLeft | MiniHudAnchor::TopRight => h - 4,
+            MiniHudAnchor::BottomLeft => hotbar_top,
+            MiniHudAnchor::BottomRight => stack_bottom,
+        };
+        // The right stack (subtitles + conflict button) bounds anything
+        // reaching its column on the right.
+        if box_x.end > stack_left && box_x.start < w - 4 {
+            bottom_edge = bottom_edge.min(stack_bottom);
+        }
+        // Vitals icon columns.
+        if box_x.start < vl.end && box_x.end > vl.start {
+            bottom_edge = bottom_edge.min(vtop_l - 2);
+        }
+        if box_x.start < vr.end && box_x.end > vr.start {
+            bottom_edge = bottom_edge.min(vtop_r - 2);
+        }
+        // Hotbar slot cells + XP bar + actionbar band are center-bottom.
+        if box_x.start < rx && box_x.end > hx {
+            bottom_edge = bottom_edge.min(if abar.is_some() { hy - 46 } else { hy - 2 });
+        }
+        // Chat occupies the left band up to its widest drawn line.
+        if chat_right > 0 && box_x.start < chat_right {
+            bottom_edge = bottom_edge.min(chat_top - 2);
+        }
+        // MagicHUD: centered bottom bars + top-right status badges.
+        if let Some(mf) = &magic_frame {
+            if box_x.start < mf.panel.end && box_x.end > mf.panel.start {
+                bottom_edge = bottom_edge.min(mf.stack_top - 2);
+            }
+            if box_x.start < mf.statuses.end && box_x.end > mf.statuses.start {
+                top_edge = top_edge.max(mf.status_bottom + 2);
+            }
+        }
+
+        let avail = bottom_edge - top_edge;
+        let max_lines = ((avail - 2 * pad + 2) / 10).max(0) as usize;
+        if max_lines > 0 {
+            let shown: Vec<&String> = clipped.iter().take(max_lines).collect();
+            let text_w = shown
+                .iter()
+                .map(|line| line.chars().count() as i32 * 8)
+                .max()
+                .unwrap_or(0);
+            let box_w = (text_w + 2 * pad).min(max_box_w);
+            let bx = match anchor {
+                MiniHudAnchor::TopLeft | MiniHudAnchor::BottomLeft => 4,
+                MiniHudAnchor::TopRight | MiniHudAnchor::BottomRight => {
+                    (w - 4 - box_w).max(4)
+                }
+            };
+            let box_h = 2 * pad + shown.len() as i32 * 10 - 2;
+            let by = match anchor {
+                MiniHudAnchor::TopLeft | MiniHudAnchor::TopRight => top_edge,
+                _ => bottom_edge - box_h,
+            };
+            ctx.fill(bx, by, box_w, box_h, UiColor::rgba(0, 0, 0, 110));
+            for (i, line) in shown.iter().enumerate() {
+                ctx.text(bx + pad, by + pad + i as i32 * 10, 1, pal::TEXT, line);
+            }
         }
     }
 
@@ -1481,6 +1859,54 @@ fn hud(ctx: &mut Ctx) {
     }
 }
 
+/// The screen space MagicHUD claims (mirroring `magic_hud.rs`'s internal
+/// scale math) so other overlays can stack around it.
+struct MagicFrame {
+    /// Centered mana/cast/cooldown panel column, logical px.
+    panel: std::ops::Range<i32>,
+    /// Top of that bottom stack, logical px.
+    stack_top: i32,
+    /// Top-right status-badge column, logical px.
+    statuses: std::ops::Range<i32>,
+    /// Bottom of the badge stack, logical px.
+    status_bottom: i32,
+}
+
+fn magic_frame(magic: &MagicHudState, vpw: u32, vph: u32, s: i32) -> Option<MagicFrame> {
+    if magic.is_empty() || vpw < 80 || vph < 140 {
+        return None;
+    }
+    let ms = (vph / 360).clamp(1, 4).min((vpw / 320).max(1)) as i32;
+    let (mw, mh) = (vpw as i32 / ms, vph as i32 / ms);
+    let to_logical = |v: i32| v * ms / s;
+    let panel_w = 194.min(mw - 16);
+    let panel_left = (mw - panel_w) / 2;
+    let has_cooldowns = magic.cooldowns.iter().any(|c| c.remaining_ticks > 0);
+    let stack_top = if has_cooldowns {
+        mh - 128
+    } else if magic.active_cast.is_some() {
+        mh - 98
+    } else if magic.max_mana.is_finite() && magic.max_mana > 0.0 {
+        mh - 68
+    } else {
+        mh - 38
+    };
+    let status_rows = ((stack_top - 10) / 19).max(0) as usize;
+    let n_status = magic
+        .custom_statuses
+        .iter()
+        .filter(|st| st.remaining_ticks > 0)
+        .take(6usize.min(status_rows))
+        .count() as i32;
+    let status_w = 156.min(mw - 16);
+    Some(MagicFrame {
+        panel: to_logical(panel_left)..to_logical(panel_left + panel_w),
+        stack_top: to_logical(stack_top),
+        statuses: to_logical(mw - 8 - status_w)..to_logical(mw),
+        status_bottom: to_logical(8 + n_status * 19 - 3),
+    })
+}
+
 fn slot_cell(ctx: &mut Ctx, x: i32, y: i32, item: Option<&String>, selected: bool) {
     ctx.fill(x, y, 22, 22, pal::SLOT);
     ctx.border(
@@ -1495,8 +1921,8 @@ fn slot_cell(ctx: &mut Ctx, x: i32, y: i32, item: Option<&String>, selected: boo
         },
     );
     if let Some(name) = item {
-        let short: String = name.chars().take(3).collect();
-        ctx.text(x + 3, y + 7, 1, pal::TEXT_DIM, &short);
+        // Two cells max: three glyphs would spill into the next slot.
+        ctx.text(x + 3, y + 7, 1, pal::TEXT_DIM, &hud_str(name, 2));
     }
 }
 
@@ -1559,46 +1985,54 @@ fn pause(ctx: &mut Ctx) {
 
     ctx.ctext(cx, 40, 2, pal::TEXT, tr(lang, "Game Paused", "一時停止中"));
 
-    let bw = 200;
+    let bw = 200.min(ctx.w - 8).max(24);
     let x = cx - bw / 2;
-    let mut y = 76;
-    let step = 24;
+    // Six buttons must clear the Report-Bug corner link at h-26; when
+    // the window is too short the stack hugs the top and the link hides.
+    let wants_report = !ctx.state.report_url.is_empty();
+    let reserve = if wants_report { 28 } else { 2 };
+    let step = 24.min((ctx.h - reserve - 20 - 76) / 5).max(4);
+    let bh = 20.min(step);
+    let mut y = 76.min(ctx.h - reserve - 5 * step - bh).max(2);
     ctx.btn(
         WidgetId::PauseBackToGame,
-        lr(x, y, bw, 20),
+        lr(x, y, bw, bh),
         tr(lang, "Back to Game", "ゲームに戻る"),
     );
     y += step;
     ctx.btn(
         WidgetId::PauseSettings,
-        lr(x, y, bw, 20),
+        lr(x, y, bw, bh),
         tr(lang, "Settings", "設定"),
     );
     y += step;
     ctx.btn(
         WidgetId::PauseStatistics,
-        lr(x, y, bw, 20),
+        lr(x, y, bw, bh),
         tr(lang, "Statistics", "統計"),
     );
     y += step;
     ctx.btn(
         WidgetId::PauseRecipeBrowser,
-        lr(x, y, bw, 20),
+        lr(x, y, bw, bh),
         tr(lang, "Recipe Browser", "レシピブラウザ"),
     );
     y += step;
     ctx.btn(
         WidgetId::PauseInvite,
-        lr(x, y, bw, 20),
+        lr(x, y, bw, bh),
         tr(lang, "Invite Friend", "フレンドを招待"),
     );
     y += step;
     ctx.btn(
         WidgetId::PauseSaveQuit,
-        lr(x, y, bw, 20),
+        lr(x, y, bw, bh),
         tr(lang, "Save & Quit to Title", "保存してタイトルへ"),
     );
-    if !ctx.state.report_url.is_empty() {
+    // The corner link draws only when the button stack leaves it room —
+    // an overlapping link is worse than a hidden one.
+    let stack_bottom = y + bh;
+    if wants_report && ctx.h - 26 >= stack_bottom + 2 {
         ctx.btn(
             WidgetId::PauseReportBug,
             lr(ctx.w - 96, ctx.h - 26, 92, 18),
@@ -1647,19 +2081,26 @@ fn crash(ctx: &mut Ctx) {
 
     if let Some(c) = &ctx.state.crash {
         let (en, ja) = c.blame_lines();
+        // Blame text embeds host data — clip to the viewport, not a
+        // fixed 74 cells (74 chars overflows below ~600 logical px).
+        let max = (((ctx.w - 16) / 8).max(0) as usize).min(74);
         for (i, line) in [en, ja].iter().enumerate() {
-            let max = 74usize;
             let clipped: String = line.chars().take(max).collect();
             ctx.ctext(cx, 56 + i as i32 * 10, 1, pal::TEXT_DIM, &clipped);
         }
     }
 
-    // Masked 4 KiB report preview.
-    let (pw, px) = (420, cx - 210);
-    ctx.panel(px, 80, pw, 136);
+    // Buttons anchor to the viewport bottom; the preview panel shrinks
+    // to leave them 8px of clearance.
+    let by = (ctx.h - 26).clamp(2, 224);
+    let pw = 420.min(ctx.w - 8).max(40);
+    let px = cx - pw / 2;
+    let preview_h = (by - 8 - 80).clamp(40, 136);
+    ctx.panel(px, 80, pw, preview_h);
     let preview = ctx.state.crash_preview();
     let max_chars = (pw - 16) / 8;
-    for (i, line) in preview.lines().take(12).enumerate() {
+    let rows = ((preview_h - 10) / 10).max(0) as usize;
+    for (i, line) in preview.lines().take(12.min(rows)).enumerate() {
         let clipped: String = line.chars().take(max_chars as usize).collect();
         ctx.text(px + 8, 86 + i as i32 * 10, 1, pal::TEXT_DIM, &clipped);
     }
@@ -1667,7 +2108,7 @@ fn crash(ctx: &mut Ctx) {
     let sent = ctx.state.crash_sent;
     ctx.button(
         WidgetId::CrashSendReport,
-        lr(cx - 140, 224, 130, 20),
+        lr(cx - 140, by, 130, 20),
         tr(
             lang,
             if sent { "Report Sent" } else { "Send Report" },
@@ -1681,7 +2122,7 @@ fn crash(ctx: &mut Ctx) {
     );
     ctx.btn(
         WidgetId::CrashReturnTitle,
-        lr(cx + 10, 224, 130, 20),
+        lr(cx + 10, by, 130, 20),
         tr(lang, "Return to Title", "タイトルへ戻る"),
     );
 }
@@ -1694,8 +2135,10 @@ fn modal(ctx: &mut Ctx) {
 
     match ctx.state.modal {
         Some(UiModal::ConfirmSendCrashReport) => {
-            let (mw, mh) = (240, 86);
-            let (mx, my) = (cx - mw / 2, ctx.h / 2 - mh / 2);
+            // The panel shrinks with the viewport instead of spilling.
+            let mw = 240.min(ctx.w - 8).max(60);
+            let mh = 86.min(ctx.h - 8).max(30);
+            let (mx, my) = (cx - mw / 2, (ctx.h / 2 - mh / 2).max(2));
             ctx.panel(mx, my, mw, mh);
             let fp = ctx.state.crash_fingerprint();
             ctx.ctext(
@@ -1712,17 +2155,18 @@ fn modal(ctx: &mut Ctx) {
                 pal::WARNING,
                 tr(lang, "Send OK?", "送信してもよい？"),
             );
-            ctx.btn(
-                WidgetId::ModalOk,
-                lr(cx - 76, my + 52, 70, 20),
-                tr(lang, "OK", "OK"),
-            );
+            // OK + Cancel share the bottom of the modal, split evenly.
+            let pair = mw - 22;
+            let ok_w = (pair - 6) / 2;
+            let cancel_w = pair - 6 - ok_w;
+            let ox = mx + (mw - pair) / 2;
+            ctx.btn(WidgetId::ModalOk, lr(ox, my + mh - 34, ok_w, 20), tr(lang, "OK", "OK"));
             if let Some(r) = ctx.regions.last_mut() {
                 r.modal = true;
             }
             ctx.btn(
                 WidgetId::ModalCancel,
-                lr(cx + 6, my + 52, 90, 20),
+                lr(ox + ok_w + 6, my + mh - 34, cancel_w, 20),
                 tr(lang, "Cancel", "キャンセル"),
             );
             if let Some(r) = ctx.regions.last_mut() {

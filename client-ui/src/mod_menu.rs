@@ -1144,7 +1144,9 @@ impl ModMenuState {
 
     fn render_panes(&self, lay: &mut Lay, hits: &mut Vec<ModMenuHitRegion>) {
         let inner_w = lay.w - 2 * MARGIN - 8;
-        let list_w = ((inner_w - PANE_GAP) * 2 / 5).clamp(140, 420);
+        // Keep at least a sliver of detail pane at minimum-width windows.
+        let min_list_w = 140.min((inner_w - PANE_GAP - 40).max(30));
+        let list_w = ((inner_w - PANE_GAP) * 2 / 5).clamp(min_list_w, 420);
         let list_x = MARGIN + 4;
         let list_right = list_x + list_w;
         let detail_x = list_right + PANE_GAP;
@@ -1362,7 +1364,7 @@ impl ModMenuState {
         let mut rows: Vec<Vec<(ModMenuWidgetId, String, bool, i32)>> = vec![Vec::new()];
         let mut row_w = 0;
         for (id, label, live) in buttons {
-            let w = label.chars().count() as i32 * 8 + 12;
+            let w = (label.chars().count() as i32 * 8 + 12).min(tw);
             if row_w > 0 && row_w + btn_gap + w > tw {
                 rows.push(Vec::new());
                 row_w = 0;
@@ -1376,52 +1378,72 @@ impl ModMenuState {
         let mut actions_top = pane.bottom() - 6 - actions_h;
 
         // ---- missing-dependencies warning box above the actions --------
+        // The box has a 36px fixed cost (header + button + padding); dep
+        // lines cost 10px each. It shrinks to the space left above the
+        // action rows and collapses to a bare button below 36px so it
+        // never paints over the pane header or the list above.
         let mut warn_bottom = actions_top - 4;
-        if !entry.missing_deps.is_empty() {
-            let dep_lines = entry.missing_deps.len().min(3);
-            let extra = entry.missing_deps.len() > dep_lines;
-            let warn_h = 8 + 10 + dep_lines as i32 * 10 + if extra { 10 } else { 0 } + 16 + 6;
+        let warn_avail = (actions_top - 4 - (pane.y + 4)).max(0);
+        let missing_label = tr(
+            lang,
+            "Download Missing (Modrinth)",
+            "不足分を入手 (Modrinth)",
+        );
+        if !entry.missing_deps.is_empty() && warn_avail >= 18 {
+            let line_budget = ((warn_avail - 36) / 10).max(0) as usize;
+            let shown = entry.missing_deps.len().min(3).min(line_budget);
+            // Reserve one line for "+N more" when the budget cut deps off.
+            let (shown, extra) = if entry.missing_deps.len() > shown && line_budget > 0 {
+                (shown.saturating_sub(1), true)
+            } else {
+                (shown, entry.missing_deps.len() > shown)
+            };
+            let extra = extra && line_budget > shown;
+            let content_lines = shown + usize::from(extra);
+            let full_box = warn_avail >= 36;
+            let warn_h = if full_box {
+                8 + 10 + content_lines as i32 * 10 + 16 + 6
+            } else {
+                18
+            };
             let warn = UiRect::new(tx, actions_top - 4 - warn_h, tw as u32, warn_h as u32);
             lay.fill_rect(warn, WARN_BG);
             lay.border_rect(warn, palette::WARNING);
-            lay.text_fit(
-                warn.x + 5,
-                warn.y + 4,
-                1,
-                palette::WARNING,
-                tr(lang, "Missing dependencies:", "不足している依存関係:"),
-                cells - 1,
-            );
-            let mut wy = warn.y + 14;
-            for dep in entry.missing_deps.iter().take(3) {
+            let mut wy = warn.y + 4;
+            if full_box {
                 lay.text_fit(
-                    warn.x + 9,
+                    warn.x + 5,
                     wy,
                     1,
-                    palette::TEXT,
-                    &format!("- {dep}"),
-                    cells - 2,
+                    palette::WARNING,
+                    tr(lang, "Missing dependencies:", "不足している依存関係:"),
+                    cells.saturating_sub(1),
                 );
                 wy += 10;
+                for dep in entry.missing_deps.iter().take(shown) {
+                    lay.text_fit(
+                        warn.x + 9,
+                        wy,
+                        1,
+                        palette::TEXT,
+                        &format!("- {dep}"),
+                        cells.saturating_sub(2),
+                    );
+                    wy += 10;
+                }
+                if extra {
+                    lay.text_fit(
+                        warn.x + 9,
+                        wy,
+                        1,
+                        palette::TEXT_DIM,
+                        &format!("+{} more", entry.missing_deps.len() - shown),
+                        cells.saturating_sub(2),
+                    );
+                }
             }
-            if extra {
-                lay.text_fit(
-                    warn.x + 9,
-                    wy,
-                    1,
-                    palette::TEXT_DIM,
-                    &format!("+{} more", entry.missing_deps.len() - 3),
-                    cells - 2,
-                );
-                wy += 10;
-            }
-            let label = tr(
-                lang,
-                "Download Missing (Modrinth)",
-                "不足分を入手 (Modrinth)",
-            );
-            let btn_w = (label.chars().count() as i32 * 8 + 12).min(tw);
-            let btn = UiRect::new(warn.x + 4, wy + 2, btn_w as u32, 14);
+            let btn_w = (missing_label.chars().count() as i32 * 8 + 12).min(tw - 8);
+            let btn = UiRect::new(warn.x + 4, warn.bottom() - 16, btn_w.max(0) as u32, 14);
             let bg = if self.hover == Some(ModMenuWidgetId::DownloadMissingDeps) {
                 palette::BUTTON_HOVER
             } else {
@@ -1433,7 +1455,7 @@ impl ModMenuState {
                 btn,
                 1,
                 palette::TEXT_DARK,
-                &fit_text(label, ((btn_w - 8) / 8).max(1) as usize),
+                &fit_text(missing_label, ((btn_w - 8) / 8).max(1) as usize),
             );
             lay.region(hits, ModMenuWidgetId::DownloadMissingDeps, btn);
             warn_bottom = warn.y - 4;
@@ -1460,7 +1482,9 @@ impl ModMenuState {
         lay.text_fit(tx, y, 1, palette::TEXT_DIM, &meta, cells);
         y += 11;
 
-        // Badge row: loader / tier / reloadability.
+        // Badge row: loader / tier / reloadability — badges that would
+        // cross the pane edge are skipped, not clipped.
+        let badge_right = tx + tw;
         let mut bx = tx;
         let loader_bg = match entry.loader {
             ModLoaderTag::MeguNative => palette::ACCENT,
@@ -1468,7 +1492,7 @@ impl ModMenuState {
             ModLoaderTag::ShaderPack => palette::AIR,
             _ => palette::BUTTON,
         };
-        bx += self.badge(lay, bx, y, entry.loader.label(), loader_bg);
+        bx += self.badge(lay, bx, y, entry.loader.label(), loader_bg, badge_right);
         let (tier_bg, tier_fg) = match entry.tier {
             ModAdaptationBadge::Tier1Native => (palette::ACCENT, palette::TEXT_DARK),
             ModAdaptationBadge::Tier2Shim => (palette::WARNING, palette::TEXT_DARK),
@@ -1476,7 +1500,7 @@ impl ModMenuState {
             ModAdaptationBadge::Superseded => (palette::BUTTON_DISABLED, palette::TEXT_DIM),
             ModAdaptationBadge::ClientOnly => (palette::AIR, palette::TEXT_DARK),
         };
-        bx += self.badge_fg(lay, bx, y, entry.tier.label(), tier_bg, tier_fg);
+        bx += self.badge_fg(lay, bx, y, entry.tier.label(), (tier_bg, tier_fg), badge_right);
         let (reload_bg, reload_fg) = match entry.reload_mode {
             ModReloadBadge::HotReload => (palette::ACCENT, palette::TEXT_DARK),
             ModReloadBadge::SoftRestart => (palette::WARNING, palette::TEXT_DARK),
@@ -1487,8 +1511,8 @@ impl ModMenuState {
             bx,
             y,
             entry.reload_mode.label(lang),
-            reload_bg,
-            reload_fg,
+            (reload_bg, reload_fg),
+            badge_right,
         );
         y += 15;
 
@@ -1563,25 +1587,31 @@ impl ModMenuState {
         }
     }
 
-    fn badge(&self, lay: &mut Lay, x: i32, y: i32, label: &str, bg: UiColor) -> i32 {
+    fn badge(&self, lay: &mut Lay, x: i32, y: i32, label: &str, bg: UiColor, max_x: i32) -> i32 {
         let fg = if bg == palette::BUTTON || bg == palette::BUTTON_DISABLED {
             palette::TEXT
         } else {
             palette::TEXT_DARK
         };
-        self.badge_fg(lay, x, y, label, bg, fg)
+        self.badge_fg(lay, x, y, label, (bg, fg), max_x)
     }
 
+    /// Returns the advance past the badge, or `0` (drawing nothing) when
+    /// it would not fit before `max_x`.
     fn badge_fg(
         &self,
         lay: &mut Lay,
         x: i32,
         y: i32,
         label: &str,
-        bg: UiColor,
-        fg: UiColor,
+        colors: (UiColor, UiColor),
+        max_x: i32,
     ) -> i32 {
+        let (bg, fg) = colors;
         let w = label.chars().count() as i32 * 8 + 8;
+        if x + w > max_x {
+            return 0;
+        }
         let rect = UiRect::new(x, y, w as u32, 11);
         lay.fill_rect(rect, bg);
         lay.ctext_in(rect, 1, fg, label);
@@ -1603,7 +1633,12 @@ impl ModMenuState {
                 tr(lang, "Open Mods Folder", "Modフォルダを開く"),
             ),
         ] {
-            let w = label.chars().count() as i32 * 8 + 14;
+            // Buttons shrink to the space left; when none is left, skip.
+            let avail = lay.w - MARGIN - x;
+            let w = (label.chars().count() as i32 * 8 + 14).min(avail);
+            if w < 24 {
+                break;
+            }
             let rect = UiRect::new(x, y1, w as u32, 16);
             let bg = if self.hover == Some(id) {
                 palette::BUTTON_HOVER
@@ -1636,32 +1671,37 @@ impl ModMenuState {
             }
         };
         let done_label = tr(lang, "Done", "完了");
-        let done_w = done_label.chars().count() as i32 * 8 + 20;
-        let apply_w = apply_label.chars().count() as i32 * 8 + 14;
+        let done_w = (done_label.chars().count() as i32 * 8 + 20)
+            .min(lay.w - 2 * MARGIN)
+            .max(24);
         let done = UiRect::new(lay.w - MARGIN - done_w, y2, done_w as u32, 16);
-        let apply = UiRect::new(done.x - 6 - apply_w, y2, apply_w as u32, 16);
-
-        let apply_bg = if !dirty {
-            palette::BUTTON_DISABLED
-        } else if self.hover == Some(ModMenuWidgetId::ApplyChanges) {
-            palette::BUTTON_HOVER
-        } else {
-            palette::ACCENT
-        };
-        lay.fill_rect(apply, apply_bg);
-        lay.border_rect(apply, palette::BUTTON_BORDER);
-        lay.ctext_in(
-            apply,
-            1,
-            if dirty {
-                palette::TEXT_DARK
+        // Apply shrinks to the space left of Done; below ~60px it hides.
+        let apply_w = (apply_label.chars().count() as i32 * 8 + 14)
+            .min(done.x - 6 - MARGIN);
+        if apply_w >= 24 {
+            let apply = UiRect::new(done.x - 6 - apply_w, y2, apply_w as u32, 16);
+            let apply_bg = if !dirty {
+                palette::BUTTON_DISABLED
+            } else if self.hover == Some(ModMenuWidgetId::ApplyChanges) {
+                palette::BUTTON_HOVER
             } else {
-                palette::TEXT_DIM
-            },
-            &apply_label,
-        );
-        if dirty {
-            lay.region(hits, ModMenuWidgetId::ApplyChanges, apply);
+                palette::ACCENT
+            };
+            lay.fill_rect(apply, apply_bg);
+            lay.border_rect(apply, palette::BUTTON_BORDER);
+            lay.ctext_in(
+                apply,
+                1,
+                if dirty {
+                    palette::TEXT_DARK
+                } else {
+                    palette::TEXT_DIM
+                },
+                &apply_label,
+            );
+            if dirty {
+                lay.region(hits, ModMenuWidgetId::ApplyChanges, apply);
+            }
         }
 
         let done_bg = if self.hover == Some(ModMenuWidgetId::Done) {
@@ -1763,28 +1803,50 @@ impl Lay {
     }
 
     /// Horizontally centered text inside `r` (8px glyph cell, `mult`×).
+    /// Labels are elided to the rect first so they can never spill past
+    /// the widget's edges.
     fn ctext_in(&mut self, r: UiRect, mult: u32, color: UiColor, text: &str) {
+        let text = fit_text(text, ((r.w as i32 - 4) / (8 * mult as i32)).max(0) as usize);
         let scale = (mult as i32 * self.s).max(1) as u32;
-        let w = text_width(text, scale) as i32;
+        let w = text_width(&text, scale) as i32;
         let cx = r.x + r.w as i32 / 2;
         let ty = r.y + ((r.h as i32 - 8 * mult as i32) / 2).max(0);
         self.list
-            .text_str(cx * self.s - w / 2, ty * self.s, scale, color, text);
+            .text_str(cx * self.s - w / 2, ty * self.s, scale, color, &text);
     }
 
     fn region(&self, hits: &mut Vec<ModMenuHitRegion>, id: ModMenuWidgetId, r: UiRect) {
+        let p = self.phys(r);
+        let (x0, y0) = (p.x.max(0), p.y.max(0));
+        let (x1, y1) = (
+            p.right().min(self.w * self.s),
+            p.bottom().min(self.h * self.s),
+        );
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
         hits.push(ModMenuHitRegion {
-            rect: self.phys(r),
+            rect: UiRect::new(x0, y0, (x1 - x0) as u32, (y1 - y0) as u32),
             id,
         });
     }
 }
 
-/// Elide a label to `cells` glyph cells so text never overflows its widget.
+/// Elide a label to `cells` glyph cells so text never overflows its
+/// widget. Control characters are flattened first — a hostile string
+/// must not wrap its widget into a second line.
 fn fit_text(label: &str, cells: usize) -> String {
+    let label = if label.chars().any(|c| c.is_control()) {
+        label
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>()
+    } else {
+        label.to_owned()
+    };
     let count = label.chars().count();
     if count <= cells {
-        return label.to_owned();
+        return label;
     }
     if cells <= 3 {
         return ".".repeat(cells);

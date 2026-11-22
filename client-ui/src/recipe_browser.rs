@@ -3044,7 +3044,9 @@ impl RecipeBrowserState {
             1,
             palette::TEXT,
             &title,
-            ((lay.w - 2 * MARGIN - 8) / 8).max(1) as usize,
+            // Reserve the top-right corner: the host shell draws a Done
+            // chrome button there when this screen is embedded.
+            ((lay.w - 2 * MARGIN - 8 - 64) / 8).max(1) as usize,
         );
 
         // Search row: [search field][x]
@@ -3466,22 +3468,45 @@ impl RecipeBrowserState {
                 &line1,
                 ((row.w as i32 - 32) / 8).max(1) as usize,
             );
-            // Line 2: input chips → output chips (+chanced).
+            // Line 2: input chips → output chips (+chanced). Chips stop
+            // at the "+" column; the remainder collapses to a "+N" tail
+            // so a huge recipe can never paint past the row edge.
             let mut cx = row.x + 5;
             let chip_y = y + 12;
-            for ing in recipe.inputs.iter().take(9) {
+            let chip_right = plus.x - 4;
+            let mut hidden = 0usize;
+            for ing in recipe.inputs.iter() {
+                if cx + 26 > chip_right {
+                    hidden += 1;
+                    continue;
+                }
                 cx += self.ingredient_chip(lay, cx, chip_y, ing);
             }
-            if recipe.inputs.len() > 9 {
-                lay.text_fit(cx, chip_y + 3, 1, palette::TEXT_DIM, "..", 2);
-                cx += 16;
+            if hidden > 0 && cx + 18 <= chip_right {
+                lay.text_fit(
+                    cx,
+                    chip_y + 3,
+                    1,
+                    palette::TEXT_DIM,
+                    &format!("+{hidden}"),
+                    4,
+                );
+                cx += 20;
             }
-            lay.text_fit(cx, chip_y + 3, 1, palette::TEXT_DIM, "->", 2);
-            cx += 14;
+            if cx + 14 <= chip_right {
+                lay.text_fit(cx, chip_y + 3, 1, palette::TEXT_DIM, "->", 2);
+                cx += 14;
+            }
             for out in &recipe.outputs {
+                if cx + 26 > chip_right {
+                    break;
+                }
                 cx += self.stack_chip(lay, cx, chip_y, &out.item, out.count, palette::TEXT);
             }
             for (id, count, chance) in &recipe.chanced_outputs {
+                if cx + 26 > chip_right {
+                    break;
+                }
                 cx += self.stack_chip(lay, cx, chip_y, id, *count, palette::WARNING);
                 lay.text_fit(
                     cx - 8,
@@ -3603,62 +3628,79 @@ impl RecipeBrowserState {
             tree.root_count,
             self.index.display_name(&tree.root_item)
         );
+        let pin_label = tr(lang, "Pin", "ピン");
+        let pin_w = pin_label.chars().count() as i32 * 8 + 12;
+        // Right-side chrome (pin + count controls) hides entirely when
+        // the pane is too narrow to host it inside the border.
+        let show_pin = main.w as i32 >= pin_w + 14;
+        let show_counts = main.w as i32 >= pin_w + 58;
+        let chrome_w = match (show_pin, show_counts) {
+            (true, true) => pin_w + 6 + 44,
+            (true, false) => pin_w + 6,
+            _ => 0,
+        };
         lay.text_fit(
             main.x + 6,
             main.y + 5,
             1,
             palette::TEXT,
             &header,
-            ((main.w as i32 - 200) / 8).max(1) as usize,
+            ((main.w as i32 - 12 - chrome_w) / 8).max(1) as usize,
         );
-        let pin_label = tr(lang, "Pin", "ピン");
-        let pin_w = pin_label.chars().count() as i32 * 8 + 12;
         let pin = UiRect::new(main.right() - 6 - pin_w, main.y + 3, pin_w as u32, 13);
-        let pinned = self
-            .pinned_trees
-            .iter()
-            .any(|(i, c)| *i == tree.root_item && *c == tree.root_count);
-        lay.fill_rect(
-            pin,
-            if pinned {
-                palette::ACCENT
-            } else if self.hover == Some(RecipeWidgetId::TreePin) {
-                palette::BUTTON_HOVER
-            } else {
-                palette::BUTTON
-            },
-        );
-        lay.border_rect(pin, palette::BUTTON_BORDER);
-        lay.ctext_in(
-            pin,
-            1,
-            if pinned { palette::TEXT_DARK } else { palette::TEXT },
-            pin_label,
-        );
-        lay.region(hits, RecipeWidgetId::TreePin, pin);
-        for (id, label) in [
-            (RecipeWidgetId::TreeCountDown, "-"),
-            (RecipeWidgetId::TreeCountUp, "+"),
-        ] {
-            let w = 16;
-            let x = pin.x - 8 - w - if id == RecipeWidgetId::TreeCountDown { 20 } else { 0 };
-            let rect = UiRect::new(x, main.y + 3, w as u32, 13);
+        if show_pin {
+            let pinned = self
+                .pinned_trees
+                .iter()
+                .any(|(i, c)| *i == tree.root_item && *c == tree.root_count);
             lay.fill_rect(
-                rect,
-                if self.hover == Some(id) {
+                pin,
+                if pinned {
+                    palette::ACCENT
+                } else if self.hover == Some(RecipeWidgetId::TreePin) {
                     palette::BUTTON_HOVER
                 } else {
                     palette::BUTTON
                 },
             );
-            lay.border_rect(rect, palette::BUTTON_BORDER);
-            lay.ctext_in(rect, 1, palette::TEXT, label);
-            lay.region(hits, id, rect);
+            lay.border_rect(pin, palette::BUTTON_BORDER);
+            lay.ctext_in(
+                pin,
+                1,
+                if pinned { palette::TEXT_DARK } else { palette::TEXT },
+                pin_label,
+            );
+            lay.region(hits, RecipeWidgetId::TreePin, pin);
+        }
+        if show_counts {
+            for (id, label) in [
+                (RecipeWidgetId::TreeCountDown, "-"),
+                (RecipeWidgetId::TreeCountUp, "+"),
+            ] {
+                let w = 16;
+                let x =
+                    pin.x - 8 - w - if id == RecipeWidgetId::TreeCountDown { 20 } else { 0 };
+                let rect = UiRect::new(x, main.y + 3, w as u32, 13);
+                lay.fill_rect(
+                    rect,
+                    if self.hover == Some(id) {
+                        palette::BUTTON_HOVER
+                    } else {
+                        palette::BUTTON
+                    },
+                );
+                lay.border_rect(rect, palette::BUTTON_BORDER);
+                lay.ctext_in(rect, 1, palette::TEXT, label);
+                lay.region(hits, id, rect);
+            }
         }
 
-        // Split: node list | totals.
-        let totals_w = (main.w as i32 / 3).clamp(120, 200);
-        let list_w = main.w as i32 - totals_w - 8;
+        // Split: node list | totals. The totals column yields first on
+        // narrow panes so the node list keeps a usable width.
+        let totals_w = (main.w as i32 / 3)
+            .clamp(120, 200)
+            .min((main.w as i32 - 52).max(24));
+        let list_w = (main.w as i32 - totals_w - 8).max(8);
         let list_top = main.y + 20;
         let list_bottom = main.bottom() - 4;
         let rows = ((list_bottom - list_top) / TREE_ROW_PITCH).max(0) as usize;
@@ -3676,7 +3718,9 @@ impl RecipeBrowserState {
             if node.recipe_id.is_some() {
                 lay.region(hits, RecipeWidgetId::TreeNodeRow(fi), rect);
             }
-            let indent = (*depth as i32 * 8).min(list_w - 60);
+            // Keep the indent inside the row: a deep tree on a narrow
+            // pane clamps at the row edge instead of going negative.
+            let indent = (*depth as i32 * 8).min((list_w - 40).max(0));
             let marker = if node.is_cycle {
                 tr(lang, " [loop]", " [循環]")
             } else if node.is_truncated {
@@ -4224,13 +4268,16 @@ impl Lay {
     }
 
     /// Horizontally centered text inside `r` (8px glyph cell, `mult`×).
+    /// Labels are elided to the rect first so they never spill past the
+    /// widget's edges.
     fn ctext_in(&mut self, r: UiRect, mult: u32, color: UiColor, text: &str) {
+        let text = fit_text(text, ((r.w as i32 - 4) / (8 * mult as i32)).max(0) as usize);
         let scale = (mult as i32 * self.s).max(1) as u32;
-        let w = text_width(text, scale) as i32;
+        let w = text_width(&text, scale) as i32;
         let cx = r.x + r.w as i32 / 2;
         let ty = r.y + ((r.h as i32 - 8 * mult as i32) / 2).max(0);
         self.list
-            .text_str(cx * self.s - w / 2, ty * self.s, scale, color, text);
+            .text_str(cx * self.s - w / 2, ty * self.s, scale, color, &text);
     }
 
     /// Ponder scene rasterized directly in physical pixels inside `r`.
@@ -4240,18 +4287,37 @@ impl Lay {
     }
 
     fn region(&self, hits: &mut Vec<RecipeHitRegion>, id: RecipeWidgetId, r: UiRect) {
+        let p = self.phys(r);
+        let (x0, y0) = (p.x.max(0), p.y.max(0));
+        let (x1, y1) = (
+            p.right().min(self.w * self.s),
+            p.bottom().min(self.h * self.s),
+        );
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
         hits.push(RecipeHitRegion {
-            rect: self.phys(r),
+            rect: UiRect::new(x0, y0, (x1 - x0) as u32, (y1 - y0) as u32),
             id,
         });
     }
 }
 
 /// Elide a label to `cells` glyph cells so text never overflows.
+/// Control characters are flattened first — a hostile name must not
+/// wrap its widget into a second line.
 fn fit_text(label: &str, cells: usize) -> String {
+    let label = if label.chars().any(|c| c.is_control()) {
+        label
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>()
+    } else {
+        label.to_owned()
+    };
     let count = label.chars().count();
     if count <= cells {
-        return label.to_owned();
+        return label;
     }
     if cells <= 3 {
         return ".".repeat(cells);

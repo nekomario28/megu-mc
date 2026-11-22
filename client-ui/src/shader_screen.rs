@@ -476,7 +476,10 @@ impl ShaderPackScreenState {
             24,
             2,
             palette::TEXT,
-            self.label("shader.title", "Shader Packs"),
+            fit_text(
+                self.label("shader.title", "Shader Packs"),
+                (panel_w.saturating_sub(24) / 16) as usize,
+            ),
         );
 
         let Some(pack) = self.selected() else {
@@ -485,40 +488,55 @@ impl ShaderPackScreenState {
                 65,
                 1,
                 palette::TEXT_DIM,
-                self.label("shader.empty", "No shader packs available"),
+                fit_text(
+                    self.label("shader.empty", "No shader packs available"),
+                    (panel_w.saturating_sub(24) / 8) as usize,
+                ),
             );
             return (draw, hits);
         };
 
         let strip = UiRect::new(left + 12, 55, panel_w.saturating_sub(24), 32);
         draw.fill_rect(strip, palette::BUTTON);
-        let prev = UiRect::new(strip.x, strip.y, 34, strip.h);
-        let next = UiRect::new(strip.right() - 34, strip.y, 34, strip.h);
-        draw.text(prev.x + 10, prev.y + 11, 1, palette::TEXT, "<");
-        draw.text(next.x + 10, next.y + 11, 1, palette::TEXT, ">");
+        // Cycle arrows need 68px inside the strip; below that they would
+        // overlap each other or fall outside the panel.
+        let show_arrows = strip.w >= 80;
+        if show_arrows {
+            let prev = UiRect::new(strip.x, strip.y, 34, strip.h);
+            let next = UiRect::new(strip.right() - 34, strip.y, 34, strip.h);
+            draw.text(prev.x + 10, prev.y + 11, 1, palette::TEXT, "<");
+            draw.text(next.x + 10, next.y + 11, 1, palette::TEXT, ">");
+            if self.packs.len() > 1 {
+                let selected = self.selected_pack.unwrap_or(0);
+                hits.push(ShaderScreenHitRegion {
+                    rect: prev,
+                    target: ShaderScreenHitTarget::Pack(
+                        (selected + self.packs.len() - 1) % self.packs.len(),
+                    ),
+                });
+                hits.push(ShaderScreenHitRegion {
+                    rect: next,
+                    target: ShaderScreenHitTarget::Pack((selected + 1) % self.packs.len()),
+                });
+            }
+        }
+        let title_x = strip.x + if show_arrows { 46 } else { 10 };
         draw.text(
-            strip.x + 46,
+            title_x,
             strip.y + 11,
             1,
             palette::TEXT,
-            fit_text(&pack.title, (strip.w.saturating_sub(96) / 8) as usize),
+            fit_text(
+                &pack.title,
+                ((strip.right() - title_x - 12).max(0) as u32 / 8) as usize,
+            ),
         );
-        if self.packs.len() > 1 {
-            let selected = self.selected_pack.unwrap_or(0);
-            hits.push(ShaderScreenHitRegion {
-                rect: prev,
-                target: ShaderScreenHitTarget::Pack(
-                    (selected + self.packs.len() - 1) % self.packs.len(),
-                ),
-            });
-            hits.push(ShaderScreenHitRegion {
-                rect: next,
-                target: ShaderScreenHitTarget::Pack((selected + 1) % self.packs.len()),
-            });
-        }
 
+        // Optional blocks must end above the footer; when the window is
+        // short they collapse top-down instead of painting over it.
+        let footer_y = h - 50;
         let mut y = 97;
-        if !pack.profiles.is_empty() {
+        if !pack.profiles.is_empty() && y + 30 <= footer_y - 6 {
             let title = self
                 .profile
                 .as_ref()
@@ -526,6 +544,7 @@ impl ShaderPackScreenState {
                 .unwrap_or_else(|| self.label("shader.profile.default", "Default"));
             let profile_rect = UiRect::new(left + 12, y, panel_w.saturating_sub(24), 30);
             draw.fill_rect(profile_rect, palette::BUTTON);
+            let profile_arrows = profile_rect.w >= 92;
             draw.text(
                 profile_rect.x + 10,
                 y + 9,
@@ -533,24 +552,27 @@ impl ShaderPackScreenState {
                 palette::TEXT,
                 fit_text(
                     &format!("{}: {}", self.label("shader.profile", "Profile"), title),
-                    (profile_rect.w.saturating_sub(78) / 8) as usize,
+                    (profile_rect.w.saturating_sub(if profile_arrows { 78 } else { 20 }) / 8)
+                        as usize,
                 ),
             );
-            let prev = UiRect::new(profile_rect.right() - 68, y, 34, 30);
-            let next = UiRect::new(profile_rect.right() - 34, y, 34, 30);
-            draw.text(prev.x + 11, y + 9, 1, palette::TEXT, "<");
-            draw.text(next.x + 11, y + 9, 1, palette::TEXT, ">");
-            hits.push(ShaderScreenHitRegion {
-                rect: prev,
-                target: ShaderScreenHitTarget::PreviousProfile,
-            });
-            hits.push(ShaderScreenHitRegion {
-                rect: next,
-                target: ShaderScreenHitTarget::NextProfile,
-            });
+            if profile_arrows {
+                let prev = UiRect::new(profile_rect.right() - 68, y, 34, 30);
+                let next = UiRect::new(profile_rect.right() - 34, y, 34, 30);
+                draw.text(prev.x + 11, y + 9, 1, palette::TEXT, "<");
+                draw.text(next.x + 11, y + 9, 1, palette::TEXT, ">");
+                hits.push(ShaderScreenHitRegion {
+                    rect: prev,
+                    target: ShaderScreenHitTarget::PreviousProfile,
+                });
+                hits.push(ShaderScreenHitRegion {
+                    rect: next,
+                    target: ShaderScreenHitTarget::NextProfile,
+                });
+            }
             y += 38;
         }
-        if pack.falls_back_to_builtin {
+        if pack.falls_back_to_builtin && y + 42 <= footer_y - 6 {
             let banner = UiRect::new(left + 12, y, panel_w.saturating_sub(24), 42);
             draw.fill_rect(banner, UiColor::rgb(85, 60, 23));
             draw.text(
@@ -571,17 +593,24 @@ impl ShaderPackScreenState {
                 banner.y + 23,
                 1,
                 palette::TEXT,
-                self.label("shader.fallback.detail", "Using built-in graphics instead."),
+                fit_text(
+                    self.label("shader.fallback.detail", "Using built-in graphics instead."),
+                    (banner.w.saturating_sub(16) / 8) as usize,
+                ),
             );
             y += 48;
         }
-        if let Some(screen) = self.active_screen() {
+        if self.active_screen().is_some() && y + 26 <= footer_y - 6 && right - 68 >= left + 12 {
+            let screen = self.active_screen().unwrap_or_default();
             draw.text(
                 left + 12,
                 y + 6,
                 1,
                 palette::TEXT,
-                self.label(&format!("screen.{screen}"), screen),
+                fit_text(
+                    self.label(&format!("screen.{screen}"), screen),
+                    (panel_w.saturating_sub(100) / 8) as usize,
+                ),
             );
             let rect = UiRect::new(right - 68, y, 56, 26);
             draw.fill_rect(rect, palette::BUTTON);
@@ -590,7 +619,7 @@ impl ShaderPackScreenState {
                 y + 9,
                 1,
                 palette::TEXT,
-                self.label("shader.back", "Back"),
+                fit_text(self.label("shader.back", "Back"), 5),
             );
             hits.push(ShaderScreenHitRegion {
                 rect,
@@ -621,21 +650,29 @@ impl ShaderPackScreenState {
                 format!("option.{}", row.key)
             };
             let label = self.label(&label_key, &row.key);
+            // The right-side value+stepper chrome needs ~140px; on
+            // narrow panels it collapses so nothing clips outside.
+            let chrome = rect.w >= 160;
             draw.text(
                 rect.x + 10,
                 y + 12,
                 1,
                 palette::TEXT,
-                fit_text(label, (rect.w.saturating_sub(138) / 8) as usize),
+                fit_text(
+                    label,
+                    (rect.w.saturating_sub(if chrome { 138 } else { 20 }) / 8) as usize,
+                ),
             );
-            let value = self.option_text(row);
-            draw.text(
-                rect.right() - 112,
-                y + 12,
-                1,
-                palette::TEXT,
-                fit_text(&value, 12),
-            );
+            if chrome {
+                let value = self.option_text(row);
+                draw.text(
+                    rect.right() - 112,
+                    y + 12,
+                    1,
+                    palette::TEXT,
+                    fit_text(&value, 12),
+                );
+            }
             let target = match &row.kind {
                 ShaderOptionKind::Toggle { .. } => {
                     hits.push(ShaderScreenHitRegion {
@@ -645,18 +682,27 @@ impl ShaderPackScreenState {
                     None
                 }
                 ShaderOptionKind::Slider { .. } | ShaderOptionKind::Cycle { .. } => {
-                    let step_left = UiRect::new(rect.right() - 128, y, 20, 32);
-                    let step_right = UiRect::new(rect.right() - 22, y, 22, 32);
-                    draw.text(step_left.x + 6, y + 12, 1, palette::TEXT, "<");
-                    draw.text(step_right.x + 6, y + 12, 1, palette::TEXT, ">");
-                    hits.push(ShaderScreenHitRegion {
-                        rect: step_left,
-                        target: ShaderScreenHitTarget::Step(row.key.clone(), -1),
-                    });
-                    hits.push(ShaderScreenHitRegion {
-                        rect: step_right,
-                        target: ShaderScreenHitTarget::Step(row.key.clone(), 1),
-                    });
+                    if chrome {
+                        let step_left = UiRect::new(rect.right() - 128, y, 20, 32);
+                        let step_right = UiRect::new(rect.right() - 22, y, 22, 32);
+                        draw.text(step_left.x + 6, y + 12, 1, palette::TEXT, "<");
+                        draw.text(step_right.x + 6, y + 12, 1, palette::TEXT, ">");
+                        hits.push(ShaderScreenHitRegion {
+                            rect: step_left,
+                            target: ShaderScreenHitTarget::Step(row.key.clone(), -1),
+                        });
+                        hits.push(ShaderScreenHitRegion {
+                            rect: step_right,
+                            target: ShaderScreenHitTarget::Step(row.key.clone(), 1),
+                        });
+                    } else {
+                        // No room for steppers: the row still steps via
+                        // pointer through the whole-row target.
+                        hits.push(ShaderScreenHitRegion {
+                            rect,
+                            target: ShaderScreenHitTarget::Step(row.key.clone(), 1),
+                        });
+                    }
                     None
                 }
                 ShaderOptionKind::SubScreen { screen } => {
@@ -669,7 +715,6 @@ impl ShaderPackScreenState {
             y += 38;
         }
 
-        let footer_y = h - 50;
         let half = panel_w.saturating_sub(36) / 2;
         let apply = UiRect::new(left + 12, footer_y, half, 32);
         let reset = UiRect::new(apply.right() + 12, footer_y, half, 32);
@@ -680,14 +725,20 @@ impl ShaderPackScreenState {
             footer_y + 11,
             1,
             palette::TEXT,
-            self.label("shader.apply", "Apply"),
+            fit_text(
+                self.label("shader.apply", "Apply"),
+                (half.saturating_sub(16) / 8) as usize,
+            ),
         );
         draw.text(
             reset.x + 12,
             footer_y + 11,
             1,
             palette::TEXT,
-            self.label("shader.reset", "Reset"),
+            fit_text(
+                self.label("shader.reset", "Reset"),
+                (half.saturating_sub(16) / 8) as usize,
+            ),
         );
         hits.push(ShaderScreenHitRegion {
             rect: apply,
