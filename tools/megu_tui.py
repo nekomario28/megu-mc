@@ -274,6 +274,22 @@ RE_LAN = re.compile(r"\[lan\]\s+advertising\s+\"([^\"]*)\"\s+on port\s+(\d+)")
 RE_FATAL = re.compile(r"\[FATAL\]|panicked")
 RE_ERROR = re.compile(r"\berror\b|\bfailed\b|FAILED|refusing")
 RE_WARN = re.compile(r"\[security\]|refused|rejected|\bwarn\b|skipped|missing")
+RE_MS_PER_CHUNK_KV = re.compile(
+    r"\bms/chunk\s*[=:]\s*([0-9]+(?:\.[0-9]+)?)")
+RE_MS_PER_CHUNK_PAREN = re.compile(
+    r"\(([0-9]+(?:\.[0-9]+)?)\s*ms/chunk\)")
+RE_CHUNKPROF_MS = re.compile(
+    r"\bCHUNKPROF\b.*?\bmap=([0-9]+(?:\.[0-9]+)?)\s*ms\b", re.IGNORECASE)
+
+
+def ms_per_chunk_from(line):
+    """ms-per-chunk figure from a profiling line; None when none is present."""
+    for pattern in (RE_MS_PER_CHUNK_KV, RE_MS_PER_CHUNK_PAREN,
+                    RE_CHUNKPROF_MS):
+        match = pattern.search(line)
+        if match:
+            return float(match.group(1))
+    return None
 
 
 class MetricsParser:
@@ -288,6 +304,10 @@ class MetricsParser:
         self.tps = collections.deque(maxlen=history)
         self.mspt = collections.deque(maxlen=history)
         self.mem_mib = collections.deque(maxlen=history)
+        self.cpu_pct = collections.deque(maxlen=history)
+        self.threads = None
+        self.ms_per_chunk = collections.deque(maxlen=history)
+        self.revision = 0
         self.players = {}
         self.players_online = None
         self.players_max = None
@@ -315,7 +335,12 @@ class MetricsParser:
     def feed(self, line):
         line = strip_ansi(line).rstrip()
         self.lines_seen += 1
+        self.revision += 1
         self.log.append(line)
+
+        mspc = ms_per_chunk_from(line)
+        if mspc is not None:
+            self.ms_per_chunk.append(mspc)
 
         match = RE_READY.search(line)
         if match:
@@ -445,17 +470,34 @@ class MetricsParser:
             self.errors += 1
         elif RE_WARN.search(line):
             self.warnings += 1
-        return "log"
+        return "ms_per_chunk" if mspc is not None else "log"
+
+    def note_proc_metrics(self, rss_mib, threads, cpu_pct):
+        """Record one /proc sample: RSS MiB, thread count, delta CPU %."""
+        changed = False
+        if finite(rss_mib) and rss_mib >= 0:
+            self.mem_mib.append(float(rss_mib))
+            changed = True
+        if (isinstance(threads, int) and not isinstance(threads, bool)
+                and threads >= 0):
+            self.threads = threads
+            changed = True
+        if finite(cpu_pct) and cpu_pct >= 0:
+            self.cpu_pct.append(float(cpu_pct))
+            changed = True
+        if changed:
+            self.revision += 1
 
     def note_memory(self, mib):
         """Record an external RSS sample (from /proc/<pid>/status)."""
-        if finite(mib) and mib >= 0:
-            self.mem_mib.append(float(mib))
+        self.note_proc_metrics(mib, None, None)
 
     def snapshot(self):
         tps = list(self.tps)
         mspt = list(self.mspt)
         mem = list(self.mem_mib)
+        cpu = list(self.cpu_pct)
+        mspc = list(self.ms_per_chunk)
         online = (self.players_online if self.players_online is not None
                   else len(self.players))
         return {
@@ -474,6 +516,12 @@ class MetricsParser:
             "mspt_p95": percentile(mspt, 95),
             "mem": mem,
             "mem_cur": mem[-1] if mem else None,
+            "cpu": cpu,
+            "cpu_cur": cpu[-1] if cpu else None,
+            "threads": self.threads,
+            "ms_per_chunk": mspc,
+            "ms_per_chunk_cur": mspc[-1] if mspc else None,
+            "revision": self.revision,
             "players": sorted(self.players),
             "players_online": online,
             "players_max": self.players_max,
@@ -512,9 +560,19 @@ def _tps_band(cur):
 def _mspt_band(cur):
     if cur is None:
         return "grey"
-    if cur <= 50.0:
+    if cur < 20.0:
         return "green"
-    if cur <= 75.0:
+    if cur < 40.0:
+        return "yellow"
+    return "red"
+
+
+def _cpu_band(cur):
+    if cur is None:
+        return "grey"
+    if cur < 50.0:
+        return "green"
+    if cur < 100.0:
         return "yellow"
     return "red"
 
@@ -592,6 +650,9 @@ def _cards(snap, cols, ascii_mode, color):
     players_text = f"{snap.get('players_online', 0)}/{players_max if players_max is not None else '?'}"
     chunks = snap.get("loaded_chunks")
     chunks_text = f"{chunks:,}" if isinstance(chunks, int) else "n/a"
+    mspc = snap.get("ms_per_chunk_cur")
+    if mspc is not None:
+        chunks_text += f" {_dot(ascii_mode)} {mspc:.1f}ms/ch"
     mods = snap.get("mods", {})
     mods_text = (f"N:{mods.get('native', 0)} "
                  f"S:{mods.get('shim', 0)} F:{mods.get('fallback', 0)}")
@@ -679,19 +740,32 @@ def render_frame(snap, cols, rows, ascii_mode=False, color=False, ui=None):
         head.append("")
 
     tps_stat = (f"{fmt(snap.get('tps_cur'))}  min {fmt(snap.get('tps_min'))}  "
-                f"avg {fmt(snap.get('tps_avg'))}")
+                f"avg {fmt(snap.get('tps_avg'))}  [0..20]")
     mspt_stat = (f"{fmt(snap.get('mspt_cur'), 1)}ms  "
-                 f"p95 {fmt(snap.get('mspt_p95'), 1)}ms")
+                 f"p95 {fmt(snap.get('mspt_p95'), 1)}ms  [0..50]")
     mem_stat = (f"{fmt(snap.get('mem_cur'), 0)} MiB"
                 if snap.get("mem_cur") is not None else "n/a MiB")
+    threads = snap.get("threads")
+    if threads is not None:
+        mem_stat += f"  thr {threads}"
     metrics = [
         _metric_line("TPS", tps_stat, snap.get("tps", []), cols,
-                     _tps_band(snap.get("tps_cur")), ascii_mode, color),
+                     _tps_band(snap.get("tps_cur")), ascii_mode, color,
+                     low=0.0, high=20.0),
         _metric_line("MSPT", mspt_stat, snap.get("mspt", []), cols,
-                     _mspt_band(snap.get("mspt_cur")), ascii_mode, color, low=0.0),
+                     _mspt_band(snap.get("mspt_cur")), ascii_mode, color,
+                     low=0.0, high=50.0),
         _metric_line("MEM", mem_stat, snap.get("mem", []), cols,
                      _mem_band(snap.get("mem_cur")), ascii_mode, color),
     ]
+    cpu = snap.get("cpu", [])
+    if rows >= 26 and cpu:
+        cpu_stat = (f"{fmt(snap.get('cpu_cur'), 1)}%  "
+                    f"thr {threads if threads is not None else '?'}")
+        metrics.append(
+            _metric_line("CPU", cpu_stat, cpu, cols,
+                         _cpu_band(snap.get("cpu_cur")), ascii_mode, color,
+                         low=0.0))
 
     cards = []
     if rows >= 17:
@@ -756,6 +830,7 @@ Mods: 2 native, 1 compatibility mode
 [tick] observed_tps=19.95 avg_work_ms=9.02 max_work_ms=15.77 over_budget=0/100
 [security] velocity forwarding refused for Mallory from 10.0.0.9: missing forwarding secret
 [sz] t=500 VmRSS: 524288 kB | mobs=44 drops=8 xps=4 arrows=0 bob=0 pearl=0 primed=0 chests=18 furn=6 crops=12 world=0 inv=2 clients=2
+[chunkprof] window=60s chunks=1284 (4.2 ms/chunk) map=15.8ms entities=91
 """
 
 
@@ -764,12 +839,16 @@ def demo_parser():
     parser = MetricsParser()
     for line in DEMO_LOG.splitlines():
         parser.feed(line)
+    parser.threads = 14
     for i in range(72):
         crest = abs((i % 24) - 12) / 12.0
         dip = max(0.0, 1.0 - abs(i - 52) / 9.0)
         parser.tps.append(round(19.2 + 0.8 * crest - 4.5 * dip, 2))
         parser.mspt.append(round(11.0 + 6.0 * (1.0 - crest) + 41.0 * dip, 2))
         parser.mem_mib.append(round(468.0 + i * 0.7 + (i % 6), 1))
+        parser.cpu_pct.append(round(14.0 + 26.0 * crest + 48.0 * dip, 1))
+        parser.ms_per_chunk.append(
+            round(2.8 + 1.4 * (1.0 - crest) + 5.6 * dip, 2))
     return parser
 
 
@@ -849,17 +928,99 @@ def finish_stop(proc, state, stop_timeout):
         escalate(proc)
 
 
-def sample_rss_mib(pid):
-    """Resident memory of `pid` in MiB from /proc; None off-Linux."""
+def parse_proc_status(text):
+    """(rss_mib, threads) from /proc/<pid>/status text; fields may be None."""
+    rss_mib = None
+    threads = None
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        if parts[0] == "VmRSS:":
+            try:
+                rss_mib = int(parts[1]) / 1024.0
+            except ValueError:
+                pass
+        elif parts[0] == "Threads:":
+            try:
+                threads = int(parts[1])
+            except ValueError:
+                pass
+    return rss_mib, threads
+
+
+def parse_proc_stat_jiffies(text):
+    """utime+stime jiffies from /proc/<pid>/stat text; None when unparsable.
+
+    The comm field may contain spaces and parentheses, so fields are counted
+    back from the last ')' instead of split naively.
+    """
+    rparen = text.rfind(")")
+    if rparen < 0:
+        return None
+    fields = text[rparen + 1:].split()
+    # fields[0] is state (field 3); utime/stime are fields 14 and 15.
+    if len(fields) < 13:
+        return None
+    try:
+        return int(fields[11]) + int(fields[12])
+    except ValueError:
+        return None
+
+
+def cpu_pct_delta(prev_sample, cur_sample, hz):
+    """CPU % between two (jiffies, wall_s) samples; None when not computable."""
+    if prev_sample is None or cur_sample is None or hz <= 0:
+        return None
+    delta_jiffies = cur_sample[0] - prev_sample[0]
+    delta_wall = cur_sample[1] - prev_sample[1]
+    if delta_jiffies < 0 or delta_wall <= 0:
+        return None
+    return 100.0 * delta_jiffies / (hz * delta_wall)
+
+
+def _clock_ticks_hz():
+    try:
+        return os.sysconf("SC_CLK_TCK")
+    except (AttributeError, OSError, ValueError):
+        return 100
+
+
+def sample_proc_metrics(pid, prev_cpu_sample=None, now=None):
+    """One-shot /proc telemetry: VmRSS MiB, thread count, delta CPU %.
+
+    Reads /proc/<pid>/status and /proc/<pid>/stat once each. `prev_cpu_sample`
+    is the `cpu_sample` value returned by the previous call for the same pid;
+    `cpu_pct` is None on the first sample, off-Linux, or when the wall-clock
+    delta is not positive. Every metric degrades to None on read failure.
+    """
+    now = time.monotonic() if now is None else now
+    rss_mib = threads = None
     try:
         with open(f"/proc/{pid}/status", "r", encoding="ascii",
                   errors="replace") as handle:
-            for line in handle:
-                if line.startswith("VmRSS"):
-                    return int(line.split()[1]) / 1024.0
-    except (OSError, ValueError, IndexError):
+            rss_mib, threads = parse_proc_status(handle.read())
+    except OSError:
         pass
-    return None
+    cpu_sample = prev_cpu_sample
+    cpu_pct = None
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="ascii",
+                  errors="replace") as handle:
+            jiffies = parse_proc_stat_jiffies(handle.read())
+    except OSError:
+        jiffies = None
+    if jiffies is not None:
+        cpu_sample = (jiffies, now)
+        cpu_pct = cpu_pct_delta(prev_cpu_sample, cpu_sample,
+                                _clock_ticks_hz())
+    return {"rss_mib": rss_mib, "threads": threads,
+            "cpu_pct": cpu_pct, "cpu_sample": cpu_sample}
+
+
+def sample_rss_mib(pid):
+    """Resident memory of `pid` in MiB from /proc; None off-Linux."""
+    return sample_proc_metrics(pid)["rss_mib"]
 
 
 # ------------------------------------------------------------ plain passthru
@@ -982,12 +1143,19 @@ def handle_keys(data, state, proc):
                 state["cmd_buf"] = ""
 
 
+def render_key(parser, state, cols, rows):
+    """Compact dirty-frame key: a frame is redrawn only while this changes."""
+    return (parser.revision, state.get("mods"), state.get("cmd_mode"),
+            state.get("cmd_buf"), state.get("stopping"), cols, rows)
+
+
 def tui_loop(proc, parser, lock, threads, state, term, args, color):
     """Render frames until the server exits or a stop is requested."""
     stop_deadline = None
     escalate_deadline = None
     next_rss = 0.0
     frame_at = 0.0
+    prev_key = None
     while True:
         now = time.monotonic()
         data = read_stdin(term.in_fd, 0.2)
@@ -1014,20 +1182,28 @@ def tui_loop(proc, parser, lock, threads, state, term, args, color):
                     pass
                 escalate_deadline = None
         elif now >= next_rss:
-            mib = sample_rss_mib(proc.pid)
-            if mib is not None:
+            metrics = sample_proc_metrics(proc.pid, state.get("cpu_sample"))
+            state["cpu_sample"] = metrics["cpu_sample"]
+            if (metrics["rss_mib"] is not None
+                    or metrics["threads"] is not None
+                    or metrics["cpu_pct"] is not None):
                 with lock:
-                    parser.note_memory(mib)
+                    parser.note_proc_metrics(metrics["rss_mib"],
+                                             metrics["threads"],
+                                             metrics["cpu_pct"])
             next_rss = now + 1.0
         if now >= frame_at or data:
-            with lock:
-                snap = parser.snapshot()
-            size = shutil.get_terminal_size(fallback=(100, 30))
-            frame = render_frame(snap, size.columns, size.lines,
-                                 ascii_mode=args.ascii_mode, color=color,
-                                 ui=state)
-            term.write("\x1b[H" + "\r\n".join(frame) + "\x1b[J")
             frame_at = now + 0.25
+            size = shutil.get_terminal_size(fallback=(100, 30))
+            with lock:
+                key = render_key(parser, state, size.columns, size.lines)
+                if key != prev_key:
+                    snap = parser.snapshot()
+                    frame = render_frame(snap, size.columns, size.lines,
+                                         ascii_mode=args.ascii_mode,
+                                         color=color, ui=state)
+                    term.write("\x1b[H" + "\r\n".join(frame) + "\x1b[J")
+                    prev_key = key
     for thread in threads:
         thread.join(timeout=0.4)
 
@@ -1067,7 +1243,7 @@ def run_tui(command, args):
     lock = threading.Lock()
     state = {"quit": False, "stopping": False, "stop_sent": False,
              "mods": False, "cmd_mode": False, "cmd_buf": "",
-             "sigterm": False}
+             "sigterm": False, "cpu_sample": None}
 
     def reader(pipe):
         try:
