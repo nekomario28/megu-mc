@@ -765,6 +765,20 @@ pub struct UiSettings {
     pub audio: AudioSettings,
     pub shader_quick: ShaderQuickSettings,
     pub qol: QolSettings,
+    /// Camera field of view in degrees (`30..=110`).
+    pub fov_deg: u16,
+    /// Mouse sensitivity as a percentage (`10..=200`, where 100 = 1.0).
+    pub mouse_sensitivity_pct: u16,
+    /// Zoom divisor in tenths (`15..=100`, where 40 = 4.0x).
+    pub zoom_divisor_tenths: u16,
+    /// Built-in Jade-style looking-at HUD, yielded when Jade is installed.
+    pub qol_looking_at_hud: bool,
+    /// Built-in mouse drag tweaks, yielded when Mouse Tweaks is installed.
+    pub qol_mouse_tweaks: bool,
+    /// Built-in inventory sorting, yielded when Inventory Sort is installed.
+    pub qol_inventory_sort: bool,
+    /// Zsh-style command bar with ghost completions and 8x8 inline badges.
+    pub zsh_command_bar: bool,
     pub fair_play: FairPlaySettings,
     pub language: LanguageSetting,
     /// Full-fidelity locale selection (16 Tier-1 built-ins); the legacy
@@ -783,11 +797,62 @@ impl Default for UiSettings {
             audio: AudioSettings::default(),
             shader_quick: ShaderQuickSettings::default(),
             qol: QolSettings::default(),
+            fov_deg: 70,
+            mouse_sensitivity_pct: 100,
+            zoom_divisor_tenths: 40,
+            qol_looking_at_hud: true,
+            qol_mouse_tweaks: true,
+            qol_inventory_sort: true,
+            zsh_command_bar: true,
             fair_play: FairPlaySettings::default(),
             language: LanguageSetting::Auto,
             locale: BuiltinLocale::EnUs,
             visual: VisualStyleSettings::default(),
         }
+    }
+}
+
+impl UiSettings {
+    /// Effective camera FOV in degrees, bounded even if a public field was set directly.
+    pub fn fov_f32(&self) -> f32 {
+        self.fov_deg.clamp(30, 110) as f32
+    }
+
+    /// Effective mouse sensitivity multiplier (`0.10..=2.00`).
+    pub fn mouse_sensitivity_f32(&self) -> f32 {
+        self.mouse_sensitivity_pct.clamp(10, 200) as f32 / 100.0
+    }
+
+    /// Effective camera zoom divisor (`1.5..=10.0`).
+    pub fn zoom_divisor_f32(&self) -> f32 {
+        self.zoom_divisor_tenths.clamp(15, 100) as f32 / 10.0
+    }
+
+    pub fn set_fov_deg(&mut self, value: u16) {
+        self.fov_deg = value.clamp(30, 110);
+    }
+
+    pub fn set_mouse_sensitivity_pct(&mut self, value: u16) {
+        self.mouse_sensitivity_pct = value.clamp(10, 200);
+    }
+
+    pub fn set_zoom_divisor_tenths(&mut self, value: u16) {
+        self.zoom_divisor_tenths = value.clamp(15, 100);
+    }
+
+    /// Enable the built-in looking-at HUD only if Jade does not own it.
+    pub fn builtin_looking_at_hud_active(&self, jade_installed: bool) -> bool {
+        self.qol_looking_at_hud && !jade_installed
+    }
+
+    /// Enable the built-in drag behavior only if Mouse Tweaks does not own it.
+    pub fn builtin_mouse_tweaks_active(&self, mouse_tweaks_installed: bool) -> bool {
+        self.qol_mouse_tweaks && !mouse_tweaks_installed
+    }
+
+    /// Enable the built-in sorting only if Inventory Sort does not own it.
+    pub fn builtin_inventory_sort_active(&self, inventory_sort_installed: bool) -> bool {
+        self.qol_inventory_sort && !inventory_sort_installed
     }
 }
 
@@ -830,6 +895,13 @@ pub enum SettingKey {
     WorldEffects,
     WorldEffectsDetail,
     CameraMicroMotion,
+    FovDeg,
+    MouseSensitivityPct,
+    ZoomDivisorTenths,
+    QolLookingAtHud,
+    QolMouseTweaks,
+    QolInventorySort,
+    ZshCommandBar,
     QolSmoothZoom,
     QolToolWarnPercent,
     QolPreventToolBreak,
@@ -907,6 +979,13 @@ impl SettingsTransaction {
             K::CameraMicroMotion => {
                 current.visual.camera_micro_motion == opened.visual.camera_micro_motion
             }
+            K::FovDeg => current.fov_deg == opened.fov_deg,
+            K::MouseSensitivityPct => current.mouse_sensitivity_pct == opened.mouse_sensitivity_pct,
+            K::ZoomDivisorTenths => current.zoom_divisor_tenths == opened.zoom_divisor_tenths,
+            K::QolLookingAtHud => current.qol_looking_at_hud == opened.qol_looking_at_hud,
+            K::QolMouseTweaks => current.qol_mouse_tweaks == opened.qol_mouse_tweaks,
+            K::QolInventorySort => current.qol_inventory_sort == opened.qol_inventory_sort,
+            K::ZshCommandBar => current.zsh_command_bar == opened.zsh_command_bar,
             K::QolSmoothZoom => current.qol.smooth_zoom == opened.qol.smooth_zoom,
             K::QolToolWarnPercent => {
                 current.qol.tool_warn_percent == opened.qol.tool_warn_percent
@@ -996,6 +1075,13 @@ impl SettingsTransaction {
             K::CameraMicroMotion => {
                 current.visual.camera_micro_motion = opened.visual.camera_micro_motion
             }
+            K::FovDeg => current.fov_deg = opened.fov_deg,
+            K::MouseSensitivityPct => current.mouse_sensitivity_pct = opened.mouse_sensitivity_pct,
+            K::ZoomDivisorTenths => current.zoom_divisor_tenths = opened.zoom_divisor_tenths,
+            K::QolLookingAtHud => current.qol_looking_at_hud = opened.qol_looking_at_hud,
+            K::QolMouseTweaks => current.qol_mouse_tweaks = opened.qol_mouse_tweaks,
+            K::QolInventorySort => current.qol_inventory_sort = opened.qol_inventory_sort,
+            K::ZshCommandBar => current.zsh_command_bar = opened.zsh_command_bar,
             K::QolSmoothZoom => current.qol.smooth_zoom = opened.qol.smooth_zoom,
             K::QolToolWarnPercent => {
                 current.qol.tool_warn_percent = opened.qol.tool_warn_percent
@@ -1939,6 +2025,18 @@ impl UiState {
         }
         tx.undo_stack.push(prior);
         tx.redo_stack.clear();
+    }
+
+    /// Commit an externally driven settings edit through the same undo/redo
+    /// history and change notification as the built-in settings widgets.
+    pub fn edit_settings(&mut self, edit: impl FnOnce(&mut UiSettings)) -> Vec<UiAction> {
+        let prior = self.settings.clone();
+        edit(&mut self.settings);
+        if self.settings == prior {
+            return Vec::new();
+        }
+        self.push_settings_undo(prior);
+        vec![UiAction::SettingsChanged]
     }
 
     /// Restore ONLY `key`'s setting to the session-open snapshot,
