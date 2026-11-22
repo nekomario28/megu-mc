@@ -24,6 +24,23 @@ fn within_tick(a: &ScheduledTick, b: &ScheduledTick) -> Ordering {
     (a.priority, a.sub_order).cmp(&(b.priority, b.sub_order))
 }
 
+/// Comparator over each container chunk's head tick. `collect` only pushes
+/// keys whose chunk is present with a non-empty heap, but a missing entry
+/// compares equal instead of panicking inside the container heap.
+fn within_chunk_head(
+    chunks: &HashMap<ChunkPos, ChunkTicks>,
+    a: &ChunkPos,
+    b: &ChunkPos,
+) -> Ordering {
+    match (
+        chunks.get(a).and_then(|c| c.heap.first()),
+        chunks.get(b).and_then(|c| c.heap.first()),
+    ) {
+        (Some(x), Some(y)) => within_tick(x, y),
+        _ => Ordering::Equal,
+    }
+}
+
 thread_local! {
     /// `collect` runs once per queue per tick and its per-chunk container
     /// heap is pure scratch — it never escapes the drain — so it rides a
@@ -186,7 +203,9 @@ impl NextChunks {
         }
         for key in wrapped {
             let i = self.slot(key);
-            let (_, due) = self.slots[i].unwrap();
+            let Some((_, due)) = self.slots[i] else {
+                continue;
+            };
             if ready(key, due) {
                 self.remove_slot(i, |_| {});
                 // Fastutil's iterator uses regular map removal for wrapped
@@ -1360,7 +1379,9 @@ impl ScheduledTicks {
             *counts.entry((pos.0 >> 4, pos.2 >> 4)).or_default() += 1;
         }
         for (pos, block) in pending {
-            let remaining = counts.get_mut(&(pos.0 >> 4, pos.2 >> 4)).unwrap();
+            let Some(remaining) = counts.get_mut(&(pos.0 >> 4, pos.2 >> 4)) else {
+                continue;
+            };
             self.schedule(ScheduledTick {
                 pos,
                 block,
@@ -1432,7 +1453,7 @@ impl ScheduledTicks {
         fn take<const N: usize>(input: &mut &[u8]) -> Result<[u8; N], &'static str> {
             let (value, rest) = input.split_at_checked(N).ok_or("truncated tick state")?;
             *input = rest;
-            Ok(value.try_into().unwrap())
+            value.try_into().map_err(|_| "invalid tick field")
         }
         let mut result = Self::new();
         let count = u32::from_be_bytes(take(input)?) as usize;
@@ -1510,7 +1531,7 @@ impl ScheduledTicks {
                     .filter(|v| v.0 == key)
                     .map(|v| v.1)
             };
-            if due != Some(ticks.heap[0].due) {
+            if due != ticks.heap.first().map(|t| t.due) {
                 return Err("tick table does not match heap");
             }
         }
@@ -1558,7 +1579,7 @@ impl ScheduledTicks {
                 return false;
             }
             heap_push(&mut containers, chunk, |a, b| {
-                within_tick(&self.chunks[a].heap[0], &self.chunks[b].heap[0])
+                within_chunk_head(&self.chunks, a, b)
             });
             true
         });
@@ -1568,17 +1589,30 @@ impl ScheduledTicks {
         // return, and the returned `Vec` still owns its own buffer.
         let mut result = Vec::with_capacity(containers.len().min(limit));
         while result.len() < limit && !containers.is_empty() {
-            let chunk = heap_pop(&mut containers, |a, b| {
-                within_tick(&self.chunks[a].heap[0], &self.chunks[b].heap[0])
-            })
-            .unwrap();
-            let first =
-                heap_pop(&mut self.chunks.get_mut(&chunk).unwrap().heap, full_order).unwrap();
+            let Some(chunk) = heap_pop(&mut containers, |a, b| {
+                within_chunk_head(&self.chunks, a, b)
+            }) else {
+                break;
+            };
+            let Some(first) = self
+                .chunks
+                .get_mut(&chunk)
+                .and_then(|entry| heap_pop(&mut entry.heap, full_order))
+            else {
+                continue;
+            };
             self.waiting.remove(&(first.pos, first.block));
             result.push(first);
-            let other = containers.first().map(|c| self.chunks[c].heap[0]);
+            let other = containers
+                .first()
+                .and_then(|c| self.chunks.get(c).and_then(|e| e.heap.first()).copied());
             while result.len() < limit {
-                let Some(tick) = self.chunks[&chunk].heap.first().copied() else {
+                let Some(tick) = self
+                    .chunks
+                    .get(&chunk)
+                    .and_then(|e| e.heap.first())
+                    .copied()
+                else {
                     break;
                 };
                 if tick.due > now
@@ -1586,15 +1620,20 @@ impl ScheduledTicks {
                 {
                     break;
                 }
-                let tick =
-                    heap_pop(&mut self.chunks.get_mut(&chunk).unwrap().heap, full_order).unwrap();
+                let Some(tick) = self
+                    .chunks
+                    .get_mut(&chunk)
+                    .and_then(|e| heap_pop(&mut e.heap, full_order))
+                else {
+                    break;
+                };
                 self.waiting.remove(&(tick.pos, tick.block));
                 result.push(tick);
             }
-            if let Some(tick) = self.chunks[&chunk].heap.first().copied() {
+            if let Some(tick) = self.chunks.get(&chunk).and_then(|e| e.heap.first()).copied() {
                 if tick.due <= now && result.len() < limit {
                     heap_push(&mut containers, chunk, |a, b| {
-                        within_tick(&self.chunks[a].heap[0], &self.chunks[b].heap[0])
+                        within_chunk_head(&self.chunks, a, b)
                     });
                 } else {
                     self.next.put(chunk_key(chunk), tick.due);
@@ -1602,8 +1641,9 @@ impl ScheduledTicks {
             }
         }
         for chunk in containers.drain(..) {
-            self.next
-                .put(chunk_key(chunk), self.chunks[&chunk].heap[0].due);
+            if let Some(tick) = self.chunks.get(&chunk).and_then(|e| e.heap.first()).copied() {
+                self.next.put(chunk_key(chunk), tick.due);
+            }
         }
         bound_collect_scratch(&mut containers);
         COLLECT_CONTAINERS.with(|cell| *cell.borrow_mut() = containers);

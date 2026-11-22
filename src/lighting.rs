@@ -714,7 +714,9 @@ impl IncrementalLighting {
         }
         for &p in patch.iter() {
             let mut level = self.source(kind, p);
-            let (chunk, index) = self.cell(p).expect("patch lies in the light window");
+            let Some((chunk, index)) = self.cell(p) else {
+                continue;
+            };
             let target = chunk.blocks[index];
             for (face, neighbor) in p.adjacent() {
                 if !self.in_patch(neighbor, stamp) {
@@ -781,7 +783,9 @@ impl IncrementalLighting {
         columns.sort_unstable();
         columns.dedup();
         for (x, z) in columns.drain(..) {
-            let chunk = self.chunks.get_mut(&(x >> 4, z >> 4)).unwrap();
+            let Some(chunk) = self.chunks.get_mut(&(x >> 4, z >> 4)) else {
+                continue;
+            };
             let i = ((z & 15) << 4 | (x & 15)) as usize;
             Self::refresh_column(self.min_y, self.height, chunk, i, &mut |y| {
                 sky_changes.push(Position::new(x, y, z));
