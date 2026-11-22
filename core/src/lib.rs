@@ -61,6 +61,7 @@
 #![deny(unsafe_code)]
 
 pub mod crash_report;
+pub mod dye_and_items;
 pub mod fault_isolation;
 pub mod hw_adaptive_engine;
 pub mod id;
