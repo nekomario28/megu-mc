@@ -76,9 +76,18 @@ function mockFetch(state) {
   globalThis.fetch = async (url, init = {}) => {
     const u = String(url);
     state.calls.push({ url: u, method: init.method || "GET",
+      headers: init.headers || {},
       body: init.body ? String(init.body) : null });
     const json = (obj, status = 200) => new Response(JSON.stringify(obj), {
       status, headers: { "content-type": "application/json" } });
+
+    const failure = state.githubFailure;
+    if (failure && u.startsWith("https://api.github.com/") &&
+        u.endsWith(failure.path) &&
+        (init.method || "GET") === failure.method) {
+      if (failure.network) throw new Error(failure.message);
+      return json({ message: failure.message }, failure.status);
+    }
 
     if (u.includes("challenges.cloudflare.com")) {
       return json({ success: state.turnstileOk !== false });
@@ -230,22 +239,110 @@ await test("onRequestPost creates a fresh issue then dedups", async () => {
     assert.equal(state.comments, 0); // creation is not a milestone comment
 
     // 4 more sightings -> count 5 hits a milestone comment, still 1 issue.
+    let milestone;
     for (let i = 0; i < 4; i++) {
       const res = await report.onRequestPost(
         postContext(validPayload(), env));
       const j = await res.json();
       assert.equal(j.duplicate, true);
+      milestone = j;
     }
     assert.equal(state.issues, 1, "duplicate fingerprint must not " +
       "create a second issue");
     assert.equal(state.comments, 1, "count 5 should post one comment");
+    assert.equal(milestone.comment_posted, true);
 
     const rec = JSON.parse(kv.map.get("report:fp:MEGU-E-1A2B3C4D"));
     assert.equal(rec.count, 5);
     assert.ok(rec.versions.includes("1.21.1"));
     assert.ok(rec.os_list.includes("Linux x86_64"));
+
+    const githubCalls = state.calls.filter(c =>
+      c.url.startsWith("https://api.github.com/"));
+    for (const [method, suffix] of [
+      ["GET", "/labels/auto-crash"],
+      ["POST", "/labels"],
+      ["POST", "/issues"],
+      ["POST", "/issues/1/comments"],
+    ]) {
+      assert.ok(githubCalls.some(c => c.method === method &&
+        c.url.endsWith(suffix)), `${method} ${suffix} not called`);
+    }
+    for (const call of githubCalls) {
+      assert.equal(call.headers.authorization, "Bearer test-token", call.url);
+      assert.equal(call.headers.accept, "application/vnd.github+json", call.url);
+      assert.equal(call.headers["x-github-api-version"], "2022-11-28", call.url);
+      assert.equal(call.headers["user-agent"], "megu-site-functions", call.url);
+      if (call.method === "POST") {
+        assert.equal(call.headers["content-type"], "application/json", call.url);
+      }
+    }
   } finally {
     restore();
+  }
+});
+
+await test("onRequestPost returns redacted 502 on GitHub API errors", async () => {
+  for (const failure of [
+    { method: "GET", path: "/labels/auto-crash", status: 401 },
+    { method: "POST", path: "/labels", status: 500 },
+    { method: "POST", path: "/issues", status: 401 },
+    { method: "POST", path: "/issues", status: 500, kind: "idea" },
+    { method: "POST", path: "/issues", network: true },
+  ]) {
+    const kv = makeKv();
+    const state = { calls: [], issues: 0, comments: 0,
+      githubFailure: { ...failure, message: "test-token upstream failure" } };
+    const restore = mockFetch(state);
+    try {
+      const env = baseEnv(kv);
+      const payload = validPayload(failure.kind ? { kind: failure.kind } : {});
+      const res = await report.onRequestPost(postContext(payload, env));
+      assert.equal(res.status, 502, JSON.stringify(failure));
+      assert.equal(res.headers.get("content-type"),
+        "application/json; charset=utf-8");
+      const body = await res.text();
+      assert.deepEqual(JSON.parse(body), {
+        ok: false, error: "github issue creation failed",
+      });
+      assert.ok(!body.includes(env.GITHUB_TOKEN), "GitHub token leaked");
+      assert.equal(kv.map.size, 0, "failed issue must not be recorded");
+    } finally {
+      restore();
+    }
+  }
+});
+
+await test("onRequestPost keeps recorded counts on comment failure", async () => {
+  for (const network of [false, true]) {
+    const kv = makeKv();
+    const state = { calls: [], issues: 0, comments: 0 };
+    const restore = mockFetch(state);
+    try {
+      const env = baseEnv(kv);
+      const payload = validPayload();
+      const first = await report.onRequestPost(postContext(payload, env));
+      assert.equal(first.status, 200);
+      state.githubFailure = {
+        method: "POST", path: "/issues/1/comments", status: 500,
+        network, message: "test-token comment failure",
+      };
+      let res;
+      for (let i = 0; i < 4; i++) {
+        res = await report.onRequestPost(postContext(payload, env));
+      }
+      assert.equal(res.status, 200);
+      const j = await res.json();
+      assert.equal(j.ok, true);
+      assert.equal(j.duplicate, true);
+      assert.equal(j.issue_url, "https://github.com/o/r/issues/1");
+      assert.equal(j.fingerprint, "MEGU-E-1A2B3C4D");
+      assert.equal(j.total_reports, 5);
+      assert.equal(j.comment_posted, false);
+      assert.equal(JSON.parse(kv.map.get("report:fp:MEGU-E-1A2B3C4D")).count, 5);
+    } finally {
+      restore();
+    }
   }
 });
 

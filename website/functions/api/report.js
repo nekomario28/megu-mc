@@ -215,10 +215,9 @@ function githubHeaders(env) {
 }
 
 async function githubFetch(env, path, init) {
-  const res = await fetch(GITHUB_API + path, Object.assign({
-    headers: githubHeaders(env),
-  }, init || {}));
-  return res;
+  const opts = Object.assign({}, init || {});
+  opts.headers = Object.assign(githubHeaders(env), opts.headers || {});
+  return fetch(GITHUB_API + path, opts);
 }
 
 // Ensures a label exists so issue creation never 422s on a missing label.
@@ -226,7 +225,10 @@ async function ensureLabel(env, repo, name) {
   const res = await githubFetch(env,
     `/repos/${repo}/labels/${encodeURIComponent(name)}`);
   if (res.ok) return;
-  await githubFetch(env, `/repos/${repo}/labels`, {
+  if (res.status !== 404) {
+    throw new Error(`github label lookup failed: ${res.status}`);
+  }
+  const created = await githubFetch(env, `/repos/${repo}/labels`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -234,6 +236,9 @@ async function ensureLabel(env, repo, name) {
       color: name === "auto-crash" ? "b60205" : "fbca04",
     }),
   });
+  if (!created.ok) {
+    throw new Error(`github label creation failed: ${created.status}`);
+  }
 }
 
 async function createIssue(env, repo, report) {
@@ -248,8 +253,7 @@ async function createIssue(env, repo, report) {
     }),
   });
   if (!res.ok) {
-    const detail = await res.text().catch(() => "");
-    throw new Error(`github issue create failed: ${res.status} ${detail}`);
+    throw new Error(`github issue create failed: ${res.status}`);
   }
   return res.json();
 }
@@ -263,11 +267,12 @@ async function postMilestoneComment(env, repo, issueNumber, report, count) {
     `Report #${count}` +
     (report.fingerprint ? ` for \`${report.fingerprint}\`` : "") +
     ` — seen on ${seen.join(", ") || "unknown env"}.`;
-  await githubFetch(env, `/repos/${repo}/issues/${issueNumber}/comments`, {
+  const res = await githubFetch(env, `/repos/${repo}/issues/${issueNumber}/comments`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ body }),
   });
+  return res.ok;
 }
 
 // Small deterministic hash for bug reports that arrive without a
@@ -378,8 +383,14 @@ export async function onRequestPost(context) {
       record.os_list = osList;
       await env.CRASH_INDEX.put(kvKey, JSON.stringify(record));
 
+      let commentPosted = false;
       if (shouldPostMilestoneComment(count)) {
-        await postMilestoneComment(env, repo, record.issue_number, report, count);
+        try {
+          commentPosted = await postMilestoneComment(
+            env, repo, record.issue_number, report, count);
+        } catch (_) {
+          // The report count is already stored; a comment failure is optional.
+        }
       }
       return jsonResponse({
         ok: true,
@@ -387,11 +398,17 @@ export async function onRequestPost(context) {
         issue_url: record.issue_url,
         duplicate: true,
         total_reports: count,
+        comment_posted: commentPosted,
       });
     }
 
     // First sighting: file the issue, then seed the dedup record.
-    const issue = await createIssue(env, repo, report);
+    let issue;
+    try {
+      issue = await createIssue(env, repo, report);
+    } catch (_) {
+      return errorResponse(502, "github issue creation failed");
+    }
     await env.CRASH_INDEX.put(kvKey, JSON.stringify({
       count: 1,
       versions: [report.mc_version],
@@ -409,7 +426,12 @@ export async function onRequestPost(context) {
   }
 
   // --- Idea path: compact [Idea] issue, no dedup -------------------------
-  const issue = await createIssue(env, repo, report);
+  let issue;
+  try {
+    issue = await createIssue(env, repo, report);
+  } catch (_) {
+    return errorResponse(502, "github issue creation failed");
+  }
   return jsonResponse({
     ok: true,
     fingerprint: null,
