@@ -1,0 +1,1272 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+
+//! Optional **Vanilla+** pixel-consistent procedural 3D mesh upgrade.
+//!
+//! This module is **opt-in and default OFF**: [`VanillaPlus3dConfig::default`]
+//! has `enabled == false`, so nothing about the vanilla look changes unless the
+//! user explicitly turns the feature on. When enabled it procedurally upgrades
+//! flat 2D cross-plane blocks (crops, flowers, amethyst crystals, pointed
+//! dripstone, rails, ladders, chains, iron bars, torches, lanterns) and the
+//! celestial bodies (3D voxel Sun and 8-phase 3D voxel Moon) into low-quad 3D
+//! meshes that keep the unmistakable Minecraft pixel-art identity: every face
+//! is a flat texel-grid facet with axis-aligned or 45-degree geometry, never a
+//! smooth "realistic" shape.
+//!
+//! Three fail-safes keep the upgrade invisible when it should be:
+//!
+//! * **Resource-pack priority** — when a block model hint reports a custom 3D
+//!   resource-pack model and `respect_custom_resourcepack_models` is set
+//!   (default), [`vanilla_plus_decision`] returns
+//!   [`MeshUpgradeDecision::DeferToResourcePack`] so authored 3D packs always
+//!   win with zero conflicts.
+//! * **Distance LOD** — beyond `lod_cutoff_blocks` (default 24, clamped to
+//!   `8.0..=64.0`) the decision is
+//!   [`MeshUpgradeDecision::Use2dLodFallback`], so far-away chunks stay
+//!   zero-overhead flat cross planes and FPS stays rock-solid.
+//! * **Per-category toggles** — celestial, crops/flora, crystals, rails/ladders
+//!   and fixtures/chains are independently selectable; a disabled category
+//!   falls back to [`MeshUpgradeDecision::Use2dVanilla`].
+//!
+//! All geometry is emitted in block-local `0..=1` space with outward
+//! counterclockwise quads (the same winding convention as
+//! [`crate::model_baker::BakedModelQuad`]), unit normals and `0..=1` UVs, so
+//! the output can feed the same upload path as baked resource-pack models.
+//! Everything is pure `std`, deterministic, and reads no wall clock: the only
+//! "randomness" is a position hash used for sub-texel crop jitter.
+//!
+//! No Mojang or third-party geometry or texture data is referenced anywhere in
+//! this file: all shapes are generated from first principles and an optional
+//! caller-supplied 16x16 alpha mask (which works identically for vanilla and
+//! modded cross sprites).
+
+use std::f32::consts::{FRAC_1_SQRT_2, PI, SQRT_2};
+
+use crate::section::Direction;
+
+// ---------------------------------------------------------------------------
+// Limits and constants (fail-closed, shared spirit with model_baker)
+// ---------------------------------------------------------------------------
+
+/// One sprite texel in block units (`1/16`).
+pub const TEXEL: f32 = 1.0 / 16.0;
+
+/// Alpha value at or above which a sprite texel counts as solid. Matches the
+/// classic alpha-test threshold so cutout sprites extrude exactly the pixels
+/// the vanilla shader would draw.
+pub const ALPHA_CUTOFF: u8 = 128;
+
+/// Hard cap on quads emitted for one upgraded mesh. Natural bounds are far
+/// lower (a full 16x16 extrusion is 6 quads); the cap exists so a future
+/// caller cannot accidentally build an unbounded mesh.
+pub const MAX_UPGRADE_QUADS: usize = 4096;
+
+/// Default distance in blocks beyond which upgraded blocks fall back to the
+/// flat 2D model.
+pub const DEFAULT_LOD_CUTOFF_BLOCKS: f32 = 24.0;
+/// Smallest accepted LOD cutoff.
+pub const MIN_LOD_CUTOFF_BLOCKS: f32 = 8.0;
+/// Largest accepted LOD cutoff.
+pub const MAX_LOD_CUTOFF_BLOCKS: f32 = 64.0;
+
+/// Maximum absolute micro-offset applied to cross blades, in block units.
+const JITTER_AMP: f32 = 1.0 / 64.0;
+
+// ---------------------------------------------------------------------------
+// Configuration & decision
+// ---------------------------------------------------------------------------
+
+/// Feature category an upgraded block belongs to. Each maps to one opt-in
+/// toggle on [`VanillaPlus3dConfig`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VanillaPlusCategory {
+    /// 3D voxel Sun and 8-phase 3D voxel Moon.
+    Celestial3d,
+    /// Wheat/carrots/potatoes/beetroots/nether wart, flowers, saplings, tall
+    /// grass — and any modded `is_cross_model` block generically.
+    CropsAndFlora,
+    /// Amethyst cluster + buds, pointed dripstone, sea pickle, and crystal-like
+    /// modded sprites.
+    CrystalsAndClusters,
+    /// Rail, powered/detector/activator rail, ladder.
+    RailsAndLadders,
+    /// Chain, iron bars, torches, lanterns.
+    FixturesAndChains,
+}
+
+/// Per-user configuration for the Vanilla+ 3D upgrade. `Default` is fully
+/// vanilla: `enabled == false`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VanillaPlus3dConfig {
+    /// Master opt-in switch. **`false` by default** — the upgrade never
+    /// changes the vanilla look unless explicitly enabled.
+    pub enabled: bool,
+    /// Upgrade the Sun and Moon to voxel 3D bodies.
+    pub celestial_3d: bool,
+    /// Upgrade cross-plane crops, flowers, saplings and grass sprites.
+    pub crops_and_flora: bool,
+    /// Upgrade amethyst buds/clusters, pointed dripstone, sea pickles and
+    /// similar crystal sprites.
+    pub crystals_and_clusters: bool,
+    /// Upgrade rails and ladders.
+    pub rails_and_ladders: bool,
+    /// Upgrade chains, iron bars, torches and lanterns.
+    pub fixtures_and_chains: bool,
+    /// Distance in blocks beyond which the flat 2D model is used. Clamped to
+    /// `8.0..=64.0` when read via [`Self::effective_lod_cutoff`].
+    pub lod_cutoff_blocks: f32,
+    /// When `true` (default), blocks whose resource-pack stack already
+    /// provides a custom 3D model are left alone entirely.
+    pub respect_custom_resourcepack_models: bool,
+}
+
+impl Default for VanillaPlus3dConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            celestial_3d: true,
+            crops_and_flora: true,
+            crystals_and_clusters: true,
+            rails_and_ladders: true,
+            fixtures_and_chains: true,
+            lod_cutoff_blocks: DEFAULT_LOD_CUTOFF_BLOCKS,
+            respect_custom_resourcepack_models: true,
+        }
+    }
+}
+
+impl VanillaPlus3dConfig {
+    /// LOD cutoff clamped to `8.0..=64.0` blocks.
+    pub fn effective_lod_cutoff(&self) -> f32 {
+        self.lod_cutoff_blocks
+            .clamp(MIN_LOD_CUTOFF_BLOCKS, MAX_LOD_CUTOFF_BLOCKS)
+    }
+
+    /// Whether the per-category toggle for `category` is on.
+    pub fn category_enabled(&self, category: VanillaPlusCategory) -> bool {
+        match category {
+            VanillaPlusCategory::Celestial3d => self.celestial_3d,
+            VanillaPlusCategory::CropsAndFlora => self.crops_and_flora,
+            VanillaPlusCategory::CrystalsAndClusters => self.crystals_and_clusters,
+            VanillaPlusCategory::RailsAndLadders => self.rails_and_ladders,
+            VanillaPlusCategory::FixturesAndChains => self.fixtures_and_chains,
+        }
+    }
+}
+
+/// What the mesher should do for one block occurrence.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MeshUpgradeDecision {
+    /// Keep the vanilla flat model (feature off, unclassified block, or a
+    /// disabled category).
+    Use2dVanilla,
+    /// A custom 3D resource-pack model exists; defer to it untouched.
+    DeferToResourcePack,
+    /// Inside an upgrade-eligible category but beyond `lod_cutoff_blocks`:
+    /// keep the cheap 2D model for this far block.
+    Use2dLodFallback,
+    /// Build a procedural 3D upgrade mesh for the given category.
+    Upgrade3d(VanillaPlusCategory),
+}
+
+/// Caller-supplied facts about the resolved model for one block occurrence.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BlockModelHint {
+    /// The active resource-pack stack bakes a custom 3D model for this block.
+    pub has_custom_3d_resourcepack_model: bool,
+    /// The resolved model is a flat cross ("X" or "#" planes with no
+    /// thickness), i.e. the shape this upgrade knows how to thicken. Set for
+    /// modded blocks with no exact id match.
+    pub is_cross_model: bool,
+}
+
+/// Combines config, block identity and distance into a mesh decision.
+///
+/// Evaluation order: master switch -> resource-pack deference ->
+/// classification -> per-category toggle -> distance LOD.
+pub fn vanilla_plus_decision(
+    config: &VanillaPlus3dConfig,
+    block_id: &str,
+    hint: &BlockModelHint,
+    distance_blocks: f32,
+) -> MeshUpgradeDecision {
+    if !config.enabled {
+        return MeshUpgradeDecision::Use2dVanilla;
+    }
+    if config.respect_custom_resourcepack_models && hint.has_custom_3d_resourcepack_model {
+        return MeshUpgradeDecision::DeferToResourcePack;
+    }
+    let Some(category) = classify_vanilla_plus_block(block_id, hint.is_cross_model) else {
+        return MeshUpgradeDecision::Use2dVanilla;
+    };
+    if !config.category_enabled(category) {
+        return MeshUpgradeDecision::Use2dVanilla;
+    }
+    if distance_blocks > config.effective_lod_cutoff() {
+        return MeshUpgradeDecision::Use2dLodFallback;
+    }
+    MeshUpgradeDecision::Upgrade3d(category)
+}
+
+/// Classifies a block id into a Vanilla+ category.
+///
+/// `block_id` may be namespaced (`"minecraft:wheat"` or `"mymod:foo"`); only
+/// the path component is matched. Vanilla ids map to their category; a modded
+/// `is_cross_model` block with no exact or pattern match falls back
+/// generically to [`VanillaPlusCategory::CropsAndFlora`]. The strings `"sun"`
+/// and `"moon"` classify as [`VanillaPlusCategory::Celestial3d`].
+pub fn classify_vanilla_plus_block(
+    block_id: &str,
+    is_cross_model: bool,
+) -> Option<VanillaPlusCategory> {
+    use VanillaPlusCategory::*;
+    let id = block_id.rsplit(':').next().unwrap_or(block_id);
+
+    match id {
+        "sun" | "moon" => return Some(Celestial3d),
+        "rail" | "powered_rail" | "detector_rail" | "activator_rail" | "ladder" => {
+            return Some(RailsAndLadders)
+        }
+        "amethyst_cluster" | "small_amethyst_bud" | "medium_amethyst_bud"
+        | "large_amethyst_bud" | "pointed_dripstone" | "sea_pickle" => {
+            return Some(CrystalsAndClusters)
+        }
+        "chain" | "iron_bars" | "torch" | "soul_torch" | "redstone_torch" | "wall_torch"
+        | "soul_wall_torch" | "redstone_wall_torch" | "lantern" | "soul_lantern" => {
+            return Some(FixturesAndChains)
+        }
+        _ => {}
+    }
+
+    const CROPS: &[&str] = &[
+        "wheat",
+        "carrots",
+        "potatoes",
+        "beetroots",
+        "nether_wart",
+        "melon_stem",
+        "pumpkin_stem",
+        "attached_melon_stem",
+        "attached_pumpkin_stem",
+        "sweet_berry_bush",
+        "torchflower_crop",
+        "pitcher_crop",
+    ];
+    const FLORA: &[&str] = &[
+        "dandelion",
+        "poppy",
+        "blue_orchid",
+        "allium",
+        "azure_bluet",
+        "red_tulip",
+        "orange_tulip",
+        "white_tulip",
+        "pink_tulip",
+        "oxeye_daisy",
+        "cornflower",
+        "lily_of_the_valley",
+        "torchflower",
+        "pink_petals",
+        "wither_rose",
+        "sunflower",
+        "lilac",
+        "rose_bush",
+        "peony",
+        "pitcher_plant",
+        "grass",
+        "short_grass",
+        "tall_grass",
+        "fern",
+        "large_fern",
+        "dead_bush",
+        "crimson_fungus",
+        "warped_fungus",
+        "crimson_roots",
+        "warped_roots",
+        "nether_sprouts",
+        "brown_mushroom",
+        "red_mushroom",
+        "hanging_roots",
+        "spore_blossom",
+        "small_dripleaf",
+        "big_dripleaf",
+    ];
+
+    if CROPS.contains(&id)
+        || FLORA.contains(&id)
+        || id.ends_with("_sapling")
+        || id.ends_with("_stem")
+        || id.ends_with("_fungus")
+        || id.ends_with("_roots")
+    {
+        return Some(CropsAndFlora);
+    }
+    if id.contains("crystal") || id.ends_with("_cluster") || id.ends_with("_bud") {
+        return Some(CrystalsAndClusters);
+    }
+    if is_cross_model {
+        return Some(CropsAndFlora);
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Geometry primitives
+// ---------------------------------------------------------------------------
+
+/// One upgraded quad: four outward-counterclockwise vertex positions in
+/// block-local `0..=1` space, a unit outward normal, `0..=1` UVs, and an
+/// optional tint tag (`-1` = none; rails use `0`/`1` for unpowered/powered).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExtrudedQuad {
+    pub positions: [[f32; 3]; 4],
+    pub normal: [f32; 3],
+    pub uv: [[f32; 2]; 4],
+    pub tint_index: i32,
+}
+
+/// An upgraded mesh: a bounded list of [`ExtrudedQuad`]s.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ExtrudedMesh {
+    pub quads: Vec<ExtrudedQuad>,
+}
+
+impl ExtrudedMesh {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of emitted quads.
+    pub fn quad_count(&self) -> usize {
+        self.quads.len()
+    }
+
+    /// Push one quad, computing its normal from the winding. Degenerate
+    /// (zero-area) quads are dropped; emission stops at
+    /// [`MAX_UPGRADE_QUADS`].
+    fn push(&mut self, positions: [[f32; 3]; 4], uv: [[f32; 2]; 4], tint_index: i32) {
+        if self.quads.len() >= MAX_UPGRADE_QUADS {
+            return;
+        }
+        let Some(normal) = quad_normal(&positions) else {
+            return;
+        };
+        self.quads.push(ExtrudedQuad {
+            positions,
+            normal,
+            uv,
+            tint_index,
+        });
+    }
+
+    /// Append a copy of `other`'s quads (bounded by [`MAX_UPGRADE_QUADS`]).
+    pub fn append(&mut self, other: &ExtrudedMesh) {
+        for q in &other.quads {
+            if self.quads.len() >= MAX_UPGRADE_QUADS {
+                return;
+            }
+            self.quads.push(*q);
+        }
+    }
+
+    /// Translate the whole mesh by `off`.
+    pub fn translate(&mut self, off: [f32; 3]) {
+        for q in &mut self.quads {
+            for p in &mut q.positions {
+                p[0] += off[0];
+                p[1] += off[1];
+                p[2] += off[2];
+            }
+        }
+    }
+
+    /// Apply `p' = M * (p - pivot) + target` to positions and `n' = M * n`
+    /// (renormalized) to normals. `M` should be a rotation or a
+    /// rotation-times-uniform-scale product so winding and outwardness are
+    /// preserved.
+    pub fn affine(&mut self, m: [[f32; 3]; 3], pivot: [f32; 3], target: [f32; 3]) {
+        for q in &mut self.quads {
+            for p in &mut q.positions {
+                let u = [p[0] - pivot[0], p[1] - pivot[1], p[2] - pivot[2]];
+                *p = [
+                    target[0] + m[0][0] * u[0] + m[0][1] * u[1] + m[0][2] * u[2],
+                    target[1] + m[1][0] * u[0] + m[1][1] * u[1] + m[1][2] * u[2],
+                    target[2] + m[2][0] * u[0] + m[2][1] * u[1] + m[2][2] * u[2],
+                ];
+            }
+            let n = [
+                m[0][0] * q.normal[0] + m[0][1] * q.normal[1] + m[0][2] * q.normal[2],
+                m[1][0] * q.normal[0] + m[1][1] * q.normal[1] + m[1][2] * q.normal[2],
+                m[2][0] * q.normal[0] + m[2][1] * q.normal[1] + m[2][2] * q.normal[2],
+            ];
+            q.normal = normalize_or(n, q.normal);
+        }
+    }
+}
+
+fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn add_scaled(a: [f32; 3], u: [f32; 3], s: f32) -> [f32; 3] {
+    [a[0] + u[0] * s, a[1] + u[1] * s, a[2] + u[2] * s]
+}
+
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn norm(a: [f32; 3]) -> f32 {
+    dot(a, a).sqrt()
+}
+
+fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
+    norm(sub(a, b))
+}
+
+fn normalize_or(a: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
+    let l = norm(a);
+    if l > 1e-12 {
+        [a[0] / l, a[1] / l, a[2] / l]
+    } else {
+        fallback
+    }
+}
+
+/// Outward normal of a CCW-wound convex quad, or `None` when degenerate.
+fn quad_normal(p: &[[f32; 3]; 4]) -> Option<[f32; 3]> {
+    let n = cross(sub(p[1], p[0]), sub(p[2], p[0]));
+    let l = norm(n);
+    (l > 1e-12).then(|| [n[0] / l, n[1] / l, n[2] / l])
+}
+
+/// A beam/frustum between two rectangular cross-sections. `u*`/`v*` are the
+/// half-extent edge vectors of each end ring; `c1 - c0` is the beam axis.
+struct Frustum {
+    c0: [f32; 3],
+    c1: [f32; 3],
+    u0: [f32; 3],
+    v0: [f32; 3],
+    u1: [f32; 3],
+    v1: [f32; 3],
+}
+
+/// Emits one frustum: 4 side quads + 2 end caps, all outward-CCW. Equal end
+/// widths produce an ordinary (possibly sloped) box; shrunken ends produce a
+/// tapered pixel-art facet.
+fn emit_frustum(mesh: &mut ExtrudedMesh, f: &Frustum, tint_index: i32) {
+    const SIGNS: [(f32, f32); 4] = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
+    let axis = sub(f.c1, f.c0);
+    // Keep (u, v, axis) right-handed so the ring order below faces outward.
+    let flip = dot(cross(f.u0, f.v0), axis) < 0.0;
+    let neg = |v: [f32; 3]| [-v[0], -v[1], -v[2]];
+    let (u0, u1) = if flip { (neg(f.u0), neg(f.u1)) } else { (f.u0, f.u1) };
+
+    let ring = |c: [f32; 3], u: [f32; 3], v: [f32; 3]| -> [[f32; 3]; 4] {
+        let mut r = [[0.0; 3]; 4];
+        for (i, &(a, b)) in SIGNS.iter().enumerate() {
+            r[i] = add_scaled(add_scaled(c, u, a), v, b);
+        }
+        r
+    };
+    let r0 = ring(f.c0, u0, f.v0);
+    let r1 = ring(f.c1, u1, f.v1);
+    let len = dist(f.c0, f.c1).min(1.0);
+
+    for i in 0..4 {
+        let j = (i + 1) % 4;
+        let w = dist(r0[i], r0[j]).min(1.0);
+        mesh.push(
+            [r0[i], r0[j], r1[j], r1[i]],
+            [[0.0, 0.0], [w, 0.0], [w, len], [0.0, len]],
+            tint_index,
+        );
+    }
+    let w1a = dist(r1[0], r1[1]).min(1.0);
+    let w1b = dist(r1[1], r1[2]).min(1.0);
+    mesh.push(
+        [r1[0], r1[1], r1[2], r1[3]],
+        [[0.0, 0.0], [w1a, 0.0], [w1a, w1b], [0.0, w1b]],
+        tint_index,
+    );
+    let w0a = dist(r0[0], r0[1]).min(1.0);
+    let w0b = dist(r0[1], r0[2]).min(1.0);
+    mesh.push(
+        [r0[3], r0[2], r0[1], r0[0]],
+        [[0.0, 0.0], [w0a, 0.0], [w0a, w0b], [0.0, w0b]],
+        tint_index,
+    );
+}
+
+/// Emits an axis-aligned box (`from`/`to` corners), all six faces outward.
+fn push_box(mesh: &mut ExtrudedMesh, from: [f32; 3], to: [f32; 3], tint_index: i32) {
+    let cx = (from[0] + to[0]) * 0.5;
+    let cz = (from[2] + to[2]) * 0.5;
+    let (y0, y1) = (from[1].min(to[1]), from[1].max(to[1]));
+    let hx = (to[0] - from[0]).abs() * 0.5;
+    let hz = (to[2] - from[2]).abs() * 0.5;
+    emit_frustum(
+        mesh,
+        &Frustum {
+            c0: [cx, y0, cz],
+            c1: [cx, y1, cz],
+            u0: [hx, 0.0, 0.0],
+            v0: [0.0, 0.0, -hz],
+            u1: [hx, 0.0, 0.0],
+            v1: [0.0, 0.0, -hz],
+        },
+        tint_index,
+    );
+}
+
+/// Emits a tapered "pixel crystal" spike: a frustum from `base` along `dir`
+/// for `len` blocks, shrinking from width `w0` to `w1`.
+fn emit_spike(
+    mesh: &mut ExtrudedMesh,
+    base: [f32; 3],
+    dir: [f32; 3],
+    len: f32,
+    w0: f32,
+    w1: f32,
+    tint_index: i32,
+) {
+    let d = normalize_or(dir, [0.0, 1.0, 0.0]);
+    let seed = if d[2].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0] };
+    let u = normalize_or(cross(d, seed), [1.0, 0.0, 0.0]);
+    // u x v = d holds exactly for v = d x u with unit u perpendicular to d.
+    let v = normalize_or(cross(d, u), [0.0, 0.0, 1.0]);
+    // Tilted spikes have base rings that are not flush with the floor; lift
+    // the base just enough that no ring vertex dips below y = 0.
+    let lift = w0 * 0.5 * (u[1].abs() + v[1].abs());
+    let base = [base[0], base[1].max(lift), base[2]];
+    let s = |v: [f32; 3], k: f32| [v[0] * k, v[1] * k, v[2] * k];
+    emit_frustum(
+        mesh,
+        &Frustum {
+            c0: base,
+            c1: add_scaled(base, d, len),
+            u0: s(u, w0 * 0.5),
+            v0: s(v, w0 * 0.5),
+            u1: s(u, w1 * 0.5),
+            v1: s(v, w1 * 0.5),
+        },
+        tint_index,
+    );
+}
+
+/// Emits a horizontal beam with a rectangular cross-section (`w` across the
+/// track plane, `h` tall) between two points — used for rail bars and ties.
+fn emit_beam(
+    mesh: &mut ExtrudedMesh,
+    c0: [f32; 3],
+    c1: [f32; 3],
+    w: f32,
+    h: f32,
+    tint_index: i32,
+) {
+    let d = sub(c1, c0);
+    let perp = normalize_or(cross(d, [0.0, 1.0, 0.0]), [0.0, 0.0, 1.0]);
+    let s = |v: [f32; 3], k: f32| [v[0] * k, v[1] * k, v[2] * k];
+    emit_frustum(
+        mesh,
+        &Frustum {
+            c0,
+            c1,
+            u0: s(perp, w * 0.5),
+            v0: [0.0, h * 0.5, 0.0],
+            u1: s(perp, w * 0.5),
+            v1: [0.0, h * 0.5, 0.0],
+        },
+        tint_index,
+    );
+}
+
+/// `M * v` for `M = R_y(k * 90 degrees)` about the block centre column.
+fn yaw_matrix(quarter_turns: i32) -> [[f32; 3]; 3] {
+    match quarter_turns.rem_euclid(4) {
+        0 => [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        1 => [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]],
+        2 => [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]],
+        _ => [[0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
+    }
+}
+
+/// Rotate a mesh by `k` quarter turns about the block-centre vertical axis.
+fn yaw(mesh: &mut ExtrudedMesh, quarter_turns: i32) {
+    if quarter_turns.rem_euclid(4) == 0 {
+        return;
+    }
+    mesh.affine(
+        yaw_matrix(quarter_turns),
+        [0.5, 0.0, 0.5],
+        [0.5, 0.0, 0.5],
+    );
+}
+
+/// Rotation matrix mapping local up-space (`+Y` = growth direction, base at
+/// the `y = 0` face) onto the attachment direction of a wall/floor/ceiling
+/// fixture. Only 90-degree rotations, so facets stay axis-aligned.
+fn direction_rotation(dir: Direction) -> [[f32; 3]; 3] {
+    match dir {
+        Direction::Up => [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        Direction::Down => [[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]],
+        Direction::North => [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]],
+        Direction::South => [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
+        Direction::East => [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        Direction::West => [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+    }
+}
+
+/// Deterministic per-block micro-offset (in `+/- JITTER_AMP`) from an integer
+/// position hash — no RNG, no clock, stable across rebuilds.
+fn block_jitter(block: [i32; 3]) -> [f32; 2] {
+    let mut h = (block[0] as u32).wrapping_mul(0x8da6_b343)
+        ^ (block[1] as u32).wrapping_mul(0xd816_3841)
+        ^ (block[2] as u32).wrapping_mul(0xcb1a_b31f);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x9e37_79b9);
+    h ^= h >> 13;
+    let jx = ((h & 0xff) as f32 / 255.0 - 0.5) * 2.0 * JITTER_AMP;
+    let jz = (((h >> 8) & 0xff) as f32 / 255.0 - 0.5) * 2.0 * JITTER_AMP;
+    [jx, jz]
+}
+
+// ---------------------------------------------------------------------------
+// Generic texel-grid sprite extruder
+// ---------------------------------------------------------------------------
+
+/// Extrudes a `16x16` alpha/opacity mask (`alpha[y * 16 + x]`, row 0 = sprite
+/// top) into a plate `t` blocks thick lying in `z in [0, t]`.
+///
+/// Front and back faces are greedy-merged over the opaque mask; side rim
+/// quads are emitted only along opaque->transparent boundaries and merged
+/// into runs, so hidden interior faces never exist. A single opaque texel
+/// yields exactly 6 quads; a solid sprite yields exactly 6 quads. Works for
+/// any vanilla or modded sprite mask — no hand-authored JSON needed.
+///
+/// `t` is clamped to `0..=1`; `TEXEL` (one texel) is the pixel-consistent
+/// default thickness.
+pub fn extrude_alpha_mask_16x16(alpha: &[u8; 256], t: f32) -> ExtrudedMesh {
+    let mut mesh = ExtrudedMesh::new();
+    let t = t.clamp(0.0, 1.0);
+    if t <= 0.0 {
+        return mesh;
+    }
+    let opaque = |x: usize, y: usize| alpha[y * 16 + x] >= ALPHA_CUTOFF;
+
+    // Greedy-merge opaque rectangles; emit front + back faces per rectangle.
+    let mut done = [false; 256];
+    for ty in 0..16 {
+        for tx in 0..16 {
+            if !opaque(tx, ty) || done[ty * 16 + tx] {
+                continue;
+            }
+            let mut w = 1usize;
+            while tx + w < 16 && opaque(tx + w, ty) && !done[ty * 16 + tx + w] {
+                w += 1;
+            }
+            let mut h = 1usize;
+            'grow: while ty + h < 16 {
+                for xx in tx..tx + w {
+                    if !opaque(xx, ty + h) || done[(ty + h) * 16 + xx] {
+                        break 'grow;
+                    }
+                }
+                h += 1;
+            }
+            for yy in ty..ty + h {
+                for xx in tx..tx + w {
+                    done[yy * 16 + xx] = true;
+                }
+            }
+            let x0 = tx as f32 * TEXEL;
+            let x1 = (tx + w) as f32 * TEXEL;
+            let y_hi = 1.0 - ty as f32 * TEXEL;
+            let y_lo = 1.0 - (ty + h) as f32 * TEXEL;
+            let (u0, u1) = (x0, x1);
+            let (v0, v1) = (ty as f32 * TEXEL, (ty + h) as f32 * TEXEL);
+            // Front (z = 0, normal -Z); UVs mirrored like vanilla's far side.
+            mesh.push(
+                [
+                    [x0, y_lo, 0.0],
+                    [x0, y_hi, 0.0],
+                    [x1, y_hi, 0.0],
+                    [x1, y_lo, 0.0],
+                ],
+                [[u0, v1], [u0, v0], [u1, v0], [u1, v1]],
+                -1,
+            );
+            // Back (z = t, normal +Z).
+            mesh.push(
+                [
+                    [x0, y_lo, t],
+                    [x1, y_lo, t],
+                    [x1, y_hi, t],
+                    [x0, y_hi, t],
+                ],
+                [[u0, v1], [u1, v1], [u1, v0], [u0, v0]],
+                -1,
+            );
+        }
+    }
+
+    // Vertical rims: per column, runs of cells whose left/right neighbour is
+    // transparent merge into one quad each.
+    for tx in 0..16 {
+        for &left_side in &[true, false] {
+            let mut run: Option<usize> = None;
+            for ty in 0..=16 {
+                let edge = ty < 16
+                    && opaque(tx, ty)
+                    && if left_side {
+                        tx == 0 || !opaque(tx - 1, ty)
+                    } else {
+                        tx == 15 || !opaque(tx + 1, ty)
+                    };
+                match (edge, run) {
+                    (true, None) => run = Some(ty),
+                    (false, Some(start)) => {
+                        let x_e = if left_side {
+                            tx as f32 * TEXEL
+                        } else {
+                            (tx + 1) as f32 * TEXEL
+                        };
+                        let y_hi = 1.0 - start as f32 * TEXEL;
+                        let y_lo = 1.0 - ty as f32 * TEXEL;
+                        let (v0, v1) = (start as f32 * TEXEL, ty as f32 * TEXEL);
+                        let quad = if left_side {
+                            [
+                                [x_e, y_lo, t],
+                                [x_e, y_hi, t],
+                                [x_e, y_hi, 0.0],
+                                [x_e, y_lo, 0.0],
+                            ]
+                        } else {
+                            [
+                                [x_e, y_lo, 0.0],
+                                [x_e, y_hi, 0.0],
+                                [x_e, y_hi, t],
+                                [x_e, y_lo, t],
+                            ]
+                        };
+                        mesh.push(quad, [[0.0, v1], [0.0, v0], [t, v0], [t, v1]], -1);
+                        run = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Horizontal rims: per row, runs of cells whose top/bottom neighbour is
+    // transparent merge into one quad each.
+    for ty in 0..16 {
+        for &top_side in &[true, false] {
+            let mut run: Option<usize> = None;
+            for tx in 0..=16 {
+                let edge = tx < 16
+                    && opaque(tx, ty)
+                    && if top_side {
+                        ty == 0 || !opaque(tx, ty - 1)
+                    } else {
+                        ty == 15 || !opaque(tx, ty + 1)
+                    };
+                match (edge, run) {
+                    (true, None) => run = Some(tx),
+                    (false, Some(start)) => {
+                        let y_e = if top_side {
+                            1.0 - ty as f32 * TEXEL
+                        } else {
+                            1.0 - (ty + 1) as f32 * TEXEL
+                        };
+                        let x0 = start as f32 * TEXEL;
+                        let x1 = tx as f32 * TEXEL;
+                        let quad = if top_side {
+                            [
+                                [x0, y_e, 0.0],
+                                [x0, y_e, t],
+                                [x1, y_e, t],
+                                [x1, y_e, 0.0],
+                            ]
+                        } else {
+                            [
+                                [x0, y_e, 0.0],
+                                [x1, y_e, 0.0],
+                                [x1, y_e, t],
+                                [x0, y_e, t],
+                            ]
+                        };
+                        mesh.push(
+                            quad,
+                            [[x0, 0.0], [x0, t], [x1, t], [x1, 0.0]],
+                            -1,
+                        );
+                        run = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    mesh
+}
+
+// ---------------------------------------------------------------------------
+// Cross-plane crops / flora
+// ---------------------------------------------------------------------------
+
+/// Blade arrangement for a cross-plane plant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrossLayout {
+    /// Two intersecting diagonal blades (45 degrees / 135 degrees), the
+    /// classic flower/grass cross.
+    Diagonal,
+    /// Four axis-parallel blades in a `#` grid, the classic wheat/carrot
+    /// crop field layout.
+    HashGrid,
+}
+
+/// Builds a 3D cross mesh from any `16x16` sprite alpha mask: the mask is
+/// extruded one texel thick and arranged into blades per `layout`, with a
+/// deterministic sub-texel offset derived from `block` so neighbouring plants
+/// do not z-fight identically. All geometry stays strictly inside `0..=1`.
+pub fn build_3d_cross_mesh(
+    alpha: &[u8; 256],
+    layout: CrossLayout,
+    block: [i32; 3],
+) -> ExtrudedMesh {
+    let sprite = extrude_alpha_mask_16x16(alpha, TEXEL);
+    let mut mesh = ExtrudedMesh::new();
+    let [jx, jz] = block_jitter(block);
+    match layout {
+        CrossLayout::Diagonal => {
+            let c = FRAC_1_SQRT_2;
+            // Blade length chosen so rotated corners plus the jitter margin
+            // still land strictly inside the block.
+            let s = 2.0 * SQRT_2 * (0.5 - JITTER_AMP - 0.01) - TEXEL;
+            for &sgn in &[1.0f32, -1.0] {
+                let m = [
+                    [s * c, 0.0, sgn * c],
+                    [0.0, 1.0, 0.0],
+                    [-sgn * s * c, 0.0, c],
+                ];
+                let mut blade = sprite.clone();
+                blade.affine(m, [0.5, 0.0, TEXEL * 0.5], [0.5 + jx, 0.0, 0.5 + jz]);
+                mesh.append(&blade);
+            }
+        }
+        CrossLayout::HashGrid => {
+            let d = 1.0 / 6.0;
+            // Blades span slightly less than the full block so the jitter
+            // shift can never push a vertex outside `0..=1`.
+            let s = 1.0 - 2.0 * JITTER_AMP - 0.02;
+            let rot90_scaled = [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-s, 0.0, 0.0]];
+            for &sgn in &[1.0f32, -1.0] {
+                let mut a = sprite.clone();
+                a.affine(
+                    [[s, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                    [0.5, 0.0, TEXEL * 0.5],
+                    [0.5 + jx, 0.0, 0.5 + sgn * d + jz],
+                );
+                mesh.append(&a);
+                let mut b = sprite.clone();
+                b.affine(
+                    rot90_scaled,
+                    [0.5, 0.0, TEXEL * 0.5],
+                    [0.5 + sgn * d + jx, 0.0, 0.5 + jz],
+                );
+                mesh.append(&b);
+            }
+        }
+    }
+    mesh
+}
+
+// ---------------------------------------------------------------------------
+// Crystals: amethyst buds / clusters, dripstone, sea pickles
+// ---------------------------------------------------------------------------
+
+/// Growth stage of a crystal formation; scales height, width and spike count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrystalStage {
+    SmallBud,
+    MediumBud,
+    LargeBud,
+    Cluster,
+}
+
+/// Builds a stepped pixel-art crystal prism cluster whose base sits on the
+/// face opposite `facing` and points along `facing` (matching the attachment
+/// convention of buds/dripstone). Facets are flat, axis-aligned or 45-ish
+/// degree surfaces — blocky, never smooth.
+pub fn build_3d_crystal_mesh(stage: CrystalStage, facing: Direction) -> ExtrudedMesh {
+    let mut mesh = ExtrudedMesh::new();
+    let centre = [0.5, 0.0, 0.5];
+    match stage {
+        CrystalStage::SmallBud => emit_spike(&mut mesh, centre, [0.0, 1.0, 0.0], 0.22, 0.20, 0.06, -1),
+        CrystalStage::MediumBud => {
+            emit_spike(&mut mesh, centre, [0.0, 1.0, 0.0], 0.34, 0.26, 0.08, -1)
+        }
+        CrystalStage::LargeBud => {
+            emit_spike(&mut mesh, centre, [0.0, 1.0, 0.0], 0.48, 0.34, 0.10, -1)
+        }
+        CrystalStage::Cluster => {
+            emit_spike(&mut mesh, centre, [0.0, 1.0, 0.0], 0.80, 0.42, 0.14, -1);
+            // Four shorter tilted side spikes — the iconic cluster silhouette.
+            for &(sx, sz) in &[(1.0f32, 0.0f32), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+                emit_spike(
+                    &mut mesh,
+                    [0.5 + sx * 0.13, 0.0, 0.5 + sz * 0.13],
+                    [sx * 0.55, 1.0, sz * 0.55],
+                    0.40,
+                    0.18,
+                    0.05,
+                    -1,
+                );
+            }
+        }
+    }
+    if facing != Direction::Up {
+        mesh.affine(direction_rotation(facing), [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]);
+    }
+    mesh
+}
+
+// ---------------------------------------------------------------------------
+// Rails & ladders
+// ---------------------------------------------------------------------------
+
+/// Vanilla rail shapes the 3D upgrade knows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RailShape {
+    NorthSouth,
+    EastWest,
+    AscendingNorth,
+    AscendingSouth,
+    AscendingEast,
+    AscendingWest,
+    CurveSouthEast,
+    CurveSouthWest,
+    CurveNorthWest,
+    CurveNorthEast,
+}
+
+const RAIL_GAUGE: f32 = 0.21875;
+const RAIL_BAR_W: f32 = 0.125;
+const RAIL_BAR_H: f32 = 0.125;
+const RAIL_BAR_Y: f32 = 0.10;
+const RAIL_TIE_W: f32 = 0.15;
+const RAIL_TIE_H: f32 = 0.07;
+const RAIL_TIE_Y: f32 = 0.035;
+
+/// Straight east-west track: two raised bars plus five sleepers.
+fn rail_straight_ew(mesh: &mut ExtrudedMesh, tint: i32) {
+    for &sgn in &[1.0f32, -1.0] {
+        let z = 0.5 + sgn * RAIL_GAUGE;
+        emit_beam(mesh, [0.01, RAIL_BAR_Y, z], [0.99, RAIL_BAR_Y, z], RAIL_BAR_W, RAIL_BAR_H, tint);
+    }
+    for i in 0..5 {
+        let x = 0.10 + i as f32 * 0.20;
+        emit_beam(
+            mesh,
+            [x, RAIL_TIE_Y, 0.06],
+            [x, RAIL_TIE_Y, 0.94],
+            RAIL_TIE_W,
+            RAIL_TIE_H,
+            -1,
+        );
+    }
+}
+
+/// Ascending track rising toward +X; stepped sleepers keep it pixel-art.
+fn rail_ascending_east(mesh: &mut ExtrudedMesh, tint: i32) {
+    for &sgn in &[1.0f32, -1.0] {
+        let z = 0.5 + sgn * RAIL_GAUGE;
+        emit_beam(mesh, [0.01, 0.12, z], [0.99, 0.92, z], RAIL_BAR_W, RAIL_BAR_H, tint);
+    }
+    for i in 0..6 {
+        let x = 0.08 + i as f32 * 0.164;
+        let y = RAIL_TIE_Y + x * 0.82;
+        emit_beam(mesh, [x, y, 0.10], [x, y, 0.90], RAIL_TIE_W, RAIL_TIE_H, -1);
+    }
+}
+
+/// 90-degree bend joining the south edge midpoint to the east edge midpoint:
+/// each rail is a straight segment, a 45-degree chord, then another straight.
+fn rail_curve_se(mesh: &mut ExtrudedMesh, tint: i32) {
+    let (inner, outer) = (0.5 - RAIL_GAUGE, 0.5 + RAIL_GAUGE);
+    // Inner rail hugs the block centre.
+    emit_beam(mesh, [inner, RAIL_BAR_Y, 0.99], [inner, RAIL_BAR_Y, 0.60], RAIL_BAR_W, RAIL_BAR_H, tint);
+    emit_beam(mesh, [inner, RAIL_BAR_Y, 0.60], [0.60, RAIL_BAR_Y, inner], RAIL_BAR_W, RAIL_BAR_H, tint);
+    emit_beam(mesh, [0.60, RAIL_BAR_Y, inner], [0.99, RAIL_BAR_Y, inner], RAIL_BAR_W, RAIL_BAR_H, tint);
+    // Outer rail bends wider.
+    emit_beam(mesh, [outer, RAIL_BAR_Y, 0.99], [outer, RAIL_BAR_Y, 0.40], RAIL_BAR_W, RAIL_BAR_H, tint);
+    emit_beam(mesh, [outer, RAIL_BAR_Y, 0.40], [0.40, RAIL_BAR_Y, outer], RAIL_BAR_W, RAIL_BAR_H, tint);
+    emit_beam(mesh, [0.40, RAIL_BAR_Y, outer], [0.99, RAIL_BAR_Y, outer], RAIL_BAR_W, RAIL_BAR_H, tint);
+    // Ties: one per straight leg plus a diagonal tie under the bend.
+    emit_beam(mesh, [0.15, RAIL_TIE_Y, 0.86], [0.86, RAIL_TIE_Y, 0.86], RAIL_TIE_W, RAIL_TIE_H, -1);
+    emit_beam(mesh, [0.86, RAIL_TIE_Y, 0.15], [0.86, RAIL_TIE_Y, 0.86], RAIL_TIE_W, RAIL_TIE_H, -1);
+    emit_beam(mesh, [0.30, RAIL_TIE_Y, 0.30], [0.70, RAIL_TIE_Y, 0.70], RAIL_TIE_W, RAIL_TIE_H, -1);
+}
+
+/// Builds a raised-bar 3D rail (metal bars tinted `1` when `powered`,
+/// wooden sleepers untinted) for `shape`.
+pub fn build_3d_rail_mesh(shape: RailShape, powered: bool) -> ExtrudedMesh {
+    let tint = i32::from(powered);
+    let mut mesh = ExtrudedMesh::new();
+    let turns = match shape {
+        RailShape::EastWest => {
+            rail_straight_ew(&mut mesh, tint);
+            0
+        }
+        RailShape::NorthSouth => {
+            rail_straight_ew(&mut mesh, tint);
+            1
+        }
+        RailShape::AscendingEast => {
+            rail_ascending_east(&mut mesh, tint);
+            0
+        }
+        RailShape::AscendingNorth => {
+            rail_ascending_east(&mut mesh, tint);
+            1
+        }
+        RailShape::AscendingWest => {
+            rail_ascending_east(&mut mesh, tint);
+            2
+        }
+        RailShape::AscendingSouth => {
+            rail_ascending_east(&mut mesh, tint);
+            3
+        }
+        RailShape::CurveSouthEast => {
+            rail_curve_se(&mut mesh, tint);
+            0
+        }
+        RailShape::CurveNorthEast => {
+            rail_curve_se(&mut mesh, tint);
+            1
+        }
+        RailShape::CurveNorthWest => {
+            rail_curve_se(&mut mesh, tint);
+            2
+        }
+        RailShape::CurveSouthWest => {
+            rail_curve_se(&mut mesh, tint);
+            3
+        }
+    };
+    yaw(&mut mesh, turns);
+    mesh
+}
+
+/// Builds a 3D ladder: two stiles plus four rungs as a thin plate against the
+/// `facing` side of the block (`North` -> plate near `z = 0`, and so on).
+/// `Up`/`Down` are not valid wall facings and fall back to `North`/`South`.
+pub fn build_3d_ladder_mesh(facing: Direction) -> ExtrudedMesh {
+    let mut mesh = ExtrudedMesh::new();
+    let depth = TEXEL;
+    // Stiles.
+    push_box(&mut mesh, [0.09, 0.0, 0.0], [0.19, 1.0, depth], -1);
+    push_box(&mut mesh, [0.81, 0.0, 0.0], [0.91, 1.0, depth], -1);
+    // Rungs.
+    for i in 0..4 {
+        let y0 = 0.11 + i as f32 * 0.25;
+        push_box(&mut mesh, [0.19, y0, 0.0], [0.81, y0 + 0.07, depth * 0.8], -1);
+    }
+    let turns = match facing {
+        Direction::East => 3,
+        Direction::South => 2,
+        Direction::West => 1,
+        _ => 0,
+    };
+    yaw(&mut mesh, turns);
+    mesh
+}
+
+// ---------------------------------------------------------------------------
+// Fixtures: chains, iron bars, torches, lanterns
+// ---------------------------------------------------------------------------
+
+/// Fixture shapes covered by the `fixtures_and_chains` toggle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FixtureKind {
+    Chain,
+    IronBars,
+    Torch,
+    Lantern,
+}
+
+/// Builds a generic 3D fixture centred in the block. Wall-mounted variants
+/// are produced by the caller yawing/orienting the returned mesh.
+pub fn build_3d_fixture_mesh(kind: FixtureKind) -> ExtrudedMesh {
+    let mut mesh = ExtrudedMesh::new();
+    match kind {
+        FixtureKind::Chain => {
+            // Central link column plus three alternating cross plates.
+            push_box(&mut mesh, [0.44, 0.0, 0.44], [0.56, 1.0, 0.56], -1);
+            for (i, &along_x) in [true, false, true].iter().enumerate() {
+                let y0 = 0.17 + i as f32 * 0.33;
+                if along_x {
+                    push_box(&mut mesh, [0.31, y0, 0.44], [0.69, y0 + 0.07, 0.56], -1);
+                } else {
+                    push_box(&mut mesh, [0.44, y0, 0.31], [0.56, y0 + 0.07, 0.69], -1);
+                }
+            }
+        }
+        FixtureKind::IronBars => {
+            // Pane: two horizontal cross bars plus four vertical posts.
+            push_box(&mut mesh, [0.0, 0.30, 0.47], [1.0, 0.40, 0.53], -1);
+            push_box(&mut mesh, [0.0, 0.70, 0.47], [1.0, 0.80, 0.53], -1);
+            push_box(&mut mesh, [0.47, 0.30, 0.0], [0.53, 0.40, 1.0], -1);
+            push_box(&mut mesh, [0.47, 0.70, 0.0], [0.53, 0.80, 1.0], -1);
+            for &(px, pz) in &[(0.22f32, 0.5f32), (0.78, 0.5), (0.5, 0.22), (0.5, 0.78)] {
+                push_box(
+                    &mut mesh,
+                    [px - 0.03, 0.0, pz - 0.03],
+                    [px + 0.03, 1.0, pz + 0.03],
+                    -1,
+                );
+            }
+        }
+        FixtureKind::Torch => {
+            // Handle plus a slightly wider flame head.
+            push_box(&mut mesh, [0.44, 0.0, 0.44], [0.56, 0.62, 0.56], -1);
+            push_box(&mut mesh, [0.37, 0.62, 0.37], [0.63, 0.76, 0.63], 0);
+        }
+        FixtureKind::Lantern => {
+            push_box(&mut mesh, [0.34, 0.0, 0.34], [0.66, 0.09, 0.66], -1);
+            push_box(&mut mesh, [0.37, 0.09, 0.37], [0.63, 0.50, 0.63], -1);
+            push_box(&mut mesh, [0.34, 0.50, 0.34], [0.66, 0.60, 0.66], -1);
+            // Hanging ring: two side bars and a top bar.
+            push_box(&mut mesh, [0.41, 0.60, 0.47], [0.47, 0.78, 0.53], -1);
+            push_box(&mut mesh, [0.53, 0.60, 0.47], [0.59, 0.78, 0.53], -1);
+            push_box(&mut mesh, [0.41, 0.78, 0.47], [0.59, 0.84, 0.53], -1);
+        }
+    }
+    mesh
+}
+
+// ---------------------------------------------------------------------------
+// Celestial: 3D voxel Sun and 8-phase Moon
+// ---------------------------------------------------------------------------
+
+/// Builds the voxel Sun in a `0..=1` sky-space cube centred on `(0.5, 0.5,
+/// 0.5)`: a cubic core plus stepped square corona plates on all six axes.
+/// Deliberately square and layered — unmistakably Minecraft, never a smooth
+/// sphere.
+pub fn build_3d_sun_mesh() -> ExtrudedMesh {
+    let mut mesh = ExtrudedMesh::new();
+    push_box(&mut mesh, [0.24, 0.24, 0.24], [0.76, 0.76, 0.76], -1);
+    // (centre offset from block centre, plate size, plate thickness)
+    const CORONA: [(f32, f32, f32); 3] = [
+        (0.28, 0.62, 0.09),
+        (0.38, 0.40, 0.09),
+        (0.455, 0.20, 0.07),
+    ];
+    for dir in Direction::ALL {
+        let axis = match dir {
+            Direction::Down => [0.0, -1.0, 0.0],
+            Direction::Up => [0.0, 1.0, 0.0],
+            Direction::North => [0.0, 0.0, -1.0],
+            Direction::South => [0.0, 0.0, 1.0],
+            Direction::West => [-1.0, 0.0, 0.0],
+            Direction::East => [1.0, 0.0, 0.0],
+        };
+        for &(off, size, thick) in &CORONA {
+            let c = [
+                0.5 + axis[0] * off,
+                0.5 + axis[1] * off,
+                0.5 + axis[2] * off,
+            ];
+            let (hx, hy, hz) = (
+                if axis[0] != 0.0 { thick } else { size } * 0.5,
+                if axis[1] != 0.0 { thick } else { size } * 0.5,
+                if axis[2] != 0.0 { thick } else { size } * 0.5,
+            );
+            push_box(
+                &mut mesh,
+                [c[0] - hx, c[1] - hy, c[2] - hz],
+                [c[0] + hx, c[1] + hy, c[2] + hz],
+                -1,
+            );
+        }
+    }
+    mesh
+}
+
+/// The `16x16` alpha mask of the Moon's disc (radius 7.5 texels), shared by
+/// every phase so the silhouette never wobbles.
+pub fn moon_disc_mask() -> [u8; 256] {
+    let mut mask = [0u8; 256];
+    for y in 0..16 {
+        for x in 0..16 {
+            let nx = (x as f32 + 0.5 - 8.0) / 7.5;
+            let ny = (y as f32 + 0.5 - 8.0) / 7.5;
+            if nx * nx + ny * ny <= 1.0 {
+                mask[y * 16 + x] = 255;
+            }
+        }
+    }
+    mask
+}
+
+/// The `16x16` lit mask for lunar `phase` (`0..=7`: full, waning gibbous,
+/// third quarter, waning crescent, new, waxing crescent, first quarter,
+/// waxing gibbous — the vanilla order). The terminator follows an elliptical
+/// arc, so gibbous and crescent silhouettes read correctly.
+pub fn moon_lit_mask(phase: u8) -> [u8; 256] {
+    let mut mask = [0u8; 256];
+    let p = phase & 7;
+    let c = (PI * p as f32 / 4.0).cos();
+    for y in 0..16 {
+        for x in 0..16 {
+            let nx = (x as f32 + 0.5 - 8.0) / 7.5;
+            let ny = (y as f32 + 0.5 - 8.0) / 7.5;
+            if nx * nx + ny * ny > 1.0 {
+                continue;
+            }
+            let s = (1.0 - ny * ny).max(0.0).sqrt();
+            let lit = match p {
+                0 => true,
+                4 => false,
+                1..=3 => nx <= c * s - 0.001,
+                _ => nx >= -c * s + 0.001,
+            };
+            if lit {
+                mask[y * 16 + x] = 255;
+            }
+        }
+    }
+    mask
+}
+
+/// Fraction of the lunar disc lit in `phase`, in `0.0..=1.0`.
+pub fn moon_lit_fraction(phase: u8) -> f32 {
+    let lit = moon_lit_mask(phase).iter().filter(|&&a| a >= ALPHA_CUTOFF).count();
+    let disc = moon_disc_mask().iter().filter(|&&a| a >= ALPHA_CUTOFF).count();
+    if disc == 0 {
+        0.0
+    } else {
+        lit as f32 / disc as f32
+    }
+}
+
+/// Builds the 3D voxel Moon for `phase` (`0..=7`, vanilla order): a thin
+/// extruded disc whose sunlit texels stand in raised relief over the
+/// shadowed base — the phases read as real geometry, not a texture swap.
+pub fn build_3d_moon_mesh(phase: u8) -> ExtrudedMesh {
+    let mut mesh = extrude_alpha_mask_16x16(&moon_disc_mask(), TEXEL);
+    let mut lit = extrude_alpha_mask_16x16(&moon_lit_mask(phase), TEXEL * 0.5);
+    lit.translate([0.0, 0.0, TEXEL]);
+    mesh.append(&lit);
+    mesh
+}
