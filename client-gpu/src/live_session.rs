@@ -1276,12 +1276,13 @@ impl LiveSession {
             }
             PlayEvent::ContainerSetSlot {
                 window_id,
+                state_id,
                 slot,
                 raw_item,
-                ..
             } => {
                 if let Some(screen) = &mut self.open_screen {
                     if screen.window_id == i32::from(window_id) {
+                        screen.state_id = state_id;
                         match decode_item_stack_components(&raw_item) {
                             Ok((stack, _)) => {
                                 if slot < 0 {

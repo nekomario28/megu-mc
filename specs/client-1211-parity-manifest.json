@@ -2441,7 +2441,7 @@
       "category": "physics_and_input",
       "description": "Sneak edge-prevent: back off from block edges while sneaking.",
       "kernel_file": "client-kernel/src/player_physics.rs",
-      "kernel_symbol": "back_off_from_edge",
+      "kernel_symbol": "step_player_physics",
       "live_consumers": [
         "client-app/src/sim.rs",
         "client-gpu/src/live_session.rs",

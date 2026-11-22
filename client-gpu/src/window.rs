@@ -13,6 +13,10 @@ use mc_spine_kernel::debug_chords::{
     finish_gamemode_switcher, handle_f3_chord, DebugChordAction, DebugChordContext,
     DebugChordState, DebugTarget, F3Chord, PlayerDebugInfo,
 };
+use mc_spine_client::protocol::encode_slot_stack;
+use mc_spine_ui::container_screen::{
+    menu_schema, ContainerScreenState, DragState, UiItemStack,
+};
 use mc_spine_ui::draw::rasterize_draw_list;
 use mc_spine_ui::magic_hud::build_magic_hud_draw_list;
 use mc_spine_ui::state::{
@@ -444,6 +448,8 @@ pub struct GpuApp {
     paused: bool,
     show_diagnostics: bool,
     mouse_pos: (i32, i32),
+    left_mouse_held: bool,
+    container_screen: Option<ContainerScreenState>,
     ui: UiState,
     ui_cache: UiUploadCache,
     render_config: RenderConfig,
@@ -506,6 +512,8 @@ impl GpuApp {
             paused: false,
             show_diagnostics: false,
             mouse_pos: (0, 0),
+            left_mouse_held: false,
+            container_screen: None,
             ui,
             ui_cache: UiUploadCache::default(),
             render_config,
@@ -681,6 +689,217 @@ impl GpuApp {
         Ok(())
     }
 
+    /// Mirror the live session's server-driven `open_screen` into a
+    /// `ContainerScreenState`: the schema comes from `menu_schema` (all 25
+    /// vanilla `0x33` menus), slots/carried refresh when `state_id` bumps,
+    /// and the pointer is released while a screen is up (vanilla mouse
+    /// behavior).
+    fn sync_container_screen(&mut self) {
+        // Phase 1: resolve the schema + snapshot the shared state under an
+        // immutable borrow of `self.live`.
+        struct Snapshot {
+            schema: &'static mc_spine_ui::container_screen::MenuScreenSchema,
+            window_id: u8,
+            state_id: i32,
+        }
+        let snap = self
+            .live
+            .as_ref()
+            .and_then(|live| live.open_screen.as_ref())
+            .and_then(|open| {
+                let schema = open.menu_type.try_into().ok().and_then(menu_schema)?;
+                let window_id = u8::try_from(open.window_id).ok()?;
+                Some(Snapshot {
+                    schema,
+                    window_id,
+                    state_id: open.state_id,
+                })
+            });
+        // Phase 2: mutate `self.container_screen` / grab state freely.
+        match snap {
+            Some(Snapshot {
+                schema,
+                window_id,
+                state_id,
+            }) => {
+                let opened_now = !matches!(
+                    &self.container_screen,
+                    Some(screen) if screen.window_id == window_id
+                );
+                if opened_now {
+                    self.container_screen = Some(ContainerScreenState::new(
+                        schema,
+                        window_id,
+                        state_id,
+                        "container",
+                    ));
+                    self.set_cursor_grab(false);
+                }
+                let screen = self.container_screen.as_mut().unwrap();
+                if opened_now || screen.state_id != state_id {
+                    screen.state_id = state_id;
+                    if let Some(open) = self
+                        .live
+                        .as_ref()
+                        .and_then(|live| live.open_screen.as_ref())
+                    {
+                        for (index, stack) in &open.slots {
+                            if let Ok(index) = usize::try_from(*index) {
+                                screen.set_slot(
+                                    index,
+                                    UiItemStack::new(
+                                        stack.item_id.max(0) as u32,
+                                        stack.count.clamp(0, 255) as u8,
+                                    ),
+                                );
+                            }
+                        }
+                        screen.set_cursor(open.carried.as_ref().map(|carried| {
+                            UiItemStack::new(
+                                carried.item_id.max(0) as u32,
+                                carried.count.clamp(0, 255) as u8,
+                            )
+                        }));
+                    }
+                }
+            }
+            None => {
+                if self.container_screen.take().is_some()
+                    && self.live.is_some()
+                    && !self.paused
+                    && self.focused
+                {
+                    self.set_cursor_grab(true);
+                }
+            }
+        }
+    }
+
+    /// Forward one UI click action as the matching `container_click` /
+    /// `container_button_click` serverbound packet on the worker.
+    fn forward_click_action(
+        live: &mut LiveSession,
+        action: mc_spine_ui::container_screen::ClickWindowAction,
+    ) {
+        let changed: Vec<(i16, Vec<u8>)> = action
+            .changed_slots
+            .iter()
+            .map(|change| {
+                (
+                    change.slot,
+                    encode_slot_stack(change.stack.item_id as i32, i32::from(change.stack.count)),
+                )
+            })
+            .collect();
+        let carried = action
+            .carried_item
+            .as_ref()
+            .map(|stack| encode_slot_stack(stack.item_id as i32, i32::from(stack.count)))
+            .unwrap_or_else(|| encode_slot_stack(0, 0));
+        live.container_click(
+            action.window_id,
+            action.state_id,
+            action.slot,
+            action.button,
+            i32::from(action.mode),
+            changed,
+            carried,
+        );
+    }
+
+    /// Route a press/release to the open container screen when one is up.
+    /// Returns `true` when the event was consumed by the screen.
+    fn container_mouse_input(&mut self, state: ElementState, button: MouseButton) -> bool {
+        let Some(screen) = &mut self.container_screen else {
+            return false;
+        };
+        let (mx, my) = self.mouse_pos;
+        let (w, h) = self
+            .active
+            .as_ref()
+            .map(|a| (a.size.width as f32, a.size.height as f32))
+            .unwrap_or((0.0, 0.0));
+        let button_id: i8 = match button {
+            MouseButton::Left => 0,
+            MouseButton::Right => 1,
+            MouseButton::Middle => 2,
+            _ => return true,
+        };
+        match state {
+            ElementState::Pressed => {
+                let layout = screen.layout(w, h);
+                if let Some(hit) = layout
+                    .slots
+                    .iter()
+                    .find(|slot| slot.rect.contains(mx, my))
+                {
+                    let slot_index = hit.index;
+                    if let Some(action) = screen.click(slot_index, button_id) {
+                        if let Some(live) = &mut self.live {
+                            Self::forward_click_action(live, action);
+                        }
+                    }
+                } else if let Some(hit) = layout
+                    .buttons
+                    .iter()
+                    .find(|b| b.rect.contains(mx, my))
+                {
+                    let id = hit.id;
+                    if let Some(action) = screen.button_click(id) {
+                        if let Some(live) = &mut self.live {
+                            live.container_button_click(action.window_id, action.button_id);
+                        }
+                    }
+                }
+            }
+            ElementState::Released => {
+                if let Some(action) = screen.drag_end() {
+                    if let Some(live) = &mut self.live {
+                        Self::forward_click_action(live, action);
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// While a container screen is open: hover highlight, plus vanilla
+    /// quick-craft (`mode = 5`) slot painting while the left button is held
+    /// after a `DragState` has been armed.
+    fn container_cursor_moved(&mut self) {
+        let Some(screen) = &mut self.container_screen else {
+            return;
+        };
+        let (mx, my) = self.mouse_pos;
+        let (w, h) = self
+            .active
+            .as_ref()
+            .map(|a| (a.size.width as f32, a.size.height as f32))
+            .unwrap_or((0.0, 0.0));
+        let layout = screen.layout(w, h);
+        let hovered = layout
+            .slots
+            .iter()
+            .find(|slot| slot.rect.contains(mx, my))
+            .map(|slot| (slot.index, usize::from(slot.index.max(0) as u16)));
+        screen.hover(hovered.map(|(_, index)| index));
+        if self.left_mouse_held {
+            if let Some(DragState { slots, .. }) = screen.drag_mode.as_ref() {
+                // The drag is armed: entering a new slot paints it into the
+                // quick-craft set (`click_mode` mode 5 handles dedup).
+                if let Some(&(slot_index, _)) = hovered.as_ref() {
+                    if !slots.contains(&slot_index) {
+                        if let Some(action) = screen.click_mode(slot_index, 0, 5) {
+                            if let Some(live) = &mut self.live {
+                                Self::forward_click_action(live, action);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn render_frame(&mut self) {
         let frame_begin = Instant::now();
         self.frame_start = frame_begin;
@@ -699,6 +918,7 @@ impl GpuApp {
                 self.camera.pitch_deg = (-pose.pitch).clamp(-89.9, 89.9);
             }
         }
+        self.sync_container_screen();
 
         // Camera movement only applies while unpaused and grabbed.
         if !self.paused {
@@ -796,6 +1016,10 @@ impl GpuApp {
                     .commands
                     .extend(build_magic_hud_draw_list(&live.magic, w, h).commands);
             }
+        }
+        // Server-driven container screen draws above the HUD.
+        if let Some(screen) = &self.container_screen {
+            screen.render(w as f32, h as f32, &mut draw_list);
         }
         // Dirty-only upload: unchanged HUD frames skip the `w*h*4` rasterize
         // and the texture upload instead of burning GB/s of PCIe bandwidth.
@@ -962,11 +1186,19 @@ impl GpuApp {
                     live.hud.show_player_list = visible;
                 }
             }
+            WindowInputEvent::SwapOffhand => {
+                if let Some(live) = &mut self.live {
+                    live.swap_offhand();
+                }
+            }
+            WindowInputEvent::DropItem { entire_stack } => {
+                if let Some(live) = &mut self.live {
+                    live.drop_item(entire_stack);
+                }
+            }
             // These bindings are emitted by the router. Inventory/chat screens
             // and server-side item operations require their own runtime APIs.
-            WindowInputEvent::SwapOffhand
-            | WindowInputEvent::DropItem { .. }
-            | WindowInputEvent::OpenInventory
+            WindowInputEvent::OpenInventory
             | WindowInputEvent::OpenChat { .. }
             | WindowInputEvent::SortInventory
             | WindowInputEvent::OpenAdvancements => {}
@@ -1127,20 +1359,24 @@ impl ApplicationHandler for GpuApp {
                         self.apply_ui_action(&action, event_loop);
                     }
                 }
+                self.container_cursor_moved();
             }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Left,
-                ..
-            } => {
-                if self.paused {
-                    let (x, y) = self.mouse_pos;
-                    let actions = self.ui.handle_input(UiInputEvent::Click { x, y });
-                    for action in actions {
-                        self.apply_ui_action(&action, event_loop);
+            WindowEvent::MouseInput { state, button, .. } => {
+                if button == MouseButton::Left {
+                    self.left_mouse_held = state == ElementState::Pressed;
+                }
+                if self.container_screen.is_some() {
+                    self.container_mouse_input(state, button);
+                } else if state == ElementState::Pressed && button == MouseButton::Left {
+                    if self.paused {
+                        let (x, y) = self.mouse_pos;
+                        let actions = self.ui.handle_input(UiInputEvent::Click { x, y });
+                        for action in actions {
+                            self.apply_ui_action(&action, event_loop);
+                        }
+                    } else {
+                        self.set_cursor_grab(true);
                     }
-                } else {
-                    self.set_cursor_grab(true);
                 }
             }
             WindowEvent::RedrawRequested => self.render_frame(),
