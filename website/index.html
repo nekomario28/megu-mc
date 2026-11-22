@@ -4,9 +4,43 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Megu — Experimental Rust Minecraft runtime and tools</title>
+  <title>Megu (mc-spine) — Native Rust + wgpu Minecraft 1.21.1 Engine | マイクラ Rust クライアント＆サーバー</title>
   <meta name="description"
-        content="Megu (codename mc-spine) is an experimental Rust Minecraft runtime for 1.21.1 and 26.3, with 12 standalone crates including client-gpu, bounded JVM-free mod adaptation, external shaderpack formats, and declarative Magic/VFX/Animation/Combat-Motion engines.">
+        content="Megu (mc-spine): open-source LGPL-3.0 Minecraft: Java Edition engine in Rust + wgpu — native client &amp; server for 1.21.1 (LTS) and 26.3, no JVM required. LGPL-3.0のRust製Minecraftエンジン。1.21.1/26.3対応のクライアント＆サーバー。">
+  <link rel="canonical" href="https://megu.megumin.tech/">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Megu (mc-spine)">
+  <meta property="og:title"
+        content="Megu (mc-spine) — Native Rust + wgpu Minecraft 1.21.1 Engine">
+  <meta property="og:description"
+        content="Open-source LGPL-3.0 Minecraft: Java Edition engine in Rust + wgpu — native client &amp; server for 1.21.1 (LTS) and 26.3, no JVM required. LGPL-3.0のRust製Minecraftエンジン。">
+  <meta property="og:url" content="https://megu.megumin.tech/">
+  <meta property="og:locale" content="en_US">
+  <meta property="og:locale:alternate" content="ja_JP">
+  <meta property="og:image" content="https://megu.megumin.tech/og-card.svg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt"
+        content="Megu (mc-spine) — Native Rust + wgpu Minecraft engine, LGPL-3.0">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title"
+        content="Megu (mc-spine) — Native Rust + wgpu Minecraft 1.21.1 Engine">
+  <meta name="twitter:description"
+        content="Open-source LGPL-3.0 Minecraft: Java Edition engine in Rust + wgpu — native client &amp; server for 1.21.1 (LTS) and 26.3, no JVM required.">
+  <meta name="twitter:image" content="https://megu.megumin.tech/og-card.svg">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "Megu (mc-spine)",
+    "applicationCategory": "GameApplication",
+    "operatingSystem": "Linux, Windows, macOS",
+    "license": "https://www.gnu.org/licenses/lgpl-3.0.html",
+    "isAccessibleForFree": true,
+    "url": "https://megu.megumin.tech/",
+    "codeRepository": "https://github.com/nekomario28/mc-spine"
+  }
+  </script>
   <link rel="stylesheet" href="style.css">
   <script src="site-config.js"></script>
   <script src="app.js" defer></script>
@@ -211,7 +245,7 @@
           <article class="pillar">
             <h3 data-i18n="p3_title">Automatic mod adaptation at boot</h3>
             <p data-i18n="p3_body">
-              The mods/ startup scan skips a catalog of 36 superseded performance mods and attempts bounded data, culinary, and Mixin lifting through live_mod_bridge / auto_adapter. Unsupported code is classified for fallback or quarantine.
+              The mods/ startup scan skips a catalog of 52 superseded performance mods and attempts bounded data, culinary, and Mixin lifting through live_mod_bridge / auto_adapter. Unsupported code is classified for fallback or quarantine.
             </p>
           </article>
           <article class="pillar">
@@ -509,7 +543,7 @@ mc-spine-client --ping localhost:25565</code></pre>
       p2_title: "クライアントと描画の実装状況",
       p2_body: "クライアントにはプロトコル Ping、Magic/VFX/Animation/Combat-Motion 処理、保守的なシェーダーパック機能計画があります。独立した client-gpu には winit + wgpu の実ウィンドウ／オフスクリーン描画があり、AMD RX 7800 XT（RADV）で非空の Vulkan オフスクリーン描画を確認した記録があります。",
       p3_title: "起動時の Mod 自動適応",
-      p3_body: "mods/ の起動時スキャンで、置き換え済みの軽量化 Mod 36 種をスキップし、live_mod_bridge / auto_adapter によりデータ・調理・Mixin の対応範囲を適応します。未対応コードはフォールバック・隔離の必要性を分類します。",
+      p3_body: "mods/ の起動時スキャンで、置き換え済みの軽量化 Mod 52 種をスキップし、live_mod_bridge / auto_adapter によりデータ・調理・Mixin の対応範囲を適応します。未対応コードはフォールバック・隔離の必要性を分類します。",
       p4_title: "独立した 5 個の CLI バイナリ",
       p4_body: "mc-spine（サーバー）、mc-spine-client（クライアント補助）、mc-spine-mod-check（検査・適応・雛形生成）、mc-spine-world-migrate（1.21.1 ↔ 26.3 のワールド移行）、mc-spine-init（EULA 明示同意付き初期化）を提供します。",
       mods_title: "Mod の自動適応とネイティブ制作",

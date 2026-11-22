@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title desc">
+  <title id="title">Megu (mc-spine) — Native Rust + wgpu Minecraft engine</title>
+  <desc id="desc">Open-source LGPL-3.0 Minecraft: Java Edition engine in Rust + wgpu for 1.21.1 and 26.3.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0c0e11"/>
+      <stop offset="1" stop-color="#13161b"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#d97745"/>
+      <stop offset="1" stop-color="#d9b04c"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <g stroke="#232832" stroke-width="2">
+    <path d="M0 470 H1200" fill="none" opacity="0.6"/>
+    <path d="M0 520 H1200" fill="none" opacity="0.35"/>
+  </g>
+  <g fill="#6aa2e0" opacity="0.16">
+    <rect x="880" y="60" width="240" height="240" rx="8"/>
+    <rect x="960" y="-20" width="240" height="240" rx="8"/>
+    <rect x="1040" y="140" width="240" height="240" rx="8"/>
+  </g>
+  <g fill="none" stroke="url(#accent)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M120 140 L160 140 L160 180 L200 180"/>
+    <path d="M200 180 L240 140 L280 140" opacity="0.9"/>
+  </g>
+  <rect x="120" y="240" width="120" height="10" rx="5" fill="url(#accent)"/>
+  <text x="120" y="370" font-family="ui-sans-serif, system-ui, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="96" font-weight="700" fill="#ebedf2" letter-spacing="-2">Megu</text>
+  <text x="120" y="430" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="34" fill="#9aa3b2" letter-spacing="1">mc-spine · Rust + wgpu</text>
+  <g font-family="ui-sans-serif, system-ui, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="26" font-weight="600">
+    <rect x="120" y="480" width="220" height="56" rx="28" fill="#191d24" stroke="#323a48"/>
+    <text x="230" y="516" text-anchor="middle" fill="#d9b04c">1.21.1 LTS</text>
+    <rect x="362" y="480" width="180" height="56" rx="28" fill="#191d24" stroke="#323a48"/>
+    <text x="452" y="516" text-anchor="middle" fill="#6aa2e0">26.3 Latest</text>
+    <rect x="564" y="480" width="200" height="56" rx="28" fill="#191d24" stroke="#323a48"/>
+    <text x="664" y="516" text-anchor="middle" fill="#4ec48a">LGPL-3.0</text>
+    <rect x="786" y="480" width="294" height="56" rx="28" fill="#191d24" stroke="#323a48"/>
+    <text x="933" y="516" text-anchor="middle" fill="#d97745">No JVM required</text>
+  </g>
+  <text x="120" y="590" font-family="ui-sans-serif, system-ui, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="24" fill="#6c7585">megu.megumin.tech — native Minecraft client &amp; server, Linux · Windows · macOS</text>
+</svg>

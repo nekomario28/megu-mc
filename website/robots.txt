@@ -1,0 +1,6 @@
+# megu.megumin.tech — crawler policy
+User-agent: *
+Allow: /
+Disallow: /api/
+
+Sitemap: https://megu.megumin.tech/sitemap.xml

@@ -6,7 +6,7 @@
 //
 // 1. A faithful browser-side port of the modpack pre-flight analyzer in
 //    mod-adapter-core/src/modpack.rs (+ the version-range engine in
-//    version_compat.rs and the 36-entry BUILTIN_SUPERSEDED_PERF_MODS catalog
+//    version_compat.rs and the 52-entry BUILTIN_SUPERSEDED_PERF_MODS catalog
 //    in fallback.rs, which tools/mod_launcher.py also mirrors). It parses
 //    Modrinth `modrinth.index.json` and CurseForge `manifest.json`
 //    documents fail-closed — malformed JSON, wrong
@@ -589,12 +589,15 @@
   // ---------------------------------------------------------------------
 
   var BUILTIN_SUPERSEDED_PERF_MODS = [
-    // Rendering / mesh / LOD.
+    // Rendering / mesh / LOD — superseded by mc-spine's native wgpu
+    // renderer (client-gpu / client-port), never loaded as Java mods.
     "sodium",
     "embeddium",
     "rubidium",
     "xenon",
     "magnesium",
+    "vulkanmod",
+    "nvidium",
     "immediatelyfast",
     "entityculling",
     "moreculling",
@@ -606,11 +609,25 @@
     "reeses-sodium-options",
     "sodium-extra",
     "embeddium_extra",
+    "acedium",
+    "accedium",
+    "chlorine",
+    "helium",
+    "optifine",
+    "optifabric",
+    "canvas",
+    "canvas-renderer",
+    "exordium",
+    "badoptimizations",
+    "enhancedblockentities",
+    "cullleaves",
+    "cull-less-leaves",
     // Server tick / lighting / memory / startup.
     "lithium",
     "radium",
     "canary",
     "starlight",
+    "scalablelux",
     "phosphor",
     "scalpel",
     "ferritecore",

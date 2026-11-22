@@ -24,6 +24,9 @@ Checks, all fail-closed:
      Cloudflare Pages Functions in functions/api/ (payload validation,
      redaction, milestone comments, KV dedup, Turnstile, /api/latest)
      against fully mocked GitHub/KV/fetch — no network access.
+  7. SEO surface: <link rel="canonical">, robots.txt, sitemap.xml,
+     Open Graph / Twitter Card meta, og-card.svg, and a parseable
+     schema.org SoftwareApplication JSON-LD block.
 
 Exit status: 0 clean, 1 findings.
 """
@@ -35,6 +38,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 WEBSITE = Path(__file__).resolve().parent
@@ -92,6 +96,13 @@ class AssetCollector(html.parser.HTMLParser):
         wanted = self.EMBED_ATTRS.get(tag)
         if not wanted:
             return
+        if tag == "link":
+            # <link rel="canonical"> names the canonical origin URL; it is
+            # metadata, not an embedded resource, so an absolute https://
+            # href is expected and allowed.
+            rel = next((v for n, v in attrs if n == "rel"), "")
+            if "canonical" in rel.split():
+                return
         for name, value in attrs:
             if value and name in wanted:
                 self.refs.append((tag, name, value))
@@ -246,6 +257,145 @@ def check_site_config_keys():
     return findings
 
 
+CANONICAL_URL = "https://megu.megumin.tech/"
+SITEMAP_URL = "https://megu.megumin.tech/sitemap.xml"
+OG_IMAGE_URL = "https://megu.megumin.tech/og-card.svg"
+
+
+def _tag_attrs(markup, tag):
+    """Yield {attr: value} dicts for every `<tag ...>` start tag."""
+    for match in re.finditer(r"<" + tag + r"\b[^>]*>", markup):
+        yield dict(re.findall(r'([\w-]+)="([^"]*)"', match.group(0)))
+
+
+def _meta_content(markup, attr, key):
+    for attrs in _tag_attrs(markup, "meta"):
+        if attrs.get(attr) == key:
+            return attrs.get("content")
+    return None
+
+
+def _ld_json_blocks(markup):
+    """Return (parsed, raw) pairs for each application/ld+json script."""
+    blocks = []
+    for match in re.finditer(
+            r"<script\b[^>]*>(.*?)</script>", markup, re.DOTALL):
+        open_tag = match.group(0)[:match.group(0).index(">") + 1]
+        attrs = dict(re.findall(r'([\w-]+)="([^"]*)"', open_tag))
+        if attrs.get("type") != "application/ld+json":
+            continue
+        try:
+            blocks.append(json.loads(match.group(1)))
+        except json.JSONDecodeError as error:
+            blocks.append(error)
+    return blocks
+
+
+def check_seo_metadata():
+    """Check 7: canonical URL, crawler files, social meta, JSON-LD."""
+    findings = []
+    index = WEBSITE / "index.html"
+    if not index.is_file():
+        return ["index.html is missing"]
+    markup = index.read_text(encoding="utf-8")
+
+    canonical = [
+        attrs.get("href") for attrs in _tag_attrs(markup, "link")
+        if "canonical" in (attrs.get("rel") or "").split()
+    ]
+    if canonical != [CANONICAL_URL]:
+        findings.append(
+            "index.html must declare exactly one "
+            f'<link rel="canonical" href="{CANONICAL_URL}"> '
+            f"(found: {canonical or 'none'})")
+
+    required_meta = {
+        ("property", "og:type"): "website",
+        ("property", "og:site_name"): "Megu (mc-spine)",
+        ("property", "og:title"): None,
+        ("property", "og:description"): None,
+        ("property", "og:url"): CANONICAL_URL,
+        ("property", "og:locale"): "en_US",
+        ("property", "og:locale:alternate"): "ja_JP",
+        ("property", "og:image"): OG_IMAGE_URL,
+        ("name", "twitter:card"): "summary_large_image",
+        ("name", "twitter:title"): None,
+        ("name", "twitter:description"): None,
+    }
+    for (attr, key), expected in required_meta.items():
+        content = _meta_content(markup, attr, key)
+        if content is None:
+            findings.append(f"index.html is missing <meta {attr}=\"{key}\">")
+        elif expected is not None and content != expected:
+            findings.append(
+                f'<meta {attr}="{key}"> is "{content}", '
+                f'expected "{expected}"')
+
+    app = None
+    for block in _ld_json_blocks(markup):
+        if isinstance(block, json.JSONDecodeError):
+            findings.append(f"JSON-LD block does not parse: {block}")
+            continue
+        if isinstance(block, dict) and block.get("@type") == "SoftwareApplication":
+            app = block
+    if app is None:
+        findings.append("index.html has no parseable SoftwareApplication JSON-LD")
+    else:
+        expected_fields = {
+            "name": "Megu (mc-spine)",
+            "applicationCategory": "GameApplication",
+            "operatingSystem": "Linux, Windows, macOS",
+            "license": "https://www.gnu.org/licenses/lgpl-3.0.html",
+            "isAccessibleForFree": True,
+            "url": CANONICAL_URL,
+            "codeRepository": "https://github.com/nekomario28/mc-spine",
+        }
+        for key, expected in expected_fields.items():
+            if app.get(key) != expected:
+                findings.append(
+                    f"JSON-LD SoftwareApplication.{key} is "
+                    f"{app.get(key)!r}, expected {expected!r}")
+
+    card = WEBSITE / "og-card.svg"
+    if not card.is_file():
+        findings.append("website/og-card.svg is missing")
+    else:
+        svg = card.read_text(encoding="utf-8", errors="replace")
+        for needle in ('width="1200"', 'height="630"', "<svg"):
+            if needle not in svg:
+                findings.append(f"og-card.svg lacks {needle}")
+
+    robots = WEBSITE / "robots.txt"
+    if not robots.is_file():
+        findings.append("website/robots.txt is missing")
+    else:
+        text = robots.read_text(encoding="utf-8")
+        for needle in ("User-agent: *", "Allow: /", "Disallow: /api/",
+                       f"Sitemap: {SITEMAP_URL}"):
+            if needle not in text:
+                findings.append(f"robots.txt lacks '{needle}'")
+
+    sitemap = WEBSITE / "sitemap.xml"
+    if not sitemap.is_file():
+        findings.append("website/sitemap.xml is missing")
+    else:
+        try:
+            root = ET.parse(sitemap).getroot()
+        except ET.ParseError as error:
+            findings.append(f"sitemap.xml is not well-formed XML: {error}")
+        else:
+            locs = [el.text for el in root.iter() if el.tag.endswith("loc")]
+            if CANONICAL_URL not in locs:
+                findings.append(
+                    f"sitemap.xml does not list {CANONICAL_URL} "
+                    f"(found: {locs})")
+            lastmods = [
+                el.text for el in root.iter() if el.tag.endswith("lastmod")]
+            if not lastmods:
+                findings.append("sitemap.xml entries lack <lastmod>")
+    return findings
+
+
 JS_HARNESS = r"""
 "use strict";
 const assert = require("assert");
@@ -253,7 +403,7 @@ require(process.env.SITE_CONFIG_JS); // sets globalThis.SITE_CONFIG
 const m = require(process.env.APP_JS);
 
 // Catalog sanity.
-assert.strictEqual(m.BUILTIN_SUPERSEDED_PERF_MODS.length, 36);
+assert.strictEqual(m.BUILTIN_SUPERSEDED_PERF_MODS.length, 52);
 
 // --- Masked feedback /api/report contract and fallback -----------------
 const sensitive = "Crash in /home/alice/.minecraft/logs/latest.log on " +
@@ -821,6 +971,7 @@ def main():
         ("site config & EN/JA copy", check_site_config_keys),
         ("app.js unit check (node)", check_js_unit),
         ("functions unit check (node)", check_functions_unit),
+        ("SEO metadata & crawler files", check_seo_metadata),
     )
     failures = []
     skipped = 0
