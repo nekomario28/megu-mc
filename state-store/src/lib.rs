@@ -132,8 +132,8 @@ pub use pregen::{
     PregenRunConfig, PregenRunReport, PregenShape, PregenState, TicketKind,
 };
 pub use region_tick::{
-    partition_independent_regions, tick_dimension_regions_parallel, RegionCoord, RegionTickStats,
-    RegionWork, REGION_SIDE_CHUNKS, WAVE_COUNT,
+    partition_independent_regions, tick_dimension_regions_parallel, tick_regions_in_pool,
+    RegionCoord, RegionMobTable, RegionTickStats, RegionWork, REGION_SIDE_CHUNKS, WAVE_COUNT,
 };
 pub use sharded::{
     chunk_shard, BlockCoord, ChunkCoord, ChunkOverlay, DimensionState, EntityRecord, PendingTick,

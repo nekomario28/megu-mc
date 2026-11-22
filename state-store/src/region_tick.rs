@@ -10,9 +10,16 @@
 //! border. Ticking the regions of one wave in parallel therefore produces
 //! zero cross-region chunk contention, and running the waves in order gives
 //! bit-identical results for any worker count.
+//!
+//! Parallelism runs on the resident [`MeguTaskPool`] workers of
+//! `mc_spine_core::task_pool` via `scope_blocking` — scoped, stack-borrowing
+//! fan-out with caller help-stealing, so there is no per-wave OS thread
+//! spawn/join cost and even a single-worker pool cannot deadlock.
 
 use std::collections::BTreeMap;
-use std::thread;
+use std::sync::OnceLock;
+
+use mc_spine_core::task_pool::{MeguTaskPool, TaskLane};
 
 use crate::sharded::{ChunkCoord, DimensionState};
 
@@ -109,16 +116,47 @@ pub struct RegionTickStats {
     pub chunks_ticked: usize,
 }
 
+/// Process-wide resident pool backing [`tick_dimension_regions_parallel`]
+/// when the caller does not supply one. Sized once from the probed hardware
+/// profile; the `OnceLock` intentionally lives for the whole process so
+/// waves never pay OS thread spawn/join cost after the first tick.
+fn default_pool() -> &'static MeguTaskPool {
+    static DEFAULT_POOL: OnceLock<MeguTaskPool> = OnceLock::new();
+    DEFAULT_POOL.get_or_init(MeguTaskPool::for_host)
+}
+
 /// Tick every active chunk of `dimension`, partitioned into independent
-/// waves. Within a wave the regions are split into `threads` contiguous
-/// slices — each worker walks its slice in `(rx, rz)` order — and waves run
-/// strictly in order, so the result is bit-identical for any `threads`
-/// (same-color regions never share a chunk border, so concurrent region
-/// ticks cannot contend).
+/// waves on the process-wide resident [`MeguTaskPool`]. Within a wave the
+/// regions are split into `threads` contiguous slices — each task walks its
+/// slice in `(rx, rz)` order — and waves run strictly in order, so the
+/// result is bit-identical for any `threads` (same-color regions never
+/// share a chunk border, so concurrent region ticks cannot contend).
 ///
 /// `tick_fn` receives the dimension, the region coordinate and that region's
 /// sorted active-chunk slice; it is invoked exactly once per region.
 pub fn tick_dimension_regions_parallel<F>(
+    dimension: &DimensionState,
+    active_chunks: &[ChunkCoord],
+    threads: usize,
+    tick_fn: F,
+) -> RegionTickStats
+where
+    F: Fn(&DimensionState, RegionCoord, &[ChunkCoord]) + Sync,
+{
+    tick_regions_in_pool(default_pool(), dimension, active_chunks, threads, tick_fn)
+}
+
+/// [`tick_dimension_regions_parallel`] on an explicit pool. Tests use this
+/// to pin determinism across pool topologies (e.g. 1 vs 8 interactive
+/// workers) without touching the process-wide default.
+///
+/// `threads` is the requested slice granularity per wave, exactly as in
+/// [`tick_dimension_regions_parallel`]; slice tasks are stolen across the
+/// pool's Lane-A workers and the calling thread helps when the pool is
+/// smaller than `threads`, so the partition — and therefore the result — is
+/// independent of pool size.
+pub fn tick_regions_in_pool<F>(
+    pool: &MeguTaskPool,
     dimension: &DimensionState,
     active_chunks: &[ChunkCoord],
     threads: usize,
@@ -136,16 +174,18 @@ where
         chunks_ticked: waves.iter().flatten().map(|w| w.chunks.len()).sum(),
     };
     for wave in &waves {
-        run_wave(dimension, wave, threads, &tick_fn);
+        run_wave(pool, dimension, wave, threads, &tick_fn);
     }
     stats
 }
 
-/// Run one wave's regions over at most `threads` workers. The sorted region
-/// list is cut into contiguous slices so every region is ticked exactly once
-/// in a deterministic assignment — scheduling order may interleave, but the
-/// regions are non-adjacent by construction so interleaving is unobservable.
+/// Run one wave's regions over at most `threads` pool tasks. The sorted
+/// region list is cut into contiguous slices so every region is ticked
+/// exactly once in a deterministic assignment — scheduling order may
+/// interleave, but the regions are non-adjacent by construction so
+/// interleaving is unobservable.
 fn run_wave<F>(
+    pool: &MeguTaskPool,
     dimension: &DimensionState,
     wave: &[RegionWork],
     threads: usize,
@@ -160,7 +200,7 @@ fn run_wave<F>(
         return;
     }
     let slice_len = wave.len().div_ceil(threads.min(wave.len()));
-    thread::scope(|scope| {
+    pool.scope_blocking(TaskLane::Interactive, |scope| {
         for slice in wave.chunks(slice_len) {
             scope.spawn(move || {
                 for work in slice {
@@ -169,6 +209,168 @@ fn run_wave<F>(
             });
         }
     });
+}
+
+/// Bits per [`RegionMobTable::alive_mask`] word.
+const ALIVE_WORD_BITS: usize = 64;
+/// Fixed integration step for [`RegionMobTable::step`], in seconds.
+const MOB_STEP_DT: f64 = 0.05;
+/// Per-tick downward acceleration applied to `vel_y` before integration.
+const MOB_GRAVITY: f32 = 0.08;
+/// Ground plane height; mobs clamp at `y = 0` with a damped bounce.
+const MOB_GROUND_Y: f64 = 0.0;
+/// Fraction of impact velocity kept after a ground bounce.
+const MOB_BOUNCE_DAMP: f32 = 0.4;
+
+/// Region-owned structure-of-arrays mob table.
+///
+/// One [`RegionCoord`] owns its table exclusively for the duration of a wave
+/// tick, so [`RegionMobTable::step`] runs with **zero** lock acquisitions —
+/// every field is a plain `Vec` and [`RegionMobTable::alive_mask`] is a
+/// bitset scanned word-at-a-time, the shape auto-vectorizers target. The
+/// table deliberately holds no `Mutex`/`RwLock`/atomic: cross-region mob
+/// movement is *not* handled here, it goes through the deterministic
+/// per-region outbox merged between waves, keeping same-wave ticks free of
+/// shared mutable state.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RegionMobTable {
+    /// Stable entity ids, parallel to every other column.
+    pub eid: Vec<i32>,
+    /// Packed entity-type id.
+    pub etype: Vec<u16>,
+    /// World position, one `f64` per axis.
+    pub pos_x: Vec<f64>,
+    pub pos_y: Vec<f64>,
+    pub pos_z: Vec<f64>,
+    /// Per-axis velocity.
+    pub vel_x: Vec<f32>,
+    pub vel_y: Vec<f32>,
+    pub vel_z: Vec<f32>,
+    /// `[yaw, pitch]` pair per mob.
+    pub yaw_pitch: Vec<[f32; 2]>,
+    /// Hit points; `<= 0.0` marks the mob dead.
+    pub hp: Vec<f32>,
+    /// `[fuse_ticks, fire_ticks, air_ticks]` packed per mob.
+    pub fuse_fire_air: Vec<[i16; 3]>,
+    /// Liveness bitset — dead mobs are skipped without touching their rows.
+    /// Padding bits beyond `len()` are always zero.
+    pub alive_mask: Vec<u64>,
+}
+
+impl RegionMobTable {
+    /// Number of mob slots, alive or dead.
+    pub fn len(&self) -> usize {
+        self.eid.len()
+    }
+
+    /// Whether the table holds no mob slots.
+    pub fn is_empty(&self) -> bool {
+        self.eid.is_empty()
+    }
+
+    /// Append one live mob across every column.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push(
+        &mut self,
+        eid: i32,
+        etype: u16,
+        pos: [f64; 3],
+        vel: [f32; 3],
+        yaw_pitch: [f32; 2],
+        hp: f32,
+        fuse_fire_air: [i16; 3],
+    ) {
+        self.eid.push(eid);
+        self.etype.push(etype);
+        self.pos_x.push(pos[0]);
+        self.pos_y.push(pos[1]);
+        self.pos_z.push(pos[2]);
+        self.vel_x.push(vel[0]);
+        self.vel_y.push(vel[1]);
+        self.vel_z.push(vel[2]);
+        self.yaw_pitch.push(yaw_pitch);
+        self.hp.push(hp);
+        self.fuse_fire_air.push(fuse_fire_air);
+        let index = self.eid.len() - 1;
+        if index.is_multiple_of(ALIVE_WORD_BITS) {
+            self.alive_mask.push(0);
+        }
+        self.set_alive(index, true);
+    }
+
+    /// Liveness of slot `index`; out-of-range slots read as dead.
+    pub fn alive(&self, index: usize) -> bool {
+        self.alive_mask
+            .get(index / ALIVE_WORD_BITS)
+            .is_some_and(|word| word & (1u64 << (index % ALIVE_WORD_BITS)) != 0)
+    }
+
+    /// Set or clear slot `index`'s liveness bit; out-of-range is a no-op.
+    pub fn set_alive(&mut self, index: usize, alive: bool) {
+        let Some(word) = self.alive_mask.get_mut(index / ALIVE_WORD_BITS) else {
+            return;
+        };
+        let bit = 1u64 << (index % ALIVE_WORD_BITS);
+        if alive {
+            *word |= bit;
+        } else {
+            *word &= !bit;
+        }
+    }
+
+    /// Number of live mobs (popcount over the mask words).
+    pub fn alive_count(&self) -> usize {
+        self.alive_mask
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum()
+    }
+
+    /// Advance every live mob by one deterministic tick: gravity, semi-
+    /// implicit Euler integration, the `y = 0` ground plane with a damped
+    /// bounce, fuse/fire/air countdowns, and death when `hp <= 0` or a lit
+    /// fuse reaches zero.
+    ///
+    /// Runs entirely on `&mut self` with no `Mutex`, atomics or shared
+    /// state, so a region can hold its table across a whole wave tick.
+    /// `tick` is reserved for scheduled AI phases and does not affect the
+    /// integration constants — the gameplay-accurate kernel replaces them
+    /// without changing the ownership or lock-free contract.
+    pub fn step(&mut self, tick: u64) {
+        let _ = tick;
+        for index in 0..self.len() {
+            if !self.alive(index) {
+                continue;
+            }
+            self.vel_y[index] -= MOB_GRAVITY;
+            self.pos_x[index] += f64::from(self.vel_x[index]) * MOB_STEP_DT;
+            self.pos_y[index] += f64::from(self.vel_y[index]) * MOB_STEP_DT;
+            self.pos_z[index] += f64::from(self.vel_z[index]) * MOB_STEP_DT;
+            if self.pos_y[index] < MOB_GROUND_Y {
+                self.pos_y[index] = MOB_GROUND_Y;
+                if self.vel_y[index] < 0.0 {
+                    self.vel_y[index] = -self.vel_y[index] * MOB_BOUNCE_DAMP;
+                }
+            }
+            let mut fuse_fire_air = self.fuse_fire_air[index];
+            if fuse_fire_air[0] > 0 {
+                fuse_fire_air[0] -= 1;
+                if fuse_fire_air[0] == 0 {
+                    self.hp[index] = 0.0;
+                }
+            }
+            if fuse_fire_air[1] > 0 {
+                fuse_fire_air[1] -= 1;
+            }
+            if fuse_fire_air[2] > i16::MIN {
+                fuse_fire_air[2] -= 1;
+            }
+            self.fuse_fire_air[index] = fuse_fire_air;
+            if self.hp[index] <= 0.0 {
+                self.set_alive(index, false);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
