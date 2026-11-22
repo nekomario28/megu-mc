@@ -45,6 +45,7 @@
 #![deny(unsafe_code)]
 
 pub mod crash_report;
+pub mod hw_adaptive_engine;
 pub mod id;
 pub mod math;
 pub mod perf_kit;
