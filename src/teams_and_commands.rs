@@ -4352,6 +4352,18 @@ fn live_server_policy() -> &'static Mutex<LiveServerPolicy> {
     POLICY.get_or_init(|| Mutex::new(LiveServerPolicy::default()))
 }
 
+/// Lane WIRE-MINECUT-ORBITAL-SYNC: the `(mine_all, cut_all)` trigger modes
+/// the live block-break path reads on every confirmed break. Both default
+/// `"off"`; values were validated by `/megu policy set` (or the `server.toml`
+/// load path) to `off`/`sneak_only`/`while_not_sneaking`/`always`.
+#[cfg(feature = "mod-suite")]
+fn live_mine_cut_all_modes() -> (String, String) {
+    let policy = live_server_policy()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    (policy.mine_all.clone(), policy.cut_all.clone())
+}
+
 /// OPS-SRE friendly-fire gates. Both read the live policy so a
 /// `/megu policy set` lands on the very next hit, and both are Vanilla by
 /// default: `true` means every hit connects exactly like stock, and only an

@@ -3147,6 +3147,24 @@ fn try_toggle_trapdoor(dim: DimId, x: i32, y: i32, z: i32) -> bool {
 /// drops). Shared by the dig packet's immediate path and the tick-driven
 /// destroy progress that runs after START_DESTROY_BLOCK.
 fn finish_block_break(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, old: u32) {
+    // Lane WIRE-MINECUT-ORBITAL-SYNC (`mod-suite` only): the opt-in
+    // MineAll/CutAll plan must run while the origin block is still in the
+    // world — it is the BFS search origin. `live_mine_cut_all_apply` below
+    // fires only after the origin actually broke, and both policies default
+    // to `off`, which returns an empty plan before touching the world.
+    #[cfg(feature = "mod-suite")]
+    let vein_plan = live_mine_cut_all_plan(me, dim, x, y, z);
+    finish_block_break_one(me, dim, x, y, z, old);
+    #[cfg(feature = "mod-suite")]
+    live_mine_cut_all_apply(me, dim, vein_plan, (x, y, z), old);
+}
+
+/// The confirmed single-block break [`finish_block_break`] runs for the
+/// origin and — under `mod-suite` — for every extra position the opt-in
+/// MineAll/CutAll planner emits. Extras re-enter this body so the adventure
+/// `mayDestroy` recheck, the progression gate, and the NeoForge break event
+/// all apply to every expanded cell exactly as they do to the origin.
+fn finish_block_break_one(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, old: u32) {
     let held = {
         let held_slot = *me.held.lock().unwrap_or_else(|e| e.into_inner());
         let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
@@ -3292,6 +3310,202 @@ fn finish_block_break(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, old:
             };
             drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lane WIRE-MINECUT-ORBITAL-SYNC: opt-in MineAll/CutAll expansion over
+// `mod_adapter_core::mine_cut_all`. Armed only by `/megu policy set
+// mine_all|cut_all <sneak_only|while_not_sneaking|always>` (or server.toml);
+// both modes default `off` and the live break path is then byte-identical to
+// vanilla. The planner's `can_break` closure is the same spawn-protection +
+// claim predicate the dig handler enforces on the origin, so an expansion
+// can never reach into a protected chunk.
+// ---------------------------------------------------------------------------
+
+/// Read-only live-world view for `mod_adapter_core::mine_cut_all`: block
+/// names and effective tag membership come from `breg()`, claim/spawn
+/// protection comes from `can_player_modify_block` — the predicate the dig
+/// handler itself enforces, so the expansion stops at exactly the same wall.
+#[cfg(feature = "mod-suite")]
+struct LiveMineCutAllWorld<'a> {
+    dim: DimId,
+    reg: &'static block_registry::BReg,
+    player_name: &'a str,
+    op_level: u8,
+}
+
+#[cfg(feature = "mod-suite")]
+impl mod_adapter_core::mine_cut_all::MineCutAllWorld for LiveMineCutAllWorld<'_> {
+    fn block_id_at(
+        &self,
+        pos: mod_adapter_core::mine_cut_all::MineCutAllPos,
+    ) -> Option<&str> {
+        let st = block_at_dim(self.dim, pos.x, pos.y, pos.z);
+        if self.reg.is_air(st) {
+            None
+        } else {
+            Some(self.reg.name_of(st))
+        }
+    }
+
+    fn block_has_tag(&self, block_id: &str, tag: &str) -> bool {
+        self.reg.in_tag(self.reg.state_of(block_id, None), tag)
+    }
+
+    fn can_break(&self, pos: mod_adapter_core::mine_cut_all::MineCutAllPos) -> bool {
+        can_player_modify_block(self.dim, pos.x, pos.z, self.player_name, self.op_level)
+    }
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_mine_cut_all_trigger(mode: &str) -> mod_adapter_core::mine_cut_all::TriggerMode {
+    use mod_adapter_core::mine_cut_all::TriggerMode;
+    match mode {
+        "sneak_only" => TriggerMode::SneakOnly,
+        "while_not_sneaking" => TriggerMode::WhileNotSneaking,
+        "always" => TriggerMode::Always,
+        _ => TriggerMode::Off,
+    }
+}
+
+/// Map the live held stack onto the planner's mod-agnostic tool descriptor:
+/// vanilla tool-band items synthesize their `minecraft:<tool>s` family tag,
+/// datapack/builtin item tags carry modded families (`c:tools/pickaxe` et
+/// al.), and a `minecraft:tool` component contributes its mineable block
+/// tags. Durability is `max_damage - damage`; unbreakable and non-damageable
+/// stacks carry no budget at all.
+#[cfg(feature = "mod-suite")]
+fn live_mine_cut_all_tool(held: &Stack) -> mod_adapter_core::mine_cut_all::ToolDescriptor {
+    use mod_adapter_core::mine_cut_all as mca;
+    let item_id = item_to_name(held.0).unwrap_or("minecraft:air");
+    let mut tags = std::collections::BTreeSet::new();
+    // Vanilla band sword/shovel/pickaxe/axe/hoe x 6 tiers: items 818..=847.
+    if (818..=847).contains(&held.0) {
+        tags.insert(
+            match (held.0 - 818) % 5 {
+                1 => "minecraft:shovels",
+                2 => "minecraft:pickaxes",
+                3 => "minecraft:axes",
+                4 => "minecraft:hoes",
+                _ => "minecraft:swords",
+            }
+            .to_string(),
+        );
+    }
+    {
+        let item_tags = item_tags().lock().unwrap_or_else(|e| e.into_inner());
+        for (tag, members) in item_tags.iter() {
+            if members.iter().any(|m| name_to_item(m) == Some(held.0)) {
+                tags.insert(tag.clone());
+            }
+        }
+    }
+    let mut tool = mca::ToolDescriptor::new(item_id).with_item_tags(tags);
+    if let Some(component) = tool_component_for(held) {
+        tool = tool.with_mineable_tags(component.rules.iter().filter_map(|r| r.tag.clone()));
+    }
+    if comp_get(&held.2, COMP_UNBREAKABLE).is_some() {
+        return tool.with_unbreakable();
+    }
+    if let Some(max_damage) =
+        comp_varint(&held.2, COMP_MAX_DAMAGE).or_else(|| tool_max_damage(held.0))
+    {
+        let used = comp_varint(&held.2, COMP_DAMAGE).unwrap_or(0);
+        tool = tool.with_remaining_durability((max_damage - used).max(0) as u32);
+    }
+    tool
+}
+
+/// Plan the opt-in vein/tree expansion for a confirmed break at `(x, y, z)`.
+/// Runs BEFORE the origin mutates — the BFS needs it as its search origin.
+/// Every early-out (both modes off, sneak gate closed, no registry) returns
+/// the shared empty plan, so the vanilla-default path costs one policy read.
+#[cfg(feature = "mod-suite")]
+fn live_mine_cut_all_plan(
+    me: &Arc<Client>,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> mod_adapter_core::mine_cut_all::MineCutAllPlan {
+    use mod_adapter_core::mine_cut_all as mca;
+    let (mine_all, cut_all) = live_mine_cut_all_modes();
+    let config = mca::MineCutAllConfig::default().with_trigger(
+        live_mine_cut_all_trigger(&mine_all),
+        live_mine_cut_all_trigger(&cut_all),
+    );
+    if config.mine_all.is_off() && config.cut_all.is_off() {
+        return mca::MineCutAllPlan::default();
+    }
+    let sneaking = *me.sneaking.lock().unwrap_or_else(|e| e.into_inner());
+    if !config.mine_all.allows(sneaking) && !config.cut_all.allows(sneaking) {
+        return mca::MineCutAllPlan::default();
+    }
+    let Some(reg) = block_registry::breg() else {
+        return mca::MineCutAllPlan::default();
+    };
+    let held = {
+        let held_slot = *me.held.lock().unwrap_or_else(|e| e.into_inner());
+        me.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(36 + held_slot))
+            .cloned()
+            .unwrap_or((0, 0, Vec::new()))
+    };
+    let tool = live_mine_cut_all_tool(&held);
+    let world = LiveMineCutAllWorld {
+        dim,
+        reg,
+        player_name: &me.name,
+        op_level: client_permission_level(me),
+    };
+    mca::plan_vein_or_tree_break(
+        &config,
+        &tool,
+        &world,
+        mca::MineCutAllPos::new(x, y, z),
+        sneaking,
+    )
+}
+
+/// Break every extra position a [`live_mine_cut_all_plan`] produced. The
+/// apply fires only when the origin cell actually left `origin_state` — a
+/// denied or resynced break never expands — and each extra goes back through
+/// [`finish_block_break_one`], so drops, block updates, tool damage,
+/// exhaustion, the adventure `mayDestroy` recheck and the progression gate
+/// all behave exactly as they do for the origin. Positions re-read their
+/// live state: a cell another actor cleared in the meantime is a no-op, and
+/// recursion is impossible because extras never re-plan.
+#[cfg(feature = "mod-suite")]
+fn live_mine_cut_all_apply(
+    me: &Arc<Client>,
+    dim: DimId,
+    plan: mod_adapter_core::mine_cut_all::MineCutAllPlan,
+    (ox, oy, oz): (i32, i32, i32),
+    origin_state: u32,
+) {
+    if plan.positions.len() < 2
+        || plan.kind == mod_adapter_core::mine_cut_all::MineCutAllKind::None
+        || block_at_dim(dim, ox, oy, oz) == origin_state
+    {
+        return;
+    }
+    for pos in &plan.positions[1..] {
+        let cur = block_at_dim(dim, pos.x, pos.y, pos.z);
+        if block_registry::breg().is_none_or(|reg| reg.is_air(cur)) {
+            continue;
+        }
+        finish_block_break_one(me, dim, pos.x, pos.y, pos.z, cur);
+        record_live_block_audit(
+            dim,
+            (pos.x, pos.y, pos.z),
+            &me.name,
+            cur,
+            block_at_dim(dim, pos.x, pos.y, pos.z),
+            TICK_IDX.load(Ordering::Relaxed),
+        );
     }
 }
 
@@ -18686,6 +18900,217 @@ mod p5c_live_tests {
                 "doMobSpawning=false gates the spawn even on a hit roll"
             );
             GR_MOB_SPAWNING.store(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Lane WIRE-MINECUT-ORBITAL-SYNC (`mod-suite`): the opt-in MineAll /
+    /// CutAll policy reaches the LIVE `finish_block_break` path — the same
+    /// function the `0x24` dig-packet completion and the tick-driven dig
+    /// both funnel through. Vanilla default (`off`) breaks exactly one
+    /// block; `always` expands a connected ore vein; `sneak_only` expands
+    /// only while sneaking; a claimed neighbour chunk bounds the BFS and
+    /// a one-durability tool stops after the origin.
+    #[cfg(feature = "mod-suite")]
+    mod wire_mine_cut_all_tests {
+        use super::*;
+
+        /// Save `mine_all`/`cut_all`, apply new modes through the same
+        /// `LiveServerPolicy::set` validation `/megu policy set` uses, and
+        /// restore on drop so the next test sees pristine defaults.
+        struct MineCutPolicy((String, String));
+        impl MineCutPolicy {
+            fn set(mine: &str, cut: &str) -> Self {
+                let mut policy = live_server_policy()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let prev = (policy.mine_all.clone(), policy.cut_all.clone());
+                policy.set("mine_all", mine).unwrap();
+                policy.set("cut_all", cut).unwrap();
+                MineCutPolicy(prev)
+            }
+        }
+        impl std::ops::Drop for MineCutPolicy {
+            fn drop(&mut self) {
+                let mut policy = live_server_policy()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                policy.set("mine_all", &self.0 .0).unwrap();
+                policy.set("cut_all", &self.0 .1).unwrap();
+            }
+        }
+
+        /// Survival player at `(x, y, z)` holding item `item` in the held
+        /// slot; `comps` are applied verbatim (durability tests write
+        /// `COMP_DAMAGE`/`COMP_MAX_DAMAGE`).
+        fn minecut_client(
+            name: &str,
+            eid: i32,
+            item: i64,
+            comps: Vec<(i64, Vec<u8>)>,
+        ) -> (Arc<Client>, std::net::TcpStream) {
+            let (me, peer) = loopback_client(name, eid);
+            *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+            let held_slot = *me.held.lock().unwrap_or_else(|e| e.into_inner());
+            me.inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(36 + held_slot, (item, 1, comps));
+            (me, peer)
+        }
+
+        fn varint(value: i64) -> Vec<u8> {
+            let mut out = Vec::new();
+            write_varint(&mut out, value);
+            out
+        }
+
+        /// Claim `chunk` under an unrelated owner so `can_break` denies it
+        /// for the test player; removed on drop.
+        struct ForeignClaim((DimId, i32, i32));
+        impl ForeignClaim {
+            fn claim(dim: DimId, x: i32, z: i32) -> Self {
+                let key = claim_chunk_key(dim, x, z);
+                live_claims()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        key,
+                        LiveClaimRecord {
+                            owner: "other_owner".to_string(),
+                            trusted: BTreeSet::new(),
+                            created_tick: 0,
+                        },
+                    );
+                ForeignClaim(key)
+            }
+        }
+        impl std::ops::Drop for ForeignClaim {
+            fn drop(&mut self) {
+                live_claims()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&self.0);
+            }
+        }
+
+        /// Default `mine_all = off`: breaking one ore of a connected vein
+        /// breaks exactly that one block — byte-identical vanilla.
+        #[test]
+        fn live_mine_all_off_breaks_only_origin() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            let _policy = MineCutPolicy::set("off", "off");
+            let reg = crate::block_registry::breg().unwrap();
+            let ore = reg.state_of("minecraft:iron_ore", None);
+            let air = reg.state_of("minecraft:air", None);
+            let mut cells = Cells::new();
+            cells.set(5000, 70, 5000, ore);
+            cells.set(5001, 70, 5000, ore);
+            cells.set(5000, 71, 5000, ore);
+            let (me, _peer) = minecut_client("minecut_off", 0x7b01, 840, Vec::new());
+            finish_block_break(&me, DimId::Overworld, 5000, 70, 5000, ore);
+            assert_eq!(block_at(5000, 70, 5000), air, "origin broke");
+            assert_eq!(block_at(5001, 70, 5000), ore, "vein untouched while off");
+            assert_eq!(block_at(5000, 71, 5000), ore, "vein untouched while off");
+        }
+
+        /// `/megu policy set mine_all always`: one pickaxe break on a
+        /// 3-ore connected vein breaks all three through the live path —
+        /// including the claim boundary stop (a foreign-owned neighbour
+        /// chunk's ore survives) and drops per extra block.
+        #[test]
+        fn live_mine_all_always_breaks_vein_and_respects_claims() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            let _policy = MineCutPolicy::set("always", "off");
+            let reg = crate::block_registry::breg().unwrap();
+            let ore = reg.state_of("minecraft:iron_ore", None);
+            let air = reg.state_of("minecraft:air", None);
+            let mut cells = Cells::new();
+            // Contiguous vein 5118 -> 5119 -> 5120 crosses the chunk
+            // boundary at x=5120 (chunk 320, foreign-owned); the two cells
+            // in chunk 319 stay open.
+            cells.set(5118, 70, 5000, ore);
+            cells.set(5119, 70, 5000, ore);
+            cells.set(5120, 70, 5000, ore);
+            let _claim = ForeignClaim::claim(DimId::Overworld, 5120, 5000);
+            let (me, _peer) = minecut_client("minecut_on", 0x7b02, 840, Vec::new());
+            finish_block_break(&me, DimId::Overworld, 5118, 70, 5000, ore);
+            assert_eq!(block_at(5118, 70, 5000), air, "origin broke");
+            assert_eq!(block_at(5119, 70, 5000), air, "vein member broke");
+            assert_eq!(
+                block_at(5120, 70, 5000),
+                ore,
+                "foreign-claimed ore is never expanded into"
+            );
+        }
+
+        /// `/megu policy set cut_all sneak_only`: sneaking breaks the
+        /// connected log column; standing (not sneaking) is vanilla —
+        /// exactly one block.
+        #[test]
+        fn live_cut_all_sneak_only_gates_on_sneak() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            let _policy = MineCutPolicy::set("off", "sneak_only");
+            let reg = crate::block_registry::breg().unwrap();
+            let log = reg.state_of("minecraft:oak_log", None);
+            let air = reg.state_of("minecraft:air", None);
+            let mut cells = Cells::new();
+            for dy in 0..3 {
+                cells.set(5200, 70 + dy, 5000, log);
+            }
+            // Diamond axe (841) — axe family is the CutAll tool family.
+            let (me, _peer) = minecut_client("minecut_sneak", 0x7b03, 841, Vec::new());
+            *me.sneaking.lock().unwrap_or_else(|e| e.into_inner()) = false;
+            finish_block_break(&me, DimId::Overworld, 5200, 70, 5000, log);
+            assert_eq!(block_at(5200, 70, 5000), air, "origin broke");
+            assert_eq!(
+                block_at(5200, 71, 5000),
+                log,
+                "standing player gets vanilla single-block break"
+            );
+            // Replenish the origin and re-break while sneaking.
+            *me.sneaking.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            finish_block_break(&me, DimId::Overworld, 5200, 71, 5000, log);
+            assert_eq!(block_at(5200, 71, 5000), air, "sneak origin broke");
+            assert_eq!(
+                block_at(5200, 72, 5000),
+                air,
+                "sneaking fells the rest of the column"
+            );
+        }
+
+        /// A tool with exactly one durability point left stops before it
+        /// would break: `stop_before_tool_break` caps the plan at the
+        /// origin, so the vein stays standing.
+        #[test]
+        fn live_mine_all_stops_before_tool_break() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            let _policy = MineCutPolicy::set("always", "off");
+            let reg = crate::block_registry::breg().unwrap();
+            let ore = reg.state_of("minecraft:iron_ore", None);
+            let air = reg.state_of("minecraft:air", None);
+            let mut cells = Cells::new();
+            cells.set(5300, 70, 5000, ore);
+            cells.set(5301, 70, 5000, ore);
+            // Explicit durability: max 4, damage 3 -> 1 remaining. With
+            // `stop_before_tool_break` the plan keeps the tool alive, so
+            // the budget covers only the origin.
+            let (me, _peer) = minecut_client(
+                "minecut_dura",
+                0x7b04,
+                840,
+                vec![(COMP_MAX_DAMAGE, varint(4)), (COMP_DAMAGE, varint(3))],
+            );
+            finish_block_break(&me, DimId::Overworld, 5300, 70, 5000, ore);
+            assert_eq!(block_at(5300, 70, 5000), air, "origin broke");
+            assert_eq!(
+                block_at(5301, 70, 5000),
+                ore,
+                "durability budget stopped the expansion"
+            );
         }
     }
 }

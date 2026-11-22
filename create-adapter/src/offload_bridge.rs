@@ -42,16 +42,31 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::thread;
 
 use mc_spine_core::perf_kit::FingerprintBuilder;
-use mod_offload::region_scheduler::RegionKey;
+use mod_offload::region_scheduler::{Region, RegionKey};
 use mod_offload::sleeping_transport::TransportError;
+use mod_offload::sync_bridge::{GraphDeltaSink, MeGraphTarget, OffloadSyncBridge};
 
+// The sync-bridge public surface re-exported so callers that only depend
+// on `create-adapter` (e.g. the root live bridge under `create-offload`,
+// which has no `mod-offload` dep of its own) can name the delta/report
+// types without a second edge in the workspace graph.
+pub use mod_offload::sync_bridge::{BridgeError, BridgeSyncReport, ExternalGraphDelta};
+
+use crate::aeronautics::RigidBodySubWorld;
 use crate::contraption_adapter::{ContraptionError, ContraptionKind, LiveContraption};
 use crate::factory::CreateFactory;
+use crate::orbital::{
+    OrbitalDimension, OrbitalTransitionRouter, OrbitalTransitionRule, ShipDimensionTransition,
+};
 
 /// Maximum simultaneously registered contraption assemblies.
 pub const MAX_ASSEMBLIES: usize = 1024;
 /// Maximum blocks one assembly may carry into the offload bridge.
 pub const MAX_BLOCKS_PER_ASSEMBLY: usize = 4096;
+/// Maximum simultaneously registered orbital/aeronautics 6-DOF ships.
+pub const MAX_ORBITAL_SHIPS: usize = 256;
+/// Fixed orbital-ship integration step: one server tick in seconds.
+const ORBITAL_SHIP_STEP_DT: f64 = 0.05;
 /// Default per-region factory work budget, matching the main-crate bridge.
 const DEFAULT_FACTORY_REGION_STEPS: usize = 1_024;
 /// Default per-region factory time budget in microseconds.
@@ -275,6 +290,10 @@ pub enum OffloadError {
     TickWentBackwards { current: u64, requested: u64 },
     /// The factory's region scheduler rejected the tick.
     Factory(TransportError),
+    /// Registration would exceed [`MAX_ORBITAL_SHIPS`].
+    TooManyOrbitalShips { count: usize, limit: usize },
+    /// Orbital ship id already registered.
+    DuplicateOrbitalShip(u64),
 }
 
 /// Per-batch outcome of one [`OffloadBridge::step_tick`], in plan order.
@@ -316,6 +335,8 @@ pub struct OffloadTickReport {
     pub factory_regions: usize,
     /// Factory batch records exported this tick.
     pub factory_records: usize,
+    /// Orbital dimension transitions that fired this tick.
+    pub orbital_transitions: usize,
     /// FNV-1a state digest after this tick — identical across worker counts.
     pub digest: u64,
 }
@@ -338,7 +359,10 @@ impl OffloadedAssembly {
 }
 
 /// The offload bridge: an optional [`CreateFactory`] for kinetic/factory
-/// networks plus a capped, region-partitioned set of live contraptions.
+/// networks plus a capped, region-partitioned set of live contraptions,
+/// an [`OffloadSyncBridge`] feeding external/JVM graph deltas into the
+/// offload kernels, and an [`OrbitalTransitionRouter`] stepping every
+/// registered 6-DOF ship through orbital dimension transitions.
 pub struct OffloadBridge {
     factory: Option<CreateFactory>,
     assemblies: BTreeMap<u32, OffloadedAssembly>,
@@ -352,6 +376,65 @@ pub struct OffloadBridge {
     /// Running FNV-1a fingerprint of factory step outputs, folded in
     /// canonical region order each tick.
     factory_fp: FingerprintBuilder,
+    /// Incremental ingestion of external/JVM dirty-node graph deltas into
+    /// the offload kernels — kinetic, fluid, transport and ME.
+    sync_bridge: OffloadSyncBridge<OffloadGraphTarget>,
+    /// Atomic dimension-transition router for the registered ships.
+    orbital_router: OrbitalTransitionRouter,
+    /// Registered 6-DOF ships keyed by ship id — `BTreeMap` so stepping and
+    /// the digest both run in canonical order.
+    orbital_ships: BTreeMap<u64, RigidBodySubWorld>,
+    /// Transitions fired by the most recent [`step_tick`](Self::step_tick)
+    /// / [`step_orbital_ships`](Self::step_orbital_ships), queued until
+    /// [`take_orbital_transitions`](Self::take_orbital_transitions) drains
+    /// them (teleport intents ride out to the wire layer).
+    pending_orbital_transitions: Vec<ShipDimensionTransition>,
+}
+
+/// Composite [`GraphDeltaSink`] the bridge's sync path owns: kinetic,
+/// fluid and transport deltas land in a dedicated external [`Region`]
+/// (namespace `dimension: i32::MAX`, disjoint from every live dim band)
+/// while `Me*` deltas route to an [`MeGraphTarget`] — `Region` itself
+/// rejects those as unsupported. The external region is authoritative
+/// kernel state: ingest applies deltas through the same
+/// [`GraphDeltaSink for Region`](mod_offload::sync_bridge) semantics the
+/// scheduler uses, and `external_graph_target` exposes it for solutions
+/// and exports.
+pub struct OffloadGraphTarget {
+    region: Region,
+    me: MeGraphTarget,
+}
+
+impl OffloadGraphTarget {
+    fn new() -> Self {
+        Self {
+            region: Region::new(RegionKey::for_block(i32::MAX, 0, 0)),
+            me: MeGraphTarget::default(),
+        }
+    }
+
+    /// The external region holding ingested kinetic/fluid/transport state.
+    pub fn region(&self) -> &Region {
+        &self.region
+    }
+
+    /// The ingested ME channel graph + priority storage index.
+    pub fn me(&self) -> &MeGraphTarget {
+        &self.me
+    }
+}
+
+impl GraphDeltaSink for OffloadGraphTarget {
+    fn apply(&mut self, delta: &ExternalGraphDelta) -> Result<(), BridgeError> {
+        match delta {
+            ExternalGraphDelta::MeNodeUpsert { .. }
+            | ExternalGraphDelta::MeNodeRemove { .. }
+            | ExternalGraphDelta::MeLink { .. }
+            | ExternalGraphDelta::MeCellUpsert { .. }
+            | ExternalGraphDelta::MeCellRemove { .. } => self.me.apply(delta),
+            _ => self.region.apply(delta),
+        }
+    }
 }
 
 impl OffloadBridge {
@@ -366,6 +449,10 @@ impl OffloadBridge {
             tick: 0,
             started: false,
             factory_fp: FingerprintBuilder::new(),
+            sync_bridge: OffloadSyncBridge::new(OffloadGraphTarget::new()),
+            orbital_router: OrbitalTransitionRouter::new(),
+            orbital_ships: BTreeMap::new(),
+            pending_orbital_transitions: Vec::new(),
         }
     }
 
@@ -389,6 +476,132 @@ impl OffloadBridge {
     /// so export bookkeeping and the digest stay consistent.
     pub fn factory_mut(&mut self) -> Option<&mut CreateFactory> {
         self.factory.as_mut()
+    }
+
+    /// Ingest one batch of external/JVM dirty-node deltas through the
+    /// bridge's [`OffloadSyncBridge`]: state deltas coalesce last-wins per
+    /// shadow key and apply in canonical order, `TransportInsert` events
+    /// always apply in relative order, unchanged deltas are skipped, and
+    /// per-delta failures collect in the returned [`BridgeSyncReport`].
+    pub fn ingest_external_deltas(
+        &mut self,
+        deltas: &[ExternalGraphDelta],
+    ) -> Result<BridgeSyncReport, BridgeError> {
+        self.sync_bridge.ingest(deltas)
+    }
+
+    /// The sync bridge's sink — the external [`Region`] (kinetic, fluid,
+    /// transport) plus [`MeGraphTarget`] (ME channel graph + storage).
+    /// Read-only on purpose: mutating the sink behind the shadow map would
+    /// desynchronize ingest's skip bookkeeping.
+    pub fn external_graph_target(&self) -> &OffloadGraphTarget {
+        self.sync_bridge.sink()
+    }
+
+    /// Register a dimension the orbital router can route ships through.
+    pub fn register_orbital_dimension(&mut self, dim: u32, descriptor: OrbitalDimension) {
+        self.orbital_router.register_dimension(dim, descriptor);
+    }
+
+    /// Register an orbital transition rule (e.g. `Y >= 560` Overworld ->
+    /// orbit). Takes effect on the next ship step.
+    pub fn register_orbital_rule(&mut self, rule: OrbitalTransitionRule) {
+        self.orbital_router.register_rule(rule);
+    }
+
+    /// The orbital transition router (dimension table, rules, passengers,
+    /// cooldowns).
+    pub fn orbital_router(&self) -> &OrbitalTransitionRouter {
+        &self.orbital_router
+    }
+
+    /// Register a 6-DOF ship the router steps every [`step_tick`]. Fails
+    /// closed on a duplicate id or the [`MAX_ORBITAL_SHIPS`] cap.
+    pub fn register_orbital_ship(
+        &mut self,
+        ship: RigidBodySubWorld,
+    ) -> Result<(), OffloadError> {
+        let id = ship.id;
+        if self.orbital_ships.contains_key(&id) {
+            return Err(OffloadError::DuplicateOrbitalShip(id));
+        }
+        if self.orbital_ships.len() >= MAX_ORBITAL_SHIPS {
+            return Err(OffloadError::TooManyOrbitalShips {
+                count: self.orbital_ships.len() + 1,
+                limit: MAX_ORBITAL_SHIPS,
+            });
+        }
+        self.orbital_ships.insert(id, ship);
+        Ok(())
+    }
+
+    /// Remove a registered ship and return it to the caller. `None` when
+    /// the id is not registered.
+    pub fn unregister_orbital_ship(&mut self, ship_id: u64) -> Option<RigidBodySubWorld> {
+        self.orbital_ships.remove(&ship_id)
+    }
+
+    /// Read-only access to a registered ship.
+    pub fn orbital_ship(&self, ship_id: u64) -> Option<&RigidBodySubWorld> {
+        self.orbital_ships.get(&ship_id)
+    }
+
+    /// Mutable access to a registered ship — the live caller's only way to
+    /// apply thrust, player input, or block changes between ticks.
+    pub fn orbital_ship_mut(&mut self, ship_id: u64) -> Option<&mut RigidBodySubWorld> {
+        self.orbital_ships.get_mut(&ship_id)
+    }
+
+    /// Registered ship count; [`step_tick`](Self::step_tick) skips orbital
+    /// work entirely when this is `0`.
+    pub fn orbital_ship_count(&self) -> usize {
+        self.orbital_ships.len()
+    }
+
+    /// Attach rider `entity_id` to `ship_id` at a local offset from the
+    /// ship's center of mass; the rider rides through every dimension
+    /// transition as a
+    /// [`ShipPassengerTransition`](crate::orbital::ShipPassengerTransition).
+    pub fn attach_orbital_passenger(
+        &mut self,
+        entity_id: i32,
+        ship_id: u64,
+        local_offset: [f64; 3],
+    ) -> bool {
+        self.orbital_router
+            .attach_passenger(entity_id, ship_id, local_offset)
+    }
+
+    /// Detach rider `entity_id` (dismount, disassembly, logout).
+    pub fn detach_orbital_passenger(&mut self, entity_id: i32) -> bool {
+        self.orbital_router.detach_passenger(entity_id)
+    }
+
+    /// Step every registered ship once under the router at `dt` seconds,
+    /// in ship-id order. Each ship flies under its current dimension's
+    /// atmosphere, then the declarative rules evaluate against its
+    /// post-step center of mass; fired rules atomically transfer the ship
+    /// plus every attached passenger and emit one
+    /// [`ShipDimensionTransition`]. Fired transitions are queued for
+    /// [`take_orbital_transitions`](Self::take_orbital_transitions) AND
+    /// returned to the caller in ship-id order.
+    pub fn step_orbital_ships(&mut self, dt: f64) -> Vec<ShipDimensionTransition> {
+        let mut fired = Vec::new();
+        for ship in self.orbital_ships.values_mut() {
+            if let Some(transition) =
+                self.orbital_router.step_with_dimension_transitions(ship, dt)
+            {
+                fired.push(transition);
+            }
+        }
+        self.pending_orbital_transitions.extend(fired.iter().cloned());
+        fired
+    }
+
+    /// Drain every queued orbital transition — the wire layer's hand-off
+    /// for ship re-parenting and passenger teleport intents.
+    pub fn take_orbital_transitions(&mut self) -> Vec<ShipDimensionTransition> {
+        std::mem::take(&mut self.pending_orbital_transitions)
     }
 
     /// Register a live contraption under its own `id` with a stress spec.
@@ -538,6 +751,27 @@ impl OffloadBridge {
             f.write_bool(asm.halted);
             f.write_f64(asm.stress.capacity);
             f.write_f64(asm.stress.consumption);
+        }
+        // Orbital fleet: ship id order is canonical, and the router tick +
+        // queued transitions keep bridge state fully fingerprinted.
+        f.write_u64(self.orbital_router.tick());
+        f.write_usize(self.pending_orbital_transitions.len());
+        f.write_usize(self.orbital_ships.len());
+        for (id, ship) in &self.orbital_ships {
+            f.write_u64(*id);
+            f.write_u32(ship.parent_dim);
+            for v in ship.pos {
+                f.write_f64(v);
+            }
+            for v in ship.quat {
+                f.write_f64(v);
+            }
+            for v in ship.vel {
+                f.write_f64(v);
+            }
+            for v in ship.omega {
+                f.write_f64(v);
+            }
         }
         f.finish()
     }
@@ -744,6 +978,14 @@ impl OffloadBridge {
             }
         }
 
+        // 5. Orbital ships — one router step per registered 6-DOF ship at
+        // the fixed server-tick dt; transition rules fire against the
+        // post-step pose. Zero cost when no ship is registered.
+        if !self.orbital_ships.is_empty() {
+            report.orbital_transitions =
+                self.step_orbital_ships(ORBITAL_SHIP_STEP_DT).len();
+        }
+
         report.batches = self
             .plan
             .batches
@@ -841,6 +1083,7 @@ impl OffloadTickReport {
             batches: Vec::new(),
             factory_regions: 0,
             factory_records: 0,
+            orbital_transitions: 0,
             digest: 0,
         }
     }

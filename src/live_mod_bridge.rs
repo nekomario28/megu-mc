@@ -2339,6 +2339,106 @@ fn live_progression_denies_break(_me: &Client, _dim: DimId, _x: i32, _y: i32, _z
     false
 }
 
+// ---------------------------------------------------------------------------
+// Lane WIRE-MINECUT-ORBITAL-SYNC (`create-offload`): production entry points
+// through the process-wide `mod_offload_bridge()` — the same bridge
+// `mod_offload_tick` steps every game tick — for the two live offload
+// surfaces that need no further packet plumbing yet:
+//   * `live_ingest_external_graph_deltas` — an external/JVM graph source
+//     (NeoForge Create bridge, datapack scheduler, remote mod runtime)
+//     pushes incremental dirty-node deltas straight into the offload
+//     kernels via `mod_offload::sync_bridge::OffloadSyncBridge`.
+//   * `live_register_orbital_*` / `live_take_orbital_transitions` —
+//     aeronautics sub-worlds register for per-tick orbital stepping; fired
+//     `ShipDimensionTransition`s queue for the wire layer to drain.
+// ---------------------------------------------------------------------------
+
+/// Ingest one batch of external dirty-node deltas (kinetic, fluid,
+/// transport, ME) into the live offload bridge. State deltas coalesce
+/// last-wins and apply in canonical order inside
+/// [`create_adapter::offload_bridge::OffloadBridge::ingest_external_deltas`].
+#[cfg(feature = "create-offload")]
+#[allow(dead_code)]
+fn live_ingest_external_graph_deltas(
+    deltas: &[create_adapter::offload_bridge::ExternalGraphDelta],
+) -> Result<
+    create_adapter::offload_bridge::BridgeSyncReport,
+    create_adapter::offload_bridge::BridgeError,
+> {
+    mod_offload_bridge()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .offload
+        .ingest_external_deltas(deltas)
+}
+
+/// Register a dimension the live orbital router can route 6-DOF ships
+/// through (`"minecraft:overworld"`, a discovered `ad_astra:` dim, ...).
+#[cfg(feature = "create-offload")]
+#[allow(dead_code)]
+fn live_register_orbital_dimension(
+    dim: u32,
+    descriptor: create_adapter::orbital::OrbitalDimension,
+) {
+    mod_offload_bridge()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .offload
+        .register_orbital_dimension(dim, descriptor);
+}
+
+/// Register an orbital transition rule on the live bridge — e.g. an
+/// `AscendCeiling` rule taking a ship at `Y >= 560` from the Overworld
+/// into space.
+#[cfg(feature = "create-offload")]
+#[allow(dead_code)]
+fn live_register_orbital_rule(rule: create_adapter::orbital::OrbitalTransitionRule) {
+    mod_offload_bridge()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .offload
+        .register_orbital_rule(rule);
+}
+
+/// Register a 6-DOF ship for per-tick orbital stepping by the live
+/// bridge's router (invoked from `mod_offload_tick` -> `step_tick`).
+#[cfg(feature = "create-offload")]
+#[allow(dead_code)]
+fn live_register_orbital_ship(
+    ship: create_adapter::aeronautics::RigidBodySubWorld,
+) -> Result<(), create_adapter::offload_bridge::OffloadError> {
+    mod_offload_bridge()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .offload
+        .register_orbital_ship(ship)
+}
+
+/// Attach rider `entity_id` to `ship_id` at a local offset from the ship's
+/// center of mass so the rider rides through orbital transitions.
+#[cfg(feature = "create-offload")]
+#[allow(dead_code)]
+fn live_attach_orbital_passenger(entity_id: i32, ship_id: u64, local_offset: [f64; 3]) -> bool {
+    mod_offload_bridge()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .offload
+        .attach_orbital_passenger(entity_id, ship_id, local_offset)
+}
+
+/// Drain the queued orbital dimension transitions — ship re-parenting plus
+/// per-rider `TeleportIntent`s the wire layer executes.
+#[cfg(feature = "create-offload")]
+#[allow(dead_code)]
+fn live_take_orbital_transitions()
+-> Vec<create_adapter::orbital::ShipDimensionTransition> {
+    mod_offload_bridge()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .offload
+        .take_orbital_transitions()
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
