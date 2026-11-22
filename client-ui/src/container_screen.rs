@@ -7,7 +7,9 @@
 //! [`UiDrawList`] producer: centered panel, slots, items, progress bars,
 //! cursor, buttons, and a viewport-clamped tooltip.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 
 use crate::draw::{palette, text_height, text_width, UiColor, UiDrawList, UiRect};
 
@@ -572,7 +574,7 @@ pub fn menu_schema(menu_id: u32) -> Option<&'static MenuScreenSchema> {
         .filter(|s| s.menu_id == menu_id)
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct UiEnchantment {
     pub name: String,
     pub level: i32,
@@ -1646,5 +1648,243 @@ impl ContainerScreenState {
             window_id: self.window_id,
             button_id,
         })
+    }
+}
+
+/// QoL inventory-sort state (Inventory-Sort / MouseTweaks semantics).
+///
+/// Tracks the sort-key toggle/hover state and performs deterministic
+/// vanilla-mod-style sorting over a [`ContainerScreenState`]: partial
+/// stacks that are fully stack-compatible are merged up to `max_stack`,
+/// then stacks are ordered by count descending with `item_id` ascending
+/// as the tie-break and empty slots sink to the end of the range.
+#[derive(Clone, Debug)]
+pub struct InventorySortState {
+    /// Whether the sort keybinding is armed (settings-gated by consumers).
+    pub enabled: bool,
+    /// Slot the pointer currently hovers, used for region picking.
+    pub hovered_slot: Option<usize>,
+    /// Monotonic tick of the most recent completed sort (`None` = never).
+    pub last_sort_tick: Option<u64>,
+    /// Number of completed sort operations.
+    pub sort_count: u64,
+    /// Slot range touched by the most recent sort.
+    pub last_sorted_range: Option<Range<usize>>,
+    /// `true` while a sort operation is executing. Consumers driving an
+    /// animated sort may hold it via [`Self::begin_sort`]/[`Self::end_sort`].
+    pub sort_in_progress: bool,
+    tick: u64,
+}
+
+impl Default for InventorySortState {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hovered_slot: None,
+            last_sort_tick: None,
+            sort_count: 0,
+            last_sorted_range: None,
+            sort_in_progress: false,
+            tick: 0,
+        }
+    }
+}
+
+/// Deterministic ordering key for non-empty stacks: count descending,
+/// then `item_id` ascending, then every stackable-relevant field so the
+/// result never depends on input order.
+type StackSortKey = (
+    Reverse<u16>,
+    u32,
+    String,
+    i32,
+    i32,
+    Vec<String>,
+    Vec<UiEnchantment>,
+    (u8, u8, u8, u8),
+);
+
+fn stack_sort_key(stack: &UiItemStack) -> StackSortKey {
+    let color = stack.rarity_color;
+    (
+        Reverse(u16::from(stack.count)),
+        stack.item_id,
+        stack.display_name.clone(),
+        stack.durability,
+        stack.max_durability,
+        stack.lore.clone(),
+        stack.enchantments.clone(),
+        (color.r, color.g, color.b, color.a),
+    )
+}
+
+impl InventorySortState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mark the start of a consumer-driven (e.g. animated) sort.
+    pub fn begin_sort(&mut self) {
+        self.sort_in_progress = true;
+    }
+
+    /// Mark the end of a consumer-driven sort.
+    pub fn end_sort(&mut self) {
+        self.sort_in_progress = false;
+    }
+
+    /// Contiguous sortable region containing `index`.
+    ///
+    /// Player-inventory slots map to the 36-slot player region
+    /// (`inventory_start..inventory_start + 36`). Every other slot maps to
+    /// the container region: the span covering all non-player slots whose
+    /// [`SlotKind`] accepts placement (i.e. not `Output`/`Locked`), so
+    /// result slots are never swept into a sort.
+    pub fn slot_range_for(
+        &self,
+        screen: &ContainerScreenState,
+        index: usize,
+    ) -> Range<usize> {
+        let len = screen.slot_count();
+        let schema = screen.schema();
+        let inv_start = schema.inventory_start.max(0) as usize;
+        let inv_end = if schema.has_player_inventory {
+            (inv_start + 36).min(len)
+        } else {
+            inv_start
+        };
+        if schema.has_player_inventory && index >= inv_start && index < inv_end {
+            return inv_start..inv_end;
+        }
+        self.container_range(screen)
+    }
+
+    /// The sortable container region (non-player, placement-accepting
+    /// slots) as one contiguous span, or `0..0` when none exists.
+    pub fn container_range(&self, screen: &ContainerScreenState) -> Range<usize> {
+        let len = screen.slot_count();
+        let schema = screen.schema();
+        let inv_start = schema.inventory_start.max(0) as usize;
+        let inv_end = if schema.has_player_inventory {
+            (inv_start + 36).min(len)
+        } else {
+            inv_start
+        };
+        let mut lo = len;
+        let mut hi = 0usize;
+        for i in 0..len {
+            if schema.has_player_inventory && i >= inv_start && i < inv_end {
+                continue;
+            }
+            match screen.slot_kind(i as i16) {
+                Some(SlotKind::Output) | Some(SlotKind::Locked) | None => continue,
+                _ => {}
+            }
+            lo = lo.min(i);
+            hi = i + 1;
+        }
+        if lo < hi { lo..hi } else { 0..0 }
+    }
+
+    /// Region sorted when no slot is hovered: the player inventory when
+    /// the schema provides one, otherwise the container region.
+    pub fn default_sort_range(&self, screen: &ContainerScreenState) -> Range<usize> {
+        let schema = screen.schema();
+        if schema.has_player_inventory {
+            let inv_start = schema.inventory_start.max(0) as usize;
+            inv_start..(inv_start + 36).min(screen.slot_count())
+        } else {
+            self.container_range(screen)
+        }
+    }
+
+    /// Deterministic vanilla-mod-style sort over `range`.
+    ///
+    /// (a) Stacks inside `range` that are fully stack-compatible
+    /// ([`UiItemStack::same_stackable`]: same `item_id`, `max_stack`,
+    /// durability, display name, lore, enchantments and rarity) are merged
+    /// up to `max_stack`; fully consumed sources become
+    /// [`UiItemStack::empty`]. (b) The resulting stacks are ordered by
+    /// count descending, `item_id` ascending as tie-break, then every
+    /// remaining stackable-relevant field; empties sink to the end of the
+    /// range. Only slots inside `range` are modified.
+    pub fn sort_container_range(
+        &mut self,
+        screen: &mut ContainerScreenState,
+        range: Range<usize>,
+    ) {
+        let start = range.start.min(screen.slot_count());
+        let end = range.end.min(screen.slot_count());
+        if start >= end {
+            return;
+        }
+        self.sort_in_progress = true;
+        self.tick += 1;
+        self.last_sort_tick = Some(self.tick);
+        self.sort_count += 1;
+        self.last_sorted_range = Some(start..end);
+
+        let mut merged: Vec<UiItemStack> = Vec::with_capacity(end - start);
+        for index in start..end {
+            let mut stack = screen.slots[index].clone();
+            while !stack.is_empty() {
+                let mut fully_placed = false;
+                for target in merged.iter_mut() {
+                    if !target.same_stackable(&stack) {
+                        continue;
+                    }
+                    let capacity = u32::from(target.max_stack)
+                        .saturating_sub(u32::from(target.count));
+                    if capacity == 0 {
+                        continue;
+                    }
+                    let amount = u32::from(stack.count).min(capacity) as u8;
+                    target.count += amount;
+                    stack.count -= amount;
+                    if stack.count == 0 {
+                        fully_placed = true;
+                        break;
+                    }
+                }
+                if fully_placed || stack.count == 0 {
+                    break;
+                }
+                merged.push(stack);
+                break;
+            }
+        }
+        let mut non_empty: Vec<UiItemStack> = merged
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect();
+        non_empty.sort_by_cached_key(stack_sort_key);
+
+        for (offset, index) in (start..end).enumerate() {
+            screen.slots[index] = non_empty.get(offset).cloned().unwrap_or_else(UiItemStack::empty);
+        }
+        self.sort_in_progress = false;
+    }
+
+    /// Sort-key press (vanilla mods bind `R` or middle-click).
+    ///
+    /// Sorts the region containing `hovered_slot`: the player-inventory
+    /// region for player slots, the container region for container slots,
+    /// and the player region (or container region when the schema has no
+    /// player inventory) when nothing is hovered. No-op while `enabled`
+    /// is `false`.
+    pub fn toggle_sort_key(
+        &mut self,
+        hovered_slot: Option<usize>,
+        screen: &mut ContainerScreenState,
+    ) {
+        self.hovered_slot = hovered_slot.filter(|&s| s < screen.slot_count());
+        if !self.enabled {
+            return;
+        }
+        let range = match self.hovered_slot {
+            Some(index) => self.slot_range_for(screen, index),
+            None => self.default_sort_range(screen),
+        };
+        self.sort_container_range(screen, range);
     }
 }
