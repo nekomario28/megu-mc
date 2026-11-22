@@ -64,6 +64,16 @@
 //!   (commands, escape prefix, existing Japanese, URLs, mentions,
 //!   numerics, all-caps acronyms) with a vanilla-safe 256-char bound.
 //!   [`romaji_ime::RomajiChatMode::Off`] is the strict vanilla default.
+//! * [`tier25_guard_batch`] — the Tier-2.5 zero-JNI-idle, `O(1)`-per-tick
+//!   bridge between native hot paths and bounded JVM loader hosts:
+//!   [`tier25_guard_batch::GuardPredicate`] entry guards (lava/water/
+//!   ground/sneak/effect/type/dimension/held-item/slot leaves plus
+//!   depth- and node-bounded `And`/`Or`/`Not`) evaluated in pure Rust
+//!   before any JNI crossing, and
+//!   [`tier25_guard_batch::TickBatchCoalescer`], which queues a tick's
+//!   surviving events per `NeoForge`/`Fabric` lane with coalesce-key
+//!   dedup and drains them as ONE `TB25` big-endian CRC32-checked flat
+//!   frame — 0 JNI calls on idle ticks, 1 on any busy tick.
 //! * [`zip_archive`] — lazy, zero-dependency, zero-disk-extraction ZIP/JAR
 //!   indexing: [`zip_archive::LazyZipIndex`] reads only the EOCD tail +
 //!   Central Directory (ZIP64 included), seeks per entry on demand, resolves
@@ -87,5 +97,6 @@ pub mod romaji_ime;
 pub mod server_perf_governors;
 pub mod sys_metrics;
 pub mod task_pool;
+pub mod tier25_guard_batch;
 pub mod version;
 pub mod zip_archive;
