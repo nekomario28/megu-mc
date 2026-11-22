@@ -12,8 +12,10 @@ use mc_spine_client::friend_client::{FriendGuestBridge, FriendHostSession};
 use mc_spine_client::integrated;
 use mc_spine_client::protocol::encode_slot_stack;
 use mc_spine_client::render::{FrameBudgetGovernor, RenderConfig, ThrottleStage};
+use mc_spine_client::spatial_audio::SpatialAudioPreset;
 use mc_spine_client::zsh_command_bar::ZshCommandBar;
 use mc_spine_client_mesh::builtin_shadow_wgsl::{BuiltinShadowQuality, RenderScalePreset};
+use mc_spine_client_mesh::tactile_effects::{TactileEffectsConfig, TactilePreset};
 use mc_spine_client_mesh::ChunkUploadBudget;
 use mc_spine_kernel::debug_chords::{
     finish_gamemode_switcher, handle_f3_chord, DebugChordAction, DebugChordContext,
@@ -875,6 +877,36 @@ impl GpuApp {
                 self.reconfigure(size);
             }
         }
+
+        // Live-session surfaces (QUAL-4): the 3D blocks/skins and nature
+        // packs, the tactile weather/touch sim, and the spatial-audio
+        // mixer preset all take the same toggles the settings screen
+        // exposes.
+        if let Some(live) = &mut self.live {
+            live.vanilla_plus_cfg.three_d.enabled = settings.visual.blocks_and_skins_3d;
+            live.vanilla_plus_cfg.nature.enabled = settings.visual.world_effects;
+            let detail = &settings.visual.world_effects_detail;
+            let tactile = live.tactile_config().clone();
+            live.set_tactile_config(TactileEffectsConfig {
+                preset: if settings.visual.world_effects {
+                    TactilePreset::Fancy
+                } else {
+                    TactilePreset::Off
+                },
+                water_and_lava_reactions: detail.water_splash || detail.ripples,
+                tree_shake_and_footsteps: detail.cherry_leaves || detail.autumn_leaves,
+                cold_breath_and_embers: detail.cold_breath,
+                shooting_stars_and_aurora: detail.night_sky,
+                subtle_camera_motion: settings.visual.camera_micro_motion,
+                ..tactile
+            });
+            let preset = if settings.visual.spatial_audio_3d {
+                SpatialAudioPreset::Realistic
+            } else {
+                SpatialAudioPreset::Off
+            };
+            live.set_spatial_audio_preset(preset);
+        }
     }
 
     fn set_cursor_grab(&mut self, grab: bool) {
@@ -954,7 +986,7 @@ impl GpuApp {
 
     /// Spawn a session against `host:port` and switch the UI into gameplay.
     fn connect_to(&mut self, host: String, port: u16) {
-        self.live = Some(LiveSession::connect_with_paths_and_auth(
+        let live = LiveSession::connect_with_paths_and_auth(
             host,
             port,
             self.config.username.clone(),
@@ -962,7 +994,17 @@ impl GpuApp {
             self.session_paths.clone(),
             self.config.access_token.clone(),
             self.config.uuid.clone(),
-        ));
+        );
+        // Windowed path: the dedicated real-time `AudioMixThread` owns the
+        // cpal stream; gameplay code enqueues `AudioCmd`s non-blocking.
+        // (`attach_live` test fixtures intentionally keep the synchronous
+        // `pump()` fallback.)
+        // Windowed sessions hand their sink to the real-time mix thread
+        // lazily in `render_frame` (first live frame): `AudioMixCore`
+        // construction is heavy enough that running it on small test
+        // threads overflows their stack, and headless/test sessions keep
+        // the synchronous `pump()` path by design.
+        self.live = Some(live);
         self.ui.screen = Screen::InGameHud;
         self.ui.hud = mc_spine_ui::state::HudState::default();
         self.paused = false;
@@ -1829,6 +1871,38 @@ impl GpuApp {
                 live.upload_pending_atlas(&mut active.renderer);
             }
             active.renderer.sync_subworlds(&mut live.subworlds);
+            // First live frame on the windowed path: hand the sink to the
+            // dedicated real-time `AudioMixThread` so gameplay code
+            // submits `AudioCmd`s non-blocking (headless/test sessions
+            // keep the synchronous `pump()` fallback).
+            if !live.dedicated_audio_mix() {
+                live.enable_dedicated_audio_mix();
+            }
+            // Upload admission finished above: drop the CPU mesh copies
+            // of the sections VRAM now owns (keeps `packed_mesh_count()`
+            // at the working-set bound, V2).
+            live.release_uploaded_cpu_copies(&mut active.renderer);
+            // Tactile weather/touch sim ticks on the render clock.
+            let submerged = live.pose.is_some_and(|pose| {
+                let eye = [
+                    pose.feet[0].floor() as i32,
+                    (pose.feet[1] + 1.62).floor() as i32,
+                    pose.feet[2].floor() as i32,
+                ];
+                live.world
+                    .fluid_cell_at(eye[0], eye[1], eye[2])
+                    .kind
+                    .is_some()
+            });
+            live.step_tactile_frame(
+                dt,
+                live.world_time_ticks(),
+                live.world.rain_level <= 0.0,
+                submerged,
+                15,
+                0.0,
+                live.world.rain_level > 0.0,
+            );
             self.ui
                 .hud
                 .chat_lines
@@ -1921,7 +1995,22 @@ impl GpuApp {
                 let view = frame
                     .texture
                     .create_view(&wgpu::TextureViewDescriptor::default());
-                active.renderer.render_to_view(&view, w, h, &sky);
+                match &self.live {
+                    Some(live) => {
+                        let lights = live.dynamic_colored_lights();
+                        active.renderer.render_to_view_with_env(
+                            &view,
+                            w,
+                            h,
+                            &sky,
+                            &live.atmosphere_blender,
+                            &live.chunk_fades,
+                            live.world_time_ticks(),
+                            &lights,
+                        );
+                    }
+                    None => active.renderer.render_to_view(&view, w, h, &sky),
+                }
                 // Wayland `wl_surface.frame` pacing: notify the compositor
                 // right before present so frame callbacks align with the
                 // actual swap (a no-op everywhere else; the policy gates

@@ -7,7 +7,9 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use mc_spine_client::audio_out::{AudioRuntime, AudioSessionConfig, AudioSinkKind};
+use mc_spine_client::audio_out::{
+    AudioCmd, AudioCmdRing, AudioRuntime, AudioSessionConfig, AudioSinkKind,
+};
 use mc_spine_client::online_auth::OnlineAuthOptions;
 use mc_spine_client::protocol::{
     decode_item_stack_components, handle_transfer_packet, offline_uuid, parse_uuid,
@@ -19,17 +21,17 @@ use mc_spine_client::protocol::{
 use mc_spine_client::render::ClientVfxHost;
 use mc_spine_client::render_graph::GpuPipelineKind;
 use mc_spine_client::session::{AudioStats, WorldAcousticSnapshot};
-use mc_spine_client::spatial_audio::{SpatialSubtitleCue, SubtitleDirection};
+use mc_spine_client::spatial_audio::{SpatialAudioPreset, SpatialSubtitleCue, SubtitleDirection};
 use mc_spine_client::world::{BlockTable, WorldState};
 use mc_spine_client_mesh::asset_pipeline::{CompiledAssetBundle, ResourcePackLayer};
 use mc_spine_client_mesh::atlas::{AtlasMip, PackedAtlas, SpriteAnimation, SpritePlacement};
-use mc_spine_client_mesh::model_baker::blockstate::BlockStateDef;
-use mc_spine_client_mesh::model_baker::ResourcePackModelStack;
 use mc_spine_client_mesh::builtin_shadow_wgsl::BuiltinShadowQuality;
 use mc_spine_client_mesh::entity_rig::{classify_entity_rig, EntityRigSpec};
 use mc_spine_client_mesh::mesher::{
     BlockVisualEnhancementResult, BlockVisualInput, VanillaPlusPipelineConfig,
 };
+use mc_spine_client_mesh::model_baker::blockstate::BlockStateDef;
+use mc_spine_client_mesh::model_baker::ResourcePackModelStack;
 use mc_spine_client_mesh::tactile_effects::{
     compute_environment_audio_hint, evaluate_night_sky_drama, CameraMicroOffset,
     EnvironmentAudioHint, FluidEntryEvent, GroundSurfaceKind, ImpactMaterial, LeafCanopyKind,
@@ -1034,6 +1036,71 @@ impl LiveSession {
         self.audio.pump_frames(frames);
     }
 
+    /// Authoritative server world clock (`set_time` time_of_day,
+    /// reduced to the 0..24000 day cycle) — the renderer's
+    /// `world_time_ticks` and the tactile/eclipse systems all key off it.
+    pub fn world_time_ticks(&self) -> u64 {
+        self.world.time_of_day.rem_euclid(24_000) as u64
+    }
+
+    /// Current VFX1 dynamic colored lights for the frame's light UBO.
+    pub fn dynamic_colored_lights(
+        &self,
+    ) -> Vec<mc_spine_client_mesh::vfx_engine::DynamicColoredLight> {
+        let forward = self.pose.map_or([0.0, 0.0, 1.0], |p| {
+            let (yaw, pitch) = (p.yaw.to_radians(), p.pitch.to_radians());
+            [
+                -yaw.sin() * pitch.cos(),
+                -pitch.sin(),
+                yaw.cos() * pitch.cos(),
+            ]
+        });
+        self.vfx.frame_output(forward).lights
+    }
+
+    /// Drain the sections whose meshes finished VRAM upload and release
+    /// their CPU copies — keeps `WorldState::packed_mesh_count()` at the
+    /// working-set bound (V2) instead of growing with residency.
+    pub fn release_uploaded_cpu_copies(&mut self, renderer: &mut GpuRenderer) {
+        for coord in renderer.take_uploaded_section_coords() {
+            self.world.release_uploaded_section_cpu_copies(coord);
+        }
+    }
+
+    /// Install a new spatial-audio quality tier on the caller-side mixer,
+    /// preserving the live acoustic-world binding (`Off` is the bit-exact
+    /// vanilla passthrough, `Realistic`/`Ultra` the ray-traced tiers).
+    /// With the dedicated real-time mix thread running, the caller-side
+    /// mixer is a parked fallback — the thread's DSP keeps the preset it
+    /// was spawned with.
+    pub fn set_spatial_audio_preset(&mut self, preset: SpatialAudioPreset) {
+        let mut mixer =
+            mc_spine_client::session::SoundMixer::new(self.audio.mixer.sample_rate(), preset);
+        mixer.set_world(Box::new(self.acoustic_world.clone()));
+        self.audio.mixer = mixer;
+    }
+
+    /// Hand the audio sink to the dedicated real-time `AudioMixThread`
+    /// and return the lock-free command ring. Windowed sessions call this
+    /// once at startup; headless/unit-test sessions skip it and keep the
+    /// synchronous `pump()` path.
+    pub fn enable_dedicated_audio_mix(&mut self) -> std::sync::Arc<AudioCmdRing> {
+        self.audio.enable_dedicated_mix_thread()
+    }
+
+    /// `true` once [`Self::enable_dedicated_audio_mix`] handed the sink
+    /// to the real-time mix thread.
+    pub fn dedicated_audio_mix(&self) -> bool {
+        self.audio.mix_thread().is_some()
+    }
+
+    /// O(1) lock-free audio command submission for the render thread —
+    /// `false` when no dedicated mix thread runs (callers keep the
+    /// synchronous `ingest`/`pump` path).
+    pub fn submit_audio_cmd_nonblocking(&self, cmd: AudioCmd) -> bool {
+        self.audio.submit_cmd_nonblocking(cmd)
+    }
+
     /// Update a known entity location for entity-bound sound packets.
     pub fn set_entity_position(&mut self, entity_id: i32, position: [f64; 3]) {
         self.entity_positions.insert(entity_id, position);
@@ -1275,7 +1342,11 @@ impl LiveSession {
                 }
             }
         }
-        self.audio.pump();
+        // Synchronous pump only when no dedicated mix thread owns the
+        // sink — `pump` would write to the null sink otherwise.
+        if self.audio.mix_thread().is_none() {
+            self.audio.pump();
+        }
         // Preserve the last received terrain even if the peer closes immediately
         // after sending chunk data.
         let had_pending = self.world.pending_mesh_sections() > 0;
@@ -1677,8 +1748,24 @@ impl LiveSession {
 
     fn update_audio_listener(&mut self) {
         if let Some(pose) = self.pose {
-            self.audio
-                .update_listener(pose.feet, Some(pose.yaw), Some(pose.pitch));
+            // Dedicated mix thread: stream the pose over the lock-free
+            // ring instead of touching the caller-side mixer. The
+            // synchronous call stays the headless/unit-test fallback.
+            let sent = self.audio.submit_cmd_nonblocking(AudioCmd::UpdateListener {
+                pos: [
+                    pose.feet[0] as f32,
+                    (pose.feet[1] + 1.62) as f32,
+                    pose.feet[2] as f32,
+                ],
+                vel: [0.0; 3],
+                yaw_deg: pose.yaw,
+                pitch_deg: pose.pitch,
+                submerged: false,
+            });
+            if !sent {
+                self.audio
+                    .update_listener(pose.feet, Some(pose.yaw), Some(pose.pitch));
+            }
             if let Some(entity_id) = self.player_entity_id {
                 self.entity_positions.insert(entity_id, pose.feet);
             }
@@ -1887,8 +1974,7 @@ impl LiveSession {
             return;
         }
         let (vertices, indices) = voxel_clouds_to_geometry(&cells, &lighting);
-        let mut entry =
-            SubWorldRenderEntry::new(CLOUD_SUBWORLD_ID, transform, vertices, indices);
+        let mut entry = SubWorldRenderEntry::new(CLOUD_SUBWORLD_ID, transform, vertices, indices);
         entry.alpha = CLOUD_RENDER_ALPHA;
         self.subworlds.upsert(entry);
         self.cloud_mesh_key = Some(key);
@@ -3649,8 +3735,15 @@ mod tests {
         done_tx.send(()).unwrap();
         server.join().unwrap();
         let mesh = live.world.packed_meshes().next().expect("TCP chunk mesh");
-        let geometry =
-            section_geometry(mesh.1, live.world.translucent_order(mesh.0).unwrap_or(&[]));
+        let geometry = section_geometry(
+            mesh.1,
+            live.world.translucent_order(mesh.0).unwrap_or(&[]),
+            [
+                mesh.0 .0 as f32 * 16.0,
+                mesh.0 .1 as f32 * 16.0,
+                mesh.0 .2 as f32 * 16.0,
+            ],
+        );
         assert!(!geometry.opaque.is_empty());
         let _ = assert_live_gpu_frame(&live.world);
     }
@@ -3821,8 +3914,15 @@ mod tests {
             .packed_meshes()
             .next()
             .expect("solid section mesh");
-        let geometry =
-            section_geometry(mesh.1, live.world.translucent_order(mesh.0).unwrap_or(&[]));
+        let geometry = section_geometry(
+            mesh.1,
+            live.world.translucent_order(mesh.0).unwrap_or(&[]),
+            [
+                mesh.0 .0 as f32 * 16.0,
+                mesh.0 .1 as f32 * 16.0,
+                mesh.0 .2 as f32 * 16.0,
+            ],
+        );
         assert!(!geometry.opaque.is_empty());
         assert!(!geometry.opaque_indices.is_empty());
 

@@ -21,19 +21,17 @@ use std::collections::BTreeMap;
 
 use mc_spine_client::protocol::{decode_chunk_packet, ClientPlayEvent, PlayEvent, TeleportSync};
 use mc_spine_client_gpu::gpu_hiz::{
-    CullStats, CullUniforms, GpuHizCuller, IndirectArgs, SectionGpuRecord,
-    HIZ_BUILD_WGSL, HIZ_DOWNSAMPLE_WGSL, SECTION_CULL_WGSL,
+    CullStats, CullUniforms, GpuHizCuller, IndirectArgs, SectionGpuRecord, HIZ_BUILD_WGSL,
+    HIZ_DOWNSAMPLE_WGSL, SECTION_CULL_WGSL,
 };
 use mc_spine_client_gpu::live_session::hw_adaptive_engine::{
     MemoryFootprintClass, MemoryTransferStrategy,
 };
-use mc_spine_client_gpu::live_session::{
-    CompiledAssetMeta, LiveSession, PendingAtlasPixels,
-};
+use mc_spine_client_gpu::live_session::{CompiledAssetMeta, LiveSession, PendingAtlasPixels};
 use mc_spine_client_gpu::renderer::{
     frustum_planes_from_view_proj, probe_adapters, request_gpu_device,
-    rotate_opaque_quads_for_shared_index, GpuRenderer, TransferTopologyBudget,
-    UploadStagingRing, OFFSCREEN_FORMAT, QUAD_DIAGONAL_FLIP_BIT,
+    rotate_opaque_quads_for_shared_index, GpuRenderer, TransferTopologyBudget, UploadStagingRing,
+    OFFSCREEN_FORMAT, QUAD_DIAGONAL_FLIP_BIT,
 };
 use mc_spine_client_gpu::Camera;
 use mc_spine_client_mesh::atlas::{AtlasMip, PackedAtlas, SpritePlacement};
@@ -109,8 +107,8 @@ fn session_with_stone_chunks(chunks: &[(i32, i32)]) -> LiveSession {
     })))
     .unwrap();
     for &(cx, cz) in chunks {
-        let chunk = decode_chunk_packet(&chunk_body(cx, cz, 4), 24, 64)
-            .expect("decoded real chunk");
+        let chunk =
+            decode_chunk_packet(&chunk_body(cx, cz, 4), 24, 64).expect("decoded real chunk");
         live.apply_event(ClientPlayEvent::Play(PlayEvent::ChunkData(Box::new(chunk))))
             .unwrap();
     }
@@ -266,8 +264,10 @@ fn v5_shared_quad_index_rotation_parity_and_staging_ring_zero_steady_allocs() {
     let Some(ctx) = try_gpu() else {
         return;
     };
-    let budget =
-        TransferTopologyBudget::for_topology(MemoryTransferStrategy::DiscreteStagedArena, MemoryFootprintClass::Standard);
+    let budget = TransferTopologyBudget::for_topology(
+        MemoryTransferStrategy::DiscreteStagedArena,
+        MemoryFootprintClass::Standard,
+    );
     let mut ring = UploadStagingRing::new(&ctx.device, &budget);
     let construction_allocs = ring.staging_ring_allocs;
     assert_eq!(construction_allocs, u64::from(budget.staging_ring_slots));
@@ -319,7 +319,12 @@ fn validate_wgsl(name: &str, source: &str) {
 }
 
 /// Copy `size` bytes of `src` to a map-read buffer and return the bytes.
-fn read_buffer(device: &wgpu::Device, queue: &wgpu::Queue, src: &wgpu::Buffer, size: u64) -> Vec<u8> {
+fn read_buffer(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    src: &wgpu::Buffer,
+    size: u64,
+) -> Vec<u8> {
     let dst = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("test-readback"),
         size,
@@ -548,7 +553,9 @@ fn v4_gpu_compute_hiz_and_section_cull_execute_on_real_gpu_zero_false_negatives(
     let stats_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("cull-stats"),
         size: std::mem::size_of::<CullStats>() as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
     queue.write_buffer(&stats_buf, 0, bytemuck::bytes_of(&CullStats::default()));
@@ -582,12 +589,20 @@ fn v4_gpu_compute_hiz_and_section_cull_execute_on_real_gpu_zero_false_negatives(
         (sections.len() * std::mem::size_of::<IndirectArgs>()) as u64,
     );
     let args: &[IndirectArgs] = bytemuck::cast_slice(&args_bytes);
-    let stats_bytes = read_buffer(device, queue, &stats_buf, std::mem::size_of::<CullStats>() as u64);
+    let stats_bytes = read_buffer(
+        device,
+        queue,
+        &stats_buf,
+        std::mem::size_of::<CullStats>() as u64,
+    );
     let stats: &CullStats = &bytemuck::cast_slice::<u8, CullStats>(&stats_bytes)[0];
 
     assert_eq!(args[0].instance_count, 1, "front section must survive");
     assert_eq!(args[0].index_count, 6);
-    assert_eq!(args[1].instance_count, 0, "walled-off section must be culled");
+    assert_eq!(
+        args[1].instance_count, 0,
+        "walled-off section must be culled"
+    );
     assert_eq!(
         args[2].instance_count, 1,
         "far section outside the wall column must survive (no false negatives)"

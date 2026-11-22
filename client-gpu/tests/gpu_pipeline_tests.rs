@@ -231,7 +231,7 @@ fn live_geometry_preserves_diagonals_and_translucent_sort() {
         .into_iter()
         .flatten()
         .collect();
-    let geometry = section_geometry(&packed, &[3, 1]);
+    let geometry = section_geometry(&packed, &[3, 1], [0.0, 0.0, 0.0]);
     assert_eq!(geometry.opaque.len(), 8);
     assert_eq!(geometry.translucent.len(), 8);
     assert_eq!(
@@ -244,7 +244,7 @@ fn live_geometry_preserves_diagonals_and_translucent_sort() {
     );
 
     // A duplicate or incomplete sort falls back to the original order.
-    let fallback = section_geometry(&packed, &[1, 1]);
+    let fallback = section_geometry(&packed, &[1, 1], [0.0, 0.0, 0.0]);
     assert_eq!(
         fallback.translucent_indices,
         [0, 1, 3, 1, 2, 3, 4, 5, 6, 4, 6, 7]

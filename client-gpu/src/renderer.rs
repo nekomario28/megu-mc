@@ -22,8 +22,10 @@ use mc_spine_client_mesh::builtin_shadow_wgsl::{
     build_shadow_uniforms_celestial, compute_cascade_splits, compute_sun_direction,
     negotiate_builtin_shadow_quality, pack_vfx1_lights, BuiltinShadowQuality, CascadeConfig,
     DirtyOnlyShadowCache, EclipseMode, RenderScalePreset, ShadowCacheDecision, ShadowCamera,
-    ShadowDirtyReason, ShadowUniforms, MEGU_SHADOW_CASTERS_WGSL, MEGU_SHADOW_DEPTH_WGSL,
-    MEGU_SHADOW_SAMPLING_WGSL, MEGU_SKY_ATMOSPHERE_WGSL,
+    ShadowDirtyReason, ShadowUniforms, MEGU_SHADOW_CASTERS_WGSL, MEGU_SHADOW_CUTOUT_DEPTH_WGSL,
+    MEGU_SHADOW_DEPTH_WGSL, MEGU_SHADOW_SAMPLING_WGSL, MEGU_SKY_ATMOSPHERE_WGSL,
+    MEGU_SPATIAL_SHARPEN_WGSL, MEGU_STAINED_GLASS_SHADOW_COLOR_WGSL, MEGU_TERRAIN_LIT_WGSL,
+    MEGU_WATER_SURFACE_WGSL,
 };
 use mc_spine_client_mesh::ffi::PackedVertex;
 use mc_spine_client_mesh::vanilla_plus_3d::ExtrudedMesh;
@@ -283,8 +285,9 @@ pub fn clamp_requested_limits(limits: wgpu::Limits) -> wgpu::Limits {
     l.max_binding_array_acceleration_structure_elements_per_shader_stage = l
         .max_binding_array_acceleration_structure_elements_per_shader_stage
         .min(1_000_000);
-    l.max_binding_array_sampler_elements_per_shader_stage =
-        l.max_binding_array_sampler_elements_per_shader_stage.min(1_000_000);
+    l.max_binding_array_sampler_elements_per_shader_stage = l
+        .max_binding_array_sampler_elements_per_shader_stage
+        .min(1_000_000);
     l.max_uniform_buffer_binding_size = l.max_uniform_buffer_binding_size.min(1 << 30);
     l.max_storage_buffer_binding_size = l.max_storage_buffer_binding_size.min(1 << 31);
     l.max_vertex_buffers = l.max_vertex_buffers.min(16);
@@ -404,6 +407,12 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Offscreen/UI-framebuffer pixel format.
 pub const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
+/// Fixed demo time for the legacy camera-free entry points
+/// (`render_to_view`, scene-only tests): vanilla noon. Live paths pass the
+/// authoritative `world_time_ticks` through
+/// [`GpuRenderer::render_to_view_with_env`] instead.
+const DEMO_WORLD_TIME_TICKS: u64 = 6000;
+
 fn depth_state(write: bool) -> wgpu::DepthStencilState {
     wgpu::DepthStencilState {
         format: DEPTH_FORMAT,
@@ -458,15 +467,81 @@ struct TerrainBuffers {
     translucent_vertices: wgpu::Buffer,
     translucent_indices: wgpu::Buffer,
     translucent_index_count: u32,
+    /// Cutout-quad indices into `opaque_vertices` (shadow-pass only).
+    cutout_indices: wgpu::Buffer,
+    cutout_index_count: u32,
+    /// Decoded `MEGU_WATER_SURFACE_WGSL` stream (world pos + depth hint).
+    water_vertices: wgpu::Buffer,
+    water_indices: wgpu::Buffer,
+    water_index_count: u32,
 }
+
+/// Decoded water-surface vertex for `MEGU_WATER_SURFACE_WGSL`
+/// (`@location(0)` world blocks, `@location(1)` depth hint `0..=1`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WaterVertex {
+    /// World-space position in blocks.
+    pub position: [f32; 3],
+    /// Approximate depth `0.0..=1.0` (deeper = darker blue).
+    pub depth_hint: f32,
+}
+
+// bytemuck Pod/Zeroable for direct buffer upload.
+unsafe impl bytemuck::Pod for WaterVertex {}
+unsafe impl bytemuck::Zeroable for WaterVertex {}
+
+/// World-space vertex for `MEGU_TERRAIN_LIT_WGSL`: position, normal,
+/// albedo and the packed light word (`block_light` bits 5..8,
+/// `sky_light` bits 9..12 — the shader decodes both).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LitTerrainVertex {
+    /// World-space position in blocks.
+    pub position: [f32; 3],
+    /// Unit outward normal.
+    pub normal: [f32; 3],
+    /// Linear-ish albedo `0.0..=1.0` per channel.
+    pub albedo: [f32; 3],
+    /// `PackedVertex::attributes`-compatible light word.
+    pub light_attr: u32,
+}
+
+// bytemuck Pod/Zeroable for direct buffer upload.
+unsafe impl bytemuck::Pod for LitTerrainVertex {}
+unsafe impl bytemuck::Zeroable for LitTerrainVertex {}
+
+/// World-space stained-glass caster for
+/// `MEGU_STAINED_GLASS_SHADOW_COLOR_WGSL` (`@location(1)` carries the
+/// vanilla `DyeColor` index `0..=15`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StainedCasterVertex {
+    /// World-space position in blocks.
+    pub position: [f32; 3],
+    /// Vanilla dye index `0..=15` (white .. black).
+    pub color_idx: u32,
+}
+
+// bytemuck Pod/Zeroable for direct buffer upload.
+unsafe impl bytemuck::Pod for StainedCasterVertex {}
+unsafe impl bytemuck::Zeroable for StainedCasterVertex {}
 
 /// Local mesh vertices and draw indices, keeping translucent quads ordered.
 #[derive(Clone, Debug, Default)]
 pub struct LiveSectionGeometry {
     pub opaque: Vec<PackedVertex>,
     pub opaque_indices: Vec<u32>,
+    /// Indices into `opaque` covering every `Layer::Cutout` quad — the
+    /// alpha-test shadow caster pass draws these without any extra
+    /// vertex copy.
+    pub cutout_indices: Vec<u32>,
     pub translucent: Vec<PackedVertex>,
     pub translucent_indices: Vec<u32>,
+    /// Water quads decoded to world space for the dedicated
+    /// `MEGU_WATER_SURFACE_WGSL` pass.
+    pub water: Vec<WaterVertex>,
+    pub water_indices: Vec<u32>,
 }
 
 fn append_live_quad(
@@ -523,41 +598,120 @@ pub fn quad_index_pattern(count: u32) -> Vec<u32> {
     out
 }
 
-pub fn section_geometry(packed: &[PackedVertex], translucent_order: &[u32]) -> LiveSectionGeometry {
+/// Packed-attribute decode shared by `section_geometry` and callers:
+/// `(layer, fluid_kind)` from `PackedVertex::attributes` bits 13..16.
+#[inline(always)]
+fn packed_layer_fluid(attributes: u32) -> (u32, u32) {
+    ((attributes >> 13) & 3, (attributes >> 15) & 3)
+}
+
+/// `PackedVertex.position` bit decode — identical to every WGSL caster:
+/// `x | (z << 5) | (y * 1024 << 10)` in section-local 1/1024-block steps.
+#[inline(always)]
+fn decode_packed_local(position: u32) -> [f32; 3] {
+    [
+        (position & 31) as f32,
+        (position >> 10) as f32 / 1024.0,
+        ((position >> 5) & 31) as f32,
+    ]
+}
+
+/// Split one packed section mesh into the streams the live passes draw:
+/// opaque (+ a shared-buffer cutout index stream for the shadow pass),
+/// ordered translucent, and water quads decoded to world-space
+/// [`WaterVertex`]s for `MEGU_WATER_SURFACE_WGSL`. `origin_blocks` is the
+/// section's world origin (`coord * 16`).
+///
+/// `translucent_order` indexes the original packed quad array and covers
+/// the union of `Layer::Translucent` + water quads (the sort the world
+/// produced); a non-matching entry falls both streams back to mesh
+/// order, preserving the pre-change semantics.
+pub fn section_geometry(
+    packed: &[PackedVertex],
+    translucent_order: &[u32],
+    origin_blocks: [f32; 3],
+) -> LiveSectionGeometry {
     let mut out = LiveSectionGeometry::default();
     let mut translucent = Vec::new();
+    let mut water_quads = Vec::new();
     for quad in packed.as_chunks::<4>().0 {
-        let attrs = quad[0].attributes;
-        let layer = (attrs >> 13) & 3;
-        let fluid = (attrs >> 15) & 3;
-        if layer == 2 || (layer == 3 && fluid == 1) {
+        let (layer, fluid) = packed_layer_fluid(quad[0].attributes);
+        if layer == 3 && fluid == 1 {
+            water_quads.push(quad.as_slice());
+        } else if layer == 2 {
             translucent.push(quad.as_slice());
         } else {
+            let base = out.opaque.len() as u32;
             append_live_quad(&mut out.opaque, &mut out.opaque_indices, quad);
+            if layer == 1 {
+                // Cutout stays in the opaque stream for the color pass;
+                // a parallel index list feeds the alpha-test shadow
+                // caster without duplicating vertex data.
+                out.cutout_indices
+                    .extend([0u32, 1, 2, 0, 2, 3].map(|c| base + c));
+            }
         }
     }
-    // The world sort refers to the original packed quad indices.
-    let mut ordered = Vec::new();
+    // The world sort refers to the original packed quad indices and
+    // interleaves translucent and water quads — re-apply it to both
+    // streams so back-to-front ordering survives the split.
+    let mut ordered_translucent = Vec::new();
+    let mut ordered_water = Vec::new();
     let mut seen = HashSet::new();
     for &idx in translucent_order {
         let index = idx as usize;
         let quad = packed.get(index.saturating_mul(4)..index.saturating_mul(4).saturating_add(4));
-        if let Some(quad) = quad {
-            let layer = (quad[0].attributes >> 13) & 3;
-            let fluid = (quad[0].attributes >> 15) & 3;
-            if seen.insert(index) && (layer == 2 || (layer == 3 && fluid == 1)) {
-                ordered.push(quad);
-                continue;
-            }
+        let Some(quad) = quad else {
+            ordered_translucent.clear();
+            ordered_water.clear();
+            break;
+        };
+        let (layer, fluid) = packed_layer_fluid(quad[0].attributes);
+        if !seen.insert(index) {
+            ordered_translucent.clear();
+            ordered_water.clear();
+            break;
         }
-        ordered.clear();
-        break;
+        if layer == 3 && fluid == 1 {
+            ordered_water.push(quad);
+        } else if layer == 2 {
+            ordered_translucent.push(quad);
+        } else {
+            ordered_translucent.clear();
+            ordered_water.clear();
+            break;
+        }
     }
-    if ordered.len() != translucent.len() {
-        ordered = translucent;
+    if ordered_translucent.len() != translucent.len() || ordered_water.len() != water_quads.len() {
+        ordered_translucent = translucent;
+        ordered_water = water_quads;
     }
-    for quad in ordered {
+    for quad in ordered_translucent {
         append_live_quad(&mut out.translucent, &mut out.translucent_indices, quad);
+    }
+    for quad in ordered_water {
+        let base = out.water.len() as u32;
+        for vertex in quad {
+            let local = decode_packed_local(vertex.position);
+            // Skylight at the surface vertex is a free depth proxy:
+            // open water reads 15 (shallow, bright), shaded/deep water
+            // dims toward the deep-sea colour — no packed field needed.
+            let sky_light = ((vertex.attributes >> 9) & 0xf) as f32 / 15.0;
+            out.water.push(WaterVertex {
+                position: [
+                    origin_blocks[0] + local[0],
+                    origin_blocks[1] + local[1],
+                    origin_blocks[2] + local[2],
+                ],
+                depth_hint: (1.0 - sky_light).clamp(0.0, 1.0),
+            });
+        }
+        let corners = if quad[0].attributes & (1 << 17) == 0 {
+            [0, 1, 2, 0, 2, 3]
+        } else {
+            [0, 1, 3, 1, 2, 3]
+        };
+        out.water_indices.extend(corners.map(|c| base + c));
     }
     out
 }
@@ -993,7 +1147,14 @@ impl RegionArena {
                     break;
                 }
                 *dma_remaining -= len;
-                ring.stage_copy(device, queue, encoder, &self.vertex_buffer, *byte_offset, bytes);
+                ring.stage_copy(
+                    device,
+                    queue,
+                    encoder,
+                    &self.vertex_buffer,
+                    *byte_offset,
+                    bytes,
+                );
                 self.flushed_vertex_len =
                     self.flushed_vertex_len.max((byte_offset + len) as u32 / 16);
                 committed.push(coord);
@@ -1884,6 +2045,29 @@ pub struct GpuRenderer {
     pub dynamic_buffer_allocs: u64,
     subworld_gpu: SubWorldGpuCache,
     scaled_target: Option<ScaledTarget>,
+    /// Edge-adaptive 5-tap spatial sharpen pass used for the
+    /// `render_scale < Native100` upscale (created lazily on first use).
+    sharpen: Option<SharpenGpu>,
+    /// Dedicated `MEGU_WATER_SURFACE_WGSL` pass — created the first frame
+    /// any live section carries decoded water geometry, `None` otherwise.
+    water: Option<WaterGpu>,
+    /// `MEGU_TERRAIN_LIT_WGSL` receiver path: created lazily on the first
+    /// [`Self::upload_lit_terrain`] call (the decoded-vertex stream is for
+    /// explicit lit uploads, not the packed section path).
+    lit_terrain: Option<LitTerrainGpu>,
+    /// Epoch of the last `ShadowGpu` creation — `lit_terrain`'s group-0
+    /// bind group holds depth-texture refs that go stale on rebuild.
+    shadow_gpu_epoch: u64,
+    /// Pending stained-glass casters the lazy `MEGU_STAINED_GLASS_SHADOW_COLOR_WGSL`
+    /// pass uploads on the next shadow encode (`None`/`empty` = zero cost).
+    pending_stained_casters: Vec<StainedCasterVertex>,
+    /// Sections whose latest mesh data completed VRAM upload — the window
+    /// loop drains this and calls
+    /// `WorldState::release_uploaded_section_cpu_copies` on each.
+    uploaded_section_coords: Vec<SectionCoord>,
+    /// Bumped by `upload_block_atlas` — the cutout caster's atlas bind
+    /// group holds texture/storage-buffer refs that go stale on reload.
+    atlas_epoch: u64,
     /// The negotiated built-in shadow quality (`negotiate_builtin_shadow_quality`
     /// output); `Off` unless [`Self::set_shadow_quality`] ran.
     pub shadow_quality: BuiltinShadowQuality,
@@ -2166,8 +2350,133 @@ impl AtlasGpu {
 /// Depth layers and the comparison sampler have matching lifetimes, while
 /// each cascade owns an independent uniform buffer to avoid queue write
 /// aliasing between passes in the same command submission.
+/// Vertex layout for [`StainedCasterVertex`] (`MEGU_STAINED_GLASS_SHADOW_COLOR_WGSL`).
+const STAINED_CASTER_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+    array_stride: std::mem::size_of::<StainedCasterVertex>() as u64,
+    step_mode: wgpu::VertexStepMode::Vertex,
+    attributes: &[
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x3,
+            offset: 0,
+            shader_location: 0,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Uint32,
+            offset: 12,
+            shader_location: 1,
+        },
+    ],
+};
+
+/// Vertex layout for [`WaterVertex`] (`MEGU_WATER_SURFACE_WGSL`).
+const WATER_VERTEX_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+    array_stride: std::mem::size_of::<WaterVertex>() as u64,
+    step_mode: wgpu::VertexStepMode::Vertex,
+    attributes: &[
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x3,
+            offset: 0,
+            shader_location: 0,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32,
+            offset: 12,
+            shader_location: 1,
+        },
+    ],
+};
+
+/// Vertex layout for [`LitTerrainVertex`] (`MEGU_TERRAIN_LIT_WGSL`).
+const LIT_TERRAIN_VERTEX_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+    array_stride: std::mem::size_of::<LitTerrainVertex>() as u64,
+    step_mode: wgpu::VertexStepMode::Vertex,
+    attributes: &[
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x3,
+            offset: 0,
+            shader_location: 0,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x3,
+            offset: 12,
+            shader_location: 1,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x3,
+            offset: 24,
+            shader_location: 2,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Uint32,
+            offset: 36,
+            shader_location: 3,
+        },
+    ],
+};
+
+/// `MEGU_SHADOW_CUTOUT_DEPTH_WGSL` caster resources — lazily created the
+/// first time a section carries `Layer::Cutout` quads, so worlds without
+/// leaves/panes/glass pay zero.
+struct CutoutGpu {
+    pipeline: wgpu::RenderPipeline,
+    /// `{atlas_tex, atlas_sampler, atlas_rects, atlas_states}` —
+    /// group 3 of the cutout shader.
+    bind_group: wgpu::BindGroup,
+    /// `GpuRenderer::atlas_epoch` at creation — rebuilt on atlas reload.
+    atlas_epoch: u64,
+}
+
+/// `MEGU_STAINED_GLASS_SHADOW_COLOR_WGSL` caster resources: pipeline,
+/// per-cascade RGBA color targets (cleared white = full transmission)
+/// and the staged caster vertex buffer.
+struct StainedGpu {
+    pipeline: wgpu::RenderPipeline,
+    color_view: Vec<wgpu::TextureView>,
+    vertices: wgpu::Buffer,
+    vertex_count: u32,
+}
+
+/// `MEGU_WATER_SURFACE_WGSL` pass: own uniform (`view_proj`, `time`,
+/// `camera_pos`) and single-bindgroup pipeline layout.
+struct WaterGpu {
+    pipeline: wgpu::RenderPipeline,
+    uniform: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+/// `MEGU_TERRAIN_LIT_WGSL` receiver path for explicitly uploaded
+/// decoded-vertex terrain (`LitTerrainVertex` stream with
+/// sky/block light in `light_attr`).
+struct LitTerrainGpu {
+    pipeline: wgpu::RenderPipeline,
+    bind_group: wgpu::BindGroup,
+    vertices: wgpu::Buffer,
+    indices: wgpu::Buffer,
+    index_count: u32,
+    /// `GpuRenderer::shadow_gpu_epoch` the group-0 bind group was built
+    /// against — rebuilt when the shadow depth texture is recreated.
+    shadow_epoch: u64,
+}
+
+/// `MEGU_SPATIAL_SHARPEN_WGSL` upscale pass for `render_scale < 100%`:
+/// 5-tap edge-adaptive sharpening of the world color target.
+struct SharpenGpu {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    uniform: wgpu::Buffer,
+}
+
 struct ShadowGpu {
     config: CascadeConfig,
+    /// `{shadow_uniform}` caster layout — shared by the opaque, cutout
+    /// and stained-glass caster pipelines.
+    caster_layout: wgpu::BindGroupLayout,
+    /// Whole-array depth view + comparison sampler (also used by the
+    /// `MEGU_TERRAIN_LIT_WGSL` receiver bind group).
+    array_view: wgpu::TextureView,
+    compare_sampler: wgpu::Sampler,
+    cutout: Option<CutoutGpu>,
+    stained: Option<StainedGpu>,
     _texture: wgpu::Texture,
     layer_views: Vec<wgpu::TextureView>,
     receiver_uniform: wgpu::Buffer,
@@ -2228,6 +2537,48 @@ fn shadow_uniform_bytes(value: &ShadowUniforms) -> Vec<u8> {
     }
     assert_eq!(floats.len() * 4, std::mem::size_of::<ShadowUniforms>());
     bytemuck::cast_slice(&floats).to_vec()
+}
+
+/// Minimal `ShadowUniforms` for the water pass when no shadow preset is
+/// active: camera transform plus the celestial fields
+/// `MEGU_WATER_SURFACE_WGSL` actually reads (`sun_direction`,
+/// `render_params` quality/day-phase, `sun_color`, `moon_color`,
+/// `celestial_params`). Derived from the live server clock so water
+/// still tracks day/night with shadows off.
+fn water_fallback_uniforms(
+    view_proj: Mat4,
+    camera_position: [f32; 3],
+    world_time_ticks: u64,
+) -> ShadowUniforms {
+    let sun = compute_sun_direction(world_time_ticks);
+    let day_phase = (world_time_ticks % 24_000) as f32 / 24_000.0;
+    let identity = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ];
+    ShadowUniforms {
+        light_view_proj: [identity, identity, identity],
+        camera_view_proj: view_proj,
+        cascade_splits: [0.0; 4],
+        sun_direction: [sun[0], sun[1], sun[2], 0.0],
+        sun_color: [1.0, 0.98, 0.92, 1.0],
+        moon_color: [0.55, 0.62, 0.78, 0.35],
+        camera_position: [
+            camera_position[0],
+            camera_position[1],
+            camera_position[2],
+            1.0,
+        ],
+        camera_forward: [0.0, 0.0, 1.0, 0.0],
+        camera_right: [1.0, 0.0, 0.0, 0.0],
+        camera_up: [0.0, 1.0, 0.0, 0.0],
+        shadow_params: [0.0; 4],
+        // quality tier + day phase (+fog/exposure unused by water).
+        render_params: [1.0, day_phase, 0.0, 1.0],
+        celestial_params: [0.0; 4],
+    }
 }
 
 /// Composite opaque geometry receives a distinct shader entry when shadows
@@ -2369,8 +2720,8 @@ pub fn cascade_world_aabb(ortho: &CascadeOrtho) -> ([f32; 3], [f32; 3]) {
     let mut min = ortho.center;
     let mut max = ortho.center;
     for i in 0..3 {
-        let half = ortho.radius * (right[i].abs() + up[i].abs())
-            + ortho.depth_radius * sun[i].abs();
+        let half =
+            ortho.radius * (right[i].abs() + up[i].abs()) + ortho.depth_radius * sun[i].abs();
         min[i] -= half;
         max[i] += half;
     }
@@ -2443,7 +2794,10 @@ fn build_stable_shadow_uniforms(
         192.0
     };
     let fov = if camera.fov_deg.is_finite() {
-        camera.fov_deg.to_radians().clamp(0.1, std::f32::consts::PI - 0.1)
+        camera
+            .fov_deg
+            .to_radians()
+            .clamp(0.1, std::f32::consts::PI - 0.1)
     } else {
         std::f32::consts::PI / 3.0
     };
@@ -2454,15 +2808,24 @@ fn build_stable_shadow_uniforms(
     };
     let tan_half_fov = (fov * 0.5).tan();
     let sun = compute_sun_direction(world_time_ticks);
-    let light_right = v3_norm(v3_cross([0.0, 0.0, 1.0], sun), [1.0, 0.0, 0.0]);
-    let light_up = v3_cross(sun, light_right);
+    // Sun by day, real moon at `-sun` by night — identical caster rule to
+    // `build_shadow_uniforms_celestial` and `MEGU_SHADOW_SAMPLING_WGSL`'s
+    // `shadow_caster_direction`, so light space stays overhead through the
+    // whole day cycle instead of pointing into the earth after sunset.
+    let caster = if sun[1] >= 0.0 {
+        sun
+    } else {
+        v3_scale(sun, -1.0)
+    };
+    let light_right = v3_norm(v3_cross([0.0, 0.0, 1.0], caster), [1.0, 0.0, 0.0]);
+    let light_up = v3_cross(caster, light_right);
     let count = config.cascade_count.min(3);
     let splits = compute_cascade_splits(near, far, count, 0.65);
     let mut orthos = [CascadeOrtho {
         center: [0.0; 3],
         radius: 0.0,
         depth_radius: 0.0,
-        axes: [light_right, light_up, sun],
+        axes: [light_right, light_up, caster],
     }; 3];
     for (index, &end) in splits.iter().enumerate() {
         // Bounding sphere centered on the camera covering the whole
@@ -2478,38 +2841,43 @@ fn build_stable_shadow_uniforms(
         let snap = |coordinate: f32| (coordinate / texel).round() * texel;
         let cx = snap(v3_dot(position, light_right));
         let cy = snap(v3_dot(position, light_up));
-        let cz = snap(v3_dot(position, sun));
+        let cz = snap(v3_dot(position, caster));
         let depth_radius = radius * 4.0;
         let inverse_depth = 1.0 / (2.0 * depth_radius);
         uniforms.light_view_proj[index] = [
             [
                 light_right[0] / radius,
                 light_up[0] / radius,
-                -sun[0] * inverse_depth,
+                -caster[0] * inverse_depth,
                 0.0,
             ],
             [
                 light_right[1] / radius,
                 light_up[1] / radius,
-                -sun[1] * inverse_depth,
+                -caster[1] * inverse_depth,
                 0.0,
             ],
             [
                 light_right[2] / radius,
                 light_up[2] / radius,
-                -sun[2] * inverse_depth,
+                -caster[2] * inverse_depth,
                 0.0,
             ],
-            [-cx / radius, -cy / radius, (depth_radius + cz) * inverse_depth, 1.0],
+            [
+                -cx / radius,
+                -cy / radius,
+                (depth_radius + cz) * inverse_depth,
+                1.0,
+            ],
         ];
         orthos[index] = CascadeOrtho {
             center: v3_add(
                 v3_add(v3_scale(light_right, cx), v3_scale(light_up, cy)),
-                v3_scale(sun, cz),
+                v3_scale(caster, cz),
             ),
             radius,
             depth_radius,
-            axes: [light_right, light_up, sun],
+            axes: [light_right, light_up, caster],
         };
     }
     StableShadow { uniforms, orthos }
@@ -2603,6 +2971,7 @@ fn record_shadow_cascade<'a>(
     ortho: &CascadeOrtho,
     scene: Option<(&'a TerrainBuffers, u32)>,
     section_offsets: &[(SectionCoord, u32)],
+    cutout_sections: &[SectionCoord],
     live_sections: &'a HashMap<SectionCoord, LiveTerrainSection>,
     region_offsets: &[([i32; 3], u32)],
     region_arenas: &'a BTreeMap<[i32; 3], RegionArena>,
@@ -2643,6 +3012,40 @@ fn record_shadow_cascade<'a>(
         pass.set_vertex_buffer(0, Some(section.terrain.opaque_vertices.slice(..)));
         pass.set_index_buffer(shared_index.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..section.terrain.opaque_index_count, 0, 0..1);
+    }
+    // Alpha-tested casters (leaves, panes, bars, flowers) draw a second
+    // time through `MEGU_SHADOW_CUTOUT_DEPTH_WGSL` — same packed vertex
+    // stream, dedicated index list, atlas-tested fragment discard.
+    if !cutout_sections.is_empty() {
+        let cutout = shadow.cutout.as_ref().expect("cutout ensured");
+        pass.set_pipeline(&cutout.pipeline);
+        pass.set_bind_group(3, Some(&cutout.bind_group), &[]);
+        for coord in cutout_sections {
+            let min = [
+                coord.0 as f32 * EDGE as f32,
+                coord.1 as f32 * EDGE as f32,
+                coord.2 as f32 * EDGE as f32,
+            ];
+            let max = [
+                min[0] + EDGE as f32,
+                min[1] + EDGE as f32,
+                min[2] + EDGE as f32,
+            ];
+            if !aabb_in_cascade(min, max, ortho) {
+                culled += 1;
+                continue;
+            }
+            let section = &live_sections[coord];
+            pass.set_bind_group(0, Some(&shadow.caster_bgs[layer as usize]), &[]);
+            pass.set_bind_group(1, Some(&section.bind_group), &[]);
+            pass.set_bind_group(2, Some(&shadow.draw_bg), &[0]);
+            pass.set_vertex_buffer(0, Some(section.terrain.opaque_vertices.slice(..)));
+            pass.set_index_buffer(
+                section.terrain.cutout_indices.slice(..),
+                wgpu::IndexFormat::Uint32,
+            );
+            pass.draw_indexed(0..section.terrain.cutout_index_count, 0, 0..1);
+        }
     }
     // Arena-resident sections cast through the region depth pipeline:
     // the light needs every bucket, so the arena's committed live ranges
@@ -3026,6 +3429,9 @@ impl ShadowGpu {
         );
         Self {
             config,
+            caster_layout,
+            array_view,
+            compare_sampler: sampler,
             _texture: texture,
             layer_views,
             receiver_uniform,
@@ -3046,7 +3452,282 @@ impl ShadowGpu {
             instanced_color,
             draw_pool_epoch: 0,
             cascade_bundles: [None, None, None],
+            cutout: None,
+            stained: None,
         }
+    }
+
+    /// `MEGU_SHADOW_CUTOUT_DEPTH_WGSL` caster state, built on first use —
+    /// sections with no `Layer::Cutout` quads never pay for it. Rebuilt
+    /// automatically when the block atlas (its bind-group resources) is
+    /// replaced.
+    fn ensure_cutout(
+        &mut self,
+        device: &wgpu::Device,
+        frame_layout: &wgpu::BindGroupLayout,
+        draw_layout: &wgpu::BindGroupLayout,
+        atlas: &AtlasGpu,
+        atlas_epoch: u64,
+    ) -> &CutoutGpu {
+        if self
+            .cutout
+            .as_ref()
+            .is_some_and(|c| c.atlas_epoch != atlas_epoch)
+        {
+            self.cutout = None;
+        }
+        if self.cutout.is_none() {
+            // `@group(3)`: `{atlas_tex, atlas_sampler, atlas_rects,
+            // atlas_states}` — the fragment alpha-tests the sprite each
+            // `state_id` maps to through the states table.
+            let atlas_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("cutout-atlas-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("cutout-atlas"),
+                layout: &atlas_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&atlas.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&atlas.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: atlas.rects.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: atlas.state_sprites.as_entire_binding(),
+                    },
+                ],
+            });
+            // Groups: 0 = caster shadow uniform, 1 = the section's
+            // `frame_layout` bind group (`ShadowSection.origin`), 2 =
+            // unused draw pool slot, 3 = atlas resources.
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("cutout-caster-layout"),
+                bind_group_layouts: &[
+                    Some(&self.caster_layout),
+                    Some(frame_layout),
+                    Some(draw_layout),
+                    Some(&atlas_layout),
+                ],
+                immediate_size: 0,
+            });
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("shadow-cutout-depth"),
+                source: wgpu::ShaderSource::Wgsl(MEGU_SHADOW_CUTOUT_DEPTH_WGSL.into()),
+            });
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("shadow-cutout-depth"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_cutout"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[Some(TERRAIN_VERTEX_LAYOUT)],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: Some(wgpu::Face::Front),
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState {
+                        constant: 1,
+                        slope_scale: 1.5,
+                        clamp: 0.0,
+                    },
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_cutout"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+            self.cutout = Some(CutoutGpu {
+                pipeline,
+                bind_group,
+                atlas_epoch,
+            });
+        }
+        self.cutout.as_ref().expect("cutout ensured")
+    }
+
+    /// Lazy `MEGU_STAINED_GLASS_SHADOW_COLOR_WGSL` caster state — the
+    /// RGBA shadow-color pass exists only while live stained casters
+    /// exist, keeping the zero-glass case at zero cost.
+    fn ensure_stained(&mut self, device: &wgpu::Device) -> &mut StainedGpu {
+        if self.stained.is_none() {
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("stained-caster-layout"),
+                bind_group_layouts: &[Some(&self.caster_layout)],
+                immediate_size: 0,
+            });
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("stained-shadow-color"),
+                source: wgpu::ShaderSource::Wgsl(MEGU_STAINED_GLASS_SHADOW_COLOR_WGSL.into()),
+            });
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("stained-shadow-color"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_stained"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[Some(STAINED_CASTER_LAYOUT)],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState {
+                        constant: 2,
+                        slope_scale: 1.5,
+                        clamp: 0.0,
+                    },
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_stained"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        // Multiplicative transmission: dst *= src.
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::Zero,
+                                dst_factor: wgpu::BlendFactor::Src,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::Zero,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+            let color_view = (0..self.config.cascade_count)
+                .map(|_| {
+                    let tex = device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("stained-shadow-color"),
+                        size: wgpu::Extent3d {
+                            width: self.config.map_resolution,
+                            height: self.config.map_resolution,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    });
+                    tex.create_view(&wgpu::TextureViewDescriptor::default())
+                })
+                .collect();
+            let vertices = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("stained-casters"),
+                size: (16 * std::mem::size_of::<StainedCasterVertex>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.stained = Some(StainedGpu {
+                pipeline,
+                color_view,
+                vertices,
+                vertex_count: 0,
+            });
+        }
+        self.stained.as_mut().expect("stained ensured")
+    }
+
+    /// Replace the staged stained-glass caster buffer (non-indexed
+    /// world-space triangles — the caller triangulates quads).
+    fn write_stained_casters(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        casters: &[StainedCasterVertex],
+    ) {
+        let stained = self.ensure_stained(device);
+        if casters.is_empty() {
+            stained.vertex_count = 0;
+            return;
+        }
+        if (stained.vertex_count as usize) < casters.len() {
+            stained.vertices = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("stained-casters"),
+                size: ((casters.len().next_power_of_two().max(16))
+                    * std::mem::size_of::<StainedCasterVertex>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        queue.write_buffer(&stained.vertices, 0, bytemuck::cast_slice(casters));
+        stained.vertex_count = casters.len() as u32;
     }
 
     fn draw_bind_group(
@@ -3206,7 +3887,10 @@ impl SkyGpu {
 struct ScaledTarget {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
-    bind_group: wgpu::BindGroup,
+    sampler: wgpu::Sampler,
+    /// `MEGU_SPATIAL_SHARPEN_WGSL` group-0 for this target (built once
+    /// the sharpen pipeline exists).
+    sharpen_bg: Option<wgpu::BindGroup>,
     size: (u32, u32),
 }
 
@@ -3221,6 +3905,9 @@ struct ComposedWorldTarget<'a> {
     chunk_fades: &'a ChunkFadeTracker,
     /// Camera position — seeds the [`GraphCuller`] search's camera section.
     camera_position: [f32; 3],
+    /// Authoritative server clock — the water pass derives its
+    /// `ShadowUniforms` fallback (sun/moon direction, day phase) from it.
+    world_time_ticks: u64,
 }
 
 /// Everything [`GpuRenderer::render_offscreen_composed_frame`] needs beyond
@@ -3384,6 +4071,7 @@ impl GpuRenderer {
         let bind_group = gpu_atlas.bind_group(device, &self.composite);
         self.composite.atlas = gpu_atlas;
         self.composite.env_bg = bind_group;
+        self.atlas_epoch += 1;
         Ok(())
     }
 
@@ -3803,10 +4491,8 @@ impl GpuRenderer {
         // Transfer-layer sizing keyed by the detected memory topology x
         // RAM class — strictly bus parameters, never visual quality.
         let memory_footprint_class = profile.memory_class;
-        let transfer_budget = TransferTopologyBudget::for_topology(
-            seeded_strategy.memory,
-            memory_footprint_class,
-        );
+        let transfer_budget =
+            TransferTopologyBudget::for_topology(seeded_strategy.memory, memory_footprint_class);
         let staging_ring = UploadStagingRing::new(&ctx.device, &transfer_budget);
         // The shared static quad index buffer starts at one slab of the
         // canonical `[0,1,2,0,2,3]` pattern; `flush_region_arenas` grows
@@ -3938,6 +4624,13 @@ impl GpuRenderer {
             dynamic_buffer_allocs: 0,
             subworld_gpu: SubWorldGpuCache::new(),
             scaled_target: None,
+            sharpen: None,
+            water: None,
+            lit_terrain: None,
+            shadow_gpu_epoch: 0,
+            pending_stained_casters: Vec::new(),
+            uploaded_section_coords: Vec::new(),
+            atlas_epoch: 0,
             shadow_quality: BuiltinShadowQuality::Off,
             render_scale: RenderScalePreset::default(),
             shadow_cache: DirtyOnlyShadowCache::new(),
@@ -4762,6 +5455,11 @@ impl GpuRenderer {
                 "translucent-idx",
                 &translucent_idx,
             ),
+            cutout_indices: self.empty_index_buffer.clone(),
+            cutout_index_count: 0,
+            water_vertices: self.empty_vertex_buffer.clone(),
+            water_indices: self.empty_index_buffer.clone(),
+            water_index_count: 0,
         };
         self.scene = Some(buffers);
         self.scene_revision += 1;
@@ -4984,7 +5682,12 @@ impl GpuRenderer {
         order: &Arc<[u32]>,
         buckets: Option<DirectionBuckets>,
     ) {
-        let geometry = section_geometry(packed, order);
+        let origin = [
+            coord.0 as f32 * 16.0,
+            coord.1 as f32 * 16.0,
+            coord.2 as f32 * 16.0,
+        ];
+        let geometry = section_geometry(packed, order, origin);
         let opaque_bucket_ranges = buckets.map(|b| compute_opaque_bucket_ranges(packed, b));
         self.install_live_section_geometry(
             coord,
@@ -5100,6 +5803,41 @@ impl GpuRenderer {
                 ),
             )
         };
+        let cutout_index_count = geometry.cutout_indices.len() as u32;
+        let cutout_indices = if cutout_index_count == 0 || arena_origin.is_some() {
+            // Arena-resident opaque streams keep section-local indices
+            // meaningless — cutout shadow draws stay per-section only.
+            self.empty_index_buffer.clone()
+        } else {
+            index_buffer(
+                &self.ctx.device,
+                &self.ctx.queue,
+                "live-cutout-indices",
+                &geometry.cutout_indices,
+            )
+        };
+        let water_index_count = geometry.water_indices.len() as u32;
+        let (water_vertices, water_indices) = if water_index_count == 0 {
+            (
+                self.empty_vertex_buffer.clone(),
+                self.empty_index_buffer.clone(),
+            )
+        } else {
+            (
+                typed_vertex_buffer(
+                    &self.ctx.device,
+                    &self.ctx.queue,
+                    "live-water-verts",
+                    &geometry.water,
+                ),
+                index_buffer(
+                    &self.ctx.device,
+                    &self.ctx.queue,
+                    "live-water-indices",
+                    &geometry.water_indices,
+                ),
+            )
+        };
         let terrain = TerrainBuffers {
             opaque_index_count,
             translucent_index_count,
@@ -5107,6 +5845,15 @@ impl GpuRenderer {
             opaque_indices,
             translucent_vertices,
             translucent_indices,
+            cutout_indices,
+            cutout_index_count: if arena_origin.is_some() {
+                0
+            } else {
+                cutout_index_count
+            },
+            water_vertices,
+            water_indices,
+            water_index_count,
         };
         let shared_group =
             translucent_index_count == 0 && (arena_origin.is_some() || opaque_index_total == 0);
@@ -5171,6 +5918,14 @@ impl GpuRenderer {
         // Occluders changed: the installed pyramid (if any) is stale.
         self.invalidate_hiz();
         self.cull_world_revision += 1;
+        self.uploaded_section_coords.push(coord);
+    }
+
+    /// Coords whose latest mesh finished the VRAM upload this session —
+    /// drained by the window loop so `WorldState` can release the matching
+    /// CPU copies (`release_uploaded_section_cpu_copies`).
+    pub fn take_uploaded_section_coords(&mut self) -> Vec<SectionCoord> {
+        std::mem::take(&mut self.uploaded_section_coords)
     }
 
     /// Drop the worker-built pyramid when terrain residency shifts; an
@@ -5357,9 +6112,8 @@ impl GpuRenderer {
                 arena.empty_frames = 0;
             }
         }
-        self.region_arenas.retain(|_, arena| {
-            !arena.slots.is_empty() || arena.empty_frames < grace
-        });
+        self.region_arenas
+            .retain(|_, arena| !arena.slots.is_empty() || arena.empty_frames < grace);
         if self.ensure_shared_quad_index_capacity() {
             replaced = true;
         }
@@ -5703,7 +6457,12 @@ impl GpuRenderer {
         let uniforms = CullUniforms {
             view_proj: *view_proj,
             planes: frustum_planes_from_view_proj(view_proj),
-            camera_pos: [camera_position[0], camera_position[1], camera_position[2], 0.0],
+            camera_pos: [
+                camera_position[0],
+                camera_position[1],
+                camera_position[2],
+                0.0,
+            ],
             params: [hiz_w as f32, hiz_h as f32, mip_count as f32, count as f32],
         };
         let device = &self.ctx.device;
@@ -5976,8 +6735,7 @@ impl GpuRenderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         self.depth_view = Some(texture.create_view(&wgpu::TextureViewDescriptor::default()));
@@ -6180,11 +6938,19 @@ impl GpuRenderer {
             sky,
             &BiomeAtmosphereBlender::new(params),
             &ChunkFadeTracker::new(),
+            DEMO_WORLD_TIME_TICKS,
+            &[],
         );
     }
 
-    /// Render the live window with the current biome, depth tint and chunk
-    /// fade progress. Requires a camera set by `set_camera` for world draws.
+    /// Render the live window with the current biome, depth tint, chunk
+    /// fade progress, live world time and dynamic colored lights.
+    /// Requires a camera set by `set_camera` for world draws.
+    ///
+    /// `world_time_ticks` is the authoritative server clock
+    /// (`set_time` day-time); `lights` carries this frame's VFX1 dynamic
+    /// point lights (empty slice renders the ambient-only path).
+    #[allow(clippy::too_many_arguments)]
     pub fn render_to_view_with_env(
         &mut self,
         view: &wgpu::TextureView,
@@ -6193,6 +6959,8 @@ impl GpuRenderer {
         sky: &SkyFogOutput,
         atmosphere: &BiomeAtmosphereBlender,
         chunk_fades: &ChunkFadeTracker,
+        world_time_ticks: u64,
+        lights: &[DynamicColoredLight],
     ) {
         self.ensure_depth(width, height);
         let mut encoder = self
@@ -6209,6 +6977,8 @@ impl GpuRenderer {
                 sky,
                 atmosphere,
                 chunk_fades,
+                world_time_ticks,
+                lights,
             );
         } else {
             // No camera => no composed pass; still run the per-frame upload
@@ -6362,8 +7132,11 @@ impl GpuRenderer {
         self.ctx.queue.submit([encoder.finish()]);
     }
 
-    /// Window camera currently uses the same fixed noon time as `set_camera`.
-    /// The composed-frame API also accepts live world time and VFX lights.
+    /// Window camera renders the live world at its true server time —
+    /// day/night cycle, moon-phase cascades and VFX1 dynamic lights all
+    /// follow `world_time_ticks`/`lights` exactly like the offscreen
+    /// composed-frame path.
+    #[allow(clippy::too_many_arguments)]
     fn encode_window_composed_world(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -6372,17 +7145,18 @@ impl GpuRenderer {
         sky: &SkyFogOutput,
         atmosphere: &BiomeAtmosphereBlender,
         chunk_fades: &ChunkFadeTracker,
+        world_time_ticks: u64,
+        lights: &[DynamicColoredLight],
     ) {
         let (width, height) = size;
         let camera = self.window_camera.get().expect("checked by caller");
         let aspect = width.max(1) as f32 / height.max(1) as f32;
-        const NOON: u64 = 6000;
-        self.prepare_shadow(&camera, aspect, NOON);
-        let decision = self.shadow_decision(&camera, 0, NOON);
+        self.prepare_shadow(&camera, aspect, world_time_ticks);
+        let decision = self.shadow_decision(&camera, 0, world_time_ticks);
         self.dispatch_shadow_work(encoder, &camera, aspect, decision);
 
         let atmo = atmosphere.current();
-        let sun = compute_sun_direction(NOON);
+        let sun = compute_sun_direction(world_time_ticks);
         let env = CompositeEnvUniforms {
             sun: [sun[0], sun[1], sun[2], atmo.sun_intensity],
             ambient: [
@@ -6400,7 +7174,7 @@ impl GpuRenderer {
             ],
         };
         self.write_env_ubo_dedup(&env);
-        let lights = VfxLightsGpu::from(&pack_vfx1_lights(&[], self.shadow_quality));
+        let lights = VfxLightsGpu::from(&pack_vfx1_lights(lights, self.shadow_quality));
         self.write_lights_ubo_dedup(&lights);
         self.write_frame_uniforms(&camera, aspect, atmo.fog_rgb, sky.fog_start, sky.fog_end);
         // Pending uploads may all be admitted by this frame's drain inside
@@ -6415,21 +7189,49 @@ impl GpuRenderer {
             + usize::from(self.entity_ber.is_some())
             + self.particle_alphas.len();
         self.ensure_draw_capacity(draws.max(8));
-        self.encode_composed_world(
-            encoder,
-            &ComposedWorldTarget {
-                view,
-                size: (width, height),
-                view_proj: camera.view_projection(aspect),
-                clear_rgb: [
-                    atmo.sky_horizon_rgb[0].max(atmo.fog_rgb[0] * 0.8),
-                    atmo.sky_horizon_rgb[1].max(atmo.fog_rgb[1] * 0.8),
-                    atmo.sky_horizon_rgb[2].max(atmo.fog_rgb[2] * 0.8),
-                ],
-                chunk_fades,
-                camera_position: camera.position,
-            },
-        );
+        let clear_rgb = [
+            atmo.sky_horizon_rgb[0].max(atmo.fog_rgb[0] * 0.8),
+            atmo.sky_horizon_rgb[1].max(atmo.fog_rgb[1] * 0.8),
+            atmo.sky_horizon_rgb[2].max(atmo.fog_rgb[2] * 0.8),
+        ];
+        // `render_scale < 100%`: the world pass draws into the reduced-res
+        // target and the spatial-sharpen pass upscales it onto `view`
+        // before the caller's UI overlay (matching the offscreen path).
+        let (world_w, world_h) = self.render_scale.scaled_dimensions(width, height);
+        if (world_w, world_h) != (width, height) {
+            self.ensure_scaled_target(world_w, world_h);
+            let target_view = self
+                .scaled_target
+                .as_ref()
+                .map(|t| t.view.clone())
+                .expect("ensured above");
+            self.encode_composed_world(
+                encoder,
+                &ComposedWorldTarget {
+                    view: &target_view,
+                    size: (world_w, world_h),
+                    view_proj: camera.view_projection(world_w as f32 / world_h as f32),
+                    clear_rgb,
+                    chunk_fades,
+                    camera_position: camera.position,
+                    world_time_ticks,
+                },
+            );
+            self.encode_sharpen_upscale(encoder, view, (world_w, world_h));
+        } else {
+            self.encode_composed_world(
+                encoder,
+                &ComposedWorldTarget {
+                    view,
+                    size: (width, height),
+                    view_proj: camera.view_projection(aspect),
+                    clear_rgb,
+                    chunk_fades,
+                    camera_position: camera.position,
+                    world_time_ticks,
+                },
+            );
+        }
     }
 
     /// Render a frame to an offscreen RGBA target and read the pixels back.
@@ -6566,6 +7368,7 @@ impl GpuRenderer {
         if negotiated != self.shadow_quality {
             self.shadow_cache.invalidate();
             self.shadow = None;
+            self.shadow_gpu_epoch += 1;
             self.shadow_active = false;
             self.last_shadow_camera = None;
             self.pending_cascade_layers = 0;
@@ -6616,9 +7419,13 @@ impl GpuRenderer {
             && camera.far > camera.near
             && camera.fov_deg > 1.0
             && camera.fov_deg < 179.0;
+        // Cascades stay live across the whole day cycle: below the horizon
+        // the caster is the moon at `-sun`, and the sampling shader fades
+        // the handover over `|sun.y|` in `0.02..0.08`, so the map only
+        // idles inside the fade floor where it reports fully lit anyway.
         let enabled = self.shadow_quality.config().cascade_count > 0
             && sun.iter().all(|v| v.is_finite())
-            && sun[1] > 0.08
+            && sun[1].abs() > 0.02
             && valid_camera;
         if !enabled {
             if self.shadow_active {
@@ -6635,6 +7442,7 @@ impl GpuRenderer {
                 self.target_format,
                 self.shadow_quality.config(),
             ));
+            self.shadow_gpu_epoch += 1;
             self.shadow_cache.invalidate();
         }
         // Yaw and pitch deliberately absent: the bounding-sphere orthos
@@ -6670,8 +7478,7 @@ impl GpuRenderer {
         let mask = match decision {
             ShadowCacheDecision::Rerender(ShadowDirtyReason::CameraCrossedSnapRegion) => {
                 self.pending_cascade_layers |= all;
-                self.pending_cascade_layers
-                    & self.pending_cascade_layers.wrapping_neg()
+                self.pending_cascade_layers & self.pending_cascade_layers.wrapping_neg()
             }
             ShadowCacheDecision::Rerender(_) => {
                 self.pending_cascade_layers |= all;
@@ -6722,9 +7529,11 @@ impl GpuRenderer {
         for (index, lvp) in self.rendered_lvp.iter().enumerate() {
             uniforms.light_view_proj[index] = *lvp;
         }
-        self.ctx
-            .queue
-            .write_buffer(&shadow.receiver_uniform, 0, &shadow_uniform_bytes(&uniforms));
+        self.ctx.queue.write_buffer(
+            &shadow.receiver_uniform,
+            0,
+            &shadow_uniform_bytes(&uniforms),
+        );
     }
 
     /// Record + execute shadow caster depth for every cascade in `mask`
@@ -6782,6 +7591,28 @@ impl GpuRenderer {
             .filter(|(_, section)| section.arena.is_none() && section.opaque_index_total > 0)
             .map(|(coord, _)| (*coord, push_model(identity)))
             .collect();
+        // Cutout casters: sorted for stable pool slots across recorded
+        // bundle replays (a reorder would silently swap section offsets).
+        let mut cutout_coords: Vec<SectionCoord> = self
+            .live_sections
+            .iter()
+            .filter(|(_, section)| {
+                section.arena.is_none() && section.terrain.cutout_index_count > 0
+            })
+            .map(|(coord, _)| *coord)
+            .collect();
+        cutout_coords.sort_unstable();
+        if !cutout_coords.is_empty() {
+            let atlas_epoch = self.atlas_epoch;
+            shadow.ensure_cutout(
+                &self.ctx.device,
+                &self.frame_layout,
+                &self.composite.draw_layout,
+                &self.composite.atlas,
+                atlas_epoch,
+            );
+        }
+        let cutout_sections: &[SectionCoord] = &cutout_coords;
         let region_offsets: Vec<_> = self
             .region_arenas
             .iter()
@@ -6826,6 +7657,18 @@ impl GpuRenderer {
                 u64::from(self.live_sections[coord].opaque_index_total),
             );
         }
+        for coord in &cutout_coords {
+            fnv1a_u32(&mut casters, coord.0 as u32);
+            fnv1a_u32(&mut casters, coord.1 as u32);
+            fnv1a_u32(&mut casters, coord.2 as u32);
+            fnv1a_u64(
+                &mut casters,
+                u64::from(self.live_sections[coord].terrain.cutout_index_count),
+            );
+        }
+        // Atlas replacement rebuilds the cutout bind group — re-record
+        // the bundle so it samples the new texture.
+        fnv1a_u64(&mut casters, self.atlas_epoch);
         // The shared index buffer's identity is part of the caster set —
         // a growth realloc invalidates recorded draws referencing it.
         fnv1a_u64(&mut casters, u64::from(self.shared_quad_index_capacity));
@@ -6887,22 +7730,19 @@ impl GpuRenderer {
             let bundle = match &shadow.cascade_bundles[layer] {
                 Some(cached) if cached.key == key => None,
                 _ => {
-                    let mut bundle_encoder =
-                        self.ctx
-                            .device
-                            .create_render_bundle_encoder(
-                                &wgpu::RenderBundleEncoderDescriptor {
-                                    label: Some("shadow-cascade-bundle"),
-                                    color_formats: &[],
-                                    depth_stencil: Some(wgpu::RenderBundleDepthStencil {
-                                        format: DEPTH_FORMAT,
-                                        depth_read_only: false,
-                                        stencil_read_only: true,
-                                    }),
-                                    sample_count: 1,
-                                    multiview: None,
-                                },
-                            );
+                    let mut bundle_encoder = self.ctx.device.create_render_bundle_encoder(
+                        &wgpu::RenderBundleEncoderDescriptor {
+                            label: Some("shadow-cascade-bundle"),
+                            color_formats: &[],
+                            depth_stencil: Some(wgpu::RenderBundleDepthStencil {
+                                format: DEPTH_FORMAT,
+                                depth_read_only: false,
+                                stencil_read_only: true,
+                            }),
+                            sample_count: 1,
+                            multiview: None,
+                        },
+                    );
                     let (bundle_entry_offsets, bundle_batch_offsets) =
                         (entry_offsets.as_slice(), batch_offsets.as_slice());
                     culled_total += record_shadow_cascade(
@@ -6912,6 +7752,7 @@ impl GpuRenderer {
                         ortho,
                         self.scene.as_ref().zip(scene_offset),
                         &section_offsets,
+                        cutout_sections,
                         &self.live_sections,
                         &region_offsets,
                         &self.region_arenas,
@@ -6955,6 +7796,52 @@ impl GpuRenderer {
             self.rendered_orthos[layer] = stable.orthos[layer];
             self.rendered_lvp[layer] = stable.uniforms.light_view_proj[layer];
             self.pending_cascade_layers &= !(1 << layer);
+        }
+        // Lazy stained-glass transmission: the RGBA shadow-color pass
+        // only runs while casters were staged — zero cost otherwise.
+        if !self.pending_stained_casters.is_empty() {
+            let casters = std::mem::take(&mut self.pending_stained_casters);
+            shadow.write_stained_casters(&self.ctx.device, &self.ctx.queue, &casters);
+        }
+        if shadow.stained.as_ref().is_some_and(|s| s.vertex_count > 0) {
+            for layer in 0..count {
+                if mask & (1 << layer) == 0 {
+                    continue;
+                }
+                let (depth_view, color_view) = {
+                    let stained = shadow.stained.as_ref().expect("checked");
+                    (&shadow.layer_views[layer], &stained.color_view[layer])
+                };
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("stained-glass-shadow-color"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: color_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            // White = full transmission; casters multiply.
+                            load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                let stained = shadow.stained.as_ref().expect("checked");
+                pass.set_pipeline(&stained.pipeline);
+                pass.set_bind_group(0, &shadow.caster_bgs[layer], &[]);
+                pass.set_vertex_buffer(0, stained.vertices.slice(..));
+                pass.draw(0..stained.vertex_count, 0..1);
+            }
         }
         self.shadow_regions_culled += culled_total;
         self.shadow_rerender_count += 1;
@@ -7005,13 +7892,21 @@ impl GpuRenderer {
         world_time_ticks: u64,
     ) -> ShadowCacheDecision {
         let sun = compute_sun_direction(world_time_ticks);
+        // The dirty tracker watches the active caster (sun by day, moon at
+        // `-sun` by night) so the dusk/dawn handover is a real direction
+        // change and re-renders the map exactly once.
+        let caster = if sun[1] >= 0.0 {
+            sun
+        } else {
+            v3_scale(sun, -1.0)
+        };
         let chunk = [
             (camera.position[0] / 16.0).floor() as i32,
             (camera.position[1] / 16.0).floor() as i32,
             (camera.position[2] / 16.0).floor() as i32,
         ];
         self.last_shadow_decision = self.shadow_cache.should_rerender_shadow_map(
-            sun,
+            caster,
             chunk,
             world_revision,
             self.shadow_quality,
@@ -7191,29 +8086,409 @@ impl GpuRenderer {
             min_filter: wgpu::FilterMode::Linear,
             ..wgpu::SamplerDescriptor::default()
         });
-        let bind_group = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("scaled-upscale-bind-group"),
-                layout: &self.ui_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&sampler),
-                    },
-                ],
-            });
         self.scaled_target = Some(ScaledTarget {
             _texture: texture,
             view,
-            bind_group,
+            sampler,
+            sharpen_bg: None,
             size: (width, height),
         });
+    }
+
+    /// `MEGU_SPATIAL_SHARPEN_WGSL` resources, created on first sub-native
+    /// upscale (`render_scale < Native100`).
+    fn ensure_sharpen(&mut self) -> &SharpenGpu {
+        if self.sharpen.is_none() {
+            let device = &self.ctx.device;
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("sharpen-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("sharpen-pipeline-layout"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("spatial-sharpen"),
+                source: wgpu::ShaderSource::Wgsl(MEGU_SPATIAL_SHARPEN_WGSL.into()),
+            });
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("spatial-sharpen"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: self.target_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+            let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sharpen-uniform"),
+                // SharpenUniforms.texel_strength: vec4<f32>.
+                size: 16,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.sharpen = Some(SharpenGpu {
+                pipeline,
+                bind_group_layout: layout,
+                uniform,
+            });
+        }
+        self.sharpen.as_ref().expect("sharpen ensured")
+    }
+
+    /// Fullscreen `MEGU_SPATIAL_SHARPEN_WGSL` upscale: 5-tap edge-adaptive
+    /// sharpen of `scaled_target` onto `view` at native size.
+    fn encode_sharpen_upscale(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        scaled_size: (u32, u32),
+    ) {
+        self.ensure_sharpen();
+        let sharpen = self.sharpen.as_ref().expect("ensured");
+        let target = self.scaled_target.as_mut().expect("scaled target ensured");
+        if target.sharpen_bg.is_none() {
+            target.sharpen_bg = Some(self.ctx.device.create_bind_group(
+                &wgpu::BindGroupDescriptor {
+                    label: Some("sharpen-bind-group"),
+                    layout: &sharpen.bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: sharpen.uniform.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&target.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&target.sampler),
+                        },
+                    ],
+                },
+            ));
+        }
+        let texel = [
+            1.0 / scaled_size.0.max(1) as f32,
+            1.0 / scaled_size.1.max(1) as f32,
+            0.6,
+            0.25,
+        ];
+        self.ctx
+            .queue
+            .write_buffer(&sharpen.uniform, 0, bytemuck::cast_slice(&texel));
+        let sharpen = self.sharpen.as_ref().expect("ensured");
+        let bg = target.sharpen_bg.as_ref().expect("created");
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("spatial-sharpen-upscale"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&sharpen.pipeline);
+        pass.set_bind_group(0, bg, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    /// `MEGU_WATER_SURFACE_WGSL` resources — the pass binds the frame's
+    /// shadow-receiver uniform (camera + celestial state) so water picks
+    /// up day/night shading for free. Created on first decoded water.
+    fn ensure_water(&mut self) -> &WaterGpu {
+        if self.water.is_none() {
+            let device = &self.ctx.device;
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("water-layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("water-pipeline-layout"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("water-surface"),
+                source: wgpu::ShaderSource::Wgsl(MEGU_WATER_SURFACE_WGSL.into()),
+            });
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("water-surface"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[Some(WATER_VERTEX_LAYOUT)],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: self.target_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+            let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("water-uniform"),
+                size: std::mem::size_of::<ShadowUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("water-bind-group"),
+                layout: &layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.as_entire_binding(),
+                }],
+            });
+            self.water = Some(WaterGpu {
+                pipeline,
+                uniform,
+                bind_group,
+            });
+        }
+        self.water.as_ref().expect("water ensured")
+    }
+
+    /// Stage stained-glass casters for the next shadow encode. The lazy
+    /// `MEGU_STAINED_GLASS_SHADOW_COLOR_WGSL` pass runs only while this is
+    /// non-empty — clear it to drop the glass cost back to zero.
+    pub fn upload_stained_glass_casters(&mut self, casters: &[StainedCasterVertex]) {
+        self.pending_stained_casters.clear();
+        self.pending_stained_casters.extend_from_slice(casters);
+    }
+
+    /// Upload an explicitly decoded `LitTerrainVertex` mesh for the
+    /// `MEGU_TERRAIN_LIT_WGSL` receiver path (sky/block light decoded
+    /// from `light_attr`). Requires active shadow resources.
+    pub fn upload_lit_terrain(
+        &mut self,
+        vertices: &[LitTerrainVertex],
+        indices: &[u32],
+    ) -> Result<(), RendererError> {
+        if vertices.is_empty() || indices.is_empty() {
+            self.lit_terrain = None;
+            return Ok(());
+        }
+        let Some(shadow) = self.shadow.as_ref() else {
+            return Err(RendererError::Device(
+                "upload_lit_terrain requires an active shadow preset".into(),
+            ));
+        };
+        let device = &self.ctx.device;
+        if self
+            .lit_terrain
+            .as_ref()
+            .is_some_and(|l| l.shadow_epoch != self.shadow_gpu_epoch)
+        {
+            self.lit_terrain = None;
+        }
+        if self.lit_terrain.is_none() {
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("lit-terrain-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2Array,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("lit-terrain-bind-group"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: shadow.receiver_uniform.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&shadow.array_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&shadow.compare_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.composite.lights_ubo.as_entire_binding(),
+                    },
+                ],
+            });
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("lit-terrain-pipeline-layout"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("terrain-lit"),
+                source: wgpu::ShaderSource::Wgsl(MEGU_TERRAIN_LIT_WGSL.into()),
+            });
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("terrain-lit"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[Some(LIT_TERRAIN_VERTEX_LAYOUT)],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: self.target_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+            self.lit_terrain = Some(LitTerrainGpu {
+                pipeline,
+                bind_group,
+                vertices: self.empty_vertex_buffer.clone(),
+                indices: self.empty_index_buffer.clone(),
+                index_count: 0,
+                shadow_epoch: self.shadow_gpu_epoch,
+            });
+        }
+        let lit = self.lit_terrain.as_mut().expect("created");
+        lit.vertices = typed_vertex_buffer(device, &self.ctx.queue, "lit-terrain-verts", vertices);
+        lit.indices = index_buffer(device, &self.ctx.queue, "lit-terrain-indices", indices);
+        lit.index_count = indices.len() as u32;
+        Ok(())
     }
 
     /// Encode the whole world pass (terrain + sub-worlds + instanced parts)
@@ -7238,8 +8513,30 @@ impl GpuRenderer {
             clear_rgb,
             chunk_fades,
             camera_position,
+            world_time_ticks,
         } = *target;
         self.ensure_depth(width, height);
+        // Lazily stand up the dedicated water pass the first frame any
+        // resident section carries decoded water geometry, and refresh
+        // its shadow-uniform (stable frame state when shadow resources
+        // are active, else a local fallback from the live world clock).
+        if self
+            .live_sections
+            .values()
+            .any(|s| s.terrain.water_index_count > 0)
+        {
+            self.ensure_water();
+            let uniforms = self
+                .frame_stable_shadow
+                .map(|s| s.uniforms)
+                .unwrap_or_else(|| {
+                    water_fallback_uniforms(view_proj, camera_position, world_time_ticks)
+                });
+            let water = self.water.as_ref().expect("ensured");
+            self.ctx
+                .queue
+                .write_buffer(&water.uniform, 0, &shadow_uniform_bytes(&uniforms));
+        }
         self.begin_render_upload_frame();
         self.cull_live_sections(&view_proj, camera_position);
         self.culled_sections += self.cull_result.len() as u64;
@@ -7315,14 +8612,14 @@ impl GpuRenderer {
         let frame_bind_group = &self.frame_bind_group;
         let depth_view = self.depth_view.as_ref().expect("depth ensured");
         let sky = &self.sky;
+        let water = &self.water;
+        let lit_terrain = &self.lit_terrain;
         if let Some(stable) = &self.frame_stable_shadow {
             // The dome reads only camera vectors, sun, render/celestial
             // params — all carried by the frame's stable uniform build.
-            self.ctx.queue.write_buffer(
-                &sky.uniform,
-                0,
-                &shadow_uniform_bytes(&stable.uniforms),
-            );
+            self.ctx
+                .queue
+                .write_buffer(&sky.uniform, 0, &shadow_uniform_bytes(&stable.uniforms));
         }
         gpu.draw_scratch.clear();
         {
@@ -7454,6 +8751,19 @@ impl GpuRenderer {
             if let Some(shadow) = shadow {
                 pass.set_bind_group(3, &shadow.receiver_bg, &[]);
             }
+            // `MEGU_TERRAIN_LIT_WGSL` receiver draws — explicitly
+            // uploaded decoded-vertex terrain with sky/block light in
+            // the attribute word (the packed section path stays on the
+            // atlas composite pipelines).
+            if let Some(lit) = lit_terrain {
+                if lit.index_count > 0 {
+                    pass.set_pipeline(&lit.pipeline);
+                    pass.set_bind_group(0, &lit.bind_group, &[]);
+                    pass.set_vertex_buffer(0, lit.vertices.slice(..));
+                    pass.set_index_buffer(lit.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..lit.index_count, 0, 0..1);
+                }
+            }
             // Sky dome behind all opaque geometry: the depth-1.0
             // fullscreen triangle passes `CompareFunction::Equal` only on
             // untouched pixels, so terrain-occluded sky never runs a
@@ -7524,6 +8834,29 @@ impl GpuRenderer {
                         wgpu::IndexFormat::Uint32,
                     );
                     pass.draw_indexed(0..section.terrain.translucent_index_count, 0, 0..1);
+                }
+            }
+
+            // Dedicated water pass: decoded world-space stream through
+            // `MEGU_WATER_SURFACE_WGSL` (waves, depth tint, sun/moon
+            // specular via the shadow uniform written above).
+            if let Some(water) = water {
+                let mut pipeline_set = false;
+                for (coord, section) in live_sections.iter() {
+                    if culled_sections.contains(coord) || section.terrain.water_index_count == 0 {
+                        continue;
+                    }
+                    if !pipeline_set {
+                        pass.set_pipeline(&water.pipeline);
+                        pass.set_bind_group(0, &water.bind_group, &[]);
+                        pipeline_set = true;
+                    }
+                    pass.set_vertex_buffer(0, section.terrain.water_vertices.slice(..));
+                    pass.set_index_buffer(
+                        section.terrain.water_indices.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    pass.draw_indexed(0..section.terrain.water_index_count, 0, 0..1);
                 }
             }
 
@@ -7727,34 +9060,11 @@ impl GpuRenderer {
                     clear_rgb,
                     chunk_fades: frame.chunk_fades,
                     camera_position: camera.position,
+                    world_time_ticks: frame.world_time_ticks,
                 },
             );
             // Upscale the reduced-res world to native before the UI pass.
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("scaled-upscale"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &native_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_pipeline(&self.ui_pipeline);
-                pass.set_bind_group(
-                    0,
-                    &self.scaled_target.as_ref().expect("ensured").bind_group,
-                    &[],
-                );
-                pass.draw(0..3, 0..1);
-            }
+            self.encode_sharpen_upscale(&mut encoder, &native_view, (world_w, world_h));
         } else {
             self.encode_composed_world(
                 &mut encoder,
@@ -7765,6 +9075,7 @@ impl GpuRenderer {
                     clear_rgb,
                     chunk_fades: frame.chunk_fades,
                     camera_position: camera.position,
+                    world_time_ticks: frame.world_time_ticks,
                 },
             );
         }
@@ -7884,6 +9195,27 @@ fn vertex_buffer(
             bytes.extend_from_slice(&v.tint.to_ne_bytes());
         }
         queue.write_buffer(&buffer, 0, &bytes);
+    }
+    buffer
+}
+
+/// Generic `bytemuck::Pod` vertex upload — used by the decoded
+/// `WaterVertex`/`LitTerrainVertex`/`StainedCasterVertex` streams
+/// (`PackedVertex` keeps its manual u32 serialization above).
+fn typed_vertex_buffer<T: bytemuck::Pod>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    verts: &[T],
+) -> wgpu::Buffer {
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: std::mem::size_of_val(verts).max(16) as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    if !verts.is_empty() {
+        queue.write_buffer(&buffer, 0, bytemuck::cast_slice(verts));
     }
     buffer
 }

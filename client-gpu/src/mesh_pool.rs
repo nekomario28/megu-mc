@@ -196,7 +196,12 @@ fn execute(job: MeshJob) -> MeshResult {
             order,
             buckets,
         } => {
-            let geometry = section_geometry(&packed, &order);
+            let origin = [
+                coord.0 as f32 * 16.0,
+                coord.1 as f32 * 16.0,
+                coord.2 as f32 * 16.0,
+            ];
+            let geometry = section_geometry(&packed, &order, origin);
             let opaque_bucket_ranges = buckets.map(|b| compute_opaque_bucket_ranges(&packed, b));
             MeshResult::SectionGeometry {
                 coord,

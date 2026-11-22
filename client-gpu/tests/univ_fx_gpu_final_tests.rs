@@ -13,7 +13,7 @@ use mc_spine_client_gpu::live_session::hw_adaptive_engine::GpuComputeParadigm;
 use mc_spine_client_gpu::live_session::{LiveSession, PlayerPose, CLOUD_SUBWORLD_ID};
 use mc_spine_client_gpu::renderer::{
     probe_adapters, request_gpu_device, select_depth_store_op, sort_regions_front_to_back,
-    ComposedFrame, GpuRenderer, SKY_DEPTH_COMPARE, OFFSCREEN_FORMAT,
+    ComposedFrame, GpuRenderer, OFFSCREEN_FORMAT, SKY_DEPTH_COMPARE,
 };
 use mc_spine_client_gpu::subworld_render::{
     box_mesh, SubWorldRenderBank, SubWorldRenderEntry, SubWorldTransform, COMPOSITE_TERRAIN_WGSL,
@@ -221,8 +221,7 @@ fn univ_front_to_back_sky_equal_tbdr_discard_and_vertex_hoisted_wgsl() {
         floor_vertices,
         floor_indices,
     ));
-    let (box_vertices, box_indices) =
-        box_mesh([0.0, 0.0, -2.0], [2.0, 3.0, 0.0], [0.6, 0.6, 0.6]);
+    let (box_vertices, box_indices) = box_mesh([0.0, 0.0, -2.0], [2.0, 3.0, 0.0], [0.6, 0.6, 0.6]);
     bank.upsert(SubWorldRenderEntry::new(
         22,
         SubWorldTransform::IDENTITY,
@@ -391,8 +390,7 @@ fn fx_dynamic_ring_zero_steady_allocs_cloud_cell_reuse_and_atmosphere_settled() 
     let warm_up_allocs = renderer.dynamic_buffer_allocs;
     assert_eq!(warm_up_allocs, 2, "one alloc per ring at warm-up");
     for _ in 0..4 {
-        renderer
-            .set_entity_and_ber_meshes(vec![(&mesh, [0.0, 64.0, 0.0], [1.0, 1.0, 1.0])]);
+        renderer.set_entity_and_ber_meshes(vec![(&mesh, [0.0, 64.0, 0.0], [1.0, 1.0, 1.0])]);
         renderer.set_particle_billboards(&[particle]);
     }
     assert_eq!(
@@ -472,4 +470,3 @@ fn fx_dynamic_ring_zero_steady_allocs_cloud_cell_reuse_and_atmosphere_settled() 
         "snap_to_target must be exactly settled"
     );
 }
-

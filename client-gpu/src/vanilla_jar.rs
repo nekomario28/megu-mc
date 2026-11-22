@@ -21,6 +21,7 @@ use std::path::Path;
 
 use mc_spine_client_mesh::asset_pipeline::ResourcePackLayer;
 use mc_spine_client_mesh::png_decode;
+use mc_spine_core::zip_archive::{LazyZipIndex, ZipError};
 
 /// Total on-disk bytes the archive itself may occupy.
 pub const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
@@ -30,8 +31,6 @@ pub const MAX_ARCHIVE_ENTRIES: usize = 50_000;
 pub const MAX_UNPACKED_BYTES: u64 = 256 * 1024 * 1024;
 /// Per-entry uncompressed cap (matches the asset pipeline's pack-file cap).
 pub const MAX_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
-
-const EOCD_SEARCH_WINDOW: usize = 66_000;
 
 /// Why a JAR/pack read failed — every variant is a fail-closed stop, never
 /// a silent partial load.
@@ -108,196 +107,100 @@ fn validate_entry_name(name: &str) -> Result<(), JarError> {
     Ok(())
 }
 
-fn u16le(data: &[u8], off: usize) -> Result<u16, JarError> {
-    data.get(off..off + 2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-        .ok_or_else(|| JarError::Malformed {
-            reason: "truncated record".to_owned(),
-        })
-}
-
-fn u32le(data: &[u8], off: usize) -> Result<u32, JarError> {
-    data.get(off..off + 4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .ok_or_else(|| JarError::Malformed {
-            reason: "truncated record".to_owned(),
-        })
-}
-
 /// Read `path` and decompress the central-directory entries whose names
 /// pass `select`. The archive itself is read once, size-checked before and
 /// after the read, and only matching entries are inflated — a hostile
 /// archive can never make the client decompress unrelated payloads.
+/// Read `path` and decompress the central-directory entries whose names
+/// pass `select`. Backed by [`LazyZipIndex`]: only the EOCD tail window
+/// and the Central Directory are indexed, then each selected entry is
+/// fetched and inflated on demand — the whole archive is never loaded
+/// and zero temporary files are created. Entries are size-checked
+/// before and after inflation, so a hostile archive can never make the
+/// client decompress unrelated payloads.
 pub fn read_selected_entries(
     path: &Path,
     select: impl Fn(&str) -> bool,
 ) -> Result<(Vec<JarEntry>, JarReadReport), JarError> {
-    let meta = std::fs::metadata(path).map_err(|e| JarError::Io {
-        reason: format!("cannot stat {}: {e}", path.display()),
-    })?;
-    if meta.len() > MAX_ARCHIVE_BYTES {
-        return Err(JarError::BudgetExceeded {
-            reason: format!(
-                "{} is {} bytes (limit {MAX_ARCHIVE_BYTES})",
-                path.display(),
-                meta.len()
-            ),
-        });
-    }
-    let zip = std::fs::read(path).map_err(|e| JarError::Io {
-        reason: format!("cannot read {}: {e}", path.display()),
-    })?;
-    if zip.len() as u64 > MAX_ARCHIVE_BYTES {
-        return Err(JarError::BudgetExceeded {
-            reason: format!("{} exceeds {MAX_ARCHIVE_BYTES} bytes", path.display()),
-        });
-    }
-    let mut report = JarReadReport::default();
-    let entries = read_central_directory(&zip, select, &mut report)?;
-    Ok((entries, report))
-}
-
-fn read_central_directory(
-    zip: &[u8],
-    select: impl Fn(&str) -> bool,
-    report: &mut JarReadReport,
-) -> Result<Vec<JarEntry>, JarError> {
-    let malformed = |reason: &str| JarError::Malformed {
-        reason: reason.to_owned(),
+    let index = LazyZipIndex::open_all(path).map_err(|e| zip_to_jar(path, e))?;
+    let mut report = JarReadReport {
+        entries_seen: index.entries().len(),
+        ..JarReadReport::default()
     };
-    // Locate EOCD by scanning the tail window backwards.
-    let start = zip.len().saturating_sub(EOCD_SEARCH_WINDOW);
-    let mut eocd = None;
-    for i in (start..zip.len().saturating_sub(3)).rev() {
-        if zip[i..i + 4] == [0x50, 0x4b, 0x05, 0x06] {
-            eocd = Some(i);
-            break;
-        }
-    }
-    let eocd = eocd.ok_or_else(|| malformed("no end-of-central-directory record"))?;
-    let disk = u16le(zip, eocd + 4)?;
-    let cd_disk = u16le(zip, eocd + 6)?;
-    if disk != 0 || cd_disk != 0 {
-        return Err(JarError::Unsupported {
-            reason: "multi-disk archive".to_owned(),
-        });
-    }
-    let total_entries = u16le(zip, eocd + 10)? as usize;
-    let cd_offset = u32le(zip, eocd + 16)? as usize;
-    if total_entries == 0xFFFF || u32le(zip, eocd + 12)? == 0xFFFF_FFFF || cd_offset == 0xFFFF_FFFF
-    {
-        return Err(JarError::Unsupported {
-            reason: "ZIP64 archive".to_owned(),
-        });
-    }
-    if total_entries > MAX_ARCHIVE_ENTRIES {
-        return Err(JarError::BudgetExceeded {
-            reason: format!("{total_entries} entries (limit {MAX_ARCHIVE_ENTRIES})"),
-        });
-    }
-    report.entries_seen = total_entries;
-
     let mut out = Vec::new();
     let mut total_unpacked = 0u64;
-    let mut off = cd_offset;
-    for _ in 0..total_entries {
-        if u32le(zip, off)? != 0x0201_4b50 {
-            return Err(malformed("bad central-directory signature"));
-        }
-        let flags = u16le(zip, off + 8)?;
-        let method = u16le(zip, off + 10)?;
-        let csize = u32le(zip, off + 20)? as usize;
-        let usize_ = u32le(zip, off + 24)? as u64;
-        let name_len = u16le(zip, off + 28)? as usize;
-        let extra_len = u16le(zip, off + 30)? as usize;
-        let comment_len = u16le(zip, off + 32)? as usize;
-        let lh_off = u32le(zip, off + 42)? as usize;
-        if flags & 0x1 != 0 {
-            return Err(JarError::Unsupported {
-                reason: "encrypted entry".to_owned(),
-            });
-        }
-        if csize == 0xFFFF_FFFF || usize_ == u64::from(u32::MAX) {
-            return Err(JarError::Unsupported {
-                reason: "ZIP64 entry".to_owned(),
-            });
-        }
-        let name_bytes = zip
-            .get(off + 46..off + 46 + name_len)
-            .ok_or_else(|| malformed("truncated entry name"))?;
-        let name = std::str::from_utf8(name_bytes)
-            .map_err(|_| malformed("non-UTF-8 entry name"))?
-            .to_owned();
-        off += 46 + name_len + extra_len + comment_len;
-
-        if name.ends_with('/') || !select(&name) {
+    for meta in index.entries() {
+        let name = &meta.name;
+        if name.ends_with('/') || !select(name) {
             continue;
         }
-        // Validate *before* touching the name further; a traversal entry is
-        // a record in `skipped`, not a load abort — the rest of the pack is
-        // still honest. (`validate_entry_name` only ever reports
-        // `UnsafePath`.)
-        if validate_entry_name(&name).is_err() {
+        // A traversal entry is a record in `skipped`, not a load abort —
+        // the rest of the pack is still honest.
+        if validate_entry_name(name).is_err() {
             report
                 .skipped
-                .push((name, "unsafe archive path".to_owned()));
+                .push((name.clone(), "unsafe archive path".to_owned()));
             continue;
         }
-        if usize_ > MAX_ENTRY_BYTES {
+        if meta.uncompressed_size > MAX_ENTRY_BYTES {
             report.skipped.push((
-                name,
-                format!("entry exceeds {MAX_ENTRY_BYTES}-byte cap ({usize_})"),
+                name.clone(),
+                format!(
+                    "entry exceeds {MAX_ENTRY_BYTES}-byte cap ({})",
+                    meta.uncompressed_size
+                ),
             ));
             continue;
         }
-        if usize_ > MAX_UNPACKED_BYTES.saturating_sub(total_unpacked) {
+        if meta.uncompressed_size > MAX_UNPACKED_BYTES.saturating_sub(total_unpacked) {
             return Err(JarError::BudgetExceeded {
                 reason: format!("unpacked bytes exceed {MAX_UNPACKED_BYTES}"),
             });
         }
-        // Local header: re-read name/extra lengths to find the data.
-        if u32le(zip, lh_off)? != 0x0403_4b50 {
-            return Err(malformed("bad local-file-header signature"));
+        match index.read_entry(name, MAX_ENTRY_BYTES as usize) {
+            Ok(bytes) => {
+                total_unpacked += bytes.len() as u64;
+                out.push(JarEntry {
+                    name: name.clone(),
+                    bytes,
+                });
+                report.entries_loaded += 1;
+            }
+            Err(e) => report.skipped.push((name.clone(), e.to_string())),
         }
-        let l_name_len = u16le(zip, lh_off + 26)? as usize;
-        let l_extra_len = u16le(zip, lh_off + 28)? as usize;
-        let data_start = lh_off
-            .checked_add(30)
-            .and_then(|v| v.checked_add(l_name_len))
-            .and_then(|v| v.checked_add(l_extra_len))
-            .ok_or_else(|| malformed("header offset overflow"))?;
-        let data = zip
-            .get(data_start..data_start + csize)
-            .ok_or_else(|| malformed("truncated entry data"))?;
-        let bytes = match method {
-            0 => {
-                if data.len() as u64 != usize_ {
-                    return Err(malformed("stored entry size mismatch"));
-                }
-                data.to_vec()
-            }
-            8 => match inflate(data, usize_ as usize) {
-                Ok(bytes) => bytes,
-                Err(reason) => {
-                    report.skipped.push((name, reason));
-                    continue;
-                }
-            },
-            m => {
-                return Err(JarError::Unsupported {
-                    reason: format!("compression method {m}"),
-                })
-            }
-        };
-        total_unpacked += bytes.len() as u64;
-        out.push(JarEntry { name, bytes });
-        report.entries_loaded += 1;
     }
-    Ok(out)
+    Ok((out, report))
 }
 
-/// `assets/<ns>/textures/<sub>` -> (`ns`, `sub`) when `sub` sits inside one
-/// of `dirs`. Shared by the JAR and pack-zip entry filters.
+fn zip_to_jar(path: &Path, e: ZipError) -> JarError {
+    match e {
+        ZipError::Io(io) => JarError::Io {
+            reason: format!("cannot read {}: {io}", path.display()),
+        },
+        ZipError::MultiDisk => JarError::Unsupported {
+            reason: "multi-disk archive".to_owned(),
+        },
+        ZipError::Encrypted(name) => JarError::Unsupported {
+            reason: format!("encrypted entry {name}"),
+        },
+        ZipError::UnsupportedMethod(m) => JarError::Unsupported {
+            reason: format!("compression method {m}"),
+        },
+        ZipError::InvalidEntryName(name) => JarError::UnsafePath { path: name },
+        ZipError::EntryTooLarge {
+            uncompressed_size, ..
+        } => JarError::BudgetExceeded {
+            reason: format!("entry is {uncompressed_size} bytes"),
+        },
+        ZipError::OutputCapExceeded => JarError::BudgetExceeded {
+            reason: "inflated entry exceeds output cap".to_owned(),
+        },
+        other => JarError::Malformed {
+            reason: other.to_string(),
+        },
+    }
+}
+
 fn texture_subpath(name: &str, dirs: &[&str]) -> Option<(String, String)> {
     let rest = name.strip_prefix("assets/")?;
     let (ns, tail) = rest.split_once('/')?;
@@ -508,301 +411,6 @@ pub fn configured_resource_packs(game_dir: &Path) -> Vec<String> {
 
 /// Inflate `input` (raw DEFLATE) into at most `limit` bytes. Output is
 /// capped at `limit` so a hostile stream cannot expand unboundedly.
-fn inflate(input: &[u8], limit: usize) -> Result<Vec<u8>, String> {
-    let mut br = BitReader::new(input);
-    let mut out: Vec<u8> = Vec::new();
-    loop {
-        let bfinal = br.bits(1)?;
-        let btype = br.bits(2)?;
-        match btype {
-            0 => {
-                br.align_byte();
-                let len = br.aligned_u16()?;
-                let nlen = br.aligned_u16()?;
-                if len != !nlen {
-                    return Err("deflate stored-block LEN/NLEN mismatch".to_owned());
-                }
-                for _ in 0..len {
-                    let b = br.aligned_byte()?;
-                    if out.len() >= limit {
-                        return Err("deflate output exceeds declared size".to_owned());
-                    }
-                    out.push(b);
-                }
-            }
-            1 | 2 => {
-                let (lit, dist) = if btype == 1 {
-                    (fixed_litlen_huffman(), fixed_dist_huffman())
-                } else {
-                    read_dynamic_tables(&mut br)?
-                };
-                loop {
-                    let sym = lit.decode(&mut br)?;
-                    match sym {
-                        0..=255 => {
-                            if out.len() >= limit {
-                                return Err("deflate output exceeds declared size".to_owned());
-                            }
-                            out.push(sym as u8);
-                        }
-                        256 => break,
-                        257..=285 => {
-                            let idx = (sym - 257) as usize;
-                            let length =
-                                LENGTH_BASE[idx] as usize + br.bits(LENGTH_EXTRA[idx])? as usize;
-                            let dsym = dist.decode(&mut br)? as usize;
-                            if dsym >= DIST_BASE.len() {
-                                return Err("invalid distance symbol".to_owned());
-                            }
-                            let distance =
-                                DIST_BASE[dsym] as usize + br.bits(DIST_EXTRA[dsym])? as usize;
-                            if distance == 0 || distance > out.len() {
-                                return Err("back-reference before output start".to_owned());
-                            }
-                            let start = out.len() - distance;
-                            for i in 0..length {
-                                if out.len() >= limit {
-                                    return Err("deflate output exceeds declared size".to_owned());
-                                }
-                                let b = out[start + i];
-                                out.push(b);
-                            }
-                        }
-                        _ => return Err("invalid literal/length symbol".to_owned()),
-                    }
-                }
-            }
-            _ => return Err("reserved deflate block type".to_owned()),
-        }
-        if bfinal == 1 {
-            break;
-        }
-    }
-    Ok(out)
-}
-
-const LENGTH_BASE: [u16; 29] = [
-    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
-    163, 195, 227, 258,
-];
-const LENGTH_EXTRA: [u32; 29] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
-];
-const DIST_BASE: [u16; 30] = [
-    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
-    2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
-];
-const DIST_EXTRA: [u32; 30] = [
-    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
-    13,
-];
-const CLEN_ORDER: [usize; 19] = [
-    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
-];
-
-/// LSB-first bit reader over a byte slice.
-struct BitReader<'a> {
-    data: &'a [u8],
-    pos: usize,
-    buf: u64,
-    len: u32,
-}
-
-impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self {
-            data,
-            pos: 0,
-            buf: 0,
-            len: 0,
-        }
-    }
-
-    fn bits(&mut self, n: u32) -> Result<u32, String> {
-        debug_assert!(n <= 32);
-        while self.len < n {
-            let b = *self
-                .data
-                .get(self.pos)
-                .ok_or_else(|| "deflate stream truncated".to_owned())?;
-            self.pos += 1;
-            self.buf |= u64::from(b) << self.len;
-            self.len += 8;
-        }
-        let v = (self.buf & ((1u64 << n) - 1)) as u32;
-        self.buf >>= n;
-        self.len -= n;
-        Ok(v)
-    }
-
-    fn align_byte(&mut self) {
-        let drop = self.len % 8;
-        self.buf >>= drop;
-        self.len -= drop;
-    }
-
-    fn aligned_byte(&mut self) -> Result<u8, String> {
-        if self.len >= 8 {
-            let b = self.buf as u8;
-            self.buf >>= 8;
-            self.len -= 8;
-            Ok(b)
-        } else {
-            self.bits(8).map(|v| v as u8)
-        }
-    }
-
-    fn aligned_u16(&mut self) -> Result<u16, String> {
-        let lo = self.aligned_byte()?;
-        let hi = self.aligned_byte()?;
-        Ok(u16::from_le_bytes([lo, hi]))
-    }
-}
-
-/// Canonical Huffman table decoded puff-style: `counts[n]` is how many
-/// symbols have code length `n`, `symbols` lists them in code order.
-struct Huffman {
-    counts: [u16; 16],
-    symbols: Vec<u16>,
-}
-
-impl Huffman {
-    fn build(lengths: &[u8]) -> Result<Self, String> {
-        let mut counts = [0u16; 16];
-        for &l in lengths {
-            if l > 15 {
-                return Err("invalid huffman table".to_owned());
-            }
-            counts[l as usize] += 1;
-        }
-        if counts[0] as usize == lengths.len() {
-            return Err("invalid huffman table".to_owned());
-        }
-        // Check for an over-subscribed code.
-        let mut left: i32 = 1;
-        for &c in counts.iter().skip(1) {
-            left <<= 1;
-            left -= i32::from(c);
-            if left < 0 {
-                return Err("invalid huffman table".to_owned());
-            }
-        }
-        let mut offs = [0usize; 16];
-        for i in 1..15 {
-            offs[i + 1] = offs[i] + counts[i] as usize;
-        }
-        let mut symbols = vec![0u16; lengths.len()];
-        for (sym, &l) in lengths.iter().enumerate() {
-            if l != 0 {
-                symbols[offs[l as usize]] = sym as u16;
-                offs[l as usize] += 1;
-            }
-        }
-        Ok(Self { counts, symbols })
-    }
-
-    fn decode(&self, br: &mut BitReader<'_>) -> Result<u16, String> {
-        let mut code: i32 = 0;
-        let mut first: i32 = 0;
-        let mut index: i32 = 0;
-        for len in 1..16usize {
-            code |= br.bits(1)? as i32;
-            let count = i32::from(self.counts[len]);
-            if code - first < count {
-                return self
-                    .symbols
-                    .get((index + (code - first)) as usize)
-                    .copied()
-                    .ok_or_else(|| "invalid huffman code".to_owned());
-            }
-            index += count;
-            first = (first + count) << 1;
-            code <<= 1;
-        }
-        Err("invalid huffman code".to_owned())
-    }
-}
-
-fn fixed_litlen_huffman() -> Huffman {
-    let mut lengths = [0u8; 288];
-    for (i, l) in lengths.iter_mut().enumerate() {
-        *l = match i {
-            0..=143 => 8,
-            144..=255 => 9,
-            256..=279 => 7,
-            _ => 8,
-        };
-    }
-    // Lengths are compile-time constants; build cannot fail.
-    match Huffman::build(&lengths) {
-        Ok(h) => h,
-        Err(_) => unreachable!("fixed deflate table is well-formed"),
-    }
-}
-
-fn fixed_dist_huffman() -> Huffman {
-    match Huffman::build(&[5u8; 30]) {
-        Ok(h) => h,
-        Err(_) => unreachable!("fixed deflate table is well-formed"),
-    }
-}
-
-/// Read a dynamic-Huffman block header and build the literal/length and
-/// distance tables.
-fn read_dynamic_tables(br: &mut BitReader<'_>) -> Result<(Huffman, Huffman), String> {
-    let hlit = br.bits(5)? as usize + 257;
-    let hdist = br.bits(5)? as usize + 1;
-    let hclen = br.bits(4)? as usize + 4;
-    if hlit > 286 || hdist > 30 {
-        return Err("dynamic table size out of range".to_owned());
-    }
-    let mut clen_lengths = [0u8; 19];
-    for &idx in CLEN_ORDER.iter().take(hclen) {
-        clen_lengths[idx] = br.bits(3)? as u8;
-    }
-    let clen = Huffman::build(&clen_lengths)?;
-    let mut lengths = vec![0u8; hlit + hdist];
-    let mut i = 0;
-    while i < lengths.len() {
-        let sym = clen.decode(br)?;
-        match sym {
-            0..=15 => {
-                lengths[i] = sym as u8;
-                i += 1;
-            }
-            16 => {
-                if i == 0 {
-                    return Err("repeat with no previous length".to_owned());
-                }
-                let prev = lengths[i - 1];
-                let rep = 3 + br.bits(2)? as usize;
-                for _ in 0..rep {
-                    if i >= lengths.len() {
-                        return Err("repeat overflows table".to_owned());
-                    }
-                    lengths[i] = prev;
-                    i += 1;
-                }
-            }
-            17 | 18 => {
-                let rep = if sym == 17 {
-                    3 + br.bits(3)? as usize
-                } else {
-                    11 + br.bits(7)? as usize
-                };
-                i += rep;
-                if i > lengths.len() {
-                    return Err("zero-run overflows table".to_owned());
-                }
-            }
-            _ => return Err("invalid code-length symbol".to_owned()),
-        }
-    }
-    let lit = Huffman::build(&lengths[..hlit])?;
-    let dist = Huffman::build(&lengths[hlit..])?;
-    Ok((lit, dist))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

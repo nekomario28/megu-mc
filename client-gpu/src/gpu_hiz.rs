@@ -598,11 +598,15 @@ impl GpuHizCuller {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&self.mip_views[level as usize - 1]),
+                        resource: wgpu::BindingResource::TextureView(
+                            &self.mip_views[level as usize - 1],
+                        ),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&self.mip_views[level as usize]),
+                        resource: wgpu::BindingResource::TextureView(
+                            &self.mip_views[level as usize],
+                        ),
                     },
                 ],
             });
@@ -620,10 +624,7 @@ impl GpuHizCuller {
 
     /// `(width, height)` of pyramid `level` (level 0 is full resolution).
     fn mip_dims(&self, level: u32) -> (u32, u32) {
-        (
-            (self.width >> level).max(1),
-            (self.height >> level).max(1),
-        )
+        ((self.width >> level).max(1), (self.height >> level).max(1))
     }
 
     /// Build the pyramid from a `Depth32Float`/`texture_depth_2d` view:
