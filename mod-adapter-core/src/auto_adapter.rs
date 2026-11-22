@@ -55,6 +55,7 @@ use crate::ecosystem_compat::{
     scan_mod_jar_named, JarScanError, ModEnvironment, ModJarDescriptor,
 };
 use crate::fallback::{is_builtin_superseded_mod, REASON_SUPERSEDED};
+use crate::hard_mod_primitives::{classify_perf_or_render_mod_compat, EngineCompatDisposition};
 use crate::mixin_lifter::{LiftedBinding, MixinLiftVerdict, MixinSite, UnliftableReason};
 use crate::modpack::{infer_candidate_mod_id, read_zip_member, zip_member_list};
 use crate::unified_bundle::{DeclarativeModBundle, BUNDLE_SCHEMA};
@@ -184,6 +185,9 @@ pub struct JarAdaptationResult {
     pub descriptor: Option<ModJarDescriptor>,
     /// The tier the JAR was assigned.
     pub tier: AdaptationTier,
+    /// Integration strategy inferred from the declared mod id, falling
+    /// back to the JAR name when loader metadata is unavailable.
+    pub engine_compat: EngineCompatDisposition,
     /// Chronological audit trail of every pipeline decision.
     pub audit_notes: Vec<String>,
     /// Exact human-readable blockers — non-empty iff
@@ -291,6 +295,45 @@ fn superseded_id(id: &str) -> bool {
             .any(|entry| normalized_mod_key(entry) == normalized_mod_key(id))
 }
 
+/// Record the hard-mod integration strategy independently of the execution
+/// tier. A superseded JAR can still require a client-side resource bridge.
+fn classify_adapted_mod_compat(
+    descriptor: Option<&ModJarDescriptor>,
+    inferred_mod_id: Option<&str>,
+    audit_notes: &mut Vec<String>,
+) -> EngineCompatDisposition {
+    let mod_id = descriptor
+        .map(|d| d.mod_id.as_str())
+        .filter(|id| !id.is_empty())
+        .or(inferred_mod_id);
+    let disposition = mod_id.map_or(EngineCompatDisposition::StandardModAdapter, |id| {
+        let classified = classify_perf_or_render_mod_compat(id);
+        if classified == EngineCompatDisposition::StandardModAdapter && descriptor.is_none() {
+            // Filename inference folds underscores into hyphens; the
+            // classifier retains underscores in some canonical mod ids.
+            classify_perf_or_render_mod_compat(&id.replace('-', "_"))
+        } else {
+            classified
+        }
+    });
+    let note = match disposition {
+        EngineCompatDisposition::NativeAccelerated { native_subsystem } => {
+            Some(format!("engine compatibility strategy: native_accelerated:{native_subsystem}"))
+        }
+        EngineCompatDisposition::NativeGameplayPrimitive { engine } => {
+            Some(format!("engine compatibility strategy: native_gameplay_primitive:{engine}"))
+        }
+        EngineCompatDisposition::CoexistResourceBridge { bridge } => {
+            Some(format!("engine compatibility strategy: coexist_resource_bridge:{bridge}"))
+        }
+        EngineCompatDisposition::StandardModAdapter => None,
+    };
+    if let Some(note) = note {
+        audit_notes.push(note);
+    }
+    disposition
+}
+
 fn env_str(env: ModEnvironment) -> &'static str {
     match env {
         ModEnvironment::Client => "client",
@@ -393,6 +436,7 @@ fn skipped_result(
     jar: String,
     inferred_mod_id: Option<String>,
     descriptor: Option<ModJarDescriptor>,
+    engine_compat: EngineCompatDisposition,
     audit_notes: Vec<String>,
     data: GenericDataSummary,
 ) -> JarAdaptationResult {
@@ -401,6 +445,7 @@ fn skipped_result(
         inferred_mod_id,
         descriptor,
         tier: AdaptationTier::AutoSkipped,
+        engine_compat,
         audit_notes,
         blockers: Vec::new(),
         mixin_scan: None,
@@ -490,6 +535,8 @@ pub fn auto_adapt_jar_bytes(
     //    bytecode byte is interpreted.
     if let Some(id) = inferred_mod_id.as_deref() {
         if superseded_id(id) {
+            let engine_compat =
+                classify_adapted_mod_compat(None, inferred_mod_id.as_deref(), &mut audit_notes);
             audit_notes.push(format!(
                 "filename-inferred mod id '{id}' matches BUILTIN_SUPERSEDED_PERF_MODS ({REASON_SUPERSEDED}); skipped before any bytecode read"
             ));
@@ -497,6 +544,7 @@ pub fn auto_adapt_jar_bytes(
                 display.to_string(),
                 inferred_mod_id,
                 None,
+                engine_compat,
                 audit_notes,
                 GenericDataSummary::default(),
             ));
@@ -535,6 +583,8 @@ pub fn auto_adapt_jar_bytes(
             manifest_error.as_deref().unwrap_or("<unknown>")
         )),
     }
+    let engine_compat =
+        classify_adapted_mod_compat(descriptor.as_ref(), inferred_mod_id.as_deref(), &mut audit_notes);
 
     // 4. Declared-id superseded skip — a `lithium-*.jar` renamed to
     //    `cool-mod.jar` is still caught on its manifest id, before any
@@ -548,6 +598,7 @@ pub fn auto_adapt_jar_bytes(
                 display.to_string(),
                 inferred_mod_id,
                 descriptor,
+                engine_compat,
                 audit_notes,
                 data,
             ));
@@ -566,6 +617,7 @@ pub fn auto_adapt_jar_bytes(
             display.to_string(),
             inferred_mod_id,
             descriptor,
+            engine_compat,
             audit_notes,
             data,
         ));
@@ -801,6 +853,7 @@ pub fn auto_adapt_jar_bytes(
         inferred_mod_id,
         descriptor,
         tier,
+        engine_compat,
         audit_notes,
         blockers,
         mixin_scan: Some(mixin_scan),
@@ -1285,6 +1338,24 @@ fn jar_result_json(result: &JarAdaptationResult) -> String {
     );
     jf_opt(&mut out, 1, "mod_id", result.mod_id(), true);
     jf_str(&mut out, 1, "tier", result.tier.as_str(), true);
+    let (disposition, detail) = match result.engine_compat {
+        EngineCompatDisposition::NativeAccelerated { native_subsystem } => {
+            ("native_accelerated", Some(("native_subsystem", native_subsystem)))
+        }
+        EngineCompatDisposition::NativeGameplayPrimitive { engine } => {
+            ("native_gameplay_primitive", Some(("engine", engine)))
+        }
+        EngineCompatDisposition::CoexistResourceBridge { bridge } => {
+            ("coexist_resource_bridge", Some(("bridge", bridge)))
+        }
+        EngineCompatDisposition::StandardModAdapter => ("standard_mod_adapter", None),
+    };
+    let _ = writeln!(out, "  \"engine_compat\": {{");
+    jf_str(&mut out, 2, "disposition", disposition, detail.is_some());
+    if let Some((key, value)) = detail {
+        jf_str(&mut out, 2, key, value, false);
+    }
+    let _ = writeln!(out, "  }},");
 
     match &result.descriptor {
         None => {
@@ -1617,7 +1688,15 @@ fn format_adapt_dir_human(report: &ModsDirAdaptationReport) -> String {
                 format!("Tier 3 — {}", jar.blockers.join("; "))
             }
         };
-        let _ = writeln!(out, "  {} [{id}]: {detail}", jar.jar);
+        let _ = write!(out, "  {} [{id}]: {detail}", jar.jar);
+        if let Some(note) = jar
+            .audit_notes
+            .iter()
+            .find(|note| note.starts_with("engine compatibility strategy:"))
+        {
+            let _ = write!(out, "; {note}");
+        }
+        let _ = writeln!(out);
     }
     for note in &report.audit_notes {
         let _ = writeln!(out, "  - {note}");

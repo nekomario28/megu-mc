@@ -1,8 +1,269 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 
+use mod_adapter_core::auto_adapter::{
+    auto_adapt_jar, auto_adapt_jar_bytes, auto_adapt_mods_dir, AdaptationTier, AutoAdaptOptions,
+};
 use mod_adapter_core::hard_mod_primitives::*;
+
+static NEXT_SCRATCH: AtomicUsize = AtomicUsize::new(0);
+
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "mc-spine-hard-mod-adaptation-{}-{}",
+            std::process::id(),
+            NEXT_SCRATCH.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).expect("create scratch mods directory");
+        Self(path)
+    }
+
+    fn write(&self, name: &str, contents: &[u8]) -> PathBuf {
+        let path = self.0.join(name);
+        fs::write(&path, contents).expect("write synthetic mod JAR");
+        path
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = 0u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+fn synthetic_jar(mod_id: &str) -> Vec<u8> {
+    let manifest = format!(r#"{{"id":"{mod_id}","version":"1.0.0","environment":"*"}}"#);
+    let (name, data): (&[u8], &[u8]) = if mod_id.is_empty() {
+        (b"README.txt", b"no loader manifest")
+    } else {
+        (b"fabric.mod.json", manifest.as_bytes())
+    };
+    let size = data.len() as u32;
+    let crc = crc32(data);
+    let mut out = Vec::new();
+    out.extend(0x0403_4b50u32.to_le_bytes());
+    out.extend(10u16.to_le_bytes());
+    out.extend([0u8; 8]);
+    out.extend(crc.to_le_bytes());
+    out.extend(size.to_le_bytes());
+    out.extend(size.to_le_bytes());
+    out.extend((name.len() as u16).to_le_bytes());
+    out.extend(0u16.to_le_bytes());
+    out.extend(name);
+    out.extend(data);
+
+    let central_offset = out.len() as u32;
+    out.extend(0x0201_4b50u32.to_le_bytes());
+    out.extend(20u16.to_le_bytes());
+    out.extend(10u16.to_le_bytes());
+    out.extend([0u8; 8]);
+    out.extend(crc.to_le_bytes());
+    out.extend(size.to_le_bytes());
+    out.extend(size.to_le_bytes());
+    out.extend((name.len() as u16).to_le_bytes());
+    out.extend([0u8; 8]);
+    out.extend(0u32.to_le_bytes());
+    out.extend(0u32.to_le_bytes());
+    out.extend(name);
+    let central_size = out.len() as u32 - central_offset;
+    out.extend(0x0605_4b50u32.to_le_bytes());
+    out.extend([0u8; 4]);
+    out.extend(1u16.to_le_bytes());
+    out.extend(1u16.to_le_bytes());
+    out.extend(central_size.to_le_bytes());
+    out.extend(central_offset.to_le_bytes());
+    out.extend(0u16.to_le_bytes());
+    out
+}
+
+#[test]
+fn auto_adapter_classifies_carryon_from_manifest() {
+    let scratch = ScratchDir::new();
+    let path = scratch.write("renamed.jar", &synthetic_jar("carryon"));
+    let result = auto_adapt_jar(&path, &AutoAdaptOptions::default()).unwrap();
+    assert_eq!(result.mod_id(), Some("carryon"));
+    assert_eq!(
+        result.engine_compat,
+        EngineCompatDisposition::NativeGameplayPrimitive {
+            engine: "CarryOnEngine"
+        }
+    );
+    assert!(result.to_json().contains("\"engine\": \"CarryOnEngine\""));
+    assert!(result
+        .format_human()
+        .contains("native_gameplay_primitive:CarryOnEngine"));
+}
+
+#[test]
+fn auto_adapter_classifies_vulkan_and_filename_fallback() {
+    let result = auto_adapt_jar_bytes(
+        &synthetic_jar("vulkanmod"),
+        "otherwise-unknown.jar",
+        &AutoAdaptOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        result.engine_compat,
+        EngineCompatDisposition::NativeAccelerated {
+            native_subsystem: "vulkan_render_backend"
+        }
+    );
+    assert!(result
+        .to_json()
+        .contains("\"native_subsystem\": \"vulkan_render_backend\""));
+    assert!(result
+        .format_human()
+        .contains("native_accelerated:vulkan_render_backend"));
+
+    let fallback = auto_adapt_jar_bytes(
+        &synthetic_jar(""),
+        "sound_physics_remastered-1.0.jar",
+        &AutoAdaptOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        fallback.engine_compat,
+        EngineCompatDisposition::CoexistResourceBridge {
+            bridge: "audio_occlusion_bridge"
+        }
+    );
+    assert_eq!(fallback.tier, AdaptationTier::Tier3FallbackRequired);
+
+    let unknown = auto_adapt_jar_bytes(
+        &synthetic_jar(""),
+        "unknown-addon.jar",
+        &AutoAdaptOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        unknown.engine_compat,
+        EngineCompatDisposition::StandardModAdapter
+    );
+    assert!(unknown.requires_fallback());
+    assert!(
+        auto_adapt_jar_bytes(&[], "vulkanmod.jar", &AutoAdaptOptions::default()).is_err(),
+        "malformed archives must still fail closed"
+    );
+}
+
+#[test]
+fn mods_dir_surfaces_hard_mod_strategies_including_distant_horizons() {
+    let scratch = ScratchDir::new();
+    let cases = [
+        (
+            "carryon",
+            EngineCompatDisposition::NativeGameplayPrimitive {
+                engine: "CarryOnEngine",
+            },
+        ),
+        (
+            "sophisticatedbackpacks",
+            EngineCompatDisposition::NativeGameplayPrimitive {
+                engine: "BackpackGuard",
+            },
+        ),
+        (
+            "gravestone",
+            EngineCompatDisposition::NativeGameplayPrimitive {
+                engine: "GraveStore",
+            },
+        ),
+        (
+            "waystones",
+            EngineCompatDisposition::NativeGameplayPrimitive {
+                engine: "WaystoneNetwork",
+            },
+        ),
+        (
+            "pipez",
+            EngineCompatDisposition::NativeGameplayPrimitive {
+                engine: "CollapsedLogisticsNetwork",
+            },
+        ),
+        (
+            "vulkanmod",
+            EngineCompatDisposition::NativeAccelerated {
+                native_subsystem: "vulkan_render_backend",
+            },
+        ),
+        (
+            "nvidium",
+            EngineCompatDisposition::NativeAccelerated {
+                native_subsystem: "mesh_shader_renderer",
+            },
+        ),
+        (
+            "sodium",
+            EngineCompatDisposition::NativeAccelerated {
+                native_subsystem: "chunk_renderer",
+            },
+        ),
+        (
+            "ferritecore",
+            EngineCompatDisposition::NativeAccelerated {
+                native_subsystem: "compact_registry_storage",
+            },
+        ),
+        (
+            "iris",
+            EngineCompatDisposition::CoexistResourceBridge {
+                bridge: "shader_pipeline_bridge",
+            },
+        ),
+        (
+            "distanthorizons",
+            EngineCompatDisposition::CoexistResourceBridge {
+                bridge: "lod_stream_bridge",
+            },
+        ),
+        (
+            "sound_physics_remastered",
+            EngineCompatDisposition::CoexistResourceBridge {
+                bridge: "audio_occlusion_bridge",
+            },
+        ),
+    ];
+    for (index, (mod_id, _)) in cases.iter().enumerate() {
+        scratch.write(&format!("fixture-{index:02}.jar"), &synthetic_jar(mod_id));
+    }
+
+    let report = auto_adapt_mods_dir(&scratch.0, &AutoAdaptOptions::default()).unwrap();
+    assert_eq!(report.jars.len(), cases.len());
+    for (result, (mod_id, disposition)) in report.jars.iter().zip(cases) {
+        assert_eq!(result.mod_id(), Some(mod_id));
+        assert_eq!(result.engine_compat, disposition, "mod id {mod_id}");
+        assert!(result.to_json().contains("\"engine_compat\""));
+    }
+    let distant_horizons = &report.jars[10];
+    assert_eq!(distant_horizons.tier, AdaptationTier::AutoSkipped);
+    assert!(distant_horizons
+        .audit_notes
+        .iter()
+        .any(|note| note.contains("coexist_resource_bridge:lod_stream_bridge")));
+    assert!(report
+        .to_json()
+        .contains("\"bridge\": \"lod_stream_bridge\""));
+    assert!(report.format_human().contains("coexist_resource_bridge:lod_stream_bridge"));
+}
 
 fn chest(slots: Vec<(u16, String, u32)>) -> CarriedPayload {
     CarriedPayload::Block {
