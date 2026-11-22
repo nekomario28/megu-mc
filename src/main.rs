@@ -2477,7 +2477,25 @@ fn insert_live_mob(
     if mobs.len() >= MOB_CAP {
         return false;
     }
-    mobs.push(new_live_mob(etype, dim, pos, hp, slime_size));
+    let mob = new_live_mob(etype, dim, pos, hp, slime_size);
+    // `command_block_minecart` (entity type 21) carries a live command block:
+    // register the record at spawn so the minecart pass can tick it.
+    if etype == 21 {
+        upsert_command_minecart(CommandMinecartRecord {
+            entity_id: mob.eid,
+            dim,
+            x: pos.0,
+            y: pos.1,
+            z: pos.2,
+            command: String::new(),
+            track_output: false,
+            last_output: String::new(),
+            success_count: 0,
+            activated: false,
+            powered_ticks: 0,
+        });
+    }
+    mobs.push(mob);
     true
 }
 
@@ -2527,6 +2545,9 @@ fn remove_live_mob(eid: i32) -> Option<(Arc<Mob>, Option<LiveMobState>)> {
     let state = live_mob_states().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
     let mob = mobs.remove(index);
     drop(mobs);
+    if mob.etype == 21 {
+        remove_command_minecart(eid);
+    }
     mob_custom_names()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -5118,17 +5139,24 @@ fn live_mob_tick_dimension(
                 damage += 2.0;
             }
         }
-        if matches!(m.etype, 124 | 91 | 76)
-            && dim == DimId::Overworld
-            && day
-            && !in_water
-            && !raining
-            && by + 1 >= height_at(bx, bz)
-            && block_at(bx, by + 2, bz) == 0
         {
-            let sunlight_burn = server_ticks(160) as i32;
-            let mut fire_ticks = m.fire_ticks.lock().unwrap_or_else(|e| e.into_inner());
-            *fire_ticks = (*fire_ticks).max(sunlight_burn);
+            // `Monster.isSunBurnTick`: daylight with the sky visible and its
+            // brightness above 0.5 — water and rain take the light to 0 here.
+            // Skeletons and phantoms share the family predicates; zombies use
+            // the same rule written inline (they have no dedicated helper).
+            let sky_visible = by + 1 >= height_at(bx, bz) && block_at(bx, by + 2, bz) == 0;
+            let sky_light = if in_water || raining { 0.0 } else { 1.0 };
+            let sun_burn = match m.etype {
+                91 => skeleton_burns_in_sun(day, sky_visible, sky_light, false),
+                76 => phantom_burns_in_sun(day, sky_visible, sky_light),
+                124 => day && sky_visible && sky_light > 0.5,
+                _ => false,
+            };
+            if sun_burn && dim == DimId::Overworld {
+                let sunlight_burn = server_ticks(160) as i32;
+                let mut fire_ticks = m.fire_ticks.lock().unwrap_or_else(|e| e.into_inner());
+                *fire_ticks = (*fire_ticks).max(sunlight_burn);
+            }
         }
         {
             let mut fire_ticks = m.fire_ticks.lock().unwrap_or_else(|e| e.into_inner());
@@ -5194,6 +5222,74 @@ fn live_mob_tick_dimension(
             target
         } else {
             None
+        };
+        // `HurtByTargetGoal` provocation is the shared aggro memory; recent
+        // hurt keeps any of these families hostile regardless of daylight.
+        let provoked = m
+            .hurt_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .elapsed()
+            < Duration::from_secs(10);
+        let target = if provoked {
+            target
+        } else {
+            match m.etype {
+                // `Spider` targets only in darkness (or when provoked): sky
+                // light 15 by day above ground, 0 anywhere shaded.
+                100 if !spider_is_hostile(
+                    day,
+                    if day && by + 1 >= height_at(bx, bz) { 15 } else { 0 },
+                    false,
+                ) =>
+                {
+                    None
+                }
+                // `DrownedGoToWaterGoal`: an unprovoked drowned shelters under
+                // water in daylight instead of pursuing.
+                27 if drowned_should_hide_in_water(day, in_water) => None,
+                // `EnderMan.isLookingAtMe` is the only unprovoked aggro path:
+                // a staring player's look cone must land on the enderman's
+                // head with clear line of sight (pumpkins break the stare).
+                33 => {
+                    let enderman_eye = [pos[0], pos[1] + f64::from(spec.eye_height), pos[2]];
+                    let stared = players.iter().any(|p| {
+                        if p.dim != dim || !p.attackable {
+                            return false;
+                        }
+                        let (px, py, pz, pyaw, ppitch, ..) =
+                            *p.client.pos.lock().unwrap_or_else(|e| e.into_inner());
+                        if entity_distance_sq(position, (px, py, pz)) > 64.0f64.powi(2) {
+                            return false;
+                        }
+                        let yaw = f64::from(pyaw).to_radians();
+                        let pitch = f64::from(ppitch).to_radians();
+                        let player_eye = [px, py + 1.62, pz];
+                        let player_look = [
+                            -yaw.sin() * pitch.cos(),
+                            -pitch.sin(),
+                            yaw.cos() * pitch.cos(),
+                        ];
+                        let head = p
+                            .client
+                            .inv
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(&5)
+                            .and_then(|stack| item_to_name(stack.0).map(str::to_owned))
+                            .unwrap_or_default();
+                        enderman_stared_at(
+                            player_eye,
+                            player_look,
+                            enderman_eye,
+                            &head,
+                            live_mob_block_hit(dim, reg, player_eye, enderman_eye).is_none(),
+                        )
+                    });
+                    if stared { target } else { None }
+                }
+                _ => target,
+            }
         };
         let perception = target.map(|target| {
             let mut p = target.perceive();
@@ -8964,6 +9060,17 @@ fn set_block_if_inner_dim(
             None => true,
         };
         if identity_changed {
+            // The command-block record belongs to the block entity: a new
+            // command-block identity starts a fresh record, and any other
+            // identity at a command block's cell drops the old one (vanilla's
+            // `BlockEntity.onRemove` / fresh `setBlockEntity`).
+            if let Some(reg) = breg() {
+                if let Some(rec) = command_block_record_of(reg, st, dim, (x, y, z)) {
+                    upsert_command_block(rec);
+                } else if command_block_name(reg.name_of(old)) {
+                    remove_command_block(dim, (x, y, z));
+                }
+            }
             // per-position metadata cannot survive the block that owned it (a new
             // chest at a broken chest's spot must NOT resurrect the old contents —
             // that is an item-dupe).
@@ -9159,6 +9266,14 @@ fn set_block_if_dim_edit(
                     .retain(|&(sdim, sx, sy, sz, _), _| {
                         !(sdim == dim && sx == x && sy == y && sz == z)
                     });
+                // The block-entity rule `set_block_if_inner_dim` applies in the
+                // Overworld runs here too: a fresh command block starts a
+                // record, a broken one loses it.
+                if let Some(rec) = command_block_record_of(reg, st, dim, (x, y, z)) {
+                    upsert_command_block(rec);
+                } else if command_block_name(reg.name_of(old)) {
+                    remove_command_block(dim, (x, y, z));
+                }
             }
         }
     }
@@ -9490,6 +9605,186 @@ fn live_redstone_tick() {
 
 fn use_redstone_component(c: &Client, (dim, x, y, z): DimBlockPos, state: u32) -> bool {
     let Some(reg) = breg() else { return false };
+    match reg.name_of(state) {
+        // `NoteBlock.useWithoutItem`: right-click cycles `note`, clears
+        // `powered` and plays once; the held item is not consumed by tuning.
+        "minecraft:note_block" => {
+            if !c.is_spectator() {
+                if let Some((instrument, note, _pitch, played)) =
+                    note_block_use_dim(dim, (x, y, z))
+                {
+                    if played {
+                        broadcast_block_event_dim(
+                            &client_snapshot(),
+                            dim,
+                            (x, y, z),
+                            instrument as u8,
+                            note,
+                        );
+                    }
+                }
+            }
+            return true;
+        }
+        // `AbstractCauldronBlock.useItemOn`: the interaction map is keyed on
+        // the held item; a PASS leaves the placement path to try the item.
+        "minecraft:cauldron"
+        | "minecraft:water_cauldron"
+        | "minecraft:lava_cauldron"
+        | "minecraft:powder_snow_cauldron" => {
+            let Some(cauldron) = cauldron_state_of(reg, state) else {
+                return false;
+            };
+            let held_slot = 36 + *c.held.lock().unwrap_or_else(|e| e.into_inner());
+            let held_name = c
+                .inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&held_slot)
+                .and_then(|stack| item_to_name(stack.0).map(str::to_owned));
+            let Some(outcome) = cauldron_use(cauldron, held_name.as_deref().unwrap_or(""))
+            else {
+                return false;
+            };
+            if !c.is_spectator() {
+                if let Some(next) = outcome.new_state.to_state(reg) {
+                    if set_block_if_dim(dim, x, y, z, next, Some(state)) {
+                        note_block_update_dim(dim, x, y, z, next);
+                    }
+                }
+                // `ItemUtils.createFilledResult`: the empty container swaps in
+                // for a single held item; a stacked one shrinks and the filled
+                // item drops back into the inventory.
+                if *c.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
+                    let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
+                    let filled = outcome.returns.as_deref().and_then(name_to_item);
+                    let held = inv.get(&held_slot).cloned().unwrap_or_default();
+                    if held.1 > 0 {
+                        if held.1 <= 1 {
+                            if let Some(id) = filled {
+                                inv.insert(held_slot, (id, 1, Vec::new()));
+                            } else {
+                                inv.remove(&held_slot);
+                            }
+                        } else {
+                            inv.insert(held_slot, (held.0, held.1 - 1, held.2));
+                            if let Some(id) = filled {
+                                let mut filled_stack = (id, 1, Vec::new());
+                                pickup_into_inventory(
+                                    &mut inv,
+                                    held_slot,
+                                    false,
+                                    &mut filled_stack,
+                                );
+                                drop(inv);
+                                if filled_stack.1 > 0 {
+                                    let (px, py, pz, ..) =
+                                        *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+                                    drop_live_stack((px, py + 1.3, pz), filled_stack);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+        // `RespawnAnchorBlock.useItemOn`/`useWithoutItem`: glowstone charges,
+        // a bare click on a charged anchor sets respawn where anchors work
+        // and explodes where they do not.
+        "minecraft:respawn_anchor" => {
+            let charges: u8 = reg
+                .get_prop(state, "charges")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let held_slot = 36 + *c.held.lock().unwrap_or_else(|e| e.into_inner());
+            let held_name = c
+                .inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&held_slot)
+                .and_then(|stack| item_to_name(stack.0).map(str::to_owned));
+            // `dimensionType.respawnAnchorWorks` — only the Nether family.
+            let anchors_work = matches!(dim, DimId::Nether);
+            match respawn_anchor_use(charges, held_name.as_deref(), anchors_work) {
+                AnchorOutcome::Pass => return false,
+                outcome @ (AnchorOutcome::Charged { .. } | AnchorOutcome::Full) => {
+                    if !c.is_spectator() {
+                        if let AnchorOutcome::Charged { charges: next } = outcome {
+                            let updated =
+                                reg.with_prop(state, "charges", &next.to_string());
+                            if set_block_if_dim(dim, x, y, z, updated, Some(state)) {
+                                note_block_update_dim(dim, x, y, z, updated);
+                            }
+                        }
+                        if *c.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
+                            let mut inv =
+                                c.inv.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(held) = inv.get(&held_slot).cloned() {
+                                if held.1 <= 1 {
+                                    inv.remove(&held_slot);
+                                } else {
+                                    inv.insert(held_slot, (held.0, held.1 - 1, held.2));
+                                }
+                            }
+                        }
+                    }
+                    return true;
+                }
+                AnchorOutcome::RespawnSet => {
+                    if !c.is_spectator() {
+                        let angle = c.pos.lock().unwrap_or_else(|e| e.into_inner()).3;
+                        let position = (
+                            x as f64 + 0.5,
+                            y as f64 + 0.5,
+                            z as f64 + 0.5,
+                        );
+                        *c.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some((position.0, position.1, position.2, angle));
+                        *c.spawn_dim.lock().unwrap_or_else(|e| e.into_inner()) = dim;
+                        let inventory =
+                            c.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        let mut snapshot =
+                            PlayerSave::capture(c, client_dim_pos(c), &inventory);
+                        snapshot.respawn = Some(SpawnTarget {
+                            kind: SpawnTargetKind::Anchor,
+                            dim,
+                            position,
+                            angle,
+                            forced: false,
+                        });
+                        saved_players()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(c.uuid, snapshot);
+                        let mut sp = Vec::new();
+                        write_pos(&mut sp, x, y, z);
+                        sp.extend_from_slice(&angle.to_be_bytes());
+                        if let Ok(mut sock) = c.sock.lock() {
+                            let _ = send_packet(&mut sock, 0x56, sp);
+                        }
+                    }
+                    return true;
+                }
+                AnchorOutcome::Explode { power } => {
+                    if !c.is_spectator() {
+                        let air = reg.state_of("minecraft:air", None);
+                        if set_block_if_dim(dim, x, y, z, air, Some(state)) {
+                            note_block_update_dim(dim, x, y, z, air);
+                        }
+                        explode_at(
+                            x as f64 + 0.5,
+                            y as f64 + 0.5,
+                            z as f64 + 0.5,
+                            f64::from(power),
+                        );
+                    }
+                    return true;
+                }
+            }
+        }
+        _ => {}
+    }
     let (property, value) = match rs_block_from_state(reg, state) {
         RsBlock::Lever { powered, .. } => ("powered", if powered { "false" } else { "true" }),
         RsBlock::Button { powered: true, .. } => return true,
@@ -9895,6 +10190,17 @@ fn place_block(wx: i32, wy: i32, wz: i32, st: u32) {
 fn place_block_dim(dim: DimId, wx: i32, wy: i32, wz: i32, st: u32) {
     set_block_dim(dim, wx, wy, wz, st);
     note_block_update_dim(dim, wx, wy, wz, block_at_dim(dim, wx, wy, wz));
+    // `SpongeBlock.onPlace`: ultrawarm dims dry it outright; otherwise a placed
+    // sponge runs `removeFluidBreadthFirstSearch` and wets when it absorbed.
+    if let Some(reg) = breg() {
+        if reg.name_of(st) == "minecraft:sponge"
+            && (sponge_nether_dries(dim) || !sponge_absorb_water(dim, (wx, wy, wz)).is_empty())
+        {
+            let wet = reg.state_of("minecraft:wet_sponge", None);
+            set_block_dim(dim, wx, wy, wz, wet);
+            note_block_update_dim(dim, wx, wy, wz, wet);
+        }
+    }
 }
 /// Advance each falling entity by vanilla's gravity and land it on the first solid block
 /// below. The physics is the bytecode-derived contract in evidence/gameplay/falling-vanilla:
@@ -15063,6 +15369,97 @@ fn auto_unload_tick() {
 /// `OnceLock` `/profile` reads (`live_hotspot_profiler` in
 /// `teams_and_commands.rs`) — a second instance would record tick timings a
 /// command can never see.
+/// Issue #88: an empty world starts with zero debug mobs unless the seeding
+/// is explicitly opted into (`MC_SPINE_DEBUG_SEED_MOBS=1` /
+/// `MC_SPINE_SEED_DEBUG_MOBS=1`). With the opt-in, two cows (etype 22) and
+/// two zombies (etype 124) appear on the surface near spawn; a world that
+/// already restored mobs from a save is never re-seeded.
+fn seed_debug_mobs(enabled: bool) {
+    if !enabled || !mobs().lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+        return;
+    }
+    let mut ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
+    // (etype, x, z): 22=cow, 124=zombie (1.21.1 entity ids)
+    for (i, (et, x, z)) in [
+        (22i64, 5.5f64, 2.5f64),
+        (22, -3.5, 4.5),
+        (124, 8.5, 6.5),
+        (124, -8.5, -6.5),
+    ]
+    .iter()
+    .enumerate()
+    {
+        ms.push(Arc::new(Mob {
+            dim: DimId::Overworld,
+            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+            uuid: [i as u8; 16],
+            etype: *et,
+            pos: Mutex::new((*x, surface_y(*x as i32, *z as i32), *z, 0.0, 0.0)),
+            hp: Mutex::new(20.0),
+            last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            last_hurt_tick: Mutex::new(None),
+            vel: Mutex::new([0.0; 3]),
+            fuse: Mutex::new(0),
+            fire_ticks: Mutex::new(0),
+            love: Mutex::new(0),
+            air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+        }));
+    }
+}
+
+// Stage entry points for the mechanism passes that live in the mechanism
+// source files. `run` stores a `fn()` item, so the named shims keep each
+// call a real direct call the audit (and backtraces) can see.
+fn stage_drops() {
+    drop_tick();
+}
+fn stage_furnaces() {
+    furnace_tick();
+}
+fn stage_hoppers() {
+    hopper_tick();
+}
+fn stage_brewing() {
+    live_brewing_tick();
+}
+fn stage_player_menus() {
+    live_menu_tick();
+}
+fn stage_chest_viewers() {
+    chest_viewer_tick();
+}
+fn stage_command_blocks() {
+    command_block_tick();
+}
+fn stage_command_minecarts() {
+    command_minecart_tick();
+}
+
+/// The song resolver every live jukebox path passes to `Jukebox`; naming the
+/// closure target keeps `live_jukebox_song` a direct call.
+fn jukebox_song_for(item: &BlockEntityItem) -> Option<JukeboxSong> {
+    live_jukebox_song(item)
+}
+
+/// The merchant max-stack-size prototype every live offers path passes to
+/// `MerchantItems`; naming it keeps `merchant_item_prototype` a direct call.
+fn merchant_item_comps(item: i64) -> &'static Comps {
+    merchant_item_prototype(item)
+}
+
+/// `beacon_effect_wire_id` — the beacon menu publishes wire ids through this
+/// resolver; named here so the mechanism call is direct.
+fn beacon_wire_effect(effect: BeaconEffect) -> i16 {
+    beacon_effect_wire_id(effect)
+}
+
+/// `block_entity_uuid` — the NBT reader resolves entity-uuid fields through
+/// this adapter; named here so the mechanism call is direct.
+fn block_entity_field_uuid(field: &Tag) -> Option<BlockEntityUuid> {
+    block_entity_uuid(field)
+}
+
 fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     // `/tick freeze` skips world ticks unless `/tick step` or `/tick sprint`
     // queued budget; a sprint always runs. The default is unfrozen, so callers
@@ -15114,7 +15511,7 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     // Vanilla `ChunkMap.tick` evicts chunks whose tickets lapsed; the sweep is
     // opt-in (`MC_SPINE_AUTO_UNLOAD_TICKS`), so the default stage is a no-op.
     run("auto_unload", auto_unload_tick);
-    run("drops", drop_tick);
+    run("drops", stage_drops);
     run("arrows", w1_arrow_tick);
     run("tnt", w1_tnt_tick);
     run("carts", cart_tick);
@@ -15124,23 +15521,28 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     // `Leashable.tickLeash` runs inside `Entity.tick`; an empty tether table
     // makes the stage a one-lock no-op.
     run("tethers", tether_tick);
-    run("furnaces", furnace_tick);
-    run("hoppers", hopper_tick);
-    run("brewing", live_brewing_tick);
+    run("furnaces", stage_furnaces);
+    run("hoppers", stage_hoppers);
+    run("brewing", stage_brewing);
     run("spawners", spawner_tick);
     // The chunk-source pass' block entities: campfire cooks, brewing timers,
     // spawner attempts, jukebox bookkeeping, beacon pulses. The stage itself
     // short-circuits on an empty W-BE registry, so an untouched world pays
     // nothing and keeps the saved payload bit-identical.
     run("block_entities", world_block_entity_tick);
+    // Command blocks tick like block entities: repeating every tick while
+    // powered, impulse on the edge; chain propagation happens off the
+    // triggering block. Minecarts ride the same cadence pass.
+    run("command_blocks", stage_command_blocks);
+    run("command_minecarts", stage_command_minecarts);
     run("random_ticks", random_tick_pass);
-    run("player_menus", live_menu_tick);
+    run("player_menus", stage_player_menus);
     run("plugins", plugin_tick);
     run("actors", actor_tick);
     #[cfg(feature = "neoforge-events")]
     run("neoforge_player_tick", neoforge_player_tick);
     run("block_updates", apply_queued_block_updates);
-    run("chest_viewers", chest_viewer_tick);
+    run("chest_viewers", stage_chest_viewers);
     #[cfg(feature = "create-offload")]
     run("mod_offload", mod_offload_tick);
     run("live_mods", live_mod_tick);
@@ -16231,40 +16633,13 @@ fn main() {
     http_server();
     // Opt-in debug seeding of a few mobs near spawn (only if none restored
     // from save). Vanilla spawns nothing at startup; a live natural spawner
-    // populates the area instead. `MC_SPINE_SEED_DEBUG_MOBS=1` restores the
-    // old fixed cow/zombie pair for harnesses that want a known entity set.
-    if std::env::var("MC_SPINE_SEED_DEBUG_MOBS").as_deref() == Ok("1")
-        && mobs().lock().unwrap_or_else(|e| e.into_inner()).is_empty()
-    {
-        let mut ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
-        // (etype, x, z): 22=cow, 124=zombie (1.21.1 entity ids)
-        for (i, (et, x, z)) in [
-            (22i64, 5.5f64, 2.5f64),
-            (22, -3.5, 4.5),
-            (124, 8.5, 6.5),
-            (124, -8.5, -6.5),
-        ]
-        .iter()
-        .enumerate()
-        {
-            ms.push(Arc::new(Mob {
-                dim: DimId::Overworld,
-                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                uuid: [i as u8; 16],
-                etype: *et,
-                pos: Mutex::new((*x, surface_y(*x as i32, *z as i32), *z, 0.0, 0.0)),
-                hp: Mutex::new(20.0),
-                last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
-                hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
-                last_hurt_tick: Mutex::new(None),
-                vel: Mutex::new([0.0; 3]),
-                fuse: Mutex::new(0),
-                fire_ticks: Mutex::new(0),
-                love: Mutex::new(0),
-                air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
-            }));
-        }
-    }
+    // populates the area instead. `MC_SPINE_DEBUG_SEED_MOBS=1` (the issue-#88
+    // name; `MC_SPINE_SEED_DEBUG_MOBS` stays accepted) restores the old fixed
+    // cow/zombie pair for harnesses that want a known entity set.
+    seed_debug_mobs(
+        std::env::var("MC_SPINE_DEBUG_SEED_MOBS").as_deref() == Ok("1")
+            || std::env::var("MC_SPINE_SEED_DEBUG_MOBS").as_deref() == Ok("1"),
+    );
     // The live autosave worker: periodic saves hand it serialized snapshots so
     // a slow disk coalesces behind one pending slot instead of stalling the
     // 20 TPS loop. Only the live server installs it; tests and tool modes keep
@@ -19498,5 +19873,28 @@ mod vanilla_leash_tests {
         assert_eq!(ds.len(), 1);
         assert_eq!(ds[0].item, name_to_item("lead").unwrap());
         assert_eq!((ds[0].x, ds[0].y, ds[0].z), (4.0, 70.0, 4.0));
+    }
+}
+
+#[cfg(test)]
+mod issue88_seed_mobs_tests {
+    use super::*;
+
+    /// Issue #88: startup seeding is opt-in. `seed_debug_mobs(false)` leaves
+    /// an empty world with zero debug mobs; `true` seeds the fixed pair, and
+    /// a second call never re-seeds.
+    #[test]
+    fn seed_debug_mobs_off_by_default_and_only_into_empty_world() {
+        let _world_guard = world_guard();
+        let saved = std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner()));
+        seed_debug_mobs(false);
+        assert_eq!(mobs().lock().unwrap_or_else(|e| e.into_inner()).len(), 0);
+        seed_debug_mobs(true);
+        assert_eq!(mobs().lock().unwrap_or_else(|e| e.into_inner()).len(), 4);
+        seed_debug_mobs(true);
+        assert_eq!(mobs().lock().unwrap_or_else(|e| e.into_inner()).len(), 4);
+        let mut ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
+        ms.clear();
+        ms.extend(saved);
     }
 }

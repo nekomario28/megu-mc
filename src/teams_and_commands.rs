@@ -4219,6 +4219,9 @@ struct LiveServerPolicy {
     /// owner/party allies and party-vs-party damage respectively.
     pub pet_friendly_fire: bool,
     pub party_friendly_fire: bool,
+    /// Opt-in QOL-DEATH toggle: own death drops restore to the slot they were
+    /// scattered from on pickup. Off is the pure-Vanilla pickup path.
+    pub death_slot_restore: bool,
 }
 
 impl Default for LiveServerPolicy {
@@ -4235,6 +4238,7 @@ impl Default for LiveServerPolicy {
             max_frame_mib: 2,
             pet_friendly_fire: true,
             party_friendly_fire: true,
+            death_slot_restore: false,
         }
     }
 }
@@ -4273,6 +4277,7 @@ impl LiveServerPolicy {
             "max_frame_mib" => Ok(self.max_frame_mib.to_string()),
             "pet_friendly_fire" => Ok(self.pet_friendly_fire.to_string()),
             "party_friendly_fire" => Ok(self.party_friendly_fire.to_string()),
+            "death_slot_restore" => Ok(self.death_slot_restore.to_string()),
             _ => Err(format!("Unknown policy '{key}'")),
         }
     }
@@ -4290,6 +4295,7 @@ impl LiveServerPolicy {
             ("max_frame_mib", self.max_frame_mib.to_string()),
             ("pet_friendly_fire", self.pet_friendly_fire.to_string()),
             ("party_friendly_fire", self.party_friendly_fire.to_string()),
+            ("death_slot_restore", self.death_slot_restore.to_string()),
         ]
     }
 
@@ -4342,6 +4348,9 @@ impl LiveServerPolicy {
             }
             "pet_friendly_fire" => self.pet_friendly_fire = policy_bool(key, value)?,
             "party_friendly_fire" => self.party_friendly_fire = policy_bool(key, value)?,
+            "death_slot_restore" => {
+                self.death_slot_restore = policy_bool(key, value)?
+            }
             _ => return Err(format!("Unknown policy '{key}'")),
         }
         Ok(())
@@ -4418,14 +4427,21 @@ fn run_policy_command(level: u8, args: &[&str]) -> String {
             Err(error) => error,
         },
         ["policy", "set", key, value] => match policy.set(key, value) {
-            Ok(()) => match policy.get(key) {
-                Ok(current) => format!("{key} = {current}"),
-                Err(error) => error,
-            },
+            Ok(()) => {
+                // The QOL-DEATH atomic backs `drop_tick`'s pickup path; keep it
+                // in step with the policy so a `/megu policy set` lands on the
+                // very next pickup.
+                set_death_slot_restore(policy.death_slot_restore);
+                match policy.get(key) {
+                    Ok(current) => format!("{key} = {current}"),
+                    Err(error) => error,
+                }
+            }
             Err(error) => error,
         },
         ["policy", "reset"] => {
             policy.reset();
+            set_death_slot_restore(policy.death_slot_restore);
             "All server policies reset to defaults".into()
         }
         _ => POLICY_USAGE.into(),
@@ -4847,6 +4863,15 @@ fn run_damage_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> 
             if *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
                 continue;
             }
+            // OPS-SRE `party_friendly_fire` gate: a player-issued `/damage` on a
+            // teammate respects the policy exactly like a melee hit would.
+            if let Some(attacker) = me {
+                let team = p3b_team_of(&attacker.name);
+                let ally = team.is_some() && team == p3b_team_of(&c.name);
+                if !should_allow_party_pvp(ally) {
+                    continue;
+                }
+            }
             let mut h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
             *h = (*h - hurt_absorb(c, dmg_after(c, amt, 0))).max(0.0);
             if *h <= 0.0 {
@@ -4883,6 +4908,33 @@ fn run_damage_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> 
             .find(|m| m.eid == eid)
             .cloned();
         if let Some(m) = mob {
+            // OPS-SRE `pet_friendly_fire` gate: a player-issued `/damage` on a
+            // tamed pet is refused for its owner and party allies; mob and
+            // command-block sources (`me == None`) deal normal damage.
+            if let Some(attacker) = me {
+                let owner = live_mob_states()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&m.eid)
+                    .and_then(|state| match &state.behavior {
+                        Some(MobBehaviorState::Wolf(pet) | MobBehaviorState::Cat(pet)) => {
+                            pet.owner
+                        }
+                        _ => None,
+                    });
+                let owner_name = owner.and_then(|uuid| {
+                    cls_snap
+                        .iter()
+                        .find(|c| c.uuid == uuid)
+                        .map(|c| c.name.clone())
+                });
+                let team = p3b_team_of(&attacker.name);
+                let ally = team.is_some()
+                    && owner_name.as_deref().is_some_and(|name| team == p3b_team_of(name));
+                if !should_allow_pet_damage(attacker.uuid, owner, ally) {
+                    continue;
+                }
+            }
             *m.hurt_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
             broadcast_seen(eid, |_c| (0x24, hurt_anim(eid)));
             if dead {
@@ -5590,6 +5642,26 @@ fn command_block_tick() {
     if !command_blocks_enabled() {
         return;
     }
+    // `CommandBlock.neighborChanged` latches the redstone input into `powered`
+    // — here the pass polls the live signal once per tick per block so the
+    // edge bookkeeping below sees vanilla's `powered` transitions.
+    if let Some(reg) = breg() {
+        let positions: Vec<(DimId, i32, i32, i32)> = live_command_blocks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect();
+        for (dim, x, y, z) in positions {
+            // A record without a placed command-block cell keeps its scripted
+            // `powered` — `neighborChanged` only exists for a real block.
+            if !command_block_name(reg.name_of(block_at_dim(dim, x, y, z))) {
+                continue;
+            }
+            let powered = nearby_redstone(reg, dim, RsPos(x, y, z));
+            set_command_block_powered(dim, (x, y, z), powered);
+        }
+    }
     let triggers: Vec<(DimId, i32, i32, i32)> = {
         let mut map = live_command_blocks()
             .lock()
@@ -5693,6 +5765,46 @@ fn remove_command_minecart(entity_id: i32) -> Option<CommandMinecartRecord> {
         .remove(&entity_id)
 }
 
+/// `minecraft:(chain_|repeating_)?command_block` — the three placed forms.
+#[allow(dead_code)]
+fn command_block_name(name: &str) -> bool {
+    matches!(
+        name,
+        "minecraft:command_block"
+            | "minecraft:chain_command_block"
+            | "minecraft:repeating_command_block"
+    )
+}
+
+/// The record a freshly placed command-block state starts: mode from the block
+/// name, facing and conditional from the block-state properties the placer
+/// oriented — the vanilla `CommandBlockEntity` defaults otherwise.
+#[allow(dead_code)]
+fn command_block_record_of(
+    reg: &crate::block_registry::BReg,
+    state: u32,
+    dim: DimId,
+    pos: (i32, i32, i32),
+) -> Option<CommandBlockRecord> {
+    let mut rec = CommandBlockRecord::new(dim, pos);
+    rec.mode = match reg.name_of(state) {
+        "minecraft:chain_command_block" => CommandBlockMode::Sequence,
+        "minecraft:repeating_command_block" => CommandBlockMode::Auto,
+        "minecraft:command_block" => CommandBlockMode::Redstone,
+        _ => return None,
+    };
+    rec.facing = match reg.get_prop(state, "facing").as_deref() {
+        Some("down") => CommandBlockFacing::Down,
+        Some("north") => CommandBlockFacing::North,
+        Some("south") => CommandBlockFacing::South,
+        Some("west") => CommandBlockFacing::West,
+        Some("east") => CommandBlockFacing::East,
+        _ => CommandBlockFacing::Up,
+    };
+    rec.conditional = reg.get_prop(state, "conditional").as_deref() == Some("true");
+    Some(rec)
+}
+
 /// One server tick of the command-minecart engine: an activated cart runs its
 /// command every 4 ticks (vanilla's `tickCount % 4 == 0` cadence) at OP level
 /// 2, positioned at the cart.
@@ -5700,6 +5812,48 @@ fn remove_command_minecart(entity_id: i32) -> Option<CommandMinecartRecord> {
 fn command_minecart_tick() {
     if !command_blocks_enabled() {
         return;
+    }
+    // Sync each record with its live entity: the cart's position feeds the
+    // command source, and a record for a removed entity is dropped.
+    {
+        let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
+        let mut carts = command_minecarts()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let reg = breg();
+        let mut rail_updates = Vec::new();
+        for (id, rec) in carts.iter_mut() {
+            // Sync each record with its live entity: the cart's position feeds
+            // the command source. A record without a live entity keeps its
+            // scripted fields (`remove_live_mob` owns cleanup).
+            let Some(mob) = mobs.iter().find(|mob| mob.eid == *id) else {
+                continue;
+            };
+            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            rec.dim = mob.dim;
+            rec.x = x;
+            rec.y = y;
+            rec.z = z;
+            // `AbstractMinecart.onActivatorRail`: a powered activator rail
+            // under the cart latches `activated` for the run cadence below.
+            if let Some(reg) = reg {
+                let st = block_at_dim(
+                    rec.dim,
+                    x.floor() as i32,
+                    y.floor() as i32,
+                    z.floor() as i32,
+                );
+                rail_updates.push((
+                    *id,
+                    reg.name_of(st) == "minecraft:activator_rail"
+                        && reg.get_prop(st, "powered").as_deref() == Some("true"),
+                ));
+            }
+        }
+        drop(carts);
+        for (id, powered) in rail_updates {
+            set_command_minecart_activated(id, powered);
+        }
     }
     let due: Vec<i32> = {
         let mut carts = command_minecarts()
@@ -8531,7 +8685,8 @@ mod policy_cmd_tests {
             assert_eq!(policy.max_frame_mib, 2);
             assert!(policy.pet_friendly_fire);
             assert!(policy.party_friendly_fire);
-            assert_eq!(policy.list().len(), 11);
+            assert!(!policy.death_slot_restore);
+            assert_eq!(policy.list().len(), 12);
         }
         let ctx = policy_ctx(None);
         for (key, value) in [
@@ -8546,6 +8701,7 @@ mod policy_cmd_tests {
             ("max_frame_mib", "2"),
             ("pet_friendly_fire", "true"),
             ("party_friendly_fire", "true"),
+            ("death_slot_restore", "false"),
         ] {
             assert_eq!(
                 policy_run(&ctx, &format!("/megu policy get {key}")),
@@ -8565,6 +8721,7 @@ mod policy_cmd_tests {
             "max_frame_mib",
             "pet_friendly_fire",
             "party_friendly_fire",
+            "death_slot_restore",
         ] {
             assert!(list.contains(&format!("{key} = ")), "{list}");
         }

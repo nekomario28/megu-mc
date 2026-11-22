@@ -2516,7 +2516,12 @@ pub(crate) fn unpack_loot_table_json(
         &mut rng,
         &resolvers,
     );
-    let stacks: Vec<Stack> = items.iter().filter_map(loot_json_stack).collect();
+    let mut stacks: Vec<Stack> = Vec::new();
+    for item in items.iter() {
+        if let Some(stack) = loot_json_stack(item) {
+            stacks.push(stack);
+        }
+    }
     let slot_limit = slot_limit.min(i16::MAX as usize);
     let mut slots: Vec<i16> = (0..slot_limit as i16).collect();
     loot_json_shuffle(&mut slots, &mut rng);
@@ -3105,9 +3110,12 @@ fn is_chest_blocked_at(pos: BlockPos) -> bool {
 /// a single chest is blocked if its cell is blocked; a double chest is blocked if EITHER
 /// half is blocked. Barrels and minecart chests never use this predicate.
 fn chest_window_blocked(window: (ContainerKey, Option<ContainerKey>)) -> bool {
-    chest_window_halves(window)
-        .into_iter()
-        .any(is_chest_blocked_at)
+    for pos in chest_window_halves(window) {
+        if is_chest_blocked_at(pos) {
+            return true;
+        }
+    }
+    false
 }
 fn client_eye_pos(c: &Client) -> (f64, f64, f64) {
     let (px, py, pz, ..) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
@@ -6627,7 +6635,7 @@ impl SkullProfile {
         }
         Some(Self {
             name: block_entity_str_field(tag, "name"),
-            id: tag.get("id").and_then(block_entity_uuid),
+            id: tag.get("id").and_then(block_entity_field_uuid),
             properties,
         })
     }
@@ -6842,7 +6850,7 @@ fn block_entity_read_uuids(tag: &Tag, key: &str) -> Vec<BlockEntityUuid> {
     let mut seen = std::collections::HashSet::new();
     block_entity_entries(tag, key)
         .iter()
-        .filter_map(block_entity_uuid)
+        .filter_map(block_entity_field_uuid)
         .filter(|id| seen.insert(*id))
         .collect()
 }
@@ -7357,7 +7365,7 @@ impl LiveBlockEntity {
             }
             "minecraft:decorated_pot" => Self::DecoratedPot(DecoratedPot::from_nbt(tag)),
             "minecraft:crafter" => Self::Crafter(Crafter::from_nbt(tag), None),
-            "minecraft:jukebox" => Self::Jukebox(Jukebox::from_nbt(tag, live_jukebox_song)),
+            "minecraft:jukebox" => Self::Jukebox(Jukebox::from_nbt(tag, jukebox_song_for)),
             "minecraft:banner" => Self::Banner(Banner::from_nbt(tag)),
             "minecraft:skull" => Self::Skull(Skull::from_nbt(tag)),
             "minecraft:brushable_block" => Self::Brushable(Brushable::from_nbt(tag)),
@@ -7804,7 +7812,7 @@ fn use_live_block_entity(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u
                         }
                         ejected = box_.eject();
                         next_state = reg.with_prop(state, "has_record", "false");
-                    } else if box_.insert(&mut held, live_jukebox_song) {
+                    } else if box_.insert(&mut held, jukebox_song_for) {
                         if let Some((id, _)) =
                             box_.record.as_ref().and_then(live_jukebox_song_entry)
                         {
@@ -9847,7 +9855,7 @@ pub(crate) fn live_comparator_signal_at(dim: DimId, x: i32, y: i32, z: i32) -> O
                     pot.comparator_signal(stack_limit)
                 }
                 LiveBlockEntity::Crafter(crafter, _) => crafter.comparator_signal(),
-                LiveBlockEntity::Jukebox(box_) => box_.comparator_signal(live_jukebox_song),
+                LiveBlockEntity::Jukebox(box_) => box_.comparator_signal(jukebox_song_for),
                 // Stored block entities with no analog output report 0, just
                 // like their W-BE counterparts (spawner, beacon, campfire...).
                 _ => 0,
@@ -10803,7 +10811,7 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
                 return;
             };
             let output = menu
-                .active_offer(&villager.offers, &MerchantItems(&merchant_item_prototype))
+                .active_offer(&villager.offers, &MerchantItems(&merchant_item_comps))
                 .map(|i| villager.offers[i].result.clone())
                 .unwrap_or_default();
             if send_offers {
@@ -10880,11 +10888,11 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
                 },
                 WindowPropertyUpdate {
                     property: 1,
-                    value: beacon.primary.map_or(-1, beacon_effect_wire_id),
+                    value: beacon.primary.map_or(-1, beacon_wire_effect),
                 },
                 WindowPropertyUpdate {
                     property: 2,
-                    value: beacon.secondary.map_or(-1, beacon_effect_wire_id),
+                    value: beacon.secondary.map_or(-1, beacon_wire_effect),
                 },
             ]);
             vec![menu.payment.clone()]
@@ -11113,7 +11121,7 @@ fn live_select_trade(c: &Client, index: i32) {
                     index,
                     &villager.offers,
                     &mut c.inv.lock().unwrap_or_else(|e| e.into_inner()),
-                    &MerchantItems(&merchant_item_prototype),
+                    &MerchantItems(&merchant_item_comps),
                 );
             }
             sync_live_menu(c, session, false);
@@ -11317,7 +11325,7 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
             }
             LiveMenu::Merchant(id, menu) => {
                 let mut villagers = live_villagers().lock().unwrap_or_else(|e| e.into_inner());
-                let items = MerchantItems(&merchant_item_prototype);
+                let items = MerchantItems(&merchant_item_comps);
                 let result = villagers.get_mut(id).and_then(|villager| {
                     let index = menu.active_offer(&villager.offers, &items)?;
                     receive(&villager.offers[index].result).then_some(())?;

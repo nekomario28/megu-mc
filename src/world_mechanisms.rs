@@ -2325,6 +2325,12 @@ pub(crate) fn comparator_signal_at_be(dim: DimId, pos: BlockPos) -> Option<u8> {
                 .get_prop(st, "charges")
                 .and_then(|value| value.parse().ok())
                 .map(|charges| respawn_anchor_comparator(charges)),
+            // `CommandBlock` reads its `successCount` (clamped 0..15) through
+            // the live command-block records, like vanilla's
+            // `getAnalogOutputSignal`.
+            name if command_block_name(name) => {
+                Some(command_block_comparator_signal(dim, pos))
+            }
             _ => cauldron_state_of(reg, st).map(|state| state.comparator_signal()),
         };
     };
