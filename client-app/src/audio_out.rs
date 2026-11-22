@@ -11,22 +11,27 @@
 //! paces how many samples are *due*; the mixer itself
 //! ([`crate::session::SoundMixer`]) is deterministic for fixed inputs.
 
-use std::collections::VecDeque;
+use std::cell::UnsafeCell;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::audio_qol::AudioLimiter;
 use crate::protocol::{WireSoundEvent, WireStopSound};
 use crate::session::{AudioStats, OpenAirWorld, PlaySoundEvent, SoundMixer};
 use crate::sound_assets::{
     placeholder_pcm, sound_name_for_id, DecodedPcm, SoundEventRegistry, SoundLibrary,
     MIX_SAMPLE_RATE,
 };
-use crate::spatial_audio::{ListenerPose, SpatialAudioPreset};
+use crate::spatial_audio::{
+    ListenerPose, SharedListenerFdnBus, SoundSource, SpatialAudioEngine, SpatialAudioPreset,
+};
 
 /// PCM format every sink consumes: signed 16-bit stereo interleaved at
 /// [`MIX_SAMPLE_RATE`].
@@ -1387,6 +1392,12 @@ pub struct AudioRuntime {
     scratch_i16: Vec<i16>,
     warned_null: bool,
     finished: bool,
+    /// Dedicated real-time mix thread once
+    /// [`AudioRuntime::enable_dedicated_mix_thread`] hands it the sink —
+    /// the Render Thread then drives audio purely through the lock-free
+    /// command ring (Gate P3), while `pump`/`pump_frames` stay intact for
+    /// the synchronous path.
+    mix_thread: Option<AudioMixThread>,
 }
 
 impl AudioRuntime {
@@ -1450,6 +1461,7 @@ impl AudioRuntime {
             scratch_i16: Vec::new(),
             warned_null: false,
             finished: false,
+            mix_thread: None,
         }
     }
 
@@ -1771,7 +1783,52 @@ impl AudioRuntime {
 
     /// The active sink backend label.
     pub fn sink_label(&self) -> &'static str {
-        self.sink.label()
+        self.mix_thread
+            .as_ref()
+            .map(AudioMixThread::sink_label)
+            .unwrap_or_else(|| self.sink.label())
+    }
+
+    /// Hand the sink to a dedicated [`AudioMixThread`] (audit §3.3 /
+    /// Gate P3): mixing, spatialization and the shared FDN bus move off
+    /// the Render Thread onto the real-time 128-sample loop. Returns the
+    /// SPSC command ring the caller posts [`AudioCmd`]s to. Idempotent —
+    /// a second call returns the existing ring.
+    ///
+    /// After this call `pump`/`pump_frames` write to a null sink (the
+    /// thread owns the device); keep using `ingest`/`pump` only on the
+    /// synchronous path.
+    pub fn enable_dedicated_mix_thread(&mut self) -> Arc<AudioCmdRing> {
+        if let Some(thread) = &self.mix_thread {
+            return thread.ring();
+        }
+        let sink = std::mem::replace(&mut self.sink, Box::new(NullSink::default()));
+        let thread = AudioMixThread::spawn(
+            sink,
+            &AudioMixThreadOptions {
+                preset: SpatialAudioPreset::Realistic,
+                sample_rate: MIX_SAMPLE_RATE,
+                max_volume_cap: self.mixer.limiter.max_volume_cap(),
+            },
+        );
+        let ring = thread.ring();
+        self.mix_thread = Some(thread);
+        ring
+    }
+
+    /// Non-blocking command submission for the Render Thread — O(1),
+    /// lock-free, never panics. `false` when no dedicated mix thread is
+    /// enabled or the ring is full (fail-closed; see
+    /// [`AudioCmdRing::dropped_commands`]).
+    pub fn submit_cmd_nonblocking(&self, cmd: AudioCmd) -> bool {
+        self.mix_thread
+            .as_ref()
+            .is_some_and(|thread| thread.submit(cmd))
+    }
+
+    /// The dedicated mix thread handle, when enabled (telemetry access).
+    pub fn mix_thread(&self) -> Option<&AudioMixThread> {
+        self.mix_thread.as_ref()
     }
 
     /// Mixer counters (events seen, voices, limiter verdicts, placeholders).
@@ -1785,7 +1842,7 @@ impl AudioRuntime {
         format!(
             "sink={} events={} voices={} stolen={} suppressed={} placeholder={} \
              unknown_id={} missing_event={} decode_err={} subtitles={}",
-            self.sink.label(),
+            self.sink_label(),
             s.events_submitted,
             s.voices_started,
             s.voices_stolen,
@@ -1804,6 +1861,9 @@ impl AudioRuntime {
             return;
         }
         self.finished = true;
+        // Stop and join the dedicated mix thread first — it owns the real
+        // sink once enabled (`self.sink` is a null stand-in by then).
+        self.mix_thread = None;
         self.sink.finish();
         eprintln!("mc-spine-client audio done: {}", self.report_line());
     }
@@ -1818,6 +1878,899 @@ impl Drop for AudioRuntime {
 /// Bound for the protocol client's retained wire-event queue.
 pub fn pending_wire_event_bound() -> usize {
     MAX_PENDING_WIRE_EVENTS
+}
+
+// ---------------------------------------------------------------------------
+// Dedicated real-time AudioMixThread (audit §3.3 / Gate P3)
+// ---------------------------------------------------------------------------
+
+/// Frames per mix block: 128 at 48 kHz ≈ 2.67 ms — the real-time cadence.
+pub const AUDIO_MIX_BLOCK_FRAMES: usize = 128;
+/// Interleaved stereo samples per block.
+pub const AUDIO_MIX_BLOCK_SAMPLES: usize = AUDIO_MIX_BLOCK_FRAMES * 2;
+/// Fixed voice slots owned by the mix thread; admission replaces the oldest
+/// slot when all 64 are busy.
+pub const AUDIO_MIX_VOICE_SLOTS: usize = 64;
+/// Command-ring capacity (power of two) shared between the Render Thread
+/// producer and the Audio Mix Thread consumer.
+pub const AUDIO_CMD_RING_CAPACITY: usize = 512;
+/// Whole block periods a late delivery may lag before it counts starved
+/// buffers — the sink's own queue already absorbs sub-period jitter.
+const UNDERRUN_GRACE_BLOCKS: u64 = 1;
+/// Tail of each deadline wait spent spinning instead of sleeping — OS
+/// sleep granularity (≈1 ms) would otherwise land every block late and
+/// slowly drift the cadence.
+const SPIN_BEFORE_DEADLINE: Duration = Duration::from_micros(400);
+/// New voices admitted per block — admission builds a
+/// `SpatialAudioEngine` (the only allocation-capable work on the
+/// thread), so a burst of `PlayDecoded`s is metered across blocks
+/// instead of stalling a single deadline.
+const VOICE_ADMIT_PER_BLOCK: usize = 16;
+
+/// Queued `PlayDecoded` awaiting its admission batch.
+struct PendingVoice {
+    voice_id: u64,
+    pcm: Arc<DecodedPcm>,
+    pos: [f32; 3],
+    entity_id: Option<i32>,
+    volume: f32,
+    pitch: f32,
+    attenuation_distance: f32,
+    is_2d: bool,
+}
+
+/// Lightweight commands the Render Thread posts to the Audio Mix Thread
+/// over the lock-free SPSC ring. Decoding, asset I/O and acoustic raycasts
+/// all happen upstream (Lane B workers); the mix thread only consumes
+/// results — nothing in a command requires I/O or a lock on its side.
+#[derive(Debug)]
+pub enum AudioCmd {
+    /// Listener pose in world space (feet→ear conversion already applied by
+    /// the caller, matching `AudioRuntime::update_listener`).
+    UpdateListener {
+        /// Ear position in block coordinates.
+        pos: [f32; 3],
+        /// Velocity in blocks/second for Doppler.
+        vel: [f32; 3],
+        /// Horizontal facing, degrees.
+        yaw_deg: f32,
+        /// Vertical facing, degrees.
+        pitch_deg: f32,
+        /// `true` when the listener's ears are submerged.
+        submerged: bool,
+    },
+    /// Play an already-decoded clip. `is_2d` keeps stereo assets on the
+    /// bypass path (Music/UI/global); 3D voices spatialize the mono downmix.
+    PlayDecoded {
+        /// Caller-assigned id used by `ApplyAcousticResult`/`UpdateEntityPos`.
+        voice_id: u64,
+        /// Decoded payload shared over `Arc` — no copy, no decode here.
+        pcm: Arc<DecodedPcm>,
+        /// Emission point in block coordinates.
+        pos: [f32; 3],
+        /// Entity this voice follows, when entity-bound.
+        entity_id: Option<i32>,
+        /// Packet/resolved volume (may exceed 1.0 — it widens range).
+        volume: f32,
+        /// Playback-rate multiplier (clamped 0.5..=2.0).
+        pitch: f32,
+        /// Vanilla attenuation distance in blocks; the mix thread applies
+        /// the same `attenuation_distance * max(volume, 1)` range law as
+        /// `AudioRuntime::ingest`.
+        attenuation_distance: f32,
+        /// `true` for the 2D stereo bypass (no spatializer, no reverb send).
+        is_2d: bool,
+    },
+    /// Latest tracked pose for an entity-bound voice.
+    UpdateEntityPos {
+        /// Entity being tracked.
+        entity_id: i32,
+        /// Current position in block coordinates.
+        pos: [f32; 3],
+        /// Finite velocity in blocks/second, derived upstream.
+        vel: [f32; 3],
+    },
+    /// Acoustic raycast result from a Lane B worker: fold the traced
+    /// occlusion loss and reverb send into the running voice's scene. The
+    /// mix thread never raycasts itself.
+    ApplyAcousticResult {
+        /// Voice the result belongs to (`PlayDecoded::voice_id`).
+        voice_id: u64,
+        /// Effective transmission loss in dB (diffraction already folded).
+        occlusion_db: f32,
+        /// Late-reverb send level `0..=1`.
+        reverb_send: f32,
+    },
+    /// Stop every sounding voice (Stop Sound with a match-all filter).
+    StopAll,
+    /// Ask the mix thread to exit its loop cleanly.
+    Shutdown,
+}
+
+// AudioCmd is Send: every field is plain data or `Arc<DecodedPcm>`
+// (`DecodedPcm` is `Send + Sync`), so the ring can carry it across threads.
+
+/// Lock-free single-producer/single-consumer command ring. The producer
+/// (Render Thread) calls [`AudioCmdRing::try_push`]; the consumer (Audio
+/// Mix Thread) calls [`AudioCmdRing::try_pop`]. Both are O(1), allocate
+/// nothing, and never block or panic — a full ring drops the command and
+/// counts it instead of stalling the producer.
+///
+/// SPSC contract: exactly one thread may call `try_push` and exactly one
+/// thread may call `try_pop` over the ring's lifetime. `Send`/`Sync` are
+/// asserted on that contract: `Release`/`Acquire` ordering pairs the tail
+/// store with the consumer's tail load (command payload is visible before
+/// the slot is claimed) and vice-versa for `head`.
+pub struct AudioCmdRing {
+    slots: Box<[UnsafeCell<MaybeUninit<AudioCmd>>]>,
+    mask: usize,
+    head: AtomicUsize,
+    tail: AtomicUsize,
+    dropped_cmds: AtomicU64,
+}
+
+// SAFETY: sound only under the SPSC contract above — single producer owns
+// tail-write/slot-write, single consumer owns head-write/slot-read, and
+// Release/Acquire ordering pairs each index publish with the peer's load.
+// No slot is ever written twice before being popped (the full check keeps
+// producer and consumer indices strictly ordered).
+unsafe impl Send for AudioCmdRing {}
+// SAFETY: as above — `&self` methods are safe to share across the two
+// threads of the SPSC pair.
+unsafe impl Sync for AudioCmdRing {}
+
+impl AudioCmdRing {
+    /// Empty ring with `capacity` slots; `capacity` must be a power of two
+    /// (it becomes the wrap mask).
+    pub fn new(capacity: usize) -> Self {
+        assert!(capacity.is_power_of_two(), "ring capacity must be a power of two");
+        Self {
+            slots: (0..capacity)
+                .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            mask: capacity - 1,
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            dropped_cmds: AtomicU64::new(0),
+        }
+    }
+
+    /// Ring capacity in commands.
+    pub fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Producer side: enqueue `cmd` without blocking. `false` — never a
+    /// panic, never a wait — when the ring is full; the command is dropped
+    /// and counted in [`Self::dropped_commands`].
+    pub fn try_push(&self, cmd: AudioCmd) -> bool {
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+        if tail.wrapping_sub(head) >= self.slots.len() {
+            self.dropped_cmds.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        // SAFETY: producer is the sole writer; the slot at `tail & mask`
+        // is free because `tail - head < len`, and the release store of
+        // `tail` below publishes the write to the consumer.
+        unsafe {
+            (*self.slots[tail & self.mask].get()).write(cmd);
+        }
+        self.tail.store(tail.wrapping_add(1), Ordering::Release);
+        true
+    }
+
+    /// Consumer side: dequeue the oldest command without blocking;
+    /// `None` when the ring is empty.
+    pub fn try_pop(&self) -> Option<AudioCmd> {
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
+        if head == tail {
+            return None;
+        }
+        // SAFETY: consumer is the sole reader; the slot at `head & mask`
+        // holds an initialized command because the producer released it
+        // before publishing `tail` (acquired above).
+        let cmd = unsafe { (*self.slots[head & self.mask].get()).assume_init_read() };
+        self.head.store(head.wrapping_add(1), Ordering::Release);
+        Some(cmd)
+    }
+
+    /// Best-effort snapshot of queued commands (diagnostics only — it can
+    /// race with either end).
+    pub fn len(&self) -> usize {
+        self.tail
+            .load(Ordering::Acquire)
+            .wrapping_sub(self.head.load(Ordering::Acquire))
+            .min(self.slots.len())
+    }
+
+    /// `true` when no command is queued (same snapshot caveat as `len`).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Commands the producer dropped because the ring was full.
+    pub fn dropped_commands(&self) -> u64 {
+        self.dropped_cmds.load(Ordering::Relaxed)
+    }
+}
+
+/// Atomics shared between the Audio Mix Thread and whatever thread owns
+/// the [`AudioMixThread`] handle — the lock-free telemetry surface.
+#[derive(Default)]
+pub struct AudioMixTelemetry {
+    /// Blocks successfully mixed and written to the sink.
+    pub blocks_mixed: AtomicU64,
+    /// Voice slots currently sounding.
+    pub active_voices: AtomicUsize,
+    /// Whole block periods missed (device-starved buffers) plus sink write
+    /// failures — anything that produced an audible gap.
+    pub underruns: AtomicU64,
+    /// Ring commands handled on the mix thread.
+    pub commands_processed: AtomicU64,
+    /// Sink `push` calls that returned an error.
+    pub sink_errors: AtomicU64,
+}
+
+/// One pre-allocated voice slot. `pcm: None` marks the slot free; slot
+/// memory (including an idle `SpatialAudioEngine` once admitted) is
+/// retained so the steady-state mix allocates nothing.
+struct MixVoiceSlot {
+    active: bool,
+    /// Monotonic admission order — the steal metric when every slot is busy.
+    order: u64,
+    voice_id: u64,
+    pcm: Option<Arc<DecodedPcm>>,
+    /// Fractional read position in `pcm` frames.
+    cursor: f64,
+    /// Frames advanced per output sample (= clamped pitch).
+    step: f64,
+    /// Post-clamp mix gain (`volume.clamp(0.0, 1.0)`).
+    gain: f32,
+    entity_id: Option<i32>,
+    /// Spatializer — `Some` for 3D voices, `None` for the 2D bypass.
+    engine: Option<SpatialAudioEngine>,
+    position: [f32; 3],
+}
+
+impl MixVoiceSlot {
+    fn empty() -> Self {
+        Self {
+            active: false,
+            order: 0,
+            voice_id: 0,
+            pcm: None,
+            cursor: 0.0,
+            step: 1.0,
+            gain: 0.0,
+            entity_id: None,
+            engine: None,
+            position: [0.0; 3],
+        }
+    }
+
+    /// Next `out.len()` mono samples for the spatial path (zeros past the
+    /// clip end; stereo assets are downmixed). Linear interpolation on the
+    /// fractional pitch cursor — identical to `SoundMixer`'s render.
+    fn render_mono(&mut self, out: &mut [f32]) {
+        let Some(pcm) = &self.pcm else {
+            out.fill(0.0);
+            self.active = false;
+            return;
+        };
+        let frames = pcm.frames();
+        let mono_at = |i: usize| -> f32 {
+            match &**pcm {
+                DecodedPcm::Mono(v) => v[i],
+                DecodedPcm::Stereo(v) => (v[i][0] + v[i][1]) * 0.5,
+            }
+        };
+        for s in out.iter_mut() {
+            let i = self.cursor as usize;
+            *s = if i + 1 < frames {
+                let frac = (self.cursor - i as f64) as f32;
+                let a = mono_at(i);
+                a + (mono_at(i + 1) - a) * frac
+            } else {
+                0.0
+            };
+            self.cursor += self.step;
+        }
+        if self.cursor as usize >= frames.saturating_sub(1) {
+            self.active = false;
+        }
+    }
+
+    /// 2D bypass render straight into the stereo mix: stereo keeps L/R,
+    /// mono duplicates — no engine, no reverb send.
+    fn render_2d(&mut self, out: &mut [f32]) {
+        let Some(pcm) = &self.pcm else {
+            self.active = false;
+            return;
+        };
+        let frames = pcm.frames();
+        let gain = self.gain;
+        match &**pcm {
+            DecodedPcm::Stereo(v) => {
+                for i in 0..out.len() / 2 {
+                    let idx = self.cursor as usize;
+                    if idx + 1 < frames {
+                        let frac = (self.cursor - idx as f64) as f32;
+                        let a = v[idx];
+                        let b = v[idx + 1];
+                        out[2 * i] += (a[0] + (b[0] - a[0]) * frac) * gain;
+                        out[2 * i + 1] += (a[1] + (b[1] - a[1]) * frac) * gain;
+                    }
+                    self.cursor += self.step;
+                }
+            }
+            DecodedPcm::Mono(v) => {
+                for i in 0..out.len() / 2 {
+                    let idx = self.cursor as usize;
+                    if idx + 1 < frames {
+                        let frac = (self.cursor - idx as f64) as f32;
+                        let s = v[idx] + (v[idx + 1] - v[idx]) * frac;
+                        out[2 * i] += s * gain;
+                        out[2 * i + 1] += s * gain;
+                    }
+                    self.cursor += self.step;
+                }
+            }
+        }
+        if self.cursor as usize >= frames.saturating_sub(1) {
+            self.active = false;
+        }
+    }
+}
+
+/// The deterministic mixing core the dedicated thread drives. Owns the
+/// sink, the fixed 64-slot voice array, the shared 8-channel listener FDN
+/// bus and every pre-allocated scratch buffer — the per-sample mix loop
+/// performs no heap allocation (voice admission, which builds a
+/// [`SpatialAudioEngine`], happens only on the command-drain path).
+pub struct AudioMixCore {
+    sink: Box<dyn AudioSink>,
+    sink_failed: bool,
+    slots: [MixVoiceSlot; AUDIO_MIX_VOICE_SLOTS],
+    reverb_bus: SharedListenerFdnBus,
+    listener: ListenerPose,
+    /// Latest pose per tracked entity — `UpdateEntityPos` writes it,
+    /// `PlayDecoded` reads it to bind entity voices that arrive first.
+    entities: BTreeMap<i32, ([f32; 3], [f32; 3])>,
+    /// `PlayDecoded`s waiting for their per-block admission batch —
+    /// pre-reserved so pushes stay on the bounded control path.
+    pending: VecDeque<PendingVoice>,
+    order: u64,
+    sample_rate: u32,
+    preset: SpatialAudioPreset,
+    max_volume_cap: f32,
+    /// Pre-allocated block scratch — the zero-alloc steady state.
+    mix_f32: [f32; AUDIO_MIX_BLOCK_SAMPLES],
+    mono_scratch: [f32; AUDIO_MIX_BLOCK_FRAMES],
+    send_scratch: [f32; AUDIO_MIX_BLOCK_FRAMES],
+    stereo_scratch: Vec<f32>,
+    out_i16: [i16; AUDIO_MIX_BLOCK_SAMPLES],
+    /// `AudioCmd::Shutdown` drained — the run loop exits at block end.
+    wants_shutdown: bool,
+}
+
+impl AudioMixCore {
+    /// Core over `sink` at `preset` quality and the `max_volume_cap` bus
+    /// ceiling. All fixed buffers are allocated here, never in the mix loop.
+    pub fn new(sink: Box<dyn AudioSink>, opts: &AudioMixThreadOptions) -> Self {
+        Self {
+            sink,
+            sink_failed: false,
+            slots: std::array::from_fn(|_| MixVoiceSlot::empty()),
+            reverb_bus: SharedListenerFdnBus::new(opts.sample_rate),
+            listener: ListenerPose::default(),
+            entities: BTreeMap::new(),
+            pending: VecDeque::with_capacity(AUDIO_CMD_RING_CAPACITY),
+            order: 0,
+            sample_rate: opts.sample_rate,
+            preset: opts.preset,
+            max_volume_cap: opts.max_volume_cap,
+            mix_f32: [0.0; AUDIO_MIX_BLOCK_SAMPLES],
+            mono_scratch: [0.0; AUDIO_MIX_BLOCK_FRAMES],
+            send_scratch: [0.0; AUDIO_MIX_BLOCK_FRAMES],
+            stereo_scratch: Vec::with_capacity(AUDIO_MIX_BLOCK_SAMPLES),
+            out_i16: [0; AUDIO_MIX_BLOCK_SAMPLES],
+            wants_shutdown: false,
+        }
+    }
+
+    /// Drain pending ring commands, mix exactly one 128-frame block
+    /// (2D bypass + 3D spatialized voices + shared FDN tail + limiter),
+    /// and write it to the sink. Deterministic — no clock reads — so unit
+    /// tests drive it synchronously for timing/verification.
+    pub fn step_one_block(&mut self, ring: &AudioCmdRing, telemetry: &AudioMixTelemetry) {
+        // Command drain: bounded by the ring's own capacity; voice
+        // admission/retirement (the only allocation-capable work) is
+        // confined here — the sample loop below touches pre-allocated
+        // state only.
+        for _ in 0..AUDIO_CMD_RING_CAPACITY {
+            let Some(cmd) = ring.try_pop() else {
+                break;
+            };
+            self.apply(cmd);
+            telemetry.commands_processed.fetch_add(1, Ordering::Relaxed);
+        }
+        // Metered admission: engine construction is the only
+        // allocation-capable work on this thread, so a burst is spread
+        // over blocks instead of overrunning one deadline.
+        for _ in 0..VOICE_ADMIT_PER_BLOCK {
+            let Some(voice) = self.pending.pop_front() else {
+                break;
+            };
+            self.admit_voice(voice);
+        }
+        self.mix_block(telemetry);
+    }
+
+    /// Apply one command to voice/listener state (control path).
+    fn apply(&mut self, cmd: AudioCmd) {
+        match cmd {
+            AudioCmd::UpdateListener {
+                pos,
+                vel,
+                yaw_deg,
+                pitch_deg,
+                submerged,
+            } => {
+                self.listener = ListenerPose {
+                    position: pos,
+                    yaw_deg,
+                    pitch_deg,
+                    velocity: vel,
+                    submerged,
+                };
+                for slot in &mut self.slots {
+                    if let Some(engine) = &mut slot.engine {
+                        engine.set_listener(self.listener);
+                    }
+                }
+            }
+            AudioCmd::PlayDecoded {
+                voice_id,
+                pcm,
+                pos,
+                entity_id,
+                volume,
+                pitch,
+                attenuation_distance,
+                is_2d,
+            } => self.pending.push_back(PendingVoice {
+                voice_id,
+                pcm,
+                pos,
+                entity_id,
+                volume,
+                pitch,
+                attenuation_distance,
+                is_2d,
+            }),
+            AudioCmd::UpdateEntityPos {
+                entity_id,
+                pos,
+                vel,
+            } => {
+                self.entities.insert(entity_id, (pos, vel));
+                for slot in &mut self.slots {
+                    if slot.entity_id == Some(entity_id) {
+                        slot.position = pos;
+                        if let Some(engine) = &mut slot.engine {
+                            engine.set_source(SoundSource {
+                                position: pos,
+                                velocity: vel,
+                            });
+                        }
+                    }
+                }
+            }
+            AudioCmd::ApplyAcousticResult {
+                voice_id,
+                occlusion_db,
+                reverb_send,
+            } => {
+                if let Some(engine) = self
+                    .slots
+                    .iter_mut()
+                    .find(|s| s.active && s.voice_id == voice_id)
+                    .and_then(|s| s.engine.as_mut())
+                {
+                    let mut scene = engine.scene().clone();
+                    scene.occlusion.transmission_loss_db = if occlusion_db.is_finite() {
+                        occlusion_db.max(0.0)
+                    } else {
+                        0.0
+                    };
+                    scene.wet_gain = if reverb_send.is_finite() {
+                        reverb_send.clamp(0.0, 1.0)
+                    } else {
+                        scene.wet_gain
+                    };
+                    engine.set_scene(scene);
+                    // `set_scene` restores RT60s but geometry targets
+                    // (direct_gain/wet_send/er_gain) only recompute on a
+                    // pose update — nudge it with the current listener.
+                    engine.set_listener(self.listener);
+                }
+            }
+            AudioCmd::StopAll => {
+                self.pending.clear();
+                for slot in &mut self.slots {
+                    slot.active = false;
+                    slot.pcm = None;
+                }
+            }
+            AudioCmd::Shutdown => self.wants_shutdown = true,
+        }
+    }
+
+    /// Admit one decoded clip into a slot (free slot first, oldest-slot
+    /// steal when all 64 are busy). Runs on the command path only.
+    fn admit_voice(&mut self, voice: PendingVoice) {
+        let PendingVoice {
+            voice_id,
+            pcm,
+            pos,
+            entity_id,
+            volume,
+            pitch,
+            attenuation_distance,
+            is_2d,
+        } = voice;
+        self.order += 1;
+        let order = self.order;
+        let idx = self
+            .slots
+            .iter()
+            .position(|s| !s.active)
+            .unwrap_or_else(|| {
+                self.slots
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, s)| s.order)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            });
+        // Entity-bound voices start at the latest tracked pose when the
+        // command's position is still the caller's best guess — the same
+        // fallback the synchronous mixer applies.
+        let (position, velocity) = entity_id
+            .and_then(|eid| self.entities.get(&eid).copied())
+            .unwrap_or((pos, [0.0; 3]));
+        let gain = if volume.is_finite() {
+            volume.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let engine = if is_2d {
+            None
+        } else {
+            let mut engine = SpatialAudioEngine::new(self.sample_rate, self.preset);
+            // Vanilla range law: `attenuation_distance * max(volume, 1.0)`.
+            engine.set_max_range(attenuation_distance * volume.max(1.0));
+            engine.set_source(SoundSource { position, velocity });
+            // Default open-air scene until a Lane B worker posts
+            // `ApplyAcousticResult` — the engine never raycasts here.
+            engine.set_listener(self.listener);
+            Some(engine)
+        };
+        let slot = &mut self.slots[idx];
+        *slot = MixVoiceSlot {
+            active: true,
+            order,
+            voice_id,
+            pcm: Some(pcm),
+            cursor: 0.0,
+            step: f64::from(pitch.clamp(0.5, 2.0)),
+            gain,
+            entity_id,
+            engine,
+            position,
+        };
+    }
+
+    /// One 128-frame block: per-voice render → spatialization → shared FDN
+    /// tail → bus limiter → s16 conversion → sink write. Zero allocation.
+    fn mix_block(&mut self, telemetry: &AudioMixTelemetry) {
+        self.mix_f32.fill(0.0);
+        self.send_scratch.fill(0.0);
+        let mut active = 0usize;
+        for i in 0..AUDIO_MIX_VOICE_SLOTS {
+            let slot = &mut self.slots[i];
+            if !slot.active {
+                continue;
+            }
+            if slot.engine.is_some() {
+                slot.render_mono(&mut self.mono_scratch);
+                if let Some(engine) = &mut slot.engine {
+                    engine.process_shared(
+                        &self.mono_scratch,
+                        &mut self.stereo_scratch,
+                        &mut self.send_scratch,
+                        slot.gain,
+                    );
+                }
+                let gain = slot.gain;
+                for f in 0..AUDIO_MIX_BLOCK_FRAMES {
+                    self.mix_f32[2 * f] += self.stereo_scratch[2 * f] * gain;
+                    self.mix_f32[2 * f + 1] += self.stereo_scratch[2 * f + 1] * gain;
+                }
+            } else {
+                slot.render_2d(&mut self.mix_f32);
+            }
+            if slot.active {
+                active += 1;
+            }
+        }
+        // The shared bus runs even with zero voices so a finishing tail
+        // decays instead of cutting off — same semantics as `SoundMixer`.
+        for f in 0..AUDIO_MIX_BLOCK_FRAMES {
+            let (wet_l, wet_r) = self.reverb_bus.step_input(self.send_scratch[f]);
+            self.mix_f32[2 * f] += wet_l;
+            self.mix_f32[2 * f + 1] += wet_r;
+        }
+        AudioLimiter::limit_mix_buffer(&mut self.mix_f32, self.max_volume_cap);
+        for (i, &s) in self.mix_f32.iter().enumerate() {
+            self.out_i16[i] = (s.clamp(-1.0, 1.0) * 32_767.0).round() as i16;
+        }
+        telemetry.active_voices.store(active, Ordering::Relaxed);
+        if self.sink.push(&self.out_i16).is_err() {
+            // A sink that cannot accept the block starved the device:
+            // count it as an underrun and fail closed to the null sink,
+            // exactly like `AudioRuntime::pump_frames`.
+            telemetry.sink_errors.fetch_add(1, Ordering::Relaxed);
+            if !self.sink_failed {
+                self.sink_failed = true;
+                telemetry.underruns.fetch_add(1, Ordering::Relaxed);
+                self.sink.finish();
+                self.sink = Box::<NullSink>::default();
+            }
+            let _ = self.sink.push(&self.out_i16);
+        }
+        telemetry.blocks_mixed.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Tunables for [`AudioMixThread`]/[`AudioMixCore`].
+#[derive(Clone, Copy, Debug)]
+pub struct AudioMixThreadOptions {
+    /// Mix rate — must match the sink (`48_000`).
+    pub sample_rate: u32,
+    /// Voice spatialization quality tier.
+    pub preset: SpatialAudioPreset,
+    /// Bus limiter ceiling (`qol.max_volume_cap`).
+    pub max_volume_cap: f32,
+}
+
+impl Default for AudioMixThreadOptions {
+    fn default() -> Self {
+        Self {
+            sample_rate: MIX_SAMPLE_RATE,
+            preset: SpatialAudioPreset::Realistic,
+            max_volume_cap: 1.0,
+        }
+    }
+}
+
+/// The dedicated real-time audio mix thread (audit §3.3 / Gate P3). The
+/// Render Thread never mixes: it posts [`AudioCmd`]s to the SPSC ring with
+/// [`AudioMixThread::submit`], and the mix thread consumes them on a fixed
+/// 128-sample (≈2.67 ms) cadence, so a stalled render pass can never starve
+/// the device.
+///
+/// Two drive modes:
+/// * [`AudioMixThread::spawn`] — the real-time mode: a named OS thread
+///   runs `step_one_block` on the deadline-anchored cadence above.
+/// * [`AudioMixThread::manual`] — the deterministic mode: no OS thread;
+///   the caller drives [`AudioMixThread::step_one_block`] synchronously.
+pub struct AudioMixThread {
+    ring: Arc<AudioCmdRing>,
+    telemetry: Arc<AudioMixTelemetry>,
+    shutdown: Arc<AtomicBool>,
+    /// `Some` in manual mode until `start` moves it onto the OS thread.
+    core: Option<AudioMixCore>,
+    handle: Option<JoinHandle<()>>,
+    sink_label: &'static str,
+    period: Duration,
+}
+
+impl AudioMixThread {
+    /// Spawn the mix thread over `sink`. The thread owns the sink from
+    /// here on; `Drop` pushes `Shutdown`, sets the exit flag and joins.
+    pub fn spawn(sink: Box<dyn AudioSink>, opts: &AudioMixThreadOptions) -> Self {
+        let mut this = Self::manual(sink, opts);
+        // Spawn can only fail on OS thread exhaustion — surface it by
+        // falling back to manual mode (the caller still gets a working,
+        // caller-driven mixer rather than a panic on the render path).
+        let _ = this.start();
+        this
+    }
+
+    /// Deterministic manual mode: ring + core exist, no OS thread yet.
+    /// Drive with [`Self::step_one_block`], or promote with [`Self::start`].
+    pub fn manual(sink: Box<dyn AudioSink>, opts: &AudioMixThreadOptions) -> Self {
+        let sink_label = sink.label();
+        Self {
+            ring: Arc::new(AudioCmdRing::new(AUDIO_CMD_RING_CAPACITY)),
+            telemetry: Arc::new(AudioMixTelemetry::default()),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            core: Some(AudioMixCore::new(sink, opts)),
+            handle: None,
+            sink_label,
+            period: Duration::from_secs_f64(
+                AUDIO_MIX_BLOCK_FRAMES as f64 / f64::from(opts.sample_rate.max(1)),
+            ),
+        }
+    }
+
+    /// Promote manual mode onto a named OS thread running the fixed
+    /// 128-sample cadence. `Err` when the thread cannot spawn or the core
+    /// was already moved to a thread.
+    pub fn start(&mut self) -> Result<(), String> {
+        let Some(core) = self.core.take() else {
+            return Err("audio mix thread already started".to_string());
+        };
+        let ring = self.ring.clone();
+        let telemetry = self.telemetry.clone();
+        let shutdown = self.shutdown.clone();
+        let period = self.period;
+        // One-shot handoff: the core reaches the OS thread only after a
+        // successful spawn — a failed spawn keeps it for manual mode.
+        let (tx, rx) = std::sync::mpsc::channel::<AudioMixCore>();
+        match std::thread::Builder::new()
+            .name("mc-spine-audio-mix".to_string())
+            .spawn(move || {
+                let Ok(mut core) = rx.recv() else {
+                    return;
+                };
+                Self::run(&mut core, &ring, &telemetry, &shutdown, period);
+            }) {
+            Ok(handle) => {
+                let _ = tx.send(core);
+                self.handle = Some(handle);
+                Ok(())
+            }
+            Err(e) => {
+                self.core = Some(core);
+                Err(format!("cannot spawn audio mix thread: {e}"))
+            }
+        }
+    }
+
+    /// Real-time loop: deadline-anchored so one slow block does not drift
+    /// the cadence; a block delivered more than [`UNDERRUN_GRACE_BLOCKS`]
+    /// whole periods late counts the extra periods as underruns — the
+    /// buffers the device starved on — and the schedule skips ahead.
+    fn run(
+        core: &mut AudioMixCore,
+        ring: &AudioCmdRing,
+        telemetry: &AudioMixTelemetry,
+        shutdown: &AtomicBool,
+        period: Duration,
+    ) {
+        let period_nanos = period.as_nanos();
+        let mut next_due = Instant::now() + period;
+        loop {
+            // Wait for the deadline: coarse sleep, then a bounded spin so
+            // the block lands on time instead of one tick late.
+            loop {
+                let now = Instant::now();
+                if now >= next_due {
+                    break;
+                }
+                if shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
+                let wait = next_due - now;
+                if wait > SPIN_BEFORE_DEADLINE {
+                    std::thread::sleep(wait - SPIN_BEFORE_DEADLINE);
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            let now = Instant::now();
+            let starved = (now.saturating_duration_since(next_due).as_nanos()
+                / period_nanos) as u64;
+            if starved > UNDERRUN_GRACE_BLOCKS {
+                telemetry
+                    .underruns
+                    .fetch_add(starved - UNDERRUN_GRACE_BLOCKS, Ordering::Relaxed);
+            }
+            core.step_one_block(ring, telemetry);
+            // Skip the slots the device already starved through — one
+            // period per block keeps the schedule from compounding.
+            next_due += period * (starved + 1) as u32;
+            if core.wants_shutdown {
+                break;
+            }
+        }
+    }
+
+    /// Deterministic single-block step for unit/timing verification —
+    /// manual mode only; `false` once the core lives on the OS thread.
+    pub fn step_one_block(&mut self) -> bool {
+        let Some(core) = self.core.as_mut() else {
+            return false;
+        };
+        core.step_one_block(&self.ring, &self.telemetry);
+        true
+    }
+
+    /// Non-blocking command submission for the Render Thread — O(1),
+    /// lock-free, never panics. `false` when the ring is full (command
+    /// dropped, counted in [`Self::dropped_commands`]).
+    pub fn submit(&self, cmd: AudioCmd) -> bool {
+        self.ring.try_push(cmd)
+    }
+
+    /// The shared ring handle — post commands with
+    /// [`AudioCmdRing::try_push`] from the producer thread.
+    pub fn ring(&self) -> Arc<AudioCmdRing> {
+        self.ring.clone()
+    }
+
+    /// Backend label of the sink the thread owns.
+    pub fn sink_label(&self) -> &'static str {
+        self.sink_label
+    }
+
+    /// `true` while the OS thread is running (manual mode reports `false`
+    /// until [`Self::start`]).
+    pub fn is_running(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_some_and(|h| !h.is_finished())
+    }
+
+    /// Blocks mixed and written to the sink.
+    pub fn blocks_mixed(&self) -> u64 {
+        self.telemetry.blocks_mixed.load(Ordering::Relaxed)
+    }
+
+    /// Voice slots currently sounding.
+    pub fn active_voice_count(&self) -> usize {
+        self.telemetry.active_voices.load(Ordering::Relaxed)
+    }
+
+    /// Starved device buffers + sink write failures so far.
+    pub fn underrun_count(&self) -> u64 {
+        self.telemetry.underruns.load(Ordering::Relaxed)
+    }
+
+    /// Ring commands handled on the mix thread.
+    pub fn commands_processed(&self) -> u64 {
+        self.telemetry.commands_processed.load(Ordering::Relaxed)
+    }
+
+    /// Producer-side drops when the ring was full.
+    pub fn dropped_commands(&self) -> u64 {
+        self.ring.dropped_commands()
+    }
+
+    /// Ask the thread to stop and join it. Idempotent; also runs in `Drop`.
+    pub fn shutdown(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        // Best-effort: the flag above is authoritative, so a flooded ring
+        // can never hang shutdown.
+        let _ = self.ring.try_push(AudioCmd::Shutdown);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for AudioMixThread {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 #[cfg(test)]
