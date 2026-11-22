@@ -195,13 +195,16 @@ pub struct LiveOpenScreen {
     pub carried: Option<ItemStackComponents>,
 }
 
+/// `(display_nbt, render_type, number_format_kind)` carried by `set_objective`.
+pub type ScoreboardObjectiveMeta = (Option<Vec<u8>>, i32, Option<i32>);
+
 /// Session-side scoreboard mirror: objectives, scores, and sidebar pinning
 /// exactly as the vanilla client tracks them for the sidebar overlay.
 #[derive(Clone, Debug, Default)]
 pub struct LiveScoreboard {
     /// `set_objective` upserts keyed by objective name: `(display_nbt,
     /// render_type, number_format_kind)`.
-    pub objectives: BTreeMap<String, (Option<Vec<u8>>, i32, Option<i32>)>,
+    pub objectives: BTreeMap<String, ScoreboardObjectiveMeta>,
     /// `set_score` lines keyed by `(objective, owner)` -> value.
     pub scores: BTreeMap<(String, String), i32>,
     /// `set_display_objective` slot -> objective name.
@@ -1014,6 +1017,7 @@ impl LiveSession {
     /// `sim.rs`'s shared-physics step so the GPU session gets vanilla
     /// collision, step-up, fluid drag, and sneak edge protection
     /// (`step_player_physics` -> `back_off_from_edge`).
+    #[allow(clippy::too_many_arguments)]
     pub fn predict_movement(
         &mut self,
         strafe: f32,

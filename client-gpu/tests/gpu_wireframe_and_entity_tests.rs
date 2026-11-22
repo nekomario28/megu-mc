@@ -100,8 +100,8 @@ fn rx7800_xt_debug_lines_entities_ber_particles_readback() {
     renderer.set_entity_and_ber_meshes(vec![(&zombie, [7.0, 1.0, 9.0], [0.25, 1.0, 0.2])]);
     let zombie_pixels = render(&mut renderer, &camera);
     let changed_zombie = baseline
-        .chunks_exact(4)
-        .zip(zombie_pixels.chunks_exact(4))
+        .as_chunks::<4>().0.iter()
+        .zip(zombie_pixels.as_chunks::<4>().0.iter())
         .filter(|(a, b)| a[0..3] != b[0..3])
         .count();
     assert!(
@@ -112,8 +112,8 @@ fn rx7800_xt_debug_lines_entities_ber_particles_readback() {
     renderer.set_entity_and_ber_meshes(vec![(&chest, [9.0, 1.0, 9.0], [1.0, 0.55, 0.20])]);
     let chest_pixels = render(&mut renderer, &camera);
     let changed_chest = baseline
-        .chunks_exact(4)
-        .zip(chest_pixels.chunks_exact(4))
+        .as_chunks::<4>().0.iter()
+        .zip(chest_pixels.as_chunks::<4>().0.iter())
         .filter(|(a, b)| a[0..3] != b[0..3])
         .count();
     assert!(
@@ -127,8 +127,8 @@ fn rx7800_xt_debug_lines_entities_ber_particles_readback() {
     ]);
     let lit = render(&mut renderer, &camera);
     let changed_lit = baseline
-        .chunks_exact(4)
-        .zip(lit.chunks_exact(4))
+        .as_chunks::<4>().0.iter()
+        .zip(lit.as_chunks::<4>().0.iter())
         .filter(|(a, b)| a[0..3] != b[0..3])
         .count();
     assert!(
@@ -169,8 +169,8 @@ fn rx7800_xt_debug_lines_entities_ber_particles_readback() {
     renderer.set_debug_lines(&lines);
     let with_lines = render(&mut renderer, &camera);
     let added_pixels = lit
-        .chunks_exact(4)
-        .zip(with_lines.chunks_exact(4))
+        .as_chunks::<4>().0.iter()
+        .zip(with_lines.as_chunks::<4>().0.iter())
         .filter(|(a, b)| a[0..3] != b[0..3])
         .count();
     assert!(
@@ -180,7 +180,7 @@ fn rx7800_xt_debug_lines_entities_ber_particles_readback() {
     let mut red = 0;
     let mut yellow = 0;
     let mut blue = 0;
-    for pixel in with_lines.chunks_exact(4) {
+    for pixel in with_lines.as_chunks::<4>().0 {
         if pixel[0] > 180 && pixel[1] < 95 && pixel[2] < 95 {
             red += 1;
         }
@@ -208,8 +208,8 @@ fn rx7800_xt_debug_lines_entities_ber_particles_readback() {
     let with_particle = render(&mut renderer, &camera);
     assert!(
         with_lines
-            .chunks_exact(4)
-            .zip(with_particle.chunks_exact(4))
+            .as_chunks::<4>().0.iter()
+            .zip(with_particle.as_chunks::<4>().0.iter())
             .any(|(a, b)| a[0..3] != b[0..3]),
         "particle quad must change GPU pixels"
     );
