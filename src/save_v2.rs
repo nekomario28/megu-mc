@@ -1742,11 +1742,38 @@ thread_local! { static SAVE_GUARD: std::cell::Cell<bool> = const { std::cell::Ce
 /// observe the block removed but the entity not yet added, or a landing placed but its entity
 /// still queued. Re-entrant per thread: `spawn_fall` is reached from `falling_tick`'s placement
 /// and from another `spawn_fall`, and only the outermost call locks.
+fn save_lock_prof() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MC_SPINE_LOCK_PROF").is_some())
+}
+#[track_caller]
 fn with_save_guard<R>(f: impl FnOnce() -> R) -> R {
     if SAVE_GUARD.with(|g| g.get()) {
         return f();
     }
+    let prof = save_lock_prof();
+    let __wt = std::time::Instant::now();
     let _save = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if prof {
+        let __w = __wt.elapsed();
+        if __w > std::time::Duration::from_millis(20) {
+            eprintln!("[save-lock] wait {:?} at {}", __w, std::panic::Location::caller());
+        }
+    }
+    let __ht = std::time::Instant::now();
+    struct HoldLog(std::time::Instant, &'static std::panic::Location<'static>, bool);
+    impl std::ops::Drop for HoldLog {
+        fn drop(&mut self) {
+            if !self.2 {
+                return;
+            }
+            let h = self.0.elapsed();
+            if h > std::time::Duration::from_millis(20) {
+                eprintln!("[save-lock] held {:?} at {}", h, self.1);
+            }
+        }
+    }
+    let _hl = HoldLog(__ht, std::panic::Location::caller(), prof);
     SAVE_GUARD.with(|g| g.set(true));
     struct Reset;
     impl std::ops::Drop for Reset {

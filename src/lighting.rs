@@ -825,6 +825,25 @@ impl IncrementalLighting {
         }
     }
 
+    /// Adds chunks the live engine does not cover yet, then re-derives the
+    /// light field once. The game layer uses this when the edit halo outgrows
+    /// the engine's chunk set: the already-loaded neighbours stay, so only the
+    /// missing chunks' terrain has to be snapshotted. `rebuild` runs over the
+    /// union either way — extra chunks only add accurate propagation context.
+    pub fn add_chunks(&mut self, chunks: impl IntoIterator<Item = (Chunk, Vec<LightBlock>)>) {
+        let mut added = false;
+        for ((cx, cz), blocks) in chunks {
+            if !self.chunks.contains_key(&(cx, cz)) {
+                self.chunks
+                    .insert((cx, cz), LightingChunk::new(self.min_y, self.height, blocks));
+                added = true;
+            }
+        }
+        if added {
+            self.rebuild();
+        }
+    }
+
     /// Store a detached scratch back on the engine, shrinking any buffer
     /// whose retained capacity outgrew [`SCRATCH_KEEP_BYTES`].
     fn stash_scratch(&mut self, mut scratch: Scratch) {
