@@ -261,8 +261,9 @@ impl EntityInterpolationTable {
             ((elapsed + t) / MAX_INTERP_STEPS as f32).min(1.0)
         };
         let mut position = [0.0; 3];
-        for i in 0..3 {
-            position[i] = state.prev_pos[i] + (state.curr_pos[i] - state.prev_pos[i]) * f64::from(f);
+        for (i, coordinate) in position.iter_mut().enumerate() {
+            *coordinate =
+                state.prev_pos[i] + (state.curr_pos[i] - state.prev_pos[i]) * f64::from(f);
         }
         Some(InterpolatedPose {
             position,

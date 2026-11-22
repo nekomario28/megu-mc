@@ -15,6 +15,10 @@ use mc_spine_client_mesh::{
     LAVA, LIGHT_BYTES, NO_FLUID, OPAQUE, SAME_STATE_CULL, SECTION_CELLS, TINTED, TRANSLUCENT,
     WATER,
 };
+use mc_spine_kernel::skeletal_anim::{
+    decode_animation_trigger, parse_animation_json, parse_geometry_json, AnimationClip,
+    AnimationController, AnimationError, BoneMask, LoopMode, SkeletonRig, MAX_CLIPS,
+};
 use mc_spine_kernel::{
     Aabb, FluidCell, FluidKind, LightEdit, LightEngine, LightFact, LightUpdateMultiWord,
     PalettedSection, Registry, STATE_COUNT,
@@ -962,6 +966,269 @@ struct SectionVisibility {
     renderable: bool,
 }
 
+/// Validated model assets and the deterministic mapping from wire clip IDs to
+/// animation names. The first clip in `register_model` is wire clip ID 0.
+struct RegisteredAnimationModel {
+    rig: SkeletonRig,
+    clips: Vec<AnimationClip>,
+    clip_names: HashMap<(u16, u8), String>,
+    clip_ids: HashMap<String, u16>,
+}
+
+struct EntityAnimation {
+    model_id: String,
+    controller: AnimationController,
+}
+
+/// Client-side skeletal animation state. ANM1 packets target entities already
+/// bound to registered models; the host never creates entities from packets.
+#[derive(Default)]
+pub struct WorldAnimationHost {
+    models: HashMap<String, RegisteredAnimationModel>,
+    entities: HashMap<i32, EntityAnimation>,
+}
+
+/// Alternative name for the world's model and entity animation registry.
+pub type EntityAnimationRegistry = WorldAnimationHost;
+
+fn loop_mode_id(mode: LoopMode) -> u8 {
+    match mode {
+        LoopMode::Once => 0,
+        LoopMode::Loop => 1,
+        LoopMode::HoldOnLastFrame => 2,
+    }
+}
+
+impl WorldAnimationHost {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register clips in their wire-ID order (0 through `clips.len() - 1`).
+    pub fn register_model(
+        &mut self,
+        model_id: impl Into<String>,
+        rig: SkeletonRig,
+        clips: Vec<AnimationClip>,
+    ) -> Result<(), AnimationError> {
+        let numbered = clips
+            .into_iter()
+            .enumerate()
+            .map(|(id, clip)| (id as u16, clip))
+            .collect();
+        self.register_model_with_clip_ids(model_id, rig, numbered)
+    }
+
+    /// Register explicit ANM1 clip IDs. Duplicate model, clip or wire IDs fail
+    /// before the registry is modified.
+    pub fn register_model_with_clip_ids(
+        &mut self,
+        model_id: impl Into<String>,
+        rig: SkeletonRig,
+        mut clips: Vec<(u16, AnimationClip)>,
+    ) -> Result<(), AnimationError> {
+        let model_id = model_id.into();
+        if model_id.is_empty() || self.models.contains_key(&model_id) {
+            return Err(AnimationError::InvalidRig);
+        }
+        if clips.len() > MAX_CLIPS {
+            return Err(AnimationError::LimitExceeded);
+        }
+        clips.sort_by_key(|(id, _)| *id);
+        let mut native = Vec::with_capacity(clips.len());
+        let mut clip_names = HashMap::new();
+        let mut clip_ids = HashMap::new();
+        for (id, clip) in &clips {
+            if *id > 4095
+                || clip_ids.insert(clip.name.clone(), *id).is_some()
+                || native
+                    .last()
+                    .is_some_and(|(previous, _): &(u16, AnimationClip)| previous == id)
+            {
+                return Err(AnimationError::InvalidClip);
+            }
+            native.push((*id, clip.clone()));
+        }
+        // Let the kernel validate tracks, bone names and clip contents before
+        // constructing wire-facing variants.
+        AnimationController::new(rig.clone(), native.iter().map(|(_, c)| c.clone()).collect())?;
+
+        let mut controller_clips = Vec::with_capacity(MAX_CLIPS.min(clips.len() * 3));
+        for (id, mut clip) in native {
+            let original_mode = loop_mode_id(clip.loop_mode);
+            let internal_name = format!("anm1.{id}.{original_mode}");
+            clip.name = internal_name.clone();
+            clip_names.insert((id, original_mode), internal_name);
+            controller_clips.push(clip);
+        }
+        // ANM1 chooses loop mode per trigger. Populate alternate modes while
+        // respecting the kernel's MAX_CLIPS bound; unavailable overrides fail
+        // explicitly instead of silently playing with incorrect loop behavior.
+        for (id, clip) in &clips {
+            for mode in [LoopMode::Once, LoopMode::Loop, LoopMode::HoldOnLastFrame] {
+                if controller_clips.len() == MAX_CLIPS {
+                    break;
+                }
+                let mode_id = loop_mode_id(mode);
+                if clip_names.contains_key(&(*id, mode_id)) {
+                    continue;
+                }
+                let mut variant = clip.clone();
+                variant.name = format!("anm1.{id}.{mode_id}");
+                variant.loop_mode = mode;
+                clip_names.insert((*id, mode_id), variant.name.clone());
+                controller_clips.push(variant);
+            }
+        }
+        self.models.insert(
+            model_id,
+            RegisteredAnimationModel {
+                rig,
+                clips: controller_clips,
+                clip_names,
+                clip_ids,
+            },
+        );
+        Ok(())
+    }
+
+    /// Load a single Bedrock/GeckoLib geometry and animation document.
+    /// Parsed clips are sorted by name for stable wire clip IDs.
+    pub fn register_model_json(
+        &mut self,
+        model_id: impl Into<String>,
+        geometry_json: &str,
+        animation_json: &str,
+    ) -> Result<(), AnimationError> {
+        let rig = parse_geometry_json(geometry_json)?;
+        let mut clips = parse_animation_json(animation_json)?;
+        clips.sort_by(|a, b| a.name.cmp(&b.name));
+        self.register_model(model_id, rig, clips)
+    }
+
+    /// Find the ANM1 clip ID for a model's registered animation name.
+    pub fn clip_id(&self, model_id: &str, clip_name: &str) -> Option<u16> {
+        self.models.get(model_id)?.clip_ids.get(clip_name).copied()
+    }
+
+    /// Bind a spawned entity to a model, with a full-body base layer.
+    pub fn bind_entity(&mut self, entity_id: i32, model_id: &str) -> Result<(), AnimationError> {
+        let model = self
+            .models
+            .get(model_id)
+            .ok_or(AnimationError::InvalidRig)?;
+        let mask = BoneMask::all(&model.rig);
+        self.bind_entity_with_layers(entity_id, model_id, vec![(mask, 1.0)])
+    }
+
+    /// Bind an entity with ordered layers, e.g. a full-body walk layer and an
+    /// upper-body-only cast layer. Binding the same entity replaces its pose.
+    pub fn bind_entity_with_layers(
+        &mut self,
+        entity_id: i32,
+        model_id: &str,
+        layers: Vec<(BoneMask, f32)>,
+    ) -> Result<(), AnimationError> {
+        if entity_id < 0 {
+            return Err(AnimationError::InvalidWire);
+        }
+        let model = self
+            .models
+            .get(model_id)
+            .ok_or(AnimationError::InvalidRig)?;
+        let mut controller = AnimationController::new(model.rig.clone(), model.clips.clone())?;
+        for (mask, weight) in layers {
+            controller.add_layer(mask, weight)?;
+        }
+        self.entities.insert(
+            entity_id,
+            EntityAnimation {
+                model_id: model_id.to_owned(),
+                controller,
+            },
+        );
+        Ok(())
+    }
+
+    /// Add a masked layer without restarting any playing layers.
+    pub fn add_entity_layer(
+        &mut self,
+        entity_id: i32,
+        mask: BoneMask,
+        weight: f32,
+    ) -> Result<usize, AnimationError> {
+        self.entities
+            .get_mut(&entity_id)
+            .ok_or(AnimationError::InvalidWire)?
+            .controller
+            .add_layer(mask, weight)
+    }
+
+    /// Ingest a complete `mc-spine:anim_v1` (ANM1) custom-payload body.
+    /// Protocol fade ticks use Minecraft's 20 ticks per second.
+    pub fn ingest_anm1_payload(&mut self, bytes: &[u8]) -> Result<(), AnimationError> {
+        let trigger = decode_animation_trigger(bytes)?;
+        let entity = self
+            .entities
+            .get_mut(&trigger.entity_id)
+            .ok_or(AnimationError::InvalidWire)?;
+        let model = self
+            .models
+            .get(&entity.model_id)
+            .ok_or(AnimationError::InvalidRig)?;
+        let name = model
+            .clip_names
+            .get(&(trigger.clip_id, loop_mode_id(trigger.loop_mode)))
+            .ok_or(AnimationError::UnknownClip)?;
+        while entity.controller.layers().len() <= usize::from(trigger.layer) {
+            entity
+                .controller
+                .add_layer(BoneMask::all(&model.rig), 1.0)?;
+        }
+        entity.controller.play(
+            usize::from(trigger.layer),
+            name,
+            f32::from(trigger.fade_ticks) / 20.0,
+            trigger.speed,
+            trigger.restart,
+        )
+    }
+
+    pub fn advance(&mut self, dt_sec: f32) -> Result<(), AnimationError> {
+        if !dt_sec.is_finite() || dt_sec < 0.0 {
+            return Err(AnimationError::InvalidTime);
+        }
+        for entity in self.entities.values_mut() {
+            entity.controller.advance(dt_sec)?;
+        }
+        Ok(())
+    }
+
+    /// One column-major model-space matrix per bone, ordered as in the rig.
+    /// Despawned and unbound entities return `Ok(None)`.
+    pub fn evaluate_entity_pose(
+        &self,
+        entity_id: i32,
+    ) -> Result<Option<Vec<[f32; 16]>>, AnimationError> {
+        self.entities
+            .get(&entity_id)
+            .map(|entity| entity.controller.evaluate_world_matrices())
+            .transpose()
+    }
+
+    pub fn despawn_entity(&mut self, entity_id: i32) -> bool {
+        self.entities.remove(&entity_id).is_some()
+    }
+
+    pub fn clear_entities(&mut self) {
+        self.entities.clear();
+    }
+
+    pub fn entity_count(&self) -> usize {
+        self.entities.len()
+    }
+}
+
 pub struct WorldState {
     pub dimension: DimensionMeta,
     pub blocks: BlockTable,
@@ -996,6 +1263,8 @@ pub struct WorldState {
     /// Block cells relit by the local `LightEngine` after 0x09/0x49 edits.
     pub local_light_edits: u64,
     pub metrics: MeshMetrics,
+    /// Skeletal animation models and live entity controllers.
+    pub animations: WorldAnimationHost,
 }
 
 /// Candidate directories holding the pinned `assets/` pair, mirroring
@@ -1103,11 +1372,13 @@ impl WorldState {
             block_updates: 0,
             local_light_edits: 0,
             metrics: MeshMetrics::default(),
+            animations: WorldAnimationHost::new(),
         }
     }
 
     pub fn reset_dimension(&mut self, dimension: DimensionMeta) {
         self.dimension = dimension;
+        self.animations.clear_entities();
         self.light_engine = light_engine_for(&self.dimension, self.registry.is_some());
         self.columns.clear();
         self.mesh_cache = MeshCache::new(MissingNeighbor::Air);
@@ -1118,6 +1389,25 @@ impl WorldState {
         self.direction_buckets.clear();
         self.render_regions = RenderRegions::default();
         self.recompute_live_totals();
+    }
+
+    pub fn ingest_anm1_payload(&mut self, bytes: &[u8]) -> Result<(), AnimationError> {
+        self.animations.ingest_anm1_payload(bytes)
+    }
+
+    pub fn advance_animations(&mut self, dt_sec: f32) -> Result<(), AnimationError> {
+        self.animations.advance(dt_sec)
+    }
+
+    pub fn evaluate_entity_pose(
+        &self,
+        entity_id: i32,
+    ) -> Result<Option<Vec<[f32; 16]>>, AnimationError> {
+        self.animations.evaluate_entity_pose(entity_id)
+    }
+
+    pub fn despawn_entity(&mut self, entity_id: i32) -> bool {
+        self.animations.despawn_entity(entity_id)
     }
 
     pub fn loaded_chunks(&self) -> usize {
