@@ -91,6 +91,9 @@ pub enum VanillaPlusCategory {
     RailsAndLadders,
     /// Chain, iron bars, torches, lanterns.
     FixturesAndChains,
+    /// Subtle 0.5-texel outward relief on exposed ore vein texels for
+    /// `*_ore`/`ancient_debris` blocks, driven by a caller-supplied vein mask.
+    Ores3dRelief,
 }
 
 /// Per-user configuration for the Vanilla+ 3D upgrade. `Default` is fully
@@ -111,6 +114,9 @@ pub struct VanillaPlus3dConfig {
     pub rails_and_ladders: bool,
     /// Upgrade chains, iron bars, torches and lanterns.
     pub fixtures_and_chains: bool,
+    /// Raise exposed ore vein texels by half a texel for a subtle 3D
+    /// mineral-fleck relief.
+    pub ores_3d_relief: bool,
     /// Distance in blocks beyond which the flat 2D model is used. Clamped to
     /// `8.0..=64.0` when read via [`Self::effective_lod_cutoff`].
     pub lod_cutoff_blocks: f32,
@@ -128,6 +134,7 @@ impl Default for VanillaPlus3dConfig {
             crystals_and_clusters: true,
             rails_and_ladders: true,
             fixtures_and_chains: true,
+            ores_3d_relief: true,
             lod_cutoff_blocks: DEFAULT_LOD_CUTOFF_BLOCKS,
             respect_custom_resourcepack_models: true,
         }
@@ -149,6 +156,7 @@ impl VanillaPlus3dConfig {
             VanillaPlusCategory::CrystalsAndClusters => self.crystals_and_clusters,
             VanillaPlusCategory::RailsAndLadders => self.rails_and_ladders,
             VanillaPlusCategory::FixturesAndChains => self.fixtures_and_chains,
+            VanillaPlusCategory::Ores3dRelief => self.ores_3d_relief,
         }
     }
 }
@@ -213,7 +221,9 @@ pub fn vanilla_plus_decision(
 /// the path component is matched. Vanilla ids map to their category; a modded
 /// `is_cross_model` block with no exact or pattern match falls back
 /// generically to [`VanillaPlusCategory::CropsAndFlora`]. The strings `"sun"`
-/// and `"moon"` classify as [`VanillaPlusCategory::Celestial3d`].
+/// and `"moon"` classify as [`VanillaPlusCategory::Celestial3d`]. Any id
+/// ending in `_ore` (plus `ancient_debris`) classifies as
+/// [`VanillaPlusCategory::Ores3dRelief`].
 pub fn classify_vanilla_plus_block(
     block_id: &str,
     is_cross_model: bool,
@@ -302,6 +312,9 @@ pub fn classify_vanilla_plus_block(
     }
     if id.contains("crystal") || id.ends_with("_cluster") || id.ends_with("_bud") {
         return Some(CrystalsAndClusters);
+    }
+    if id.ends_with("_ore") || id == "ancient_debris" {
+        return Some(Ores3dRelief);
     }
     if is_cross_model {
         return Some(CropsAndFlora);
@@ -1269,4 +1282,331 @@ pub fn build_3d_moon_mesh(phase: u8) -> ExtrudedMesh {
     lit.translate([0.0, 0.0, TEXEL]);
     mesh.append(&lit);
     mesh
+}
+
+// ---------------------------------------------------------------------------
+// Procedural 3D crops: three clean-room archetypes
+// ---------------------------------------------------------------------------
+
+/// Broad crop silhouette families for the procedural 3D crop upgrade.
+///
+/// The archetype is a *shape grammar*, not a texture lookup: every vanilla
+/// and modded crop maps onto exactly one family, so no hand-authored
+/// per-block geometry is ever needed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Crop3dArchetype {
+    /// Wheat/rice/corn style: a cluster of tapered stalks that lean
+    /// outward, each topped by a grain head once growth passes the
+    /// halfway point.
+    SheafStalk,
+    /// Carrot/potato/beetroot/onion/cabbage style: a ground-level bulb or
+    /// root mass plus a rosette of angled leaf blades.
+    BulbLeaf,
+    /// Tomato/berry/pepper style: a supporting vine stem with foliage and
+    /// distinct 3D fruit pods that emerge in the upper growth stages.
+    VineFruit,
+}
+
+/// Facts the procedural crop builder needs for one block occurrence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Crop3dSpec {
+    /// Which silhouette family to build.
+    pub archetype: Crop3dArchetype,
+    /// Current growth stage (`0` = freshly planted).
+    pub stage: u8,
+    /// Maximum growth stage. `0` fails closed to the smallest silhouette.
+    pub max_stage: u8,
+    /// Extra caller seed mixed into the deterministic lean/jitter so two
+    /// adjacent identical crops still vary their pose.
+    pub seed: u64,
+    /// World-space block position, hashed into the pose jitter.
+    pub block_pos: [i32; 3],
+}
+
+/// Growth fraction in `0.0..=1.0`; `max_stage == 0` fails closed to `0.0`.
+fn growth_fraction(spec: &Crop3dSpec) -> f32 {
+    let max = spec.max_stage.max(1) as f32;
+    (spec.stage.min(spec.max_stage) as f32) / max
+}
+
+/// Deterministic `0.0..1.0` value from the spec seed mixed with a salt and
+/// the block position — pure integer mixing, identical on every rebuild.
+fn spec_jitter(spec: &Crop3dSpec, salt: u64) -> f32 {
+    let mut h = spec.seed ^ salt.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    h ^= (spec.block_pos[0] as u32 as u64).wrapping_mul(0x8da6_b343);
+    h ^= (spec.block_pos[1] as u32 as u64).wrapping_mul(0xd816_3841);
+    h ^= (spec.block_pos[2] as u32 as u64).wrapping_mul(0xcb1a_b31f);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^= h >> 31;
+    // Top 24 bits -> [0, 1); exact and monotone in the integer hash.
+    ((h >> 40) & 0x00ff_ffff) as f32 / 16_777_216.0
+}
+
+/// `(lean_x, lean_z)` unit-ish direction scaled to `amount` blocks for `i`.
+fn lean_dir(spec: &Crop3dSpec, salt: u64, amount: f32) -> [f32; 3] {
+    // Angle snapped to eighth-turns so lean stays pixel-art friendly.
+    let a = spec_jitter(spec, salt) * 8.0;
+    let eighth = (a as u32 & 7) as f32 * (PI * 0.25);
+    [eighth.cos() * amount, 0.0, eighth.sin() * amount]
+}
+
+/// Builds a deterministic procedural 3D crop for `spec`.
+///
+/// All geometry lives in block-local `0..=1` space, grows monotonically with
+/// `stage / max_stage`, and depends only on `spec` — no clock, no RNG, no
+/// external assets. Degenerate specs (`max_stage == 0`) fail closed to the
+/// stage-0 silhouette rather than dividing by zero.
+pub fn build_3d_crop_mesh(spec: &Crop3dSpec) -> ExtrudedMesh {
+    match spec.archetype {
+        Crop3dArchetype::SheafStalk => build_sheaf_stalk(spec),
+        Crop3dArchetype::BulbLeaf => build_bulb_leaf(spec),
+        Crop3dArchetype::VineFruit => build_vine_fruit(spec),
+    }
+}
+
+/// Wheat/rice/corn: `N` tapered stalks leaning outward from the block
+/// centre; a grain head box crowns each stalk once `t >= 0.5`.
+fn build_sheaf_stalk(spec: &Crop3dSpec) -> ExtrudedMesh {
+    let mut mesh = ExtrudedMesh::new();
+    let t = growth_fraction(spec);
+    // Cluster positions snapped to the texel grid (4/16 and 12/16 lanes).
+    const LANES: [(f32, f32); 5] = [
+        (0.50, 0.50),
+        (0.25, 0.31),
+        (0.75, 0.31),
+        (0.31, 0.75),
+        (0.69, 0.69),
+    ];
+    for (i, &(px, pz)) in LANES.iter().enumerate() {
+        let jx = spec_jitter(spec, 0x100 + i as u64);
+        let lean = lean_dir(spec, 0x200 + i as u64, 0.02 + 0.06 * jx);
+        // Stalk height grows monotonically: 3.5..13 texels.
+        let h = 0.22 + 0.60 * t;
+        // `emit_beam` centres its cross-section on the endpoint; seat the
+        // base ring half a width up so the stalk bottom lands on y = 0.
+        let w = 0.055 - 0.020 * t; // stalks slim as they stretch.
+        let base = [px, w * 0.5, pz];
+        let top = [px + lean[0], h, pz + lean[2]];
+        emit_beam(&mut mesh, base, top, w, w, -1);
+        // Grain head: appears at t >= 0.5, swells with growth.
+        if t >= 0.5 {
+            let hs = 0.06 + 0.10 * (t - 0.5);
+            push_box(
+                &mut mesh,
+                [top[0] - hs, top[1] - hs * 0.5, top[2] - hs],
+                [top[0] + hs, (top[1] + hs).min(0.98), top[2] + hs],
+                0,
+            );
+        }
+    }
+    mesh
+}
+
+/// Carrot/onion/cabbage: a ground bulb plus a rosette of leaf blades angled
+/// outward; both grow monotonically with `t`.
+fn build_bulb_leaf(spec: &Crop3dSpec) -> ExtrudedMesh {
+    let mut mesh = ExtrudedMesh::new();
+    let t = growth_fraction(spec);
+    // Bulb: half-buried root mass, 1..4.5 texels wide, peeking above soil.
+    let r = 0.06 + 0.16 * t;
+    let crown = 0.04 + 0.10 * t;
+    push_box(
+        &mut mesh,
+        [0.5 - r, 0.0, 0.5 - r],
+        [0.5 + r, crown, 0.5 + r],
+        0,
+    );
+    // Six blades ring the bulb; lean and length grow with `t`.
+    for i in 0..6u32 {
+        let a = (i as f32 + spec_jitter(spec, 0x300) * 0.5) * (PI / 3.0);
+        let (ca, sa) = (a.cos(), a.sin());
+        let inner = r * 0.6;
+        let reach = (r + 0.10 + 0.10 * t).min(0.46);
+        let lift = crown + 0.05 + 0.30 * t;
+        // Two-segment blade: up from the bulb, then tipped outward.
+        let elbow = [0.5 + ca * inner, lift * 0.55, 0.5 + sa * inner];
+        let tip = [0.5 + ca * reach, lift, 0.5 + sa * reach];
+        let w = 0.045 - 0.015 * t;
+        let root = [0.5 + ca * inner * 0.3, w * 0.5, 0.5 + sa * inner * 0.3];
+        emit_beam(&mut mesh, root, elbow, w, w, -1);
+        emit_beam(&mut mesh, elbow, tip, w, w * 0.6, -1);
+    }
+    mesh
+}
+
+/// Tomato/berry/pepper: a wiry vine stem, two foliage blades, and fruit
+/// pods that pop in above `t = 0.55` (a discrete monotonic step).
+fn build_vine_fruit(spec: &Crop3dSpec) -> ExtrudedMesh {
+    let mut mesh = ExtrudedMesh::new();
+    let t = growth_fraction(spec);
+    let lean = lean_dir(spec, 0x400, 0.05);
+    let h = 0.30 + 0.55 * t;
+    let stem_top = [0.5 + lean[0], h, 0.5 + lean[2]];
+    // Wiry stem: slight S-curve via a mid-joint; the base ring sits half a
+    // width up so the stem bottom lands on y = 0.
+    let mid = [0.5 - lean[2] * 0.5, h * 0.5, 0.5 + lean[0] * 0.5];
+    emit_beam(&mut mesh, [0.5, 0.02, 0.5], mid, 0.04, 0.04, -1);
+    emit_beam(&mut mesh, mid, stem_top, 0.04, 0.04, -1);
+    // Two foliage blades at the mid joint and crown.
+    for (i, at) in [mid, stem_top].iter().enumerate() {
+        let a = spec_jitter(spec, 0x500 + i as u64) * 8.0;
+        let eighth = (a as u32 & 7) as f32 * (PI * 0.25);
+        let tip = [
+            at[0] + eighth.cos() * 0.16,
+            at[1] + 0.06 + 0.08 * t,
+            at[2] + eighth.sin() * 0.16,
+        ];
+        emit_beam(&mut mesh, *at, tip, 0.06, 0.02, -1);
+    }
+    // Fruit pods: three distinct berries emerge in the upper stages.
+    if t > 0.55 {
+        for i in 0..3u64 {
+            let a = spec_jitter(spec, 0x600 + i) * 8.0;
+            let eighth = (a as u32 & 7) as f32 * (PI * 0.25);
+            let pod_r = 0.05 + 0.04 * (t - 0.55);
+            let cy = h * (0.55 + 0.15 * i as f32) - pod_r;
+            let cx = stem_top[0] + eighth.cos() * 0.14;
+            let cz = stem_top[2] + eighth.sin() * 0.14;
+            push_box(
+                &mut mesh,
+                [cx - pod_r, cy.max(0.02), cz - pod_r],
+                [
+                    (cx + pod_r).min(0.98),
+                    (cy + pod_r * 2.0).min(0.98),
+                    (cz + pod_r).min(0.98),
+                ],
+                1,
+            );
+        }
+    }
+    mesh
+}
+
+// ---------------------------------------------------------------------------
+// 0.5-texel outward ore vein relief
+// ---------------------------------------------------------------------------
+
+/// Outward relief depth for ore vein texels: half a sprite texel
+/// (`0.5 / 16`), subtle enough to keep the vanilla silhouette while making
+/// the mineral flecks read as real geometry.
+pub const ORE_RELIEF_DEPTH: f32 = 0.5 / 16.0;
+
+/// Maps a face-local relief plate (`x = u`, `y = 1 - v`, `z` outward from
+/// the block surface) onto block space for `dir`, returning the
+/// `(rotation, translation)` pair for [`ExtrudedMesh::affine`]. Every
+/// rotation is a proper 90-degree grid rotation (determinant `+1`), so
+/// winding and outwardness survive untouched.
+fn ore_relief_transform(dir: Direction) -> ([[f32; 3]; 3], [f32; 3]) {
+    match dir {
+        // Face y=1: u -> +x, v -> +z, outward +y.
+        Direction::Up => (
+            [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]],
+            [0.0, 1.0, 1.0],
+        ),
+        // Face y=0: u -> 1-x, v -> +z, outward -y.
+        Direction::Down => (
+            [[-1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, -1.0, 0.0]],
+            [1.0, 0.0, 1.0],
+        ),
+        // Face z=0: u -> 1-x, v -> 1-y, outward -z.
+        Direction::North => (
+            [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]],
+            [1.0, 0.0, 0.0],
+        ),
+        // Face z=1: u -> +x, v -> 1-y, outward +z.
+        Direction::South => (
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [0.0, 0.0, 1.0],
+        ),
+        // Face x=0: u -> +z, v -> 1-y, outward -x.
+        Direction::West => (
+            [[0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
+            [0.0; 3],
+        ),
+        // Face x=1: u -> 1-z, v -> 1-y, outward +x.
+        Direction::East => (
+            [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]],
+            [1.0, 0.0, 1.0],
+        ),
+    }
+}
+
+/// Builds the 0.5-texel outward relief mesh for an ore block.
+///
+/// `vein_mask` is a `16x16` face-space occupancy grid (`vein_mask[v * 16 +
+/// u]`, row 0 = texture top) describing which texels carry mineral vein art.
+/// Every non-zero texel is extruded outward by [`ORE_RELIEF_DEPTH`] on each
+/// face whose bit is set in `exposed_faces` (a [`Direction::bit`] mask, so
+/// `Down = 1 << 0 .. East = 1 << 5`). Faces not set emit zero quads — strict
+/// hidden-face culling. An empty mask or an `exposed_faces` of `0` fails
+/// closed to an empty mesh.
+///
+/// Per face the plate is greedy-merged exactly like the sprite extruder:
+/// one front quad per merged vein span, one rim quad per boundary run, and
+/// no inner face (the base cube already owns that plane, so nothing
+/// z-fights). UVs stay in sprite space so the raised pixels keep their
+/// exact texture footprint.
+pub fn build_3d_ore_relief(vein_mask: &[u8; 256], exposed_faces: u8) -> ExtrudedMesh {
+    let mut mesh = ExtrudedMesh::new();
+    if exposed_faces & 0x3f == 0 {
+        return mesh;
+    }
+    // Occupancy follows the caller's non-zero convention, not the sprite
+    // alpha cutoff: any vein intensity raises a fleck.
+    let mut mask = [0u8; 256];
+    for i in 0..256 {
+        mask[i] = u8::from(vein_mask[i] != 0) * 255;
+    }
+    if !mask.iter().any(|&a| a != 0) {
+        return mesh;
+    }
+    for dir in Direction::ALL {
+        if exposed_faces & dir.bit() == 0 {
+            continue;
+        }
+        let mut plate = extrude_alpha_mask_16x16(&mask, ORE_RELIEF_DEPTH);
+        // Drop the inner face quads: they sit coplanar with the base cube
+        // face and only cause depth fighting.
+        plate.quads.retain(|q| q.normal[2] > -0.5);
+        let (m, t) = ore_relief_transform(dir);
+        plate.affine(m, [0.0; 3], t);
+        mesh.append(&plate);
+    }
+    mesh
+}
+
+// ---------------------------------------------------------------------------
+// Mesh fingerprinting
+// ---------------------------------------------------------------------------
+
+/// Deterministic FNV-1a fingerprint over every quad's positions, UVs and
+/// `tint_index` — the stable pin used by golden-hash tests to detect any
+/// drift in generated crop or relief geometry.
+pub fn mesh_fingerprint(mesh: &ExtrudedMesh) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    let mut feed = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(PRIME);
+        }
+    };
+    for q in &mesh.quads {
+        for p in &q.positions {
+            for &c in p {
+                feed(&c.to_bits().to_ne_bytes());
+            }
+        }
+        for uv in &q.uv {
+            for &c in uv {
+                feed(&c.to_bits().to_ne_bytes());
+            }
+        }
+        feed(&q.tint_index.to_ne_bytes());
+    }
+    h
 }

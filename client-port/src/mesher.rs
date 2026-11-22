@@ -34,10 +34,11 @@ use crate::classic_ores::{
 };
 use crate::section::Direction;
 use crate::vanilla_plus_3d::{
-    build_3d_cross_mesh, build_3d_crystal_mesh, build_3d_fixture_mesh, build_3d_ladder_mesh,
-    build_3d_moon_mesh, build_3d_rail_mesh, build_3d_sun_mesh, vanilla_plus_decision,
-    BlockModelHint, CrossLayout, CrystalStage, ExtrudedMesh, FixtureKind, MeshUpgradeDecision,
-    RailShape, VanillaPlus3dConfig, VanillaPlusCategory,
+    build_3d_crop_mesh, build_3d_cross_mesh, build_3d_crystal_mesh, build_3d_fixture_mesh,
+    build_3d_ladder_mesh, build_3d_moon_mesh, build_3d_ore_relief, build_3d_rail_mesh,
+    build_3d_sun_mesh, vanilla_plus_decision, BlockModelHint, Crop3dSpec, CrossLayout,
+    CrystalStage, ExtrudedMesh, FixtureKind, MeshUpgradeDecision, RailShape, VanillaPlus3dConfig,
+    VanillaPlusCategory,
 };
 use crate::vanilla_plus_nature::{
     classify_leaf_block, classify_wind_sway_block, LeafParticleStyle, NatureModRegistry,
@@ -155,6 +156,16 @@ pub struct BlockVisualInput<'a> {
     /// `16x16` sprite alpha mask for cross extrusion; `None` extrudes the
     /// full sprite quad.
     pub cross_alpha: Option<&'a [u8; 256]>,
+    /// Procedural 3D crop spec. `Some` routes eligible `CropsAndFlora`
+    /// blocks to [`build_3d_crop_mesh`] instead of the generic cross-plane
+    /// extrusion; `None` preserves the existing cross fallback.
+    pub crop_3d: Option<Crop3dSpec>,
+    /// `16x16` ore-vein occupancy mask for the 0.5-texel outward relief;
+    /// `None` (or a non-ore block) emits no relief geometry.
+    pub ore_vein_mask: Option<&'a [u8; 256]>,
+    /// 6-bit exposed-face mask ([`Direction::bit`] order) limiting which ore
+    /// faces get relief. Defaults to `0x3F` (all faces exposed).
+    pub exposed_faces: u8,
     /// Lunar phase `0..=7` (vanilla order) for a `moon` celestial id.
     pub moon_phase: u8,
     /// Ore sprite pixel width; only `16` is restylable.
@@ -204,6 +215,9 @@ impl<'a> Default for BlockVisualInput<'a> {
             crystal_stage: None,
             cross_layout: None,
             cross_alpha: None,
+            crop_3d: None,
+            ore_vein_mask: None,
+            exposed_faces: 0x3F,
             moon_phase: 0,
             ore_texture_width: CLASSIC_ORE_DIM,
             ore_texture_height: CLASSIC_ORE_DIM,
@@ -402,7 +416,16 @@ pub fn evaluate_block_visual_pipeline(
         out.upgrade_decision =
             vanilla_plus_decision(three_d, input.block_id, &hint, distance_blocks);
         if let MeshUpgradeDecision::Upgrade3d(category) = out.upgrade_decision {
-            out.upgrade_mesh = Some(build_upgrade_mesh(input, category));
+            let mesh = build_upgrade_mesh(input, category);
+            // An upgrade that emits zero quads (an ore without a vein mask,
+            // a fully transparent cross sprite) is indistinguishable from
+            // vanilla, so it reports no override and the result stays
+            // `is_vanilla()`.
+            if mesh.quads.is_empty() {
+                out.upgrade_decision = MeshUpgradeDecision::Use2dVanilla;
+            } else {
+                out.upgrade_mesh = Some(mesh);
+            }
         }
     }
 
@@ -472,9 +495,17 @@ fn build_upgrade_mesh(input: &BlockVisualInput, category: VanillaPlusCategory) -
     let path = block_path(input.block_id);
     match category {
         VanillaPlusCategory::CropsAndFlora => {
-            let alpha = input.cross_alpha.unwrap_or(&FULL_ALPHA_MASK);
-            build_3d_cross_mesh(alpha, cross_layout_for(path, input), input.block_pos)
+            if let Some(spec) = input.crop_3d {
+                build_3d_crop_mesh(&spec)
+            } else {
+                let alpha = input.cross_alpha.unwrap_or(&FULL_ALPHA_MASK);
+                build_3d_cross_mesh(alpha, cross_layout_for(path, input), input.block_pos)
+            }
         }
+        VanillaPlusCategory::Ores3dRelief => input
+            .ore_vein_mask
+            .map(|mask| build_3d_ore_relief(mask, input.exposed_faces))
+            .unwrap_or_default(),
         VanillaPlusCategory::CrystalsAndClusters => build_3d_crystal_mesh(
             input.crystal_stage.unwrap_or_else(|| crystal_stage_for(path)),
             input.facing,
