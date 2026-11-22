@@ -2606,6 +2606,818 @@ fn player_command_targets(target: &str, source: Option<&Arc<Client>>) -> Vec<Arc
         .collect()
 }
 
+// ---------------------------------------------------------------- /item (#225)
+/// Vanilla 1.21.1 `SlotArgument` names for a player-style entity, mapped to
+/// this server's window-0 slot keys. `hotbar.N` (0..8) lands in the hotbar
+/// band 36..44 and `inventory.N` (0..26) in the main band 9..35 — the two can
+/// never collide — while `container.N` walks the raw `Inventory` index the way
+/// Vanilla resolves it on a player (0..8 hotbar, 9..35 main, 36..39 armor in
+/// Vanilla order feet→legs→chest→head, 40 offhand).
+fn entity_window_slot(spec: &str, held: i16) -> Option<i16> {
+    Some(match spec {
+        "weapon.mainhand" => 36 + held,
+        "weapon.offhand" => 45,
+        "armor.head" => 5,
+        "armor.chest" => 6,
+        "armor.legs" => 7,
+        "armor.feet" => 8,
+        _ => {
+            if let Some(n) = spec
+                .strip_prefix("hotbar.")
+                .and_then(|v| v.parse::<i16>().ok())
+            {
+                (0..=8).contains(&n).then_some(36 + n)?
+            } else if let Some(n) = spec
+                .strip_prefix("inventory.")
+                .and_then(|v| v.parse::<i16>().ok())
+            {
+                (0..=26).contains(&n).then_some(9 + n)?
+            } else {
+                let n = spec
+                    .strip_prefix("container.")
+                    .and_then(|v| v.parse::<i16>().ok())?;
+                match n {
+                    0..=8 => 36 + n,
+                    9..=35 => n,
+                    36..=39 => 44 - n,
+                    40 => 45,
+                    _ => return None,
+                }
+            }
+        }
+    })
+}
+
+// ---------------------------------------------------- chat components (#225)
+/// JSON text-component fields that serialize as TAG_Byte flags on the wire.
+const COMPONENT_BOOL_KEYS: &[&str] = &[
+    "bold",
+    "italic",
+    "underlined",
+    "strikethrough",
+    "obfuscated",
+];
+
+/// Convert one parsed JSON value into its wire component tag: strings stay
+/// TAG_String, objects become compounds (nested objects and `extra`/`with`
+/// arrays recurse), and arrays decode like Vanilla's Gson path — the first
+/// element is the base component and the rest append as `extra` siblings.
+/// Scalar/non-component input degrades to literal text rather than failing.
+fn text_component_tag(value: &J) -> Option<ExecTag> {
+    match value {
+        J::Str(text) => Some(ExecTag::String(NbtString::text(text))),
+        J::Num(n) => Some(ExecTag::String(NbtString::text(&n.to_string()))),
+        J::Null => Some(ExecTag::String(NbtString::text(""))),
+        J::Obj(fields) => {
+            let mut compound = std::collections::BTreeMap::new();
+            for (name, field) in fields {
+                if matches!(field, J::Null) {
+                    continue;
+                }
+                let tag = if COMPONENT_BOOL_KEYS.contains(&name.as_str()) {
+                    let on = match field {
+                        J::Num(n) => *n != 0.0,
+                        J::Str(s) => s == "true",
+                        _ => continue,
+                    };
+                    ExecTag::Byte(i8::from(on))
+                } else {
+                    match field {
+                        J::Arr(items) => {
+                            let mut elements = Vec::new();
+                            for item in items {
+                                elements.push(text_component_tag(item)?);
+                            }
+                            exec_tag_homogeneous_list(elements)
+                        }
+                        _ => text_component_tag(field)?,
+                    }
+                };
+                compound.insert(NbtString::text(name), tag);
+            }
+            Some(ExecTag::Compound(compound))
+        }
+        J::Arr(items) => {
+            let mut base = match items.first() {
+                Some(first) => text_component_tag(first)?,
+                None => ExecTag::String(NbtString::text("")),
+            };
+            let rest: Option<Vec<ExecTag>> =
+                items[1..].iter().map(text_component_tag).collect();
+            let rest = rest?;
+            if rest.is_empty() {
+                return Some(base);
+            }
+            if let ExecTag::String(text) = base {
+                let mut compound = std::collections::BTreeMap::new();
+                compound.insert(NbtString::text("text"), ExecTag::String(text));
+                base = ExecTag::Compound(compound);
+            }
+            if let ExecTag::Compound(fields) = &mut base {
+                let existing =
+                    fields.entry(NbtString::text("extra")).or_insert_with(|| {
+                        ExecTag::List(0, Vec::new())
+                    });
+                if let ExecTag::List(kind, elements) = existing {
+                    for tag in rest {
+                        if *kind == 0 && elements.is_empty() {
+                            *kind = tag.id();
+                        } else if tag.id() != *kind {
+                            // Java NBT lists are homogeneous; a mixed
+                            // component list keeps every element under a
+                            // singleton compound like NbtOps does.
+                            let mut wrapped = Vec::new();
+                            for element in std::mem::take(elements) {
+                                wrapped.push(exec_tag_wrap(element));
+                            }
+                            *elements = wrapped;
+                            *kind = 10;
+                            elements.push(exec_tag_wrap(tag));
+                            continue;
+                        }
+                        elements.push(tag);
+                    }
+                }
+                Some(base)
+            } else {
+                let mut compound = std::collections::BTreeMap::new();
+                compound.insert(
+                    NbtString::text("extra"),
+                    exec_tag_homogeneous_list(rest),
+                );
+                Some(ExecTag::Compound(compound))
+            }
+        }
+    }
+}
+
+/// Wrap one tag into a singleton compound (`{ "": tag }`) — the escape hatch
+/// Java's NbtOps uses to keep a TAG_Compound list homogeneous.
+fn exec_tag_wrap(tag: ExecTag) -> ExecTag {
+    let mut wrapped = std::collections::BTreeMap::new();
+    wrapped.insert(NbtString(Vec::new()), tag);
+    ExecTag::Compound(wrapped)
+}
+
+/// A TAG_List whose element id is the first element's tag (0 when empty);
+/// a heterogeneous set is re-normalized the way `nbt::registry_json_to_nbt`
+/// lists are, wrapping non-uniform members into singleton compounds.
+fn exec_tag_homogeneous_list(mut elements: Vec<ExecTag>) -> ExecTag {
+    let kind = elements.first().map_or(0u8, ExecTag::id);
+    if elements.iter().any(|tag| tag.id() != kind) {
+        elements = elements.into_iter().map(exec_tag_wrap).collect();
+        return ExecTag::List(10, elements);
+    }
+    ExecTag::List(kind, elements)
+}
+
+/// Serialize a `/tellraw`/`/title` JSON text-component argument into the
+/// anonymous-NBT form protocol 767 carries: compounds go through
+/// `nbt::write_network_nbt`, a literal component becomes a bare TAG_String.
+/// Unparseable input degrades to literal text exactly like before.
+fn text_component_nbt(input: &str) -> Vec<u8> {
+    let Some(value) = jparse(input.as_bytes()) else {
+        // The previous flat extractor stays the degradation path: for plain
+        // text it emits the identical `{"text":...}` compound, and for
+        // malformed JSON it keeps whatever fields it can find.
+        return json_component_nbt(input);
+    };
+    match text_component_tag(&value) {
+        Some(tag @ ExecTag::Compound(_)) => {
+            nbt::write_network_nbt(&tag).unwrap_or_else(|_| chat_nbt(input))
+        }
+        Some(ExecTag::String(s)) => s
+            .to_utf8()
+            .map_or_else(|_| chat_nbt(input), |text| nbt_string(&text)),
+        _ => chat_nbt(input),
+    }
+}
+
+/// Reduce a text component to literal text — a `{"text":...}` object yields
+/// its text, a JSON string itself, anything else the raw input. Used where
+/// the live model stores plain names (summon `CustomName`).
+fn component_literal_text(input: &str) -> String {
+    match jparse(input.as_bytes()) {
+        Some(value @ J::Obj(_)) => value
+            .get("text")
+            .map(|t| t.str().to_owned())
+            .unwrap_or_else(|| input.to_owned()),
+        Some(J::Str(s)) => s,
+        _ => input.to_owned(),
+    }
+}
+
+// ---------------------------------------------------------- /effect (#225)
+/// `/effect` state for non-player targets. Players keep effects on the
+/// `Client` record; a mob has no such field, so command-applied effects live
+/// here keyed by entity id. `Eff.left` follows the same never-zero
+/// convention as players (`i32::MAX` stores `infinite`).
+fn mob_command_effects() -> &'static Mutex<HashMap<i32, Vec<Eff>>> {
+    static EFFECTS: OnceLock<Mutex<HashMap<i32, Vec<Eff>>>> = OnceLock::new();
+    EFFECTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `/effect` with the non-player half of `<targets>` (#225).
+/// `run_effect_command` resolves players only; a `m:<eid>` selector result
+/// lands here — instant effects act on the mob's health, sustained ones enter
+/// `mob_command_effects` and reach tracking clients through the same
+/// entity-effect / remove-effect packets Vanilla sends.
+fn run_effect_command_parity(args: &[&str], me: Option<&Arc<Client>>) -> String {
+    let sub = args.first().copied().unwrap_or("");
+    let sel = args.get(1).copied().unwrap_or("@s");
+    let targets = if sel.starts_with('@') {
+        resolve_selector(sel, me)
+    } else {
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|c| c.name == sel)
+            .map(|c| vec![c.eid.to_string()])
+            .unwrap_or_default()
+    };
+    let mob_eids: Vec<i32> = targets
+        .iter()
+        .filter_map(|t| t.strip_prefix("m:")?.parse().ok())
+        .collect();
+    if mob_eids.is_empty() {
+        return run_effect_command(args, me);
+    }
+    // Validate exactly like run_effect_command before touching mob state: a
+    // rejected command fails for every target, not just the player half.
+    match sub {
+        "give" => {
+            let ename = args.get(2).copied().unwrap_or("");
+            let Some(effect) = name_to_effect(ename) else {
+                return format!("unknown effect '{ename}'");
+            };
+            let (secs, infinite) = match args.get(3) {
+                None => (30, false),
+                Some(&"infinite") => (0, true),
+                Some(raw) => match raw.parse::<i32>() {
+                    Ok(s) if (1..=1_000_000).contains(&s) => (s, false),
+                    _ => return format!("Invalid duration '{raw}'"),
+                },
+            };
+            let amp = match args.get(4) {
+                None => 0,
+                Some(raw) => match raw.parse::<i32>() {
+                    Ok(a) if (0..=255).contains(&a) => a,
+                    _ => return format!("Invalid amplifier '{raw}'"),
+                },
+            };
+            let hide = match args.get(5) {
+                None => false,
+                Some(&"true") => true,
+                Some(&"false") => false,
+                Some(raw) => return format!("Invalid hideParticles '{raw}'"),
+            };
+            if args.len() > 6 {
+                return "usage: /effect give <targets> <effect> [infinite|<seconds>] [<amplifier>] [<hideParticles>]".into();
+            }
+            let ticks = if infinite {
+                i32::MAX
+            } else {
+                secs * TICKS_PER_SECOND as i32
+            };
+            // Drop entries for mobs that no longer exist so the map cannot
+            // grow one stale record per summoned-and-killed entity.
+            {
+                let live: HashSet<i32> = mobs()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .map(|m| m.eid)
+                    .collect();
+                mob_command_effects()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|eid, _| live.contains(eid));
+            }
+            let mut touched = 0usize;
+            let mut applied: Vec<(i32, Vec<u8>)> = Vec::new();
+            for eid in &mob_eids {
+                let mob = mobs()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .find(|m| m.eid == *eid)
+                    .cloned();
+                let Some(mob) = mob else { continue };
+                match effect {
+                    // instant_health heals, instant_damage hurts — the same
+                    // mechanical application the player branch performs.
+                    5 => {
+                        let max = entity_spec_by_id(mob.etype)
+                            .map(|spec| spec.max_health)
+                            .unwrap_or(20.0);
+                        let mut hp = mob.hp.lock().unwrap_or_else(|e| e.into_inner());
+                        *hp = (*hp + 4.0 * (amp + 1) as f32).min(max);
+                    }
+                    6 => {
+                        let dead = {
+                            let mut hp =
+                                mob.hp.lock().unwrap_or_else(|e| e.into_inner());
+                            *hp -= 6.0 * (amp + 1) as f32;
+                            *hp <= 0.0
+                        };
+                        if dead {
+                            let (x, y, z) = {
+                                let p = mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+                                (p.0, p.1, p.2)
+                            };
+                            kill_mob(*eid, mob.etype, x, y, z);
+                        }
+                    }
+                    _ => {
+                        {
+                            let mut store = mob_command_effects()
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            let list = store.entry(*eid).or_default();
+                            list.retain(|e| e.id != effect);
+                            list.push(Eff {
+                                id: effect,
+                                amp,
+                                left: ticks,
+                            });
+                        }
+                        applied.push((
+                            *eid,
+                            entity_effect_pkt_flags(
+                                *eid,
+                                effect,
+                                amp,
+                                if infinite { -1 } else { ticks },
+                                hide,
+                            ),
+                        ));
+                    }
+                }
+                touched += 1;
+            }
+            // The player half applies through the shared path; the reply just
+            // names the combined touch count Vanilla reports.
+            let _ = run_effect_command(args, me);
+            let cls = client_snapshot();
+            let player_touched = targets
+                .iter()
+                .filter(|t| cls.iter().any(|c| c.eid.to_string() == **t))
+                .count();
+            for (eid, pkt) in &applied {
+                broadcast_seen(*eid, |_c| (0x76, pkt.clone()));
+            }
+            format!("Applied effect to {} target(s)", player_touched + touched)
+        }
+        "clear" => {
+            let ename = args.get(2).copied().unwrap_or("");
+            let want: Option<i32> = if ename.is_empty() {
+                None
+            } else {
+                match name_to_effect(ename) {
+                    Some(effect) => Some(effect),
+                    None => return format!("unknown effect '{ename}'"),
+                }
+            };
+            let mut touched = 0usize;
+            for eid in &mob_eids {
+                if mobs()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .all(|m| m.eid != *eid)
+                {
+                    continue;
+                }
+                let gone: Vec<i32> = {
+                    let mut store = mob_command_effects()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let list = store.entry(*eid).or_default();
+                    let removed: Vec<i32> = list
+                        .iter()
+                        .filter(|e| want.map(|w| w == e.id).unwrap_or(true))
+                        .map(|e| e.id)
+                        .collect();
+                    list.retain(|e| want.map(|w| w != e.id).unwrap_or(false));
+                    removed
+                };
+                for id in gone {
+                    broadcast_seen(*eid, move |_c| {
+                        (0x43, remove_effect_pkt(*eid, id))
+                    });
+                }
+                touched += 1;
+            }
+            let _ = run_effect_command(args, me);
+            let cls = client_snapshot();
+            let player_touched = targets
+                .iter()
+                .filter(|t| cls.iter().any(|c| c.eid.to_string() == **t))
+                .count();
+            format!(
+                "Cleared effects from {} target(s)",
+                player_touched + touched
+            )
+        }
+        _ => run_effect_command(args, me),
+    }
+}
+
+// ---------------------------------------------------------- /summon (#225)
+/// Merge one `/summon` SNBT compound into a freshly spawned mob — Vanilla's
+/// `Entity#load` applied to the live record. Fields with live homes
+/// (`Health`, `Pos`, `Motion`, `Air`, `Fire`, `Tags`, equipment) land through
+/// the shared `/data` writer; `CustomName` additionally feeds the name-tag
+/// store so the metadata packet renders it; `active_effects` feeds the
+/// command-effect store; the rest are filed as entity extras (`NoAI`,
+/// `Silent`, `Invulnerable`, `PersistenceRequired`, arbitrary keys).
+fn summon_apply_mob_nbt(mob: &Arc<Mob>, tag: &ExecTag) {
+    let ExecTag::Compound(fields) = tag else {
+        return;
+    };
+    let entity = ExecuteEntity::Mob(mob.clone());
+    for (key, value) in fields {
+        let Ok(name) = key.to_utf8() else {
+            continue;
+        };
+        match name.as_str() {
+            "CustomName" => {
+                if let Some(raw) = value
+                    .string()
+                    .and_then(|s| s.to_utf8().ok())
+                {
+                    let text = component_literal_text(&raw);
+                    mob_custom_names()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(mob.eid, text.clone());
+                    broadcast_mob_custom_name(mob.eid, &text);
+                }
+            }
+            "active_effects" => summon_apply_mob_effects(mob.eid, value),
+            _ => {}
+        }
+        data_apply_entity_field(&entity, &name, value);
+    }
+}
+
+/// The `active_effects` list of a summon compound — Vanilla writes
+/// `{id:"minecraft:x", amplifier:N, duration:N}` per entry; a negative or
+/// missing duration stores the never-expiring sentinel like `infinite`.
+fn summon_apply_mob_effects(eid: i32, value: &ExecTag) {
+    let Some(entries) = value.list() else {
+        return;
+    };
+    let mut parsed = Vec::new();
+    for entry in entries {
+        let Some(name) = entry
+            .get("id")
+            .and_then(ExecTag::string)
+            .and_then(|s| s.to_utf8().ok())
+        else {
+            continue;
+        };
+        let Some(id) = name_to_effect(&name) else {
+            continue;
+        };
+        let amp = entry
+            .get("amplifier")
+            .and_then(data_nbt_f64)
+            .unwrap_or(0.0) as i32;
+        let left = entry
+            .get("duration")
+            .and_then(data_nbt_f64)
+            .map(|v| v as i32)
+            .filter(|v| *v >= 0)
+            .unwrap_or(i32::MAX);
+        parsed.push(Eff { id, amp, left });
+    }
+    if !parsed.is_empty() {
+        mob_command_effects()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(eid)
+            .or_default()
+            .extend(parsed);
+    }
+}
+
+// ----------------------------------------------------------- /clear (#225)
+/// One `/clear` component test — `[k]` requires the component, `[!k]` forbids
+/// it, `[k=v]` compares it.
+enum ClearCompTest {
+    Has(String),
+    Lacks(String),
+    Equals(String, String),
+}
+
+/// The component names the inventory model can store and therefore compare;
+/// `/clear` fails closed on any other key instead of over-matching.
+fn clear_component_key(raw: &str) -> Result<String, String> {
+    let key = raw.trim().trim_start_matches("minecraft:").to_owned();
+    match key.as_str() {
+        "custom_name" | "enchantments" | "unbreakable" | "lore" | "custom_data"
+        | "damage" | "max_damage" | "repair_cost" | "max_stack_size"
+        | "potion_contents" => Ok(key),
+        _ => Err(format!("Unknown component '{key}'")),
+    }
+}
+
+fn clear_component_type(key: &str) -> i64 {
+    match key {
+        "custom_name" => COMP_CUSTOM_NAME,
+        "enchantments" => COMP_ENCHANTMENTS,
+        "unbreakable" => COMP_UNBREAKABLE,
+        "lore" => COMP_LORE,
+        "custom_data" => COMP_CUSTOM_DATA,
+        "damage" => COMP_DAMAGE,
+        "max_damage" => COMP_MAX_DAMAGE,
+        "potion_contents" => COMP_POTION_CONTENTS,
+        "repair_cost" => 16,
+        "max_stack_size" => 1,
+        _ => i64::MIN,
+    }
+}
+
+/// Parse the `item[predicate]` argument of `/clear`: the item id plus the
+/// component tests the `[k=v,!k,k]` body names.
+fn clear_item_filter(arg: &str) -> Result<(i64, Vec<ClearCompTest>), String> {
+    let (name, predicate) = match arg.split_once('[') {
+        Some((name, rest)) => match rest.strip_suffix(']') {
+            Some(body) => (name, Some(body)),
+            None => return Err(format!("Invalid item predicate '{arg}'")),
+        },
+        None => (arg, None),
+    };
+    let Some(item) = name_to_item(name) else {
+        return Err(format!("Unknown item '{name}'"));
+    };
+    let mut tests = Vec::new();
+    if let Some(body) = predicate {
+        for part in body.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if let Some(key) = part.strip_prefix('!') {
+                tests.push(ClearCompTest::Lacks(clear_component_key(key)?));
+            } else if let Some((key, value)) = part.split_once('=') {
+                tests.push(ClearCompTest::Equals(
+                    clear_component_key(key)?,
+                    value.trim().trim_matches(['\'', '"']).to_owned(),
+                ));
+            } else {
+                tests.push(ClearCompTest::Has(clear_component_key(part)?));
+            }
+        }
+    }
+    Ok((item, tests))
+}
+
+/// The literal text stored inside a `COMP_CUSTOM_NAME` payload
+/// (`nbt_string`'s `[8][len][mutf8]` blob), or `None` when malformed.
+fn decode_comp_name(data: &[u8]) -> Option<String> {
+    if data.len() < 3 || data[0] != 8 {
+        return None;
+    }
+    let len = usize::from(u16::from_be_bytes([data[1], data[2]]));
+    if data.len() < 3 + len {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&data[3..3 + len]).into_owned())
+}
+
+/// Whether one stored stack satisfies every `/clear` component test.
+fn clear_stack_matches(stack: &Stack, tests: &[ClearCompTest]) -> bool {
+    let present = |key: &str| comp_get(&stack.2, clear_component_type(key)).is_some();
+    tests.iter().all(|test| match test {
+        ClearCompTest::Has(key) => present(key),
+        ClearCompTest::Lacks(key) => !present(key),
+        ClearCompTest::Equals(key, value) => match key.as_str() {
+            "custom_name" => comp_get(&stack.2, COMP_CUSTOM_NAME)
+                .and_then(decode_comp_name)
+                .map(|stored| {
+                    component_literal_text(&stored) == component_literal_text(value)
+                })
+                .unwrap_or(false),
+            "damage" | "max_damage" | "repair_cost" | "max_stack_size" => value
+                .parse::<i64>()
+                .ok()
+                .is_some_and(|v| comp_varint(&stack.2, clear_component_type(key)) == Some(v)),
+            "enchantments" => {
+                let have = enchantments_get(&stack.2);
+                let inner = value.trim().trim_start_matches('{').trim_end_matches('}');
+                if inner.trim().is_empty() {
+                    return present(key);
+                }
+                inner.split(',').all(|entry| {
+                    let entry = entry.trim();
+                    let Some((name, level)) = entry.rsplit_once(':') else {
+                        return enchant_id(entry.trim_matches(['\'', '"']))
+                            .is_some_and(|id| have.iter().any(|(x, _)| *x == id));
+                    };
+                    match (
+                        enchant_id(name.trim().trim_matches(['\'', '"'])),
+                        level.trim().parse::<i64>(),
+                    ) {
+                        (Some(id), Ok(lvl)) => have.contains(&(id, lvl)),
+                        _ => false,
+                    }
+                })
+            }
+            _ => present(key),
+        },
+    })
+}
+
+/// `/clear [<targets>] [<item>[predicate]] [<maxCount>]` (#225): the item
+/// argument accepts a `[component]` predicate, and `maxCount = 0` is Vanilla's
+/// dry-run that counts without removing (the shared
+/// `run_clear_command` keeps the plain-argument path byte-identical).
+fn run_clear_command_parity(args: &[&str], me: Option<&Arc<Client>>) -> String {
+    // The component-aware path is only needed for `item[predicate]` item
+    // arguments or an item-shaped first token; the plain grammar delegates
+    // to the shared implementation unchanged.
+    let has_predicate = args.iter().any(|a| a.contains('['));
+    let item_shaped_first = args
+        .first()
+        .map(|a| {
+            !a.starts_with('@')
+                && name_to_item(a.split('[').next().unwrap_or(a)).is_some()
+        })
+        .unwrap_or(false);
+    if !has_predicate && !item_shaped_first {
+        return run_clear_command(args, me);
+    }
+    if args.len() > 3 {
+        return "usage: /clear [target] [item] [maxCount]".into();
+    }
+    // Vanilla's first positional argument is the entity argument; an
+    // item-shaped first token is a player lookup that fails — but before it
+    // fails it must not clear an unfiltered inventory either. The `me`
+    // fallback keeps the bare `/clear` and `/clear <item>` console paths.
+    let (targets, item_arg, count_arg): (Vec<String>, Option<&str>, Option<&str>) =
+        match args {
+            [] => (
+                me.map(|c| vec![c.eid.to_string()]).unwrap_or_default(),
+                None,
+                None,
+            ),
+            [first, rest @ ..] if first.starts_with('@') => (
+                resolve_selector(first, me),
+                rest.first().copied(),
+                rest.get(1).copied(),
+            ),
+            [first, rest @ ..] => {
+                let item_shaped = name_to_item(first.split('[').next().unwrap_or(first)).is_some();
+                if item_shaped {
+                    (
+                        me.map(|c| vec![c.eid.to_string()]).unwrap_or_default(),
+                        Some(*first),
+                        rest.first().copied(),
+                    )
+                } else {
+                    let found = clients()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .iter()
+                        .find(|c| c.name == *first)
+                        .map(|c| vec![c.eid.to_string()])
+                        .unwrap_or_default();
+                    (found, rest.first().copied(), rest.get(1).copied())
+                }
+            }
+        };
+    let want = match item_arg {
+        Some(arg) => match clear_item_filter(arg) {
+            Ok(filter) => Some(filter),
+            Err(error) => return error,
+        },
+        None => None,
+    };
+    let max = match count_arg {
+        Some(count) => match count.parse::<u32>() {
+            Ok(value) => Some(value),
+            Err(_) => return "Invalid maximum count".into(),
+        },
+        None => None,
+    };
+    let mut removed = 0i64;
+    let cls: Vec<Arc<Client>> = client_snapshot();
+    for t in &targets {
+        if let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) {
+            let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
+            let keys: Vec<i16> = inv
+                .iter()
+                .filter(|(_, stack)| {
+                    want.as_ref()
+                        .map(|(item, tests)| {
+                            stack.0 == *item && clear_stack_matches(stack, tests)
+                        })
+                        .unwrap_or(true)
+                })
+                .map(|(&k, _)| k)
+                .collect();
+            let mut player_removed = 0u32;
+            for k in keys {
+                let (it, cnt, comps) = inv[&k].clone();
+                let take = if max == Some(0) {
+                    u32::from(cnt)
+                } else {
+                    max.map(|m| u32::from(cnt).min(m.saturating_sub(player_removed)))
+                        .unwrap_or(u32::from(cnt))
+                };
+                if take == 0 {
+                    break;
+                }
+                player_removed += take;
+                removed += i64::from(take);
+                if max != Some(0) {
+                    if take == u32::from(cnt) {
+                        inv.remove(&k);
+                    } else {
+                        inv.insert(k, (it, cnt - take as u8, comps));
+                    }
+                }
+            }
+            // resync window 0 so the client drops the cleared items
+            let mut q = vec![0u8];
+            write_varint(&mut q, 0);
+            write_varint(&mut q, 46);
+            for i in 0..46i16 {
+                let (it2, c2, cc2) = inv.get(&i).cloned().unwrap_or((0, 0, Vec::new()));
+                q.extend_from_slice(&slot_wire(&(it2, c2, cc2)));
+            }
+            q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
+            if let Ok(mut w) = c.sock.lock() {
+                let _ = send_packet(&mut w, 0x13, q);
+            }
+        }
+    }
+    format!("Cleared {} item(s)", removed)
+}
+
+// ------------------------------------------------------- /attribute (#225)
+/// `/attribute` accepts Vanilla 1.21.1's operation ids
+/// (`add_value`/`add_multiplied_base`/`add_multiplied_total`); the shared
+/// store kept the pre-1.21 spellings, so the parity layer translates them
+/// (the legacy spellings stay accepted — a strict superset).
+fn run_attribute_command_parity(args: &[&str], me: Option<&Arc<Client>>) -> String {
+    let mut translated: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+    if translated.len() == 7 && translated[2] == "modifier" && translated[3] == "add" {
+        translated[6] = match translated[6].as_str() {
+            "add_value" => "add",
+            "add_multiplied_base" => "multiply_base",
+            "add_multiplied_total" => "multiply",
+            other => other,
+        }
+        .to_owned();
+    }
+    let args: Vec<&str> = translated.iter().map(String::as_str).collect();
+    run_attribute_command(&args, me)
+}
+
+/// Whether a `PersistenceRequired` flag was filed on the entity (a `/summon`
+/// tag or `/data merge`) — the mark Vanilla's `Mob#persistenceRequired`
+/// consults before a peaceful-difficulty despawn.
+fn mob_is_persistent(eid: i32) -> bool {
+    data_entity_extras()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&format!("e:{eid}"))
+        .and_then(|tag| tag.get("PersistenceRequired"))
+        .and_then(data_nbt_f64)
+        .is_some_and(|v| v != 0.0)
+}
+
+/// `/damage <target> <amount> [<damageType>] [at <pos>|by <entity> [from
+/// <cause>]]` (#225). The shared `run_damage_command` already resolves the
+/// `by`/`from` entity arguments and the damage type; the `at` clause needs
+/// the strictness Vanilla's Vec3 argument has — a malformed coordinate fails
+/// instead of silently parsing as 0.
+fn run_damage_command_parity(
+    ctx: &CmdCtx,
+    args: &[&str],
+    me: Option<&Arc<Client>>,
+) -> String {
+    if let ["at", x, y, z] = args.get(3..).unwrap_or_default() {
+        let strict = |tok: &str, base: f64| -> bool {
+            if let Some(off) = tok.strip_prefix('~') {
+                off.parse::<f64>().map(|v| base + v).unwrap_or(base)
+            } else {
+                tok.parse::<f64>()
+                    .unwrap_or(f64::NAN)
+            }
+            .is_finite()
+        };
+        if !strict(x, ctx.x) || !strict(y, ctx.y) || !strict(z, ctx.z) {
+            return "Invalid damage source position".into();
+        }
+    }
+    run_damage_command(ctx, args, me)
+}
+
 fn run_experience_command(args: &[&str], source: Option<&Arc<Client>>) -> String {
     if let ["query", target, unit @ ("points" | "levels")] = args {
         let targets = player_command_targets(target, source);
@@ -2621,7 +3433,15 @@ fn run_experience_command(args: &[&str], source: Option<&Arc<Client>>) -> String
             progress: session.xp_bar.1,
             total_experience: 0,
         };
-        let amount = if *unit == "levels" { xp.query_experience_levels() } else { xp.query_experience_points() };
+        // Vanilla's ExperienceCommands.queryExperience reports
+        // `experienceLevel` for levels and
+        // `Math.round(experienceProgress * getXpNeededForNextLevel())` for
+        // points — round, not floor.
+        let amount = if *unit == "levels" {
+            xp.query_experience_levels()
+        } else {
+            (xp.progress * xp.points_to_next_level() as f32).round() as i32
+        };
         return format!("{} has {} experience {}", player.name, amount, unit);
     }
     let [action @ ("add" | "set"), target, amount, units @ ..] = args else {
@@ -4702,6 +5522,7 @@ fn set_difficulty(difficulty: u8) {
                 .filter(|mob| {
                     entity_category_1211(mob.etype) == EntityMobCategory::Monster
                         && !matches!(mob.etype, 31 | 119) // Ender Dragon and Wither persist in Peaceful.
+                        && !mob_is_persistent(mob.eid) // `PersistenceRequired` mobs persist too.
                 })
                 .map(|mob| mob.eid)
                 .collect();
@@ -6447,21 +7268,7 @@ fn loot_table_pools(id: &str) -> Option<Vec<LootPool>> {
 /// `/loot <slot>` spec shared by the `replace` targets — the same window-0
 /// keys `/item` understands.
 fn loot_slot_of(spec: &str, held: i16) -> Option<i16> {
-    Some(match spec {
-        "weapon.mainhand" => 36 + held,
-        "weapon.offhand" => 45,
-        "armor.head" => 5,
-        "armor.chest" => 6,
-        "armor.legs" => 7,
-        "armor.feet" => 8,
-        _ => {
-            let n = spec
-                .strip_prefix("hotbar.")
-                .or_else(|| spec.strip_prefix("inventory."))
-                .or_else(|| spec.strip_prefix("container."))?;
-            n.parse::<i16>().ok().map(|x| 9 + x)?
-        }
-    })
+    entity_window_slot(spec, held)
 }
 
 /// Give a stack to a player exactly like `/give`: merge into a matching
@@ -7277,8 +8084,8 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             });
             "Stopping the server".into()
         }
-        "clear" => run_clear_command(&args, me),
-        "effect" => run_effect_command(&args, me),
+        "clear" => run_clear_command_parity(&args, me),
+        "effect" => run_effect_command_parity(&args, me),
         "xp" | "experience" => run_experience_command(&args, me),
         "setblock" => {
             if args.len() < 4 {
@@ -7375,26 +8182,85 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             format!("Set block at {} {} {} in {}", x, y, z, dim.dimension_id())
         }
         "summon" => {
-            if args.len() < 4 {
-                return "usage: /summon <entity> x y z".into();
-            }
-            let Some(etype) = name_to_etype(args[0]) else {
-                return format!("Unknown entity {}", args[0]);
+            // /summon <entity> [<x> <y> <z>] [<nbt>] — coordinates default to
+            // the executor position and a trailing {snbt} merges into the
+            // fresh entity the way Vanilla's Entity#load does.
+            let Some(raw_name) = args.first() else {
+                return "usage: /summon <entity> [<x> <y> <z>] [<nbt>]".into();
             };
-            let (x, y, z) = (coord(args[1], ctx.x), coord(args[2], ctx.y), coord(args[3], ctx.z));
+            let Some(etype) = name_to_etype(raw_name) else {
+                return format!("Unknown entity {}", raw_name);
+            };
+            let rest = &args[1..];
+            let (x, y, z, nbt_text) = match rest {
+                [] => (ctx.x, ctx.y, ctx.z, None),
+                [tag] if tag.starts_with('{') => (ctx.x, ctx.y, ctx.z, Some(*tag)),
+                [a, b, c] => (
+                    coord(a, ctx.x),
+                    coord(b, ctx.y),
+                    coord(c, ctx.z),
+                    None,
+                ),
+                [a, b, c, tag] if tag.starts_with('{') => (
+                    coord(a, ctx.x),
+                    coord(b, ctx.y),
+                    coord(c, ctx.z),
+                    Some(*tag),
+                ),
+                _ => {
+                    return "usage: /summon <entity> [<x> <y> <z>] [<nbt>]".into()
+                }
+            };
             if ![x, y, z].into_iter().all(f64::is_finite)
                 || x.abs() >= 30_000_000.0 || z.abs() >= 30_000_000.0 || y.abs() > 30_000_000.0
             {
                 return "Invalid summon position".into();
             }
+            let nbt = match nbt_text {
+                Some(text) => {
+                    let mut reader = brigadier::StringReader::new(text);
+                    match execute_read_snbt(&mut reader, 0) {
+                        Some(tag @ ExecTag::Compound(_)) if !reader.can_read() => {
+                            Some(tag)
+                        }
+                        _ => return format!("Invalid entity data '{text}'"),
+                    }
+                }
+                None => None,
+            };
             let dim = cmd_dim(ctx);
             if etype == 106 && dim == DimId::Overworld {
                 let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                primed().lock().unwrap_or_else(|e| e.into_inner()).push(Primed { eid, x, y, z, left: server_ticks(TNT_FUSE_GT) as i32 });
-            } else if !insert_live_mob(etype, dim, (x, y, z, 0.0, 0.0), default_mob_hp(args[0]), None) {
-                return "mob cap reached".into();
+                let fuse = nbt
+                    .as_ref()
+                    .and_then(|tag| tag.get("fuse").or_else(|| tag.get("Fuse")))
+                    .and_then(data_nbt_f64)
+                    .map_or(TNT_FUSE_GT, |v| v.max(0.0) as u64);
+                primed().lock().unwrap_or_else(|e| e.into_inner()).push(Primed { eid, x, y, z, left: server_ticks(fuse) as i32 });
+            } else {
+                // A Health tag wins over the per-type default the way
+                // Entity#load does; the summon path keeps the mob Arc so the
+                // rest of the SNBT can merge into the live record.
+                let hp = nbt
+                    .as_ref()
+                    .and_then(|tag| tag.get("Health"))
+                    .and_then(data_nbt_f64)
+                    .map(|v| v as f32)
+                    .unwrap_or_else(|| default_mob_hp(raw_name));
+                let mob = {
+                    let mut live = mobs().lock().unwrap_or_else(|e| e.into_inner());
+                    if live.len() >= MOB_CAP {
+                        return "mob cap reached".into();
+                    }
+                    let mob = new_live_mob(etype, dim, (x, y, z, 0.0, 0.0), hp, None);
+                    live.push(mob.clone());
+                    mob
+                };
+                if let Some(tag) = &nbt {
+                    summon_apply_mob_nbt(&mob, tag);
+                }
             }
-            format!("Summoned {}", args[0])
+            format!("Summoned {}", raw_name)
         }
         "give" => {
             // /give <target> <item>[comps] [count] — the item arg may carry a
@@ -7493,20 +8359,11 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             // /item modify|replace entity <sel> <slot> <modifier|with item>
             //            block <x> <y> <z> <slot> ...
             // slots (window-0 keys): weapon.mainhand, weapon.offhand,
-            // armor.head|chest|legs|feet, hotbar.N, inventory.N, container.N
+            // armor.head|chest|legs|feet, hotbar.N, inventory.N, container.N —
+            // `entity_window_slot` keeps the hotbar (36..44) and inventory
+            // (9..35) bands disjoint.
             let slot_of = |sp: &str, held: i16| -> Option<i16> {
-                Some(match sp {
-                    "weapon.mainhand" => 36 + held,
-                    "weapon.offhand" => 45,
-                    "armor.head" => 5, "armor.chest" => 6,
-                    "armor.legs" => 7, "armor.feet" => 8,
-                    _ => {
-                        {
-                            let n = sp.strip_prefix("hotbar.").or_else(|| sp.strip_prefix("inventory.")).or_else(|| sp.strip_prefix("container."))?;
-                            n.parse::<i16>().ok().map(|x| 9 + x)?
-                        }
-                    }
-                })
+                entity_window_slot(sp, held)
             };
             let Some(action) = args.first().copied() else { return "usage: /item modify|replace ...".into() };
             match action {
@@ -7653,49 +8510,69 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         "loot" => run_loot_command(ctx, &args, me),
         "playsound" => playsound_command(ctx, &args, me),
         "title" => {
-            if args.len() < 3 { return "usage: /title <targets> title|subtitle|actionbar|times <text>".into(); }
-            // /title <targets> title|subtitle|actionbar|times <text|i s o>
-            let targets = resolve_selector(args.first().copied().unwrap_or(""), me);
-            let mode = args.get(1).copied().unwrap_or("title");
-            let text = args.get(2..).unwrap_or_default().join(" ");
-            let pkt_id: i64 = match mode { "title" => 0x65, "subtitle" => 0x63, "actionbar" => 0x4c, _ => -1 };
-            if mode == "times" {
-                let (a, b, c): (i32, i32, i32) = (args.get(2).and_then(|v| v.parse().ok()).unwrap_or(10),
-                                 args.get(3).and_then(|v| v.parse().ok()).unwrap_or(70),
-                                 args.get(4).and_then(|v| v.parse().ok()).unwrap_or(20));
-                let mut p = Vec::new();
-                p.extend_from_slice(&a.to_be_bytes()); p.extend_from_slice(&b.to_be_bytes()); p.extend_from_slice(&c.to_be_bytes());
+            // /title <targets> title|subtitle|actionbar <json>
+            //        | times <fadeIn> <stay> <fadeOut> | clear | reset
+            let (Some(&sel), Some(&mode)) = (args.first(), args.get(1)) else {
+                return "usage: /title <targets> title|subtitle|actionbar|times|clear|reset ...".into();
+            };
+            let targets = resolve_selector(sel, me);
+            let send_to = |packet: i64, payload: &Vec<u8>| -> usize {
                 let mut n = 0;
                 for e in &targets {
                     let found = clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c2| c2.eid.to_string() == *e).cloned();
                     if let Some(c2) = found {
-                        if let Ok(mut w) = c2.sock.lock() { let _ = send_packet(&mut w, 0x66, p.clone()); n += 1; }
+                        if let Ok(mut w) = c2.sock.lock() { let _ = send_packet(&mut w, packet, payload.clone()); n += 1; }
                     }
                 }
-                return format!("Set title times for {} player(s)", n);
-            }
-            if pkt_id < 0 { return "usage: /title <targets> title|subtitle|actionbar|times <text>".into() }
-            // accept raw json {"text":".."} or plain text
-            let txt = if text.starts_with('{') {
-                jstr(&text, "text").unwrap_or(&text).to_string() } else { text };
-            let payload = chat_nbt(&txt);
-            let mut n = 0;
-            for e in &targets {
-                let found = clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c2| c2.eid.to_string() == *e).cloned();
-                    if let Some(c2) = found {
-                    if let Ok(mut w) = c2.sock.lock() { let _ = send_packet(&mut w, pkt_id, payload.clone()); n += 1; }
+                n
+            };
+            match mode {
+                "clear" | "reset" => {
+                    if args.len() > 2 {
+                        return "usage: /title <targets> clear|reset".into();
+                    }
+                    // 0x0f clear_titles carries a single `reset` flag.
+                    let n = send_to(0x0f, &vec![u8::from(mode == "reset")]);
+                    format!("{} title for {} player(s)",
+                        if mode == "reset" { "Reset" } else { "Cleared" }, n)
                 }
+                "times" => {
+                    if args.len() < 5 {
+                        return "usage: /title <targets> times <fadeIn> <stay> <fadeOut>".into();
+                    }
+                    let (a, b, c): (i32, i32, i32) = (args.get(2).and_then(|v| v.parse().ok()).unwrap_or(10),
+                                     args.get(3).and_then(|v| v.parse().ok()).unwrap_or(70),
+                                     args.get(4).and_then(|v| v.parse().ok()).unwrap_or(20));
+                    let mut p = Vec::new();
+                    p.extend_from_slice(&a.to_be_bytes()); p.extend_from_slice(&b.to_be_bytes()); p.extend_from_slice(&c.to_be_bytes());
+                    let n = send_to(0x66, &p);
+                    format!("Set title times for {} player(s)", n)
+                }
+                "title" | "subtitle" | "actionbar" => {
+                    if args.len() < 3 {
+                        return "usage: /title <targets> title|subtitle|actionbar <json>".into();
+                    }
+                    // A structured JSON component serializes verbatim; plain
+                    // text still decodes to the same `{"text":...}` form.
+                    let text = args.get(2..).unwrap_or_default().join(" ");
+                    let payload = text_component_nbt(&text);
+                    let pkt_id: i64 = match mode { "title" => 0x65, "subtitle" => 0x63, _ => 0x4c };
+                    let n = send_to(pkt_id, &payload);
+                    format!("Title {} to {} player(s)", mode, n)
+                }
+                _ => "usage: /title <targets> title|subtitle|actionbar|times|clear|reset ...".into(),
             }
-            format!("Title {} to {} player(s)", mode, n)
         }
         "particle" => particle_command(ctx, &args, me),
         "spreadplayers" => spreadplayers_command(ctx, &args, me),
         "trigger" => run_trigger_command(&args, me),
-        "attribute" => run_attribute_command(&args, me),
+        "attribute" => run_attribute_command_parity(&args, me),
         "tellraw" => {
-            // /tellraw <targets> <json-component>
+            // /tellraw <targets> <json-component> — the component argument
+            // parses as JSON (text/color/bold/…/extra/translate) and falls
+            // back to literal text on a parse failure.
             let targets = resolve_selector(args.first().copied().unwrap_or(""), me);
-            let payload = json_component_nbt(&args[1..].join(" "));
+            let payload = text_component_nbt(&args[1..].join(" "));
             let mut n = 0;
             for e in &targets {
                 let found = clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.eid.to_string() == *e).cloned();
@@ -7707,19 +8584,36 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             format!("Sent to {} player(s)", n)
         }
         "stopsound" => {
-            // /stopsound <targets> [source] [sound]
-            let targets = resolve_selector(args.first().copied().unwrap_or(""), me);
+            // /stopsound <targets> [*|<source>] [<sound>] — flags byte:
+            // 0x01 source present (varint id), 0x02 sound present (name).
+            if args.is_empty() || args.len() > 3 {
+                return "usage: /stopsound <targets> [*|<source>] [<sound>]".into();
+            }
+            let src = args.get(1).copied().unwrap_or("");
             let snd = args.get(2).copied().unwrap_or("");
+            let source_id = if src.is_empty() || src == "*" {
+                None
+            } else {
+                match SOUNDSOURCE_IDS.iter().find(|(name, _)| *name == src) {
+                    Some((_, id)) => Some(*id),
+                    None => return format!("Unknown sound source '{src}'"),
+                }
+            };
+            let targets = resolve_selector(args[0], me);
+            let mut p = Vec::new();
+            p.push(u8::from(source_id.is_some()) | (u8::from(!snd.is_empty()) << 1));
+            if let Some(id) = source_id {
+                write_varint(&mut p, id);
+            }
+            if !snd.is_empty() {
+                let sn = if snd.contains(':') { snd.to_string() } else { format!("minecraft:{}", snd) };
+                write_str(&mut p, &sn);
+            }
             let mut n = 0;
             for e in &targets {
                 let found = clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.eid.to_string() == *e).cloned();
                 if let Some(c) = found {
-                    let mut p = Vec::new();
-                    if snd.is_empty() { p.push(0u8); }
-                    else { p.push(2u8);
-                        let sn = if snd.contains(':') { snd.to_string() } else { format!("minecraft:{}", snd) };
-                        write_str(&mut p, &sn); }
-                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x6a, p); n += 1; }
+                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x6a, p.clone()); n += 1; }
                 }
             }
             format!("Stopped sound for {} player(s)", n)
@@ -7799,7 +8693,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             else { format!("{canonical} = {value}") }
         }
         "tag" => run_tag_command(&args, me),
-        "damage" => run_damage_command(ctx, &args, me),
+        "damage" => run_damage_command_parity(ctx, &args, me),
         "schedule" => {
             // schedule function <fn> <time>[t|s|d] — t=game ticks(20/s), s=seconds
             if args.first().copied() == Some("clear") {
@@ -9133,5 +10027,924 @@ mod w_brig_tests {
                 .kind(),
             brigadier::BrigadierErrorKind::UnknownRoot
         );
+    }
+}
+
+#[cfg(test)]
+mod issue225_parity_tests {
+    // Lane C225 — issue #225 player/entity command parity.
+    use super::*;
+    use std::io::Read;
+    use std::net::TcpStream;
+
+    fn c225_ctx(me: Option<Arc<Client>>) -> CmdCtx {
+        CmdCtx {
+            me,
+            x: 0.5,
+            y: 16.0,
+            z: 0.5,
+        }
+    }
+
+    fn c225_run(ctx: &CmdCtx, msg: &str) -> String {
+        run_command_ctx(ctx, msg, &mut None)
+    }
+
+    fn c225_client(eid: i32, name: &str) -> (Arc<Client>, TcpStream) {
+        let (mut client, receiver) = crate::effect_tests::client_pair();
+        client.eid = eid;
+        client.name = name.into();
+        (Arc::new(client), receiver)
+    }
+
+    /// One uncompressed frame: varint length, varint packet id, payload.
+    fn c225_frame(r: &mut TcpStream) -> Option<(i64, Vec<u8>)> {
+        let varint = |r: &mut TcpStream| -> Option<(i64, usize)> {
+            let mut value = 0i64;
+            for i in 0..5 {
+                let mut b = [0u8; 1];
+                r.read_exact(&mut b).ok()?;
+                value |= i64::from(b[0] & 0x7f) << (7 * i);
+                if b[0] & 0x80 == 0 {
+                    return Some((value, i + 1));
+                }
+            }
+            None
+        };
+        let (len, _) = varint(r)?;
+        let (id, used) = varint(r)?;
+        let mut payload = vec![0u8; (len as usize).checked_sub(used)?];
+        r.read_exact(&mut payload).ok()?;
+        Some((id, payload))
+    }
+
+    fn c225_remove_client(client: &Client) {
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|c| c.eid != client.eid);
+    }
+
+    // #225.1 — `hotbar.N` maps to the window-0 hotbar band 36..44 and
+    // `inventory.N` to the main band 9..35; the two can never collide and
+    // `container.N` walks the raw vanilla index (0..8 hotbar, 9..35 main,
+    // 36..39 armor feet→head, 40 offhand).
+    #[test]
+    fn item_slot_mapping_keeps_hotbar_and_inventory_disjoint() {
+        assert_eq!(entity_window_slot("hotbar.0", 3), Some(36));
+        assert_eq!(entity_window_slot("hotbar.8", 0), Some(44));
+        assert_eq!(entity_window_slot("inventory.0", 0), Some(9));
+        assert_eq!(entity_window_slot("inventory.26", 0), Some(35));
+        assert_eq!(entity_window_slot("container.0", 0), Some(36));
+        assert_eq!(entity_window_slot("container.8", 0), Some(44));
+        assert_eq!(entity_window_slot("container.9", 0), Some(9));
+        assert_eq!(entity_window_slot("container.35", 0), Some(35));
+        // Vanilla's armor index order is feet, legs, chest, head — reversed
+        // onto window slots 8..5.
+        assert_eq!(entity_window_slot("container.36", 0), Some(8));
+        assert_eq!(entity_window_slot("container.39", 0), Some(5));
+        assert_eq!(entity_window_slot("container.40", 0), Some(45));
+        assert_eq!(entity_window_slot("weapon.offhand", 0), Some(45));
+        assert_eq!(entity_window_slot("weapon.mainhand", 4), Some(40));
+        for bad in [
+            "hotbar.9",
+            "hotbar.-1",
+            "inventory.27",
+            "container.41",
+            "container.-1",
+            "hotbar.x",
+            "weapon",
+            "enderchest.0",
+        ] {
+            assert_eq!(entity_window_slot(bad, 0), None, "{bad}");
+        }
+        // `container.N` is Vanilla's raw inventory index and *aliases* the
+        // named ranges by design: 0..8 ↔ hotbar, 9..35 ↔ inventory,
+        // 36..39 ↔ armor feet→head, 40 ↔ offhand.
+        for n in 0..=8 {
+            assert_eq!(
+                entity_window_slot(&format!("container.{n}"), 0),
+                entity_window_slot(&format!("hotbar.{n}"), 0)
+            );
+        }
+        for n in 0..=26 {
+            assert_eq!(
+                entity_window_slot(&format!("container.{}", n + 9), 0),
+                entity_window_slot(&format!("inventory.{n}"), 0)
+            );
+        }
+        assert_eq!(
+            entity_window_slot("container.36", 0),
+            entity_window_slot("armor.feet", 0)
+        );
+        assert_eq!(
+            entity_window_slot("container.39", 0),
+            entity_window_slot("armor.head", 0)
+        );
+        assert_eq!(
+            entity_window_slot("container.40", 0),
+            entity_window_slot("weapon.offhand", 0)
+        );
+        // Every named slot across the *distinct* families lands on its own
+        // window-0 key — hotbar and inventory can never collide.
+        // (`weapon.mainhand` aliases hotbar.<held> — that is the point of the
+        // slot — and `container.*` aliases everything, so both are excluded
+        // from the uniqueness sweep.)
+        let mut seen = std::collections::HashMap::new();
+        for spec in (0..=8)
+            .map(|n| format!("hotbar.{n}"))
+            .chain((0..=26).map(|n| format!("inventory.{n}")))
+            .chain(
+                [
+                    "weapon.offhand",
+                    "armor.head",
+                    "armor.chest",
+                    "armor.legs",
+                    "armor.feet",
+                ]
+                .map(str::to_owned),
+            )
+        {
+            let slot = entity_window_slot(&spec, 0).expect(&spec);
+            let prev = seen.insert(slot, spec.clone());
+            assert!(
+                prev.is_none(),
+                "{spec} collides with {}",
+                prev.unwrap_or_default()
+            );
+        }
+    }
+
+    // #225.1 end-to-end — `/item replace` writes hotbar and inventory specs
+    // into their own bands, not the same slot.
+    #[test]
+    fn item_replace_writes_hotbar_and_inventory_to_different_slots() {
+        let ctx = c225_ctx(None);
+        let (client, _rx) = c225_client(7201, "c225-item");
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(client.clone());
+        let stone = name_to_item("stone").unwrap();
+        let dirt = name_to_item("dirt").unwrap();
+
+        assert_eq!(
+            c225_run(&ctx, "/item replace entity @a[name=c225-item] hotbar.0 with stone"),
+            "Replaced item on 1 target(s)"
+        );
+        assert_eq!(
+            c225_run(&ctx, "/item replace entity @a[name=c225-item] inventory.0 with dirt"),
+            "Replaced item on 1 target(s)"
+        );
+        assert_eq!(
+            c225_run(&ctx, "/item replace entity @a[name=c225-item] container.10 with stone 2"),
+            "Replaced item on 1 target(s)"
+        );
+        {
+            let inv = client.inv.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(inv.get(&36).map(|s| (s.0, s.1)), Some((stone, 1)));
+            assert_eq!(inv.get(&9).map(|s| (s.0, s.1)), Some((dirt, 1)));
+            assert_eq!(inv.get(&10).map(|s| (s.0, s.1)), Some((stone, 2)));
+        }
+        // An out-of-range spec is rejected rather than wrapped.
+        assert_eq!(
+            c225_run(&ctx, "/item replace entity @a[name=c225-item] inventory.27 with stone"),
+            "Replaced item on 0 target(s)"
+        );
+        c225_remove_client(&client);
+    }
+
+    // #225.4 — `/summon` without coordinates spawns at the executor position,
+    // and a trailing SNBT merges onto the live mob.
+    #[test]
+    fn summon_defaults_to_executor_position_and_applies_nbt() {
+        let ctx = c225_ctx(None);
+        let before = mobs().lock().unwrap_or_else(|e| e.into_inner()).len();
+        assert_eq!(
+            c225_run(&ctx, "/summon minecraft:zombie"),
+            "Summoned minecraft:zombie"
+        );
+        let mob = mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last()
+            .cloned()
+            .expect("summoned mob");
+        {
+            let pos = mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!((pos.0, pos.1, pos.2), (ctx.x, ctx.y, ctx.z));
+        }
+
+        assert_eq!(
+            c225_run(
+                &ctx,
+                "/summon minecraft:cow 5 64 5 {CustomName:\"Bessie\",Health:12,NoAI:1b,Invulnerable:1b,Silent:1b,PersistenceRequired:1b}"
+            ),
+            "Summoned minecraft:cow"
+        );
+        let cow = mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last()
+            .cloned()
+            .expect("named cow");
+        assert_eq!(
+            *cow.hp.lock().unwrap_or_else(|e| e.into_inner()),
+            12.0,
+            "Health tag overrides the type default"
+        );
+        assert_eq!(
+            mob_custom_names()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&cow.eid)
+                .cloned(),
+            Some("Bessie".to_owned())
+        );
+        let extras = data_entity_extras()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&format!("e:{}", cow.eid))
+            .cloned()
+            .expect("summon extras");
+        for key in ["NoAI", "Invulnerable", "Silent", "PersistenceRequired"] {
+            let value = extras
+                .get(key)
+                .and_then(data_nbt_f64)
+                .unwrap_or_default();
+            assert_eq!(value, 1.0, "{key}");
+        }
+
+        // A JSON CustomName reduces to its literal text.
+        assert_eq!(
+            c225_run(&ctx, "/summon minecraft:cow 6 64 6 {CustomName:'{\"text\":\"Json\"}'}"),
+            "Summoned minecraft:cow"
+        );
+        // An unbalanced compound is rejected by the tokenizer itself; a
+        // balanced-but-invalid one fails the SNBT parser.
+        assert!(c225_run(&ctx, "/summon minecraft:cow 6 64 6 {NoAI:").starts_with("Invalid command:"));
+        assert_eq!(
+            c225_run(&ctx, "/summon minecraft:cow 6 64 6 {Bogus}"),
+            "Invalid entity data '{Bogus}'"
+        );
+        // A bare tag-only form still defaults to the executor position.
+        assert_eq!(
+            c225_run(&ctx, "/summon minecraft:cow {NoAI:1b}"),
+            "Summoned minecraft:cow"
+        );
+
+        let spawned: Vec<i32> = mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .skip(before)
+            .map(|m| m.eid)
+            .collect();
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|m| !spawned.contains(&m.eid));
+        for eid in &spawned {
+            data_entity_extras()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&format!("e:{eid}"));
+            mob_custom_names()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(eid);
+        }
+    }
+
+    // #225.5 — `/title` clear and reset emit the protocol clear_titles packet
+    // with the reset flag, and the text subcommands carry the JSON component
+    // on the wire.
+    #[test]
+    fn title_clear_reset_and_json_component() {
+        let ctx = c225_ctx(None);
+        let (client, mut rx) = c225_client(7203, "c225-title");
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(client.clone());
+
+        assert_eq!(
+            c225_run(&ctx, "/title @a[name=c225-title] clear"),
+            "Cleared title for 1 player(s)"
+        );
+        let (id, payload) = c225_frame(&mut rx).expect("clear packet");
+        assert_eq!(id, 0x0f);
+        assert_eq!(payload, vec![0]);
+
+        assert_eq!(
+            c225_run(&ctx, "/title @a[name=c225-title] reset"),
+            "Reset title for 1 player(s)"
+        );
+        let (id, payload) = c225_frame(&mut rx).expect("reset packet");
+        assert_eq!(id, 0x0f);
+        assert_eq!(payload, vec![1]);
+
+        // A structured component serializes as an NBT compound carrying the
+        // style fields — not a bare {"text":...} literal.
+        assert_eq!(
+            c225_run(
+                &ctx,
+                "/title @a[name=c225-title] title {\"text\":\"Hi\",\"color\":\"red\",\"bold\":true}"
+            ),
+            "Title title to 1 player(s)"
+        );
+        let (id, payload) = c225_frame(&mut rx).expect("title packet");
+        assert_eq!(id, 0x65);
+        let tag = nbt::read_network_nbt(&mut payload.as_slice()).expect("compound payload");
+        assert_eq!(
+            tag.get("text")
+                .and_then(ExecTag::string)
+                .and_then(|s| s.to_utf8().ok()),
+            Some("Hi".to_owned())
+        );
+        assert_eq!(
+            tag.get("color")
+                .and_then(ExecTag::string)
+                .and_then(|s| s.to_utf8().ok()),
+            Some("red".to_owned())
+        );
+        assert_eq!(tag.get("bold"), Some(&ExecTag::Byte(1)));
+
+        // Plain text still arrives as a literal component.
+        assert_eq!(
+            c225_run(&ctx, "/title @a[name=c225-title] subtitle plain words"),
+            "Title subtitle to 1 player(s)"
+        );
+        let (id, payload) = c225_frame(&mut rx).expect("subtitle packet");
+        assert_eq!(id, 0x63);
+        let tag = nbt::read_network_nbt(&mut payload.as_slice()).expect("subtitle payload");
+        assert_eq!(
+            tag.get("text")
+                .and_then(ExecTag::string)
+                .and_then(|s| s.to_utf8().ok()),
+            Some("plain words".to_owned())
+        );
+        c225_remove_client(&client);
+    }
+
+    // #225.3 — `/effect give` accepts `infinite` + a hide-particles boolean for
+    // players, and applies sustained effects to non-player mob targets.
+    #[test]
+    fn effect_infinite_hidden_player_and_mob_targets() {
+        let ctx = c225_ctx(None);
+        let (client, mut rx) = c225_client(7204, "c225-eff");
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(client.clone());
+
+        assert_eq!(
+            c225_run(&ctx, "/effect give c225-eff speed infinite 1 true"),
+            "Applied effect to 1 target(s)"
+        );
+        {
+            let effs = client.effs.lock().unwrap_or_else(|e| e.into_inner());
+            let speed = effs.iter().find(|e| e.id == 0).expect("speed effect");
+            assert_eq!(speed.amp, 1);
+            assert_eq!(speed.left, i32::MAX, "infinite never expires");
+        }
+        let (id, payload) = c225_frame(&mut rx).expect("entity effect packet");
+        assert_eq!(id, 0x76);
+        let mut body = payload.as_slice();
+        assert_eq!(read_varint(&mut body), Some(7204));
+        assert_eq!(read_varint(&mut body), Some(0)); // speed wire id
+        assert_eq!(read_varint(&mut body), Some(1)); // amplifier
+        // -1 is the vanilla wire encoding for `infinite`.
+        assert_eq!(read_varint(&mut body).map(|v| v as u32 as i32), Some(-1));
+        assert_eq!(body, &[0x04], "hideParticles clears the 0x02 bit");
+
+        // Mob targets: summon a pig, then give it a sustained effect.
+        assert_eq!(
+            c225_run(&ctx, "/summon minecraft:pig 1 64 1"),
+            "Summoned minecraft:pig"
+        );
+        let mob = mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last()
+            .cloned()
+            .unwrap();
+        client
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(mob.eid);
+        assert_eq!(
+            c225_run(&ctx, "/effect give @e[type=pig] slowness 60 2 false"),
+            "Applied effect to 1 target(s)"
+        );
+        {
+            let store = mob_command_effects()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let list = store.get(&mob.eid).expect("mob effect entry");
+            let eff = list.iter().find(|e| e.id == 1).expect("slowness");
+            assert_eq!(eff.amp, 2);
+            assert_eq!(eff.left, 1200);
+        }
+        let (id, payload) = c225_frame(&mut rx).expect("mob effect packet");
+        assert_eq!(id, 0x76);
+        let mut body = payload.as_slice();
+        assert_eq!(read_varint(&mut body), Some(i64::from(mob.eid)));
+        assert_eq!(read_varint(&mut body), Some(1));
+        assert_eq!(read_varint(&mut body), Some(2));
+        assert_eq!(read_varint(&mut body), Some(1200));
+
+        // `effect clear` removes it and emits the remove packet.
+        assert_eq!(
+            c225_run(&ctx, "/effect clear @e[type=pig] slowness"),
+            "Cleared effects from 1 target(s)"
+        );
+        assert!(mob_command_effects()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&mob.eid)
+            .map(|l| l.is_empty())
+            .unwrap_or(true));
+        let (id, payload) = c225_frame(&mut rx).expect("remove packet");
+        assert_eq!(id, 0x43);
+        let mut body = payload.as_slice();
+        assert_eq!(read_varint(&mut body), Some(i64::from(mob.eid)));
+        assert_eq!(read_varint(&mut body), Some(1));
+
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|m| m.eid != mob.eid);
+        mob_command_effects()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&mob.eid);
+        c225_remove_client(&client);
+    }
+
+    // #225.2 — the 1.21.1 operation spellings `add_value`,
+    // `add_multiplied_base`, `add_multiplied_total` drive the shared modifier
+    // store alongside remove and `modifier value get`.
+    #[test]
+    fn attribute_modifier_accepts_1211_operation_names() {
+        let ctx = c225_ctx(None);
+        let (client, _rx) = c225_client(7205, "c225-attr");
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(client.clone());
+        let key = format!("p:{}", client.name);
+
+        assert_eq!(
+            c225_run(&ctx, "/attribute @a[name=c225-attr] generic.movement_speed base set 0.25"),
+            "Set base value of attribute generic.movement_speed for entity c225-attr to 0.25"
+        );
+        // legacy spellings still work
+        assert!(c225_run(
+            &ctx,
+            "/attribute @a[name=c225-attr] generic.movement_speed modifier add mcspine:legacy 0.25 add"
+        )
+        .starts_with("Added modifier"));
+        // vanilla 1.21.1 spellings
+        assert!(c225_run(
+            &ctx,
+            "/attribute @a[name=c225-attr] generic.movement_speed modifier add mcspine:mb 1.0 add_multiplied_base"
+        )
+        .starts_with("Added modifier"));
+        assert!(c225_run(
+            &ctx,
+            "/attribute @a[name=c225-attr] generic.movement_speed modifier add mcspine:mt 1.0 add_multiplied_total"
+        )
+        .starts_with("Added modifier"));
+        // (base + add) * (1 + multiply_base) * (1 + multiply_total)
+        // = (0.25 + 0.25) * 2 * 2 = 2 — powers of two keep the f64 exact.
+        assert_eq!(
+            c225_run(&ctx, "/attribute @a[name=c225-attr] generic.movement_speed get"),
+            "Value of attribute generic.movement_speed for entity c225-attr is 2"
+        );
+        assert_eq!(
+            c225_run(
+                &ctx,
+                "/attribute @a[name=c225-attr] generic.movement_speed modifier value get mcspine:mb"
+            ),
+            "Value of modifier mcspine:mb on attribute generic.movement_speed for entity c225-attr is 1"
+        );
+        assert!(c225_run(
+            &ctx,
+            "/attribute @a[name=c225-attr] generic.movement_speed modifier remove mcspine:mb"
+        )
+        .starts_with("Removed modifier"));
+        assert_eq!(
+            c225_run(&ctx, "/attribute @a[name=c225-attr] generic.movement_speed get"),
+            "Value of attribute generic.movement_speed for entity c225-attr is 1"
+        );
+
+        attr_modifiers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+        attrs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+        c225_remove_client(&client);
+    }
+
+    // #225.7 — `/experience query` reports the level and the rounded progress
+    // points, and the level↔total formulas match the vanilla ranges.
+    #[test]
+    fn experience_query_reports_level_and_rounded_progress() {
+        let ctx = c225_ctx(None);
+        let (client, _rx) = c225_client(7206, "c225-xp");
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(client.clone());
+        player_mechanism_sessions()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                client.eid,
+                PlayerMechanismSession {
+                    xp_bar: (10, 0.5),
+                    food_timer: 0,
+                    menus: Arc::new(LiveMenuConnection {
+                        active: Mutex::new(None),
+                        next_id: std::sync::atomic::AtomicU8::new(4),
+                        enchantment_seed: Mutex::new(0),
+                    }),
+                },
+            );
+
+        assert_eq!(
+            c225_run(&ctx, "/experience query c225-xp levels"),
+            "c225-xp has 10 experience levels"
+        );
+        // Level 10 needs 27 points to the next level; 0.5 progress rounds to
+        // 14 like Java's Math.round, not 13 like floor.
+        assert_eq!(
+            c225_run(&ctx, "/experience query c225-xp points"),
+            "c225-xp has 14 experience points"
+        );
+
+        // The exact vanilla total-XP formulas across the three ranges.
+        assert_eq!(xp_points_for_level(16), 352); // l*l + 6l
+        assert_eq!(xp_points_for_level(17), 394); // 2.5l² - 40.5l + 360
+        assert_eq!(xp_points_for_level(31), 1507);
+        assert_eq!(xp_points_for_level(32), 1628); // 4.5l² - 162.5l + 2220
+        assert_eq!(xp_needed_for_next_level(0), 7);
+        assert_eq!(xp_needed_for_next_level(15), 37);
+        assert_eq!(xp_needed_for_next_level(30), 112);
+
+        player_mechanism_sessions()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&client.eid);
+        c225_remove_client(&client);
+    }
+
+    // #225.6 — `/tellraw` carries a structured component: styles become byte
+    // flags, `extra`/`with` become component lists, `translate` stays a string.
+    #[test]
+    fn tellraw_serializes_structured_json_components() {
+        let ctx = c225_ctx(None);
+        let (client, mut rx) = c225_client(7207, "c225-tell");
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(client.clone());
+
+        assert_eq!(
+            c225_run(
+                &ctx,
+                "/tellraw @a[name=c225-tell] {\"text\":\"outer\",\"italic\":true,\"extra\":[{\"text\":\"inner\",\"color\":\"gold\"}]}"
+            ),
+            "Sent to 1 player(s)"
+        );
+        let (id, payload) = c225_frame(&mut rx).expect("tellraw packet");
+        assert_eq!(id, 0x6c);
+        // Trailing byte: overlay flag appended by the command.
+        assert_eq!(payload.last(), Some(&0));
+        let tag = nbt::read_network_nbt(&mut payload[..payload.len() - 1].as_ref())
+            .expect("component compound");
+        assert_eq!(
+            tag.get("text")
+                .and_then(ExecTag::string)
+                .and_then(|s| s.to_utf8().ok()),
+            Some("outer".to_owned())
+        );
+        assert_eq!(tag.get("italic"), Some(&ExecTag::Byte(1)));
+        let extra = tag.get("extra").and_then(ExecTag::list).expect("extra list");
+        let [sibling] = extra else {
+            panic!("one extra sibling, got {extra:?}")
+        };
+        assert_eq!(
+            sibling
+                .get("text")
+                .and_then(ExecTag::string)
+                .and_then(|s| s.to_utf8().ok()),
+            Some("inner".to_owned())
+        );
+        assert_eq!(
+            sibling
+                .get("color")
+                .and_then(ExecTag::string)
+                .and_then(|s| s.to_utf8().ok()),
+            Some("gold".to_owned())
+        );
+
+        // translate components keep their key and `with` arguments.
+        assert_eq!(
+            c225_run(
+                &ctx,
+                "/tellraw @a[name=c225-tell] {\"translate\":\"chat.type.text\",\"with\":[{\"text\":\"sender\"},{\"text\":\"hi\"}]}"
+            ),
+            "Sent to 1 player(s)"
+        );
+        let (id, payload) = c225_frame(&mut rx).expect("translate packet");
+        assert_eq!(id, 0x6c);
+        let tag = nbt::read_network_nbt(&mut payload[..payload.len() - 1].as_ref())
+            .expect("translate compound");
+        assert_eq!(
+            tag.get("translate")
+                .and_then(ExecTag::string)
+                .and_then(|s| s.to_utf8().ok()),
+            Some("chat.type.text".to_owned())
+        );
+        assert_eq!(
+            tag.get("with").and_then(ExecTag::list).map(|l| l.len()),
+            Some(2)
+        );
+        c225_remove_client(&client);
+    }
+
+    // #225.9 — `/clear` item predicates match component data, and a `maxCount`
+    // of 0 counts without removing.
+    #[test]
+    fn clear_matches_component_predicates_and_dry_counts() {
+        let ctx = c225_ctx(None);
+        let (client, _rx) = c225_client(7208, "c225-clear");
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(client.clone());
+        let stone = name_to_item("stone").unwrap();
+        {
+            let mut inv = client.inv.lock().unwrap_or_else(|e| e.into_inner());
+            inv.insert(
+                10,
+                (
+                    stone,
+                    4,
+                    vec![(
+                        COMP_CUSTOM_NAME,
+                        nbt_string("{\"text\":\"Named\"}"),
+                    )],
+                ),
+            );
+            inv.insert(11, (stone, 2, Vec::new()));
+        }
+
+        // Predicate only matches the named stack: dry count reports 4.
+        assert_eq!(
+            c225_run(&ctx, "/clear @a[name=c225-clear] stone[custom_name=\"Named\"] 0"),
+            "Cleared 4 item(s)"
+        );
+        {
+            let inv = client.inv.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(inv.get(&10).map(|s| s.1), Some(4), "dry count kept the stack");
+            assert_eq!(inv.get(&11).map(|s| s.1), Some(2));
+        }
+        // The component form of the name compares as a component.
+        assert_eq!(
+            c225_run(&ctx, "/clear @a[name=c225-clear] stone[custom_name='{\"text\":\"Named\"}'] 0"),
+            "Cleared 4 item(s)"
+        );
+        // A name that does not match removes nothing.
+        assert_eq!(
+            c225_run(&ctx, "/clear @a[name=c225-clear] stone[custom_name=\"Other\"] 0"),
+            "Cleared 0 item(s)"
+        );
+        // A real clear removes only the predicate-matching stack.
+        assert_eq!(
+            c225_run(&ctx, "/clear @a[name=c225-clear] stone[custom_name=\"Named\"]"),
+            "Cleared 4 item(s)"
+        );
+        {
+            let inv = client.inv.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(!inv.contains_key(&10));
+            assert_eq!(inv.get(&11).map(|s| s.1), Some(2));
+        }
+        // Unknown component keys fail closed instead of over-matching.
+        assert_eq!(
+            c225_run(&ctx, "/clear @a[name=c225-clear] stone[bogus_component=1]"),
+            "Unknown component 'bogus_component'"
+        );
+        c225_remove_client(&client);
+    }
+
+    // #225.8 — `/damage` accepts `at <pos>` and `by <entity> [from <cause>]`,
+    // fails closed on malformed positions, and requires single-entity sources.
+    #[test]
+    fn damage_accepts_at_and_by_source_clauses() {
+        let ctx = c225_ctx(None);
+        let (client, _rx) = c225_client(7209, "c225-dmg");
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(client.clone());
+        *client.hp.lock().unwrap_or_else(|e| e.into_inner()) = 20.0;
+
+        assert_eq!(
+            c225_run(&ctx, "/damage c225-dmg 5 generic at 0 64 0"),
+            "Applied 5 damage to 1 target(s)"
+        );
+        assert!(*client.hp.lock().unwrap_or_else(|e| e.into_inner()) < 20.0);
+        *client.hp.lock().unwrap_or_else(|e| e.into_inner()) = 20.0;
+        assert_eq!(
+            c225_run(&ctx, "/damage c225-dmg 5 generic by c225-dmg"),
+            "Applied 5 damage to 1 target(s)"
+        );
+        assert_eq!(
+            c225_run(&ctx, "/damage c225-dmg 5 generic by c225-dmg from c225-dmg"),
+            "Applied 5 damage to 1 target(s)"
+        );
+        assert_eq!(
+            c225_run(&ctx, "/damage c225-dmg 5 generic at bogus 64 0"),
+            "Invalid damage source position"
+        );
+        assert_eq!(
+            c225_run(&ctx, "/damage c225-dmg 5 generic by @a[name=nobody-here]"),
+            "Expected a single entity"
+        );
+        c225_remove_client(&client);
+    }
+
+    // #225.10 — `/stopsound` encodes the source filter and the sound name in
+    // the flags byte; `*` leaves the source open.
+    #[test]
+    fn stopsound_encodes_source_and_sound_filters() {
+        let ctx = c225_ctx(None);
+        let (client, mut rx) = c225_client(7210, "c225-stop");
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(client.clone());
+
+        // Sound only: flag 0x02 + the namespaced sound name.
+        assert_eq!(
+            c225_run(&ctx, "/stopsound @a[name=c225-stop] * minecraft:entity.pig.ambient"),
+            "Stopped sound for 1 player(s)"
+        );
+        let (id, payload) = c225_frame(&mut rx).expect("stopsound packet");
+        assert_eq!(id, 0x6a);
+        assert_eq!(payload[0], 0x02);
+
+        // Source only: flag 0x01 + the source varint (hostile = 5).
+        assert_eq!(
+            c225_run(&ctx, "/stopsound @a[name=c225-stop] hostile"),
+            "Stopped sound for 1 player(s)"
+        );
+        let (id, payload) = c225_frame(&mut rx).expect("source packet");
+        assert_eq!(id, 0x6a);
+        assert_eq!(payload, vec![0x01, 0x05]);
+
+        // Both filters set: 0x03, source id, then the sound name.
+        assert_eq!(
+            c225_run(&ctx, "/stopsound @a[name=c225-stop] ambient minecraft:ambient.cave"),
+            "Stopped sound for 1 player(s)"
+        );
+        let (id, payload) = c225_frame(&mut rx).expect("source+sound packet");
+        assert_eq!(id, 0x6a);
+        assert_eq!(payload[0], 0x03);
+        assert_eq!(payload[1], 0x08); // ambient = 8
+
+        // An unknown source fails closed.
+        assert_eq!(
+            c225_run(&ctx, "/stopsound @a[name=c225-stop] bogus"),
+            "Unknown sound source 'bogus'"
+        );
+        c225_remove_client(&client);
+    }
+
+    // #225.10 — `/particle` full form `dx dy dz speed count force` reaches
+    // force-range viewers while `normal` stays inside the 32-block bubble.
+    #[test]
+    fn particle_full_form_reaches_force_viewers() {
+        let ctx = c225_ctx(None);
+        let (viewer, mut rx) = c225_client(7211, "c225-pv");
+        *viewer.pos.lock().unwrap_or_else(|e| e.into_inner()) = (40.5, 16.0, 0.5, 0.0, 0.0, true);
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(viewer.clone());
+
+        assert_eq!(
+            c225_run(&ctx, "/particle minecraft:flame 0.5 16 0.5 0 0 0 0 5 force @a[name=c225-pv]"),
+            "Displayed 5 minecraft:flame"
+        );
+        let (id, _payload) = c225_frame(&mut rx).expect("particle packet");
+        assert_eq!(id, 0x29);
+
+        // normal mode has a 32-block bubble: a viewer 40 blocks out resolves
+        // to nobody and gets nothing.
+        assert_eq!(
+            c225_run(&ctx, "/particle minecraft:flame 0.5 16 0.5 0 0 0 0 5 normal @a[name=c225-pv]"),
+            "No players in range"
+        );
+        assert!(c225_frame(&mut rx).is_none(), "normal-range viewer gets nothing");
+        c225_remove_client(&viewer);
+    }
+
+    // #225.10 — `/playsound` explicit volume/pitch/minVolume land on the wire.
+    #[test]
+    fn playsound_writes_volume_pitch_min_volume() {
+        let ctx = c225_ctx(None);
+        let (client, mut rx) = c225_client(7212, "c225-snd");
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 16.0, 0.5, 0.0, 0.0, true);
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(client.clone());
+
+        assert_eq!(
+            c225_run(
+                &ctx,
+                "/playsound ambient.cave master @a[name=c225-snd] 0.5 16 0.5 2 0.5 0.1"
+            ),
+            "Played sound to 1 player(s)"
+        );
+        let (id, payload) = c225_frame(&mut rx).expect("playsound packet");
+        assert_eq!(id, 0x68);
+        // [sound varint = registry id + 1][source varint][x,y,z i32*3]
+        // [volume f32][pitch f32][seed i64]
+        let mut body = payload.as_slice();
+        assert_eq!(read_varint(&mut body), Some(9)); // ambient.cave + 1
+        assert_eq!(read_varint(&mut body), Some(0)); // master source
+        body = &body[12..]; // x,y,z fixed-point
+        let (volume, rest) = body.split_at(4);
+        assert_eq!(f32::from_be_bytes(volume.try_into().unwrap()), 2.0);
+        let (pitch, _) = rest.split_at(4);
+        assert_eq!(f32::from_be_bytes(pitch.try_into().unwrap()), 0.5);
+        c225_remove_client(&client);
+    }
+
+    // #225.11 — peaceful despawns hostile mobs but keeps `PersistenceRequired`
+    // and boss entities.
+    #[test]
+    fn difficulty_peaceful_keeps_persistent_and_boss_mobs() {
+        let ctx = c225_ctx(None);
+        // Two hostiles: one persistent, one not; plus the Wither boss.
+        assert_eq!(
+            c225_run(&ctx, "/summon minecraft:zombie 0 64 0 {PersistenceRequired:1b}"),
+            "Summoned minecraft:zombie"
+        );
+        assert_eq!(
+            c225_run(&ctx, "/summon minecraft:zombie 0 64 0"),
+            "Summoned minecraft:zombie"
+        );
+        assert_eq!(
+            c225_run(&ctx, "/summon minecraft:wither 0 64 0"),
+            "Summoned minecraft:wither"
+        );
+        let (persistent, ordinary, wither) = {
+            let live = mobs().lock().unwrap_or_else(|e| e.into_inner());
+            let mut it = live.iter().rev();
+            let wither = it.next().unwrap().eid;
+            let ordinary = it.next().unwrap().eid;
+            let persistent = it.next().unwrap().eid;
+            (persistent, ordinary, wither)
+        };
+        let prev_difficulty = DIFFICULTY.load(Ordering::Relaxed);
+        assert_eq!(
+            c225_run(&ctx, "/difficulty peaceful"),
+            "Set difficulty to peaceful"
+        );
+        {
+            let live = mobs().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                live.iter().any(|m| m.eid == persistent),
+                "PersistenceRequired mob survives peaceful"
+            );
+            assert!(
+                !live.iter().any(|m| m.eid == ordinary),
+                "plain hostile mob despawns on peaceful"
+            );
+            assert!(
+                live.iter().any(|m| m.eid == wither),
+                "Wither persists in peaceful"
+            );
+        }
+        // Restore and clean up.
+        DIFFICULTY.store(prev_difficulty, Ordering::Relaxed);
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|m| m.eid != persistent && m.eid != wither);
+        data_entity_extras()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&format!("e:{persistent}"));
     }
 }
