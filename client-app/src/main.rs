@@ -178,6 +178,7 @@ fn main() -> ExitCode {
             sink: cfg.audio_sink.clone(),
             assets_dir: cfg.assets_dir.clone(),
             asset_index: cfg.asset_index.clone(),
+            game_dir: cfg.game_dir.clone(),
             max_volume_cap: cfg.client_settings.qol.max_volume_cap,
             max_concurrent_same_sound: cfg.client_settings.qol.max_concurrent_same_sound,
             subtitle_path: None,

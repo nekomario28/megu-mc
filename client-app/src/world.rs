@@ -131,6 +131,12 @@ pub struct BlockTable {
     collision_shapes: Vec<Vec<u16>>,
     fluid_cells: Vec<FluidCell>,
     air_mask: Vec<bool>,
+    /// Per-state registry name (`"minecraft:oak_planks"`) when the table was
+    /// built from `block_states_1211.json`; empty in builtin fallback mode.
+    state_names: Vec<String>,
+    /// O(1) state→material table built once alongside `state_names`
+    /// (empty → StoneLike fallback in builtin mode).
+    acoustic_lut: crate::spatial_audio::AcousticMaterialLut,
     pub loaded_from_json: bool,
     pub source_path: Option<PathBuf>,
 }
@@ -192,6 +198,8 @@ impl BlockTable {
             collision_shapes,
             fluid_cells,
             air_mask,
+            state_names: Vec::new(),
+            acoustic_lut: crate::spatial_audio::AcousticMaterialLut::from_state_names(&[]),
             loaded_from_json: false,
             source_path: None,
         }
@@ -214,12 +222,14 @@ impl BlockTable {
         }
 
         let mut names: Vec<&str> = vec![""; count];
+        let mut owned_names: Vec<String> = vec![String::new(); count];
         let mut base_ids: Vec<u32> = vec![0; count];
         for (name, base, len) in &parsed.blocks {
             let start = *base as usize;
             let end = start.saturating_add(*len as usize).min(count);
             for idx in start..end {
                 names[idx] = name.as_str();
+                owned_names[idx] = name.clone();
                 base_ids[idx] = *base;
             }
         }
@@ -361,6 +371,8 @@ impl BlockTable {
             collision_shapes: parsed.collision_shapes,
             fluid_cells,
             air_mask,
+            acoustic_lut: crate::spatial_audio::AcousticMaterialLut::from_state_names(&owned_names),
+            state_names: owned_names,
             loaded_from_json: true,
             source_path: None,
         })
@@ -378,6 +390,32 @@ impl BlockTable {
             .get(state_id as usize)
             .copied()
             .unwrap_or(false)
+    }
+
+    /// Registry name for a block state (`"minecraft:oak_planks"`); `None`
+    /// for out-of-range states or the builtin fallback table.
+    pub fn state_name(&self, state_id: u32) -> Option<&str> {
+        self.state_names
+            .get(state_id as usize)
+            .map(String::as_str)
+            .filter(|n| !n.is_empty())
+    }
+
+    /// Number of global block states this table covers.
+    pub fn state_count(&self) -> usize {
+        self.mesh_blocks.len()
+    }
+
+    /// Per-state registry names indexed by state id (empty in builtin
+    /// fallback mode); bulk source for acoustic/material LUT construction.
+    pub fn state_names(&self) -> &[String] {
+        &self.state_names
+    }
+
+    /// The O(1) acoustic LUT built once when this table loaded — every
+    /// ray/snapshot query is a single indexed read, never a name scan.
+    pub fn acoustic_lut(&self) -> &crate::spatial_audio::AcousticMaterialLut {
+        &self.acoustic_lut
     }
 
     pub fn fluid_cell(&self, state_id: u32) -> FluidCell {

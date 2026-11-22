@@ -231,6 +231,39 @@ pub enum MaterialClass {
     Liquid,
 }
 
+impl MaterialClass {
+    /// Stable 1-byte code used by `WorldAcousticSnapshot` histograms so the
+    /// mixer and the GUI agree on which families dominate a scene without
+    /// re-classifying names.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Air => 0,
+            Self::StoneLike => 1,
+            Self::Metal => 2,
+            Self::Glass => 3,
+            Self::Wood => 4,
+            Self::Earth => 5,
+            Self::SoftAbsorber => 6,
+            Self::Liquid => 7,
+        }
+    }
+
+    /// Inverse of [`Self::code`]; out-of-range codes read as `Air` so a
+    /// truncated/older snapshot can never misclassify air as a solid.
+    pub const fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::StoneLike,
+            2 => Self::Metal,
+            3 => Self::Glass,
+            4 => Self::Wood,
+            5 => Self::Earth,
+            6 => Self::SoftAbsorber,
+            7 => Self::Liquid,
+            _ => Self::Air,
+        }
+    }
+}
+
 /// Per-material acoustic coefficients. Absorption and scattering follow the
 /// Sabine convention (`0.0` = perfectly reflective, `1.0` = perfectly
 /// absorptive/diffuse); `transmission_loss_db` is the broadband loss a direct
@@ -372,6 +405,15 @@ impl AcousticMaterial {
             "hopper",
             "minecart",
             "lodestone",
+            // Modded metal families: Create's brass, alloy steels, common
+            // ore metals. "casing" stays out — andesite_casing is stone.
+            "brass",
+            "bronze",
+            "steel",
+            "aluminum",
+            "aluminium",
+            "platinum",
+            "metal",
         ]) {
             MaterialClass::Metal
         } else if has(&[
@@ -441,6 +483,80 @@ impl AcousticMaterial {
     /// `true` when the block stops a DDA ray (everything except air/liquid).
     pub fn is_solid(&self) -> bool {
         !matches!(self.class, MaterialClass::Air | MaterialClass::Liquid)
+    }
+}
+
+/// O(1) `block_state_id -> AcousticMaterial` table built once when the block
+/// registry loads.
+///
+/// Vanilla block tags (`#minecraft:wool`, `#minecraft:leaves`,
+/// `#minecraft:planks`, `#minecraft:impermeable`, `#c:storage_blocks/iron`,
+/// `#minecraft:logs`...) resolve to the same keyword families
+/// [`AcousticMaterial::from_block_name`] encodes — and the name fallback
+/// keeps working for unknown Mod blocks (`create:brass_casing` → Metal,
+/// `biomesoplenty:maple_leaves` → SoftAbsorber,
+/// `chipped:stained_glass` → Glass). Classification runs once per state at
+/// build time, so the DDA raytracer and the snapshot histogram only ever do
+/// an indexed read.
+#[derive(Clone, Debug, Default)]
+pub struct AcousticMaterialLut {
+    materials: Vec<AcousticMaterial>,
+}
+
+impl AcousticMaterialLut {
+    /// Build the table from the per-state registry name slice; `names[i]`
+    /// must be the name of state `i` (empty string when unknown).
+    pub fn from_state_names(names: &[String]) -> Self {
+        Self {
+            materials: names
+                .iter()
+                .map(|n| {
+                    if n.is_empty() {
+                        // Never-named states (builtin fallback / sparse table)
+                        // behave like the dominant solid, matching the legacy
+                        // opaque-cube default — never air, which would let
+                        // rays pierce real walls.
+                        AcousticMaterial::from_class(MaterialClass::StoneLike)
+                    } else {
+                        AcousticMaterial::from_block_name(n)
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// Single state-name convenience constructor (tests, tiny tables).
+    pub fn from_names_iter<'a>(names: impl Iterator<Item = &'a str>) -> Self {
+        Self {
+            materials: names
+                .map(|n| {
+                    if n.is_empty() {
+                        AcousticMaterial::from_class(MaterialClass::StoneLike)
+                    } else {
+                        AcousticMaterial::from_block_name(n)
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// Material for `state_id`; out-of-range ids read as StoneLike.
+    #[inline]
+    pub fn get(&self, state_id: u32) -> AcousticMaterial {
+        self.materials
+            .get(state_id as usize)
+            .copied()
+            .unwrap_or_else(|| AcousticMaterial::from_class(MaterialClass::StoneLike))
+    }
+
+    /// Number of states the LUT covers.
+    pub fn len(&self) -> usize {
+        self.materials.len()
+    }
+
+    /// `true` when no registry names were supplied.
+    pub fn is_empty(&self) -> bool {
+        self.materials.is_empty()
     }
 }
 
@@ -1904,6 +2020,15 @@ impl SharedListenerFdnBus {
         let input = std::mem::take(&mut self.in_acc);
         self.fdn.step(input)
     }
+
+    /// Advance the shared FDN one sample on a pre-summed input (e.g. the
+    /// per-sample accumulator the mixer fills from every voice's wet send)
+    /// without touching [`Self::send`]/`in_acc`. The tail keeps decaying on
+    /// `step_input(0.0)` after the last voice finishes.
+    #[inline]
+    pub fn step_input(&mut self, input: f32) -> (f32, f32) {
+        self.fdn.step(input)
+    }
 }
 
 /// Direction buckets for automatic subtitle placement.
@@ -2023,6 +2148,9 @@ pub struct SpatialAudioEngine {
     az_rel: f32,
     distance_m: f32,
     base_delay: f32,
+    /// Vanilla audible range (`attenuation_distance * max(volume, 1)` or the
+    /// server `range` override). `INFINITY` disables range fading.
+    max_range_m: f32,
 }
 
 impl SpatialAudioEngine {
@@ -2074,6 +2202,7 @@ impl SpatialAudioEngine {
             az_rel: 0.0,
             distance_m: 0.0,
             base_delay: 8.0,
+            max_range_m: f32::INFINITY,
         }
     }
 
@@ -2156,6 +2285,25 @@ impl SpatialAudioEngine {
     pub fn set_source(&mut self, source: SoundSource) {
         self.source = source;
         self.update_geometry();
+    }
+
+    /// Set the Vanilla audible range in blocks: `attenuation_distance *
+    /// max(volume, 1.0)` computed by the caller (or the server's explicit
+    /// `range` override). Beyond it the direct path and reverb send fade to
+    /// silence; inside it the physical rolloff model runs unchanged.
+    /// Non-finite or non-positive input disables range fading.
+    pub fn set_max_range(&mut self, range_m: f32) {
+        self.max_range_m = if range_m.is_finite() && range_m > 0.0 {
+            range_m
+        } else {
+            f32::INFINITY
+        };
+        self.update_geometry();
+    }
+
+    /// Current audible range (`INFINITY` when unset).
+    pub fn max_range(&self) -> f32 {
+        self.max_range_m
     }
 
     /// Listener-space spherical geometry: azimuth (positive = right),
@@ -2257,10 +2405,20 @@ impl SpatialAudioEngine {
         ] {
             f.set_target(occ.cutoff_hz);
         }
-        self.direct_gain = (rolloff * occ_lin).clamp(0.0, 1.0);
+        // Vanilla range cutoff: full attenuation once the listener leaves
+        // `attenuation_distance * max(volume, 1)` (or the server range
+        // override). The fade is linear like Vanilla's distance curve
+        // applied to the audible range.
+        let range_atten = if self.max_range_m.is_finite() {
+            ((self.max_range_m - dist) / self.max_range_m).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        self.direct_gain = (rolloff * occ_lin * range_atten).clamp(0.0, 1.0);
         // Reflected energy sneaks around walls better than the direct path —
         // half-strength dB penalty on the reverb send, milder still on taps.
-        self.wet_send = self.scene.wet_gain * db_to_linear(occ.transmission_loss_db * 0.5);
+        self.wet_send =
+            self.scene.wet_gain * db_to_linear(occ.transmission_loss_db * 0.5) * range_atten;
         self.er_gain = db_to_linear(occ.transmission_loss_db * 0.33);
 
         // Air absorption (Ultra): broad-band air robs highs over distance.
@@ -2353,6 +2511,34 @@ impl SpatialAudioEngine {
     /// and limited so pathological input can never emit NaN or exceed
     /// [`OUTPUT_LIMIT`].
     pub fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        self.process_inner(input, out, None);
+    }
+
+    /// Like [`Self::process`], but instead of stepping this voice's private
+    /// FDN it accumulates `s * wet_send * send_scale` per sample into
+    /// `wet_send_acc` (length `input.len()`); `send_scale` carries the
+    /// voice's mix gain that the old per-voice FDN output was multiplied by
+    /// downstream. The mixer then runs one [`SharedListenerFdnBus`] per
+    /// listener on the summed send, so the cave tail keeps decaying after
+    /// short voices finish — and every voice reverberates through the same
+    /// acoustic field.
+    pub fn process_shared(
+        &mut self,
+        input: &[f32],
+        out: &mut Vec<f32>,
+        wet_send_acc: &mut [f32],
+        send_scale: f32,
+    ) {
+        debug_assert_eq!(wet_send_acc.len(), input.len());
+        self.process_inner(input, out, Some((wet_send_acc, send_scale)));
+    }
+
+    fn process_inner(
+        &mut self,
+        input: &[f32],
+        out: &mut Vec<f32>,
+        wet_acc: Option<(&mut [f32], f32)>,
+    ) {
         out.clear();
         out.reserve(input.len() * 2);
         if !self.preset.enabled() {
@@ -2380,7 +2566,8 @@ impl SpatialAudioEngine {
             *pre = precompute_tap(tap, yaw_deg);
         }
 
-        for &raw in input {
+        let mut wet_acc = wet_acc;
+        for (i, &raw) in input.iter().enumerate() {
             let s = sanitize_sample(raw);
             self.hist[self.wpos] = s;
 
@@ -2409,10 +2596,16 @@ impl SpatialAudioEngine {
                 er_r += v * tap.gain_r;
             }
 
-            // Late reverb (FDN) fed by the same mono input.
-            let (wet_l, wet_r) = match &mut self.fdn {
-                Some(fdn) => fdn.step(s * self.wet_send),
-                None => (0.0, 0.0),
+            // Late reverb: either the private FDN (standalone engine use) or
+            // the shared listener bus (mixer path) fed by the same input.
+            let (wet_l, wet_r) = if let Some((acc, scale)) = wet_acc.as_mut() {
+                acc[i] += s * self.wet_send * *scale;
+                (0.0, 0.0)
+            } else {
+                match &mut self.fdn {
+                    Some(fdn) => fdn.step(s * self.wet_send),
+                    None => (0.0, 0.0),
+                }
             };
 
             let mut out_l = l + er_l * self.er_gain + wet_l;

@@ -32,8 +32,8 @@ use crate::protocol::{decode_megu_custom_payload, MeguCustomPayload, SeasonWireS
 use crate::recovery::{ContainmentOutcome, CrashCircuitBreaker, CrashGuard, RecoveryAction};
 use crate::sound_assets::{normalize_sound_name, sound_name_hash};
 use crate::spatial_audio::{
-    AcousticMaterial, AcousticTracer, ListenerPose, MaterialClass, SoundSource, SpatialAudioEngine,
-    SpatialAudioPreset, SpatialSubtitleCue, VoxelAcousticWorld,
+    AcousticMaterial, AcousticTracer, ListenerPose, MaterialClass, SharedListenerFdnBus,
+    SoundSource, SpatialAudioEngine, SpatialAudioPreset, SpatialSubtitleCue, VoxelAcousticWorld,
 };
 use crate::world::WorldState;
 use mc_spine_client_mesh::tactile_effects::EnvironmentAudioHint;
@@ -338,6 +338,10 @@ const VOICE_CAP: usize = 24;
 /// Maximum retained subtitle cues for consumers that drain them late.
 const SUBTITLE_LOG_CAP: usize = 256;
 
+/// Debug snapshot of one live [`Voice`]:
+/// `(label, entity_id, position, velocity, spatialized)`.
+pub type VoiceDebugInfo = (String, Option<i32>, [f32; 3], [f32; 3], bool);
+
 /// A decoded, asset-resolved sound event ready to be voiced — the typed
 /// queue element [`SoundMixer`] consumes. `pcm` is mono `f32` at the
 /// mixer's sample rate.
@@ -347,23 +351,34 @@ pub struct PlaySoundEvent {
     pub label: String,
     /// Mono PCM at the mixer sample rate (`Arc` so replays share decode).
     pub pcm: Arc<Vec<f32>>,
+    /// Original stereo frames when the asset shipped stereo — used only by
+    /// 2D-bypassed voices (Music/UI/global); 3D sounds always spatialize
+    /// the mono downmix so a stereo Mod `.ogg` never leaks raw L/R into the
+    /// world mix.
+    pub stereo_pcm: Option<Arc<Vec<[f32; 2]>>>,
     /// `true` when `pcm` is the deterministic placeholder tone (no usable
     /// asset or decoder) — the stats keep this honest.
     pub is_placeholder: bool,
     /// Vanilla sound-source category varint (0=master .. 9=voice).
     pub category: i32,
     /// World position in blocks (`sound_effect`), or `None` for
-    /// entity-bound events (`sound_entity`) — those play at the listener
-    /// because this wire layer does not track entity positions.
+    /// entity-bound events (`sound_entity`) — those follow the live entity
+    /// position map, falling back to the listener until it resolves.
     pub position: Option<[f32; 3]>,
     /// The entity the sound is attached to, when entity-bound.
     pub entity_id: Option<i32>,
-    /// Packet volume × variant volume (0..=1 after clamping).
+    /// Packet volume × variant volume. May exceed `1.0` — Vanilla widens the
+    /// audible range (`attenuation_distance * max(volume, 1)`) while output
+    /// gain still clamps at `min(volume, 1)`.
     pub volume: f32,
     /// Playback-rate multiplier (0.5..=2.0 after clamping).
     pub pitch: f32,
     /// Packet seed — retained for reporting; variant selection already ran.
     pub seed: i64,
+    /// Vanilla audible range in blocks
+    /// (`attenuation_distance * max(volume, 1.0)`, or the server's explicit
+    /// `range` override); `f32::INFINITY` disables range fading.
+    pub max_range_m: f32,
 }
 
 /// Mixer counters — the honest accounting of what played, what was
@@ -415,11 +430,31 @@ pub struct SubtitleCueRecord {
     pub at_sample: u64,
 }
 
-/// One sounding voice: its own [`SpatialAudioEngine`] (per the engine's
-/// one-voice-per-source contract), the mono PCM cursor, and mix gain.
+/// One sounding voice: either a [`SpatialAudioEngine`] spatial voice
+/// (per the engine's one-voice-per-source contract) or a 2D stereo bypass
+/// (Music/UI/global), the PCM cursor, and mix gain.
 struct Voice {
-    engine: SpatialAudioEngine,
+    /// Spatializer — `Some` for world-positioned/entity voices, `None` for
+    /// bypassed 2D sounds so they can never pick up cave reverb, underwater
+    /// LP, or mono squash.
+    engine: Option<SpatialAudioEngine>,
+    /// Original stereo frames for bypassed voices.
+    stereo: Option<Arc<Vec<[f32; 2]>>>,
     position: [f32; 3],
+    /// Finite per-second source velocity tracked from entity positions —
+    /// feeds the engine's Doppler term.
+    source_velocity: [f32; 3],
+    /// Entity this voice follows (`sound_entity`), if any.
+    entity_id: Option<i32>,
+    /// `samples_rendered` when `position` was last updated — the dt of the
+    /// next finite velocity estimate.
+    track_at_sample: u64,
+    /// Block cell the source currently sits in; a crossing triggers a
+    /// re-trace on `retrace` voices.
+    cell: [i32; 3],
+    /// `true` when the clip is long enough (>0.5 s) to benefit from
+    /// cell-crossing re-traces.
+    retrace: bool,
     pcm: Arc<Vec<f32>>,
     /// Fractional read position into `pcm` (pitch stepping).
     cursor: f64,
@@ -454,6 +489,45 @@ impl Voice {
             self.done = true;
         }
     }
+
+    /// 2D bypass render: stereo stays stereo, mono duplicates to both ears —
+    /// no engine, no reverb send, no underwater filter. `out` is summed into
+    /// like every other voice path.
+    fn render_2d(&mut self, out: &mut [f32]) {
+        let gain = self.gain;
+        if let Some(stereo) = self.stereo.clone() {
+            let len = stereo.len();
+            for i in 0..out.len() / 2 {
+                let idx = self.cursor as usize;
+                if idx + 1 < len {
+                    let frac = (self.cursor - idx as f64) as f32;
+                    let a = stereo[idx];
+                    let b = stereo[idx + 1];
+                    out[2 * i] += (a[0] + (b[0] - a[0]) * frac) * gain;
+                    out[2 * i + 1] += (a[1] + (b[1] - a[1]) * frac) * gain;
+                }
+                self.cursor += self.step;
+            }
+            if self.cursor as usize >= len.saturating_sub(1) {
+                self.done = true;
+            }
+        } else {
+            let len = self.pcm.len();
+            for i in 0..out.len() / 2 {
+                let idx = self.cursor as usize;
+                if idx + 1 < len {
+                    let frac = (self.cursor - idx as f64) as f32;
+                    let s = self.pcm[idx] * (1.0 - frac) + self.pcm[idx + 1] * frac;
+                    out[2 * i] += s * gain;
+                    out[2 * i + 1] += s * gain;
+                }
+                self.cursor += self.step;
+            }
+            if self.cursor as usize >= len.saturating_sub(1) {
+                self.done = true;
+            }
+        }
+    }
 }
 
 /// The live mixer: a bounded typed event queue, per-voice spatialization
@@ -485,6 +559,19 @@ pub struct SoundMixer {
     subtitles: VecDeque<SubtitleCueRecord>,
     spatial_subtitles: VecDeque<SpatialSubtitleCue>,
     environment_hint: EnvironmentAudioHint,
+    /// Live entity positions (blocks) fed by the world/entity-tracking
+    /// layer — `sound_entity` voices follow these and derive their Doppler
+    /// velocity from deltas.
+    entity_positions: BTreeMap<i32, [f32; 3]>,
+    /// Listener's last block cell — a crossing re-traces long voices.
+    listener_cell: [i32; 3],
+    /// One shared FDN reverb every active spatial voice feeds; the tail
+    /// keeps decaying after short voices finish.
+    reverb_bus: SharedListenerFdnBus,
+    /// RT60 last applied to `reverb_bus` — elementwise max across active
+    /// voice scenes, retained after the last voice ends so the tail decays
+    /// with the room's real time constant.
+    bus_rt60: [f32; 3],
 }
 
 impl SoundMixer {
@@ -509,6 +596,10 @@ impl SoundMixer {
             subtitles: VecDeque::new(),
             spatial_subtitles: VecDeque::new(),
             environment_hint: EnvironmentAudioHint::default(),
+            entity_positions: BTreeMap::new(),
+            listener_cell: [i32::MIN; 3],
+            reverb_bus: SharedListenerFdnBus::new(sample_rate),
+            bus_rt60: [0.0; 3],
         }
     }
 
@@ -561,14 +652,18 @@ impl SoundMixer {
         let listener = self.acoustic_listener();
         let hint = self.environment_hint;
         for voice in &mut self.voices {
-            Self::analyze_voice(
-                &*self.world,
-                listener,
-                hint,
-                &mut voice.engine,
-                voice.position,
-            );
+            if let Some(engine) = &mut voice.engine {
+                Self::analyze_voice(
+                    &*self.world,
+                    listener,
+                    hint,
+                    engine,
+                    voice.position,
+                    voice.source_velocity,
+                );
+            }
         }
+        self.update_bus_rt60();
     }
 
     fn acoustic_listener(&self) -> ListenerPose {
@@ -589,13 +684,11 @@ impl SoundMixer {
         hint: EnvironmentAudioHint,
         engine: &mut SpatialAudioEngine,
         position: [f32; 3],
+        velocity: [f32; 3],
     ) {
         engine.analyze(
             world,
-            &SoundSource {
-                position,
-                velocity: [0.0; 3],
-            },
+            &SoundSource { position, velocity },
             &listener,
         );
         let mut scene = engine.scene().clone();
@@ -629,6 +722,52 @@ impl SoundMixer {
     /// Labels of live voices in insertion order (diagnostics/tests).
     pub fn voice_labels(&self) -> Vec<String> {
         self.voices.iter().map(|v| v.label.clone()).collect()
+    }
+
+    /// Feed one entity's current position (blocks). `sound_entity` voices
+    /// attached to `entity_id` follow it each render and derive a finite
+    /// source velocity (and thus Doppler) from the position delta.
+    pub fn set_entity_position(&mut self, entity_id: i32, pos: [f64; 3]) {
+        let pos = [pos[0] as f32, pos[1] as f32, pos[2] as f32];
+        if pos.iter().all(|v| v.is_finite()) {
+            self.entity_positions.insert(entity_id, pos);
+        }
+    }
+
+    /// Drop a tracked entity (despawn/remove_entities).
+    pub fn remove_entity_position(&mut self, entity_id: i32) {
+        self.entity_positions.remove(&entity_id);
+    }
+
+    /// Last reported position of `entity_id` (diagnostics/tests).
+    pub fn entity_position(&self, entity_id: i32) -> Option<[f32; 3]> {
+        self.entity_positions.get(&entity_id).copied()
+    }
+
+    /// First live voice labelled `label`'s Vanilla audible range (`None`
+    /// when no such voice exists or it is a 2D-bypass voice).
+    pub fn voice_max_range(&self, label: &str) -> Option<f32> {
+        self.voices
+            .iter()
+            .find(|v| v.label == label)
+            .and_then(|v| v.engine.as_ref().map(SpatialAudioEngine::max_range))
+    }
+
+    /// `(label, entity_id, position, velocity, spatialized)` per live voice —
+    /// the entity-tracking test surface.
+    pub fn voice_debug(&self) -> Vec<VoiceDebugInfo> {
+        self.voices
+            .iter()
+            .map(|v| {
+                (
+                    v.label.clone(),
+                    v.entity_id,
+                    v.position,
+                    v.source_velocity,
+                    v.engine.is_some(),
+                )
+            })
+            .collect()
     }
 
     /// Queue one event. The queue is bounded; a flooded session drops the
@@ -673,9 +812,114 @@ impl SoundMixer {
             .map(|(i, _)| i)
     }
 
+    /// `true` when the event plays as a 2D stereo voice — Music, UI/global
+    /// sounds, and non-positioned non-entity events never see the
+    /// spatializer (no cave reverb, no underwater LP, no mono squash).
+    fn is_2d_bypass(ev: &PlaySoundEvent) -> bool {
+        ev.category == 1 // Music
+            || normalize_sound_name(&ev.label).starts_with("ui.")
+            || (ev.position.is_none() && ev.entity_id.is_none())
+            || (ev.volume.is_finite() && ev.volume >= 100.0)
+    }
+
+    /// Update the shared listener FDN's RT60: the elementwise max across
+    /// live voice scenes — every voice reverberates through the same room,
+    /// and the last RT60 sticks after the final voice ends so the tail
+    /// decays at the room's real time constant.
+    fn update_bus_rt60(&mut self) {
+        let mut rt = [0.0_f32; 3];
+        for v in &self.voices {
+            if let Some(engine) = &v.engine {
+                let s = engine.scene();
+                rt[0] = rt[0].max(s.rt60_low_s);
+                rt[1] = rt[1].max(s.rt60_mid_s);
+                rt[2] = rt[2].max(s.rt60_high_s);
+            }
+        }
+        if rt.iter().any(|&r| r > 0.0) {
+            self.bus_rt60 = rt;
+        }
+        self.reverb_bus.set_rt60(self.bus_rt60);
+    }
+
+    /// Follow live entity positions for attached voices: finite per-second
+    /// velocity from the position delta (never NaN — non-finite or extreme
+    /// estimates are clamped), then feed the engine so Doppler is live.
+    fn track_entity_voices(&mut self) {
+        let now = self.samples_rendered;
+        let sr = f64::from(self.sample_rate);
+        for voice in &mut self.voices {
+            let Some(eid) = voice.entity_id else {
+                continue;
+            };
+            let Some(&pos) = self.entity_positions.get(&eid) else {
+                continue;
+            };
+            if pos == voice.position {
+                continue;
+            }
+            let dt = now.saturating_sub(voice.track_at_sample).max(1) as f64;
+            let mut vel = [0.0_f32; 3];
+            for i in 0..3 {
+                let v = ((f64::from(pos[i]) - f64::from(voice.position[i])) * sr / dt) as f32;
+                vel[i] = if v.is_finite() {
+                    v.clamp(-256.0, 256.0)
+                } else {
+                    0.0
+                };
+            }
+            voice.source_velocity = vel;
+            voice.position = pos;
+            voice.track_at_sample = now;
+            if let Some(engine) = &mut voice.engine {
+                engine.set_source(SoundSource {
+                    position: pos,
+                    velocity: vel,
+                });
+            }
+        }
+    }
+
+    /// Re-trace long voices when the source or the listener crossed a block
+    /// cell boundary — cheap voices keep their original trace.
+    fn retrace_moved_voices(&mut self) {
+        let cell = self.listener.position.map(|v| v.floor() as i32);
+        let listener_crossed = cell != self.listener_cell;
+        self.listener_cell = cell;
+        if !listener_crossed && !self.voices.iter().any(|v| v.retrace) {
+            return;
+        }
+        let listener = self.acoustic_listener();
+        let hint = self.environment_hint;
+        for voice in &mut self.voices {
+            let cell = voice.position.map(|v| v.floor() as i32);
+            let crossed = cell != voice.cell;
+            voice.cell = cell;
+            if voice.retrace && (crossed || listener_crossed) {
+                if let Some(engine) = &mut voice.engine {
+                    Self::analyze_voice(
+                        &*self.world,
+                        listener,
+                        hint,
+                        engine,
+                        voice.position,
+                        voice.source_velocity,
+                    );
+                }
+            }
+        }
+    }
+
     /// Admit one queued event into a voice.
     fn admit(&mut self, ev: PlaySoundEvent) {
-        let position = ev.position.unwrap_or(self.listener.position);
+        let position = ev
+            .position
+            .or_else(|| {
+                ev.entity_id
+                    .and_then(|eid| self.entity_positions.get(&eid).copied())
+            })
+            .unwrap_or(self.listener.position);
+        let bypass_2d = Self::is_2d_bypass(&ev);
         let key = SoundKey::at_block(
             sound_name_hash(&ev.label),
             position[0].floor() as i32,
@@ -704,16 +948,38 @@ impl SoundMixer {
             .get(ev.category as usize)
             .copied()
             .unwrap_or(1.0);
-        let gain = (ev.volume * cat_gain * self.master_gain * admission_gain).clamp(0.0, 1.0);
-        let mut engine = SpatialAudioEngine::new(self.sample_rate, self.preset);
-        Self::analyze_voice(
-            &*self.world,
-            self.acoustic_listener(),
-            self.environment_hint,
-            &mut engine,
-            position,
-        );
-        let mut cue = engine.subtitle_cue();
+        // Vanilla: `volume > 1.0` widens the audible range but output gain
+        // still saturates at 1.0 — `min`, not `clamp(0,1)` up front.
+        let volume_out = if ev.volume.is_finite() {
+            ev.volume.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let gain = (volume_out * cat_gain * self.master_gain * admission_gain).clamp(0.0, 1.0);
+        let engine = if bypass_2d {
+            None
+        } else {
+            let mut engine = SpatialAudioEngine::new(self.sample_rate, self.preset);
+            engine.set_max_range(ev.max_range_m);
+            Self::analyze_voice(
+                &*self.world,
+                self.acoustic_listener(),
+                self.environment_hint,
+                &mut engine,
+                position,
+                [0.0; 3],
+            );
+            Some(engine)
+        };
+        let mut cue = engine
+            .as_ref()
+            .map(SpatialAudioEngine::subtitle_cue)
+            .unwrap_or(SpatialSubtitleCue {
+                direction: crate::spatial_audio::SubtitleDirection::Center,
+                loudness: gain,
+                distance_m: 0.0,
+                label: String::new(),
+            });
         cue.label = ev.label.clone();
         self.subtitles.push_back(SubtitleCueRecord {
             name: ev.label.clone(),
@@ -731,7 +997,13 @@ impl SoundMixer {
         self.order += 1;
         self.voices.push(Voice {
             engine,
+            stereo: if bypass_2d { ev.stereo_pcm } else { None },
             position,
+            source_velocity: [0.0; 3],
+            entity_id: ev.entity_id,
+            track_at_sample: self.samples_rendered,
+            cell: position.map(|v| v.floor() as i32),
+            retrace: ev.pcm.len() > (self.sample_rate / 2) as usize,
             pcm: ev.pcm,
             cursor: 0.0,
             step: f64::from(ev.pitch.clamp(0.5, 2.0)),
@@ -760,15 +1032,37 @@ impl SoundMixer {
             self.stats.events_submitted += 1;
             self.admit(ev);
         }
+        self.update_bus_rt60();
+        self.track_entity_voices();
+        self.retrace_moved_voices();
         let mut mono = vec![0.0f32; frames];
+        // Per-sample summed reverb send fed by every spatial voice's
+        // `s * wet_send` (scaled by voice gain, matching the old per-voice
+        // FDN semantics where the wet output was gain-scaled downstream).
+        let mut send = vec![0.0f32; frames];
         for voice in &mut self.voices {
-            mono.fill(0.0);
-            voice.render_mono(&mut mono);
-            let stereo = voice.engine.process_voice_frame(&mono);
-            for i in 0..frames {
-                out[2 * i] += stereo[2 * i] * voice.gain;
-                out[2 * i + 1] += stereo[2 * i + 1] * voice.gain;
+            if voice.engine.is_some() {
+                mono.fill(0.0);
+                voice.render_mono(&mut mono);
+                let mut stereo = Vec::with_capacity(frames * 2);
+                let gain = voice.gain;
+                if let Some(engine) = &mut voice.engine {
+                    engine.process_shared(&mono, &mut stereo, &mut send, gain);
+                }
+                for i in 0..frames {
+                    out[2 * i] += stereo[2 * i] * gain;
+                    out[2 * i + 1] += stereo[2 * i + 1] * gain;
+                }
+            } else {
+                voice.render_2d(out);
             }
+        }
+        // The shared bus runs even with zero active voices so an ending
+        // tail finishes decaying instead of cutting off.
+        for i in 0..frames {
+            let (wet_l, wet_r) = self.reverb_bus.step_input(send[i]);
+            out[2 * i] += wet_l;
+            out[2 * i + 1] += wet_r;
         }
         let finished = self.voices.iter().filter(|v| v.done).count() as u64;
         self.stats.voices_finished += finished;
@@ -800,9 +1094,9 @@ impl VoxelAcousticWorld for OpenAirWorld {
 
 /// Read-only acoustic view over the live [`WorldState`] section cache.
 /// Unloaded cells report air; fluids report [`MaterialClass::Liquid`];
-/// other solid states report [`MaterialClass::StoneLike`] — the block
-/// registry on this layer cannot name individual blocks, so material
-/// detail within "solid" is approximated.
+/// every other state resolves through the registry's
+/// [`crate::spatial_audio::AcousticMaterialLut`], so wool/wood/glass/metal
+/// and unknown Mod blocks keep their real acoustic behaviour.
 pub struct WorldAcousticView<'a> {
     /// The world being viewed.
     pub world: &'a WorldState,
@@ -817,13 +1111,19 @@ impl VoxelAcousticWorld for WorldAcousticView<'_> {
     }
 }
 
+/// O(1) material lookup for one block state: air and fluids short-circuit
+/// (`Liquid` carries its own acoustic coefficients), every other state reads
+/// the registry-name LUT the [`crate::world::BlockTable`] built at load — so
+/// wool, planks, glass, iron, and unknown Mod blocks
+/// (`create:brass_casing`, `custom:stained_glass`) all report their real
+/// acoustic class instead of collapsing to `StoneLike`.
 fn acoustic_material_for_state(world: &WorldState, state: u32) -> AcousticMaterial {
     if world.blocks.is_air(state) {
         AcousticMaterial::AIR
     } else if world.blocks.fluid_cell(state).kind.is_some() {
         AcousticMaterial::from_class(MaterialClass::Liquid)
     } else {
-        AcousticMaterial::from_class(MaterialClass::StoneLike)
+        world.blocks.acoustic_lut().get(state)
     }
 }
 
@@ -874,11 +1174,7 @@ impl WorldAcousticSnapshot {
                     let cells: Box<[u8]> = (0..4096)
                         .map(|idx| {
                             let state = section.palette.get(idx).unwrap_or(0);
-                            match acoustic_material_for_state(world, state).class {
-                                MaterialClass::Liquid => 1,
-                                MaterialClass::StoneLike => 2,
-                                _ => 0,
-                            }
+                            acoustic_material_for_state(world, state).class.code()
                         })
                         .collect::<Vec<_>>()
                         .into_boxed_slice();
@@ -899,11 +1195,7 @@ impl WorldAcousticSnapshot {
         let Some(state) = world.get_block_state(pos[0], pos[1], pos[2]) else {
             return;
         };
-        let class = match acoustic_material_for_state(world, state).class {
-            MaterialClass::Liquid => 1,
-            MaterialClass::StoneLike => 2,
-            _ => 0,
-        };
+        let class = acoustic_material_for_state(world, state).class.code();
         let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let sy = i64::from(pos[1]) - i64::from(inner.min_y);
         if sy < 0 || sy >= i64::from(inner.height) {
@@ -954,11 +1246,7 @@ impl VoxelAcousticWorld for WorldAcousticSnapshot {
                     + z.rem_euclid(16) as usize * 16
                     + x.rem_euclid(16) as usize]
             });
-        match class {
-            1 => AcousticMaterial::from_class(MaterialClass::Liquid),
-            2 => AcousticMaterial::from_class(MaterialClass::StoneLike),
-            _ => AcousticMaterial::AIR,
-        }
+        AcousticMaterial::from_class(MaterialClass::from_code(class))
     }
 }
 

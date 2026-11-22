@@ -4757,10 +4757,18 @@ impl ProtocolClient {
             self.dimension_types_by_id.clear();
             self.dimension_types_by_name.clear();
         }
+        let capture_sounds = registry_name == "minecraft:sound_event";
+        let mut sound_names = capture_sounds.then(|| Vec::with_capacity(count));
         for idx in 0..count {
             let entry_name = r.read_string(256)?;
             let has_nbt = r.read_bool()?;
             let entry_nbt = if has_nbt { Some(r.read_nbt()?) } else { None };
+            if let Some(names) = &mut sound_names {
+                // Wire order is the registry id (id = index); Mod
+                // namespaces ride along verbatim — the audio library's
+                // layered map keys them as `modid:event`.
+                names.push(entry_name.clone());
+            }
             if registry_name == "minecraft:dimension_type" {
                 let meta = entry_nbt
                     .as_ref()
@@ -4778,6 +4786,11 @@ impl ProtocolClient {
                     self.dimension_types_by_id.insert(idx as i32, m);
                     self.dimension_types_by_name.insert(entry_name, m);
                 }
+            }
+        }
+        if let Some(names) = sound_names {
+            if let Some(rt) = &mut self.audio {
+                rt.set_sound_event_registry(crate::sound_assets::SoundEventRegistry::from_names(names));
             }
         }
         Ok(())

@@ -22,7 +22,10 @@ use std::time::{Duration, Instant};
 
 use crate::protocol::{WireSoundEvent, WireStopSound};
 use crate::session::{AudioStats, OpenAirWorld, PlaySoundEvent, SoundMixer};
-use crate::sound_assets::{placeholder_pcm, sound_name_for_id, SoundLibrary, MIX_SAMPLE_RATE};
+use crate::sound_assets::{
+    placeholder_pcm, sound_name_for_id, DecodedPcm, SoundEventRegistry, SoundLibrary,
+    MIX_SAMPLE_RATE,
+};
 use crate::spatial_audio::{ListenerPose, SpatialAudioPreset};
 
 /// PCM format every sink consumes: signed 16-bit stereo interleaved at
@@ -105,6 +108,33 @@ pub fn host_os() -> TargetOs {
     } else {
         TargetOs::Other
     }
+}
+
+/// Sorted immediate children of `dir` matching `kind`: a file extension
+/// (`"jar"`, `"zip"`) or `"dir"` for directories. Missing/unreadable dirs
+/// yield an empty list — the sound-layer scan treats them as absent.
+fn sorted_dir_entries(dir: &Path, kind: &str) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let matches = if kind == "dir" {
+            path.is_dir()
+        } else {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case(kind))
+        };
+        if matches {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
 }
 
 /// `true` when `path` names an executable file (no spawn — pure stat).
@@ -1154,7 +1184,11 @@ mod winmm {
     }
 }
 
-const PW_CAT_ARGS: [&str; 8] = [
+/// `pw-cat` playback flags. `--latency=480` requests a 480-sample
+/// (≈10 ms at 48 kHz) stream buffer — the low-latency hint from the
+/// §3.6 audit lane; PipeWire clamps it to what the device can do, so it
+/// is safe on every `pw-cat` version that accepts the flag.
+const PW_CAT_ARGS: [&str; 9] = [
     "--playback",
     "--raw",
     "--rate",
@@ -1163,6 +1197,7 @@ const PW_CAT_ARGS: [&str; 8] = [
     "2",
     "--format",
     "s16",
+    "--latency=480",
 ];
 const APLAY_ARGS: [&str; 10] = [
     "-q", "-f", "S16_LE", "-r", "48000", "-c", "2", "-t", "raw", "-",
@@ -1273,6 +1308,10 @@ pub struct AudioSessionConfig {
     pub assets_dir: Option<PathBuf>,
     /// `--assetIndex` id (`None` → placeholder tones only).
     pub asset_index: Option<String>,
+    /// `--gameDir` for the layered sound scan: `mods/*.jar` then
+    /// `resourcepacks/*` merge above the vanilla index, exactly like the
+    /// vanilla launcher layout (`None` → vanilla assets only).
+    pub game_dir: Option<PathBuf>,
     /// `qol.max_volume_cap` — the bus limiter ceiling.
     pub max_volume_cap: f32,
     /// `qol.max_concurrent_same_sound` — admission coalescing budget.
@@ -1327,10 +1366,21 @@ pub struct AudioRuntime {
     library_tried: bool,
     assets_dir: Option<PathBuf>,
     asset_index: Option<String>,
+    game_dir: Option<PathBuf>,
     subtitle_file: Option<BufWriter<std::fs::File>>,
     subtitles_to_stderr: bool,
     listener_yaw: f32,
     listener_pitch: f32,
+    /// `minecraft:sound_event` registry id → name table captured from the
+    /// configuration-phase `registry_data` packet (covers every Mod
+    /// namespace the server declared); the bundled table stays as the
+    /// fallback for sessions that never saw one.
+    sound_registry: SoundEventRegistry,
+    /// Previous listener feet position + when it was seen — the finite
+    /// difference between updates is the listener velocity fed to the
+    /// spatializer's Doppler term.
+    last_listener_pos: Option<[f64; 3]>,
+    last_listener_at: Option<Instant>,
     last_pump: Instant,
     carry_frames: f32,
     scratch_f32: Vec<f32>,
@@ -1386,10 +1436,14 @@ impl AudioRuntime {
             library_tried: false,
             assets_dir: cfg.assets_dir.clone(),
             asset_index: cfg.asset_index.clone(),
+            game_dir: cfg.game_dir.clone(),
             subtitle_file,
             subtitles_to_stderr: cfg.subtitles_to_stderr,
             listener_yaw: 0.0,
             listener_pitch: 0.0,
+            sound_registry: SoundEventRegistry::default(),
+            last_listener_pos: None,
+            last_listener_at: None,
             last_pump: Instant::now(),
             carry_frames: 0.0,
             scratch_f32: Vec::new(),
@@ -1405,57 +1459,127 @@ impl AudioRuntime {
     }
 
     /// Lazily load the sound library on first use so a session that never
-    /// hears a sound never pays the index parse.
+    /// hears a sound never pays the index parse. When `--gameDir` is set,
+    /// `mods/*.jar` then `resourcepacks/*` merge on top of the vanilla
+    /// index (lowest→highest priority, matching vanilla layer order).
     fn library(&mut self) -> Option<&mut SoundLibrary> {
         if self.library.is_none() && !self.library_tried {
             self.library_tried = true;
-            if let (Some(dir), Some(index)) = (&self.assets_dir, &self.asset_index) {
-                match SoundLibrary::load(dir, index) {
+            let mut lib = match (&self.assets_dir, &self.asset_index) {
+                (Some(dir), Some(index)) => match SoundLibrary::load(dir, index) {
                     Ok(lib) => {
                         eprintln!(
                             "mc-spine-client audio: {} sound events from {}",
                             lib.event_count(),
                             dir.display()
                         );
-                        self.library = Some(lib);
+                        Some(lib)
                     }
-                    Err(e) => eprintln!(
-                        "mc-spine-client audio: sound library unavailable ({e}); \
-                         placeholder tones will play"
-                    ),
+                    Err(e) => {
+                        eprintln!(
+                            "mc-spine-client audio: sound library unavailable ({e}); \
+                             placeholder tones will play"
+                        );
+                        None
+                    }
+                },
+                _ => None,
+            };
+            if let Some(game_dir) = &self.game_dir {
+                // Deterministic layer order: sorted Mod JARs first, then
+                // sorted resource packs — packs always win over JAR
+                // assets and everything beats the vanilla index.
+                let mods_dir = game_dir.join("mods");
+                let mut jars = sorted_dir_entries(&mods_dir, "jar");
+                jars.extend(sorted_dir_entries(&mods_dir, "zip"));
+                let packs_dir = game_dir.join("resourcepacks");
+                for path in jars
+                    .into_iter()
+                    .chain(sorted_dir_entries(&packs_dir, "zip"))
+                    .chain(sorted_dir_entries(&packs_dir, "dir"))
+                {
+                    // No vanilla index? A Mod JAR/pack can still carry the
+                    // whole namespace — merge onto an empty library.
+                    let lib = lib.get_or_insert_with(SoundLibrary::empty);
+                    match lib.merge_sound_layer(&path) {
+                        Ok(n) => {
+                            eprintln!(
+                                "mc-spine-client audio: merged {n} sounds.json from {}",
+                                path.display()
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("mc-spine-client audio: {}: {e}", path.display());
+                        }
+                    }
                 }
             }
+            self.library = lib;
         }
         self.library.as_mut()
+    }
+
+    /// Install the `minecraft:sound_event` registry table captured from
+    /// `registry_data` — covers every id→name mapping the server declared,
+    /// including Mod namespaces the bundled table does not know.
+    pub fn set_sound_event_registry(&mut self, registry: SoundEventRegistry) {
+        self.sound_registry = registry;
+    }
+
+    /// Feed a live entity position (`teleport_entity`/`move_entity*` world
+    /// tracking applied upstream) so `sound_entity` voices follow it.
+    pub fn update_entity_position(&mut self, entity_id: i32, pos: [f64; 3]) {
+        self.mixer.set_entity_position(entity_id, pos);
+    }
+
+    /// Drop a tracked entity (`remove_entities`/`remove_entity` packet).
+    pub fn remove_entity_position(&mut self, entity_id: i32) {
+        self.mixer.remove_entity_position(entity_id);
     }
 
     /// Ingest one decoded `sound_effect`/`sound_entity` packet.
     pub fn ingest(&mut self, ev: &WireSoundEvent) {
         let (name, label) = match (&ev.name, ev.registry_id) {
             (Some(n), _) => (n.clone(), n.clone()),
-            (None, Some(id)) => match sound_name_for_id(id) {
-                Some(n) => (n.to_string(), n.to_string()),
-                None => {
-                    self.mixer.stats.unknown_sound_id += 1;
-                    (format!("sound.{id}"), format!("sound.{id}"))
+            (None, Some(id)) => {
+                if let Some(n) = self.sound_registry.name(id) {
+                    (n.to_string(), n.to_string())
+                } else {
+                    match sound_name_for_id(id) {
+                        Some(n) => (n.to_string(), n.to_string()),
+                        None => {
+                            self.mixer.stats.unknown_sound_id += 1;
+                            (format!("sound.{id}"), format!("sound.{id}"))
+                        }
+                    }
                 }
-            },
+            }
             (None, None) => return,
         };
 
-        // Asset resolution: real OGG when the index + sounds.json map this
-        // event, else a deterministic placeholder tone counted as such.
+        // Asset resolution: real OGG when the layered sound library maps
+        // this event, else a deterministic placeholder tone counted as
+        // such. Stereo assets keep their L/R for the 2D-bypass path; the
+        // spatializer always consumes the mono downmix.
         let mut pcm = None;
         let mut is_placeholder = false;
         let mut variant_volume = 1.0f32;
         let mut variant_pitch = 1.0f32;
+        let mut attenuation_distance = None;
         if let Some(lib) = self.library() {
             match lib.resolve(&name, ev.seed) {
                 Some(resolved) => {
                     variant_volume = resolved.volume;
                     variant_pitch = resolved.pitch;
-                    match lib.decode(&resolved.path) {
-                        Ok(p) => pcm = Some(p),
+                    attenuation_distance = resolved.attenuation_distance;
+                    match lib.decode_source(&resolved.source) {
+                        Ok(dpcm) => {
+                            let stereo = match &*dpcm {
+                                DecodedPcm::Stereo(v) => Some(Arc::new(v.clone())),
+                                DecodedPcm::Mono(_) => None,
+                            };
+                            pcm = Some((Arc::new(dpcm.to_mono()), stereo));
+                        }
                         Err(e) => {
                             self.mixer.stats.decode_errors += 1;
                             if self.mixer.stats.decode_errors <= 3 {
@@ -1469,31 +1593,52 @@ impl AudioRuntime {
         } else {
             self.mixer.stats.missing_assets += 1;
         }
-        let pcm = match pcm {
-            Some(p) => p,
+        let (pcm, stereo_pcm) = match pcm {
+            Some((m, s)) => (m, s),
             None => {
                 is_placeholder = true;
                 self.mixer.stats.placeholder_voices += 1;
-                Arc::new(placeholder_pcm(
-                    &name,
-                    ev.category,
-                    self.mixer.sample_rate(),
-                ))
+                (
+                    Arc::new(placeholder_pcm(
+                        &name,
+                        ev.category,
+                        self.mixer.sample_rate(),
+                    )),
+                    None,
+                )
             }
         };
-        if ev.entity_id.is_some() {
-            self.mixer.stats.entity_pos_unresolved += 1;
+        // Vanilla distance law: the packet volume widens the audible range
+        // (`attenuation_distance * max(volume, 1.0)`) while output gain
+        // still saturates at `min(volume, 1.0)` inside the mixer — so a
+        // `volume=4.0` explosion carries 64 m, not 16. An inline
+        // `fixed_range` overrides everything, exactly like the wire
+        // semantics.
+        let effective_volume = if (ev.volume * variant_volume).is_finite() {
+            (ev.volume * variant_volume).max(0.0)
+        } else {
+            0.0
+        };
+        let max_range_m = ev.fixed_range.unwrap_or_else(|| {
+            attenuation_distance.unwrap_or(16.0) * effective_volume.max(1.0)
+        });
+        if let Some(eid) = ev.entity_id {
+            if self.mixer.entity_position(eid).is_none() {
+                self.mixer.stats.entity_pos_unresolved += 1;
+            }
         }
         self.mixer.submit(PlaySoundEvent {
             label,
             pcm,
+            stereo_pcm,
             is_placeholder,
             category: ev.category,
             position: ev.position,
             entity_id: ev.entity_id,
-            volume: (ev.volume * variant_volume).clamp(0.0, 1.0),
+            volume: effective_volume,
             pitch: (ev.pitch * variant_pitch).clamp(0.5, 2.0),
             seed: ev.seed,
+            max_range_m,
         });
     }
 
@@ -1513,6 +1658,28 @@ impl AudioRuntime {
         if let Some(p) = pitch {
             self.listener_pitch = p;
         }
+        // Real listener velocity from the pose delta between updates —
+        // the spatializer's Doppler term needs a finite m/s estimate, so
+        // non-finite or absurd values (>256 m/s) are clamped away.
+        let now = Instant::now();
+        let velocity = match (self.last_listener_pos, self.last_listener_at) {
+            (Some(prev), Some(at)) => {
+                let dt = now.saturating_duration_since(at).as_secs_f64().max(1e-3);
+                let mut v = [0.0_f32; 3];
+                for i in 0..3 {
+                    let d = (pos[i] - prev[i]) / dt;
+                    v[i] = if d.is_finite() {
+                        (d as f32).clamp(-256.0, 256.0)
+                    } else {
+                        0.0
+                    };
+                }
+                v
+            }
+            _ => [0.0; 3],
+        };
+        self.last_listener_pos = Some(pos);
+        self.last_listener_at = Some(now);
         self.mixer.set_listener(ListenerPose {
             position: [
                 pos[0] as f32,
@@ -1521,7 +1688,7 @@ impl AudioRuntime {
             ],
             yaw_deg: self.listener_yaw,
             pitch_deg: self.listener_pitch,
-            velocity: [0.0; 3],
+            velocity,
             submerged: false,
         });
     }

@@ -25,6 +25,8 @@ fn sound_event(name: &str, volume: f32, position: Option<[f32; 3]>) -> PlaySound
     PlaySoundEvent {
         label: name.to_string(),
         pcm: Arc::new(placeholder_pcm(name, 0, MIX_SAMPLE_RATE)),
+        stereo_pcm: None,
+        max_range_m: f32::INFINITY,
         is_placeholder: true,
         category: 0,
         position,

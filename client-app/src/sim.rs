@@ -600,6 +600,9 @@ fn escape_json(s: &str) -> String {
 struct SessionRunner {
     client: ProtocolClient,
     world: WorldState,
+    /// Shared acoustic cache the audio runtime's mixer traces against —
+    /// `sync_chunk`/`sync_block` keep it live as the world changes.
+    acoustics: crate::session::WorldAcousticSnapshot,
     player: PlayerPhysics,
     /// Far-terrain LOD store driven by the resolved `ClientSettings`
     /// (`None` when `distant_horizon` is off).
@@ -630,9 +633,11 @@ impl SessionRunner {
                 self.entity_id = entity_id;
                 self.play_ok = true;
                 self.world.reset_dimension(dimension);
+                self.acoustics.reset_dimension(&self.world);
             }
             PlayEvent::Respawn { dimension } => {
                 self.world.reset_dimension(dimension);
+                self.acoustics.reset_dimension(&self.world);
                 self.initial_spawn_done = false;
             }
             PlayEvent::KeepAlive(id) => {
@@ -671,6 +676,8 @@ impl SessionRunner {
                         lod.insert_column(cx, cz, &views);
                     }
                 }
+                self.acoustics.sync_chunk(&self.world, cx, cz);
+                self.refresh_audio_acoustics();
             }
             PlayEvent::ChunkBatchFinished(_size) => {
                 self.client.send_chunk_batch_received(30.0)?;
@@ -681,16 +688,43 @@ impl SessionRunner {
             }
             PlayEvent::BlockUpdate { pos, state_id } => {
                 self.world.apply_block_update(pos, state_id)?;
+                self.acoustics.sync_block(&self.world, pos);
+                self.refresh_audio_acoustics();
             }
             PlayEvent::SectionBlocksUpdate(updates) => {
                 for (pos, state_id) in updates {
                     self.world.apply_block_update(pos, state_id)?;
+                    self.acoustics.sync_block(&self.world, pos);
                 }
+                self.refresh_audio_acoustics();
             }
             PlayEvent::UnloadChunk { cx, cz } => {
                 self.world.unload_chunk(cx, cz);
                 if let Some(lod) = self.lod.as_mut() {
                     lod.remove_column(cx, cz);
+                }
+                self.acoustics.unload_chunk(cx, cz);
+                self.refresh_audio_acoustics();
+            }
+            PlayEvent::RemoveEntities { ref eids } => {
+                self.world.apply_play_event(&event)?;
+                if let Some(rt) = &mut self.client.audio {
+                    for &eid in eids {
+                        rt.remove_entity_position(eid);
+                    }
+                }
+            }
+            PlayEvent::AddEntity { eid, .. }
+            | PlayEvent::MoveEntityPos { eid, .. }
+            | PlayEvent::MoveEntityPosRot { eid, .. }
+            | PlayEvent::MoveEntityRot { eid, .. }
+            | PlayEvent::TeleportEntity { eid, .. }
+            | PlayEvent::SetEntityMotion { eid, .. } => {
+                self.world.apply_play_event(&event)?;
+                if let Some(rt) = &mut self.client.audio {
+                    if let Some(ent) = self.world.entities.get(&eid) {
+                        rt.update_entity_position(eid, ent.pos);
+                    }
                 }
             }
             PlayEvent::SetCenterChunk { .. } => {}
@@ -711,6 +745,14 @@ impl SessionRunner {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Tell the audio mixer's spatial voices the acoustic scene changed so
+    /// occlusion/reverb retraces against fresh chunk data.
+    fn refresh_audio_acoustics(&mut self) {
+        if let Some(rt) = &mut self.client.audio {
+            rt.mixer.refresh_acoustics();
+        }
     }
 
     fn poll_once(&mut self, timeout: Duration) -> Result<bool, String> {
@@ -754,9 +796,17 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
     // Resolved player settings drive the renderer, the far-terrain LOD
     // radii, and (via `cfg.view_distance`) the requested chunk window.
     let render_config = crate::render::RenderConfig::from_settings(&cfg.client_settings);
+    // The mixer traces occlusion/reverb against a shared acoustic snapshot
+    // of the live world; `sync_chunk`/`sync_block` calls in `handle_event`
+    // keep it current as blocks change.
+    let acoustics = crate::session::WorldAcousticSnapshot::new(&world);
+    if let Some(rt) = &mut client.audio {
+        rt.mixer.set_world(Box::new(acoustics.clone()));
+    }
     let mut runner = SessionRunner {
         client,
         world,
+        acoustics,
         player: PlayerPhysics::new([0.0, 64.0, 0.0], 0.0, 0.0),
         lod: cfg.client_settings.to_lod_config().map(LodManager::new),
         entity_id: 0,

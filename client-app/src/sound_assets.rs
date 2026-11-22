@@ -21,6 +21,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use symphonia::core::io::MediaSource;
+
 use crate::protocol::{parse_json, JsonValue};
 
 /// Mixer bus rate; decoded OGGs (usually 44.1 kHz) are linear-resampled to
@@ -91,6 +93,89 @@ pub fn sound_name_for_id(id: u32) -> Option<&'static str> {
         .map(|(_, v)| *v)
 }
 
+/// Full `minecraft:sound_event` numeric-id → name table — populated either
+/// from the server's `registry_data` packet (authoritative, covers every
+/// Mod namespace too) or from a `registries.json`-shaped document on disk.
+/// [`sound_name_for_id`] remains the built-in fallback for the ids the
+/// bundled table knows.
+#[derive(Clone, Debug, Default)]
+pub struct SoundEventRegistry {
+    /// `names[id]` is the entry name (`"entity.player.levelup"`).
+    names: Vec<String>,
+}
+
+impl SoundEventRegistry {
+    /// Build from the registry entries in wire order (`names[i]` ↔ id `i`).
+    pub fn from_names(names: Vec<String>) -> Self {
+        Self { names }
+    }
+
+    /// Load a vanilla `registries.json`-shaped document:
+    /// `{"minecraft:sound_event": {"entries": {"name": {"protocol_id": N}}}}`.
+    /// Missing registry/entries keys fail closed.
+    pub fn load_registries_json(path: &Path) -> Result<Self, String> {
+        let raw = read_capped(path, MAX_ASSET_JSON_BYTES)?;
+        let text = String::from_utf8(raw)
+            .map_err(|_| format!("{} is not UTF-8 JSON", path.display()))?;
+        let doc = parse_json(&text, MAX_ASSET_JSON_NODES)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let entries = doc
+            .get("minecraft:sound_event")
+            .and_then(|r| r.get("entries"))
+            .and_then(|e| match e {
+                JsonValue::Obj(m) => Some(m),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                format!("{}: no minecraft:sound_event entries", path.display())
+            })?;
+        let mut pairs: Vec<(u32, &str)> = Vec::with_capacity(entries.len());
+        for (name, val) in entries {
+            if let Some(id) = val
+                .get("protocol_id")
+                .and_then(JsonValue::as_i64)
+                .and_then(|v| u32::try_from(v).ok())
+            {
+                pairs.push((id, name.as_str()));
+            }
+        }
+        if pairs.is_empty() {
+            return Err(format!("{}: empty minecraft:sound_event", path.display()));
+        }
+        pairs.sort_unstable_by_key(|(id, _)| *id);
+        let max_id = pairs
+            .last()
+            .map(|(id, _)| *id as usize)
+            .unwrap_or(0)
+            .min(65_535);
+        let mut names = vec![String::new(); max_id + 1];
+        for (id, name) in pairs {
+            names[id as usize] = name.to_string();
+        }
+        Ok(Self { names })
+    }
+
+    /// Event name for `id` (`"entity.player.levelup"`), normalized to the
+    /// bare path form. `None` when the registry does not cover the id.
+    pub fn name(&self, id: u32) -> Option<&str> {
+        self.names
+            .get(id as usize)
+            .map(String::as_str)
+            .filter(|n| !n.is_empty())
+            .map(normalize_sound_name)
+    }
+
+    /// Number of id slots the registry covers.
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    /// `true` when no entries loaded.
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+}
+
 /// Strip a `minecraft:` namespace prefix — sounds.json keys, stop-sound
 /// names, and holder identifiers all normalize to the bare path form.
 pub fn normalize_sound_name(name: &str) -> &str {
@@ -122,6 +207,12 @@ pub struct SoundVariant {
     pub weight: u32,
     /// `type: "event"` redirects to another event's variants.
     pub redirect: Option<String>,
+    /// Per-variant Vanilla attenuation distance (`attenuation_distance`,
+    /// default 16 — jukeboxes declare 64, explosions reach 16 × volume).
+    pub attenuation_distance: Option<f32>,
+    /// `stream: true` — vanilla marks long music files; kept for API
+    /// completeness (the client decodes once into bounded memory either way).
+    pub stream: bool,
 }
 
 /// A `sounds.json` event definition.
@@ -132,23 +223,89 @@ pub struct SoundEventDef {
     /// `subtitle` translation key, when declared (e.g.
     /// `subtitles.entity.player.levelup`).
     pub subtitle: Option<String>,
+    /// `replace: true` — a higher-priority layer discards lower layers'
+    /// variants entirely instead of appending (resource packs use this).
+    pub replace: bool,
+}
+
+/// Where a resolved `.ogg` actually lives — the multi-layer equivalent of
+/// "a path in the vanilla object store".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SoundSourceData {
+    /// Plain filesystem path (vanilla object store or resource-pack dir).
+    File(PathBuf),
+    /// One entry inside a ZIP/JAR — decompressed in memory on decode; no
+    /// file is ever extracted to disk.
+    ZipEntry {
+        /// Archive path (Mod JAR or pack ZIP).
+        archive_path: PathBuf,
+        /// Safe entry name (`assets/<ns>/sounds/...`), indexed at layer
+        /// merge time.
+        entry_name: String,
+    },
+}
+
+/// Decoded PCM payload — `Mono` for world sounds and legacy callers,
+/// `Stereo` for 2D-bypassed assets (Music/UI) that must keep their L/R.
+#[derive(Clone, Debug)]
+pub enum DecodedPcm {
+    /// 48 kHz mono samples.
+    Mono(Vec<f32>),
+    /// 48 kHz `[L, R]` frames.
+    Stereo(Vec<[f32; 2]>),
+}
+
+impl DecodedPcm {
+    /// Mono copy — downmixes stereo `(L+R)*0.5` for 3D use.
+    pub fn to_mono(&self) -> Vec<f32> {
+        match self {
+            Self::Mono(v) => v.clone(),
+            Self::Stereo(v) => v.iter().map(|f| (f[0] + f[1]) * 0.5).collect(),
+        }
+    }
+
+    /// Frame count (samples for mono, `[L,R]` pairs for stereo).
+    pub fn frames(&self) -> usize {
+        match self {
+            Self::Mono(v) => v.len(),
+            Self::Stereo(v) => v.len(),
+        }
+    }
+
+    /// Decoded byte footprint (cache accounting).
+    pub fn bytes(&self) -> usize {
+        self.frames() * std::mem::size_of::<f32>() * if self.is_stereo() { 2 } else { 1 }
+    }
+
+    /// `true` for the stereo variant.
+    pub fn is_stereo(&self) -> bool {
+        matches!(self, Self::Stereo(_))
+    }
 }
 
 /// A resolved variant ready to decode.
 #[derive(Clone, Debug)]
 pub struct ResolvedSound {
-    /// Object-store path of the `.ogg`.
+    /// Filesystem path of the `.ogg` (object store or pack dir); for
+    /// archive-resident entries this is a `jar!/entry` surrogate used for
+    /// display and cache keys — never opened directly.
     pub path: PathBuf,
+    /// Where to read the OGG bytes from.
+    pub source: SoundSourceData,
     /// Combined volume multiplier (variant-level).
     pub volume: f32,
     /// Combined pitch multiplier (variant-level).
     pub pitch: f32,
+    /// `stream: true` variant flag (vanilla long-form/music marker).
+    pub stream: bool,
+    /// Variant `attenuation_distance` when declared (default 16 vanilla).
+    pub attenuation_distance: Option<f32>,
 }
 
 /// One decoded sound held by [`SoundLibrary`]'s LRU replay cache.
 struct CachedPcm {
-    /// Shared decoded 48 kHz mono samples.
-    pcm: Arc<Vec<f32>>,
+    /// Shared decoded 48 kHz PCM (mono or stereo).
+    pcm: Arc<DecodedPcm>,
     /// `pcm.len() * size_of::<f32>()` — the bytes counted against the cap.
     bytes: usize,
     /// Last `lru_clock` tick that inserted or touched this entry; the
@@ -156,9 +313,22 @@ struct CachedPcm {
     last_used: u64,
 }
 
+/// One merged `sounds.json` layer — a resource-pack directory or a ZIP/JAR
+/// archive (Mod JAR or zipped resource pack). Layers are ordered
+/// lowest→highest priority at merge time; object lookups scan them
+/// highest→lowest so packs always win over Mod assets, which always win
+/// over the vanilla index.
+struct SoundLayer {
+    /// Resource-pack root directory (`assets/` sits directly under it).
+    dir: Option<PathBuf>,
+    /// Indexed archive (Mod JAR / zipped pack) with safe entry names.
+    zip: Option<crate::zip_entries::ZipArchive>,
+}
+
 /// The parsed asset index + `sounds.json` for one `--assetsDir`/
-/// `--assetIndex` pair, with a decoded-PCM cache so replayed sounds decode
-/// once. The cache is strictly bounded to
+/// `--assetIndex` pair, layered with any Mod JARs and resource packs merged
+/// through [`SoundLibrary::merge_sound_layer`], plus a decoded-PCM cache so
+/// replayed sounds decode once. The cache is strictly bounded to
 /// [`DEFAULT_SOUND_PCM_CACHE_CAP_BYTES`] (configurable via
 /// [`SoundLibrary::with_pcm_cache_cap_bytes`]) and evicts
 /// least-recently-used entries when an insert would overflow it; a single
@@ -167,6 +337,10 @@ struct CachedPcm {
 pub struct SoundLibrary {
     objects: HashMap<String, PathBuf>,
     events: HashMap<String, SoundEventDef>,
+    /// Extra layers in lowest→highest priority order (Mod JARs first, then
+    /// resource packs). Their merged event definitions already live in
+    /// `events`; the layer list exists to resolve object paths.
+    layers: Vec<SoundLayer>,
     decode_cache: HashMap<PathBuf, CachedPcm>,
     /// Byte cap applied to `decode_cache` on every insert.
     pcm_cache_cap_bytes: usize,
@@ -237,6 +411,7 @@ impl SoundLibrary {
         Ok(Self {
             objects,
             events,
+            layers: Vec::new(),
             decode_cache: HashMap::new(),
             pcm_cache_cap_bytes: DEFAULT_SOUND_PCM_CACHE_CAP_BYTES,
             pcm_cache_bytes: 0,
@@ -244,6 +419,120 @@ impl SoundLibrary {
             pcm_cache_hits: 0,
             lru_clock: 0,
         })
+    }
+
+    /// An empty library (no vanilla index); layers can still be merged.
+    /// Used by Mod-only sessions and by tests building pack/JAR layers.
+    pub fn empty() -> Self {
+        Self {
+            objects: HashMap::new(),
+            events: HashMap::new(),
+            layers: Vec::new(),
+            decode_cache: HashMap::new(),
+            pcm_cache_cap_bytes: DEFAULT_SOUND_PCM_CACHE_CAP_BYTES,
+            pcm_cache_bytes: 0,
+            pcm_cache_evictions: 0,
+            pcm_cache_hits: 0,
+            lru_clock: 0,
+        }
+    }
+
+    /// Merge one `sounds.json` layer into the library. `path` may be:
+    ///
+    /// * a resource-pack **directory** — every `assets/<ns>/sounds.json`
+    ///   under it merges, and `.ogg` files resolve from disk;
+    /// * a **ZIP/JAR** (Mod JAR or zipped pack) — indexed by the bounded
+    ///   reader; `assets/<ns>/sounds.json` merges and `.ogg` entries decode
+    ///   straight from memory (nothing is extracted).
+    ///
+    /// Call order defines priority: later merges sit above earlier ones —
+    /// the intended order is vanilla → Mod JARs → resource packs.
+    /// `replace: true` in a higher layer discards lower layers' variants
+    /// for that event; `replace` absent/`false` appends variants.
+    ///
+    /// Returns the number of `sounds.json` documents merged.
+    pub fn merge_sound_layer(&mut self, path: &Path) -> Result<usize, String> {
+        if path.is_dir() {
+            let assets = path.join("assets");
+            let ns_entries = std::fs::read_dir(&assets)
+                .map_err(|e| format!("cannot scan {}: {e}", assets.display()))?;
+            let mut count = 0usize;
+            for ns_entry in ns_entries {
+                let ns_entry = ns_entry.map_err(|e| format!("read_dir: {e}"))?;
+                let sj = ns_entry.path().join("sounds.json");
+                if sj.is_file() {
+                    let ns = ns_entry.file_name().to_string_lossy().into_owned();
+                    self.merge_defs(
+                        ns.as_str(),
+                        parse_sounds_json_bytes(
+                            &read_capped(&sj, MAX_ASSET_JSON_BYTES)?,
+                            &sj,
+                        )?,
+                    );
+                    count += 1;
+                }
+            }
+            self.layers.push(SoundLayer {
+                dir: Some(path.to_path_buf()),
+                zip: None,
+            });
+            return Ok(count);
+        }
+        let zip = crate::zip_entries::ZipArchive::open(path)?;
+        let mut count = 0usize;
+        let names: Vec<String> = zip
+            .entry_names()
+            .filter(|n| {
+                n.starts_with("assets/")
+                    && n.ends_with("/sounds.json")
+                    && n.split('/').count() == 3
+            })
+            .map(str::to_string)
+            .collect();
+        for name in names {
+            let bytes = zip
+                .read_entry(&name, MAX_ASSET_JSON_BYTES as usize)?
+                .ok_or_else(|| format!("{name} vanished from archive"))?;
+            let ns = name.split('/').nth(1).unwrap_or_default();
+            self.merge_defs(ns, parse_sounds_json_bytes(&bytes, &PathBuf::from(&name))?);
+            count += 1;
+        }
+        self.layers.push(SoundLayer {
+            dir: None,
+            zip: Some(zip),
+        });
+        Ok(count)
+    }
+
+    /// Apply one layer's definitions under namespace `ns`, honoring
+    /// `replace`. `sounds.json` keys carry no namespace on the wire — the
+    /// namespace comes from the `assets/<ns>/` directory — so each event
+    /// merges as `<ns>:<event>` (`minecraft:` normalizes to the bare
+    /// vanilla form the wire packets already use).
+    fn merge_defs(&mut self, ns: &str, defs: Vec<(String, SoundEventDef)>) {
+        for (raw_name, def) in defs {
+            let qualified = if raw_name.contains(':') {
+                raw_name
+            } else {
+                format!("{ns}:{raw_name}")
+            };
+            let name = normalize_sound_name(&qualified).to_string();
+            if def.replace {
+                self.events.insert(name, def);
+            } else {
+                match self.events.get_mut(&name) {
+                    Some(existing) => {
+                        existing.variants.extend(def.variants);
+                        if def.subtitle.is_some() {
+                            existing.subtitle = def.subtitle;
+                        }
+                    }
+                    None => {
+                        self.events.insert(name, def);
+                    }
+                }
+            }
+        }
     }
 
     /// Override the decoded-PCM cache byte cap. Builder-style so tests can
@@ -336,6 +625,7 @@ impl SoundLibrary {
             }
             return false;
         }
+        let pcm = Arc::new(DecodedPcm::Mono((*pcm).clone()));
         if let Some(entry) = self.decode_cache.get_mut(path) {
             self.pcm_cache_bytes -= entry.bytes;
             entry.pcm = pcm;
@@ -358,11 +648,13 @@ impl SoundLibrary {
         true
     }
 
-    /// Resolve `event_name` (`"entity.player.levelup"` or namespaced) to an
-    /// on-disk OGG plus its variant multipliers. `seed` (the packet's sound
-    /// seed) picks the variant by cumulative weight, following vanilla's
-    /// seeded-variant rule. `type: "event"` indirections resolve through
-    /// their target, bounded at 4 hops.
+    /// Resolve `event_name` (`"entity.player.levelup"` or namespaced) to a
+    /// playable OGG source plus its variant multipliers. `seed` (the
+    /// packet's sound seed) picks the variant by cumulative weight,
+    /// following vanilla's seeded-variant rule. `type: "event"`
+    /// indirections resolve through their target, bounded at 4 hops. The
+    /// winning layer supplies the object: resource packs first, then Mod
+    /// JARs, then the vanilla object index.
     pub fn resolve(&self, event_name: &str, seed: i64) -> Option<ResolvedSound> {
         let mut name = normalize_sound_name(event_name);
         for _ in 0..4 {
@@ -389,43 +681,117 @@ impl SoundLibrary {
                 name = normalize_sound_name(redirect);
                 continue;
             }
-            let path = self.objects.get(&chosen.object_key)?.clone();
+            let (source, path) = self.resolve_source(&chosen.object_key)?;
             return Some(ResolvedSound {
                 path,
+                source,
                 volume: chosen.volume,
                 pitch: chosen.pitch,
+                stream: chosen.stream,
+                attenuation_distance: chosen.attenuation_distance,
             });
         }
         None
     }
 
-    /// Decode an object-store OGG to 48 kHz mono `f32`, memoized by path
-    /// under the bounded LRU replay cache. Cache hits refresh the entry's
-    /// recency; decoded clips that would push the cache over
-    /// [`SoundLibrary::pcm_cache_cap_bytes`] evict least-recently-used
-    /// entries first, and a clip larger than the whole cap is returned
-    /// uncached so resident PCM never exceeds the budget.
-    pub fn decode(&mut self, path: &Path) -> Result<Arc<Vec<f32>>, String> {
+    /// Locate `object_key` (`"ns/sounds/path.ogg"`) across layers —
+    /// resource packs first, then Mod JARs, then the vanilla object index.
+    /// Fail-closed: a hostile `sounds.json` name containing `..`, leading
+    /// slashes, or backslashes resolves to nothing rather than escaping
+    /// the layer root.
+    fn resolve_source(&self, object_key: &str) -> Option<(SoundSourceData, PathBuf)> {
+        if object_key.is_empty()
+            || object_key.contains('\0')
+            || object_key.contains('\\')
+            || object_key.starts_with('/')
+            || object_key.split('/').any(|p| p == "..")
+        {
+            return None;
+        }
+        let entry_name = format!("assets/{object_key}");
+        for layer in self.layers.iter().rev() {
+            if let Some(dir) = &layer.dir {
+                let candidate = dir.join(&entry_name);
+                if candidate.is_file() {
+                    return Some((SoundSourceData::File(candidate.clone()), candidate));
+                }
+            }
+            if let Some(zip) = &layer.zip {
+                if zip.entry_names().any(|n| n == entry_name) {
+                    let archive_path = zip_archive_path(zip);
+                    return Some((
+                        SoundSourceData::ZipEntry {
+                            archive_path: archive_path.clone(),
+                            entry_name: entry_name.clone(),
+                        },
+                        PathBuf::from(format!("{}!{entry_name}", archive_path.display())),
+                    ));
+                }
+            }
+        }
+        self.objects
+            .get(object_key)
+            .cloned()
+            .map(|p| (SoundSourceData::File(p.clone()), p))
+    }
+
+    /// Decode a resolved source to 48 kHz [`DecodedPcm`] (mono or stereo),
+    /// memoized under the bounded LRU replay cache.
+    pub fn decode_source(&mut self, source: &SoundSourceData) -> Result<Arc<DecodedPcm>, String> {
+        let cache_key = match source {
+            SoundSourceData::File(p) => p.clone(),
+            SoundSourceData::ZipEntry {
+                archive_path,
+                entry_name,
+            } => PathBuf::from(format!("{}!{entry_name}", archive_path.display())),
+        };
         self.lru_clock += 1;
         let tick = self.lru_clock;
-        if let Some(entry) = self.decode_cache.get_mut(path) {
+        if let Some(entry) = self.decode_cache.get_mut(&cache_key) {
             entry.last_used = tick;
             self.pcm_cache_hits += 1;
             return Ok(entry.pcm.clone());
         }
-        let (pcm, rate) = decode_ogg_mono(path, MAX_OGG_BYTES, MAX_DECODED_SAMPLES)?;
-        let pcm = if rate == MIX_SAMPLE_RATE {
-            pcm
-        } else {
-            resample_linear(&pcm, rate, MIX_SAMPLE_RATE)
+        let pcm = match source {
+            SoundSourceData::File(p) => decode_ogg(p, MAX_OGG_BYTES, MAX_DECODED_SAMPLES)?,
+            SoundSourceData::ZipEntry {
+                archive_path,
+                entry_name,
+            } => {
+                let zip = self
+                    .layers
+                    .iter()
+                    .filter_map(|l| l.zip.as_ref())
+                    .find(|z| {
+                        archive_path == &zip_archive_path(z)
+                            && z.entry_names().any(|n| n == entry_name.as_str())
+                    });
+                let bytes = match zip {
+                    Some(z) => z
+                        .read_entry(entry_name, MAX_OGG_BYTES as usize)?
+                        .ok_or_else(|| format!("zip entry {entry_name} vanished"))?,
+                    None => {
+                        // Source resolved before a later merge reordered
+                        // layers — open the archive fresh rather than fail.
+                        crate::zip_entries::ZipArchive::open(archive_path)?
+                            .read_entry(entry_name, MAX_OGG_BYTES as usize)?
+                            .ok_or_else(|| format!("zip entry {entry_name} vanished"))?
+                    }
+                };
+                decode_ogg_mem(&bytes, MAX_DECODED_SAMPLES)?
+            }
         };
-        let shared: Arc<Vec<f32>> = Arc::new(pcm);
-        let bytes = shared.len() * std::mem::size_of::<f32>();
+        let pcm = match pcm {
+            (DecodedPcm::Mono(v), rate) => {
+                DecodedPcm::Mono(resample_if_needed(&v, rate))
+            }
+            (DecodedPcm::Stereo(v), rate) => DecodedPcm::Stereo(resample_stereo(&v, rate)),
+        };
+        let shared: Arc<DecodedPcm> = Arc::new(pcm);
+        let bytes = shared.bytes();
         if bytes <= self.pcm_cache_cap_bytes {
-            // The new entry is always the most-recently-used, so the
-            // budget pass only ever evicts older clips.
             self.decode_cache.insert(
-                path.to_path_buf(),
+                cache_key,
                 CachedPcm {
                     pcm: shared.clone(),
                     bytes,
@@ -437,6 +803,64 @@ impl SoundLibrary {
         }
         Ok(shared)
     }
+
+    /// Decode an object-store OGG to 48 kHz mono `f32`, memoized by path
+    /// under the bounded LRU replay cache. Cache hits refresh the entry's
+    /// recency; decoded clips that would push the cache over
+    /// [`SoundLibrary::pcm_cache_cap_bytes`] evict least-recently-used
+    /// entries first, and a clip larger than the whole cap is returned
+    /// uncached so resident PCM never exceeds the budget. Stereo assets
+    /// are downmixed — channel-preserving callers use
+    /// [`SoundLibrary::decode_source`].
+    pub fn decode(&mut self, path: &Path) -> Result<Arc<Vec<f32>>, String> {
+        let pcm = self.decode_source(&SoundSourceData::File(path.to_path_buf()))?;
+        Ok(Arc::new(pcm.to_mono()))
+    }
+}
+
+/// The path a stored [`SoundLayer::zip`] was opened from (used for cache
+/// keys and `SoundSourceData::ZipEntry::archive_path`).
+fn zip_archive_path(zip: &crate::zip_entries::ZipArchive) -> PathBuf {
+    zip.path().to_path_buf()
+}
+
+/// Resample mono PCM to [`MIX_SAMPLE_RATE`] when needed.
+fn resample_if_needed(pcm: &[f32], rate: u32) -> Vec<f32> {
+    if rate == MIX_SAMPLE_RATE {
+        pcm.to_vec()
+    } else {
+        resample_linear(pcm, rate, MIX_SAMPLE_RATE)
+    }
+}
+
+/// Stereo-aware resample: each channel runs the same linear interpolator.
+fn resample_stereo(pcm: &[[f32; 2]], rate: u32) -> Vec<[f32; 2]> {
+    if rate == MIX_SAMPLE_RATE {
+        return pcm.to_vec();
+    }
+    let l: Vec<f32> = pcm.iter().map(|f| f[0]).collect();
+    let r: Vec<f32> = pcm.iter().map(|f| f[1]).collect();
+    let l = resample_linear(&l, rate, MIX_SAMPLE_RATE);
+    let r = resample_linear(&r, rate, MIX_SAMPLE_RATE);
+    l.into_iter().zip(r).map(|(a, b)| [a, b]).collect()
+}
+
+/// Parse one `sounds.json` document into `(event, def)` pairs.
+fn parse_sounds_json_bytes(
+    raw: &[u8],
+    origin: &Path,
+) -> Result<Vec<(String, SoundEventDef)>, String> {
+    let text = String::from_utf8(raw.to_vec())
+        .map_err(|_| format!("{} is not UTF-8 JSON", origin.display()))?;
+    let doc = parse_json(&text, MAX_ASSET_JSON_NODES)
+        .map_err(|e| format!("{}: {e}", origin.display()))?;
+    let JsonValue::Obj(top) = doc else {
+        return Err(format!("{} is not a sounds.json object", origin.display()));
+    };
+    Ok(top
+        .iter()
+        .map(|(event, def)| (event.clone(), parse_sound_event_def(def)))
+        .collect())
 }
 
 /// One parsed `sounds.json` event: `{sounds: [...], subtitle?, replace?}`.
@@ -445,6 +869,7 @@ fn parse_sound_event_def(value: &JsonValue) -> SoundEventDef {
     if let Some(subtitle) = value.get("subtitle").and_then(JsonValue::as_str) {
         def.subtitle = Some(subtitle.to_string());
     }
+    def.replace = matches!(value.get("replace"), Some(JsonValue::Bool(true)));
     let Some(JsonValue::Arr(sounds)) = value.get("sounds") else {
         return def;
     };
@@ -457,6 +882,8 @@ fn parse_sound_event_def(value: &JsonValue) -> SoundEventDef {
                 pitch: 1.0,
                 weight: 1,
                 redirect: None,
+                attenuation_distance: None,
+                stream: false,
             });
             continue;
         }
@@ -493,6 +920,12 @@ fn parse_sound_event_def(value: &JsonValue) -> SoundEventDef {
             } else {
                 None
             },
+            attenuation_distance: entry
+                .get("attenuation_distance")
+                .and_then(JsonValue::as_f64)
+                .map(|d| (d as f32).max(0.0))
+                .filter(|d| d.is_finite() && *d > 0.0),
+            stream: matches!(entry.get("stream"), Some(JsonValue::Bool(true))),
         });
     }
     def
@@ -539,6 +972,56 @@ fn read_capped(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Decode OGG bytes entirely in memory — the entry point for
+/// ZIP/JAR-resident sounds; `cap_samples` bounds decoded frames.
+/// Channel count is preserved (mono stays `Mono`, multi-channel keeps
+/// `Stereo` L/R — extra channels fold into L/R symmetrically).
+pub fn decode_ogg_mem(
+    bytes: &[u8],
+    cap_samples: usize,
+) -> Result<(DecodedPcm, u32), String> {
+    struct MemSource {
+        inner: std::io::Cursor<Vec<u8>>,
+        len: u64,
+    }
+    impl std::io::Read for MemSource {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+    impl std::io::Seek for MemSource {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+    impl MediaSource for MemSource {
+        fn is_seekable(&self) -> bool {
+            true
+        }
+        fn byte_len(&self) -> Option<u64> {
+            Some(self.len)
+        }
+    }
+    let len = bytes.len() as u64;
+    let src = MemSource {
+        inner: std::io::Cursor::new(bytes.to_vec()),
+        len,
+    };
+    decode_vorbis(Box::new(src), cap_samples, "memory")
+}
+
+/// Decode an OGG Vorbis file preserving channels at its native rate —
+/// mono yields [`DecodedPcm::Mono`], multi-channel yields `Stereo` L/R.
+/// `cap_bytes`/`cap_samples` bound hostile inputs.
+pub fn decode_ogg(
+    path: &Path,
+    cap_bytes: u64,
+    cap_samples: usize,
+) -> Result<(DecodedPcm, u32), String> {
+    let src = file_source(path, cap_bytes)?;
+    decode_vorbis(src, cap_samples, &path.display().to_string())
+}
+
 /// Decode an OGG Vorbis file to mono `f32` at its native rate.
 /// `cap_bytes`/`cap_samples` bound hostile inputs. All channels are
 /// downmixed equally; symphonia already sanitizes non-finite output, and
@@ -548,16 +1031,15 @@ pub fn decode_ogg_mono(
     cap_bytes: u64,
     cap_samples: usize,
 ) -> Result<(Vec<f32>, u32), String> {
-    use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::DecoderOptions;
-    use symphonia::core::errors::Error as SymphoniaError;
-    use symphonia::core::formats::FormatOptions;
-    use symphonia::core::io::{MediaSource, MediaSourceStream};
-    use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
+    let src = file_source(path, cap_bytes)?;
+    let (pcm, rate) = decode_vorbis(src, cap_samples, &path.display().to_string())?;
+    Ok((pcm.to_mono(), rate))
+}
 
-    // Read/Seek facade that never yields more than `cap` absolute bytes,
-    // even across seeks (the OGG demuxer seeks to the tail for duration).
+/// Bounded `File` as a symphonia `MediaSource`: reads never yield more
+/// than `cap` absolute bytes, even across seeks (the OGG demuxer seeks to
+/// the tail for duration).
+fn file_source(path: &Path, cap_bytes: u64) -> Result<Box<dyn MediaSource>, String> {
     struct Capped {
         inner: std::fs::File,
         pos: u64,
@@ -598,12 +1080,31 @@ pub fn decode_ogg_mono(
         .metadata()
         .map(|m| m.len().min(cap_bytes))
         .unwrap_or(cap_bytes);
-    let src = Capped {
+    Ok(Box::new(Capped {
         inner: file,
         pos: 0,
         cap: len,
-    };
-    let mss = MediaSourceStream::new(Box::new(src), Default::default());
+    }))
+}
+
+/// Channel-preserving symphonia decode shared by the file and memory
+/// entry points. Mono/stereo assets keep their channel layout; assets
+/// with more channels fold into symmetric L/R pairs so 2D playback stays
+/// binaural and 3D downmixes correctly.
+fn decode_vorbis(
+    src: Box<dyn MediaSource>,
+    cap_samples: usize,
+    what: &str,
+) -> Result<(DecodedPcm, u32), String> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::errors::Error as SymphoniaError;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    let mss = MediaSourceStream::new(src, Default::default());
     let mut hint = Hint::new();
     hint.with_extension("ogg");
     let probed = symphonia::default::get_probe()
@@ -613,17 +1114,19 @@ pub fn decode_ogg_mono(
             &FormatOptions::default(),
             &MetadataOptions::default(),
         )
-        .map_err(|e| format!("{}: probe failed: {e}", path.display()))?;
+        .map_err(|e| format!("{what}: probe failed: {e}"))?;
     let mut format = probed.format;
     let track = format
         .default_track()
-        .ok_or_else(|| format!("{}: no audio track", path.display()))?;
+        .ok_or_else(|| format!("{what}: no audio track"))?;
     let rate = track.codec_params.sample_rate.unwrap_or(MIX_SAMPLE_RATE);
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
-        .map_err(|e| format!("{}: decoder init failed: {e}", path.display()))?;
+        .map_err(|e| format!("{what}: decoder init failed: {e}"))?;
     let track_id = track.id;
-    let mut out: Vec<f32> = Vec::new();
+    let mut mono: Vec<f32> = Vec::new();
+    let mut stereo: Vec<[f32; 2]> = Vec::new();
+    let mut stereo_mode = false;
     loop {
         let packet = match format.next_packet() {
             Ok(p) => p,
@@ -632,7 +1135,7 @@ pub fn decode_ogg_mono(
                 decoder.reset();
                 continue;
             }
-            Err(e) => return Err(format!("{}: demux failed: {e}", path.display())),
+            Err(e) => return Err(format!("{what}: demux failed: {e}")),
         };
         if packet.track_id() != track_id {
             continue;
@@ -641,7 +1144,7 @@ pub fn decode_ogg_mono(
             Ok(d) => d,
             Err(SymphoniaError::DecodeError(_)) => continue,
             Err(SymphoniaError::IoError(_)) => break,
-            Err(e) => return Err(format!("{}: decode failed: {e}", path.display())),
+            Err(e) => return Err(format!("{what}: decode failed: {e}")),
         };
         let spec = *decoded.spec();
         let channels = spec.channels.count().max(1);
@@ -649,19 +1152,38 @@ pub fn decode_ogg_mono(
         let mut buf = SampleBuffer::<f32>::new(frames as u64, spec);
         buf.copy_interleaved_ref(decoded);
         let samples = buf.samples();
-        let inv = 1.0 / channels as f32;
-        for i in 0..frames.min(samples.len() / channels) {
-            let mut acc = 0.0f32;
-            for c in 0..channels {
-                acc += samples[i * channels + c];
+        if channels == 1 {
+            for &s in samples.iter().take(frames.min(samples.len())) {
+                mono.push(s);
+                if mono.len() >= cap_samples {
+                    return Ok((DecodedPcm::Mono(mono), rate));
+                }
             }
-            out.push(acc * inv);
-            if out.len() >= cap_samples {
-                return Ok((out, rate));
+        } else {
+            // Once any packet decodes multi-channel the asset is stereo —
+            // earlier mono frames can never occur (channel count is fixed
+            // per Vorbis stream), so `stereo` starts empty on first use.
+            stereo_mode = true;
+            let l_idx = 0usize;
+            let r_idx = if channels == 2 { 1 } else { channels / 2 };
+            for i in 0..frames.min(samples.len() / channels) {
+                let l = samples[i * channels + l_idx];
+                let mut r_acc = 0.0f32;
+                for c in r_idx..channels {
+                    r_acc += samples[i * channels + c];
+                }
+                stereo.push([l, r_acc / (channels - r_idx) as f32]);
+                if stereo.len() >= cap_samples {
+                    return Ok((DecodedPcm::Stereo(stereo), rate));
+                }
             }
         }
     }
-    Ok((out, rate))
+    if stereo_mode {
+        Ok((DecodedPcm::Stereo(stereo), rate))
+    } else {
+        Ok((DecodedPcm::Mono(mono), rate))
+    }
 }
 
 /// Linear-interpolation resampler — deterministic, cheap, and accurate

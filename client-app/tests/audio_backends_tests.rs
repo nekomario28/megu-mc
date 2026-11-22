@@ -204,6 +204,8 @@ fn mixer_output_stays_bounded_through_limiter() {
         mixer.submit(mc_spine_client::session::PlaySoundEvent {
             label: "loud".to_string(),
             pcm: Arc::new(placeholder_pcm("entity.explode", 0, MIX_SAMPLE_RATE)),
+            stereo_pcm: None,
+            max_range_m: f32::INFINITY,
             is_placeholder: true,
             category: 0,
             position: None,
@@ -227,6 +229,7 @@ fn null_sink_runtime_pumps_without_panic() {
         sink: AudioSinkKind::Null,
         assets_dir: None,
         asset_index: None,
+        game_dir: None,
         max_volume_cap: 1.0,
         max_concurrent_same_sound: 4,
         subtitle_path: None,
