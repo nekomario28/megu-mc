@@ -13,7 +13,27 @@ use mc_spine_client::render::ClientVfxHost;
 use mc_spine_client::render_graph::GpuPipelineKind;
 use mc_spine_client::world::{BlockTable, WorldState};
 use mc_spine_ui::magic_hud::{CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState};
-use mc_spine_ui::state::HudState;
+use mc_spine_ui::state::{HudState, MiniHudPreset, UiState};
+
+// client-gpu's manifest cannot be changed in this lane. Reuse the pure-std
+// core implementations until the crate can declare mc-spine-core directly.
+#[allow(dead_code)]
+#[path = "../../core/src/hw_adaptive_engine.rs"]
+pub mod hw_adaptive_engine;
+#[allow(dead_code)]
+#[path = "../../core/src/sys_metrics.rs"]
+pub mod sys_metrics;
+
+use crate::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
+use crate::subworld_render::SubWorldRenderBank;
+use hw_adaptive_engine::{
+    detect_host_hardware_caps, select_compute_strategy, ComputeStrategy, HostHardwareCaps,
+    PagedSectionPool, SpeculativeChunkPrefetcher,
+};
+use sys_metrics::{sample_host_metrics, CpuSampler, FrameTimingStats};
+
+const PREFETCH_VIEW_DISTANCE: u32 = 8;
+const PREFETCH_MAX_CHUNKS: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionStatus {
@@ -98,6 +118,16 @@ pub struct LiveSession {
     pub animation_rejected: u64,
     pub motion_packets: u64,
     pub chat_message: Option<String>,
+    pub hw_caps: HostHardwareCaps,
+    pub compute_strategy: ComputeStrategy,
+    pub paged_sections: PagedSectionPool,
+    pub prefetcher: SpeculativeChunkPrefetcher,
+    pub metrics_probe: CpuSampler,
+    pub frame_timings: FrameTimingStats,
+    pub atmosphere_blender: BiomeAtmosphereBlender,
+    pub chunk_fades: ChunkFadeTracker,
+    pub subworlds: SubWorldRenderBank,
+    last_motion_delta: [f64; 2],
     last_vfx_tick: Instant,
     last_animation_tick: Instant,
 }
@@ -114,6 +144,8 @@ impl LiveSession {
         incoming: Receiver<WorkerMessage>,
         outgoing: SyncSender<WorkerCommand>,
     ) -> Self {
+        let hw_caps = detect_host_hardware_caps();
+        let compute_strategy = select_compute_strategy(&hw_caps);
         Self {
             incoming,
             outgoing,
@@ -132,6 +164,16 @@ impl LiveSession {
             animation_rejected: 0,
             motion_packets: 0,
             chat_message: None,
+            hw_caps,
+            compute_strategy,
+            paged_sections: PagedSectionPool::new(),
+            prefetcher: SpeculativeChunkPrefetcher::new(),
+            metrics_probe: CpuSampler::new(),
+            frame_timings: FrameTimingStats::new(),
+            atmosphere_blender: BiomeAtmosphereBlender::new(AtmosphereParams::default()),
+            chunk_fades: ChunkFadeTracker::new(),
+            subworlds: SubWorldRenderBank::new(),
+            last_motion_delta: [0.0; 2],
             last_vfx_tick: Instant::now(),
             last_animation_tick: Instant::now(),
         }
@@ -190,8 +232,60 @@ impl LiveSession {
         if !matches!(self.status, SessionStatus::Playing) || self.pose.is_none() {
             return;
         }
+        if let Some(previous) = self.pose {
+            self.last_motion_delta = [
+                movement.pose.feet[0] - previous.feet[0],
+                movement.pose.feet[2] - previous.feet[2],
+            ];
+        }
         self.pose = Some(movement.pose);
+        self.refresh_prefetcher();
         let _ = self.outgoing.try_send(WorkerCommand::Movement(movement));
+    }
+
+    fn refresh_prefetcher(&mut self) {
+        let Some(pose) = self.pose else {
+            return;
+        };
+        let columns = &self.world.columns;
+        self.prefetcher.update(
+            pose.feet[0],
+            pose.feet[2],
+            self.last_motion_delta[0],
+            self.last_motion_delta[1],
+            PREFETCH_VIEW_DISTANCE,
+            PREFETCH_MAX_CHUNKS,
+            |cx, cz| columns.contains_key(&(cx, cz)),
+        );
+    }
+
+    /// Record frame timing and advance visual transitions before HUD rendering.
+    pub fn record_frame_and_refresh_minihud(&mut self, frame_dt_sec: f32, ui: &mut UiState) {
+        let frame_us = f64::from(frame_dt_sec) * 1_000_000.0;
+        self.frame_timings.push_frame_ms(frame_us / 1_000.0);
+        self.chunk_fades.tick(frame_dt_sec);
+        self.atmosphere_blender.advance(frame_dt_sec);
+
+        if ui.settings.qol.mini_hud_preset() == MiniHudPreset::Off {
+            return;
+        }
+
+        let host = sample_host_metrics(&mut self.metrics_probe);
+        let telemetry = sys_metrics::MiniHudData::from_telemetry(&host, &self.frame_timings);
+        let hud = &mut ui.hud.mini_hud_data;
+        hud.fps = telemetry.fps;
+        hud.fps_one_percent_low = telemetry.fps_one_percent_low;
+        hud.ram_used_mib = telemetry.ram_used_mib;
+        hud.ram_total_mib = telemetry.ram_total_mib;
+        hud.cpu_percent = telemetry.cpu_percent;
+        hud.gpu_name = telemetry.gpu_name;
+        hud.gpu_busy_percent = telemetry.gpu_busy_percent;
+        hud.vram_used_mib = telemetry.vram_used_mib;
+        hud.vram_total_mib = telemetry.vram_total_mib;
+        hud.loaded_chunks = Some(self.world.loaded_chunks().min(u32::MAX as usize) as u32);
+        hud.coords = self
+            .pose
+            .map(|pose| (pose.feet[0], pose.feet[1], pose.feet[2]));
     }
 
     /// Apply a decoded packet, also used by framed protocol regression tests.
@@ -208,6 +302,10 @@ impl LiveSession {
                 self.world.reset_dimension(dimension);
                 self.terrain_dirty = true;
                 self.pose = None;
+                self.last_motion_delta = [0.0; 2];
+                self.chunk_fades = ChunkFadeTracker::new();
+                self.prefetcher = SpeculativeChunkPrefetcher::new();
+                self.atmosphere_blender.snap_to_target();
             }
             PlayEvent::Teleport(teleport) => {
                 let pose = PlayerPose::from_teleport(&teleport, self.pose);
@@ -215,7 +313,10 @@ impl LiveSession {
                 self.camera_sync = Some(pose);
             }
             PlayEvent::ChunkData(chunk) => {
+                let (cx, cz) = (chunk.cx, chunk.cz);
                 self.world.apply_chunk(*chunk)?;
+                self.chunk_fades.note_chunk(cx, cz);
+                self.refresh_prefetcher();
                 self.terrain_dirty = true;
             }
             PlayEvent::UpdateLight { cx, cz, light } => {
@@ -231,6 +332,8 @@ impl LiveSession {
             }
             PlayEvent::UnloadChunk { cx, cz } => {
                 self.world.unload_chunk(cx, cz);
+                self.chunk_fades.forget(cx, cz);
+                self.refresh_prefetcher();
                 self.terrain_dirty = true;
             }
             PlayEvent::SetHealth { health, food, .. } => {
@@ -454,6 +557,69 @@ mod tests {
         let (tx, incoming) = mpsc::sync_channel(8);
         let (outgoing, _rx) = mpsc::sync_channel(8);
         (LiveSession::with_channels(incoming, outgoing), tx)
+    }
+
+    #[test]
+    fn initializes_host_strategy_and_live_resources() {
+        let (live, _) = session();
+        assert!(live.hw_caps.logical_cores >= 1);
+        assert_eq!(
+            live.compute_strategy,
+            select_compute_strategy(&live.hw_caps)
+        );
+        assert_eq!(live.paged_sections.stats().logical_sections, 0);
+        assert_eq!(live.prefetcher.pending_count(), 0);
+        assert_eq!(live.frame_timings.frame_count(), 0);
+        assert_eq!(live.subworlds.len(), 0);
+    }
+
+    #[test]
+    fn chunk_arrival_fades_until_advanced_and_unload_forgets() {
+        let (mut live, _) = session();
+        let body = decoded_frame(0x27, &stone_chunk());
+        let chunk = decode_chunk_packet(&body, 24, 64).unwrap();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ChunkData(Box::new(chunk))))
+            .unwrap();
+        assert_eq!(live.chunk_fades.fade_alpha(0, 0), 0.0);
+        assert!(live.chunk_fades.is_fading(0, 0));
+
+        let mut ui = UiState::new();
+        live.record_frame_and_refresh_minihud(0.125, &mut ui);
+        assert!((live.chunk_fades.fade_alpha(0, 0) - 0.5).abs() < 0.001);
+        live.record_frame_and_refresh_minihud(0.125, &mut ui);
+        assert!(!live.chunk_fades.is_fading(0, 0));
+
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::UnloadChunk {
+            cx: 0,
+            cz: 0,
+        }))
+        .unwrap();
+        assert_eq!(live.chunk_fades.len(), 0);
+    }
+
+    #[test]
+    fn basic_and_advanced_minihud_receive_frame_and_host_telemetry() {
+        let (mut live, _) = session();
+        let mut ui = UiState::new();
+        ui.settings.qol.mini_hud.enabled = false;
+        live.record_frame_and_refresh_minihud(0.02, &mut ui);
+        assert_eq!(live.frame_timings.frame_count(), 1);
+        assert_eq!(ui.hud.mini_hud_data.fps, None);
+
+        ui.settings.qol.cycle_mini_hud();
+        assert_eq!(ui.settings.qol.mini_hud_preset(), MiniHudPreset::Basic);
+        live.record_frame_and_refresh_minihud(0.02, &mut ui);
+        assert!((ui.hud.mini_hud_data.fps.unwrap() - 50.0).abs() < 0.01);
+        assert!((ui.hud.mini_hud_data.fps_one_percent_low.unwrap() - 50.0).abs() < 0.01);
+        assert_eq!(ui.hud.mini_hud_data.loaded_chunks, Some(0));
+
+        ui.settings.qol.cycle_mini_hud();
+        assert_eq!(ui.settings.qol.mini_hud_preset(), MiniHudPreset::Advanced);
+        live.record_frame_and_refresh_minihud(0.04, &mut ui);
+        assert_eq!(live.frame_timings.frame_count(), 3);
+        assert!((live.frame_timings.frame_ms_avg() - 26.666_666).abs() < 0.001);
+        assert!((ui.hud.mini_hud_data.fps.unwrap() - 37.5).abs() < 0.01);
+        assert!((ui.hud.mini_hud_data.fps_one_percent_low.unwrap() - 25.0).abs() < 0.01);
     }
 
     fn varint(out: &mut Vec<u8>, mut value: u32) {

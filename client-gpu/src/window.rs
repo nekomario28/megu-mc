@@ -276,6 +276,7 @@ impl GpuApp {
                 live.terrain_dirty = false;
             }
             self.ui.hud = live.hud.clone();
+            live.record_frame_and_refresh_minihud(dt, &mut self.ui);
         }
 
         // HUD/diagnostics through the real client-ui state machine.
