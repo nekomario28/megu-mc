@@ -13,13 +13,14 @@
 //! modal is composited on top and — critically — only the modal's hit
 //! regions are returned, so the dimmed screen is truly inert.
 
+use mc_spine_core::i18n::UiTextKey;
 use mc_spine_core::sys_metrics::{format_mini_hud_lines, MiniHudAnchor};
 
 use crate::draw::{palette as pal, text_width, UiColor, UiCommand, UiDrawList, UiRect};
 use crate::magic_hud::MagicHudState;
 use crate::state::{
-    tr, HitRegion, HudState, HudSubtitle, MiniHudPreset, ModSyncChange, Screen, SettingsTab,
-    SubtitleDirection, UiLang, UiModal, UiState, WidgetId, FPS_CAP_STEPS,
+    tr, HitRegion, HudState, HudSubtitle, MiniHudPreset, ModSyncChange, Screen, SettingKey,
+    SettingsTab, SubtitleDirection, UiLang, UiModal, UiState, WidgetId, FPS_CAP_STEPS,
 };
 
 /// Build the frame for the current screen: `(draw_list, hit_regions)`.
@@ -352,6 +353,18 @@ fn onoff(v: bool) -> &'static str {
     }
 }
 
+impl Ctx<'_> {
+    /// The `●` dirty marker drawn just right of a settings widget whose
+    /// value differs from the session-open snapshot. Kept out of the
+    /// widget label so button text stays byte-identical; off-viewport
+    /// dots are dropped by [`Ctx::text`] like any other draw command.
+    fn dirty_dot(&mut self, key: SettingKey, x: i32, y: i32) {
+        if self.state.is_setting_dirty(key) {
+            self.text(x, y, 1, pal::WARNING, "●");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Title
 // ---------------------------------------------------------------------------
@@ -460,6 +473,29 @@ fn title(ctx: &mut Ctx) {
         short_version
     };
     ctx.text(4, ctx.h - 12, 1, pal::TEXT_DIM, version);
+
+    boot_badge(ctx, 106);
+}
+
+/// The compact `Boot: N ms` telemetry badge on Title/About. Emitted
+/// only while [`UiState::startup_timeline`] is populated *and* the
+/// badge can sit in the bottom-right corner without ever reaching the
+/// centered widget column (`clear` is the half-width to stay right of).
+fn boot_badge(ctx: &mut Ctx, clear: i32) {
+    let Some(timeline) = &ctx.state.startup_timeline else {
+        return;
+    };
+    let label = format!(
+        "{}: {} ms",
+        tr(ctx.lang, "Boot", "起動"),
+        timeline.total_ms
+    );
+    let bw = (label.chars().count() as i32 * 8 + 8).min(ctx.w - 8);
+    let bx = ctx.w - 4 - bw;
+    if bw < 24 || ctx.h < 30 || bx < ctx.w / 2 + clear {
+        return;
+    }
+    ctx.btn(WidgetId::BootBadge, lr(bx, ctx.h - 26, bw, 12), &label);
 }
 
 // ---------------------------------------------------------------------------
@@ -562,25 +598,55 @@ fn settings(ctx: &mut Ctx, active: SettingsTab) {
     ctx.band_top = i32::MAX;
 
     // Footer buttons: adaptive row that compresses (then stacks) on
-    // narrow logical widths instead of clipping off the left edge.
+    // narrow logical widths instead of clipping off the left edge. The
+    // mistake-proof session toolbar (Undo / Redo / Discard / Reset)
+    // joins the row while all seven buttons still fit.
     let labels = [
-        (WidgetId::SettingsDone, tr(lang, "Done", "完了")),
+        (WidgetId::SettingsDone, tr(lang, "Done", "完了"), true),
         (
             WidgetId::SettingsMods,
             tr(lang, "Mods & Packs", "Modとパック"),
+            true,
         ),
         (
             WidgetId::SettingsAboutMegu,
             tr(lang, "About Megu", "Meguについて"),
+            true,
         ),
+        (
+            WidgetId::SettingsUndo,
+            tr(lang, "Undo", "元に戻す"),
+            !ctx.state.settings_tx.undo_stack.is_empty(),
+        ),
+        (
+            WidgetId::SettingsRedo,
+            tr(lang, "Redo", "やり直す"),
+            !ctx.state.settings_tx.redo_stack.is_empty(),
+        ),
+        (
+            WidgetId::SettingsDiscard,
+            tr(lang, "Discard", "破棄"),
+            ctx.state.is_session_dirty(),
+        ),
+        (WidgetId::SettingsResetDefaults, tr(lang, "Reset", "初期化"), true),
     ];
     let gap = 4;
+    let bw7 = 100.min((ctx.w - 16 - gap * 6) / 7);
+    if bw7 >= 40 {
+        let total = bw7 * 7 + gap * 6;
+        let mut bx = cx - total / 2;
+        for (id, label, enabled) in labels {
+            ctx.button_unchecked(id, lr(bx, ctx.h - 30, bw7, 20), label, enabled);
+            bx += bw7 + gap;
+        }
+        return;
+    }
     let bw = 100.min((ctx.w - 16 - gap * 2) / 3);
     let total = bw * 3 + gap * 2;
     if total <= ctx.w - 4 {
         let mut bx = cx - total / 2;
-        for (id, label) in labels {
-            ctx.button_unchecked(id, lr(bx, ctx.h - 30, bw, 20), label, true);
+        for (id, label, _) in &labels[..3] {
+            ctx.button_unchecked(*id, lr(bx, ctx.h - 30, bw, 20), label, true);
             bx += bw + gap;
         }
     } else if ctx.h >= 96 {
@@ -596,7 +662,7 @@ fn settings(ctx: &mut Ctx, active: SettingsTab) {
             true,
         );
         let mut bx = cx - half / 2;
-        for (id, label) in &labels[1..] {
+        for (id, label, _) in &labels[1..3] {
             ctx.button_unchecked(*id, lr(bx, y1 + 24, bw2, 20), label, true);
             bx += bw2 + gap;
         }
@@ -699,6 +765,9 @@ fn about_megu(ctx: &mut Ctx) {
         lr(cx - 50, ctx.h - 30, 100, 20),
         tr(lang, "Back", "戻る"),
     );
+    // 150 keeps the badge right of the optional link buttons (cx+144)
+    // and Back (cx+50); the panel itself already ends above it.
+    boot_badge(ctx, 150);
 }
 
 /// Row geometry for settings pages: a `320`-wide control column.
@@ -759,6 +828,7 @@ fn shaders_tab(ctx: &mut Ctx, y0: i32) {
             tr(lang, "Shaders: OFF", "シェーダー: OFF")
         },
     );
+    ctx.dirty_dot(SettingKey::ShadersEnabled, x + 326, y0 + 50);
     ctx.btn(
         WidgetId::ShadersOpenOptions,
         lr(x, y0 + 68, 320, 20),
@@ -779,6 +849,55 @@ fn shaders_tab(ctx: &mut Ctx, y0: i32) {
         );
         ctx.ctext(cx, y0 + 108, 1, pal::TEXT, &hud_str(label, 38));
     }
+
+    // Visual style: an external shader pack always wins — it shows a
+    // clean status line and every built-in visual shader yields to it.
+    let vs = &ctx.state.settings.visual;
+    if let Some(status) = vs.external_shader_status(lang) {
+        ctx.ctext(cx, y0 + 126, 1, pal::ACCENT, &hud_str(&status, 44));
+    } else {
+        ctx.btn(
+            WidgetId::VisualPreset,
+            lr(x, y0 + 124, 320, 20),
+            &format!(
+                "{}: {}",
+                tr(lang, "Visual Style", "ビジュアルスタイル"),
+                vs.preset.label(lang)
+            ),
+        );
+        ctx.dirty_dot(SettingKey::VisualStylePreset, x + 326, y0 + 130);
+    }
+    ctx.btn(
+        WidgetId::VisualBlocks3d,
+        lr(x, y0 + 148, 320, 20),
+        &format!(
+            "{}: {}",
+            tr(lang, "3D Blocks & Skins", "立体ブロック＆スキン"),
+            onoff(vs.blocks_and_skins_3d)
+        ),
+    );
+    ctx.dirty_dot(SettingKey::BlocksAndSkins3d, x + 326, y0 + 154);
+    ctx.btn(
+        WidgetId::VisualWorldEffects,
+        lr(x, y0 + 172, 320, 20),
+        &format!(
+            "{}: {}",
+            tr(lang, "World Effects", "環境エフェクト"),
+            onoff(vs.world_effects)
+        ),
+    );
+    ctx.dirty_dot(SettingKey::WorldEffects, x + 326, y0 + 178);
+    ctx.btn(
+        WidgetId::VisualCameraMotion,
+        lr(x, y0 + 196, 320, 20),
+        &format!(
+            "{}: {} ({})",
+            tr(lang, "Camera Motion", "カメラの微揺れ"),
+            onoff(vs.camera_micro_motion),
+            tr(lang, "opt-in", "オプトイン")
+        ),
+    );
+    ctx.dirty_dot(SettingKey::CameraMicroMotion, x + 326, y0 + 202);
 }
 
 fn video_tab(ctx: &mut Ctx, y0: i32) {
@@ -791,6 +910,7 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
         lr(x, y, 320, 20),
         &format!("{}: {}", tr(lang, "Preset", "プリセット"), v.preset.label()),
     );
+    ctx.dirty_dot(SettingKey::VideoPreset, x + 326, y + 6);
 
     let (x, y) = row(ctx, 1, y0);
     let frac = v.view_distance.saturating_sub(6) as f32 / 26.0;
@@ -805,6 +925,7 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
             tr(lang, "chunks", "チャンク")
         ),
     );
+    ctx.dirty_dot(SettingKey::VideoViewDistance, x + 326, y + 6);
 
     let (x, y) = row(ctx, 2, y0);
     ctx.btn(
@@ -812,6 +933,7 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
         lr(x, y, 320, 20),
         &format!("{}: {}", tr(lang, "Distant LOD", "遠景LOD"), v.lod.label()),
     );
+    ctx.dirty_dot(SettingKey::VideoLod, x + 326, y + 6);
 
     let (x, y) = row(ctx, 3, y0);
     ctx.btn(
@@ -823,6 +945,7 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
             v.gpu_backend.label()
         ),
     );
+    ctx.dirty_dot(SettingKey::VideoGpuBackend, x + 326, y + 6);
 
     // FPS cap: slider + custom numeric field on the same row (no overlap).
     let (x, y) = row(ctx, 4, y0);
@@ -840,6 +963,7 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
         ctx.state.fps_field_active(),
         tr(lang, "custom fps", "カスタムfps"),
     );
+    ctx.dirty_dot(SettingKey::VideoFpsCap, x + 326, y + 6);
     if ctx.state.fps_field_error() {
         ctx.text(
             x + 218,
@@ -865,6 +989,7 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
             bg_label
         ),
     );
+    ctx.dirty_dot(SettingKey::VideoBackgroundFps, x + 326, y + 6);
 
     let (x, y) = row(ctx, 6, y0);
     ctx.btn(
@@ -872,6 +997,7 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
         lr(x, y, 320, 20),
         &format!("VSync: {}", onoff(v.vsync)),
     );
+    ctx.dirty_dot(SettingKey::VideoVsync, x + 326, y + 6);
 
     let (x, y) = row(ctx, 7, y0);
     ctx.btn(
@@ -883,30 +1009,43 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
             onoff(v.smooth_lighting)
         ),
     );
+    ctx.dirty_dot(SettingKey::VideoSmoothLighting, x + 326, y + 6);
 }
 
 fn audio_tab(ctx: &mut Ctx, y0: i32) {
     let lang = ctx.lang;
     let a = &ctx.state.settings.audio;
 
-    let rows: [(WidgetId, &str, u8); 7] = [
-        (WidgetId::AudioMaster, "Master Volume", a.master),
-        (WidgetId::AudioMusic, "Music", a.music),
-        (WidgetId::AudioBlocks, "Blocks", a.blocks),
-        (WidgetId::AudioHostile, "Hostile Mobs", a.hostile),
-        (WidgetId::AudioFriendly, "Friendly Mobs", a.friendly),
+    let rows: [(WidgetId, SettingKey, &str, u8); 7] = [
+        (WidgetId::AudioMaster, SettingKey::AudioMaster, "Master Volume", a.master),
+        (WidgetId::AudioMusic, SettingKey::AudioMusic, "Music", a.music),
+        (WidgetId::AudioBlocks, SettingKey::AudioBlocks, "Blocks", a.blocks),
+        (
+            WidgetId::AudioHostile,
+            SettingKey::AudioHostile,
+            "Hostile Mobs",
+            a.hostile,
+        ),
+        (
+            WidgetId::AudioFriendly,
+            SettingKey::AudioFriendly,
+            "Friendly Mobs",
+            a.friendly,
+        ),
         (
             WidgetId::AudioMaxVolumeCap,
+            SettingKey::AudioMaxVolumeCap,
             "Max-Volume Limiter",
             a.max_volume_cap,
         ),
         (
             WidgetId::AudioMaxConcurrent,
+            SettingKey::AudioMaxConcurrentSameSound,
             "Same-Sound Coalescing",
             a.max_concurrent_same_sound,
         ),
     ];
-    for (i, (id, name, val)) in rows.iter().enumerate() {
+    for (i, (id, key, name, val)) in rows.iter().enumerate() {
         let (x, y) = row(ctx, i as i32, y0);
         let frac = if *id == WidgetId::AudioMaxConcurrent {
             (*val as f32 - 1.0) / 31.0
@@ -919,10 +1058,26 @@ fn audio_tab(ctx: &mut Ctx, y0: i32) {
             format!("{name}: {val}%")
         };
         ctx.slider(*id, lr(x, y, 320, 20), frac, &label);
+        ctx.dirty_dot(*key, x + 326, y + 6);
     }
+
+    // 3D Audio: a plain OFF/ON toggle — full 64-ray quality internally,
+    // no ray-count dropdown to mis-set.
+    let (x, y) = row(ctx, 7, y0);
+    ctx.btn(
+        WidgetId::AudioSpatial3d,
+        lr(x, y, 320, 20),
+        &format!(
+            "{}: {}",
+            tr(lang, "3D Audio", "立体音響"),
+            onoff(ctx.state.settings.visual.spatial_audio_3d)
+        ),
+    );
+    ctx.dirty_dot(SettingKey::AudioSpatial3d, x + 326, y + 6);
+
     ctx.ctext(
         ctx.w / 2,
-        y0 + 7 * 24 + 2,
+        y0 + 8 * 24 + 2,
         1,
         pal::TEXT_DIM,
         tr(
@@ -955,6 +1110,7 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             onoff(q.smooth_zoom)
         ),
     );
+    ctx.dirty_dot(SettingKey::QolSmoothZoom, x + 326, qy(0) + (bh - 8) / 2);
 
     ctx.slider(
         WidgetId::QolToolWarn,
@@ -966,6 +1122,7 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             q.tool_warn_percent
         ),
     );
+    ctx.dirty_dot(SettingKey::QolToolWarnPercent, x + 326, qy(1) + (bh - 8) / 2);
 
     ctx.btn(
         WidgetId::QolPreventBreak,
@@ -977,6 +1134,7 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             tr(lang, "opt-in", "オプトイン")
         ),
     );
+    ctx.dirty_dot(SettingKey::QolPreventToolBreak, x + 326, qy(2) + (bh - 8) / 2);
 
     let frac = (q.chat_history_lines as f32 - 100.0) / 4900.0;
     ctx.slider(
@@ -990,6 +1148,7 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             tr(lang, "lines", "行")
         ),
     );
+    ctx.dirty_dot(SettingKey::QolChatHistoryLines, x + 326, qy(3) + (bh - 8) / 2);
 
     ctx.btn(
         WidgetId::QolRetainChat,
@@ -999,6 +1158,11 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             tr(lang, "Keep Chat on Reconnect", "再接続時にチャット保持"),
             onoff(q.retain_chat_on_reconnect)
         ),
+    );
+    ctx.dirty_dot(
+        SettingKey::QolRetainChatOnReconnect,
+        x + 326,
+        qy(4) + (bh - 8) / 2,
     );
 
     ctx.btn(
@@ -1010,6 +1174,7 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             q.crash_report_mode.label()
         ),
     );
+    ctx.dirty_dot(SettingKey::QolCrashReportMode, x + 326, qy(5) + (bh - 8) / 2);
 
     ctx.btn(
         WidgetId::QolShowSupportLinks,
@@ -1028,6 +1193,7 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             )
         },
     );
+    ctx.dirty_dot(SettingKey::QolShowSupportLinks, x + 326, qy(6) + (bh - 8) / 2);
 
     // The two opt-in overlays share one compact row of half-width
     // toggles: the MiniHUD cycles Off/Basic/Advanced presets, the
@@ -1051,6 +1217,8 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             onoff(q.show_subtitles)
         ),
     );
+    ctx.dirty_dot(SettingKey::QolMiniHud, x + 162, qy(7) + (bh - 8) / 2);
+    ctx.dirty_dot(SettingKey::QolShowSubtitles, x + 326, qy(7) + (bh - 8) / 2);
 
     if ctx.h >= 300 {
         ctx.ctext(
@@ -1081,6 +1249,7 @@ fn fairplay_tab(ctx: &mut Ctx, y0: i32) {
             f.minimap_mode.label()
         ),
     );
+    ctx.dirty_dot(SettingKey::FpMinimapMode, x + 326, y + 6);
 
     let (x, y) = row(ctx, 1, y0);
     ctx.btn(
@@ -1092,6 +1261,7 @@ fn fairplay_tab(ctx: &mut Ctx, y0: i32) {
             onoff(f.allow_cave_map)
         ),
     );
+    ctx.dirty_dot(SettingKey::FpAllowCaveMap, x + 326, y + 6);
 
     let (x, y) = row(ctx, 2, y0);
     ctx.btn(
@@ -1103,6 +1273,7 @@ fn fairplay_tab(ctx: &mut Ctx, y0: i32) {
             onoff(f.allow_mob_radar)
         ),
     );
+    ctx.dirty_dot(SettingKey::FpAllowMobRadar, x + 326, y + 6);
 
     let (x, y) = row(ctx, 3, y0);
     ctx.btn(
@@ -1114,6 +1285,7 @@ fn fairplay_tab(ctx: &mut Ctx, y0: i32) {
             f.player_radar_scope.label()
         ),
     );
+    ctx.dirty_dot(SettingKey::FpPlayerRadarScope, x + 326, y + 6);
 
     let (x, y) = row(ctx, 4, y0);
     ctx.btn(
@@ -1125,6 +1297,7 @@ fn fairplay_tab(ctx: &mut Ctx, y0: i32) {
             onoff(f.allow_waypoint_teleport)
         ),
     );
+    ctx.dirty_dot(SettingKey::FpAllowWaypointTeleport, x + 326, y + 6);
 
     ctx.ctext(
         ctx.w / 2,
@@ -1141,20 +1314,44 @@ fn fairplay_tab(ctx: &mut Ctx, y0: i32) {
 
 fn language_tab(ctx: &mut Ctx, y0: i32) {
     let lang = ctx.lang;
-    let l = ctx.state.settings.language;
 
+    // The cycler steps Auto → English → Japanese → the remaining 13
+    // built-in locales, each shown by its native autonym.
     let (x, y) = row(ctx, 0, y0);
+    let name = ctx.state.language_display_name();
     ctx.btn(
         WidgetId::LanguageChoice,
         lr(x, y, 320, 20),
-        &format!("{}: {}", tr(lang, "Language", "言語"), l.label_en()),
+        &format!(
+            "{}: {}",
+            tr(lang, "Language", "言語"),
+            first_chars(&name, 30)
+        ),
     );
+    ctx.dirty_dot(SettingKey::Language, x + 326, y + 6);
+
+    // Auto-detect via the OS locale environment (LC_ALL/LANG).
+    let (x, y) = row(ctx, 1, y0);
+    ctx.btn(
+        WidgetId::LanguageDetectOs,
+        lr(x, y, 320, 20),
+        ctx.state.ui_text(UiTextKey::LanguageAuto),
+    );
+
+    let (_, y) = row(ctx, 2, y0);
+    let locale = ctx.state.settings.locale;
     ctx.ctext(
         ctx.w / 2,
-        y0 + 24 + 4,
+        y + 4,
         1,
         pal::TEXT_DIM,
-        tr(lang, "Auto | English | Japanese", "自動 | 英語 | 日本語"),
+        &format!(
+            "{} — {} · {} {}",
+            locale.code(),
+            locale.english_name(),
+            mc_spine_core::i18n::ALL_BUILTIN_LOCALES.len(),
+            tr(lang, "built-in + .json packs", "内蔵 + .jsonパック")
+        ),
     );
 }
 
@@ -2168,6 +2365,117 @@ fn modal(ctx: &mut Ctx) {
                 WidgetId::ModalCancel,
                 lr(ox + ok_w + 6, my + mh - 34, cancel_w, 20),
                 tr(lang, "Cancel", "キャンセル"),
+            );
+            if let Some(r) = ctx.regions.last_mut() {
+                r.modal = true;
+            }
+        }
+        Some(UiModal::ConfirmResetDefaults) => {
+            // Reset requires this explicit gate; confirming stays
+            // 1-click Undo-recoverable, which the hint says so plainly.
+            let mw = 260.min(ctx.w - 8).max(60);
+            let mh = 96.min(ctx.h - 8).max(30);
+            let (mx, my) = (cx - mw / 2, (ctx.h / 2 - mh / 2).max(2));
+            ctx.panel(mx, my, mw, mh);
+            ctx.ctext(
+                cx,
+                my + 10,
+                1,
+                pal::TEXT,
+                tr(lang, "Reset all settings", "すべての設定を"),
+            );
+            ctx.ctext(
+                cx,
+                my + 22,
+                1,
+                pal::TEXT,
+                tr(lang, "to defaults?", "初期値に戻す？"),
+            );
+            ctx.ctext(
+                cx,
+                my + 36,
+                1,
+                pal::WARNING,
+                tr(
+                    lang,
+                    "Undo can recover this",
+                    "「元に戻す」で復元できます",
+                ),
+            );
+            let pair = mw - 22;
+            let ok_w = (pair - 6) / 2;
+            let cancel_w = pair - 6 - ok_w;
+            let ox = mx + (mw - pair) / 2;
+            ctx.btn(
+                WidgetId::ModalOk,
+                lr(ox, my + mh - 34, ok_w, 20),
+                tr(lang, "OK", "OK"),
+            );
+            if let Some(r) = ctx.regions.last_mut() {
+                r.modal = true;
+            }
+            ctx.btn(
+                WidgetId::ModalCancel,
+                lr(ox + ok_w + 6, my + mh - 34, cancel_w, 20),
+                tr(lang, "Cancel", "キャンセル"),
+            );
+            if let Some(r) = ctx.regions.last_mut() {
+                r.modal = true;
+            }
+        }
+        Some(UiModal::StartupTimeline) => {
+            // Per-stage boot telemetry opened from the Boot badge.
+            let mw = 340.min(ctx.w - 8).max(80);
+            let mh = 190.min(ctx.h - 8).max(40);
+            let (mx, my) = (cx - mw / 2, (ctx.h / 2 - mh / 2).max(2));
+            ctx.panel(mx, my, mw, mh);
+            ctx.ctext(
+                cx,
+                my + 8,
+                1,
+                pal::TEXT,
+                tr(lang, "Startup Timeline", "起動タイムライン"),
+            );
+            if let Some(t) = &ctx.state.startup_timeline {
+                ctx.ctext(
+                    cx,
+                    my + 22,
+                    1,
+                    pal::ACCENT,
+                    &format!("{}: {} ms", tr(lang, "Total", "合計"), t.total_ms),
+                );
+                let rows = ((mh - 84) / 10).max(0) as usize;
+                let cell_w = ((mw - 24) / 8).max(1) as usize;
+                for (i, st) in t.stages.iter().take(rows).enumerate() {
+                    let line = format!("{} {}ms {}", st.stage, st.duration_ms, st.detail);
+                    ctx.text(
+                        mx + 10,
+                        my + 36 + i as i32 * 10,
+                        1,
+                        pal::TEXT_DIM,
+                        first_chars(&line, cell_w),
+                    );
+                }
+                ctx.ctext(
+                    cx,
+                    my + mh - 46,
+                    1,
+                    pal::TEXT_DIM,
+                    &format!(
+                        "{}: {} | {}: {} | {}: {}",
+                        tr(lang, "native", "ネイティブ"),
+                        t.native_mods,
+                        "wgpu",
+                        t.wgpu_routed_mods,
+                        tr(lang, "quarantined", "隔離"),
+                        t.quarantined_mods
+                    ),
+                );
+            }
+            ctx.btn(
+                WidgetId::ModalOk,
+                lr(cx - 40, my + mh - 30, 80, 20),
+                tr(lang, "OK", "OK"),
             );
             if let Some(r) = ctx.regions.last_mut() {
                 r.modal = true;

@@ -24,6 +24,7 @@
 //! rasterizer — the string data stays correct for richer GPU atlases.
 
 use mc_spine_core::crash_report::CrashContext;
+use mc_spine_core::i18n::{BuiltinLocale, I18nCatalog, UiTextKey, ALL_BUILTIN_LOCALES};
 use mc_spine_core::sys_metrics::{MiniHudConfig, MiniHudData};
 
 use crate::draw::UiRect;
@@ -624,8 +625,141 @@ pub struct ShaderQuickSettings {
     pub shaders_enabled: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Visual style & experience settings (zero-jargon, mistake-proof controls)
+// ---------------------------------------------------------------------------
+
+/// Built-in visual style preset. Three plain-language stops — no
+/// confusing names (`Feather`) or jargon (`陰翳礼讃`) in the UI.
+///
+/// The ordering is deliberate: lightest first, richest last, with
+/// `Vanilla` as the 100%-pure-vanilla default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VisualStylePreset {
+    /// Pure vanilla rendering — nothing extra drawn (default).
+    #[default]
+    Vanilla,
+    /// Megu Natural with no shadowmaps — fast even on Intel Celeron/iGPU.
+    MeguNaturalLight,
+    /// Full Megu lighting, shadows, reflections, and atmosphere.
+    MeguNatural,
+}
+
+impl VisualStylePreset {
+    /// All presets in their fixed cycle order.
+    pub const ALL: [Self; 3] = [Self::Vanilla, Self::MeguNaturalLight, Self::MeguNatural];
+
+    pub fn next(self) -> Self {
+        self.step(1)
+    }
+
+    /// Cycle forward (`dir > 0`) or backward (`dir < 0`) through [`Self::ALL`].
+    pub fn step(self, dir: i32) -> Self {
+        let i = Self::ALL.iter().position(|p| *p == self).unwrap_or(0) as i32;
+        Self::ALL[(i + dir).rem_euclid(Self::ALL.len() as i32) as usize]
+    }
+
+    pub const fn label(self, lang: UiLang) -> &'static str {
+        match (self, lang) {
+            (Self::Vanilla, UiLang::En) => "Vanilla (Lightest)",
+            (Self::Vanilla, UiLang::Ja) => "Vanilla (最軽量)",
+            (Self::MeguNaturalLight, UiLang::En) => "Megu Natural (Light)",
+            (Self::MeguNaturalLight, UiLang::Ja) => "Megu Natural (軽量)",
+            (Self::MeguNatural, _) => "Megu Natural",
+        }
+    }
+}
+
+/// Individual world-effect sub-toggles. The single `World Effects`
+/// ON/OFF switch gates them all; these let a player keep e.g. water
+/// ripples while dropping falling leaves without leaving the config.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorldEffectsDetail {
+    pub water_splash: bool,
+    pub ripples: bool,
+    pub cherry_leaves: bool,
+    pub autumn_leaves: bool,
+    pub cold_breath: bool,
+    pub night_sky: bool,
+}
+
+impl Default for WorldEffectsDetail {
+    fn default() -> Self {
+        Self {
+            water_splash: true,
+            ripples: true,
+            cherry_leaves: true,
+            autumn_leaves: true,
+            cold_breath: true,
+            night_sky: true,
+        }
+    }
+}
+
+/// The spatial-audio tracer always runs this many rays internally —
+/// frame-budget pacing smooths the cost, so the UI offers a simple
+/// ON/OFF with no ray-count dropdown.
+pub const SPATIAL_AUDIO_3D_RAYS: u32 = 64;
+
+/// The four clean two-way experience toggles plus the visual-style
+/// preset. Every toggle is a plain `bool` — no four-level ladders.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisualStyleSettings {
+    /// Built-in style preset (`Vanilla` by default).
+    pub preset: VisualStylePreset,
+    /// When the host installed an external Minecraft shader pack it
+    /// always wins: `Some(name)` shows a status line and yields every
+    /// built-in visual shader to it.
+    pub external_shader_pack_name: Option<String>,
+    /// `3D Blocks & Skins` — OFF/ON.
+    pub blocks_and_skins_3d: bool,
+    /// `World Effects` — OFF/ON master switch for [`Self::world_effects_detail`].
+    pub world_effects: bool,
+    /// Per-effect sub-toggles under the `World Effects` switch.
+    pub world_effects_detail: WorldEffectsDetail,
+    /// `3D Audio` — OFF/ON. Internally [`SPATIAL_AUDIO_3D_RAYS`] rays.
+    pub spatial_audio_3d: bool,
+    /// `Camera Motion` — OFF/ON, independent of every other effect and
+    /// default `false` for motion-sickness safety.
+    pub camera_micro_motion: bool,
+}
+
+impl Default for VisualStyleSettings {
+    fn default() -> Self {
+        Self {
+            preset: VisualStylePreset::Vanilla,
+            external_shader_pack_name: None,
+            blocks_and_skins_3d: false,
+            world_effects: false,
+            world_effects_detail: WorldEffectsDetail::default(),
+            spatial_audio_3d: false,
+            camera_micro_motion: false,
+        }
+    }
+}
+
+impl VisualStyleSettings {
+    /// `true` while an external shader pack owns visual rendering and
+    /// every built-in visual shader yields to it.
+    pub fn builtin_shaders_yielded(&self) -> bool {
+        self.external_shader_pack_name.is_some()
+    }
+
+    /// The clean status line shown while an external pack is active
+    /// (`"External Shader Active: <name>"` / `"外部シェーダー優先中: <name>"`).
+    pub fn external_shader_status(&self, lang: UiLang) -> Option<String> {
+        self.external_shader_pack_name.as_ref().map(|name| {
+            format!(
+                "{}: {}",
+                tr(lang, "External Shader Active", "外部シェーダー優先中"),
+                name
+            )
+        })
+    }
+}
+
 /// Everything the settings screens can change.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UiSettings {
     pub video: VideoSettings,
     pub audio: AudioSettings,
@@ -633,6 +767,322 @@ pub struct UiSettings {
     pub qol: QolSettings,
     pub fair_play: FairPlaySettings,
     pub language: LanguageSetting,
+    /// Full-fidelity locale selection (16 Tier-1 built-ins); the legacy
+    /// [`LanguageSetting`] above stays synchronized for backward
+    /// compatibility — `ja_jp` maps to `Japanese`, `en_us` to
+    /// `English`, every other locale reports `Auto`.
+    pub locale: BuiltinLocale,
+    /// Visual-style preset and the four OFF/ON experience toggles.
+    pub visual: VisualStyleSettings,
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        Self {
+            video: VideoSettings::default(),
+            audio: AudioSettings::default(),
+            shader_quick: ShaderQuickSettings::default(),
+            qol: QolSettings::default(),
+            fair_play: FairPlaySettings::default(),
+            language: LanguageSetting::Auto,
+            locale: BuiltinLocale::EnUs,
+            visual: VisualStyleSettings::default(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Settings session transaction (undo/redo + per-item revert + guarded reset)
+// ---------------------------------------------------------------------------
+
+/// A point-in-time copy of every player-facing setting.
+pub type SettingsSnapshot = UiSettings;
+
+/// Hard cap on the undo/redo history kept per settings session.
+pub const SETTINGS_SESSION_UNDO_CAP: usize = 64;
+
+/// Identifies one revertable setting for dirty tracking and
+/// [`UiState::revert_single_setting`]. `Language` deliberately covers
+/// both [`UiSettings::language`] and [`UiSettings::locale`] so the two
+/// synchronized fields always move together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingKey {
+    VideoPreset,
+    VideoViewDistance,
+    VideoLod,
+    VideoGpuBackend,
+    VideoFpsCap,
+    VideoBackgroundFps,
+    VideoVsync,
+    VideoSmoothLighting,
+    AudioMaster,
+    AudioMusic,
+    AudioBlocks,
+    AudioHostile,
+    AudioFriendly,
+    AudioMaxVolumeCap,
+    AudioMaxConcurrentSameSound,
+    AudioSpatial3d,
+    ShadersEnabled,
+    VisualStylePreset,
+    ExternalShaderPack,
+    BlocksAndSkins3d,
+    WorldEffects,
+    WorldEffectsDetail,
+    CameraMicroMotion,
+    QolSmoothZoom,
+    QolToolWarnPercent,
+    QolPreventToolBreak,
+    QolChatHistoryLines,
+    QolRetainChatOnReconnect,
+    QolCrashReportMode,
+    QolShowSupportLinks,
+    QolMiniHud,
+    QolShowSubtitles,
+    FpMinimapMode,
+    FpAllowCaveMap,
+    FpAllowMobRadar,
+    FpPlayerRadarScope,
+    FpAllowWaypointTeleport,
+    Language,
+}
+
+/// The open-settings-session bookkeeping: the snapshot taken on entry
+/// plus the bounded undo/redo history built by edits inside the
+/// session. Even a confirmed reset-to-defaults stays one Undo away.
+#[derive(Clone, Debug, Default)]
+pub struct SettingsTransaction {
+    /// What the settings looked like when `Screen::Settings(_)` opened.
+    pub opened_snapshot: SettingsSnapshot,
+    /// Prior states, oldest first; drops the front past
+    /// [`SETTINGS_SESSION_UNDO_CAP`].
+    pub undo_stack: Vec<SettingsSnapshot>,
+    /// States recoverable via redo; cleared by every fresh edit.
+    pub redo_stack: Vec<SettingsSnapshot>,
+}
+
+impl SettingsTransaction {
+    /// `true` when `key`'s field(s) in `current` equal the session-open
+    /// snapshot.
+    fn field_equal(&self, current: &UiSettings, key: SettingKey) -> bool {
+        let opened = &self.opened_snapshot;
+        use SettingKey as K;
+        match key {
+            K::VideoPreset => current.video.preset == opened.video.preset,
+            K::VideoViewDistance => current.video.view_distance == opened.video.view_distance,
+            K::VideoLod => current.video.lod == opened.video.lod,
+            K::VideoGpuBackend => current.video.gpu_backend == opened.video.gpu_backend,
+            K::VideoFpsCap => current.video.fps_cap == opened.video.fps_cap,
+            K::VideoBackgroundFps => current.video.background_fps == opened.video.background_fps,
+            K::VideoVsync => current.video.vsync == opened.video.vsync,
+            K::VideoSmoothLighting => {
+                current.video.smooth_lighting == opened.video.smooth_lighting
+            }
+            K::AudioMaster => current.audio.master == opened.audio.master,
+            K::AudioMusic => current.audio.music == opened.audio.music,
+            K::AudioBlocks => current.audio.blocks == opened.audio.blocks,
+            K::AudioHostile => current.audio.hostile == opened.audio.hostile,
+            K::AudioFriendly => current.audio.friendly == opened.audio.friendly,
+            K::AudioMaxVolumeCap => current.audio.max_volume_cap == opened.audio.max_volume_cap,
+            K::AudioMaxConcurrentSameSound => {
+                current.audio.max_concurrent_same_sound
+                    == opened.audio.max_concurrent_same_sound
+            }
+            K::AudioSpatial3d => current.visual.spatial_audio_3d == opened.visual.spatial_audio_3d,
+            K::ShadersEnabled => {
+                current.shader_quick.shaders_enabled == opened.shader_quick.shaders_enabled
+            }
+            K::VisualStylePreset => current.visual.preset == opened.visual.preset,
+            K::ExternalShaderPack => {
+                current.visual.external_shader_pack_name
+                    == opened.visual.external_shader_pack_name
+            }
+            K::BlocksAndSkins3d => {
+                current.visual.blocks_and_skins_3d == opened.visual.blocks_and_skins_3d
+            }
+            K::WorldEffects => current.visual.world_effects == opened.visual.world_effects,
+            K::WorldEffectsDetail => {
+                current.visual.world_effects_detail == opened.visual.world_effects_detail
+            }
+            K::CameraMicroMotion => {
+                current.visual.camera_micro_motion == opened.visual.camera_micro_motion
+            }
+            K::QolSmoothZoom => current.qol.smooth_zoom == opened.qol.smooth_zoom,
+            K::QolToolWarnPercent => {
+                current.qol.tool_warn_percent == opened.qol.tool_warn_percent
+            }
+            K::QolPreventToolBreak => {
+                current.qol.prevent_tool_break == opened.qol.prevent_tool_break
+            }
+            K::QolChatHistoryLines => {
+                current.qol.chat_history_lines == opened.qol.chat_history_lines
+            }
+            K::QolRetainChatOnReconnect => {
+                current.qol.retain_chat_on_reconnect == opened.qol.retain_chat_on_reconnect
+            }
+            K::QolCrashReportMode => {
+                current.qol.crash_report_mode == opened.qol.crash_report_mode
+            }
+            K::QolShowSupportLinks => {
+                current.qol.show_support_links == opened.qol.show_support_links
+            }
+            K::QolMiniHud => current.qol.mini_hud == opened.qol.mini_hud,
+            K::QolShowSubtitles => current.qol.show_subtitles == opened.qol.show_subtitles,
+            K::FpMinimapMode => current.fair_play.minimap_mode == opened.fair_play.minimap_mode,
+            K::FpAllowCaveMap => {
+                current.fair_play.allow_cave_map == opened.fair_play.allow_cave_map
+            }
+            K::FpAllowMobRadar => {
+                current.fair_play.allow_mob_radar == opened.fair_play.allow_mob_radar
+            }
+            K::FpPlayerRadarScope => {
+                current.fair_play.player_radar_scope == opened.fair_play.player_radar_scope
+            }
+            K::FpAllowWaypointTeleport => {
+                current.fair_play.allow_waypoint_teleport
+                    == opened.fair_play.allow_waypoint_teleport
+            }
+            K::Language => {
+                current.language == opened.language && current.locale == opened.locale
+            }
+        }
+    }
+
+    /// Copy `key`'s field(s) from the session-open snapshot into
+    /// `current`. Callers push the prior state themselves.
+    fn restore_field(&self, current: &mut UiSettings, key: SettingKey) {
+        let opened = &self.opened_snapshot;
+        use SettingKey as K;
+        match key {
+            K::VideoPreset => current.video.preset = opened.video.preset,
+            K::VideoViewDistance => current.video.view_distance = opened.video.view_distance,
+            K::VideoLod => current.video.lod = opened.video.lod,
+            K::VideoGpuBackend => current.video.gpu_backend = opened.video.gpu_backend,
+            K::VideoFpsCap => current.video.fps_cap = opened.video.fps_cap,
+            K::VideoBackgroundFps => current.video.background_fps = opened.video.background_fps,
+            K::VideoVsync => current.video.vsync = opened.video.vsync,
+            K::VideoSmoothLighting => {
+                current.video.smooth_lighting = opened.video.smooth_lighting
+            }
+            K::AudioMaster => current.audio.master = opened.audio.master,
+            K::AudioMusic => current.audio.music = opened.audio.music,
+            K::AudioBlocks => current.audio.blocks = opened.audio.blocks,
+            K::AudioHostile => current.audio.hostile = opened.audio.hostile,
+            K::AudioFriendly => current.audio.friendly = opened.audio.friendly,
+            K::AudioMaxVolumeCap => current.audio.max_volume_cap = opened.audio.max_volume_cap,
+            K::AudioMaxConcurrentSameSound => {
+                current.audio.max_concurrent_same_sound =
+                    opened.audio.max_concurrent_same_sound
+            }
+            K::AudioSpatial3d => {
+                current.visual.spatial_audio_3d = opened.visual.spatial_audio_3d
+            }
+            K::ShadersEnabled => {
+                current.shader_quick.shaders_enabled = opened.shader_quick.shaders_enabled
+            }
+            K::VisualStylePreset => current.visual.preset = opened.visual.preset,
+            K::ExternalShaderPack => {
+                current.visual.external_shader_pack_name =
+                    opened.visual.external_shader_pack_name.clone()
+            }
+            K::BlocksAndSkins3d => {
+                current.visual.blocks_and_skins_3d = opened.visual.blocks_and_skins_3d
+            }
+            K::WorldEffects => current.visual.world_effects = opened.visual.world_effects,
+            K::WorldEffectsDetail => {
+                current.visual.world_effects_detail =
+                    opened.visual.world_effects_detail.clone()
+            }
+            K::CameraMicroMotion => {
+                current.visual.camera_micro_motion = opened.visual.camera_micro_motion
+            }
+            K::QolSmoothZoom => current.qol.smooth_zoom = opened.qol.smooth_zoom,
+            K::QolToolWarnPercent => {
+                current.qol.tool_warn_percent = opened.qol.tool_warn_percent
+            }
+            K::QolPreventToolBreak => {
+                current.qol.prevent_tool_break = opened.qol.prevent_tool_break
+            }
+            K::QolChatHistoryLines => {
+                current.qol.chat_history_lines = opened.qol.chat_history_lines
+            }
+            K::QolRetainChatOnReconnect => {
+                current.qol.retain_chat_on_reconnect = opened.qol.retain_chat_on_reconnect
+            }
+            K::QolCrashReportMode => {
+                current.qol.crash_report_mode = opened.qol.crash_report_mode
+            }
+            K::QolShowSupportLinks => {
+                current.qol.show_support_links = opened.qol.show_support_links
+            }
+            K::QolMiniHud => current.qol.mini_hud = opened.qol.mini_hud.clone(),
+            K::QolShowSubtitles => current.qol.show_subtitles = opened.qol.show_subtitles,
+            K::FpMinimapMode => {
+                current.fair_play.minimap_mode = opened.fair_play.minimap_mode
+            }
+            K::FpAllowCaveMap => {
+                current.fair_play.allow_cave_map = opened.fair_play.allow_cave_map
+            }
+            K::FpAllowMobRadar => {
+                current.fair_play.allow_mob_radar = opened.fair_play.allow_mob_radar
+            }
+            K::FpPlayerRadarScope => {
+                current.fair_play.player_radar_scope = opened.fair_play.player_radar_scope
+            }
+            K::FpAllowWaypointTeleport => {
+                current.fair_play.allow_waypoint_teleport =
+                    opened.fair_play.allow_waypoint_teleport
+            }
+            K::Language => {
+                current.language = opened.language;
+                current.locale = opened.locale;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive startup telemetry (instant boot + live loading timeline)
+// ---------------------------------------------------------------------------
+
+/// One measured stage of the client boot sequence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartupStageTiming {
+    /// Short stage name (`"kernel-init"`, `"mod-scan"`, ...).
+    pub stage: String,
+    /// Wall time the stage consumed, milliseconds.
+    pub duration_ms: u32,
+    /// Optional extra context (`"42 mods"`, `"wgpu"`).
+    pub detail: String,
+}
+
+/// Whole-boot timing the launcher fills in. Fast boots
+/// (`total_ms < 250`) never show a splash; slower ones feed the live
+/// progress overlay, and afterwards a compact `Boot: N ms` badge stays
+/// available on Title/About.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StartupTimeline {
+    /// End-to-end boot time, milliseconds.
+    pub total_ms: u32,
+    /// Per-stage breakdown, in execution order.
+    pub stages: Vec<StartupStageTiming>,
+    /// Mods that ran on the native hot path.
+    pub native_mods: u32,
+    /// Mods automatically routed onto the wgpu path.
+    pub wgpu_routed_mods: u32,
+    /// Mods quarantined by fault isolation during boot.
+    pub quarantined_mods: u32,
+}
+
+/// Boot at or above this many milliseconds shows the live overlay.
+pub const LIVE_LOADING_OVERLAY_MIN_MS: u32 = 250;
+
+impl StartupTimeline {
+    /// `true` only when the boot was slow enough to be worth a live
+    /// splash (`>= 250 ms`); fast boots go straight to Title.
+    pub fn should_show_live_overlay(&self) -> bool {
+        self.total_ms >= LIVE_LOADING_OVERLAY_MIN_MS
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1041,9 +1491,18 @@ pub enum WidgetId {
     VideoBackgroundFps,
     VideoVsync,
     VideoSmoothLighting,
+    // Settings session toolbar (mistake-proof undo/redo/discard/reset)
+    SettingsUndo,
+    SettingsRedo,
+    SettingsDiscard,
+    SettingsResetDefaults,
     // Shaders tab
     ShadersEnabled,
     ShadersOpenOptions,
+    VisualPreset,
+    VisualBlocks3d,
+    VisualWorldEffects,
+    VisualCameraMotion,
     // Audio tab
     AudioMaster,
     AudioMusic,
@@ -1052,6 +1511,7 @@ pub enum WidgetId {
     AudioFriendly,
     AudioMaxVolumeCap,
     AudioMaxConcurrent,
+    AudioSpatial3d,
     // QoL tab
     QolSmoothZoom,
     QolToolWarn,
@@ -1070,6 +1530,9 @@ pub enum WidgetId {
     FpWaypointTeleport,
     // Language tab
     LanguageChoice,
+    LanguageDetectOs,
+    // Telemetry badge (Title/About bottom-right)
+    BootBadge,
     // Friends
     FriendsGenerate,
     FriendsCopy,
@@ -1122,6 +1585,10 @@ impl WidgetId {
                 | Self::VideoVsync
                 | Self::VideoSmoothLighting
                 | Self::ShadersEnabled
+                | Self::VisualPreset
+                | Self::VisualBlocks3d
+                | Self::VisualWorldEffects
+                | Self::VisualCameraMotion
                 | Self::AudioMaster
                 | Self::AudioMusic
                 | Self::AudioBlocks
@@ -1129,6 +1596,7 @@ impl WidgetId {
                 | Self::AudioFriendly
                 | Self::AudioMaxVolumeCap
                 | Self::AudioMaxConcurrent
+                | Self::AudioSpatial3d
                 | Self::QolSmoothZoom
                 | Self::QolToolWarn
                 | Self::QolPreventBreak
@@ -1189,6 +1657,11 @@ impl HitRegion {
 pub enum UiModal {
     /// `"Send OK?"` gate before a crash report leaves the machine.
     ConfirmSendCrashReport,
+    /// `"Reset all settings to defaults?"` gate — a single accidental
+    /// click can never wipe the session's settings.
+    ConfirmResetDefaults,
+    /// Per-stage boot timeline opened from the `Boot: N ms` badge.
+    StartupTimeline,
 }
 
 // ---------------------------------------------------------------------------
@@ -1262,6 +1735,16 @@ pub struct UiState {
     /// Shaderpack selection and options supplied by the host loader.
     pub shader_packs: crate::shader_screen::ShaderPackScreenState,
 
+    /// Mistake-proof settings session: opened snapshot + bounded
+    /// undo/redo history + dirty tracking backing [`is_setting_dirty`].
+    pub settings_tx: SettingsTransaction,
+    /// Optional external Minecraft `.json` language packs layered over
+    /// the 16 built-in locales; [`UiState::ui_text`] resolves through it.
+    pub i18n_catalog: Option<I18nCatalog>,
+    /// Launcher-supplied boot timing; powers the live-loading decision
+    /// and the `Boot: N ms` telemetry badge.
+    pub startup_timeline: Option<StartupTimeline>,
+
     /// The integrated ModMenu-style Mods & Packs screen
     /// ([`Screen::ModMenu`]). The host fills `entries`; `lang`/`ui_scale`
     /// are re-synced from this state on every [`render`](Self::render).
@@ -1310,6 +1793,9 @@ impl Default for UiState {
             active_shaderpack_name: String::new(),
             active_shaderpack_profile: String::new(),
             shader_packs: crate::shader_screen::ShaderPackScreenState::default(),
+            settings_tx: SettingsTransaction::default(),
+            i18n_catalog: None,
+            startup_timeline: None,
             mod_menu: crate::mod_menu::ModMenuState::default(),
             recipe_browser: crate::recipe_browser::RecipeBrowserState::default(),
             invite_counter: 0,
@@ -1337,9 +1823,188 @@ impl UiState {
         }
     }
 
-    /// Resolved display language.
+    /// Resolved display language. Backward compatible with the legacy
+    /// [`LanguageSetting`]: `Japanese` renders `Ja` exactly as before,
+    /// and a directly selected `ja_jp` locale does too.
     pub fn lang(&self) -> UiLang {
-        self.settings.language.resolve()
+        if self.settings.locale == BuiltinLocale::JaJp
+            || self.settings.language == LanguageSetting::Japanese
+        {
+            UiLang::Ja
+        } else {
+            UiLang::En
+        }
+    }
+
+    /// Select one of the 16 built-in locales directly, keeping the
+    /// legacy [`LanguageSetting`] and any external pack in sync.
+    pub fn set_locale(&mut self, locale: BuiltinLocale) {
+        self.settings.locale = locale;
+        self.settings.language = match locale {
+            BuiltinLocale::EnUs => LanguageSetting::English,
+            BuiltinLocale::JaJp => LanguageSetting::Japanese,
+            _ => LanguageSetting::Auto,
+        };
+        if let Some(catalog) = &mut self.i18n_catalog {
+            // Built-in codes always parse; keep the catalog consistent.
+            let _ = catalog.set_locale(locale.code());
+        }
+    }
+
+    /// Detect the OS locale (POSIX `LC_ALL`/`LC_MESSAGES`/`LANG`) and
+    /// apply it as the player's language preference. Reports `Auto` in
+    /// the legacy field because the choice was automatic.
+    pub fn detect_and_apply_os_locale(&mut self) {
+        let detected = mc_spine_core::i18n::detect_os_locale();
+        self.set_locale(detected);
+        self.settings.language = LanguageSetting::Auto;
+    }
+
+    /// The Language-tab label for the current selection: `"Auto"` while
+    /// the auto default holds, otherwise the locale's native autonym.
+    pub fn language_display_name(&self) -> String {
+        if self.settings.language == LanguageSetting::Auto
+            && self.settings.locale == BuiltinLocale::EnUs
+        {
+            tr(self.lang(), "Auto", "自動").to_string()
+        } else {
+            self.settings.locale.native_name().to_string()
+        }
+    }
+
+    /// Cycle the language selection: `Auto → English → Japanese →`
+    /// every remaining built-in locale in catalog order `→ Auto`.
+    /// `dir` steps backward when negative. The legacy
+    /// [`LanguageSetting`] stays a faithful projection of the cycle,
+    /// so `Auto → English → Japanese → Auto` still takes three clicks.
+    fn cycle_language(&mut self, dir: i32) {
+        // Step 0 is the Auto stop; steps 1..=16 index ALL_BUILTIN_LOCALES.
+        let step: i32 = match (self.settings.language, self.settings.locale) {
+            (LanguageSetting::Auto, BuiltinLocale::EnUs) => 0,
+            (_, locale) => {
+                1 + ALL_BUILTIN_LOCALES
+                    .iter()
+                    .position(|&l| l == locale)
+                    .unwrap_or(0) as i32
+            }
+        };
+        let next = (step + dir).rem_euclid(1 + ALL_BUILTIN_LOCALES.len() as i32);
+        if next == 0 {
+            self.settings.language = LanguageSetting::Auto;
+            self.settings.locale = BuiltinLocale::EnUs;
+            if let Some(catalog) = &mut self.i18n_catalog {
+                let _ = catalog.set_locale("en_us");
+            }
+        } else {
+            self.set_locale(ALL_BUILTIN_LOCALES[(next - 1) as usize]);
+        }
+    }
+
+    /// Resolve built-in UI text for the active locale, layered under
+    /// any externally loaded Minecraft `.json` language pack.
+    pub fn ui_text(&self, key: UiTextKey) -> &str {
+        match &self.i18n_catalog {
+            Some(catalog) => catalog.resolve_key(key),
+            None => key.builtin_text(self.settings.locale),
+        }
+    }
+
+    // -- settings session transaction ----------------------------------
+
+    /// `true` when `key`'s setting differs from the session-open
+    /// snapshot — the `●` dirty indicator shown beside the widget.
+    pub fn is_setting_dirty(&self, key: SettingKey) -> bool {
+        !self.settings_tx.field_equal(&self.settings, key)
+    }
+
+    /// `true` when anything in the session differs from the snapshot.
+    pub fn is_session_dirty(&self) -> bool {
+        self.settings != self.settings_tx.opened_snapshot
+    }
+
+    /// Begin (or restart) a settings session: snapshot the current
+    /// settings and clear the bounded undo/redo history.
+    fn begin_settings_session(&mut self) {
+        self.settings_tx.opened_snapshot = self.settings.clone();
+        self.settings_tx.undo_stack.clear();
+        self.settings_tx.redo_stack.clear();
+    }
+
+    /// Record `prior` on the bounded undo stack and clear redo — every
+    /// committed settings edit routes here.
+    fn push_settings_undo(&mut self, prior: SettingsSnapshot) {
+        let tx = &mut self.settings_tx;
+        if tx.undo_stack.len() >= SETTINGS_SESSION_UNDO_CAP {
+            tx.undo_stack.remove(0);
+        }
+        tx.undo_stack.push(prior);
+        tx.redo_stack.clear();
+    }
+
+    /// Restore ONLY `key`'s setting to the session-open snapshot,
+    /// pushing the prior full state onto the undo stack first.
+    pub fn revert_single_setting(&mut self, key: SettingKey) -> Vec<UiAction> {
+        if !self.is_setting_dirty(key) {
+            return Vec::new();
+        }
+        let prior = self.settings.clone();
+        self.settings_tx.restore_field(&mut self.settings, key);
+        self.push_settings_undo(prior);
+        vec![UiAction::SettingsChanged]
+    }
+
+    /// `Ctrl+Z` / Undo: pop one prior state (also reachable via the
+    /// settings toolbar button).
+    pub fn undo_settings(&mut self) -> Vec<UiAction> {
+        match self.settings_tx.undo_stack.pop() {
+            Some(prev) => {
+                let current = std::mem::replace(&mut self.settings, prev);
+                self.settings_tx.redo_stack.push(current);
+                vec![UiAction::SettingsChanged]
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// `Ctrl+Y` / Redo: re-apply the last undone state.
+    pub fn redo_settings(&mut self) -> Vec<UiAction> {
+        match self.settings_tx.redo_stack.pop() {
+            Some(next) => {
+                let current = std::mem::replace(&mut self.settings, next);
+                self.settings_tx.undo_stack.push(current);
+                vec![UiAction::SettingsChanged]
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Restore the whole session-open snapshot; the discarded state is
+    /// itself one Undo away.
+    pub fn discard_settings_session(&mut self) -> Vec<UiAction> {
+        if self.settings == self.settings_tx.opened_snapshot {
+            return Vec::new();
+        }
+        let prior = std::mem::replace(
+            &mut self.settings,
+            self.settings_tx.opened_snapshot.clone(),
+        );
+        self.push_settings_undo(prior);
+        vec![UiAction::SettingsChanged]
+    }
+
+    /// Open the [`UiModal::ConfirmResetDefaults`] gate — never resets on
+    /// one accidental click.
+    pub fn request_reset_defaults(&mut self) -> Vec<UiAction> {
+        self.modal = Some(UiModal::ConfirmResetDefaults);
+        Vec::new()
+    }
+
+    /// `true` only when the recorded boot took at least 250 ms — fast
+    /// boots go straight to Title with zero splash wait.
+    pub fn should_show_live_loading_overlay(&self) -> bool {
+        self.startup_timeline
+            .as_ref()
+            .is_some_and(StartupTimeline::should_show_live_overlay)
     }
 
     /// Lay out the current screen, cache the hit regions, and return the
@@ -1377,6 +2042,11 @@ impl UiState {
 
     /// Push `screen` and navigate to it.
     pub fn navigate(&mut self, screen: Screen) {
+        // Entering Settings from outside snapshots the session so dirty
+        // tracking, per-item revert, and Discard measure from this entry.
+        if matches!(screen, Screen::Settings(_)) && !matches!(self.screen, Screen::Settings(_)) {
+            self.begin_settings_session();
+        }
         if self.screen != screen {
             self.nav_stack.push(self.screen);
         }
@@ -1678,6 +2348,19 @@ impl UiState {
     }
 
     fn handle_char(&mut self, c: char) -> Vec<UiAction> {
+        // Ctrl+Z / Ctrl+Y arrive as control characters when no text
+        // field owns typing: session undo/redo on the settings screen.
+        if self.modal.is_none()
+            && !self.fps_field_focused
+            && !self.join_field_focused
+            && matches!(self.screen, Screen::Settings(_))
+        {
+            match c {
+                '\u{1a}' => return self.undo_settings(),
+                '\u{19}' => return self.redo_settings(),
+                _ => {}
+            }
+        }
         if self.fps_field_focused {
             if c.is_ascii_digit() && self.fps_field_text.len() < FPS_FIELD_MAX_LEN {
                 self.fps_field_text.push(c);
@@ -1699,8 +2382,10 @@ impl UiState {
         if self.fps_field_focused {
             match self.fps_field_text.parse::<u32>() {
                 Ok(v) if v == 0 || (CUSTOM_FPS_MIN..=CUSTOM_FPS_MAX).contains(&v) => {
+                    let prior = self.settings.clone();
                     self.settings.video.fps_cap = v;
                     self.settings.video.preset = VideoPreset::Custom;
+                    self.push_settings_undo(prior);
                     self.unfocus_fields();
                     vec![UiAction::SettingsChanged]
                 }
@@ -1859,6 +2544,27 @@ impl UiState {
             WidgetId::TabLanguage => self.select_tab(SettingsTab::Language),
             WidgetId::ShadersOpenOptions => vec![UiAction::OpenShaderOptions],
 
+            WidgetId::SettingsUndo => self.undo_settings(),
+            WidgetId::SettingsRedo => self.redo_settings(),
+            WidgetId::SettingsDiscard => self.discard_settings_session(),
+            WidgetId::SettingsResetDefaults => self.request_reset_defaults(),
+            WidgetId::LanguageDetectOs => {
+                let prior = self.settings.clone();
+                self.detect_and_apply_os_locale();
+                if self.settings != prior {
+                    self.push_settings_undo(prior);
+                    vec![UiAction::SettingsChanged]
+                } else {
+                    Vec::new()
+                }
+            }
+            WidgetId::BootBadge => {
+                if self.startup_timeline.is_some() {
+                    self.modal = Some(UiModal::StartupTimeline);
+                }
+                Vec::new()
+            }
+
             WidgetId::VideoFpsSlider => {
                 // Map click x to the nearest slider stop.
                 let frac = ((x - rect.x) as f32 / rect.w.max(1) as f32).clamp(0.0, 1.0);
@@ -1959,7 +2665,17 @@ impl UiState {
                     self.crash_sent = true;
                     vec![UiAction::SubmitCrashReport]
                 }
-                None => Vec::new(),
+                Some(UiModal::ConfirmResetDefaults) => {
+                    self.modal = None;
+                    // Even a confirmed reset stays 1-click Undo-recoverable.
+                    let prior = std::mem::take(&mut self.settings);
+                    self.push_settings_undo(prior);
+                    vec![UiAction::SettingsChanged]
+                }
+                Some(UiModal::StartupTimeline) | None => {
+                    self.modal = None;
+                    Vec::new()
+                }
             },
             WidgetId::ModalCancel => {
                 self.modal = None;
@@ -1988,10 +2704,23 @@ impl UiState {
 
     /// Left/Right (or click on cyclers/toggles): `dir` = -1 or +1.
     fn adjust(&mut self, id: WidgetId, dir: i32) -> Vec<UiAction> {
+        // Language cycling touches `language` + `locale` together, so it
+        // can't live inside the field-split match below.
+        if id == WidgetId::LanguageChoice {
+            let prior = self.settings.clone();
+            self.cycle_language(dir);
+            if self.settings != prior {
+                self.push_settings_undo(prior);
+                return vec![UiAction::SettingsChanged];
+            }
+            return Vec::new();
+        }
+        let prior = self.settings.clone();
         let v = &mut self.settings.video;
         let a = &mut self.settings.audio;
         let q = &mut self.settings.qol;
         let f = &mut self.settings.fair_play;
+        let s = &mut self.settings.visual;
         let changed = match id {
             WidgetId::VideoPreset => {
                 v.preset = v.preset.next();
@@ -2037,6 +2766,26 @@ impl UiState {
             WidgetId::ShadersEnabled => {
                 self.settings.shader_quick.shaders_enabled =
                     !self.settings.shader_quick.shaders_enabled;
+                true
+            }
+            WidgetId::VisualPreset => {
+                s.preset = s.preset.step(dir);
+                true
+            }
+            WidgetId::VisualBlocks3d => {
+                s.blocks_and_skins_3d = !s.blocks_and_skins_3d;
+                true
+            }
+            WidgetId::VisualWorldEffects => {
+                s.world_effects = !s.world_effects;
+                true
+            }
+            WidgetId::VisualCameraMotion => {
+                s.camera_micro_motion = !s.camera_micro_motion;
+                true
+            }
+            WidgetId::AudioSpatial3d => {
+                s.spatial_audio_3d = !s.spatial_audio_3d;
                 true
             }
             WidgetId::AudioMaster => {
@@ -2130,13 +2879,10 @@ impl UiState {
                 f.allow_waypoint_teleport = !f.allow_waypoint_teleport;
                 true
             }
-            WidgetId::LanguageChoice => {
-                self.settings.language = self.settings.language.next();
-                true
-            }
             _ => false,
         };
         if changed {
+            self.push_settings_undo(prior);
             vec![UiAction::SettingsChanged]
         } else {
             Vec::new()
@@ -2145,8 +2891,15 @@ impl UiState {
 
     fn set_fps_step(&mut self, idx: usize) -> Vec<UiAction> {
         let idx = idx.min(FPS_CAP_STEPS.len() - 1);
+        if self.settings.video.fps_cap == FPS_CAP_STEPS[idx]
+            && self.settings.video.preset == VideoPreset::Custom
+        {
+            return Vec::new();
+        }
+        let prior = self.settings.clone();
         self.settings.video.fps_cap = FPS_CAP_STEPS[idx];
         self.settings.video.preset = VideoPreset::Custom;
+        self.push_settings_undo(prior);
         vec![UiAction::SettingsChanged]
     }
 

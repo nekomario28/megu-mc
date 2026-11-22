@@ -67,7 +67,11 @@ const ANCHORS: [MiniHudAnchor; 4] = [
     MiniHudAnchor::BottomRight,
 ];
 
-const MODALS: [UiModal; 1] = [UiModal::ConfirmSendCrashReport];
+const MODALS: [UiModal; 3] = [
+    UiModal::ConfirmSendCrashReport,
+    UiModal::ConfirmResetDefaults,
+    UiModal::StartupTimeline,
+];
 
 const ALL_TABS: [SettingsTab; 6] = [
     SettingsTab::Video,
