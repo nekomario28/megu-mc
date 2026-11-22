@@ -6,10 +6,14 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use mc_spine_client::audio_qol::{ZoomState, DEFAULT_ZOOM_SMOOTHING_RATE};
 use mc_spine_client::render::{FrameBudgetGovernor, RenderConfig};
+use mc_spine_client_mesh::builtin_shadow_wgsl::{BuiltinShadowQuality, RenderScalePreset};
 use mc_spine_ui::draw::rasterize_draw_list;
 use mc_spine_ui::magic_hud::build_magic_hud_draw_list;
-use mc_spine_ui::state::{Screen, UiAction, UiInputEvent, UiKey, UiState};
+use mc_spine_ui::state::{
+    Screen, UiAction, UiInputEvent, UiKey, UiSettings, UiState, VideoPreset, VisualStylePreset,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
@@ -31,6 +35,166 @@ pub const WINDOW_TITLE: &str = "mc-spine";
 /// Event-loop wake interval while the surface is occluded: slow enough for
 /// zero-GPU sleep, fast enough to keep a live session's network pump alive.
 const OCCLUDED_TICK: Duration = Duration::from_millis(50);
+
+const THIRD_PERSON_DISTANCE: f32 = 4.0;
+const SPRINT_FOV_BOOST: f32 = 0.10;
+const SPRINT_FOV_SMOOTHING_RATE: f32 = 12.0;
+
+/// The three Minecraft camera views in F5 cycling order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CameraMode {
+    #[default]
+    FirstPerson,
+    ThirdPersonBack,
+    ThirdPersonFront,
+}
+
+/// Window-independent input and projection state. The player's camera stays
+/// at the eye position for movement/network updates in every view mode.
+#[derive(Clone, Debug)]
+pub struct CameraController {
+    mode: CameraMode,
+    zoom: ZoomState,
+    base_fov_deg: f32,
+    base_sensitivity: f32,
+    sprint_blend: f32,
+}
+
+impl Default for CameraController {
+    fn default() -> Self {
+        Self::new(70.0, 1.0, 4.0)
+    }
+}
+
+impl CameraController {
+    /// `sensitivity` multiplies the shared camera mouse-look speed.
+    pub fn new(fov_deg: f32, sensitivity: f32, zoom_divisor: f32) -> Self {
+        let mut controller = Self {
+            mode: CameraMode::FirstPerson,
+            // Keep ZoomState's base constant so changing FOV mid-zoom does
+            // not reset the current interpolated zoom factor.
+            zoom: ZoomState::with_zoom_divisor(1.0, zoom_divisor),
+            base_fov_deg: 70.0,
+            base_sensitivity: 1.0,
+            sprint_blend: 0.0,
+        };
+        controller.apply_settings(fov_deg, sensitivity, zoom_divisor);
+        controller
+    }
+
+    pub fn mode(&self) -> CameraMode {
+        self.mode
+    }
+
+    pub fn cycle_mode(&mut self) -> CameraMode {
+        self.mode = match self.mode {
+            CameraMode::FirstPerson => CameraMode::ThirdPersonBack,
+            CameraMode::ThirdPersonBack => CameraMode::ThirdPersonFront,
+            CameraMode::ThirdPersonFront => CameraMode::FirstPerson,
+        };
+        self.mode
+    }
+
+    /// Apply live settings while retaining the current zoom transition.
+    pub fn apply_settings(&mut self, fov_deg: f32, sensitivity: f32, zoom_divisor: f32) {
+        self.base_fov_deg = finite_clamp(fov_deg, 70.0, 10.0, 120.0);
+        self.base_sensitivity = finite_clamp(sensitivity, 1.0, 0.01, 10.0);
+        self.zoom.set_zoom_divisor(zoom_divisor);
+    }
+
+    pub fn base_fov_deg(&self) -> f32 {
+        self.base_fov_deg
+    }
+
+    pub fn base_sensitivity(&self) -> f32 {
+        self.base_sensitivity
+    }
+
+    pub fn zoom_divisor(&self) -> f32 {
+        self.zoom.zoom_divisor()
+    }
+
+    pub fn set_zoomed(&mut self, held: bool) {
+        self.zoom.set_zoomed(held);
+    }
+
+    /// Disabling smoothing makes zoom snap at the next frame update.
+    pub fn set_smooth_zoom(&mut self, enabled: bool) {
+        self.zoom.set_smoothing_rate(if enabled {
+            DEFAULT_ZOOM_SMOOTHING_RATE
+        } else {
+            10_000.0
+        });
+    }
+
+    pub fn is_zoomed(&self) -> bool {
+        self.zoom.is_zoomed()
+    }
+
+    /// Advance smooth zoom and the 10% sprint FOV transition using frame dt.
+    pub fn tick(&mut self, dt: f32, sprinting: bool) -> f32 {
+        self.zoom.tick(dt);
+        let dt = finite_clamp(dt, 0.0, 0.0, 0.25);
+        let target = if sprinting { 1.0 } else { 0.0 };
+        let blend = 1.0 - (-SPRINT_FOV_SMOOTHING_RATE * dt).exp();
+        self.sprint_blend += (target - self.sprint_blend) * blend;
+        self.effective_fov_deg()
+    }
+
+    /// Effective vertical projection FOV, always finite and within bounds.
+    pub fn effective_fov_deg(&self) -> f32 {
+        finite_clamp(
+            self.base_fov_deg / self.zoom.zoom_factor()
+                * (1.0 + SPRINT_FOV_BOOST * self.sprint_blend),
+            self.base_fov_deg,
+            10.0,
+            120.0,
+        )
+    }
+
+    pub fn effective_sensitivity(&self) -> f32 {
+        self.zoom.scaled_sensitivity(self.base_sensitivity)
+    }
+
+    /// Apply raw device mouse motion to the player's orientation.
+    pub fn apply_mouse_look(&self, camera: &mut Camera, dx: f64, dy: f64) {
+        if !dx.is_finite() || !dy.is_finite() {
+            return;
+        }
+        camera.apply_mouse_look(
+            dx * f64::from(self.effective_sensitivity()),
+            dy * f64::from(self.effective_sensitivity()),
+        );
+    }
+
+    /// Derived render camera. Does not change player movement or network pose.
+    pub fn view_camera(&self, player: &Camera) -> Camera {
+        let mut camera = *player;
+        let forward = player.forward_vector();
+        let distance = match self.mode {
+            CameraMode::FirstPerson => 0.0,
+            CameraMode::ThirdPersonBack => -THIRD_PERSON_DISTANCE,
+            CameraMode::ThirdPersonFront => THIRD_PERSON_DISTANCE,
+        };
+        for (eye, direction) in camera.position.iter_mut().zip(forward) {
+            *eye += direction * distance;
+        }
+        if self.mode == CameraMode::ThirdPersonFront {
+            camera.yaw_deg = (camera.yaw_deg + 180.0).rem_euclid(360.0);
+            camera.pitch_deg = -camera.pitch_deg;
+        }
+        camera.fov_deg = self.effective_fov_deg();
+        camera
+    }
+}
+
+fn finite_clamp(value: f32, fallback: f32, low: f32, high: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(low, high)
+    } else {
+        fallback
+    }
+}
 
 /// Dirty-only gate for the software-rasterized UI framebuffer: remembers
 /// the `(width, height, fingerprint)` of the last uploaded frame so
@@ -105,6 +269,7 @@ pub struct GpuApp {
     live: Option<LiveSession>,
     active: Option<ActiveWindow>,
     camera: Camera,
+    camera_controller: CameraController,
     keys: Keys,
     focused: bool,
     occluded: bool,
@@ -156,6 +321,7 @@ impl GpuApp {
             ..Camera::default()
         };
         let mut ui = UiState::new();
+        ui.settings.video.vsync = render_config.vsync;
         ui.screen = Screen::InGameHud;
         ui.hud = mc_spine_ui::state::HudState::demo();
         Self {
@@ -163,6 +329,7 @@ impl GpuApp {
             live,
             active: None,
             camera,
+            camera_controller: CameraController::new(render_config.fov_deg as f32, 1.0, 4.0),
             keys: Keys::default(),
             focused: true,
             occluded: false,
@@ -185,6 +352,64 @@ impl GpuApp {
     /// The fatal setup error, if `resumed` hit one (`run` reports it).
     pub fn fatal(&self) -> Option<&str> {
         self.fatal.as_deref()
+    }
+
+    pub fn camera_controller(&self) -> &CameraController {
+        &self.camera_controller
+    }
+
+    pub fn render_config(&self) -> &RenderConfig {
+        &self.render_config
+    }
+
+    /// Camera values can also be updated by a settings source with FOV,
+    /// sensitivity and zoom-divisor controls.
+    pub fn apply_camera_settings(&mut self, fov_deg: f32, sensitivity: f32, zoom_divisor: f32) {
+        self.camera_controller
+            .apply_settings(fov_deg, sensitivity, zoom_divisor);
+        self.render_config.fov_deg = f64::from(self.camera_controller.base_fov_deg());
+    }
+
+    /// Apply settings immediately, including the active swapchain and GPU.
+    /// `UiSettings` currently offers video/visual presets and a zoom toggle;
+    /// camera numerical values are accepted through `apply_camera_settings`.
+    pub fn apply_settings(&mut self, settings: &UiSettings) {
+        let video = &settings.video;
+        self.camera_controller
+            .set_smooth_zoom(settings.qol.smooth_zoom);
+        let vsync_changed = self.render_config.vsync != video.vsync;
+        let fps_cap = (video.fps_cap > 0).then_some(video.fps_cap);
+        if self.render_config.max_fps != fps_cap {
+            self.governor = FrameBudgetGovernor::new(fps_cap);
+        }
+        self.render_config.max_fps = fps_cap;
+        self.render_config.background_fps_limit = video.background_fps;
+        self.render_config.vsync = video.vsync;
+        self.render_config.smooth_lighting = video.smooth_lighting;
+        self.render_config.view_distance = Some(i32::from(video.view_distance));
+
+        if let Some(active) = &mut self.active {
+            let shadow_quality = match settings.visual.preset {
+                VisualStylePreset::Vanilla | VisualStylePreset::MeguNaturalLight => {
+                    BuiltinShadowQuality::Off
+                }
+                VisualStylePreset::MeguNatural => BuiltinShadowQuality::Natural,
+            };
+            active.renderer.set_shadow_quality(shadow_quality);
+            let scale = match video.preset {
+                VideoPreset::Fast => RenderScalePreset::Performance67,
+                VideoPreset::Balanced | VideoPreset::High | VideoPreset::Ultra => {
+                    RenderScalePreset::Native100
+                }
+                VideoPreset::Custom => active.renderer.render_scale,
+            };
+            active.renderer.set_render_scale(scale);
+        }
+        if vsync_changed {
+            if let Some(size) = self.active.as_ref().map(|active| active.size) {
+                self.reconfigure(size);
+            }
+        }
     }
 
     fn set_cursor_grab(&mut self, grab: bool) {
@@ -282,6 +507,8 @@ impl GpuApp {
             active.renderer.load_shaderpack(path);
         }
         self.active = Some(active);
+        let settings = self.ui.settings.clone();
+        self.apply_settings(&settings);
         self.set_cursor_grab(true);
         Ok(())
     }
@@ -309,6 +536,8 @@ impl GpuApp {
         if !self.paused {
             self.camera.apply_move(self.keys.move_input(), dt.min(0.1));
         }
+        self.camera_controller
+            .tick(dt, !self.paused && self.keys.sprint);
 
         if let Some(live) = &mut self.live {
             let input = self.keys.move_input();
@@ -406,9 +635,10 @@ impl GpuApp {
                 return;
             }
         }
+        let render_camera = self.camera_controller.view_camera(&self.camera);
         let sky = active
             .renderer
-            .set_camera(&self.camera, w as f32 / h as f32);
+            .set_camera(&render_camera, w as f32 / h as f32);
         match active.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
@@ -456,9 +686,16 @@ impl GpuApp {
             KeyCode::Space => self.keys.up = pressed,
             KeyCode::ShiftLeft | KeyCode::ShiftRight => self.keys.down = pressed,
             KeyCode::ControlLeft | KeyCode::ControlRight => self.keys.sprint = pressed,
+            KeyCode::KeyC => self.camera_controller.set_zoomed(pressed && !self.paused),
+            KeyCode::F5 if pressed && !self.paused => {
+                self.camera_controller.cycle_mode();
+            }
             KeyCode::F3 if pressed => self.show_diagnostics = !self.show_diagnostics,
             KeyCode::Escape if pressed => {
                 self.paused = !self.paused;
+                if self.paused {
+                    self.camera_controller.set_zoomed(false);
+                }
                 if self.paused {
                     self.ui.navigate(Screen::Pause);
                 } else {
@@ -491,6 +728,10 @@ impl GpuApp {
             UiAction::Back => {
                 self.ui
                     .handle_input(UiInputEvent::KeyPressed(UiKey::Escape));
+            }
+            UiAction::SettingsChanged => {
+                let settings = self.ui.settings.clone();
+                self.apply_settings(&settings);
             }
             _ => {}
         }
@@ -607,6 +848,7 @@ impl ApplicationHandler for GpuApp {
                 self.focused = focused;
                 if !focused {
                     self.keys = Keys::default();
+                    self.camera_controller.set_zoomed(false);
                     self.set_cursor_grab(false);
                 } else if !self.paused {
                     self.set_cursor_grab(true);
@@ -661,7 +903,8 @@ impl ApplicationHandler for GpuApp {
         // cursor clamping at screen edges.
         if let DeviceEvent::MouseMotion { delta } = event {
             if self.cursor_grabbed && !self.paused {
-                self.camera.apply_mouse_look(delta.0, delta.1);
+                self.camera_controller
+                    .apply_mouse_look(&mut self.camera, delta.0, delta.1);
             }
         }
     }
