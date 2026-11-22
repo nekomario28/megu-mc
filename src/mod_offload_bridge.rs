@@ -21,8 +21,10 @@
 
 use create_adapter::blockstates::{core_create_registry, CreateBlockRegistry};
 use create_adapter::contraption_adapter::{
-    ContraptionActor, ContraptionActorKind, ContraptionError, ContraptionKind, ContraptionSnapshot,
-    ContraptionStorage, LiveContraption, WorldBlockEdit, DEFAULT_MAX_CONTRAPTION_BLOCKS,
+    is_immovable_block_id, ActorTickReport, ContraptionActor, ContraptionActorKind,
+    ContraptionError, ContraptionKind, ContraptionSnapshot, ContraptionStorage,
+    ContraptionWorldQuery, LiveContraption, SuperGlueVolume, WorldBlockEdit,
+    DEFAULT_MAX_CONTRAPTION_BLOCKS,
 };
 use create_adapter::factory::{CreateFactory, DimBlockPos as ModBlockPos};
 use create_adapter::neoforge_wire as create_wire;
@@ -234,6 +236,86 @@ impl ModOffloadBridge {
         )?;
         self.contraptions.insert(id, contraption);
         Ok((id, edits))
+    }
+
+    /// Assemble only blocks joined through Super Glue or a radial sticky
+    /// block. The input's canonical names provide the adapter predicates.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble_contraption_with_glue(
+        &mut self,
+        dim: DimId,
+        anchor: [i32; 3],
+        seed: [i32; 3],
+        world_blocks: &BTreeMap<[i32; 3], (u32, String)>,
+        glue: &SuperGlueVolume,
+        kind: ContraptionKind,
+    ) -> Result<(u32, Vec<WorldBlockEdit>), ContraptionError> {
+        let mut classes = BTreeMap::<u32, (bool, bool)>::new();
+        let mut states = BTreeMap::new();
+        for (pos, (state_id, block_id)) in world_blocks {
+            states.insert(*pos, *state_id);
+            let sticky = matches!(
+                block_id.as_str(),
+                "create:linear_chassis"
+                    | "create:secondary_linear_chassis"
+                    | "create:radial_chassis"
+                    | "minecraft:slime_block"
+                    | "minecraft:honey_block"
+            );
+            let immovable = is_immovable_block_id(block_id);
+            let class = classes.entry(*state_id).or_default();
+            class.0 |= sticky;
+            class.1 |= immovable;
+        }
+        let id = self.next_contraption_id;
+        let next_id = id.checked_add(1).ok_or_else(|| {
+            ContraptionError::CorruptSnapshot("contraption id space exhausted".to_string())
+        })?;
+        let (contraption, edits) = LiveContraption::assemble_with_glue(
+            id,
+            dim.raw() as i32,
+            anchor,
+            seed,
+            &states,
+            glue,
+            |state| classes.get(&state).is_some_and(|class| class.0),
+            |state| classes.get(&state).is_some_and(|class| class.1),
+            kind,
+            DEFAULT_MAX_CONTRAPTION_BLOCKS,
+        )?;
+        self.enable_create();
+        self.next_contraption_id = next_id;
+        self.contraptions.insert(id, contraption);
+        Ok((id, edits))
+    }
+
+    /// Advance mounted Create actors and return their proposed world edits.
+    fn step_contraption_actors(
+        &mut self,
+        id: u32,
+        query: &dyn ContraptionWorldQuery,
+    ) -> Option<ActorTickReport> {
+        Some(self.contraptions.get_mut(&id)?.step_actors(query))
+    }
+
+    /// Unmount a contraption only when every placement target is available.
+    /// An unknown id returns an empty conflict list and preserves the bridge.
+    fn disassemble_contraption_checked<F>(
+        &mut self,
+        id: u32,
+        is_occupied: F,
+    ) -> Result<Vec<WorldBlockEdit>, Vec<ModBlockPos>>
+    where
+        F: Fn(ModBlockPos) -> bool,
+    {
+        let Some(contraption) = self.contraptions.get(&id) else {
+            return Err(Vec::new());
+        };
+        let edits = contraption.disassemble_to_world_checked(is_occupied)?;
+        self.contraptions.remove(&id);
+        self.contraption_riders
+            .retain(|_, rider| rider.contraption != id);
+        Ok(edits)
     }
 
     /// Attach player `eid` to a live contraption at world `anchor`. Each tick the
@@ -920,12 +1002,89 @@ fn mod_offload_load_bytes(bytes: &[u8]) -> bool {
 #[cfg(all(test, feature = "create-offload"))]
 mod mod_offload_bridge_tests {
     use super::*;
+    use create_adapter::contraption_adapter::{ActorCell, ActorWorldEdit, SuperGlueBox};
 
     /// Several tests here reprogram the process-global bridge; serialize them.
     static MOB_LOCK: Mutex<()> = Mutex::new(());
 
     fn fresh_bridge() {
         *mod_offload_bridge().lock().unwrap_or_else(|e| e.into_inner()) = ModOffloadBridge::new();
+    }
+
+    #[test]
+    fn mod_offload_bridge_glue_actors_and_checked_disassembly() {
+        struct StoneAt([i32; 3]);
+        impl ContraptionWorldQuery for StoneAt {
+            fn cell_at(&self, pos: [i32; 3]) -> ActorCell {
+                if pos == self.0 {
+                    ActorCell::block("minecraft:stone", true)
+                } else {
+                    ActorCell::air()
+                }
+            }
+        }
+
+        let mut bridge = ModOffloadBridge::new();
+        let dim = DimId::from_raw(6);
+        let seed = [10, 64, 10];
+        let attached = [11, 64, 10];
+        let unglued = [12, 64, 10];
+        let mut world = BTreeMap::from([
+            (seed, (100, "minecraft:stone".to_string())),
+            (attached, (101, "minecraft:oak_planks".to_string())),
+            (unglued, (102, "minecraft:stone".to_string())),
+        ]);
+        let glue = SuperGlueVolume::from_boxes(vec![SuperGlueBox::new(seed, attached)]);
+        let driver = ContraptionKind::Linear {
+            velocity_per_tick: [0.0; 3],
+        };
+
+        world.insert(attached, (101, "minecraft:bedrock".to_string()));
+        assert_eq!(
+            bridge.assemble_contraption_with_glue(dim, seed, seed, &world, &glue, driver),
+            Err(ContraptionError::ImmovableBlock { pos: attached })
+        );
+        assert_eq!(bridge.next_contraption_id, 1);
+        assert!(bridge.contraptions.is_empty());
+        world.insert(attached, (101, "minecraft:oak_planks".to_string()));
+
+        let (id, removals) = bridge
+            .assemble_contraption_with_glue(dim, seed, seed, &world, &glue, driver)
+            .unwrap();
+        assert_eq!(id, 1);
+        assert_eq!(removals.len(), 2);
+        assert!(removals.iter().all(|edit| edit.state_id.is_none()));
+        assert!(!removals.iter().any(|edit| edit.pos.x == unglued[0]));
+
+        bridge.contraptions.get_mut(&id).unwrap().actors.push(ContraptionActor {
+            local: [1, 0, 0],
+            facing: [1, 0, 0],
+            kind: ContraptionActorKind::MechanicalDrill,
+        });
+        let report = bridge.step_contraption_actors(id, &StoneAt(unglued)).unwrap();
+        assert_eq!(report.edits, vec![ActorWorldEdit::BreakBlock {
+            pos: ModBlockPos::new(dim.raw() as i32, unglued[0], unglued[1], unglued[2])
+        }]);
+        assert!(bridge.step_contraption_actors(id + 1, &StoneAt(unglued)).is_none());
+
+        assert!(bridge.note_contraption_rider(900, id, [10.0, 64.0, 10.0]));
+        let conflict = ModBlockPos::new(dim.raw() as i32, attached[0], attached[1], attached[2]);
+        assert_eq!(
+            bridge.disassemble_contraption_checked(id, |pos| pos == conflict),
+            Err(vec![conflict])
+        );
+        assert!(bridge.contraptions.contains_key(&id));
+        assert!(bridge.contraption_riders.contains_key(&900));
+
+        let edits = bridge.disassemble_contraption_checked(id, |_| false).unwrap();
+        assert_eq!(edits.len(), 2);
+        assert_eq!(
+            edits.iter().filter_map(|edit| edit.state_id).collect::<Vec<_>>(),
+            vec![100, 101]
+        );
+        assert!(!bridge.contraptions.contains_key(&id));
+        assert!(!bridge.contraption_riders.contains_key(&900));
+        assert_eq!(bridge.disassemble_contraption_checked(id, |_| false), Err(Vec::new()));
     }
 
     /// Synthetic `Client` (same fixture style as `entity_fluid`'s tests) — a

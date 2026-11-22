@@ -94,7 +94,18 @@ use mod_adapter_core::mixin_lifter::{LiftedBinding, MixinLiftVerdict, StandardEv
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::mod_sync as lmb_sync;
 #[cfg(feature = "mod-suite")]
+use mod_adapter_core::season_primitives::{
+    encode_ssn1, seasonal_foliage_tint, seasonal_grass_tint, BiomeClimateClass,
+    BiomeClimateRules, SeasonCalendarConfig, SeasonState, SeasonSyncState, SeasonalTintRules,
+    SSN1_FRAME_LEN,
+};
+#[cfg(feature = "mod-suite")]
 use mod_adapter_core::unified_bundle::{DeclarativeModBundle, UnifiedModRuntime};
+#[cfg(feature = "mod-suite")]
+use mod_adapter_core::vanilla_qol_and_holidays::{
+    chest_holiday_variant, evaluate_right_click_harvest, roll_halloween_headgear, CalendarDate,
+    ChestVisualVariant, HalloweenHeadgearKind, HolidayConfig, QuarkCompatQolConfig,
+};
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::version_compat::McVersion;
 #[cfg(feature = "mod-suite")]
@@ -194,6 +205,8 @@ struct LiveModSuite {
     /// Per-eid AppleSkin delta suppressors (keyed like every other per-player
     /// runtime map).
     appleskin: HashMap<i32, AppleSkinDeltaTracker>,
+    /// Last successfully sent SSN1 frame, scoped to the player's session.
+    season_sync: HashMap<i32, ([u8; 16], [u8; SSN1_FRAME_LEN])>,
     /// Encoded `MSY1` body for `mc-spine:mod_sync_v1`, validated at arm time.
     mod_sync_body: Option<Vec<u8>>,
     mod_sync_root_hash: Option<[u8; 32]>,
@@ -218,6 +231,7 @@ impl LiveModSuite {
             barriers: ProgressionBarrierEngine::new(Vec::new()),
             extra_advancements: BTreeSet::new(),
             appleskin: HashMap::new(),
+            season_sync: HashMap::new(),
             mod_sync_body: None,
             mod_sync_root_hash: None,
         }
@@ -1177,6 +1191,133 @@ fn live_mod_payload_body(channel: &str, payload: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The season payload channel requested by the server bridge's wire contract.
+#[cfg(feature = "mod-suite")]
+const LIVE_MOD_SEASON_CHANNEL: &str = "megu:season";
+
+/// Assemble the deterministic SSN1 season snapshot for the selected biome
+/// temperature. Tints use the representative plains biome because the bridge
+/// currently receives only the temperature, rather than a biome identifier.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_season_sync_frame(world_ticks: u64, biome_temp: f32) -> Option<(String, Vec<u8>)> {
+    if !biome_temp.is_finite() {
+        return None;
+    }
+    let state = SeasonState::from_world_ticks(world_ticks, &SeasonCalendarConfig::default());
+    let climate = BiomeClimateRules::default().classify_biome("minecraft:plains", biome_temp);
+    let tints = SeasonalTintRules::default();
+    let foliage = seasonal_foliage_tint(&state, climate, "minecraft:plains", &tints);
+    let grass = seasonal_grass_tint(&state, climate, &tints);
+    let tropical = matches!(climate, BiomeClimateClass::Tropical);
+    let wire = SeasonSyncState::from_state(&state, foliage, grass, tropical, false, !tropical);
+    Some((LIVE_MOD_SEASON_CHANNEL.to_string(), encode_ssn1(&wire)))
+}
+
+/// Send a new SSN1 snapshot as the protocol-767 S2C custom payload (0x19).
+/// Per-eid caches additionally pin the UUID to prevent a reused eid from
+/// inheriting the previous session's frame.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_emit_season_sync(cid: u64, world_ticks: u64, biome_temp: f32) -> bool {
+    let Ok(eid) = i32::try_from(cid) else {
+        return false;
+    };
+    let Some((channel, payload)) = live_mod_season_sync_frame(world_ticks, biome_temp) else {
+        return false;
+    };
+    let Ok(frame): Result<[u8; SSN1_FRAME_LEN], _> = payload.as_slice().try_into() else {
+        return false;
+    };
+    let client = {
+        let players = clients().lock().unwrap_or_else(|e| e.into_inner());
+        players.iter().find(|player| player.eid == eid).cloned()
+    };
+    let Some(client) = client else {
+        return false;
+    };
+    {
+        let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+        if !suite.active || suite.season_sync.get(&eid) == Some(&(client.uuid, frame)) {
+            return false;
+        }
+    }
+    let sent = {
+        let mut socket = client.sock.lock().unwrap_or_else(|e| e.into_inner());
+        send_packet(
+            &mut socket,
+            LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID,
+            live_mod_payload_body(&channel, &payload),
+        )
+        .is_ok()
+    };
+    if sent {
+        live_mod_suite()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .season_sync
+            .insert(eid, (client.uuid, frame));
+    }
+    sent
+}
+
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_roll_halloween_headgear(
+    entity_id: &str,
+    month: u8,
+    day: u8,
+    roll: f32,
+) -> Option<(&'static str, f32)> {
+    let date = CalendarDate::new(month, day)?;
+    let headgear = roll_halloween_headgear(entity_id, date, &HolidayConfig::default(), roll)?;
+    let id = match headgear.kind {
+        HalloweenHeadgearKind::JackOLantern => "minecraft:jack_o_lantern",
+        HalloweenHeadgearKind::CarvedPumpkin => "minecraft:carved_pumpkin",
+    };
+    Some((id, headgear.head_drop_chance))
+}
+
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_chest_holiday_variant(block_id: &str, month: u8, day: u8) -> &'static str {
+    let Some(date) = CalendarDate::new(month, day) else {
+        return "standard";
+    };
+    match chest_holiday_variant(block_id, date, &HolidayConfig::default()) {
+        ChestVisualVariant::Standard => "standard",
+        ChestVisualVariant::ChristmasPresent => "christmas_present",
+    }
+}
+
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code, clippy::too_many_arguments)]
+fn live_mod_try_qol_right_click_harvest(
+    enabled: bool,
+    block_id: &str,
+    age: u8,
+    max_age: u8,
+    drop_item: &str,
+    seed_item: &str,
+    raw_drops: u32,
+    seed_drops: u32,
+) -> Option<(u8, u32, u32)> {
+    let config = QuarkCompatQolConfig {
+        right_click_harvest: enabled,
+        ..Default::default()
+    };
+    let plan = evaluate_right_click_harvest(block_id, age, max_age, &config)?;
+    // Replanting consumes an actual seed from the loot. If seeds are also
+    // represented by the main drop, deduct from that bucket instead.
+    if seed_drops >= plan.seeds_deducted {
+        Some((plan.reset_age, raw_drops, seed_drops - plan.seeds_deducted))
+    } else if drop_item == seed_item && raw_drops >= plan.seeds_deducted {
+        Some((plan.reset_age, raw_drops - plan.seeds_deducted, seed_drops))
+    } else {
+        None
+    }
+}
+
 /// Uncompressed protocol-767 Play packet frame: VarInt length, packet id
 /// 0x19, channel identifier, and opaque custom payload. When writing to a
 /// live socket, re-enter `send_packet` so compression/encryption are honored.
@@ -1584,6 +1725,14 @@ fn live_mod_tick() {
     let players = clients().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let connected: HashSet<[u8; 16]> = players.iter().map(|client| client.uuid).collect();
     {
+        let connected_sessions: HashSet<(i32, [u8; 16])> =
+            players.iter().map(|client| (client.eid, client.uuid)).collect();
+        let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+        suite
+            .season_sync
+            .retain(|eid, (uuid, _)| connected_sessions.contains(&(*eid, *uuid)));
+    }
+    {
         let mut magic = live_magic_state().lock().unwrap_or_else(|e| e.into_inner());
         magic.players.retain(|uuid, _| connected.contains(uuid));
     }
@@ -1828,6 +1977,55 @@ fn live_mod_progression_rules_from_json(bytes: &[u8]) -> Result<Vec<ProgressionR
 // ===========================================================================
 // Default-build stubs: identical call sites, zero emitted code.
 // ===========================================================================
+
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code)]
+#[inline(always)]
+fn live_mod_season_sync_frame(_world_ticks: u64, _biome_temp: f32) -> Option<(String, Vec<u8>)> {
+    None
+}
+
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code)]
+#[inline(always)]
+fn live_mod_emit_season_sync(_cid: u64, _world_ticks: u64, _biome_temp: f32) -> bool {
+    false
+}
+
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code)]
+#[inline(always)]
+fn live_mod_roll_halloween_headgear(
+    _entity_id: &str,
+    _month: u8,
+    _day: u8,
+    _roll: f32,
+) -> Option<(&'static str, f32)> {
+    None
+}
+
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code)]
+#[inline(always)]
+fn live_mod_chest_holiday_variant(_block_id: &str, _month: u8, _day: u8) -> &'static str {
+    "standard"
+}
+
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code, clippy::too_many_arguments)]
+#[inline(always)]
+fn live_mod_try_qol_right_click_harvest(
+    _enabled: bool,
+    _block_id: &str,
+    _age: u8,
+    _max_age: u8,
+    _drop_item: &str,
+    _seed_item: &str,
+    _raw_drops: u32,
+    _seed_drops: u32,
+) -> Option<(u8, u32, u32)> {
+    None
+}
 
 /// Default builds do not emit mod custom payloads.
 #[cfg(not(feature = "mod-suite"))]
@@ -3425,6 +3623,89 @@ mod wire_mods_tests {
         *me2.sat.lock().unwrap_or_else(|e| e.into_inner()) = 1.0;
         live_mod_appleskin_sync(&me2);
         assert!(lmb_silent(&mut peer2), "inactive suite must emit nothing");
+    }
+
+    #[test]
+    fn live_mod_bridge_season_sync_is_ssn1_and_suppressed_per_player() {
+        use mod_adapter_core::season_primitives::{decode_ssn1, SSN1_FRAME_LEN, SSN1_MAGIC};
+
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()).active = true;
+        let (player_a, mut peer_a) = lmb_client("wire_season_a", 977_201);
+        let (player_b, mut peer_b) = lmb_client("wire_season_b", 977_202);
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend([Arc::clone(&player_a), Arc::clone(&player_b)]);
+
+        let (channel, payload) = live_mod_season_sync_frame(0, 0.8).unwrap();
+        assert_eq!(channel, "megu:season");
+        assert_eq!(payload.len(), SSN1_FRAME_LEN);
+        assert_eq!(&payload[..4], SSN1_MAGIC);
+        assert!(decode_ssn1(&payload).is_some());
+        assert!(live_mod_emit_season_sync(977_201, 0, 0.8));
+        let mut stash_a = Vec::new();
+        let (id, body) = lmb_read_frame(&mut peer_a, &mut stash_a).unwrap();
+        assert_eq!(id, LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID);
+        assert_eq!(lmb_decode_payload(&body), (channel, payload.clone()));
+        assert!(!live_mod_emit_season_sync(977_201, 0, 0.8));
+        assert!(lmb_silent(&mut peer_a));
+
+        assert!(live_mod_emit_season_sync(977_202, 0, 0.8));
+        let (id, body) = lmb_read_frame(&mut peer_b, &mut Vec::new()).unwrap();
+        assert_eq!(id, LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID);
+        assert_eq!(lmb_decode_payload(&body), ("megu:season".into(), payload.clone()));
+        assert!(live_mod_emit_season_sync(977_201, 24_000 * 8, 0.8));
+        let (_, body) = lmb_read_frame(&mut peer_a, &mut stash_a).unwrap();
+        let (_, changed) = lmb_decode_payload(&body);
+        assert!(decode_ssn1(&changed).is_some());
+        assert_ne!(changed, payload);
+
+        assert!(!live_mod_emit_season_sync(u64::MAX, 0, 0.8));
+        assert!(live_mod_season_sync_frame(0, f32::NAN).is_none());
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|client| client.eid != 977_201 && client.eid != 977_202);
+        fresh_suite();
+    }
+
+    #[test]
+    fn live_mod_bridge_holiday_and_harvest_adapters() {
+        assert_eq!(
+            live_mod_roll_halloween_headgear("minecraft:zombie", 10, 31, 0.01),
+            Some(("minecraft:jack_o_lantern", 0.0))
+        );
+        assert_eq!(
+            live_mod_roll_halloween_headgear("minecraft:skeleton", 10, 31, 0.1),
+            Some(("minecraft:carved_pumpkin", 0.0))
+        );
+        assert_eq!(live_mod_roll_halloween_headgear("minecraft:creeper", 10, 31, 0.01), None);
+        assert_eq!(live_mod_roll_halloween_headgear("minecraft:zombie", 10, 30, 0.01), None);
+        assert_eq!(live_mod_roll_halloween_headgear("minecraft:zombie", 13, 31, 0.01), None);
+        assert_eq!(live_mod_chest_holiday_variant("minecraft:chest", 12, 25), "christmas_present");
+        assert_eq!(live_mod_chest_holiday_variant("minecraft:trapped_chest", 12, 24), "christmas_present");
+        assert_eq!(live_mod_chest_holiday_variant("minecraft:ender_chest", 12, 25), "standard");
+        assert_eq!(live_mod_chest_holiday_variant("minecraft:chest", 12, 27), "standard");
+        assert_eq!(
+            live_mod_try_qol_right_click_harvest(
+                true, "minecraft:wheat", 7, 7, "minecraft:wheat", "minecraft:wheat_seeds", 3, 2
+            ),
+            Some((0, 3, 1))
+        );
+        assert_eq!(
+            live_mod_try_qol_right_click_harvest(
+                true, "minecraft:carrots", 7, 7, "minecraft:carrot", "minecraft:carrot", 3, 0
+            ),
+            Some((0, 2, 0))
+        );
+        assert!(live_mod_try_qol_right_click_harvest(
+            true, "minecraft:wheat", 7, 7, "minecraft:wheat", "minecraft:wheat_seeds", 3, 0
+        ).is_none());
+        assert!(live_mod_try_qol_right_click_harvest(
+            false, "minecraft:wheat", 7, 7, "minecraft:wheat", "minecraft:wheat_seeds", 3, 2
+        ).is_none());
     }
 
     // ---------- progression barrier ----------
