@@ -605,6 +605,8 @@
     "moreculling",
     "distanthorizons",
     "voxy",
+    "iris",
+    "oculus",
     "bobby",
     "farsight",
     "indium",

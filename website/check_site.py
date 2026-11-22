@@ -25,8 +25,8 @@ Checks, all fail-closed:
      redaction, milestone comments, KV dedup, Turnstile, /api/latest)
      against fully mocked GitHub/KV/fetch — no network access.
   7. SEO surface: <link rel="canonical">, robots.txt, sitemap.xml,
-     Open Graph / Twitter Card meta, og-card.svg, and a parseable
-     schema.org SoftwareApplication JSON-LD block.
+     Open Graph / Twitter Card meta, og-card.png (1200x630) + og-card.svg,
+     and a parseable schema.org SoftwareApplication JSON-LD block.
 
 Exit status: 0 clean, 1 findings.
 """
@@ -259,7 +259,7 @@ def check_site_config_keys():
 
 CANONICAL_URL = "https://megu.megumin.tech/"
 SITEMAP_URL = "https://megu.megumin.tech/sitemap.xml"
-OG_IMAGE_URL = "https://megu.megumin.tech/og-card.svg"
+OG_IMAGE_URL = "https://megu.megumin.tech/og-card.png"
 
 
 def _tag_attrs(markup, tag):
@@ -318,9 +318,11 @@ def check_seo_metadata():
         ("property", "og:locale"): "en_US",
         ("property", "og:locale:alternate"): "ja_JP",
         ("property", "og:image"): OG_IMAGE_URL,
+        ("property", "og:image:type"): "image/png",
         ("name", "twitter:card"): "summary_large_image",
         ("name", "twitter:title"): None,
         ("name", "twitter:description"): None,
+        ("name", "twitter:image"): OG_IMAGE_URL,
     }
     for (attr, key), expected in required_meta.items():
         content = _meta_content(markup, attr, key)
@@ -355,6 +357,19 @@ def check_seo_metadata():
                 findings.append(
                     f"JSON-LD SoftwareApplication.{key} is "
                     f"{app.get(key)!r}, expected {expected!r}")
+
+    card_png = WEBSITE / "og-card.png"
+    if not card_png.is_file():
+        findings.append("website/og-card.png is missing")
+    else:
+        raw = card_png.read_bytes()
+        if len(raw) < 24 or raw[:8] != b"\x89PNG\r\n\x1a\n" or raw[12:16] != b"IHDR":
+            findings.append("website/og-card.png is not a valid PNG")
+        else:
+            w = int.from_bytes(raw[16:20], "big")
+            h = int.from_bytes(raw[20:24], "big")
+            if (w, h) != (1200, 630):
+                findings.append(f"website/og-card.png is {w}x{h}, expected 1200x630")
 
     card = WEBSITE / "og-card.svg"
     if not card.is_file():
@@ -403,7 +418,7 @@ require(process.env.SITE_CONFIG_JS); // sets globalThis.SITE_CONFIG
 const m = require(process.env.APP_JS);
 
 // Catalog sanity.
-assert.strictEqual(m.BUILTIN_SUPERSEDED_PERF_MODS.length, 52);
+assert.strictEqual(m.BUILTIN_SUPERSEDED_PERF_MODS.length, 54);
 
 // --- Masked feedback /api/report contract and fallback -----------------
 const sensitive = "Crash in /home/alice/.minecraft/logs/latest.log on " +
