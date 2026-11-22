@@ -5,6 +5,10 @@
 //! and contraption edits are synchronous.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -104,6 +108,7 @@ pub struct BatchReport {
 #[derive(Default)]
 pub struct RegionScheduler {
     regions: BTreeMap<RegionKey, Region>,
+    pool: Option<WorkerPool>,
 }
 
 impl RegionScheduler {
@@ -127,6 +132,10 @@ impl RegionScheduler {
     /// `(key, outcome)` pairs come back in sorted key order regardless of how
     /// the work interleaved, making `threads = 1` and `threads = N` runs
     /// bit-identical. One region's error never stops its neighbours.
+    ///
+    /// Parallel rounds hand whole owned regions to a resident [`WorkerPool`]
+    /// instead of spawning scoped threads per tick; workers park on a condvar
+    /// while idle, so an unused pool costs no CPU and `Drop` joins it cleanly.
     pub fn advance_all(
         &mut self,
         tick: u64,
@@ -135,7 +144,7 @@ impl RegionScheduler {
     ) -> Vec<(RegionKey, Result<RegionReport, TransportError>)> {
         let workers = threads.max(1).min(self.regions.len().max(1));
         // Most idle and small servers have a single active region. Avoid the
-        // intermediate region list and scoped-thread setup on that tick path.
+        // pool hand-off on that tick path.
         if workers == 1 {
             return self
                 .regions
@@ -143,29 +152,193 @@ impl RegionScheduler {
                 .map(|(&key, region)| (key, region.advance_to(tick, budget)))
                 .collect();
         }
-        let mut regions: Vec<(RegionKey, &mut Region)> = self
-            .regions
-            .iter_mut()
-            .map(|(&key, region)| (key, region))
-            .collect();
-        let slice_len = regions.len().div_ceil(workers);
-        let run = |slice: &mut [(RegionKey, &mut Region)]| {
-            slice
-                .iter_mut()
-                .map(|(key, region)| (*key, region.advance_to(tick, budget)))
-                .collect::<Vec<_>>()
-        };
-        thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(workers);
-            for slice in regions.chunks_mut(slice_len) {
-                handles.push(scope.spawn(move || run(slice)));
+        let pool = self.pool.get_or_insert_with(WorkerPool::new);
+        pool.ensure_workers(workers);
+        let job_count = self.regions.len();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        {
+            let mut jobs = mutex_lock(&pool.shared.jobs);
+            for (key, region) in std::mem::take(&mut self.regions) {
+                jobs.push_back(RegionJob {
+                    key,
+                    region,
+                    tick,
+                    budget,
+                    reply: reply_tx.clone(),
+                });
             }
-            handles
-                .into_iter()
-                .flat_map(|handle| handle.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
-                .collect()
-        })
+        }
+        pool.shared.job_ready.notify_all();
+        drop(reply_tx);
+
+        let mut results = BTreeMap::new();
+        let mut restored = BTreeMap::new();
+        let mut first_panic = None;
+        let mut received = 0_usize;
+        while received < job_count {
+            let Ok(outcome) = reply_rx.recv() else {
+                break;
+            };
+            received += 1;
+            match outcome {
+                RegionOutcome::Done {
+                    key,
+                    result,
+                    region,
+                } => {
+                    results.insert(key, result);
+                    restored.insert(key, region);
+                }
+                RegionOutcome::Panicked {
+                    key,
+                    region,
+                    payload,
+                } => {
+                    restored.insert(key, region);
+                    if first_panic.is_none() {
+                        first_panic = Some(payload);
+                    }
+                }
+            }
+        }
+        if received < job_count {
+            // Workers only exit on pool shutdown, so this cannot happen while
+            // `advance_all` holds `&mut self`; still return every queued
+            // region to the map before failing.
+            let mut jobs = mutex_lock(&pool.shared.jobs);
+            for job in jobs.drain(..) {
+                restored.insert(job.key, job.region);
+            }
+            self.regions = restored;
+            panic!(
+                "mod-offload worker pool lost {} region(s)",
+                job_count - received
+            );
+        }
+        self.regions = restored;
+        if let Some(payload) = first_panic {
+            panic::resume_unwind(payload);
+        }
+        results.into_iter().collect()
     }
+}
+
+/// One region's slice of an `advance_all` round. The region travels as an
+/// owned value so no borrowed `&mut` ever crosses a thread boundary; the
+/// worker reports back over `reply`.
+struct RegionJob {
+    key: RegionKey,
+    region: Region,
+    tick: u64,
+    budget: RegionBudget,
+    reply: mpsc::Sender<RegionOutcome>,
+}
+
+enum RegionOutcome {
+    Done {
+        key: RegionKey,
+        result: Result<RegionReport, TransportError>,
+        region: Region,
+    },
+    Panicked {
+        key: RegionKey,
+        region: Region,
+        payload: Box<dyn std::any::Any + Send>,
+    },
+}
+
+struct PoolShared {
+    jobs: Mutex<VecDeque<RegionJob>>,
+    job_ready: Condvar,
+    shutdown: AtomicBool,
+}
+
+/// Resident worker pool shared by every parallel `advance_all` call. Workers
+/// park on `job_ready` between rounds, so an idle pool costs no CPU; `Drop`
+/// flips `shutdown`, wakes every worker and joins them.
+struct WorkerPool {
+    shared: Arc<PoolShared>,
+    handles: Vec<thread::JoinHandle<()>>,
+}
+
+impl WorkerPool {
+    fn new() -> Self {
+        Self {
+            shared: Arc::new(PoolShared {
+                jobs: Mutex::new(VecDeque::new()),
+                job_ready: Condvar::new(),
+                shutdown: AtomicBool::new(false),
+            }),
+            handles: Vec::new(),
+        }
+    }
+
+    /// Grow the pool to `count` workers; already-running workers are kept.
+    fn ensure_workers(&mut self, count: usize) {
+        while self.handles.len() < count {
+            let shared = Arc::clone(&self.shared);
+            self.handles
+                .push(thread::spawn(move || worker_loop(shared)));
+        }
+    }
+}
+
+impl Drop for WorkerPool {
+    fn drop(&mut self) {
+        self.shared.shutdown.store(true, Ordering::Release);
+        self.shared.job_ready.notify_all();
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn worker_loop(shared: Arc<PoolShared>) {
+    loop {
+        let job = {
+            let mut jobs = mutex_lock(&shared.jobs);
+            loop {
+                if shared.shutdown.load(Ordering::Acquire) {
+                    return;
+                }
+                if let Some(job) = jobs.pop_front() {
+                    break job;
+                }
+                jobs = match shared.job_ready.wait(jobs) {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+            }
+        };
+        let RegionJob {
+            key,
+            mut region,
+            tick,
+            budget,
+            reply,
+        } = job;
+        let outcome = match panic::catch_unwind(AssertUnwindSafe(|| {
+            region.advance_to(tick, budget)
+        })) {
+            Ok(result) => RegionOutcome::Done {
+                key,
+                result,
+                region,
+            },
+            Err(payload) => RegionOutcome::Panicked {
+                key,
+                region,
+                payload,
+            },
+        };
+        let _ = reply.send(outcome);
+    }
+}
+
+fn mutex_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub struct Region {
