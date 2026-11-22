@@ -20,18 +20,20 @@
 //! fed caller-injected `tick`/millisecond values exactly like the rest of
 //! [`crate::recovery`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use crate::audio_qol::{AudioLimiter, SoundAdmission, SoundKey};
 use crate::crash_reporter::ReportEnv;
 use crate::protocol::{decode_megu_custom_payload, MeguCustomPayload, SeasonWireSync};
-use crate::recovery::{
-    ContainmentOutcome, CrashCircuitBreaker, CrashGuard, RecoveryAction,
-};
+use crate::recovery::{ContainmentOutcome, CrashCircuitBreaker, CrashGuard, RecoveryAction};
+use crate::sound_assets::{normalize_sound_name, sound_name_hash};
 use crate::spatial_audio::{
-    AcousticTracer, ListenerPose, MaterialClass, SpatialAudioEngine, SpatialAudioPreset,
-    VoxelAcousticWorld,
+    AcousticMaterial, AcousticTracer, ListenerPose, MaterialClass, SoundSource, SpatialAudioEngine,
+    SpatialAudioPreset, SpatialSubtitleCue, VoxelAcousticWorld,
 };
+use crate::world::WorldState;
 
 /// Default spatial-audio sample rate (matches the `VCR1` PCM path).
 const DEFAULT_SAMPLE_RATE: u32 = 48_000;
@@ -282,10 +284,9 @@ fn listener_relative(source_pos: [f32; 3], listener: &ListenerPose) -> (f32, f32
         fwd[2] * 0.0 - fwd[0] * 0.0,
         fwd[0] * 1.0 - fwd[1] * 0.0,
     ];
-    let right_norm = (right_raw[0] * right_raw[0]
-        + right_raw[1] * right_raw[1]
-        + right_raw[2] * right_raw[2])
-        .sqrt();
+    let right_norm =
+        (right_raw[0] * right_raw[0] + right_raw[1] * right_raw[1] + right_raw[2] * right_raw[2])
+            .sqrt();
     let right = if right_norm < 1e-6 {
         [cy, 0.0, -sy]
     } else {
@@ -303,11 +304,407 @@ fn listener_relative(source_pos: [f32; 3], listener: &ListenerPose) -> (f32, f32
     let rel_x = u[0] * right[0] + u[1] * right[1] + u[2] * right[2];
     let rel_y = u[0] * up[0] + u[1] * up[1] + u[2] * up[2];
     let rel_z = u[0] * fwd[0] + u[1] * fwd[1] + u[2] * fwd[2];
-    (
-        rel_x.atan2(rel_z),
-        rel_y.clamp(-1.0, 1.0).asin(),
-        dist,
-    )
+    (rel_x.atan2(rel_z), rel_y.clamp(-1.0, 1.0).asin(), dist)
+}
+
+// ---------------------------------------------------------------------------
+// Live sound mixer: wire events -> voices -> limited stereo bus
+// ---------------------------------------------------------------------------
+
+/// Maximum pending sound events in the mixer's typed queue.
+const SOUND_QUEUE_CAP: usize = 128;
+/// Maximum simultaneously sounding voices.
+const VOICE_CAP: usize = 24;
+/// Maximum retained subtitle cues for consumers that drain them late.
+const SUBTITLE_LOG_CAP: usize = 256;
+
+/// A decoded, asset-resolved sound event ready to be voiced — the typed
+/// queue element [`SoundMixer`] consumes. `pcm` is mono `f32` at the
+/// mixer's sample rate.
+#[derive(Clone, Debug)]
+pub struct PlaySoundEvent {
+    /// Display/limiter label — the sound-event name (or `sound.<id>`).
+    pub label: String,
+    /// Mono PCM at the mixer sample rate (`Arc` so replays share decode).
+    pub pcm: Arc<Vec<f32>>,
+    /// `true` when `pcm` is the deterministic placeholder tone (no usable
+    /// asset or decoder) — the stats keep this honest.
+    pub is_placeholder: bool,
+    /// Vanilla sound-source category varint (0=master .. 9=voice).
+    pub category: i32,
+    /// World position in blocks (`sound_effect`), or `None` for
+    /// entity-bound events (`sound_entity`) — those play at the listener
+    /// because this wire layer does not track entity positions.
+    pub position: Option<[f32; 3]>,
+    /// The entity the sound is attached to, when entity-bound.
+    pub entity_id: Option<i32>,
+    /// Packet volume × variant volume (0..=1 after clamping).
+    pub volume: f32,
+    /// Playback-rate multiplier (0.5..=2.0 after clamping).
+    pub pitch: f32,
+    /// Packet seed — retained for reporting; variant selection already ran.
+    pub seed: i64,
+}
+
+/// Mixer counters — the honest accounting of what played, what was
+/// dropped, and why.
+#[derive(Clone, Debug, Default)]
+pub struct AudioStats {
+    /// Sound events submitted to the mixer queue.
+    pub events_submitted: u64,
+    /// Events the limiter suppressed outright (same-sound storm).
+    pub events_suppressed: u64,
+    /// Events admitted at reduced gain by the limiter.
+    pub events_attenuated: u64,
+    /// Voices actually started.
+    pub voices_started: u64,
+    /// Voices removed early by cap stealing.
+    pub voices_stolen: u64,
+    /// Voices removed early by Stop Sound.
+    pub voices_stopped: u64,
+    /// Voices that finished naturally.
+    pub voices_finished: u64,
+    /// `sound_entity` events played at the listener position because no
+    /// entity-position tracking exists on this wire layer.
+    pub entity_pos_unresolved: u64,
+    /// Registry ids that did not map to a known event name.
+    pub unknown_sound_id: u64,
+    /// Events with no `sounds.json` definition.
+    pub missing_event_def: u64,
+    /// Events handled with no asset library loaded.
+    pub missing_assets: u64,
+    /// Voices playing the placeholder tone instead of a real OGG.
+    pub placeholder_voices: u64,
+    /// OGG decode failures after a successful resolve.
+    pub decode_errors: u64,
+    /// Events dropped when the submit queue was full.
+    pub queue_dropped: u64,
+    /// Subtitle cues emitted.
+    pub subtitle_cues: u64,
+}
+
+/// One subtitle record: label + direction/loudness cue + the mix position
+/// (in output samples) when the sound started.
+#[derive(Clone, Debug)]
+pub struct SubtitleCueRecord {
+    /// Sound-event name (e.g. `entity.player.levelup`).
+    pub name: String,
+    /// Direction + loudness + distance from the voice's engine.
+    pub cue: SpatialSubtitleCue,
+    /// Absolute output-sample index when the voice started.
+    pub at_sample: u64,
+}
+
+/// One sounding voice: its own [`SpatialAudioEngine`] (per the engine's
+/// one-voice-per-source contract), the mono PCM cursor, and mix gain.
+struct Voice {
+    engine: SpatialAudioEngine,
+    pcm: Arc<Vec<f32>>,
+    /// Fractional read position into `pcm` (pitch stepping).
+    cursor: f64,
+    /// Samples advanced per output sample (= clamped pitch).
+    step: f64,
+    /// Final mix gain: volume × category × master × admission.
+    gain: f32,
+    /// Steal metric — the voice's submitted loudness.
+    loudness: f32,
+    label: String,
+    category: i32,
+    order: u64,
+    done: bool,
+}
+
+impl Voice {
+    /// Fill `out` with this voice's next mono samples (zeros past the end);
+    /// linear interpolation for the fractional `pitch` cursor.
+    fn render_mono(&mut self, out: &mut [f32]) {
+        let len = self.pcm.len();
+        for s in out.iter_mut() {
+            let i = self.cursor as usize;
+            if i + 1 < len {
+                let frac = (self.cursor - i as f64) as f32;
+                *s = self.pcm[i] * (1.0 - frac) + self.pcm[i + 1] * frac;
+            } else {
+                *s = 0.0;
+            }
+            self.cursor += self.step;
+        }
+        if self.cursor as usize >= len.saturating_sub(1) {
+            self.done = true;
+        }
+    }
+}
+
+/// The live mixer: a bounded typed event queue, per-voice spatialization
+/// through [`SpatialAudioEngine`], category/master volumes, [`AudioLimiter`]
+/// admission and bus limiting, a voice cap with deterministic
+/// quietest-then-oldest stealing, and Stop Sound handling.
+///
+/// Deterministic: no wall-clock reads and no RNG anywhere in this type —
+/// `render` output is a pure function of submitted events, listener poses,
+/// the attached world view, and render calls.
+pub struct SoundMixer {
+    queue: VecDeque<PlaySoundEvent>,
+    voices: Vec<Voice>,
+    /// Admission limiter (`qol.max_volume_cap`,
+    /// `qol.max_concurrent_same_sound`) — `pub` for direct configuration.
+    pub limiter: AudioLimiter,
+    listener: ListenerPose,
+    world: Box<dyn VoxelAcousticWorld>,
+    preset: SpatialAudioPreset,
+    sample_rate: u32,
+    voice_cap: usize,
+    master_gain: f32,
+    category_gain: [f32; 10],
+    order: u64,
+    render_calls: u64,
+    samples_rendered: u64,
+    /// Public counters — see [`AudioStats`].
+    pub stats: AudioStats,
+    subtitles: VecDeque<SubtitleCueRecord>,
+}
+
+impl SoundMixer {
+    /// Mixer at `sample_rate` with `preset` quality (the engine voices each
+    /// create their own [`SpatialAudioEngine`] at these settings).
+    pub fn new(sample_rate: u32, preset: SpatialAudioPreset) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            voices: Vec::new(),
+            limiter: AudioLimiter::new(),
+            listener: ListenerPose::default(),
+            world: Box::new(OpenAirWorld),
+            preset,
+            sample_rate,
+            voice_cap: VOICE_CAP,
+            master_gain: 1.0,
+            category_gain: [1.0; 10],
+            order: 0,
+            render_calls: 0,
+            samples_rendered: 0,
+            stats: AudioStats::default(),
+            subtitles: VecDeque::new(),
+        }
+    }
+
+    /// Mixer output rate.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// Attach the acoustic world occlusion/reverb is traced against
+    /// (default: [`OpenAirWorld`], i.e. clear line of sight everywhere).
+    pub fn set_world(&mut self, world: Box<dyn VoxelAcousticWorld>) {
+        self.world = world;
+    }
+
+    /// Update the listener pose — cheap geometry refresh on every voice.
+    pub fn set_listener(&mut self, listener: ListenerPose) {
+        self.listener = listener;
+        for voice in &mut self.voices {
+            voice.engine.set_listener(listener);
+        }
+    }
+
+    /// Per-category gain (`0..=9` vanilla sound-source ids), clamped 0..=1.
+    pub fn set_category_gain(&mut self, category: i32, gain: f32) {
+        if let Some(slot) = self.category_gain.get_mut(category as usize) {
+            *slot = gain.clamp(0.0, 1.0);
+        }
+    }
+
+    /// Master gain applied to every voice, clamped 0..=1.
+    pub fn set_master_gain(&mut self, gain: f32) {
+        self.master_gain = gain.clamp(0.0, 1.0);
+    }
+
+    /// Live voice count (test/diagnostic).
+    pub fn voice_count(&self) -> usize {
+        self.voices.len()
+    }
+
+    /// Labels of live voices in insertion order (diagnostics/tests).
+    pub fn voice_labels(&self) -> Vec<String> {
+        self.voices.iter().map(|v| v.label.clone()).collect()
+    }
+
+    /// Queue one event. The queue is bounded; a flooded session drops the
+    /// oldest pending event rather than growing without limit.
+    pub fn submit(&mut self, ev: PlaySoundEvent) {
+        if self.queue.len() >= SOUND_QUEUE_CAP {
+            self.queue.pop_front();
+            self.stats.queue_dropped += 1;
+        }
+        self.queue.push_back(ev);
+    }
+
+    /// Stop Sound: remove queued and sounding voices matching the filter —
+    /// `None` fields match everything (mirrors the packet's flag bits).
+    pub fn submit_stop(&mut self, category: Option<i32>, name: Option<&str>) {
+        let name = name.map(normalize_sound_name);
+        let matches = |v: &Voice| {
+            category.is_none_or(|c| c == v.category)
+                && name.is_none_or(|n| n == normalize_sound_name(&v.label))
+        };
+        let before = self.voices.len();
+        self.voices.retain(|v| !matches(v));
+        self.stats.voices_stopped += (before - self.voices.len()) as u64;
+        self.queue.retain(|ev| {
+            !(category.is_none_or(|c| c == ev.category)
+                && name.is_none_or(|n| n == normalize_sound_name(&ev.label)))
+        });
+    }
+
+    /// The voice selected to make room for a new one: quietest submitted
+    /// loudness, ties broken by oldest start order — deterministic.
+    fn steal_index(&self) -> Option<usize> {
+        self.voices
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                a.loudness
+                    .partial_cmp(&b.loudness)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.order.cmp(&b.order))
+            })
+            .map(|(i, _)| i)
+    }
+
+    /// Admit one queued event into a voice.
+    fn admit(&mut self, ev: PlaySoundEvent) {
+        let position = ev.position.unwrap_or(self.listener.position);
+        let key = SoundKey::at_block(
+            sound_name_hash(&ev.label),
+            position[0].floor() as i32,
+            position[1].floor() as i32,
+            position[2].floor() as i32,
+        );
+        let admission_gain = match self.limiter.register_sound(key, self.render_calls) {
+            SoundAdmission::Play => 1.0,
+            SoundAdmission::Attenuate { gain } => {
+                self.stats.events_attenuated += 1;
+                gain
+            }
+            SoundAdmission::Suppress => {
+                self.stats.events_suppressed += 1;
+                return;
+            }
+        };
+        if self.voices.len() >= self.voice_cap {
+            if let Some(idx) = self.steal_index() {
+                self.voices.remove(idx);
+                self.stats.voices_stolen += 1;
+            }
+        }
+        let cat_gain = self
+            .category_gain
+            .get(ev.category as usize)
+            .copied()
+            .unwrap_or(1.0);
+        let gain = (ev.volume * cat_gain * self.master_gain * admission_gain).clamp(0.0, 1.0);
+        let mut engine = SpatialAudioEngine::new(self.sample_rate, self.preset);
+        engine.analyze(
+            &*self.world,
+            &SoundSource {
+                position,
+                velocity: [0.0; 3],
+            },
+            &self.listener,
+        );
+        self.subtitles.push_back(SubtitleCueRecord {
+            name: ev.label.clone(),
+            cue: engine.subtitle_cue(),
+            at_sample: self.samples_rendered,
+        });
+        self.stats.subtitle_cues += 1;
+        while self.subtitles.len() > SUBTITLE_LOG_CAP {
+            self.subtitles.pop_front();
+        }
+        self.order += 1;
+        self.voices.push(Voice {
+            engine,
+            pcm: ev.pcm,
+            cursor: 0.0,
+            step: f64::from(ev.pitch.clamp(0.5, 2.0)),
+            gain,
+            loudness: ev.volume,
+            label: ev.label,
+            category: ev.category,
+            order: self.order,
+            done: gain <= 0.0,
+        });
+        self.stats.voices_started += 1;
+    }
+
+    /// Render `out.len()/2` stereo frames into the interleaved buffer,
+    /// applying the bus limiter last so the output never exceeds the cap.
+    /// `out` is NOT cleared — it is expected zeroed and is summed into, so
+    /// callers render layers; the limiter still runs on the final mix.
+    pub fn render(&mut self, out: &mut [f32]) {
+        debug_assert!(out.len().is_multiple_of(2));
+        let frames = out.len() / 2;
+        if frames == 0 {
+            return;
+        }
+        self.render_calls += 1;
+        while let Some(ev) = self.queue.pop_front() {
+            self.stats.events_submitted += 1;
+            self.admit(ev);
+        }
+        let mut mono = vec![0.0f32; frames];
+        for voice in &mut self.voices {
+            mono.fill(0.0);
+            voice.render_mono(&mut mono);
+            let stereo = voice.engine.process_voice_frame(&mono);
+            for i in 0..frames {
+                out[2 * i] += stereo[2 * i] * voice.gain;
+                out[2 * i + 1] += stereo[2 * i + 1] * voice.gain;
+            }
+        }
+        let finished = self.voices.iter().filter(|v| v.done).count() as u64;
+        self.stats.voices_finished += finished;
+        self.voices.retain(|v| !v.done);
+        AudioLimiter::limit_mix_buffer(out, self.limiter.max_volume_cap());
+        self.samples_rendered += frames as u64;
+    }
+
+    /// Pop the oldest pending subtitle cue.
+    pub fn drain_subtitle(&mut self) -> Option<SubtitleCueRecord> {
+        self.subtitles.pop_front()
+    }
+}
+
+/// Acoustic world with air everywhere — the default when no voxel view is
+/// attached (clear line of sight, no reverb).
+pub struct OpenAirWorld;
+
+impl VoxelAcousticWorld for OpenAirWorld {
+    fn acoustic_material(&self, _x: i32, _y: i32, _z: i32) -> AcousticMaterial {
+        AcousticMaterial::AIR
+    }
+}
+
+/// Read-only acoustic view over the live [`WorldState`] section cache.
+/// Unloaded cells report air; fluids report [`MaterialClass::Liquid`];
+/// other solid states report [`MaterialClass::StoneLike`] — the block
+/// registry on this layer cannot name individual blocks, so material
+/// detail within "solid" is approximated.
+pub struct WorldAcousticView<'a> {
+    /// The world being viewed.
+    pub world: &'a WorldState,
+}
+
+impl VoxelAcousticWorld for WorldAcousticView<'_> {
+    fn acoustic_material(&self, x: i32, y: i32, z: i32) -> AcousticMaterial {
+        match self.world.get_block_state(x, y, z) {
+            Some(state) if self.world.blocks.is_air(state) => AcousticMaterial::AIR,
+            Some(state) if self.world.blocks.fluid_cell(state).kind.is_some() => {
+                AcousticMaterial::from_class(MaterialClass::Liquid)
+            }
+            Some(_) => AcousticMaterial::from_class(MaterialClass::StoneLike),
+            None => AcousticMaterial::AIR,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -331,7 +728,8 @@ mod tests {
     }
 
     fn scratch_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("mc-spine-session-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("mc-spine-session-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -411,8 +809,7 @@ mod tests {
         let mut session = session("guard");
         // Trip on the second crash inside the window regardless of panic
         // fingerprinting, so the trip rule under test is deterministic.
-        session.crash_breaker =
-            CrashCircuitBreaker::with_thresholds(2, 60_000, 5, 30_000);
+        session.crash_breaker = CrashCircuitBreaker::with_thresholds(2, 60_000, 5, 30_000);
         let mut calls = 0u32;
 
         // First panic: contained, recorded, subsystem still enabled.

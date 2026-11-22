@@ -169,6 +169,21 @@ fn main() -> ExitCode {
     let _friend_bridge = friend_bridge;
 
     crash_reporter::set_active_stage("play_session");
+    // Live sound path: decode->mixer->sink config picked up by
+    // ProtocolClient when it connects. `off` leaves the runtime absent;
+    // `auto`/`pipewire`/`alsa` fail closed to the null sink when no
+    // playback tool exists or the child dies.
+    mc_spine_client::audio_out::install_session_audio_config(
+        mc_spine_client::audio_out::AudioSessionConfig {
+            sink: cfg.audio_sink.clone(),
+            assets_dir: cfg.assets_dir.clone(),
+            asset_index: cfg.asset_index.clone(),
+            max_volume_cap: cfg.client_settings.qol.max_volume_cap,
+            max_concurrent_same_sound: cfg.client_settings.qol.max_concurrent_same_sound,
+            subtitle_path: None,
+            subtitles_to_stderr: true,
+        },
+    );
     let _client_session = ClientSession::new(crash_reporter::ReportEnv::detect(), crash_dir);
     let mut frame_pacer = FrameBudgetPacer::new();
     if cfg.render_png.is_some() {

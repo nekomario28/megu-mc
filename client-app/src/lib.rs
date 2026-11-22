@@ -2,11 +2,12 @@
 //! Standalone native Minecraft 1.21.1 (Protocol 767) client library combining
 //! `mc-spine-kernel` and `mc-spine-client-mesh`.
 
+pub mod audio_out;
 pub mod audio_qol;
 pub mod cli;
 pub mod crash_reporter;
-pub mod friend_client;
 pub mod frame_pacer;
+pub mod friend_client;
 pub mod hardware_profile;
 pub mod integrated;
 pub mod lod;
@@ -19,5 +20,6 @@ pub mod settings;
 pub mod shaderpack_runtime;
 pub mod shaders;
 pub mod sim;
+pub mod sound_assets;
 pub mod spatial_audio;
 pub mod world;

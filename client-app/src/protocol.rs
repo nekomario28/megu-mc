@@ -2,7 +2,7 @@
 //! Zero-dependency Minecraft 1.21.1 (Protocol 767) TCP wire codec, RFC 1950 zlib,
 //! and Handshake -> Login -> Configuration -> Play state machine.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, OnceLock};
@@ -1641,6 +1641,99 @@ pub struct TeleportSync {
     pub teleport_id: i32,
 }
 
+/// One decoded `sound_effect` (0x68) or `sound_entity` (0x67) payload —
+/// the typed wire event [`crate::audio_out::AudioRuntime`] ingests.
+#[derive(Clone, Debug)]
+pub struct WireSoundEvent {
+    /// Inline `sound_event` identifier (holder id `0`), e.g.
+    /// `minecraft:entity.player.levelup`.
+    pub name: Option<String>,
+    /// `minecraft:sound_event` registry id (holder id `>0`, minus one).
+    pub registry_id: Option<u32>,
+    /// Vanilla sound-source category (0=master .. 9=voice).
+    pub category: i32,
+    /// World position in blocks — fixed-point /8 decoded (`sound_effect`
+    /// only).
+    pub position: Option<[f32; 3]>,
+    /// Attached entity id (`sound_entity` only).
+    pub entity_id: Option<i32>,
+    /// Wire volume (0..=1 typical; the server may send larger).
+    pub volume: f32,
+    /// Wire pitch multiplier (0.5..=2.0 per vanilla).
+    pub pitch: f32,
+    /// Wire seed — used for variant selection like vanilla's seeded pick.
+    pub seed: i64,
+    /// Optional fixed audible range on inline events (blocks).
+    pub fixed_range: Option<f32>,
+}
+
+/// One decoded `stop_sound` (0x6A) payload: flags byte, optional category
+/// varint, optional sound-event identifier.
+#[derive(Clone, Debug)]
+pub struct WireStopSound {
+    /// Sound-source category filter when flag 0x01 is set.
+    pub category: Option<i32>,
+    /// Event-name filter when flag 0x02 is set.
+    pub name: Option<String>,
+}
+
+/// Decode `sound_effect`/`sound_entity` payloads (`entity_bound` selects
+/// entity-id vs fixed-point-position layout) on the 767 wire.
+pub fn decode_play_sound_body(body: &[u8], entity_bound: bool) -> Result<WireSoundEvent, String> {
+    let mut r = WireReader::new(body);
+    let holder = r.read_varint()?;
+    let (name, registry_id, fixed_range) = if holder == 0 {
+        let name = r.read_string(256)?;
+        let has_range = r.read_bool()?;
+        let range = if has_range { Some(r.read_f32()?) } else { None };
+        (Some(name), None, range)
+    } else {
+        let id =
+            u32::try_from(holder - 1).map_err(|_| "invalid sound_event registry id".to_string())?;
+        (None, Some(id), None)
+    };
+    let category = r.read_varint()?;
+    let (position, entity_id) = if entity_bound {
+        (None, Some(r.read_varint()?))
+    } else {
+        // Effect positions are fixed-point Ints: real = raw / 8.
+        let x = r.read_i32()?;
+        let y = r.read_i32()?;
+        let z = r.read_i32()?;
+        (Some([x as f32 / 8.0, y as f32 / 8.0, z as f32 / 8.0]), None)
+    };
+    Ok(WireSoundEvent {
+        name,
+        registry_id,
+        category,
+        position,
+        entity_id,
+        volume: r.read_f32()?,
+        pitch: r.read_f32()?,
+        seed: r.read_i64()?,
+        fixed_range,
+    })
+}
+
+/// Decode a `stop_sound` payload on the 767 wire: flags byte (0x01 category
+/// present, 0x02 name present), optional category varint, optional
+/// sound-event identifier.
+pub fn decode_stop_sound_body(body: &[u8]) -> Result<WireStopSound, String> {
+    let mut r = WireReader::new(body);
+    let flags = r.read_u8()?;
+    let category = if flags & 0x01 != 0 {
+        Some(r.read_varint()?)
+    } else {
+        None
+    };
+    let name = if flags & 0x02 != 0 {
+        Some(r.read_string(256)?)
+    } else {
+        None
+    };
+    Ok(WireStopSound { category, name })
+}
+
 #[derive(Clone, Debug)]
 pub enum PlayEvent {
     JoinGame {
@@ -1680,7 +1773,10 @@ pub enum PlayEvent {
     },
     /// `system_chat` — extracted plain text plus the overlay (action-bar)
     /// flag; the NBT component itself stays in `protocol`'s decoder.
-    SystemChat { text: String, overlay: bool },
+    SystemChat {
+        text: String,
+        overlay: bool,
+    },
     Disconnect(String),
     Other(i32),
 }
@@ -1727,6 +1823,16 @@ pub struct ProtocolClient {
     pub protocol_version: mc_spine_proto::ProtocolVersion,
     pub packets_rx: u64,
     pub packets_tx: u64,
+    /// Decoded `sound_effect`/`sound_entity` payloads, retained bounded for
+    /// non-audio consumers (drained by the audio runtime when present).
+    pub sound_events: VecDeque<WireSoundEvent>,
+    /// Decoded `stop_sound` payloads, same retention policy.
+    pub stop_sound_events: VecDeque<WireStopSound>,
+    /// Live audio output pipeline — installed from the session audio
+    /// config when one is configured (see
+    /// [`crate::audio_out::install_session_audio_config`]); `None` when
+    /// audio is off or unconfigured.
+    pub audio: Option<crate::audio_out::AudioRuntime>,
 }
 
 impl ProtocolClient {
@@ -1751,6 +1857,11 @@ impl ProtocolClient {
             protocol_version,
             packets_rx: 0,
             packets_tx: 0,
+            sound_events: VecDeque::new(),
+            stop_sound_events: VecDeque::new(),
+            audio: crate::audio_out::session_audio_config()
+                .filter(crate::audio_out::AudioRuntime::enabled)
+                .map(|cfg| crate::audio_out::AudioRuntime::new(&cfg)),
         }
     }
 
@@ -1846,9 +1957,7 @@ impl ProtocolClient {
             view_distance,
             timeout,
             protocol_version,
-            |h, p| {
-                mc_spine_proto::resolve_server_address(h, p).map_err(|e| e.to_string())
-            },
+            |h, p| mc_spine_proto::resolve_server_address(h, p).map_err(|e| e.to_string()),
         )
     }
 
@@ -1972,7 +2081,11 @@ impl ProtocolClient {
                             let mut resp = Vec::new();
                             write_string(&mut resp, &key);
                             resp.push(0); // has_payload = false
-                            client.send_named(PacketPhase::Configuration, "cookie_response", &resp)?;
+                            client.send_named(
+                                PacketPhase::Configuration,
+                                "cookie_response",
+                                &resp,
+                            )?;
                             continue;
                         }
                     }
@@ -2147,6 +2260,7 @@ impl ProtocolClient {
     ) -> Result<(), String> {
         let mut p = Vec::with_capacity(33);
         write_varint(&mut p, teleport_id);
+        self.audio_listener(pos[0], pos[1], pos[2], Some(yaw), Some(pitch));
         if !self.wire_26x() {
             return self.send_named(PacketPhase::Play, "accept_teleportation", &p);
         }
@@ -2221,6 +2335,7 @@ impl ProtocolClient {
         // 767 ends with a bare on-ground boolean, 26.x with a flag byte whose
         // 0x01 bit is on-ground — the encoding is identical for a client that
         // never reports horizontal collision.
+        self.audio_listener(x, y, z, None, None);
         let mut p = Vec::with_capacity(25);
         p.extend_from_slice(&x.to_be_bytes());
         p.extend_from_slice(&y.to_be_bytes());
@@ -2238,6 +2353,7 @@ impl ProtocolClient {
         pitch: f32,
         on_ground: bool,
     ) -> Result<(), String> {
+        self.audio_listener(x, y, z, Some(yaw), Some(pitch));
         let mut p = Vec::with_capacity(33);
         p.extend_from_slice(&x.to_be_bytes());
         p.extend_from_slice(&y.to_be_bytes());
@@ -2250,8 +2366,10 @@ impl ProtocolClient {
 
     pub fn recv_play(&mut self, timeout: Duration) -> Result<Option<PlayEvent>, String> {
         let Some((pid, body)) = self.recv_raw(timeout)? else {
+            self.pump_audio();
             return Ok(None);
         };
+        self.pump_audio();
         self.decode_play_event(pid, &body).map(Some)
     }
 
@@ -2262,8 +2380,10 @@ impl ProtocolClient {
         timeout: Duration,
     ) -> Result<Option<ClientPlayEvent>, String> {
         let Some((pid, body)) = self.recv_raw(timeout)? else {
+            self.pump_audio();
             return Ok(None);
         };
+        self.pump_audio();
         if self.s2c_name(PacketPhase::Play, pid).as_deref() == Some("custom_payload") {
             return decode_custom_payload_packet(&body)
                 .map(ClientPlayEvent::CustomChannel)
@@ -2272,6 +2392,45 @@ impl ProtocolClient {
         self.decode_play_event(pid, &body)
             .map(ClientPlayEvent::Play)
             .map(Some)
+    }
+
+    /// Retain one decoded sound event bounded for non-audio consumers and
+    /// feed the live audio runtime when one is installed.
+    fn ingest_sound_event(&mut self, ev: WireSoundEvent) {
+        if self.sound_events.len() >= crate::audio_out::pending_wire_event_bound() {
+            self.sound_events.pop_front();
+        }
+        if let Some(rt) = &mut self.audio {
+            rt.ingest(&ev);
+        }
+        self.sound_events.push_back(ev);
+    }
+
+    fn ingest_stop_sound(&mut self, s: WireStopSound) {
+        if self.stop_sound_events.len() >= crate::audio_out::pending_wire_event_bound() {
+            self.stop_sound_events.pop_front();
+        }
+        if let Some(rt) = &mut self.audio {
+            rt.ingest_stop(&s);
+        }
+        self.stop_sound_events.push_back(s);
+    }
+
+    /// Render whatever audio is due; cheap when nothing is installed or
+    /// no wall-clock time has passed.
+    fn pump_audio(&mut self) {
+        if let Some(rt) = &mut self.audio {
+            rt.pump();
+        }
+    }
+
+    /// Listener pose update from the position packets the session runner
+    /// already sends every tick — feet position; `None` look angles keep
+    /// the last seen values (position-only packets carry none).
+    fn audio_listener(&mut self, x: f64, y: f64, z: f64, yaw: Option<f32>, pitch: Option<f32>) {
+        if let Some(rt) = &mut self.audio {
+            rt.update_listener([x, y, z], yaw, pitch);
+        }
     }
 
     fn decode_play_event(&mut self, pid: i32, body: &[u8]) -> Result<PlayEvent, String> {
@@ -2414,10 +2573,7 @@ impl ProtocolClient {
             }
             Some("system_chat") => {
                 let mut r = WireReader::new(body);
-                let text = r
-                    .read_nbt()
-                    .map(|v| v.extract_text())
-                    .unwrap_or_default();
+                let text = r.read_nbt().map(|v| v.extract_text()).unwrap_or_default();
                 let overlay = r.read_bool()?;
                 Ok(PlayEvent::SystemChat { text, overlay })
             }
@@ -2427,6 +2583,28 @@ impl ProtocolClient {
                     .map(|v| v.extract_text())
                     .unwrap_or_else(|_| "disconnected by server".to_string());
                 Ok(PlayEvent::Disconnect(msg))
+            }
+            Some("sound_effect") | Some("sound_entity") => {
+                // 767 layout only: on the 26.x wire these packets carry a
+                // different shape, so they stay undecoded `Other`s rather
+                // than mis-parsed audio.
+                if !self.wire_26x() {
+                    if let Ok(ev) = decode_play_sound_body(
+                        body,
+                        self.s2c_name(PacketPhase::Play, pid).as_deref() == Some("sound_entity"),
+                    ) {
+                        self.ingest_sound_event(ev);
+                    }
+                }
+                Ok(PlayEvent::Other(pid))
+            }
+            Some("stop_sound") => {
+                if !self.wire_26x() {
+                    if let Ok(s) = decode_stop_sound_body(body) {
+                        self.ingest_stop_sound(s);
+                    }
+                }
+                Ok(PlayEvent::Other(pid))
             }
             _ => Ok(PlayEvent::Other(pid)),
         }
@@ -2803,7 +2981,11 @@ fn parse_status_response(text: &str) -> Result<ServerStatusPing, String> {
         .map(|s| match s {
             JsonValue::Arr(items) => items
                 .iter()
-                .filter_map(|e| e.get("name").and_then(JsonValue::as_str).map(str::to_string))
+                .filter_map(|e| {
+                    e.get("name")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_string)
+                })
                 .collect(),
             _ => Vec::new(),
         })
@@ -2835,7 +3017,7 @@ fn parse_status_response(text: &str) -> Result<ServerStatusPing, String> {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq)]
-enum JsonValue {
+pub(crate) enum JsonValue {
     Null,
     Bool(bool),
     Num(f64),
@@ -2845,26 +3027,31 @@ enum JsonValue {
 }
 
 impl JsonValue {
-    fn get(&self, key: &str) -> Option<&JsonValue> {
+    pub(crate) fn get(&self, key: &str) -> Option<&JsonValue> {
         match self {
-            Self::Obj(entries) => entries
-                .iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v),
+            Self::Obj(entries) => entries.iter().find(|(k, _)| k == key).map(|(_, v)| v),
             _ => None,
         }
     }
 
-    fn as_str(&self) -> Option<&str> {
+    pub(crate) fn as_str(&self) -> Option<&str> {
         match self {
             Self::Str(s) => Some(s),
             _ => None,
         }
     }
 
-    fn as_i64(&self) -> Option<i64> {
+    pub(crate) fn as_i64(&self) -> Option<i64> {
         match self {
             Self::Num(n) if n.fract() == 0.0 && n.abs() <= i64::MAX as f64 => Some(*n as i64),
+            _ => None,
+        }
+    }
+
+    /// Numeric value as `f64` (fractional values included).
+    pub(crate) fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Num(n) => Some(*n),
             _ => None,
         }
     }
@@ -2893,10 +3080,17 @@ impl JsonValue {
 }
 
 fn parse_status_json(text: &str) -> Result<JsonValue, String> {
+    parse_json(text, MAX_STATUS_JSON_NODES)
+}
+
+/// Crate-shared minimal JSON parser (status ping, asset indexes,
+/// `sounds.json`). `max_nodes` bounds parser work on hostile input.
+pub(crate) fn parse_json(text: &str, max_nodes: usize) -> Result<JsonValue, String> {
     let mut parser = JsonParser {
         bytes: text.as_bytes(),
         pos: 0,
         nodes: 0,
+        max_nodes,
     };
     parser.skip_ws();
     let value = parser.value(0)?;
@@ -2911,6 +3105,7 @@ struct JsonParser<'a> {
     bytes: &'a [u8],
     pos: usize,
     nodes: usize,
+    max_nodes: usize,
 }
 
 impl<'a> JsonParser<'a> {
@@ -2929,7 +3124,7 @@ impl<'a> JsonParser<'a> {
             return Err("status JSON nesting depth exceeded".to_string());
         }
         self.nodes += 1;
-        if self.nodes > MAX_STATUS_JSON_NODES {
+        if self.nodes > self.max_nodes {
             return Err("status JSON node budget exceeded".to_string());
         }
         match self.peek() {
@@ -2991,8 +3186,7 @@ impl<'a> JsonParser<'a> {
         }
         let s = std::str::from_utf8(&self.bytes[self.pos..end])
             .map_err(|_| "invalid \\u escape in status JSON".to_string())?;
-        let value =
-            u32::from_str_radix(s, 16).map_err(|_| format!("invalid \\u escape '{s}'"))?;
+        let value = u32::from_str_radix(s, 16).map_err(|_| format!("invalid \\u escape '{s}'"))?;
         self.pos = end;
         Ok(value)
     }
@@ -3053,7 +3247,10 @@ impl<'a> JsonParser<'a> {
                             out.push(ch);
                         }
                         other => {
-                            return Err(format!("invalid escape '\\{}' in status JSON", other as char))
+                            return Err(format!(
+                                "invalid escape '\\{}' in status JSON",
+                                other as char
+                            ))
                         }
                     }
                 }
@@ -3219,7 +3416,10 @@ mod tests {
 
     #[test]
     fn megu_router_fails_closed_on_unknown_channels() {
-        assert_eq!(decode_megu_custom_payload("example:unrecognized", b"\x01\x02"), None);
+        assert_eq!(
+            decode_megu_custom_payload("example:unrecognized", b"\x01\x02"),
+            None
+        );
         assert_eq!(decode_megu_custom_payload(CHANNEL_MAGIC_V1, b"BAD!"), None);
     }
 }

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use mc_spine_client_mesh::RenderBackendPreference;
 use mc_spine_proto::friend_relay::InviteCode;
 
+use crate::audio_out::AudioSinkKind;
 use crate::crash_reporter::parse_report_url;
 use crate::hardware_profile::{probe_host_hardware, recommend_tuning};
 use crate::settings::{
@@ -115,6 +116,10 @@ pub struct CliConfig {
     /// `MC_SPINE_VERSION_DIR`) for `Registry::from_version_dir`.
     pub version_dir: Option<PathBuf>,
     pub headless: bool,
+    /// `--audio-sink <auto|pipewire|alsa|null|off>`: playback backend for
+    /// the live sound path; `auto` (default) tries `pw-cat` then `aplay`
+    /// and fails closed to the null sink.
+    pub audio_sink: AudioSinkKind,
     pub ticks: u32,
     pub view_distance: i8,
     pub assets_json: Option<PathBuf>,
@@ -242,6 +247,7 @@ impl Default for CliConfig {
             ping: None,
             version_dir: None,
             headless: false,
+            audio_sink: AudioSinkKind::Auto,
             ticks: 40,
             view_distance: 2,
             assets_json: None,
@@ -323,6 +329,7 @@ impl fmt::Debug for CliConfig {
             .field("ping", &self.ping)
             .field("version_dir", &self.version_dir)
             .field("headless", &self.headless)
+            .field("audio_sink", &self.audio_sink)
             .field("ticks", &self.ticks)
             .field("view_distance", &self.view_distance)
             .field("assets_json", &self.assets_json)
@@ -436,10 +443,7 @@ impl CliConfig {
     /// [`CliConfig::resolve_client_settings`] with an explicit directory for
     /// the `mc-spine-client.toml` auto-load, kept separate so tests can
     /// point it at a scratch directory.
-    pub fn resolve_client_settings_from(
-        &mut self,
-        auto_dir: &Path,
-    ) -> Result<Vec<String>, String> {
+    pub fn resolve_client_settings_from(&mut self, auto_dir: &Path) -> Result<Vec<String>, String> {
         let mut warnings = Vec::new();
         let mut source_present = self.preset.is_some();
         let mut settings = self
@@ -775,6 +779,24 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
             "--gameDir" => cfg.game_dir = Some(PathBuf::from(take_val(flag, &mut i)?)),
             "--assetsDir" => cfg.assets_dir = Some(PathBuf::from(take_val(flag, &mut i)?)),
             "--assetIndex" => cfg.asset_index = Some(take_val(flag, &mut i)?),
+            "--audio-sink" => {
+                let raw = take_val(flag, &mut i)?;
+                cfg.audio_sink = match raw.as_str() {
+                    "auto" => AudioSinkKind::Auto,
+                    "pipewire" | "pw-cat" => AudioSinkKind::PipeWire,
+                    "alsa" | "aplay" => AudioSinkKind::Alsa,
+                    "null" => AudioSinkKind::Null,
+                    "off" => AudioSinkKind::Off,
+                    other => {
+                        return Err(format!(
+                            "invalid --audio-sink '{other}' (expected auto, pipewire, alsa, null, or off)"
+                        ));
+                    }
+                };
+            }
+            "--audio-wav" => {
+                cfg.audio_sink = AudioSinkKind::Wav(PathBuf::from(take_val(flag, &mut i)?));
+            }
             "--quickPlayMultiplayer" => {
                 cfg.quick_play_multiplayer = Some(take_val(flag, &mut i)?);
             }
@@ -967,8 +989,7 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
                 })?);
             }
             "--allow-waypoint-teleport" => {
-                cfg.allow_waypoint_teleport =
-                    Some(parse_on_off(&take_val(flag, &mut i)?, flag)?);
+                cfg.allow_waypoint_teleport = Some(parse_on_off(&take_val(flag, &mut i)?, flag)?);
             }
             "--mc-version" => {
                 let raw = take_val(flag, &mut i)?;
@@ -1112,6 +1133,11 @@ NATIVE CLIENT FLAGS:
   --version-dir <path>               Kernel version pack directory for the block
                                      registry (env: MC_SPINE_VERSION_DIR)
   --headless                         Run headless protocol + meshing + physics session
+  --audio-sink <backend>             Sound playback: auto|pipewire|alsa|null|off
+                                     (default: auto = pw-cat, else aplay, else null)
+  --audio-wav <path>                 Write mixed 48 kHz s16 stereo audio to a WAV
+                                     file instead of a playback backend; a
+                                     <path>.subtitles.txt sidecar records cues
   --ticks <N>                        Number of simulation ticks to run (default: 40)
   --view-distance <N>                Client view distance in chunks, 2..=32 (default: 2)
   --assets-json <path>               Path to assets/block_states_1211.json
@@ -1221,10 +1247,8 @@ mod tests {
     use crate::settings::MAX_VIEW_DISTANCE;
 
     fn scratch_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "mc-spine-cli-test-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("mc-spine-cli-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1426,7 +1450,10 @@ mod tests {
             RenderBackendPreference::ClassicLowSpec
         );
         assert_eq!(cfg.client_settings.preset, QualityPreset::Custom);
-        assert_eq!(cfg.gpu_backend, Some(RenderBackendPreference::ClassicLowSpec));
+        assert_eq!(
+            cfg.gpu_backend,
+            Some(RenderBackendPreference::ClassicLowSpec)
+        );
 
         // Every documented token parses.
         for (token, want) in [
@@ -1457,7 +1484,10 @@ mod tests {
         ])
         .unwrap();
         cfg.resolve_client_settings_from(&dir).unwrap();
-        assert_eq!(cfg.client_settings.gpu_backend, RenderBackendPreference::Classic);
+        assert_eq!(
+            cfg.client_settings.gpu_backend,
+            RenderBackendPreference::Classic
+        );
         // Without the flag the TOML value applies on its own.
         let mut cfg = parse_args(&["--settings", file.to_str().unwrap()]).unwrap();
         cfg.resolve_client_settings_from(&dir).unwrap();
