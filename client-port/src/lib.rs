@@ -3,6 +3,7 @@
 //! CPU section meshing for Minecraft Java 1.21.1 (protocol 767).
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod asset_pipeline;
 pub mod atlas;
 pub mod ber_instancing;
 pub mod builtin_shadow_wgsl;

@@ -365,13 +365,14 @@ fn face_uv_rotation_tintindex_and_shade_plumb_through() {
         .iter()
         .find(|q| q.tintindex == 3)
         .expect("up face has tintindex 3");
-    // Up-face UV rect [0,0,4,2] with in-face rotation 90: corner pair
-    // index (3,2,1,0) shifted by one -> pairs 0,3,2,1 =
-    // (u0,v0) (u0,v1) (u1,v1) (u1,v0).
-    assert_eq!(up.uv[0], [0.0, 0.0]);
-    assert_eq!(up.uv[1], [0.0, 2.0]);
-    assert_eq!(up.uv[2], [4.0, 2.0]);
-    assert_eq!(up.uv[3], [4.0, 0.0]);
+    // Up-face UV rect [0,0,4,2] with in-face rotation 90: `BlockFaceUV`
+    // shifts UV assignment clockwise by one slot (verified against Vanilla
+    // 1.21.1), so the corner pairs become
+    // (u1,v1) (u1,v0) (u0,v0) (u0,v1).
+    assert_eq!(up.uv[0], [4.0, 2.0]);
+    assert_eq!(up.uv[1], [4.0, 0.0]);
+    assert_eq!(up.uv[2], [0.0, 0.0]);
+    assert_eq!(up.uv[3], [0.0, 2.0]);
     assert!(up.shade, "shade defaults to true");
 
     let models = pack(&[(
