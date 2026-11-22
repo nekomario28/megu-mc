@@ -15,6 +15,7 @@ use mc_spine_client::shaders::{
 };
 use mc_spine_client::world::WorldState;
 use mc_spine_client_mesh::atlas::{AtlasMip, PackedAtlas};
+use mc_spine_client_mesh::ber_instancing::{VanillaParticleQuad, VanillaParticleWorld};
 use mc_spine_client_mesh::builtin_shadow_wgsl::{
     build_shadow_uniforms_celestial, compute_sun_direction, negotiate_builtin_shadow_quality,
     pack_vfx1_lights, BuiltinShadowQuality, CascadeConfig, DirtyOnlyShadowCache, EclipseMode,
@@ -22,21 +23,24 @@ use mc_spine_client_mesh::builtin_shadow_wgsl::{
     MEGU_SHADOW_DEPTH_WGSL, MEGU_SHADOW_SAMPLING_WGSL,
 };
 use mc_spine_client_mesh::ffi::PackedVertex;
+use mc_spine_client_mesh::vanilla_plus_3d::ExtrudedMesh;
 use mc_spine_client_mesh::vfx_engine::DynamicColoredLight;
 use mc_spine_client_mesh::SectionCoord;
 use mc_spine_client_mesh::{
     is_megu_wgsl_pack, BackendResolution, GpuCapabilities, GpuShaderCaps, MeguWgslPack, PassKind,
     PipelineStage, RenderBackendPreference, ShaderPackSource,
 };
+use mc_spine_kernel::debug_chords::DebugLine;
 use mc_spine_kernel::entity_interp::{evaluate_sky_and_fog, SkyFogInput, SkyFogOutput};
 use winit::event_loop::OwnedDisplayHandle;
 
 use crate::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
 use crate::mat4_mul;
 use crate::subworld_render::{
-    CompositeDrawUniforms, CompositeEnvUniforms, SubWorldGpuCache, SubWorldRenderBank,
-    VfxLightsGpu, COMPOSITE_LIT_WGSL, COMPOSITE_TERRAIN_WGSL, DRAW_UNIFORM_STRIDE,
-    LIT_VERTEX_LAYOUT, PART_INSTANCE_LAYOUT,
+    CompositeDrawUniforms, CompositeEnvUniforms, DebugLineVertex, SubWorldGpuCache,
+    SubWorldRenderBank, TerrainVertex, VfxLightsGpu, COMPOSITE_LIT_WGSL, COMPOSITE_TERRAIN_WGSL,
+    DEBUG_LINE_VERTEX_LAYOUT, DEBUG_LINE_WGSL, DRAW_UNIFORM_STRIDE, LIT_VERTEX_LAYOUT,
+    PART_INSTANCE_LAYOUT,
 };
 use crate::{
     build_index_buffer, gpu_capabilities_for, gpu_shader_caps_for, negotiate_pipeline,
@@ -449,6 +453,11 @@ pub struct GpuRenderer {
     scene: Option<TerrainBuffers>,
     live_sections: HashMap<SectionCoord, LiveTerrainSection>,
     composite: CompositeGpu,
+    debug_line_pipeline: wgpu::RenderPipeline,
+    debug_lines: Option<(wgpu::Buffer, u32)>,
+    entity_ber: Option<DynamicLitGpu>,
+    particles: Option<DynamicLitGpu>,
+    particle_alphas: Vec<f32>,
     subworld_gpu: SubWorldGpuCache,
     scaled_target: Option<ScaledTarget>,
     /// The negotiated built-in shadow quality (`negotiate_builtin_shadow_quality`
@@ -473,6 +482,77 @@ pub struct GpuRenderer {
     pub shaderpack: ShaderpackAttempt,
     /// Latest notice line the HUD/diagnostics can display.
     pub notice: Option<String>,
+}
+
+pub const MAX_DEBUG_LINES: usize = 65_536;
+const MAX_DYNAMIC_QUADS: usize = 16_384;
+
+struct DynamicLitGpu {
+    vertices: wgpu::Buffer,
+    indices: wgpu::Buffer,
+    index_count: u32,
+}
+
+impl DynamicLitGpu {
+    fn upload(ctx: &GpuDevice, vertices: &[TerrainVertex], indices: &[u32]) -> Option<Self> {
+        if indices.is_empty() {
+            return None;
+        }
+        let vertices_gpu = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dynamic-lit-vertices"),
+            size: std::mem::size_of_val(vertices) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let indices_gpu = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dynamic-lit-indices"),
+            size: std::mem::size_of_val(indices) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        ctx.queue
+            .write_buffer(&vertices_gpu, 0, bytemuck::cast_slice(vertices));
+        ctx.queue
+            .write_buffer(&indices_gpu, 0, bytemuck::cast_slice(indices));
+        Some(Self {
+            vertices: vertices_gpu,
+            indices: indices_gpu,
+            index_count: indices.len() as u32,
+        })
+    }
+}
+
+fn append_dynamic_quad(
+    vertices: &mut Vec<TerrainVertex>,
+    indices: &mut Vec<u32>,
+    positions: [[f32; 3]; 4],
+    normal: [f32; 3],
+    uv: [[f32; 2]; 4],
+    tint: [f32; 3],
+) -> bool {
+    if vertices.len() / 4 >= MAX_DYNAMIC_QUADS
+        || !positions
+            .iter()
+            .flatten()
+            .chain(normal.iter())
+            .chain(uv.iter().flatten())
+            .chain(tint.iter())
+            .all(|v| v.is_finite())
+    {
+        return false;
+    }
+    let base = vertices.len() as u32;
+    for corner in 0..4 {
+        vertices.push(TerrainVertex {
+            position: positions[corner],
+            normal,
+            albedo: tint.map(|v| v.clamp(0.0, 1.0)),
+            uv: uv[corner],
+            atlas_index: u32::MAX,
+        });
+    }
+    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    true
 }
 
 /// GPU state for the composed pass: the fade/light-aware terrain pipeline,
@@ -1333,6 +1413,50 @@ impl GpuRenderer {
             ..wgpu::SamplerDescriptor::default()
         });
         let composite = Self::build_composite(&ctx, target_format, &frame_layout, &frame_ubo);
+        let debug_line_module = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("debug-line-shader"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(DEBUG_LINE_WGSL)),
+            });
+        let debug_line_layout =
+            ctx.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("debug-line-pipeline-layout"),
+                    bind_group_layouts: &[Some(&composite.lit_frame_layout)],
+                    immediate_size: 0,
+                });
+        let debug_line_pipeline =
+            ctx.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("debug-3d-lines"),
+                    layout: Some(&debug_line_layout),
+                    vertex: wgpu::VertexState {
+                        module: &debug_line_module,
+                        entry_point: Some("debug_line_vs"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        buffers: &[Some(DEBUG_LINE_VERTEX_LAYOUT)],
+                    },
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::LineList,
+                        cull_mode: None,
+                        ..wgpu::PrimitiveState::default()
+                    },
+                    depth_stencil: Some(depth_state(false)),
+                    multisample: wgpu::MultisampleState::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module: &debug_line_module,
+                        entry_point: Some("debug_line_fs"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: target_format,
+                            blend: Some(ALPHA_BLEND),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                });
         Self {
             ctx,
             target_format,
@@ -1356,6 +1480,11 @@ impl GpuRenderer {
             scene: None,
             live_sections: HashMap::new(),
             composite,
+            debug_line_pipeline,
+            debug_lines: None,
+            entity_ber: None,
+            particles: None,
+            particle_alphas: Vec::new(),
             subworld_gpu: SubWorldGpuCache::new(),
             scaled_target: None,
             shadow_quality: BuiltinShadowQuality::Off,
@@ -1375,6 +1504,134 @@ impl GpuRenderer {
             },
             notice: None,
         }
+    }
+
+    /// Upload world-space F3+G/F3+B segments. Invalid segments are omitted,
+    /// and uploads are capped to keep remote diagnostics bounded.
+    pub fn set_debug_lines(&mut self, lines: &[DebugLine]) {
+        let mut vertices = Vec::with_capacity(lines.len().min(MAX_DEBUG_LINES) * 2);
+        for line in lines {
+            if vertices.len() >= MAX_DEBUG_LINES * 2 {
+                break;
+            }
+            if !line
+                .start
+                .iter()
+                .chain(line.end.iter())
+                .all(|v| v.is_finite())
+            {
+                continue;
+            }
+            let color = line.rgba.map(|v| f32::from(v) / 255.0);
+            vertices.push(DebugLineVertex {
+                position: line.start,
+                color,
+            });
+            vertices.push(DebugLineVertex {
+                position: line.end,
+                color,
+            });
+        }
+        self.debug_lines = if vertices.is_empty() {
+            None
+        } else {
+            let buffer = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("debug-line-vertices"),
+                size: std::mem::size_of_val(vertices.as_slice()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.ctx
+                .queue
+                .write_buffer(&buffer, 0, bytemuck::cast_slice(&vertices));
+            Some((buffer, vertices.len() as u32))
+        };
+    }
+
+    /// Batch articulated entity rigs and Vanilla block entity meshes into
+    /// one GPU vertex/index stream, using the existing lit shader and atlas.
+    pub fn set_entity_and_ber_meshes(&mut self, meshes: Vec<(&ExtrudedMesh, [f32; 3], [f32; 3])>) {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        'meshes: for (mesh, origin, tint) in meshes {
+            if !origin.iter().chain(tint.iter()).all(|v| v.is_finite()) {
+                continue;
+            }
+            for quad in &mesh.quads {
+                if vertices.len() / 4 >= MAX_DYNAMIC_QUADS {
+                    break 'meshes;
+                }
+                let positions = quad.positions.map(|point| {
+                    [
+                        point[0] + origin[0],
+                        point[1] + origin[1],
+                        point[2] + origin[2],
+                    ]
+                });
+                append_dynamic_quad(
+                    &mut vertices,
+                    &mut indices,
+                    positions,
+                    quad.normal,
+                    quad.uv,
+                    tint,
+                );
+            }
+        }
+        self.entity_ber = DynamicLitGpu::upload(&self.ctx, &vertices, &indices);
+    }
+
+    /// Upload precomputed camera-facing particle quads with individual alpha.
+    pub fn set_particle_billboards(&mut self, quads: &[VanillaParticleQuad]) {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        self.particle_alphas.clear();
+        for quad in quads.iter().take(MAX_DYNAMIC_QUADS) {
+            if !quad.color.iter().all(|v| v.is_finite()) {
+                continue;
+            }
+            let u = [
+                quad.positions[1][0] - quad.positions[0][0],
+                quad.positions[1][1] - quad.positions[0][1],
+                quad.positions[1][2] - quad.positions[0][2],
+            ];
+            let v = [
+                quad.positions[3][0] - quad.positions[0][0],
+                quad.positions[3][1] - quad.positions[0][1],
+                quad.positions[3][2] - quad.positions[0][2],
+            ];
+            let n = [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ];
+            let length = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            if !length.is_finite() || length <= f32::EPSILON {
+                continue;
+            }
+            let normal = n.map(|component| component / length);
+            if append_dynamic_quad(
+                &mut vertices,
+                &mut indices,
+                quad.positions,
+                normal,
+                quad.uv,
+                [quad.color[0], quad.color[1], quad.color[2]],
+            ) {
+                self.particle_alphas.push(quad.color[3].clamp(0.0, 1.0));
+            }
+        }
+        self.particles = DynamicLitGpu::upload(&self.ctx, &vertices, &indices);
+    }
+
+    /// Convert the Vanilla particle simulation to camera-facing quads.
+    pub fn set_particle_world(
+        &mut self,
+        world: &VanillaParticleWorld,
+        camera_right: [f32; 3],
+        camera_up: [f32; 3],
+    ) {
+        self.set_particle_billboards(&world.billboard_quads(camera_right, camera_up));
     }
 
     /// Build the composed-pass pipelines and shared uniforms. Group layout:
@@ -2443,7 +2700,9 @@ impl GpuRenderer {
         let draws = self.live_sections.len() * 2
             + 2
             + self.subworld_gpu.entry_count()
-            + self.subworld_gpu.batch_count();
+            + self.subworld_gpu.batch_count()
+            + usize::from(self.entity_ber.is_some())
+            + self.particle_alphas.len();
         self.ensure_draw_capacity(draws.max(8));
         self.encode_composed_world(
             encoder,
@@ -3067,6 +3326,11 @@ impl GpuRenderer {
         let scene = &self.scene;
         let live_sections = &self.live_sections;
         let subworld_gpu = &self.subworld_gpu;
+        let entity_ber = &self.entity_ber;
+        let particles = &self.particles;
+        let particle_alphas = &self.particle_alphas;
+        let debug_lines = &self.debug_lines;
+        let debug_line_pipeline = &self.debug_line_pipeline;
         let frame_bind_group = &self.frame_bind_group;
         let depth_view = self.depth_view.as_ref().expect("depth ensured");
         gpu.draw_scratch.clear();
@@ -3248,6 +3512,34 @@ impl GpuRenderer {
                 pass.set_index_buffer(entry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..entry.index_count, 0, 0..1);
             }
+
+            if let Some(mesh) = entity_ber {
+                pass.set_pipeline(shadow.map_or(&gpu.lit_pipeline, |s| &s.lit_color));
+                pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
+                let off = slot(identity, 1.0, 1.0);
+                pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
+            if let Some(mesh) = particles {
+                pass.set_pipeline(shadow.map_or(&gpu.lit_alpha_pipeline, |s| &s.lit_alpha_color));
+                pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
+                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                for (i, &alpha) in particle_alphas.iter().enumerate() {
+                    let off = slot(identity, 1.0, alpha);
+                    pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+                    pass.draw_indexed((i as u32 * 6)..((i as u32 + 1) * 6), 0, 0..1);
+                }
+            }
+
+            if let Some((buffer, count)) = debug_lines {
+                pass.set_pipeline(debug_line_pipeline);
+                pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
+                pass.set_vertex_buffer(0, buffer.slice(..));
+                pass.draw(0..*count, 0..1);
+            }
         }
         // Upload the recorded draw uniforms ahead of this frame's submit.
         let gpu = &self.composite;
@@ -3297,7 +3589,9 @@ impl GpuRenderer {
         let draw_count = self.live_sections.len() * 2
             + 2
             + self.subworld_gpu.entry_count()
-            + self.subworld_gpu.batch_count();
+            + self.subworld_gpu.batch_count()
+            + usize::from(self.entity_ber.is_some())
+            + self.particle_alphas.len();
         self.ensure_draw_capacity(draw_count.max(8));
 
         // The world pass renders into the scaled target (or straight into

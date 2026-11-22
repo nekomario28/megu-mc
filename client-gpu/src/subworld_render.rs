@@ -82,6 +82,65 @@ pub const LIT_VERTEX_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBuf
     attributes: &LIT_VERTEX_ATTRS,
 };
 
+/// World-space debug overlays share the composed frame's view-projection uniform.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct DebugLineVertex {
+    pub position: [f32; 3],
+    pub color: [f32; 4],
+}
+
+const DEBUG_LINE_ATTRS: [wgpu::VertexAttribute; 2] = [
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x3,
+        offset: 0,
+        shader_location: 0,
+    },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x4,
+        offset: 12,
+        shader_location: 1,
+    },
+];
+
+pub const DEBUG_LINE_VERTEX_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+    array_stride: std::mem::size_of::<DebugLineVertex>() as wgpu::BufferAddress,
+    step_mode: wgpu::VertexStepMode::Vertex,
+    attributes: &DEBUG_LINE_ATTRS,
+};
+
+pub const DEBUG_LINE_WGSL: &str = r#"
+struct FrameUniforms {
+    view_proj: mat4x4<f32>,
+    camera_pos: vec3<f32>,
+    fog_start: f32,
+    fog_color: vec3<f32>,
+    fog_end: f32,
+    _pad: vec2<f32>,
+};
+@group(0) @binding(0) var<uniform> frame: FrameUniforms;
+
+struct LineInput {
+    @location(0) position: vec3<f32>,
+    @location(1) color: vec4<f32>,
+};
+struct LineOutput {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+@vertex
+fn debug_line_vs(input: LineInput) -> LineOutput {
+    var output: LineOutput;
+    output.clip = frame.view_proj * vec4<f32>(input.position, 1.0);
+    output.color = input.color;
+    return output;
+}
+@fragment
+fn debug_line_fs(input: LineOutput) -> @location(0) vec4<f32> {
+    return input.color;
+}
+"#;
+
 // ---------------------------------------------------------------------------
 // SubWorldTransform: 6-DOF rigid transform (position + quaternion + scale)
 // ---------------------------------------------------------------------------
