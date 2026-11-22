@@ -52,6 +52,7 @@
 //!   bridging one host tunnel to many guest TCP connections.
 
 pub mod codec;
+pub mod channel_router;
 mod data_v767;
 mod data_v777;
 pub mod friend_relay;
@@ -66,6 +67,13 @@ pub mod wire;
 pub use codec::{
     C2SPacket, CodecV767, EquipmentSlot, ItemStack, LoginProperty, MenuKind,
     ProtocolCodec, RawComponent, RegistryDataEntry, S2CPacket, TeamInfo, TeamOperation,
+};
+pub use channel_router::{
+    classify_channel, decode_register_payload, encode_register_payload, validate_channel_name,
+    ChannelDirection, ChannelFirewall, ChannelFirewallConfig, ChannelFirewallMetrics,
+    ChannelHandlerKind, ChannelNameError, DropReason, FirewallDisconnectReason, FirewallVerdict,
+    OperatorRuleError, RegisterPayloadError, ThrottleReason, MAX_BULK_PAYLOAD_BYTES,
+    MAX_CHANNEL_NAME_BYTES, MAX_REGISTERED_CHANNELS_PER_PEER, MAX_REGISTER_PAYLOAD_BYTES,
 };
 pub use friend_relay::{
     ExpiredHost, FriendPacket, FriendRelayConfig, FriendRelayMetrics, FriendRelayRouter,
