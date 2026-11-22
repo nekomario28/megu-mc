@@ -1256,6 +1256,11 @@ pub struct HudState {
     /// Directional subtitle rows, newest last (drawn only when
     /// [`QolSettings::show_subtitles`] is on).
     pub subtitles: Vec<HudSubtitle>,
+    /// Live spatial-subtitle panel state: the game feeds
+    /// [`crate::subtitle_hud::SubtitleHudState::push`] from drained audio
+    /// cues and ticks it on the frame clock; the HUD composites it via
+    /// [`crate::layout::layout_subtitle_hud`] when `show_subtitles` is on.
+    pub subtitle_hud: crate::subtitle_hud::SubtitleHudState,
     /// Crafting-conflict switcher: `total_candidates >= 2` draws one
     /// compact `< k/N >` cycle button; `<= 1` emits nothing at all.
     pub crafting_conflict: CraftingConflictOverlay,
@@ -1313,6 +1318,7 @@ impl Default for HudState {
             magic: crate::magic_hud::MagicHudState::default(),
             mini_hud_data: MiniHudData::default(),
             subtitles: Vec::new(),
+            subtitle_hud: crate::subtitle_hud::SubtitleHudState::default(),
             crafting_conflict: CraftingConflictOverlay::default(),
         }
     }
@@ -1350,6 +1356,7 @@ impl HudState {
             magic: crate::magic_hud::MagicHudState::default(),
             mini_hud_data: MiniHudData::default(),
             subtitles: Vec::new(),
+            subtitle_hud: crate::subtitle_hud::SubtitleHudState::default(),
             crafting_conflict: CraftingConflictOverlay::default(),
         }
     }
@@ -2032,6 +2039,9 @@ impl UiState {
         self.recipe_browser.ui_scale = self.ui_scale;
         let mut regions = std::mem::take(&mut self.hit_regions);
         layout::layout_screen_into(self, width, height, out, &mut regions);
+        if self.screen == Screen::InGameHud {
+            layout::layout_subtitle_hud(self, &self.hud.subtitle_hud, width, height, out);
+        }
         self.hit_regions = regions;
         if let Some(i) = self.focus_index {
             if i >= self.hit_regions.len() {

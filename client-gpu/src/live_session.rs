@@ -15,7 +15,7 @@ use mc_spine_client::protocol::{
 use mc_spine_client::render::ClientVfxHost;
 use mc_spine_client::render_graph::GpuPipelineKind;
 use mc_spine_client::session::{AudioStats, WorldAcousticSnapshot};
-use mc_spine_client::spatial_audio::SpatialSubtitleCue;
+use mc_spine_client::spatial_audio::{SpatialSubtitleCue, SubtitleDirection};
 use mc_spine_client::world::{BlockTable, WorldState};
 use mc_spine_client_mesh::mesher::{
     BlockVisualEnhancementResult, BlockVisualInput, VanillaPlusPipelineConfig,
@@ -31,6 +31,7 @@ use mc_spine_client_mesh::vanilla_plus_nature::{
 };
 use mc_spine_ui::magic_hud::{CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState};
 use mc_spine_ui::state::{HudState, MiniHudPreset, UiState};
+use mc_spine_ui::subtitle_hud::{SubtitleArrow, DEFAULT_TTL_SECS};
 
 // client-gpu's manifest cannot be changed in this lane. Reuse the pure-std
 // core implementations until the crate can declare mc-spine-core directly.
@@ -693,6 +694,7 @@ impl LiveSession {
         self.frame_timings.push_frame_ms(frame_us / 1_000.0);
         self.chunk_fades.tick(frame_dt_sec);
         self.atmosphere_blender.advance(frame_dt_sec);
+        self.refresh_subtitle_hud(frame_dt_sec, &mut ui.hud);
 
         if ui.settings.qol.mini_hud_preset() == MiniHudPreset::Off {
             return;
@@ -714,6 +716,34 @@ impl LiveSession {
         hud.coords = self
             .pose
             .map(|pose| (pose.feet[0], pose.feet[1], pose.feet[2]));
+    }
+
+    /// Drain the mixer's spatial subtitle feed into the live HUD state.
+    ///
+    /// Every admitted sound already arrives with the event label stamped by
+    /// the mixer; `SubtitleHudState` dedups repeat plays of the same event
+    /// onto one row. `self.hud` stays the canonical store — the window
+    /// clones `live.hud` into `ui.hud` before this runs each frame — so the
+    /// post-clone `hud` gets the updated snapshot mirrored back.
+    fn refresh_subtitle_hud(&mut self, frame_dt_sec: f32, hud: &mut HudState) {
+        self.hud.subtitle_hud.tick(frame_dt_sec);
+        for cue in self.drain_subtitle_cues() {
+            let id = if cue.label.is_empty() {
+                "sound.event".to_owned()
+            } else {
+                cue.label
+            };
+            let arrow = match cue.direction {
+                SubtitleDirection::Left => SubtitleArrow::Left,
+                SubtitleDirection::Center => SubtitleArrow::Center,
+                SubtitleDirection::Right => SubtitleArrow::Right,
+                SubtitleDirection::Behind => SubtitleArrow::Behind,
+            };
+            self.hud
+                .subtitle_hud
+                .push(id.clone(), subtitle_label(&id), arrow, DEFAULT_TTL_SECS);
+        }
+        hud.subtitle_hud = self.hud.subtitle_hud.clone();
     }
 
     /// Apply a decoded packet, also used by framed protocol regression tests.
@@ -901,6 +931,32 @@ fn seasonal_atmosphere(base: AtmosphereParams, season: &SeasonAmbienceInput) -> 
         }
     }
     out.sanitized()
+}
+
+/// Humanize a sound-event name into a subtitle row label: strip the
+/// `minecraft:` namespace, drop the `subtitles.` prefix when present, and
+/// turn `block.stone.break`/`entity_player_levelup`-style ids into
+/// `block stone break` — the clean-room stand-in for localized subtitle
+/// text until lang assets land.
+fn subtitle_label(name: &str) -> String {
+    let tail = name
+        .trim()
+        .trim_start_matches("minecraft:")
+        .trim_start_matches("subtitles.");
+    let mut out = String::with_capacity(tail.len());
+    for ch in tail.chars() {
+        if ch == '.' || ch == '_' || ch == '/' || ch == '-' {
+            if !out.ends_with(' ') && !out.is_empty() {
+                out.push(' ');
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    if out.is_empty() {
+        out.push_str("sound");
+    }
+    out
 }
 
 pub fn magic_hud_from_sync(sync: &DecodedMagicSync) -> MagicHudState {

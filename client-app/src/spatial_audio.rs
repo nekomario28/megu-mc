@@ -1385,7 +1385,7 @@ pub enum SubtitleDirection {
 
 /// What the client subtitle line needs: which side indicator to draw and how
 /// loud the sound is perceived (after distance, occlusion, and reverb).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SpatialSubtitleCue {
     /// Direction bucket for the `<`/`>` glyph.
     pub direction: SubtitleDirection,
@@ -1393,6 +1393,10 @@ pub struct SpatialSubtitleCue {
     pub loudness: f32,
     /// Listener↔source distance in blocks.
     pub distance_m: f32,
+    /// Sound-event name for the HUD row (e.g. `entity.player.levelup`). The
+    /// engine fills this empty — it knows geometry, not event names — and the
+    /// mixer stamps the admitted event's label onto each queued cue.
+    pub label: String,
 }
 
 /// The real-time half of the engine. Owns all DSP state for one spatialized
@@ -1854,6 +1858,7 @@ impl SpatialAudioEngine {
             direction,
             loudness: (self.direct_gain * 1.6 + self.scene.wet_gain * 0.15).clamp(0.0, 1.0),
             distance_m: self.distance_m,
+            label: String::new(),
         }
     }
 }

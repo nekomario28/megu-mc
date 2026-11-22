@@ -694,10 +694,11 @@ impl SoundMixer {
             &mut engine,
             position,
         );
-        let cue = engine.subtitle_cue();
+        let mut cue = engine.subtitle_cue();
+        cue.label = ev.label.clone();
         self.subtitles.push_back(SubtitleCueRecord {
             name: ev.label.clone(),
-            cue,
+            cue: cue.clone(),
             at_sample: self.samples_rendered,
         });
         self.spatial_subtitles.push_back(cue);
