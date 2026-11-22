@@ -2247,27 +2247,10 @@ fn plan_backup_rotation(
             min_free_bytes: policy.min_free_bytes,
         };
     }
-    let mut ordered: Vec<(u64, &str)> = Vec::with_capacity(existing.len());
-    for name in existing {
-        match backup_seq_of(name) {
-            Some(seq) => ordered.push((seq, name.as_str())),
-            None => {
-                return BackupVerdict::RejectedName {
-                    name: name.clone(),
-                }
-            }
-        }
+    match backup_rotation_prune(existing, policy.max_backups) {
+        Ok(prune) => BackupVerdict::Proceed { prune },
+        Err(name) => BackupVerdict::RejectedName { name },
     }
-    ordered.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
-    // After the new backup lands the set holds existing+1; prune the excess
-    // oldest so retention never exceeds max_backups.
-    let excess = (ordered.len() + 1).saturating_sub(policy.max_backups);
-    let prune = ordered
-        .iter()
-        .take(excess)
-        .map(|(_, name)| (*name).to_owned())
-        .collect();
-    BackupVerdict::Proceed { prune }
 }
 
 /// One scrape of server vitals for a Prometheus text endpoint. Every field is
@@ -2791,4 +2774,503 @@ mod ops_sre_tests {
         }
         assert!(text.contains("mc_spine_mspt_p99 0\n"), "{text}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Lane OPS-ADMIN-BUILTIN: the built-in server-administration surface that
+// replaces the four external admin plugins — live block audit + OP-4 grief
+// rollback, chunk land claims + spawn protection, rotating-backup status and
+// a live Prometheus scrape — all reached through `/megu` subcommands. The
+// command layer (`teams_and_commands.rs`) owns the permission gates; this
+// section owns the state and the deterministic query/restore mechanics.
+// ---------------------------------------------------------------------------
+
+/// Bounded ring of live block edits. 8_192 entries covers several minutes of
+/// heavy griefing at ~50 edits/sec while staying under ~1 MiB resident.
+const LIVE_BLOCK_AUDIT_CAP: usize = 8_192;
+static LIVE_BLOCK_AUDIT_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// One recorded block transition. `old_state`/`new_state` are registry state
+/// ids, exactly what `block_at_dim`/`set_block_dim` speak.
+#[derive(Clone, Debug)]
+struct LiveBlockAuditEntry {
+    /// Monotonic sequence — the chronological order rollback walks back.
+    #[allow(dead_code)]
+    seq: u64,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    actor: String,
+    old_state: u32,
+    new_state: u32,
+    tick: u64,
+}
+
+fn live_block_audit() -> &'static Mutex<std::collections::VecDeque<LiveBlockAuditEntry>> {
+    static AUDIT: OnceLock<Mutex<std::collections::VecDeque<LiveBlockAuditEntry>>> =
+        OnceLock::new();
+    AUDIT.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
+}
+
+/// Record one live block edit. Called by the command-driven writers
+/// (`/setblock`, `/fill`, `/clone`) with the executor's name — or `"Server"`
+/// for console/RCON frames — so `/megu audit` and `/megu rollback` always see
+/// who changed the world and when (server tick, never a wall clock).
+fn record_live_block_audit(
+    dim: DimId,
+    pos: (i32, i32, i32),
+    actor: &str,
+    old_state: u32,
+    new_state: u32,
+    tick: u64,
+) {
+    if old_state == new_state {
+        return;
+    }
+    let entry = LiveBlockAuditEntry {
+        seq: LIVE_BLOCK_AUDIT_SEQ.fetch_add(1, Ordering::Relaxed),
+        dim,
+        x: pos.0,
+        y: pos.1,
+        z: pos.2,
+        actor: actor.to_owned(),
+        old_state,
+        new_state,
+        tick,
+    };
+    let mut audit = live_block_audit()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if audit.len() >= LIVE_BLOCK_AUDIT_CAP {
+        audit.pop_front();
+    }
+    audit.push_back(entry);
+}
+
+/// Deterministic audit query: every recorded edit matching the filters,
+/// returned oldest-first so callers can iterate or reverse for rollback.
+/// `center`/`radius` is a 3-D Euclidean bound around a block position in
+/// `center_dim`; `dim` alone restricts the dimension without a radius.
+#[derive(Default)]
+struct LiveBlockAuditQuery {
+    actor: Option<String>,
+    dim: Option<DimId>,
+    center: Option<(DimId, i32, i32, i32)>,
+    radius: i32,
+    since_tick: Option<u64>,
+}
+
+fn query_live_block_audit(query: &LiveBlockAuditQuery) -> Vec<LiveBlockAuditEntry> {
+    let audit = live_block_audit()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let radius_sq = i64::from(query.radius.max(0)) * i64::from(query.radius.max(0));
+    audit
+        .iter()
+        .filter(|entry| {
+            if let Some(actor) = &query.actor {
+                if entry.actor != *actor {
+                    return false;
+                }
+            }
+            if let Some(dim) = query.dim {
+                if entry.dim != dim {
+                    return false;
+                }
+            }
+            if let Some(since) = query.since_tick {
+                if entry.tick < since {
+                    return false;
+                }
+            }
+            if let Some((dim, cx, cy, cz)) = query.center {
+                if entry.dim != dim {
+                    return false;
+                }
+                let dx = i64::from(entry.x) - i64::from(cx);
+                let dy = i64::from(entry.y) - i64::from(cy);
+                let dz = i64::from(entry.z) - i64::from(cz);
+                if dx * dx + dy * dy + dz * dz > radius_sq {
+                    return false;
+                }
+            }
+            true
+        })
+        .cloned()
+        .collect()
+}
+
+fn live_block_audit_len() -> usize {
+    live_block_audit()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len()
+}
+
+/// What one `/megu rollback` pass did, persisted so operators can audit the
+/// audit tool itself.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct LiveRollbackSummary {
+    tick: u64,
+    op: String,
+    target: String,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    radius: i32,
+    matched: usize,
+    restored: usize,
+    skipped: usize,
+    truncated: bool,
+}
+
+const LIVE_ROLLBACK_CAP: usize = 256;
+
+fn live_rollback_log() -> &'static Mutex<std::collections::VecDeque<LiveRollbackSummary>> {
+    static LOG: OnceLock<Mutex<std::collections::VecDeque<LiveRollbackSummary>>> =
+        OnceLock::new();
+    LOG.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
+}
+
+fn record_live_rollback_summary(summary: LiveRollbackSummary) {
+    let mut log = live_rollback_log()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if log.len() >= LIVE_ROLLBACK_CAP {
+        log.pop_front();
+    }
+    log.push_back(summary);
+}
+
+#[allow(dead_code)]
+fn live_rollback_summaries() -> Vec<LiveRollbackSummary> {
+    live_rollback_log()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .cloned()
+        .collect()
+}
+
+/// Restore audited blocks newest-first. An entry is only rolled back while
+/// the world still shows the state the audit recorded as `new_state` — a
+/// later edit (by anyone) makes the cell diverge and it is skipped rather
+/// than clobbered, which is what makes reverse-chronological rollback safe
+/// against interleaved grief. Returns `(restored, skipped, applied)` where
+/// `applied` counts the entries actually considered (bounded by `max_blocks`).
+fn rollback_live_block_entries(
+    entries_newest_first: &[LiveBlockAuditEntry],
+    max_blocks: usize,
+) -> (usize, usize, usize) {
+    let mut restored = 0usize;
+    let mut skipped = 0usize;
+    let mut applied = 0usize;
+    for entry in entries_newest_first.iter().take(max_blocks) {
+        applied += 1;
+        if block_at_dim(entry.dim, entry.x, entry.y, entry.z) != entry.new_state {
+            skipped += 1;
+            continue;
+        }
+        set_block_dim(entry.dim, entry.x, entry.y, entry.z, entry.old_state);
+        note_block_update_dim(entry.dim, entry.x, entry.y, entry.z, entry.old_state);
+        let mut body = Vec::with_capacity(12);
+        write_pos(&mut body, entry.x, entry.y, entry.z);
+        write_varint(
+            &mut body,
+            i64::from(visible_block_update_state(
+                entry.dim,
+                entry.x,
+                entry.y,
+                entry.z,
+                entry.old_state,
+            )),
+        );
+        broadcast_chunk_dim(entry.dim, entry.x >> 4, entry.z >> 4, |_c| {
+            (0x09, body.clone())
+        });
+        restored += 1;
+    }
+    (restored, skipped, applied)
+}
+
+// ------------------------------------------------------------- land claims
+
+/// One chunk's claim: who owns it, who the owner trusts, and when (server
+/// tick) the claim was staked. Keyed `(dim, chunk_x, chunk_z)`.
+struct LiveClaimRecord {
+    owner: String,
+    trusted: std::collections::BTreeSet<String>,
+    created_tick: u64,
+}
+
+fn live_claims() -> &'static Mutex<HashMap<(DimId, i32, i32), LiveClaimRecord>> {
+    static CLAIMS: OnceLock<Mutex<HashMap<(DimId, i32, i32), LiveClaimRecord>>> =
+        OnceLock::new();
+    CLAIMS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Per-player claim quota in chunks. Generous enough for a normal base,
+/// bounded so one player cannot wall off the world.
+static LIVE_CLAIM_QUOTA: AtomicUsize = AtomicUsize::new(256);
+
+fn live_claim_quota() -> usize {
+    LIVE_CLAIM_QUOTA.load(Ordering::Relaxed)
+}
+
+/// Spawn-protection radius in blocks around the world spawn; `0` (the
+/// vanilla-faithful default) disables it entirely.
+static SPAWN_PROTECT_RADIUS: AtomicI32 = AtomicI32::new(0);
+const SPAWN_PROTECT_RADIUS_MAX: i32 = 1024;
+
+fn live_spawn_protect_radius() -> i32 {
+    SPAWN_PROTECT_RADIUS.load(Ordering::Relaxed)
+}
+
+fn set_live_spawn_protect_radius(radius: i32) -> Result<(), String> {
+    if !(0..=SPAWN_PROTECT_RADIUS_MAX).contains(&radius) {
+        return Err(format!(
+            "spawn protection radius must be in 0..={SPAWN_PROTECT_RADIUS_MAX}"
+        ));
+    }
+    SPAWN_PROTECT_RADIUS.store(radius, Ordering::Relaxed);
+    Ok(())
+}
+
+fn claim_chunk_key(dim: DimId, x: i32, z: i32) -> (DimId, i32, i32) {
+    (dim, x.div_euclid(16), z.div_euclid(16))
+}
+
+/// May `player_name` at `op_level` modify the block column at (x, z) in `dim`?
+/// OP level 4 always may (the admin override). Inside an armed spawn-protect
+/// radius on the Overworld nobody below OP-4 may, claim or not — the vanilla
+/// spawn-protection semantic. Otherwise a claimed chunk admits only its owner
+/// and trusted allies; unclaimed chunks are open to everyone.
+///
+/// Read by the claim/info command paths and by tests; the live dig/place
+/// enforcement wiring lives in `play_protocol.rs`, outside this lane's file
+/// ownership, so the predicate itself is `allow(dead_code)` until that lane
+/// lands — it is the single source of truth they must call.
+#[allow(dead_code)]
+fn can_player_modify_block(
+    dim: DimId,
+    x: i32,
+    z: i32,
+    player_name: &str,
+    op_level: u8,
+) -> bool {
+    if op_level >= 4 {
+        return true;
+    }
+    let radius = live_spawn_protect_radius();
+    if radius > 0 && dim == DimId::Overworld {
+        let spawn = *WORLD_SPAWN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dx = f64::from(x) - spawn.0;
+        let dz = f64::from(z) - spawn.2;
+        if dx * dx + dz * dz <= f64::from(radius) * f64::from(radius) {
+            return false;
+        }
+    }
+    let key = claim_chunk_key(dim, x, z);
+    match live_claims()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+    {
+        Some(record) => {
+            record.owner == player_name || record.trusted.contains(player_name)
+        }
+        None => true,
+    }
+}
+
+// ------------------------------------------------------- backup & metrics
+
+/// The directory the rotating `world-backup-<seq>.tar.gz` generations live
+/// in: `backups/` beside the live world save.
+fn live_backup_dir() -> std::path::PathBuf {
+    world_save_dir().join("backups")
+}
+
+/// Basenames in `dir` that look like backup generations, sorted. Only
+/// `world-backup-*` names are considered — the rotation planner itself still
+/// rejects any candidate that is not a strict `world-backup-<seq>.tar.gz`,
+/// so a malformed name fails closed instead of being pruned blindly.
+fn backup_dir_listing(dir: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with("world-backup-"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Free bytes available to `dir`'s filesystem (`f_bavail * f_frsize`), or
+/// `None` where the platform cannot report it — the caller then shows the
+/// prune plan without a disk verdict rather than guessing.
+#[cfg(target_os = "linux")]
+fn backup_volume_free_bytes(dir: &std::path::Path) -> Option<u64> {
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct Statvfs {
+        f_bsize: u64,
+        f_frsize: u64,
+        f_blocks: u64,
+        f_bfree: u64,
+        f_bavail: u64,
+        f_files: u64,
+        f_ffree: u64,
+        f_favail: u64,
+        f_fsid: u64,
+        f_flag: u64,
+        f_namemax: u64,
+    }
+    unsafe extern "C" {
+        fn statvfs(path: *const std::ffi::c_char, buf: *mut Statvfs) -> i32;
+    }
+    let c_path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
+    let mut stat: Statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    Some(stat.f_bavail.saturating_mul(stat.f_frsize))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn backup_volume_free_bytes(_dir: &std::path::Path) -> Option<u64> {
+    None
+}
+
+/// The sequence the next `world-backup-<seq>.tar.gz` would take: one past
+/// the highest well-formed existing name, or 1 for an empty/missing dir.
+fn backup_next_seq(existing: &[String]) -> u64 {
+    existing
+        .iter()
+        .filter_map(|name| backup_seq_of(name))
+        .max()
+        .map_or(1, |max| max.saturating_add(1))
+}
+
+/// The prune half of [`plan_backup_rotation`], split out so the status/plan
+/// reports can show *what would be deleted* even when free disk space cannot
+/// be measured. `Err(name)` names the first candidate that is not a strict
+/// backup basename — the same fail-closed rejection the planner applies.
+fn backup_rotation_prune(existing: &[String], max_backups: usize) -> Result<Vec<String>, String> {
+    let mut ordered: Vec<(u64, &str)> = Vec::with_capacity(existing.len());
+    for name in existing {
+        match backup_seq_of(name) {
+            Some(seq) => ordered.push((seq, name.as_str())),
+            None => return Err(name.clone()),
+        }
+    }
+    ordered.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    let excess = (ordered.len() + 1).saturating_sub(max_backups);
+    Ok(ordered
+        .iter()
+        .take(excess)
+        .map(|(_, name)| (*name).to_owned())
+        .collect())
+}
+
+/// `/megu backup plan` — the live rotation decision for the default policy:
+/// what the next generation would be named, which oldest files it would
+/// prune, and whether the disk guard passes. Every number comes from the
+/// real backup directory and filesystem, never a guess.
+fn format_backup_plan_report() -> String {
+    let policy = RollingBackupPolicy::default();
+    let dir = live_backup_dir();
+    let existing = backup_dir_listing(&dir);
+    let next = backup_next_seq(&existing);
+    let prune = match backup_rotation_prune(&existing, policy.max_backups) {
+        Ok(prune) => prune,
+        Err(name) => {
+            return format!(
+                "Backup plan refused: '{name}' is not a world-backup-<seq>.tar.gz name"
+            )
+        }
+    };
+    let free = backup_volume_free_bytes(&dir);
+    let mut out = format!(
+        "Next backup: world-backup-{next}.tar.gz; existing {} generation(s)\n",
+        existing.len()
+    );
+    if prune.is_empty() {
+        out.push_str("Prune: none (retention not exceeded)\n");
+    } else {
+        out.push_str(&format!("Prune {} oldest: {}\n", prune.len(), prune.join(", ")));
+    }
+    match free {
+        Some(free_bytes) if free_bytes < policy.min_free_bytes => out.push_str(&format!(
+            "Disk guard: SKIP — {} free bytes under the {} byte floor\n",
+            free_bytes, policy.min_free_bytes
+        )),
+        Some(free_bytes) => out.push_str(&format!(
+            "Disk guard: OK — {} free bytes (floor {})\n",
+            free_bytes, policy.min_free_bytes
+        )),
+        None => out.push_str("Disk guard: free space unavailable on this platform\n"),
+    }
+    out
+}
+
+/// `/megu backup status` — policy bounds plus the live directory state, so an
+/// operator sees retention config and reality in one reply.
+fn format_backup_status_report() -> String {
+    let policy = RollingBackupPolicy::default();
+    let dir = live_backup_dir();
+    let existing = backup_dir_listing(&dir);
+    let free = backup_volume_free_bytes(&dir);
+    let mut out = format!(
+        "Backup dir: {}\nRetention: keep at most {} world-backup-*.tar.gz, min free {} bytes\n",
+        dir.display(),
+        policy.max_backups,
+        policy.min_free_bytes
+    );
+    out.push_str(&format!("Existing backups: {}\n", existing.len()));
+    for name in existing.iter().take(8) {
+        out.push_str(&format!("  {name}\n"));
+    }
+    if existing.len() > 8 {
+        out.push_str(&format!("  … and {} more\n", existing.len() - 8));
+    }
+    match free {
+        Some(bytes) => out.push_str(&format!("Free disk: {bytes} bytes\n")),
+        None => out.push_str("Free disk: unavailable on this platform\n"),
+    }
+    out.push_str(&format!(
+        "Next sequence: world-backup-{}.tar.gz\n",
+        backup_next_seq(&existing)
+    ));
+    out
+}
+
+/// `/megu metrics` — a live Prometheus text exposition built from the same
+/// sources `/status` and `/profile` read: the hotspot profiler's tick
+/// percentiles, the online player list, the hot chunk set and process RSS.
+fn live_operator_metrics_prometheus() -> String {
+    let report = live_hotspot_profiler()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .summary(0);
+    let health = operator_health_snapshot();
+    OperatorMetricsSnapshot {
+        tps: report.tps,
+        mspt_p50: report.mspt_p50,
+        mspt_p95: report.mspt_p95,
+        mspt_p99: report.mspt_p99,
+        players_online: health.players_online as u64,
+        loaded_chunks: health.loaded_chunks as u64,
+        quarantined_faults: 0,
+        rss_mib: memory_usage_mb().map_or(0.0, |mib| mib as f64),
+        uptime_seconds: TICK.load(Ordering::Relaxed) as f64 / f64::from(TICKS_PER_SECOND),
+    }
+    .format_prometheus()
 }

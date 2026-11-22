@@ -4434,6 +4434,405 @@ fn run_policy_command(level: u8, args: &[&str]) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Lane OPS-ADMIN-BUILTIN: `/megu audit|rollback|claim|backup|metrics` — the
+// built-in replacement for the block-audit/rollback, land-claim and
+// backup/metrics admin plugins. `audit`, `rollback`, `backup` and `metrics`
+// are OP-4 only and re-check `level` here so a level-2 `.mcfunction` frame
+// can never reach them; `claim` self-management (`here|unclaim|trust|
+// untrust|info`) is open to normal players for their own chunks while the
+// admin overrides (`admin-unclaim`, `spawn-radius`, `spawn-protect`) stay
+// OP-4 inside the same handler.
+// ---------------------------------------------------------------------------
+
+const MEGU_USAGE: &str = "usage: /megu policy list|get <key>|set <key> <value>|reset \
+| audit [player] [radius] | rollback <player> <radius> [max_blocks] \
+| claim here|unclaim|trust <player>|untrust <player>|info|admin-unclaim|spawn-radius <n>|spawn-protect <n> \
+| backup plan|status | metrics";
+
+/// `/megu <sub> ...` dispatch. `policy` keeps its own usage/handler; every
+/// other subcommand is owned by this lane.
+fn run_megu_command(ctx: &CmdCtx, level: u8, args: &[&str]) -> String {
+    match args.first().copied().unwrap_or("") {
+        // Bare `/megu` keeps the policy usage line — the pre-existing
+        // POLICY-CMD contract — while unknown subcommands get the full map.
+        "" | "policy" => run_policy_command(level, args),
+        "audit" => run_megu_audit(ctx, level, &args[1..]),
+        "rollback" => run_megu_rollback(ctx, level, &args[1..]),
+        "claim" => run_megu_claim(ctx, level, &args[1..]),
+        "backup" => run_megu_backup(level, &args[1..]),
+        "metrics" => run_megu_metrics(level, &args[1..]),
+        _ => MEGU_USAGE.into(),
+    }
+}
+
+/// Registry state id -> operator-readable block name (`state#<id>` when the
+/// registry is not loaded).
+fn audit_block_label(state: u32) -> String {
+    breg().map_or_else(
+        || format!("state#{state}"),
+        |reg| reg.name_of(state).to_owned(),
+    )
+}
+
+fn audit_entry_line(entry: &LiveBlockAuditEntry) -> String {
+    format!(
+        "tick {} {} {}, {}, {}: {}: {} -> {}",
+        entry.tick,
+        profiler_dim_name(entry.dim),
+        entry.x,
+        entry.y,
+        entry.z,
+        entry.actor,
+        audit_block_label(entry.old_state),
+        audit_block_label(entry.new_state),
+    )
+}
+
+/// `/megu audit [player] [radius]` — OP-4. Queries the bounded live audit
+/// ring around the executor (dimension, position, radius) for one actor, or
+/// every actor when `player` is omitted/`all`. Newest first, capped display.
+fn run_megu_audit(ctx: &CmdCtx, level: u8, args: &[&str]) -> String {
+    if level < 4 {
+        return P8C_DENIED.into();
+    }
+    let mut actor: Option<String> = None;
+    let mut radius: i32 = 64;
+    for arg in args {
+        // A bare integer is always the radius; the first non-numeric token
+        // (other than the `all` wildcard) is the actor filter.
+        if let Ok(r) = arg.parse::<i32>() {
+            if !(0..=30_000_000).contains(&r) {
+                return "audit radius must be in 0..=30000000".into();
+            }
+            radius = r;
+        } else if *arg == "all" {
+            // Wildcard: every actor — only valid before any actor was named.
+            if actor.is_some() {
+                return MEGU_USAGE.into();
+            }
+        } else if actor.is_none() {
+            actor = Some((*arg).to_owned());
+        } else {
+            return MEGU_USAGE.into();
+        }
+    }
+    let dim = cmd_dim(ctx);
+    let center = (
+        dim,
+        ctx.x.floor() as i32,
+        ctx.y.floor() as i32,
+        ctx.z.floor() as i32,
+    );
+    let mut entries = query_live_block_audit(&LiveBlockAuditQuery {
+        actor,
+        dim: Some(dim),
+        center: Some(center),
+        radius,
+        since_tick: None,
+    });
+    entries.reverse();
+    let matched = entries.len();
+    let mut out = format!(
+        "Block audit: {matched} edit(s) within {radius} of ({}, {}, {}) in {}\n",
+        center.1,
+        center.2,
+        center.3,
+        profiler_dim_name(dim),
+    );
+    for entry in entries.iter().take(25) {
+        out.push_str(&audit_entry_line(entry));
+        out.push('\n');
+    }
+    if matched > 25 {
+        out.push_str(&format!("… and {} more (ring holds {})\n", matched - 25, live_block_audit_len()));
+    }
+    out
+}
+
+/// `/megu rollback <player> <radius> [max_blocks]` — OP-4. Restores the
+/// audited pre-edit state of every matching block in reverse chronological
+/// order; cells that diverged since the recorded edit are skipped, and the
+/// pass is summarised into the rollback log.
+fn run_megu_rollback(ctx: &CmdCtx, level: u8, args: &[&str]) -> String {
+    if level < 4 {
+        return P8C_DENIED.into();
+    }
+    let (Some(target), Some(radius_arg)) = (args.first(), args.get(1)) else {
+        return "usage: /megu rollback <player> <radius> [max_blocks]".into();
+    };
+    let Ok(radius) = radius_arg.parse::<i32>() else {
+        return "usage: /megu rollback <player> <radius> [max_blocks]".into();
+    };
+    if !(0..=30_000_000).contains(&radius) {
+        return "rollback radius must be in 0..=30000000".into();
+    }
+    let max_blocks = match args.get(2) {
+        None => 1_024usize,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) if (1..=65_536).contains(&n) => n,
+            _ => return "max_blocks must be in 1..=65536".into(),
+        },
+    };
+    if args.len() > 3 {
+        return "usage: /megu rollback <player> <radius> [max_blocks]".into();
+    }
+    let dim = cmd_dim(ctx);
+    let center = (
+        dim,
+        ctx.x.floor() as i32,
+        ctx.y.floor() as i32,
+        ctx.z.floor() as i32,
+    );
+    let mut entries = query_live_block_audit(&LiveBlockAuditQuery {
+        actor: Some((*target).to_owned()),
+        dim: Some(dim),
+        center: Some(center),
+        radius,
+        since_tick: None,
+    });
+    // Reverse chronological: newest edit rolls back first so a chain of
+    // edits on one cell unwinds cleanly to the oldest original state.
+    entries.reverse();
+    let matched = entries.len();
+    let (restored, skipped, applied) =
+        rollback_live_block_entries(&entries, max_blocks);
+    let op = ctx
+        .me
+        .as_ref()
+        .map(|c| c.name.clone())
+        .unwrap_or_else(|| "Server".to_owned());
+    record_live_rollback_summary(LiveRollbackSummary {
+        tick: TICK.load(Ordering::Relaxed),
+        op,
+        target: (*target).to_owned(),
+        dim,
+        x: center.1,
+        y: center.2,
+        z: center.3,
+        radius,
+        matched,
+        restored,
+        skipped,
+        truncated: matched > applied,
+    });
+    format!(
+        "Rollback for {target}: restored {restored} block(s), skipped {skipped} diverged, \
+         of {matched} matched edit(s){}",
+        if matched > applied {
+            format!(" (truncated at {max_blocks})")
+        } else {
+            String::new()
+        }
+    )
+}
+
+/// The claim subcommands a normal player may run for their own chunks. The
+/// outer permission gate (`command_allowed_for_player`) consults this list so
+/// `/megu claim here` parses for level-0 players while every admin override
+/// stays behind the OP-4 `megu` root gate — fail closed either way.
+fn megu_claim_player_subcommand(args: &[&str]) -> bool {
+    args.first().copied() == Some("claim")
+        && matches!(
+            args.get(1).copied(),
+            Some("here" | "unclaim" | "trust" | "untrust" | "info")
+        )
+}
+
+/// `/megu claim ...` — self-management for normal players, OP-4 overrides.
+/// Requires a player executor for every subcommand except the OP-4 admin
+/// ones, so command blocks and console frames can never stake a claim.
+fn run_megu_claim(ctx: &CmdCtx, level: u8, args: &[&str]) -> String {
+    let dim = cmd_dim(ctx);
+    let (x, z) = (ctx.x.floor() as i32, ctx.z.floor() as i32);
+    let key = claim_chunk_key(dim, x, z);
+    let player = ctx.me.as_ref().map(|c| c.name.clone());
+    match args {
+        ["here"] => {
+            let Some(player) = player else {
+                return "Claims require a player".into();
+            };
+            let tick = TICK.load(Ordering::Relaxed);
+            let mut claims = live_claims()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(record) = claims.get(&key) {
+                return if record.owner == player {
+                    format!("This chunk is already claimed by you")
+                } else {
+                    format!("This chunk is already claimed by {}", record.owner)
+                };
+            }
+            let owned = claims
+                .values()
+                .filter(|rec| rec.owner == player)
+                .count();
+            let quota = live_claim_quota();
+            if owned >= quota {
+                return format!(
+                    "Claim quota reached ({owned}/{quota} chunks) — unclaim elsewhere first"
+                );
+            }
+            claims.insert(
+                key,
+                LiveClaimRecord {
+                    owner: player.clone(),
+                    trusted: std::collections::BTreeSet::new(),
+                    created_tick: tick,
+                },
+            );
+            format!(
+                "Claimed chunk ({}, {}) in {} for {player} ({owned}/{quota} used)",
+                key.1,
+                key.2,
+                profiler_dim_name(dim),
+            )
+        }
+        ["unclaim"] => {
+            let Some(player) = player else {
+                return "Claims require a player".into();
+            };
+            let mut claims = live_claims()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match claims.get(&key) {
+                Some(record) if record.owner == player => {
+                    claims.remove(&key);
+                    format!("Unclaimed chunk ({}, {})", key.1, key.2)
+                }
+                Some(record) => format!("This chunk is claimed by {}, not you", record.owner),
+                None => "This chunk is not claimed".into(),
+            }
+        }
+        ["trust", name] | ["untrust", name] => {
+            let trust = args[0] == "trust";
+            let Some(player) = player else {
+                return "Claims require a player".into();
+            };
+            let mut claims = live_claims()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let Some(record) = claims.get_mut(&key) else {
+                return "This chunk is not claimed".into();
+            };
+            if record.owner != player && level < 4 {
+                return format!("Only the claim owner ({}) or an operator may do that", record.owner);
+            }
+            if trust {
+                record.trusted.insert((*name).to_owned());
+                format!("Trusted {name} on this claim")
+            } else {
+                record.trusted.remove(*name);
+                format!("Removed trust for {name} on this claim")
+            }
+        }
+        ["info"] => {
+            let claims = live_claims()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut out = String::new();
+            match claims.get(&key) {
+                Some(record) => {
+                    out.push_str(&format!(
+                        "Chunk ({}, {}) in {}: claimed by {} since tick {}\n",
+                        key.1,
+                        key.2,
+                        profiler_dim_name(dim),
+                        record.owner,
+                        record.created_tick,
+                    ));
+                    if record.trusted.is_empty() {
+                        out.push_str("Trusted: none\n");
+                    } else {
+                        out.push_str(&format!(
+                            "Trusted: {}\n",
+                            record.trusted.iter().cloned().collect::<Vec<_>>().join(", ")
+                        ));
+                    }
+                }
+                None => out.push_str(&format!(
+                    "Chunk ({}, {}) in {}: unclaimed\n",
+                    key.1,
+                    key.2,
+                    profiler_dim_name(dim),
+                )),
+            }
+            let radius = live_spawn_protect_radius();
+            if radius > 0 {
+                out.push_str(&format!(
+                    "Spawn protection: {radius} blocks around world spawn (Overworld)\n"
+                ));
+            } else {
+                out.push_str("Spawn protection: off\n");
+            }
+            if let Some(player) = player {
+                let owned = claims
+                    .values()
+                    .filter(|rec| rec.owner == player)
+                    .count();
+                out.push_str(&format!(
+                    "Your claims: {owned}/{} chunks\n",
+                    live_claim_quota()
+                ));
+            }
+            out
+        }
+        ["admin-unclaim"] => {
+            if level < 4 {
+                return P8C_DENIED.into();
+            }
+            let mut claims = live_claims()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match claims.remove(&key) {
+                Some(record) => format!("Admin-unclaimed chunk ({}, {}) from {}", key.1, key.2, record.owner),
+                None => "This chunk is not claimed".into(),
+            }
+        }
+        ["spawn-radius", raw] | ["spawn-protect", raw] => {
+            if level < 4 {
+                return P8C_DENIED.into();
+            }
+            match raw.parse::<i32>() {
+                Ok(radius) => match set_live_spawn_protect_radius(radius) {
+                    Ok(()) if radius == 0 => "Spawn protection disabled".into(),
+                    Ok(()) => format!("Spawn protection set to {radius} blocks"),
+                    Err(error) => error,
+                },
+                Err(_) => MEGU_USAGE.into(),
+            }
+        }
+        _ => MEGU_USAGE.into(),
+    }
+}
+
+/// `/megu backup plan|status` — OP-4. Wires the live `plan_backup_rotation`
+/// decision and the on-disk backup directory into an instant operator
+/// answer; no external plugin required.
+fn run_megu_backup(level: u8, args: &[&str]) -> String {
+    if level < 4 {
+        return P8C_DENIED.into();
+    }
+    match args {
+        ["plan"] => format_backup_plan_report(),
+        ["status"] => format_backup_status_report(),
+        _ => "usage: /megu backup plan|status".into(),
+    }
+}
+
+/// `/megu metrics` — OP-4. The live Prometheus text exposition
+/// (`format_prometheus` over a snapshot gathered from the running server),
+/// the same scrape a localhost collector would pull.
+fn run_megu_metrics(level: u8, args: &[&str]) -> String {
+    if level < 4 {
+        return P8C_DENIED.into();
+    }
+    if !args.is_empty() {
+        return "usage: /megu metrics".into();
+    }
+    live_operator_metrics_prometheus()
+}
+
 /// MOD-SUITE bridge: the bounded pregen sweep `mc-spine-world-migrate
 /// pregen-run` drives offline, offered to the live mod suite over a real
 /// `ServerContext` — the same `PregenJob` spiral, the same ticket-LRU
@@ -10267,5 +10666,316 @@ mod parity_51_gr_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|p| p.name != "p51_gr");
+    }
+}
+
+// ------------------------------------------------- ops_admin_builtin_tests ---
+
+#[cfg(test)]
+mod ops_admin_builtin_tests {
+    use super::*;
+
+    fn ops_admin_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn ops_client(name: &str) -> (Arc<Client>, std::net::TcpStream) {
+        let (mut client, receiver) = crate::effect_tests::client_pair();
+        client.name = name.into();
+        (Arc::new(client), receiver)
+    }
+
+    fn ops_ctx(me: Option<Arc<Client>>, x: f64, y: f64, z: f64) -> CmdCtx {
+        CmdCtx { me, x, y, z }
+    }
+
+    fn ops_run(ctx: &CmdCtx, msg: &str) -> String {
+        run_command_ctx(ctx, msg, &mut None)
+    }
+
+    fn ops_op_ctx(name: &str, level: u8, x: f64, y: f64, z: f64) -> CmdCtx {
+        if level > 0 {
+            ops_registry()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set(name, level, false);
+        }
+        let (client, _receiver) = ops_client(name);
+        ops_ctx(Some(client), x, y, z)
+    }
+
+    fn ops_deop(name: &str) {
+        ops_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
+    }
+
+    fn ops_reset_claims() {
+        live_claims()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        let _ = set_live_spawn_protect_radius(0);
+        LIVE_CLAIM_QUOTA.store(256, Ordering::Relaxed);
+        live_block_audit()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        live_rollback_log()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    #[test]
+    fn ops_admin_builtin_audit_records_and_rollback_restores_reverse_order() {
+        let _world = world_guard();
+        let _serial = ops_admin_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ops_reset_claims();
+        // Unique coords + actor so parallel lanes' audit entries cannot match.
+        let (bx, by, bz) = (777_i32, 200_i32, 777_i32);
+        let dim = DimId::Overworld;
+        let before = block_at_dim(dim, bx, by, bz);
+        let griefer = ops_op_ctx("ops_audit_griefer", 2, bx as f64 + 0.5, by as f64, bz as f64 + 0.5);
+        let stone = state_from_arg("minecraft:stone").expect("stone state");
+        let gold = state_from_arg("minecraft:gold_block").expect("gold state");
+        assert!(ops_run(&griefer, &format!("/setblock {bx} {by} {bz} minecraft:stone")).starts_with("Set block"));
+        assert!(ops_run(&griefer, &format!("/setblock {bx} {by} {bz} minecraft:gold_block")).starts_with("Set block"));
+        assert_eq!(block_at_dim(dim, bx, by, bz), gold);
+        // The audit ring saw both transitions, attributed to the griefer.
+        let entries = query_live_block_audit(&LiveBlockAuditQuery {
+            actor: Some("ops_audit_griefer".to_owned()),
+            dim: Some(dim),
+            center: Some((dim, bx, by, bz)),
+            radius: 2,
+            since_tick: None,
+        });
+        assert_eq!(entries.len(), 2, "expected air->stone and stone->gold entries");
+        assert_eq!(entries[0].old_state, before);
+        assert_eq!(entries[0].new_state, stone);
+        assert_eq!(entries[1].old_state, stone);
+        assert_eq!(entries[1].new_state, gold);
+        // OP-4 audit query around the executor sees the same edits.
+        let op = ops_op_ctx("ops_audit_op", 4, bx as f64 + 0.5, by as f64, bz as f64 + 0.5);
+        let audit = ops_run(&op, "/megu audit ops_audit_griefer 8");
+        assert!(audit.contains("ops_audit_griefer"), "{audit}");
+        assert!(audit.contains("2 edit(s)"), "{audit}");
+        // Rollback unwinds newest-first back to the original state.
+        let reply = ops_run(&op, "/megu rollback ops_audit_griefer 8");
+        assert!(reply.contains("restored 2"), "{reply}");
+        assert!(reply.contains("skipped 0"), "{reply}");
+        assert_eq!(block_at_dim(dim, bx, by, bz), before, "rollback must restore the original state");
+        let summaries = live_rollback_summaries();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].target, "ops_audit_griefer");
+        assert_eq!(summaries[0].restored, 2);
+        ops_deop("ops_audit_griefer");
+        ops_deop("ops_audit_op");
+        ops_reset_claims();
+    }
+
+    #[test]
+    fn ops_admin_builtin_rollback_skips_diverged_cells() {
+        let _world = world_guard();
+        let _serial = ops_admin_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ops_reset_claims();
+        let (bx, by, bz) = (778_i32, 200_i32, 778_i32);
+        let dim = DimId::Overworld;
+        let before = block_at_dim(dim, bx, by, bz);
+        let actor = "ops_audit_diverge";
+        record_live_block_audit(dim, (bx, by, bz), actor, before, 1, TICK.load(Ordering::Relaxed));
+        // Someone else changed the cell after the audited edit: rollback must
+        // skip rather than clobber the diverged state.
+        set_block_dim(dim, bx, by, bz, 2);
+        let op = ops_op_ctx("ops_audit_op2", 4, bx as f64 + 0.5, by as f64, bz as f64 + 0.5);
+        let reply = ops_run(&op, &format!("/megu rollback {actor} 8"));
+        assert!(reply.contains("restored 0"), "{reply}");
+        assert!(reply.contains("skipped 1"), "{reply}");
+        assert_eq!(block_at_dim(dim, bx, by, bz), 2, "diverged cell must not be clobbered");
+        ops_deop("ops_audit_op2");
+        ops_reset_claims();
+    }
+
+    #[test]
+    fn ops_admin_builtin_audit_rollback_refuse_below_op4_and_command_blocks() {
+        let _world = world_guard();
+        let _serial = ops_admin_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ops_reset_claims();
+        for level in 0u8..4 {
+            let name = format!("ops_gate_l{level}");
+            let ctx = ops_op_ctx(&name, level, 10.5, 70.0, 10.5);
+            for msg in [
+                "/megu audit",
+                "/megu audit someone 8",
+                "/megu rollback someone 8",
+                "/megu backup plan",
+                "/megu backup status",
+                "/megu metrics",
+                "/megu policy list",
+            ] {
+                assert_eq!(
+                    ops_run(&ctx, msg),
+                    P8C_DENIED,
+                    "level-{level} must be refused {msg}"
+                );
+            }
+            // The claim admin overrides are OP-4 too.
+            for msg in [
+                "/megu claim admin-unclaim",
+                "/megu claim spawn-radius 5",
+                "/megu claim spawn-protect 5",
+            ] {
+                assert_eq!(
+                    ops_run(&ctx, msg),
+                    "You do not have permission to run that command",
+                    "level-{level} must be refused {msg}"
+                );
+            }
+            ops_deop(&name);
+        }
+        // Command blocks: the root deny-list refuses `megu` outright, and a
+        // pinned level-2 dispatch re-checks the same gate.
+        assert!(!command_block_source_allowed("megu"));
+        let ctx = ops_ctx(None, 0.5, 64.0, 0.5);
+        for msg in ["/megu audit", "/megu rollback p 8", "/megu backup plan", "/megu metrics"] {
+            assert_eq!(
+                run_command_ctx_level(&ctx, msg, &mut None, Some(COMMAND_BLOCK_OP_LEVEL)),
+                "You do not have permission to run that command",
+                "command-block level must be refused {msg}"
+            );
+        }
+        // The level-4 tree still advertises `megu`; lower levels do not.
+        for level in 0u8..4 {
+            assert!(command_tree_at_level(level).child("megu").is_none());
+        }
+        assert!(command_tree_at_level(4).child("megu").is_some());
+        ops_reset_claims();
+    }
+
+    #[test]
+    fn ops_admin_builtin_claim_here_trust_unclaim_info_and_quota() {
+        let _world = world_guard();
+        let _serial = ops_admin_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ops_reset_claims();
+        let dim = DimId::Overworld;
+        let (x, z) = (400.5_f64, 400.5_f64);
+        let alice = ops_op_ctx("ops_claim_alice", 0, x, 70.0, z);
+        let bob = ops_op_ctx("ops_claim_bob", 0, x, 70.0, z);
+        // Normal players claim their own chunk through the level-0 path.
+        assert!(ops_run(&alice, "/megu claim here").contains("Claimed chunk"));
+        assert!(ops_run(&bob, "/megu claim here").contains("already claimed by ops_claim_alice"));
+        // Protection: owner and OPs pass, strangers fail closed.
+        assert!(can_player_modify_block(dim, 400, 400, "ops_claim_alice", 0));
+        assert!(!can_player_modify_block(dim, 400, 400, "ops_claim_bob", 0));
+        assert!(can_player_modify_block(dim, 400, 400, "ops_claim_bob", 4));
+        // Trusted allies may build; untrust revokes.
+        assert!(ops_run(&alice, "/megu claim trust ops_claim_bob").contains("Trusted"));
+        assert!(can_player_modify_block(dim, 400, 400, "ops_claim_bob", 0));
+        // A stranger cannot manage the claim.
+        assert!(ops_run(&bob, "/megu claim untrust ops_claim_bob").contains("claim owner"));
+        assert!(ops_run(&alice, "/megu claim info").contains("claimed by ops_claim_alice"));
+        assert!(ops_run(&alice, "/megu claim untrust ops_claim_bob").contains("Removed trust"));
+        assert!(!can_player_modify_block(dim, 400, 400, "ops_claim_bob", 0));
+        // Unclaim frees the chunk for the next player.
+        assert!(ops_run(&alice, "/megu claim unclaim").contains("Unclaimed"));
+        assert!(can_player_modify_block(dim, 400, 400, "ops_claim_bob", 0));
+        assert!(ops_run(&bob, "/megu claim here").contains("Claimed chunk"));
+        // Quota is per-player: with the cap at 1, carol's second chunk is
+        // refused while a different player may still claim their first.
+        LIVE_CLAIM_QUOTA.store(1, Ordering::Relaxed);
+        let carol = ops_op_ctx("ops_claim_carol", 0, 432.5, 70.0, 432.5);
+        assert!(ops_run(&carol, "/megu claim here").contains("Claimed chunk"));
+        let carol2 = ops_op_ctx("ops_claim_carol", 0, 448.5, 70.0, 448.5);
+        assert!(ops_run(&carol2, "/megu claim here").contains("Claim quota reached"));
+        let dave = ops_op_ctx("ops_claim_dave", 0, 464.5, 70.0, 464.5);
+        assert!(ops_run(&dave, "/megu claim here").contains("Claimed chunk"));
+        LIVE_CLAIM_QUOTA.store(256, Ordering::Relaxed);
+        // Admin override: OP-4 removes anyone's claim at the executor chunk.
+        let op = ops_op_ctx("ops_claim_op", 4, 432.5, 70.0, 432.5);
+        assert!(ops_run(&op, "/megu claim admin-unclaim").contains("Admin-unclaimed"));
+        assert!(can_player_modify_block(dim, 432, 432, "ops_claim_carol", 0));
+        for name in ["ops_claim_alice", "ops_claim_bob", "ops_claim_carol", "ops_claim_dave", "ops_claim_op"] {
+            ops_deop(name);
+        }
+        ops_reset_claims();
+    }
+
+    #[test]
+    fn ops_admin_builtin_spawn_protection_radius_gates_non_ops() {
+        let _world = world_guard();
+        let _serial = ops_admin_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ops_reset_claims();
+        let dim = DimId::Overworld;
+        let spawn = *WORLD_SPAWN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (sx, sz) = (spawn.0.floor() as i32, spawn.2.floor() as i32);
+        let op = ops_op_ctx("ops_spawn_op", 4, sx as f64 + 0.5, 70.0, sz as f64 + 0.5);
+        assert_eq!(ops_run(&op, "/megu claim spawn-radius 12"), "Spawn protection set to 12 blocks");
+        // Inside the radius a level-0 player is refused; outside it is open;
+        // OP-4 always passes — the vanilla spawn-protection semantic.
+        assert!(!can_player_modify_block(dim, sx, sz, "ops_spawn_victim", 0));
+        assert!(can_player_modify_block(dim, sx + 100, sz + 100, "ops_spawn_victim", 0));
+        assert!(can_player_modify_block(dim, sx, sz, "ops_spawn_victim", 4));
+        assert_eq!(ops_run(&op, "/megu claim info").lines().any(|l| l.contains("Spawn protection: 12")), true);
+        // `spawn-protect` is the same setter; 0 disables cleanly.
+        assert_eq!(ops_run(&op, "/megu claim spawn-protect 0"), "Spawn protection disabled");
+        assert!(can_player_modify_block(dim, sx, sz, "ops_spawn_victim", 0));
+        assert!(ops_run(&op, "/megu claim spawn-radius 2048").contains("must be in 0..=1024"));
+        ops_deop("ops_spawn_op");
+        ops_reset_claims();
+    }
+
+    #[test]
+    fn ops_admin_builtin_backup_plan_status_and_metrics_are_live_and_gated() {
+        let _world = world_guard();
+        let _serial = ops_admin_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ops_reset_claims();
+        let op = ops_op_ctx("ops_bm_op", 4, 0.5, 70.0, 0.5);
+        let plan = ops_run(&op, "/megu backup plan");
+        assert!(plan.contains("Next backup: world-backup-"), "{plan}");
+        assert!(plan.contains("Prune"), "{plan}");
+        assert!(plan.contains("Disk guard"), "{plan}");
+        let status = ops_run(&op, "/megu backup status");
+        assert!(status.contains("Retention: keep at most 12"), "{status}");
+        assert!(status.contains("Existing backups:"), "{status}");
+        let metrics = ops_run(&op, "/megu metrics");
+        assert!(metrics.starts_with("# HELP mc_spine_tps"), "{metrics}");
+        assert!(metrics.contains("mc_spine_players_online"), "{metrics}");
+        assert!(metrics.contains("mc_spine_uptime_seconds"), "{metrics}");
+        // Usage failures are clean, and levels below 4 never reach the handlers.
+        assert_eq!(ops_run(&op, "/megu backup"), "usage: /megu backup plan|status");
+        assert_eq!(ops_run(&op, "/megu metrics now"), "usage: /megu metrics");
+        let pleb = ops_op_ctx("ops_bm_pleb", 0, 0.5, 70.0, 0.5);
+        assert_eq!(ops_run(&pleb, "/megu backup plan"), P8C_DENIED);
+        assert_eq!(ops_run(&pleb, "/megu metrics"), P8C_DENIED);
+        // A level-0 player CAN still self-manage claims — the one exception.
+        assert!(ops_run(&pleb, "/megu claim info").contains("unclaimed"));
+        ops_deop("ops_bm_op");
+        ops_deop("ops_bm_pleb");
+        ops_reset_claims();
+    }
+
+    #[test]
+    fn ops_admin_builtin_claim_requires_player_and_unknown_subcommand_fails_closed() {
+        let _world = world_guard();
+        let _serial = ops_admin_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ops_reset_claims();
+        // Console (no player) cannot stake claims.
+        let console = ops_ctx(None, 0.5, 70.0, 0.5);
+        for msg in ["/megu claim here", "/megu claim unclaim", "/megu claim trust x"] {
+            let reply = ops_run(&console, msg);
+            assert!(reply.contains("Claims require a player") || reply == P8C_DENIED || reply == MEGU_USAGE, "{msg} -> {reply}");
+        }
+        // Bare `/megu` keeps the POLICY-CMD usage contract; unknown
+        // subcommands and a bare `claim` get the full OPS-ADMIN map.
+        let op = ops_op_ctx("ops_misc_op", 4, 0.5, 70.0, 0.5);
+        assert_eq!(ops_run(&op, "/megu"), POLICY_USAGE);
+        assert_eq!(ops_run(&op, "/megu bogus"), MEGU_USAGE);
+        assert_eq!(ops_run(&op, "/megu claim"), MEGU_USAGE);
+        ops_deop("ops_misc_op");
+        ops_reset_claims();
     }
 }

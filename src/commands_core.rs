@@ -5118,6 +5118,10 @@ fn run_block_modification(ctx: &CmdCtx, cmd: &str, args: &[&str]) -> Result<Stri
             destroyed,
         } in changes
         {
+            // OPS-ADMIN-BUILTIN: snapshot the pre-edit state before the
+            // destroy/replace writes so the audit ring records the true
+            // old -> new transition for every touched cell.
+            let audit_before = block_at_dim(dim, x, y, z);
             if let Some(previous) = destroyed {
                 set_block_dim(dim, x, y, z, COMMAND_AIR_STATE);
                 // Item entities currently belong to the Overworld item simulation.
@@ -5146,6 +5150,18 @@ fn run_block_modification(ctx: &CmdCtx, cmd: &str, args: &[&str]) -> Result<Stri
                 }
             }
             place_block_dim(dim, x, y, z, state);
+            record_live_block_audit(
+                dim,
+                (x, y, z),
+                &ctx
+                    .me
+                    .as_ref()
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| "Server".to_owned()),
+                audit_before,
+                state,
+                TICK.load(Ordering::Relaxed),
+            );
         }
         let action = if cmd == "fill" { "Filled" } else { "Cloned" };
         Ok(format!("{action} {count} blocks"))
@@ -5327,6 +5343,12 @@ fn run_command(me: Option<&Arc<Client>>, msg: &str, s: &mut Option<&Client>) {
 fn command_allowed_for_player(cmd: &str, args: &[&str]) -> bool {
     command_allowed_at_level(cmd, 0)
         || (cmd == "time" && matches!(args.first().copied(), Some("query" | "get")))
+        // OPS-ADMIN-BUILTIN: `/megu claim` self-management is the one
+        // player-facing corner of the OP-4 `/megu` root — chunk claims for
+        // your own land. Every other `/megu` subcommand stays behind the
+        // level-4 source gate, and the claim handler re-checks ownership and
+        // quota itself, so this exception cannot widen into admin access.
+        || (cmd == "megu" && megu_claim_player_subcommand(args))
 }
 /// `/megu` is a server-added owner command: `required_permission_level` lives
 /// in `server_ops.rs`, outside this lane, so the OP-4 mapping is applied at
@@ -5383,7 +5405,7 @@ fn command_usage(name: &str) -> String {
         "locate" => "/locate structure|biome|poi <id>",
         "loot" => "/loot spawn|give|insert|replace <target> <source>",
         "me" => "/me <action>",
-        "megu" => "/megu policy list|get <key>|set <key> <value>|reset",
+        "megu" => "/megu policy list|get <key>|set <key> <value>|reset|audit [player] [radius]|rollback <player> <radius> [max_blocks]|claim here|unclaim|trust <player>|untrust <player>|info|admin-unclaim|spawn-radius <n>|backup plan|status|metrics",
         "msg" | "tell" | "w" => "/msg <player> <message>",
         "op" => "/op <player>",
         "pardon" => "/pardon <player>",
@@ -6213,6 +6235,10 @@ fn native_command_dispatcher(
     }
     if level >= 4 {
         register(literal("profile").then(args("arguments")));
+        // OPS-ADMIN-BUILTIN: the advertised `/megu` tree stays OP-4 only —
+        // player-facing `claim` self-management parses through the dispatch
+        // fallthrough, never through this tree, so levels 0..3 see no `megu`
+        // node at all.
         register(done("megu").then(
             done("policy")
                 .then(done("list"))
@@ -6224,7 +6250,11 @@ fn native_command_dispatcher(
                             .then(policy_command_argument("value").executes(|_| Ok(0))),
                     ),
                 ),
-        ));
+        ).then(done("audit").then(args("arguments")))
+        .then(done("rollback").then(args("arguments")))
+        .then(done("claim").then(args("arguments")))
+        .then(done("backup").then(args("arguments")))
+        .then(done("metrics")));
     }
     // P8c cluster-C owner commands; `required_permission_level` already maps
     // all four to 4, so `register_at_level` advertises them at level 4 only.
@@ -8205,6 +8235,22 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 write_varint(&mut body, i64::from(visible_block_update_state(dim, x, y, z, st)));
                 broadcast_chunk_dim(dim, x >> 4, z >> 4, |_c| (0x09, body.clone()));
             }
+            // OPS-ADMIN-BUILTIN: every live block write lands in the bounded
+            // audit ring so `/megu audit`/`/megu rollback` can answer who
+            // changed what and when. Net transition old -> new; the destroy
+            // mode's intermediate air write is part of the same edit.
+            record_live_block_audit(
+                dim,
+                (x, y, z),
+                &ctx
+                    .me
+                    .as_ref()
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| "Server".to_owned()),
+                old,
+                st,
+                TICK.load(Ordering::Relaxed),
+            );
             if let Some(tag) = nbt {
                 setblock_attach_nbt(dim, x, y, z, tag);
             }
@@ -8806,7 +8852,9 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         // defaults unmapped names to 2 and a level-2 `.mcfunction` frame must
         // never reach either command.
         "profile" => run_profile_command(level, &args),
-        "megu" => run_policy_command(level, &args),
+        // OPS-ADMIN-BUILTIN: `/megu` fans out to policy/audit/rollback/claim/
+        // backup/metrics; the handler re-checks `level` per subcommand.
+        "megu" => run_megu_command(ctx, level, &args),
         "transfer" => run_transfer_command(ctx, level, &args),
         // P8c cluster-C diagnostics are owner-level (4) too; each handler
         // re-checks `level` like `run_profile_command` does.
