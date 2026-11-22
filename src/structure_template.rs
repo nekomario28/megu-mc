@@ -2509,11 +2509,11 @@ mod tests {
             String::new(),
         ];
         let mut out = Vec::new();
-        crate::sign_side_nbt(&mut out, "front_text", &lines);
-        // `sign_side_nbt` writes a named compound, so read it as one.
+        crate::sign_side_nbt_meta(&mut out, "front_text", &lines, "black", false);
+        // `sign_side_nbt_meta` writes a named compound, so read it as one.
         let (name, tag) = crate::nbt::read_named(&out).expect("sign side parses");
         assert_eq!(name.to_utf8().unwrap(), "front_text");
-        assert_eq!(tag.get("color").cloned(), Some(crate::nbt::Tag::String(crate::nbt::NbtString::text("white"))));
+        assert_eq!(tag.get("color").cloned(), Some(crate::nbt::Tag::String(crate::nbt::NbtString::text("black"))));
         assert_eq!(tag.get("has_glowing_text").cloned(), Some(crate::nbt::Tag::Byte(0)));
         let messages = match tag.get("messages") {
             Some(crate::nbt::Tag::List(kind, items)) => {

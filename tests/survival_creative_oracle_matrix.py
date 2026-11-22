@@ -797,7 +797,8 @@ def server_session(kind, binary, root, jar=JAR):
     env = dict(os.environ, TMPDIR=str(ROOT / "target/tmp"))
     if kind == "megu":
         for link, source in (("config_packets.bin", ROOT / "config_packets.bin"),
-                             ("assets", ROOT / "assets")):
+                             ("assets", ROOT / "assets"),
+                             ("datapacks", ROOT / "datapacks")):
             if not (root / link).exists():
                 (root / link).symlink_to(source,
                                          target_is_directory=source.is_dir())

@@ -12290,10 +12290,90 @@ fn falling_tick() {
     }
 }
 
+/// `AttachFace.getConnectedDirection` in direction-code space: floor -> 0 (down),
+/// ceiling -> 1 (up), wall -> the `facing` prop's own direction.
+fn attach_face_toward(reg: &BReg, state: u32) -> u8 {
+    match reg.get_prop(state, "face").as_deref() {
+        Some("ceiling") => 1,
+        Some("wall") => match reg.get_prop(state, "facing").as_deref() {
+            Some("north") => 2,
+            Some("south") => 3,
+            Some("west") => 4,
+            Some("east") => 5,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+/// Re-evaluate a neighbour's support rule as vanilla `updateShape` does: the
+/// block drops only when the changed cell sits on the side its family
+/// attaches to (`direction == support_side` and `!canSurvive`).
+fn neighbor_loses_support(
+    reg: &BReg,
+    state: u32,
+    toward: u8,
+    support: u32,
+) -> bool {
+    let name = reg.name_of(state);
+    if reg.fragile_loses_support(state, toward, support) {
+        return true;
+    }
+    let below_sturdy = |s: u32| reg.is_face_sturdy(s, 1, Support::Full);
+    match name {
+        // Attached below: the support is the cell under the block.
+        "minecraft:rail" | "minecraft:bell"
+            if toward == 0 =>
+        {
+            !below_sturdy(support)
+        }
+        _ if name.ends_with("_rail") || name.ends_with("_pressure_plate") => {
+            toward == 0 && !below_sturdy(support)
+        }
+        "minecraft:redstone_wire" | "minecraft:repeater" | "minecraft:comparator" => {
+            toward == 0
+                && !(below_sturdy(support) || reg.name_of(support) == "minecraft:hopper")
+        }
+        _ if name.ends_with("_carpet") => toward == 0 && !below_sturdy(support),
+        // AttachFace blocks (lever, buttons, grindstone): face picks the support
+        // direction — floor attaches below, ceiling above, wall toward `facing`.
+        "minecraft:lever" | "minecraft:grindstone"
+            if toward == attach_face_toward(reg, state) =>
+        {
+            !below_sturdy(support)
+        }
+        _ if name.ends_with("_button") && toward == attach_face_toward(reg, state) => {
+            !below_sturdy(support)
+        }
+        _ if reg.in_tag(state, "minecraft:flowers")
+            || reg.in_tag(state, "minecraft:saplings")
+            || name == "minecraft:sweet_berry_bush"
+            || name == "minecraft:tall_grass"
+            || name == "minecraft:large_fern"
+            || name == "minecraft:fern" =>
+        {
+            toward == 0
+                && !(reg.in_tag(support, "minecraft:dirt")
+                    || matches!(
+                        reg.name_of(support),
+                        "minecraft:farmland"
+                            | "minecraft:dirt_path"
+                            | "minecraft:moss_block"
+                            | "minecraft:mud"
+                            | "minecraft:podzol"
+                            | "minecraft:mycelium"
+                            | "minecraft:coarse_dirt"
+                            | "minecraft:rooted_dirt"
+                            | "minecraft:grass_block"
+                    ))
+        }
+        _ => false,
+    }
+}
+
 /// Support loss is a neighbor update, not a periodic scan. Use the same
 /// compare-and-set that protects falling-block creation: repeated notifications
-/// and concurrent mutations may not duplicate drops. This covers only the
-/// known torch and lantern attachment families (other shapes are separate).
+/// and concurrent mutations may not duplicate drops.
 fn note_fragile_supports(x: i32, y: i32, z: i32) {
     let Some(reg) = crate::block_registry::breg() else { return };
     let support = block_at(x, y, z);
@@ -12303,7 +12383,7 @@ fn note_fragile_supports(x: i32, y: i32, z: i32) {
             continue;
         }
         let state = block_at(q.0, q.1, q.2);
-        if !reg.fragile_loses_support(state, (dir as u8) ^ 1, support) {
+        if !neighbor_loses_support(reg, state, (dir as u8) ^ 1, support) {
             continue;
         }
         if set_block_if(q.0, q.1, q.2, 0, Some(state)) {
@@ -15588,9 +15668,22 @@ fn build_map_chunk_lane(
             };
             let mut n = Vec::new();
             n.push(10);
-            sign_side_nbt(&mut n, "front_text", fl);
-            sign_side_nbt(&mut n, "back_text", bl);
-            nbt_named_byte(&mut n, "is_waxed", 0);
+            let meta = sign_meta_at(dim, x, y, z);
+            sign_side_nbt_meta(
+                &mut n,
+                "front_text",
+                fl,
+                &meta.front.color,
+                meta.front.has_glowing_text,
+            );
+            sign_side_nbt_meta(
+                &mut n,
+                "back_text",
+                bl,
+                &meta.back.color,
+                meta.back.has_glowing_text,
+            );
+            nbt_named_byte(&mut n, "is_waxed", u8::from(meta.is_waxed));
             n.push(0);
             ((x, y, z), 7i64, n)
         })

@@ -420,7 +420,8 @@ def live_server(kind, binary, root, jar=JAR):
     env = dict(os.environ, TMPDIR=str(ROOT / "target/tmp"))
     if kind == "megu":
         for link, source in (("config_packets.bin", ROOT / "config_packets.bin"),
-                             ("assets", ROOT / "assets")):
+                             ("assets", ROOT / "assets"),
+                             ("datapacks", ROOT / "datapacks")):
             (root / link).symlink_to(source, target_is_directory=source.is_dir())
         env.update(MEGU_PORT=str(game), MEGU_BIND_ADDR="127.0.0.1",
                    MEGU_SEED=str(SEED), MEGU_WG="old",

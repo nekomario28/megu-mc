@@ -1705,6 +1705,23 @@ mod tag_tests {
             );
         }
     }
+
+    /// Support-loss for flowers/saplings re-reads `#minecraft:flowers`, which is a
+    /// nested tag (`#small_flowers` + `#tall_flowers` + direct members). The
+    /// expansion must reach members two levels deep or flowers never pop.
+    #[test]
+    fn nested_flowers_tag_reaches_small_flower_members() {
+        let reg = super::breg().expect("registry");
+        for name in ["poppy", "dandelion", "torchflower", "sunflower"] {
+            let st = reg.state_of(name, None);
+            assert!(
+                reg.in_tag(st, "minecraft:flowers"),
+                "{name} must be in #minecraft:flowers"
+            );
+        }
+        assert!(reg.in_tag(reg.state_of("grass_block", None), "minecraft:dirt"));
+        assert!(!reg.in_tag(reg.state_of("stone", None), "minecraft:dirt"));
+    }
 }
 
 #[cfg(test)]

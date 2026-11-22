@@ -7347,9 +7347,6 @@ fn json_text(s: &str) -> String {
 /// **JSON string** component (`'"Hi"'`), not a `{"text":...}` object, and with
 /// `filtered_messages` present. A tag without that list loads as empty text natively, so
 /// writing the shorter shape here would make a client show blank lines.
-fn sign_side_nbt(v: &mut Vec<u8>, name: &str, lines: &[String; 4]) {
-    sign_side_nbt_meta(v, name, lines, "white", false)
-}
 fn sign_side_nbt_meta(
     v: &mut Vec<u8>,
     name: &str,

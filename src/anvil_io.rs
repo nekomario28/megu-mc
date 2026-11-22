@@ -1350,7 +1350,7 @@ fn anvil_sign_id(dim: DimId, x: i32, y: i32, z: i32) -> &'static str {
 /// `SignText`-shaped compound for one side of a sign, matching the shape
 /// `sign_side_nbt` writes for the wire: color, glow flag, both message lists,
 /// each message a JSON string component.
-fn anvil_sign_side(lines: &[String; 4], filled: bool) -> AnvilNbt {
+fn anvil_sign_side(lines: &[String; 4], filled: bool, color: &str, glow: bool) -> AnvilNbt {
     let to_list = |values: Vec<String>| {
         AnvilNbt::List(
             8,
@@ -1358,8 +1358,8 @@ fn anvil_sign_side(lines: &[String; 4], filled: bool) -> AnvilNbt {
         )
     };
     anvil_obj(&[
-        ("color", anvil_s("white")),
-        ("has_glowing_text", AnvilNbt::Byte(0)),
+        ("color", anvil_s(color)),
+        ("has_glowing_text", AnvilNbt::Byte(i8::from(glow))),
         (
             "filtered_messages",
             to_list(vec![String::new(), String::new(), String::new(), String::new()]),
@@ -1568,6 +1568,7 @@ fn anvil_export_block_entities(
         debug_assert_eq!(sdim, dim);
         let empty = || [String::new(), String::new(), String::new(), String::new()];
         let (fl, bl) = if front != 0 { (lines, empty()) } else { (empty(), lines) };
+        let meta = sign_meta_at(dim, x, y, z);
         by_pos.insert(
             (x, y, z),
             anvil_obj(&[
@@ -1575,9 +1576,15 @@ fn anvil_export_block_entities(
                 ("x", AnvilNbt::Int(x)),
                 ("y", AnvilNbt::Int(y)),
                 ("z", AnvilNbt::Int(z)),
-                ("front_text", anvil_sign_side(&fl, true)),
-                ("back_text", anvil_sign_side(&bl, true)),
-                ("is_waxed", AnvilNbt::Byte(0)),
+                (
+                    "front_text",
+                    anvil_sign_side(&fl, true, &meta.front.color, meta.front.has_glowing_text),
+                ),
+                (
+                    "back_text",
+                    anvil_sign_side(&bl, true, &meta.back.color, meta.back.has_glowing_text),
+                ),
+                ("is_waxed", AnvilNbt::Byte(i8::from(meta.is_waxed))),
             ]),
         );
     }
@@ -2941,6 +2948,30 @@ fn apply_chunk_block_entities(dim: DimId, entities: &[AnvilNbt]) {
             if back.iter().any(|line| !line.is_empty()) {
                 sign_map.insert((dim, x, y, z, 0), back);
             }
+            drop(sign_map);
+            let side_meta = |side: Option<&AnvilNbt>| SignSideMeta {
+                color: side
+                    .and_then(|s| anvil_str(s, "color"))
+                    .unwrap_or_else(|| "black".to_string()),
+                has_glowing_text: side
+                    .and_then(|s| s.get("has_glowing_text"))
+                    .and_then(nbt_int_val)
+                    .unwrap_or(0)
+                    != 0,
+            };
+            let meta = SignBlockMeta {
+                front: side_meta(entity.get("front_text")),
+                back: side_meta(entity.get("back_text")),
+                is_waxed: entity
+                    .get("is_waxed")
+                    .and_then(nbt_int_val)
+                    .unwrap_or(0)
+                    != 0,
+            };
+            sign_meta()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert((dim, x, y, z), meta);
         }
         let _ = restore_live_block_entity(key, entity);
         let mut items_owned = false;
