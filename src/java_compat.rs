@@ -1,6 +1,7 @@
 //! One JVM owner and guarded Rust world ABI for pinned Fabric and NeoForge operations.
 use crate::landing_types::{
     decode_mutation_batch, Loader, MutationOp, Request, S1EventOutcome, Trample,
+    FIRST_MOD_BLOCK_STATE_ID,
 };
 #[cfg(feature = "neoforge-events")]
 use crate::landing_types::{
@@ -39,6 +40,10 @@ static SERVER: OnceLock<bool> = OnceLock::new();
 static COMMITTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static ACTIVE: std::sync::Mutex<Option<Trample>> = std::sync::Mutex::new(None);
 
+const S1_MAX_FRAME_BYTES: usize = 256 * 1024;
+const S1_MAX_MUTATIONS: usize = 4096;
+const S1_MAX_MESSAGE_BYTES: usize = 4096;
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct BatchCommitReport {
@@ -48,45 +53,126 @@ pub(crate) struct BatchCommitReport {
     pub(crate) registered_commands: Vec<String>,
 }
 
-/// Commit in batch order. Each block write rechecks its own guard, and a save
-/// waits for the whole batch. The caller delivers the returned side effects.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn apply_s1_outcome(outcome: S1EventOutcome) -> Result<BatchCommitReport, String> {
-    let mut report = BatchCommitReport::default();
-    if outcome.canceled {
-        return Ok(report);
-    }
-    // Validate typed callers as well as wire callers before changing any block.
-    for mutation in &outcome.mutations {
-        if let MutationOp::SetBlockIf { dim, pos, .. } = mutation {
-            let dim = super::DimId::ALL
-                .get(usize::from(*dim))
-                .ok_or_else(|| format!("invalid S1 dimension slot {dim}"))?;
-            super::check_modification_bounds(*dim, *pos)?;
+fn validate_s1_state(state: u32) -> Result<(), String> {
+    if state < FIRST_MOD_BLOCK_STATE_ID {
+        if super::breg().is_some_and(|registry| (state as usize) < registry.state_count()) {
+            return Ok(());
+        }
+    } else {
+        #[cfg(feature = "neoforge-events")]
+        if NEOFORGE.get().is_some_and(|runtime| {
+            runtime.registry.entries().iter().any(|entry| {
+                entry.registry == crate::landing_types::ModRegistry::Block
+                    && entry.runtime_id == state
+            })
+        }) {
+            return Ok(());
         }
     }
+    Err(format!("invalid S1 block state {state}"))
+}
+
+fn validate_s1_outcome(outcome: &S1EventOutcome) -> Result<(), String> {
+    if outcome.mutations.len() > S1_MAX_MUTATIONS {
+        return Err("S1 mutation count exceeds limit".into());
+    }
+    if outcome.canceled
+        && (!outcome.mutations.is_empty()
+            || outcome.break_exp.is_some()
+            || outcome.chat_message.is_some())
+    {
+        return Err("canceled S1 event has staged changes".into());
+    }
+    let mut bytes = outcome.chat_message.as_ref().map_or(0, String::len);
+    if bytes > S1_MAX_MESSAGE_BYTES {
+        return Err("S1 chat message exceeds limit".into());
+    }
+    for mutation in &outcome.mutations {
+        match mutation {
+            MutationOp::SetBlockIf {
+                dim,
+                pos,
+                new_state,
+                expected_state,
+            } => {
+                let dim = super::DimId::ALL
+                    .get(usize::from(*dim))
+                    .ok_or_else(|| format!("invalid S1 dimension slot {dim}"))?;
+                super::check_modification_bounds(*dim, *pos)?;
+                validate_s1_state(*new_state)?;
+                if let Some(expected) = expected_state {
+                    validate_s1_state(*expected)?;
+                }
+            }
+            MutationOp::SendSystemMessage { message, .. } => {
+                if message.len() > S1_MAX_MESSAGE_BYTES {
+                    return Err("S1 system message exceeds limit".into());
+                }
+                bytes = bytes.saturating_add(message.len());
+            }
+            MutationOp::RegisterCommand { literal } => {
+                if literal.len() > 32767 {
+                    return Err("S1 command literal exceeds limit".into());
+                }
+                bytes = bytes.saturating_add(literal.len());
+            }
+        }
+        if bytes > S1_MAX_FRAME_BYTES {
+            return Err("S1 staged payload exceeds limit".into());
+        }
+    }
+    Ok(())
+}
+
+/// Validate the entire ordered CAS sequence before committing any world edit.
+/// The save guard encloses both phases, including cross-dimension writes.
+/// The caller delivers side effects only after a successful commit.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn apply_s1_outcome(outcome: S1EventOutcome) -> Result<BatchCommitReport, String> {
+    validate_s1_outcome(&outcome)?;
+    if outcome.canceled {
+        return Ok(BatchCommitReport::default());
+    }
     super::with_save_guard(|| {
+        let mut staged = std::collections::HashMap::new();
+        for mutation in &outcome.mutations {
+            if let MutationOp::SetBlockIf {
+                dim,
+                pos: (x, y, z),
+                new_state,
+                expected_state,
+            } = mutation
+            {
+                let dimension = super::DimId::ALL[usize::from(*dim)];
+                let position = (dimension, *x, *y, *z);
+                let current = *staged
+                    .entry(position)
+                    .or_insert_with(|| super::block_at_dim(dimension, *x, *y, *z));
+                if expected_state.is_some_and(|expected| expected != current) {
+                    return Err(format!(
+                        "S1 CAS precondition failed at {dimension:?} ({x}, {y}, {z})"
+                    ));
+                }
+                staged.insert(position, *new_state);
+            }
+        }
+        let mut report = BatchCommitReport::default();
         for mutation in outcome.mutations {
             match mutation {
                 MutationOp::SetBlockIf {
                     dim,
                     pos: (x, y, z),
                     new_state,
-                    expected_state,
+                    expected_state: _,
                 } => {
                     let dim = super::DimId::ALL[usize::from(dim)];
-                    if super::set_block_if_dim(dim, x, y, z, new_state, expected_state) {
-                        super::note_block_update_dim(
-                            dim,
-                            x,
-                            y,
-                            z,
-                            super::block_at_dim(dim, x, y, z),
-                        );
-                        report.applied_blocks += 1;
-                    } else {
-                        report.skipped_cas_blocks += 1;
-                    }
+                    // Every ordered CAS has already passed preflight under the
+                    // save guard. Block callbacks may edit a later CAS target,
+                    // so rechecking mid-commit could leave a partial batch.
+                    // All validated positions are writable with no second CAS.
+                    super::set_block_if_dim(dim, x, y, z, new_state, None);
+                    super::note_block_update_dim(dim, x, y, z, super::block_at_dim(dim, x, y, z));
+                    report.applied_blocks += 1;
                 }
                 MutationOp::SendSystemMessage {
                     player_eid,
@@ -97,8 +183,8 @@ pub(crate) fn apply_s1_outcome(outcome: S1EventOutcome) -> Result<BatchCommitRep
                 MutationOp::RegisterCommand { literal } => report.registered_commands.push(literal),
             }
         }
-    });
-    Ok(report)
+        Ok(report)
+    })
 }
 
 #[cfg_attr(not(feature = "neoforge-events"), allow(dead_code))]
@@ -228,7 +314,12 @@ pub(crate) fn dispatch_s1_event(
                     ],
                 )
             }
-            S1Event::Command { dim, pos: (x, y, z), name, literal } => {
+            S1Event::Command {
+                dim,
+                pos: (x, y, z),
+                name,
+                literal,
+            } => {
                 let name = env.new_string(name.as_ref())?;
                 let literal = env.new_string(literal.as_ref())?;
                 env.call_static_method(
@@ -257,7 +348,12 @@ pub(crate) fn dispatch_s1_event(
         Ok(wire)
     });
     let wire = wire.map_err(|error| java_error(env, error))?;
-    decode_mutation_batch(&wire)
+    if wire.len() > S1_MAX_FRAME_BYTES {
+        return Err("S1 wire frame exceeds limit".into());
+    }
+    let outcome = decode_mutation_batch(&wire)?;
+    validate_s1_outcome(&outcome)?;
+    Ok(outcome)
 }
 
 #[cfg(feature = "neoforge-events")]
@@ -424,9 +520,7 @@ fn dispatch_s4_payload_frame(
     frame: &[u8],
 ) -> Result<Vec<CustomPayloadEnvelope>, String> {
     require_s4_owner()?;
-    if frame.len() > 13 + S4_MAX_CHANNEL + S4_MAX_PAYLOAD {
-        return Err("oversized S4 inbound frame".into());
-    }
+    validate_s4_inbound_frame(frame)?;
     let result = env
         .with_local_frame(8, |env| -> jni::errors::Result<_> {
             let input = env.byte_array_from_slice(frame)?;
@@ -452,6 +546,23 @@ fn dispatch_s4_payload_frame(
         .map_err(|error| java_error(env, error))?;
     let wire = result.ok_or("oversized S4 outbound frame")?;
     decode_s4_payload_batch(&wire).map_err(str::to_owned)
+}
+
+#[cfg(feature = "neoforge-events")]
+fn validate_s4_inbound_frame(frame: &[u8]) -> Result<(), String> {
+    if frame.len() > 13 + S4_MAX_CHANNEL + S4_MAX_PAYLOAD {
+        return Err("oversized S4 inbound frame".into());
+    }
+    let inbound = decode_s4_payload_batch(frame).map_err(|error| match error {
+        // Keep the existing host diagnostic when a frame advertises a
+        // payload beyond the S4 wire limit.
+        "oversized S4 payload" => "oversized S4 payload frame".to_owned(),
+        _ => error.to_owned(),
+    })?;
+    if inbound.len() != 1 || inbound[0].target_eid.is_some() {
+        return Err("S4 C2S must contain exactly one targetless payload".into());
+    }
+    Ok(())
 }
 
 #[cfg(feature = "neoforge-events")]
@@ -1642,10 +1753,9 @@ mod tests {
             ],
         };
 
-        assert_eq!(
-            apply_s1_outcome(batch(true)),
-            Ok(BatchCommitReport::default())
-        );
+        let mut canceled = batch(true);
+        canceled.mutations.clear();
+        assert_eq!(apply_s1_outcome(canceled), Ok(BatchCommitReport::default()));
         assert_eq!((state(end), state(nether)), (end_before, nether_before));
 
         let mut invalid = batch(false);
@@ -1653,11 +1763,18 @@ mod tests {
         assert!(apply_s1_outcome(invalid).is_err());
         assert_eq!((state(end), state(nether)), (end_before, nether_before));
 
+        assert!(apply_s1_outcome(batch(false))
+            .unwrap_err()
+            .contains("CAS precondition"));
+        assert_eq!((state(end), state(nether)), (end_before, nether_before));
+
+        let mut valid = batch(false);
+        valid.mutations.remove(1);
         assert_eq!(
-            apply_s1_outcome(batch(false)),
+            apply_s1_outcome(valid),
             Ok(BatchCommitReport {
                 applied_blocks: 3,
-                skipped_cas_blocks: 1,
+                skipped_cas_blocks: 0,
                 system_messages: vec![(42, "updated".into())],
                 registered_commands: vec!["greet".into()],
             })
@@ -1679,5 +1796,196 @@ mod tests {
             nether_before,
             Some(nether_state)
         ));
+    }
+
+    #[test]
+    fn s1_cross_dimension_failed_last_cas_is_atomic() {
+        let _world = super::super::world_guard();
+        let pos = (3209, 85, -3206);
+        let dim = [
+            super::super::DimId::Overworld,
+            super::super::DimId::Nether,
+            super::super::DimId::End,
+        ];
+        let previous = dim.map(|d| super::super::block_at_dim(d, pos.0, pos.1, pos.2));
+        let mutations = dim
+            .iter()
+            .enumerate()
+            .map(|(i, _)| MutationOp::SetBlockIf {
+                dim: i as u8,
+                pos,
+                new_state: if previous[i] == 1 { 2 } else { 1 },
+                expected_state: Some(if i == 2 { u32::MAX } else { previous[i] }),
+            })
+            .collect();
+        let failure = S1EventOutcome {
+            canceled: false,
+            break_exp: None,
+            chat_message: None,
+            mutations,
+        };
+        // The invalid final CAS must reject the whole batch before the
+        // Overworld or Nether can acquire even a transient edit.
+        assert!(apply_s1_outcome(failure).is_err());
+        assert_eq!(
+            dim.map(|d| super::super::block_at_dim(d, pos.0, pos.1, pos.2)),
+            previous
+        );
+
+        let mutations = dim
+            .iter()
+            .enumerate()
+            .map(|(i, _)| MutationOp::SetBlockIf {
+                dim: i as u8,
+                pos,
+                new_state: if previous[i] == 1 { 2 } else { 1 },
+                expected_state: Some(if i == 2 { 0 } else { previous[i] }),
+            })
+            .collect();
+        // A valid but stale final expected state must also roll back all dimensions.
+        let mut stale = S1EventOutcome {
+            canceled: false,
+            break_exp: None,
+            chat_message: None,
+            mutations,
+        };
+        let stale_state = if previous[2] == 0 { 1 } else { 0 };
+        if let MutationOp::SetBlockIf { expected_state, .. } = &mut stale.mutations[2] {
+            *expected_state = Some(stale_state);
+        }
+        assert!(apply_s1_outcome(stale)
+            .unwrap_err()
+            .contains("CAS precondition"));
+        assert_eq!(
+            dim.map(|d| super::super::block_at_dim(d, pos.0, pos.1, pos.2)),
+            previous
+        );
+    }
+
+    #[test]
+    fn s1_invalid_bounds_states_counts_and_canceled_outcomes_fail_closed() {
+        let _world = super::super::world_guard();
+        let pos = (3214, 80, -3212);
+        let end = super::super::DimId::End;
+        let before = super::super::block_at_dim(end, pos.0, pos.1, pos.2);
+        let good = || MutationOp::SetBlockIf {
+            dim: 2,
+            pos,
+            new_state: 1,
+            expected_state: Some(before),
+        };
+        let check = |mutation: MutationOp| {
+            let outcome = S1EventOutcome {
+                canceled: false,
+                break_exp: None,
+                chat_message: None,
+                mutations: vec![good(), mutation],
+            };
+            assert!(apply_s1_outcome(outcome).is_err());
+            assert_eq!(super::super::block_at_dim(end, pos.0, pos.1, pos.2), before);
+        };
+        for (dim, y) in [
+            (0, -65),
+            (0, 320),
+            (1, -1),
+            (1, 256),
+            (2, -1),
+            (2, 256),
+            (3, 80),
+            (u8::MAX, 80),
+        ] {
+            check(MutationOp::SetBlockIf {
+                dim,
+                pos: (pos.0, y, pos.2),
+                new_state: 1,
+                expected_state: None,
+            });
+        }
+        for (new_state, expected_state) in [(u32::MAX, None), (1, Some(u32::MAX))] {
+            check(MutationOp::SetBlockIf {
+                dim: 2,
+                pos,
+                new_state,
+                expected_state,
+            });
+        }
+        assert!(apply_s1_outcome(S1EventOutcome {
+            canceled: true,
+            break_exp: None,
+            chat_message: None,
+            mutations: vec![good()]
+        })
+        .is_err());
+        assert_eq!(super::super::block_at_dim(end, pos.0, pos.1, pos.2), before);
+        let mut mutations = (0..S1_MAX_MUTATIONS)
+            .map(|_| MutationOp::SendSystemMessage {
+                player_eid: 1,
+                message: "x".into(),
+            })
+            .collect::<Vec<_>>();
+        mutations.insert(0, good());
+        let outcome = S1EventOutcome {
+            canceled: false,
+            break_exp: None,
+            chat_message: None,
+            mutations,
+        };
+        assert!(apply_s1_outcome(outcome).is_err());
+        assert_eq!(super::super::block_at_dim(end, pos.0, pos.1, pos.2), before);
+    }
+
+    #[cfg(feature = "neoforge-events")]
+    #[test]
+    fn s3_s4_host_rejects_oversized_and_multiple_payloads() {
+        use crate::landing_types::{S3Activation, S3TickRequest, S3_MAX_RECORDS};
+
+        let request = S3TickRequest {
+            activation: S3Activation::BlockEntityTick,
+            dim: 0,
+            kind: 1,
+            id: 1,
+            generation: 1,
+            pos: (0, 64, 0),
+            state: 1,
+        };
+        let mut buf = vec![0; S3_CAPACITY];
+        assert!(encode_s3_request_batch(&mut buf, 1, &vec![request; S3_MAX_RECORDS + 1]).is_err());
+        let mut response = vec![b'S', b'3', 1, 1];
+        response.extend_from_slice(&((S3_MAX_RECORDS + 1) as u32).to_le_bytes());
+        response.extend_from_slice(&1u64.to_le_bytes());
+        assert!(decode_s3_response_batch(&response, 1, &[request]).is_err());
+
+        let envelope = CustomPayloadEnvelope {
+            channel: "test:hello".into(),
+            target_eid: None,
+            bytes: vec![1, 2],
+        };
+        let valid = encode_s4_payload_batch(std::slice::from_ref(&envelope)).unwrap();
+        assert!(validate_s4_inbound_frame(&valid).is_ok());
+        assert!(validate_s4_inbound_frame(&valid[..valid.len() - 1]).is_err());
+        let double = encode_s4_payload_batch(&[envelope.clone(), envelope.clone()]).unwrap();
+        assert!(validate_s4_inbound_frame(&double).is_err());
+        let targeted = encode_s4_payload_batch(&[CustomPayloadEnvelope {
+            target_eid: Some(42),
+            ..envelope.clone()
+        }])
+        .unwrap();
+        assert!(validate_s4_inbound_frame(&targeted).is_err());
+        let mut oversized_header = valid.clone();
+        let payload_offset = oversized_header.len() - envelope.bytes.len();
+        oversized_header[payload_offset - 4..payload_offset]
+            .copy_from_slice(&((S4_MAX_PAYLOAD + 1) as u32).to_le_bytes());
+        assert!(validate_s4_inbound_frame(&oversized_header)
+            .unwrap_err()
+            .contains("oversized S4 payload frame"));
+        let too_many = vec![envelope; 65];
+        assert!(encode_s4_payload_batch(&too_many).is_err());
+        let oversized = vec![0; S4_MAX_PAYLOAD + 1];
+        assert!(encode_s4_payload_batch(&[CustomPayloadEnvelope {
+            channel: "test:hello".into(),
+            target_eid: None,
+            bytes: oversized,
+        }])
+        .is_err());
     }
 }
