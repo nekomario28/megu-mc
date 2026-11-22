@@ -42,6 +42,16 @@
 //! * [`directory`] — [`directory::ServerDirectory`], the facade that owns the
 //!   whole set: `load_or_init`, Vanilla-precedence `admit_login` and
 //!   `save_all_atomic`, pinned to a [`mc_spine_core::version::TargetVersion`].
+//!   Also home to the standard folder layouts:
+//!   [`directory::ensure_server_game_dir_layout`] /
+//!   [`directory::ensure_client_game_dir_layout`] scaffold the
+//!   Vanilla/Fabric/NeoForge dedicated-server and `.minecraft`/Prism/Modrinth
+//!   client `<gameDir>` trees idempotently and fail closed on traversal
+//!   `level-name`s and symlinks.
+//! * [`mods_dir`] — [`mods_dir::scan_mods_folder`], the launcher-grade
+//!   `mods/` scanner: deterministic `.jar` discovery (plus the optional
+//!   `<mc_version>` subfolder) with a typed [`mods_dir::ModsDirSkipReason`]
+//!   for every entry it sets aside.
 //! * [`perf_cache`] — zero-side-effect performance caches: a shared
 //!   `Arc<[u8]>` compressed chunk packet cache keyed on every
 //!   rendering/protocol discriminator, a view-direction chunk send queue
@@ -56,6 +66,7 @@ pub mod directory;
 pub mod eula;
 pub mod json;
 pub mod lists;
+pub mod mods_dir;
 pub mod optifine_compat;
 pub mod pack_loader;
 pub mod pack_router;
@@ -76,7 +87,11 @@ pub use claims_wire::{
     CHANNEL_FTBCHUNKS_CLAIMS_SYNC, CHANNEL_MC_SPINE_CLAIMS_V1, CHANNEL_OPENPAC_CLAIMS_SYNC,
     MAX_WIRE_CLAIMS_PER_BATCH, MAX_WIRE_STRING_BYTES, WIRE_PROTOCOL_TAG,
 };
-pub use directory::{AdmissionDecision, ServerDirectory};
+pub use directory::{
+    ensure_client_game_dir_layout, ensure_server_game_dir_layout, AdmissionDecision,
+    FolderOutcome, ServerDirectory, StandardLayoutEntry, StandardLayoutReport,
+    CLIENT_STANDARD_FOLDERS, SERVER_STANDARD_FOLDERS,
+};
 pub use eula::{check_eula, write_default_eula, EulaStatus, EULA_FILE, EULA_LINK};
 pub use json::{Json, JsonError};
 pub use lists::{
@@ -84,6 +99,7 @@ pub use lists::{
     IpBanEntry, OpEntry, OpsList, Whitelist, WhitelistEntry, BANNED_IPS_FILE, BANNED_PLAYERS_FILE,
     OPS_FILE, WHITELIST_FILE,
 };
+pub use mods_dir::{scan_mods_folder, ModsDirSkipReason, ModsFolderScan, SkippedModEntry};
 pub use pack_router::{
     inspect_and_route_pack, PackCapabilities, PackKind, PackRouteDecision, PackRouterPolicy,
     PackRoutingReport, PackThreat, PackThreatKind, ShaderFallbackTarget,

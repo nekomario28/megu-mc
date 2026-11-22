@@ -26,13 +26,23 @@ pub enum EulaStatus {
 }
 
 /// Read `dir/eula.txt` and report whether it accepts the EULA.
+///
+/// The parser tolerates the quirks real editors leave behind — a UTF-8 BOM
+/// from Windows Notepad, CRLF and classic-CR line endings, whitespace around
+/// the key, separator and value, and blank/`#` comment lines — but stays
+/// strict about the token itself: only the exact value `true`
+/// (case-insensitive) counts, so `eula=trueish` or `eula=true#comment` fail
+/// closed to [`EulaStatus::NotAccepted`].
 pub fn check_eula(dir: &Path) -> EulaStatus {
     let bytes = match std::fs::read(dir.join(EULA_FILE)) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return EulaStatus::Missing,
         Err(_) => return EulaStatus::NotAccepted,
     };
-    match PropertiesFile::parse_bytes(&bytes) {
+    // Windows Notepad prepends EF BB BF on save; left in place it would glue
+    // U+FEFF onto the first line's key and `eula` would never resolve.
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
+    match PropertiesFile::parse_bytes(bytes) {
         Ok(props) if props.get("eula").map(|v| v.trim().eq_ignore_ascii_case("true")) == Some(true) => {
             EulaStatus::Accepted
         }

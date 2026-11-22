@@ -4,8 +4,8 @@
 use mc_spine_core::version::TargetVersion;
 use mc_spine_server_files::json::Json;
 use mc_spine_server_files::{
-    check_eula, write_atomic, write_default_eula, EulaStatus, OpsList, ServerDirectory, Whitelist,
-    EULA_FILE, EULA_LINK, OPS_FILE, WHITELIST_FILE,
+    check_eula, ensure_server_game_dir_layout, write_atomic, write_default_eula, EulaStatus,
+    OpsList, ServerDirectory, Whitelist, EULA_FILE, EULA_LINK, OPS_FILE, WHITELIST_FILE,
 };
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -281,7 +281,16 @@ fn initialize(options: &Options, actions: &[Planned]) -> io::Result<()> {
             _ => unreachable!(),
         }
     }
-    Ok(())
+
+    // Scaffold the rest of the familiar Vanilla/Fabric/NeoForge folder tree
+    // (config/, logs/, crash-reports/, <level-name>/datapacks/, ...). These
+    // folders are additive scaffolding: they deliberately stay out of the
+    // plan's action list and hold nothing the plan manages. A traversal
+    // `level-name` or a symlink at a target path fails the whole init.
+    match &directory {
+        Some(dir) => dir.ensure_standard_folders().map(|_| ()),
+        None => ensure_server_game_dir_layout(&options.dir).map(|_| ()),
+    }
 }
 
 fn report(options: &Options, actions: &[Planned]) {

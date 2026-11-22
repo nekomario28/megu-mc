@@ -192,6 +192,193 @@ impl ServerDirectory {
         self.usercache.save_to(&self.root.join(USERCACHE_FILE))?;
         Ok(())
     }
+
+    /// Ensure the standard dedicated-server folder layout under
+    /// [`Self::root`]: [`SERVER_STANDARD_FOLDERS`] plus
+    /// `<level-name>/datapacks`, with `level-name` taken from the loaded
+    /// `server.properties` (Vanilla's `world` default when the key is
+    /// absent). Idempotent and fail-closed like
+    /// [`ensure_server_game_dir_layout`], but uses this directory's parsed
+    /// properties instead of re-reading the file.
+    pub fn ensure_standard_folders(&self) -> io::Result<StandardLayoutReport> {
+        ensure_standard_folders_at(&self.root, &self.properties.level_name())
+    }
+}
+
+// -------------------------------------------------------- standard layout
+
+/// The folders a Vanilla/Paper/Fabric/NeoForge dedicated server keeps in
+/// its working directory. `<level-name>/datapacks` is derived from
+/// `level-name` and ensured in addition to these.
+pub const SERVER_STANDARD_FOLDERS: [&str; 6] = [
+    "mods",
+    "config",
+    "defaultconfigs",
+    "logs",
+    "crash-reports",
+    "backups",
+];
+
+/// The folders a standard client game directory (`.minecraft`, a Prism
+/// Launcher instance, a Modrinth App profile) keeps.
+pub const CLIENT_STANDARD_FOLDERS: [&str; 8] = [
+    "mods",
+    "config",
+    "resourcepacks",
+    "shaderpacks",
+    "saves",
+    "screenshots",
+    "logs",
+    "crash-reports",
+];
+
+/// What happened to one folder in a [`StandardLayoutReport`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FolderOutcome {
+    /// The folder did not exist and was created.
+    Created,
+    /// The folder already existed as a real directory; left untouched.
+    AlreadyPresent,
+}
+
+/// One folder a standard-layout pass ensured.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandardLayoutEntry {
+    /// The folder's path relative to the managed root (`mods`,
+    /// `world/datapacks`, ...).
+    pub relative_path: PathBuf,
+    /// Whether it was created or already present.
+    pub outcome: FolderOutcome,
+}
+
+/// The folders a standard-layout pass ensured, in fixed declaration order
+/// — nothing is ever removed or rewritten, so a repeated pass reports
+/// [`FolderOutcome::AlreadyPresent`] everywhere.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StandardLayoutReport {
+    /// One entry per ensured folder.
+    pub entries: Vec<StandardLayoutEntry>,
+}
+
+impl StandardLayoutReport {
+    /// The relative paths this pass created.
+    pub fn created(&self) -> Vec<&Path> {
+        self.entries
+            .iter()
+            .filter(|e| e.outcome == FolderOutcome::Created)
+            .map(|e| e.relative_path.as_path())
+            .collect()
+    }
+}
+
+fn traversal_err(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{} is not a safe relative folder name", path.display()),
+    )
+}
+
+fn unsafe_folder_err(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{} has an unsafe or incompatible file type", path.display()),
+    )
+}
+
+/// `level-name` is joined under the server root, so it must be a relative
+/// path of plain components only: `..`, an absolute path or an empty name
+/// would escape the server directory, so they fail closed.
+fn validated_level_path(level_name: &str) -> io::Result<PathBuf> {
+    let rel = Path::new(level_name);
+    if !level_name.is_empty()
+        && rel
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+    {
+        // `components` already normalizes stray `.` components away.
+        Ok(rel.components().collect())
+    } else {
+        Err(traversal_err(rel))
+    }
+}
+
+/// Ensure `root/rel` is a real directory. Every existing component on the
+/// way down must be a genuine directory — a symlink or a regular file
+/// anywhere fails closed — and the first missing component (plus anything
+/// under it) is created with `create_dir_all`.
+fn ensure_folder(root: &Path, rel: &Path) -> io::Result<FolderOutcome> {
+    let target = root.join(rel);
+    let mut cursor = root.to_path_buf();
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(name) => cursor.push(name),
+            _ => return Err(traversal_err(rel)),
+        }
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Err(unsafe_folder_err(&cursor));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // Everything above `cursor` exists; `create_dir_all` fills
+                // in this component and the rest of `rel` under it.
+                std::fs::create_dir_all(&target)?;
+                return Ok(FolderOutcome::Created);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(FolderOutcome::AlreadyPresent)
+}
+
+fn ensure_standard_folders_at(root: &Path, level_name: &str) -> io::Result<StandardLayoutReport> {
+    // Validate `level-name` before creating anything: a traversal in the
+    // world folder must not be preceded by six successfully created ones.
+    let datapacks = validated_level_path(level_name)?.join("datapacks");
+    let mut report = StandardLayoutReport::default();
+    for rel in SERVER_STANDARD_FOLDERS
+        .iter()
+        .map(PathBuf::from)
+        .chain([datapacks])
+    {
+        report.entries.push(StandardLayoutEntry {
+            outcome: ensure_folder(root, &rel)?,
+            relative_path: rel,
+        });
+    }
+    Ok(report)
+}
+
+/// Ensure `server_dir` carries the folder set a Vanilla/Paper/Fabric/
+/// NeoForge dedicated server expects: [`SERVER_STANDARD_FOLDERS`] plus
+/// `<level-name>/datapacks` (with `level-name` read from
+/// `server.properties`, defaulting to Vanilla's `world`).
+///
+/// Idempotent: existing real directories are reported
+/// [`FolderOutcome::AlreadyPresent`] and never modified. Fails closed on a
+/// `level-name` that escapes `server_dir` (`..`, absolute, empty), on a
+/// corrupt `server.properties` (rather than guessing a folder), and on a
+/// symlink or non-directory at any target path.
+pub fn ensure_server_game_dir_layout(server_dir: &Path) -> io::Result<StandardLayoutReport> {
+    let properties = ServerProperties::load_from(&server_dir.join(PROPERTIES_FILE))?;
+    ensure_standard_folders_at(server_dir, &properties.level_name())
+}
+
+/// Ensure `game_dir` carries the folder set a standard client game
+/// directory (`.minecraft`, Prism instance, Modrinth profile) expects:
+/// [`CLIENT_STANDARD_FOLDERS`]. Same idempotency and fail-closed symlink
+/// rules as [`ensure_server_game_dir_layout`]; a missing `game_dir` is
+/// created along the way.
+pub fn ensure_client_game_dir_layout(game_dir: &Path) -> io::Result<StandardLayoutReport> {
+    let mut report = StandardLayoutReport::default();
+    for name in CLIENT_STANDARD_FOLDERS {
+        let rel = PathBuf::from(name);
+        report.entries.push(StandardLayoutEntry {
+            outcome: ensure_folder(game_dir, &rel)?,
+            relative_path: rel,
+        });
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
