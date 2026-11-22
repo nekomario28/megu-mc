@@ -33,6 +33,14 @@
 //!   [`perf_kit::CoalescedDeltaBatch`] last-write-wins delta collapser, and
 //!   an [`perf_kit::AdaptiveLoadGovernor`] hysteresis budget scale — all
 //!   generic so any vanilla or modded subsystem can plug in.
+//! * [`sys_metrics`] — a fail-safe system & performance telemetry
+//!   snapshotter for the opt-in Advanced MiniHUD and server TUI: pure
+//!   `/proc` + `/sys/class/drm` parsers for RAM/CPU/GPU with `None`
+//!   fallback off Linux, a [`sys_metrics::FrameTimingStats`] rolling
+//!   FPS/1%-low/MSPT ring buffer, and the
+//!   [`sys_metrics::MiniHudConfig`] + [`sys_metrics::format_mini_hud_lines`]
+//!   selectable-overlay formatter. No clocks, no panics, no external
+//!   crates.
 
 #![deny(unsafe_code)]
 
@@ -41,4 +49,5 @@ pub mod id;
 pub mod math;
 pub mod perf_kit;
 pub mod random;
+pub mod sys_metrics;
 pub mod version;
