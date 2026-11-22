@@ -172,6 +172,7 @@ pub mod neoforge_wire;
 pub mod profile;
 pub mod season_primitives;
 pub mod unified_bundle;
+pub mod vanilla_qol_and_holidays;
 pub mod version_compat;
 pub mod world_extensions;
 
