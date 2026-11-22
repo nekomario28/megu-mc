@@ -11,11 +11,30 @@
 //! deterministic shelf packer: identical inputs always produce a
 //! byte-identical atlas, which keeps texture uploads cache-stable.
 //!
+//! The padding border's fill is controlled by [`PaddingMode`], set builder-
+//! wide with [`AtlasBuilder::set_padding_mode`] or per sprite with
+//! [`AtlasBuilder::add_sprite_with_mode`]: [`PaddingMode::Transparent`] (the
+//! default, the historical `(0, 0, 0, 0)` gutter), [`PaddingMode::ClampEdge`]
+//! which replicates the nearest sprite edge texel outward, or
+//! [`PaddingMode::WrapTile`] which wraps texels from the opposite sprite
+//! edge so `fract`-wrapped shader sampling tiles seamlessly. The fill covers
+//! the full `1..=padding` border on all four sides including the corners.
+//! [`AtlasBuilder::for_blocks`] presets [`PaddingMode::WrapTile`] for
+//! tile-safe block atlases.
+//!
 //! [`build_mipmaps`] downsamples a packed atlas with alpha-weighted
 //! averaging: colour channels are weighted by each texel's alpha, so fully
 //! transparent texels (`a == 0`) contribute nothing and cutout foliage,
 //! flowers and 3D-model leaves keep their pure colours instead of picking up
 //! a black fringe at lower mip levels.
+//!
+//! [`build_mipmaps_linear`] is the gamma-correct variant: RGB is averaged in
+//! linear sRGB space through a deterministic 256-entry decode LUT and
+//! encoded back to sRGB, so averaging sRGB 0 and 255 yields ~188 instead of
+//! the naive ~128. Its optional `cutout_alpha_cutoff` rescales each level's
+//! alpha — deterministically binary-searching a factor in `1.0..=4.0` — so
+//! the fraction of texels passing the cutoff tracks the base image and
+//! distant cutout foliage keeps its silhouette instead of vanishing.
 //!
 //! [`SpriteAnimation`] is the client-side half of the `.mcmeta` animation
 //! section: it resolves a vertical strip sprite (`height = frame_count *
@@ -25,8 +44,10 @@
 //!
 //! [`remap_baked_quad_uvs`] (and its half-texel-inset variant) maps a
 //! [`BakedModelQuad`]'s vanilla `0..16` UVs into the sprite's sub-rect of a
-//! [`PackedAtlas`], and [`apply_biome_tint`] performs the cheap RGB multiply
-//! biomes apply to foliage and grass without touching alpha.
+//! [`PackedAtlas`], [`PackedAtlas::tile_rect`] exposes the same sub-rect in
+//! tile-safe form for shaders that wrap sprite UVs with `fract` and sample
+//! with `textureSampleGrad`, and [`apply_biome_tint`] performs the cheap RGB
+//! multiply biomes apply to foliage and grass without touching alpha.
 //!
 //! Every limit is fail-closed: bad sprite dimensions, bad RGBA lengths,
 //! duplicate names, atlas overflow, mip chains that would drop below 1x1 and
@@ -279,6 +300,28 @@ struct SpriteData {
     width: u32,
     height: u32,
     rgba: Vec<u8>,
+    mode: PaddingMode,
+}
+
+/// How the padding border reserved around a packed sprite is filled.
+///
+/// The border exists so mipmapped edges cannot bleed a neighbouring
+/// sprite's colours into this one; the mode decides what the border texels
+/// contain. The fill covers the full `1..=padding` border on all four
+/// sides including the four corners. See [`AtlasBuilder::set_padding_mode`]
+/// and [`AtlasBuilder::add_sprite_with_mode`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PaddingMode {
+    /// Fully transparent `(0, 0, 0, 0)` gutter — the historical default.
+    #[default]
+    Transparent,
+    /// Replicates the nearest sprite edge texel outward on every side and
+    /// corner, so the border continues the sprite's edge colours and alpha.
+    ClampEdge,
+    /// Wraps texels from the opposite sprite edge (wrapping both axes at
+    /// the corners), so `fract`-wrapped shader sampling tiles seamlessly
+    /// across the sprite boundary.
+    WrapTile,
 }
 
 /// Queues RGBA8 sprites and packs them into a deterministic power-of-two
@@ -289,15 +332,30 @@ pub struct AtlasBuilder {
     sprites: BTreeMap<String, SpriteData>,
     max_dim: u32,
     padding: u32,
+    padding_mode: PaddingMode,
 }
 
 impl AtlasBuilder {
-    /// A builder with [`DEFAULT_ATLAS_MAX_DIM`] and no padding.
+    /// A builder with [`DEFAULT_ATLAS_MAX_DIM`], no padding and
+    /// [`PaddingMode::Transparent`] gutters.
     pub fn new() -> Self {
         Self {
             sprites: BTreeMap::new(),
             max_dim: DEFAULT_ATLAS_MAX_DIM,
             padding: 0,
+            padding_mode: PaddingMode::Transparent,
+        }
+    }
+
+    /// A builder preset for block atlases: [`DEFAULT_ATLAS_MAX_DIM`], no
+    /// padding, and [`PaddingMode::WrapTile`] gutter fills so tiled
+    /// (`fract`-wrapped) UV sampling continues seamlessly across sprite
+    /// edges. Call [`set_padding`](Self::set_padding) to reserve the border
+    /// the mode fills.
+    pub fn for_blocks() -> Self {
+        Self {
+            padding_mode: PaddingMode::WrapTile,
+            ..Self::new()
         }
     }
 
@@ -322,13 +380,26 @@ impl AtlasBuilder {
     }
 
     /// Sets the per-sprite padding border: `0` disables it, `1..=8` reserves
-    /// that many transparent texels on every side of each sprite.
+    /// that many texels on every side of each sprite.
     pub fn set_padding(&mut self, padding: u32) -> Result<(), AtlasError> {
         if padding > MAX_SPRITE_PADDING {
             return Err(AtlasError::InvalidPadding(padding));
         }
         self.padding = padding;
         Ok(())
+    }
+
+    /// The [`PaddingMode`] applied to sprites queued with
+    /// [`add`](Self::add).
+    pub fn padding_mode(&self) -> PaddingMode {
+        self.padding_mode
+    }
+
+    /// Sets the default [`PaddingMode`] for subsequently queued sprites.
+    /// [`add_sprite_with_mode`](Self::add_sprite_with_mode) overrides it
+    /// per sprite. Has no visible effect while `padding` is 0.
+    pub fn set_padding_mode(&mut self, mode: PaddingMode) {
+        self.padding_mode = mode;
     }
 
     /// Number of queued sprites.
@@ -341,7 +412,8 @@ impl AtlasBuilder {
         self.sprites.is_empty()
     }
 
-    /// Queues one RGBA8 sprite. `rgba` must be exactly `width * height * 4`
+    /// Queues one RGBA8 sprite with the builder's current
+    /// [`PaddingMode`]. `rgba` must be exactly `width * height * 4`
     /// bytes in row-major order. Fails closed on an empty name, zero
     /// dimensions, a length mismatch, a duplicate name, or a sprite whose
     /// padded cell can never fit inside the atlas limit.
@@ -351,6 +423,20 @@ impl AtlasBuilder {
         width: u32,
         height: u32,
         rgba: Vec<u8>,
+    ) -> Result<(), AtlasError> {
+        let mode = self.padding_mode;
+        self.add_sprite_with_mode(name, width, height, rgba, mode)
+    }
+
+    /// [`add`](Self::add) with an explicit [`PaddingMode`] for this
+    /// sprite's padding border, overriding the builder default.
+    pub fn add_sprite_with_mode(
+        &mut self,
+        name: impl Into<String>,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+        mode: PaddingMode,
     ) -> Result<(), AtlasError> {
         let name = name.into();
         if name.is_empty() {
@@ -392,6 +478,7 @@ impl AtlasBuilder {
                 width,
                 height,
                 rgba,
+                mode,
             },
         );
         Ok(())
@@ -502,6 +589,7 @@ impl AtlasBuilder {
                 let dst = ((y as usize + row) * atlas_w as usize + x as usize) * 4;
                 rgba[dst..dst + src_row].copy_from_slice(src);
             }
+            fill_padding_gutter(&mut rgba, atlas_w, sprite, x, y, padding);
         }
 
         Ok(PackedAtlas {
@@ -520,6 +608,58 @@ impl Default for AtlasBuilder {
     }
 }
 
+/// Fills the `padding`-texel gutter around `sprite` — placed at atlas pixel
+/// `x, y` — according to `sprite.mode`, covering the full `1..=padding`
+/// border on all four sides including the four corners.
+///
+/// The cell `[x - padding, x + width + padding)` ×
+/// `[y - padding, y + height + padding)` is exclusively owned by this
+/// sprite: the shelf packer never overlaps cells, so the fill cannot touch
+/// a neighbour's texels. No-op for [`PaddingMode::Transparent`] (the
+/// buffer is already zeroed) and for `padding == 0`.
+fn fill_padding_gutter(
+    rgba: &mut [u8],
+    atlas_w: u32,
+    sprite: &SpriteData,
+    x: u32,
+    y: u32,
+    padding: u32,
+) {
+    if padding == 0 || sprite.mode == PaddingMode::Transparent {
+        return;
+    }
+    let cell_x = x - padding;
+    let cell_y = y - padding;
+    let cell_right = x + sprite.width + padding;
+    let cell_bottom = y + sprite.height + padding;
+    for cy in cell_y..cell_bottom {
+        for cx in cell_x..cell_right {
+            // Skip the sprite's own texels.
+            if cx >= x && cx < x + sprite.width && cy >= y && cy < y + sprite.height {
+                continue;
+            }
+            // Offset from the sprite's top-left, in
+            // `-padding..width + padding` on each axis.
+            let sx = i64::from(cx) - i64::from(x);
+            let sy = i64::from(cy) - i64::from(y);
+            let (tx, ty) = match sprite.mode {
+                PaddingMode::ClampEdge => (
+                    sx.clamp(0, i64::from(sprite.width) - 1) as u32,
+                    sy.clamp(0, i64::from(sprite.height) - 1) as u32,
+                ),
+                PaddingMode::WrapTile => (
+                    sx.rem_euclid(i64::from(sprite.width)) as u32,
+                    sy.rem_euclid(i64::from(sprite.height)) as u32,
+                ),
+                PaddingMode::Transparent => continue,
+            };
+            let src = (ty as usize * sprite.width as usize + tx as usize) * 4;
+            let dst = (cy as usize * atlas_w as usize + cx as usize) * 4;
+            rgba[dst..dst + 4].copy_from_slice(&sprite.rgba[src..src + 4]);
+        }
+    }
+}
+
 /// Where one sprite's pixels landed inside a [`PackedAtlas`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpritePlacement {
@@ -531,6 +671,32 @@ pub struct SpritePlacement {
     pub width: u32,
     /// Sprite height in texels.
     pub height: u32,
+}
+
+/// Tile-safe sampling sub-rect of one packed sprite, for shaders that wrap
+/// sprite UVs with `fract` (`uv - floor(uv)`) and sample with
+/// `textureSampleGrad`.
+///
+/// The sprite's `[0, 1)` UV domain maps onto
+/// `[u0, u0 + u_scale)` × `[v0, v0 + v_scale)` in normalized atlas space, so
+/// every wrapped sample — including UVs far outside `0..1` — lands on this
+/// sprite's texels and nowhere else. `texel_u`/`texel_v` are one atlas
+/// texel in normalized UV units (`1 / width`, `1 / height`), for scaling
+/// explicit sample gradients. See [`PackedAtlas::tile_rect`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AtlasTileRect {
+    /// Left edge of the sprite rect in normalized atlas U.
+    pub u0: f32,
+    /// Top edge of the sprite rect in normalized atlas V.
+    pub v0: f32,
+    /// Sprite rect width in normalized atlas U (right edge minus `u0`).
+    pub u_scale: f32,
+    /// Sprite rect height in normalized atlas V (bottom edge minus `v0`).
+    pub v_scale: f32,
+    /// One atlas texel in normalized U (`1 / atlas.width`).
+    pub texel_u: f32,
+    /// One atlas texel in normalized V (`1 / atlas.height`).
+    pub texel_v: f32,
 }
 
 /// A finished atlas: power-of-two RGBA8 pixels plus every sprite's pixel
@@ -562,6 +728,31 @@ impl PackedAtlas {
     pub fn uv_rect(&self, name: &str) -> Option<[f32; 4]> {
         self.placement(name)
             .map(|placement| self.placement_uv_rect(placement))
+    }
+
+    /// Tile-safe sampling rect for `name`, or `None` when the sprite is not
+    /// packed. Resolves `name` like the baked-quad remappers: exact sprite
+    /// name, then the path part of a `namespace:path` id, then a
+    /// `minecraft:`-prefixed guess for namespace-less ids.
+    ///
+    /// The shader contract is `fract`-wrapped UVs: with
+    /// `f = uv - floor(uv)` (GLSL `fract`), the atlas coordinate
+    /// `u0 + f_u * u_scale`, `v0 + f_v * v_scale` always lands inside
+    /// `[u0, u0 + u_scale)` × `[v0, v0 + v_scale)` — the sprite's own
+    /// texels — for any input UV, so tiled block faces never sample a
+    /// neighbour. `texel_u`/`texel_v` carry the atlas texel size for
+    /// `textureSampleGrad` derivative scaling.
+    pub fn tile_rect(&self, name: &str) -> Option<AtlasTileRect> {
+        let placement = find_placement(self, name)?;
+        let rect = self.placement_uv_rect(placement);
+        Some(AtlasTileRect {
+            u0: rect[0],
+            v0: rect[1],
+            u_scale: rect[2] - rect[0],
+            v_scale: rect[3] - rect[1],
+            texel_u: 1.0 / self.width as f32,
+            texel_v: 1.0 / self.height as f32,
+        })
     }
 
     /// Maximum mip chain depth: the number of times the smaller atlas
@@ -648,14 +839,9 @@ fn mip_half(src_w: u32, src_h: u32, src: &[u8]) -> (u32, u32, Vec<u8>) {
     (dst_w, dst_h, dst)
 }
 
-/// Generates `levels` downsampled mip levels below the atlas base image
-/// (level 1 is half resolution; the base image itself is not returned).
-///
-/// Every step is alpha-weighted: transparent texels do not bleed black into
-/// cutout sprites. Fails closed with [`AtlasError::MalformedAtlas`] on a
-/// hand-damaged [`PackedAtlas`] or [`AtlasError::TooManyMipLevels`] when the
-/// chain would shrink a dimension below 1 texel.
-pub fn build_mipmaps(atlas: &PackedAtlas, levels: u32) -> Result<Vec<AtlasMip>, AtlasError> {
+/// Validates an atlas's pixel buffer and the requested mip depth, shared
+/// by [`build_mipmaps`] and [`build_mipmaps_linear`].
+fn validate_mip_request(atlas: &PackedAtlas, levels: u32) -> Result<(), AtlasError> {
     // u128 math: `PackedAtlas` fields are public, so a hand-built atlas may
     // carry dimensions whose byte count overflows u64; the comparison must
     // never wrap or panic.
@@ -673,6 +859,18 @@ pub fn build_mipmaps(atlas: &PackedAtlas, levels: u32) -> Result<Vec<AtlasMip>, 
             max,
         });
     }
+    Ok(())
+}
+
+/// Generates `levels` downsampled mip levels below the atlas base image
+/// (level 1 is half resolution; the base image itself is not returned).
+///
+/// Every step is alpha-weighted: transparent texels do not bleed black into
+/// cutout sprites. Fails closed with [`AtlasError::MalformedAtlas`] on a
+/// hand-damaged [`PackedAtlas`] or [`AtlasError::TooManyMipLevels`] when the
+/// chain would shrink a dimension below 1 texel.
+pub fn build_mipmaps(atlas: &PackedAtlas, levels: u32) -> Result<Vec<AtlasMip>, AtlasError> {
+    validate_mip_request(atlas, levels)?;
     let mut mips: Vec<AtlasMip> = Vec::with_capacity(levels as usize);
     for level in 1..=levels {
         // Level 1 downsamples the base atlas; level k downsamples level k-1.
@@ -683,6 +881,185 @@ pub fn build_mipmaps(atlas: &PackedAtlas, levels: u32) -> Result<Vec<AtlasMip>, 
             (prev.width, prev.height, prev.rgba.as_slice())
         };
         let (width, height, rgba) = mip_half(src_w, src_h, src);
+        mips.push(AtlasMip {
+            level,
+            width,
+            height,
+            rgba,
+        });
+    }
+    Ok(mips)
+}
+
+// ---------------------------------------------------------------------------
+// Gamma-correct (linear sRGB) mipmaps
+// ---------------------------------------------------------------------------
+
+/// Deterministic 256-entry sRGB → linear-light decode table (IEC 61966-2-1
+/// EOTF). Index `i` decodes sRGB byte `i` to a linear `f32` in `0.0..=1.0`.
+fn srgb_to_linear_lut() -> [f32; 256] {
+    let mut lut = [0f32; 256];
+    for (i, entry) in lut.iter_mut().enumerate() {
+        let c = i as f32 / 255.0;
+        *entry = if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        };
+    }
+    lut
+}
+
+/// Encodes a linear-light channel (`0.0..=1.0`, clamped) back to an sRGB
+/// byte with round-to-nearest — the inverse of [`srgb_to_linear_lut`].
+fn linear_to_srgb_u8(linear: f64) -> u8 {
+    let l = linear.clamp(0.0, 1.0);
+    let encoded = if l <= 0.003_130_8 {
+        l * 12.92
+    } else {
+        1.055 * l.powf(1.0 / 2.4) - 0.055
+    };
+    (encoded * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+/// [`mip_half`] in linear sRGB space: each source texel's RGB is decoded
+/// through `srgb_to_linear`, alpha-weighted averaged, and encoded back.
+/// Alpha handling is identical to [`mip_half`].
+fn mip_half_linear(
+    src_w: u32,
+    src_h: u32,
+    src: &[u8],
+    srgb_to_linear: &[f32; 256],
+) -> (u32, u32, Vec<u8>) {
+    let dst_w = src_w / 2;
+    let dst_h = src_h / 2;
+    let mut dst = vec![0u8; dst_w as usize * dst_h as usize * 4];
+    for dy in 0..dst_h {
+        for dx in 0..dst_w {
+            let mut alpha_sum = 0u64;
+            let mut color_sum = [0f64; 3];
+            for sy in 0..2u32 {
+                for sx in 0..2u32 {
+                    let px = dx * 2 + sx;
+                    let py = dy * 2 + sy;
+                    if px >= src_w || py >= src_h {
+                        continue;
+                    }
+                    let i = ((py * src_w + px) * 4) as usize;
+                    let a = u64::from(src[i + 3]);
+                    alpha_sum += a;
+                    for (channel, sum) in color_sum.iter_mut().enumerate() {
+                        *sum += f64::from(srgb_to_linear[usize::from(src[i + channel])])
+                            * a as f64;
+                    }
+                }
+            }
+            let out = ((dy * dst_w + dx) * 4) as usize;
+            if alpha_sum == 0 {
+                // dst is already zeroed: (0, 0, 0, 0).
+                continue;
+            }
+            let alpha_f = alpha_sum as f64;
+            for (channel, sum) in color_sum.iter().enumerate() {
+                dst[out + channel] = linear_to_srgb_u8(*sum / alpha_f);
+            }
+            dst[out + 3] = div_round(alpha_sum, 4);
+        }
+    }
+    (dst_w, dst_h, dst)
+}
+
+/// Fraction of texels whose alpha — optionally pre-scaled by `scale`
+/// (round-to-nearest, clamped to `u8`) — is `>= cutoff`.
+fn alpha_cutoff_fraction(rgba: &[u8], cutoff: u8, scale: f64) -> f64 {
+    let mut passing = 0u64;
+    let mut total = 0u64;
+    for px in rgba.as_chunks::<4>().0 {
+        total += 1;
+        let boosted = (f64::from(px[3]) * scale).round().min(255.0);
+        if boosted >= f64::from(cutoff) {
+            passing += 1;
+        }
+    }
+    if total == 0 {
+        return 0.0;
+    }
+    passing as f64 / total as f64
+}
+
+/// Upper bound of the cutout-coverage alpha scale search: the boost never
+/// drops below 1.0 (no dimming) nor exceeds 4.0.
+const CUTOUT_ALPHA_SCALE_MAX: f64 = 4.0;
+
+/// Fixed iteration count for the deterministic coverage binary search.
+const CUTOUT_SEARCH_STEPS: usize = 32;
+
+/// Rescales `rgba`'s alpha so the fraction of texels with `a >= cutoff`
+/// keeps tracking `base_fraction` (the fraction measured on the base
+/// image). Returns immediately when the level already passes at least
+/// `base_fraction`; otherwise binary-searches the smallest scale in
+/// `1.0..=4.0` that reaches it — best effort, so 4.0 when even that falls
+/// short — and applies it round-to-nearest.
+fn preserve_cutout_coverage(rgba: &mut [u8], base_fraction: f64, cutoff: u8) {
+    if alpha_cutoff_fraction(rgba, cutoff, 1.0) >= base_fraction {
+        return;
+    }
+    let mut lo = 1.0f64;
+    let mut hi = CUTOUT_ALPHA_SCALE_MAX;
+    for _ in 0..CUTOUT_SEARCH_STEPS {
+        let mid = (lo + hi) * 0.5;
+        if alpha_cutoff_fraction(rgba, cutoff, mid) >= base_fraction {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    for px in rgba.as_chunks_mut::<4>().0 {
+        px[3] = (f64::from(px[3]) * hi).round().min(255.0) as u8;
+    }
+}
+
+/// [`build_mipmaps`] in gamma-correct linear sRGB space.
+///
+/// RGB channels are decoded through a deterministic 256-entry sRGB→linear
+/// LUT, alpha-weighted averaged, and encoded back to sRGB, so averaging
+/// sRGB 0 and 255 yields ~188 instead of the naive ~128 and mid-tone mip
+/// colours stay perceptually correct. Alpha handling is identical to
+/// [`build_mipmaps`].
+///
+/// When `cutout_alpha_cutoff` is `Some(cutoff)`, each level's alpha is
+/// additionally rescaled so the fraction of texels with `a >= cutoff`
+/// keeps tracking the base image — distant cutout foliage and crops retain
+/// their silhouette coverage instead of alpha-diluting below the cutoff
+/// and vanishing.
+///
+/// Shares [`build_mipmaps`]'s fail-closed contract:
+/// [`AtlasError::MalformedAtlas`] on a hand-damaged [`PackedAtlas`] and
+/// [`AtlasError::TooManyMipLevels`] when the chain would shrink a dimension
+/// below 1 texel.
+pub fn build_mipmaps_linear(
+    atlas: &PackedAtlas,
+    levels: u32,
+    cutout_alpha_cutoff: Option<u8>,
+) -> Result<Vec<AtlasMip>, AtlasError> {
+    validate_mip_request(atlas, levels)?;
+    let srgb_to_linear = srgb_to_linear_lut();
+    let base_fraction = cutout_alpha_cutoff.map_or(0.0, |cutoff| {
+        alpha_cutoff_fraction(&atlas.rgba, cutoff, 1.0)
+    });
+    let mut mips: Vec<AtlasMip> = Vec::with_capacity(levels as usize);
+    for level in 1..=levels {
+        // Level 1 downsamples the base atlas; level k downsamples level k-1.
+        let (src_w, src_h, src) = if level == 1 {
+            (atlas.width, atlas.height, atlas.rgba.as_slice())
+        } else {
+            let prev = &mips[(level - 2) as usize];
+            (prev.width, prev.height, prev.rgba.as_slice())
+        };
+        let (width, height, mut rgba) = mip_half_linear(src_w, src_h, src, &srgb_to_linear);
+        if let Some(cutoff) = cutout_alpha_cutoff {
+            preserve_cutout_coverage(&mut rgba, base_fraction, cutoff);
+        }
         mips.push(AtlasMip {
             level,
             width,
