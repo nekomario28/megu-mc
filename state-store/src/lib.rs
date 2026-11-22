@@ -98,6 +98,7 @@ pub mod region_tick;
 pub mod sharded;
 pub mod snapshot;
 pub mod world_snapshot;
+pub mod world_interop;
 
 pub use anvil_inspect::{
     decode_nbt_to_data_value, encode_data_value_to_nbt, gzip_decompress, gzip_encode_stored,
@@ -138,3 +139,10 @@ pub use sharded::{
     ServerContext, TickKind, SHARD_COUNT,
 };
 pub use snapshot::{decode_snapshot, encode_snapshot, SnapshotError};
+pub use world_interop::{
+    extract_preserved_attachments, inspect_world_interop, merge_preserved_attachments,
+    prepare_cross_loader_handoff, roundtrip_level_dat_preserving_attachments,
+    roundtrip_playerdata_preserving_attachments, CompanionFileCounts, CrossLoaderHandoff,
+    InteropError, PreservedNbtEnvelope, WorldDimensionInfo, WorldInteropReport,
+    WorldLoaderOrigin, PRESERVED_MOD_ATTACHMENT_KEYS,
+};
