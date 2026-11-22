@@ -1,0 +1,4 @@
+# Cap default Cargo job fan-out so concurrent worktrees and desktop apps
+# never push a 30 GiB host past systemd-oomd's 90% swap threshold.
+[build]
+jobs = 1

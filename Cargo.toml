@@ -13,19 +13,19 @@ strip = true
 # once per isolated test, so its size is paid on every one of those runs.
 [profile.dev]
 debug = "line-tables-only"
-codegen-units = 8
+codegen-units = 2
 incremental = false
 
 # The suite is compute-bound, not compile-bound: a cold `cargo test --no-run`
 # took 12.96 s while the suite itself took 623.72 s (measured 2026-11-16). Level 1
 # keeps `debug-assertions` and `overflow-checks` on, so the assertions the tests
 # rely on still fire; it only stops the inner loops from being unoptimised.
-# Bound codegen-units and disable incremental so a single monolithic `rustc --test`
-# stays within ~1.5-2.2 GiB RSS instead of spiking to 6-10 GiB across 256 CGUs.
+# Single codegen-unit + non-incremental keeps monolithic `rustc --test` RSS
+# bounded (~1.3-1.8 GiB) instead of spiking 4-10 GiB across parallel LLVM CGUs.
 [profile.test]
 opt-level = 1
 debug = "line-tables-only"
-codegen-units = 4
+codegen-units = 1
 incremental = false
 
 # Optimized but quick-to-link builds for iteration: cargo build --profile fast
