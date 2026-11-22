@@ -22,6 +22,7 @@ mod section;
 pub mod shaderpack;
 pub mod shaderpack_reflect;
 pub mod upload_budget;
+pub mod vfx_engine;
 pub mod visibility;
 
 #[cfg(test)]
