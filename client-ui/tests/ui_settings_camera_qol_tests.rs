@@ -5,7 +5,9 @@ use mc_spine_client_ui::state::{
     Screen, SettingKey, SettingsTab, UiAction, UiInputEvent, UiModal, UiSettings, UiState, WidgetId,
 };
 
-fn edits() -> [(SettingKey, fn(&mut UiSettings)); 7] {
+type SettingEdit = (SettingKey, fn(&mut UiSettings));
+
+fn edits() -> [SettingEdit; 7] {
     [
         (SettingKey::FovDeg, |s| s.set_fov_deg(105)),
         (SettingKey::MouseSensitivityPct, |s| {

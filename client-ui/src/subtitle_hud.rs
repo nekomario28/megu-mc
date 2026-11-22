@@ -107,7 +107,7 @@ impl SubtitleArrow {
     /// Glyph cells the markers occupy (`< `, `v `, ` >` are 2 cells,
     /// centered cues have none).
     fn marker_cells(self) -> usize {
-        self.prefix().chars().count() + self.suffix().chars().count()
+        crate::draw::text_cells(self.prefix()) + crate::draw::text_cells(self.suffix())
     }
 }
 
@@ -178,7 +178,7 @@ impl SubtitleHudState {
         } else {
             DEFAULT_TTL_SECS
         };
-        let id: String = id.into().chars().take(MAX_ID_CELLS).collect();
+        let id: String = crate::draw::first_cells(id.into().as_str(), MAX_ID_CELLS).to_owned();
         let label = clean_label(&label.into());
         if let Some(pos) = self.entries.iter().position(|e| e.id == id) {
             let mut entry = self.entries.remove(pos);
@@ -285,7 +285,7 @@ impl SubtitleHudState {
         // at emit time; the backdrop stays rectangular.
         let inner_cells = rows
             .iter()
-            .map(|(entry, marker)| marker + entry.label.chars().count())
+            .map(|(entry, marker)| marker + crate::draw::text_cells(&entry.label))
             .max()
             .unwrap_or(0)
             .min(max_inner_cells(lw));
@@ -347,10 +347,10 @@ impl SubtitleHudState {
                 UiColor::rgba(0, 0, 0, (f32::from(BACKDROP_ALPHA) * fade) as u8),
             );
             let label_budget = inner_cells.saturating_sub(*marker);
-            let clipped: String = entry.label.chars().take(label_budget).collect();
+            let clipped = crate::draw::first_cells(&entry.label, label_budget);
             let mut text = String::with_capacity(entry.label.len() + 4);
             text.push_str(entry.arrow.prefix());
-            text.push_str(&clipped);
+            text.push_str(clipped);
             text.push_str(entry.arrow.suffix());
             out.text_str(
                 (panel_x + ROW_PAD_X) * ms as i32,
@@ -441,14 +441,17 @@ fn max_inner_cells(lw: i32) -> usize {
 /// Flatten control characters and truncate to [`MAX_LABEL_CELLS`] with
 /// an ellipsis — the same rule `magic_hud::clipped_label` applies.
 fn clean_label(label: &str) -> String {
-    let mut chars = label.chars().map(|ch| if ch.is_control() { ' ' } else { ch });
-    let visible: String = chars.by_ref().take(MAX_LABEL_CELLS).collect();
-    if chars.next().is_some() && MAX_LABEL_CELLS >= 3 {
-        let mut clipped: String = visible.chars().take(MAX_LABEL_CELLS - 3).collect();
+    let flat: String = label
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let visible = crate::draw::first_cells(&flat, MAX_LABEL_CELLS);
+    if visible.len() < flat.len() && MAX_LABEL_CELLS >= 3 {
+        let mut clipped = crate::draw::first_cells(&flat, MAX_LABEL_CELLS - 3).to_owned();
         clipped.push_str("...");
         clipped
     } else {
-        visible
+        visible.to_owned()
     }
 }
 

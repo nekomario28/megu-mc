@@ -3085,9 +3085,8 @@ impl RecipeBrowserState {
             if self.search_focused {
                 shown.push('_');
             }
-            let count = shown.chars().count();
-            if count > cells {
-                shown = format!("...{}", shown.chars().skip(count - cells + 3).collect::<String>());
+            if crate::draw::text_cells(&shown) > cells {
+                shown = format!("...{}", crate::draw::last_cells(&shown, cells - 3));
             }
             lay.text_fit(field.x + 5, field.y + 4, 1, palette::TEXT, &shown, cells);
         }
@@ -3121,7 +3120,7 @@ impl RecipeBrowserState {
         let mut x = MARGIN + 4;
         for (tab, id) in tabs {
             let label = tab.label(lang);
-            let w = label.chars().count() as i32 * 8 + 12;
+            let w = crate::draw::text_width(label, 1) as i32 + 12;
             if x + w > lay.w - MARGIN {
                 break;
             }
@@ -3385,7 +3384,7 @@ impl RecipeBrowserState {
         };
         // Breadcrumb header: [< Back]  "Recipes for Iron Ingot"
         let back_label = tr(lang, "< Back", "< 戻る");
-        let back_w = back_label.chars().count() as i32 * 8 + 12;
+        let back_w = crate::draw::text_width(back_label, 1) as i32 + 12;
         let back = UiRect::new(main.x + 4, main.y + 4, back_w as u32, 14);
         lay.fill_rect(
             back,
@@ -3629,7 +3628,7 @@ impl RecipeBrowserState {
             self.index.display_name(&tree.root_item)
         );
         let pin_label = tr(lang, "Pin", "ピン");
-        let pin_w = pin_label.chars().count() as i32 * 8 + 12;
+        let pin_w = crate::draw::text_width(pin_label, 1) as i32 + 12;
         // Right-side chrome (pin + count controls) hides entirely when
         // the pane is too narrow to host it inside the border.
         let show_pin = main.w as i32 >= pin_w + 14;
@@ -3832,7 +3831,7 @@ impl RecipeBrowserState {
         let mut x = main.x + 4;
         for (tab, id) in subs {
             let label = tab.label(lang);
-            let w = label.chars().count() as i32 * 8 + 10;
+            let w = crate::draw::text_width(label, 1) as i32 + 10;
             if x + w > main.right() - 4 {
                 break;
             }
@@ -4315,14 +4314,13 @@ fn fit_text(label: &str, cells: usize) -> String {
     } else {
         label.to_owned()
     };
-    let count = label.chars().count();
-    if count <= cells {
+    if crate::draw::text_cells(&label) <= cells {
         return label;
     }
     if cells <= 3 {
         return ".".repeat(cells);
     }
-    let mut clipped = label.chars().take(cells - 3).collect::<String>();
+    let mut clipped = crate::draw::first_cells(&label, cells - 3).to_owned();
     clipped.push_str("...");
     clipped
 }

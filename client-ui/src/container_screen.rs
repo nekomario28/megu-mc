@@ -1825,32 +1825,31 @@ impl InventorySortState {
         self.last_sorted_range = Some(start..end);
 
         let mut merged: Vec<UiItemStack> = Vec::with_capacity(end - start);
-        for index in start..end {
-            let mut stack = screen.slots[index].clone();
-            while !stack.is_empty() {
-                let mut fully_placed = false;
-                for target in merged.iter_mut() {
-                    if !target.same_stackable(&stack) {
-                        continue;
-                    }
-                    let capacity = u32::from(target.max_stack)
-                        .saturating_sub(u32::from(target.count));
-                    if capacity == 0 {
-                        continue;
-                    }
-                    let amount = u32::from(stack.count).min(capacity) as u8;
-                    target.count += amount;
-                    stack.count -= amount;
-                    if stack.count == 0 {
-                        fully_placed = true;
-                        break;
-                    }
+        for slot in screen.slots.iter().take(end).skip(start) {
+            let mut stack = slot.clone();
+            if stack.is_empty() {
+                continue;
+            }
+            let mut fully_placed = false;
+            for target in merged.iter_mut() {
+                if !target.same_stackable(&stack) {
+                    continue;
                 }
-                if fully_placed || stack.count == 0 {
+                let capacity = u32::from(target.max_stack)
+                    .saturating_sub(u32::from(target.count));
+                if capacity == 0 {
+                    continue;
+                }
+                let amount = u32::from(stack.count).min(capacity) as u8;
+                target.count += amount;
+                stack.count -= amount;
+                if stack.count == 0 {
+                    fully_placed = true;
                     break;
                 }
+            }
+            if !fully_placed && stack.count != 0 {
                 merged.push(stack);
-                break;
             }
         }
         let mut non_empty: Vec<UiItemStack> = merged

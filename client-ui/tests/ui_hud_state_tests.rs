@@ -75,7 +75,7 @@ fn scoreboard_state_sorts_and_caps_at_vanilla_limit() {
         entries: (0..20)
             .map(|i| ScoreboardEntry {
                 label: format!("P{i:02}"),
-                score: i as i32,
+                score: i,
             })
             .collect(),
     };
@@ -165,7 +165,7 @@ fn scoreboard_over_cap_draws_only_top_15() {
         entries: (0..20)
             .map(|i| ScoreboardEntry {
                 label: format!("P{i:02}"),
-                score: i as i32,
+                score: i,
             })
             .collect(),
     };

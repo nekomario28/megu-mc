@@ -815,10 +815,12 @@ pub struct WorldAcousticSnapshot {
     inner: Arc<RwLock<AcousticSnapshotInner>>,
 }
 
+type AcousticColumns = BTreeMap<(i32, i32), Vec<Option<Box<[u8]>>>>;
+
 struct AcousticSnapshotInner {
     min_y: i32,
     height: i32,
-    columns: BTreeMap<(i32, i32), Vec<Option<Box<[u8]>>>>,
+    columns: AcousticColumns,
 }
 
 impl WorldAcousticSnapshot {

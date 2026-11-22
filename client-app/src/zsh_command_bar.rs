@@ -743,9 +743,7 @@ impl ZshCommandBar {
     /// Usage hint for the current command, or an unknown-command hint.
     pub fn usage_hint(&self) -> Option<String> {
         let tokens = lexical_tokens(&self.buffer);
-        let Some(first) = tokens.first() else {
-            return None;
-        };
+        let first = tokens.first()?;
         let text = token_text(&self.buffer, *first);
         let name = text.trim_start_matches('/');
         if name.is_empty() {
@@ -1009,9 +1007,7 @@ impl ZshCommandBar {
     }
 
     fn handle_reverse_search_key(&mut self, key: CommandKey) -> Option<CommandBarAction> {
-        if self.reverse_search.is_none() {
-            return None;
-        }
+        self.reverse_search.as_ref()?;
         match key {
             CommandKey::Char(ch) if !ch.is_control() => {
                 self.reverse_search_push(ch);
@@ -1195,7 +1191,7 @@ impl ZshCommandBar {
         let type_pos = token.find("type=")?;
         let value_start_rel = type_pos + "type=".len();
         let value_end_rel = token[value_start_rel..]
-            .find(|ch| ch == ',' || ch == ']')
+            .find([',', ']'])
             .map(|offset| value_start_rel + offset)
             .unwrap_or(token.len());
         let cursor_rel = cursor.saturating_sub(span.start).min(token.len());
@@ -1679,7 +1675,7 @@ fn lexical_tokens(input: &str) -> Vec<TokenSpan> {
     spans
 }
 
-fn token_text<'a>(input: &'a str, span: TokenSpan) -> &'a str {
+fn token_text(input: &str, span: TokenSpan) -> &str {
     &input[span.start..span.end]
 }
 
@@ -2044,7 +2040,7 @@ fn title_words(text: &str) -> String {
 fn command_spec(name: &str) -> Option<&'static (&'static str, &'static str, &'static str)> {
     COMMAND_SPECS
         .iter()
-        .find(|spec| (**spec).0.trim_start_matches('/') == name)
+        .find(|spec| spec.0.trim_start_matches('/') == name)
 }
 
 fn roman_numeral(mut value: u32) -> String {
@@ -2159,9 +2155,7 @@ fn glyph_mob_face(seed: &str) -> [u8; GLYPH_PIXELS] {
         (3, 4, 4)
     } else if key.contains("slime") || key.contains("magma_cube") {
         (5, 4, 4)
-    } else if key.contains("piglin") {
-        (2, 4, 5)
-    } else if key.contains("villager") {
+    } else if key.contains("piglin") || key.contains("villager") {
         (2, 4, 5)
     } else {
         (2, 4, 4)

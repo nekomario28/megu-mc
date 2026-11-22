@@ -315,8 +315,8 @@ impl Ctx<'_> {
                 content.to_string()
             };
             let max_chars = ((w - 2 * pad) / 8) as usize;
-            let clipped: String = shown.chars().take(max_chars).collect();
-            self.text(x + pad, ty, 1, pal::TEXT, &clipped);
+            let clipped = crate::draw::first_cells(&shown, max_chars);
+            self.text(x + pad, ty, 1, pal::TEXT, clipped);
         }
         self.region(id, r);
     }
@@ -492,7 +492,7 @@ fn boot_badge(ctx: &mut Ctx, clear: i32) {
         tr(ctx.lang, "Boot", "起動"),
         timeline.total_ms
     );
-    let bw = (label.chars().count() as i32 * 8 + 8).min(ctx.w - 8);
+    let bw = (text_width(&label, 1) as i32 + 8).min(ctx.w - 8);
     let bx = ctx.w - 4 - bw;
     if bw < 24 || ctx.h < 30 || bx < ctx.w / 2 + clear {
         return;
@@ -780,9 +780,7 @@ fn row(ctx: &Ctx, i: i32, y0: i32) -> (i32, i32) {
 }
 
 fn first_chars(text: &str, limit: usize) -> &str {
-    text.char_indices()
-        .nth(limit)
-        .map_or(text, |(end, _)| &text[..end])
+    crate::draw::first_cells(text, limit)
 }
 
 /// Host-supplied text (boss names, chat, actionbar, mod names, player
@@ -1512,7 +1510,7 @@ fn mod_sync(ctx: &mut Ctx) {
             // Mod names come from the host: sanitize control chars and
             // clip so they can't overrun the SHA column or the panel edge.
             let sha = e.short_sha().to_string();
-            let name_cells = ((pw - 28 - 8 * sha.chars().count() as i32 - 8) / 8).max(1) as usize;
+            let name_cells = ((pw - 28 - text_width(&sha, 1) as i32 - 8) / 8).max(1) as usize;
             ctx.text(px + 20, y, 1, pal::TEXT, &hud_str(&e.name, name_cells));
             let sw = text_width(&sha, ctx.s as u32) as i32;
             ctx.text(px + pw - 8 - sw / ctx.s, y, 1, pal::TEXT_DIM, &sha);
@@ -1731,7 +1729,7 @@ fn hud(ctx: &mut Ctx) {
         None
     } else {
         let text = hud_str(&hud.actionbar, ((w - 8) / 8).max(0) as usize);
-        let aw = text.chars().count() as i32 * 8;
+        let aw = text_width(&text, 1) as i32;
         ctx.ctext(cx, hy - 44, 1, pal::TEXT, &text);
         Some(cx - aw / 2..cx + aw / 2)
     };
@@ -1776,7 +1774,7 @@ fn hud(ctx: &mut Ctx) {
         // (hearts/armor left, hunger/air right) lifts the whole stack
         // above that column — the label is never cut by an icon.
         for (i, (label, y)) in rows.iter().enumerate() {
-            let rw = label.chars().count() as i32 * 8 + 6;
+            let rw = text_width(label, 1) as i32 + 6;
             if w - 4 - rw < vr.end && *y < vy + 8 && *y + 10 > vtop_r {
                 sub_base = sub_base.min(vtop_r - 10 + (shown.len() - i) as i32 * 10);
             }
@@ -1787,7 +1785,7 @@ fn hud(ctx: &mut Ctx) {
         rows = build_rows(sub_base);
         if abar.is_some()
             && rows.iter().any(|(label, y)| {
-                let rw = label.chars().count() as i32 * 8 + 6;
+                let rw = text_width(label, 1) as i32 + 6;
                 *y < abar_band.end
                     && *y + 10 > abar_band.start
                     && w - 4 - rw < abar.as_ref().map_or(i32::MAX, |ab| ab.end)
@@ -1803,14 +1801,14 @@ fn hud(ctx: &mut Ctx) {
             .filter(|(_, y)| *y >= 0 && *y + 10 <= h)
             .collect();
         for (label, y) in &rows {
-            let rw = label.chars().count() as i32 * 8 + 6;
+            let rw = text_width(label, 1) as i32 + 6;
             ctx.fill(w - 4 - rw, *y, rw, 10, UiColor::rgba(0, 0, 0, 110));
             ctx.text(w - 4 - rw + 3, *y + 1, 1, pal::TEXT, label);
         }
         // Rows' x ranges for the chat clip below.
         subtitle_rows = rows
             .iter()
-            .map(|(label, y)| (w - 4 - (label.chars().count() as i32 * 8 + 6), *y))
+            .map(|(label, y)| (w - 4 - (text_width(label, 1) as i32 + 6), *y))
             .collect();
         for (sx, _) in &subtitle_rows {
             stack_left = stack_left.min(*sx);
@@ -1830,7 +1828,7 @@ fn hud(ctx: &mut Ctx) {
             hud.crafting_conflict.selected() + 1,
             hud.crafting_conflict.total_candidates
         );
-        let bw = (label.chars().count() as i32 * 8 + 8).min(w - 8);
+        let bw = (text_width(&label, 1) as i32 + 8).min(w - 8);
         let bx = w - 4 - bw;
         let mut bottom = stack_bottom - 2;
         if bx < vl.end {
@@ -1871,7 +1869,7 @@ fn hud(ctx: &mut Ctx) {
             continue;
         }
         let text = hud_str(line, cells);
-        let tw = text.chars().count() as i32 * 8;
+        let tw = text_width(&text, 1) as i32;
         ctx.fill(2, y - 1, tw + 6, 10, UiColor::rgba(0, 0, 0, 110));
         ctx.text(4, y, 1, pal::TEXT, &text);
         chat_top = chat_top.min(y - 1);
@@ -1956,7 +1954,7 @@ fn hud(ctx: &mut Ctx) {
             .collect();
         let text_w = clipped
             .iter()
-            .map(|line| line.chars().count() as i32 * 8)
+            .map(|line| text_width(line, 1) as i32)
             .max()
             .unwrap_or(0);
         let box_w = (text_w + 2 * pad).min(max_box_w);
@@ -2013,7 +2011,7 @@ fn hud(ctx: &mut Ctx) {
             let shown: Vec<&String> = clipped.iter().take(max_lines).collect();
             let text_w = shown
                 .iter()
-                .map(|line| line.chars().count() as i32 * 8)
+                .map(|line| text_width(line, 1) as i32)
                 .max()
                 .unwrap_or(0);
             let box_w = (text_w + 2 * pad).min(max_box_w);
@@ -2265,7 +2263,7 @@ pub fn layout_looking_at(state: &UiState, width: u32, height: u32, out: &mut UiD
     let lines = &lines[..shown];
     let panel_w = lines
         .iter()
-        .map(|(text, _)| text.chars().count() as i32 * 8)
+        .map(|(text, _)| text_width(text, 1) as i32)
         .max()
         .unwrap_or(0)
         + 2 * PAD_X;
@@ -2378,7 +2376,7 @@ fn hud_occupied_rects(state: &UiState, width: u32, height: u32) -> Vec<UiRect> {
             None
         } else {
             let text = hud_str(&hud.actionbar, ((w - 8) / 8).max(0) as usize);
-            let aw = text.chars().count() as i32 * 8;
+            let aw = text_width(&text, 1) as i32;
             if aw > 0 {
                 add(cx - aw / 2, hy - 44, aw, 8);
             }
@@ -2413,7 +2411,7 @@ fn hud_occupied_rects(state: &UiState, width: u32, height: u32) -> Vec<UiRect> {
             let mut sub_base = hotbar_top;
             let mut rows = build_rows(sub_base);
             for (i, (label, y)) in rows.iter().enumerate() {
-                let rw = label.chars().count() as i32 * 8 + 6;
+                let rw = text_width(label, 1) as i32 + 6;
                 if w - 4 - rw < vr.end && *y < vy + 8 && *y + 10 > vtop_r {
                     sub_base = sub_base.min(vtop_r - 10 + (shown.len() - i) as i32 * 10);
                 }
@@ -2424,7 +2422,7 @@ fn hud_occupied_rects(state: &UiState, width: u32, height: u32) -> Vec<UiRect> {
             rows = build_rows(sub_base);
             if abar.is_some()
                 && rows.iter().any(|(label, y)| {
-                    let rw = label.chars().count() as i32 * 8 + 6;
+                    let rw = text_width(label, 1) as i32 + 6;
                     *y < abar_band.end
                         && *y + 10 > abar_band.start
                         && w - 4 - rw < abar.as_ref().map_or(i32::MAX, |ab| ab.end)
@@ -2438,12 +2436,12 @@ fn hud_occupied_rects(state: &UiState, width: u32, height: u32) -> Vec<UiRect> {
                 .filter(|(_, y)| *y >= 0 && *y + 10 <= h)
                 .collect();
             for (label, y) in &rows {
-                let rw = label.chars().count() as i32 * 8 + 6;
+                let rw = text_width(label, 1) as i32 + 6;
                 add(w - 4 - rw, *y, rw, 10);
             }
             subtitle_rows = rows
                 .iter()
-                .map(|(label, y)| (w - 4 - (label.chars().count() as i32 * 8 + 6), *y))
+                .map(|(label, y)| (w - 4 - (text_width(label, 1) as i32 + 6), *y))
                 .collect();
             stack_bottom = sub_base - shown.len() as i32 * 10 - 2;
         }
@@ -2455,7 +2453,7 @@ fn hud_occupied_rects(state: &UiState, width: u32, height: u32) -> Vec<UiRect> {
                 hud.crafting_conflict.selected() + 1,
                 hud.crafting_conflict.total_candidates
             );
-            let bw = (label.chars().count() as i32 * 8 + 8).min(w - 8);
+            let bw = (text_width(&label, 1) as i32 + 8).min(w - 8);
             let bx = w - 4 - bw;
             let mut bottom = stack_bottom - 2;
             if bx < vl.end {
@@ -2490,7 +2488,7 @@ fn hud_occupied_rects(state: &UiState, width: u32, height: u32) -> Vec<UiRect> {
                 continue;
             }
             let text = hud_str(line, cells);
-            let tw = text.chars().count() as i32 * 8;
+            let tw = text_width(&text, 1) as i32;
             add(2, y - 1, tw + 6, 10);
         }
 
@@ -2505,7 +2503,7 @@ fn hud_occupied_rects(state: &UiState, width: u32, height: u32) -> Vec<UiRect> {
             let y = 6 + i as i32 * 16;
             let bw = (w - 40).clamp(8, 200);
             let clipped = hud_str(name, ((w - 8) / 8).max(0) as usize);
-            let nw = clipped.chars().count() as i32 * 8;
+            let nw = text_width(&clipped, 1) as i32;
             let row_w = bw.max(nw);
             add(cx - row_w / 2, y, row_w, 14);
         }
@@ -2740,8 +2738,8 @@ fn crash(ctx: &mut Ctx) {
         // fixed 74 cells (74 chars overflows below ~600 logical px).
         let max = (((ctx.w - 16) / 8).max(0) as usize).min(74);
         for (i, line) in [en, ja].iter().enumerate() {
-            let clipped: String = line.chars().take(max).collect();
-            ctx.ctext(cx, 56 + i as i32 * 10, 1, pal::TEXT_DIM, &clipped);
+            let clipped = crate::draw::first_cells(line, max);
+            ctx.ctext(cx, 56 + i as i32 * 10, 1, pal::TEXT_DIM, clipped);
         }
     }
 
@@ -2756,8 +2754,8 @@ fn crash(ctx: &mut Ctx) {
     let max_chars = (pw - 16) / 8;
     let rows = ((preview_h - 10) / 10).max(0) as usize;
     for (i, line) in preview.lines().take(12.min(rows)).enumerate() {
-        let clipped: String = line.chars().take(max_chars as usize).collect();
-        ctx.text(px + 8, 86 + i as i32 * 10, 1, pal::TEXT_DIM, &clipped);
+        let clipped = crate::draw::first_cells(line, max_chars as usize);
+        ctx.text(px + 8, 86 + i as i32 * 10, 1, pal::TEXT_DIM, clipped);
     }
 
     let sent = ctx.state.crash_sent;

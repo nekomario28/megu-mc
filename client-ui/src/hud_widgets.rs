@@ -108,14 +108,17 @@ const MAX_LABEL_CELLS: usize = 96;
 /// ellipsis when truncated — the same rule `magic_hud::clipped_label`
 /// applies.
 fn clip_cells(text: &str, max_cells: usize) -> String {
-    let mut chars = text.chars().map(|ch| if ch.is_control() { ' ' } else { ch });
-    let visible: String = chars.by_ref().take(max_cells).collect();
-    if chars.next().is_some() && max_cells >= 3 {
-        let mut clipped: String = visible.chars().take(max_cells - 3).collect();
+    let flat: String = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let visible = crate::draw::first_cells(&flat, max_cells);
+    if visible.len() < flat.len() && max_cells >= 3 {
+        let mut clipped = crate::draw::first_cells(&flat, max_cells - 3).to_owned();
         clipped.push_str("...");
         clipped
     } else {
-        visible
+        visible.to_owned()
     }
 }
 
@@ -151,9 +154,7 @@ fn lighten(c: UiColor) -> UiColor {
 
 /// First `limit` chars of `text` as a `&str` slice (no allocation).
 fn first_chars(text: &str, limit: usize) -> &str {
-    text.char_indices()
-        .nth(limit)
-        .map_or(text, |(end, _)| &text[..end])
+    crate::draw::first_cells(text, limit)
 }
 
 // ---------------------------------------------------------------------------
@@ -1154,7 +1155,7 @@ impl Ctx<'_> {
         if clipped.is_empty() {
             return;
         }
-        let tw = clipped.chars().count() as i32 * cell;
+        let tw = crate::draw::text_width(clipped, 1) as i32 * cell / 8;
         let x = (cx - tw / 2).clamp(EDGE, (self.w - EDGE - tw).max(EDGE));
         self.shadow(x, y, m, color, clipped);
     }
@@ -1336,12 +1337,12 @@ impl Ctx<'_> {
             .collect();
         let left_w = left_lines
             .iter()
-            .map(|l| l.chars().count() as i32 * 8)
+            .map(|l| crate::draw::text_width(l, 1) as i32)
             .max()
             .unwrap_or(0);
         let right_w = right_lines
             .iter()
-            .map(|l| l.chars().count() as i32 * 8)
+            .map(|l| crate::draw::text_width(l, 1) as i32)
             .max()
             .unwrap_or(0);
         let left_h = left_lines.len() as i32 * ROW_H;
@@ -1445,7 +1446,7 @@ fn debug_left_reserve(d: &F3DebugOverlay, w: i32) -> i32 {
     let cells = left
         .iter()
         .take(MAX_DEBUG_LINES)
-        .map(|l| clip_cells(l, cap).chars().count())
+        .map(|l| crate::draw::text_cells(&clip_cells(l, cap)))
         .max()
         .unwrap_or(0);
     if cells == 0 {
@@ -1480,7 +1481,7 @@ impl Ctx<'_> {
             let title = clip_cells(&bar.title, name_cells);
             // Center the name over the bar (not the viewport) so it
             // stays inside the free span.
-            let tw = title.chars().count() as i32 * 8;
+            let tw = crate::draw::text_width(&title, 1) as i32;
             let tx = (bar_x + bw / 2 - tw / 2).clamp(bar_x + 1, (bar_x + bw - 1 - tw).max(bar_x + 1));
             self.shadow(tx, y, 1, palette::TEXT, &title);
             let by = y + 9;
@@ -1657,7 +1658,7 @@ impl Ctx<'_> {
             let mut y1 = bar_y + 3;
             if v.xp_level > 0 {
                 let level = v.xp_level.to_string();
-                let tw = level.chars().count() as i32 * 8;
+                let tw = crate::draw::text_width(&level, 1) as i32;
                 let tx = cx - tw / 2;
                 let ty = bar_y - 9;
                 self.text(tx, ty, 1, palette::XP, &level);
@@ -1693,11 +1694,11 @@ impl Ctx<'_> {
         let title_cells = ((self.w - 2 * EDGE) / 16).max(0) as usize;
         let sub_cells = ((self.w - 2 * EDGE) / 8).max(0) as usize;
         let block_w = title
-            .map(|t| clip_cells(&t.text, title_cells).chars().count() * 16)
+            .map(|t| crate::draw::text_cells(&clip_cells(&t.text, title_cells)) * 16)
             .unwrap_or(0)
             .max(
                 subtitle
-                    .map(|t| clip_cells(&t.text, sub_cells).chars().count() * 8)
+                    .map(|t| crate::draw::text_cells(&clip_cells(&t.text, sub_cells)) * 8)
                     .unwrap_or(0),
             ) as i32;
         let cx = self.w / 2;
@@ -1732,7 +1733,7 @@ impl Ctx<'_> {
             return;
         }
         let alpha = (t.alpha() * 255.0) as u8;
-        let tw = text.chars().count() as i32 * 8;
+        let tw = crate::draw::text_width(&text, 1) as i32;
         let cx = self.w / 2;
         let y = self.h - ACTIONBAR_LIFT;
         let x = (cx - tw / 2).clamp(EDGE, (self.w - EDGE - tw).max(EDGE));
@@ -1804,7 +1805,7 @@ impl Ctx<'_> {
                 let mut m = 0i32;
                 for (i, e) in entries.iter().enumerate().take(limit) {
                     if i / rows == c {
-                        let cells = clip_cells(&e.name, MAX_LABEL_CELLS).chars().count() as i32;
+                        let cells = crate::draw::text_cells(&clip_cells(&e.name, MAX_LABEL_CELLS)) as i32;
                         m = m.max(cells);
                     }
                 }
@@ -1889,12 +1890,12 @@ impl Ctx<'_> {
         }
         let label_cells = rows
             .iter()
-            .map(|e| clip_cells(&e.label, MAX_LABEL_CELLS).chars().count() as i32)
+            .map(|e| crate::draw::text_cells(&clip_cells(&e.label, MAX_LABEL_CELLS)) as i32)
             .max()
             .unwrap_or(0);
         let score_cells = rows
             .iter()
-            .map(|e| e.score.to_string().chars().count() as i32)
+            .map(|e| crate::draw::text_cells(&e.score.to_string()) as i32)
             .max()
             .unwrap_or(0);
         let title_cells = if has_title {
@@ -1940,7 +1941,7 @@ impl Ctx<'_> {
                 let label = clip_cells(&entry.label, label_cap);
                 self.emit(x + 4, y, 1, palette::TEXT, &label);
                 let score = entry.score.to_string();
-                let sw = score.chars().count() as i32 * 8;
+                let sw = crate::draw::text_width(&score, 1) as i32;
                 self.emit(x + width - 4 - sw, y, 1, palette::TEXT_DIM, &score);
                 y += ROW_H;
             }
@@ -1995,7 +1996,7 @@ impl Ctx<'_> {
                     let mut widest = 0i32;
                     for cand in chat.completions.iter().take(rows) {
                         widest =
-                            widest.max(clip_cells(cand, MAX_LABEL_CELLS).chars().count() as i32);
+                            widest.max(crate::draw::text_cells(&clip_cells(cand, MAX_LABEL_CELLS)) as i32);
                     }
                     let pop_w = (widest * 8 + 8).min(self.w - 2 * EDGE);
                     // Drop rows until the popup clears every earlier
@@ -2085,7 +2086,7 @@ impl Ctx<'_> {
             if text.is_empty() {
                 continue;
             }
-            let tw = text.chars().count() as i32 * 8;
+            let tw = crate::draw::text_width(text, 1) as i32;
             self.fill(EDGE - 2, y - 1, tw + 6, ROW_H, ROW_BACK);
             self.emit(EDGE, y, 1, palette::TEXT, text);
             self.claim("chat.line", EDGE - 2, y - 1, tw + 6, ROW_H);

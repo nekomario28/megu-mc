@@ -58,19 +58,168 @@ pub trait AudioSink: Send {
 /// Selected backend from `--audio-sink`/`--audio-wav`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AudioSinkKind {
-    /// `pw-cat` if present, else `aplay`, else `null` (with a warning).
+    /// Native backend in OS probe order (`pw-cat`/`aplay` on Linux,
+    /// CoreAudio on macOS, WinMM on Windows), else `null` (with a warning).
     Auto,
     /// Force `pw-cat`; falls back to `null` with a warning when it cannot
     /// start or dies.
     PipeWire,
     /// Force `aplay`; same null fallback.
     Alsa,
+    /// Force the macOS CoreAudio/AudioQueue backend; null fallback when the
+    /// queue cannot start (headless or no output device).
+    CoreAudio,
+    /// Force the Windows `winmm.dll` `waveOut*` backend; null fallback when
+    /// the device cannot open (headless or no output device).
+    WinMm,
     /// Discard samples (still counts them) — the fail-closed default.
     Null,
     /// Stream a 48 kHz s16le stereo WAV to the given path (`--audio-wav`).
     Wav(PathBuf),
     /// No runtime at all — audio disabled.
     Off,
+}
+
+/// Operating system a sink probe runs on — explicit parameter so the
+/// probe ordering is unit-testable without cross-compiling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetOs {
+    /// Linux (and other Unixes that ship `pw-cat`/`aplay`).
+    Linux,
+    /// macOS — CoreAudio/AudioQueue.
+    MacOs,
+    /// Windows — `winmm.dll` `waveOut*`.
+    Windows,
+    /// Anything else — only the null sink exists.
+    Other,
+}
+
+/// The OS this build targets.
+pub fn host_os() -> TargetOs {
+    if cfg!(target_os = "macos") {
+        TargetOs::MacOs
+    } else if cfg!(target_os = "windows") {
+        TargetOs::Windows
+    } else if cfg!(target_os = "linux") || cfg!(unix) {
+        TargetOs::Linux
+    } else {
+        TargetOs::Other
+    }
+}
+
+/// `true` when `path` names an executable file (no spawn — pure stat).
+fn path_has_executable(prog: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for dir in std::env::split_paths(&path) {
+        let cand = dir.join(prog);
+        if cand.is_file() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if cand
+                    .metadata()
+                    .map(|m| m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false)
+                {
+                    return true;
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Availability probe for the *native* backend `key` (`"pipewire"`,
+/// `"alsa"`, `"coreaudio"`, `"winmm"`). Injected into
+/// [`detect_available_sinks_for_os`] in production; tests substitute a stub
+/// so probe order is checked without spawning or cross-compiling.
+///
+/// Framework backends (CoreAudio/WinMM) report availability of the
+/// *framework* — the queue/device open inside `open_sink` is what decides
+/// whether real output exists, and it fails closed to [`NullSink`].
+pub fn native_backend_available(key: &str) -> bool {
+    match key {
+        "pipewire" => path_has_executable("pw-cat"),
+        "alsa" => path_has_executable("aplay"),
+        "coreaudio" => cfg!(target_os = "macos"),
+        "winmm" => cfg!(target_os = "windows"),
+        _ => false,
+    }
+}
+
+/// Ordered native sink candidates for `os`, filtered by `available`.
+///
+/// - Linux → `[PipeWire, Alsa]` (PipeWire first — the modern stack)
+/// - macOS → `[CoreAudio]`
+/// - Windows → `[WinMm]`
+/// - anything else → `[]`
+///
+/// When the probe filters out every native backend (headless, missing
+/// tools) the list is `[Null]` — the fail-closed sentinel — so callers can
+/// iterate the list and always end on a working sink.
+pub fn detect_available_sinks_for_os(
+    os: TargetOs,
+    available: impl Fn(&str) -> bool,
+) -> Vec<AudioSinkKind> {
+    let candidates: &[(&str, AudioSinkKind)] = match os {
+        TargetOs::Linux => &[
+            ("pipewire", AudioSinkKind::PipeWire),
+            ("alsa", AudioSinkKind::Alsa),
+        ],
+        TargetOs::MacOs => &[("coreaudio", AudioSinkKind::CoreAudio)],
+        TargetOs::Windows => &[("winmm", AudioSinkKind::WinMm)],
+        TargetOs::Other => &[],
+    };
+    let mut kinds: Vec<AudioSinkKind> = candidates
+        .iter()
+        .filter(|(key, _)| available(key))
+        .map(|(_, kind)| kind.clone())
+        .collect();
+    if kinds.is_empty() {
+        kinds.push(AudioSinkKind::Null);
+    }
+    kinds
+}
+
+/// Serialize `pcm` (interleaved s16 stereo) to little-endian bytes — the
+/// on-the-wire/on-disk format every PCM sink shares.
+pub fn encode_pcm_le(pcm: &[i16]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(pcm.len() * 2);
+    for s in pcm {
+        bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    bytes
+}
+
+/// Exact 44-byte RIFF/WAVE header for `data_bytes` of s16 stereo PCM at
+/// `MIX_SAMPLE_RATE` — the same header [`WavSink`] writes and patches.
+/// Sizes saturate at `u32::MAX` (the RIFF ceiling).
+pub fn wav_header_bytes(data_bytes: u64) -> [u8; 44] {
+    let data = data_bytes.min(u64::from(u32::MAX)) as u32;
+    let total = 36u64
+        .saturating_add(data_bytes)
+        .min(u64::from(u32::MAX)) as u32;
+    let mut h = [0u8; 44];
+    h[0..4].copy_from_slice(b"RIFF");
+    h[4..8].copy_from_slice(&total.to_le_bytes());
+    h[8..12].copy_from_slice(b"WAVE");
+    h[12..16].copy_from_slice(b"fmt ");
+    h[16..20].copy_from_slice(&16u32.to_le_bytes());
+    h[20..22].copy_from_slice(&1u16.to_le_bytes()); // PCM
+    h[22..24].copy_from_slice(&2u16.to_le_bytes()); // stereo
+    h[24..28].copy_from_slice(&MIX_SAMPLE_RATE.to_le_bytes());
+    h[28..32].copy_from_slice(&(MIX_SAMPLE_RATE * 4).to_le_bytes());
+    h[32..34].copy_from_slice(&4u16.to_le_bytes()); // block align
+    h[34..36].copy_from_slice(&16u16.to_le_bytes()); // bits
+    h[36..40].copy_from_slice(b"data");
+    h[40..44].copy_from_slice(&data.to_le_bytes());
+    h
 }
 
 /// Sink that drops everything but keeps a sample counter for diagnostics.
@@ -120,34 +269,20 @@ impl WavSink {
     }
 
     fn write_header(&mut self) -> Result<(), String> {
-        let h = &mut [0u8; 44];
-        h[0..4].copy_from_slice(b"RIFF");
-        // h[4..8] total size — patched on finish.
-        h[8..12].copy_from_slice(b"WAVE");
-        h[12..16].copy_from_slice(b"fmt ");
-        h[16..20].copy_from_slice(&16u32.to_le_bytes());
-        h[20..22].copy_from_slice(&1u16.to_le_bytes()); // PCM
-        h[22..24].copy_from_slice(&2u16.to_le_bytes()); // stereo
-        h[24..28].copy_from_slice(&MIX_SAMPLE_RATE.to_le_bytes());
-        h[28..32].copy_from_slice(&(MIX_SAMPLE_RATE * 4).to_le_bytes());
-        h[32..34].copy_from_slice(&4u16.to_le_bytes()); // block align
-        h[34..36].copy_from_slice(&16u16.to_le_bytes()); // bits
-        h[36..40].copy_from_slice(b"data");
-        // h[40..44] data size — patched on finish.
+        // Sizes are zero up front and patched on finish.
         self.file
-            .write_all(h)
+            .write_all(&wav_header_bytes(0))
             .map_err(|e| format!("{}: header write failed: {e}", self.path.display()))
     }
 }
 
 impl AudioSink for WavSink {
     fn push(&mut self, pcm: &[i16]) -> Result<(), String> {
-        for s in pcm {
-            self.file
-                .write_all(&s.to_le_bytes())
-                .map_err(|e| format!("{}: write failed: {e}", self.path.display()))?;
-        }
-        self.data_bytes += (pcm.len() * 2) as u64;
+        let bytes = encode_pcm_le(pcm);
+        self.file
+            .write_all(&bytes)
+            .map_err(|e| format!("{}: write failed: {e}", self.path.display()))?;
+        self.data_bytes += bytes.len() as u64;
         Ok(())
     }
 
@@ -162,14 +297,8 @@ impl AudioSink for WavSink {
         self.finished = true;
         let _ = self.file.flush();
         let f = self.file.get_mut();
-        let data = (self.data_bytes.min(u64::from(u32::MAX))) as u32;
-        let total = 36u64
-            .saturating_add(self.data_bytes)
-            .min(u64::from(u32::MAX)) as u32;
-        let _ = f.seek(SeekFrom::Start(4));
-        let _ = f.write_all(&total.to_le_bytes());
-        let _ = f.seek(SeekFrom::Start(40));
-        let _ = f.write_all(&data.to_le_bytes());
+        let _ = f.seek(SeekFrom::Start(0));
+        let _ = f.write_all(&wav_header_bytes(self.data_bytes));
         let _ = f.flush();
     }
 }
@@ -358,11 +487,7 @@ impl AudioSink for SubprocessSink {
                 }
             }
         }
-        let mut bytes = Vec::with_capacity(pcm.len() * 2);
-        for s in pcm {
-            bytes.extend_from_slice(&s.to_le_bytes());
-        }
-        self.queue.push(bytes);
+        self.queue.push(encode_pcm_le(pcm));
         Ok(())
     }
 
@@ -401,23 +526,685 @@ impl Drop for SubprocessSink {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Native platform sinks
+// ---------------------------------------------------------------------------
+
+/// PCM bytes one native buffer carries: 4096 stereo frames ≈ 85 ms.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const NATIVE_BUF_BYTES: usize = 16_384;
+/// Native buffers allowed in flight — ~0.5 s of audio, hard bound.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const NATIVE_MAX_BUFS: usize = 6;
+/// How long `push` waits for a device buffer before failing closed.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const NATIVE_WAIT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Open the macOS CoreAudio/AudioQueue sink. Fails (→ null fallback) when
+/// the queue cannot be created or started — no device, headless session.
+#[cfg(target_os = "macos")]
+fn coreaudio_sink() -> Result<Box<dyn AudioSink>, String> {
+    coreaudio::CoreAudioSink::open().map(|s| Box::new(s) as Box<dyn AudioSink>)
+}
+
+/// Non-macOS stub: the backend does not exist here.
+#[cfg(not(target_os = "macos"))]
+fn coreaudio_sink() -> Result<Box<dyn AudioSink>, String> {
+    Err("coreaudio backend is only available on macOS".to_string())
+}
+
+/// Open the Windows WinMM `waveOut*` sink. Fails (→ null fallback) when no
+/// output device can be opened — headless session, driver missing.
+#[cfg(target_os = "windows")]
+fn winmm_sink() -> Result<Box<dyn AudioSink>, String> {
+    winmm::WinMmSink::open().map(|s| Box::new(s) as Box<dyn AudioSink>)
+}
+
+/// Non-Windows stub: the backend does not exist here.
+#[cfg(not(target_os = "windows"))]
+fn winmm_sink() -> Result<Box<dyn AudioSink>, String> {
+    Err("winmm backend is only available on Windows".to_string())
+}
+
+/// Native macOS output through AudioToolbox `AudioQueue`.
+///
+/// `unsafe` boundary: every FFI declaration and call is confined to this
+/// module behind `#[cfg(target_os = "macos")]`. The `AudioQueue` API is
+/// documented thread-safe for enqueue/stop from any thread, and the
+/// buffer-done callback only pushes a pointer back onto a mutex-guarded
+/// free list, so `unsafe impl Send` is sound. The [`Pool`] the callback
+/// dereferences is `Box::leak`ed for the queue's whole lifetime and
+/// reclaimed in [`CoreAudioSink::finish`] after `AudioQueueDispose`.
+#[cfg(target_os = "macos")]
+mod coreaudio {
+    use super::{AudioSink, NATIVE_BUF_BYTES, NATIVE_MAX_BUFS, NATIVE_WAIT_TIMEOUT};
+    use super::{encode_pcm_le, SINK_DRAIN_TIMEOUT};
+    use std::ffi::c_void;
+    use std::sync::{Condvar, Mutex};
+    use std::time::Instant;
+
+    type OSStatus = i32;
+    type AudioQueueRef = *mut c_void;
+    type AudioQueueBufferRef = *mut AudioQueueBuffer;
+
+    const K_AUDIO_FORMAT_LINEAR_PCM: u32 = u32::from_be_bytes(*b"lpcm");
+    /// `kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked`.
+    const PCM_FORMAT_FLAGS: u32 = (1 << 3) | (1 << 2);
+
+    #[repr(C)]
+    struct AudioStreamBasicDescription {
+        sample_rate: f64,
+        format_id: u32,
+        format_flags: u32,
+        bytes_per_packet: u32,
+        frames_per_packet: u32,
+        bytes_per_frame: u32,
+        channels_per_frame: u32,
+        bits_per_channel: u32,
+        reserved: u32,
+    }
+
+    #[repr(C)]
+    struct AudioQueueBuffer {
+        audio_data_bytes_capacity: u32,
+        audio_data: *mut c_void,
+        audio_data_size: u32,
+        user_data: *mut c_void,
+    }
+
+    type OutputCallback =
+        extern "C" fn(*mut c_void, AudioQueueRef, AudioQueueBufferRef);
+
+    #[link(name = "AudioToolbox", kind = "framework")]
+    extern "C" {
+        fn AudioQueueNewOutput(
+            format: *const AudioStreamBasicDescription,
+            callback: Option<OutputCallback>,
+            user_data: *mut c_void,
+            callback_run_loop: *mut c_void,
+            callback_run_loop_mode: *mut c_void,
+            flags: u32,
+            out: *mut AudioQueueRef,
+        ) -> OSStatus;
+        fn AudioQueueAllocateBuffer(
+            queue: AudioQueueRef,
+            size: u32,
+            out: *mut AudioQueueBufferRef,
+        ) -> OSStatus;
+        fn AudioQueueEnqueueBuffer(
+            queue: AudioQueueRef,
+            buf: AudioQueueBufferRef,
+            num_packet_descs: u32,
+            packet_descs: *const c_void,
+        ) -> OSStatus;
+        fn AudioQueueFreeBuffer(queue: AudioQueueRef, buf: AudioQueueBufferRef) -> OSStatus;
+        fn AudioQueueStart(queue: AudioQueueRef, start_time: *const c_void) -> OSStatus;
+        fn AudioQueueStop(queue: AudioQueueRef, immediate: bool) -> OSStatus;
+        fn AudioQueueDispose(queue: AudioQueueRef, immediate: bool) -> OSStatus;
+    }
+
+    /// Free-buffer list the AudioQueue callback refills.
+    struct Pool {
+        free: Mutex<Vec<AudioQueueBufferRef>>,
+        cond: Condvar,
+        allocated: Mutex<usize>,
+    }
+
+    impl Pool {
+        /// Take a free buffer, allocating one when under the cap; `None`
+        /// when every buffer is in flight.
+        fn take(&self, queue: AudioQueueRef) -> Option<AudioQueueBufferRef> {
+            if let Some(buf) = self
+                .free
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop()
+            {
+                return Some(buf);
+            }
+            let mut allocated = self.allocated.lock().unwrap_or_else(|e| e.into_inner());
+            if *allocated >= NATIVE_MAX_BUFS {
+                return None;
+            }
+            let mut buf = std::ptr::null_mut();
+            // SAFETY: `queue` is a live AudioQueueRef; `buf` is a valid
+            // out-pointer. The returned buffer is owned by this pool.
+            let status = unsafe { AudioQueueAllocateBuffer(queue, NATIVE_BUF_BYTES as u32, &mut buf) };
+            if status == 0 && !buf.is_null() {
+                *allocated += 1;
+                Some(buf)
+            } else {
+                None
+            }
+        }
+
+        /// Wait for a free buffer, allocating greedily at first. `Err`
+        /// when nothing frees up inside [`NATIVE_WAIT_TIMEOUT`].
+        fn take_wait(&self, queue: AudioQueueRef) -> Result<AudioQueueBufferRef, String> {
+            let deadline = Instant::now() + NATIVE_WAIT_TIMEOUT;
+            loop {
+                if let Some(buf) = self.take(queue) {
+                    return Ok(buf);
+                }
+                let rem = deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or_else(|| "coreaudio device is not draining buffers".to_string())?;
+                let mut g = self.free.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(buf) = g.pop() {
+                    return Ok(buf);
+                }
+                let (guard, _) = self
+                    .cond
+                    .wait_timeout(g, rem)
+                    .unwrap_or_else(|e| e.into_inner());
+                g = guard;
+                drop(g);
+            }
+        }
+
+        fn release(&self, buf: AudioQueueBufferRef) {
+            self.free
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(buf);
+            self.cond.notify_one();
+        }
+
+        /// `true` when every allocated buffer is back on the free list.
+        fn drained(&self) -> bool {
+            self.free.lock().unwrap_or_else(|e| e.into_inner()).len()
+                == *self.allocated.lock().unwrap_or_else(|e| e.into_inner())
+        }
+    }
+
+    extern "C" fn on_buffer_done(
+        user_data: *mut c_void,
+        _queue: AudioQueueRef,
+        buf: AudioQueueBufferRef,
+    ) {
+        // SAFETY: `user_data` is the `Pool` leaked by `open`, alive until
+        // `AudioQueueDispose` completes and `finish` reclaims it. The
+        // callback only locks the pool and returns the buffer pointer.
+        unsafe {
+            (*(user_data as *const Pool)).release(buf);
+        }
+    }
+
+    /// AudioQueue-backed sink: buffers are allocated on demand up to
+    /// [`NATIVE_MAX_BUFS`], filled from a staging accumulator, and recycled
+    /// through the buffer-done callback.
+    pub struct CoreAudioSink {
+        queue: AudioQueueRef,
+        pool: *mut Pool,
+        staging: Vec<u8>,
+        started: bool,
+        finished: bool,
+    }
+
+    // SAFETY: all queue/buffer access happens in `push`/`finish` on the
+    // owning thread; AudioQueue itself is thread-safe per Apple docs.
+    unsafe impl Send for CoreAudioSink {}
+
+    impl CoreAudioSink {
+        pub fn open() -> Result<Self, String> {
+            let format = AudioStreamBasicDescription {
+                sample_rate: super::MIX_SAMPLE_RATE as f64,
+                format_id: K_AUDIO_FORMAT_LINEAR_PCM,
+                format_flags: PCM_FORMAT_FLAGS,
+                bytes_per_packet: 4,
+                frames_per_packet: 1,
+                bytes_per_frame: 4,
+                channels_per_frame: 2,
+                bits_per_channel: 16,
+                reserved: 0,
+            };
+            let pool = Box::leak(Box::new(Pool {
+                free: Mutex::new(Vec::new()),
+                cond: Condvar::new(),
+                allocated: Mutex::new(0),
+            }));
+            let mut queue: AudioQueueRef = std::ptr::null_mut();
+            // SAFETY: `format`/`queue` are valid for the call duration;
+            // `pool` outlives the queue (leaked, reclaimed in finish).
+            let status = unsafe {
+                AudioQueueNewOutput(
+                    &format,
+                    Some(on_buffer_done),
+                    pool as *mut Pool as *mut c_void,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                    &mut queue,
+                )
+            };
+            if status != 0 || queue.is_null() {
+                // Reclaim the pool — no queue was created.
+                drop(unsafe { Box::from_raw(pool) });
+                return Err(format!("AudioQueueNewOutput failed (status {status})"));
+            }
+            Ok(Self {
+                queue,
+                pool,
+                staging: Vec::new(),
+                started: false,
+                finished: false,
+            })
+        }
+
+        fn submit(&mut self, bytes: &[u8]) -> Result<(), String> {
+            let buf = unsafe { &*self.pool }.take_wait(self.queue)?;
+            // SAFETY: `buf` is an owned pool buffer with capacity
+            // `NATIVE_BUF_BYTES`; `bytes` never exceeds it.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    (*buf).audio_data as *mut u8,
+                    bytes.len(),
+                );
+                (*buf).audio_data_size = bytes.len() as u32;
+            }
+            // SAFETY: `buf` is prepared with exactly `audio_data_size`
+            // bytes of valid PCM; CBR streams pass no packet descriptions.
+            let status =
+                unsafe { AudioQueueEnqueueBuffer(self.queue, buf, 0, std::ptr::null()) };
+            if status != 0 {
+                unsafe { &*self.pool }.release(buf);
+                return Err(format!("AudioQueueEnqueueBuffer failed (status {status})"));
+            }
+            if !self.started {
+                // SAFETY: queue is live; NULL start time = ASAP.
+                let status = unsafe { AudioQueueStart(self.queue, std::ptr::null()) };
+                if status != 0 {
+                    return Err(format!("AudioQueueStart failed (status {status})"));
+                }
+                self.started = true;
+            }
+            Ok(())
+        }
+    }
+
+    impl AudioSink for CoreAudioSink {
+        fn push(&mut self, pcm: &[i16]) -> Result<(), String> {
+            self.staging.extend_from_slice(&encode_pcm_le(pcm));
+            while self.staging.len() >= NATIVE_BUF_BYTES {
+                let chunk: Vec<u8> = self.staging.drain(..NATIVE_BUF_BYTES).collect();
+                self.submit(&chunk)?;
+            }
+            Ok(())
+        }
+
+        fn label(&self) -> &'static str {
+            "coreaudio"
+        }
+
+        fn finish(&mut self) {
+            if self.finished {
+                return;
+            }
+            self.finished = true;
+            // Flush the partial tail, then let the queue play out what is
+            // queued (bounded by SINK_DRAIN_TIMEOUT) before disposing.
+            if !self.staging.is_empty() {
+                let tail = std::mem::take(&mut self.staging);
+                let _ = self.submit(&tail);
+            }
+            if self.started {
+                // SAFETY: queue is live; async drain, then bounded wait.
+                let _ = unsafe { AudioQueueStop(self.queue, false) };
+                let deadline = Instant::now() + SINK_DRAIN_TIMEOUT;
+                while !unsafe { &*self.pool }.drained() && Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            // SAFETY: immediate dispose stops the queue and ends callbacks
+            // before the pool is reclaimed below.
+            let _ = unsafe { AudioQueueDispose(self.queue, true) };
+            let pool = unsafe { &*self.pool };
+            for buf in pool
+                .free
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .drain(..)
+            {
+                // SAFETY: queue is disposed; freeing owned buffers.
+                let _ = unsafe { AudioQueueFreeBuffer(self.queue, buf) };
+            }
+            // SAFETY: `pool` was leaked in `open` and the queue — the only
+            // other handle on it — is disposed; reclaim it exactly once.
+            drop(unsafe { Box::from_raw(self.pool) });
+            self.queue = std::ptr::null_mut();
+        }
+    }
+
+    impl Drop for CoreAudioSink {
+        fn drop(&mut self) {
+            self.finish();
+        }
+    }
+}
+
+/// Native Windows output through `winmm.dll` `waveOut*` (the classic MME
+/// PCM API, present on every Windows since 3.x — no WASAPI/COM needed).
+///
+/// `unsafe` boundary: FFI declarations and calls are confined to this
+/// module behind `#[cfg(target_os = "windows")]`. The sink polls
+/// `WHDR_DONE` instead of installing a callback (`CALLBACK_NULL`), so no
+/// foreign thread ever dereferences our state. `Box`ed headers keep their
+/// addresses stable while the driver owns them; data Vecs' heap buffers
+/// are stable for the same reason.
+#[cfg(target_os = "windows")]
+mod winmm {
+    use super::{AudioSink, NATIVE_BUF_BYTES, NATIVE_MAX_BUFS, NATIVE_WAIT_TIMEOUT};
+    use super::{encode_pcm_le, SINK_DRAIN_TIMEOUT};
+    use std::time::Instant;
+
+    type HWaveOut = *mut std::ffi::c_void;
+    type MMResult = u32;
+
+    const MMSYSERR_NOERROR: MMResult = 0;
+    const WAVE_MAPPER: u32 = u32::MAX;
+    const WAVE_FORMAT_PCM: u16 = 1;
+    const WHDR_DONE: u32 = 0x0000_0001;
+    const CALLBACK_NULL: u32 = 0;
+
+    #[repr(C)]
+    struct WaveFormatEx {
+        format_tag: u16,
+        channels: u16,
+        samples_per_sec: u32,
+        avg_bytes_per_sec: u32,
+        block_align: u16,
+        bits_per_sample: u16,
+        cb_size: u16,
+    }
+
+    #[repr(C)]
+    struct WaveHdr {
+        data: *mut u8,
+        buffer_length: u32,
+        bytes_recorded: u32,
+        user: usize,
+        flags: u32,
+        loops: u32,
+        next: *mut WaveHdr,
+        reserved: usize,
+    }
+
+    #[link(name = "winmm")]
+    extern "C" {
+        fn waveOutOpen(
+            out: *mut HWaveOut,
+            device: u32,
+            format: *const WaveFormatEx,
+            callback: usize,
+            instance: usize,
+            flags: u32,
+        ) -> MMResult;
+        fn waveOutPrepareHeader(hwo: HWaveOut, hdr: *mut WaveHdr, size: u32) -> MMResult;
+        fn waveOutUnprepareHeader(hwo: HWaveOut, hdr: *mut WaveHdr, size: u32)
+            -> MMResult;
+        fn waveOutWrite(hwo: HWaveOut, hdr: *mut WaveHdr, size: u32) -> MMResult;
+        fn waveOutReset(hwo: HWaveOut) -> MMResult;
+        fn waveOutClose(hwo: HWaveOut) -> MMResult;
+    }
+
+    /// One in-flight buffer the driver owns until `WHDR_DONE`.
+    struct InFlight {
+        hdr: Box<WaveHdr>,
+        /// Heap-stable PCM data `hdr.data` points into.
+        _data: Vec<u8>,
+    }
+
+    /// `waveOut*` sink: buffers are prepared+written on demand, polled for
+    /// `WHDR_DONE`, and reaped back to Rust on each `push`.
+    pub struct WinMmSink {
+        handle: HWaveOut,
+        in_flight: Vec<InFlight>,
+        staging: Vec<u8>,
+        finished: bool,
+    }
+
+    // SAFETY: the handle and headers are only touched from `push`/`finish`
+    // on the owning thread; the driver only reads the pinned buffers.
+    unsafe impl Send for WinMmSink {}
+
+    impl WinMmSink {
+        pub fn open() -> Result<Self, String> {
+            let format = WaveFormatEx {
+                format_tag: WAVE_FORMAT_PCM,
+                channels: 2,
+                samples_per_sec: super::MIX_SAMPLE_RATE,
+                avg_bytes_per_sec: super::MIX_SAMPLE_RATE * 4,
+                block_align: 4,
+                bits_per_sample: 16,
+                cb_size: 0,
+            };
+            let mut handle: HWaveOut = std::ptr::null_mut();
+            // SAFETY: `handle`/`format` are valid out/in pointers;
+            // CALLBACK_NULL means no callback pointer is ever invoked.
+            let status = unsafe {
+                waveOutOpen(
+                    &mut handle,
+                    WAVE_MAPPER,
+                    &format,
+                    0,
+                    0,
+                    CALLBACK_NULL,
+                )
+            };
+            if status != MMSYSERR_NOERROR || handle.is_null() {
+                return Err(format!("waveOutOpen failed (code {status})"));
+            }
+            Ok(Self {
+                handle,
+                in_flight: Vec::new(),
+                staging: Vec::new(),
+                finished: false,
+            })
+        }
+
+        /// Unprepare and free every buffer the driver has finished.
+        fn reap_done(&mut self) {
+            let mut done: Vec<InFlight> = Vec::new();
+            let mut i = 0;
+            while i < self.in_flight.len() {
+                if self.in_flight[i].hdr.flags & WHDR_DONE != 0 {
+                    done.push(self.in_flight.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            for mut entry in done {
+                // SAFETY: the header was prepared below and the driver
+                // signalled completion; unprepare before freeing.
+                let _ = unsafe {
+                    waveOutUnprepareHeader(
+                        self.handle,
+                        entry.hdr.as_mut(),
+                        std::mem::size_of::<WaveHdr>() as u32,
+                    )
+                };
+            }
+        }
+
+        /// Wait for at least one in-flight buffer to finish. `Err` when
+        /// the device stalls past [`NATIVE_WAIT_TIMEOUT`].
+        fn wait_for_buffer(&mut self) -> Result<(), String> {
+            let deadline = Instant::now() + NATIVE_WAIT_TIMEOUT;
+            loop {
+                self.reap_done();
+                if self.in_flight.len() < NATIVE_MAX_BUFS {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err("winmm device is not draining buffers".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+
+        fn submit(&mut self, bytes: &[u8]) -> Result<(), String> {
+            self.wait_for_buffer()?;
+            let mut data = bytes.to_vec();
+            let mut hdr = Box::new(WaveHdr {
+                data: data.as_mut_ptr(),
+                buffer_length: data.len() as u32,
+                bytes_recorded: 0,
+                user: 0,
+                flags: 0,
+                loops: 0,
+                next: std::ptr::null_mut(),
+                reserved: 0,
+            });
+            // SAFETY: `hdr`/`data` are boxed and live until `WHDR_DONE`
+            // plus `waveOutUnprepareHeader` in `reap_done`/`finish`.
+            let status = unsafe {
+                waveOutPrepareHeader(
+                    self.handle,
+                    hdr.as_mut(),
+                    std::mem::size_of::<WaveHdr>() as u32,
+                )
+            };
+            if status != MMSYSERR_NOERROR {
+                return Err(format!("waveOutPrepareHeader failed (code {status})"));
+            }
+            // SAFETY: header is prepared and owned by us; ownership of the
+            // buffer passes to the driver until WHDR_DONE.
+            let status = unsafe {
+                waveOutWrite(
+                    self.handle,
+                    hdr.as_mut(),
+                    std::mem::size_of::<WaveHdr>() as u32,
+                )
+            };
+            if status != MMSYSERR_NOERROR {
+                // SAFETY: write never took the buffer; unprepare it back.
+                let _ = unsafe {
+                    waveOutUnprepareHeader(
+                        self.handle,
+                        hdr.as_mut(),
+                        std::mem::size_of::<WaveHdr>() as u32,
+                    )
+                };
+                return Err(format!("waveOutWrite failed (code {status})"));
+            }
+            self.in_flight.push(InFlight { hdr, _data: data });
+            Ok(())
+        }
+    }
+
+    impl AudioSink for WinMmSink {
+        fn push(&mut self, pcm: &[i16]) -> Result<(), String> {
+            self.staging.extend_from_slice(&encode_pcm_le(pcm));
+            while self.staging.len() >= NATIVE_BUF_BYTES {
+                let chunk: Vec<u8> = self.staging.drain(..NATIVE_BUF_BYTES).collect();
+                self.submit(&chunk)?;
+            }
+            Ok(())
+        }
+
+        fn label(&self) -> &'static str {
+            "winmm"
+        }
+
+        fn finish(&mut self) {
+            if self.finished {
+                return;
+            }
+            self.finished = true;
+            if !self.staging.is_empty() {
+                let tail = std::mem::take(&mut self.staging);
+                let _ = self.submit(&tail);
+            }
+            // Bounded drain: let queued audio play out, then reset and
+            // reclaim anything still in flight.
+            let deadline = Instant::now() + SINK_DRAIN_TIMEOUT;
+            while !self.in_flight.is_empty() && Instant::now() < deadline {
+                self.reap_done();
+                if !self.in_flight.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            if !self.in_flight.is_empty() {
+                // SAFETY: handle is live; reset marks all buffers DONE.
+                let _ = unsafe { waveOutReset(self.handle) };
+                self.reap_done();
+            }
+            // Anything the driver never released is unprepared and freed.
+            for mut entry in self.in_flight.drain(..) {
+                // SAFETY: header was prepared by `submit`; device is reset.
+                let _ = unsafe {
+                    waveOutUnprepareHeader(
+                        self.handle,
+                        entry.hdr.as_mut(),
+                        std::mem::size_of::<WaveHdr>() as u32,
+                    )
+                };
+            }
+            // SAFETY: all buffers are unprepared; the handle closes once.
+            let _ = unsafe { waveOutClose(self.handle) };
+            self.handle = std::ptr::null_mut();
+        }
+    }
+
+    impl Drop for WinMmSink {
+        fn drop(&mut self) {
+            self.finish();
+        }
+    }
+}
+
+const PW_CAT_ARGS: [&str; 8] = [
+    "--playback",
+    "--raw",
+    "--rate",
+    "48000",
+    "--channels",
+    "2",
+    "--format",
+    "s16",
+];
+const APLAY_ARGS: [&str; 10] = [
+    "-q", "-f", "S16_LE", "-r", "48000", "-c", "2", "-t", "raw", "-",
+];
+const PW_TARGET: [&str; 1] = ["-"];
+
+/// Open one subprocess sink (`pw-cat` or `aplay`); `None` on spawn failure.
+fn try_subprocess(
+    prog: &'static str,
+    args: &'static [&'static str],
+    label: &'static str,
+) -> Option<Box<dyn AudioSink>> {
+    let mut argv: Vec<&str> = args.to_vec();
+    if prog == "pw-cat" {
+        argv.extend_from_slice(&PW_TARGET);
+    }
+    SubprocessSink::spawn(prog, &argv, label)
+        .ok()
+        .map(|s| Box::new(s) as Box<dyn AudioSink>)
+}
+
+/// Open one native/subprocess sink candidate; `Err` text on failure so the
+/// caller can report which backends were attempted.
+fn open_native(kind: &AudioSinkKind) -> Result<Box<dyn AudioSink>, String> {
+    match kind {
+        AudioSinkKind::PipeWire => try_subprocess("pw-cat", &PW_CAT_ARGS, "pipewire")
+            .ok_or_else(|| "pw-cat could not start".to_string()),
+        AudioSinkKind::Alsa => try_subprocess("aplay", &APLAY_ARGS, "alsa")
+            .ok_or_else(|| "aplay could not start".to_string()),
+        AudioSinkKind::CoreAudio => coreaudio_sink(),
+        AudioSinkKind::WinMm => winmm_sink(),
+        AudioSinkKind::Null | AudioSinkKind::Off => Ok(Box::<NullSink>::default()),
+        other => Err(format!("{other:?} is not a native streaming backend")),
+    }
+}
+
 /// Open a sink for `kind`, returning the sink plus an optional warning.
-/// `Auto` tries `pw-cat` then `aplay` before falling back to `null`.
+/// `Auto` walks [`detect_available_sinks_for_os`] for the host OS
+/// (`pw-cat`→`aplay` on Linux, CoreAudio on macOS, WinMM on Windows) and
+/// falls back to `null` when every candidate is missing or refuses to
+/// start — the headless path.
 pub fn open_sink(kind: &AudioSinkKind) -> (Box<dyn AudioSink>, Option<String>) {
-    const PW_CAT_ARGS: [&str; 8] = [
-        "--playback",
-        "--raw",
-        "--rate",
-        "48000",
-        "--channels",
-        "2",
-        "--format",
-        "s16",
-    ];
-    const APLAY_ARGS: [&str; 10] = [
-        "-q", "-f", "S16_LE", "-r", "48000", "-c", "2", "-t", "raw", "-",
-    ];
-    const PW_TARGET: [&str; 1] = ["-"];
     match kind {
         AudioSinkKind::Off | AudioSinkKind::Null => (Box::<NullSink>::default(), None),
         AudioSinkKind::Wav(path) => match WavSink::create(path) {
@@ -427,49 +1214,47 @@ pub fn open_sink(kind: &AudioSinkKind) -> (Box<dyn AudioSink>, Option<String>) {
                 Some(format!("{e}; falling back to null sink")),
             ),
         },
-        AudioSinkKind::PipeWire | AudioSinkKind::Alsa | AudioSinkKind::Auto => {
-            let try_one = |prog: &'static str,
-                           args: &'static [&'static str],
-                           label: &'static str|
-             -> Option<Box<dyn AudioSink>> {
-                let mut argv: Vec<&str> = args.to_vec();
-                if prog == "pw-cat" {
-                    argv.extend_from_slice(&PW_TARGET);
-                }
-                SubprocessSink::spawn(prog, &argv, label)
-                    .ok()
-                    .map(|s| Box::new(s) as Box<dyn AudioSink>)
-            };
-            match kind {
-                AudioSinkKind::Auto => {
-                    if let Some(s) = try_one("pw-cat", &PW_CAT_ARGS, "pipewire") {
-                        return (s, None);
+        AudioSinkKind::Auto => {
+            let mut errors = Vec::new();
+            for candidate in detect_available_sinks_for_os(host_os(), native_backend_available) {
+                match open_native(&candidate) {
+                    Ok(sink) => {
+                        if sink.label() == "null" && candidate != AudioSinkKind::Null {
+                            continue;
+                        }
+                        let warn = if errors.is_empty() && candidate == AudioSinkKind::Null
+                        {
+                            Some("no native audio backend on this OS; audio sink is null"
+                                .to_string())
+                        } else if errors.is_empty() {
+                            None
+                        } else {
+                            Some(format!(
+                                "audio backends failed ({}); using {}",
+                                errors.join(", "),
+                                sink.label()
+                            ))
+                        };
+                        return (sink, warn);
                     }
-                    if let Some(s) = try_one("aplay", &APLAY_ARGS, "alsa") {
-                        return (s, None);
-                    }
-                    (
-                        Box::<NullSink>::default(),
-                        Some("no pw-cat or aplay on PATH; audio sink is null".to_string()),
-                    )
+                    Err(e) => errors.push(format!("{candidate:?}: {e}")),
                 }
-                AudioSinkKind::PipeWire => match try_one("pw-cat", &PW_CAT_ARGS, "pipewire") {
-                    Some(s) => (s, None),
-                    None => (
-                        Box::<NullSink>::default(),
-                        Some("pw-cat could not start; audio sink is null".to_string()),
-                    ),
-                },
-                AudioSinkKind::Alsa => match try_one("aplay", &APLAY_ARGS, "alsa") {
-                    Some(s) => (s, None),
-                    None => (
-                        Box::<NullSink>::default(),
-                        Some("aplay could not start; audio sink is null".to_string()),
-                    ),
-                },
-                _ => unreachable!(),
             }
+            (
+                Box::<NullSink>::default(),
+                Some(format!(
+                    "no audio backend available ({}); audio sink is null",
+                    errors.join(", ")
+                )),
+            )
         }
+        other => match open_native(other) {
+            Ok(sink) => (sink, None),
+            Err(e) => (
+                Box::<NullSink>::default(),
+                Some(format!("{e}; audio sink is null")),
+            ),
+        },
     }
 }
 

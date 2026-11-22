@@ -4151,6 +4151,7 @@ impl ProtocolClient {
     /// `container_click` — one slot-mode/button/drag transaction against
     /// the open window (`encode_container_click` carries the slot blobs;
     /// build simple stacks with [`encode_slot_stack`]).
+    #[allow(clippy::too_many_arguments)]
     pub fn send_container_click(
         &mut self,
         window_id: u8,

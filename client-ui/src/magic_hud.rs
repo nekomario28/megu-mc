@@ -162,16 +162,17 @@ fn slot_time_label(ticks: u32, max_cells: usize) -> String {
 
 /// Keep labels inside their cells and prevent embedded newlines from moving text.
 fn clipped_label(label: &str, max_cells: usize) -> String {
-    let mut chars = label
+    let flat: String = label
         .chars()
-        .map(|ch| if ch.is_control() { ' ' } else { ch });
-    let visible: String = chars.by_ref().take(max_cells).collect();
-    if chars.next().is_some() && max_cells >= 3 {
-        let mut clipped: String = visible.chars().take(max_cells - 3).collect();
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let visible = crate::draw::first_cells(&flat, max_cells);
+    if visible.len() < flat.len() && max_cells >= 3 {
+        let mut clipped = crate::draw::first_cells(&flat, max_cells - 3).to_owned();
         clipped.push_str("...");
         clipped
     } else {
-        visible
+        visible.to_owned()
     }
 }
 

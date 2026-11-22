@@ -1600,3 +1600,141 @@ fn crafting_conflict_overlay_is_zero_clutter_until_two_candidates() {
         ui.hud.crafting_conflict = CraftingConflictOverlay::default();
     }
 }
+
+// ---------- CJK / ja_jp glyph coverage ----------
+
+/// Every `ja_jp` screen must render without a single tofu box: every
+/// glyph cell emitted to the draw list has real font coverage.
+#[test]
+fn every_ja_screen_has_zero_tofu_glyphs() {
+    use mc_spine_client_ui::draw::glyph_is_covered;
+    let mut missing = std::collections::BTreeSet::new();
+    let mut ui = UiState::new();
+    ui.settings.language = LanguageSetting::Japanese;
+    for (w, h) in SIZES {
+        for screen in all_screens(&mut ui) {
+            ui.screen = screen;
+            let list = ui.render(w, h);
+            let mut texts = 0usize;
+            for cmd in &list.commands {
+                if let UiCommand::Text { text, .. } = cmd {
+                    texts += 1;
+                    for c in text.chars() {
+                        if !glyph_is_covered(c) {
+                            missing.insert(c);
+                        }
+                    }
+                }
+            }
+            assert!(texts > 0, "{screen:?} @ {w}x{h} emitted no text at all");
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "ja_jp screens emit uncovered chars: {missing:?}"
+    );
+}
+
+/// Every character class the built-in ja_jp UI uses — hiragana,
+/// katakana, CJK punctuation, and a sample of the UI kanji — has a
+/// distinct, non-blank, non-fallback bitmap.
+#[test]
+fn cjk_glyphs_are_distinct_non_blank_and_fullwidth() {
+    use mc_spine_client_ui::draw::{glyph_bitmap, glyph_cells, glyph_is_covered};
+    let wide = [
+        'あ', 'い', 'ん', 'を', 'が', 'ぱ', 'っ', 'ゃ', // hiragana
+        'ア', 'イ', 'ン', 'ヲ', 'ガ', 'パ', 'ッ', 'ャ', // katakana
+        '、', '。', '・', '「', '」', '『', '』', '【', '】', 'ー', '〜', '！', '？',
+        '（', '）', // punctuation
+        '設', '定', '日', '本', '語', '画', '面', '音', // kanji used in ja UI
+    ];
+    let mut seen = std::collections::HashMap::new();
+    for &c in &wide {
+        assert!(glyph_is_covered(c), "{c:?} falls back to tofu");
+        assert_eq!(glyph_cells(c), 2, "{c:?} must be full-width");
+        let g = glyph_bitmap(c);
+        assert_eq!(g.cells, 2);
+        assert!(
+            g.tiles.iter().flatten().any(|&b| b != 0),
+            "{c:?} rendered as a blank glyph"
+        );
+        if let Some(prev) = seen.insert(g.tiles, c) {
+            panic!("{prev:?} and {c:?} share identical bitmaps");
+        }
+    }
+    // Half-width stays exactly one cell; the fallback box is 1-cell narrow
+    // for unassigned narrow codepoints and 2-cell wide for unassigned
+    // fullwidth ranges.
+    assert_eq!(glyph_cells('A'), 1);
+    assert!(glyph_is_covered('A'));
+    assert!(!glyph_is_covered('\u{10FF}'));
+    assert_eq!(glyph_cells('\u{10FF}'), 1);
+    assert!(!glyph_is_covered('鿿'));
+    assert_eq!(glyph_cells('鿿'), 2);
+}
+
+/// `measure_text_px`/`text_width` advance full-width glyphs double and
+/// keep ASCII pixel-identical to the legacy 8px-per-char table.
+#[test]
+fn fullwidth_advance_is_exactly_double() {
+    use mc_spine_client_ui::draw::{measure_text_px, text_width};
+    assert_eq!(text_width("abc", 1), 24);
+    assert_eq!(text_width("abc", 2), 48);
+    assert_eq!(text_width("あいう", 1), 48);
+    assert_eq!(text_width("あいう", 2), 96);
+    assert_eq!(text_width("aあb", 1), 32);
+    assert_eq!(measure_text_px("日本語", 1), (48, 8));
+    assert_eq!(measure_text_px("日本語", 2), (96, 16));
+    // Ideographic space advances a full cell pair but paints nothing.
+    assert_eq!(text_width("　", 1), 16);
+}
+
+/// A hand-made Unifont `.hex` pack loads strictly, rasterizes distinct
+/// pixels, and honors full-width advances — including a codepoint the
+/// built-in font lacks.
+#[test]
+fn unifont_pack_loads_and_rasters_distinct_glyphs() {
+    use mc_spine_client_ui::font_cjk::GlyphAtlas;
+    // 8x16 half-width 'A' (Unifont's canonical U+0041 bitmap).
+    let a = "0041:0000000018242442427E424242420000";
+    // 16x16 full-width box (private-use codepoint built-ins miss).
+    let wide = "E000:FFFF80018001800180018001800180018001800180018001800180018001FFFF";
+    let atlas = GlyphAtlas::load_unifont_hex(&format!("{a}\n{wide}\n")).unwrap();
+    assert_eq!(atlas.glyph_count(), 2);
+    assert!(atlas.covers('A'));
+    assert!(atlas.covers('\u{E000}'));
+    let g = atlas.glyph_bitmap('\u{E000}').unwrap();
+    assert_eq!(g.cells, 2);
+    let (w, h) = atlas.measure_text_px("A\u{E000}", 1);
+    assert_eq!((w, h), (24, 8));
+    let (w, h, px) = atlas.rasterize_text_px("A\u{E000}", 1);
+    assert_eq!((w, h), (24, 8));
+    assert!(px.chunks(4).any(|p| p[3] != 0), "pack rasterized blank");
+}
+
+/// Malformed or oversized `.hex` inputs fail closed: `Err`, no panic,
+/// and nothing installed.
+#[test]
+fn unifont_loader_fails_closed_on_bad_input() {
+    use mc_spine_client_ui::font_cjk::GlyphAtlas;
+    let bad = [
+        "0041", // no separator
+        "0041:", // empty hexbits
+        "0041:FF", // wrong length
+        "0041:0000000018242442427E4242424200000", // 33 digits
+        "ZZZZ:0000000018242442427E424242420000", // non-hex codepoint
+        "10000:0000000018242442427E424242420000", // above BMP
+        "0041:0000000018242442427G424242420000", // non-hex digit
+        "0041:0000000018242442427E424242420000\n0041:0000000018242442427E424242420000", // duplicate
+        &format!("{:200}", 'x'), // line over the 96-char bound
+    ];
+    for input in bad {
+        assert!(
+            GlyphAtlas::load_unifont_hex(input).is_err(),
+            "accepted malformed input {input:?}"
+        );
+    }
+    // Oversized whole input (bound is 8 MiB).
+    let huge = "0041:0000000018242442427E424242420000\n".repeat(300_000);
+    assert!(GlyphAtlas::load_unifont_hex(&huge).is_err());
+}

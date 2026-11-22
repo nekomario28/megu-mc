@@ -1441,14 +1441,11 @@ impl ModMenuState {
                 shown.push('_');
             }
             // Right-align the tail so the newest characters stay visible.
-            let char_count = shown.chars().count();
-            if char_count > cells {
+            let char_cells = crate::draw::text_cells(&shown);
+            if char_cells > cells {
                 shown = format!(
                     "...{}",
-                    shown
-                        .chars()
-                        .skip(char_count - cells + 3)
-                        .collect::<String>()
+                    crate::draw::last_cells(&shown, cells - 3)
                 );
             }
             lay.text_fit(field.x + 5, field.y + 4, 1, palette::TEXT, &shown, cells);
@@ -1562,7 +1559,7 @@ impl ModMenuState {
             };
         let mut x = MARGIN + 4;
         for (label, id, active) in pills {
-            let w = label.chars().count() as i32 * 8 + 12;
+            let w = crate::draw::text_width(label, 1) as i32 + 12;
             if x + w > lay.w - MARGIN {
                 break;
             }
@@ -1833,7 +1830,7 @@ impl ModMenuState {
         let mut rows: Vec<Vec<(ModMenuWidgetId, String, bool, i32)>> = vec![Vec::new()];
         let mut row_w = 0;
         for (id, label, live) in buttons {
-            let w = (label.chars().count() as i32 * 8 + 12).min(tw);
+            let w = (crate::draw::text_width(&label, 1) as i32 + 12).min(tw);
             if row_w > 0 && row_w + btn_gap + w > tw {
                 rows.push(Vec::new());
                 row_w = 0;
@@ -1911,7 +1908,7 @@ impl ModMenuState {
                     );
                 }
             }
-            let btn_w = (missing_label.chars().count() as i32 * 8 + 12).min(tw - 8);
+            let btn_w = (crate::draw::text_width(missing_label, 1) as i32 + 12).min(tw - 8);
             let btn = UiRect::new(warn.x + 4, warn.bottom() - 16, btn_w.max(0) as u32, 14);
             let bg = if self.hover == Some(ModMenuWidgetId::DownloadMissingDeps) {
                 palette::BUTTON_HOVER
@@ -2131,7 +2128,7 @@ impl ModMenuState {
         max_x: i32,
     ) -> i32 {
         let (bg, fg) = colors;
-        let w = label.chars().count() as i32 * 8 + 8;
+        let w = crate::draw::text_width(label, 1) as i32 + 8;
         if x + w > max_x {
             return 0;
         }
@@ -2158,7 +2155,7 @@ impl ModMenuState {
         ] {
             // Buttons shrink to the space left; when none is left, skip.
             let avail = lay.w - MARGIN - x;
-            let w = (label.chars().count() as i32 * 8 + 14).min(avail);
+            let w = (crate::draw::text_width(label, 1) as i32 + 14).min(avail);
             if w < 24 {
                 break;
             }
@@ -2194,12 +2191,12 @@ impl ModMenuState {
             }
         };
         let done_label = tr(lang, "Done", "完了");
-        let done_w = (done_label.chars().count() as i32 * 8 + 20)
+        let done_w = (crate::draw::text_width(done_label, 1) as i32 + 20)
             .min(lay.w - 2 * MARGIN)
             .max(24);
         let done = UiRect::new(lay.w - MARGIN - done_w, y2, done_w as u32, 16);
         // Apply shrinks to the space left of Done; below ~60px it hides.
-        let apply_w = (apply_label.chars().count() as i32 * 8 + 14).min(done.x - 6 - MARGIN);
+        let apply_w = (crate::draw::text_width(&apply_label, 1) as i32 + 14).min(done.x - 6 - MARGIN);
         if apply_w >= 24 {
             let apply = UiRect::new(done.x - 6 - apply_w, y2, apply_w as u32, 16);
             let apply_bg = if !dirty {
@@ -2366,14 +2363,13 @@ fn fit_text(label: &str, cells: usize) -> String {
     } else {
         label.to_owned()
     };
-    let count = label.chars().count();
-    if count <= cells {
+    if crate::draw::text_cells(&label) <= cells {
         return label;
     }
     if cells <= 3 {
         return ".".repeat(cells);
     }
-    let mut clipped = label.chars().take(cells - 3).collect::<String>();
+    let mut clipped = crate::draw::first_cells(&label, cells - 3).to_owned();
     clipped.push_str("...");
     clipped
 }
@@ -2392,10 +2388,10 @@ fn wrap_text(text: &str, cells: usize) -> Vec<String> {
             if rest.is_empty() {
                 break;
             }
-            let cur_len = cur.chars().count();
+            let cur_len = crate::draw::text_cells(&cur);
             let sep = usize::from(!cur.is_empty());
             let avail = cells.saturating_sub(cur_len + sep);
-            if rest.chars().count() <= avail {
+            if crate::draw::text_cells(rest) <= avail {
                 if sep == 1 {
                     cur.push(' ');
                 }
@@ -2412,21 +2408,13 @@ fn wrap_text(text: &str, cells: usize) -> Vec<String> {
                 if sep == 1 {
                     cur.push(' ');
                 }
-                let at = rest
-                    .char_indices()
-                    .nth(avail)
-                    .map(|(i, _)| i)
-                    .unwrap_or(rest.len());
+                let at = crate::draw::first_cells(rest, avail).len();
                 cur.push_str(&rest[..at]);
                 rest = &rest[at..];
                 lines.push(std::mem::take(&mut cur));
             } else {
                 // Empty line: split the overlong word at `cells`.
-                let at = rest
-                    .char_indices()
-                    .nth(cells)
-                    .map(|(i, _)| i)
-                    .unwrap_or(rest.len());
+                let at = crate::draw::first_cells(rest, cells).len();
                 cur.push_str(&rest[..at]);
                 rest = &rest[at..];
                 lines.push(std::mem::take(&mut cur));

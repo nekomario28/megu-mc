@@ -2233,7 +2233,9 @@ pub fn render_debug_lines(
                 continue;
             }
             let idx = iy as usize * width + ix as usize;
-            if !(p[2] < f64::from(raster.depth[idx])) {
+            if p[2].partial_cmp(&f64::from(raster.depth[idx]))
+                != Some(std::cmp::Ordering::Less)
+            {
                 continue;
             }
             let dst = idx * 3;

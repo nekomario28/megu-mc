@@ -22,11 +22,17 @@
 //!   blocks, RFC 2083/1950) so tests and crash dumpers can persist pixels
 //!   without a window system.
 //!
-//! The font is an original clean-room 8×8 pixel face authored for this
-//! crate: each glyph is written as eight rows of `#`/`.` art (visible in
-//! [`FONT_8X8`] below) and compiled to bytes by a `const fn`. It covers
-//! printable ASCII `0x20..=0x7E`; every other code point draws the
-//! [`FALLBACK_GLYPH`] box so labels never silently disappear.
+//! The font is an original clean-room pixel face authored for this crate:
+//! each glyph is written as rows of `#`/`.` art (visible in [`FONT_8X8`]
+//! below and in [`crate::font_cjk::EXTRA_GLYPHS`]) and compiled to bytes by
+//! a `const fn`. It covers printable ASCII `0x20..=0x7E` on the 8×8 cell
+//! plus the full-width CJK/kana/punctuation/Hangul and half-width extended
+//! Latin/Cyrillic sets in [`crate::font_cjk`] — every code point the
+//! bilingual UI can emit — on a 16×8 "double cell" canvas (a full-width
+//! glyph advances two cells). Anything still unmapped draws the
+//! [`FALLBACK_GLYPH`] box (or its wide twin) so labels never silently
+//! disappear, and an external [`crate::font_cjk::GlyphAtlas`] font pack can
+//! fill the remaining gaps at runtime.
 
 /// Axis-aligned rectangle in physical pixels.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -508,29 +514,95 @@ pub const FONT_8X8: [[u8; 8]; FONT_GLYPH_COUNT] = [
     glyph(["........", "........", ".##..#..", "#..##...", "........", "........", "........", "........"]),
 ];
 
-/// Atlas tile index for `c`: `c - 0x20` for printable ASCII, or
-/// [`FONT_GLYPH_COUNT`] (the fallback tile) otherwise.
+/// Atlas tile index of the *first* (left or only) tile of `c`'s glyph:
+/// `c - 0x20` for printable ASCII, `EXTRA_GLYPH_TILE_BASE + 2*i` for a
+/// built-in extended glyph, [`crate::font_cjk::WIDE_FALLBACK_TILE`] for an
+/// unmapped full-width codepoint, or [`FONT_GLYPH_COUNT`] (the fallback
+/// tile) otherwise. A full-width glyph's right tile is `index + 1`.
 pub fn glyph_index(c: char) -> u32 {
     let cp = c as u32;
     if (0x20..=0x7e).contains(&cp) {
-        cp - 0x20
-    } else {
-        FONT_GLYPH_COUNT as u32
+        return cp - 0x20;
     }
+    if let Some((idx, _)) = crate::font_cjk::lookup_extra(c) {
+        return crate::font_cjk::EXTRA_GLYPH_TILE_BASE + 2 * idx as u32;
+    }
+    if crate::font_cjk::is_fullwidth_codepoint(cp) {
+        return crate::font_cjk::WIDE_FALLBACK_TILE;
+    }
+    FONT_GLYPH_COUNT as u32
 }
 
 /// Glyph bitmap for `c` (eight row bytes, MSB = leftmost pixel).
+///
+/// For full-width glyphs this returns the *left* cell of the pair; use
+/// [`glyph_bitmap`] for the complete glyph.
 pub fn glyph_for(c: char) -> &'static [u8; 8] {
-    let idx = glyph_index(c);
-    if (idx as usize) < FONT_GLYPH_COUNT {
-        &FONT_8X8[idx as usize]
-    } else {
-        &FALLBACK_GLYPH
+    let cp = c as u32;
+    if (0x20..=0x7e).contains(&cp) {
+        return &FONT_8X8[(cp - 0x20) as usize];
+    }
+    if let Some((idx, _)) = crate::font_cjk::lookup_extra(c) {
+        return &crate::font_cjk::EXTRA_GLYPHS[idx].2[0];
+    }
+    &FALLBACK_GLYPH
+}
+
+/// Complete raster data for `c`: one or two 8×8 cells painted left-to-right.
+///
+/// Resolution order is deterministic: the built-in ASCII face, then the
+/// built-in extended table ([`crate::font_cjk::EXTRA_GLYPHS`]), then the
+/// installed external [`crate::font_cjk::GlyphAtlas`] pack, then the
+/// fallback box — wide when `c` is an East-Asian full-width codepoint,
+/// narrow otherwise — so every character advances without overlap.
+pub fn glyph_bitmap(c: char) -> crate::font_cjk::GlyphBitmap {
+    let cp = c as u32;
+    if (0x20..=0x7e).contains(&cp) {
+        return crate::font_cjk::GlyphBitmap {
+            cells: 1,
+            tiles: [FONT_8X8[(cp - 0x20) as usize], [0; 8]],
+        };
+    }
+    if let Some((_, bitmap)) = crate::font_cjk::lookup_extra(c) {
+        return bitmap;
+    }
+    if let Some(bitmap) = crate::font_cjk::external_glyph(c) {
+        return bitmap;
+    }
+    if crate::font_cjk::is_fullwidth_codepoint(cp) {
+        return crate::font_cjk::GlyphBitmap {
+            cells: 2,
+            tiles: crate::font_cjk::WIDE_FALLBACK_GLYPH,
+        };
+    }
+    crate::font_cjk::GlyphBitmap {
+        cells: 1,
+        tiles: [FALLBACK_GLYPH, [0; 8]],
     }
 }
 
-/// Pixel width of `text` rendered at `scale` (every cell advances 8·scale,
-/// including spaces; `'\n'` resets to a new line and is not counted).
+/// Advance width of `c` in 8-px cells: 1 for half-width, 2 for full-width.
+pub fn glyph_cells(c: char) -> u32 {
+    u32::from(glyph_bitmap(c).cells.max(1))
+}
+
+/// `true` when `c` has a real glyph (built-in ASCII, built-in extended
+/// table, or the installed external pack) — `false` when it would draw a
+/// fallback "tofu" box.
+pub fn glyph_is_covered(c: char) -> bool {
+    let cp = c as u32;
+    if (0x20..=0x7e).contains(&cp) {
+        return true;
+    }
+    if crate::font_cjk::lookup_extra(c).is_some() {
+        return true;
+    }
+    crate::font_cjk::external_glyph(c).is_some()
+}
+
+/// Pixel width of `text` rendered at `scale`: every glyph advances
+/// `cells × 8 × scale` px (half-width 1 cell, full-width 2), including
+/// spaces; `'\n'` resets to a new line and is not counted.
 pub fn text_width(text: &str, scale: u32) -> u32 {
     let mut width = 0u32;
     let mut line = 0u32;
@@ -539,10 +611,58 @@ pub fn text_width(text: &str, scale: u32) -> u32 {
             width = width.max(line);
             line = 0;
         } else {
-            line += GLYPH_SIZE * scale;
+            line += glyph_cells(c) * GLYPH_SIZE * scale;
         }
     }
     width.max(line)
+}
+
+/// `(width, height)` in pixels of `text` rendered at `scale` — the pair of
+/// [`text_width`] and [`text_height`] in one call.
+pub fn measure_text_px(text: &str, scale: u32) -> (u32, u32) {
+    (text_width(text, scale), text_height(text, scale))
+}
+
+/// Glyph cells `text` advances (sum of [`glyph_cells`], `'\n'` excluded
+/// from the running count): `text_width(text, 1) / 8` without the `u32`
+/// cast dance.
+pub fn text_cells(text: &str) -> usize {
+    let mut cells = 0usize;
+    for c in text.chars() {
+        if c != '\n' {
+            cells += glyph_cells(c) as usize;
+        }
+    }
+    cells
+}
+
+/// Longest prefix of `text` that fits `limit` glyph cells (no allocation).
+/// A full-width glyph that would only half-fit is dropped whole — glyphs
+/// are never clipped mid-cell.
+pub fn first_cells(text: &str, limit: usize) -> &str {
+    let mut used = 0usize;
+    for (end, c) in text.char_indices() {
+        let cells = glyph_cells(c) as usize;
+        if used + cells > limit {
+            return &text[..end];
+        }
+        used += cells;
+    }
+    text
+}
+
+/// Longest suffix of `text` that fits `limit` glyph cells — the
+/// mirror of [`first_cells`] for right-aligned scrolling text.
+pub fn last_cells(text: &str, limit: usize) -> &str {
+    let mut used = 0usize;
+    for (start, c) in text.char_indices().rev() {
+        let cells = glyph_cells(c) as usize;
+        if used + cells > limit {
+            return &text[start + c.len_utf8()..];
+        }
+        used += cells;
+    }
+    text
 }
 
 /// Pixel height of `text` rendered at `scale` (8·scale per line).
@@ -557,12 +677,21 @@ pub fn text_height(text: &str, scale: u32) -> u32 {
 
 /// Tiles per atlas row.
 pub const ATLAS_COLS: u32 = 16;
-/// Atlas rows: 96 glyph tiles (95 ASCII + 1 fallback) + 1 solid-white tile
-/// at index [`WHITE_TILE_INDEX`] used for untextured color quads.
-pub const ATLAS_ROWS: u32 = 8;
+/// Atlas rows: 95 ASCII tiles + the narrow fallback + the solid-white tile
+/// at [`WHITE_TILE_INDEX`] + the two-tile wide fallback + two tiles per
+/// built-in extended glyph ([`crate::font_cjk::EXTRA_GLYPH_COUNT`]).
+/// Glyphs installed from an external pack have no atlas tile — the GPU
+/// path draws the fallback box for them (the software rasterizer paints
+/// them correctly); baking a pack into the atlas is an embedder choice.
+pub const ATLAS_ROWS: u32 = {
+    let tiles =
+        crate::font_cjk::EXTRA_GLYPH_TILE_BASE + 2 * crate::font_cjk::EXTRA_GLYPH_COUNT as u32;
+    tiles.div_ceil(ATLAS_COLS)
+};
 /// Atlas tile index of the solid white tile (`color * 1.0` passthrough).
 pub const WHITE_TILE_INDEX: u32 = (FONT_GLYPH_COUNT as u32) + 1;
-/// Atlas dimensions in pixels (128×64: sixteen 8×8 tiles per row).
+/// Atlas dimensions in pixels (128 px wide = sixteen 8×8 tiles per row;
+/// [`ATLAS_ROWS`] × 8 px tall).
 pub const FONT_ATLAS_WIDTH: u32 = ATLAS_COLS * GLYPH_SIZE;
 pub const FONT_ATLAS_HEIGHT: u32 = ATLAS_ROWS * GLYPH_SIZE;
 
@@ -597,6 +726,19 @@ pub fn font_atlas_rgba() -> Vec<u8> {
     }
     paint(FONT_GLYPH_COUNT as u32, &FALLBACK_GLYPH);
     paint(WHITE_TILE_INDEX, &[0xff; 8]);
+    paint(
+        crate::font_cjk::WIDE_FALLBACK_TILE,
+        &crate::font_cjk::WIDE_FALLBACK_GLYPH[0],
+    );
+    paint(
+        crate::font_cjk::WIDE_FALLBACK_TILE + 1,
+        &crate::font_cjk::WIDE_FALLBACK_GLYPH[1],
+    );
+    for (i, (_, _, tiles)) in crate::font_cjk::EXTRA_GLYPHS.iter().enumerate() {
+        let base = crate::font_cjk::EXTRA_GLYPH_TILE_BASE + 2 * i as u32;
+        paint(base, &tiles[0]);
+        paint(base + 1, &tiles[1]);
+    }
     out
 }
 
@@ -764,11 +906,19 @@ pub fn tessellate_draw_list(_width: u32, _height: u32, list: &UiDrawList) -> UiM
                         cy += cell as i32;
                         continue;
                     }
-                    if ch != ' ' {
-                        let uv = tile_uv(glyph_index(ch));
-                        mesh.quad(UiRect::new(cx, cy, cell, cell), uv, *color);
+                    if ch != ' ' && ch != '\u{3000}' {
+                        let base = glyph_index(ch);
+                        let cells = glyph_cells(ch);
+                        for tile in 0..cells {
+                            let uv = tile_uv(base + tile);
+                            mesh.quad(
+                                UiRect::new(cx + (tile * cell) as i32, cy, cell, cell),
+                                uv,
+                                *color,
+                            );
+                        }
                     }
-                    cx += cell as i32;
+                    cx += (glyph_cells(ch) * cell) as i32;
                 }
             }
             UiCommand::ProgressBar {
@@ -875,21 +1025,26 @@ impl Frame<'_> {
     }
 
     fn glyph_cell(&mut self, ch: char, x: i32, y: i32, scale: u32, color: UiColor) {
-        let bitmap = glyph_for(ch);
-        for (row, bits) in bitmap.iter().enumerate() {
-            for col in 0..8u32 {
-                if (bits & (0x80 >> col)) == 0 {
-                    continue;
+        let bitmap = glyph_bitmap(ch);
+        for (tile_idx, tile) in bitmap.tiles.iter().enumerate() {
+            if tile_idx >= bitmap.cells as usize {
+                break;
+            }
+            for (row, bits) in tile.iter().enumerate() {
+                for col in 0..8u32 {
+                    if (bits & (0x80 >> col)) == 0 {
+                        continue;
+                    }
+                    self.fill(
+                        UiRect::new(
+                            x + (tile_idx as i32 * 8 + col as i32) * scale as i32,
+                            y + (row as i32) * scale as i32,
+                            scale,
+                            scale,
+                        ),
+                        color,
+                    );
                 }
-                self.fill(
-                    UiRect::new(
-                        x + (col as i32) * scale as i32,
-                        y + (row as i32) * scale as i32,
-                        scale,
-                        scale,
-                    ),
-                    color,
-                );
             }
         }
     }
@@ -903,10 +1058,10 @@ impl Frame<'_> {
                 cy += cell;
                 continue;
             }
-            if ch != ' ' {
+            if ch != ' ' && ch != '\u{3000}' {
                 self.glyph_cell(ch, cx, cy, scale, color);
             }
-            cx += cell;
+            cx += glyph_cells(ch) as i32 * cell;
         }
     }
 }

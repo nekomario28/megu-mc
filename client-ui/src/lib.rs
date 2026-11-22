@@ -4,10 +4,13 @@
 //! Three layers, all `std`-only:
 //!
 //! * [`draw`] — the deterministic [`draw::UiDrawList`] command buffer, an
-//!   original built-in 8×8 ASCII bitmap font, GPU quad tessellation with a
+//!   original built-in bitmap font (ASCII plus the [`font_cjk`] CJK/kana/
+//!   Hangul/extended-Latin coverage), GPU quad tessellation with a
 //!   companion WGSL shader ([`draw::UI_QUAD_WGSL`]), a software RGBA
 //!   rasterizer ([`draw::rasterize_draw_list`]) and a dependency-free PNG
 //!   encoder ([`draw::encode_png_rgba`]).
+//! * [`font_cjk`] — the extended glyph table and the pure-`std` external
+//!   GNU Unifont `.hex` font pack loader ([`font_cjk::GlyphAtlas`]).
 //! * [`state`] — the screen state machine: title, tabbed settings
 //!   (Video/Audio/QoL/Fair-Play/Language), friends invite codes, mod-sync
 //!   consent, in-game HUD, pause, and the NotEnoughCrashes-style crash
@@ -31,6 +34,7 @@
 
 pub mod container_screen;
 pub mod draw;
+pub mod font_cjk;
 pub mod hud_widgets;
 pub mod layout;
 pub mod magic_hud;

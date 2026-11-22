@@ -755,14 +755,13 @@ impl ShaderPackScreenState {
 // Built-in bitmap font uses fixed 8px cells. Elide overlong labels rather
 // than painting text over an adjacent control or outside a panel.
 fn fit_text(label: &str, cells: usize) -> String {
-    let count = label.chars().count();
-    if count <= cells {
+    if crate::draw::text_cells(label) <= cells {
         return label.to_owned();
     }
     if cells <= 3 {
         return ".".repeat(cells);
     }
-    let mut clipped = label.chars().take(cells - 3).collect::<String>();
+    let mut clipped = crate::draw::first_cells(label, cells - 3).to_owned();
     clipped.push_str("...");
     clipped
 }
