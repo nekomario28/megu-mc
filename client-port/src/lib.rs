@@ -23,6 +23,7 @@ mod mesh;
 pub mod mesher;
 pub mod model_baker;
 mod packed;
+pub mod png_decode;
 mod region;
 mod section;
 pub mod shaderpack;

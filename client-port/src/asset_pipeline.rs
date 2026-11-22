@@ -14,11 +14,11 @@
 //! escapes are rejected), and every file is capped at
 //! [`MAX_ASSET_FILE_BYTES`].
 //!
-//! On-disk sprite format is [`RGBA8_SPRITE_FORMAT`]: an 8-byte little-endian
-//! `width`/`height` header followed by `width * height * 4` row-major RGBA8
-//! texels. PNG decoding is deliberately out of scope for this pure-`std`
-//! kernel — callers that need real `.png` textures decode them upstream and
-//! insert the resulting [`ResourcePackLayer`] programmatically.
+//! On-disk sprite formats are [`RGBA8_SPRITE_FORMAT`] (`.rgba`: an 8-byte
+//! little-endian `width`/`height` header followed by `width * height * 4`
+//! row-major RGBA8 texels) and real `.png` files, decoded by
+//! [`crate::png_decode::decode_png_rgba`] — a bounded clean-room decoder
+//! that fails closed on corrupt or oversized images.
 //!
 //! [`CompiledAssetBundle::build`] merges the layer stack lowest-to-highest
 //! priority: blockstates and sprites are highest-priority-wins per id,
@@ -60,9 +60,10 @@ use crate::section::Direction;
 // ---------------------------------------------------------------------------
 
 /// Per-file cap for [`ResourcePackLayer::from_dir`]: 8 MiB. Applies to every
-/// file the loader reads (JSON documents, `.rgba` sprites, `.mcmeta`
+/// file the loader reads (JSON documents, `.rgba`/`.png` sprites, `.mcmeta`
 /// animations) before and after the read so a swapped-in oversized file
-/// still fails closed.
+/// still fails closed. `.png` files are capped on their *compressed* size;
+/// [`crate::png_decode`] separately bounds the decoded output.
 pub const MAX_ASSET_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Border reserved around every packed sprite, in texels. Two texels keeps
@@ -117,9 +118,11 @@ pub enum AssetPipelineError {
         /// Observed size in bytes.
         bytes: u64,
     },
-    /// A `.rgba` sprite or `.mcmeta` animation file is malformed: bad
-    /// header, wrong payload length, invalid UTF-8 JSON, or an animation
-    /// table the [`SpriteAnimation`] constructors reject.
+    /// A `.rgba` sprite or `.mcmeta`/JSON pack file is malformed: bad
+    /// header, wrong payload length, invalid UTF-8, or an animation
+    /// table the [`SpriteAnimation`] constructors reject. (Undecodable
+    /// `.png` textures do not fail the load — they are recorded in
+    /// [`CompiledAssetBundle::skipped_errors`] at build time.)
     InvalidPackFile {
         /// Pack-relative path of the offending file.
         path: String,
@@ -180,6 +183,11 @@ impl Error for AssetPipelineError {
 /// RGBA8)`; `animations` maps the same id space to resolved
 /// [`SpriteAnimation`] tables. Layers are ordered lowest-to-highest
 /// priority: for every id the last layer defining it wins.
+///
+/// A `.png` texture that fails to decode is kept as a `(0, 0, bytes)`
+/// marker holding the raw file bytes — zero-size sprites are never
+/// valid — so [`CompiledAssetBundle::build`] can record the decode
+/// failure in `skipped_errors` instead of the load aborting.
 #[derive(Clone, Debug, Default)]
 pub struct ResourcePackLayer {
     /// Human-readable pack name (the directory name for [`from_dir`]).
@@ -200,11 +208,18 @@ impl ResourcePackLayer {
     /// * `assets/<ns>/blockstates/**/*.json` -> [`blockstates`](Self::blockstates)
     /// * `assets/<ns>/models/**/*.json` -> [`models`](Self::models)
     /// * `assets/<ns>/textures/**/*.rgba` -> [`sprites`](Self::sprites)
-    /// * `assets/<ns>/textures/**/*.rgba.mcmeta` -> [`animations`](Self::animations)
+    /// * `assets/<ns>/textures/**/*.png` -> [`sprites`](Self::sprites)
+    /// * `assets/<ns>/textures/**/*.rgba.mcmeta` or `*.png.mcmeta` ->
+    ///   [`animations`](Self::animations)
     ///
-    /// `.png` files and unrelated directories are ignored (this kernel has
-    /// no PNG decoder). An `.mcmeta` must sit next to its `.rgba` sibling —
-    /// the sprite's dimensions define the animation's frame geometry.
+    /// `.rgba` sprites use [`RGBA8_SPRITE_FORMAT`]; `.png` sprites are
+    /// decoded by [`crate::png_decode::decode_png_rgba`] straight into the
+    /// same RGBA8 shape — an undecodable `.png` is kept as a `(0, 0, bytes)`
+    /// marker and reported through
+    /// [`CompiledAssetBundle::skipped_errors`] at build time rather than
+    /// failing the load. Unrelated directories and files are ignored. An
+    /// `.mcmeta` must sit next to its `.rgba`/`.png` sibling — the sprite's
+    /// dimensions define the animation's frame geometry.
     ///
     /// Fail-closed: any I/O error, symlink escaping the pack root, file over
     /// [`MAX_ASSET_FILE_BYTES`], non-UTF-8 JSON, malformed `.rgba` or
@@ -328,13 +343,36 @@ impl ResourcePackLayer {
                                 .sprites
                                 .insert(format!("{ns}:{stem}"), (width, height, rgba));
                         }
+                        ("textures", Some("png")) => {
+                            let bytes = read_capped(&file, &display)?;
+                            let stem = rel
+                                .strip_suffix(".png")
+                                .expect(".png extension was matched");
+                            let key = format!("{ns}:{stem}");
+                            match crate::png_decode::decode_png_rgba(&bytes) {
+                                Ok((width, height, rgba)) => {
+                                    layer.sprites.insert(key, (width, height, rgba));
+                                }
+                                // A corrupt or oversized PNG must not kill
+                                // the whole pack load: keep the raw bytes as
+                                // a (0, 0, _) marker — zero-size sprites are
+                                // never valid — and let
+                                // `CompiledAssetBundle::build` re-decode it
+                                // into `skipped_errors` with the real reason.
+                                Err(_) => {
+                                    layer.sprites.insert(key, (0, 0, bytes));
+                                }
+                            }
+                        }
                         ("textures", Some("mcmeta")) => {
-                            // Only `<name>.rgba.mcmeta` animates a sprite we
-                            // can decode; `*.png.mcmeta` and friends are
-                            // ignored with the PNGs they describe.
+                            // Only `<name>.rgba.mcmeta` / `<name>.png.mcmeta`
+                            // animates a sprite we can decode; `*.mcmeta`
+                            // files for anything else are ignored.
                             let Some(stem) = rel
                                 .strip_suffix(".mcmeta")
-                                .and_then(|s| s.strip_suffix(".rgba"))
+                                .and_then(|s| {
+                                    s.strip_suffix(".rgba").or_else(|| s.strip_suffix(".png"))
+                                })
                             else {
                                 continue;
                             };
@@ -353,6 +391,12 @@ impl ResourcePackLayer {
                     reason: format!("animation has no sibling sprite {sprite_key:?}"),
                 });
             };
+            // A (0, 0, _) sprite is an undecodable `.png` marker; the sprite
+            // itself lands in `skipped_errors` at build time and there is
+            // no geometry to animate.
+            if width == 0 && height == 0 {
+                continue;
+            }
             if let Some(animation) = animation_from_mcmeta(&text, width, height)
                 .map_err(|reason| AssetPipelineError::InvalidPackFile {
                     path: display.clone(),
@@ -616,6 +660,20 @@ impl CompiledAssetBundle {
             .set_padding(ATLAS_PADDING_TEXELS)
             .map_err(AssetPipelineError::Atlas)?;
         for (name, (width, height, rgba)) in sprites {
+            // `from_dir` keeps undecodable `.png` files as (0, 0, bytes)
+            // markers so the load itself stays alive; resolve them here so
+            // the failure is recorded with the real decode reason.
+            let (width, height, rgba) = if width == 0 && height == 0 {
+                match crate::png_decode::decode_png_rgba(&rgba) {
+                    Ok(decoded) => decoded,
+                    Err(err) => {
+                        skipped_errors.push((name, err.to_string()));
+                        continue;
+                    }
+                }
+            } else {
+                (width, height, rgba)
+            };
             let mode = sprite_padding_mode(&rgba);
             if let Err(err) =
                 builder.add_sprite_with_mode(name.clone(), width, height, rgba, mode)
