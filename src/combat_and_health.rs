@@ -4600,6 +4600,7 @@ mod p1_combat_tests {
 
     #[test]
     fn p1_combat_attack_cooldown_counts_game_ticks() {
+        let _guard = crate::world_guard();
         let _g = CombatGuard::new();
         let (client, _rx) = client_pair();
         let client = Arc::new(client);
@@ -4622,6 +4623,7 @@ mod p1_combat_tests {
 
     #[test]
     fn p1_combat_attack_cooldown_ignores_wall_clock() {
+        let _guard = crate::world_guard();
         let _g = CombatGuard::new();
         let (client, _rx) = client_pair();
         let client = Arc::new(client);
@@ -4638,6 +4640,7 @@ mod p1_combat_tests {
 
     #[test]
     fn p1_combat_held_item_switch_resets_charge() {
+        let _guard = crate::world_guard();
         let _g = CombatGuard::new();
         let (client, _rx) = client_pair();
         let client = Arc::new(client);
@@ -4656,6 +4659,7 @@ mod p1_combat_tests {
 
     #[test]
     fn p1_combat_mob_hurt_window_runs_on_ticks() {
+        let _guard = crate::world_guard();
         let _g = CombatGuard::new();
         let mob = test_mob(4242);
         mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob.clone());
@@ -4681,6 +4685,7 @@ mod p1_combat_tests {
 
     #[test]
     fn p1_combat_mob_hurt_window_stamped_paths_hold() {
+        let _guard = crate::world_guard();
         let _g = CombatGuard::new();
         let mob = test_mob(4242);
         mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob.clone());
@@ -4773,6 +4778,7 @@ mod p1_combat_tests {
 
     #[test]
     fn p1_combat_live_melee_uses_attribute_components() {
+        let _guard = crate::world_guard();
         let _g = CombatGuard::new();
         let (client, _rx) = client_pair();
         let client = Arc::new(client);
@@ -4803,6 +4809,7 @@ mod p1_combat_tests {
 
     #[test]
     fn p1_combat_knockback_resistance_from_component() {
+        let _guard = crate::world_guard();
         let _g = CombatGuard::new();
         let (client, _rx) = client_pair();
         let client = Arc::new(client);
@@ -4821,6 +4828,7 @@ mod p1_combat_tests {
 
     #[test]
     fn p1_combat_max_health_component_via_attr_cache() {
+        let _guard = crate::world_guard();
         let _g = CombatGuard::new();
         let (client, _rx) = client_pair();
         let client = Arc::new(client);
@@ -4922,6 +4930,7 @@ mod p5a_parity_tests {
     // creeper's fuse countdown or the sunlight-burn field.
     #[test]
     fn p5a_parity_fire_aspect_never_touches_creeper_fuse() {
+        let _guard = crate::world_guard();
         let _g = FireGuard::new();
         let creeper = mob(4243, name_to_etype("creeper").unwrap());
         *creeper.fuse.lock().unwrap_or_else(|e| e.into_inner()) = 7;
@@ -4955,6 +4964,7 @@ mod p5a_parity_tests {
     // family, decrements to zero, and water/rain extinguishes.
     #[test]
     fn p5a_parity_mob_fire_ticks_decrement_damage_and_extinguish() {
+        let _guard = crate::world_guard();
         let _g = FireGuard::new();
         let eid = 4244;
         ignite_mob(eid, server_ticks(80) as u32);
@@ -5241,6 +5251,7 @@ mod p5a_parity_tests {
     // the burn but pays no damage, matching the melee gate.
     #[test]
     fn p5a_parity_fire_aspect_immune_mob_records_no_damage() {
+        let _guard = crate::world_guard();
         let _g = FireGuard::new();
         let blaze = name_to_etype("blaze").unwrap();
         ignite_mob_fire_aspect(4245, 1);
@@ -5477,6 +5488,7 @@ mod vanilla_combat2_tests {
 
     #[test]
     fn vanilla_combat2_wind_charge_fall_reset() {
+        let _guard = crate::world_guard();
         let _g = LaneGuard::new();
         let (c, _r) = client_pair();
         *c.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = 120.0;
@@ -5489,6 +5501,7 @@ mod vanilla_combat2_tests {
 
     #[test]
     fn vanilla_combat2_wind_charge_redstone_triggers() {
+        let _guard = crate::world_guard();
         let mut g = LaneGuard::new();
         let d = DimId::Overworld;
         // Toggleable: lever, button, bell, wooden door, trapdoor, fence gate.
@@ -5554,6 +5567,7 @@ mod vanilla_combat2_tests {
 
     #[test]
     fn vanilla_combat2_wind_charge_door_flips_both_halves() {
+        let _guard = crate::world_guard();
         let mut g = LaneGuard::new();
         let d = DimId::Overworld;
         let Some(lower) = name_to_state("oak_door") else { return };
@@ -5572,6 +5586,7 @@ mod vanilla_combat2_tests {
 
     #[test]
     fn vanilla_combat2_wind_charge_burst_launches_and_resets() {
+        let _guard = crate::world_guard();
         let _g = LaneGuard::new();
         let (c, mut r) = client_pair();
         *c.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = 200.0;
@@ -5795,6 +5810,7 @@ mod vanilla_combat2_tests {
 
     #[test]
     fn vanilla_combat2_shield_state_tick_and_block_gate() {
+        let _guard = crate::world_guard();
         let _g = LaneGuard::new();
         let (c, _r) = client_pair();
         let c = Arc::new(c);
@@ -5824,6 +5840,7 @@ mod vanilla_combat2_tests {
 
     #[test]
     fn vanilla_combat2_totem_offhand_pop_effects_status35() {
+        let _guard = crate::world_guard();
         let _g = LaneGuard::new();
         let (c, mut r) = client_pair();
         let totem = name_to_item("totem_of_undying").unwrap();
@@ -5882,6 +5899,7 @@ mod vanilla_combat2_tests {
 
     #[test]
     fn vanilla_combat2_totem_mainhand_pop() {
+        let _guard = crate::world_guard();
         let _g = LaneGuard::new();
         let (c, _r) = client_pair();
         let totem = name_to_item("totem_of_undying").unwrap();
@@ -5902,6 +5920,7 @@ mod vanilla_combat2_tests {
 
     #[test]
     fn vanilla_combat2_totem_void_and_kill_bypass() {
+        let _guard = crate::world_guard();
         let _g = LaneGuard::new();
         for kind in [TotemDamageKind::Void, TotemDamageKind::Kill] {
             let (c, _r) = client_pair();
@@ -5925,6 +5944,7 @@ mod vanilla_combat2_tests {
 
     #[test]
     fn vanilla_combat2_totem_check_void_zone_no_pop() {
+        let _guard = crate::world_guard();
         let _g = LaneGuard::new();
         let (c, _r) = client_pair();
         let totem = name_to_item("totem_of_undying").unwrap();
@@ -5955,6 +5975,7 @@ mod vanilla_combat2_tests {
 
     #[test]
     fn vanilla_combat2_totem_nonlethal_and_empty_hand() {
+        let _guard = crate::world_guard();
         let _g = LaneGuard::new();
         let (c, _r) = client_pair();
         let totem = name_to_item("totem_of_undying").unwrap();
@@ -6127,6 +6148,7 @@ mod vanilla_combat2_tests {
 
     #[test]
     fn vanilla_combat2_trident_loyalty_return_tick() {
+        let _guard = crate::world_guard();
         let _g = LaneGuard::new();
         let (c, _r) = client_pair();
         {
@@ -6220,6 +6242,7 @@ mod vanilla_combat2_tests {
 
     #[test]
     fn vanilla_combat2_riptide_spin_state() {
+        let _guard = crate::world_guard();
         let _g = LaneGuard::new();
         TICK_IDX.store(1000, Ordering::Relaxed);
         riptide_spin()
@@ -6235,8 +6258,8 @@ mod vanilla_combat2_tests {
 
     #[test]
     fn parity_live_wire_wind_totem_trident() {
-        crate::test_support::require_vanilla_data();
         let _guard = world_guard();
+        crate::test_support::require_vanilla_data();
         let mut lane = LaneGuard::new();
         let reg = crate::block_registry::breg().unwrap();
 

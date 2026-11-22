@@ -38,6 +38,7 @@ fn plains_creature_spawners(biome: &str, category: &str) -> Vec<CreatureSpawnerD
 
 #[test]
 fn chunk_generation_creatures_use_deterministic_scatter_and_pack_bounds() {
+    let _guard = crate::world_guard();
     let mut a = ChunkCreatureScene { accept: true, ..Default::default() };
     let mut b = ChunkCreatureScene { accept: true, ..Default::default() };
     let seed = seed_passing(0.2);
@@ -55,6 +56,7 @@ fn chunk_generation_creatures_use_deterministic_scatter_and_pack_bounds() {
 
 #[test]
 fn chunk_generation_creature_probability_gates_and_checks_ground_placement() {
+    let _guard = crate::world_guard();
     let mut scene = ChunkCreatureScene { accept: true, ..Default::default() };
     let mut rng = Lcg::new(0x117);
     let before = rng.state48();
@@ -238,6 +240,7 @@ impl World for NativeScene {
 
 #[test]
 fn native_spawner_ticks_match_all_1211_cases() {
+    let _guard = crate::world_guard();
     let tsv = include_str!("../tests/data/mineshaft_spawner_1211.tsv");
     let origin = (24, 201, 0);
     let mut persistent_spiders = Vec::new();
@@ -319,6 +322,7 @@ fn native_spawner_ticks_match_all_1211_cases() {
 
 #[test]
 fn spawner_fails_closed_on_unsupported_edited_nbt() {
+    let _guard = crate::world_guard();
     struct DummyWorld;
     impl World for DummyWorld {
         fn active(&mut self, _: Pos, _: i32) -> bool {
@@ -425,6 +429,7 @@ fn spawner_fails_closed_on_unsupported_edited_nbt() {
 
 #[test]
 fn spawner_validates_general_1211_mobs_and_weighted_potentials() {
+    let _guard = crate::world_guard();
     struct DummyWorld;
     impl World for DummyWorld {
         fn active(&mut self, _: Pos, _: i32) -> bool {
@@ -522,13 +527,13 @@ fn spawner_validates_general_1211_mobs_and_weighted_potentials() {
 /// touches are swapped out and restored like `container_tests`' LiveWorld.
 #[test]
 fn chunk_gen_and_natural_spawning_cover_passive_aquatic_and_end() {
+    let _guard = crate::world_guard();
     use crate::{DimId, MobCategory};
     use std::sync::atomic::Ordering;
 
     // This test rewrites shared spawn/world state; hold the world-test lock for its whole
     // body so a sibling mutating the same globals (or reading `world()`/`mobs()` under it)
     // cannot overlap. The swaps below alone leave the window between them unguarded.
-    let _guard = crate::world_guard();
     let mob_spawning = crate::GR_MOB_SPAWNING.swap(1, Ordering::Relaxed);
     let difficulty = crate::DIFFICULTY.swap(1, Ordering::Relaxed);
     let saved_visited = std::mem::take(&mut *crate::spawned_creature_chunks().lock().unwrap_or_else(|e| e.into_inner()));

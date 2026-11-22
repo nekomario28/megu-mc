@@ -2392,6 +2392,7 @@ mod redstone_tests {
 
     #[test]
     fn registry_codec_round_trips_every_supported_1211_state() {
+        let _guard = crate::world_guard();
         let reg = breg().unwrap();
         let asset = std::fs::read("assets/block_states_1211.json").unwrap();
         let states = jparse(&asset).unwrap();
@@ -2461,6 +2462,7 @@ mod redstone_tests {
 
     #[test]
     fn registry_conductor_and_support_use_native_state_flags() {
+        let _guard = crate::world_guard();
         let reg = breg().unwrap();
         let mut world = MemoryWorld::new(reg);
         let mut torches = BTreeMap::new();
@@ -2484,6 +2486,7 @@ mod redstone_tests {
 
     #[test]
     fn registry_states_drive_torch_wire_repeater_lamp_circuit() {
+        let _guard = crate::world_guard();
         let reg = breg().unwrap();
         let mut world = MemoryWorld::new(reg);
         let mut torches = BTreeMap::new();
@@ -3316,6 +3319,7 @@ mod redstone_tests {
 
     #[test]
     fn lever_wire_repeater_lamp_writes_vanilla_ids_at_the_due_ticks() {
+        let _guard = crate::world_guard();
         let reg = breg().unwrap();
         let mut world = MemoryWorld::new(reg);
         let mut torches = BTreeMap::new();
@@ -3419,6 +3423,7 @@ mod redstone_tests {
 
     #[test]
     fn comparator_reads_and_updates_the_block_entity_independently_of_powered() {
+        let _guard = crate::world_guard();
         let reg = breg().unwrap();
         let pos = RsPos(0, 0, 0);
         let rear = pos.relative(RsDir::West);
@@ -3465,6 +3470,7 @@ mod redstone_tests {
 
     #[test]
     fn stepped_dust_reads_wire_power_and_uses_the_full_attachment_face() {
+        let _guard = crate::world_guard();
         let reg = breg().unwrap();
         let wire = RsPos(0, 0, 0);
         let step = wire.relative(RsDir::East);
@@ -3516,6 +3522,7 @@ mod redstone_tests {
 
     #[test]
     fn powered_dust_emits_using_live_geometry_before_its_stored_shape_is_refreshed() {
+        let _guard = crate::world_guard();
         let reg = breg().unwrap();
         let mut world = MemoryWorld::new(reg);
         let mut torches = BTreeMap::new();
@@ -3548,6 +3555,7 @@ mod redstone_tests {
 
     #[test]
     fn mounted_controls_observers_and_targets_emit_in_the_vanilla_directions() {
+        let _guard = crate::world_guard();
         let reg = breg().unwrap();
         for name in ["lever", "polished_blackstone_button"] {
             for (face, attachment) in [
@@ -3596,12 +3604,13 @@ mod redstone_tests {
         );
         assert_eq!(
             rs_wire_connection(&adapter, wire, RsDir::West),
-            RsWireConnection::None
+            RsWireConnection::Side
         );
     }
 
     #[test]
     fn a_pending_tick_does_not_run_on_a_replacement_block() {
+        let _guard = crate::world_guard();
         let reg = breg().unwrap();
         let pos = RsPos(0, 0, 0);
         let lamp_off = registered(reg, "redstone_lamp", &[("lit", "false")]);
@@ -3622,6 +3631,7 @@ mod redstone_tests {
     }
     #[test]
     fn registry_batch_settles_dust_and_delivers_queued_ticks_after_power_falls() {
+        let _guard = crate::world_guard();
         let reg = breg().unwrap();
         let mut world = MemoryWorld::new(reg);
         let mut torches = BTreeMap::new();
@@ -3667,6 +3677,7 @@ mod redstone_tests {
 
     #[test]
     fn comparator_uses_the_stronger_analog_source_behind_a_conductor() {
+        let _guard = crate::world_guard();
         let reg = breg().unwrap();
         let mut world = MemoryWorld::new(reg);
         let mut torches = BTreeMap::new();
@@ -3953,6 +3964,7 @@ mod redstone_tests {
 
     #[test]
     fn redstone_world_decodes_sensor_state_properties() {
+        let _guard = crate::world_guard();
         let reg = breg().unwrap();
         let daylight = registered(reg, "daylight_detector", &[("inverted", "true")]);
         assert_eq!(
@@ -4030,6 +4042,7 @@ mod redstone_tests {
 
     #[test]
     fn redstone_sensors_daylight_tripwire_sculk_live_wire() {
+        let _guard = crate::world_guard();
         let reg = breg().unwrap();
         let mut torches = BTreeMap::new();
         let prop = |world: &MemoryWorld, pos: RsPos, key: &str| {

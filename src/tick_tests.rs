@@ -81,8 +81,8 @@ fn p02_biome_row(biome: &str, category: &str, mob: &str) -> feature::SpawnerData
 
 #[test]
 fn p02_end_biome_weighted_enderman_reaches_live_entity_registry() {
-    crate::test_support::require_vanilla_data();
     let _guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _world = WorldSnapshot::take();
     let _runtime = RuntimeRegistrySnapshot::take();
     let _flags = P02SpawnFlagRestore::enable();
@@ -105,8 +105,8 @@ fn p02_end_biome_weighted_enderman_reaches_live_entity_registry() {
 
 #[test]
 fn p02_water_biome_rows_spawn_in_water_and_reject_dry_cells() {
-    crate::test_support::require_vanilla_data();
     let _guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _world = WorldSnapshot::take();
     let _runtime = RuntimeRegistrySnapshot::take();
     let _flags = P02SpawnFlagRestore::enable();
@@ -139,8 +139,8 @@ fn p02_water_biome_rows_spawn_in_water_and_reject_dry_cells() {
 
 #[test]
 fn p02_underground_bat_glow_squid_and_lush_axolotl_require_valid_sites() {
-    crate::test_support::require_vanilla_data();
     let _guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _world = WorldSnapshot::take();
     let _runtime = RuntimeRegistrySnapshot::take();
     let _flags = P02SpawnFlagRestore::enable();
@@ -177,6 +177,7 @@ fn p02_underground_bat_glow_squid_and_lush_axolotl_require_valid_sites() {
 
 #[test]
 fn combat_enchantment_targets_and_critical_gates_follow_vanilla_sets() {
+    let _guard = crate::world_guard();
     for name in ["husk", "drowned", "wither", "phantom", "zombie_horse"] {
         assert!(enchantment_targets_undead(name_to_etype(name).unwrap()), "{name}");
     }
@@ -239,8 +240,8 @@ impl std::ops::Drop for RuntimeRegistrySnapshot {
 
 #[test]
 fn d1_nether_crop_growth_writes_only_its_dimension() {
-    crate::test_support::require_vanilla_data();
     let _guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _world = WorldSnapshot::take();
     let _runtime = RuntimeRegistrySnapshot::take();
     let (x, y, z) = (0, 70, 0);
@@ -258,8 +259,8 @@ fn d1_nether_crop_growth_writes_only_its_dimension() {
 
 #[test]
 fn d1_reload_saved_drop_eid_does_not_collide_with_mob() {
-    crate::test_support::require_vanilla_data();
     let _guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _world = WorldSnapshot::take();
     let _runtime = RuntimeRegistrySnapshot::take();
     NEXT_EID.store(1000, Ordering::SeqCst);
@@ -308,6 +309,7 @@ fn d1_reload_saved_drop_eid_does_not_collide_with_mob() {
 
 #[test]
 fn gp2_saved_mob_dimensions_follow_legacy_record_order() {
+    let _guard = crate::world_guard();
     if crate::test_support::isolated_world_test() {
         return;
     }
@@ -341,6 +343,7 @@ fn gp2_saved_mob_dimensions_follow_legacy_record_order() {
 
 #[test]
 fn gp2_mismatched_mob_dimension_footer_does_not_apply_overlay() {
+    let _guard = crate::world_guard();
     if crate::test_support::isolated_world_test() {
         return;
     }
@@ -367,8 +370,8 @@ fn gp2_mismatched_mob_dimension_footer_does_not_apply_overlay() {
 
 #[test]
 fn d1_player_fluid_checks_use_nether_blocks() {
-    crate::test_support::require_vanilla_data();
     let _guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _world = WorldSnapshot::take();
     let (y, z) = (60, 0);
     // A crouched player's eyes at y+1.27 are below source water at y+1.
@@ -386,6 +389,7 @@ fn d1_player_fluid_checks_use_nether_blocks() {
 
 #[test]
 fn m2_crafting_log_to_planks_uses_item_registry_ids() {
+    let _guard = crate::world_guard();
     for (log, plank) in [
         ("oak_log", "oak_planks"),
         ("spruce_log", "spruce_planks"),
@@ -714,6 +718,7 @@ fn generated_dispatcher_fixture() {
 /// (rather than hanging) if it does not return.
 #[test]
 fn adv_event_returns_with_a_loaded_advancement_set() {
+    let _guard = crate::world_guard();
     advancements().lock().unwrap_or_else(|e| e.into_inner()).insert(
         "test:ping".to_string(),
         Advancement {
@@ -816,8 +821,8 @@ impl std::ops::Drop for WorldSnapshot {
 
 #[test]
 fn fragile_support_loss_drops_torches_and_lanterns_exactly_once() {
-    crate::test_support::require_vanilla_data();
     let _guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snapshot = WorldSnapshot::take();
     set_test_region(HashSet::from([(0, 0)]), HashSet::from([(0, 0)]));
     let reg = crate::block_registry::breg().unwrap();
@@ -860,6 +865,7 @@ fn fragile_support_loss_drops_torches_and_lanterns_exactly_once() {
 
 #[test]
 fn fragile_direction_matching_is_not_just_any_air_neighbor() {
+    let _guard = crate::world_guard();
     let reg = crate::block_registry::breg().unwrap();
     let air = reg.state_of("minecraft:air", None);
     let stone = reg.state_of("minecraft:stone", None);
@@ -878,6 +884,7 @@ fn fragile_direction_matching_is_not_just_any_air_neighbor() {
 
 #[test]
 fn multiway_wall_post_and_compatible_fence_pane_connections() {
+    let _guard = crate::world_guard();
     let reg = crate::block_registry::breg().unwrap();
     let air = reg.state_of("minecraft:air", None);
     let stone = reg.state_of("minecraft:stone", None);
@@ -926,8 +933,8 @@ fn multiway_wall_post_and_compatible_fence_pane_connections() {
 
 #[test]
 fn runtime_connected_shapes_connect_and_disconnect_with_waterlogged_retained() {
-    crate::test_support::require_vanilla_data();
     let _guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snapshot = WorldSnapshot::take();
     WATERLOGGED_DEFER.with(|v| v.borrow_mut().clear());
     set_test_region(HashSet::from([(0, 0)]), HashSet::from([(0, 0)]));
@@ -964,8 +971,8 @@ fn runtime_connected_shapes_connect_and_disconnect_with_waterlogged_retained() {
 
 #[test]
 fn waterlogged_source_flows_on_fifth_game_tick_without_replacing_its_block() {
-    crate::test_support::require_vanilla_data();
     let _guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snapshot = WorldSnapshot::take();
     WATERLOGGED_DEFER.with(|v| v.borrow_mut().clear());
     let reg = crate::block_registry::breg().unwrap();
@@ -1018,6 +1025,7 @@ fn waterlogged_source_flows_on_fifth_game_tick_without_replacing_its_block() {
 
 #[test]
 fn world_mechanisms_fluid_reactions_resolve_vanilla_blocks() {
+    let _guard = crate::world_guard();
     crate::test_support::require_vanilla_data();
     let reg = crate::block_registry::breg().unwrap();
     for (reaction, name) in [
@@ -1031,6 +1039,7 @@ fn world_mechanisms_fluid_reactions_resolve_vanilla_blocks() {
 
 #[test]
 fn world_mechanisms_fluid_wash_away_excludes_waterloggable_hosts() {
+    let _guard = crate::world_guard();
     crate::test_support::require_vanilla_data();
     let reg = crate::block_registry::breg().unwrap();
     for name in ["minecraft:torch", "minecraft:wall_torch", "minecraft:wheat", "minecraft:short_grass"] {
@@ -1052,8 +1061,8 @@ fn world_mechanisms_fluid_wash_away_excludes_waterloggable_hosts() {
 
 #[test]
 fn world_mechanisms_generated_fluids_cross_chunk_borders_on_their_tick_deadlines() {
-    crate::test_support::require_vanilla_data();
     let _guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snapshot = WorldSnapshot::take();
     WATERLOGGED_DEFER.with(|deferred| deferred.borrow_mut().clear());
     let reg = crate::block_registry::breg().unwrap();
@@ -1100,6 +1109,7 @@ fn world_mechanisms_generated_fluids_cross_chunk_borders_on_their_tick_deadlines
 
 #[test]
 fn scheduled_leaf_distance_matches_native_vectors() {
+    let _guard = crate::world_guard();
     let reg = crate::block_registry::breg().unwrap();
     let make = |kind: &str| -> u32 {
         match kind {
@@ -2499,12 +2509,12 @@ fn entity_life_and_pickup_delay_count_server_ticks_and_freeze_when_cold() {
 
 #[test]
 fn air_supply_is_derived_everywhere_a_creature_is_constructed() {
+    let _world_guard = world_guard();
     // The air supply is a duration, so it must come from the cadence owner. A
     // leftover 4TPS literal would give 3s instead of the vanilla 15s, and only
     // the reset paths had been converted, not the construction sites.
     assert_eq!(AIR_SUPPLY_GT, 300);
     assert_eq!(server_ticks(AIR_SUPPLY_GT) * TICK_MS, 15_000);
-    let _world_guard = world_guard();
     let old_mobs = std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner()));
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let old_tick = TICK.swap(1, Ordering::Relaxed);
@@ -3356,8 +3366,8 @@ fn a_backoff_past_the_queue_cap_waits_for_its_real_deadline() {
 /// the first consumer of the stream.
 #[test]
 fn sixteen_random_ticks_raise_sugar_cane_one_block() {
-    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let (old_hot, old_warm) = test_region();
     let top = 150;
@@ -3430,8 +3440,8 @@ fn sixteen_random_ticks_raise_sugar_cane_one_block() {
 /// nothing, and that is what makes it safe to compute unconditionally.
 #[test]
 fn measure_the_light_cost_per_chunk() {
-    crate::test_support::require_vanilla_data();
     let _g = world_guard();
+    crate::test_support::require_vanilla_data();
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
     refresh_hot();
@@ -3661,8 +3671,8 @@ fn falling_world_tick_test() {
 /// before due time prevents conversion, and a subsequent removal rebooks.
 #[test]
 fn falling_booking_is_two_game_ticks_and_support_rescue_cancels_it() {
-    crate::test_support::require_vanilla_data();
     let _guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snapshot = WorldSnapshot::take();
     let old_tick = TICK_IDX.load(Ordering::Relaxed);
     let (hot, warm) = test_region();
@@ -3702,8 +3712,8 @@ fn falling_booking_is_two_game_ticks_and_support_rescue_cancels_it() {
 /// first solid block below. The bytecode contract is evidence/gameplay/falling-vanilla.
 #[test]
 fn sand_falls_under_vanilla_gravity_until_it_lands() {
-    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snap = WorldSnapshot::take();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
@@ -3801,8 +3811,8 @@ fn sand_falls_under_vanilla_gravity_until_it_lands() {
 /// a platform whose cell is entirely above `floor(new_y)`.
 #[test]
 fn a_fast_falling_block_lands_on_a_thin_platform_it_crosses() {
-    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snap = WorldSnapshot::take();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
@@ -3883,8 +3893,8 @@ fn beginning_a_falling_tick_leaves_the_queue_visible() {
 /// ticked to completion: every starting block must reappear exactly once.
 #[test]
 fn a_save_concurrent_with_falling_conserves_every_block() {
-    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snap = WorldSnapshot::take();
     // Earlier tests can leave mobs in the global registry; every save/load
     // round-trip here serialises `mobs()` wholesale and the loader appends, so a
@@ -4031,8 +4041,8 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
 /// transition must neither duplicate nor lose the item when its snapshot is reloaded.
 #[test]
 fn a_saved_below_world_drop_is_not_duplicated() {
-    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snap = WorldSnapshot::take();
     // Earlier tests can leave mobs in the global registry; every save/load
     // round-trip here serialises `mobs()` wholesale and the loader appends, so a
@@ -4247,8 +4257,8 @@ fn concurrent_knockout_and_falling_conserve_blocks() {
 /// block it never showed, because the check returns before locking when there is nothing above.
 #[test]
 fn two_stacked_sand_blocks_fall_without_deadlocking() {
-    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snap = WorldSnapshot::take();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
@@ -4327,8 +4337,8 @@ fn two_stacked_sand_blocks_fall_without_deadlocking() {
 /// it and left the block hanging in the air forever.
 #[test]
 fn a_new_block_in_a_passing_entity_cell_still_falls() {
-    crate::test_support::require_vanilla_data();
     let _g = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snap = WorldSnapshot::take();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
@@ -4400,8 +4410,8 @@ fn a_new_block_in_a_passing_entity_cell_still_falls() {
 /// block (a flower) and replaces it, rather than resting on top of it.
 #[test]
 fn a_falling_block_passes_through_a_replaceable_block() {
-    crate::test_support::require_vanilla_data();
     let _g = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snap = WorldSnapshot::take();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
@@ -4462,8 +4472,8 @@ fn a_falling_block_passes_through_a_replaceable_block() {
 /// recursion bound.
 #[test]
 fn a_long_unsupported_column_converts_in_one_pass() {
-    crate::test_support::require_vanilla_data();
     let _g = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snap = WorldSnapshot::take();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
@@ -4513,8 +4523,8 @@ fn a_long_unsupported_column_converts_in_one_pass() {
 /// would leave a ghost block on the client.
 #[test]
 fn placing_unsupported_sand_queues_air_not_a_ghost() {
-    crate::test_support::require_vanilla_data();
     let _g = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snap = WorldSnapshot::take();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
@@ -4561,8 +4571,8 @@ fn placing_unsupported_sand_queues_air_not_a_ghost() {
 /// list of three states kept that test green.
 #[test]
 fn every_falling_block_becomes_an_entity_and_lands() {
-    crate::test_support::require_vanilla_data();
     let _g = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snap = WorldSnapshot::take();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
@@ -4626,8 +4636,8 @@ fn every_falling_block_becomes_an_entity_and_lands() {
 /// the way down and land it in a chunk nobody had ever visited.
 #[test]
 fn a_falling_block_waits_in_a_cold_chunk() {
-    crate::test_support::require_vanilla_data();
     let _g = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snap = WorldSnapshot::take();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
@@ -4672,6 +4682,7 @@ fn a_falling_block_waits_in_a_cold_chunk() {
 /// A live container is the positive control: a no-op reader must fail this round trip.
 #[test]
 fn a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load() {
+    let _guard = crate::world_guard();
     if test_support::isolated_world_test() {
         return;
     }
@@ -4792,8 +4803,8 @@ fn drop_count(item: i64) -> usize {
 /// deferred to the next tick's re-check.
 #[test]
 fn a_support_placed_under_a_falling_entity_is_landed_on() {
-    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snap = WorldSnapshot::take();
     // Earlier tests can leave mobs in the global registry; every save/load
     // round-trip here serialises `mobs()` wholesale and the loader appends, so a
@@ -4945,8 +4956,8 @@ fn a_knockout_and_a_save_in_the_same_tick_conserve_the_block() {
 /// placed or dropped, and no block falls twice.
 #[test]
 fn two_knockouts_of_adjacent_supports_conserve_every_block() {
-    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snap = WorldSnapshot::take();
     let (_, ow) = test_region();
     let mut warm = ow.clone();
@@ -5027,8 +5038,8 @@ fn two_knockouts_of_adjacent_supports_conserve_every_block() {
 /// after conversion.
 #[test]
 fn a_save_during_entity_conversion_has_no_duplicate_drop() {
-    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snap = WorldSnapshot::take();
     // Earlier tests can leave mobs in the global registry; every save/load
     // round-trip here serialises `mobs()` wholesale and the loader appends, so a
@@ -5098,8 +5109,8 @@ fn a_save_during_entity_conversion_has_no_duplicate_drop() {
 /// chunk is warm again.
 #[test]
 fn region_change_mid_fall_keeps_the_entity() {
-    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snap = WorldSnapshot::take();
     let (_, ow) = test_region();
     let mut warm = ow.clone();
@@ -5166,6 +5177,7 @@ fn the_projectile_sweep_covers_the_whole_tick() {
 /// Preserve point-blank start-inside behavior while retiring sampled intersection.
 #[test]
 fn the_production_arrow_loop_hits_a_target_it_leaves_the_bow_inside() {
+    let _guard = crate::world_guard();
     let (hp, arrow_x) = arrow_sweep_outcome(0.6, 5.0);
     assert_eq!(
         hp,
@@ -5176,6 +5188,7 @@ fn the_production_arrow_loop_hits_a_target_it_leaves_the_bow_inside() {
 
 #[test]
 fn primitives_arrow_tick_hits_between_the_old_samples() {
+    let _guard = crate::world_guard();
     let (hp, arrow_x) = arrow_sweep_outcome(3.0, 20.0);
     assert_eq!(
         hp,
@@ -5185,7 +5198,6 @@ fn primitives_arrow_tick_hits_between_the_old_samples() {
 }
 
 fn arrow_sweep_outcome(target_x: f64, velocity: f64) -> (Option<f32>, Option<f64>) {
-    let _world_guard = world_guard();
     let old_arrows = std::mem::take(&mut *arrows().lock().unwrap_or_else(|e| e.into_inner()));
     let old_mobs = std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner()));
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
@@ -5278,6 +5290,7 @@ fn tmp_geode_noise_scale() {
 
 #[test]
 fn nightly_hostile_type_uses_the_pinned_biome_spawners() {
+    let _guard = crate::world_guard();
     // Plains' supported entries in list order: spider(100), zombie(95),
     // skeleton(100), creeper(100); the runtime's entity ids are 100/124/91/23.
     assert_eq!(spawn_etype_for_biome(Some("minecraft:plains"), 0), 100);
@@ -5296,6 +5309,7 @@ const CLEAR_MIDNIGHT_PACK_SEED: u64 = 1176;
 
 #[test]
 fn gp2_nightly_hostiles_spawn_packs_and_stop_at_the_cap() {
+    let _guard = crate::world_guard();
     if crate::test_support::isolated_world_test() {
         return;
     }
@@ -5376,6 +5390,7 @@ fn gp2_nightly_hostiles_spawn_packs_and_stop_at_the_cap() {
 
 #[test]
 fn gp2_nightly_hostiles_respect_player_distance_and_dimension() {
+    let _guard = crate::world_guard();
     if crate::test_support::isolated_world_test() {
         return;
     }
@@ -5494,6 +5509,7 @@ fn gp2_nightly_hostiles_respect_player_distance_and_dimension() {
 
 #[test]
 fn gp2_nightly_monster_cap_uses_the_union_of_eligible_player_chunks() {
+    let _guard = crate::world_guard();
     if crate::test_support::isolated_world_test() {
         return;
     }
@@ -5571,6 +5587,7 @@ fn gp2_nightly_monster_cap_uses_the_union_of_eligible_player_chunks() {
 
 #[test]
 fn gp2_nightly_placement_respects_support_and_entity_collision() {
+    let _guard = crate::world_guard();
     if crate::test_support::isolated_world_test() {
         return;
     }
@@ -5703,6 +5720,7 @@ fn gp2_nightly_placement_respects_support_and_entity_collision() {
 
 #[test]
 fn gp2_nightly_hostiles_respect_spawn_light() {
+    let _guard = crate::world_guard();
     if crate::test_support::isolated_world_test() {
         return;
     }
@@ -5793,6 +5811,7 @@ fn gp2_nightly_hostiles_respect_spawn_light() {
 ///   MC_SPINE_CHUNK_BENCH=1 cargo test --release --nocapture chunk_delivery_path_bench
 #[test]
 fn chunk_delivery_path_bench() {
+    let _guard = crate::world_guard();
     if std::env::var("MC_SPINE_CHUNK_BENCH").is_err() {
         return;
     }
@@ -5825,7 +5844,6 @@ fn chunk_delivery_path_bench() {
     } else {
         None
     };
-    let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _gen_guard = crate::worldgen::lock_gen_for_tests();
     assert!(worldgen::init(0, crate::name_to_state), "worldgen");
     let mut gen_sources: GenSources = HashMap::new();
@@ -5928,10 +5946,10 @@ fn chunk_delivery_path_bench() {
 /// that chunk (blocks, biomes, light arrays).
 #[test]
 fn chunk_delivery_digest() {
+    let _guard = world_guard();
     if std::env::var("MC_SPINE_CHUNK_DIGEST").is_err() {
         return;
     }
-    let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _gen_guard = crate::worldgen::lock_gen_for_tests();
     assert!(worldgen::init(0, crate::name_to_state), "worldgen");
     let mut gen_sources: GenSources = HashMap::new();
@@ -6031,11 +6049,11 @@ fn chunk_delivery_digest() {
 /// budget (filtered `tick_tests::`: 5.5 s green without this test, 28 s and one failure with it).
 #[test]
 fn p2_3_s1_overworld_streaming_path_keeps_its_bytes() {
+    let _guard = world_guard();
     if crate::test_support::isolated_world_test() {
         return;
     }
     const PINNED: &str = "9591b6dadd9bc27eb0e198f66f284615";
-    let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _gen_guard = crate::worldgen::lock_gen_for_tests();
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -6104,6 +6122,7 @@ fn p2_3_s1_overworld_streaming_path_keeps_its_bytes() {
 #[cfg(feature = "native-oracle")]
 #[test]
 fn native_survival_fragile_port_pair() {
+    let _guard = crate::world_guard();
     const SCENES: [(&str, u8); 12] = [
         ("empty", 0),
         ("floor_stone", 1),
@@ -6205,6 +6224,7 @@ fn native_survival_fragile_port_pair() {
 #[cfg(feature = "native-oracle")]
 #[test]
 fn native_neighbor_shape_port_pair() {
+    let _guard = crate::world_guard();
     fn parse(reg: &crate::block_registry::BReg, text: &str) -> u32 {
         let (name, properties) = match text.split_once('[') {
             Some((n, ps)) => (n, Some(ps.strip_suffix(']').expect("closing state ]"))),
@@ -6299,6 +6319,7 @@ fn native_neighbor_shape_port_pair() {
 #[cfg(feature = "native-oracle")]
 #[test]
 fn native_level_ticks_port_delivery_pair() {
+    let _guard = crate::world_guard();
     #[derive(Clone)]
     struct Request {
         phase: String,
@@ -6464,8 +6485,8 @@ fn a_block_write_waits_for_an_in_progress_save_before_booking() {
 /// that will move it.
 #[test]
 fn a_saved_snapshot_never_holds_an_unbooked_gravity_block() {
-    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snap = WorldSnapshot::take();
     // Earlier tests can leave mobs in the global registry; every save/load
     // round-trip here serialises `mobs()` wholesale and the loader appends, so a
@@ -6575,8 +6596,8 @@ fn a_saved_snapshot_never_holds_an_unbooked_gravity_block() {
 /// The placement booking has already fired by then, so it cannot stand in for it.
 #[test]
 fn removing_a_support_schedules_the_block_above_after_its_own_booking_fired() {
-    crate::test_support::require_vanilla_data();
     let _g = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snap = WorldSnapshot::take();
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
@@ -6630,8 +6651,8 @@ fn removing_a_support_schedules_the_block_above_after_its_own_booking_fired() {
 /// the block callback gate alone cannot cover this, because the entity exists.
 #[test]
 fn a_falling_entity_stops_moving_when_its_chunk_goes_cold() {
-    crate::test_support::require_vanilla_data();
     let _g = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snap = WorldSnapshot::take();
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
@@ -7127,6 +7148,7 @@ fn breaking_a_chest_drops_each_stack_once_and_leaves_no_entry() {
 /// that exist and their halves, and invents no container.
 #[test]
 fn chest_pairing_states_and_contents_survive_a_save_and_load() {
+    let _guard = crate::world_guard();
     if test_support::isolated_world_test() {
         return;
     }
@@ -7236,8 +7258,8 @@ fn fast_chest_viewer(eid: i32, at: BlockPos) -> (Arc<Client>, TcpStream) {
 
 #[test]
 fn chest_contract_redstone_conductor_matches_1211_rules() {
-    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let reg = breg().expect("block registry");
     let cell: BlockPos = (74, 165, 60);
 
@@ -7318,8 +7340,8 @@ fn chest_contract_redstone_conductor_matches_1211_rules() {
 
 #[test]
 fn chest_contract_blocked_single_double_cat_and_unblocked_barrel() {
-    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let y = 166;
     let stone = name_to_state("stone").unwrap();
     let glass = name_to_state("glass").unwrap();
@@ -7424,8 +7446,8 @@ fn chest_contract_blocked_single_double_cat_and_unblocked_barrel() {
 
 #[test]
 fn chest_contract_multi_viewer_broadcast_changes() {
-    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let y = 167;
     let left: BlockPos = (82, y, 60);
     let right: BlockPos = (83, y, 60);
@@ -7521,8 +7543,8 @@ fn chest_contract_multi_viewer_broadcast_changes() {
 
 #[test]
 fn chest_contract_recheck_openers_reach_and_lid_close() {
-    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let y = 168;
     let left: BlockPos = (88, y, 60);
     let right: BlockPos = (89, y, 60);
@@ -7738,6 +7760,7 @@ fn identity_fixture(orbs: &mut Vec<Xp>, items: &mut Vec<Drop>) -> IdentityFixtur
 
 #[test]
 fn the_tick_preserves_the_saved_world_payload_byte_for_byte() {
+    let _world_guard = world_guard();
     // The payload carries process-wide state - the world clock, the weather budget, the
     // random stream - and the digest is only meaningful if that state started where the
     // fixture says it did. A test running beside this one can advance any of them between
@@ -7747,7 +7770,6 @@ fn the_tick_preserves_the_saved_world_payload_byte_for_byte() {
     if crate::test_support::isolated_world_test() {
         return;
     }
-    let _world_guard = world_guard();
     // Self-check first: this must be the FNV-1a 128 offset basis, or the digest below is
     // not the function it claims to be.
     assert_eq!(
@@ -7917,8 +7939,8 @@ fn decode_block_updates(frames: Vec<(i64, Vec<u8>)>) -> Vec<(BlockPos, u32)> {
 
 #[test]
 fn chest_contract_3d_block_loot_stays_lazy_until_first_open() {
-    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snapshot = WorldSnapshot::take();
     // Earlier tests can leave mobs in the global registry; every save/load
     // round-trip here serialises `mobs()` wholesale and the loader appends, so a
@@ -8113,8 +8135,8 @@ fn chest_contract_3d_block_loot_stays_lazy_until_first_open() {
 
 #[test]
 fn chest_contract_3d_barrel_toggles_open_property_without_block_event() {
-    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snapshot = WorldSnapshot::take();
 
     let reg = breg().expect("block registry");
@@ -8185,8 +8207,8 @@ fn chest_contract_3d_barrel_toggles_open_property_without_block_event() {
 
 #[test]
 fn chest_contract_3d_waterlogged_double_chest_schedules_and_spreads_without_dry_partner_error() {
-    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snapshot = WorldSnapshot::take();
     WATERLOGGED_DEFER.with(|v| v.borrow_mut().clear());
     set_test_region(HashSet::from([(6, 3)]), HashSet::from([(6, 3)]));
@@ -8282,8 +8304,8 @@ fn chest_contract_3d_waterlogged_double_chest_schedules_and_spreads_without_dry_
 
 #[test]
 fn chest_contract_3d_ender_chest_emits_block_event_and_invalidates_on_break() {
-    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _snapshot = WorldSnapshot::take();
 
     let reg = breg().expect("block registry");
@@ -8858,8 +8880,8 @@ fn travel_contract_4d_lava_push_scale_dimension() {
 
 #[test]
 fn travel_contract_4d_mob_tick_water_and_lava_sink_without_fall_damage() {
-    crate::test_support::require_vanilla_data();
     let _guard = world_guard();
+    crate::test_support::require_vanilla_data();
     let _fixture = Travel4dWorld::take();
     set_level_ultra_warm(false); // Overworld: dimension_type/overworld.json ultra_warm=false
     let stone = name_to_state("stone").unwrap();
@@ -8989,7 +9011,7 @@ fn travel_contract_4d_mob_tick_water_and_lava_sink_without_fall_damage() {
 /// through `Arc::make_mut` and must leave the wire clean flag false even when reverted.
 #[test]
 fn section_store_is_dimension_keyed_and_patch_dirties_wire() {
-    let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = world_guard();
     let _gen_guard = crate::worldgen::lock_gen_for_tests();
 
     // Exclusive chunk coordinates: the store is a process global shared with other tests.
@@ -9057,6 +9079,7 @@ fn section_store_is_dimension_keyed_and_patch_dirties_wire() {
 /// feature layer's population order makes two full deliveries of the same bytes differ.
 #[test]
 fn chunk_data_opt_zero_repack_matches_legacy_wire_and_gen_sources() {
+    let _guard = crate::world_guard();
     let Some(reg) = breg() else {
         return;
     };
@@ -9152,6 +9175,7 @@ fn chunk_data_opt_zero_repack_matches_legacy_wire_and_gen_sources() {
 /// under the pinned block registry's `opacity_of`.
 #[test]
 fn section_light_class_answers_are_exactly_uniform_opacity() {
+    let _guard = crate::world_guard();
     let Some(reg) = breg() else {
         return;
     };
@@ -9366,11 +9390,11 @@ fn s3_parse_map_chunk(bytes: &[u8]) -> S3Packet {
 
 #[test]
 fn p2_3_s3_nether_and_end_chunk_packets_emit_16_sections_and_zero_sky_mask() {
+    let _guard = world_guard();
     if crate::test_support::isolated_world_test() {
         return;
     }
     crate::test_support::require_vanilla_data();
-    let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _gen_guard = crate::worldgen::lock_gen_for_tests();
     assert!(worldgen::init(0, crate::name_to_state), "overworld");
     assert!(
@@ -9414,11 +9438,11 @@ fn p2_3_s3_nether_and_end_chunk_packets_emit_16_sections_and_zero_sky_mask() {
 
 #[test]
 fn p2_3_s3_nether_and_end_block_light_anchors_at_light_min_y_minus_16() {
+    let _guard = world_guard();
     if crate::test_support::isolated_world_test() {
         return;
     }
     crate::test_support::require_vanilla_data();
-    let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _gen_guard = crate::worldgen::lock_gen_for_tests();
     assert!(worldgen::init(0, crate::name_to_state), "overworld");
     assert!(worldgen::init_dim(DimId::Nether, 0, crate::name_to_state));
@@ -9514,11 +9538,11 @@ fn p2_3_s3_nether_and_end_block_light_anchors_at_light_min_y_minus_16() {
 
 #[test]
 fn p2_3_s3_chunk_caches_isolate_dimensions_on_same_coords() {
+    let _guard = world_guard();
     if crate::test_support::isolated_world_test() {
         return;
     }
     crate::test_support::require_vanilla_data();
-    let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _gen_guard = crate::worldgen::lock_gen_for_tests();
     assert!(worldgen::init(0, crate::name_to_state), "overworld");
     assert!(worldgen::init_dim(DimId::Nether, 0, crate::name_to_state));
@@ -9629,6 +9653,7 @@ fn s4_spawn_info(b: &[u8], p: &mut usize) -> (i64, String) {
 
 #[test]
 fn p2_3_s4_dimension_type_wire_ids_come_from_the_pinned_registry() {
+    let _guard = crate::world_guard();
     // The blob must be readable from the crate root: the ids are derived from it, not
     // hard-coded, so a regenerated registry with a different order changes the wire id.
     assert!(std::path::Path::new("config_packets.bin").exists());
@@ -9643,6 +9668,7 @@ fn p2_3_s4_dimension_type_wire_ids_come_from_the_pinned_registry() {
 
 #[test]
 fn p2_3_s4_join_game_declares_all_three_dimensions_and_names_spawn_dim() {
+    let _guard = crate::world_guard();
     for (dim, id, name) in [
         (DimId::Overworld, 0, "minecraft:overworld"),
         (DimId::Nether, 3, "minecraft:the_nether"),
@@ -9682,11 +9708,11 @@ fn p2_3_s4_join_game_declares_all_three_dimensions_and_names_spawn_dim() {
 
 #[test]
 fn p2_3_s4_switch_client_dimension_emits_respawn_clears_chunks_and_syncs_position() {
+    let _guard = world_guard();
     if crate::test_support::isolated_world_test() {
         return;
     }
     crate::test_support::require_vanilla_data();
-    let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _gen_guard = crate::worldgen::lock_gen_for_tests();
     assert!(worldgen::init(0, crate::name_to_state), "overworld");
     assert!(
@@ -9796,11 +9822,11 @@ fn p2_3_s4_broadcast_chunk_dim_filters_other_dimensions() {
 
 #[test]
 fn m3_p5_map_chunk_cache_hit_and_invalidation() {
+    let _guard = world_guard();
     if crate::test_support::isolated_world_test() {
         return;
     }
     crate::test_support::require_vanilla_data();
-    let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _gen_guard = crate::worldgen::lock_gen_for_tests();
     assert!(worldgen::init(0, crate::name_to_state), "overworld");
     let dim = DimId::Overworld;
@@ -9882,11 +9908,11 @@ fn m3_p5_map_chunk_cache_hit_and_invalidation() {
 
 #[test]
 fn p2_c_uniform_sections_emitters_match_cell_by_cell() {
+    let _guard = world_guard();
     if crate::test_support::isolated_world_test() {
         return;
     }
     crate::test_support::require_vanilla_data();
-    let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _gen_guard = crate::worldgen::lock_gen_for_tests();
     assert!(worldgen::init(0, crate::name_to_state), "overworld");
     assert!(worldgen::enabled(), "worldgen must be loaded");

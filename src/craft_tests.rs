@@ -214,6 +214,7 @@ impl std::ops::Drop for AdvancementRegistrySnapshot {
 
 #[test]
 fn a_shaped_recipe_matches_at_a_non_zero_grid_offset() {
+    let _guard = crate::world_guard();
     let _advs = AdvancementRegistrySnapshot::take();
     load_datapacks();
     let diamond_block = name_to_item("minecraft:diamond_block").expect("diamond_block");
@@ -241,6 +242,7 @@ fn a_shaped_recipe_matches_at_a_non_zero_grid_offset() {
 
 #[test]
 fn vanilla_stonecutting_json_parses_ingredient_and_result_count() {
+    let _guard = crate::world_guard();
     let _advs = AdvancementRegistrySnapshot::take();
     load_datapacks();
     let recipe = parse_special_recipe(
@@ -259,6 +261,7 @@ fn vanilla_stonecutting_json_parses_ingredient_and_result_count() {
 
 #[test]
 fn vanilla_smithing_transform_json_preserves_base_components() {
+    let _guard = crate::world_guard();
     let _advs = AdvancementRegistrySnapshot::take();
     load_datapacks();
     let recipe = parse_special_recipe(
@@ -283,6 +286,7 @@ fn vanilla_smithing_transform_json_preserves_base_components() {
 
 #[test]
 fn vanilla_smithing_trim_json_applies_the_trim_component_to_armor() {
+    let _guard = crate::world_guard();
     let _advs = AdvancementRegistrySnapshot::take();
     load_datapacks();
     let recipe = parse_special_recipe(
@@ -305,6 +309,7 @@ fn vanilla_smithing_trim_json_applies_the_trim_component_to_armor() {
 
 #[test]
 fn vanilla_decorated_pot_keeps_north_east_south_west_decoration_order() {
+    let _guard = crate::world_guard();
     let _advs = AdvancementRegistrySnapshot::take();
     load_datapacks();
     let recipe = parse_special_recipe(
