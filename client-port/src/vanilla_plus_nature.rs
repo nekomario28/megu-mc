@@ -26,12 +26,21 @@
 //!   intensity. It is a glow mask hint only: zero model, rig or animation
 //!   changes.
 //!
+//! Modded content plugs in through [`NatureModRegistry`] plus the
+//! `classify_*` / `*_with_atmosphere` helpers at the bottom of this file:
+//! modded leaf/canopy blocks, swayable plants and lanterns, emissive mobs,
+//! and foreign biomes/dimensions are classified deterministically from
+//! resource ids, `c:`/`forge:`/`minecraft:` tags and a caller-supplied
+//! `atmosphere_density`. Everything unknown — a solid modded block, a
+//! vacuum space dimension, an underground cave — fails closed to `None` or
+//! an empty output, never to a guessed effect.
+//!
 //! Everything is pure `std`, deterministic, and reads no wall clock: all
 //! animation derives from `world_time_ticks`, `dt_sec` and integer position
 //! hashes. No Mojang or third-party geometry or texture data is referenced
 //! anywhere in this file.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::f32::consts::{PI, TAU};
 
 use crate::vfx_engine::VfxHardwareTier;
@@ -194,8 +203,8 @@ fn block_phase(block: [i32; 3]) -> f32 {
 }
 
 /// Strips a `namespace:` prefix and any trailing state suffix from an id.
-fn entity_path(entity_id: &str) -> &str {
-    let path = entity_id.rsplit(':').next().unwrap_or(entity_id);
+fn resource_path(id: &str) -> &str {
+    let path = id.rsplit(':').next().unwrap_or(id);
     path.trim()
 }
 
@@ -1005,7 +1014,7 @@ pub struct MobEmissiveHint {
 /// path component is matched. Returns `None` for everything else — the table
 /// is intentionally minimal.
 pub fn emissive_mob_feature(entity_id: &str) -> Option<MobEmissiveHint> {
-    let path = entity_path(entity_id);
+    let path = resource_path(entity_id);
     let hint = |feature, rgb, intensity| {
         Some(MobEmissiveHint {
             feature,
@@ -1038,4 +1047,623 @@ pub fn emissive_mob_hint(
     } else {
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// Mod integration: registries, block classifiers, biome ambience
+// ---------------------------------------------------------------------------
+
+/// Fallback leaf tint for auto-classified canopy with no registered colour.
+/// Matches the spring/summer base used by the ambience leaf spawner.
+pub const FALLBACK_LEAF_RGB: [f32; 3] = [0.30, 0.52, 0.20];
+/// Warm yellow-green firefly tint for humid overworld-style mod biomes
+/// (swamps, plains, forests).
+pub const WARM_FIREFLY_RGB: [f32; 3] = [0.90, 1.00, 0.35];
+/// Soft cyan-violet firefly tint for `#c:is_magical` biomes (Twilight
+/// Forest groves, Ars Nouveau starbuncle clearings, ...).
+pub const MAGICAL_FIREFLY_RGB: [f32; 3] = [0.60, 0.70, 1.00];
+
+/// Minimum atmosphere density for fireflies and rain ripples.
+const MIN_AMBIENT_ATMOSPHERE: f32 = 0.25;
+/// Minimum atmosphere density for layered clouds and falling leaves.
+const MIN_SKY_ATMOSPHERE: f32 = 0.15;
+/// Biome temperature at or below which fireflies and ripples stay off.
+const FIREFLY_MIN_TEMPERATURE: f32 = 0.15;
+/// Temperature above which a biome with no precipitation counts as dry.
+const DRY_INFERENCE_TEMPERATURE: f32 = 0.95;
+
+/// How falling-leaf particles from one canopy block should be tinted.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LeafParticleStyle {
+    /// Base particle colour in linear `0..=1` rgb.
+    pub rgb: [f32; 3],
+    /// Whether the seasonal autumn factor may blend this leaf towards amber.
+    /// Evergreen, flowering and dead canopies register `false`.
+    pub allow_autumn_tint: bool,
+}
+
+/// Registry of modded blocks and entities that join the nature systems.
+///
+/// Lookups try the exact (namespaced) id first and fall back to the bare
+/// path component, so a pack may register either `"mymod:maple_leaves"` or
+/// `"maple_leaves"`. Every colour is sanitised on registration — a NaN or
+/// out-of-range component can never reach a particle or glow mask.
+#[derive(Clone, Debug, Default)]
+pub struct NatureModRegistry {
+    mod_leaves: BTreeMap<String, LeafParticleStyle>,
+    mod_emissive_mobs: BTreeMap<String, MobEmissiveHint>,
+}
+
+impl NatureModRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers `block_id` (namespaced, e.g. `"biomesoplenty:maple_leaves"`,
+    /// `"twilightforest:rainbow_oak_leaves"`, `"quark:lavender_blossom_leaves"`,
+    /// or a bare path) as a leaf-shedding canopy block with an explicit tint.
+    /// Non-finite rgb components fall back to [`FALLBACK_LEAF_RGB`] and the
+    /// result is clamped to `0..=1`.
+    pub fn register_mod_leaf(&mut self, block_id: &str, rgb: [f32; 3], allow_autumn_tint: bool) {
+        let key = block_id.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            return;
+        }
+        let safe = [
+            finite_or(rgb[0], FALLBACK_LEAF_RGB[0]).clamp(0.0, 1.0),
+            finite_or(rgb[1], FALLBACK_LEAF_RGB[1]).clamp(0.0, 1.0),
+            finite_or(rgb[2], FALLBACK_LEAF_RGB[2]).clamp(0.0, 1.0),
+        ];
+        self.mod_leaves.insert(
+            key,
+            LeafParticleStyle {
+                rgb: safe,
+                allow_autumn_tint,
+            },
+        );
+    }
+
+    /// Registers an emissive glow hint for a modded entity, e.g.
+    /// `"twilightforest:lich"`, `"alexsmobs:enderiophage"` or
+    /// `"ars_nouveau:starbuncle"`. rgb and intensity are clamped to `0..=1`
+    /// (non-finite components become `0.0`). Glow mask only — registering a
+    /// mob never changes its geometry, rig or animation.
+    pub fn register_mod_emissive_mob(&mut self, entity_id: &str, hint: MobEmissiveHint) {
+        let key = entity_id.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            return;
+        }
+        let safe = MobEmissiveHint {
+            feature: hint.feature,
+            rgb: [
+                finite_or(hint.rgb[0], 0.0).clamp(0.0, 1.0),
+                finite_or(hint.rgb[1], 0.0).clamp(0.0, 1.0),
+                finite_or(hint.rgb[2], 0.0).clamp(0.0, 1.0),
+            ],
+            intensity: finite_or(hint.intensity, 0.0).clamp(0.0, 1.0),
+        };
+        self.mod_emissive_mobs.insert(key, safe);
+    }
+
+    /// Registered leaf style for `block_id`: exact namespaced match first,
+    /// then the bare path. `None` when unregistered.
+    pub fn registered_leaf(&self, block_id: &str) -> Option<LeafParticleStyle> {
+        let key = block_id.trim().to_ascii_lowercase();
+        self.mod_leaves
+            .get(key.as_str())
+            .or_else(|| self.mod_leaves.get(resource_path(&key)))
+            .copied()
+    }
+
+    /// Registered emissive hint for `entity_id`: exact namespaced match
+    /// first, then the bare path. `None` when unregistered.
+    pub fn registered_emissive_mob(&self, entity_id: &str) -> Option<MobEmissiveHint> {
+        let key = entity_id.trim().to_ascii_lowercase();
+        self.mod_emissive_mobs
+            .get(key.as_str())
+            .or_else(|| self.mod_emissive_mobs.get(resource_path(&key)))
+            .copied()
+    }
+}
+
+/// `true` when `path` ends with `_<token>` — an underscore-delimited suffix,
+/// so `"glowfern"` never matches `fern` and `"catalog"` never matches `log`.
+fn ends_with_token(path: &str, token: &str) -> bool {
+    path.len() > token.len()
+        && path.ends_with(token)
+        && path.as_bytes()[path.len() - token.len() - 1] == b'_'
+}
+
+fn contains_any(path: &str, hints: &[&str]) -> bool {
+    hints.iter().any(|h| path.contains(*h))
+}
+
+/// Normalises a biome/block tag: trims whitespace and a leading `#`.
+fn normalize_tag(tag: &str) -> &str {
+    tag.trim().trim_start_matches('#')
+}
+
+/// `true` when any tag equals one of `accepted` (after normalising and a
+/// case-insensitive compare, so `#C:Leaves` still counts).
+fn has_any_tag(tags: &[&str], accepted: &[&str]) -> bool {
+    tags.iter().any(|t| {
+        let n = normalize_tag(t);
+        accepted.iter().any(|a| n.eq_ignore_ascii_case(a))
+    })
+}
+
+/// Canopy tags that mark a block as leaf-shedding across loaders.
+const LEAF_BLOCK_TAGS: &[&str] = &["minecraft:leaves", "c:leaves", "forge:leaves", "leaves"];
+/// Crop block tags across loaders.
+const CROP_BLOCK_TAGS: &[&str] = &[
+    "minecraft:crops",
+    "c:crops",
+    "forge:crops",
+    "minecraft:crop",
+    "c:crop",
+];
+/// Small-plant block tags: flowers and saplings sway like short grass.
+const PLANT_BLOCK_TAGS: &[&str] = &[
+    "minecraft:flowers",
+    "minecraft:small_flowers",
+    "minecraft:tall_flowers",
+    "c:flowers",
+    "forge:flowers",
+    "minecraft:saplings",
+    "c:saplings",
+    "forge:saplings",
+    "c:plants",
+    "forge:plants",
+];
+
+/// Suffix tokens that mark a block as a small pinned-root plant. Matching is
+/// underscore-delimited via [`ends_with_token`], so `cauliflower`, `seagrass`
+/// and `primrose` stay unclassified.
+const PLANT_SUFFIX_TOKENS: &[&str] = &[
+    "grass", "fern", "flower", "flowers", "blossom", "sapling", "seedling", "sprout", "shoot",
+    "stalk", "crop", "crops", "cane", "reed", "tulip", "rose", "daisy", "lily", "orchid", "poppy",
+    "mushroom", "fungus",
+];
+
+/// Name endings that mark a block as a solid cube and veto every positive
+/// classification — the hard fail-closed layer. A block that is tagged as a
+/// crop but clearly named `*_ore` or `*_planks` stays silent rather than
+/// swaying. Exact names (`"stone"`, `"dirt"`) match too.
+const SOLID_NAME_HINTS: &[&str] = &[
+    "stone",
+    "deepslate",
+    "andesite",
+    "diorite",
+    "granite",
+    "tuff",
+    "calcite",
+    "slate",
+    "shale",
+    "basalt",
+    "blackstone",
+    "netherrack",
+    "obsidian",
+    "bedrock",
+    "dripstone",
+    "planks",
+    "log",
+    "wood",
+    "stem",
+    "hyphae",
+    "beam",
+    "pillar",
+    "brick",
+    "bricks",
+    "tile",
+    "tiles",
+    "terracotta",
+    "concrete",
+    "concrete_powder",
+    "glass",
+    "sand",
+    "sandstone",
+    "gravel",
+    "dirt",
+    "mud",
+    "clay",
+    "ice",
+    "snow",
+    "rock",
+    "cobblestone",
+    "prismarine",
+    "quartz",
+    "amethyst",
+    "crystal",
+    "gem",
+    "ore",
+    "metal",
+    "alloy",
+    "ingot",
+    "copper",
+    "iron",
+    "gold",
+    "steel",
+    "brass",
+    "zinc",
+    "titanium",
+    "casing",
+    "machine",
+    "block",
+    "crate",
+    "barrel",
+    "chest",
+    "furnace",
+    "anvil",
+    "lamp",
+    "slab",
+    "stairs",
+    "stair",
+    "wall",
+    "fence",
+    "gate",
+    "door",
+    "trapdoor",
+    "rail",
+    "shelf",
+    "pot",
+    "vase",
+];
+
+/// `true` when the bare path names an obviously solid block. Deliberately
+/// conservative: the cost of a false veto is a plant that does not sway,
+/// never a cube that does.
+fn is_solid_block_name(path: &str) -> bool {
+    SOLID_NAME_HINTS
+        .iter()
+        .any(|h| path == *h || ends_with_token(path, h))
+}
+
+/// Name substrings for canopy that stays green year-round (or that autumn
+/// cannot improve).
+const EVERGREEN_NAME_HINTS: &[&str] = &[
+    "spruce", "fir", "pine", "conifer", "cedar", "redwood", "cypress", "juniper", "holly",
+];
+
+/// Derives a leaf style for an unregistered but leaf-classified block. The
+/// tint is a deterministic keyword guess with a plain green fallback —
+/// fail-closed, never non-finite, and evergreen/flowering/dead names opt out
+/// of the autumn blend.
+fn derive_leaf_style(path: &str) -> LeafParticleStyle {
+    let evergreen = contains_any(path, EVERGREEN_NAME_HINTS);
+    let rgb = if path.contains("maple") {
+        [0.85, 0.45, 0.12]
+    } else if path.contains("lavender")
+        || path.contains("violet")
+        || path.contains("jacaranda")
+        || path.contains("purple")
+    {
+        // Checked before `blossom`: `lavender_blossom_leaves` is violet, not pink.
+        [0.62, 0.52, 0.85]
+    } else if path.contains("cherry") || path.contains("sakura") || path.contains("blossom") {
+        [0.95, 0.70, 0.80]
+    } else if path.contains("rainbow") {
+        [0.80, 0.55, 0.90]
+    } else if evergreen {
+        [0.18, 0.36, 0.20]
+    } else if path.contains("birch") || path.contains("aspen") || path.contains("ginkgo") {
+        [0.62, 0.74, 0.30]
+    } else if path.contains("jungle") || path.contains("palm") || path.contains("tropical") {
+        [0.22, 0.58, 0.24]
+    } else if path.contains("mangrove") {
+        [0.20, 0.46, 0.30]
+    } else if path.contains("dead") || path.contains("wither") || path.contains("brown") {
+        [0.45, 0.34, 0.18]
+    } else {
+        FALLBACK_LEAF_RGB
+    };
+    let allow_autumn_tint = !(evergreen
+        || path.contains("cherry")
+        || path.contains("sakura")
+        || path.contains("blossom")
+        || path.contains("palm")
+        || path.contains("jungle")
+        || path.contains("dead")
+        || path.contains("wither"));
+    LeafParticleStyle {
+        rgb,
+        allow_autumn_tint,
+    }
+}
+
+/// Classifies a (possibly modded) block for falling-leaf particles.
+///
+/// Order: explicit [`NatureModRegistry`] entries first, then a hard veto for
+/// obviously solid names, then `#minecraft:leaves` / `#c:leaves` /
+/// `#forge:leaves` tags, then a `*_leaves` id suffix. Anything else returns
+/// `None` — a `stone` or `create:brass_casing` can never shed leaves, even
+/// with a misleading tag. Unregistered matches get a name-derived tint via
+/// [`derive_leaf_style`], falling back to [`FALLBACK_LEAF_RGB`].
+pub fn classify_leaf_block(
+    block_id: &str,
+    tags: &[&str],
+    reg: &NatureModRegistry,
+) -> Option<LeafParticleStyle> {
+    let path = resource_path(block_id).to_ascii_lowercase();
+    if path.is_empty() {
+        return None;
+    }
+    if let Some(style) = reg.registered_leaf(block_id) {
+        return Some(style);
+    }
+    if is_solid_block_name(&path) {
+        return None;
+    }
+    if has_any_tag(tags, LEAF_BLOCK_TAGS) || path == "leaves" || ends_with_token(&path, "leaves") {
+        return Some(derive_leaf_style(&path));
+    }
+    None
+}
+
+/// Alias for the classifier API: the same categories drive both
+/// [`classify_wind_sway_block`] and [`compute_wind_sway`].
+pub type WindSwayKind = WindSwayCategory;
+
+/// Classifies a (possibly modded) block for weather wind sway.
+///
+/// * `#minecraft:crops` / `#c:crops` (and `forge:` variants) -> [`WindSwayCategory::Crop`]
+/// * `#minecraft:leaves` / `#c:leaves`, registered leaves, `*_leaves` -> [`WindSwayCategory::Leaves`]
+/// * `#minecraft:flowers` / `#c:flowers` / `#minecraft:saplings` (and `forge:`/unprefixed
+///   variants) plus `*_tall_grass` / `*_fern` / `*_flower` / `*_sapling` and friends
+///   -> [`WindSwayCategory::ShortGrass`] — all root-pinned at `local_y == 0.0`
+/// * `*_lantern` -> [`WindSwayCategory::HangingLantern`], top-pinned at `local_y == 1.0`
+///
+/// Fail-closed: `sea_lantern`/`jack_o_lantern` (solid cubes despite the
+/// suffix), everything matching [`is_solid_block_name`] (`stone`, `planks`,
+/// `*_ore`, `create:brass_casing`, ...), and all unrecognised ids return
+/// `None`. The solid veto runs before the tag and suffix matches so a wrong
+/// tag cannot make a cube sway.
+pub fn classify_wind_sway_block(
+    block_id: &str,
+    tags: &[&str],
+    reg: &NatureModRegistry,
+) -> Option<WindSwayKind> {
+    let path = resource_path(block_id).to_ascii_lowercase();
+    if path.is_empty() {
+        return None;
+    }
+    if reg.registered_leaf(block_id).is_some() {
+        return Some(WindSwayCategory::Leaves);
+    }
+    // Solid cubes that merely end in `_lantern`.
+    if path == "sea_lantern" || path == "jack_o_lantern" {
+        return None;
+    }
+    if is_solid_block_name(&path) {
+        return None;
+    }
+    if path == "lantern" || ends_with_token(&path, "lantern") {
+        return Some(WindSwayCategory::HangingLantern);
+    }
+    if has_any_tag(tags, CROP_BLOCK_TAGS) {
+        return Some(WindSwayCategory::Crop);
+    }
+    if has_any_tag(tags, LEAF_BLOCK_TAGS) || path == "leaves" || ends_with_token(&path, "leaves") {
+        return Some(WindSwayCategory::Leaves);
+    }
+    if has_any_tag(tags, PLANT_BLOCK_TAGS)
+        || PLANT_SUFFIX_TOKENS
+            .iter()
+            .any(|t| ends_with_token(&path, t))
+    {
+        return Some(WindSwayCategory::ShortGrass);
+    }
+    None
+}
+
+/// Facts the caller already knows about a (possibly modded) biome. Slices
+/// are borrowed — classification is a pure function over them.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ModBiomeFacts<'a> {
+    /// Namespaced biome id, e.g. `"twilightforest:enchanted_forest"`.
+    pub biome_id: &'a str,
+    /// Loader biome tags, `#` prefix optional: `#c:is_swamp`, `#c:is_forest`,
+    /// `#c:is_magical`, `#c:is_cold`, `#c:is_snowy`, `#c:is_dry`,
+    /// `#c:is_desert`, `#c:is_nether`, `#c:is_end`, `#c:is_underground`.
+    pub tags: &'a [&'a str],
+    /// Vanilla-style temperature; `<= 0.15` means frozen/snowy. Non-finite
+    /// values are treated as frozen (fail closed).
+    pub temperature: f32,
+    /// Whether the biome reports normal precipitation.
+    pub has_precipitation: bool,
+    /// Atmosphere density: `1.0` for a normal overworld/fantasy biome,
+    /// `0.0` for a hard-vacuum space dimension. Non-finite or negative
+    /// values are treated as `0.0` (fail closed).
+    pub atmosphere_density: f32,
+}
+
+/// Deterministic, fail-closed ambience decision for one biome. `allow_*`
+/// gates are absolute: when a flag is `false` the caller must emit nothing
+/// of that family, whatever the local block lists say.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BiomeAmbienceProfile {
+    /// `true` when dusk fireflies may spawn.
+    pub allow_fireflies: bool,
+    /// Tint for allowed fireflies: warm yellow-green in humid biomes, soft
+    /// cyan-violet in magical ones. Meaningless when `allow_fireflies` is
+    /// `false` but still finite and deterministic.
+    pub firefly_rgb: [f32; 3],
+    /// `true` when canopy blocks may shed leaves (off in vacuum, nether, end).
+    pub allow_falling_leaves: bool,
+    /// `true` when rain ripples may form on exposed water.
+    pub allow_rain_ripples: bool,
+    /// `true` when layered voxel clouds may render (off in vacuum, nether,
+    /// end and underground).
+    pub allow_clouds: bool,
+    /// Scale for [`wind_sway_params`] strength: `atmosphere_density` clamped
+    /// to `0..=1.5`, forced to `0.0` in vacuum, underground, nether and end.
+    pub wind_multiplier: f32,
+}
+
+// Biome-class tags across loaders; each family accepts c:/minecraft:/forge:.
+const NETHER_BIOME_TAGS: &[&str] = &["c:is_nether", "minecraft:is_nether", "forge:is_nether"];
+const END_BIOME_TAGS: &[&str] = &["c:is_end", "minecraft:is_end", "forge:is_end"];
+const UNDERGROUND_BIOME_TAGS: &[&str] = &[
+    "c:is_underground",
+    "minecraft:is_underground",
+    "forge:is_underground",
+];
+const DRY_BIOME_TAGS: &[&str] = &[
+    "c:is_dry",
+    "minecraft:is_dry",
+    "forge:is_dry",
+    "c:is_desert",
+    "minecraft:is_desert",
+    "forge:is_desert",
+    "c:is_wasteland",
+    "forge:is_wasteland",
+];
+const COLD_BIOME_TAGS: &[&str] = &[
+    "c:is_cold",
+    "minecraft:is_cold",
+    "forge:is_cold",
+    "c:is_snowy",
+    "minecraft:is_snowy",
+    "forge:is_snowy",
+    "c:is_icy",
+    "forge:is_icy",
+];
+const MAGICAL_BIOME_TAGS: &[&str] = &[
+    "c:is_magical",
+    "minecraft:is_magical",
+    "forge:is_magical",
+    "c:is_magic",
+    "forge:is_magic",
+];
+
+/// Mod namespaces whose biomes read as magical even without a tag; used only
+/// to pick the cyan-violet firefly tint, never to unlock fireflies.
+const MAGICAL_NAMESPACES: &[&str] = &["twilightforest", "ars_nouveau", "botania", "aether"];
+
+/// Classifies a (possibly modded) biome into a [`BiomeAmbienceProfile`].
+///
+/// Pure and deterministic over `facts`: same facts, same profile. Hostile
+/// classes are detected from both tags and conservative id heuristics —
+/// `nether`/`the_end`/`end_*` paths, `cave`/`deep_dark`/`underground` paths,
+/// `snow`/`frozen`/`ice` paths — so an untagged biome still fails closed.
+/// A `has_precipitation == false` biome above [`DRY_INFERENCE_TEMPERATURE`]
+/// counts as dry even without a `is_dry`/`is_desert` tag.
+pub fn classify_mod_biome_ambience(facts: &ModBiomeFacts) -> BiomeAmbienceProfile {
+    let id = facts.biome_id.trim().to_ascii_lowercase();
+    let namespace = id.split(':').next().unwrap_or("");
+    let path = resource_path(&id);
+    let density = finite_or(facts.atmosphere_density, 0.0).max(0.0);
+    let temperature = finite_or(facts.temperature, 0.0);
+
+    let is_nether = has_any_tag(facts.tags, NETHER_BIOME_TAGS)
+        || path.contains("nether")
+        || matches!(
+            path,
+            "soul_sand_valley" | "crimson_forest" | "warped_forest" | "basalt_deltas"
+        );
+    let is_end = has_any_tag(facts.tags, END_BIOME_TAGS)
+        || path.starts_with("end_")
+        || path.ends_with("_end")
+        || matches!(path, "the_end" | "end" | "the_void");
+    let is_underground = has_any_tag(facts.tags, UNDERGROUND_BIOME_TAGS)
+        || path.contains("cave")
+        || path.contains("deep_dark")
+        || path.contains("underground");
+    let is_dry = has_any_tag(facts.tags, DRY_BIOME_TAGS)
+        || (!facts.has_precipitation && temperature > DRY_INFERENCE_TEMPERATURE);
+    let is_cold = temperature <= FIREFLY_MIN_TEMPERATURE
+        || has_any_tag(facts.tags, COLD_BIOME_TAGS)
+        || path.contains("snow")
+        || path.contains("frozen")
+        || path.contains("ice_spikes");
+    let is_magical = has_any_tag(facts.tags, MAGICAL_BIOME_TAGS)
+        || MAGICAL_NAMESPACES.contains(&namespace)
+        || path.contains("magic")
+        || path.contains("enchant")
+        || path.contains("fey")
+        || path.contains("fairy");
+
+    let firefly_rgb = if is_magical {
+        MAGICAL_FIREFLY_RGB
+    } else {
+        WARM_FIREFLY_RGB
+    };
+    let allow_fireflies = !is_nether
+        && !is_end
+        && !is_underground
+        && !is_dry
+        && !is_cold
+        && temperature > FIREFLY_MIN_TEMPERATURE
+        && density >= MIN_AMBIENT_ATMOSPHERE;
+    let allow_falling_leaves = !is_nether && !is_end && density >= MIN_SKY_ATMOSPHERE;
+    let allow_rain_ripples = facts.has_precipitation
+        && temperature > FIREFLY_MIN_TEMPERATURE
+        && density >= MIN_AMBIENT_ATMOSPHERE
+        && !is_nether
+        && !is_end;
+    let allow_clouds = density >= MIN_SKY_ATMOSPHERE && !is_nether && !is_end && !is_underground;
+    let wind_multiplier = if is_nether || is_end || is_underground {
+        0.0
+    } else {
+        density.clamp(0.0, 1.5)
+    };
+
+    BiomeAmbienceProfile {
+        allow_fireflies,
+        firefly_rgb,
+        allow_falling_leaves,
+        allow_rain_ripples,
+        allow_clouds,
+        wind_multiplier,
+    }
+}
+
+/// Registry-aware wrapper around [`emissive_mob_feature`]: returns `None`
+/// unless `config.enabled && config.emissive_mob_eyes`, then checks the
+/// [`NatureModRegistry`] (exact id first, then bare path) before the vanilla
+/// table — so a mod can both add its own glowing mobs and override a vanilla
+/// tint. Glow mask only, zero geometry changes either way.
+pub fn emissive_mob_hint_with_registry(
+    entity_id: &str,
+    config: &VanillaPlusNatureConfig,
+    reg: &NatureModRegistry,
+) -> Option<MobEmissiveHint> {
+    if !(config.enabled && config.emissive_mob_eyes) {
+        return None;
+    }
+    reg.registered_emissive_mob(entity_id)
+        .or_else(|| emissive_mob_feature(entity_id))
+}
+
+/// Atmosphere-gated variant of [`generate_layered_voxel_clouds`]: returns an
+/// empty `Vec` when `allow_clouds` is `false` or the atmosphere is too thin
+/// (`atmosphere_density < 0.15`, non-finite counting as `0.0`) — zero clouds
+/// in space, nether, end and underground dimensions. Otherwise identical to
+/// the base generator, including the `config.enabled` gate.
+pub fn generate_layered_voxel_clouds_with_atmosphere(
+    config: &VanillaPlusNatureConfig,
+    camera_x: f32,
+    camera_z: f32,
+    world_time_ticks: u64,
+    atmosphere_density: f32,
+    allow_clouds: bool,
+) -> Vec<VoxelCloudCell> {
+    if !allow_clouds || finite_or(atmosphere_density, 0.0) < MIN_SKY_ATMOSPHERE {
+        return Vec::new();
+    }
+    generate_layered_voxel_clouds(config, camera_x, camera_z, world_time_ticks)
+}
+
+/// Atmosphere-scaled variant of [`wind_sway_params`]: multiplies the sway
+/// strength by `atmosphere_density.clamp(0.0, 1.0)`, so sway fades smoothly
+/// as the atmosphere thins and is exactly `0.0` in vacuum. The
+/// `config.enabled && config.gentle_wind_sway` gate still applies.
+pub fn wind_sway_params_with_atmosphere(
+    config: &VanillaPlusNatureConfig,
+    weather: WeatherKind,
+    world_time_ticks: u64,
+    atmosphere_density: f32,
+) -> WindSwayParams {
+    let mut params = wind_sway_params(config, weather, world_time_ticks);
+    params.strength *= finite_or(atmosphere_density, 0.0).clamp(0.0, 1.0);
+    params
 }
