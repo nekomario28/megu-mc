@@ -510,6 +510,8 @@ fn mojang_http_get(url: &str) -> Result<Option<String>, String> {
             }
             response
                 .body_mut()
+                .with_config()
+                .limit(1 << 20)
                 .read_to_string()
                 .map(Some)
                 .map_err(|e| format!("sessionserver read failed: {e}"))

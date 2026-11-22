@@ -5776,7 +5776,7 @@ fn materialize_generation_payloads_inner(
                 // `RandomizableContainerBlockEntity` preserves `LootTable`/`LootTableSeed`
                 // on placed chests/barrels/pots/dispensers/hoppers until first non-spectator
                 // open, automation access, or destruction.
-                pending_block_loot().lock().unwrap().insert(
+                pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()).insert(
                     ow_block(pos),
                     PendingBlockLoot {
                         kind,
@@ -6022,7 +6022,7 @@ fn break_generated_cart(target_eid: i32, drop_loot: bool) -> bool {
         drop(gen);
         let mut spilled = Vec::new();
         if let Some(uuid) = uuid {
-            if let Some(slots) = chests().lock().unwrap().remove(&ContainerKey::Cart(uuid)) {
+            if let Some(slots) = chests().lock().unwrap_or_else(|e| e.into_inner()).remove(&ContainerKey::Cart(uuid)) {
                 spilled.extend(
                     slots
                         .into_values()
@@ -6418,7 +6418,7 @@ impl crate::spawner::World for SpawnerRuntimeWorld<'_> {
             .lock()
             .unwrap()
             .iter()
-            .filter(|m| m.dim == DimId::Overworld && m.etype == cave_spider && *m.hp.lock().unwrap() > 0.0)
+            .filter(|m| m.dim == DimId::Overworld && m.etype == cave_spider && *m.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0)
             .filter(|m| {
                 let (mx, my, mz, ..) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
                 aabb_overlaps(Self::spider_aabb([mx, my, mz]), (box_min, box_max))
@@ -9053,7 +9053,7 @@ fn set_block_if_inner_dim(
     }
     drop(w);
     if Some(st) != name_to_state("spawner") {
-        generated_content().lock().unwrap().spawners.remove(&(x,y,z));
+        generated_content().lock().unwrap_or_else(|e| e.into_inner()).spawners.remove(&(x,y,z));
     }
     // The band is a write-through view of the chunk, not an invalidated one: a leaf tick
     // writes every tick, so invalidating would rebuild a whole band per write (14 ms).
@@ -9118,7 +9118,7 @@ fn set_block_if_inner_dim(
                         .cloned(),
                 );
             }
-            if let Some(f) = furnaces().lock().unwrap().remove(&ow_block((x, y, z))) {
+            if let Some(f) = furnaces().lock().unwrap_or_else(|e| e.into_inner()).remove(&ow_block((x, y, z))) {
                 spill.extend(
                     [f.input.clone(), f.fuel.clone(), f.output.clone()]
                         .into_iter()
@@ -10190,7 +10190,7 @@ fn spawn_fall(px: i32, py: i32, pz: i32, st: u32) {
         }
         note_block_update(px, py, pz, 0);
         let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-        falling().lock().unwrap().push(Fall {
+        falling().lock().unwrap_or_else(|e| e.into_inner()).push(Fall {
             eid,
             x: px as f64 + 0.5,
             y: py as f64,
@@ -10230,7 +10230,7 @@ fn place_block_dim(dim: DimId, wx: i32, wy: i32, wz: i32, st: u32) {
 /// thread always sees the complete in-flight set; draining showed it an empty queue and lost
 /// blocks that had already left the world.
 fn begin_falling_tick() -> (Vec<Fall>, std::collections::HashSet<i32>) {
-    let active: Vec<Fall> = falling().lock().unwrap().clone();
+    let active: Vec<Fall> = falling().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let processed = active.iter().map(|f| f.eid).collect();
     (active, processed)
 }
@@ -11801,7 +11801,7 @@ fn band_state_dim(dim: DimId, x: i32, y: i32, z: i32) -> Option<u32> {
     // for an unpopulated chunk that includes its population), so it only pays when the
     // reader wants thousands of cells from that chunk — which is `chunk_data`, and it
     // installs the band from states it already has (`install_band_rows`).
-    let band = op_bands().lock().unwrap().get((dim, cx, cz))?;
+    let band = op_bands().lock().unwrap_or_else(|e| e.into_inner()).get((dim, cx, cz))?;
     band.get(y, (x & 15) as usize, (z & 15) as usize)
 }
 
@@ -12093,7 +12093,7 @@ fn chunk_versions() -> &'static LockedMap<DimChunkKey, u64> {
 fn chunk_version_dim(dim: DimId, cx: i32, cz: i32) -> u64 {
     chunk_versions()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(&(dim, cx, cz))
         .copied()
         .unwrap_or(0)
@@ -12108,8 +12108,11 @@ fn bump_world_epoch_dim(dim: DimId, x: i32, z: i32) {
     let seq = CHUNK_VERSION_SEQ.fetch_add(1, Ordering::Relaxed);
     chunk_versions()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .insert((dim, x >> 4, z >> 4), seq);
+    // Retire cached `lod_v1` frames for the written chunk promptly; the epoch
+    // check alone would only catch them on the next lookup.
+    invalidate_lod_v1_chunk(dim, x >> 4, z >> 4);
     if chunkprof::enabled() {
         chunkprof::EPOCH_BUMPS.fetch_add(1, Ordering::Relaxed);
     }
@@ -16644,6 +16647,19 @@ fn main() {
         eprintln!("[security] {why}");
         std::process::exit(2);
     }
+    // A public bind without an identity layer fails closed too: offline mode
+    // trusts the claimed name for every privilege check, so a reachable
+    // listener must run online-mode or Velocity forwarding — or carry the
+    // operator's explicit insecure-override.
+    if let Err(why) = offline_public_bind_check(
+        &bind,
+        online_mode_enabled(),
+        velocity_forwarding_enabled(),
+        env_flag("MC_SPINE_ALLOW_INSECURE_OFFLINE_PUBLIC"),
+    ) {
+        eprintln!("[security] {why}");
+        std::process::exit(2);
+    }
     if let Err(error) = load_operators(std::path::Path::new(OPS_FILE)) {
         eprintln!("[spine] could not load {OPS_FILE}: {error}");
     }
@@ -16787,7 +16803,14 @@ fn main() {
         thread::spawn(move || {
             let _slot = ConnectionSlot(&ACTIVE);
             let _ip_slot = ip_slot;
-            handle(s);
+            // `handle` already isolates a panic through `run_isolated_connection`;
+            // this belt catches anything that escaped before that wrapper armed,
+            // so one connection can never take down the accept loop or leak its
+            // slot bookkeeping.
+            let label = peer_label(&s);
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(s))).is_err() {
+                eprintln!("[spine] connection '{label}' escaped its isolation: handler panicked");
+            }
         });
     }
 }

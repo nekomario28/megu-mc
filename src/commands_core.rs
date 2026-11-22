@@ -5481,10 +5481,21 @@ fn valid_player_name(name: &str) -> bool {
 /// Vanilla permission level `0..=4` for a player name: `4` for the console and
 /// the unsafe test escape, the operator entry's level otherwise.
 fn player_permission_level(name: &str) -> u8 {
+    verified_permission_level("", name, false)
+}
+
+/// `player_permission_level` for an identity the server verified: `uuid` is the
+/// session/forwarded UUID (dashed or plain hex) and `authenticated` says it can
+/// be trusted. The registry judges the UUID before the name; a stored-UUID
+/// conflict never grants operator level (see `OpsRegistry::find_authenticated`).
+fn verified_permission_level(uuid: &str, name: &str, authenticated: bool) -> u8 {
     if allow_unsafe_player_admin() {
         return 4;
     }
-    let level = ops_registry().lock().unwrap_or_else(|e| e.into_inner()).op_level_of(name);
+    let level = ops_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .op_level_of_authenticated(uuid, name, authenticated);
     if level > 0 {
         return level;
     }
@@ -5500,11 +5511,25 @@ fn player_permission_level(name: &str) -> u8 {
     0
 }
 
+/// The permission level a live connection carries: its verified UUID and the
+/// authenticated mark login stamped on it decide together.
+fn client_permission_level(client: &Client) -> u8 {
+    verified_permission_level(
+        &uuid_text(&client.uuid),
+        &client.name,
+        authenticated_player(client.eid),
+    )
+}
+
 fn player_is_admin(name: &str) -> bool {
     // The server's offline login claims a name. The same case folding is used
     // by the login reservation and operator list. Vanilla's `hasPermission(2)`
     // is the gate that splits cheat commands from the everyone set.
     player_permission_level(name) >= 2
+}
+
+fn client_is_admin(client: &Client) -> bool {
+    client_permission_level(client) >= 2
 }
 
 fn set_difficulty(difficulty: u8) {
@@ -6225,7 +6250,7 @@ fn send_commands_at_level(socket: &mut TcpStream, level: u8) -> std::io::Result<
 
 fn update_client_commands(client: &Client) {
     let mut socket = client.sock.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = send_commands_at_level(&mut socket, player_permission_level(&client.name));
+    let _ = send_commands_at_level(&mut socket, client_permission_level(client));
 }
 
 fn command_suggestion_response(
@@ -6256,7 +6281,7 @@ fn reply_to_command_suggestion(client: &Client, body: &[u8]) {
     let Ok(request) = brigadier_wire::parse_command_suggestions_request(body) else {
         return;
     };
-    let level = player_permission_level(&client.name);
+    let level = client_permission_level(client);
     let mut completions = CommandCompletions {
         players: client_snapshot().iter().map(|c| c.name.clone()).collect(),
         ..CommandCompletions::default()
@@ -7671,7 +7696,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
     let level = PINNED_COMMAND_LEVEL
         .with(std::cell::Cell::get)
         .map(|pinned| pinned.min(4))
-        .unwrap_or_else(|| me.map_or(4, |player| player_permission_level(&player.name)));
+        .unwrap_or_else(|| me.map_or(4, |player| client_permission_level(player)));
     if !command_allowed_for_source(cmd, level)
         && !command_allowed_for_player(cmd, &args)
         && !mod_command_permitted(cmd, level)

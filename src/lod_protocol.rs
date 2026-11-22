@@ -33,8 +33,27 @@ const LOD_V1_MAX_CHANNEL: usize = 256;
 const LOD_V1_MAX_PAYLOAD: usize = 32 * 1024;
 
 /// A requester may ask only for columns inside this Chebyshev chunk radius of
-/// its own chunk: distant requests could force unbounded worldgen.
-const LOD_V1_MAX_RANGE_CHUNKS: i32 = 128;
+/// its own chunk: distant requests force worldgen, and each in-range request
+/// runs up to 256 heightmap scans. 64 chunks already covers every sane LOD
+/// horizon; the original 128 multiplied the worst-case fan-out fourfold.
+const LOD_V1_MAX_RANGE_CHUNKS: i32 = 64;
+
+/// One `LOD1` answer costs up to 256 `lod_top_cell` scans (each possibly
+/// generating a chunk), so encoded frames are cached per
+/// `(dim, cx, cz, resolution)` and capped: the oldest entry is evicted once
+/// the cap is reached, and a block write in the chunk invalidates the frame.
+const LOD_V1_CACHE_CAP: usize = 2048;
+
+/// Per-connection `REQ1` budget: up to `LOD_V1_REQ_BURST` requests may burst,
+/// then the bucket refills at `LOD_V1_REQ_PER_SEC` per second. Requests over
+/// budget are dropped the same way malformed ones are — silently, and before
+/// any world scan runs.
+const LOD_V1_REQ_BURST: u32 = 16;
+const LOD_V1_REQ_PER_SEC: u32 = 8;
+
+/// How many column scans ran (cache misses): the counter tests read to prove
+/// a cache hit skipped `encode_lod_v1_column`.
+static LOD_V1_COLUMN_SCANS: AtomicU64 = AtomicU64::new(0);
 
 /// How far above the reported surface the top scan reaches for trees and other
 /// above-ground generated blocks before it gives up.
@@ -246,6 +265,120 @@ fn encode_lod_v1_column(dim: DimId, cx: i32, cz: i32, resolution: u8) -> Option<
     encode_lod_v1(cx, cz, resolution, &cells)
 }
 
+/// One connection's `REQ1` budget. `last` advances only by whole granted
+/// tokens, so a sub-token remainder keeps accruing between requests.
+struct LodV1Bucket {
+    tokens: u32,
+    last: Instant,
+}
+
+impl LodV1Bucket {
+    fn take(&mut self, now: Instant) -> bool {
+        let elapsed_ms = now.saturating_duration_since(self.last).as_millis() as u64;
+        let refill = (elapsed_ms * u64::from(LOD_V1_REQ_PER_SEC) / 1000) as u32;
+        if refill > 0 {
+            self.tokens = (self.tokens + refill).min(LOD_V1_REQ_BURST);
+            self.last += Duration::from_millis(
+                u64::from(refill) * 1000 / u64::from(LOD_V1_REQ_PER_SEC),
+            );
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
+}
+
+/// The shared `lod_v1` runtime state behind one lock: the encoded-frame cache
+/// and every connection's request bucket. Both are leaf-critical sections —
+/// nothing else is locked while they are held.
+/// `(dim, cx, cz, resolution)` -> `(chunk epoch, inserted, frame)`. A cached
+/// hit must match the chunk's live `chunk_version_dim`, so any `set_block*`
+/// write in the column retires the frame — the same invalidation rule the
+/// chunk packet cache keys on.
+type LodV1FrameCache = HashMap<(DimId, i32, i32, u8), (u64, Instant, Vec<u8>)>;
+
+#[derive(Default)]
+struct LodV1Shared {
+    frames: LodV1FrameCache,
+    /// Per-connection `REQ1` buckets keyed by entity id; swept with the rest
+    /// of the per-eid session state on disconnect.
+    buckets: HashMap<i32, LodV1Bucket>,
+}
+
+fn lod_v1_shared() -> &'static Mutex<LodV1Shared> {
+    static SHARED: OnceLock<Mutex<LodV1Shared>> = OnceLock::new();
+    SHARED.get_or_init(|| Mutex::new(LodV1Shared::default()))
+}
+
+/// Drop a disconnected connection's request bucket with the rest of its
+/// per-eid state (`forget_per_eid_state` calls this).
+fn lod_v1_forget(eid: i32) {
+    lod_v1_shared()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .buckets
+        .remove(&eid);
+}
+
+/// Retire every cached frame for chunk `(cx, cz)` in `dim`; called from
+/// `bump_world_epoch_dim` so block writes drop stale columns promptly rather
+/// than only on the next epoch-miss.
+fn invalidate_lod_v1_chunk(dim: DimId, cx: i32, cz: i32) {
+    lod_v1_shared()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .frames
+        .retain(|&(d, x, z, _), _| !(d == dim && x == cx && z == cz));
+}
+
+/// The cached frame for `key` when it is still at the chunk's live epoch.
+fn lod_v1_cached(key: (DimId, i32, i32, u8), epoch: u64) -> Option<Vec<u8>> {
+    let shared = lod_v1_shared().lock().unwrap_or_else(|e| e.into_inner());
+    match shared.frames.get(&key) {
+        Some(&(at_epoch, _, ref frame)) if at_epoch == epoch => Some(frame.clone()),
+        _ => None,
+    }
+}
+
+/// Whether `eid`'s bucket can spend a token now.
+fn lod_v1_rate_take(eid: i32, now: Instant) -> bool {
+    let mut shared = lod_v1_shared().lock().unwrap_or_else(|e| e.into_inner());
+    shared
+        .buckets
+        .entry(eid)
+        .or_insert(LodV1Bucket {
+            tokens: LOD_V1_REQ_BURST,
+            last: now,
+        })
+        .take(now)
+}
+
+/// Store a freshly encoded frame, evicting the oldest entries at the cap.
+/// Stale-epoch entries are harmless dead weight — lookups already re-check the
+/// epoch — so plain oldest-first keeps this critical section a leaf (no calls
+/// into `chunk_versions`, which `invalidate_lod_v1_chunk` may be holding).
+fn lod_v1_cache_insert(key: (DimId, i32, i32, u8), epoch: u64, frame: &[u8], now: Instant) {
+    let mut shared = lod_v1_shared().lock().unwrap_or_else(|e| e.into_inner());
+    if shared.frames.len() >= LOD_V1_CACHE_CAP && !shared.frames.contains_key(&key) {
+        while shared.frames.len() >= LOD_V1_CACHE_CAP {
+            let Some(&oldest) = shared
+                .frames
+                .iter()
+                .min_by_key(|(_, (_, at, _))| *at)
+                .map(|(k, _)| k)
+            else {
+                break;
+            };
+            shared.frames.remove(&oldest);
+        }
+    }
+    shared
+        .frames
+        .insert(key, (epoch, now, frame.to_vec()));
+}
+
 /// `minecraft:register` / `minecraft:unregister` payloads carry the channel
 /// list as NUL-separated UTF-8 names; yield each entry as `&str`.
 fn registered_channels(payload: &[u8]) -> impl Iterator<Item = &str> {
@@ -299,9 +432,30 @@ fn lod_v1_request(client: &Client, payload: &[u8]) {
     if near > i64::from(LOD_V1_MAX_RANGE_CHUNKS) {
         return;
     }
-    let dim = *client.dim.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(frame) = encode_lod_v1_column(dim, cx, cz, resolution) else {
+    let now = Instant::now();
+    // Token bucket per connection: over-budget requests are dropped before any
+    // column scan runs, so a REQ1 flood costs nothing but the drop.
+    if !lod_v1_rate_take(client.eid, now) {
         return;
+    }
+    let dim = *client.dim.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (dim, cx, cz, resolution);
+    let epoch = chunk_version_dim(dim, cx, cz);
+    let frame = match lod_v1_cached(key, epoch) {
+        Some(frame) => frame,
+        None => {
+            LOD_V1_COLUMN_SCANS.fetch_add(1, Ordering::Relaxed);
+            let Some(frame) = encode_lod_v1_column(dim, cx, cz, resolution) else {
+                return;
+            };
+            // Only cache under the epoch the column still sits at: a mid-scan
+            // block write gets correct bytes that are simply not cached — the
+            // same rule the chunk packet cache applies.
+            if chunk_version_dim(dim, cx, cz) == epoch {
+                lod_v1_cache_insert(key, epoch, &frame, now);
+            }
+            frame
+        }
     };
     let mut out = Vec::with_capacity(frame.len() + LOD_V1_CHANNEL.len() + 8);
     write_str(&mut out, LOD_V1_CHANNEL);

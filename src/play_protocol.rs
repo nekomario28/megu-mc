@@ -1201,6 +1201,27 @@ static NEXT_EID: AtomicI32 = AtomicI32::new(1000);
 fn clients() -> &'static Mutex<Vec<Arc<Client>>> {
     CLIENTS.get_or_init(|| Mutex::new(Vec::new()))
 }
+
+/// The entity ids whose login identity the server verified (online-mode session
+/// check or Velocity forwarding). Login stamps the mark; every disconnect path
+/// clears it. An unmarked client is an offline-mode claim: permission lookups
+/// on it must never let a stored UUID be overruled by a name collision.
+fn authenticated_players() -> &'static Mutex<HashSet<i32>> {
+    static AUTHENTICATED: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+    AUTHENTICATED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+fn mark_authenticated(eid: i32) {
+    authenticated_players()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(eid);
+}
+fn authenticated_player(eid: i32) -> bool {
+    authenticated_players()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&eid)
+}
 enum AngleRounding {
     Floor,
     Truncate,
@@ -1298,6 +1319,8 @@ fn load_skin_properties(name: &str) -> Option<(String, String)> {
         .call()
         .ok()?
         .body_mut()
+        .with_config()
+        .limit(1 << 20)
         .read_to_string()
         .ok()?;
     let id = jstr(&prof, "id")?.to_string();
@@ -1309,6 +1332,8 @@ fn load_skin_properties(name: &str) -> Option<(String, String)> {
         .call()
         .ok()?
         .body_mut()
+        .with_config()
+        .limit(1 << 20)
         .read_to_string()
         .ok()?;
     let value = jstr(&full, "value")?.to_string();
@@ -1759,7 +1784,7 @@ fn interest_tick() {
             job,
         });
     };
-    for cart in generated_content().lock().unwrap().carts.iter() {
+    for cart in generated_content().lock().unwrap_or_else(|e| e.into_inner()).carts.iter() {
         let cart = cart.clone();
         let [x, y, z] = cart.pos().expect("validated generated cart");
         queue(
@@ -2743,7 +2768,7 @@ fn broadcast_chunk_dim_in<F: Fn(&Client) -> (i64, Vec<u8>)>(
         let Ok(mut socket) = client.sock.lock() else {
             continue;
         };
-        if *client.dim.lock().unwrap() != dim {
+        if *client.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
             continue;
         }
         let (id, packet) = mk(client);
@@ -4574,7 +4599,7 @@ fn decode_teleport_to_entity(body: &[u8]) -> Option<[u8; 16]> {
 /// The `Player.canUseGameMasterBlocks` shape every gamemaster packet in this
 /// section shares: `hasPermissions(2)` plus creative mode.
 fn sender_gamemaster_permitted(me: &Client) -> bool {
-    player_permission_level(&me.name) >= 2
+    client_permission_level(me) >= 2
         && *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1
 }
 
@@ -4771,7 +4796,7 @@ fn c2s_apply_player_abilities(me: &Client, flags: u8) {
 /// `lock_difficulty` apply: OP>=2 only, then the `ChangeDifficulty` broadcast
 /// every client gets — `difficulty` byte plus the new `difficultyLocked` flag.
 fn c2s_apply_lock_difficulty(me: &Client, locked: bool) -> bool {
-    if player_permission_level(&me.name) < 2 {
+    if client_permission_level(me) < 2 {
         return false;
     }
     DIFFICULTY_LOCKED.store(locked as u8, Ordering::Relaxed);
@@ -5395,7 +5420,7 @@ fn switch_client_dimension(
         );
     }
     if old_dim != new_dim {
-        me.chunks.lock().unwrap().clear();
+        me.chunks.lock().unwrap_or_else(|e| e.into_inner()).clear();
         me.gen_sources.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
     let teleport_id = {
@@ -6880,6 +6905,37 @@ fn online_mode_enabled() -> bool {
     env_flag("MC_SPINE_ONLINE_MODE")
 }
 
+/// The public-bind gate the startup listener applies after `check_bind`: a
+/// non-loopback bind with `online-mode` off and no Velocity forwarding would
+/// admit any claimed name as if it were verified — including an operator's —
+/// so the listener refuses to start. Loopback and LAN play, online-mode and
+/// forwarded deployments all pass; anything else needs the explicit
+/// `MC_SPINE_ALLOW_INSECURE_OFFLINE_PUBLIC=1` override.
+fn offline_public_bind_check(
+    bind: &str,
+    online_mode: bool,
+    velocity_forwarding: bool,
+    allow_insecure_offline_public: bool,
+) -> Result<(), String> {
+    if connection_limits::is_loopback_bind(bind)
+        || online_mode
+        || velocity_forwarding
+        || allow_insecure_offline_public
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to bind the game listener to non-loopback address {bind} with \
+         online-mode off and no Velocity forwarding: offline mode trusts the \
+         claimed player name for operator, whitelist and ban checks, so anyone \
+         could log in as an operator. Set `online_mode = true` \
+         (MC_SPINE_ONLINE_MODE=1), enable Velocity forwarding \
+         (MC_SPINE_VELOCITY_FORWARDING=1 + MC_SPINE_VELOCITY_SECRET), or set \
+         MC_SPINE_ALLOW_INSECURE_OFFLINE_PUBLIC=1 only on a network segment you \
+         fully control."
+    ))
+}
+
 /// S2C Login Plugin Request (`0x04`) on `velocity:player_info`, then the C2S
 /// Plugin Response (`0x02`) verified through `verify_velocity_forwarding`.
 /// The `data` of both plugin messages is the remaining frame bytes, not a
@@ -7244,7 +7300,7 @@ fn step_live_vehicle(me: &Arc<Client>, pkt: &MoveVehiclePacket) {
     );
     let seat = mounts()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .registry
         .passengers_of(vehicle)
         .iter()
@@ -7364,9 +7420,15 @@ fn live_chat_validate(
     let policy = chat_signature_policy();
     let is_op = live_admission()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .is_some_and(|admission| admission.ops.is_op(&me.name));
+        .is_some_and(|admission| {
+            admission.ops.is_op_authenticated(
+                &uuid_text(&me.uuid),
+                &me.name,
+                authenticated_player(me.eid),
+            )
+        });
     validate_chat_envelope_as(env, &policy, online_mode_enabled(), is_op)
 }
 
@@ -7771,11 +7833,88 @@ fn handle(s: TcpStream) {
 }
 
 /// The play-state part of a connection's teardown when the handler panics
-/// mid-session: unregister the client from the online list and detach it from
-/// the mount graph like the normal disconnect path does.
+/// mid-session: unregister the client from the online list, sweep every
+/// per-eid session map and detach it from the mount graph like the normal
+/// disconnect path does. Each step is idempotent, so running it after the
+/// `Drop` guard's own teardown (or after a partial teardown) is safe.
 fn forget_live_client(eid: i32) {
     clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.eid != eid);
     live_mount_forget(eid);
+    forget_per_eid_state(eid);
+}
+
+/// Every per-eid session map entry a disconnecting client may have left: the
+/// authenticated mark, the lod_v1 budget and all the play-state maps. Shared
+/// by `disconnect_cleanup` and the panic path so neither leaves a ghost.
+fn forget_per_eid_state(eid: i32) {
+    authenticated_players()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&eid);
+    lod_v1_forget(eid);
+    player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+    death_drop_marks().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+    beacon_menu_anchors().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+    // PARITY-58-C2S: per-connection packet state dies with the connection.
+    chat_ack_offsets().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+    chat_sessions().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+    client_cookies().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+    debug_sample_subscribers().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+    last_client_pongs().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+    client_abilities_flying().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+    seen_advancement_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+    combat_sessions().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+    reconfigure_acked().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+    // A disconnecting player drops both sides of `ServerPlayer.camera`: the
+    // entry naming their own view and any spectator still watching them.
+    {
+        let mut cams = spectator_cameras().lock().unwrap_or_else(|e| e.into_inner());
+        cams.remove(&eid);
+        cams.retain(|_, target| *target != eid);
+    }
+}
+
+/// The disconnect teardown, run once by `ConnectionCleanupGuard`'s `Drop`:
+/// whether the connection loop ends cleanly or unwinds through a panic, the
+/// guard's scope ending runs the whole sequence — item merge-back, the
+/// inventory/position save, open-window release, client-list removal, the
+/// per-eid sweep, mount/lead detach and the destroy/info broadcasts. The
+/// steps are individually idempotent so a partial run followed by
+/// `forget_live_client`'s sweep can never strand state.
+struct ConnectionCleanupGuard {
+    client: Option<Arc<Client>>,
+    peer: String,
+}
+
+impl ConnectionCleanupGuard {
+    /// Arm the guard the moment the client joins the online list: from then on
+    /// the end of the handler's scope — clean exit or panic unwind alike —
+    /// runs `disconnect_cleanup` exactly once.
+    fn new(client: Arc<Client>, peer: &str) -> Self {
+        Self {
+            client: Some(client),
+            peer: peer.to_owned(),
+        }
+    }
+}
+
+impl std::ops::Drop for ConnectionCleanupGuard {
+    fn drop(&mut self) {
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        if std::thread::panicking() {
+            // Mid-unwind a second panic would abort the process: run the
+            // teardown under its own isolation and let `forget_live_client`'s
+            // residual sweep in `handle` cover anything it could not finish.
+            let peer = self.peer.clone();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                disconnect_cleanup(&client, &peer);
+            }));
+        } else {
+            disconnect_cleanup(&client, &self.peer);
+        }
+    }
 }
 
 fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
@@ -7811,7 +7950,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         if let Some((0, _)) = read_packet(&mut s, login_deadline) {
             let online_players: Vec<(String, [u8; 16])> = clients()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .iter()
                 .map(|c| (c.name.clone(), c.uuid))
                 .collect();
@@ -7845,6 +7984,9 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     // whitelist checks judge the *verified* identity — the Velocity-forwarded
     // triple or the Mojang session profile — not whatever the socket claims.
     let mut login_skin = None;
+    // `true` once an identity-bearing exchange verified this connection: every
+    // privilege decision below may then trust the UUID, not just the claimed name.
+    let mut authenticated = false;
     if velocity_forwarding_enabled() {
         match velocity_login(&mut s, login_deadline) {
             Ok(fwd) => {
@@ -7853,6 +7995,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 uuid = fwd.uuid;
                 name = fwd.username;
                 login_skin = forwarded_skin(&fwd.properties);
+                authenticated = true;
             }
             Err(why) => {
                 eprintln!("[security] velocity forwarding refused for {name} from {peer}: {why}");
@@ -7866,6 +8009,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 uuid = profile.uuid;
                 name = profile.name;
                 login_skin = forwarded_skin(&profile.properties);
+                authenticated = true;
             }
             Err(why) => {
                 eprintln!("[security] online-mode login refused for {name} from {peer}: {why}");
@@ -7892,14 +8036,16 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         let online = clients().lock().unwrap_or_else(|e| e.into_inner()).len();
         let mut live = live_admission().lock().unwrap_or_else(|e| e.into_inner());
         let live = live.get_or_insert_with(LiveAdmission::load);
-        if let Err(reason) = check_login_admission(
+        if let Err(reason) = check_login_admission_verified(
             &name,
+            &uuid_text(&uuid),
             &peer,
             online,
             live.max_players,
             &live.ops,
             &live.bans,
             &live.whitelist,
+            authenticated,
         ) {
             eprintln!("[security] login refused for {name} from {peer}: {reason}");
             login_disconnect_text(&mut s, &reason);
@@ -8054,7 +8200,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         );
     }
     send_view_distance(&mut s, client_view.clamp(2, SERVER_VIEW_DISTANCE));
-    let login_admin = player_is_admin(&name);
+    let login_admin = verified_permission_level(&uuid_text(&uuid), &name, authenticated) >= 2;
     if send_commands(&mut s, login_admin).is_err() {
         return;
     }
@@ -8188,7 +8334,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     if let Some(cipher) = conn_cipher(&s) {
         socket_wire()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .entry(socket_key(&writer))
             .or_default()
             .cipher = Some(cipher);
@@ -8264,6 +8410,9 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     // Published to the panic cleanup in `handle` before the client list sees
     // the player, so a panic anywhere below still unregisters this eid.
     live_eid.store(me.eid, Ordering::SeqCst);
+    if authenticated {
+        mark_authenticated(me.eid);
+    }
     let mut retry_chunks = chunk_delivery.has_pending();
     me.enter_play_wire(compression, chunk_delivery);
     {
@@ -8328,9 +8477,14 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
             let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x0a, bossbar_pkt(id, 0, Some(bar)));
         }
     }
+    // Armed the moment the client is on the online list: the guard's `Drop`
+    // runs the whole disconnect teardown when this function's scope ends —
+    // a clean `'conn` break and a panic unwind take the same path. `handle`'s
+    // `forget_live_client` then sweeps anything a mid-unwind teardown missed.
+    let _disconnect_guard = ConnectionCleanupGuard::new(me.clone(), &peer);
     // An operator change can happen during the initial chunk stream, before
     // the client is present in the online list used by /op and /reload.
-    if login_admin != player_is_admin(&me.name) {
+    if login_admin != client_is_admin(&me) {
         update_client_commands(&me);
     }
     // A forwarded or session-verified skin is already on `me`; only run the
@@ -8361,7 +8515,6 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         drop(ms);
         // drops/xp/mobs stream via interest_tick (distance-gated)
     }
-    let me_cleanup = me.clone();
     // Opt-in minimap fair-play (`MC_SPINE_FAIR_PLAY` or `/megu policy`
     // `minimap_mode`, default off): the control code goes out once here, on
     // play join. Off by default — nothing is sent unless the operator armed
@@ -8528,7 +8681,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     && b.len() == 2
                     && b[0] <= 3
                     && b[1] <= 1
-                    && player_is_admin(&me.name)
+                    && client_is_admin(&me)
                 {
                     set_difficulty(b[0]);
                 }
@@ -8833,7 +8986,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     let draw_t = me
                         .bow_draw
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .take()
                         .map(|st| st.elapsed().as_secs_f32())
                         .unwrap_or(0.0);
@@ -8841,7 +8994,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         let arrow_slot = me
                             .inv
                             .lock()
-                            .unwrap()
+                            .unwrap_or_else(|e| e.into_inner())
                             .iter()
                             .find(|(_, (i, c, _))| *i == 802 && *c > 0)
                             .map(|(&sl, _)| sl);
@@ -8879,11 +9032,15 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             };
                             if !inf {
                                 let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                let n = inv[&asl].1 - 1;
-                                if n == 0 {
-                                    inv.remove(&asl);
-                                } else {
-                                    inv.get_mut(&asl).unwrap().1 = n;
+                                // `asl` was found under a previous guard; RCON
+                                // or console inventory edits (`/clear`, `/item
+                                // replace`) may have taken the stack since, so
+                                // the slot is consumed only if it is still there.
+                                if let Some(stack) = inv.get_mut(&asl) {
+                                    stack.1 = stack.1.saturating_sub(1);
+                                    if stack.1 == 0 {
+                                        inv.remove(&asl);
+                                    }
                                 }
                             }
                             let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
@@ -9895,7 +10052,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     let vt: Option<Arc<Client>> = {
                         clients()
                             .lock()
-                            .unwrap()
+                            .unwrap_or_else(|e| e.into_inner())
                             .iter()
                             .find(|c| c.eid == target)
                             .cloned()
@@ -10873,7 +11030,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     }
                     signs()
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .insert((dim, sx, sy, sz, front), lines.clone());
                     broadcast_chunk_dim(dim, sx.div_euclid(16), sz.div_euclid(16), |_c| {
                         (0x07, sign_entity_pkt(sx, sy, sz, front, &lines))
@@ -12255,7 +12412,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 // block_entity_tag_query: the OP>=2 debug-stick query; the
                 // block's live NBT answers on `tag_query` (S2C 0x6e).
                 if let Some((tx_id, pos)) = decode_block_entity_tag_query(&b) {
-                    if player_permission_level(&me.name) >= 2 {
+                    if client_permission_level(&me) >= 2 {
                         let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
                         let nbt = live_block_entity_snapshot((dim, pos.0, pos.1, pos.2))
                             .map(|(_, tag)| tag);
@@ -12322,7 +12479,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 // debug_sample_subscription: OP>=2 subscribes to the per-tick
                 // `debug_sample` push; everyone else is refused fail-closed.
                 if let Some(sample_type) = decode_debug_sample_subscription(&b) {
-                    if player_permission_level(&me.name) >= 2 {
+                    if client_permission_level(&me) >= 2 {
                         debug_sample_subscribers()
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -12339,7 +12496,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 // entity_tag_query: OP>=2, answers with the target's
                 // `id`/`Pos`/`Rotation` NBT on `tag_query` (S2C 0x6e).
                 if let Some((tx_id, entity_id)) = decode_entity_tag_query(&b) {
-                    if player_permission_level(&me.name) >= 2 {
+                    if client_permission_level(&me) >= 2 {
                         let _ = send_packet(
                             &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
                             0x6e,
@@ -12421,7 +12578,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 if let Some(update) = decode_set_command_block_c2s(&b) {
                     let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
                     let _ = apply_set_command_block(
-                        player_permission_level(&me.name),
+                        client_permission_level(&me),
                         *me.gm.lock().unwrap_or_else(|e| e.into_inner()),
                         true,
                         dim,
@@ -12435,7 +12592,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 if let Some(update) = decode_set_command_minecart_c2s(&b) {
                     let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
                     let _ = apply_set_command_minecart(
-                        player_permission_level(&me.name),
+                        client_permission_level(&me),
                         *me.gm.lock().unwrap_or_else(|e| e.into_inner()),
                         true,
                         dim,
@@ -12482,8 +12639,20 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         }
         apply_queued_block_updates();
     }
+    // The `_disconnect_guard` armed at registration runs `disconnect_cleanup`
+    // here — and on any panic unwind — so every exit takes the same teardown.
+}
+
+/// The whole `ServerPlayer.disconnect` teardown for one registered client:
+/// owned projectiles, dropped-item flush, menu close, inventory/position
+/// persistence, open-window release, the client list and every per-eid
+/// session map, mount/lead detach, then the destroy and tab-list-remove
+/// broadcasts. Runs exactly once per connection through
+/// `ConnectionCleanupGuard`; `forget_live_client` covers the residual client
+/// list/maps when a panic interrupted it partway.
+fn disconnect_cleanup(me_cleanup: &Arc<Client>, peer: &str) {
     {
-        eprintln!("[spine] {} left (from {})", name, peer);
+        eprintln!("[spine] {} left (from {})", me_cleanup.name, peer);
         {
             // remove owned projectile/bobber entities
             let mut fb = bobbers().lock().unwrap_or_else(|e| e.into_inner());
@@ -12504,8 +12673,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 broadcast_seen_destroy(*eid);
             }
         }
-        drop_player_items_on_death(&me_cleanup);
-        close_live_menu(&me_cleanup, false, false);
+        drop_player_items_on_death(me_cleanup);
+        close_live_menu(me_cleanup, false, false);
         {
             // vanilla containerMenu.removed: cursor and crafting grid
             // are placed back into the inventory (the
@@ -12572,19 +12741,19 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
             drop(inv);
             inv_store()
                 .lock()
-                .unwrap()
-                .insert(name.clone(), inventory_snapshot.clone());
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(me_cleanup.name.clone(), inventory_snapshot.clone());
             // A logout persists the dimension the player was actually in, so the next
             // login's 0x2b Join Game and first chunk window resume in that world.
-            let record = client_dim_pos(&me_cleanup);
-            pos_store().lock().unwrap_or_else(|e| e.into_inner()).insert(name.clone(), record);
-            save_live_player_snapshot(&me_cleanup, record, &inventory_snapshot);
+            let record = client_dim_pos(me_cleanup);
+            pos_store().lock().unwrap_or_else(|e| e.into_inner()).insert(me_cleanup.name.clone(), record);
+            save_live_player_snapshot(me_cleanup, record, &inventory_snapshot);
         }
         // vanilla `ServerPlayer.disconnect` -> `containerMenu.removed` -> stopOpen:
         // the leaving viewer stops counting before it leaves the client list. The window
         // is read into a local first: `if let Some(open) = *mutex.lock().unwrap_or_else(|e| e.into_inner())` holds
         // the lock for the whole body, and the body locks it again to clear it.
-        if let Some((open, anchor)) = client_open_window_and_anchor(&me_cleanup) {
+        if let Some((open, anchor)) = client_open_window_and_anchor(me_cleanup) {
             let audience = client_snapshot();
             let cdim = *me_cleanup.dim.lock().unwrap_or_else(|e| e.into_inner());
             let halves = client_window_halves_dim(open, anchor, cdim);
@@ -12604,26 +12773,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         cls.retain(|c| c.eid != me_cleanup.eid);
         drop(cls);
         *me_cleanup.sleeping.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
-        death_drop_marks().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
-        beacon_menu_anchors().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
-        // PARITY-58-C2S: per-connection packet state dies with the connection.
-        chat_ack_offsets().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
-        chat_sessions().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
-        client_cookies().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
-        debug_sample_subscribers().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
-        last_client_pongs().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
-        client_abilities_flying().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
-        seen_advancement_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
-        combat_sessions().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
-        reconfigure_acked().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
-        // A disconnecting player drops both sides of `ServerPlayer.camera`: the
-        // entry naming their own view and any spectator still watching them.
-        {
-            let mut cams = spectator_cameras().lock().unwrap_or_else(|e| e.into_inner());
-            cams.remove(&me_cleanup.eid);
-            cams.retain(|_, target| *target != me_cleanup.eid);
-        }
+        forget_per_eid_state(me_cleanup.eid);
         // `Entity.remove` on the leaving player: they step out of any vehicle
         // and the vehicle's trackers get the updated SetPassengers.
         live_mount_forget(me_cleanup.eid);
@@ -18339,5 +18489,324 @@ mod parity_58_c2s_tests {
     fn parity_58_c2s_crafter_slot_state_no_menu_noop() {
         let (me, _peer) = p58_client("P58Crafter", 58013);
         c2s_apply_container_slot_state(&me, 4, 1, true); // must not panic
+    }
+}
+
+// ---------- REL-SECURITY-HARDENING-1: C1/H1/H2 pinned tests ----------
+
+#[cfg(test)]
+mod security_hardening_tests {
+    use super::*;
+
+    /// A `REQ1` frame on `mc-spine:lod_v1` (the same layout
+    /// `registry_tests::lod_test_req1` builds; private there, so re-made here).
+    fn sec_req1(resolution: u8, cx: i32, cz: i32) -> Vec<u8> {
+        let mut d = b"REQ1".to_vec();
+        d.push(resolution);
+        d.extend_from_slice(&cx.to_le_bytes());
+        d.extend_from_slice(&cz.to_le_bytes());
+        d
+    }
+
+    /// Read a VarInt length off the peer socket; `None` on timeout/EOF.
+    fn sec_varint(stream: &mut TcpStream) -> Option<i64> {
+        let mut out = 0i64;
+        for i in 0..5 {
+            let mut b = [0u8; 1];
+            std::io::Read::read_exact(stream, &mut b).ok()?;
+            out |= i64::from(b[0] & 0x7f) << (i * 7);
+            if b[0] & 0x80 == 0 {
+                return Some(out);
+            }
+        }
+        None
+    }
+
+    /// Every `(packet id, body-after-id)` buffered on the peer socket.
+    fn sec_frames(stream: &mut TcpStream) -> Vec<(i64, Vec<u8>)> {
+        let mut out = Vec::new();
+        while let Some(len) = sec_varint(stream) {
+            let mut body = vec![0u8; usize::try_from(len).ok().unwrap_or(0)];
+            if std::io::Read::read_exact(stream, &mut body).is_err() {
+                break;
+            }
+            let mut sl = &body[..];
+            let Some(pid) = read_varint(&mut sl) else {
+                break;
+            };
+            out.push((pid, sl.to_vec()));
+        }
+        out
+    }
+
+    /// C1 (a-d): the public-bind gate — loopback offline always passes, a
+    /// public bind in offline mode fails closed, online-mode and the explicit
+    /// insecure override pass.
+    #[test]
+    fn c1_offline_public_bind_gate() {
+        // (a) loopback offline allowed — single-player/LAN flows keep working.
+        for bind in ["127.0.0.1", "::1", "localhost"] {
+            assert!(
+                offline_public_bind_check(bind, false, false, false).is_ok(),
+                "loopback {bind} must stay seamless in offline mode"
+            );
+        }
+        // (b) public + offline + no forwarding → refused by default.
+        let err = offline_public_bind_check("0.0.0.0", false, false, false)
+            .expect_err("public offline bind must fail closed");
+        assert!(err.contains("online"), "error must name the fix: {err}");
+        assert!(
+            offline_public_bind_check("192.168.1.10", false, false, false).is_err(),
+            "LAN-external offline binds refuse too"
+        );
+        // (c) public + online-mode (or Velocity forwarding) → allowed.
+        assert!(offline_public_bind_check("0.0.0.0", true, false, false).is_ok());
+        assert!(offline_public_bind_check("0.0.0.0", false, true, false).is_ok());
+        // (d) the explicit operator override unlocks the public offline bind.
+        assert!(offline_public_bind_check("0.0.0.0", false, false, true).is_ok());
+    }
+
+    /// H2: a panic inside the guarded connection scope still runs the full
+    /// disconnect teardown — the client leaves `clients()` and every per-EID
+    /// map entry is gone, so no ghost client survives the unwind.
+    #[test]
+    fn h2_connection_cleanup_guard_removes_ghost_client_on_panic() {
+        let _world = world_guard();
+        let (mut client, _peer) = effect_tests::client_pair();
+        client.eid = 97001; // unique: parallel tests share the static tables
+        let me = Arc::new(client);
+        let eid = me.eid;
+
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(me.clone());
+        // Seed the per-EID tables the guard is responsible for draining.
+        mark_authenticated(eid);
+        death_drop_marks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(eid);
+        spectator_cameras()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(eid, 4711);
+        combat_sessions()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(eid, (Instant::now(), Instant::now()));
+        chat_ack_offsets()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(eid, 7);
+        debug_sample_subscribers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(eid, 3);
+        last_client_pongs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(eid, 5);
+        client_abilities_flying()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(eid, true);
+        reconfigure_acked()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(eid);
+        beacon_menu_anchors()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(eid, (DimId::Overworld, 1, 64, -2));
+        assert!(
+            lod_v1_rate_take(eid, Instant::now()),
+            "first request creates the bucket"
+        );
+
+        // The panic unwinds through the guard's Drop — exactly the leak the
+        // audit found when a mid-loop panic skipped the teardown block.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ConnectionCleanupGuard::new(me.clone(), "127.0.0.1:test");
+            panic!("simulated handler panic");
+        }));
+        assert!(result.is_err(), "the simulated panic reached the harness");
+
+        assert!(
+            !clients()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|c| c.eid == eid),
+            "panic teardown removed the client — no ghost client remains"
+        );
+        assert!(!authenticated_player(eid), "auth state cleared");
+        assert!(
+            !death_drop_marks()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&eid)
+        );
+        assert!(
+            !spectator_cameras()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&eid)
+        );
+        assert!(
+            !combat_sessions()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&eid)
+        );
+        assert!(
+            !chat_ack_offsets()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&eid)
+        );
+        assert!(
+            !debug_sample_subscribers()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&eid)
+        );
+        assert!(
+            !last_client_pongs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&eid)
+        );
+        assert!(
+            !client_abilities_flying()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&eid)
+        );
+        assert!(
+            !reconfigure_acked()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&eid)
+        );
+        assert!(
+            !beacon_menu_anchors()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&eid)
+        );
+        assert!(
+            !lod_v1_shared()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .buckets
+                .contains_key(&eid),
+            "lod_v1 rate bucket drained with the connection"
+        );
+        // Inventory + position snapshots are persisted, not lost.
+        assert!(
+            inv_store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("totem-test"),
+            "disconnect saved the inventory snapshot"
+        );
+        assert!(
+            pos_store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("totem-test"),
+            "disconnect saved the position snapshot"
+        );
+    }
+
+    /// H1 (a): a repeat REQ1 for the same `(dim, chunk, resolution)` serves the
+    /// cached frame — `LOD_V1_COLUMN_SCANS` does not move — and a chunk
+    /// invalidation (the same hook `bump_world_epoch_dim` fires) drops the
+    /// cached frame so the next request scans again.
+    #[test]
+    fn h1_lod_v1_cache_hit_skips_rescan_and_invalidate_recomputes() {
+        let _world = world_guard();
+        let (mut client, _peer) = effect_tests::client_pair();
+        client.eid = 97002;
+        client.lod_v1_enabled.store(true, Ordering::Relaxed);
+        // A request column no other test touches, inside the radius cap.
+        let (cx, cz, res) = (37, -41, LOD_RES_COARSE);
+        let key = (DimId::Overworld, cx, cz, res);
+        lod_v1_forget(client.eid); // fresh rate bucket
+        lod_v1_shared()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .frames
+            .remove(&key);
+
+        let scans0 = LOD_V1_COLUMN_SCANS.load(Ordering::Relaxed);
+        lod_v1_request(&client, &sec_req1(res, cx, cz));
+        let scans1 = LOD_V1_COLUMN_SCANS.load(Ordering::Relaxed);
+        assert_eq!(scans1, scans0 + 1, "cold request runs one column scan");
+        assert!(
+            lod_v1_shared()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .frames
+                .contains_key(&key),
+            "the frame is cached after the scan"
+        );
+
+        lod_v1_request(&client, &sec_req1(res, cx, cz));
+        assert_eq!(
+            LOD_V1_COLUMN_SCANS.load(Ordering::Relaxed),
+            scans1,
+            "warm request serves the cached frame without rescanning"
+        );
+
+        invalidate_lod_v1_chunk(DimId::Overworld, cx, cz);
+        assert!(
+            !lod_v1_shared()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .frames
+                .contains_key(&key),
+            "invalidation drops the cached frame"
+        );
+        lod_v1_request(&client, &sec_req1(res, cx, cz));
+        assert_eq!(
+            LOD_V1_COLUMN_SCANS.load(Ordering::Relaxed),
+            scans1 + 1,
+            "post-invalidation request scans the column again"
+        );
+    }
+
+    /// H1 (b): the per-connection token bucket bursts `LOD_V1_REQ_BURST`
+    /// requests then drops the rest — no extra frames ever leave the socket.
+    #[test]
+    fn h1_lod_v1_rate_limit_drops_burst_flood() {
+        let _world = world_guard();
+        let (mut client, mut peer) = effect_tests::client_pair();
+        client.eid = 97003;
+        client.lod_v1_enabled.store(true, Ordering::Relaxed);
+        peer.set_read_timeout(Some(Duration::from_millis(150)))
+            .unwrap();
+        lod_v1_forget(client.eid); // fresh bucket
+
+        // Same column every time: after the first scan the hits are cheap, so
+        // the packet count measures the rate gate alone, not encode cost.
+        let flood = LOD_V1_REQ_BURST + 12;
+        for _ in 0..flood {
+            lod_v1_request(&client, &sec_req1(LOD_RES_COARSE, 0, 0));
+        }
+        // Checked before the socket read (whose timeout would refill a token):
+        // the next request in the same instant is refused before any scan.
+        assert!(
+            !lod_v1_rate_take(client.eid, Instant::now()),
+            "a drained bucket refuses until tokens refill"
+        );
+        let frames = sec_frames(&mut peer);
+        assert_eq!(
+            frames.len(),
+            LOD_V1_REQ_BURST as usize,
+            "exactly the burst allowance reaches the socket; {} dropped",
+            flood - LOD_V1_REQ_BURST
+        );
     }
 }

@@ -367,3 +367,50 @@ are enabled.
   required for install (`:1464-1482`). *(Unwired — W1.)*
 - **Per-eid cleanup**: disconnect path removes all per-connection maps
   (`play_protocol.rs:12603-12629`) — when it runs (see H2).
+
+---
+
+## 6. Remediation Status (REL-SECURITY-HARDENING-1)
+
+Applied fixes; each item names the code that resolves it.
+
+- **C1 — FIXED.** `OpsRegistry::op_level_of_authenticated` /
+  `find_authenticated` (`src/server_ops.rs:140-203`) match a verified UUID
+  before the name and never grant OP when the entry's stored UUID contradicts
+  the verified one; `player_ban_authenticated` (`:403-423`),
+  `contains_authenticated` (`:614-633`) and `check_login_admission_verified`
+  (`:712-744`) apply the same rule to bans, whitelist and the player cap.
+  `verified_permission_level` / `client_permission_level`
+  (`src/commands_core.rs:5491-5533`) feed every OP-gated command path the
+  session UUID plus the `mark_authenticated` flag that only the Velocity and
+  online-mode exchanges set (`src/play_protocol.rs:7989-8016, 8410-8415`).
+  `offline_public_bind_check` (`src/play_protocol.rs:6908-6937`) fails a
+  non-loopback listener closed at startup when `online-mode` is off and no
+  forwarding is enabled (`src/main.rs:16650-16662`), with
+  `MC_SPINE_ALLOW_INSECURE_OFFLINE_PUBLIC=1` as the explicit override.
+- **H1 — FIXED.** `lod_v1` frames are cached keyed by
+  `(dim, cx, cz, resolution)` against the chunk epoch
+  (`src/lod_protocol.rs:300-308`), capped at 2048 entries; a per-connection
+  token bucket (burst 16, 8 req/s) drops over-budget `REQ1`s before any
+  world scan (`:346-358, 432-438`); the radius cap is 64 chunks
+  (`LOD_V1_MAX_RANGE_CHUNKS`); `bump_world_epoch_dim` calls
+  `invalidate_lod_v1_chunk` on every block write (`src/main.rs:12113-12115`).
+- **H2 — FIXED.** `handle(s)` runs inside `catch_unwind` in the listener
+  thread (`src/main.rs:16804-16813`) in addition to the existing
+  `run_isolated_connection` wrapper; `ConnectionCleanupGuard`
+  (`src/play_protocol.rs:7884-7918`) armed at client registration runs the
+  whole `disconnect_cleanup` (`:12653-12752`) on clean exit or panic unwind —
+  nested `catch_unwind` during unwind, `forget_per_eid_state`
+  (`:7849-7877`) sweeps every per-eid map either way. The `inv[&asl]`
+  unchecked index is a checked `get_mut` (`src/play_protocol.rs:9039-9044`);
+  all cited bare `.lock().unwrap()` sites now use
+  `.unwrap_or_else(|e| e.into_inner())` (debt-ratchet count 19 → 8).
+- **M2 — FIXED.** Both Mojang reads in `load_skin_properties`
+  (`src/play_protocol.rs:1323, 1336`) and `mojang_http_get`
+  (`src/server_reliability.rs:514`) cap bodies at 1 MiB via
+  `body_mut().with_config().limit(1 << 20)`, which errors fail-closed on
+  oversized responses.
+
+Coverage: `security_hardening_tests` (bind gate a-d, ghost-client panic,
+lod_v1 cache/rate-limit) and `server_ops_tests::c1_*` (UUID-mismatch OP
+refusal, verified ban/whitelist, admission composition).

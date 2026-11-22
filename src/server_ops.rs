@@ -76,6 +76,17 @@ fn offline_uuid_string(name: &str) -> String {
     )
 }
 
+/// Canonical form for comparing stored UUID strings against an authenticated
+/// one: lowercase hex with the dashes stripped, so `"…-…-…"`, `"…"` and any
+/// case spell the same identity.
+#[allow(dead_code)]
+fn normalize_player_uuid(uuid: &str) -> String {
+    uuid.chars()
+        .filter(|c| *c != '-')
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
 // ------------------------------------------------------------------ ops.json
 
 /// One Vanilla `ops.json` object.
@@ -120,9 +131,44 @@ impl OpsRegistry {
             .find(|e| e.name.eq_ignore_ascii_case(name))
     }
 
+    /// The verified-identity lookup: an authenticated UUID matches an entry
+    /// outright, and a name match only counts when the entry carries no stored
+    /// UUID to contradict the verified one. A name hit whose stored UUID
+    /// conflicts with the authenticated UUID is *not* the operator — without
+    /// this, a stale or forged entry would hand OP to whoever the name claim
+    /// resolves to.
+    fn find_authenticated(&self, uuid: &str, name: &str, authenticated: bool) -> Option<&OpEntry> {
+        if authenticated {
+            let uuid = normalize_player_uuid(uuid);
+            if !uuid.is_empty() {
+                if let Some(entry) = self
+                    .entries
+                    .iter()
+                    .find(|e| !e.uuid.is_empty() && normalize_player_uuid(&e.uuid) == uuid)
+                {
+                    return Some(entry);
+                }
+                return self
+                    .entries
+                    .iter()
+                    .find(|e| e.uuid.is_empty() && e.name.eq_ignore_ascii_case(name));
+            }
+        }
+        self.find(name)
+    }
+
     /// `0` when the name is not an operator, else its `1..=4` level.
     pub(crate) fn op_level_of(&self, name: &str) -> u8 {
         self.find(name).map(|e| e.level).unwrap_or(0)
+    }
+
+    /// `op_level_of` for a connection whose identity the server verified
+    /// (`authenticated = online-mode or Velocity forwarding). The verified
+    /// UUID decides before the name; a UUID conflict never grants OP.
+    pub(crate) fn op_level_of_authenticated(&self, uuid: &str, name: &str, authenticated: bool) -> u8 {
+        self.find_authenticated(uuid, name, authenticated)
+            .map(|e| e.level)
+            .unwrap_or(0)
     }
 
     /// Presence in the file — even a level-0 operator counts, as Vanilla's
@@ -131,8 +177,25 @@ impl OpsRegistry {
         self.find(name).is_some()
     }
 
+    /// `is_op` under the verified-identity rules of `find_authenticated`.
+    pub(crate) fn is_op_authenticated(&self, uuid: &str, name: &str, authenticated: bool) -> bool {
+        self.find_authenticated(uuid, name, authenticated).is_some()
+    }
+
     pub(crate) fn bypasses_player_limit(&self, name: &str) -> bool {
         self.find(name)
+            .map(|e| e.bypasses_player_limit)
+            .unwrap_or(false)
+    }
+
+    /// `bypasses_player_limit` under the verified-identity rules.
+    pub(crate) fn bypasses_player_limit_authenticated(
+        &self,
+        uuid: &str,
+        name: &str,
+        authenticated: bool,
+    ) -> bool {
+        self.find_authenticated(uuid, name, authenticated)
             .map(|e| e.bypasses_player_limit)
             .unwrap_or(false)
     }
@@ -334,6 +397,34 @@ impl BanRegistry {
             .find(|e| e.name.eq_ignore_ascii_case(name))
     }
 
+    /// `player_ban` under verified identity: the authenticated UUID matches an
+    /// entry outright; a name match only counts when the entry stored no UUID
+    /// to contradict the verified one.
+    pub(crate) fn player_ban_authenticated(
+        &self,
+        uuid: &str,
+        name: &str,
+        authenticated: bool,
+    ) -> Option<&BanEntry> {
+        if authenticated {
+            let uuid = normalize_player_uuid(uuid);
+            if !uuid.is_empty() {
+                if let Some(entry) = self
+                    .players
+                    .iter()
+                    .find(|e| !e.uuid.is_empty() && normalize_player_uuid(&e.uuid) == uuid)
+                {
+                    return Some(entry);
+                }
+                return self
+                    .players
+                    .iter()
+                    .find(|e| e.uuid.is_empty() && e.name.eq_ignore_ascii_case(name));
+            }
+        }
+        self.player_ban(name)
+    }
+
     pub(crate) fn ip_ban(&self, ip: &str) -> Option<&IpBanEntry> {
         let ip = normalize_ban_ip(ip);
         self.ips.iter().find(|e| e.ip == ip)
@@ -517,6 +608,25 @@ impl WhitelistRegistry {
             .any(|e| e.name.eq_ignore_ascii_case(name))
     }
 
+    /// `contains` under verified identity: the authenticated UUID matches an
+    /// entry outright; a name match only counts when the entry stored no UUID
+    /// to contradict the verified one.
+    pub(crate) fn contains_authenticated(&self, uuid: &str, name: &str, authenticated: bool) -> bool {
+        if authenticated {
+            let uuid = normalize_player_uuid(uuid);
+            if !uuid.is_empty() {
+                return self.entries.iter().any(|e| {
+                    if !e.uuid.is_empty() {
+                        normalize_player_uuid(&e.uuid) == uuid
+                    } else {
+                        e.name.eq_ignore_ascii_case(name)
+                    }
+                });
+            }
+        }
+        self.contains(name)
+    }
+
     /// `true` when the player was added (`false` = already whitelisted).
     pub(crate) fn add(&mut self, name: &str) -> bool {
         if self.contains(name) {
@@ -590,22 +700,48 @@ pub(crate) fn check_login_admission(
     bans: &BanRegistry,
     whitelist: &WhitelistRegistry,
 ) -> Result<(), String> {
+    check_login_admission_verified(
+        name, "", ip, online_count, max_players, ops, bans, whitelist, false,
+    )
+}
+
+/// `check_login_admission` against a verified identity: when `authenticated`
+/// is set (online-mode session check or Velocity forwarding), the ban,
+/// whitelist and operator-bypass lookups judge `uuid` first and only fall
+/// back to the name for entries that never recorded one.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn check_login_admission_verified(
+    name: &str,
+    uuid: &str,
+    ip: &str,
+    online_count: usize,
+    max_players: usize,
+    ops: &OpsRegistry,
+    bans: &BanRegistry,
+    whitelist: &WhitelistRegistry,
+    authenticated: bool,
+) -> Result<(), String> {
     if let Some(ban) = bans.ip_ban(ip) {
         return Err(format!(
             "Your IP address is banned from this server.\nReason: {}",
             ban.reason
         ));
     }
-    if let Some(ban) = bans.player_ban(name) {
+    if let Some(ban) = bans.player_ban_authenticated(uuid, name, authenticated) {
         return Err(format!(
             "You are banned from this server.\nReason: {}",
             ban.reason
         ));
     }
-    if whitelist.enabled && !whitelist.contains(name) && !ops.is_op(name) {
+    if whitelist.enabled
+        && !whitelist.contains_authenticated(uuid, name, authenticated)
+        && !ops.is_op_authenticated(uuid, name, authenticated)
+    {
         return Err("You are not white-listed on this server!".to_owned());
     }
-    if online_count >= max_players && !ops.bypasses_player_limit(name) {
+    if online_count >= max_players
+        && !ops.bypasses_player_limit_authenticated(uuid, name, authenticated)
+    {
         return Err("The server is full!".to_owned());
     }
     Ok(())
@@ -1845,6 +1981,173 @@ mod server_ops_tests {
         let b = bans.lock().unwrap_or_else(|e| e.into_inner());
         assert!(check_login_admission("Newbie", "1.2.3.4", 0, 4, &ops, &b, &wl).is_ok());
         assert!(check_login_admission("Griefer", "1.2.3.4", 0, 4, &ops, &b, &wl).is_err());
+    }
+
+    /// C1 (a): an authenticated UUID lookup judges identity, not the claimed
+    /// name — a spoofed operator name with a conflicting verified UUID gets
+    /// nothing, while the real UUID is operator under any name.
+    #[test]
+    fn c1_authenticated_uuid_lookup_refuses_name_spoof() {
+        let ops = OpsRegistry {
+            entries: vec![OpEntry {
+                uuid: "3f06bb63-1939-4bc3-b8a1-9d0d1e2c3a4b".into(),
+                name: "Steve".into(),
+                level: 4,
+                bypasses_player_limit: true,
+            }],
+        };
+        // Claimed name matches the entry but the verified UUID does not:
+        // never OP — this is the offline-mode impersonation the audit found.
+        assert_eq!(
+            ops.op_level_of_authenticated(
+                "aaaaaaaa-0000-4000-8000-000000000000",
+                "Steve",
+                true
+            ),
+            0,
+            "UUID mismatch must refuse operator level"
+        );
+        assert!(!ops.is_op_authenticated(
+            "aaaaaaaa-0000-4000-8000-000000000000",
+            "Steve",
+            true
+        ));
+        assert!(!ops.bypasses_player_limit_authenticated(
+            "aaaaaaaa-0000-4000-8000-000000000000",
+            "Steve",
+            true
+        ));
+        // The verified UUID is the identity — it matches under any name, and
+        // the normalization is case/dash-insensitive.
+        assert_eq!(
+            ops.op_level_of_authenticated(
+                "3F06BB6319394BC3B8A19D0D1E2C3A4B",
+                "Anyone",
+                true
+            ),
+            4
+        );
+        // Unauthenticated lookups keep the legacy name semantics (offline /
+        // loopback play and all existing callers).
+        assert_eq!(ops.op_level_of_authenticated("", "Steve", false), 4);
+        assert_eq!(ops.op_level_of_authenticated("", "steve", false), 4);
+    }
+
+    /// C1 (b): name-only whitelist/ban entries still work offline, but a
+    /// UUID-carrying entry cannot be dodged or spoofed through a name claim.
+    #[test]
+    fn c1_authenticated_ban_and_whitelist_use_uuid_first() {
+        let bans = BanRegistry {
+            players: vec![BanEntry {
+                uuid: "3f06bb63-1939-4bc3-b8a1-9d0d1e2c3a4b".into(),
+                name: "Griefer".into(),
+                created: "2026-01-01".into(),
+                source: "Server".into(),
+                expires: "forever".into(),
+                reason: "griefing".into(),
+            }],
+            ips: Vec::new(),
+        };
+        // The banned UUID is banned under any name it claims.
+        assert!(
+            bans.player_ban_authenticated(
+                "3f06bb63-1939-4bc3-b8a1-9d0d1e2c3a4b",
+                "Innocent",
+                true
+            )
+            .is_some()
+        );
+        // A different verified UUID claiming the banned name is NOT the ban
+        // target — the entry's stored UUID contradicts the claim.
+        assert!(
+            bans.player_ban_authenticated(
+                "bbbbbbbb-0000-4000-8000-000000000000",
+                "Griefer",
+                true
+            )
+            .is_none(),
+            "verified UUID must override the claimed name for bans"
+        );
+        // Offline sessions still honor the plain name check.
+        assert!(bans.player_ban_authenticated("", "Griefer", false).is_some());
+
+        let wl = WhitelistRegistry {
+            enabled: true,
+            entries: vec![WhitelistEntry {
+                uuid: "3f06bb63-1939-4bc3-b8a1-9d0d1e2c3a4b".into(),
+                name: "Member".into(),
+            }],
+        };
+        assert!(wl.contains_authenticated(
+            "3f06bb63-1939-4bc3-b8a1-9d0d1e2c3a4b",
+            "Renamed",
+            true
+        ));
+        assert!(
+            !wl.contains_authenticated(
+                "cccccccc-0000-4000-8000-000000000000",
+                "Member",
+                true
+            ),
+            "verified UUID mismatch must not whitelist by name alone"
+        );
+        assert!(wl.contains_authenticated("", "Member", false));
+    }
+
+    /// C1 (c): admission composes the verified lookups — an impersonator
+    /// claiming a banned operator's name is neither banned nor bypassed into
+    /// a full server, and an operator's real UUID still bypasses the cap.
+    #[test]
+    fn c1_verified_admission_combines_uuid_checks() {
+        let ops = OpsRegistry {
+            entries: vec![OpEntry {
+                uuid: "3f06bb63-1939-4bc3-b8a1-9d0d1e2c3a4b".into(),
+                name: "Admin".into(),
+                level: 4,
+                bypasses_player_limit: true,
+            }],
+        };
+        let bans = BanRegistry::default();
+        let wl = WhitelistRegistry::default();
+        // Impersonator: claims "Admin" with a conflicting verified UUID on a
+        // full server — no `bypassesPlayerLimit`, so admission refuses.
+        assert!(
+            check_login_admission_verified(
+                "Admin",
+                "dddddddd-0000-4000-8000-000000000000",
+                "9.9.9.9",
+                20,
+                20,
+                &ops,
+                &bans,
+                &wl,
+                true
+            )
+            .is_err(),
+            "name-spoofed UUID must not inherit the operator's cap bypass"
+        );
+        // The real operator UUID bypasses the cap under any name.
+        assert!(
+            check_login_admission_verified(
+                "Admin",
+                "3f06bb63-1939-4bc3-b8a1-9d0d1e2c3a4b",
+                "9.9.9.9",
+                20,
+                20,
+                &ops,
+                &bans,
+                &wl,
+                true
+            )
+            .is_ok()
+        );
+        // Offline admission is unchanged: the name path still applies.
+        assert!(
+            check_login_admission_verified(
+                "Admin", "", "9.9.9.9", 20, 20, &ops, &bans, &wl, false
+            )
+            .is_ok()
+        );
     }
 
     #[test]
