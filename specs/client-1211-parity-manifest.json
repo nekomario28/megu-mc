@@ -30,8 +30,8 @@
       "id": "f3.a_reload_chunks",
       "category": "f3_debug_chords",
       "description": "Vanilla F3+A debug chord: Reload all loaded chunks.",
-      "kernel_file": "client-gpu/src/window.rs",
-      "kernel_symbol": "f3_debug_a_reload_chunks",
+      "kernel_file": "client-kernel/src/debug_chords.rs",
+      "kernel_symbol": "F3Chord::A",
       "live_consumers": [
         "client-gpu/src/window.rs"
       ],
@@ -41,8 +41,8 @@
       "id": "f3.b_hitboxes",
       "category": "f3_debug_chords",
       "description": "Vanilla F3+B debug chord: Toggle the entity_hitboxes debug renderer (gated by reduced_debug_info).",
-      "kernel_file": "client-gpu/src/window.rs",
-      "kernel_symbol": "f3_debug_b_hitboxes",
+      "kernel_file": "client-kernel/src/debug_chords.rs",
+      "kernel_symbol": "F3Chord::B",
       "live_consumers": [
         "client-gpu/src/window.rs"
       ],
@@ -52,8 +52,8 @@
       "id": "f3.c_copy_location",
       "category": "f3_debug_chords",
       "description": "Vanilla F3+C debug chord: Copy player location as a /execute in <dim> run tp @s <pos> <rot> command; hold 10s for the manual debug crash.",
-      "kernel_file": "client-gpu/src/window.rs",
-      "kernel_symbol": "f3_debug_c_copy_location",
+      "kernel_file": "client-kernel/src/debug_chords.rs",
+      "kernel_symbol": "F3Chord::C",
       "live_consumers": [
         "client-gpu/src/window.rs"
       ],
@@ -63,8 +63,8 @@
       "id": "f3.d_clear_chat",
       "category": "f3_debug_chords",
       "description": "Vanilla F3+D debug chord: Clear chat history while keeping typed lines accessible via up/down.",
-      "kernel_file": "client-gpu/src/window.rs",
-      "kernel_symbol": "f3_debug_d_clear_chat",
+      "kernel_file": "client-kernel/src/debug_chords.rs",
+      "kernel_symbol": "F3Chord::D",
       "live_consumers": [
         "client-gpu/src/window.rs"
       ],
@@ -74,8 +74,8 @@
       "id": "f3.f4_game_mode_switcher",
       "category": "f3_debug_chords",
       "description": "Vanilla F3+F4 debug chord: Open the game-mode switcher overlay (operator permission required).",
-      "kernel_file": "client-gpu/src/window.rs",
-      "kernel_symbol": "f3_debug_f4_game_mode_switcher",
+      "kernel_file": "client-kernel/src/debug_chords.rs",
+      "kernel_symbol": "F3Chord::F4",
       "live_consumers": [
         "client-gpu/src/window.rs"
       ],
@@ -85,8 +85,8 @@
       "id": "f3.g_chunk_borders",
       "category": "f3_debug_chords",
       "description": "Vanilla F3+G debug chord: Toggle the chunk_borders debug renderer.",
-      "kernel_file": "client-gpu/src/window.rs",
-      "kernel_symbol": "f3_debug_g_chunk_borders",
+      "kernel_file": "client-kernel/src/debug_chords.rs",
+      "kernel_symbol": "F3Chord::G",
       "live_consumers": [
         "client-gpu/src/window.rs"
       ],
@@ -96,8 +96,8 @@
       "id": "f3.h_advanced_tooltips",
       "category": "f3_debug_chords",
       "description": "Vanilla F3+H debug chord: Toggle advanced item tooltips (registry ids, durability, enchantments).",
-      "kernel_file": "client-gpu/src/window.rs",
-      "kernel_symbol": "f3_debug_h_advanced_tooltips",
+      "kernel_file": "client-kernel/src/debug_chords.rs",
+      "kernel_symbol": "F3Chord::H",
       "live_consumers": [
         "client-gpu/src/window.rs"
       ],
@@ -107,8 +107,8 @@
       "id": "f3.i_copy_target_data",
       "category": "f3_debug_chords",
       "description": "Vanilla F3+I debug chord: Copy the looked-at block/entity data as a command (Shift copies client data).",
-      "kernel_file": "client-gpu/src/window.rs",
-      "kernel_symbol": "f3_debug_i_copy_target_data",
+      "kernel_file": "client-kernel/src/debug_chords.rs",
+      "kernel_symbol": "F3Chord::I",
       "live_consumers": [
         "client-gpu/src/window.rs"
       ],
@@ -118,8 +118,8 @@
       "id": "f3.n_spectator_toggle",
       "category": "f3_debug_chords",
       "description": "Vanilla F3+N debug chord: Cycle between spectator mode and the previous game mode.",
-      "kernel_file": "client-gpu/src/window.rs",
-      "kernel_symbol": "f3_debug_n_spectator_toggle",
+      "kernel_file": "client-kernel/src/debug_chords.rs",
+      "kernel_symbol": "F3Chord::N",
       "live_consumers": [
         "client-gpu/src/window.rs"
       ],
@@ -129,8 +129,8 @@
       "id": "f3.p_pause_on_focus_loss",
       "category": "f3_debug_chords",
       "description": "Vanilla F3+P debug chord: Toggle pause-when-unfocused (auto-pause) option.",
-      "kernel_file": "client-gpu/src/window.rs",
-      "kernel_symbol": "f3_debug_p_pause_on_focus_loss",
+      "kernel_file": "client-kernel/src/debug_chords.rs",
+      "kernel_symbol": "F3Chord::P",
       "live_consumers": [
         "client-gpu/src/window.rs"
       ],
@@ -140,8 +140,8 @@
       "id": "f3.q_help_overlay",
       "category": "f3_debug_chords",
       "description": "Vanilla F3+Q debug chord: Show the debug hotkey help overlay listing all F3 chords.",
-      "kernel_file": "client-gpu/src/window.rs",
-      "kernel_symbol": "f3_debug_q_help_overlay",
+      "kernel_file": "client-kernel/src/debug_chords.rs",
+      "kernel_symbol": "F3Chord::Q",
       "live_consumers": [
         "client-gpu/src/window.rs"
       ],
@@ -151,8 +151,8 @@
       "id": "f3.t_reload_resourcepacks",
       "category": "f3_debug_chords",
       "description": "Vanilla F3+T debug chord: Reload resource packs (textures, models, sounds).",
-      "kernel_file": "client-gpu/src/window.rs",
-      "kernel_symbol": "f3_debug_t_reload_resourcepacks",
+      "kernel_file": "client-kernel/src/debug_chords.rs",
+      "kernel_symbol": "F3Chord::T",
       "live_consumers": [
         "client-gpu/src/window.rs"
       ],
@@ -162,8 +162,8 @@
       "id": "f3.1_profiler_chart",
       "category": "f3_debug_chords",
       "description": "Vanilla F3+1 debug chord: Toggle the profiler pie chart on the debug screen.",
-      "kernel_file": "client-gpu/src/window.rs",
-      "kernel_symbol": "f3_debug_1_profiler_chart",
+      "kernel_file": "client-kernel/src/debug_chords.rs",
+      "kernel_symbol": "F3Chord::Key1",
       "live_consumers": [
         "client-gpu/src/window.rs"
       ],
@@ -173,8 +173,8 @@
       "id": "f3.2_fps_chart",
       "category": "f3_debug_chords",
       "description": "Vanilla F3+2 debug chord: Toggle the FPS/TPS frame-time graph on the debug screen.",
-      "kernel_file": "client-gpu/src/window.rs",
-      "kernel_symbol": "f3_debug_2_fps_chart",
+      "kernel_file": "client-kernel/src/debug_chords.rs",
+      "kernel_symbol": "F3Chord::Key2",
       "live_consumers": [
         "client-gpu/src/window.rs"
       ],
@@ -184,8 +184,8 @@
       "id": "f3.3_network_chart",
       "category": "f3_debug_chords",
       "description": "Vanilla F3+3 debug chord: Toggle the bandwidth/ping network charts on the debug screen.",
-      "kernel_file": "client-gpu/src/window.rs",
-      "kernel_symbol": "f3_debug_3_network_chart",
+      "kernel_file": "client-kernel/src/debug_chords.rs",
+      "kernel_symbol": "F3Chord::Key3",
       "live_consumers": [
         "client-gpu/src/window.rs"
       ],
@@ -2324,11 +2324,10 @@
       "id": "hud.f3_debug_overlay",
       "category": "hud_and_qol",
       "description": "Full F3 debug overlay (multi-line info text + six graphs); today only a one-line actionbar diagnostics tag exists via show_diagnostics.",
-      "kernel_file": "client-gpu/src/window.rs",
-      "kernel_symbol": "f3_debug_overlay",
+      "kernel_file": "client-kernel/src/debug_chords.rs",
+      "kernel_symbol": "DebugChordState::show_debug_overlay",
       "live_consumers": [
-        "client-gpu/src/window.rs",
-        "client-gpu/src/renderer.rs"
+        "client-gpu/src/window.rs"
       ],
       "status": "planned"
     },
@@ -2421,7 +2420,8 @@
       "kernel_symbol": "collide",
       "live_consumers": [
         "client-app/src/sim.rs",
-        "client-app/src/world.rs"
+        "client-app/src/world.rs",
+        "client-kernel/src/player_physics.rs"
       ]
     },
     {
@@ -2432,7 +2432,8 @@
       "kernel_symbol": "fluid_impulse",
       "live_consumers": [
         "client-app/src/sim.rs",
-        "client-app/src/world.rs"
+        "client-app/src/world.rs",
+        "client-kernel/src/player_physics.rs"
       ]
     },
     {
@@ -2443,7 +2444,8 @@
       "kernel_symbol": "back_off_from_edge",
       "live_consumers": [
         "client-app/src/sim.rs",
-        "client-gpu/src/live_session.rs"
+        "client-gpu/src/live_session.rs",
+        "client-kernel/src/player_physics.rs"
       ]
     },
     {
@@ -2513,11 +2515,10 @@
       "id": "input.keybind_offhand_f",
       "category": "physics_and_input",
       "description": "Offhand swap keybind (F) + swap hands packet.",
-      "kernel_file": "client-gpu/src/window.rs",
-      "kernel_symbol": "keybind_offhand",
+      "kernel_file": "client-gpu/src/live_session.rs",
+      "kernel_symbol": "swap_offhand",
       "live_consumers": [
-        "client-gpu/src/window.rs",
-        "client-app/src/protocol.rs"
+        "client-gpu/src/window.rs"
       ],
       "status": "planned"
     },
@@ -2525,11 +2526,10 @@
       "id": "input.keybind_drop_q",
       "category": "physics_and_input",
       "description": "Drop item keybind (Q, Ctrl+Q stack) + player_action packet.",
-      "kernel_file": "client-gpu/src/window.rs",
-      "kernel_symbol": "keybind_drop_item",
+      "kernel_file": "client-gpu/src/live_session.rs",
+      "kernel_symbol": "drop_item",
       "live_consumers": [
-        "client-gpu/src/window.rs",
-        "client-app/src/protocol.rs"
+        "client-gpu/src/window.rs"
       ],
       "status": "planned"
     },
@@ -2609,13 +2609,14 @@
       "id": "render.png_decoder",
       "category": "rendering_and_assets",
       "description": "PNG texture decoder (asset pipeline currently consumes raw .rgba sprites; vanilla packs ship PNG).",
-      "kernel_file": "client-port/src/asset_pipeline.rs",
-      "kernel_symbol": "decode_png_sprite",
+      "kernel_file": "client-port/src/png_decode.rs",
+      "kernel_symbol": "decode_png_rgba",
       "live_consumers": [
         "client-app/src/render.rs",
         "client-app/src/world.rs",
         "client-gpu/src/renderer.rs",
-        "client-gpu/src/live_session.rs"
+        "client-gpu/src/live_session.rs",
+        "client-port/src/asset_pipeline.rs"
       ],
       "status": "planned"
     },
@@ -2871,7 +2872,8 @@
       "kernel_symbol": "decode_item_stack_components",
       "live_consumers": [
         "client-app/src/protocol.rs",
-        "client-app/src/world.rs"
+        "client-app/src/world.rs",
+        "client-gpu/src/live_session.rs"
       ],
       "status": "planned"
     },
@@ -2916,7 +2918,7 @@
       "category": "audio_and_protocol",
       "description": "Boss-bar S2C packets (add/remove/update progress/title/color/style).",
       "kernel_file": "client-app/src/protocol.rs",
-      "kernel_symbol": "PlayEvent::BossBar",
+      "kernel_symbol": "PlayEvent::BossEvent",
       "live_consumers": [
         "client-gpu/src/live_session.rs",
         "client-ui/src/state.rs"

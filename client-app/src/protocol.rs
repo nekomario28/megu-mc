@@ -2058,8 +2058,80 @@ pub enum PlayEvent {
     PlayerInfoRemove {
         uuids: Vec<[u8; 16]>,
     },
+    /// `player_info_update` — tab-list entry mutations; `actions` is the
+    /// wire bitmask (0x01 add, 0x02 init-chat, 0x04 gamemode, 0x08 listed,
+    /// 0x10 latency, 0x20 display-name) shared by every entry.
+    PlayerInfo {
+        actions: u8,
+        entries: Vec<PlayerInfoUpdateEntry>,
+    },
+    /// `set_objective` — scoreboard objective create/remove/update; the
+    /// display fields are `Some` only for create/update (`mode` 0 or 2).
+    SetObjective {
+        objective: String,
+        mode: i8,
+        display_name_nbt: Option<Vec<u8>>,
+        render_type: Option<i32>,
+        number_format_kind: Option<i32>,
+        number_format_nbt: Option<Vec<u8>>,
+    },
+    /// `set_score` — one score line under an objective.
+    SetScore {
+        owner: String,
+        objective: String,
+        value: i32,
+        display_nbt: Option<Vec<u8>>,
+        number_format_kind: Option<i32>,
+    },
+    /// `set_display_objective` — pins an objective to a sidebar slot
+    /// (0 = sidebar, 3..=18 = per-team colors, 1 = below-name, 2 = list).
+    SetDisplayObjective {
+        slot: i32,
+        objective: String,
+    },
+    /// `reset_score` — clears one owner's lines, optionally scoped to a
+    /// single objective.
+    ResetScore {
+        owner: String,
+        objective: Option<String>,
+    },
+    /// `set_titles_animation` — title timing in ticks (vanilla
+    /// `ClientboundSetTitlesAnimationPacket`).
+    SetTitle {
+        fade_in: i32,
+        stay: i32,
+        fade_out: i32,
+    },
+    /// `transfer` — server instructs the client to reconnect to another
+    /// `host`/`port` pair (1.20.5+ cross-server handoff).
+    Transfer {
+        host: String,
+        port: i32,
+    },
     Disconnect(String),
     Other(i32),
+}
+
+/// One `player_info_update` entry: the UUID plus each field carried by the
+/// packet's action bitmask. Signature/verification blobs stay bounded-raw.
+#[derive(Clone, Debug)]
+pub struct PlayerInfoUpdateEntry {
+    pub uuid: [u8; 16],
+    /// `add_player` (0x01): profile name plus up to 16 (name, value,
+    /// signature) property triples.
+    pub name: Option<String>,
+    pub properties: Vec<(String, String, Option<String>)>,
+    /// `initialize_chat` (0x02): raw chat-session blob, retained bounded
+    /// for future signature verification.
+    pub chat_session: Option<Vec<u8>>,
+    /// `update_game_mode` (0x04).
+    pub game_mode: Option<i32>,
+    /// `update_listed` (0x08).
+    pub listed: Option<bool>,
+    /// `update_latency` (0x10), milliseconds.
+    pub latency: Option<i32>,
+    /// `update_display_name` (0x20): raw anonymous-NBT display name.
+    pub display_name_nbt: Option<Vec<u8>>,
 }
 
 /// One `set_equipment` entry: the 7-bit equipment slot and the raw `Slot`
@@ -2644,6 +2716,121 @@ fn slot_skip_extent(b: &[u8], start: usize) -> Option<usize> {
     Some(p)
 }
 
+/// One added `Slot` component: the verified 767 `data_component_type` id
+/// plus its exact wire payload bytes (boundary recovered by the
+/// `slot_component` walker, retained raw for consumers).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemComponentPatch {
+    pub type_id: i32,
+    pub data: Vec<u8>,
+}
+
+/// Decoded component patch of one raw `Slot` wire blob — the payload shape
+/// retained in `container_set_content`/`container_set_slot` `raw_*` fields
+/// and `set_equipment` `item_wire` entries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemStackComponents {
+    /// Stack count; `0` means the empty stack (no further fields encoded).
+    pub count: i32,
+    /// `minecraft:item` registry id (0 for an empty stack).
+    pub item_id: i32,
+    /// Components added over the item prototype, in wire order.
+    pub added: Vec<ItemComponentPatch>,
+    /// Prototype component ids removed, in wire order.
+    pub removed: Vec<i32>,
+}
+
+/// Decode one raw `Slot` component patch, mirroring `slot_stack`'s bounds:
+/// counts are capped, component type ids must fall inside the verified
+/// `SLOT_COMPONENT_TYPE_COUNT` table, and unknown component shapes fail
+/// closed rather than desynchronizing the patch list.
+///
+/// Returns the decoded patch plus the number of bytes consumed, so callers
+/// walking a `container_set_content` slot array can advance per slot.
+pub fn decode_item_stack_components(
+    wire: &[u8],
+) -> Result<(ItemStackComponents, usize), String> {
+    const MALFORMED: &str = "malformed item stack component patch";
+    let mut p = 0usize;
+    let cnt = slot_varint(wire, &mut p).ok_or(MALFORMED)?;
+    if cnt == 0 {
+        return Ok((
+            ItemStackComponents {
+                count: 0,
+                item_id: 0,
+                added: Vec::new(),
+                removed: Vec::new(),
+            },
+            p,
+        ));
+    }
+    if !(1..=127).contains(&cnt) {
+        return Err(MALFORMED.into());
+    }
+    let item = slot_varint(wire, &mut p).ok_or(MALFORMED)?;
+    if !(0..=i64::from(i32::MAX)).contains(&item) {
+        return Err(MALFORMED.into());
+    }
+    let nadd = slot_count(wire, &mut p, 128).ok_or(MALFORMED)?;
+    let nrem = slot_count(wire, &mut p, 128).ok_or(MALFORMED)?;
+    let mut added = Vec::with_capacity(nadd.min(16));
+    for _ in 0..nadd {
+        let ty = slot_varint(wire, &mut p).ok_or(MALFORMED)?;
+        if !(0..SLOT_COMPONENT_TYPE_COUNT).contains(&ty) {
+            return Err(MALFORMED.into());
+        }
+        let start = p;
+        slot_component(wire, &mut p, ty, 0).ok_or(MALFORMED)?;
+        added.push(ItemComponentPatch {
+            type_id: ty as i32,
+            data: wire[start..p].to_vec(),
+        });
+    }
+    let mut removed = Vec::with_capacity(nrem.min(16));
+    for _ in 0..nrem {
+        let ty = slot_varint(wire, &mut p).ok_or(MALFORMED)?;
+        if !(0..SLOT_COMPONENT_TYPE_COUNT).contains(&ty) {
+            return Err(MALFORMED.into());
+        }
+        removed.push(ty as i32);
+    }
+    Ok((
+        ItemStackComponents {
+            count: cnt as i32,
+            item_id: item as i32,
+            added,
+            removed,
+        },
+        p,
+    ))
+}
+
+/// A validated `transfer` reconnect target: the host string plus a port
+/// normalized into the `u16` range the socket path expects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransferTarget {
+    pub host: String,
+    pub port: u16,
+}
+
+/// Handle one decoded play-phase `transfer` instruction: validate the
+/// advertised `host`/`port` (matching `mc_spine_proto`'s wire-side
+/// `validate_transfer` rules) and return the reconnect target the session
+/// should dial next. Fails closed on empty/oversized hosts and
+/// out-of-range ports so a hostile packet cannot steer the reconnect.
+pub fn handle_transfer_packet(host: &str, port: i32) -> Result<TransferTarget, String> {
+    if host.is_empty() || host.len() > 255 {
+        return Err(format!("invalid transfer host ({} bytes)", host.len()));
+    }
+    if !(1..=65535).contains(&port) {
+        return Err(format!("invalid transfer port {port}"));
+    }
+    Ok(TransferTarget {
+        host: host.to_string(),
+        port: port as u16,
+    })
+}
+
 // --- Extended play event decoding -----------------------------------------
 
 /// Decode one clientbound play packet body into a [`PlayEvent`] for the
@@ -3007,6 +3194,163 @@ pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<Play
         }
         "player_info_remove" => PlayEvent::PlayerInfoRemove {
             uuids: read_uuid_list(&mut r)?,
+        },
+        "player_info_update" => {
+            let actions = r.read_u8()?;
+            let count = r.read_varint()?;
+            if !(0..=1024).contains(&count) {
+                return Err(format!("player_info_update entry count {count} out of range"));
+            }
+            let mut entries = Vec::with_capacity(count as usize & 0xff);
+            for _ in 0..count {
+                let uuid = r.read_uuid()?;
+                let mut entry = PlayerInfoUpdateEntry {
+                    uuid,
+                    name: None,
+                    properties: Vec::new(),
+                    chat_session: None,
+                    game_mode: None,
+                    listed: None,
+                    latency: None,
+                    display_name_nbt: None,
+                };
+                if actions & 0x01 != 0 {
+                    entry.name = Some(r.read_string(16)?);
+                    let props = r.read_varint()?;
+                    if !(0..=16).contains(&props) {
+                        return Err(format!("player_info property count {props} out of range"));
+                    }
+                    for _ in 0..props {
+                        let pname = r.read_string(64)?;
+                        let pvalue = r.read_string(32767)?;
+                        let sig = if r.read_bool()? {
+                            Some(r.read_string(1024)?)
+                        } else {
+                            None
+                        };
+                        entry.properties.push((pname, pvalue, sig));
+                    }
+                }
+                if actions & 0x02 != 0 && r.read_bool()? {
+                    // session id (16) + key expiry (8) + two varint-prefixed
+                    // blobs; retain the whole bounded tail for the
+                    // signature verifier rather than re-serializing it.
+                    let start = body.len() - r.rest().len();
+                    let mut tail = r;
+                    tail.read_uuid()?;
+                    tail.read_i64()?;
+                    let key_len = tail.read_varint()?;
+                    if !(0..=4096).contains(&key_len) {
+                        return Err("player_info key blob out of range".into());
+                    }
+                    for _ in 0..key_len {
+                        tail.read_u8()?;
+                    }
+                    let sig_len = tail.read_varint()?;
+                    if !(0..=4096).contains(&sig_len) {
+                        return Err("player_info signature blob out of range".into());
+                    }
+                    for _ in 0..sig_len {
+                        tail.read_u8()?;
+                    }
+                    let end = body.len() - tail.rest().len();
+                    entry.chat_session = Some(body[start..end].to_vec());
+                    r = tail;
+                }
+                if actions & 0x04 != 0 {
+                    entry.game_mode = Some(r.read_varint()?);
+                }
+                if actions & 0x08 != 0 {
+                    entry.listed = Some(r.read_bool()?);
+                }
+                if actions & 0x10 != 0 {
+                    entry.latency = Some(r.read_varint()?);
+                }
+                if actions & 0x20 != 0 && r.read_bool()? {
+                    entry.display_name_nbt = Some(read_nbt_raw(&mut r)?.to_vec());
+                }
+                entries.push(entry);
+            }
+            PlayEvent::PlayerInfo { actions, entries }
+        }
+        "set_objective" => {
+            let objective = r.read_string(16)?;
+            let mode = r.read_i8()?;
+            let (display_name_nbt, render_type, number_format_kind, number_format_nbt) =
+                if mode == 0 || mode == 2 {
+                    let display = read_nbt_raw(&mut r)?.to_vec();
+                    let render = r.read_varint()?;
+                    let (kind, nbt) = if r.read_bool()? {
+                        let kind = r.read_varint()?;
+                        let nbt = if kind == 1 || kind == 2 {
+                            Some(read_nbt_raw(&mut r)?.to_vec())
+                        } else {
+                            None
+                        };
+                        (Some(kind), nbt)
+                    } else {
+                        (None, None)
+                    };
+                    (Some(display), Some(render), kind, nbt)
+                } else {
+                    (None, None, None, None)
+                };
+            PlayEvent::SetObjective {
+                objective,
+                mode,
+                display_name_nbt,
+                render_type,
+                number_format_kind,
+                number_format_nbt,
+            }
+        }
+        "set_score" => {
+            let owner = r.read_string(32767)?;
+            let objective = r.read_string(32767)?;
+            let value = r.read_varint()?;
+            let display_nbt = if r.read_bool()? {
+                Some(read_nbt_raw(&mut r)?.to_vec())
+            } else {
+                None
+            };
+            let number_format_kind = if r.read_bool()? {
+                let kind = r.read_varint()?;
+                if kind == 1 || kind == 2 {
+                    let _ = read_nbt_raw(&mut r)?;
+                }
+                Some(kind)
+            } else {
+                None
+            };
+            PlayEvent::SetScore {
+                owner,
+                objective,
+                value,
+                display_nbt,
+                number_format_kind,
+            }
+        }
+        "set_display_objective" => PlayEvent::SetDisplayObjective {
+            slot: r.read_varint()?,
+            objective: r.read_string(16)?,
+        },
+        "reset_score" => {
+            let owner = r.read_string(32767)?;
+            let objective = if r.read_bool()? {
+                Some(r.read_string(32767)?)
+            } else {
+                None
+            };
+            PlayEvent::ResetScore { owner, objective }
+        }
+        "set_titles_animation" => PlayEvent::SetTitle {
+            fade_in: r.read_i32()?,
+            stay: r.read_i32()?,
+            fade_out: r.read_i32()?,
+        },
+        "transfer" => PlayEvent::Transfer {
+            host: r.read_string(255)?,
+            port: r.read_varint()?,
         },
         _ => return Ok(None),
     }))
@@ -3762,6 +4106,100 @@ impl ProtocolClient {
         p.extend_from_slice(&pitch.to_be_bytes());
         p.push(u8::from(on_ground));
         self.send_named(PacketPhase::Play, "move_player_pos_rot", &p)
+    }
+
+    /// `chat`/`chat_command`: vanilla splits slash-commands onto the
+    /// unsigned `chat_command` packet (no leading `/`); plain text rides
+    /// `chat` (`ClientboundPlayerChatPacket`'s serverbound pair).
+    pub fn send_chat_message(&mut self, message: &str) -> Result<(), String> {
+        let (name, payload) = if let Some(command) = message.strip_prefix('/') {
+            encode_chat_command(command)
+        } else {
+            encode_chat_message(message)
+        };
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `use_item` — use the item in `hand` while looking at `yaw`/`pitch`;
+    /// `sequence` tracks held-item slot changes like vanilla's
+    /// `ServerboundUseItemPacket`.
+    pub fn send_use_item(
+        &mut self,
+        hand: i32,
+        sequence: i32,
+        yaw: f32,
+        pitch: f32,
+    ) -> Result<(), String> {
+        let (name, payload) = encode_use_item(hand, sequence, yaw, pitch);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `player_action` — vanilla `ServerboundPlayerActionPacket` statuses:
+    /// 0 start-dig, 1 abort-dig, 2 finish-dig, 3 drop-item-stack,
+    /// 4 drop-item, 5 release-use-item, 6 swap-item-hands.
+    pub fn send_player_action(
+        &mut self,
+        status: i32,
+        pos: [i32; 3],
+        face: i8,
+        sequence: i32,
+    ) -> Result<(), String> {
+        let (name, payload) = encode_player_action(status, pos, face, sequence);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `container_click` — one slot-mode/button/drag transaction against
+    /// the open window (`encode_container_click` carries the slot blobs;
+    /// build simple stacks with [`encode_slot_stack`]).
+    pub fn send_container_click(
+        &mut self,
+        window_id: u8,
+        state_id: i32,
+        slot: i16,
+        button: i8,
+        mode: i32,
+        changed: &[(i16, &[u8])],
+        carried: &[u8],
+    ) -> Result<(), String> {
+        let (name, payload) =
+            encode_container_click(window_id, state_id, slot, button, mode, changed, carried);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `container_close` — client-initiated close of `window_id`.
+    pub fn send_container_close(&mut self, window_id: u8) -> Result<(), String> {
+        let (name, payload) = encode_container_close(window_id);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `container_button_click` — enchant/enchantment-style window button.
+    pub fn send_container_button_click(
+        &mut self,
+        window_id: u8,
+        button_id: i32,
+    ) -> Result<(), String> {
+        let (name, payload) = encode_container_button_click(window_id, button_id);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `swing` — arm-swing animation for `hand` (0 main, 1 off).
+    pub fn send_swing(&mut self, hand: i32) -> Result<(), String> {
+        let (name, payload) = encode_swing(hand);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `use_item_on` — right-click on block `pos`/`face`.
+    pub fn send_use_item_on(
+        &mut self,
+        hand: i32,
+        pos: [i32; 3],
+        face: i32,
+        hit: [f32; 3],
+        inside: bool,
+        sequence: i32,
+    ) -> Result<(), String> {
+        let (name, payload) = encode_use_item_on(hand, pos, face, hit, inside, sequence);
+        self.send_named(PacketPhase::Play, name, &payload)
     }
 
     pub fn recv_play(&mut self, timeout: Duration) -> Result<Option<PlayEvent>, String> {

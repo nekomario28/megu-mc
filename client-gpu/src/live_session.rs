@@ -8,15 +8,22 @@ use std::time::{Duration, Instant};
 
 use mc_spine_client::audio_out::{AudioRuntime, AudioSessionConfig, AudioSinkKind};
 use mc_spine_client::protocol::{
-    offline_uuid, ClientCustomChannelEvent, ClientPlayEvent, DecodedMagicCastState,
-    DecodedMagicSync, DecodedMotionTrigger, DimensionMeta, PlayEvent, ProtocolClient,
-    SeasonWireSync, TeleportSync, WireSoundEvent, WireStopSound,
+    decode_item_stack_components, handle_transfer_packet, offline_uuid,
+    ClientCustomChannelEvent, ClientPlayEvent, DecodedMagicCastState, DecodedMagicSync,
+    DecodedMotionTrigger, DimensionMeta, ItemStackComponents, PlayEvent, PlayerInfoUpdateEntry,
+    ProtocolClient, SeasonWireSync, TeleportSync, TransferTarget, WireSoundEvent, WireStopSound,
 };
+use mc_spine_kernel::player_physics::{
+    step_player_physics, PlayerInputState, PlayerPhysicsState, SurfaceKind,
+};
+use mc_spine_kernel::raycast::raycast_entities;
+use mc_spine_kernel::Aabb;
 use mc_spine_client::render::ClientVfxHost;
 use mc_spine_client::render_graph::GpuPipelineKind;
 use mc_spine_client::session::{AudioStats, WorldAcousticSnapshot};
 use mc_spine_client::spatial_audio::{SpatialSubtitleCue, SubtitleDirection};
 use mc_spine_client::world::{BlockTable, WorldState};
+use mc_spine_client_mesh::entity_rig::{classify_entity_rig, EntityRigSpec};
 use mc_spine_client_mesh::mesher::{
     BlockVisualEnhancementResult, BlockVisualInput, VanillaPlusPipelineConfig,
 };
@@ -117,6 +124,80 @@ enum WorkerMessage {
 
 enum WorkerCommand {
     Movement(PlayerMovement),
+    /// `chat`/`chat_command` — the worker splits on a leading `/` exactly
+    /// like vanilla's chat screen.
+    Chat(String),
+    /// `use_item` — right-click in air (no block target).
+    UseItem { hand: i32, sequence: i32, yaw: f32, pitch: f32 },
+    /// `use_item_on` — right-click on a block face.
+    UseItemOn {
+        hand: i32,
+        pos: [i32; 3],
+        face: i32,
+        cursor: [f32; 3],
+        inside: bool,
+        sequence: i32,
+    },
+    /// `player_action` — dig/drop/swap statuses (see `send_player_action`).
+    PlayerAction { status: i32, pos: [i32; 3], face: i8, sequence: i32 },
+    /// `swing` — arm-swing animation.
+    Swing { hand: i32 },
+    /// `container_click` — a slot transaction on the open window; slot
+    /// payloads are owned `Slot` wire blobs.
+    ContainerClick {
+        window_id: u8,
+        state_id: i32,
+        slot: i16,
+        button: i8,
+        mode: i32,
+        changed: Vec<(i16, Vec<u8>)>,
+        carried: Vec<u8>,
+    },
+    /// `container_button_click` — enchant-table-style button.
+    ContainerButtonClick { window_id: u8, button_id: i32 },
+    /// `container_close` — client-initiated window close.
+    ContainerClose { window_id: u8 },
+}
+
+/// Live view of the server's open-container instruction: the decoded
+/// `open_screen` fields plus slot contents decoded as they arrive.
+#[derive(Clone, Debug)]
+pub struct LiveOpenScreen {
+    pub window_id: i32,
+    /// Protocol `menu_type` id — resolves through `menu_schema` on the UI
+    /// side (`client-ui::container_screen`).
+    pub menu_type: i32,
+    /// Raw anonymous-NBT title (text component) exactly as sent.
+    pub title_nbt: Vec<u8>,
+    /// `container_set_content` `state_id` sequence, echoed back on clicks.
+    pub state_id: i32,
+    /// Decoded slot patches keyed by window slot index.
+    pub slots: BTreeMap<i32, ItemStackComponents>,
+    /// Carried (cursor) item, decoded when the server sets one.
+    pub carried: Option<ItemStackComponents>,
+}
+
+/// Session-side scoreboard mirror: objectives, scores, and sidebar pinning
+/// exactly as the vanilla client tracks them for the sidebar overlay.
+#[derive(Clone, Debug, Default)]
+pub struct LiveScoreboard {
+    /// `set_objective` upserts keyed by objective name: `(display_nbt,
+    /// render_type, number_format_kind)`.
+    pub objectives: BTreeMap<String, (Option<Vec<u8>>, i32, Option<i32>)>,
+    /// `set_score` lines keyed by `(objective, owner)` -> value.
+    pub scores: BTreeMap<(String, String), i32>,
+    /// `set_display_objective` slot -> objective name.
+    pub display_slots: BTreeMap<i32, String>,
+}
+
+/// One live boss-bar row keyed by its packet UUID.
+#[derive(Clone, Debug)]
+pub struct LiveBossBar {
+    /// Last `boss_event` action (0 add, 1 remove, else update-kind).
+    pub action: i32,
+    /// Action-dependent payload (title/health/color/dividers/flags) kept
+    /// raw for the boss-bar renderer.
+    pub raw_payload: Vec<u8>,
 }
 
 /// Owns UI-facing world data on the event-loop thread. The worker owns its socket.
@@ -129,6 +210,39 @@ pub struct LiveSession {
     audio: AudioRuntime,
     acoustic_world: WorldAcousticSnapshot,
     entity_positions: BTreeMap<i32, [f64; 3]>,
+    /// Vanilla rig classification per tracked entity id, populated on
+    /// `add_entity` through `classify_entity_rig` (all 130 EntityType ids).
+    entity_rigs: BTreeMap<i32, EntityRigSpec>,
+    /// Decoded equipment patches per `(entity_id, equipment_slot)` from
+    /// `set_equipment`, decoded through `decode_item_stack_components`.
+    entity_equipment: BTreeMap<(i32, u8), ItemStackComponents>,
+    /// Local-movement physics mirror advanced by [`Self::predict_movement`]
+    /// (sneak edge prevention runs inside `step_player_physics`).
+    physics_state: PlayerPhysicsState,
+    /// Entity the crosshair ray currently rests on (see `refresh_target`).
+    pub looking_at_entity: Option<i32>,
+    /// Server's open-container instruction, if any.
+    pub open_screen: Option<LiveOpenScreen>,
+    /// Scoreboard mirror fed by `set_objective`/`set_score`/
+    /// `set_display_objective`/`reset_score`.
+    pub scoreboard: LiveScoreboard,
+    /// Tab-list roster fed by `player_info_update`/`player_info_remove`.
+    pub player_info: BTreeMap<[u8; 16], PlayerInfoUpdateEntry>,
+    /// Live boss bars keyed by packet UUID.
+    pub boss_bars: BTreeMap<[u8; 16], LiveBossBar>,
+    /// `set_titles_animation` timing (ticks): fade-in, stay, fade-out.
+    pub title_times: Option<[i32; 3]>,
+    /// `set_title_text` raw anonymous-NBT title.
+    pub title_text_nbt: Option<Vec<u8>>,
+    /// `set_subtitle_text` raw anonymous-NBT subtitle.
+    pub subtitle_text_nbt: Option<Vec<u8>>,
+    /// `set_action_bar_text` raw anonymous-NBT action-bar line.
+    pub actionbar_nbt: Option<Vec<u8>>,
+    /// Validated `transfer` reconnect target, if the server issued one.
+    pub pending_transfer: Option<TransferTarget>,
+    /// Vanilla use-item/container sequence counter echoed on `use_item`,
+    /// `use_item_on`, `player_action`, and `container_click` packets.
+    use_item_sequence: i32,
     player_entity_id: Option<i32>,
     pub hud: HudState,
     pub magic: MagicHudState,
@@ -259,6 +373,20 @@ impl LiveSession {
             audio,
             acoustic_world,
             entity_positions: BTreeMap::new(),
+            entity_rigs: BTreeMap::new(),
+            entity_equipment: BTreeMap::new(),
+            physics_state: PlayerPhysicsState::default(),
+            looking_at_entity: None,
+            open_screen: None,
+            scoreboard: LiveScoreboard::default(),
+            player_info: BTreeMap::new(),
+            boss_bars: BTreeMap::new(),
+            title_times: None,
+            title_text_nbt: None,
+            subtitle_text_nbt: None,
+            actionbar_nbt: None,
+            pending_transfer: None,
+            use_item_sequence: 0,
             player_entity_id: None,
             hud: HudState::default(),
             magic: MagicHudState::default(),
@@ -662,6 +790,258 @@ impl LiveSession {
         let _ = self.outgoing.try_send(WorkerCommand::Movement(movement));
     }
 
+    /// `chat`/`chat_command` — send one chat line; a leading `/` rides the
+    /// `chat_command` packet per vanilla's sendChat semantics.
+    pub fn send_chat(&mut self, message: &str) {
+        if !matches!(self.status, SessionStatus::Playing) {
+            return;
+        }
+        let _ = self.outgoing.try_send(WorkerCommand::Chat(message.to_string()));
+    }
+
+    /// `use_item` — right-click in air with `hand` (0 main, 1 off), using
+    /// the current look angles and the next interaction sequence.
+    pub fn use_item(&mut self, hand: i32) {
+        let Some(pose) = self.pose else { return };
+        self.use_item_sequence = self.use_item_sequence.wrapping_add(1);
+        let _ = self.outgoing.try_send(WorkerCommand::UseItem {
+            hand,
+            sequence: self.use_item_sequence,
+            yaw: pose.yaw,
+            pitch: pose.pitch,
+        });
+    }
+
+    /// `use_item_on` — right-click on block `pos`/`face`; `cursor` is the
+    /// in-block hit position (each 0..=1), `inside` the inside-block flag.
+    pub fn use_item_on(
+        &mut self,
+        hand: i32,
+        pos: [i32; 3],
+        face: i32,
+        cursor: [f32; 3],
+        inside: bool,
+    ) {
+        self.use_item_sequence = self.use_item_sequence.wrapping_add(1);
+        let _ = self.outgoing.try_send(WorkerCommand::UseItemOn {
+            hand,
+            pos,
+            face,
+            cursor,
+            inside,
+            sequence: self.use_item_sequence,
+        });
+    }
+
+    /// `player_action` drop: `Q` drops one item, `Ctrl+Q` the whole stack
+    /// (vanilla statuses `drop_item` = 4 / `drop_item_stack` = 3 at
+    /// `BlockPos.ZERO` facing down).
+    pub fn drop_item(&mut self, entire_stack: bool) {
+        self.use_item_sequence = self.use_item_sequence.wrapping_add(1);
+        let _ = self.outgoing.try_send(WorkerCommand::PlayerAction {
+            status: if entire_stack { 3 } else { 4 },
+            pos: [0; 3],
+            face: 0,
+            sequence: self.use_item_sequence,
+        });
+    }
+
+    /// `player_action` swap-hands: vanilla `F` keybind (status 6).
+    pub fn swap_offhand(&mut self) {
+        self.use_item_sequence = self.use_item_sequence.wrapping_add(1);
+        let _ = self.outgoing.try_send(WorkerCommand::PlayerAction {
+            status: 6,
+            pos: [0; 3],
+            face: 0,
+            sequence: self.use_item_sequence,
+        });
+    }
+
+    /// `swing` — arm-swing animation for `hand`.
+    pub fn swing(&mut self, hand: i32) {
+        let _ = self.outgoing.try_send(WorkerCommand::Swing { hand });
+    }
+
+    /// `container_click` — one window transaction; `changed`/`carried` are
+    /// raw `Slot` wire blobs (build simple stacks via
+    /// `mc_spine_client::protocol::encode_slot_stack`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn container_click(
+        &mut self,
+        window_id: u8,
+        state_id: i32,
+        slot: i16,
+        button: i8,
+        mode: i32,
+        changed: Vec<(i16, Vec<u8>)>,
+        carried: Vec<u8>,
+    ) {
+        let _ = self.outgoing.try_send(WorkerCommand::ContainerClick {
+            window_id,
+            state_id,
+            slot,
+            button,
+            mode,
+            changed,
+            carried,
+        });
+    }
+
+    /// `container_button_click` — enchant-table-style button press.
+    pub fn container_button_click(&mut self, window_id: u8, button_id: i32) {
+        let _ = self
+            .outgoing
+            .try_send(WorkerCommand::ContainerButtonClick { window_id, button_id });
+    }
+
+    /// `container_close` — client-initiated close; also clears the tracked
+    /// open screen when it matches `window_id`.
+    pub fn container_close(&mut self, window_id: u8) {
+        if self
+            .open_screen
+            .as_ref()
+            .is_some_and(|screen| screen.window_id == i32::from(window_id))
+        {
+            self.open_screen = None;
+        }
+        let _ = self
+            .outgoing
+            .try_send(WorkerCommand::ContainerClose { window_id });
+    }
+
+    /// Take the validated `transfer` reconnect target, if one arrived.
+    pub fn take_pending_transfer(&mut self) -> Option<TransferTarget> {
+        self.pending_transfer.take()
+    }
+
+    /// The classified rig for a tracked entity (set on `add_entity`).
+    pub fn entity_rig(&self, entity_id: i32) -> Option<&EntityRigSpec> {
+        self.entity_rigs.get(&entity_id)
+    }
+
+    /// Local-movement prediction against live world collision: mirrors
+    /// `sim.rs`'s shared-physics step so the GPU session gets vanilla
+    /// collision, step-up, fluid drag, and sneak edge protection
+    /// (`step_player_physics` -> `back_off_from_edge`).
+    pub fn predict_movement(
+        &mut self,
+        strafe: f32,
+        forward: f32,
+        jump: bool,
+        sneak: bool,
+        sprint: bool,
+        yaw: f32,
+        pitch: f32,
+    ) -> Option<PlayerPose> {
+        if !matches!(self.status, SessionStatus::Playing) {
+            return None;
+        }
+        let base = self.pose.unwrap_or(PlayerPose {
+            feet: self.physics_state.pos,
+            yaw,
+            pitch,
+        });
+        self.physics_state.pos = base.feet;
+        let bounds = self.physics_state.aabb();
+        let margin = self
+            .physics_state
+            .vel
+            .map(|velocity| velocity.abs() + 1.0);
+        let sweep = Aabb {
+            min: std::array::from_fn(|axis| bounds.min[axis] - margin[axis]),
+            max: std::array::from_fn(|axis| bounds.max[axis] + margin[axis]),
+        };
+        let shapes = self.world.collect_collision_aabbs(sweep);
+        let feet = base.feet.map(|v| v.floor() as i32);
+        let inside = surface_kind(&self.world, feet);
+        let surface = if matches!(
+            inside,
+            SurfaceKind::Ladder
+                | SurfaceKind::Vine
+                | SurfaceKind::Scaffolding
+                | SurfaceKind::Cobweb
+                | SurfaceKind::PowderSnow
+        ) {
+            inside
+        } else {
+            surface_kind(
+                &self.world,
+                [feet[0], (base.feet[1] - 0.500_000_1).floor() as i32, feet[2]],
+            )
+        };
+        let state = PlayerPhysicsState {
+            pos: base.feet,
+            ultra_warm: self.world.dimension.name == "minecraft:the_nether",
+            ..self.physics_state
+        };
+        let world = &self.world;
+        let result = step_player_physics(
+            state,
+            PlayerInputState {
+                forward,
+                strafe,
+                jump,
+                sneak,
+                sprint,
+                yaw_deg: yaw,
+                pitch_deg: pitch,
+                ..PlayerInputState::default()
+            },
+            surface,
+            &shapes,
+            |x, y, z| Ok(world.fluid_cell_at(x, y, z)),
+        )
+        .ok()?;
+        self.physics_state = result.state;
+        Some(PlayerPose {
+            feet: result.state.pos,
+            yaw,
+            pitch,
+        })
+    }
+
+    /// Entity under the crosshair ray (vanilla 4.5-block attack reach,
+    /// matching `GameRenderer.pick` entity hit testing).
+    pub fn crosshair_entity(&self) -> Option<(i32, f64)> {
+        let pose = self.pose?;
+        let eye = [pose.feet[0], pose.feet[1] + 1.62, pose.feet[2]];
+        let yaw = f64::from(pose.yaw).to_radians();
+        let pitch = f64::from(pose.pitch).to_radians();
+        let direction = [
+            -yaw.sin() * pitch.cos(),
+            -pitch.sin(),
+            yaw.cos() * pitch.cos(),
+        ];
+        let mut targets: Vec<(i32, Aabb)> = Vec::with_capacity(self.world.entities.len().min(256));
+        for (eid, tracked) in self.world.entities.iter().take(4096) {
+            if Some(*eid) == self.player_entity_id {
+                continue;
+            }
+            let (w, h) = self
+                .entity_rigs
+                .get(eid)
+                .map(|spec| (f64::from(spec.width), f64::from(spec.height)))
+                .unwrap_or((0.6, 1.8));
+            targets.push((
+                *eid,
+                Aabb {
+                    min: [
+                        tracked.pos[0] - w / 2.0,
+                        tracked.pos[1],
+                        tracked.pos[2] - w / 2.0,
+                    ],
+                    max: [
+                        tracked.pos[0] + w / 2.0,
+                        tracked.pos[1] + h,
+                        tracked.pos[2] + w / 2.0,
+                    ],
+                },
+            ));
+        }
+        raycast_entities(eye, direction, 4.5, &targets)
+            .map(|hit| (hit.entity_id, hit.distance))
+    }
+
     fn refresh_prefetcher(&mut self) {
         let Some(pose) = self.pose else {
             return;
@@ -695,6 +1075,7 @@ impl LiveSession {
         self.chunk_fades.tick(frame_dt_sec);
         self.atmosphere_blender.advance(frame_dt_sec);
         self.refresh_subtitle_hud(frame_dt_sec, &mut ui.hud);
+        self.looking_at_entity = self.crosshair_entity().map(|(eid, _)| eid);
 
         if ui.settings.qol.mini_hud_preset() == MiniHudPreset::Off {
             return;
@@ -755,52 +1136,166 @@ impl LiveSession {
     }
 
     fn apply_play(&mut self, event: PlayEvent) -> Result<(), String> {
+        // World-side tracking (chunks, block/light updates, entities, block
+        // entities, time/weather, break overlays) is owned by
+        // `WorldState::apply_play_event`; session-side concerns stay below.
+        self.world.apply_play_event(&event)?;
         match event {
-            PlayEvent::JoinGame {
-                entity_id,
-                dimension,
-            } => {
+            PlayEvent::JoinGame { entity_id, .. } => {
                 self.player_entity_id = Some(entity_id);
-                self.reset_dimension(dimension);
+                self.reset_dimension();
             }
-            PlayEvent::Respawn { dimension } => self.reset_dimension(dimension),
+            PlayEvent::Respawn { .. } => self.reset_dimension(),
             PlayEvent::Teleport(teleport) => {
                 let pose = PlayerPose::from_teleport(&teleport, self.pose);
                 self.pose = Some(pose);
                 self.camera_sync = Some(pose);
+                self.physics_state.pos = pose.feet;
                 self.update_audio_listener();
             }
             PlayEvent::ChunkData(chunk) => {
                 let (cx, cz) = (chunk.cx, chunk.cz);
-                self.world.apply_chunk(*chunk)?;
                 self.acoustic_world.sync_chunk(&self.world, cx, cz);
                 self.audio.mixer.refresh_acoustics();
                 self.chunk_fades.note_chunk(cx, cz);
                 self.refresh_prefetcher();
                 self.terrain_dirty = true;
             }
-            PlayEvent::UpdateLight { cx, cz, light } => {
-                self.world.apply_light_update(cx, cz, &light)?;
-            }
-            PlayEvent::BlockUpdate { pos, state_id } => {
-                self.world.apply_block_update(pos, state_id)?;
+            PlayEvent::BlockUpdate { pos, .. } => {
                 self.acoustic_world.sync_block(&self.world, pos);
                 self.audio.mixer.refresh_acoustics();
             }
             PlayEvent::SectionBlocksUpdate(changes) => {
-                for (pos, state_id) in changes {
-                    self.world.apply_block_update(pos, state_id)?;
-                    self.acoustic_world.sync_block(&self.world, pos);
+                for (pos, _) in &changes {
+                    self.acoustic_world.sync_block(&self.world, *pos);
                 }
                 self.audio.mixer.refresh_acoustics();
             }
             PlayEvent::UnloadChunk { cx, cz } => {
-                self.world.unload_chunk(cx, cz);
                 self.acoustic_world.unload_chunk(cx, cz);
                 self.audio.mixer.refresh_acoustics();
                 self.chunk_fades.forget(cx, cz);
                 self.refresh_prefetcher();
                 self.terrain_dirty = true;
+            }
+            PlayEvent::AddEntity {
+                eid,
+                entity_type,
+                x,
+                y,
+                z,
+                ..
+            } => {
+                self.entity_positions.insert(eid, [x, y, z]);
+                if let Ok(type_id) = u16::try_from(entity_type) {
+                    if let Some(spec) = classify_entity_rig(type_id) {
+                        self.entity_rigs.insert(eid, spec);
+                    }
+                }
+            }
+            PlayEvent::RemoveEntities { eids } => {
+                for eid in &eids {
+                    self.entity_positions.remove(eid);
+                    self.entity_rigs.remove(eid);
+                    self.entity_equipment.retain(|(e, _), _| e != eid);
+                }
+            }
+            PlayEvent::MoveEntityPos { eid, .. }
+            | PlayEvent::MoveEntityPosRot { eid, .. }
+            | PlayEvent::MoveEntityRot { eid, .. }
+            | PlayEvent::TeleportEntity { eid, .. } => {
+                if let Some(tracked) = self.world.entities.get(&eid) {
+                    self.entity_positions.insert(eid, tracked.pos);
+                }
+            }
+            PlayEvent::SetEquipment { eid, entries } => {
+                for entry in &entries {
+                    match decode_item_stack_components(&entry.item_wire) {
+                        Ok((stack, _)) => {
+                            self.entity_equipment.insert((eid, entry.slot), stack);
+                        }
+                        Err(_) => {
+                            self.entity_equipment.remove(&(eid, entry.slot));
+                        }
+                    }
+                }
+            }
+            PlayEvent::OpenScreen {
+                window_id,
+                menu_type,
+                title_nbt,
+            } => {
+                self.open_screen = Some(LiveOpenScreen {
+                    window_id,
+                    menu_type,
+                    title_nbt,
+                    state_id: 0,
+                    slots: BTreeMap::new(),
+                    carried: None,
+                });
+            }
+            PlayEvent::ContainerClose { window_id } => {
+                if self
+                    .open_screen
+                    .as_ref()
+                    .is_some_and(|screen| screen.window_id == i32::from(window_id))
+                {
+                    self.open_screen = None;
+                }
+            }
+            PlayEvent::ContainerSetContent {
+                window_id,
+                state_id,
+                slot_count,
+                raw_payload,
+            } => {
+                if let Some(screen) = &mut self.open_screen {
+                    if screen.window_id == i32::from(window_id) {
+                        screen.state_id = state_id;
+                        let mut offset = 0usize;
+                        for index in 0..slot_count {
+                            let tail = &raw_payload[offset.min(raw_payload.len())..];
+                            match decode_item_stack_components(tail) {
+                                Ok((stack, consumed)) => {
+                                    offset += consumed;
+                                    screen.slots.insert(index, stack);
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        // The carried item follows the slot array.
+                        if offset < raw_payload.len() {
+                            if let Ok((carried, _)) =
+                                decode_item_stack_components(&raw_payload[offset..])
+                            {
+                                screen.carried = Some(carried);
+                            }
+                        }
+                    }
+                }
+            }
+            PlayEvent::ContainerSetSlot {
+                window_id,
+                slot,
+                raw_item,
+                ..
+            } => {
+                if let Some(screen) = &mut self.open_screen {
+                    if screen.window_id == i32::from(window_id) {
+                        match decode_item_stack_components(&raw_item) {
+                            Ok((stack, _)) => {
+                                if slot < 0 {
+                                    screen.carried = Some(stack);
+                                } else {
+                                    screen.slots.insert(i32::from(slot), stack);
+                                }
+                            }
+                            Err(_) => {
+                                screen.slots.remove(&i32::from(slot));
+                            }
+                        }
+                    }
+                }
             }
             PlayEvent::SetHealth { health, food, .. } => {
                 self.hud.health = health;
@@ -817,14 +1312,138 @@ impl LiveSession {
                 }
                 self.chat_message = Some(text);
             }
+            PlayEvent::SetActionBarText { nbt_bytes } => {
+                self.actionbar_nbt = Some(nbt_bytes);
+            }
+            PlayEvent::SetTitle {
+                fade_in,
+                stay,
+                fade_out,
+            } => {
+                self.title_times = Some([fade_in, stay, fade_out]);
+            }
+            PlayEvent::SetTitleText { nbt_bytes } => {
+                self.title_text_nbt = Some(nbt_bytes);
+            }
+            PlayEvent::SetSubtitleText { nbt_bytes } => {
+                self.subtitle_text_nbt = Some(nbt_bytes);
+            }
+            PlayEvent::BossEvent {
+                uuid,
+                action,
+                raw_payload,
+            } => {
+                if action == 1 {
+                    self.boss_bars.remove(&uuid);
+                } else {
+                    self.boss_bars
+                        .insert(uuid, LiveBossBar { action, raw_payload });
+                }
+            }
+            PlayEvent::PlayerInfo { actions, entries } => {
+                for update in &entries {
+                    let entry =
+                        self.player_info.entry(update.uuid).or_insert_with(|| {
+                            PlayerInfoUpdateEntry {
+                                uuid: update.uuid,
+                                name: None,
+                                properties: Vec::new(),
+                                chat_session: None,
+                                game_mode: None,
+                                listed: None,
+                                latency: None,
+                                display_name_nbt: None,
+                            }
+                        });
+                    if actions & 0x01 != 0 {
+                        entry.name = update.name.clone();
+                        entry.properties = update.properties.clone();
+                    }
+                    if actions & 0x02 != 0 {
+                        entry.chat_session = update.chat_session.clone();
+                    }
+                    if actions & 0x04 != 0 {
+                        entry.game_mode = update.game_mode;
+                    }
+                    if actions & 0x08 != 0 {
+                        entry.listed = update.listed;
+                    }
+                    if actions & 0x10 != 0 {
+                        entry.latency = update.latency;
+                    }
+                    if actions & 0x20 != 0 {
+                        entry.display_name_nbt = update.display_name_nbt.clone();
+                    }
+                }
+            }
+            PlayEvent::PlayerInfoRemove { uuids } => {
+                for uuid in &uuids {
+                    self.player_info.remove(uuid);
+                }
+            }
+            PlayEvent::SetObjective {
+                objective,
+                mode,
+                display_name_nbt,
+                render_type,
+                number_format_kind,
+                ..
+            } => {
+                if mode == 1 {
+                    self.scoreboard.objectives.remove(&objective);
+                    self.scoreboard
+                        .scores
+                        .retain(|(obj, _), _| obj != &objective);
+                    self.scoreboard
+                        .display_slots
+                        .retain(|_, obj| obj != &objective);
+                } else {
+                    self.scoreboard.objectives.insert(
+                        objective,
+                        (
+                            display_name_nbt,
+                            render_type.unwrap_or(0),
+                            number_format_kind,
+                        ),
+                    );
+                }
+            }
+            PlayEvent::SetScore {
+                owner,
+                objective,
+                value,
+                ..
+            } => {
+                self.scoreboard.scores.insert((objective, owner), value);
+            }
+            PlayEvent::SetDisplayObjective { slot, objective } => {
+                self.scoreboard.display_slots.insert(slot, objective);
+            }
+            PlayEvent::ResetScore { owner, objective } => {
+                match objective {
+                    Some(objective) => self
+                        .scoreboard
+                        .scores
+                        .retain(|(obj, who), _| obj != &objective || who != &owner),
+                    None => self
+                        .scoreboard
+                        .scores
+                        .retain(|(_, who), _| who != &owner),
+                }
+            }
+            PlayEvent::Transfer { host, port } => match handle_transfer_packet(&host, port) {
+                Ok(target) => self.pending_transfer = Some(target),
+                Err(reason) => {
+                    self.status = SessionStatus::Disconnected(reason);
+                }
+            },
             PlayEvent::Disconnect(reason) => self.status = SessionStatus::Disconnected(reason),
             _ => {}
         }
         Ok(())
     }
 
-    fn reset_dimension(&mut self, dimension: DimensionMeta) {
-        self.world.reset_dimension(dimension);
+    fn reset_dimension(&mut self) {
         self.acoustic_world.reset_dimension(&self.world);
         self.audio.mixer.refresh_acoustics();
         self.entity_positions.clear();
@@ -1054,6 +1673,70 @@ fn run_connection(
         loop {
             match rx.try_recv() {
                 Ok(WorkerCommand::Movement(movement)) => last_input = Some(movement),
+                Ok(WorkerCommand::Chat(message)) => {
+                    client.send_chat_message(&message)?;
+                }
+                Ok(WorkerCommand::UseItem {
+                    hand,
+                    sequence,
+                    yaw,
+                    pitch,
+                }) => {
+                    client.send_use_item(hand, sequence, yaw, pitch)?;
+                }
+                Ok(WorkerCommand::UseItemOn {
+                    hand,
+                    pos,
+                    face,
+                    cursor,
+                    inside,
+                    sequence,
+                }) => {
+                    client.send_use_item_on(hand, pos, face, cursor, inside, sequence)?;
+                }
+                Ok(WorkerCommand::PlayerAction {
+                    status,
+                    pos,
+                    face,
+                    sequence,
+                }) => {
+                    client.send_player_action(status, pos, face, sequence)?;
+                }
+                Ok(WorkerCommand::Swing { hand }) => {
+                    client.send_swing(hand)?;
+                }
+                Ok(WorkerCommand::ContainerClick {
+                    window_id,
+                    state_id,
+                    slot,
+                    button,
+                    mode,
+                    changed,
+                    carried,
+                }) => {
+                    let borrowed: Vec<(i16, &[u8])> = changed
+                        .iter()
+                        .map(|(slot, item)| (*slot, item.as_slice()))
+                        .collect();
+                    client.send_container_click(
+                        window_id,
+                        state_id,
+                        slot,
+                        button,
+                        mode,
+                        &borrowed,
+                        &carried,
+                    )?;
+                }
+                Ok(WorkerCommand::ContainerButtonClick {
+                    window_id,
+                    button_id,
+                }) => {
+                    client.send_container_button_click(window_id, button_id)?;
+                }
+                Ok(WorkerCommand::ContainerClose { window_id }) => {
+                    client.send_container_close(window_id)?;
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
             }
@@ -1124,6 +1807,48 @@ fn run_connection(
     }
 }
 
+/// Resolve the vanilla `SurfaceKind` for the block at `pos`, consulting the
+/// version-pack registry name first and falling back to the built-in 1.21.1
+/// state-id table — the same two-tier rule `sim.rs` applies.
+fn surface_kind(world: &WorldState, pos: [i32; 3]) -> SurfaceKind {
+    let Some(state_id) = world.get_block_state(pos[0], pos[1], pos[2]) else {
+        return SurfaceKind::Normal;
+    };
+    let name = world
+        .registry
+        .as_ref()
+        .and_then(|registry| registry.state_name(state_id).ok());
+    match name {
+        Some("minecraft:ice") => SurfaceKind::Ice,
+        Some("minecraft:packed_ice") => SurfaceKind::PackedIce,
+        Some("minecraft:blue_ice") => SurfaceKind::BlueIce,
+        Some("minecraft:slime_block") => SurfaceKind::Slime,
+        Some("minecraft:honey_block") => SurfaceKind::Honey,
+        Some("minecraft:soul_sand") => SurfaceKind::SoulSand,
+        Some("minecraft:cobweb") => SurfaceKind::Cobweb,
+        Some("minecraft:ladder") => SurfaceKind::Ladder,
+        Some("minecraft:vine") => SurfaceKind::Vine,
+        Some("minecraft:scaffolding") => SurfaceKind::Scaffolding,
+        Some("minecraft:powder_snow") => SurfaceKind::PowderSnow,
+        _ => match state_id {
+            // Vanilla 1.21.1 state ids used by BlockTable::builtin() when the
+            // version-pack registry is unavailable.
+            5780 => SurfaceKind::Ice,
+            10746 => SurfaceKind::PackedIce,
+            12941 => SurfaceKind::BlueIce,
+            10364 => SurfaceKind::Slime,
+            19445 => SurfaceKind::Honey,
+            5850 => SurfaceKind::SoulSand,
+            2004 => SurfaceKind::Cobweb,
+            4654..=4661 => SurfaceKind::Ladder,
+            6837..=6868 => SurfaceKind::Vine,
+            18372..=18403 => SurfaceKind::Scaffolding,
+            22318 => SurfaceKind::PowderSnow,
+            _ => SurfaceKind::Normal,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1134,8 +1859,8 @@ mod tests {
     use crate::Camera;
     use mc_spine_client::protocol::{
         decode_chunk_packet, decode_custom_payload_packet, decode_packet_body, encode_packet,
-        DecodedMotionPhase, WireReader, CHANNEL_ANIM_V1, CHANNEL_MAGIC_V1, CHANNEL_MOTION_V1,
-        CHANNEL_SEASON_V1, CHANNEL_VFX_V1, SSN1_MAGIC, SSN1_VERSION,
+        DecodedMotionPhase, EquipmentEntry, WireReader, CHANNEL_ANIM_V1, CHANNEL_MAGIC_V1,
+        CHANNEL_MOTION_V1, CHANNEL_SEASON_V1, CHANNEL_VFX_V1, SSN1_MAGIC, SSN1_VERSION,
     };
     use mc_spine_client_mesh::tactile_effects::{
         FluidEntryBody, TactileParticleKind, TactilePreset,
@@ -1955,5 +2680,263 @@ mod tests {
         assert!(hint.underwater_lowpass > 0.0, "submerged -> low-pass");
         assert!(hint.cave_reverb_mix > 0.0, "dark enclosed -> reverb");
         assert!(hint.rain_eaves_occlusion > 0.0, "rain + cover -> occlusion");
+    }
+
+    #[test]
+    fn play_events_drive_scoreboard_bossbar_tablist_and_titles() {
+        let (mut live, _tx) = session();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetObjective {
+            objective: "kills".into(),
+            mode: 0,
+            display_name_nbt: Some(vec![8, 0, 0, 0]),
+            render_type: Some(0),
+            number_format_kind: None,
+            number_format_nbt: None,
+        }))
+        .unwrap();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetScore {
+            owner: "Steve".into(),
+            objective: "kills".into(),
+            value: 42,
+            display_nbt: None,
+            number_format_kind: None,
+        }))
+        .unwrap();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetDisplayObjective {
+            slot: 1,
+            objective: "kills".into(),
+        }))
+        .unwrap();
+        assert!(live.scoreboard.objectives.contains_key("kills"));
+        assert_eq!(
+            live.scoreboard
+                .scores
+                .get(&("kills".to_string(), "Steve".to_string())),
+            Some(&42)
+        );
+        assert_eq!(live.scoreboard.display_slots.get(&1).map(String::as_str), Some("kills"));
+
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ResetScore {
+            owner: "Steve".into(),
+            objective: Some("kills".into()),
+        }))
+        .unwrap();
+        assert!(live.scoreboard.scores.is_empty());
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetObjective {
+            objective: "kills".into(),
+            mode: 1,
+            display_name_nbt: None,
+            render_type: None,
+            number_format_kind: None,
+            number_format_nbt: None,
+        }))
+        .unwrap();
+        assert!(live.scoreboard.objectives.is_empty());
+        assert!(live.scoreboard.display_slots.is_empty());
+
+        let uuid = [7u8; 16];
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::BossEvent {
+            uuid,
+            action: 0,
+            raw_payload: vec![1, 2, 3],
+        }))
+        .unwrap();
+        assert_eq!(live.boss_bars[&uuid].action, 0);
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::BossEvent {
+            uuid,
+            action: 1,
+            raw_payload: Vec::new(),
+        }))
+        .unwrap();
+        assert!(live.boss_bars.is_empty());
+
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::PlayerInfo {
+            actions: 0x19,
+            entries: vec![PlayerInfoUpdateEntry {
+                uuid,
+                name: Some("Alex".into()),
+                properties: Vec::new(),
+                chat_session: None,
+                game_mode: None,
+                listed: Some(true),
+                latency: Some(17),
+                display_name_nbt: None,
+            }],
+        }))
+        .unwrap();
+        assert_eq!(live.player_info[&uuid].name.as_deref(), Some("Alex"));
+        assert_eq!(live.player_info[&uuid].listed, Some(true));
+        assert_eq!(live.player_info[&uuid].latency, Some(17));
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::PlayerInfoRemove {
+            uuids: vec![uuid],
+        }))
+        .unwrap();
+        assert!(live.player_info.is_empty());
+
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetTitle {
+            fade_in: 5,
+            stay: 30,
+            fade_out: 10,
+        }))
+        .unwrap();
+        assert_eq!(live.title_times, Some([5, 30, 10]));
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetActionBarText {
+            nbt_bytes: vec![9, 9],
+        }))
+        .unwrap();
+        assert_eq!(live.actionbar_nbt.as_deref(), Some(&[9, 9][..]));
+    }
+
+    #[test]
+    fn play_events_drive_screens_equipment_rigs_and_transfers() {
+        let (mut live, _tx) = session();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::OpenScreen {
+            window_id: 3,
+            menu_type: 0,
+            title_nbt: Vec::new(),
+        }))
+        .unwrap();
+        // Two empty slots (`0x00` count) plus the carried slot at the tail.
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ContainerSetContent {
+            window_id: 3,
+            state_id: 11,
+            slot_count: 2,
+            raw_payload: vec![0, 0, 0],
+        }))
+        .unwrap();
+        let screen = live.open_screen.as_ref().unwrap();
+        assert_eq!(screen.state_id, 11);
+        assert_eq!(screen.slots.len(), 2);
+        assert!(screen.carried.is_some());
+
+        // Slot 1 gains a real stack (count 1, item id 5, no patches).
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ContainerSetSlot {
+            window_id: 3,
+            state_id: 12,
+            slot: 1,
+            raw_item: vec![1, 5, 0, 0],
+        }))
+        .unwrap();
+        assert_eq!(live.open_screen.as_ref().unwrap().slots[&1].item_id, 5);
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ContainerClose {
+            window_id: 3,
+        }))
+        .unwrap();
+        assert!(live.open_screen.is_none());
+
+        // Equipment: zombie rig (id 124) + one slot decoded from wire bytes.
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::AddEntity {
+            eid: 9,
+            uuid: [1; 16],
+            entity_type: 124,
+            x: 1.0,
+            y: 64.0,
+            z: 2.0,
+            pitch: 0.0,
+            yaw: 0.0,
+            head_yaw: 0.0,
+            data: 0,
+            vx: 0.0,
+            vy: 0.0,
+            vz: 0.0,
+        }))
+        .unwrap();
+        assert_eq!(live.entity_rigs[&9].name, "minecraft:zombie");
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetEquipment {
+            eid: 9,
+            entries: vec![EquipmentEntry {
+                slot: 0,
+                item_wire: vec![1, 5, 0, 0],
+            }],
+        }))
+        .unwrap();
+        assert_eq!(live.entity_equipment[&(9, 0)].item_id, 5);
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::RemoveEntities {
+            eids: vec![9],
+        }))
+        .unwrap();
+        assert!(live.entity_rigs.is_empty());
+        assert!(live.entity_equipment.is_empty());
+
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::Transfer {
+            host: "hub.example".into(),
+            port: 25565,
+        }))
+        .unwrap();
+        assert_eq!(
+            live.pending_transfer.as_ref().map(|t| t.port),
+            Some(25565)
+        );
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::Transfer {
+            host: String::new(),
+            port: 0,
+        }))
+        .unwrap();
+        assert!(matches!(live.status, SessionStatus::Disconnected(_)));
+    }
+
+    #[test]
+    fn action_commands_encode_through_the_worker_channel() {
+        let (tx, incoming) = mpsc::sync_channel(8);
+        let (outgoing, rx) = mpsc::sync_channel(8);
+        let _ = tx;
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.status = SessionStatus::Playing;
+        live.pose = Some(PlayerPose {
+            feet: [0.0; 3],
+            yaw: 90.0,
+            pitch: 10.0,
+        });
+
+        live.send_chat("hello world");
+        live.use_item(0);
+        live.drop_item(false);
+        live.drop_item(true);
+        live.swap_offhand();
+        live.swing(1);
+        live.container_close(3);
+
+        let cmd = rx.recv().unwrap();
+        assert!(matches!(cmd, WorkerCommand::Chat(ref m) if m == "hello world"));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            WorkerCommand::UseItem {
+                hand: 0,
+                sequence: 1,
+                yaw,
+                pitch,
+            } if yaw == 90.0 && pitch == 10.0
+        ));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            WorkerCommand::PlayerAction {
+                status: 4,
+                sequence: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            WorkerCommand::PlayerAction {
+                status: 3,
+                sequence: 3,
+                ..
+            }
+        ));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            WorkerCommand::PlayerAction {
+                status: 6,
+                sequence: 4,
+                ..
+            }
+        ));
+        assert!(matches!(rx.recv().unwrap(), WorkerCommand::Swing { hand: 1 }));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            WorkerCommand::ContainerClose { window_id: 3 }
+        ));
+        // The use-item/player-action sequence counter advanced monotonically.
+        assert_eq!(live.use_item_sequence, 4);
     }
 }
