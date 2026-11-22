@@ -21,8 +21,8 @@
 
 use create_adapter::blockstates::{core_create_registry, CreateBlockRegistry};
 use create_adapter::contraption_adapter::{
-    ContraptionError, ContraptionKind, ContraptionSnapshot, LiveContraption, WorldBlockEdit,
-    DEFAULT_MAX_CONTRAPTION_BLOCKS,
+    ContraptionActor, ContraptionActorKind, ContraptionError, ContraptionKind, ContraptionSnapshot,
+    ContraptionStorage, LiveContraption, WorldBlockEdit, DEFAULT_MAX_CONTRAPTION_BLOCKS,
 };
 use create_adapter::factory::{CreateFactory, DimBlockPos as ModBlockPos};
 use create_adapter::neoforge_wire as create_wire;
@@ -627,6 +627,32 @@ fn mob_w_snapshot(out: &mut Vec<u8>, snap: &ContraptionSnapshot) {
                 mob_w_f64(out, v);
             }
         }
+        ContraptionKind::BoundedLinear {
+            velocity_per_tick,
+            min_offset,
+            max_offset,
+            reverse_at_bounds,
+        } => {
+            out.push(2);
+            for v in velocity_per_tick {
+                mob_w_f64(out, v);
+            }
+            for v in min_offset {
+                mob_w_f64(out, v);
+            }
+            for v in max_offset {
+                mob_w_f64(out, v);
+            }
+            out.push(u8::from(reverse_at_bounds));
+        }
+        ContraptionKind::Minecart {
+            speed_per_tick,
+            heading_yaw,
+        } => {
+            out.push(3);
+            mob_w_f64(out, speed_per_tick);
+            mob_w_f64(out, heading_yaw);
+        }
     }
     mob_w_f32(out, snap.yaw_deg);
     mob_w_f32(out, snap.pitch_deg);
@@ -639,6 +665,35 @@ fn mob_w_snapshot(out: &mut Vec<u8>, snap: &ContraptionSnapshot) {
             mob_w_i32(out, v);
         }
         mod_wire::write_mc_string(out, name);
+    }
+    mod_wire::write_varint(out, snap.storage.capacity_slots() as u32);
+    mod_wire::write_varint(out, snap.storage.used_slots() as u32);
+    for (item_id, count) in snap.storage.slots() {
+        mod_wire::write_mc_string(out, item_id);
+        out.extend_from_slice(&count.to_be_bytes());
+    }
+    mod_wire::write_varint(out, snap.actors.len() as u32);
+    for actor in &snap.actors {
+        for v in actor.local {
+            mob_w_i32(out, v);
+        }
+        for v in actor.facing {
+            mob_w_i32(out, v);
+        }
+        match &actor.kind {
+            ContraptionActorKind::MechanicalDrill => out.push(0),
+            ContraptionActorKind::MechanicalSaw => out.push(1),
+            ContraptionActorKind::MechanicalHarvester => out.push(2),
+            ContraptionActorKind::MechanicalPlough => out.push(3),
+            ContraptionActorKind::MechanicalDeployer { filter_item: None } => out.push(4),
+            ContraptionActorKind::MechanicalDeployer {
+                filter_item: Some(item),
+            } => {
+                out.push(5);
+                mod_wire::write_mc_string(out, item);
+            }
+            ContraptionActorKind::PortableStorageInterface => out.push(6),
+        }
     }
 }
 
@@ -664,13 +719,48 @@ fn mob_r_snapshot(bytes: &[u8], cursor: &mut usize) -> Option<ContraptionSnapsho
             for v in &mut velocity_per_tick {
                 *v = mob_r_f64(bytes, cursor)?;
             }
-            if !velocity_per_tick.iter().all(|v| v.is_finite()) {
-                return None;
-            }
             ContraptionKind::Linear { velocity_per_tick }
+        }
+        2 => {
+            *cursor += 1;
+            let mut velocity_per_tick = [0.0; 3];
+            for v in &mut velocity_per_tick {
+                *v = mob_r_f64(bytes, cursor)?;
+            }
+            let mut min_offset = [0.0; 3];
+            for v in &mut min_offset {
+                *v = mob_r_f64(bytes, cursor)?;
+            }
+            let mut max_offset = [0.0; 3];
+            for v in &mut max_offset {
+                *v = mob_r_f64(bytes, cursor)?;
+            }
+            let rev_byte = *bytes.get(*cursor)?;
+            *cursor += 1;
+            let reverse_at_bounds = match rev_byte {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            ContraptionKind::BoundedLinear {
+                velocity_per_tick,
+                min_offset,
+                max_offset,
+                reverse_at_bounds,
+            }
+        }
+        3 => {
+            *cursor += 1;
+            let speed_per_tick = mob_r_f64(bytes, cursor)?;
+            let heading_yaw = mob_r_f64(bytes, cursor)?;
+            ContraptionKind::Minecart {
+                speed_per_tick,
+                heading_yaw,
+            }
         }
         _ => return None,
     };
+    kind.validate().ok()?;
     let yaw_deg = mob_r_f32(bytes, cursor)?;
     let pitch_deg = mob_r_f32(bytes, cursor)?;
     let mut translation = [0.0; 3];
@@ -690,6 +780,70 @@ fn mob_r_snapshot(bytes: &[u8], cursor: &mut usize) -> Option<ContraptionSnapsho
         let name = mod_wire::read_mc_string(bytes, cursor, mod_wire::MAX_REGISTRY_DATA_NAME_LEN)?;
         cells.push((local, name));
     }
+    let capacity_slots = mod_wire::read_varint(bytes, cursor)? as usize;
+    if capacity_slots > DEFAULT_MAX_CONTRAPTION_BLOCKS {
+        return None;
+    }
+    let used_slots = mod_wire::read_varint(bytes, cursor)? as usize;
+    if used_slots > capacity_slots {
+        return None;
+    }
+    let mut storage = ContraptionStorage::new(capacity_slots);
+    for _ in 0..used_slots {
+        let item_id =
+            mod_wire::read_mc_string(bytes, cursor, mod_wire::MAX_REGISTRY_DATA_NAME_LEN)?;
+        let count_bytes = bytes.get(*cursor..*cursor + 8)?;
+        *cursor += 8;
+        let mut remaining = u64::from_be_bytes(count_bytes.try_into().ok()?);
+        if remaining == 0 {
+            return None;
+        }
+        while remaining > 0 {
+            let chunk = remaining.min(u64::from(u32::MAX)) as u32;
+            if storage.insert_item(&item_id, chunk) != 0 {
+                return None;
+            }
+            remaining -= u64::from(chunk);
+        }
+    }
+    let actor_count = mod_wire::read_varint(bytes, cursor)? as usize;
+    if actor_count > DEFAULT_MAX_CONTRAPTION_BLOCKS {
+        return None;
+    }
+    let mut actors = Vec::with_capacity(actor_count);
+    for _ in 0..actor_count {
+        let mut local = [0; 3];
+        for v in &mut local {
+            *v = mob_r_i32(bytes, cursor)?;
+        }
+        let mut facing = [0; 3];
+        for v in &mut facing {
+            *v = mob_r_i32(bytes, cursor)?;
+        }
+        let tag = *bytes.get(*cursor)?;
+        *cursor += 1;
+        let actor_kind = match tag {
+            0 => ContraptionActorKind::MechanicalDrill,
+            1 => ContraptionActorKind::MechanicalSaw,
+            2 => ContraptionActorKind::MechanicalHarvester,
+            3 => ContraptionActorKind::MechanicalPlough,
+            4 => ContraptionActorKind::MechanicalDeployer { filter_item: None },
+            5 => {
+                let item =
+                    mod_wire::read_mc_string(bytes, cursor, mod_wire::MAX_REGISTRY_DATA_NAME_LEN)?;
+                ContraptionActorKind::MechanicalDeployer {
+                    filter_item: Some(item),
+                }
+            }
+            6 => ContraptionActorKind::PortableStorageInterface,
+            _ => return None,
+        };
+        actors.push(ContraptionActor {
+            local,
+            facing,
+            kind: actor_kind,
+        });
+    }
     Some(ContraptionSnapshot {
         id,
         dim,
@@ -699,6 +853,8 @@ fn mob_r_snapshot(bytes: &[u8], cursor: &mut usize) -> Option<ContraptionSnapsho
         pitch_deg,
         translation,
         cells,
+        storage,
+        actors,
     })
 }
 
