@@ -15,12 +15,11 @@
 
 ## 1. License Recommendation — `LGPL-3.0-or-later`
 
-### 現状
+### 現状（2026-11-22 統一済み）
 
-[LICENSING.md](../LICENSING.md) の 2026-11-20 決定では、**本体配布ライセンスは
-`GPL-3.0-or-later`**、寄稿コードは `LGPL-3.0-or-later OR GPL-3.0-or-later
-OR AGPL-3.0-or-later` のトリプルライセンス。このトリプル構造は既に
-「将来 `LGPL-3.0-or-later` へ移行する選択肢」を法的に確保している。
+[LICENSING.md](../LICENSING.md) およびルート `Cargo.toml` を含む全マニフェストは、
+2026-11-22 に **`LGPL-3.0-or-later`** 単一表記へ統一済みです（2026-11-20 時点の
+トリプルライセンス移行経路を経て確定）。
 
 ### 推奨: 本体を `LGPL-3.0-or-later` に統一する
 

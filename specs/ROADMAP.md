@@ -49,8 +49,8 @@ chunk状態の整合性・操作から保存再開までの完成・統合を主
   - `tools/vanilla_data/gen_vanilla_data.sh`（＋`verify_pack.py`、`--verify` 2,350 ファイル照合）と `assets/block_states_1211.json` の jar 自前生成化を完了。
 - **F1-2 (`P0-3 D3/D4`: GPL 同値アセット・出所不明ファイルの完全抹消と fail-closed ゲート — 完了 `4b43735`)**:
   - 旧 `assets/pblocks.json`・`assets/properties.json` と `resourcepack.zip` を消費者ごと切替・除去し、`git filter-repo --invert-paths` で過去全履歴からも完全抹消済み。`tools/provenance_check.py`（`--self-test` 11/11 PASS、`--strict-public` モード付き）で再混入を常時ブロック。
-- **F1-3 (`P0-3 D5`: トリプルライセンス寄稿条項とクリーン公開エクスポート — 完了 `04f61a7`, `bd06c8a`)**:
-  - 本体配布ライセンスを **`GPL-3.0-or-later`**（[LICENSE](../LICENSE)）、寄稿およびファーストパーティコードを **`LGPL-3.0-or-later` / `GPL-3.0-or-later` / `AGPL-3.0-or-later` のトリプルライセンス**（[COPYING.LESSER](../COPYING.LESSER) / [LICENSE](../LICENSE) / [COPYING.AGPL](../COPYING.AGPL)、[LICENSING.md](../LICENSING.md)）に統一。また、Mojang 由来生成物を一切含まない単一ルートコミット公開ツリーを出力する `tools/export_public_branch.sh`（`tests/public_export_test.py`）も完備。
+- **F1-3 (`P0-3 D5`: ライセンス統一とクリーン公開エクスポート — 完了 `04f61a7`, `bd06c8a`, 2026-11-22 LGPL 統一)**:
+  - 本体および全マニフェストの配布ライセンスを **`LGPL-3.0-or-later`**（[COPYING.LESSER](../COPYING.LESSER)・[LICENSING.md](../LICENSING.md)）に統一済み。また、Mojang 由来生成物を一切含まない単一ルートコミット公開ツリーを出力する `tools/export_public_branch.sh`（`tests/public_export_test.py`）も完備。
 
 #### Stage F2: 3次元・構造物・M2/M3 軽量性を備えた実用公開フォーク
 - **F2-1 (`P2-3-S0〜S4`: 3次元サーバーの通常経路とワールドストア次元分離 — 完了 `c543c92`)**:

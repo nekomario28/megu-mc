@@ -114,10 +114,10 @@
 
 - [ ] **P0-1 HEAD再現と失敗の基線固定** — これから検証する対象SHAのコード・入力資産・固定jarのdigestを紐付け、`tests/verify.sh`（serial / 8-thread×3 / wire / adapter / layers / debt / mutations）で現在の一次失敗を収集。テスト失敗をmutex poisonやCI課金停止と混同しない。各結果に実行環境・終了コード・省略項目を記録する。
 - [ ] **P0-2 1.21.1 density/surface/biomeの到達性監査** — `8d047a9` で `tools/p0_2_audit.py` の `Cond::Biome(u128)` アンカー検証・`< 128` 上限同期および 3 次元到達性監査スナップショット（[`evidence/foundation/audit-snapshots/p0-2-reachability-20261119.md`](../evidence/foundation/audit-snapshots/p0-2-reachability-20261119.md)、未対応・欠落ゼロ）を記録済み。残る `spawn_costs` と NaturalSpawner 実行経路の実クラス対照で完全閉鎖する。
-- [x] **P0-3 再配布・出所の隔離判断（統合/公開ブロッカー — Stage F1 完了）** — `4b43735` で D1〜D4、`04f61a7` で D5、`bd06c8a` で本体 `GPL-3.0-or-later`（寄稿は `LGPL-3.0-or-later` / `GPL-3.0-or-later` / `AGPL-3.0-or-later` のトリプルライセンス）・全ファイルの出所確定・`git filter-repo --invert-paths` による過去の削除済み不純ファイルの全履歴抹消を完了済み：
+- [x] **P0-3 再配布・出所の隔離判断（統合/公開ブロッカー — Stage F1 完了）** — `4b43735` で D1〜D4、`04f61a7` で D5、`bd06c8a` で履歴抹消、2026-11-22 に本体・全マニフェストを **`LGPL-3.0-or-later`** 単一表記へ統一完了：
   - [x] **D1/D2 (`F1-1`, `4b43735`)**: `tools/vanilla_data/gen_vanilla_data.sh`（`--verify` 2,350 ファイル・SHA-256 照合）と `assets/block_states_1211.json` の jar 自前生成化を完了。
   - [x] **D3/D4 (`F1-2`, `4b43735`)**: 旧 `assets/pblocks.json`・`assets/properties.json` および `resourcepack.zip` を消費者切替の上で削除・全履歴抹消し、`tools/provenance_check.py`（`--self-test` 11/11 PASS、`--strict-public` 対応）をゲート追加。
-  - [x] **D5 (`F1-3`, `04f61a7`, `6127c66`, `bd06c8a`)**: `tools/export_public_branch.sh`・`tests/public_export_test.py` 整備、不要な直下 `*.storyboard.png` 6枚の削除（および履歴抹消）、`datapacks/{modtest,rectest,spinetest,tagtest,testpack}` の自作確定、および `LICENSE` (`GPL-3.0-or-later`) / `COPYING.LESSER` (`LGPL-3.0-or-later`) / `COPYING.AGPL` (`AGPL-3.0-or-later`) / `Cargo.toml` / `NOTICE` / `THIRD_PARTY.md` / `README.md` / `CONTRIBUTING.md` / `LICENSING.md` の完全統一を完了。
+  - [x] **D5 (`F1-3`, `04f61a7`, `6127c66`, `bd06c8a`, 2026-11-22 統一)**: `tools/export_public_branch.sh`・`tests/public_export_test.py` 整備、不要な直下 `*.storyboard.png` 6枚の削除（および履歴抹消）、`datapacks/{modtest,rectest,spinetest,tagtest,testpack}` の自作確定、および `COPYING.LESSER` / `Cargo.toml` / `NOTICE` / `THIRD_PARTY.md` / `README.md` / `CONTRIBUTING.md` / `LICENSING.md` の `LGPL-3.0-or-later` 統一を完了。
 - [ ] **P0-4 native比較契約の固定** — Fossilが**正に配置される**fixture、complete FULL chunks、必要halo、sourceの生成順、2回のnative採取の再現性を定義。artifactに入力・SHA・対象セル数・除外数・pending tick・writerを記録し、古い測定値の流用を防ぐ。
 
 ### P1 — Template finalization（**最優先の実装列**）
@@ -202,7 +202,7 @@
 ### P4 — 統合前のゲート（自動ではmergeしない）
 
 - [ ] **P4-1 同一SHAの全gateと独立レビュー（未完了）** — `tests/verify.sh` 完走、native oracle、本番wire、mutation、serial/parallel、adapter、layers/debt、Fossil/structure/feature・dimension回帰の結果を同一revisionで収集。hosted CIを使えない場合は未実行と明記。Wave 5 で追加された Save v2／compression・`0x07` registry／`/execute`／gamerules／block entities／fluids／B4 昇格の wire と M3 `WARM=1` back-to-back、ならびに Wave 7 で追加された W1〜W5/C1 live 配線・Two-Target 配線・新 CLI バイナリ群も同一の新たな release-candidate SHA で再収集する必要がある（`a079e1d6` までの個別達成を統合受入と混同しない）。過去の[Issue #7](https://github.com/nekomario28/mc-spine/issues/7)はクローズ済み。
-- [x] **P4-2 配布物・ライセンス・履歴クリーンアップ（Stage F1 & F2 完了 `bd06c8a`）** — P0-3（D1〜D5）、本体 `GPL-3.0-or-later` ＋ 寄稿 `LGPL-3.0-or-later / GPL-3.0-or-later / AGPL-3.0-or-later` トリプルライセンス確定、`git filter-repo --invert-paths` による過去の削除済み不純ファイルの全履歴抹消、`main` への統合完了。
+- [x] **P4-2 配布物・ライセンス・履歴クリーンアップ（Stage F1 & F2 完了 `bd06c8a`, 2026-11-22 LGPL 統一）** — P0-3（D1〜D5）、本体・全マニフェスト **`LGPL-3.0-or-later`** 単一化確定、`git filter-repo --invert-paths` による過去の削除済み不純ファイルの全履歴抹消、`main` への統合完了。
 
 ## 次の着手
 

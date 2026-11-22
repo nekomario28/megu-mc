@@ -15,21 +15,22 @@ Minecraft Java 1.21.1（protocol 767）向けの実験的なRustサーバーで�
 
 ## 実装されている構成（Alpha）
 
-ルートのサーバーパッケージとは別に、以下の **11 standalone crates** を管理しています。`tests/verify.sh` は各 crate の `cargo test --offline --locked` を実行します。Clippy の警告ゼロは別途リリース対象の各 crate で確認してください。
+ルートのサーバーパッケージとは別に、以下の **12 standalone crates** を管理しています。`tests/verify.sh` は各 crate の `cargo test --offline --locked` を実行します。Clippy の警告ゼロは別途リリース対象の各 crate で確認してください。
 
 | crate | 主な役割 |
 |---|---|
-| `core` | クラッシュの指紋・機密情報の伏せ字化 |
+| `core` | クラッシュの指紋・機密情報の伏せ字化・汎用 `perf_kit` |
 | `proto` | セッション、プロトコル、招待・音声リレー |
 | `state-store` | ワールド保存、Anvil 検査、監査ログ |
 | `server-files` | サーバー初期化、パケットキャッシュ |
 | `mod-offload` | Mod 処理の分離・委譲契約 |
 | `mod-adapter-core` | Mod の静的検査、限定 `.class` VM、互換アダプター |
 | `create-adapter` | Create 系の動力・線路モデル |
-| `client-port` | メッシュ、3D モデルベイク、テクスチャアトラス、Hi-Z |
+| `client-port` | メッシュ、3D モデルベイク、テクスチャアトラス、Hi-Z、外部シェーダー計画 |
 | `client-kernel` | クライアント側レジストリ、エンティティ補間 |
 | `client-app` | クライアント CLI、描画パイプライン、フレーム制御、音量制限 |
 | `client-ui` | 純 Rust の UI 状態・レイアウト・描画リスト・ソフトウェア描画 |
+| `client-gpu` | 隔離 `winit` + `wgpu` 実ウィンドウ GPU クライアント |
 
 現時点で利用できる実装面は次の通りです。
 

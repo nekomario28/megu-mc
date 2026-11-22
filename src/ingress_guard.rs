@@ -65,6 +65,47 @@ pub(crate) fn valid_movement_frame(packet_id: i64, body: &[u8]) -> bool {
     true
 }
 
+/// Per-server-tick ceiling on processed movement packets (`0x1a`/`0x1b`) per
+/// connection. Generous enough for normal client catch-up bursts while stopping
+/// a single client from amplifying anti-cheat scans and tracker fanout.
+pub(crate) const MAX_MOVES_PER_TICK: u8 = 10;
+
+pub(crate) struct MovementFloodGuard {
+    tick: u64,
+    count: u8,
+}
+
+impl MovementFloodGuard {
+    pub(crate) const fn new() -> Self {
+        Self { tick: u64::MAX, count: 0 }
+    }
+
+    pub(crate) fn allow_tick(&mut self, server_tick: u64) -> bool {
+        if self.tick != server_tick {
+            self.tick = server_tick;
+            self.count = 1;
+            return true;
+        }
+        if self.count >= MAX_MOVES_PER_TICK {
+            return false;
+        }
+        self.count += 1;
+        true
+    }
+}
+
+pub(crate) fn movement_pose_changed(
+    before: (f64, f64, f64, f32, f32, bool),
+    after: (f64, f64, f64, f32, f32, bool),
+) -> bool {
+    before.0.to_bits() != after.0.to_bits()
+        || before.1.to_bits() != after.1.to_bits()
+        || before.2.to_bits() != after.2.to_bits()
+        || before.3.to_bits() != after.3.to_bits()
+        || before.4.to_bits() != after.4.to_bits()
+        || before.5 != after.5
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,5 +186,24 @@ mod tests {
     fn other_packets_are_not_move_packets() {
         assert!(valid_movement_frame(0x00, &[]));
         assert!(valid_movement_frame(0x08, &[0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn movement_flood_guard_caps_single_tick_and_resets_next_tick() {
+        let mut g = MovementFloodGuard::new();
+        for _ in 0..MAX_MOVES_PER_TICK {
+            assert!(g.allow_tick(42));
+        }
+        assert!(!g.allow_tick(42));
+        assert!(!g.allow_tick(42));
+        assert!(g.allow_tick(43));
+    }
+
+    #[test]
+    fn movement_pose_changed_suppresses_identical_idle_updates() {
+        let p = (1.5, 64.0, -2.5, 90.0_f32, 0.0_f32, true);
+        assert!(!movement_pose_changed(p, p));
+        assert!(movement_pose_changed(p, (1.5, 64.0, -2.5, 90.0, 0.0, false)));
+        assert!(movement_pose_changed(p, (1.6, 64.0, -2.5, 90.0, 0.0, true)));
     }
 }

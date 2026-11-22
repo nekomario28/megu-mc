@@ -9006,6 +9006,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     let mut last_rx = Instant::now();
     let mut chat_throttle = connection_limits::ChatThrottle::new(Instant::now());
     let mut packet_rate = connection_limits::PacketRateLimit::new(Instant::now());
+    let mut move_guard = ingress_guard::MovementFloodGuard::new();
     let mut read_timeout = None;
     let mut last_chunk_retry_tick = TICK_IDX.load(Ordering::Relaxed);
     'conn: loop {
@@ -9190,6 +9191,9 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
             0x1a | 0x1b => {
                 // position / position_look: f64 x,y,z first
                 if b.len() >= 24 {
+                    if !move_guard.allow_tick(TICK.load(Ordering::Relaxed)) {
+                        continue;
+                    }
                     let px = f64::from_be_bytes(b[..8].try_into().unwrap());
                     let py = f64::from_be_bytes(b[8..16].try_into().unwrap());
                     let pz = f64::from_be_bytes(b[16..24].try_into().unwrap());
@@ -9270,11 +9274,13 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             retry_chunks = pending;
                         }
                     }
-                    broadcast_seen(me.eid, |_c| {
-                        (0x70, entity_teleport(me.eid, px, py, pz, yaw, pitch, gnd))
-                    });
-                    if pid == 0x1b {
-                        broadcast_seen(me.eid, |_c| (0x48, head_rot(me.eid, yaw)));
+                    if ingress_guard::movement_pose_changed(before, (px, py, pz, yaw, pitch, gnd)) {
+                        broadcast_seen(me.eid, |_c| {
+                            (0x70, entity_teleport(me.eid, px, py, pz, yaw, pitch, gnd))
+                        });
+                        if pid == 0x1b {
+                            broadcast_seen(me.eid, |_c| (0x48, head_rot(me.eid, yaw)));
+                        }
                     }
                 }
             }
