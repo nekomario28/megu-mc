@@ -11,6 +11,7 @@ pub mod hardware_profile;
 pub mod integrated;
 pub mod lod;
 pub mod protocol;
+pub mod recovery;
 pub mod render;
 pub mod render_graph;
 pub mod settings;
