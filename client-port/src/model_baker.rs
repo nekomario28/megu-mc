@@ -105,6 +105,10 @@ pub enum ModelError {
     NonFiniteValue(String),
     /// A blockstate rotation that is not a multiple of 90 degrees.
     InvalidRotationAngle(String),
+    /// A `blockstates/*.json` document could not be resolved for a block
+    /// state: malformed variant selector, unknown property, overlapping
+    /// variant definitions, or no matching selector at all.
+    BlockState(String),
 }
 
 impl fmt::Display for ModelError {
@@ -125,6 +129,7 @@ impl fmt::Display for ModelError {
             Self::OutOfRangeCoordinate(m) => write!(f, "coordinate out of range: {m}"),
             Self::NonFiniteValue(m) => write!(f, "non-finite value: {m}"),
             Self::InvalidRotationAngle(m) => write!(f, "invalid rotation: {m}"),
+            Self::BlockState(m) => write!(f, "blockstate error: {m}"),
         }
     }
 }
@@ -1028,25 +1033,24 @@ const FACE_CORNERS: [[[u8; 3]; 4]; 6] = [
     [[1, 0, 1], [1, 0, 0], [1, 1, 0], [1, 1, 1]],
 ];
 
-/// UV rectangle corners as `(u, v)` index pairs: `0=(u0,v0)`, `1=(u1,v0)`,
-/// `2=(u1,v1)`, `3=(u0,v1)`. These map the default-UV projections (below)
-/// onto the corner order above.
-const FACE_UV_CORNER: [[usize; 4]; 6] = [
-    [0, 1, 2, 3], // down
-    [3, 2, 1, 0], // up
-    [3, 2, 1, 0], // north
-    [3, 2, 1, 0], // south
-    [3, 2, 1, 0], // west
-    [3, 2, 1, 0], // east
-];
-
-const UV_PAIRS: [(usize, usize); 4] = [(0, 1), (2, 1), (2, 3), (0, 3)];
+/// UV rectangle corner `(u_index, v_index)` pairs into the `[u0, v0, u1, v1]`
+/// rectangle for vanilla's shifted-UV slot `i`, matching `BlockFaceUV.getU`/
+/// `getV`: slot 0 = `(u0, v0)`, 1 = `(u0, v1)`, 2 = `(u1, v1)`, 3 = `(u1, v0)`.
+const VANILLA_UV_SLOTS: [(usize, usize); 4] = [(0, 1), (0, 3), (2, 3), (2, 1)];
 
 /// Vanilla's default UV rectangle for a face (`[u0, v0, u1, v1]`) when the
-/// JSON omits `uv`: the element bounds projected onto the face plane.
+/// JSON omits `uv`: the element bounds projected onto the face plane, exactly
+/// like `BlockElement.uvsByFace` — note `down` flips V against `+z` while
+/// `up` does not.
 fn default_uv(direction: Direction, from: [f32; 3], to: [f32; 3]) -> [f32; 4] {
     match direction {
-        Direction::Down | Direction::Up => [from[0], from[2], to[0], to[2]],
+        Direction::Down => [
+            from[0],
+            MODEL_UNITS_PER_BLOCK - to[2],
+            to[0],
+            MODEL_UNITS_PER_BLOCK - from[2],
+        ],
+        Direction::Up => [from[0], from[2], to[0], to[2]],
         Direction::North => [
             MODEL_UNITS_PER_BLOCK - to[0],
             MODEL_UNITS_PER_BLOCK - to[1],
@@ -1175,6 +1179,174 @@ fn rotation_steps(degrees: i32, axis: &str) -> Result<u32, ModelError> {
     Ok((wrapped / 90) as u32)
 }
 
+// ---------------------------------------------------------------------------
+// UV-lock transform (Vanilla `FaceBakery.recomputeUVs` + `BlockMath`)
+// ---------------------------------------------------------------------------
+
+/// Row-major 3×3 matrix. Every rotation this baker composes is a multiple of
+/// 90°, so entries stay exactly `0`/`±1` — no trig drift.
+type Mat3 = [[f32; 3]; 3];
+
+fn mat3_mul(a: Mat3, b: Mat3) -> Mat3 {
+    let mut out = [[0.0; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            out[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+        }
+    }
+    out
+}
+
+fn mat3_transpose(m: Mat3) -> Mat3 {
+    let mut out = [[0.0; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            out[i][j] = m[j][i];
+        }
+    }
+    out
+}
+
+fn mat3_vec(m: Mat3, v: [f32; 3]) -> [f32; 3] {
+    [
+        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+    ]
+}
+
+/// The 3×3 matrix of the blockstate `(x, y)` rotation — `x` steps then `y`
+/// steps of −90° — built from the same exact step functions that move
+/// positions, so normals, `Direction.rotate` and the UV lock agree.
+fn blockstate_matrix(x_steps: u32, y_steps: u32) -> Mat3 {
+    let mut m = [[0.0; 3]; 3];
+    for (col, e) in [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        .iter()
+        .enumerate()
+    {
+        let v = blockstate_rotate_vec(*e, x_steps, y_steps);
+        for row in 0..3 {
+            m[row][col] = v[row];
+        }
+    }
+    m
+}
+
+/// `Direction.rotate(matrix, facing)` + `Direction.getNearest`: transform the
+/// face normal and keep the axis direction with the largest dot product.
+/// Vanilla seeds the search with `NORTH`/`Float.MIN_VALUE`; for a rotation
+/// matrix exactly one candidate always wins, but the fallback is kept anyway.
+fn rotated_direction(model: Mat3, facing: Direction) -> Direction {
+    let v = mat3_vec(model, direction_vector(facing));
+    let mut best = Direction::North;
+    // Java `Float.MIN_VALUE` (smallest positive denormal, 1.4e-45): all dots
+    // are `{-1, 0, 1}` for exact 90° matrices, so only the `1` ever wins.
+    let mut best_dot = f32::from_bits(1);
+    for candidate in Direction::ALL {
+        let n = direction_vector(candidate);
+        let dot = v[0] * n[0] + v[1] * n[1] + v[2] * n[2];
+        if dot > best_dot {
+            best_dot = dot;
+            best = candidate;
+        }
+    }
+    best
+}
+
+/// `BlockMath.VANILLA_UV_TRANSFORM_LOCAL_TO_GLOBAL` restricted to the
+/// axis-aligned rotations blockstates can produce, expressed in −90° steps
+/// (single-axis, so compose order is irrelevant).
+fn l2g_matrix(direction: Direction) -> Mat3 {
+    match direction {
+        Direction::South => [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        Direction::East => blockstate_matrix(0, 3),  // rotateY(+90°)
+        Direction::West => blockstate_matrix(0, 1),  // rotateY(-90°)
+        Direction::North => blockstate_matrix(0, 2), // rotateY(180°)
+        Direction::Up => blockstate_matrix(1, 0),    // rotateX(-90°)
+        Direction::Down => blockstate_matrix(3, 0),  // rotateX(+90°)
+    }
+}
+
+/// `BlockMath.VANILLA_UV_TRANSFORM_GLOBAL_TO_LOCAL` — the inverse (transpose)
+/// of [`l2g_matrix`].
+fn g2l_matrix(direction: Direction) -> Mat3 {
+    mat3_transpose(l2g_matrix(direction))
+}
+
+/// `java.lang.Math.signum` for finite floats: `-1`, `0` or `1`.
+fn java_signum(x: f32) -> f32 {
+    if x > 0.0 {
+        1.0
+    } else if x < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
+/// Vanilla `FaceBakery.recomputeUVs`: counter-rotates a face's UV rectangle
+/// so the texture stays locked to the model's *unrotated* axes when the
+/// blockstate `(x, y)` rotation is applied with `uvlock`.
+///
+/// `uv_rect` is the `[u0, v0, u1, v1]` rectangle (explicit or default) and
+/// `rotation_deg` the face's in-face UV rotation; `model` is the blockstate
+/// rotation matrix. Returns the recomputed rectangle and in-face rotation.
+fn recompute_uvs(
+    uv_rect: [f32; 4],
+    rotation_deg: u16,
+    facing: Direction,
+    model: Mat3,
+) -> ([f32; 4], u16) {
+    // getUVLockTransform: G2L[facing] * inverse(model) * L2G[rotated facing],
+    // conjugated about the block centre (0.5, 0.5, 0.5) by blockCenterToCorner.
+    let rotated_facing = rotated_direction(model, facing);
+    let r = mat3_mul(
+        g2l_matrix(facing),
+        mat3_mul(mat3_transpose(model), l2g_matrix(rotated_facing)),
+    );
+    // The affine map on a UV point (u/16, v/16, 0) is
+    // q -> r * (q - 0.5) + 0.5; only x/y of the result are read back.
+    let project = |u: f32, v: f32| -> [f32; 2] {
+        let d = [
+            u / MODEL_UNITS_PER_BLOCK - 0.5,
+            v / MODEL_UNITS_PER_BLOCK - 0.5,
+            -0.5,
+        ];
+        let o = mat3_vec(r, d);
+        [
+            (o[0] + 0.5) * MODEL_UNITS_PER_BLOCK,
+            (o[1] + 0.5) * MODEL_UNITS_PER_BLOCK,
+        ]
+    };
+    // getU/getV(getReverseIndex(j)) always yields slot j of the *input*
+    // rotation, i.e. the diagonal corners (u0,v0) and (u1,v1).
+    let t0 = project(uv_rect[0], uv_rect[1]);
+    let t1 = project(uv_rect[2], uv_rect[3]);
+    let (u0_new, u1_new) = if java_signum(uv_rect[2] - uv_rect[0])
+        == java_signum(t1[0] - t0[0])
+    {
+        (t0[0], t1[0])
+    } else {
+        (t1[0], t0[0])
+    };
+    let (v0_new, v1_new) = if java_signum(uv_rect[3] - uv_rect[1])
+        == java_signum(t1[1] - t0[1])
+    {
+        (t0[1], t1[1])
+    } else {
+        (t1[1], t0[1])
+    };
+    // The in-face rotation re-derives from where the UV plane's (cos, sin)
+    // basis vector lands under the same 3x3 — rounded to the nearest 90°.
+    let rad = f32::from(rotation_deg).to_radians();
+    let axis = mat3_vec(r, [rad.cos(), rad.sin(), 0.0]);
+    let degrees = (axis[1] as f64).atan2(axis[0] as f64).to_degrees() / 90.0;
+    // Java Math.round == floor(x + 0.5) for this range.
+    let quarters = (degrees + 0.5).floor() as i64;
+    let new_rotation = (-(quarters as i32) * 90).rem_euclid(360) as u16;
+    ([u0_new, v0_new, u1_new, v1_new], new_rotation)
+}
+
 /// Re-checks a programmatically built element (the parser enforces the same
 /// bounds, but a `RawModelJson` can be constructed without it).
 fn validate_element(element: &ModelElement, index: usize) -> Result<(), ModelError> {
@@ -1228,8 +1400,23 @@ pub fn bake_model(
     blockstate_rot_x_deg: i32,
     blockstate_rot_y_deg: i32,
 ) -> Result<BakedModel, ModelError> {
+    bake_model_with_uvlock(stack, model_id, blockstate_rot_x_deg, blockstate_rot_y_deg, false)
+}
+
+/// [`bake_model`] plus the variant `"uvlock"` flag: when `uvlock` is true,
+/// each face's UV rectangle is counter-rotated by
+/// [`recompute_uvs`] so the texture stays aligned to the model's unrotated
+/// axes, exactly like Vanilla `FaceBakery`/`BlockMath.getUVLockTransform`.
+pub fn bake_model_with_uvlock(
+    stack: &ResourcePackModelStack,
+    model_id: &str,
+    blockstate_rot_x_deg: i32,
+    blockstate_rot_y_deg: i32,
+    uvlock: bool,
+) -> Result<BakedModel, ModelError> {
     let x_steps = rotation_steps(blockstate_rot_x_deg, "x")?;
     let y_steps = rotation_steps(blockstate_rot_y_deg, "y")?;
+    let model_mat = blockstate_matrix(x_steps, y_steps);
     let resolved = stack.resolve(model_id)?;
     if resolved.elements.len() > MAX_ELEMENTS_PER_MODEL {
         return Err(ModelError::TooManyElements(resolved.elements.len()));
@@ -1252,10 +1439,20 @@ pub fn bake_model(
             };
             let texture =
                 ResourcePackModelStack::resolve_texture(&resolved.textures, &face.texture)?;
-            let uv_rect = face
+            let mut uv_rect = face
                 .uv
                 .unwrap_or_else(|| default_uv(direction, element.from, element.to));
-            let uv_shift = usize::from(face.rotation_deg / 90);
+            let mut face_rotation = face.rotation_deg;
+            if uvlock {
+                let recomputed = recompute_uvs(uv_rect, face_rotation, direction, model_mat);
+                uv_rect = recomputed.0;
+                face_rotation = recomputed.1;
+            }
+            // `BlockFaceUV` rotates UV assignment clockwise by `rotation / 90`
+            // slots (`getShiftedIndex`). The port's `FACE_CORNERS` winding is
+            // one slot ahead of vanilla's `FaceInfo` vertex order on every
+            // face, so port corner `c` is vanilla vertex `(c + 1) % 4`.
+            let uv_shift = usize::from(face_rotation / 90);
             let mut positions = [[0.0; 3]; 4];
             let mut uvs = [[0.0; 2]; 4];
             for (corner, corner_sel) in FACE_CORNERS[direction as usize].iter().enumerate() {
@@ -1279,7 +1476,8 @@ pub fn bake_model(
                     p[1] / MODEL_UNITS_PER_BLOCK,
                     p[2] / MODEL_UNITS_PER_BLOCK,
                 ];
-                let pair = UV_PAIRS[(FACE_UV_CORNER[direction as usize][corner] + uv_shift) % 4];
+                let slot = (corner + 1 + uv_shift) % 4;
+                let pair = VANILLA_UV_SLOTS[slot];
                 uvs[corner] = [uv_rect[pair.0], uv_rect[pair.1]];
             }
             let mut normal = direction_vector(direction);
@@ -1348,4 +1546,529 @@ pub fn resolve_item_override(
         }
     }
     Ok(best.map_or(base, |(_, o)| normalize_location(&o.model)))
+}
+
+// ---------------------------------------------------------------------------
+// blockstates/*.json resolution
+// ---------------------------------------------------------------------------
+
+/// Clean-room resolver for `assets/<ns>/blockstates/<block>.json`, mirroring
+/// Vanilla `BlockStateDefinition` loading and `BlockModelDefinition`-time
+/// `"variants"`/`"multipart"` selection.
+///
+/// Determinism: weighted `"variants"`/`"apply"` arrays pick with a position
+/// hash derived from `block_pos` — no RNG state, no clock — so the same
+/// `(definition, props, pos)` always resolves identically.
+///
+/// Fail-closed: malformed JSON, schema violations, unknown properties,
+/// overlapping variant coverage and unmatchable states are all errors; the
+/// caller drops the block rather than guessing a fallback.
+pub mod blockstate {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// One concrete model choice inside a variant `"variants"` value or a
+    /// multipart `"apply"`.
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct VariantSpec {
+        /// Model location (`"minecraft:block/foo"` after normalization is
+        /// *not* applied here — pass it to the baker verbatim).
+        pub model: String,
+        /// Variant `"x"` rotation in degrees, normalized to `{0,90,180,270}`.
+        pub x_deg: i32,
+        /// Variant `"y"` rotation in degrees, normalized likewise.
+        pub y_deg: i32,
+        /// Variant `"uvlock"`: counter-rotate face UVs against the model
+        /// rotation (`FaceBakery.recomputeUVs`).
+        pub uvlock: bool,
+        /// Variant `"weight"` (>= 1); weighted arrays pick by position hash.
+        pub weight: i32,
+    }
+
+    /// The deterministic outcome of [`resolve_blockstate`].
+    #[derive(Clone, Debug, PartialEq)]
+    pub enum BlockStateResolution {
+        /// A single weighted-picked variant from `"variants"`.
+        Variant(VariantSpec),
+        /// Every matching `"multipart"` selector's weighted pick, in file
+        /// order. May be empty when no selector's `when` matched.
+        Multipart(Vec<VariantSpec>),
+    }
+
+    /// A parsed `blockstates/*.json` document.
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub struct BlockStateDef {
+        /// `"variants"` entries in file order.
+        variants: Vec<VariantEntry>,
+        /// `"multipart"` selectors in file order.
+        multipart: Vec<Selector>,
+    }
+
+    /// One `"variants"` map entry: the parsed property constraints of its
+    /// key plus its variant(s).
+    #[derive(Clone, Debug, PartialEq)]
+    struct VariantEntry {
+        /// Comma-separated `prop=value` segments of the JSON key
+        /// (`"facing=north,half=top"` -> `[("facing","north"),("half","top")]`);
+        /// an empty vec is the `""` catch-all.
+        constraints: Vec<(String, String)>,
+        variants: Vec<VariantSpec>,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Selector {
+        condition: Condition,
+        variants: Vec<VariantSpec>,
+    }
+
+    /// A multipart `"when"` condition: `AND`/`OR` combinators over
+    /// `prop=value` key-value tests. Pipe-separated values (`"low|tall"`)
+    /// and a leading `!` negation follow Vanilla `KeyValueCondition`.
+    #[derive(Clone, Debug, PartialEq)]
+    enum Condition {
+        /// No `"when"` key — always true.
+        Any,
+        KeyValue {
+            key: String,
+            values: Vec<String>,
+            negated: bool,
+        },
+        /// `"AND": [...]` (also the implicit form of multi-key objects).
+        All(Vec<Condition>),
+        /// `"OR": [...]`.
+        AnyOf(Vec<Condition>),
+    }
+
+    impl BlockStateDef {
+        /// Parses a `blockstates/*.json` document. Reuses the bounded JSON
+        /// parser (`MAX_JSON_DEPTH`, finite numbers, no trailing bytes).
+        pub fn parse(text: &str) -> Result<Self, ModelError> {
+            let root = parse_json(text).map_err(ModelError::Json)?;
+            let obj = root
+                .as_object()
+                .ok_or_else(|| schema_err("blockstate root must be a JSON object"))?;
+            let mut variants = Vec::new();
+            if let Some(value) = obj.get("variants") {
+                let map = value
+                    .as_object()
+                    .ok_or_else(|| schema_err("blockstates.variants must be an object"))?;
+                for (key, value) in map {
+                    variants.push(VariantEntry {
+                        constraints: parse_variant_key(key)?,
+                        variants: parse_multivariant(value, "variants")?,
+                    });
+                }
+            }
+            let mut multipart = Vec::new();
+            if let Some(value) = obj.get("multipart") {
+                let items = value
+                    .as_array()
+                    .ok_or_else(|| schema_err("blockstates.multipart must be an array"))?;
+                for (index, item) in items.iter().enumerate() {
+                    multipart.push(parse_selector(item, index)?);
+                }
+            }
+            if variants.is_empty() && multipart.is_empty() {
+                return Err(schema_err(
+                    "blockstate defines neither 'variants' nor 'multipart'",
+                ));
+            }
+            Ok(Self { variants, multipart })
+        }
+    }
+
+    /// Resolves `def` for a block state `props` (`property -> value`, e.g.
+    /// `{"facing": "north"}`) at world position `block_pos`.
+    ///
+    /// `"variants"` win over `"multipart"` (Vanilla pre-fills multipart for
+    /// every state, then variant predicates overwrite it). Matching variant
+    /// keys must be disjoint — two matches are the Vanilla "overlapping
+    /// definition" failure. A state matched by nothing is an error: the
+    /// caller fails closed rather than substituting a fallback model.
+    pub fn resolve_blockstate(
+        def: &BlockStateDef,
+        props: &BTreeMap<String, String>,
+        block_pos: [i32; 3],
+    ) -> Result<BlockStateResolution, ModelError> {
+        let mut matched: Option<&[VariantSpec]> = None;
+        for entry in &def.variants {
+            if variant_key_matches(&entry.constraints, props)? {
+                if matched.is_some() {
+                    return Err(ModelError::BlockState(
+                        "overlapping variant definitions".to_owned(),
+                    ));
+                }
+                matched = Some(&entry.variants);
+            }
+        }
+        if let Some(variants) = matched {
+            return Ok(BlockStateResolution::Variant(
+                pick_weighted(variants, block_pos, 0).clone(),
+            ));
+        }
+        if !def.multipart.is_empty() {
+            let mut out = Vec::new();
+            for (index, selector) in def.multipart.iter().enumerate() {
+                if selector.condition.eval(props)? {
+                    out.push(
+                        pick_weighted(&selector.variants, block_pos, index as u64 + 1).clone(),
+                    );
+                }
+            }
+            return Ok(BlockStateResolution::Multipart(out));
+        }
+        Err(ModelError::BlockState(
+            "no variant or multipart selector matches the block state".to_owned(),
+        ))
+    }
+
+    /// Resolves `def` and bakes the result: a single model for `"variants"`,
+    /// or the concatenation of every matching multipart selector's quads in
+    /// file order (like Vanilla's `MultiPartBakedModel`). Ambient occlusion
+    /// comes from the first *matching* part — Vanilla reads it from the
+    /// first selector unconditionally, but non-matching selectors are never
+    /// baked here.
+    pub fn bake_blockstate(
+        stack: &ResourcePackModelStack,
+        def: &BlockStateDef,
+        props: &BTreeMap<String, String>,
+        block_pos: [i32; 3],
+    ) -> Result<BakedModel, ModelError> {
+        match resolve_blockstate(def, props, block_pos)? {
+            BlockStateResolution::Variant(variant) => bake_model_with_uvlock(
+                stack,
+                &variant.model,
+                variant.x_deg,
+                variant.y_deg,
+                variant.uvlock,
+            ),
+            BlockStateResolution::Multipart(parts) => {
+                let mut quads = Vec::new();
+                let mut ambient_occlusion = true;
+                for (index, variant) in parts.iter().enumerate() {
+                    let baked = bake_model_with_uvlock(
+                        stack,
+                        &variant.model,
+                        variant.x_deg,
+                        variant.y_deg,
+                        variant.uvlock,
+                    )?;
+                    if index == 0 {
+                        ambient_occlusion = baked.ambient_occlusion;
+                    }
+                    quads.extend(baked.quads);
+                }
+                Ok(BakedModel {
+                    ambient_occlusion,
+                    quads,
+                })
+            }
+        }
+    }
+
+    /// Parses a `"variants"` key: comma-separated `prop=value` segments.
+    /// Empty segments (the `""` key, trailing commas, `"=v"`) contribute no
+    /// constraint, matching Vanilla's `predicate()` splitter behaviour.
+    fn parse_variant_key(key: &str) -> Result<Vec<(String, String)>, ModelError> {
+        let mut out = Vec::new();
+        for segment in key.split(',') {
+            let mut parts = segment.splitn(2, '=');
+            let name = parts.next().unwrap_or_default();
+            match parts.next() {
+                Some(value) => {
+                    if !name.is_empty() {
+                        out.push((name.to_owned(), value.to_owned()));
+                    }
+                }
+                None => {
+                    if !name.is_empty() {
+                        return Err(schema_err(format!(
+                            "malformed variant key segment {segment:?} in {key:?}"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every `prop=value` constraint must hold; a constraint naming a
+    /// property absent from `props` fails closed (Vanilla rejects unknown
+    /// blockstate properties at load time).
+    fn variant_key_matches(
+        constraints: &[(String, String)],
+        props: &BTreeMap<String, String>,
+    ) -> Result<bool, ModelError> {
+        for (key, value) in constraints {
+            match props.get(key) {
+                Some(actual) if actual == value => {}
+                Some(_) => return Ok(false),
+                None => {
+                    return Err(ModelError::BlockState(format!(
+                        "variant selector references unknown property {key:?}"
+                    )));
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// A `"variants"`/`"apply"` value: a single variant object, or a
+    /// non-empty array of them (Vanilla rejects empty arrays).
+    fn parse_multivariant(value: &Json, field: &str) -> Result<Vec<VariantSpec>, ModelError> {
+        match value {
+            Json::Obj(_) => Ok(vec![parse_variant(value, field)?]),
+            Json::Arr(items) => {
+                if items.is_empty() {
+                    return Err(schema_err(format!("{field}: empty variant array")));
+                }
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| parse_variant(item, &format!("{field}[{index}]")))
+                    .collect()
+            }
+            _ => Err(schema_err(format!(
+                "{field} must be a variant object or array of variants"
+            ))),
+        }
+    }
+
+    fn parse_variant(value: &Json, field: &str) -> Result<VariantSpec, ModelError> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| schema_err(format!("{field} must be an object")))?;
+        let model = obj
+            .get("model")
+            .and_then(Json::as_str)
+            .ok_or_else(|| schema_err(format!("{field}.model must be a string")))?
+            .to_owned();
+        let x_deg = parse_rotation(obj.get("x"), field, "x")?;
+        let y_deg = parse_rotation(obj.get("y"), field, "y")?;
+        let uvlock = match obj.get("uvlock") {
+            None | Some(Json::Null) => false,
+            Some(Json::Bool(b)) => *b,
+            Some(_) => {
+                return Err(schema_err(format!("{field}.uvlock must be a boolean")));
+            }
+        };
+        let weight = match obj.get("weight") {
+            None | Some(Json::Null) => 1,
+            Some(value) => {
+                let weight = parse_int(value, &format!("{field}.weight"))?;
+                if weight < 1 {
+                    return Err(schema_err(format!("{field}.weight must be >= 1")));
+                }
+                weight
+            }
+        };
+        Ok(VariantSpec {
+            model,
+            x_deg,
+            y_deg,
+            uvlock,
+            weight,
+        })
+    }
+
+    /// Variant `"x"`/`"y"`: an integer that, after `rem_euclid(360)`, is a
+    /// multiple of 90 — the sixteen `BlockModelRotation` combos of Vanilla.
+    fn parse_rotation(value: Option<&Json>, field: &str, axis: &str) -> Result<i32, ModelError> {
+        let Some(value) = value else {
+            return Ok(0);
+        };
+        if matches!(value, Json::Null) {
+            return Ok(0);
+        }
+        let raw = parse_int(value, &format!("{field}.{axis}"))?;
+        let wrapped = raw.rem_euclid(360);
+        if wrapped % 90 != 0 {
+            return Err(schema_err(format!(
+                "{field}.{axis} rotation {raw} is not a multiple of 90"
+            )));
+        }
+        Ok(wrapped)
+    }
+
+    /// Strict integer read for blockstate fields (Vanilla reads them via
+    /// Gson `getAsInt`): integral `f64` inside `i32` range.
+    fn parse_int(value: &Json, field: &str) -> Result<i32, ModelError> {
+        let number = value
+            .as_f64()
+            .ok_or_else(|| schema_err(format!("{field} must be an integer")))?;
+        if number.fract() != 0.0 || number < i32::MIN as f64 || number > i32::MAX as f64 {
+            return Err(schema_err(format!("{field} must be an integer")));
+        }
+        Ok(number as i32)
+    }
+
+    /// One `"multipart"` selector: optional `"when"` condition plus required
+    /// `"apply"` variant(s).
+    fn parse_selector(value: &Json, index: usize) -> Result<Selector, ModelError> {
+        let field = format!("multipart[{index}]");
+        let obj = value
+            .as_object()
+            .ok_or_else(|| schema_err(format!("{field} must be an object")))?;
+        let condition = match obj.get("when") {
+            None | Some(Json::Null) => Condition::Any,
+            Some(value) => parse_condition(value, &format!("{field}.when"))?,
+        };
+        let apply = obj
+            .get("apply")
+            .ok_or_else(|| schema_err(format!("{field}.apply is required")))?;
+        Ok(Selector {
+            condition,
+            variants: parse_multivariant(apply, &format!("{field}.apply"))?,
+        })
+    }
+
+    /// `Selector.Deserializer.getCondition`: `{"OR": [...]}` /
+    /// `{"AND": [...]}` combinators, a single `prop=value` object, or an
+    /// implicit `AND` over several `prop=value` entries.
+    fn parse_condition(value: &Json, field: &str) -> Result<Condition, ModelError> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| schema_err(format!("{field} must be an object")))?;
+        if obj.is_empty() {
+            return Err(schema_err(format!("{field}: no elements found in selector")));
+        }
+        if obj.len() == 1 {
+            if let Some(items) = obj.get("OR") {
+                return Ok(Condition::AnyOf(parse_condition_list(
+                    items, field, "OR",
+                )?));
+            }
+            if let Some(items) = obj.get("AND") {
+                return Ok(Condition::All(parse_condition_list(
+                    items, field, "AND",
+                )?));
+            }
+        }
+        let mut conditions = Vec::with_capacity(obj.len());
+        for (key, value) in obj {
+            conditions.push(parse_key_value(key, value, field)?);
+        }
+        Ok(if conditions.len() == 1 {
+            conditions.pop().unwrap_or(Condition::Any)
+        } else {
+            Condition::All(conditions)
+        })
+    }
+
+    fn parse_condition_list(
+        value: &Json,
+        field: &str,
+        token: &str,
+    ) -> Result<Vec<Condition>, ModelError> {
+        let items = value
+            .as_array()
+            .ok_or_else(|| schema_err(format!("{field}.{token} must be an array")))?;
+        items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| parse_condition(item, &format!("{field}.{token}[{index}]")))
+            .collect()
+    }
+
+    /// `KeyValueCondition`: `"value"` is `prop`'s value, optionally `!`-
+    /// negated, with `|`-separated alternatives (`"low|tall"`).
+    fn parse_key_value(
+        key: &str,
+        value: &Json,
+        field: &str,
+    ) -> Result<Condition, ModelError> {
+        let raw = value
+            .as_str()
+            .ok_or_else(|| schema_err(format!("{field}.{key} must be a string")))?;
+        let (negated, body) = match raw.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, raw),
+        };
+        let values: Vec<String> = body
+            .split('|')
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if values.is_empty() {
+            return Err(schema_err(format!("{field}.{key}: empty value")));
+        }
+        Ok(Condition::KeyValue {
+            key: key.to_owned(),
+            values,
+            negated,
+        })
+    }
+
+    impl Condition {
+        fn eval(&self, props: &BTreeMap<String, String>) -> Result<bool, ModelError> {
+            match self {
+                Self::Any => Ok(true),
+                Self::KeyValue {
+                    key,
+                    values,
+                    negated,
+                } => {
+                    let Some(actual) = props.get(key) else {
+                        return Err(ModelError::BlockState(format!(
+                            "multipart condition references unknown property {key:?}"
+                        )));
+                    };
+                    let hit = values.iter().any(|value| value == actual);
+                    Ok(if *negated { !hit } else { hit })
+                }
+                Self::All(conditions) => {
+                    for condition in conditions {
+                        if !condition.eval(props)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+                Self::AnyOf(conditions) => {
+                    for condition in conditions {
+                        if condition.eval(props)? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+            }
+        }
+    }
+
+    /// Deterministic stand-in for Vanilla's `RandomSource` in weighted
+    /// variant selection: a splitmix64-style hash of `block_pos` salted per
+    /// selector. Zero RNG state, zero clock — same inputs, same pick.
+    fn position_hash(pos: [i32; 3], salt: u64) -> u64 {
+        let mut h = salt
+            ^ (pos[0] as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (pos[1] as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+            ^ (pos[2] as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
+        h ^= h >> 30;
+        h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        h ^= h >> 27;
+        h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+        h ^ (h >> 31)
+    }
+
+    /// Vanilla `WeightedRandom.getWeightedItem`: cumulative weights in file
+    /// order; the draw is `position_hash % total_weight`.
+    fn pick_weighted(variants: &[VariantSpec], pos: [i32; 3], salt: u64) -> &VariantSpec {
+        debug_assert!(!variants.is_empty());
+        let total: u64 = variants
+            .iter()
+            .map(|variant| variant.weight.max(1) as u64)
+            .sum();
+        let mut draw = position_hash(pos, salt) % total;
+        for variant in variants {
+            let weight = variant.weight.max(1) as u64;
+            if draw < weight {
+                return variant;
+            }
+            draw -= weight;
+        }
+        variants
+            .last()
+            .expect("variant list is non-empty")
+    }
 }
