@@ -48,6 +48,7 @@
     mcTargets: ["1.21.1", "26.3"],
     githubUrl: "https://github.com/nekomario28/mc-spine",
     reportApiUrl: "",
+    turnstileSiteKey: "",
     releasesUrl: "https://github.com/nekomario28/mc-spine/releases",
     docsBaseUrl: "https://github.com/nekomario28/mc-spine/tree/main/docs",
     customDomain: "",
@@ -1969,6 +1970,13 @@
     var resultLink = $("feedback-result-link");
     var count = $("feedback-count");
     var apiUrl = typeof CFG.reportApiUrl === "string" ? CFG.reportApiUrl.trim() : "";
+    var turnstileSiteKey = typeof CFG.turnstileSiteKey === "string" ?
+      CFG.turnstileSiteKey.trim() : "";
+    var turnstileMount = $("report-turnstile");
+    var turnstileToken = "";
+    var turnstileWidgetId = null;
+    var turnstileScript = null;
+    var turnstileFailed = false;
     var draft = null;
     var pending = false;
     var failed = false;
@@ -1989,6 +1997,9 @@
         failed: "Could not send the report. Use the options below.",
         copied: "Masked report copied.",
         copyFailed: "Clipboard unavailable. Select and copy the preview above.",
+        verificationLoading: "Loading verification…",
+        verificationFailed: "Verification unavailable. Use the options below.",
+        verificationExpired: "Verification expired. Please complete it again.",
         count: function (n) { return n + " reports total"; },
       },
       ja: {
@@ -2003,6 +2014,9 @@
         failed: "送信できませんでした。以下の方法をご利用ください。",
         copied: "マスク済みレポートをコピーしました。",
         copyFailed: "コピーできませんでした。上のプレビューを選択してコピーしてください。",
+        verificationLoading: "認証を読み込み中…",
+        verificationFailed: "認証を利用できません。以下の方法をご利用ください。",
+        verificationExpired: "認証の有効期限が切れました。もう一度認証してください。",
         count: function (n) { return "報告数 " + n + " 件"; },
       },
     };
@@ -2023,11 +2037,117 @@
         !draft.report.fingerprint;
     }
 
+    function clearTurnstileToken(statusMessage) {
+      turnstileToken = "";
+      if (!pending && statusMessage) {
+        setStatus(statusMessage);
+      }
+      updateFallback();
+    }
+
+    function renderTurnstile() {
+      if (overlay.hidden || turnstileWidgetId !== null) {
+        return;
+      }
+      if (!window.turnstile || typeof window.turnstile.render !== "function") {
+        turnstileFailed = true;
+        setStatus("verificationFailed");
+        updateFallback();
+        return;
+      }
+      try {
+        turnstileWidgetId = window.turnstile.render(turnstileMount, {
+          sitekey: turnstileSiteKey,
+          size: "flexible",
+          callback: function (token) {
+            turnstileToken = token;
+            turnstileFailed = false;
+            if (!pending) {
+              setStatus("");
+            }
+            updateFallback();
+          },
+          "expired-callback": function () {
+            clearTurnstileToken("verificationExpired");
+          },
+          "timeout-callback": function () {
+            clearTurnstileToken("verificationExpired");
+          },
+          "error-callback": function () {
+            turnstileFailed = true;
+            clearTurnstileToken("verificationFailed");
+          },
+        });
+        turnstileFailed = false;
+        if (!pending && !turnstileToken) {
+          setStatus("");
+        }
+      } catch (_) {
+        turnstileFailed = true;
+        setStatus("verificationFailed");
+        updateFallback();
+      }
+    }
+
+    function loadTurnstile() {
+      if (!turnstileSiteKey || !turnstileMount) {
+        return;
+      }
+      turnstileMount.hidden = false;
+      if (turnstileWidgetId !== null) {
+        return;
+      }
+      if (window.turnstile && typeof window.turnstile.render === "function") {
+        renderTurnstile();
+        return;
+      }
+      if (turnstileScript) {
+        return;
+      }
+      turnstileFailed = false;
+      setStatus("verificationLoading");
+      turnstileScript = document.createElement("script");
+      turnstileScript.src =
+        "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+      turnstileScript.async = true;
+      turnstileScript.onload = function () {
+        if (!overlay.hidden) {
+          renderTurnstile();
+        }
+      };
+      turnstileScript.onerror = function () {
+        turnstileScript.remove();
+        turnstileScript = null;
+        turnstileFailed = true;
+        setStatus("verificationFailed");
+        updateFallback();
+      };
+      document.head.appendChild(turnstileScript);
+    }
+
+    function resetTurnstile() {
+      if (!turnstileSiteKey) {
+        return;
+      }
+      turnstileToken = "";
+      if (turnstileWidgetId !== null && window.turnstile) {
+        try {
+          window.turnstile.reset(turnstileWidgetId);
+        } catch (_) {
+          turnstileFailed = true;
+          setStatus("verificationFailed");
+        }
+      }
+      updateFallback();
+    }
+
     function updateFallback() {
-      var needsFallback = !apiUrl || failed || isCrashWithoutFingerprint();
+      var needsFallback = !apiUrl || failed || isCrashWithoutFingerprint() ||
+        (turnstileSiteKey && turnstileFailed);
       fallback.hidden = !needsFallback;
       sendRow.hidden = !apiUrl || !!isCrashWithoutFingerprint();
-      sendButton.disabled = !draft || pending;
+      sendButton.disabled = !draft || pending ||
+        !!(turnstileSiteKey && !turnstileToken);
       copyButton.disabled = !draft;
       if (draft) {
         githubLink.href = makeGitHubIssueUrl(CFG.githubUrl, draft);
@@ -2081,6 +2201,7 @@
       overlay.hidden = false;
       document.body.style.overflow = "hidden";
       refresh();
+      loadTurnstile();
       kind.focus();
     }
 
@@ -2176,11 +2297,16 @@
         summary.focus();
         return;
       }
-      if (!apiUrl || isCrashWithoutFingerprint() || pending) {
+      if (!apiUrl || isCrashWithoutFingerprint() || pending ||
+          (turnstileSiteKey && !turnstileToken)) {
         updateFallback();
         return;
       }
-      var sentJson = draft.json;
+      var payload = Object.assign({}, draft.report);
+      if (turnstileSiteKey) {
+        payload.turnstile_token = turnstileToken;
+      }
+      var sentJson = JSON.stringify(payload);
       pending = true;
       updateFallback();
       setStatus("sending");
@@ -2210,7 +2336,7 @@
         setStatus("failed");
       }).finally(function () {
         pending = false;
-        updateFallback();
+        resetTurnstile();
       });
     });
 

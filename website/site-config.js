@@ -55,13 +55,15 @@
     flagshipMods: ["create"],
     profileMods: [],
 
-    // Optional community/support endpoints. Each stays "" until a real
-    // destination exists — the footer hides the matching link while empty.
-    // reportApiUrl  — e.g. "/api/report" once Pages Functions are deployed
+    // Report endpoint and optional community/support links. Empty links stay
+    // hidden in the footer until a destination is configured.
+    // reportApiUrl  — Cloudflare Pages Functions endpoint
+    // turnstileSiteKey — public Cloudflare Turnstile widget key (never a secret)
     // discussionsUrl — GitHub Discussions (or forum) for ideas & support
     // discordUrl     — Discord invite, when the community server exists
     // sponsorUrl     — GitHub Sponsors / donation page
-    reportApiUrl: "",
+    reportApiUrl: "/api/report",
+    turnstileSiteKey: "0x4AAAAAAGNFPiu-LWbjNy5A",
     discussionsUrl: "",
     discordUrl: "",
     sponsorUrl: "",

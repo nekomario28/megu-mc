@@ -461,8 +461,9 @@ mc-spine-client --ping localhost:25565</code></pre>
         </div>
         <pre class="feedback-preview" id="feedback-preview" tabindex="0" aria-label="Masked JSON preview" data-i18n-aria-label="feedback_preview_label"></pre>
         <p class="feedback-hint" data-i18n="feedback_privacy">
-          Exactly this compact JSON is submitted. Paths, IP addresses and common secrets are masked in this browser.
+          These masked report fields are submitted with a temporary Turnstile verification token. Paths, IP addresses and common secrets are masked in this browser.
         </p>
+        <div id="report-turnstile" hidden></div>
         <p class="feedback-status" id="feedback-status" role="status" aria-live="polite"></p>
         <div class="feedback-send" id="feedback-send-row">
           <span data-i18n="feedback_confirm">Send OK?</span>
@@ -590,7 +591,7 @@ mc-spine-client --ping localhost:25565</code></pre>
       feedback_summary_hint: "わかれば再現手順も記入してください。個人情報や秘密情報は入力しないでください。",
       feedback_preview: "マスク済みレポートのプレビュー",
       feedback_preview_label: "マスク済み JSON プレビュー",
-      feedback_privacy: "この JSON をそのまま送信します。パス・IP アドレス・一般的な秘密情報はブラウザ内でマスクします。",
+      feedback_privacy: "マスク済みのレポート項目を一時的な Turnstile 認証トークンと共に送信します。パス・IP アドレス・一般的な秘密情報はブラウザ内でマスクします。",
       feedback_confirm: "送信しますか？",
       feedback_send: "送信",
       feedback_copy: "マスク済みレポートをコピー",
