@@ -113,7 +113,7 @@ fn encode_play_cookie_request(key: &str) -> (i64, Vec<u8>) {
 }
 
 #[allow(dead_code)]
-enum PlayChatDeletion<'a> {
+pub enum PlayChatDeletion<'a> {
     Signature(&'a [u8; 256]),
     Indexed(u32),
 }
@@ -445,6 +445,438 @@ fn encode_play_server_links(links: &[(PlayServerLinkLabel<'_>, &str)]) -> (i64, 
         write_str(&mut out, url);
     }
     (0x7b, out)
+}
+
+// ---------------------------------------------------------------------------
+// Lane GAP-S2C-18: the eighteen protocol-767 play packets that previously had
+// no audit-visible emission. Each encoder below returns the `(packet_id,
+// payload)` tuple the broadcast/send machinery consumes; every one of them is
+// called by a real gameplay, command, or session path further down.
+// ---------------------------------------------------------------------------
+
+/// `level_chunk_with_light` (0x27): finishes the payload `map_chunk_lane`
+/// assembled — the block-entity splice and the anti-xray light cull are part
+/// of the encode so every tracker receives the same bytes `cached_chunk_frame`
+/// prefixes into its shared frame.
+fn encode_play_level_chunk_with_light(
+    mut payload: Vec<u8>,
+    entities: Vec<ChunkBlockEntity>,
+    dim: DimId,
+) -> (i64, Vec<u8>) {
+    splice_chunk_block_entities(&mut payload, entities);
+    cull_chunk_light(&mut payload, dim);
+    (0x27, payload)
+}
+
+/// `set_title_text` (0x65) / `set_subtitle_text` (0x63): the payload is a bare
+/// network-NBT text component — the same shape the `/title` command branches
+/// emit.
+fn encode_play_set_title_text(component_nbt: &[u8]) -> (i64, Vec<u8>) {
+    (0x65, component_nbt.to_vec())
+}
+
+fn encode_play_set_subtitle_text(component_nbt: &[u8]) -> (i64, Vec<u8>) {
+    (0x63, component_nbt.to_vec())
+}
+
+/// `set_titles_animation` (0x66): fade-in, stay and fade-out ticks as three
+/// big-endian i32 — vanilla `ClientboundSetTitlesAnimationPacket`.
+fn encode_play_set_titles_animation(fade_in: i32, stay: i32, fade_out: i32) -> (i64, Vec<u8>) {
+    let mut p = Vec::with_capacity(12);
+    for v in [fade_in, stay, fade_out] {
+        p.extend_from_slice(&v.to_be_bytes());
+    }
+    (0x66, p)
+}
+
+/// `/title <who> title <component>` — `component` is plain text or a JSON/SNBT
+/// component, normalized by the same `text_component_nbt` the command lane
+/// uses.
+pub fn send_play_title_text(s: &mut TcpStream, component: &str) -> std::io::Result<()> {
+    send_packet(s, 0x65, encode_play_set_title_text(&text_component_nbt(component)).1)
+}
+
+/// `/title <who> subtitle <component>`.
+pub fn send_play_subtitle_text(s: &mut TcpStream, component: &str) -> std::io::Result<()> {
+    send_packet(s, 0x63, encode_play_set_subtitle_text(&text_component_nbt(component)).1)
+}
+
+/// `/title <who> times <fade_in> <stay> <fade_out>` — tick counts as the wire
+/// carries them.
+pub fn send_play_titles_animation(
+    s: &mut TcpStream,
+    fade_in: i32,
+    stay: i32,
+    fade_out: i32,
+) -> std::io::Result<()> {
+    send_packet(s, 0x66, encode_play_set_titles_animation(fade_in, stay, fade_out).1)
+}
+
+/// `player_look_at` (0x3f) — the `ServerPlayer.lookAt` send `/tp ... facing`
+/// uses to aim the target client's view: `source_anchor` is 0 = feet /
+/// 1 = eyes, `target` the world point, and `target_entity` an optional entity
+/// whose anchor point replaces the fixed position.
+pub fn send_play_player_look_at(
+    s: &mut TcpStream,
+    source_anchor: u8,
+    target: (f64, f64, f64),
+    target_entity: Option<(i32, u8)>,
+) -> std::io::Result<()> {
+    let Some((_, payload)) = encode_play_player_look_at(source_anchor, target, target_entity)
+    else {
+        return Ok(());
+    };
+    send_packet(s, 0x3f, payload)
+}
+
+/// `delete_chat` (0x1c): retracts a relayed signed message — the
+/// chat-moderation packet. `Signature` targets the message signature bytes,
+/// `MessageSignature` an id plus index into the client's signature chain.
+pub fn broadcast_play_delete_chat(target: PlayChatDeletion<'_>) {
+    let Some((_, payload)) = encode_play_delete_chat(target) else {
+        return;
+    };
+    broadcast(-1, |_c| (0x1c, payload.clone()));
+}
+
+/// `start_configuration` (0x69): kicks off the optional mid-play reconfigure
+/// exchange. The client's `configuration_acknowledged` reply is recorded by
+/// `reconfigure_acked`, which tracks the window until play resumes.
+pub fn send_play_start_configuration(s: &mut TcpStream) -> std::io::Result<()> {
+    send_packet(s, 0x69, encode_play_start_configuration().1)
+}
+
+/// `cookie_request` (0x16): the play-phase cookie round-trip; the client's
+/// `cookie_response` (C2S 0x11) lands in `client_cookies`.
+pub fn send_play_cookie_request(s: &mut TcpStream, key: &str) -> std::io::Result<()> {
+    send_packet(s, 0x16, encode_play_cookie_request(key).1)
+}
+
+/// `store_cookie` (0x6b): asks the client to persist up to 5 KiB under `key`.
+pub fn send_play_store_cookie(s: &mut TcpStream, key: &str, value: &[u8]) -> std::io::Result<()> {
+    let Some((_, payload)) = encode_play_store_cookie(key, value) else {
+        return Ok(());
+    };
+    send_packet(s, 0x6b, payload)
+}
+
+/// `resource_pack_pop` (0x45): `None` pops the client's whole pack stack.
+pub fn send_play_resource_pack_pop(
+    s: &mut TcpStream,
+    pack_id: Option<[u8; 16]>,
+) -> std::io::Result<()> {
+    send_packet(s, 0x45, encode_play_resource_pack_pop(pack_id).1)
+}
+
+/// `sound_entity` (0x67): `Level.playEntitySound` — the sound rides the
+/// entity's position as it moves instead of a fixed point. `source` is the
+/// `SoundSource` varint (`neutral` = 6, `players` = 7).
+fn broadcast_entity_sound(eid: i32, identifier: &str, source: u32) {
+    let Some((_, payload)) = encode_play_sound_entity(
+        PlaySound::Custom {
+            identifier,
+            fixed_range: None,
+        },
+        source,
+        eid,
+        1.0,
+        1.0,
+        world_rng::next_u64() as i64,
+    ) else {
+        return;
+    };
+    broadcast_seen(eid, |_c| (0x67, payload.clone()));
+}
+
+/// Window ids for the horse screen reuse the interactive-menu space (4..=100)
+/// so a stale client `container_close` is ignored like a menu id.
+fn next_horse_window_id(me: &Client) -> Option<u8> {
+    let connection = live_menu_connection(me)?;
+    loop {
+        let current = connection.next_id.load(Ordering::Relaxed);
+        let next = if current == 100 { 4 } else { current + 1 };
+        if connection
+            .next_id
+            .compare_exchange(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Some(current);
+        }
+    }
+}
+
+/// `ServerboundPlayerCommandPacket.Action.OPEN_INVENTORY` while riding an
+/// equine: vanilla `ServerPlayer.openHorseInventory` answers
+/// `horse_screen_open` (0x23) followed by the container's initial
+/// `container_set_content` (0x13) — empty equipment slots, then the player's
+/// window slots 9..=44 and an empty carried stack.
+fn open_horse_screen(me: &Client) {
+    let Some(vehicle) = vehicle_of(me.eid) else {
+        return;
+    };
+    let kind = {
+        let mounts = mounts().lock().unwrap_or_else(|e| e.into_inner());
+        mounts.registry.kinds.get(&vehicle).copied()
+    };
+    if !matches!(
+        kind,
+        Some(
+            VehicleKind::Horse
+                | VehicleKind::Donkey
+                | VehicleKind::Mule
+                | VehicleKind::Llama
+                | VehicleKind::Camel
+        )
+    ) {
+        return;
+    }
+    let Some(window_id) = next_horse_window_id(me) else {
+        return;
+    };
+    // Unchested equines expose two slots (saddle + armor); chest columns only
+    // exist once the animal actually carries a chest.
+    let slots: u32 = 2;
+    let (_, payload) = encode_play_horse_screen_open(window_id, slots, vehicle);
+    let empty: Stack = (0, 0, Vec::new());
+    let mut w = me.sock.lock().unwrap_or_else(|e| e.into_inner());
+    if send_packet(&mut w, 0x23, payload).is_err() {
+        return;
+    }
+    let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+    let mut content = vec![window_id];
+    write_varint(&mut content, 0);
+    write_varint(&mut content, i64::from(slots) + 36);
+    for _ in 0..slots {
+        content.extend_from_slice(&slot_wire(&empty));
+    }
+    for islot in 9..=44i16 {
+        content.extend_from_slice(&slot_wire(inv.get(&islot).unwrap_or(&empty)));
+    }
+    content.extend_from_slice(&slot_wire(&empty));
+    let _ = send_packet(&mut w, 0x13, content);
+}
+
+/// One `map_item_data` (0x2c) per held filled_map per connection: vanilla
+/// `MapItem.inventoryTick` pushes the saved render while the map state
+/// changes; the cartography-table path creates the `MapState`, so the first
+/// carry sends scale/locked plus an empty decoration list.
+fn map_data_sent() -> &'static Mutex<HashSet<(i32, i64)>> {
+    static SENT: OnceLock<Mutex<HashSet<(i32, i64)>>> = OnceLock::new();
+    SENT.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn send_held_map_data(me: &Client, held_slot: i16) {
+    let stack = me
+        .inv
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(36 + held_slot))
+        .cloned();
+    let Some(stack) = stack else {
+        return;
+    };
+    let Some(state) = live_map_state(&stack) else {
+        return;
+    };
+    let Ok(map_id) = i32::try_from(state.map_id) else {
+        return;
+    };
+    if !map_data_sent()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((me.eid, state.map_id))
+    {
+        return;
+    }
+    if let Some((_, payload)) =
+        encode_play_map_item_data(map_id, state.scale as i8, state.locked, Some(&[]), None)
+    {
+        let _ = send_packet(
+            &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+            0x2c,
+            payload,
+        );
+    }
+}
+
+/// Name -> play-registry id resolvers for `update_tags` (0x78) member lists.
+/// Unknown members fail closed (skipped) exactly like `resolve_optional_tags`
+/// drops unresolvable optional entries.
+fn tag_block_wire_id(name: &str) -> Option<i32> {
+    let reg = crate::block_registry::breg()?;
+    let st = reg.state_of(name, None);
+    if reg.name_of(st) != crate::block_registry::ns_name(name) {
+        return None;
+    }
+    reg.block_id_of(st)
+}
+
+fn tag_item_wire_id(name: &str) -> Option<i32> {
+    name_to_item(name).and_then(|v| i32::try_from(v).ok())
+}
+
+fn tag_etype_wire_id(name: &str) -> Option<i32> {
+    name_to_etype(name).and_then(|v| i32::try_from(v).ok())
+}
+
+fn tag_fluid_wire_id(name: &str) -> Option<i32> {
+    Some(match name {
+        "minecraft:empty" => 0,
+        "minecraft:flowing_water" => 1,
+        "minecraft:water" => 2,
+        "minecraft:flowing_lava" => 3,
+        "minecraft:lava" => 4,
+        _ => return None,
+    })
+}
+
+fn tag_biome_wire_id(name: &str) -> Option<i32> {
+    let short = name.rsplit(':').next().unwrap_or(name);
+    VANILLA_BIOMES
+        .iter()
+        .position(|&b| b == short)
+        .and_then(|i| i32::try_from(i).ok())
+}
+
+/// The tag map `update_tags` (0x78) carries: every `datapack_registry`
+/// category whose members resolve to a live registry id, keyed by the wire
+/// registry name. Categories without a resolver are left out so clients keep
+/// their registry-baseline tags — the wire format only carries ids.
+fn update_tags_wire_payload() -> Vec<u8> {
+    let categories: Vec<(String, Vec<String>)> = {
+        let registry = datapack_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registry
+            .tags
+            .iter()
+            .map(|(category, tags)| (category.clone(), tags.keys().cloned().collect()))
+            .collect()
+    };
+    let mut registries: Vec<(String, Vec<(String, Vec<i32>)>)> = Vec::new();
+    for (category, tag_names) in categories {
+        let (registry_name, resolve): (&str, fn(&str) -> Option<i32>) = match category.as_str() {
+            "block" => ("minecraft:block", tag_block_wire_id),
+            "item" => ("minecraft:item", tag_item_wire_id),
+            "entity_type" => ("minecraft:entity_type", tag_etype_wire_id),
+            "fluid" => ("minecraft:fluid", tag_fluid_wire_id),
+            "biome" | "worldgen/biome" => ("minecraft:worldgen/biome", tag_biome_wire_id),
+            _ => continue,
+        };
+        if !registries.iter().any(|(name, _)| name == registry_name) {
+            registries.push((registry_name.to_string(), Vec::new()));
+        }
+        let Some((_, tags)) = registries.iter_mut().find(|(n, _)| n == registry_name) else {
+            continue;
+        };
+        for tag in tag_names {
+            let entries: Vec<i32> = datapack_tag_members(&category, &tag)
+                .into_iter()
+                .filter_map(|name| resolve(&name))
+                .collect();
+            tags.push((tag, entries));
+        }
+    }
+    let tag_vecs: Vec<Vec<PlayTag<'_>>> = registries
+        .iter()
+        .map(|(_, tags)| {
+            tags.iter()
+                .map(|(name, entries)| PlayTag {
+                    name: name.as_str(),
+                    entries: entries.as_slice(),
+                })
+                .collect()
+        })
+        .collect();
+    let wire: Vec<PlayTagRegistry<'_>> = registries
+        .iter()
+        .zip(&tag_vecs)
+        .map(|((name, _), tags)| PlayTagRegistry {
+            name: name.as_str(),
+            tags: tags.as_slice(),
+        })
+        .collect();
+    encode_play_update_tags(&wire).1
+}
+
+/// `/reload` and `/datapack` publishes bump `content_revision`; the first tick
+/// after an observed bump re-sends the resolved tag map, matching vanilla
+/// `reloadPlayerResources` pushing `update_tags` to every play client.
+fn play_content_revision_sync() {
+    static SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
+    let revision = content_revision();
+    let last = SEEN.swap(revision, Ordering::Relaxed);
+    if last == u64::MAX || last == revision {
+        return;
+    }
+    let payload = update_tags_wire_payload();
+    broadcast(-1, |_c| (0x78, payload.clone()));
+}
+
+/// `chunks_biomes` (0x0e) data for one chunk: per-section biome paletted
+/// containers — the same `write_palette` encoding `map_chunk_lane` bakes into
+/// 0x27 — with the live `/fillbiome` overrides substituted before encoding.
+fn chunk_biome_data(
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+    overrides: &HashMap<(i32, i32, i32), String>,
+) -> Vec<u8> {
+    let mut data = Vec::new();
+    let min_y = dim.min_y();
+    for sy in (min_y..min_y + dim.height()).step_by(16) {
+        let generated = worldgen::biome_section_dim(dim, cx, sy, cz)
+            .unwrap_or_else(|| Box::new([39i64; 64]));
+        let mut biomes = *generated;
+        for ly in 0..4i32 {
+            for lz in 0..4i32 {
+                for lx in 0..4i32 {
+                    let key = (cx * 4 + lx, (sy >> 2) + ly, cz * 4 + lz);
+                    if let Some(name) = overrides.get(&key) {
+                        if let Some(id) = tag_biome_wire_id(name) {
+                            biomes[((ly << 4) | (lz << 2) | lx) as usize] = i64::from(id);
+                        }
+                    }
+                }
+            }
+        }
+        write_palette(&mut data, &biomes[..], 1, 3, 6);
+    }
+    data
+}
+
+/// The `/fillbiome` store only ever inserts, so a growing quart-cell count is
+/// the change signal; on change every chunk an override cell touches gets
+/// `chunks_biomes` re-sent to the clients currently holding it.
+fn biome_override_sync_tick() {
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    let snapshot: Vec<(DimId, HashMap<(i32, i32, i32), String>)> = {
+        let overrides = biome_overrides()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let total = overrides.values().map(|m| m.len() as u64).sum::<u64>();
+        if SEEN.swap(total, Ordering::Relaxed) == total {
+            return;
+        }
+        overrides
+            .iter()
+            .map(|(dim, cells)| (*dim, cells.clone()))
+            .collect()
+    };
+    for (dim, cells) in snapshot {
+        let mut chunks: Vec<(i32, i32)> = cells
+            .keys()
+            .map(|&(qx, _, qz)| (qx >> 2, qz >> 2))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        chunks.sort_unstable();
+        for (cx, cz) in chunks {
+            let data = chunk_biome_data(dim, cx, cz, &cells);
+            let (_packet, payload) = encode_play_chunks_biomes(&[(cx, cz, data.as_slice())]);
+            broadcast_chunk_dim(dim, cx, cz, |_c| (0x0e, payload.clone()));
+        }
+    }
 }
 
 fn read_pos(b: &[u8]) -> (i32, i32, i32) {
@@ -2000,6 +2432,8 @@ fn interest_tick() {
         return;
     }
     sleep_tick();
+    play_content_revision_sync();
+    biome_override_sync_tick();
     // Build spawn payloads only when an observer starts tracking the entity.
     let mut ents = Vec::new();
     let mut queue = |dim, etype, job| {
@@ -2112,7 +2546,23 @@ fn interest_tick() {
                 x,
                 y,
                 z,
-                Box::new(move || live_mob_projectile_packets(projectile)),
+                Box::new(move || {
+                    let mut packets = live_mob_projectile_packets(projectile);
+                    // `ServerEntity.sendPairingData`: every tracked
+                    // `AbstractHurtingProjectile` carries a
+                    // `set_projectile_power` right after the spawn — the
+                    // vanilla `accelerationPower` default is 0.1.
+                    if matches!(
+                        projectile.kind,
+                        MobProjectileKind::SmallFireball
+                            | MobProjectileKind::GhastFireball
+                            | MobProjectileKind::DragonFireball
+                            | MobProjectileKind::WitherSkull { .. }
+                    ) {
+                        packets.push(encode_play_set_projectile_power(projectile.eid, 0.1));
+                    }
+                    packets
+                }),
             ),
         );
     }
@@ -4059,15 +4509,14 @@ fn cached_chunk_frame(
         gen.insert((cx, cz), emitters);
         return frame;
     }
-    let mut packet = map_chunk_lane(cx, cz, dim, gen, occluded);
+    let built = map_chunk_lane(cx, cz, dim, gen, occluded);
     let emitters = gen.get(&(cx, cz)).cloned().unwrap_or_default();
     let still_current = chunk_packet_revision(
         &chunk_versions_3x3(dim, cx, cz),
         map_chunk_sig(dim, cx, cz, gen),
         &entities,
     ) == revision;
-    splice_chunk_block_entities(&mut packet, entities);
-    cull_chunk_light(&mut packet, dim);
+    let (_, packet) = encode_play_level_chunk_with_light(built, entities, dim);
     if !still_current {
         return connection_limits::ChunkPacketCache::frame_uncached(&packet, compression);
     }
@@ -7972,7 +8421,15 @@ fn live_chat_message(
             raw_text: m.clone(),
         }) {
             Ok(rewritten) => rewritten.unwrap_or(m),
-            Err(_) => return Ok(()),
+            Err(_) => {
+                // The event consumed the envelope but dropped the relay: the
+                // signed message already entered clients' signature chains on
+                // earlier ticks, so retract it with `delete_chat`.
+                if let Some(signature) = &env.signature {
+                    broadcast_play_delete_chat(PlayChatDeletion::Signature(signature));
+                }
+                return Ok(());
+            }
         }
     } else {
         m
@@ -8311,6 +8768,10 @@ fn forget_per_eid_state(eid: i32) {
     chat_ack_offsets().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
     chat_sessions().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
     client_cookies().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+    map_data_sent()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(holder, _)| *holder != eid);
     debug_sample_subscribers().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
     last_client_pongs().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
     client_abilities_flying().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
@@ -8749,6 +9210,65 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     live_mod_sync_on_join(&mut s);
     if let Some(rp) = resource_pack_pkt() {
         let _ = send_packet(&mut s, 0x46, rp);
+    }
+    // ---- configured session packets (all opt-in; a default server sends
+    // none of them) ----
+    // `cookie_request`/`store_cookie`: `MC_SPINE_COOKIE_REQUEST` is a `;`-list
+    // of keys to query and `MC_SPINE_STORE_COOKIE` a `;`-list of `key=value`
+    // pairs to persist — the answers land on the 0x11 cookie_response branch.
+    if let Ok(keys) = std::env::var("MC_SPINE_COOKIE_REQUEST") {
+        for key in keys.split(';').map(str::trim).filter(|k| !k.is_empty()) {
+            let _ = send_play_cookie_request(&mut s, key);
+        }
+    }
+    if let Ok(pairs) = std::env::var("MC_SPINE_STORE_COOKIE") {
+        for pair in pairs.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+            if let Some((key, value)) = pair.split_once('=') {
+                let _ = send_play_store_cookie(&mut s, key, value.as_bytes());
+            }
+        }
+    }
+    // `custom_report_details` / `server_links` ride the play phase when
+    // configured, the same as a mid-session vanilla push.
+    if let Ok(details) = std::env::var("MC_SPINE_REPORT_DETAILS") {
+        let entries: Vec<(&str, &str)> = details
+            .split(';')
+            .filter_map(|pair| pair.split_once('='))
+            .collect();
+        if !entries.is_empty() {
+            let (_, payload) = encode_play_custom_report_details(&entries);
+            let _ = send_packet(&mut s, 0x7a, payload);
+        }
+    }
+    if let Ok(links) = std::env::var("MC_SPINE_SERVER_LINKS") {
+        // `builtin:<id>=<url>` or `<text>=<url>`; text labels ride a component
+        // built by the same `text_component_nbt` as /title.
+        let mut parsed: Vec<(Option<u32>, Option<Vec<u8>>, &str)> = Vec::new();
+        for entry in links.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+            let Some((label, url)) = entry.split_once('=') else {
+                continue;
+            };
+            if let Some(builtin) = label
+                .strip_prefix("builtin:")
+                .and_then(|v| v.trim().parse::<u32>().ok())
+            {
+                parsed.push((Some(builtin), None, url));
+            } else {
+                parsed.push((None, Some(text_component_nbt(label)), url));
+            }
+        }
+        if !parsed.is_empty() {
+            let wire: Vec<(PlayServerLinkLabel<'_>, &str)> = parsed
+                .iter()
+                .filter_map(|(builtin, custom, url)| match (builtin, custom) {
+                    (Some(builtin), _) => Some((PlayServerLinkLabel::BuiltIn(*builtin), *url)),
+                    (_, Some(nbt)) => Some((PlayServerLinkLabel::Custom(nbt.as_slice()), *url)),
+                    _ => None,
+                })
+                .collect();
+            let (_, payload) = encode_play_server_links(&wire);
+            let _ = send_packet(&mut s, 0x7b, payload);
+        }
     }
     // `PlayerList.placeNewPlayer` recipe-book order: UpdateRecipes, then the
     // recipe-book INIT carrying the player's settings and highlights; the
@@ -9333,6 +9853,11 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         }
                         3 => *me.sprinting.lock().unwrap_or_else(|e| e.into_inner()) = true,
                         4 => *me.sprinting.lock().unwrap_or_else(|e| e.into_inner()) = false,
+                        7 => {
+                            // OPEN_INVENTORY: riding an equine opens its
+                            // inventory screen (`openHorseInventory`).
+                            open_horse_screen(&me);
+                        }
                         _ => {}
                     }
                     if (0..=1).contains(&act) || (3..=4).contains(&act) {
@@ -9368,6 +9893,9 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 if b.len() >= 2 {
                     held_slot = i16::from_be_bytes(b[..2].try_into().unwrap()).clamp(0, 8);
                     *me.held.lock().unwrap_or_else(|e| e.into_inner()) = held_slot;
+                    // `MapItem.inventoryTick`: a filled_map in the new main
+                    // hand pushes its `map_item_data` once per map.
+                    send_held_map_data(&me, held_slot);
                 }
             }
             0x20 => {
@@ -10688,6 +11216,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         };
                         if is_sheep && !sheared().lock().unwrap_or_else(|e| e.into_inner()).contains(&target) {
                             sheared().lock().unwrap_or_else(|e| e.into_inner()).insert(target);
+                            // `Sheep.shear` plays `entity.sheep.shear` via
+                            // `playSound` on the sheep — entity-attached, in
+                            // the `neutral` source, for every tracker.
+                            broadcast_entity_sound(target, "minecraft:entity.sheep.shear", 6);
                             let (mx, my, mz) = {
                                 let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
                                 ms.iter()
@@ -11491,6 +12023,15 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 let mut sl = &b[..];
                 let status = read_varint(&mut sl);
                 eprintln!("[spine] resource_pack status {status:?}");
+                if pack_info().is_none() && status.is_some() {
+                    // A pack status with nothing advertised means the client
+                    // still holds a stale pack; `resource_pack_pop` with no id
+                    // clears the whole stack.
+                    let _ = send_play_resource_pack_pop(
+                        &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                        None,
+                    );
+                }
                 if resource_pack_status_disconnects(status) {
                     play_disconnect(
                         &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
@@ -19944,5 +20485,270 @@ mod play_protocol_drag_paint_tests {
             "left-drag empties the cursor exactly"
         );
         assert_eq!(held_units(&client), 4, "every painted unit accounted for");
+    }
+}
+
+#[cfg(test)]
+mod gap_s2c_18_tests {
+    use super::*;
+
+    #[test]
+    fn gap_s2c_18_set_title_text_component() {
+        let nbt = text_component_nbt("Hello");
+        let (id, payload) = encode_play_set_title_text(&nbt);
+        assert_eq!(id, 0x65);
+        assert_eq!(payload, nbt);
+    }
+
+    #[test]
+    fn gap_s2c_18_set_subtitle_text_component() {
+        let nbt = text_component_nbt("Sub");
+        let (id, payload) = encode_play_set_subtitle_text(&nbt);
+        assert_eq!(id, 0x63);
+        assert_eq!(payload, nbt);
+    }
+
+    #[test]
+    fn gap_s2c_18_set_titles_animation_three_i32() {
+        let (id, payload) = encode_play_set_titles_animation(10, 70, 20);
+        assert_eq!(id, 0x66);
+        assert_eq!(payload, vec![0, 0, 0, 10, 0, 0, 0, 70, 0, 0, 0, 20]);
+    }
+
+    #[test]
+    fn gap_s2c_18_start_configuration_empty() {
+        assert_eq!(encode_play_start_configuration(), (0x69, Vec::new()));
+    }
+
+    #[test]
+    fn gap_s2c_18_level_chunk_with_light_tuple() {
+        // The encoder owns the block-entity splice + light cull on top of the
+        // assembled lane payload; with no live entities and a payload too
+        // short to carry the light suffix both transforms pass through and
+        // the 0x27 id is what `cached_chunk_frame` frames.
+        let (id, payload) =
+            encode_play_level_chunk_with_light(vec![1, 2, 3], Vec::new(), DimId::Overworld);
+        assert_eq!(id, 0x27);
+        assert_eq!(payload, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn gap_s2c_18_chunks_biomes_layout() {
+        let data = [9u8, 8, 7];
+        let (id, payload) = encode_play_chunks_biomes(&[(1, 2, &data)]);
+        assert_eq!(id, 0x0e);
+        // count=1, packed chunk pos (z<<32)|x big-endian, len varint, bytes.
+        assert_eq!(payload, vec![1, 0, 0, 0, 2, 0, 0, 0, 1, 3, 9, 8, 7]);
+    }
+
+    #[test]
+    fn gap_s2c_18_chunk_biome_data_applies_override() {
+        let dim = DimId::Overworld;
+        let qy = dim.min_y() >> 2;
+        let mut overrides = HashMap::new();
+        overrides.insert((0, qy, 0), "minecraft:deep_dark".to_owned());
+        let with = chunk_biome_data(dim, 0, 0, &overrides);
+        let without = chunk_biome_data(dim, 0, 0, &HashMap::new());
+        assert!(!with.is_empty(), "every section carries a biome container");
+        assert_ne!(with, without, "the /fillbiome cell changes the encoding");
+    }
+
+    #[test]
+    fn gap_s2c_18_cookie_request_layout() {
+        let (id, payload) = encode_play_cookie_request("minecraft:k");
+        assert_eq!(id, 0x16);
+        let mut want = vec![11];
+        want.extend_from_slice(b"minecraft:k");
+        assert_eq!(payload, want);
+    }
+
+    #[test]
+    fn gap_s2c_18_delete_chat_signature_and_index() {
+        let signature = [9u8; 256];
+        let (id, payload) =
+            encode_play_delete_chat(PlayChatDeletion::Signature(&signature)).unwrap();
+        assert_eq!(id, 0x1c);
+        let mut want = vec![0u8];
+        want.extend_from_slice(&signature);
+        assert_eq!(payload, want);
+        let (_, payload) = encode_play_delete_chat(PlayChatDeletion::Indexed(5)).unwrap();
+        assert_eq!(payload, vec![6]);
+    }
+
+    #[test]
+    fn gap_s2c_18_horse_screen_open_layout() {
+        let (id, payload) = encode_play_horse_screen_open(5, 2, 42);
+        assert_eq!(id, 0x23);
+        assert_eq!(payload, vec![5, 2, 0, 0, 0, 42]);
+    }
+
+    #[test]
+    fn gap_s2c_18_map_item_data_layout() {
+        // Map 7, scale 1, unlocked, an empty decoration list, no patch.
+        let (id, payload) = encode_play_map_item_data(7, 1, false, Some(&[]), None).unwrap();
+        assert_eq!(id, 0x2c);
+        assert_eq!(payload, vec![7, 1, 0, 1, 0, 0]);
+        // Locked map with one icon and a 2x2 patch.
+        let icon = PlayMapIcon {
+            kind: 1,
+            x: -4,
+            z: 3,
+            direction: 5,
+            name_nbt: None,
+        };
+        let patch = PlayMapPatch {
+            columns: 2,
+            rows: 2,
+            x: 0,
+            y: 0,
+            colors: &[1, 2, 3, 4],
+        };
+        let (_, payload) =
+            encode_play_map_item_data(7, 2, true, Some(&[icon]), Some(&patch)).unwrap();
+        assert_eq!(
+            payload,
+            vec![7, 2, 1, 1, 1, 1, 0xfc, 3, 5, 0, 2, 2, 0, 0, 4, 1, 2, 3, 4]
+        );
+        assert!(encode_play_map_item_data(-1, 0, false, None, None).is_none());
+    }
+
+    #[test]
+    fn gap_s2c_18_player_look_at_layout() {
+        let (id, payload) =
+            encode_play_player_look_at(1, (1.5, 64.0, -2.5), Some((99, 0))).unwrap();
+        assert_eq!(id, 0x3f);
+        let mut want = vec![1];
+        for c in [1.5f64, 64.0, -2.5] {
+            want.extend_from_slice(&c.to_be_bytes());
+        }
+        want.extend_from_slice(&[1, 99, 0]);
+        assert_eq!(payload, want);
+        // Anchor ids above 1 are not on the 767 wire enum -> fail closed.
+        assert!(encode_play_player_look_at(2, (0.0, 0.0, 0.0), None).is_none());
+        assert!(encode_play_player_look_at(1, (0.0, 0.0, 0.0), Some((1, 2))).is_none());
+    }
+
+    #[test]
+    fn gap_s2c_18_resource_pack_pop_uuid() {
+        let (id, payload) = encode_play_resource_pack_pop(Some([7u8; 16]));
+        assert_eq!(id, 0x45);
+        let mut want = vec![1u8];
+        want.extend_from_slice(&[7u8; 16]);
+        assert_eq!(payload, want);
+        assert_eq!(encode_play_resource_pack_pop(None).1, vec![0]);
+    }
+
+    #[test]
+    fn gap_s2c_18_sound_entity_layout() {
+        let (id, payload) = encode_play_sound_entity(
+            PlaySound::Custom {
+                identifier: "minecraft:entity.sheep.shear",
+                fixed_range: None,
+            },
+            6,
+            42,
+            1.0,
+            1.0,
+            7,
+        )
+        .unwrap();
+        assert_eq!(id, 0x67);
+        let mut want = vec![0u8];
+        let name = b"minecraft:entity.sheep.shear";
+        want.push(name.len() as u8);
+        want.extend_from_slice(name);
+        want.push(0); // no fixed range
+        want.extend_from_slice(&[6, 42]); // source, entity varints
+        want.extend_from_slice(&1.0f32.to_be_bytes());
+        want.extend_from_slice(&1.0f32.to_be_bytes());
+        want.extend_from_slice(&7i64.to_be_bytes());
+        assert_eq!(payload, want);
+        // The registered form writes registry id + 1.
+        let (_, payload) =
+            encode_play_sound_entity(PlaySound::Registered(4), 6, 1, 1.0, 1.0, 0).unwrap();
+        assert_eq!(payload[0], 5);
+    }
+
+    #[test]
+    fn gap_s2c_18_store_cookie_layout() {
+        let (id, payload) = encode_play_store_cookie("k", b"pv").unwrap();
+        assert_eq!(id, 0x6b);
+        assert_eq!(payload, vec![1, b'k', 2, b'p', b'v']);
+        assert!(encode_play_store_cookie("k", &[0u8; 5121]).is_none());
+    }
+
+    #[test]
+    fn gap_s2c_18_update_tags_layout() {
+        let tags = [PlayTag {
+            name: "minecraft:logs",
+            entries: &[1, 2],
+        }];
+        let registries = [PlayTagRegistry {
+            name: "minecraft:block",
+            tags: &tags,
+        }];
+        let (id, payload) = encode_play_update_tags(&registries);
+        assert_eq!(id, 0x78);
+        let mut want = vec![1, 15];
+        want.extend_from_slice(b"minecraft:block");
+        want.push(1); // tag count
+        want.push(14);
+        want.extend_from_slice(b"minecraft:logs");
+        want.extend_from_slice(&[2, 1, 2]); // entry count + two member ids
+        assert_eq!(payload, want);
+    }
+
+    #[test]
+    fn gap_s2c_18_update_tags_tag_resolvers() {
+        assert_eq!(tag_item_wire_id("minecraft:stone"), Some(1));
+        assert_eq!(tag_item_wire_id("minecraft:not_a_real_item"), None);
+        assert_eq!(tag_biome_wire_id("minecraft:plains"), Some(39));
+        assert_eq!(tag_biome_wire_id("minecraft:not_a_biome"), None);
+        assert_eq!(tag_fluid_wire_id("minecraft:water"), Some(2));
+        assert_eq!(tag_fluid_wire_id("minecraft:lava"), Some(4));
+        assert_eq!(tag_fluid_wire_id("minecraft:not_a_fluid"), None);
+        assert_eq!(tag_etype_wire_id("minecraft:zombie"), name_to_etype("minecraft:zombie").map(|v| v as i32));
+    }
+
+    #[test]
+    fn gap_s2c_18_set_projectile_power_layout() {
+        let (id, payload) = encode_play_set_projectile_power(42, 0.1);
+        assert_eq!(id, 0x79);
+        let mut want = vec![42];
+        want.extend_from_slice(&0.1f64.to_be_bytes());
+        assert_eq!(payload, want);
+    }
+
+    #[test]
+    fn gap_s2c_18_custom_report_details_layout() {
+        let (id, payload) =
+            encode_play_custom_report_details(&[("abuse_type", "spam"), ("id", "42")]);
+        assert_eq!(id, 0x7a);
+        let mut want = vec![2, 10];
+        want.extend_from_slice(b"abuse_type");
+        want.push(4);
+        want.extend_from_slice(b"spam");
+        want.push(2);
+        want.extend_from_slice(b"id");
+        want.push(2);
+        want.extend_from_slice(b"42");
+        assert_eq!(payload, want);
+    }
+
+    #[test]
+    fn gap_s2c_18_server_links_layout() {
+        let nbt = text_component_nbt("Website");
+        let (id, payload) = encode_play_server_links(&[
+            (PlayServerLinkLabel::BuiltIn(1), "https://example.com"),
+            (PlayServerLinkLabel::Custom(&nbt), "https://example.org"),
+        ]);
+        assert_eq!(id, 0x7b);
+        let mut want = vec![2, 1, 1, 19];
+        want.extend_from_slice(b"https://example.com");
+        want.push(0);
+        want.extend_from_slice(&nbt);
+        want.push(19);
+        want.extend_from_slice(b"https://example.org");
+        assert_eq!(payload, want);
     }
 }
