@@ -9542,8 +9542,8 @@ fn set_block_if_inner_dim(
     // Only Overworld reaches this point (the early return above handles the other
     // dimensions), but pass `dim` so the patched store slot keeps its dimension key.
     store_patch(dim, x, y, z, st);
-    let blocking_changed = breg().map_or(true, |r| (r.opacity_of(old) > 0) != (r.opacity_of(st) > 0));
-    bump_world_epoch_dim_opts(dim, x, z, blocking_changed);
+    let light_changed = breg().map_or(true, |r| light_properties(r, old) != light_properties(r, st));
+    bump_world_epoch_dim_opts(dim, x, z, light_changed);
     note_light_edit(dim, Position::new(x, y, z), old, st);
     let native_fluid_controlled = generated_fluid_changed((x, y, z), old, st);
     if st != old {
@@ -9756,8 +9756,8 @@ fn set_block_if_dim_edit(
     // Overworld slot at the same `(cx, cz)`.
     band_patch_dim(dim, x, y, z, st);
     store_patch(dim, x, y, z, st);
-    let blocking_changed = breg().map_or(true, |r| (r.opacity_of(old) > 0) != (r.opacity_of(st) > 0));
-    bump_world_epoch_dim_opts(dim, x, z, blocking_changed);
+    let light_changed = breg().map_or(true, |r| light_properties(r, old) != light_properties(r, st));
+    bump_world_epoch_dim_opts(dim, x, z, light_changed);
     note_light_edit(dim, Position::new(x, y, z), old, st);
     if old != st {
         // The Overworld path does this in `set_block_if_inner_dim`: a mined neighbour
