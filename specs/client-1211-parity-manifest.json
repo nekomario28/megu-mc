@@ -1,0 +1,3112 @@
+{
+  "manifest": "client-1211-parity-manifest",
+  "version": 1,
+  "license": "LGPL-3.0-or-later",
+  "target": {
+    "minecraft": "1.21.1",
+    "protocol": 767
+  },
+  "gate": {
+    "tool": "tools/client_parity_gate.py",
+    "statuses": [
+      "WIRED_LIVE",
+      "KERNEL_ONLY",
+      "MISSING"
+    ],
+    "description": "WIRED_LIVE: kernel_symbol is declared in kernel_file and referenced by at least one non-test live_consumers file. KERNEL_ONLY: declared in kernel_file but not referenced by any live consumer. MISSING: kernel_symbol (or kernel_file) does not exist yet; entries marked status=planned are acknowledged gaps."
+  },
+  "categories": [
+    "f3_debug_chords",
+    "menu_screens",
+    "entity_rig_coverage",
+    "block_entity_renderers",
+    "hud_and_qol",
+    "physics_and_input",
+    "rendering_and_assets",
+    "audio_and_protocol"
+  ],
+  "features": [
+    {
+      "id": "f3.a_reload_chunks",
+      "category": "f3_debug_chords",
+      "description": "Vanilla F3+A debug chord: Reload all loaded chunks.",
+      "kernel_file": "client-gpu/src/window.rs",
+      "kernel_symbol": "f3_debug_a_reload_chunks",
+      "live_consumers": [
+        "client-gpu/src/window.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "f3.b_hitboxes",
+      "category": "f3_debug_chords",
+      "description": "Vanilla F3+B debug chord: Toggle the entity_hitboxes debug renderer (gated by reduced_debug_info).",
+      "kernel_file": "client-gpu/src/window.rs",
+      "kernel_symbol": "f3_debug_b_hitboxes",
+      "live_consumers": [
+        "client-gpu/src/window.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "f3.c_copy_location",
+      "category": "f3_debug_chords",
+      "description": "Vanilla F3+C debug chord: Copy player location as a /execute in <dim> run tp @s <pos> <rot> command; hold 10s for the manual debug crash.",
+      "kernel_file": "client-gpu/src/window.rs",
+      "kernel_symbol": "f3_debug_c_copy_location",
+      "live_consumers": [
+        "client-gpu/src/window.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "f3.d_clear_chat",
+      "category": "f3_debug_chords",
+      "description": "Vanilla F3+D debug chord: Clear chat history while keeping typed lines accessible via up/down.",
+      "kernel_file": "client-gpu/src/window.rs",
+      "kernel_symbol": "f3_debug_d_clear_chat",
+      "live_consumers": [
+        "client-gpu/src/window.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "f3.f4_game_mode_switcher",
+      "category": "f3_debug_chords",
+      "description": "Vanilla F3+F4 debug chord: Open the game-mode switcher overlay (operator permission required).",
+      "kernel_file": "client-gpu/src/window.rs",
+      "kernel_symbol": "f3_debug_f4_game_mode_switcher",
+      "live_consumers": [
+        "client-gpu/src/window.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "f3.g_chunk_borders",
+      "category": "f3_debug_chords",
+      "description": "Vanilla F3+G debug chord: Toggle the chunk_borders debug renderer.",
+      "kernel_file": "client-gpu/src/window.rs",
+      "kernel_symbol": "f3_debug_g_chunk_borders",
+      "live_consumers": [
+        "client-gpu/src/window.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "f3.h_advanced_tooltips",
+      "category": "f3_debug_chords",
+      "description": "Vanilla F3+H debug chord: Toggle advanced item tooltips (registry ids, durability, enchantments).",
+      "kernel_file": "client-gpu/src/window.rs",
+      "kernel_symbol": "f3_debug_h_advanced_tooltips",
+      "live_consumers": [
+        "client-gpu/src/window.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "f3.i_copy_target_data",
+      "category": "f3_debug_chords",
+      "description": "Vanilla F3+I debug chord: Copy the looked-at block/entity data as a command (Shift copies client data).",
+      "kernel_file": "client-gpu/src/window.rs",
+      "kernel_symbol": "f3_debug_i_copy_target_data",
+      "live_consumers": [
+        "client-gpu/src/window.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "f3.n_spectator_toggle",
+      "category": "f3_debug_chords",
+      "description": "Vanilla F3+N debug chord: Cycle between spectator mode and the previous game mode.",
+      "kernel_file": "client-gpu/src/window.rs",
+      "kernel_symbol": "f3_debug_n_spectator_toggle",
+      "live_consumers": [
+        "client-gpu/src/window.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "f3.p_pause_on_focus_loss",
+      "category": "f3_debug_chords",
+      "description": "Vanilla F3+P debug chord: Toggle pause-when-unfocused (auto-pause) option.",
+      "kernel_file": "client-gpu/src/window.rs",
+      "kernel_symbol": "f3_debug_p_pause_on_focus_loss",
+      "live_consumers": [
+        "client-gpu/src/window.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "f3.q_help_overlay",
+      "category": "f3_debug_chords",
+      "description": "Vanilla F3+Q debug chord: Show the debug hotkey help overlay listing all F3 chords.",
+      "kernel_file": "client-gpu/src/window.rs",
+      "kernel_symbol": "f3_debug_q_help_overlay",
+      "live_consumers": [
+        "client-gpu/src/window.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "f3.t_reload_resourcepacks",
+      "category": "f3_debug_chords",
+      "description": "Vanilla F3+T debug chord: Reload resource packs (textures, models, sounds).",
+      "kernel_file": "client-gpu/src/window.rs",
+      "kernel_symbol": "f3_debug_t_reload_resourcepacks",
+      "live_consumers": [
+        "client-gpu/src/window.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "f3.1_profiler_chart",
+      "category": "f3_debug_chords",
+      "description": "Vanilla F3+1 debug chord: Toggle the profiler pie chart on the debug screen.",
+      "kernel_file": "client-gpu/src/window.rs",
+      "kernel_symbol": "f3_debug_1_profiler_chart",
+      "live_consumers": [
+        "client-gpu/src/window.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "f3.2_fps_chart",
+      "category": "f3_debug_chords",
+      "description": "Vanilla F3+2 debug chord: Toggle the FPS/TPS frame-time graph on the debug screen.",
+      "kernel_file": "client-gpu/src/window.rs",
+      "kernel_symbol": "f3_debug_2_fps_chart",
+      "live_consumers": [
+        "client-gpu/src/window.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "f3.3_network_chart",
+      "category": "f3_debug_chords",
+      "description": "Vanilla F3+3 debug chord: Toggle the bandwidth/ping network charts on the debug screen.",
+      "kernel_file": "client-gpu/src/window.rs",
+      "kernel_symbol": "f3_debug_3_network_chart",
+      "live_consumers": [
+        "client-gpu/src/window.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "menu.000_generic_9x1",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 0 \u2014 Generic 9x1 chest menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.001_generic_9x2",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 1 \u2014 Generic 9x2 chest menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.002_generic_9x3",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 2 \u2014 Generic 9x3 chest menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.003_generic_9x4",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 3 \u2014 Generic 9x4 chest menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.004_generic_9x5",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 4 \u2014 Generic 9x5 chest menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.005_generic_9x6",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 5 \u2014 Generic 9x6 chest menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.006_generic_3x3",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 6 \u2014 Generic 3x3 dishopper menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.007_crafter_3x3",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 7 \u2014 Crafter 3x3 automatic crafting menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.008_anvil",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 8 \u2014 Anvil rename/repair menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.009_beacon",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 9 \u2014 Beacon effect/payment menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.010_blast_furnace",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 10 \u2014 Blast furnace smelting menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.011_brewing_stand",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 11 \u2014 Brewing stand potion menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.012_crafting",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 12 \u2014 2x2 player crafting menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.013_enchantment",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 13 \u2014 Enchantment table menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.014_furnace",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 14 \u2014 Furnace smelting menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.015_grindstone",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 15 \u2014 Grindstone disenchant/repair menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.016_hopper",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 16 \u2014 Hopper menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.017_lectern",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 17 \u2014 Lectern book/page menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.018_loom",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 18 \u2014 Loom banner-pattern menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.019_merchant",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 19 \u2014 Villager merchant trade menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.020_shulker_box",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 20 \u2014 Shulker box storage menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.021_smithing",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 21 \u2014 Smithing template upgrade menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.022_smoker",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 22 \u2014 Smoker food menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.023_cartography_table",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 23 \u2014 Cartography table map menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "menu.024_stonecutter",
+      "category": "menu_screens",
+      "description": "minecraft:menu registry id 24 \u2014 Stonecutter recipe-selection menu.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "menu_schema",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.000_allay",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 0 (minecraft:allay) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.001_area_effect_cloud",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 1 (minecraft:area_effect_cloud) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.002_armadillo",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 2 (minecraft:armadillo) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.003_armor_stand",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 3 (minecraft:armor_stand) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.004_arrow",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 4 (minecraft:arrow) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.005_axolotl",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 5 (minecraft:axolotl) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.006_bat",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 6 (minecraft:bat) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.007_bee",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 7 (minecraft:bee) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.008_blaze",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 8 (minecraft:blaze) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.009_block_display",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 9 (minecraft:block_display) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.010_boat",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 10 (minecraft:boat) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.011_bogged",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 11 (minecraft:bogged) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.012_breeze",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 12 (minecraft:breeze) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.013_breeze_wind_charge",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 13 (minecraft:breeze_wind_charge) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.014_camel",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 14 (minecraft:camel) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.015_cat",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 15 (minecraft:cat) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.016_cave_spider",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 16 (minecraft:cave_spider) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.017_chest_boat",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 17 (minecraft:chest_boat) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.018_chest_minecart",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 18 (minecraft:chest_minecart) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.019_chicken",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 19 (minecraft:chicken) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.020_cod",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 20 (minecraft:cod) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.021_command_block_minecart",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 21 (minecraft:command_block_minecart) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.022_cow",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 22 (minecraft:cow) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.023_creeper",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 23 (minecraft:creeper) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.024_dolphin",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 24 (minecraft:dolphin) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.025_donkey",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 25 (minecraft:donkey) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.026_dragon_fireball",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 26 (minecraft:dragon_fireball) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.027_drowned",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 27 (minecraft:drowned) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.028_egg",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 28 (minecraft:egg) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.029_elder_guardian",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 29 (minecraft:elder_guardian) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.030_end_crystal",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 30 (minecraft:end_crystal) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.031_ender_dragon",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 31 (minecraft:ender_dragon) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.032_ender_pearl",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 32 (minecraft:ender_pearl) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.033_enderman",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 33 (minecraft:enderman) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.034_endermite",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 34 (minecraft:endermite) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.035_evoker",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 35 (minecraft:evoker) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.036_evoker_fangs",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 36 (minecraft:evoker_fangs) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.037_experience_bottle",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 37 (minecraft:experience_bottle) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.038_experience_orb",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 38 (minecraft:experience_orb) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.039_eye_of_ender",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 39 (minecraft:eye_of_ender) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.040_falling_block",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 40 (minecraft:falling_block) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.041_firework_rocket",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 41 (minecraft:firework_rocket) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.042_fox",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 42 (minecraft:fox) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.043_frog",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 43 (minecraft:frog) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.044_furnace_minecart",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 44 (minecraft:furnace_minecart) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.045_ghast",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 45 (minecraft:ghast) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.046_giant",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 46 (minecraft:giant) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.047_glow_item_frame",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 47 (minecraft:glow_item_frame) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.048_glow_squid",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 48 (minecraft:glow_squid) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.049_goat",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 49 (minecraft:goat) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.050_guardian",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 50 (minecraft:guardian) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.051_hoglin",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 51 (minecraft:hoglin) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.052_hopper_minecart",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 52 (minecraft:hopper_minecart) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.053_horse",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 53 (minecraft:horse) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.054_husk",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 54 (minecraft:husk) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.055_illusioner",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 55 (minecraft:illusioner) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.056_interaction",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 56 (minecraft:interaction) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.057_iron_golem",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 57 (minecraft:iron_golem) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.058_item",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 58 (minecraft:item) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.059_item_display",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 59 (minecraft:item_display) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.060_item_frame",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 60 (minecraft:item_frame) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.061_ominous_item_spawner",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 61 (minecraft:ominous_item_spawner) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.062_fireball",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 62 (minecraft:fireball) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.063_leash_knot",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 63 (minecraft:leash_knot) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.064_lightning_bolt",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 64 (minecraft:lightning_bolt) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.065_llama",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 65 (minecraft:llama) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.066_llama_spit",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 66 (minecraft:llama_spit) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.067_magma_cube",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 67 (minecraft:magma_cube) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.068_marker",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 68 (minecraft:marker) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.069_minecart",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 69 (minecraft:minecart) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.070_mooshroom",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 70 (minecraft:mooshroom) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.071_mule",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 71 (minecraft:mule) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.072_ocelot",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 72 (minecraft:ocelot) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.073_painting",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 73 (minecraft:painting) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.074_panda",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 74 (minecraft:panda) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.075_parrot",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 75 (minecraft:parrot) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.076_phantom",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 76 (minecraft:phantom) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.077_pig",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 77 (minecraft:pig) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.078_piglin",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 78 (minecraft:piglin) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.079_piglin_brute",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 79 (minecraft:piglin_brute) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.080_pillager",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 80 (minecraft:pillager) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.081_polar_bear",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 81 (minecraft:polar_bear) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.082_potion",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 82 (minecraft:potion) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.083_pufferfish",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 83 (minecraft:pufferfish) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.084_rabbit",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 84 (minecraft:rabbit) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.085_ravager",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 85 (minecraft:ravager) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.086_salmon",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 86 (minecraft:salmon) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.087_sheep",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 87 (minecraft:sheep) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.088_shulker",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 88 (minecraft:shulker) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.089_shulker_bullet",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 89 (minecraft:shulker_bullet) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.090_silverfish",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 90 (minecraft:silverfish) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.091_skeleton",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 91 (minecraft:skeleton) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.092_skeleton_horse",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 92 (minecraft:skeleton_horse) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.093_slime",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 93 (minecraft:slime) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.094_small_fireball",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 94 (minecraft:small_fireball) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.095_sniffer",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 95 (minecraft:sniffer) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.096_snow_golem",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 96 (minecraft:snow_golem) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.097_snowball",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 97 (minecraft:snowball) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.098_spawner_minecart",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 98 (minecraft:spawner_minecart) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.099_spectral_arrow",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 99 (minecraft:spectral_arrow) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.100_spider",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 100 (minecraft:spider) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.101_squid",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 101 (minecraft:squid) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.102_stray",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 102 (minecraft:stray) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.103_strider",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 103 (minecraft:strider) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.104_tadpole",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 104 (minecraft:tadpole) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.105_text_display",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 105 (minecraft:text_display) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.106_tnt",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 106 (minecraft:tnt) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.107_tnt_minecart",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 107 (minecraft:tnt_minecart) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.108_trader_llama",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 108 (minecraft:trader_llama) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.109_trident",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 109 (minecraft:trident) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.110_tropical_fish",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 110 (minecraft:tropical_fish) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.111_turtle",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 111 (minecraft:turtle) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.112_vex",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 112 (minecraft:vex) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.113_villager",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 113 (minecraft:villager) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.114_vindicator",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 114 (minecraft:vindicator) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.115_wandering_trader",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 115 (minecraft:wandering_trader) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.116_warden",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 116 (minecraft:warden) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.117_wind_charge",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 117 (minecraft:wind_charge) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.118_witch",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 118 (minecraft:witch) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.119_wither",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 119 (minecraft:wither) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.120_wither_skeleton",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 120 (minecraft:wither_skeleton) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.121_wither_skull",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 121 (minecraft:wither_skull) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.122_wolf",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 122 (minecraft:wolf) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.123_zoglin",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 123 (minecraft:zoglin) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.124_zombie",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 124 (minecraft:zombie) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.125_zombie_horse",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 125 (minecraft:zombie_horse) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.126_zombie_villager",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 126 (minecraft:zombie_villager) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.127_zombified_piglin",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 127 (minecraft:zombified_piglin) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.128_player",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 128 (minecraft:player) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.129_fishing_bobber",
+      "category": "entity_rig_coverage",
+      "description": "EntityType protocol id 129 (minecraft:fishing_bobber) classified by the vanilla 1.21.1 entity rig table (width/height + archetype).",
+      "kernel_file": "client-port/src/entity_rig.rs",
+      "kernel_symbol": "classify_entity_rig",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.skin_layers_3d",
+      "category": "entity_rig_coverage",
+      "description": "3D player skin outer layers (hat/jacket/sleeves/pants extruded half a texel outward from the 64x64 RGBA overlay, LOD-gated).",
+      "kernel_file": "client-port/src/vanilla_plus_visuals.rs",
+      "kernel_symbol": "build_3d_skin_layer_part",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "entity_rig.jem_model_format",
+      "category": "entity_rig_coverage",
+      "description": "JSON Entity Model (.jem) container decode for custom entity rigs.",
+      "kernel_file": "client-kernel/src/skeletal_anim.rs",
+      "kernel_symbol": "parse_jem_model",
+      "live_consumers": [
+        "client-app/src/world.rs",
+        "client-gpu/src/live_session.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "entity_rig.jpm_model_format",
+      "category": "entity_rig_coverage",
+      "description": "JSON Entity Model Part (.jpm) decode for custom entity rigs.",
+      "kernel_file": "client-kernel/src/skeletal_anim.rs",
+      "kernel_symbol": "parse_jpm_model",
+      "live_consumers": [
+        "client-app/src/world.rs",
+        "client-gpu/src/live_session.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "ber.chest",
+      "category": "block_entity_renderers",
+      "description": "Vanilla block-entity renderer family: Chest/ender/trapped chest lid+body renderer family.",
+      "kernel_file": "client-port/src/ber_instancing.rs",
+      "kernel_symbol": "VanillaBerKind::Chest",
+      "live_consumers": [
+        "client-port/src/gpu_pipeline.rs",
+        "client-port/src/mesher.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "ber.sign",
+      "category": "block_entity_renderers",
+      "description": "Vanilla block-entity renderer family: Standing/wanging sign renderer family (all wood types).",
+      "kernel_file": "client-port/src/ber_instancing.rs",
+      "kernel_symbol": "VanillaBerKind::Sign",
+      "live_consumers": [
+        "client-port/src/gpu_pipeline.rs",
+        "client-port/src/mesher.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "ber.banner",
+      "category": "block_entity_renderers",
+      "description": "Vanilla block-entity renderer family: Banner cloth renderer family.",
+      "kernel_file": "client-port/src/ber_instancing.rs",
+      "kernel_symbol": "VanillaBerKind::Banner",
+      "live_consumers": [
+        "client-port/src/gpu_pipeline.rs",
+        "client-port/src/mesher.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "ber.beacon",
+      "category": "block_entity_renderers",
+      "description": "Vanilla block-entity renderer family: Beacon beam renderer family.",
+      "kernel_file": "client-port/src/ber_instancing.rs",
+      "kernel_symbol": "VanillaBerKind::Beacon",
+      "live_consumers": [
+        "client-port/src/gpu_pipeline.rs",
+        "client-port/src/mesher.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "ber.bed",
+      "category": "block_entity_renderers",
+      "description": "Vanilla block-entity renderer family: Bed renderer family.",
+      "kernel_file": "client-port/src/ber_instancing.rs",
+      "kernel_symbol": "VanillaBerKind::Bed",
+      "live_consumers": [
+        "client-port/src/gpu_pipeline.rs",
+        "client-port/src/mesher.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "ber.skull",
+      "category": "block_entity_renderers",
+      "description": "Vanilla block-entity renderer family: Player/other/mob/wither skull renderer family.",
+      "kernel_file": "client-port/src/ber_instancing.rs",
+      "kernel_symbol": "VanillaBerKind::Skull",
+      "live_consumers": [
+        "client-port/src/gpu_pipeline.rs",
+        "client-port/src/mesher.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "ber.item_frame",
+      "category": "block_entity_renderers",
+      "description": "Vanilla block-entity renderer family: Item frame + glow item frame renderer family.",
+      "kernel_file": "client-port/src/ber_instancing.rs",
+      "kernel_symbol": "VanillaBerKind::ItemFrame",
+      "live_consumers": [
+        "client-port/src/gpu_pipeline.rs",
+        "client-port/src/mesher.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "ber.campfire",
+      "category": "block_entity_renderers",
+      "description": "Vanilla block-entity renderer family: Campfire/soul campfire renderer family.",
+      "kernel_file": "client-port/src/ber_instancing.rs",
+      "kernel_symbol": "VanillaBerKind::Campfire",
+      "live_consumers": [
+        "client-port/src/gpu_pipeline.rs",
+        "client-port/src/mesher.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "ber.brewing_stand",
+      "category": "block_entity_renderers",
+      "description": "Vanilla block-entity renderer family: Brewing stand stand+bottle renderer family.",
+      "kernel_file": "client-port/src/ber_instancing.rs",
+      "kernel_symbol": "VanillaBerKind::BrewingStand",
+      "live_consumers": [
+        "client-port/src/gpu_pipeline.rs",
+        "client-port/src/mesher.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "ber.lectern",
+      "category": "block_entity_renderers",
+      "description": "Vanilla block-entity renderer family: Lectern book renderer family.",
+      "kernel_file": "client-port/src/ber_instancing.rs",
+      "kernel_symbol": "VanillaBerKind::Lectern",
+      "live_consumers": [
+        "client-port/src/gpu_pipeline.rs",
+        "client-port/src/mesher.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "ber.decorated_pot",
+      "category": "block_entity_renderers",
+      "description": "Vanilla block-entity renderer family: Decorated pot renderer family.",
+      "kernel_file": "client-port/src/ber_instancing.rs",
+      "kernel_symbol": "VanillaBerKind::DecoratedPot",
+      "live_consumers": [
+        "client-port/src/gpu_pipeline.rs",
+        "client-port/src/mesher.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "ber.shulker_box",
+      "category": "block_entity_renderers",
+      "description": "Vanilla block-entity renderer family: Shulker box lid renderer family.",
+      "kernel_file": "client-port/src/ber_instancing.rs",
+      "kernel_symbol": "VanillaBerKind::ShulkerBox",
+      "live_consumers": [
+        "client-port/src/gpu_pipeline.rs",
+        "client-port/src/mesher.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "hud.vitals",
+      "category": "hud_and_qol",
+      "description": "Vitals cluster: health/absorption/armor/hunger/air/XP bars + hotbar level text (SetHealth feeds health+food live).",
+      "kernel_file": "client-ui/src/draw.rs",
+      "kernel_symbol": "progress_bar",
+      "live_consumers": [
+        "client-ui/src/layout.rs",
+        "client-gpu/src/window.rs"
+      ]
+    },
+    {
+      "id": "hud.hotbar",
+      "category": "hud_and_qol",
+      "description": "Hotbar + offhand item + selected-slot HUD strip.",
+      "kernel_file": "client-ui/src/state.rs",
+      "kernel_symbol": "HudState",
+      "live_consumers": [
+        "client-ui/src/layout.rs",
+        "client-gpu/src/window.rs"
+      ]
+    },
+    {
+      "id": "hud.status_effects",
+      "category": "hud_and_qol",
+      "description": "Status-effect badges (MagicHudState StatusBadgeState overlay).",
+      "kernel_file": "client-ui/src/magic_hud.rs",
+      "kernel_symbol": "StatusBadgeState",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/window.rs"
+      ]
+    },
+    {
+      "id": "hud.bossbar",
+      "category": "hud_and_qol",
+      "description": "Boss-bar overlay rows (HudState.bossbars render path is live; the boss_bar S2C feed is tracked under protocol.bossbar_s2c).",
+      "kernel_file": "client-ui/src/state.rs",
+      "kernel_symbol": "HudState",
+      "live_consumers": [
+        "client-ui/src/layout.rs",
+        "client-gpu/src/window.rs",
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "hud.scoreboard",
+      "category": "hud_and_qol",
+      "description": "Scoreboard sidebar widget (objective scores + display slots).",
+      "kernel_file": "client-ui/src/state.rs",
+      "kernel_symbol": "ScoreboardState",
+      "live_consumers": [
+        "client-ui/src/layout.rs",
+        "client-gpu/src/window.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "hud.actionbar",
+      "category": "hud_and_qol",
+      "description": "Action-bar overlay line fed by system_chat overlay=true packets.",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "PlayEvent::SystemChat",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs",
+        "client-app/src/sim.rs"
+      ]
+    },
+    {
+      "id": "hud.title",
+      "category": "hud_and_qol",
+      "description": "Title/subtitle-times overlay widget (Set Titles packet + render).",
+      "kernel_file": "client-ui/src/state.rs",
+      "kernel_symbol": "TitleOverlayState",
+      "live_consumers": [
+        "client-ui/src/layout.rs",
+        "client-gpu/src/window.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "hud.tab_list",
+      "category": "hud_and_qol",
+      "description": "Hold-Tab player list overlay (HudState.players render path live; player-info S2C feed tracked under protocol.tab_list_s2c).",
+      "kernel_file": "client-ui/src/state.rs",
+      "kernel_symbol": "HudState",
+      "live_consumers": [
+        "client-ui/src/layout.rs",
+        "client-gpu/src/window.rs",
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "hud.chat",
+      "category": "hud_and_qol",
+      "description": "Chat scrollback widget (chat_lines rendered; fed by system_chat).",
+      "kernel_file": "client-ui/src/state.rs",
+      "kernel_symbol": "HudState",
+      "live_consumers": [
+        "client-ui/src/layout.rs",
+        "client-gpu/src/window.rs",
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "hud.chat_autocomplete",
+      "category": "hud_and_qol",
+      "description": "Zsh-style chat/command autocomplete suggestions.",
+      "kernel_file": "client-kernel/src/command.rs",
+      "kernel_symbol": "complete_suggestions",
+      "live_consumers": [
+        "client-app/src/session.rs",
+        "client-gpu/src/window.rs"
+      ]
+    },
+    {
+      "id": "hud.f3_debug_overlay",
+      "category": "hud_and_qol",
+      "description": "Full F3 debug overlay (multi-line info text + six graphs); today only a one-line actionbar diagnostics tag exists via show_diagnostics.",
+      "kernel_file": "client-gpu/src/window.rs",
+      "kernel_symbol": "f3_debug_overlay",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-gpu/src/renderer.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "hud.subtitles",
+      "category": "hud_and_qol",
+      "description": "Directional subtitle rows (SubtitleHudState, spatial-audio cues).",
+      "kernel_file": "client-ui/src/subtitle_hud.rs",
+      "kernel_symbol": "SubtitleHudState",
+      "live_consumers": [
+        "client-ui/src/layout.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "hud.jade_looking_at",
+      "category": "hud_and_qol",
+      "description": "Jade-style looking-at-block info HUD (target block/entity tooltip).",
+      "kernel_file": "client-ui/src/magic_hud.rs",
+      "kernel_symbol": "LookingAtBlockState",
+      "live_consumers": [
+        "client-ui/src/layout.rs",
+        "client-gpu/src/window.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "hud.mouse_tweaks",
+      "category": "hud_and_qol",
+      "description": "MouseTweaks drag-to-split / drag-paint container item moves.",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "DragState",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "hud.inventory_sort",
+      "category": "hud_and_qol",
+      "description": "Inventory sort button + sort-key handling (Inventory Sort QoL).",
+      "kernel_file": "client-ui/src/container_screen.rs",
+      "kernel_symbol": "InventorySortState",
+      "live_consumers": [
+        "client-ui/src/layout.rs",
+        "client-gpu/src/window.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "physics.raycast_voxel_dda",
+      "category": "physics_and_input",
+      "description": "Voxel DDA block raycast with reach limits and fluid clip modes.",
+      "kernel_file": "client-kernel/src/raycast.rs",
+      "kernel_symbol": "raycast_blocks",
+      "live_consumers": [
+        "client-app/src/sim.rs",
+        "client-app/src/world.rs",
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "physics.raycast_entities",
+      "category": "physics_and_input",
+      "description": "Entity AABB raycast picking with survival/creative reach.",
+      "kernel_file": "client-kernel/src/raycast.rs",
+      "kernel_symbol": "raycast_entities",
+      "live_consumers": [
+        "client-app/src/sim.rs",
+        "client-app/src/world.rs",
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "physics.movement_kernel",
+      "category": "physics_and_input",
+      "description": "Vanilla player movement physics step (gravity, drag, jump, sneak, sneak-edge, fluids, climb, elytra, creative fly).",
+      "kernel_file": "client-kernel/src/player_physics.rs",
+      "kernel_symbol": "step_player_physics",
+      "live_consumers": [
+        "client-app/src/sim.rs",
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "physics.aabb_collision",
+      "category": "physics_and_input",
+      "description": "AABB sweep collision resolve with max-up-step.",
+      "kernel_file": "client-kernel/src/physics.rs",
+      "kernel_symbol": "collide",
+      "live_consumers": [
+        "client-app/src/sim.rs",
+        "client-app/src/world.rs"
+      ]
+    },
+    {
+      "id": "physics.fluids",
+      "category": "physics_and_input",
+      "description": "Fluid (water/lava) impulse query for movement physics.",
+      "kernel_file": "client-kernel/src/physics.rs",
+      "kernel_symbol": "fluid_impulse",
+      "live_consumers": [
+        "client-app/src/sim.rs",
+        "client-app/src/world.rs"
+      ]
+    },
+    {
+      "id": "physics.sneak_edge_prevent",
+      "category": "physics_and_input",
+      "description": "Sneak edge-prevent: back off from block edges while sneaking.",
+      "kernel_file": "client-kernel/src/player_physics.rs",
+      "kernel_symbol": "back_off_from_edge",
+      "live_consumers": [
+        "client-app/src/sim.rs",
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "physics.climbables",
+      "category": "physics_and_input",
+      "description": "Climbable surfaces (ladders/vines/scaffolding) vertical movement.",
+      "kernel_file": "client-kernel/src/player_physics.rs",
+      "kernel_symbol": "SurfaceKind",
+      "live_consumers": [
+        "client-app/src/sim.rs",
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "physics.elytra",
+      "category": "physics_and_input",
+      "description": "Elytra flight state + glide physics.",
+      "kernel_file": "client-kernel/src/player_physics.rs",
+      "kernel_symbol": "PlayerPhysicsState",
+      "live_consumers": [
+        "client-app/src/sim.rs",
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "input.f5_camera",
+      "category": "physics_and_input",
+      "description": "F5 camera mode cycle: first person / third-person back / third-person front.",
+      "kernel_file": "client-gpu/src/lib.rs",
+      "kernel_symbol": "Camera",
+      "live_consumers": [
+        "client-gpu/src/window.rs"
+      ]
+    },
+    {
+      "id": "input.smooth_zoom",
+      "category": "physics_and_input",
+      "description": "Smooth zoom (hold-C style) with configurable divisor + smoothing.",
+      "kernel_file": "client-app/src/audio_qol.rs",
+      "kernel_symbol": "ZoomState",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/render.rs"
+      ]
+    },
+    {
+      "id": "input.mouse_look",
+      "category": "physics_and_input",
+      "description": "Mouse-look camera control with sensitivity scaling.",
+      "kernel_file": "client-gpu/src/lib.rs",
+      "kernel_symbol": "apply_mouse_look",
+      "live_consumers": [
+        "client-gpu/src/window.rs"
+      ]
+    },
+    {
+      "id": "input.movement_packets",
+      "category": "physics_and_input",
+      "description": "C2S movement packet stream (position/rotation + player_input) driven by LiveSession::send_movement from the window loop.",
+      "kernel_file": "client-gpu/src/live_session.rs",
+      "kernel_symbol": "send_movement",
+      "live_consumers": [
+        "client-gpu/src/window.rs"
+      ]
+    },
+    {
+      "id": "input.keybind_offhand_f",
+      "category": "physics_and_input",
+      "description": "Offhand swap keybind (F) + swap hands packet.",
+      "kernel_file": "client-gpu/src/window.rs",
+      "kernel_symbol": "keybind_offhand",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/protocol.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "input.keybind_drop_q",
+      "category": "physics_and_input",
+      "description": "Drop item keybind (Q, Ctrl+Q stack) + player_action packet.",
+      "kernel_file": "client-gpu/src/window.rs",
+      "kernel_symbol": "keybind_drop_item",
+      "live_consumers": [
+        "client-gpu/src/window.rs",
+        "client-app/src/protocol.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "render.block_atlas",
+      "category": "rendering_and_assets",
+      "description": "Block texture atlas packing (AtlasBuilder/PackedAtlas sprite placement).",
+      "kernel_file": "client-port/src/atlas.rs",
+      "kernel_symbol": "PackedAtlas",
+      "live_consumers": [
+        "client-app/src/render.rs",
+        "client-app/src/world.rs",
+        "client-gpu/src/renderer.rs",
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "render.atlas_gutters",
+      "category": "rendering_and_assets",
+      "description": "Atlas gutter padding modes (Wrap/Clamp) + padding texels for bleed-free mips.",
+      "kernel_file": "client-port/src/atlas.rs",
+      "kernel_symbol": "PaddingMode",
+      "live_consumers": [
+        "client-app/src/render.rs",
+        "client-app/src/world.rs",
+        "client-gpu/src/renderer.rs",
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "render.srgb_mipmaps",
+      "category": "rendering_and_assets",
+      "description": "Linear-filtered sRGB mipmap chain build for the atlas.",
+      "kernel_file": "client-port/src/atlas.rs",
+      "kernel_symbol": "build_mipmaps_linear",
+      "live_consumers": [
+        "client-app/src/render.rs",
+        "client-app/src/world.rs",
+        "client-gpu/src/renderer.rs",
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "render.cutout_coverage",
+      "category": "rendering_and_assets",
+      "description": "Cutout (alpha-test) face coverage for leaves/glass/foliage quads.",
+      "kernel_file": "client-port/src/section.rs",
+      "kernel_symbol": "CUTOUT",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "render.model_baker",
+      "category": "rendering_and_assets",
+      "description": "Block/item model baker: elements, faces, UVs -> BakedModelQuad draw batches.",
+      "kernel_file": "client-port/src/model_baker.rs",
+      "kernel_symbol": "BakedModelQuad",
+      "live_consumers": [
+        "client-app/src/render.rs",
+        "client-app/src/world.rs"
+      ]
+    },
+    {
+      "id": "render.blockstates_json",
+      "category": "rendering_and_assets",
+      "description": "blockstates/*.json + model JSON resolution (variants, multipart, uvlock).",
+      "kernel_file": "client-port/src/model_baker.rs",
+      "kernel_symbol": "bake_blockstate",
+      "live_consumers": [
+        "client-app/src/world.rs",
+        "client-app/src/render.rs"
+      ]
+    },
+    {
+      "id": "render.png_decoder",
+      "category": "rendering_and_assets",
+      "description": "PNG texture decoder (asset pipeline currently consumes raw .rgba sprites; vanilla packs ship PNG).",
+      "kernel_file": "client-port/src/asset_pipeline.rs",
+      "kernel_symbol": "decode_png_sprite",
+      "live_consumers": [
+        "client-app/src/render.rs",
+        "client-app/src/world.rs",
+        "client-gpu/src/renderer.rs",
+        "client-gpu/src/live_session.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "render.cascaded_shadows",
+      "category": "rendering_and_assets",
+      "description": "Cascaded GPU shadow maps (cascade splits, dirty-only cache, celestial uniforms).",
+      "kernel_file": "client-port/src/builtin_shadow_wgsl.rs",
+      "kernel_symbol": "ShadowUniforms",
+      "live_consumers": [
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "render.crops_3d",
+      "category": "rendering_and_assets",
+      "description": "3D crop meshes (wheat/carrot/potato/beetroot growth stages).",
+      "kernel_file": "client-port/src/vanilla_plus_3d.rs",
+      "kernel_symbol": "build_3d_crop_mesh",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "render.ore_relief",
+      "category": "rendering_and_assets",
+      "description": "0.5-texel ore relief extrusion on exposed ore faces.",
+      "kernel_file": "client-port/src/vanilla_plus_3d.rs",
+      "kernel_symbol": "build_3d_ore_relief",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "render.connected_textures",
+      "category": "rendering_and_assets",
+      "description": "Connected textures (CTM) horizontal/vertical tile resolution.",
+      "kernel_file": "client-port/src/vanilla_plus_visuals.rs",
+      "kernel_symbol": "resolve_ctm_tile",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "render.better_grass_snow",
+      "category": "rendering_and_assets",
+      "description": "Better-grass overlay + better-snow partial-block rendering.",
+      "kernel_file": "client-port/src/vanilla_plus_visuals.rs",
+      "kernel_symbol": "evaluate_better_grass",
+      "live_consumers": [
+        "client-port/src/mesher.rs",
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "render.particles",
+      "category": "rendering_and_assets",
+      "description": "Particle engine: emitters, ribbons, beams, budget tiers, VFX1 wire codec.",
+      "kernel_file": "client-port/src/vfx_engine.rs",
+      "kernel_symbol": "VfxWorld",
+      "live_consumers": [
+        "client-app/src/render.rs",
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "render.atmosphere_sky_fog",
+      "category": "rendering_and_assets",
+      "description": "Sky/fog evaluation (dimension params, weather, celestial blending).",
+      "kernel_file": "client-kernel/src/entity_interp.rs",
+      "kernel_symbol": "evaluate_sky_and_fog",
+      "live_consumers": [
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "render.biome_atmosphere",
+      "category": "rendering_and_assets",
+      "description": "Per-biome atmosphere blending + chunk fade tracker.",
+      "kernel_file": "client-gpu/src/atmosphere.rs",
+      "kernel_symbol": "BiomeAtmosphereBlender",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "id": "render.voxel_clouds",
+      "category": "rendering_and_assets",
+      "description": "Layered voxel cloud generation + cloud lighting.",
+      "kernel_file": "client-port/src/vanilla_plus_nature.rs",
+      "kernel_symbol": "generate_layered_voxel_clouds",
+      "live_consumers": [
+        "client-gpu/src/atmosphere.rs",
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "audio.s2c_sound_effect",
+      "category": "audio_and_protocol",
+      "description": "S2C sound_effect packet decode -> bounded wire-event queue -> AudioRuntime ingest.",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "WireSoundEvent",
+      "live_consumers": [
+        "client-app/src/audio_out.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "audio.s2c_entity_sound",
+      "category": "audio_and_protocol",
+      "description": "S2C sound_entity packet decode (entity-bound source attachment).",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "WireSoundEvent",
+      "live_consumers": [
+        "client-app/src/audio_out.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "audio.s2c_stop_sound",
+      "category": "audio_and_protocol",
+      "description": "S2C stop_sound packet decode (category/name exclusion stop).",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "WireStopSound",
+      "live_consumers": [
+        "client-app/src/audio_out.rs",
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "audio.vorbis_decode",
+      "category": "audio_and_protocol",
+      "description": "OGG Vorbis decode to mono f32 (symphonia vorbis+ogg).",
+      "kernel_file": "client-app/src/sound_assets.rs",
+      "kernel_symbol": "decode_ogg_mono",
+      "live_consumers": [
+        "client-app/src/audio_out.rs"
+      ]
+    },
+    {
+      "id": "audio.sound_library",
+      "category": "audio_and_protocol",
+      "description": "Sound asset index/library resolution (sounds.json + object store).",
+      "kernel_file": "client-app/src/sound_assets.rs",
+      "kernel_symbol": "SoundLibrary",
+      "live_consumers": [
+        "client-app/src/audio_out.rs"
+      ]
+    },
+    {
+      "id": "audio.spatial_engine",
+      "category": "audio_and_protocol",
+      "description": "Spatial audio engine: HRTF/binaural mix, distance attenuation, Doppler.",
+      "kernel_file": "client-app/src/spatial_audio.rs",
+      "kernel_symbol": "SpatialAudioEngine",
+      "live_consumers": [
+        "client-app/src/session.rs",
+        "client-app/src/audio_out.rs"
+      ]
+    },
+    {
+      "id": "audio.occlusion",
+      "category": "audio_and_protocol",
+      "description": "Acoustic occlusion between listener and source (voxel tracer).",
+      "kernel_file": "client-app/src/spatial_audio.rs",
+      "kernel_symbol": "occlusion_between",
+      "live_consumers": [
+        "client-app/src/session.rs",
+        "client-app/src/audio_out.rs"
+      ]
+    },
+    {
+      "id": "audio.reverb_world",
+      "category": "audio_and_protocol",
+      "description": "Reverb/acoustic world implementation (OpenAirWorld default).",
+      "kernel_file": "client-app/src/session.rs",
+      "kernel_symbol": "OpenAirWorld",
+      "live_consumers": [
+        "client-app/src/audio_out.rs"
+      ]
+    },
+    {
+      "id": "audio.limiter",
+      "category": "audio_and_protocol",
+      "description": "AudioLimiter: per-key concurrency cap + master volume cap mix limiting.",
+      "kernel_file": "client-app/src/audio_qol.rs",
+      "kernel_symbol": "AudioLimiter",
+      "live_consumers": [
+        "client-app/src/session.rs"
+      ]
+    },
+    {
+      "id": "audio.subtitle_cues",
+      "category": "audio_and_protocol",
+      "description": "Sound-event -> directional subtitle cue records drained by the HUD.",
+      "kernel_file": "client-app/src/spatial_audio.rs",
+      "kernel_symbol": "subtitle_cue",
+      "live_consumers": [
+        "client-app/src/session.rs",
+        "client-ui/src/subtitle_hud.rs"
+      ]
+    },
+    {
+      "id": "protocol.cookie_exchange",
+      "category": "audio_and_protocol",
+      "description": "Configuration-phase cookie_request/cookie_response echo + legacy 8-byte keepalive fallback (inside ProtocolClient connect path).",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "ProtocolClient",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "protocol.registry_data",
+      "category": "audio_and_protocol",
+      "description": "Configuration registry_data decode (biome/dimension-type registries feeding chunk decode bounds).",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "ProtocolClient",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "protocol.select_known_packs",
+      "category": "audio_and_protocol",
+      "description": "select_known_packs / finish_configuration handshake completion.",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "ProtocolClient",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "protocol.transfer",
+      "category": "audio_and_protocol",
+      "description": "Login-phase transfer packet handling (server transfer request).",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "handle_transfer_packet",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "protocol.item_data_components",
+      "category": "audio_and_protocol",
+      "description": "Item stack decode with the 24 vanilla data components (damage/enchantments/food/weapon/tool/attribute modifiers...).",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "decode_item_stack_components",
+      "live_consumers": [
+        "client-app/src/protocol.rs",
+        "client-app/src/world.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "protocol.entity_s2c",
+      "category": "audio_and_protocol",
+      "description": "Entity S2C family: spawn_entity, add_entity, set_entity_data, teleport_entity, entity_event, set_equipment, move packets.",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "PlayEvent::AddEntity",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs",
+        "client-app/src/world.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "protocol.ber_s2c",
+      "category": "audio_and_protocol",
+      "description": "Block-entity-data S2C packet decode (BER payload -> renderer state).",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "PlayEvent::BlockEntityData",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs",
+        "client-app/src/world.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "protocol.container_s2c",
+      "category": "audio_and_protocol",
+      "description": "Container S2C family: open_screen, container_set_content, set_slot, container_set_data, recipe/book packets.",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "PlayEvent::OpenScreen",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs",
+        "client-ui/src/container_screen.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "protocol.bossbar_s2c",
+      "category": "audio_and_protocol",
+      "description": "Boss-bar S2C packets (add/remove/update progress/title/color/style).",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "PlayEvent::BossBar",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs",
+        "client-ui/src/state.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "protocol.tab_list_s2c",
+      "category": "audio_and_protocol",
+      "description": "Player-info/tab-list S2C packets (add/update/remove/list/player latency).",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "PlayEvent::PlayerInfo",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs",
+        "client-ui/src/state.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "protocol.title_s2c",
+      "category": "audio_and_protocol",
+      "description": "Set Titles S2C packet decode (title/subtitle/actionbar/times).",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "PlayEvent::SetTitle",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs",
+        "client-ui/src/state.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "protocol.scoreboard_s2c",
+      "category": "audio_and_protocol",
+      "description": "Scoreboard S2C family (objective/display/score/team packets).",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "PlayEvent::SetObjective",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs",
+        "client-ui/src/state.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "protocol.world_s2c_chunk",
+      "category": "audio_and_protocol",
+      "description": "S2C level_chunk_with_light decode (chunk batch + heightmaps + data).",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "PlayEvent::ChunkData",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs",
+        "client-app/src/world.rs"
+      ]
+    },
+    {
+      "id": "protocol.world_s2c_light",
+      "category": "audio_and_protocol",
+      "description": "S2C light_update packet decode (sky+block light masks/arrays).",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "PlayEvent::UpdateLight",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs",
+        "client-app/src/world.rs"
+      ]
+    },
+    {
+      "id": "protocol.world_s2c_block_update",
+      "category": "audio_and_protocol",
+      "description": "S2C block_update single-block change decode.",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "PlayEvent::BlockUpdate",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs",
+        "client-app/src/world.rs"
+      ]
+    },
+    {
+      "id": "protocol.world_s2c_section_blocks",
+      "category": "audio_and_protocol",
+      "description": "S2C section_blocks_update multi-block change decode.",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "PlayEvent::SectionBlocksUpdate",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs",
+        "client-app/src/world.rs"
+      ]
+    },
+    {
+      "id": "protocol.world_s2c_unload",
+      "category": "audio_and_protocol",
+      "description": "S2C forget_level_chunk + set_chunk_cache_center decode.",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "PlayEvent::UnloadChunk",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs",
+        "client-app/src/world.rs"
+      ]
+    },
+    {
+      "id": "protocol.world_s2c_health",
+      "category": "audio_and_protocol",
+      "description": "S2C set_health decode (health/food/saturation -> HUD vitals).",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "PlayEvent::SetHealth",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "protocol.world_s2c_teleport",
+      "category": "audio_and_protocol",
+      "description": "S2C player_position teleport sync decode + accept flow.",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "PlayEvent::Teleport",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "protocol.c2s_keep_alive",
+      "category": "audio_and_protocol",
+      "description": "C2S keep_alive reply.",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "send_keep_alive",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "protocol.c2s_chunk_batch_received",
+      "category": "audio_and_protocol",
+      "description": "C2S chunk_batch_received acknowledgement.",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "send_chunk_batch_received",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "protocol.c2s_teleport_confirm",
+      "category": "audio_and_protocol",
+      "description": "C2S accept_teleportation / confirm_teleport.",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "send_accept_teleportation",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "protocol.c2s_player_input",
+      "category": "audio_and_protocol",
+      "description": "C2S player_input (strafe/forward/jump/sneak flags).",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "send_player_input",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "protocol.c2s_position_rotation",
+      "category": "audio_and_protocol",
+      "description": "C2S player_position / player_position_rotation movement packets.",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "send_player_position_rotation",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs"
+      ]
+    },
+    {
+      "id": "protocol.c2s_chat_command",
+      "category": "audio_and_protocol",
+      "description": "C2S chat_message / chat_command packets.",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "send_chat_message",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/window.rs"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "protocol.c2s_use_item",
+      "category": "audio_and_protocol",
+      "description": "C2S use_item / swing / player_action packets (block place, arm swing, dig).",
+      "kernel_file": "client-app/src/protocol.rs",
+      "kernel_symbol": "send_use_item",
+      "live_consumers": [
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/window.rs"
+      ],
+      "status": "planned"
+    }
+  ]
+}
