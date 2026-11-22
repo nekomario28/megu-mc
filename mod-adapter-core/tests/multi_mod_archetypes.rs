@@ -353,14 +353,15 @@ fn fabric_manifest(id: &str, version: &str, extra: &str) -> String {
 /// Archetype 1 — a performance mod renamed to hide its identity:
 /// `my-fast-render.jar` declares `id: "sodium"`, so filename inference
 /// (`my-fast-render`) finds nothing; only the manifest-declared id catches
-/// it. The `.class` member is *deliberately corrupt* — if the superseded
-/// skip did not run before the bytecode scan this whole mods-dir pass
-/// would fail closed instead of cleanly skipping the JAR.
+/// it. Its `.class` member is valid bytecode (so the security-first static
+/// constant-pool check passes), while `mixin_scan` stays `None` because the
+/// superseded skip still bypasses Mixin lifting.
 fn perf_mod_jar() -> Vec<u8> {
     let manifest = fabric_manifest("sodium", "0.6.13", "");
+    let class = build_plain_class("com/fastsodium/RenderStub");
     jar(&[
         ("fabric.mod.json", manifest.as_bytes()),
-        ("com/fastsodium/Broken.class", b"\xde\xad\xbe\xef not a class"),
+        ("com/fastsodium/RenderStub.class", &class),
     ])
 }
 

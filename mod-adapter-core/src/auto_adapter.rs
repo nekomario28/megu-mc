@@ -572,38 +572,24 @@ pub fn auto_adapt_jar_bytes(
             bundle: None,
         });
     }
-    let early_route = routing.decision.clone();
     if let ModRouteDecision::RouteToNativeSubsystem {
         subsystem,
-        matched_by,
-        evidence,
-    } = early_route
+        matched_by: RouteMatchKind::KnownCatalogId,
+        ..
+    } = routing.decision.clone()
     {
-        let engine_compat = if matched_by == RouteMatchKind::KnownCatalogId {
-            let existing =
-                classify_adapted_mod_compat(None, inferred_mod_id.as_deref(), &mut audit_notes);
-            if existing == EngineCompatDisposition::StandardModAdapter {
-                EngineCompatDisposition::NativeAccelerated {
-                    native_subsystem: subsystem.as_str(),
-                }
-            } else {
-                existing
-            }
-        } else {
+        let existing =
+            classify_adapted_mod_compat(None, inferred_mod_id.as_deref(), &mut audit_notes);
+        let engine_compat = if existing == EngineCompatDisposition::StandardModAdapter {
             EngineCompatDisposition::NativeAccelerated {
                 native_subsystem: subsystem.as_str(),
             }
-        };
-        if matched_by == RouteMatchKind::KnownCatalogId {
-            audit_notes.push(format!(
-                "filename-inferred mod id matches BUILTIN_SUPERSEDED_PERF_MODS ({REASON_SUPERSEDED}); static security scan passed before superseded skip"
-            ));
         } else {
-            audit_notes.push(format!(
-                "unknown engine-replacement mod routed generically by structural capability signature ({}) to native {} without executing Java bytecode",
-                evidence.join(", "), subsystem.as_str()
-            ));
-        }
+            existing
+        };
+        audit_notes.push(format!(
+            "filename-inferred mod id matches BUILTIN_SUPERSEDED_PERF_MODS ({REASON_SUPERSEDED}); static security scan passed before superseded skip"
+        ));
         return Ok(skipped_result(
             display.to_string(),
             inferred_mod_id,
@@ -678,6 +664,29 @@ pub fn auto_adapt_jar_bytes(
                 ));
             }
         }
+    }
+
+    if let ModRouteDecision::RouteToNativeSubsystem {
+        subsystem,
+        matched_by: RouteMatchKind::BehavioralCapability,
+        evidence,
+    } = routing.decision.clone()
+    {
+        audit_notes.push(format!(
+            "unknown engine-replacement mod routed generically by structural capability signature ({}) to native {} without executing Java bytecode",
+            evidence.join(", "), subsystem.as_str()
+        ));
+        return Ok(skipped_result(
+            display.to_string(),
+            inferred_mod_id,
+            descriptor,
+            EngineCompatDisposition::NativeAccelerated {
+                native_subsystem: subsystem.as_str(),
+            },
+            audit_notes,
+            data,
+            routing.decision,
+        ));
     }
 
     if let ModRouteDecision::HybridSplit {
