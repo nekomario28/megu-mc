@@ -39,6 +39,7 @@
 //! caller-supplied 16x16 alpha mask (which works identically for vanilla and
 //! modded cross sprites).
 
+use std::collections::HashMap;
 use std::f32::consts::{FRAC_1_SQRT_2, PI, SQRT_2};
 
 use crate::section::Direction;
@@ -876,10 +877,194 @@ pub fn extrude_alpha_mask(width: usize, height: usize, alpha: &[u8], t: f32) -> 
 /// Extrudes a `16x16` alpha/opacity mask (`alpha[y * 16 + x]`, row 0 =
 /// sprite top) into a plate `t` blocks thick lying in `z in [0, t]`.
 ///
-/// Thin wrapper over [`extrude_alpha_mask`] for the classic sprite size;
-/// see it for the full contract.
+/// Dedicated bitboard implementation of [`extrude_alpha_mask`]'s contract
+/// for the classic sprite size: occupancy, visited state and all four rim
+/// edge sets are `[u16; 16]` stack arrays (`row & !(row << 1)` for left
+/// edges, `row & !(row >> 1)` for right, `row[y] & !row[y - 1]` for top),
+/// so the whole extrusion runs with zero heap allocation beyond the output
+/// quad list itself. Quad output is bit-identical to the generic path.
 pub fn extrude_alpha_mask_16x16(alpha: &[u8; 256], t: f32) -> ExtrudedMesh {
-    extrude_alpha_mask(16, 16, alpha, t)
+    let mut mesh = ExtrudedMesh::new();
+    let t = t.clamp(0.0, 1.0);
+    if t <= 0.0 {
+        return mesh;
+    }
+    // Bit x of row y is the texel at alpha[y * 16 + x].
+    let mut rows = [0u16; 16];
+    for (y, row) in rows.iter_mut().enumerate() {
+        let mut bits = 0u16;
+        for (x, &a) in alpha[y * 16..y * 16 + 16].iter().enumerate() {
+            if a >= ALPHA_CUTOFF {
+                bits |= 1 << x;
+            }
+        }
+        *row = bits;
+    }
+    let opaque = |x: usize, y: usize| (rows[y] >> x) & 1 != 0;
+
+    // Greedy-merge opaque rectangles; emit front + back faces per rectangle.
+    let mut done = [0u16; 16];
+    for ty in 0..16 {
+        for tx in 0..16 {
+            if !opaque(tx, ty) || done[ty] & (1 << tx) != 0 {
+                continue;
+            }
+            let mut w = 1usize;
+            while tx + w < 16 && opaque(tx + w, ty) && done[ty] & (1 << (tx + w)) == 0 {
+                w += 1;
+            }
+            let mut h = 1usize;
+            'grow: while ty + h < 16 {
+                for xx in tx..tx + w {
+                    if !opaque(xx, ty + h) || done[ty + h] & (1 << xx) != 0 {
+                        break 'grow;
+                    }
+                }
+                h += 1;
+            }
+            let span = (((1u32 << w) - 1) << tx) as u16;
+            for row in done.iter_mut().take(ty + h).skip(ty) {
+                *row |= span;
+            }
+            let x0 = tx as f32 * TEXEL;
+            let x1 = (tx + w) as f32 * TEXEL;
+            let y_hi = 1.0 - ty as f32 * TEXEL;
+            let y_lo = 1.0 - (ty + h) as f32 * TEXEL;
+            let (u0, u1) = (x0, x1);
+            let (v0, v1) = (ty as f32 * TEXEL, (ty + h) as f32 * TEXEL);
+            // Front (z = 0, normal -Z); UVs mirrored like vanilla's far side.
+            mesh.push(
+                [
+                    [x0, y_lo, 0.0],
+                    [x0, y_hi, 0.0],
+                    [x1, y_hi, 0.0],
+                    [x1, y_lo, 0.0],
+                ],
+                [[u0, v1], [u0, v0], [u1, v0], [u1, v1]],
+                -1,
+            );
+            // Back (z = t, normal +Z).
+            mesh.push(
+                [
+                    [x0, y_lo, t],
+                    [x1, y_lo, t],
+                    [x1, y_hi, t],
+                    [x0, y_hi, t],
+                ],
+                [[u0, v1], [u1, v1], [u1, v0], [u0, v0]],
+                -1,
+            );
+        }
+    }
+
+    // Rim edge sets as bitboards: a bit is set where the texel is opaque
+    // and the neighbour in that direction is transparent or absent.
+    let mut left_edge = [0u16; 16];
+    let mut right_edge = [0u16; 16];
+    let mut top_edge = [0u16; 16];
+    let mut bottom_edge = [0u16; 16];
+    for y in 0..16 {
+        left_edge[y] = rows[y] & !(rows[y] << 1);
+        right_edge[y] = rows[y] & !(rows[y] >> 1);
+        top_edge[y] = rows[y] & !(if y == 0 { 0 } else { rows[y - 1] });
+        bottom_edge[y] = rows[y] & !(if y == 15 { 0 } else { rows[y + 1] });
+    }
+
+    // Vertical rims: per column, runs of edge cells merge into one quad
+    // each. UVs sample inside column `tx` so the rim shows the texels it
+    // bounds instead of the sprite's transparent left margin.
+    for tx in 0..16 {
+        let bit = 1u16 << tx;
+        for &left_side in &[true, false] {
+            let edges = if left_side { &left_edge } else { &right_edge };
+            let mut run: Option<usize> = None;
+            for (ty, edge_bits) in edges
+                .iter()
+                .copied()
+                .chain(std::iter::once(0u16))
+                .enumerate()
+            {
+                let edge = edge_bits & bit != 0;
+                match (edge, run) {
+                    (true, None) => run = Some(ty),
+                    (false, Some(start)) => {
+                        let x_e = if left_side {
+                            tx as f32 * TEXEL
+                        } else {
+                            (tx + 1) as f32 * TEXEL
+                        };
+                        let y_hi = 1.0 - start as f32 * TEXEL;
+                        let y_lo = 1.0 - ty as f32 * TEXEL;
+                        let (v0, v1) = (start as f32 * TEXEL, ty as f32 * TEXEL);
+                        let (u0, u1) = (tx as f32 * TEXEL, (tx + 1) as f32 * TEXEL);
+                        let quad = if left_side {
+                            [
+                                [x_e, y_lo, t],
+                                [x_e, y_hi, t],
+                                [x_e, y_hi, 0.0],
+                                [x_e, y_lo, 0.0],
+                            ]
+                        } else {
+                            [
+                                [x_e, y_lo, 0.0],
+                                [x_e, y_hi, 0.0],
+                                [x_e, y_hi, t],
+                                [x_e, y_lo, t],
+                            ]
+                        };
+                        mesh.push(quad, [[u0, v1], [u0, v0], [u1, v0], [u1, v1]], -1);
+                        run = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Horizontal rims: per row, runs of edge cells merge into one quad
+    // each. UVs sample inside row `ty`.
+    for (ty, (&top_row, &bottom_row)) in top_edge.iter().zip(bottom_edge.iter()).enumerate() {
+        for &top_side in &[true, false] {
+            let row = if top_side { top_row } else { bottom_row };
+            let mut run: Option<usize> = None;
+            for tx in 0..=16 {
+                let edge = tx < 16 && row & (1 << tx) != 0;
+                match (edge, run) {
+                    (true, None) => run = Some(tx),
+                    (false, Some(start)) => {
+                        let y_e = if top_side {
+                            1.0 - ty as f32 * TEXEL
+                        } else {
+                            1.0 - (ty + 1) as f32 * TEXEL
+                        };
+                        let x0 = start as f32 * TEXEL;
+                        let x1 = tx as f32 * TEXEL;
+                        let (v0, v1) = (ty as f32 * TEXEL, (ty + 1) as f32 * TEXEL);
+                        let quad = if top_side {
+                            [
+                                [x0, y_e, 0.0],
+                                [x0, y_e, t],
+                                [x1, y_e, t],
+                                [x1, y_e, 0.0],
+                            ]
+                        } else {
+                            [
+                                [x0, y_e, 0.0],
+                                [x1, y_e, 0.0],
+                                [x1, y_e, t],
+                                [x0, y_e, t],
+                            ]
+                        };
+                        mesh.push(quad, [[x0, v0], [x0, v1], [x1, v1], [x1, v0]], -1);
+                        run = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    mesh
 }
 
 // ---------------------------------------------------------------------------
@@ -887,7 +1072,7 @@ pub fn extrude_alpha_mask_16x16(alpha: &[u8; 256], t: f32) -> ExtrudedMesh {
 // ---------------------------------------------------------------------------
 
 /// Blade arrangement for a cross-plane plant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CrossLayout {
     /// Two intersecting diagonal blades (45 degrees / 135 degrees), the
     /// classic flower/grass cross.
@@ -967,7 +1152,7 @@ pub fn build_3d_cross_mesh(
 // ---------------------------------------------------------------------------
 
 /// Growth stage of a crystal formation; scales height, width and spike count.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CrystalStage {
     SmallBud,
     MediumBud,
@@ -1017,7 +1202,7 @@ pub fn build_3d_crystal_mesh(stage: CrystalStage, facing: Direction) -> Extruded
 // ---------------------------------------------------------------------------
 
 /// Vanilla rail shapes the 3D upgrade knows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RailShape {
     NorthSouth,
     EastWest,
@@ -1195,7 +1380,7 @@ pub fn build_3d_ladder_mesh(facing: Direction) -> ExtrudedMesh {
 // ---------------------------------------------------------------------------
 
 /// Fixture shapes covered by the `fixtures_and_chains` toggle.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FixtureKind {
     Chain,
     IronBars,
@@ -1692,6 +1877,169 @@ pub fn build_3d_ore_relief(vein_mask: &[u8; 256], exposed_faces: u8) -> Extruded
         mesh.append(&plate);
     }
     mesh
+}
+
+// ---------------------------------------------------------------------------
+// Prototype atlas cache (bake once, emit translated instances)
+// ---------------------------------------------------------------------------
+
+/// Hashable identity of a baked prototype mesh. The block position is never
+/// part of the key: per-block effects like the deterministic crop jitter
+/// are pure translations applied at emission time, so every block sharing
+/// a sprite and shape reuses one extrusion.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum VanillaPlus3dKey {
+    /// A `16x16` alpha sprite extruded into a cross/`#` blade mesh.
+    CrossSprite { alpha: [u8; 256], layout: CrossLayout },
+    /// Amethyst/dripstone/pickle spike cluster.
+    Crystal { stage: CrystalStage, facing: Direction },
+    /// Rail layout + powered tint.
+    Rail { shape: RailShape, powered: bool },
+    /// Ladder plate facing.
+    Ladder { facing: Direction },
+    /// Chain/iron-bars/torch/lantern fixture.
+    Fixture { kind: FixtureKind },
+    /// Voxel sun (`None`) or one of the 8 voxel moon phases.
+    Celestial { moon_phase: Option<u8> },
+    /// Ore vein relief plates for a vein mask + exposed-face bitmask.
+    OreRelief { vein_mask: [u8; 256], exposed_faces: u8 },
+    /// Caller-namespaced identity for anything else (e.g. a spec hash).
+    Custom(u64),
+}
+
+/// Pre-bakes Vanilla+ 3D prototype meshes once per sprite/block key (e.g.
+/// at resource-pack load) so the mesher can emit translated instances with
+/// zero re-extrusion and zero per-block mask allocations. Meshing a
+/// thousand identical wheat blocks costs one extrusion plus a thousand
+/// quad copies instead of a thousand extrusions.
+///
+/// Not thread-safe by itself — wrap it at the layer that owns meshing.
+#[derive(Default)]
+pub struct VanillaPlus3dAtlasCache {
+    prototypes: HashMap<VanillaPlus3dKey, ExtrudedMesh>,
+    bakes: u64,
+    cache_hits: u64,
+    cache_misses: u64,
+}
+
+impl VanillaPlus3dAtlasCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of baked prototypes held.
+    pub fn len(&self) -> usize {
+        self.prototypes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.prototypes.is_empty()
+    }
+
+    /// Total prototype bakes performed (a bake happens exactly once per new
+    /// key; re-emission never re-extrudes).
+    pub fn bakes(&self) -> u64 {
+        self.bakes
+    }
+
+    /// Successful [`emit_translated_into`](Self::emit_translated_into)
+    /// calls — each one reuses a baked prototype with no extrusion.
+    pub fn cache_hits(&self) -> u64 {
+        self.cache_hits
+    }
+
+    /// [`emit_translated_into`](Self::emit_translated_into) calls that
+    /// found no prototype (caller should have baked first).
+    pub fn cache_misses(&self) -> u64 {
+        self.cache_misses
+    }
+
+    /// Insert a pre-baked prototype (the resource-pack-load path). Replaces
+    /// any existing prototype under the same key.
+    pub fn bake(&mut self, key: VanillaPlus3dKey, mesh: ExtrudedMesh) {
+        self.bakes += 1;
+        self.prototypes.insert(key, mesh);
+    }
+
+    /// Fetch the prototype for `key`, baking it via `bake` on a miss.
+    pub fn prototype_or_bake(
+        &mut self,
+        key: VanillaPlus3dKey,
+        bake: impl FnOnce() -> ExtrudedMesh,
+    ) -> &ExtrudedMesh {
+        if !self.prototypes.contains_key(&key) {
+            self.bake(key.clone(), bake());
+        }
+        self.prototypes.get(&key).expect("just baked")
+    }
+
+    /// Emit the cached prototype's quads translated by `offset` into
+    /// `out_quads` — the instancing fast path: a plain quad copy plus an
+    /// add per vertex, no mask, no edge detection, no extrusion.
+    ///
+    /// Returns the number of quads emitted (bounded by
+    /// [`MAX_UPGRADE_QUADS`]); `0` and a counted `cache_miss` when `key`
+    /// has no baked prototype.
+    pub fn emit_translated_into(
+        &mut self,
+        key: &VanillaPlus3dKey,
+        offset: [f32; 3],
+        out_quads: &mut Vec<ExtrudedQuad>,
+    ) -> usize {
+        let Some(proto) = self.prototypes.get(key) else {
+            self.cache_misses += 1;
+            return 0;
+        };
+        self.cache_hits += 1;
+        let mut emitted = 0;
+        for q in &proto.quads {
+            if out_quads.len() >= MAX_UPGRADE_QUADS {
+                break;
+            }
+            let mut q = *q;
+            for p in &mut q.positions {
+                p[0] += offset[0];
+                p[1] += offset[1];
+                p[2] += offset[2];
+            }
+            out_quads.push(q);
+            emitted += 1;
+        }
+        emitted
+    }
+
+    /// Emit one cross-sprite block (crops/flora): bakes the blade mesh once
+    /// per `(alpha, layout)`, then emits it translated so the result equals
+    /// [`build_3d_cross_mesh`]`(alpha, layout, block)` shifted by `block`.
+    /// The bake uses block `[0, 0, 0]`, so the emission offset subtracts
+    /// that bake's jitter and adds this block's — the per-block jitter
+    /// semantics are preserved exactly.
+    pub fn emit_cross_sprite_into(
+        &mut self,
+        alpha: &[u8; 256],
+        layout: CrossLayout,
+        block: [i32; 3],
+        out_quads: &mut Vec<ExtrudedQuad>,
+    ) -> usize {
+        let key = VanillaPlus3dKey::CrossSprite {
+            alpha: *alpha,
+            layout,
+        };
+        self.prototype_or_bake(key.clone(), || {
+            build_3d_cross_mesh(alpha, layout, [0, 0, 0])
+        });
+        let [b0x, b0z] = block_jitter([0, 0, 0]);
+        let [jx, jz] = block_jitter(block);
+        self.emit_translated_into(
+            &key,
+            [
+                block[0] as f32 + jx - b0x,
+                block[1] as f32,
+                block[2] as f32 + jz - b0z,
+            ],
+            out_quads,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

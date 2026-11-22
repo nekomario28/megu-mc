@@ -479,12 +479,20 @@ impl RibbonTrail {
     /// Two vertices per anchor; consecutive pairs form a triangle strip.
     /// The caller supplies the camera forward direction for facing.
     pub fn strip_vertices(&self, camera_forward: Vec3) -> Vec<RibbonVertex> {
+        let mut vertices = Vec::new();
+        self.strip_vertices_into(camera_forward, &mut vertices);
+        vertices
+    }
+
+    /// [`Self::strip_vertices`] writing into a caller-retained buffer so a
+    /// render loop reuses one allocation across frames.
+    pub fn strip_vertices_into(&self, camera_forward: Vec3, out: &mut Vec<RibbonVertex>) {
         let count = self.points.len();
         if count < 2 {
-            return Vec::new();
+            return;
         }
         let forward = unit_or(camera_forward, [0.0, 0.0, 1.0]);
-        let mut vertices = Vec::with_capacity(count * 2);
+        out.reserve(count * 2);
         for i in 0..count {
             let anchor = self.points[i];
             let direction = if i == 0 {
@@ -507,18 +515,17 @@ impl RibbonTrail {
             rgba[3] *= 1.0 - age;
             let offset = scale(side, half_width);
             let u = i as f32 / (count - 1) as f32;
-            vertices.push(RibbonVertex {
+            out.push(RibbonVertex {
                 pos: add(anchor.pos, offset),
                 rgba,
                 uv: [u, 0.0],
             });
-            vertices.push(RibbonVertex {
+            out.push(RibbonVertex {
                 pos: sub(anchor.pos, offset),
                 rgba,
                 uv: [u, 1.0],
             });
         }
-        vertices
     }
 }
 
@@ -681,8 +688,9 @@ struct Tracked<T> {
 
 struct EmitterState {
     spec: ParticleEmitterSpec,
-    color: Arc<ColorRamp>,
-    size: Arc<ScalarCurve>,
+    /// Interned (color, size) pair in `VfxWorld::curves`. Particles copy
+    /// this `u16` at spawn instead of cloning two `Arc`s each.
+    curve_id: u16,
     accumulator: f64,
     spawn_index: u64,
     ticks_left: u16,
@@ -694,13 +702,264 @@ struct BeamState {
     ticks_left: u16,
 }
 
+/// Slots the curve table pre-reserves. Growth past this happens only when
+/// more than 64 distinct (color, size) pairs are live at once — budgets
+/// make that unreachable, but the table still grows rather than failing.
+const CURVE_LUT_PREBAKED: usize = 64;
+
+/// `u16`-indexed refcounted curve table. Emitters intern their (color,
+/// size) pair once at spawn; every particle then carries the `u16` id
+/// instead of two `Arc` clones, so spawn/tick/despawn clone zero `Arc`s
+/// per particle. Releasing the last reference recycles the slot through
+/// the free list.
+struct CurveLut {
+    colors: Vec<Option<ColorRamp>>,
+    sizes: Vec<Option<ScalarCurve>>,
+    refs: Vec<u32>,
+    free: Vec<u16>,
+}
+
+impl CurveLut {
+    fn new() -> Self {
+        Self {
+            colors: Vec::with_capacity(CURVE_LUT_PREBAKED),
+            sizes: Vec::with_capacity(CURVE_LUT_PREBAKED),
+            refs: Vec::with_capacity(CURVE_LUT_PREBAKED),
+            free: Vec::new(),
+        }
+    }
+
+    /// The shared id for `color`+`size`, deduplicating identical live
+    /// pairs so particles of equivalent emitters share one slot.
+    fn intern(&mut self, color: &ColorRamp, size: &ScalarCurve) -> u16 {
+        for i in 0..self.colors.len() {
+            if self.refs[i] > 0
+                && self.colors[i].as_ref() == Some(color)
+                && self.sizes[i].as_ref() == Some(size)
+            {
+                self.refs[i] += 1;
+                return i as u16;
+            }
+        }
+        let index = if let Some(id) = self.free.pop() {
+            id
+        } else {
+            self.colors.push(None);
+            self.sizes.push(None);
+            self.refs.push(0);
+            u16::try_from(self.colors.len() - 1)
+                .expect("live curve pairs are bounded by effect budgets")
+        };
+        let i = index as usize;
+        self.colors[i] = Some(color.clone());
+        self.sizes[i] = Some(size.clone());
+        self.refs[i] = 1;
+        index
+    }
+
+    /// One more live holder of `id` (a particle referencing its emitter's
+    /// pair, or an emitter re-interning an existing pair).
+    fn add_ref(&mut self, id: u16) {
+        self.refs[id as usize] += 1;
+    }
+
+    /// One holder of `id` is gone; the last release recycles the slot.
+    fn release(&mut self, id: u16) {
+        let i = id as usize;
+        match self.refs[i] {
+            0 => debug_assert!(false, "double release of curve id {id}"),
+            1 => {
+                self.refs[i] = 0;
+                self.colors[i] = None;
+                self.sizes[i] = None;
+                self.free.push(id);
+            }
+            n => self.refs[i] = n - 1,
+        }
+    }
+
+    fn sample_color(&self, id: u16, t: f32) -> Rgba {
+        self.colors
+            .get(id as usize)
+            .and_then(Option::as_ref)
+            .map_or([1.0; 4], |c| c.sample(t))
+    }
+
+    fn sample_size(&self, id: u16, t: f32) -> f32 {
+        self.sizes
+            .get(id as usize)
+            .and_then(Option::as_ref)
+            .map_or(1.0, |s| s.sample(t))
+    }
+}
+
+/// Admission metadata kept parallel to the SoA columns.
+#[derive(Clone, Copy)]
+struct ParticleMeta {
+    priority: u8,
+    seq: u64,
+}
+
+/// Field bundle pushed as one particle across the SoA columns.
+#[derive(Clone, Copy)]
+struct ParticleSpawn {
+    pos: Vec3,
+    velocity: Vec3,
+    rotation: f32,
+    lifetime_ticks: u16,
+    orientation: ParticleOrientation,
+    gravity_per_tick: f32,
+    drag: f32,
+    spin_per_tick: f32,
+    curve_id: u16,
+}
+
+/// Structure-of-arrays particle store. Expiration and eviction are O(1)
+/// `swap_remove`s across all columns, and per-particle heap objects —
+/// including `Arc` curve handles — are never allocated at spawn, tick or
+/// despawn: each particle references its emitter's interned curve pair by
+/// `u16` id into the world's [`CurveLut`].
+#[derive(Default)]
+struct ParticleSoa {
+    pos_x: Vec<f32>,
+    pos_y: Vec<f32>,
+    pos_z: Vec<f32>,
+    vel_x: Vec<f32>,
+    vel_y: Vec<f32>,
+    vel_z: Vec<f32>,
+    rotation: Vec<f32>,
+    age_ticks: Vec<u16>,
+    lifetime_ticks: Vec<u16>,
+    orientation: Vec<ParticleOrientation>,
+    gravity_per_tick: Vec<f32>,
+    drag: Vec<f32>,
+    spin_per_tick: Vec<f32>,
+    curve_id: Vec<u16>,
+    meta: Vec<ParticleMeta>,
+    swap_removes: u64,
+}
+
+impl ParticleSoa {
+    fn len(&self) -> usize {
+        self.meta.len()
+    }
+
+    fn push(&mut self, meta: ParticleMeta, spawn: ParticleSpawn) {
+        self.pos_x.push(spawn.pos[0]);
+        self.pos_y.push(spawn.pos[1]);
+        self.pos_z.push(spawn.pos[2]);
+        self.vel_x.push(spawn.velocity[0]);
+        self.vel_y.push(spawn.velocity[1]);
+        self.vel_z.push(spawn.velocity[2]);
+        self.rotation.push(spawn.rotation);
+        self.age_ticks.push(0);
+        self.lifetime_ticks.push(spawn.lifetime_ticks);
+        self.orientation.push(spawn.orientation);
+        self.gravity_per_tick.push(spawn.gravity_per_tick);
+        self.drag.push(spawn.drag);
+        self.spin_per_tick.push(spawn.spin_per_tick);
+        self.curve_id.push(spawn.curve_id);
+        self.meta.push(meta);
+    }
+
+    /// O(1) removal of index `i` (the last element moves into its slot).
+    /// Returns the removed particle's curve id so the caller can release
+    /// its LUT reference.
+    fn swap_remove(&mut self, i: usize) -> u16 {
+        let curve = self.curve_id[i];
+        self.pos_x.swap_remove(i);
+        self.pos_y.swap_remove(i);
+        self.pos_z.swap_remove(i);
+        self.vel_x.swap_remove(i);
+        self.vel_y.swap_remove(i);
+        self.vel_z.swap_remove(i);
+        self.rotation.swap_remove(i);
+        self.age_ticks.swap_remove(i);
+        self.lifetime_ticks.swap_remove(i);
+        self.orientation.swap_remove(i);
+        self.gravity_per_tick.swap_remove(i);
+        self.drag.swap_remove(i);
+        self.spin_per_tick.swap_remove(i);
+        self.curve_id.swap_remove(i);
+        self.meta.swap_remove(i);
+        self.swap_removes += 1;
+        curve
+    }
+}
+
+/// Compact 24-byte GPU instance record for instanced particle billboards —
+/// 1/9th the 216-byte CPU-side quad. `pos` is world position (12 B);
+/// `size_rot_half` packs the sampled size (lo16) and rotation in radians
+/// (hi16) as IEEE-754 halves; `rgba8` is the sampled color as 0xAABBGGRR;
+/// `sprite_orient` carries the [`ParticleOrientation`] discriminant in the
+/// low byte (the rest is reserved for sprite-atlas addressing).
+/// `pack_particle_instances` produces the exact byte layout the renderer's
+/// instanced pipeline uploads.
+///
+/// `Eq` is intentionally not derived: `pos` is `f32`, where NaN breaks
+/// reflexivity — `PartialEq` is the honest bound for this record.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ParticleInstanceGpu {
+    pub pos: [f32; 3],
+    pub size_rot_half: u32,
+    pub rgba8: u32,
+    pub sprite_orient: u32,
+}
+
+/// IEEE-754 half bits of `v`: normals round-to-nearest, |v| >= 65520
+/// saturates to +/- 0x7bff, tiny magnitudes flush to the half subnormal
+/// range, non-finite input becomes 0.
+fn f32_to_f16_bits(v: f32) -> u32 {
+    if !v.is_finite() {
+        return 0;
+    }
+    let bits = v.to_bits();
+    let sign = (bits >> 16) & 0x8000;
+    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let mant = bits & 0x007f_ffff;
+    if exp >= 31 {
+        return sign | 0x7bff;
+    }
+    if exp <= 0 {
+        // Half subnormal (|v| < 2^-14): mantissa plus the implicit leading
+        // bit, truncated — error below 2^-24 is invisible at render scale.
+        if exp < -10 {
+            return sign;
+        }
+        return sign | ((mant | 0x0080_0000) >> (14 - exp) as u32);
+    }
+    // Round the 23-bit mantissa to 10 bits; a carry bumps the exponent.
+    let mut e = exp as u32;
+    let mut m = (mant + 0x1000) >> 13;
+    if m == 0x400 {
+        m = 0;
+        e += 1;
+        if e >= 31 {
+            return sign | 0x7bff;
+        }
+    }
+    sign | (e << 10) | m
+}
+
+/// `0xAABBGGRR` byte packing of a clamped 0..=1 color, round-to-nearest.
+fn pack_rgba8(rgba: Rgba) -> u32 {
+    let mut packed = 0u32;
+    for (i, &c) in rgba.iter().enumerate() {
+        let byte = (clamped(c, 0.0, 1.0) * 255.0).round() as u32;
+        packed |= byte << (i * 8);
+    }
+    packed
+}
+
 /// Fixed-tick VFX state. All retained collections and frame outputs have
 /// hard caps, including when callers supply their own budget.
 pub struct VfxWorld {
     budget: VfxBudget,
     sequence: u64,
+    curves: CurveLut,
     emitters: Vec<Tracked<EmitterState>>,
-    particles: Vec<Tracked<ActiveParticle>>,
+    particles: ParticleSoa,
     beams: Vec<Tracked<BeamState>>,
     ribbons: Vec<Tracked<RibbonTrail>>,
     auras: Vec<Tracked<EntityAura>>,
@@ -716,8 +975,9 @@ impl VfxWorld {
         Self {
             budget: budget.bounded(),
             sequence: 0,
+            curves: CurveLut::new(),
             emitters: Vec::new(),
-            particles: Vec::new(),
+            particles: ParticleSoa::default(),
             beams: Vec::new(),
             ribbons: Vec::new(),
             auras: Vec::new(),
@@ -763,24 +1023,94 @@ impl VfxWorld {
 
     pub fn spawn_emitter(&mut self, id: u32, spec: ParticleEmitterSpec) -> Result<bool, VfxError> {
         spec.validate()?;
+        let curve_id = self.curves.intern(&spec.color, &spec.size);
         let ticks_left = spec.emitter_ttl_ticks;
         let entry = Tracked {
             id: u64::from(id),
             priority: spec.priority,
             seq: self.next_sequence(),
             value: EmitterState {
-                color: Arc::new(spec.color.clone()),
-                size: Arc::new(spec.size.clone()),
                 spec,
+                curve_id,
                 accumulator: 0.0,
                 spawn_index: 0,
                 ticks_left,
             },
         };
-        let admitted = Self::upsert(&mut self.emitters, self.budget.max_emitters, entry);
+        let admitted = self.upsert_emitter(entry);
         // High-priority effects receive the finite per-tick spawn allowance first.
         self.emitters.sort_by_key(|e| (Reverse(e.priority), e.seq));
         Ok(admitted)
+    }
+
+    /// [`Self::upsert`] specialized for emitters: the interned curve id of
+    /// every replaced, evicted or rejected entry is released.
+    fn upsert_emitter(&mut self, entry: Tracked<EmitterState>) -> bool {
+        if let Some(index) = self.emitters.iter().position(|e| e.id == entry.id) {
+            let old = self.emitters.remove(index);
+            self.curves.release(old.value.curve_id);
+        }
+        let cap = self.budget.max_emitters;
+        if cap == 0 {
+            self.curves.release(entry.value.curve_id);
+            return false;
+        }
+        if self.emitters.len() >= cap {
+            let (index, lowest) = self
+                .emitters
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| (e.priority, e.seq))
+                .expect("nonzero capacity and full list");
+            if lowest.priority > entry.priority {
+                self.curves.release(entry.value.curve_id);
+                return false;
+            }
+            let old = self.emitters.remove(index);
+            self.curves.release(old.value.curve_id);
+        }
+        self.emitters.push(entry);
+        true
+    }
+
+    /// [`Self::admit`]'s cap/eviction rule specialized for particles —
+    /// evict the lowest-priority, oldest occupant — but with an O(1)
+    /// `swap_remove` instead of a `Vec::remove` shift, and a `u16` curve
+    /// reference instead of two `Arc` clones.
+    fn admit_particle(&mut self, meta: ParticleMeta, spawn: ParticleSpawn) -> bool {
+        let cap = self.budget.max_active_particles;
+        if cap == 0 {
+            return false;
+        }
+        if self.particles.len() >= cap {
+            let (index, lowest) = self
+                .particles
+                .meta
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, m)| (m.priority, m.seq))
+                .expect("nonzero capacity and full list");
+            if lowest.priority > meta.priority {
+                return false;
+            }
+            let released = self.particles.swap_remove(index);
+            self.curves.release(released);
+        }
+        self.curves.add_ref(spawn.curve_id);
+        self.particles.push(meta, spawn);
+        true
+    }
+
+    /// Number of live particles — diagnostic twin of
+    /// `frame_output().particles.len()` that never builds draw data.
+    pub fn particle_count(&self) -> usize {
+        self.particles.len()
+    }
+
+    /// Total particles removed through the O(1) `swap_remove` path
+    /// (expiration + admission eviction) since world creation.
+    pub fn swap_removed_particles(&self) -> u64 {
+        self.particles.swap_removes
     }
 
     pub fn spawn_beam(&mut self, id: u32, beam: BeamEffect) -> Result<bool, VfxError> {
@@ -894,16 +1224,29 @@ impl VfxWorld {
     /// Advances one deterministic fixed tick. Existing particles move before
     /// new emission, and no catch-up burst is ever accumulated across frames.
     pub fn tick(&mut self) {
-        for particle in &mut self.particles {
-            let p = &mut particle.value;
-            p.age_ticks = p.age_ticks.saturating_add(1);
-            p.velocity[1] -= p.gravity_per_tick;
-            p.velocity = scale(p.velocity, p.drag);
-            p.pos = add(p.pos, p.velocity);
-            p.rotation = (p.rotation + p.spin_per_tick).rem_euclid(TAU);
+        // SoA physics + O(1) expiration: expired rows are swap_removed in
+        // place and their curve references released.
+        let p = &mut self.particles;
+        for i in 0..p.len() {
+            p.age_ticks[i] = p.age_ticks[i].saturating_add(1);
+            p.vel_y[i] -= p.gravity_per_tick[i];
+            p.vel_x[i] *= p.drag[i];
+            p.vel_y[i] *= p.drag[i];
+            p.vel_z[i] *= p.drag[i];
+            p.pos_x[i] += p.vel_x[i];
+            p.pos_y[i] += p.vel_y[i];
+            p.pos_z[i] += p.vel_z[i];
+            p.rotation[i] = (p.rotation[i] + p.spin_per_tick[i]).rem_euclid(TAU);
         }
-        self.particles
-            .retain(|p| p.value.age_ticks < p.value.lifetime_ticks);
+        let mut i = 0;
+        while i < p.len() {
+            if p.age_ticks[i] >= p.lifetime_ticks[i] {
+                let released = p.swap_remove(i);
+                self.curves.release(released);
+            } else {
+                i += 1;
+            }
+        }
 
         let mut spawn_allowance = self.budget.max_spawns_per_tick;
         for index in 0..self.emitters.len() {
@@ -911,52 +1254,89 @@ impl VfxWorld {
                 let e = &self.emitters[index];
                 (e.id, e.priority)
             };
-            let emitter = &mut self.emitters[index].value;
-            emitter.accumulator += f64::from(emitter.spec.spawn_rate_per_tick);
-            let requested = (emitter.accumulator.floor() as usize).min(spawn_allowance);
-            emitter.accumulator = emitter.accumulator.fract();
-            spawn_allowance -= requested;
-            for _ in 0..requested {
-                let seed = id ^ emitter.spawn_index;
-                emitter.spawn_index = emitter.spawn_index.wrapping_add(1);
+            // Snapshot the spawn inputs first so admission can take `self`
+            // while the emitter is not borrowed.
+            let (
+                curve_id,
+                requested,
+                spawn_base,
+                pos,
+                initial_velocity,
+                position_spread,
+                velocity_spread,
+                lifetime_ticks,
+                orientation,
+                gravity_per_tick,
+                drag,
+                spin_per_tick,
+            ) = {
+                let emitter = &mut self.emitters[index].value;
+                emitter.accumulator += f64::from(emitter.spec.spawn_rate_per_tick);
+                let requested =
+                    (emitter.accumulator.floor() as usize).min(spawn_allowance);
+                emitter.accumulator = emitter.accumulator.fract();
+                spawn_allowance -= requested;
+                let spec = &emitter.spec;
+                let base = emitter.spawn_index;
+                emitter.spawn_index = emitter.spawn_index.wrapping_add(requested as u64);
+                emitter.ticks_left -= 1;
+                (
+                    emitter.curve_id,
+                    requested,
+                    base,
+                    spec.pos,
+                    spec.initial_velocity,
+                    spec.position_spread,
+                    spec.velocity_spread,
+                    spec.particle_lifetime_ticks,
+                    spec.orientation,
+                    spec.gravity_per_tick,
+                    spec.drag,
+                    spec.spin_per_tick,
+                )
+            };
+            for n in 0..requested {
+                let seed = id ^ spawn_base.wrapping_add(n as u64);
                 let jitter = [
                     random_signed(seed, 0),
                     random_signed(seed, 1),
                     random_signed(seed, 2),
                 ];
-                let spec = &emitter.spec;
-                let particle = ActiveParticle {
-                    pos: add(spec.pos, component_mul(jitter, spec.position_spread)),
-                    velocity: add(
-                        spec.initial_velocity,
-                        component_mul(jitter, spec.velocity_spread),
-                    ),
-                    rotation: 0.0,
-                    age_ticks: 0,
-                    lifetime_ticks: spec.particle_lifetime_ticks,
-                    orientation: spec.orientation,
-                    gravity_per_tick: spec.gravity_per_tick,
-                    drag: spec.drag,
-                    spin_per_tick: spec.spin_per_tick,
-                    color: Arc::clone(&emitter.color),
-                    size: Arc::clone(&emitter.size),
-                };
                 let seq = self.sequence;
                 self.sequence = self.sequence.wrapping_add(1);
-                Self::admit(
-                    &mut self.particles,
-                    self.budget.max_active_particles,
-                    Tracked {
-                        id: seq,
-                        priority,
-                        seq,
-                        value: particle,
+                self.admit_particle(
+                    ParticleMeta { priority, seq },
+                    ParticleSpawn {
+                        pos: add(pos, component_mul(jitter, position_spread)),
+                        velocity: add(
+                            initial_velocity,
+                            component_mul(jitter, velocity_spread),
+                        ),
+                        rotation: 0.0,
+                        lifetime_ticks,
+                        orientation,
+                        gravity_per_tick,
+                        drag,
+                        spin_per_tick,
+                        curve_id,
                     },
                 );
             }
-            emitter.ticks_left -= 1;
         }
-        self.emitters.retain(|e| e.value.ticks_left > 0);
+        // Expired emitters release their curve references; live particles
+        // keep the pair alive through their own references.
+        let mut expired_curves = Vec::new();
+        self.emitters.retain(|e| {
+            if e.value.ticks_left > 0 {
+                true
+            } else {
+                expired_curves.push(e.value.curve_id);
+                false
+            }
+        });
+        for id in expired_curves {
+            self.curves.release(id);
+        }
 
         for beam in &mut self.beams {
             beam.value.elapsed = beam.value.elapsed.saturating_add(1);
@@ -978,29 +1358,97 @@ impl VfxWorld {
     }
 
     pub fn frame_output(&self, camera_forward: Vec3) -> VfxFrameOutput {
-        VfxFrameOutput {
-            particles: self.particles.iter().map(|p| p.value.draw()).collect(),
-            beams: self
-                .beams
+        let mut out = VfxFrameOutput::default();
+        self.frame_output_into(camera_forward, &mut out);
+        out
+    }
+
+    /// Fills `out` with this frame's draws, reusing its buffers — callers
+    /// that keep a `VfxFrameOutput` between frames get zero fresh heap
+    /// allocations in steady state (same shape, same counts). Equivalent to
+    /// [`Self::frame_output`]; ribbon draws additionally reuse their inner
+    /// vertex buffers when ribbon ids line up frame to frame.
+    pub fn frame_output_into(&self, camera_forward: Vec3, out: &mut VfxFrameOutput) {
+        out.particles.clear();
+        out.particles.reserve(self.particles.len());
+        for i in 0..self.particles.len() {
+            let t = f32::from(self.particles.age_ticks[i])
+                / f32::from(self.particles.lifetime_ticks[i].max(1));
+            out.particles.push(ParticleDraw {
+                pos: [
+                    self.particles.pos_x[i],
+                    self.particles.pos_y[i],
+                    self.particles.pos_z[i],
+                ],
+                velocity: [
+                    self.particles.vel_x[i],
+                    self.particles.vel_y[i],
+                    self.particles.vel_z[i],
+                ],
+                rotation: self.particles.rotation[i],
+                orientation: self.particles.orientation[i],
+                size: self.curves.sample_size(self.particles.curve_id[i], t),
+                rgba: self.curves.sample_color(self.particles.curve_id[i], t),
+            });
+        }
+        out.beams.clear();
+        out.beams
+            .extend(self.beams.iter().map(|b| b.value.beam.draw(b.value.elapsed)));
+        out.beam_quads.clear();
+        out.beam_quads.extend(
+            self.beams
                 .iter()
-                .map(|b| b.value.beam.draw(b.value.elapsed))
-                .collect(),
-            beam_quads: self
-                .beams
-                .iter()
-                .map(|b| b.value.beam.quad_vertices(camera_forward, b.value.elapsed))
-                .collect(),
-            ribbons: self
-                .ribbons
-                .iter()
-                .filter(|r| r.value.points.len() > 1)
-                .map(|r| RibbonDraw {
-                    id: r.id as u32,
+                .map(|b| b.value.beam.quad_vertices(camera_forward, b.value.elapsed)),
+        );
+        // Reuse each RibbonDraw's inner vertex buffer where slots line up.
+        let mut draws = std::mem::take(&mut out.ribbons);
+        let mut idx = 0usize;
+        for r in self.ribbons.iter().filter(|r| r.value.points.len() > 1) {
+            let id = r.id as u32;
+            if let Some(existing) = draws.get_mut(idx) {
+                existing.id = id;
+                existing.vertices.clear();
+                r.value
+                    .strip_vertices_into(camera_forward, &mut existing.vertices);
+            } else {
+                draws.push(RibbonDraw {
+                    id,
                     vertices: r.value.strip_vertices(camera_forward),
-                })
-                .collect(),
-            auras: self.auras.iter().map(|a| a.value).collect(),
-            lights: self.lights.iter().map(|l| l.value).collect(),
+                });
+            }
+            idx += 1;
+        }
+        draws.truncate(idx);
+        out.ribbons = draws;
+        out.auras.clear();
+        out.auras.extend(self.auras.iter().map(|a| a.value));
+        out.lights.clear();
+        out.lights.extend(self.lights.iter().map(|l| l.value));
+    }
+
+    /// Packs live particles into the 24-byte instanced GPU record —
+    /// position, half-packed size+rotation, RGBA8 and sprite orientation —
+    /// reusing `out`'s capacity in steady state. Companion to
+    /// [`PARTICLE_BILLBOARD_INSTANCED_WGSL`].
+    pub fn pack_particle_instances(&mut self, out: &mut Vec<ParticleInstanceGpu>) {
+        out.clear();
+        out.reserve(self.particles.len());
+        for i in 0..self.particles.len() {
+            let t = f32::from(self.particles.age_ticks[i])
+                / f32::from(self.particles.lifetime_ticks[i].max(1));
+            let size = self.curves.sample_size(self.particles.curve_id[i], t);
+            let rgba = self.curves.sample_color(self.particles.curve_id[i], t);
+            out.push(ParticleInstanceGpu {
+                pos: [
+                    self.particles.pos_x[i],
+                    self.particles.pos_y[i],
+                    self.particles.pos_z[i],
+                ],
+                size_rot_half: f32_to_f16_bits(size)
+                    | (f32_to_f16_bits(self.particles.rotation[i]) << 16),
+                rgba8: pack_rgba8(rgba),
+                sprite_orient: self.particles.orientation[i] as u32,
+            });
         }
     }
 }
@@ -1416,6 +1864,101 @@ fn decode_command(reader: &mut Reader<'_>) -> Result<VfxCommand, VfxCodecError> 
         opcode => Err(VfxCodecError::UnknownOpcode(opcode)),
     }
 }
+
+/// Instanced billboard particle pipeline for [`ParticleInstanceGpu`]: one
+/// quad per instance expanded in the vertex shader from the packed
+/// 24-byte record — no CPU quad expansion, no per-particle draw call.
+/// `pos` is declared `array<f32, 3>` (stride 12, align 4) so the storage
+/// struct's array stride is exactly 24 bytes — `vec3<f32>` would force
+/// 16-byte member alignment and break the packed layout. Bindings are
+/// self-contained: group 0 binding 0 is the camera uniform, binding 1 the
+/// instance array `pack_particle_instances` produces.
+pub const PARTICLE_BILLBOARD_INSTANCED_WGSL: &str = r#"
+struct CameraUniforms {
+    view_proj: mat4x4<f32>,
+    camera_right: vec4<f32>,
+    camera_up: vec4<f32>,
+};
+struct ParticleInstance {
+    pos: array<f32, 3>,
+    size_rot_half: u32,
+    rgba8: u32,
+    sprite_orient: u32,
+};
+struct Instances {
+    items: array<ParticleInstance>,
+};
+@group(0) @binding(0) var<uniform> camera: CameraUniforms;
+@group(0) @binding(1) var<storage, read> instances: Instances;
+
+// IEEE-754 half -> f32 (the packer saturates, so no inf/nan arrives).
+fn unpack_f16(packed: u32) -> f32 {
+    let sign = select(1.0, -1.0, (packed & 0x8000u) != 0u);
+    let e = (packed >> 10u) & 0x1fu;
+    let m = packed & 0x3ffu;
+    if (e == 0u) {
+        return sign * f32(m) * 0.000000059604644775390625; // 2^-24
+    }
+    if (e == 31u) {
+        return sign * 65504.0;
+    }
+    return sign * (1.0 + f32(m) / 1024.0) * exp2(f32(i32(e) - 15));
+}
+
+struct VsOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) rgba: vec4<f32>,
+};
+
+@vertex
+fn vs_main(
+    @builtin(vertex_index) vertex_index: u32,
+    @builtin(instance_index) instance_index: u32
+) -> VsOut {
+    let inst = instances.items[instance_index];
+    // Two triangles per billboard.
+    var corners = array<vec2<f32>, 6>(
+        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0),
+        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0)
+    );
+    let corner = corners[vertex_index];
+    let size = unpack_f16(inst.size_rot_half & 0xffffu);
+    let rotation = unpack_f16(inst.size_rot_half >> 16u);
+    let c = cos(rotation);
+    let s = sin(rotation);
+    let rotated = vec2<f32>(corner.x * c - corner.y * s,
+                            corner.x * s + corner.y * c) * size * 0.5;
+    let origin = vec3<f32>(inst.pos[0], inst.pos[1], inst.pos[2]);
+    let orientation = inst.sprite_orient & 0xffu;
+    var world: vec3<f32>;
+    if (orientation == 2u) {
+        // FlatGroundDecal lies in the XZ plane.
+        world = origin + vec3<f32>(rotated.x, 0.0, rotated.y);
+    } else {
+        // CameraBillboard (0) is the default; velocity-stretched (1) and
+        // axis-aligned (3) share the camera-axis expansion until the
+        // renderer grows dedicated modes.
+        world = origin + camera.camera_right.xyz * rotated.x
+            + camera.camera_up.xyz * rotated.y;
+    }
+    var out: VsOut;
+    out.position = camera.view_proj * vec4<f32>(world, 1.0);
+    out.uv = corner * 0.5 + vec2<f32>(0.5);
+    out.rgba = vec4<f32>(
+        f32(inst.rgba8 & 0xffu) / 255.0,
+        f32((inst.rgba8 >> 8u) & 0xffu) / 255.0,
+        f32((inst.rgba8 >> 16u) & 0xffu) / 255.0,
+        f32((inst.rgba8 >> 24u) & 0xffu) / 255.0
+    );
+    return out;
+}
+
+@fragment
+fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
+    return input.rgba;
+}
+"#;
 
 #[cfg(test)]
 mod tests {

@@ -336,7 +336,7 @@ fn inei_wgsl_matches_cpu_curves_and_preserves_warm_lantern_color() {
         "visibility * clamp(shadow.sun_direction.y * 1.5, 0.0, 1.0)",
         "vec3<f32>(0.065)",
         "(dot(normal, L_dir) + wrap) / (1.0 + wrap)",
-        "pow(max(dot(normal, half_vec), 0.0), 12.0) * 0.08",
+        "pow12(max(dot(normal, half_vec), 0.0)) * 0.08",
         "lit_color += rich_albedo * lantern_light + lacquer_sheen",
     ] {
         assert!(
@@ -364,14 +364,14 @@ fn japanese_aesthetics_curves_are_mirrored_in_wgsl_without_new_bindings() {
         "visibility < 0.95 || cascade_count == 0u",
         "let wetness = clamp(shadow.render_params.z * 24.0, 0.0, 1.0)",
         "(1.0 - 0.18 * wetness)",
-        "pow(1.0 - clamp(dot(normal, view_dir), 0.0, 1.0), 4.0)",
+        "pow4(1.0 - clamp(dot(normal, view_dir), 0.0, 1.0))",
     ] {
         assert!(terrain.contains(curve), "missing terrain curve {curve}");
     }
     let water = MEGU_WATER_SURFACE_WGSL;
     for curve in [
         "if (shadow.sun_direction.y < 0.0)",
-        "let lunar_path = pow(max(dot(reflected, moon_axis), 0.0), 72.0)",
+        "let lunar_path = pow72(max(dot(reflected, moon_axis), 0.0))",
         "* rise * shadow.moon_color.w",
         "return vec4<f32>(color + suigetsu, 0.88)",
     ] {

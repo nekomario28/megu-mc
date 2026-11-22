@@ -8,7 +8,7 @@ pub const EDGE_CORNER_CELLS: usize = 12 * EDGE + 8;
 
 /// Direction values follow the server's voxel-face order.
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Direction {
     Down = 0,
     Up = 1,

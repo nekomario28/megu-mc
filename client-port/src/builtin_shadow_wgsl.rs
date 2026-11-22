@@ -373,6 +373,20 @@ impl Default for VfxLightUniforms {
     }
 }
 
+impl VfxLightUniforms {
+    /// Stamp a [`compute_region_light_mask`] result into `light_count[1..=2]`
+    /// (lo/hi u32) so the WGSL walk visits only lights intersecting the
+    /// meshed region. The fixed binding layout is unchanged: `yz` was
+    /// previously always zero, and a zero `yz` is the shader's "no culling"
+    /// fallback, so packing an empty mask is a perf no-op, never a
+    /// correctness change.
+    pub fn with_region_light_mask(mut self, mask: u64) -> Self {
+        self.light_count[1] = mask as u32;
+        self.light_count[2] = (mask >> 32) as u32;
+        self
+    }
+}
+
 /// Packs already-validated VFX1 dynamic colored lights into the WGSL binding.
 /// Invalid external values are skipped, and the selected quality caps uploads.
 pub fn pack_vfx1_lights(
@@ -405,6 +419,47 @@ pub fn pack_vfx1_lights(
         result.light_count[0] += 1;
     }
     result
+}
+
+/// Region→light culling bit mask for the terrain shader's u64 capability
+/// mask. Bit `i` is set exactly when the `i`-th packed light's bounding
+/// sphere (`position_radius.xyz`, `.w` radius) intersects the
+/// `region_aabb_min`/`region_aabb_max` AABB. The mask is meant to be packed
+/// into `VfxLightUniforms::light_count[1..=2]` (lo/hi u32) so the WGSL
+/// `light_mask_take`/`countTrailingZeros` walk touches only intersecting
+/// lights. At most 64 lights are considered; non-finite or inverted bounds
+/// and non-finite/negative radii fail closed to that light's bit cleared.
+pub fn compute_region_light_mask(
+    region_aabb_min: [f32; 3],
+    region_aabb_max: [f32; 3],
+    lights: &[GpuPointLight],
+) -> u64 {
+    if !region_aabb_min
+        .iter()
+        .chain(region_aabb_max.iter())
+        .all(|v| v.is_finite())
+    {
+        return 0;
+    }
+    let mut mask = 0u64;
+    for (index, light) in lights.iter().take(64).enumerate() {
+        let pos = light.position_radius;
+        let radius = pos[3];
+        if !radius.is_finite() || radius < 0.0 {
+            continue;
+        }
+        let mut distance_sq = 0.0f32;
+        for axis in 0..3 {
+            let lo = region_aabb_min[axis].min(region_aabb_max[axis]);
+            let hi = region_aabb_min[axis].max(region_aabb_max[axis]);
+            let delta = pos[axis] - pos[axis].clamp(lo, hi);
+            distance_sq += delta * delta;
+        }
+        if distance_sq.is_finite() && distance_sq <= radius * radius {
+            mask |= 1u64 << index;
+        }
+    }
+    mask
 }
 
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -1035,6 +1090,29 @@ struct ShadowUniforms {
 @group(3) @binding(1) var shadow_depth: texture_depth_2d_array;
 @group(3) @binding(2) var shadow_compare: sampler_comparison;
 
+// Compile-time Vogel disk: point i sits at radius sqrt((i + 0.5) / 16)
+// along golden angle i * 2.39996323. Rescaling by 4 * inverseSqrt(taps)
+// reproduces the exact sqrt((i + 0.5) / taps) footprint for any tap count
+// <= 16, so the loop below needs no per-tap sqrt/sin/cos.
+const VOGEL_16 = array<vec2<f32>, 16>(
+    vec2<f32>(0.1767766922712326, 0.0),
+    vec2<f32>(-0.2257721722126007, 0.206825852394104),
+    vec2<f32>(0.03455798327922821, -0.3937712013721466),
+    vec2<f32>(0.28457140922546387, 0.37117263674736023),
+    vec2<f32>(-0.522223174571991, -0.09237373620271683),
+    vec2<f32>(0.4946953356266022, -0.31468483805656433),
+    vec2<f32>(-0.16546531021595, 0.6155251860618591),
+    vec2<f32>(-0.31556200981140137, -0.6075941324234009),
+    vec2<f32>(0.6846423149108887, 0.25002971291542053),
+    vec2<f32>(-0.7122558951377869, 0.29400935769081116),
+    vec2<f32>(0.343354195356369, -0.7337287664413452),
+    vec2<f32>(0.253730446100235, 0.8089319467544556),
+    vec2<f32>(-0.7647467851638794, -0.4431843161582947),
+    vec2<f32>(0.8971335887908936, -0.19723407924175262),
+    vec2<f32>(-0.5475055575370789, 0.7787731885910034),
+    vec2<f32>(-0.1264883130788803, -0.9760894775390625)
+);
+
 fn shadow_cascade_visibility(world: vec3<f32>, n: vec3<f32>, layer: u32) -> f32 {
     let sun = normalize(shadow.sun_direction.xyz);
     let incidence = clamp(dot(n, sun), 0.0, 1.0);
@@ -1048,11 +1126,12 @@ fn shadow_cascade_visibility(world: vec3<f32>, n: vec3<f32>, layer: u32) -> f32 
     let resolution = max(shadow.shadow_params.x, 1.0);
     let taps = max(1u, min(u32(shadow.shadow_params.z), 16u));
     let bias = 0.00035 + (1.0 - incidence) * 0.0015;
+    // sqrt((i + 0.5) / taps) == VOGEL_16[i].xy * 4 / sqrt(taps): a single
+    // inverseSqrt per pixel replaces per-tap radius/trigonometric work.
+    let disk_scale = 4.0 * inverseSqrt(f32(taps)) * 1.7 / resolution;
     var visibility = 0.0;
     for (var i = 0u; i < taps; i = i + 1u) {
-        let radius = sqrt((f32(i) + 0.5) / f32(taps));
-        let angle = f32(i) * 2.39996323;
-        let offset = radius * vec2<f32>(cos(angle), sin(angle)) * 1.7 / resolution;
+        let offset = VOGEL_16[i] * disk_scale;
         visibility += textureSampleCompareLevel(shadow_depth, shadow_compare,
             uv + offset, i32(layer), clip.z - bias);
     }
@@ -1063,6 +1142,11 @@ fn shadow_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {
     if (shadow.sun_direction.y <= 0.08) { return 1.0; }
     let count = u32(shadow.shadow_params.y);
     if (count == 0u) { return 1.0; }
+    // Sun-backface early-out: a face strictly turned away from the sun is
+    // self-shadowed by its own block, so no shadow tap is ever needed. The
+    // moon sits at -sun, so moonlit faces have dot(n, sun) > 0 and still
+    // sample the map — komorebi/moonlight semantics are preserved exactly.
+    if (dot(n, normalize(shadow.sun_direction.xyz)) <= 0.0) { return 0.0; }
     let distance_along_view = dot(world - shadow.camera_position.xyz,
                                     shadow.camera_forward.xyz);
     var layer = 0u;
@@ -1077,8 +1161,12 @@ fn shadow_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {
         let end = shadow.cascade_splits[layer];
         let band = max((end - start) * 0.08, 0.01);
         let blend = smoothstep(end - band, end, distance_along_view);
-        visibility = mix(visibility,
-            shadow_cascade_visibility(world, n, layer + 1u), blend);
+        // Next-cascade guard: blend == 0 contributes nothing, so the second
+        // cascade PCF only runs inside the ~8% blend band.
+        if (blend > 0.001) {
+            visibility = mix(visibility,
+                shadow_cascade_visibility(world, n, layer + 1u), blend);
+        }
     }
     return visibility;
 }
@@ -1145,7 +1233,80 @@ fn poisson(i: u32) -> vec2<f32> {
     );
     return points[i];
 }
+// Compile-time Vogel disk: point i sits at radius sqrt((i + 0.5) / 16)
+// along golden angle i * 2.3999632. Rescaling by 4 * inverseSqrt(taps)
+// reproduces the exact sqrt((i + 0.5) / taps) footprint for any tap count
+// <= 16, so the loop below needs no per-tap sqrt/sin/cos.
+const VOGEL_16 = array<vec2<f32>, 16>(
+    vec2<f32>(0.1767766922712326, 0.0),
+    vec2<f32>(-0.2257721722126007, 0.206825852394104),
+    vec2<f32>(0.03455798327922821, -0.3937712013721466),
+    vec2<f32>(0.28457140922546387, 0.37117263674736023),
+    vec2<f32>(-0.522223174571991, -0.09237373620271683),
+    vec2<f32>(0.4946953356266022, -0.31468483805656433),
+    vec2<f32>(-0.16546531021595, 0.6155251860618591),
+    vec2<f32>(-0.31556200981140137, -0.6075941324234009),
+    vec2<f32>(0.6846423149108887, 0.25002971291542053),
+    vec2<f32>(-0.7122558951377869, 0.29400935769081116),
+    vec2<f32>(0.343354195356369, -0.7337287664413452),
+    vec2<f32>(0.253730446100235, 0.8089319467544556),
+    vec2<f32>(-0.7647467851638794, -0.4431843161582947),
+    vec2<f32>(0.8971335887908936, -0.19723407924175262),
+    vec2<f32>(-0.5475055575370789, 0.7787731885910034),
+    vec2<f32>(-0.1264883130788803, -0.9760894775390625)
+);
+
+// Per-pixel interleaved-gradient rotation seed for the disk.
+fn ign(p: vec2<f32>) -> f32 {
+    return fract(52.9829189 * fract(dot(p, vec2<f32>(0.06711056, 0.00583715))));
+}
+
+fn pow2(x: f32) -> f32 { return x * x; }
+fn pow3(x: f32) -> f32 { return x * x * x; }
+fn pow4(x: f32) -> f32 { let x2 = x * x; return x2 * x2; }
+fn pow12(x: f32) -> f32 { let x4 = pow4(x); return x4 * x4 * x4; }
+fn pow24(x: f32) -> f32 { let x12 = pow12(x); return x12 * x12; }
+
+// Prefix mask over the first `count` of 64 dynamic lights (u64 as lo/hi).
+fn light_mask_prefix(count: u32) -> vec2<u32> {
+    if (count >= 64u) {
+        return vec2<u32>(0xFFFFFFFFu, 0xFFFFFFFFu);
+    }
+    if (count == 32u) {
+        return vec2<u32>(0xFFFFFFFFu, 0u);
+    }
+    if (count > 32u) {
+        return vec2<u32>(0xFFFFFFFFu, (1u << (count - 32u)) - 1u);
+    }
+    if (count == 0u) {
+        return vec2<u32>(0u, 0u);
+    }
+    return vec2<u32>((1u << count) - 1u, 0u);
+}
+
+// Removes and returns the lowest set bit index of the u64 mask
+// (lo = x, hi = y), or 64 when empty — one countTrailingZeros per light.
+fn light_mask_take(mask: ptr<function, vec2<u32>>) -> u32 {
+    if ((*mask).x != 0u) {
+        let i = countTrailingZeros((*mask).x);
+        (*mask).x = (*mask).x & ((*mask).x - 1u);
+        return i;
+    }
+    if ((*mask).y != 0u) {
+        let i = countTrailingZeros((*mask).y);
+        (*mask).y = (*mask).y & ((*mask).y - 1u);
+        return 32u + i;
+    }
+    return 64u;
+}
+
 fn sample_cascade(position: vec3<f32>, normal: vec3<f32>, cascade: u32) -> f32 {
+    // Sun-backface early-out: a face strictly turned away from the sun is
+    // self-shadowed, so no tap is needed. Komorebi still applies on the
+    // dimmed path and the moon (at -sun) is untouched.
+    if (dot(normal, normalize(shadow.sun_direction.xyz)) <= 0.0) {
+        return 0.0;
+    }
     let quality = u32(shadow.render_params.x);
     // A solar eclipse softens penumbrae by widening the filter footprint.
     let texel = (1.0 + shadow.celestial_params.w * 1.5)
@@ -1162,25 +1323,23 @@ fn sample_cascade(position: vec3<f32>, normal: vec3<f32>, cascade: u32) -> f32 {
     if (taps == 0u) {
         return 1.0;
     }
-    let rotation = fract(sin(dot(position.xz, vec2<f32>(12.73, 79.41))) * 4341.21)
-        * 6.2831853;
+    // Interleaved-gradient per-pixel rotation, applied as one mat2x2:
+    // a single sin/cos pair per pixel replaces per-tap trigonometry.
+    let rotation = ign(position.xz) * 6.2831853;
     let c = cos(rotation);
     let s = sin(rotation);
+    let disk_rot = mat2x2<f32>(c, s, -s, c);
+    // sqrt((i + 0.5) / taps) == VOGEL_16[i].xy * 4 / sqrt(taps).
+    let disk_scale = 4.0 * inverseSqrt(f32(taps));
     var visibility = 0.0;
     for (var i = 0u; i < taps; i = i + 1u) {
         var offset: vec2<f32>;
         if (quality <= 1u) {
             offset = vec2<f32>(f32(i % 2u), f32(i / 2u)) * 2.0 - vec2<f32>(1.0);
         } else if (quality == 2u) {
-            offset = poisson(i);
+            offset = disk_rot * poisson(i);
         } else {
-            let angle = f32(i) * 2.3999632 + rotation;
-            let radius = sqrt((f32(i) + 0.5) / f32(taps));
-            offset = radius * vec2<f32>(cos(angle), sin(angle)) * 1.8;
-        }
-        if (quality == 2u) {
-            offset = vec2<f32>(offset.x * c - offset.y * s,
-                               offset.x * s + offset.y * c);
+            offset = disk_rot * VOGEL_16[i] * disk_scale * 1.8;
         }
         visibility += textureSampleCompareLevel(shadow_depth, depth_comparison,
                                                 uv + offset * texel, i32(cascade),
@@ -1273,7 +1432,7 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
     let rich_albedo = clamp(input.albedo
         * (vec3<f32>(1.0) + (input.albedo - vec3<f32>(wet_luma)) * (0.08 * wetness))
         * (1.0 - 0.18 * wetness), vec3<f32>(0.0), vec3<f32>(1.0));
-    let grazing_sheen = pow(1.0 - clamp(dot(normal, view_dir), 0.0, 1.0), 4.0)
+    let grazing_sheen = pow4(1.0 - clamp(dot(normal, view_dir), 0.0, 1.0))
         * 0.12 * wetness * max(normal.y, 0.0);
     // Quiet the darkest saturated materials before warm lamplight returns.
     var lit_color = rich_albedo * light;
@@ -1287,14 +1446,28 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
     var limit = 8u;
     if (shadow.render_params.x >= 2.0) { limit = 32u; }
     if (shadow.render_params.x >= 3.0) { limit = 64u; }
+    // The loop walks a u64 capability mask (lo = x, hi = y) over the first
+    // `light_limit` admitted lights; an optional region mask packed into
+    // light_count.yz by `compute_region_light_mask` narrows the walk to the
+    // lights intersecting the meshed region. The fixed 64-slot binding
+    // layout is unchanged.
     let light_limit = min(dynamic_lights.light_count.x, limit);
-    for (var i = 0u; i < light_limit; i = i + 1u) {
+    var light_mask = light_mask_prefix(light_limit);
+    let region_mask = dynamic_lights.light_count.yz;
+    if (region_mask.x != 0u || region_mask.y != 0u) {
+        light_mask = light_mask & region_mask;
+    }
+    loop {
+        let i = light_mask_take(&light_mask);
+        if (i >= 64u) {
+            break;
+        }
         let point = dynamic_lights.lights[i];
         let displacement = point.position_radius.xyz - input.world_position;
         let radius = max(point.position_radius.w, 0.01);
         let distance_sq = max(dot(displacement, displacement), 0.0001);
         let distance = sqrt(distance_sq);
-        let falloff = pow(max(1.0 - distance / radius, 0.0), 2.0);
+        let falloff = pow2(max(1.0 - distance / radius, 0.0));
         let L_dir = displacement / distance;
         let wrap = 0.28;
         let wrapped_diffuse = clamp((dot(normal, L_dir) + wrap) / (1.0 + wrap), 0.0, 1.0);
@@ -1305,7 +1478,7 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
         let half_vector = L_dir + view_dir;
         let half_vec = half_vector / max(length(half_vector), 0.0001);
         lacquer_sheen += radiance * vec3<f32>(1.0, 0.78, 0.52)
-                         * pow(max(dot(normal, half_vec), 0.0), 12.0) * 0.08;
+                         * pow12(max(dot(normal, half_vec), 0.0)) * 0.08;
     }
     lit_color += rich_albedo * lantern_light + lacquer_sheen
                  + sky_ambient * grazing_sheen;
@@ -1315,8 +1488,8 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
     let daylight = smoothstep(-0.12, 0.12, shadow.sun_direction.y);
     let twilight = 1.0 - smoothstep(0.0, 0.28, abs(shadow.sun_direction.y));
     let gaze = view_offset / max(view_distance, 0.0001);
-    let horizon_mist = pow(1.0 - abs(gaze.y), 3.0);
-    let toward_sun = pow(max(dot(gaze, to_sun), 0.0), 4.0);
+    let horizon_mist = pow3(1.0 - abs(gaze.y));
+    let toward_sun = pow4(max(dot(gaze, to_sun), 0.0));
     let indigo_fog = mix(vec3<f32>(0.075, 0.095, 0.17),
                          vec3<f32>(0.50, 0.59, 0.68), daylight);
     let mist = twilight * horizon_mist;
@@ -1326,7 +1499,7 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
     if (shadow.render_params.x >= 3.0) {
         // Screen-direction sun-shaft hint, without a volumetric buffer.
         let toward = view_offset / max(view_distance, 0.0001);
-        let beam = pow(max(dot(toward, to_sun), 0.0), 24.0);
+        let beam = pow24(max(dot(toward, to_sun), 0.0));
         color += shadow.sun_color.xyz * beam * atmosphere * 0.12;
         color = aces(color);
     }
@@ -1356,6 +1529,14 @@ struct ShadowUniforms {
 };
 @group(0) @binding(0) var<uniform> shadow: ShadowUniforms;
 
+fn pow3(x: f32) -> f32 { return x * x * x; }
+fn pow4(x: f32) -> f32 { let x2 = x * x; return x2 * x2; }
+fn pow260(x: f32) -> f32 {
+    // x^260 = x^256 * x^4 through a pure doubling chain.
+    let x4 = pow4(x);
+    return pow4(pow4(pow4(x4))) * x4;
+}
+
 struct SkyOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) ndc: vec2<f32>,
@@ -1377,7 +1558,7 @@ fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
                          + shadow.camera_up.xyz * input.ndc.y * shadow.camera_up.w);
     let sun = normalize(shadow.sun_direction.xyz);
     let mu = clamp(dot(view, sun), -1.0, 1.0);
-    let horizon = pow(1.0 - abs(view.y), 3.0);
+    let horizon = pow3(1.0 - abs(view.y));
     let day = smoothstep(-0.12, 0.12, sun.y);
     // Tasogare: ai-iro above, restrained akane by the horizon.
     let twilight = 1.0 - smoothstep(0.0, 0.28, abs(sun.y));
@@ -1392,7 +1573,7 @@ fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
         let rayleigh = (1.0 + mu * mu) * 0.75;
         let mie_g = 0.72;
         let denom = max(1.0 + mie_g * mie_g - 2.0 * mie_g * mu, 0.01);
-        let mie = (1.0 - mie_g * mie_g) / pow(denom, 1.5);
+        let mie = (1.0 - mie_g * mie_g) / (denom * sqrt(denom));
         color += vec3<f32>(0.025, 0.072, 0.15) * rayleigh * day
                  * (1.0 - twilight * 0.65);
         color += vec3<f32>(0.10, 0.075, 0.045) * mie * day * 0.1;
@@ -1413,7 +1594,7 @@ fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
             }
         }
     }
-    let toward_sun = pow(max(mu, 0.0), 4.0);
+    let toward_sun = pow4(max(mu, 0.0));
     // Asa-moya lends the twilight horizon a moist, low-contrast veil.
     color = mix(color, vec3<f32>(0.24, 0.21, 0.23), twilight * horizon * 0.16);
     color += vec3<f32>(0.42, 0.17, 0.10) * twilight * horizon * toward_sun;
@@ -1436,7 +1617,7 @@ fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
              * (1.0 - shadow.celestial_params.w);
     // The eclipse corona appears as a pale ring once the disc is covered.
     if (shadow.celestial_params.y > 0.001) {
-        let ring = pow(max(mu, 0.0), 260.0);
+        let ring = pow260(max(mu, 0.0));
         color += vec3<f32>(1.0, 0.92, 0.78) * ring
                  * shadow.celestial_params.y * 1.6;
     }
@@ -1466,6 +1647,31 @@ struct ShadowUniforms {
     celestial_params: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> shadow: ShadowUniforms;
+
+fn pow3(x: f32) -> f32 { return x * x * x; }
+fn pow4(x: f32) -> f32 { let x2 = x * x; return x2 * x2; }
+fn pow5(x: f32) -> f32 { return pow4(x) * x; }
+fn pow72(x: f32) -> f32 {
+    // x^72 = x^48 * x^24 through a pure doubling chain.
+    let x3 = x * x * x;
+    let x6 = x3 * x3;
+    let x12 = x6 * x6;
+    let x24 = x12 * x12;
+    let x48 = x24 * x24;
+    return x48 * x24;
+}
+fn pow180(x: f32) -> f32 {
+    // x^180 = x^144 * x^36 through a pure doubling chain.
+    let x2 = x * x;
+    let x4 = x2 * x2;
+    let x8 = x4 * x4;
+    let x9 = x8 * x;
+    let x18 = x9 * x9;
+    let x36 = x18 * x18;
+    let x72 = x36 * x36;
+    let x144 = x72 * x72;
+    return x144 * x36;
+}
 
 struct WaterInput {
     @location(0) world_position: vec3<f32>,
@@ -1512,7 +1718,7 @@ fn fs_main(input: WaterOutput) -> @location(0) vec4<f32> {
     var suigetsu = vec3<f32>(0.0);
     if (shadow.sun_direction.y < 0.0) {
         let moon_axis = -normalize(shadow.sun_direction.xyz);
-        let lunar_path = pow(max(dot(reflected, moon_axis), 0.0), 72.0);
+        let lunar_path = pow72(max(dot(reflected, moon_axis), 0.0));
         let ripple = 0.70 + 0.30
             * sin(input.world_position.x * 0.83 + phase * 1.8)
             * sin(input.world_position.z * 0.91 - phase * 1.4);
@@ -1523,20 +1729,20 @@ fn fs_main(input: WaterOutput) -> @location(0) vec4<f32> {
     if (quality <= 1.0) {
         return vec4<f32>(color + suigetsu, 0.88);
     }
-    let fresnel = 0.02 + 0.98 * pow(1.0 - max(dot(normal, view), 0.0), 5.0);
+    let fresnel = 0.02 + 0.98 * pow5(1.0 - max(dot(normal, view), 0.0));
     let sky = mix(vec3<f32>(0.02, 0.035, 0.085),
                   vec3<f32>(0.18, 0.44, 0.78), day);
     let sky_reflection = mix(sky * 0.6, sky, clamp(reflected.y, 0.0, 1.0))
         * (1.0 - shadow.celestial_params.w * 0.55);
     let half_vector = view + shadow.sun_direction.xyz;
     let halfway = half_vector / max(length(half_vector), 0.0001);
-    let sparkle = pow(max(dot(normal, halfway), 0.0), 180.0);
+    let sparkle = pow180(max(dot(normal, halfway), 0.0));
     color = mix(color, sky_reflection, fresnel)
             + shadow.sun_color.xyz * sparkle * day * 0.8 + suigetsu;
     if (quality >= 3.0) {
         let ripple = sin(input.world_position.x * 1.7 + phase * 3.0)
                      * sin(input.world_position.z * 1.9 - phase * 2.0);
-        let caustic = pow(max(ripple, 0.0), 3.0) * (1.0 - depth);
+        let caustic = pow3(max(ripple, 0.0)) * (1.0 - depth);
         color += vec3<f32>(0.018, 0.06, 0.075) * caustic;
     }
     return vec4<f32>(pow(max(color, vec3<f32>(0.0)),
