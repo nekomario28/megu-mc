@@ -1,0 +1,25 @@
+[package]
+name = "mc-spine-client-gpu"
+version = "0.1.0"
+edition = "2021"
+license = "LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later"
+description = "Standalone real windowed GPU client for mc-spine (winit + wgpu)"
+publish = false
+
+[lib]
+name = "mc_spine_client_gpu"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mc-spine-client-gpu"
+path = "src/main.rs"
+
+[dependencies]
+mc_spine_client = { package = "mc-spine-client", path = "../client-app" }
+mc_spine_client_mesh = { package = "mc-spine-client-mesh", path = "../client-port" }
+mc_spine_kernel = { package = "mc-spine-kernel", path = "../client-kernel" }
+mc_spine_ui = { package = "mc-spine-client-ui", path = "../client-ui" }
+bytemuck = { version = "1.25", features = ["derive"] }
+pollster = "0.4"
+wgpu = "30.0.1"
+winit = "0.30"

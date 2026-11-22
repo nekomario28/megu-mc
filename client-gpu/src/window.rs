@@ -1,0 +1,502 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+//! `winit` 0.30 window + input loop: `ApplicationHandler`, FPS camera
+//! controls, pause/settings via `mc_spine_ui`, background-FPS throttling,
+//! and `FrameBudgetGovernor` pacing — all driving the real `wgpu` renderer.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use mc_spine_client::render::{FrameBudgetGovernor, RenderConfig};
+use mc_spine_ui::draw::rasterize_draw_list;
+use mc_spine_ui::state::{Screen, UiAction, UiInputEvent, UiKey, UiState};
+use winit::application::ApplicationHandler;
+use winit::dpi::PhysicalSize;
+use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
+
+use crate::renderer::{request_gpu_device, GpuRenderer};
+use crate::{build_demo_scene, present_mode_for, Camera, GpuCliConfig, MoveInput};
+
+/// Window title.
+pub const WINDOW_TITLE: &str = "mc-spine";
+
+/// GPU-side state that exists only once the window + surface are up.
+struct ActiveWindow {
+    window: Arc<Window>,
+    surface: wgpu::Surface<'static>,
+    renderer: GpuRenderer,
+    surface_format: wgpu::TextureFormat,
+    size: PhysicalSize<u32>,
+}
+
+/// Key set for FPS movement.
+#[derive(Default)]
+struct Keys {
+    forward: bool,
+    back: bool,
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+    sprint: bool,
+}
+
+impl Keys {
+    fn move_input(&self) -> MoveInput {
+        let axis = |pos: bool, neg: bool| match (pos, neg) {
+            (true, false) => 1.0,
+            (false, true) => -1.0,
+            _ => 0.0,
+        };
+        MoveInput {
+            forward: axis(self.forward, self.back),
+            strafe: axis(self.right, self.left),
+            vertical: axis(self.up, self.down),
+            sprint: self.sprint,
+        }
+    }
+}
+
+/// The `ApplicationHandler` `EventLoop::run_app` drives.
+pub struct GpuApp {
+    config: GpuCliConfig,
+    active: Option<ActiveWindow>,
+    camera: Camera,
+    keys: Keys,
+    focused: bool,
+    cursor_grabbed: bool,
+    paused: bool,
+    show_diagnostics: bool,
+    mouse_pos: (i32, i32),
+    ui: UiState,
+    render_config: RenderConfig,
+    governor: FrameBudgetGovernor,
+    last_frame: Instant,
+    frame_start: Instant,
+    fatal: Option<String>,
+}
+
+impl GpuApp {
+    /// Build the app state (no GPU or window yet — `resumed` does that).
+    pub fn new(config: GpuCliConfig) -> Self {
+        let render_config = RenderConfig {
+            vsync: config.vsync,
+            gpu_backend: config.gpu_backend,
+            shader_pack: config.shader_pack.as_ref().map(|p| p.display().to_string()),
+            ..RenderConfig::default()
+        };
+        let governor = FrameBudgetGovernor::new(render_config.max_fps);
+        let camera = Camera {
+            position: [8.0, 18.0, 26.0],
+            yaw_deg: 180.0,
+            pitch_deg: -18.0,
+            ..Camera::default()
+        };
+        let mut ui = UiState::new();
+        ui.screen = Screen::InGameHud;
+        ui.hud = mc_spine_ui::state::HudState::demo();
+        Self {
+            config,
+            active: None,
+            camera,
+            keys: Keys::default(),
+            focused: true,
+            cursor_grabbed: false,
+            paused: false,
+            show_diagnostics: false,
+            mouse_pos: (0, 0),
+            ui,
+            render_config,
+            governor,
+            last_frame: Instant::now(),
+            frame_start: Instant::now(),
+            fatal: None,
+        }
+    }
+
+    /// The fatal setup error, if `resumed` hit one (`run` reports it).
+    pub fn fatal(&self) -> Option<&str> {
+        self.fatal.as_deref()
+    }
+
+    fn set_cursor_grab(&mut self, grab: bool) {
+        let Some(active) = &self.active else {
+            return;
+        };
+        if grab && !self.cursor_grabbed {
+            active
+                .window
+                .set_cursor_grab(CursorGrabMode::Confined)
+                .or_else(|_| active.window.set_cursor_grab(CursorGrabMode::Locked))
+                .ok();
+            active.window.set_cursor_visible(false);
+            self.cursor_grabbed = true;
+        } else if !grab && self.cursor_grabbed {
+            active.window.set_cursor_grab(CursorGrabMode::None).ok();
+            active.window.set_cursor_visible(true);
+            self.cursor_grabbed = false;
+        }
+    }
+
+    fn init_gpu(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
+        let attrs = WindowAttributes::default()
+            .with_title(WINDOW_TITLE)
+            .with_inner_size(PhysicalSize::new(1280u32, 720u32))
+            .with_resizable(true);
+        let window = Arc::new(
+            event_loop
+                .create_window(attrs)
+                .map_err(|e| format!("create_window: {e}"))?,
+        );
+        // Instance bound to this event loop's display, then adapter + device,
+        // then a surface the selected adapter can present to.
+        let ctx = request_gpu_device(
+            self.render_config.gpu_backend,
+            Some(event_loop.owned_display_handle()),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+        let surface = ctx
+            .instance
+            .create_surface(window.clone())
+            .map_err(|e| format!("create_surface: {e}"))?;
+        let caps = surface.get_capabilities(&ctx.adapter);
+        if caps.formats.is_empty() {
+            return Err(format!(
+                "adapter {:?} cannot present to this surface",
+                ctx.report.backend
+            ));
+        }
+        let surface_format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| f.is_srgb())
+            .unwrap_or(caps.formats[0]);
+        let size = window.inner_size();
+        let mut active = ActiveWindow {
+            window,
+            surface,
+            renderer: GpuRenderer::new(ctx, surface_format),
+            surface_format,
+            size,
+        };
+        let config = surface_config_for(
+            self.render_config.vsync,
+            active.surface_format,
+            active.size,
+            &caps,
+        );
+        active
+            .surface
+            .configure(&active.renderer.gpu().device, &config);
+        let scene = build_demo_scene(self.camera.position);
+        active
+            .renderer
+            .upload_scene(&scene)
+            .map_err(|e| e.to_string())?;
+        if let Some(path) = &self.config.shader_pack {
+            active.renderer.load_shaderpack(path);
+        }
+        self.active = Some(active);
+        self.set_cursor_grab(true);
+        Ok(())
+    }
+
+    fn render_frame(&mut self) {
+        let frame_begin = Instant::now();
+        self.frame_start = frame_begin;
+        let dt = frame_begin.duration_since(self.last_frame).as_secs_f32();
+        self.last_frame = frame_begin;
+
+        // Camera movement only applies while unpaused and grabbed.
+        if !self.paused {
+            self.camera.apply_move(self.keys.move_input(), dt.min(0.1));
+        }
+
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        let (w, h) = (active.size.width.max(1), active.size.height.max(1));
+
+        // HUD/diagnostics through the real client-ui state machine.
+        self.ui.hud.actionbar = if self.show_diagnostics {
+            format!(
+                "F3 | {} | {} | {:.1} ms",
+                active.renderer.gpu().report.resolution.backend.as_str(),
+                active.renderer.gpu().report.name,
+                self.governor.frame_ms(),
+            )
+        } else {
+            String::new()
+        };
+        let draw_list = self.ui.render(w, h);
+        let rgba = rasterize_draw_list(w, h, &draw_list);
+        if let Err(e) = active.renderer.update_ui_framebuffer(w, h, &rgba) {
+            self.fatal = Some(format!("UI upload: {e}"));
+            return;
+        }
+        let sky = active
+            .renderer
+            .set_camera(&self.camera, w as f32 / h as f32);
+        match active.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+                let view = frame
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+                active.renderer.render_to_view(&view, w, h, &sky);
+                active.renderer.gpu().queue.present(frame);
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {}
+            wgpu::CurrentSurfaceTexture::Outdated
+            | wgpu::CurrentSurfaceTexture::Lost
+            | wgpu::CurrentSurfaceTexture::Validation => {
+                let caps = active
+                    .surface
+                    .get_capabilities(&active.renderer.gpu().adapter);
+                let cfg = surface_config_for(
+                    self.render_config.vsync,
+                    active.surface_format,
+                    active.size,
+                    &caps,
+                );
+                active
+                    .surface
+                    .configure(&active.renderer.gpu().device, &cfg);
+            }
+        }
+        self.governor.observe_frame(frame_begin.elapsed());
+    }
+
+    fn handle_key(&mut self, code: KeyCode, state: ElementState, event_loop: &ActiveEventLoop) {
+        let pressed = state == ElementState::Pressed;
+        match code {
+            KeyCode::KeyW => self.keys.forward = pressed,
+            KeyCode::KeyS => self.keys.back = pressed,
+            KeyCode::KeyA => self.keys.left = pressed,
+            KeyCode::KeyD => self.keys.right = pressed,
+            KeyCode::Space => self.keys.up = pressed,
+            KeyCode::ShiftLeft | KeyCode::ShiftRight => self.keys.down = pressed,
+            KeyCode::ControlLeft | KeyCode::ControlRight => self.keys.sprint = pressed,
+            KeyCode::F3 if pressed => self.show_diagnostics = !self.show_diagnostics,
+            KeyCode::Escape if pressed => {
+                self.paused = !self.paused;
+                if self.paused {
+                    self.ui.navigate(Screen::Pause);
+                } else {
+                    for action in self
+                        .ui
+                        .handle_input(UiInputEvent::KeyPressed(UiKey::Escape))
+                    {
+                        self.apply_ui_action(&action, event_loop);
+                    }
+                }
+                self.set_cursor_grab(!self.paused);
+            }
+            _ => {
+                if pressed && self.paused {
+                    if let Some(key) = ui_key(code) {
+                        let actions = self.ui.handle_input(UiInputEvent::KeyPressed(key));
+                        for action in actions {
+                            self.apply_ui_action(&action, event_loop);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_ui_action(&mut self, action: &UiAction, event_loop: &ActiveEventLoop) {
+        match action {
+            UiAction::QuitGame => event_loop.exit(),
+            UiAction::OpenScreen(screen) => self.ui.navigate(*screen),
+            UiAction::Back => {
+                self.ui
+                    .handle_input(UiInputEvent::KeyPressed(UiKey::Escape));
+            }
+            _ => {}
+        }
+    }
+
+    fn reconfigure(&mut self, size: PhysicalSize<u32>) {
+        let Some(active) = &mut self.active else {
+            return;
+        };
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+        active.size = size;
+        let caps = active
+            .surface
+            .get_capabilities(&active.renderer.gpu().adapter);
+        let cfg = surface_config_for(
+            self.render_config.vsync,
+            active.surface_format,
+            active.size,
+            &caps,
+        );
+        active
+            .surface
+            .configure(&active.renderer.gpu().device, &cfg);
+    }
+}
+
+/// The effective surface configuration for the current size/caps.
+fn surface_config_for(
+    vsync: bool,
+    surface_format: wgpu::TextureFormat,
+    size: PhysicalSize<u32>,
+    caps: &wgpu::SurfaceCapabilities,
+) -> wgpu::SurfaceConfiguration {
+    wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format: surface_format,
+        color_space: wgpu::SurfaceColorSpace::Auto,
+        width: size.width.max(1),
+        height: size.height.max(1),
+        present_mode: present_mode_for(vsync, &caps.present_modes),
+        desired_maximum_frame_latency: 2,
+        alpha_mode: caps
+            .alpha_modes
+            .first()
+            .copied()
+            .unwrap_or(wgpu::CompositeAlphaMode::Auto),
+        view_formats: vec![],
+    }
+}
+
+fn ui_key(code: KeyCode) -> Option<UiKey> {
+    Some(match code {
+        KeyCode::Tab => UiKey::Tab,
+        KeyCode::ArrowUp => UiKey::Up,
+        KeyCode::ArrowDown => UiKey::Down,
+        KeyCode::ArrowLeft => UiKey::Left,
+        KeyCode::ArrowRight => UiKey::Right,
+        KeyCode::Enter => UiKey::Enter,
+        KeyCode::Backspace => UiKey::Backspace,
+        _ => return None,
+    })
+}
+
+impl ApplicationHandler for GpuApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.active.is_none() && self.fatal.is_none() {
+            if let Err(err) = self.init_gpu(event_loop) {
+                self.fatal = Some(err);
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => self.reconfigure(size),
+            WindowEvent::Focused(focused) => {
+                self.focused = focused;
+                if !focused {
+                    self.keys = Keys::default();
+                    self.set_cursor_grab(false);
+                } else if !self.paused {
+                    self.set_cursor_grab(true);
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    if !event.repeat {
+                        self.handle_key(code, event.state, event_loop);
+                    }
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.mouse_pos = (position.x as i32, position.y as i32);
+                if self.paused {
+                    let actions = self.ui.handle_input(UiInputEvent::MouseMove {
+                        x: position.x as i32,
+                        y: position.y as i32,
+                    });
+                    for action in actions {
+                        self.apply_ui_action(&action, event_loop);
+                    }
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                if self.paused {
+                    let (x, y) = self.mouse_pos;
+                    let actions = self.ui.handle_input(UiInputEvent::Click { x, y });
+                    for action in actions {
+                        self.apply_ui_action(&action, event_loop);
+                    }
+                } else {
+                    self.set_cursor_grab(true);
+                }
+            }
+            WindowEvent::RedrawRequested => self.render_frame(),
+            _ => {}
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        // Raw mouse deltas drive the camera while grabbed — unaffected by
+        // cursor clamping at screen edges.
+        if let DeviceEvent::MouseMotion { delta } = event {
+            if self.cursor_grabbed && !self.paused {
+                self.camera.apply_mouse_look(delta.0, delta.1);
+            }
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.fatal.is_some() {
+            event_loop.exit();
+            return;
+        }
+        if let Some(active) = &self.active {
+            active.window.request_redraw();
+        }
+        // The effective cap drops to `background_fps_limit` while unfocused
+        // (the RenderConfig rule); WaitUntil holds the loop to it.
+        let cap = self.render_config.effective_fps_cap(self.focused);
+        if cap > 0 {
+            let deadline = self.frame_start + Duration::from_secs_f64(1.0 / f64::from(cap));
+            if deadline > Instant::now() {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            } else {
+                event_loop.set_control_flow(ControlFlow::Poll);
+            }
+        } else {
+            event_loop.set_control_flow(ControlFlow::Poll);
+        }
+    }
+}
+
+/// Run the windowed client. Returns `Err` text when the event loop or GPU
+/// setup fails (e.g. no display — use `--headless-probe` there).
+pub fn run(config: GpuCliConfig) -> Result<(), String> {
+    let event_loop = EventLoop::new().map_err(|e| format!("EventLoop::new: {e}"))?;
+    let mut app = GpuApp::new(config);
+    event_loop
+        .run_app(&mut app)
+        .map_err(|e| format!("run_app: {e}"))?;
+    match app.fatal {
+        Some(fatal) => Err(fatal),
+        None => Ok(()),
+    }
+}
