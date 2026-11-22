@@ -56,6 +56,7 @@ pub mod crash_report;
 pub mod hw_adaptive_engine;
 pub mod id;
 pub mod math;
+pub mod math_opt_foundation;
 pub mod perf_kit;
 pub mod random;
 pub mod server_perf_governors;
