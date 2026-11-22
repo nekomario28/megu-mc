@@ -20,6 +20,7 @@ pub mod occlusion_table;
 mod physics;
 mod registry;
 mod section;
+pub mod skeletal_anim;
 
 // These projected modules retain server-only methods and lint conventions.
 #[allow(dead_code, clippy::all)]
