@@ -16,7 +16,9 @@
 //! PCM (world sounds or decoded `VCR1` voice frames) to stereo every audio
 //! callback.
 
+use std::collections::BTreeMap;
 use std::f32::consts::PI;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Speed of sound in air at sea level (m/s). Minecraft blocks are one metre,
 /// so path lengths in blocks convert directly to delay times.
@@ -69,8 +71,28 @@ fn guard_state(x: f32) -> f32 {
     }
 }
 
-fn soft_clip(x: f32) -> f32 {
-    OUTPUT_LIMIT * (x / OUTPUT_LIMIT).tanh()
+/// Soft-clip knee: below this magnitude the limiter is a strict identity —
+/// the vast majority of mixed samples never pay for the saturating branch.
+const SOFT_CLIP_KNEE: f32 = 0.85;
+
+/// Linear-guarded rational soft clipper. `|x| <= SOFT_CLIP_KNEE` returns `x`
+/// bit-exactly; beyond the knee a first-order Padé saturator
+/// `knee + h·u/(h + u)` (with `h = OUTPUT_LIMIT - knee`, `u = |x| - knee`)
+/// takes over. The rational form is C1-continuous at the knee (both sides
+/// have slope 1 there), monotone, and strictly bounded in
+/// `(-OUTPUT_LIMIT, OUTPUT_LIMIT)` ⊂ `[-1.0, 1.0]` for any finite input — one
+/// reciprocal replaces the transcendental `tanh`.
+#[doc(hidden)]
+#[inline]
+pub fn soft_clip(x: f32) -> f32 {
+    let ax = x.abs();
+    if ax <= SOFT_CLIP_KNEE {
+        x
+    } else {
+        let head = OUTPUT_LIMIT - SOFT_CLIP_KNEE;
+        let u = ax - SOFT_CLIP_KNEE;
+        (SOFT_CLIP_KNEE + head * u / (head + u)).copysign(x)
+    }
 }
 
 fn db_to_linear(db: f32) -> f32 {
@@ -439,6 +461,16 @@ pub trait VoxelAcousticWorld {
     fn is_ray_open(&self, x: i32, y: i32, z: i32) -> bool {
         !self.acoustic_material(x, y, z).is_solid()
     }
+
+    /// `true` when the whole 16×16×16-cell section `(sx, sy, sz)` — section
+    /// coordinates, i.e. `cell.div_euclid(16)` — is uniform air. The DDA
+    /// uses this as a second marching level: a ray inside a uniform-air
+    /// section warps straight to its exit face instead of querying every
+    /// cell. The default `false` keeps every existing implementation on the
+    /// exact per-cell march, so adopting it is opt-in only.
+    fn is_uniform_air_section(&self, _sx: i32, _sy: i32, _sz: i32) -> bool {
+        false
+    }
 }
 
 /// Simple bounds-checked dense voxel store — handy for tests, tools, and the
@@ -632,6 +664,144 @@ impl Default for AcousticScene {
     }
 }
 
+/// One [`AcousticSceneCache`] slot.
+struct SceneCacheEntry {
+    /// World block revision the scene was traced against.
+    revision: u64,
+    /// Last-access stamp from the cache's monotonic logical clock.
+    tick: u64,
+    scene: AcousticScene,
+}
+
+/// Bounded LRU cache of raytraced [`AcousticScene`]s keyed by 2×2×2 m cell
+/// and world block revision. Sound scenes change slowly — a listener pacing
+/// inside the same cell re-hears the same room — so each cell pays for the
+/// Fibonacci bundle once per world revision instead of once per `analyze`.
+/// The clock is a purely logical counter (no `SystemTime`), so cache
+/// behaviour is deterministic and replayable.
+pub struct AcousticSceneCache {
+    capacity: usize,
+    clock: u64,
+    hits: u64,
+    misses: u64,
+    map: BTreeMap<[i32; 3], SceneCacheEntry>,
+}
+
+impl AcousticSceneCache {
+    /// Smallest accepted capacity — below this cells thrash anyway.
+    pub const MIN_CAPACITY: usize = 64;
+    /// Largest accepted capacity — bounds worst-case RAM per cache.
+    pub const MAX_CAPACITY: usize = 256;
+
+    /// Empty cache holding up to `capacity` cells (clamped to
+    /// [`Self::MIN_CAPACITY`]..=[`Self::MAX_CAPACITY`]).
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.clamp(Self::MIN_CAPACITY, Self::MAX_CAPACITY),
+            clock: 0,
+            hits: 0,
+            misses: 0,
+            map: BTreeMap::new(),
+        }
+    }
+
+    /// The 2×2×2 m cache cell containing `position`.
+    pub fn cell_of(position: [f32; 3]) -> [i32; 3] {
+        [
+            (position[0] / 2.0).floor() as i32,
+            (position[1] / 2.0).floor() as i32,
+            (position[2] / 2.0).floor() as i32,
+        ]
+    }
+
+    /// Configured capacity after clamping.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Cells currently cached.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// `true` when nothing is cached.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Successful lookups so far.
+    pub fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    /// Failed lookups so far.
+    pub fn misses(&self) -> u64 {
+        self.misses
+    }
+
+    /// Look up `cell`; `None` when absent or traced against a different
+    /// `world_block_revision` (a revision bump invalidates every stale
+    /// entry on sight and on the next insert).
+    pub fn get(&mut self, cell: [i32; 3], world_block_revision: u64) -> Option<&AcousticScene> {
+        match self.map.get_mut(&cell) {
+            Some(entry) if entry.revision == world_block_revision => {
+                self.hits += 1;
+                self.clock += 1;
+                entry.tick = self.clock;
+                Some(&entry.scene)
+            }
+            _ => {
+                self.misses += 1;
+                None
+            }
+        }
+    }
+
+    /// Cache `scene` for `cell` at `world_block_revision`, dropping every
+    /// stale-revision entry and evicting the least-recently-used cell when
+    /// full.
+    pub fn insert(&mut self, cell: [i32; 3], world_block_revision: u64, scene: AcousticScene) {
+        self.map
+            .retain(|_, e| e.revision == world_block_revision);
+        self.clock += 1;
+        let tick = self.clock;
+        if self.map.len() >= self.capacity && !self.map.contains_key(&cell) {
+            if let Some((&victim, _)) = self
+                .map
+                .iter()
+                .min_by_key(|(_, e)| e.tick)
+            {
+                self.map.remove(&victim);
+            }
+        }
+        self.map.insert(
+            cell,
+            SceneCacheEntry {
+                revision: world_block_revision,
+                tick,
+                scene,
+            },
+        );
+    }
+
+    /// Look up `cell`, tracing and caching with `trace` on a miss. The
+    /// returned scene is always the one stored for the current revision.
+    pub fn get_or_trace(
+        &mut self,
+        cell: [i32; 3],
+        world_block_revision: u64,
+        trace: impl FnOnce() -> AcousticScene,
+    ) -> &AcousticScene {
+        if self.map.get(&cell).is_some_and(|e| e.revision == world_block_revision) {
+            // Reuse `get` for the tick/hit bookkeeping.
+            return self.get(cell, world_block_revision).expect("checked above");
+        }
+        self.misses += 1;
+        self.insert(cell, world_block_revision, trace());
+        &self.map.get(&cell).expect("just inserted").scene
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DDA raytracer
 // ---------------------------------------------------------------------------
@@ -676,17 +846,142 @@ fn scatter_dir(normal: [f32; 3], seed: u32) -> [f32; 3] {
     ])
 }
 
+/// Geometry of one diffraction probe candidate.
+enum Bend {
+    /// Single-bend detour through `p1`: enough for thin edges.
+    One { p1: [f32; 3] },
+    /// Two-bend detour through `p1` → `p2`: the path a portal or doorway
+    /// actually takes — out of the direct line on both faces of the slab,
+    /// travelling inside the opening between them.
+    Two { p1: [f32; 3], p2: [f32; 3] },
+}
+
+/// A diffraction probe candidate plus its lower bound on penalized loss:
+/// the bend tax plus the detour penalty, before any traversal loss is known.
+struct DiffractionCand {
+    bend: Bend,
+    /// `4.0 + 0.5·detour` (one bend) or `8.0 + 0.5·detour` (two bends) — the
+    /// loss this path pays even if every leg crosses open air.
+    lower_bound: f32,
+    /// `(bent_len - seg_len).max(0)` — folded into the candidate loss.
+    detour: f32,
+}
+
 /// Stateless DDA raytracer over a [`VoxelAcousticWorld`]. One tracer serves as
 /// many `compute_scene` calls as needed; all cost is in the casts.
 pub struct AcousticTracer<'w> {
     world: &'w dyn VoxelAcousticWorld,
     preset: SpatialAudioPreset,
+    /// Telemetry: how many 16³ uniform-air sections the macro-DDA warped
+    /// through instead of stepping cell by cell.
+    macro_dda_skips: AtomicU64,
+    /// Telemetry: `segment_loss_db` rays cast by the diffraction prober
+    /// (excludes the initial straight-line cast).
+    diffraction_rays_cast: AtomicU64,
 }
 
 impl<'w> AcousticTracer<'w> {
     /// Tracer bound to `world` casting at `preset` quality.
     pub fn new(world: &'w dyn VoxelAcousticWorld, preset: SpatialAudioPreset) -> Self {
-        Self { world, preset }
+        Self {
+            world,
+            preset,
+            macro_dda_skips: AtomicU64::new(0),
+            diffraction_rays_cast: AtomicU64::new(0),
+        }
+    }
+
+    /// Uniform-air 16³ sections skipped by the two-level DDA so far.
+    pub fn macro_dda_skips(&self) -> u64 {
+        self.macro_dda_skips.load(Ordering::Relaxed)
+    }
+
+    /// Rays the diffraction prober has cast so far (branch-and-bound prunes
+    /// candidates before they cost a ray; the count proves it).
+    pub fn diffraction_rays_cast(&self) -> u64 {
+        self.diffraction_rays_cast.load(Ordering::Relaxed)
+    }
+
+    /// Count one diffraction probe ray.
+    #[inline]
+    fn count_diffraction_ray(&self) {
+        self.diffraction_rays_cast.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Two-level DDA warp: when the cell `voxel` was just stepped into sits
+    /// inside a 16³ section the world reports as uniform air, every remaining
+    /// in-section cell is a guaranteed no-op. Rewind `voxel`/`t_max` to the
+    /// bit-identical state the naive march would hold just before the
+    /// section-exit crossing and return that crossing's parametric distance;
+    /// `None` when the current section is not uniform air.
+    ///
+    /// Exactness: each axis's `t_max` only ever advances by `+= inv[a]`, so
+    /// replaying the same additions in the same order reproduces the naive
+    /// accumulator bitwise — including tie ordering, which keeps the loop's
+    /// lowest-index argmin picking the same exit crossing and therefore the
+    /// same hit cell, distance, and normal.
+    fn section_warp(
+        &self,
+        step: [i32; 3],
+        inv: [f32; 3],
+        voxel: &mut [i32; 3],
+        t_max: &mut [f32; 3],
+    ) -> Option<f32> {
+        let sec = [voxel[0] >> 4, voxel[1] >> 4, voxel[2] >> 4];
+        if !self
+            .world
+            .is_uniform_air_section(sec[0], sec[1], sec[2])
+        {
+            return None;
+        }
+        self.macro_dda_skips.fetch_add(1, Ordering::Relaxed);
+
+        // Per-axis accumulated distance to the crossing that leaves the
+        // section: last inside cell on `a`, then `remaining` more `+= inv`
+        // from the current pending distance.
+        let mut exit_dist = [f32::INFINITY; 3];
+        let mut last_in = [0_i32; 3];
+        for a in 0..3 {
+            last_in[a] = if step[a] > 0 {
+                (sec[a] + 1) * 16 - 1
+            } else {
+                sec[a] * 16
+            };
+            if inv[a].is_finite() {
+                let mut d = t_max[a];
+                let interior = (last_in[a] - voxel[a]) * step[a];
+                for _ in 0..interior {
+                    d += inv[a];
+                }
+                exit_dist[a] = d;
+            }
+        }
+        // Same lowest-index-wins tie order as the march loop.
+        let a_star = if exit_dist[0] <= exit_dist[1] && exit_dist[0] <= exit_dist[2] {
+            0
+        } else if exit_dist[1] <= exit_dist[2] {
+            1
+        } else {
+            2
+        };
+        let t_star = exit_dist[a_star];
+        for a in 0..3 {
+            if a == a_star {
+                voxel[a] = last_in[a];
+                t_max[a] = t_star;
+            } else if inv[a].is_finite() {
+                // Interior crossings strictly below `t_star` — plus, on lower
+                // indices, the exact-tie crossings the naive march resolves
+                // before the exit — are replayed with their `+= inv` adds so
+                // the pending distances stay bit-identical. Crossings on
+                // higher-index ties stay pending; the loop resolves them.
+                while t_max[a] < t_star || (t_max[a] == t_star && a < a_star) {
+                    t_max[a] += inv[a];
+                    voxel[a] += step[a];
+                }
+            }
+        }
+        Some(t_star)
     }
 
     /// Amanatides-Woo DDA from `origin` along unit `dir`, stopping at the
@@ -750,7 +1045,17 @@ impl<'w> AcousticTracer<'w> {
             normal[axis] = -(step[axis] as f32);
             let material = self.world.acoustic_material(voxel[0], voxel[1], voxel[2]);
             match material.class {
-                MaterialClass::Air => {}
+                MaterialClass::Air => {
+                    // Macro-DDA: a whole uniform-air section is crossed in
+                    // one warp — bit-identical to stepping every cell.
+                    if let Some(t_star) =
+                        self.section_warp(step, inv, &mut voxel, &mut t_max)
+                    {
+                        if t_star > MAX_RAY_DIST_M {
+                            return CastResult::Escaped;
+                        }
+                    }
+                }
                 MaterialClass::Liquid => {
                     // Water carries bass well but eats highs: ~5%/m.
                     liquid_high_loss *= 0.95;
@@ -843,6 +1148,13 @@ impl<'w> AcousticTracer<'w> {
             if loss > 240.0 {
                 return loss;
             }
+            // Macro-DDA through uniform-air sections: every skipped cell is
+            // air (0 dB), so the accumulated loss is bit-identical.
+            if let Some(t_star) = self.section_warp(step, inv, &mut voxel, &mut t_max) {
+                if t_star >= seg_len || t_star > MAX_RAY_DIST_M {
+                    return loss;
+                }
+            }
         }
     }
 
@@ -850,7 +1162,154 @@ impl<'w> AcousticTracer<'w> {
     /// diffraction probes (Ultra): orthogonal offsets around the segment
     /// midpoint stand in for doorway/portal openings, and a bent path that
     /// clears the wall beats the straight one by a bending penalty.
+    ///
+    /// Candidates are explored distance-ordered — lowest geometric lower
+    /// bound (bend tax + detour penalty, before any traversal loss) first —
+    /// and a candidate whose bound already meets the best loss found is
+    /// pruned before it costs a single ray. Once the sorted order reaches a
+    /// bound `>= effective`, every remaining candidate is pruned at once.
+    /// The traversal-loss arithmetic and early-out tests are unchanged, so
+    /// the result is exactly the exhaustive search's minimum.
     pub fn occlusion_between(&self, from: [f32; 3], to: [f32; 3]) -> OcclusionInfo {
+        if !self.preset.enabled() {
+            return OcclusionInfo::clear();
+        }
+        let direct = self.segment_loss_db(from, to);
+        let mut effective = direct;
+        let mut diffracted = false;
+        if self.preset.diffraction_enabled() && direct > 2.0 {
+            let seg = sub3(to, from);
+            let seg_len = norm3(seg);
+            const FRACTIONS: [f32; 5] = [0.35, 0.5, 0.65, 0.8, 0.95];
+            const OFFSETS: [f32; 5] = [1.0, 2.0, 3.0, 4.5, 6.0];
+            let base_at = |f: f32| {
+                [
+                    from[0] + seg[0] * f,
+                    from[1] + seg[1] * f,
+                    from[2] + seg[2] * f,
+                ]
+            };
+            let mut cands = Vec::with_capacity(450);
+            for &f in &FRACTIONS {
+                for &mag in &OFFSETS {
+                    for axis in 0..3 {
+                        for &sign in &[-1.0_f32, 1.0] {
+                            let mut p1 = base_at(f);
+                            p1[axis] += sign * mag;
+                            let bent_len =
+                                norm3(sub3(p1, from)) + norm3(sub3(to, p1));
+                            let detour = (bent_len - seg_len).max(0.0);
+                            cands.push(DiffractionCand {
+                                bend: Bend::One { p1 },
+                                lower_bound: 4.0 + 0.5 * detour,
+                                detour,
+                            });
+                        }
+                    }
+                }
+            }
+            for (fi, &f1) in FRACTIONS.iter().enumerate() {
+                for &f2 in FRACTIONS.iter().skip(fi + 1) {
+                    for &mag in &OFFSETS {
+                        for axis in 0..3 {
+                            for &sign in &[-1.0_f32, 1.0] {
+                                let mut p1 = base_at(f1);
+                                let mut p2 = base_at(f2);
+                                p1[axis] += sign * mag;
+                                p2[axis] += sign * mag;
+                                let bent_len = norm3(sub3(p1, from))
+                                    + norm3(sub3(p2, p1))
+                                    + norm3(sub3(to, p2));
+                                let detour = (bent_len - seg_len).max(0.0);
+                                cands.push(DiffractionCand {
+                                    bend: Bend::Two { p1, p2 },
+                                    lower_bound: 8.0 + 0.5 * detour,
+                                    detour,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            // Stable sort keeps build order inside equal bounds — fully
+            // deterministic.
+            cands.sort_by(|a, b| {
+                a.lower_bound
+                    .partial_cmp(&b.lower_bound)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for cand in &cands {
+                // Sorted ascending: the first bound that already meets the
+                // incumbent prunes every candidate after it in one test.
+                if cand.lower_bound >= effective {
+                    break;
+                }
+                match cand.bend {
+                    Bend::One { p1 } => {
+                        self.count_diffraction_ray();
+                        let l1 = self.segment_loss_db(from, p1);
+                        if l1 >= effective {
+                            continue;
+                        }
+                        self.count_diffraction_ray();
+                        let l2 = self.segment_loss_db(p1, to);
+                        if l1 + l2 >= effective {
+                            continue;
+                        }
+                        // Diffracted energy pays a ~4 dB bend tax plus mild
+                        // extra-path absorption, so a clear doorway still
+                        // beats a straight wall and never amplifies.
+                        let candidate = l1 + l2 + 4.0 + 0.5 * cand.detour;
+                        if candidate < effective {
+                            effective = candidate;
+                            diffracted = true;
+                        }
+                    }
+                    Bend::Two { p1, p2 } => {
+                        self.count_diffraction_ray();
+                        let l1 = self.segment_loss_db(from, p1);
+                        if l1 >= effective {
+                            continue;
+                        }
+                        self.count_diffraction_ray();
+                        let l2 = self.segment_loss_db(p1, p2);
+                        if l1 + l2 >= effective {
+                            continue;
+                        }
+                        self.count_diffraction_ray();
+                        let l3 = self.segment_loss_db(p2, to);
+                        if l1 + l2 + l3 >= effective {
+                            continue;
+                        }
+                        let candidate = l1 + l2 + l3 + 8.0 + 0.5 * cand.detour;
+                        if candidate < effective {
+                            effective = candidate;
+                            diffracted = true;
+                        }
+                    }
+                }
+            }
+        }
+        let cutoff = (OCCLUSION_MAX_CUTOFF_HZ * 2.0_f32.powf(-effective / 15.0))
+            .clamp(OCCLUSION_MIN_CUTOFF_HZ, OCCLUSION_MAX_CUTOFF_HZ);
+        OcclusionInfo {
+            transmission_loss_db: effective,
+            direct_loss_db: direct,
+            cutoff_hz: cutoff,
+            diffracted,
+            blocked: effective >= 60.0,
+        }
+    }
+
+    /// Reference exhaustive diffraction search — the pre-branch-and-bound
+    /// enumeration of every one- and two-bend probe in fixed order. Kept as
+    /// the executable spec the pruned search is verified against.
+    #[doc(hidden)]
+    pub fn occlusion_between_exhaustive(
+        &self,
+        from: [f32; 3],
+        to: [f32; 3],
+    ) -> OcclusionInfo {
         if !self.preset.enabled() {
             return OcclusionInfo::clear();
         }
@@ -873,21 +1332,19 @@ impl<'w> AcousticTracer<'w> {
                 for &mag in &OFFSETS {
                     for axis in 0..3 {
                         for &sign in &[-1.0_f32, 1.0] {
-                            // Single-bend detour: enough for thin edges.
                             let mut probe = base_at(f);
                             probe[axis] += sign * mag;
+                            self.count_diffraction_ray();
                             let l1 = self.segment_loss_db(from, probe);
                             if l1 >= effective {
                                 continue;
                             }
+                            self.count_diffraction_ray();
                             let l2 = self.segment_loss_db(probe, to);
                             if l1 + l2 >= effective {
                                 continue;
                             }
                             let bent_len = norm3(sub3(probe, from)) + norm3(sub3(to, probe));
-                            // Diffracted energy pays a ~4 dB bend tax plus mild
-                            // extra-path absorption, so a clear doorway still
-                            // beats a straight wall and never amplifies.
                             let candidate = l1 + l2 + 4.0 + 0.5 * (bent_len - seg_len).max(0.0);
                             if candidate < effective {
                                 effective = candidate;
@@ -897,9 +1354,6 @@ impl<'w> AcousticTracer<'w> {
                     }
                 }
             }
-            // Two-bend detours straddling the occluder: the path a portal or
-            // doorway actually takes — out of the direct line on both faces
-            // of the slab, travelling inside the opening between them.
             for (fi, &f1) in FRACTIONS.iter().enumerate() {
                 for &f2 in FRACTIONS.iter().skip(fi + 1) {
                     for &mag in &OFFSETS {
@@ -909,14 +1363,17 @@ impl<'w> AcousticTracer<'w> {
                                 let mut p2 = base_at(f2);
                                 p1[axis] += sign * mag;
                                 p2[axis] += sign * mag;
+                                self.count_diffraction_ray();
                                 let l1 = self.segment_loss_db(from, p1);
                                 if l1 >= effective {
                                     continue;
                                 }
+                                self.count_diffraction_ray();
                                 let l2 = self.segment_loss_db(p1, p2);
                                 if l1 + l2 >= effective {
                                     continue;
                                 }
+                                self.count_diffraction_ray();
                                 let l3 = self.segment_loss_db(p2, to);
                                 if l1 + l2 + l3 >= effective {
                                     continue;
@@ -1174,8 +1631,9 @@ pub struct SoundSource {
 
 /// One-pole low-pass with a per-frame slewed cutoff so parameter changes do
 /// not zipper. Cutoffs at/above ~0.48·fs are treated as a true bypass.
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
-struct OnePoleLp {
+pub struct OnePoleLp {
     y: f32,
     a: f32,
     cutoff: f32,
@@ -1183,7 +1641,8 @@ struct OnePoleLp {
 }
 
 impl OnePoleLp {
-    fn new(cutoff_hz: f32) -> Self {
+    /// Filter parked at `cutoff_hz` with zero state and no slew applied yet.
+    pub fn new(cutoff_hz: f32) -> Self {
         Self {
             y: 0.0,
             a: 0.0,
@@ -1192,12 +1651,13 @@ impl OnePoleLp {
         }
     }
 
-    fn set_target(&mut self, cutoff_hz: f32) {
+    /// Slew destination for [`Self::settle`], clamped to the audible band.
+    pub fn set_target(&mut self, cutoff_hz: f32) {
         self.target = cutoff_hz.clamp(20.0, OCCLUSION_MAX_CUTOFF_HZ);
     }
 
     /// Advance the cutoff toward the target; `rate` ~0..1 per frame.
-    fn settle(&mut self, rate: f32, sample_rate: f32) {
+    pub fn settle(&mut self, rate: f32, sample_rate: f32) {
         self.cutoff += (self.target - self.cutoff) * rate.clamp(0.0, 1.0);
         self.a = if self.cutoff >= 0.48 * sample_rate {
             1.0
@@ -1206,8 +1666,18 @@ impl OnePoleLp {
         };
     }
 
+    /// One sample through the filter. When the slewed cutoff has reached the
+    /// bypass region (`a >= 1.0`, i.e. cutoff ≥ 0.48·fs) the filter is a
+    /// bit-exact identity: `y + 1·(x − y)` is replaced by `x` directly, which
+    /// is both faster and free of the residual rounding the general form
+    /// leaves behind. State stays current so a later cutoff drop resumes the
+    /// recursive form seamlessly.
     #[inline]
-    fn process(&mut self, x: f32) -> f32 {
+    pub fn process(&mut self, x: f32) -> f32 {
+        if self.a >= 1.0 {
+            self.y = guard_state(x);
+            return self.y;
+        }
         self.y += self.a * (x - self.y);
         self.y = guard_state(self.y);
         self.y
@@ -1263,39 +1733,53 @@ fn next_prime(mut n: usize) -> usize {
     n
 }
 
-/// Feedback delay network late reverb: `channels` mutually prime delay lines,
-/// a three-band damping split per channel driven by the raytraced RT60s, and
-/// Hadamard feedback mixing.
+/// Maximum FDN lane count — every per-channel array is a fixed `[f32; 8]`
+/// lane so the whole step loop is contiguous and auto-vectorizes.
+const MAX_FDN_CHANNELS: usize = 8;
+
+/// Feedback delay network late reverb: `n` mutually prime delay lines packed
+/// into one flat buffer, a three-band damping split per channel driven by the
+/// raytraced RT60s, and Hadamard feedback mixing. All per-channel state lives
+/// in fixed lanes indexed `0..n` — no per-step pointer chasing.
 struct Fdn {
-    lines: Vec<Vec<f32>>,
-    pos: Vec<usize>,
-    g_lo: Vec<f32>,
-    g_mid: Vec<f32>,
-    g_hi: Vec<f32>,
-    split_lo: Vec<OnePoleLp>,
-    split_hi: Vec<OnePoleLp>,
-    in_w: Vec<f32>,
-    out_l: Vec<f32>,
-    out_r: Vec<f32>,
-    outs: Vec<f32>,
-    fb: Vec<f32>,
+    n: usize,
+    /// All delay lines concatenated; `line_off[i]..line_off[i]+line_len[i]`
+    /// is channel `i`'s ring.
+    buf: Vec<f32>,
+    line_off: [usize; MAX_FDN_CHANNELS],
+    line_len: [usize; MAX_FDN_CHANNELS],
+    pos: [usize; MAX_FDN_CHANNELS],
+    g_lo: [f32; MAX_FDN_CHANNELS],
+    g_mid: [f32; MAX_FDN_CHANNELS],
+    g_hi: [f32; MAX_FDN_CHANNELS],
+    split_lo: [OnePoleLp; MAX_FDN_CHANNELS],
+    split_hi: [OnePoleLp; MAX_FDN_CHANNELS],
+    in_w: [f32; MAX_FDN_CHANNELS],
+    out_l: [f32; MAX_FDN_CHANNELS],
+    out_r: [f32; MAX_FDN_CHANNELS],
+    outs: [f32; MAX_FDN_CHANNELS],
+    fb: [f32; MAX_FDN_CHANNELS],
 }
 
 impl Fdn {
     fn new(channels: usize, sample_rate: f32) -> Self {
+        let n = channels.min(MAX_FDN_CHANNELS);
         let mut fdn = Self {
-            lines: Vec::with_capacity(channels),
-            pos: vec![0; channels],
-            g_lo: vec![0.0; channels],
-            g_mid: vec![0.0; channels],
-            g_hi: vec![0.0; channels],
-            split_lo: vec![OnePoleLp::new(BAND_LOW_HZ); channels],
-            split_hi: vec![OnePoleLp::new(BAND_HIGH_HZ); channels],
-            in_w: Vec::with_capacity(channels),
-            out_l: Vec::with_capacity(channels),
-            out_r: Vec::with_capacity(channels),
-            outs: vec![0.0; channels],
-            fb: vec![0.0; channels],
+            n,
+            buf: Vec::new(),
+            line_off: [0; MAX_FDN_CHANNELS],
+            line_len: [0; MAX_FDN_CHANNELS],
+            pos: [0; MAX_FDN_CHANNELS],
+            g_lo: [0.0; MAX_FDN_CHANNELS],
+            g_mid: [0.0; MAX_FDN_CHANNELS],
+            g_hi: [0.0; MAX_FDN_CHANNELS],
+            split_lo: [OnePoleLp::new(BAND_LOW_HZ); MAX_FDN_CHANNELS],
+            split_hi: [OnePoleLp::new(BAND_HIGH_HZ); MAX_FDN_CHANNELS],
+            in_w: [0.0; MAX_FDN_CHANNELS],
+            out_l: [0.0; MAX_FDN_CHANNELS],
+            out_r: [0.0; MAX_FDN_CHANNELS],
+            outs: [0.0; MAX_FDN_CHANNELS],
+            fb: [0.0; MAX_FDN_CHANNELS],
         };
         for c in &mut fdn.split_lo {
             c.settle(1.0, sample_rate);
@@ -1304,24 +1788,26 @@ impl Fdn {
             c.settle(1.0, sample_rate);
         }
         // Spread delay times 30..90 ms, then snap each up to a prime length.
-        for i in 0..channels {
-            let ms = if channels > 1 {
-                30.0 + 60.0 * i as f32 / (channels - 1) as f32
+        for i in 0..n {
+            let ms = if n > 1 {
+                30.0 + 60.0 * i as f32 / (n - 1) as f32
             } else {
                 45.0
             };
             let len = next_prime((ms * sample_rate / 1000.0) as usize);
-            fdn.lines.push(vec![0.0; len]);
+            fdn.line_off[i] = fdn.buf.len();
+            fdn.line_len[i] = len;
+            fdn.buf.resize(fdn.buf.len() + len, 0.0);
             // Alternate-sign input weights and equal-power pans decorrelate
             // the channels going in and recombine smoothly coming out.
-            fdn.in_w.push(if i % 2 == 0 { 1.0 } else { -1.0 });
-            let pan = if channels > 1 {
-                -1.0 + 2.0 * i as f32 / (channels - 1) as f32
+            fdn.in_w[i] = if i % 2 == 0 { 1.0 } else { -1.0 };
+            let pan = if n > 1 {
+                -1.0 + 2.0 * i as f32 / (n - 1) as f32
             } else {
                 0.0
             };
-            fdn.out_l.push(((1.0 - pan) * 0.5).sqrt());
-            fdn.out_r.push(((1.0 + pan) * 0.5).sqrt());
+            fdn.out_l[i] = ((1.0 - pan) * 0.5).sqrt();
+            fdn.out_r[i] = ((1.0 + pan) * 0.5).sqrt();
         }
         fdn
     }
@@ -1330,8 +1816,8 @@ impl Fdn {
     /// `g = 10^(-3 d / (rt60 fs))` is the standard FDN decay mapping.
     fn set_rt60(&mut self, rt60: [f32; 3], sample_rate: f32) {
         let [rl, rm, rh] = rt60.map(|t| t.clamp(0.03, 10.0));
-        for i in 0..self.lines.len() {
-            let d = self.lines[i].len() as f32;
+        for i in 0..self.n {
+            let d = self.line_len[i] as f32;
             self.g_lo[i] = 10.0_f32.powf(-3.0 * d / (rl * sample_rate));
             self.g_mid[i] = 10.0_f32.powf(-3.0 * d / (rm * sample_rate));
             self.g_hi[i] = 10.0_f32.powf(-3.0 * d / (rh * sample_rate));
@@ -1340,9 +1826,9 @@ impl Fdn {
 
     /// One mono sample in → one decorrelated stereo reverb sample out.
     fn step(&mut self, input: f32) -> (f32, f32) {
-        let n = self.lines.len();
+        let n = self.n;
         for i in 0..n {
-            self.outs[i] = self.lines[i][self.pos[i]];
+            self.outs[i] = self.buf[self.line_off[i] + self.pos[i]];
         }
         for i in 0..n {
             let x = self.outs[i];
@@ -1357,9 +1843,9 @@ impl Fdn {
         let mut wet_r = 0.0;
         for i in 0..n {
             let write = guard_state(input * self.in_w[i] + self.fb[i]);
-            self.lines[i][self.pos[i]] = write;
+            self.buf[self.line_off[i] + self.pos[i]] = write;
             self.pos[i] += 1;
-            if self.pos[i] == self.lines[i].len() {
+            if self.pos[i] == self.line_len[i] {
                 self.pos[i] = 0;
             }
             wet_l += self.outs[i] * self.out_l[i];
@@ -1367,6 +1853,56 @@ impl Fdn {
         }
         let norm = 0.5 / (n as f32).sqrt();
         (wet_l * norm, wet_r * norm)
+    }
+}
+
+/// One listener-shared 8-channel Hadamard FDN. Instead of paying one FDN per
+/// concurrently sounding voice, the mixer accumulates every voice's
+/// `s * wet_send` into a single reverb input and steps the shared network
+/// once. Every stage of the FDN — delay lines, one-pole splits, feedback
+/// gains, Hadamard mixing — is linear and time-invariant, so processing the
+/// summed send yields the same wet field as summing N independent FDN
+/// outputs: exact LTI superposition with a fraction of the state and CPU.
+pub struct SharedListenerFdnBus {
+    fdn: Fdn,
+    in_acc: f32,
+    sample_rate: f32,
+}
+
+impl SharedListenerFdnBus {
+    /// Shared 8-channel bus at `sample_rate`, initially dry (zero RT60).
+    pub fn new(sample_rate: u32) -> Self {
+        let fs = sample_rate as f32;
+        let mut fdn = Fdn::new(8, fs);
+        fdn.set_rt60([0.0, 0.0, 0.0], fs);
+        Self {
+            fdn,
+            in_acc: 0.0,
+            sample_rate: fs,
+        }
+    }
+
+    /// Update decay times from the listener's current scene RT60s
+    /// (`[low, mid, high]` in seconds).
+    pub fn set_rt60(&mut self, rt60_s: [f32; 3]) {
+        self.fdn.set_rt60(rt60_s, self.sample_rate);
+    }
+
+    /// Accumulate one voice's reverb send for the current sample. Cheap
+    /// enough to call per voice per sample; [`Self::step`] runs once after
+    /// all voices have contributed.
+    #[inline]
+    pub fn send(&mut self, sample: f32, wet_send: f32) {
+        self.in_acc += sample * wet_send;
+    }
+
+    /// Advance the shared FDN one sample on the accumulated sends and return
+    /// the `(left, right)` wet contribution. The accumulator resets to zero
+    /// for the next sample.
+    #[inline]
+    pub fn step(&mut self) -> (f32, f32) {
+        let input = std::mem::take(&mut self.in_acc);
+        self.fdn.step(input)
     }
 }
 
@@ -1397,6 +1933,51 @@ pub struct SpatialSubtitleCue {
     /// engine fills this empty — it knows geometry, not event names — and the
     /// mixer stamps the admitted event's label onto each queued cue.
     pub label: String,
+}
+
+/// Early-reflection tap resolved once per audio block: the history-ring read
+/// offset plus the folded per-ear gains (band-weighted amplitude ×
+/// equal-power pan), so the 48 kHz loop is two FMA ops per tap.
+#[derive(Clone, Copy, Debug)]
+struct PrecomputedTap {
+    delay_off: f32,
+    gain_l: f32,
+    gain_r: f32,
+}
+
+impl PrecomputedTap {
+    const ZERO: Self = Self {
+        delay_off: 0.0,
+        gain_l: 0.0,
+        gain_r: 0.0,
+    };
+}
+
+/// Resolve one [`EarlyReflectionTap`] into block-head delay + per-ear gains.
+/// Mirrors the math that used to run per sample — identical inputs give
+/// identical gains, just hoisted out of the loop.
+#[inline]
+fn precompute_tap(tap: &EarlyReflectionTap, yaw_deg: f32) -> PrecomputedTap {
+    let amp = (0.5 * tap.energy_mid + 0.3 * tap.energy_low + 0.2 * tap.energy_high).sqrt();
+    let rel = rotate_yaw(tap.direction, yaw_deg);
+    let pan = rel[0].atan2(rel[2]).clamp(-PI * 0.5, PI * 0.5) / (PI * 0.5);
+    PrecomputedTap {
+        delay_off: tap.delay_samples as f32,
+        gain_l: amp * ((1.0 - pan) * 0.5).sqrt(),
+        gain_r: amp * ((1.0 + pan) * 0.5).sqrt(),
+    }
+}
+
+/// Test-facing view of the block-head early-reflection precompute: returns
+/// `[delay_off, gain_l, gain_r]` per tap, in scene order.
+#[doc(hidden)]
+pub fn precomputed_er_gains(taps: &[EarlyReflectionTap], yaw_deg: f32) -> Vec<[f32; 3]> {
+    taps.iter()
+        .map(|t| {
+            let p = precompute_tap(t, yaw_deg);
+            [p.delay_off, p.gain_l, p.gain_r]
+        })
+        .collect()
 }
 
 /// The real-time half of the engine. Owns all DSP state for one spatialized
@@ -1730,12 +2311,14 @@ impl SpatialAudioEngine {
     }
 
     /// Fractional read of the shared mono history `off` samples behind the
-    /// write head (linear interpolation).
+    /// write head (linear interpolation). The ring length is a power of two,
+    /// so two's-complement masking replaces a 64-bit `rem_euclid` division.
     #[inline]
     fn hist_read(&self, off: f32) -> f32 {
+        debug_assert!(self.hist.len().is_power_of_two());
         let pos = self.wpos as f32 - off;
         let base = pos.floor();
-        let i0 = (base as i64).rem_euclid(self.hist.len() as i64) as usize;
+        let i0 = (base as isize as usize) & self.hist_mask;
         let i1 = (i0 + 1) & self.hist_mask;
         let frac = (pos - base).clamp(0.0, 1.0);
         self.hist[i0] + (self.hist[i1] - self.hist[i0]) * frac
@@ -1783,6 +2366,20 @@ impl SpatialAudioEngine {
         let drift_per_sample = 1.0 - self.doppler_ratio;
         let max_off = (self.hist_mask - 64) as f32;
         let yaw_deg = self.listener.yaw_deg;
+
+        // Block-head early-reflection precompute: listener-yaw rotation, pan
+        // azimuth, band-weighted amplitude, and equal-power ear gains are
+        // constant for the whole block, so the per-sample loop below only
+        // reads the ring and runs two FMA ops per tap.
+        let mut er_taps = [PrecomputedTap::ZERO; MAX_EARLY_TAPS];
+        let n_taps = self.scene.early_reflections.len().min(MAX_EARLY_TAPS);
+        for (pre, tap) in er_taps
+            .iter_mut()
+            .zip(self.scene.early_reflections.iter())
+        {
+            *pre = precompute_tap(tap, yaw_deg);
+        }
+
         for &raw in input {
             let s = sanitize_sample(raw);
             self.hist[self.wpos] = s;
@@ -1802,17 +2399,14 @@ impl SpatialAudioEngine {
             l *= self.direct_gain;
             r *= self.direct_gain;
 
-            // Early reflections share the history buffer; each tap pans by
-            // its listener-relative arrival azimuth.
+            // Early reflections share the history buffer; each tap's per-ear
+            // gain was resolved once at block head, leaving two FMAs here.
             let mut er_l = 0.0;
             let mut er_r = 0.0;
-            for tap in &self.scene.early_reflections {
-                let v = self.hist_read(off + tap.delay_samples as f32)
-                    * (0.5 * tap.energy_mid + 0.3 * tap.energy_low + 0.2 * tap.energy_high).sqrt();
-                let rel = rotate_yaw(tap.direction, yaw_deg);
-                let pan = rel[0].atan2(rel[2]).clamp(-PI * 0.5, PI * 0.5) / (PI * 0.5);
-                er_l += v * ((1.0 - pan) * 0.5).sqrt();
-                er_r += v * ((1.0 + pan) * 0.5).sqrt();
+            for tap in &er_taps[..n_taps] {
+                let v = self.hist_read(off + tap.delay_off);
+                er_l += v * tap.gain_l;
+                er_r += v * tap.gain_r;
             }
 
             // Late reverb (FDN) fed by the same mono input.
