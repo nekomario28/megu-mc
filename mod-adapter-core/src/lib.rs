@@ -166,6 +166,7 @@ pub mod loader_extensions;
 pub mod magic_primitives;
 pub mod mine_cut_all;
 pub mod mixin_lifter;
+pub mod mod_router;
 pub mod mod_sync;
 pub mod mod_tick_runtime;
 pub mod modpack;

@@ -933,6 +933,11 @@ pub fn classify_perf_or_render_mod_compat(mod_id: &str) -> EngineCompatDispositi
         "vulkanmod" => NativeAccelerated {
             native_subsystem: "wgpu_render_backend",
         },
+        "acedium" | "accedium" | "optifine" | "optifabric" | "canvas" | "canvas-renderer" => {
+            NativeAccelerated {
+                native_subsystem: "wgpu_render_backend",
+            }
+        }
         "nvidium" => NativeAccelerated {
             native_subsystem: "mesh_shader_renderer",
         },

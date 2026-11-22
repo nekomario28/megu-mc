@@ -7,10 +7,10 @@
 //! adaptation pipeline over user-supplied mod JARs with no JVM and no
 //! operator configuration:
 //!
-//! 1. **Superseded skip.** JARs whose filename-inferred or manifest-declared
-//!    mod id matches [`crate::fallback::BUILTIN_SUPERSEDED_PERF_MODS`] are
-//!    classified [`AdaptationTier::AutoSkipped`] *before* a single `.class`
-//!    byte is read, with the exact match recorded in `audit_notes`.
+//! 1. **Static security and capability routing.** Every JAR's class files
+//!    are inspected without a JVM before superseded or engine-replacement
+//!    mods can be skipped. Dangerous archives are quarantined; clean native
+//!    engine replacements are skipped with the routing evidence recorded.
 //! 2. **Loader metadata.** [`crate::ecosystem_compat::scan_mod_jar_named`] reads
 //!    `fabric.mod.json`, `quilt.mod.json`, and `META-INF/neoforge.mods.toml`
 //!    / `META-INF/mods.toml` through the crate's fail-closed ZIP reader,
@@ -57,6 +57,7 @@ use crate::ecosystem_compat::{
 use crate::fallback::{is_builtin_superseded_mod, REASON_SUPERSEDED};
 use crate::hard_mod_primitives::{classify_perf_or_render_mod_compat, EngineCompatDisposition};
 use crate::mixin_lifter::{LiftedBinding, MixinLiftVerdict, MixinSite, UnliftableReason};
+use crate::mod_router::{route_mod_jar, ModRouteDecision, RouteMatchKind, SecurityThreat};
 use crate::modpack::{infer_candidate_mod_id, read_zip_member, zip_member_list};
 use crate::unified_bundle::{DeclarativeModBundle, BUNDLE_SCHEMA};
 use crate::version_compat::{McVersion, VersionRange};
@@ -118,8 +119,8 @@ impl Default for AutoAdaptOptions {
 /// The pipeline's verdict for one mod JAR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdaptationTier {
-    /// Skipped before any bytecode read: a built-in superseded performance
-    /// mod, or a manifest declaring a client-only environment.
+    /// Skipped before JVM execution: a built-in superseded performance
+    /// mod, a capability-routed engine mod, or a client-only mod.
     AutoSkipped,
     /// Runs fully native with zero JVM: a validated
     /// `mc-spine-mod-bundle/1` document was produced (embedded or
@@ -185,6 +186,10 @@ pub struct JarAdaptationResult {
     pub descriptor: Option<ModJarDescriptor>,
     /// The tier the JAR was assigned.
     pub tier: AdaptationTier,
+    /// Static capability-routing verdict, including a security quarantine.
+    pub route: ModRouteDecision,
+    /// Evidence of dangerous bytecode or executable archive members.
+    pub security_threats: Vec<SecurityThreat>,
     /// Integration strategy inferred from the declared mod id, falling
     /// back to the JAR name when loader metadata is unavailable.
     pub engine_compat: EngineCompatDisposition,
@@ -439,12 +444,15 @@ fn skipped_result(
     engine_compat: EngineCompatDisposition,
     audit_notes: Vec<String>,
     data: GenericDataSummary,
+    route: ModRouteDecision,
 ) -> JarAdaptationResult {
     JarAdaptationResult {
         jar,
         inferred_mod_id,
         descriptor,
         tier: AdaptationTier::AutoSkipped,
+        route,
+        security_threats: Vec::new(),
         engine_compat,
         audit_notes,
         blockers: Vec::new(),
@@ -531,24 +539,80 @@ pub fn auto_adapt_jar_bytes(
     let file_name = display.rsplit('/').next().unwrap_or(display);
     let inferred_mod_id = infer_candidate_mod_id(file_name);
 
-    // 1. Filename-inferred superseded skip — before a single archive or
-    //    bytecode byte is interpreted.
-    if let Some(id) = inferred_mod_id.as_deref() {
-        if superseded_id(id) {
-            let engine_compat =
+    // 1. Every valid archive is statically security-scanned before any
+    //    filename/manifest shortcut. A corrupt archive fails closed even
+    //    when named after a known superseded mod.
+    let mut routing = route_mod_jar(jar_bytes, display, inferred_mod_id.as_deref())?;
+    if let ModRouteDecision::SecurityQuarantine { threats } = &routing.decision {
+        let blockers = threats
+            .iter()
+            .map(|t| {
+                format!(
+                    "SECURITY_QUARANTINE: {} in {} ({}) — execution and delegation prohibited",
+                    t.kind.as_str(),
+                    t.member,
+                    t.indicator
+                )
+            })
+            .collect();
+        return Ok(JarAdaptationResult {
+            jar: display.to_string(),
+            inferred_mod_id,
+            descriptor: None,
+            tier: AdaptationTier::Tier3FallbackRequired,
+            route: routing.decision.clone(),
+            security_threats: threats.clone(),
+            engine_compat: EngineCompatDisposition::StandardModAdapter,
+            audit_notes: vec!["SECURITY_QUARANTINE: static security scan blocked execution, native adaptation, and JVM fallback".to_string()],
+            blockers,
+            mixin_scan: None,
+            culinary: None,
+            dimensions: None,
+            data: GenericDataSummary::default(),
+            bundle: None,
+        });
+    }
+    let early_route = routing.decision.clone();
+    if let ModRouteDecision::RouteToNativeSubsystem {
+        subsystem,
+        matched_by,
+        evidence,
+    } = early_route
+    {
+        let engine_compat = if matched_by == RouteMatchKind::KnownCatalogId {
+            let existing =
                 classify_adapted_mod_compat(None, inferred_mod_id.as_deref(), &mut audit_notes);
+            if existing == EngineCompatDisposition::StandardModAdapter {
+                EngineCompatDisposition::NativeAccelerated {
+                    native_subsystem: subsystem.as_str(),
+                }
+            } else {
+                existing
+            }
+        } else {
+            EngineCompatDisposition::NativeAccelerated {
+                native_subsystem: subsystem.as_str(),
+            }
+        };
+        if matched_by == RouteMatchKind::KnownCatalogId {
             audit_notes.push(format!(
-                "filename-inferred mod id '{id}' matches BUILTIN_SUPERSEDED_PERF_MODS ({REASON_SUPERSEDED}); skipped before any bytecode read"
+                "filename-inferred mod id matches BUILTIN_SUPERSEDED_PERF_MODS ({REASON_SUPERSEDED}); static security scan passed before superseded skip"
             ));
-            return Ok(skipped_result(
-                display.to_string(),
-                inferred_mod_id,
-                None,
-                engine_compat,
-                audit_notes,
-                GenericDataSummary::default(),
+        } else {
+            audit_notes.push(format!(
+                "unknown engine-replacement mod routed generically by structural capability signature ({}) to native {} without executing Java bytecode",
+                evidence.join(", "), subsystem.as_str()
             ));
         }
+        return Ok(skipped_result(
+            display.to_string(),
+            inferred_mod_id,
+            None,
+            engine_compat,
+            audit_notes,
+            GenericDataSummary::default(),
+            routing.decision,
+        ));
     }
 
     // 2. Fail-closed member listing (traversal, bomb, truncation, CRC).
@@ -586,23 +650,45 @@ pub fn auto_adapt_jar_bytes(
     let engine_compat =
         classify_adapted_mod_compat(descriptor.as_ref(), inferred_mod_id.as_deref(), &mut audit_notes);
 
-    // 4. Declared-id superseded skip — a `lithium-*.jar` renamed to
-    //    `cool-mod.jar` is still caught on its manifest id, before any
-    //    `.class` member is read.
+    // 4. Resolve renamed known mods from their declared IDs. The security
+    //    scan was already completed before inspecting loader metadata.
     if let Some(d) = &descriptor {
         if let Some(hit) = d.declared_mod_ids.iter().find(|id| superseded_id(id)) {
-            audit_notes.push(format!(
-                "declared mod id '{hit}' matches BUILTIN_SUPERSEDED_PERF_MODS ({REASON_SUPERSEDED}); skipped before any bytecode read"
-            ));
-            return Ok(skipped_result(
-                display.to_string(),
-                inferred_mod_id,
-                descriptor,
-                engine_compat,
-                audit_notes,
-                data,
-            ));
+            routing = route_mod_jar(jar_bytes, display, Some(hit))?;
+            if let ModRouteDecision::RouteToNativeSubsystem { subsystem, .. } = &routing.decision {
+                audit_notes.push(format!(
+                    "declared mod id '{hit}' matches BUILTIN_SUPERSEDED_PERF_MODS ({REASON_SUPERSEDED}); security scan passed before superseded skip"
+                ));
+                let declared_strategy = classify_perf_or_render_mod_compat(hit);
+                let strategy = if declared_strategy == EngineCompatDisposition::StandardModAdapter {
+                    EngineCompatDisposition::NativeAccelerated {
+                        native_subsystem: subsystem.as_str(),
+                    }
+                } else {
+                    declared_strategy
+                };
+                return Ok(skipped_result(
+                    display.to_string(),
+                    inferred_mod_id,
+                    descriptor,
+                    strategy,
+                    audit_notes,
+                    data,
+                    routing.decision,
+                ));
+            }
         }
+    }
+
+    if let ModRouteDecision::HybridSplit {
+        client_render_fallback,
+        evidence,
+    } = &routing.decision
+    {
+        audit_notes.push(format!(
+            "hybrid mod: client rendering uses native {} ({}); gameplay continues through the standard native/shim adaptation pipeline",
+            client_render_fallback.as_str(), evidence.join(", ")
+        ));
     }
 
     // 5. Client-only manifests never stage on a dedicated server.
@@ -620,6 +706,7 @@ pub fn auto_adapt_jar_bytes(
             engine_compat,
             audit_notes,
             data,
+            routing.decision,
         ));
     }
 
@@ -810,7 +897,8 @@ pub fn auto_adapt_jar_bytes(
         || culinary_hits > 0
         || dimensions.is_dimension_mod()
         || !dimensions.dimension_types.is_empty()
-        || data.java_class_members == 0;
+        || data.java_class_members == 0
+        || matches!(routing.decision, ModRouteDecision::HybridSplit { .. });
 
     let (tier, bundle) = if !blockers.is_empty() {
         (AdaptationTier::Tier3FallbackRequired, None)
@@ -853,6 +941,8 @@ pub fn auto_adapt_jar_bytes(
         inferred_mod_id,
         descriptor,
         tier,
+        route: routing.decision,
+        security_threats: Vec::new(),
         engine_compat,
         audit_notes,
         blockers,
@@ -1357,6 +1447,58 @@ fn jar_result_json(result: &JarAdaptationResult) -> String {
     }
     let _ = writeln!(out, "  }},");
 
+    let _ = writeln!(out, "  \"route\": {{");
+    match &result.route {
+        ModRouteDecision::SecurityQuarantine { .. } => {
+            jf_str(&mut out, 2, "decision", "security_quarantine", false);
+        }
+        ModRouteDecision::RouteToNativeSubsystem {
+            subsystem,
+            matched_by,
+            evidence,
+        } => {
+            jf_str(&mut out, 2, "decision", "route_to_native_subsystem", true);
+            jf_str(&mut out, 2, "subsystem", subsystem.as_str(), true);
+            jf_str(&mut out, 2, "matched_by", matched_by.as_str(), true);
+            jf_str_list(&mut out, 2, "evidence", evidence, false);
+        }
+        ModRouteDecision::HybridSplit {
+            client_render_fallback,
+            evidence,
+        } => {
+            jf_str(&mut out, 2, "decision", "hybrid_split", true);
+            jf_str(
+                &mut out,
+                2,
+                "client_render_fallback",
+                client_render_fallback.as_str(),
+                true,
+            );
+            jf_str_list(&mut out, 2, "evidence", evidence, false);
+        }
+        ModRouteDecision::StandardPipeline => {
+            jf_str(&mut out, 2, "decision", "standard_pipeline", false);
+        }
+    }
+    let _ = writeln!(out, "  }},");
+    let _ = writeln!(out, "  \"security_threats\": [");
+    for (index, threat) in result.security_threats.iter().enumerate() {
+        let _ = writeln!(out, "    {{");
+        jf_str(&mut out, 3, "kind", threat.kind.as_str(), true);
+        jf_str(&mut out, 3, "member", &threat.member, true);
+        jf_str(&mut out, 3, "indicator", &threat.indicator, false);
+        let _ = writeln!(
+            out,
+            "    }}{}",
+            if index + 1 == result.security_threats.len() {
+                ""
+            } else {
+                ","
+            }
+        );
+    }
+    let _ = writeln!(out, "  ],");
+
     match &result.descriptor {
         None => {
             jf_opt(&mut out, 1, "version", None, true);
@@ -1588,6 +1730,50 @@ fn format_adapt_human(result: &JarAdaptationResult) -> String {
         d.loot_table_files,
         d.java_class_members,
     );
+    match &result.route {
+        ModRouteDecision::SecurityQuarantine { .. } => {
+            let _ = writeln!(
+                out,
+                "  route: SECURITY_QUARANTINE (execution and JVM delegation prohibited)"
+            );
+        }
+        ModRouteDecision::RouteToNativeSubsystem {
+            subsystem,
+            matched_by,
+            evidence,
+        } => {
+            let _ = writeln!(
+                out,
+                "  route: {} via {} ({})",
+                subsystem.as_str(),
+                matched_by.as_str(),
+                evidence.join(", ")
+            );
+        }
+        ModRouteDecision::HybridSplit {
+            client_render_fallback,
+            evidence,
+        } => {
+            let _ = writeln!(
+                out,
+                "  route: hybrid_split client {} ({})",
+                client_render_fallback.as_str(),
+                evidence.join(", ")
+            );
+        }
+        ModRouteDecision::StandardPipeline => {
+            let _ = writeln!(out, "  route: standard_pipeline");
+        }
+    }
+    for threat in &result.security_threats {
+        let _ = writeln!(
+            out,
+            "  SECURITY_QUARANTINE: {} in {} ({})",
+            threat.kind.as_str(),
+            threat.member,
+            threat.indicator
+        );
+    }
     if let Some(c) = &result.culinary {
         if c.cooking_recipes + c.cutting_recipes + c.loot_modifiers + c.food_specs > 0 {
             let _ = writeln!(
@@ -1634,11 +1820,14 @@ fn format_adapt_human(result: &JarAdaptationResult) -> String {
             );
         }
         AdaptationTier::Tier3FallbackRequired => {
-            let _ = write!(
-                out,
-                "Result: Tier 3 — {} blocker(s) require a fallback (quarantine or upstream loader).",
-                result.blockers.len()
-            );
+            if matches!(result.route, ModRouteDecision::SecurityQuarantine { .. }) {
+                let _ = write!(
+                    out,
+                    "Result: SECURITY_QUARANTINE — this JAR must never execute or be delegated."
+                );
+            } else {
+                let _ = write!(out, "Result: Tier 3 — {} blocker(s) require a fallback (quarantine or upstream loader).", result.blockers.len());
+            }
         }
     }
     out

@@ -135,10 +135,14 @@ fn auto_adapter_classifies_vulkan_and_filename_fallback() {
         .format_human()
         .contains("native_accelerated:wgpu_render_backend"));
 
-    // Filename-inferred vulkanmod/nvidium JARs are skipped before bytecode read
+    // Filename-inferred vulkanmod/nvidium JARs are statically inspected before skip
     // and cleanly fall back to the native wgpu renderer.
-    let by_name =
-        auto_adapt_jar_bytes(&[], "vulkanmod-1.21.1.jar", &AutoAdaptOptions::default()).unwrap();
+    let by_name = auto_adapt_jar_bytes(
+        &synthetic_jar("vulkanmod"),
+        "vulkanmod-1.21.1.jar",
+        &AutoAdaptOptions::default(),
+    )
+    .unwrap();
     assert_eq!(by_name.tier, AdaptationTier::AutoSkipped);
     assert_eq!(
         by_name.engine_compat,

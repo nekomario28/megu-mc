@@ -123,6 +123,10 @@ BUILTIN_SUPERSEDED_PERF_MODS = frozenset({
     "immediatelyfast", "entityculling", "moreculling", "distanthorizons",
     "voxy", "bobby", "farsight", "indium", "reeses-sodium-options",
     "sodium-extra", "embeddium_extra",
+    "acedium", "accedium", "chlorine", "helium", "optifine",
+    "optifabric", "canvas", "canvas-renderer", "exordium",
+    "badoptimizations", "enhancedblockentities", "cullleaves",
+    "cull-less-leaves",
     # Server tick / lighting / memory / startup.
     "lithium", "radium", "canary", "starlight", "scalablelux", "phosphor", "scalpel",
     "ferritecore", "modernfix", "noisium", "c2me", "krypton", "lazydfu",

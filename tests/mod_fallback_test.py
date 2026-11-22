@@ -332,7 +332,10 @@ class ClassifierUnitTests(unittest.TestCase):
                        "moreculling", "distanthorizons", "voxy", "krypton",
                        "lazydfu", "memoryleakfix", "alternate-current", "clumps",
                        "lithium", "starlight", "scalablelux", "ferritecore", "modernfix",
-                       "noisium", "c2me"):
+                       "noisium", "c2me", "acedium", "accedium", "chlorine",
+                       "helium", "optifine", "optifabric", "canvas",
+                       "canvas-renderer", "exordium", "badoptimizations",
+                       "enhancedblockentities", "cullleaves", "cull-less-leaves"):
             self.assertIn(mod_id, mod_launcher.BUILTIN_SUPERSEDED_PERF_MODS)
 
     def test_superseded_perf_mod_skips_version_check_entirely(self):
