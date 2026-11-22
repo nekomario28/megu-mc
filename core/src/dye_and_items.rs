@@ -491,7 +491,7 @@ pub fn apply_dye_target(
         },
         DyeTarget::BlockCraft { item } => match applicator {
             DyeApplicator::Dye(c) => craft_dye_result(item, c)
-                .map(|r| DyeApplied::CraftRecolor(r))
+                .map(DyeApplied::CraftRecolor)
                 .ok_or(DyeReject::NotDyeable),
             _ => Err(DyeReject::NotAnApplicator),
         },

@@ -607,7 +607,8 @@ fn shearable_entity_table() {
 #[test]
 fn foods_table_pins_vanilla() {
     // (item, nutrition, saturation_modifier, always, fast, converts_to)
-    let plain: &[(&str, u8, f32, bool, bool, Option<&str>)] = &[
+    type FoodRow<'a> = (&'a str, u8, f32, bool, bool, Option<&'a str>);
+    let plain: &[FoodRow<'_>] = &[
         ("apple", 4, 0.3, false, false, None),
         ("baked_potato", 5, 0.6, false, false, None),
         ("beef", 3, 0.3, false, false, None),
@@ -769,7 +770,7 @@ fn composter_table() {
 
 #[test]
 fn breed_foods_match_vanilla_tags() {
-    let foods = |e: &str| breed_foods_for(e).iter().map(|s| *s).collect::<BTreeSet<_>>();
+    let foods = |e: &str| breed_foods_for(e).iter().copied().collect::<BTreeSet<_>>();
     assert_eq!(foods("cow"), ["minecraft:wheat"].into());
     assert_eq!(foods("sheep"), ["minecraft:wheat"].into());
     assert_eq!(foods("goat"), ["minecraft:wheat"].into());
