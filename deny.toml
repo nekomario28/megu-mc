@@ -33,11 +33,11 @@ allow = [
 ]
 confidence-threshold = 0.93
 
-# The root crate mc-spine declares `license = "GPL-3.0-or-later"` in Cargo.toml, with all
-# first-party and contributed code triple-licensed under `LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later`
-# (COPYING.LESSER / LICENSE / COPYING.AGPL). Every third-party Rust dependency in Cargo.lock is permissive
+# The root crate and first-party code use `LGPL-3.0-or-later` (Cargo.toml,
+# LICENSING.md, COPYING.LESSER). LICENSE carries GPLv3 terms referenced by LGPLv3.
+# Every third-party Rust dependency in Cargo.lock is permissive
 # (MIT / Apache-2.0 / ISC / BSD-3-Clause / Zlib / 0BSD / Unlicense / Unicode-3.0 / CDLA-Permissive-2.0),
-# which is compatible with LGPL-3.0-or-later, GPL-3.0-or-later, and AGPL-3.0-or-later (see LICENSING.md).
+# which is compatible with LGPL-3.0-or-later (see LICENSING.md).
 
 [bans]
 multiple-versions = "warn"

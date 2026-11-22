@@ -12,18 +12,26 @@ compatibility_date = "2025-01-01"
 # Non-secret vars (safe to commit):
 #
 #   GITHUB_REPO = "nekomario28/mc-spine"   # optional; this is the default
+#   ALLOW_DEV_UNVERIFIED_REPORTS = "1"      # LOCAL DEVELOPMENT ONLY:
+#                           bypass missing Turnstile secret; never set in production
 #
 # Secrets — NEVER commit real values; set via the dashboard or
 # `wrangler pages secret put <NAME> --project-name megu-site`:
 #
 #   GITHUB_TOKEN           fine-grained PAT, issues:write on GITHUB_REPO
 #                          (required by /api/report)
-#   TURNSTILE_SECRET_KEY   optional; when set, /api/report requires a valid
-#                          turnstile_token and fails closed without one
+#   TURNSTILE_SECRET_KEY   required for production /api/report;
+#                          every crash, bug, or idea must provide a valid token
+#                          missing secret => 503 unless explicit dev override
+#   The current static form has no Turnstile widget/token integration. Add
+#   that integration before enabling direct production report submissions.
 # ---------------------------------------------------------------------------
 
-# KV namespace backing the /api/report crash/bug dedup counters
-# (one GitHub Issue per fingerprint, milestone-only comments).
+# KV namespace backing the /api/report crash/bug/idea dedup counters
+# (one GitHub Issue per key, milestone-only comments). Also stores rl:<ip>
+# counters (five reports per IP per ten minutes; 600-second TTL). KV counters
+# are best-effort due to eventual consistency. Without this binding, the
+# endpoint still rate-limits within each isolate but cannot deduplicate.
 # Create once with:  wrangler kv namespace create CRASH_INDEX
 # then paste the returned id below.
 #

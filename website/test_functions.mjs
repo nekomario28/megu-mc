@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //
 // Node unit tests for the zero-dependency Cloudflare Pages Functions in
 // functions/api/. Run:  node website/test_functions.mjs
@@ -28,7 +28,9 @@ const latest = await loadFunction("functions/api/latest.js");
 
 let passed = 0;
 let failed = 0;
+let testIpIndex = 0;
 async function test(name, fn) {
+  testIpIndex++;
   try {
     await fn();
     passed++;
@@ -63,11 +65,20 @@ function validPayload(overrides = {}) {
 
 function makeKv() {
   const map = new Map();
+  const puts = [];
   return {
     map,
+    puts,
     async get(key) { return map.has(key) ? map.get(key) : null; },
-    async put(key, value) { map.set(key, value); },
+    async put(key, value, options) {
+      map.set(key, value);
+      puts.push({ key, options });
+    },
   };
+}
+
+function reportKeys(kv) {
+  return [...kv.map.keys()].filter(key => key.startsWith("report:"));
 }
 
 // Mock fetch: GitHub issues/comments/releases + Turnstile siteverify.
@@ -123,11 +134,11 @@ function mockFetch(state) {
   return () => { globalThis.fetch = realFetch; };
 }
 
-function postContext(payload, env) {
+function postContext(payload, env, ip = `192.0.2.${testIpIndex}`) {
   return {
     request: new Request("https://megu.example/api/report", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "CF-Connecting-IP": ip },
       body: typeof payload === "string" ? payload : JSON.stringify(payload),
     }),
     env,
@@ -139,6 +150,7 @@ function baseEnv(kv) {
     CRASH_INDEX: kv,
     GITHUB_TOKEN: "test-token",
     GITHUB_REPO: "o/r",
+    ALLOW_DEV_UNVERIFIED_REPORTS: "1",
   };
 }
 
@@ -306,7 +318,7 @@ await test("onRequestPost returns redacted 502 on GitHub API errors", async () =
         ok: false, error: "github issue creation failed",
       });
       assert.ok(!body.includes(env.GITHUB_TOKEN), "GitHub token leaked");
-      assert.equal(kv.map.size, 0, "failed issue must not be recorded");
+      assert.equal(reportKeys(kv).length, 0, "failed issue must not be recorded");
     } finally {
       restore();
     }
@@ -314,14 +326,15 @@ await test("onRequestPost returns redacted 502 on GitHub API errors", async () =
 });
 
 await test("onRequestPost keeps recorded counts on comment failure", async () => {
-  for (const network of [false, true]) {
+  for (const [caseIndex, network] of [false, true].entries()) {
     const kv = makeKv();
     const state = { calls: [], issues: 0, comments: 0 };
     const restore = mockFetch(state);
     try {
       const env = baseEnv(kv);
       const payload = validPayload();
-      const first = await report.onRequestPost(postContext(payload, env));
+      const ip = `198.51.100.${caseIndex + 200}`;
+      const first = await report.onRequestPost(postContext(payload, env, ip));
       assert.equal(first.status, 200);
       state.githubFailure = {
         method: "POST", path: "/issues/1/comments", status: 500,
@@ -329,7 +342,7 @@ await test("onRequestPost keeps recorded counts on comment failure", async () =>
       };
       let res;
       for (let i = 0; i < 4; i++) {
-        res = await report.onRequestPost(postContext(payload, env));
+        res = await report.onRequestPost(postContext(payload, env, ip));
       }
       assert.equal(res.status, 200);
       const j = await res.json();
@@ -362,7 +375,7 @@ await test("onRequestPost stacks bug reports without fingerprint", async () => {
     assert.equal(j2.duplicate, true);
     assert.equal(j2.total_reports, 2);
     assert.equal(state.issues, 1);
-    assert.equal(kv.map.size, 1);
+    assert.equal(reportKeys(kv).length, 1);
   } finally {
     restore();
   }
@@ -386,6 +399,16 @@ await test("onRequestPost routes ideas to a compact [Idea] issue", async () => {
     const sent = JSON.parse(create.body);
     assert.match(sent.title, /^\[Idea\]/);
     assert.ok(sent.body.length < 2048);
+    const duplicate = await report.onRequestPost(postContext({
+      ...idea, summary: "  add a  /MEGU STATUS command  ",
+    }, baseEnv(kv)));
+    assert.equal(duplicate.status, 200);
+    const second = await duplicate.json();
+    assert.equal(second.duplicate, true);
+    assert.equal(second.total_reports, 2);
+    assert.equal(second.issue_url, j.issue_url);
+    assert.equal(state.issues, 1);
+    assert.equal(reportKeys(kv).length, 1);
   } finally {
     restore();
   }
@@ -453,6 +476,115 @@ await test("onRequestPost enforces Turnstile when configured", async () => {
     const bad = await report.onRequestPost(
       postContext(validPayload({ turnstile_token: "bad" }), env));
     assert.equal(bad.status, 403);
+    assert.equal(state.issues, 1);
+  } finally {
+    restore();
+  }
+});
+
+await test("onRequestPost requires Turnstile for all kinds and rejects bad tokens", async () => {
+  const state = { calls: [], issues: 0, comments: 0, turnstileOk: false };
+  const restore = mockFetch(state);
+  try {
+    for (const [i, kind] of ["crash", "bug", "idea"].entries()) {
+      const env = { ...baseEnv(makeKv()), TURNSTILE_SECRET_KEY: "secret" };
+      const payload = validPayload({ kind });
+      if (kind !== "crash") delete payload.fingerprint;
+      const ip = `203.0.113.${i + 1}`;
+      const missing = await report.onRequestPost(postContext(payload, env, ip));
+      assert.equal(missing.status, 403, `${kind} missing token`);
+      const invalid = await report.onRequestPost(postContext({
+        ...payload, turnstile_token: "invalid",
+      }, env, ip));
+      assert.equal(invalid.status, 403, `${kind} invalid token`);
+    }
+    assert.equal(state.issues, 0);
+  } finally {
+    restore();
+  }
+});
+
+await test("onRequestPost returns 503 without a secret or explicit development override", async () => {
+  const state = { calls: [], issues: 0, comments: 0 };
+  const restore = mockFetch(state);
+  try {
+    for (const kind of ["crash", "bug", "idea"]) {
+      const payload = validPayload({ kind });
+      if (kind !== "crash") delete payload.fingerprint;
+      const env = baseEnv(makeKv());
+      delete env.ALLOW_DEV_UNVERIFIED_REPORTS;
+      const res = await report.onRequestPost(postContext(payload, env));
+      assert.equal(res.status, 503, kind);
+      assert.match((await res.json()).error, /turnstile/);
+    }
+    assert.equal(state.calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+await test("onRequestPost allows unverified reports only with explicit development override", async () => {
+  const state = { calls: [], issues: 0, comments: 0 };
+  const restore = mockFetch(state);
+  try {
+    const env = baseEnv(makeKv());
+    for (const kind of ["crash", "bug", "idea"]) {
+      const payload = validPayload({ kind });
+      if (kind !== "crash") delete payload.fingerprint;
+      const res = await report.onRequestPost(postContext(payload, env));
+      assert.equal(res.status, 200, kind);
+    }
+    assert.equal(state.issues, 3);
+    assert.ok(state.calls.every(c => !c.url.includes("challenges.cloudflare.com")));
+  } finally {
+    restore();
+  }
+});
+
+await test("onRequestPost rate limits each kind to five reports per IP in ten minutes", async () => {
+  const state = { calls: [], issues: 0, comments: 0 };
+  const restore = mockFetch(state);
+  try {
+    for (const [i, kind] of ["crash", "bug", "idea"].entries()) {
+      const kv = makeKv();
+      const env = baseEnv(kv);
+      const payload = validPayload({ kind });
+      if (kind !== "crash") delete payload.fingerprint;
+      const ip = `198.51.100.${i + 1}`;
+      for (let n = 0; n < 5; n++) {
+        const res = await report.onRequestPost(postContext(payload, env, ip));
+        assert.equal(res.status, 200, `${kind} attempt ${n + 1}`);
+      }
+      const denied = await report.onRequestPost(postContext(payload, env, ip));
+      assert.equal(denied.status, 429, kind);
+      assert.deepEqual(await denied.json(), {
+        ok: false, error: "report rate limit exceeded",
+      });
+      const limiterPut = kv.puts.find(p => p.key === `rl:${ip}`);
+      assert.equal(limiterPut.options.expirationTtl, 600);
+      // A different IP can still submit a report.
+      const other = await report.onRequestPost(postContext(payload, env,
+        `198.51.100.${i + 10}`));
+      assert.equal(other.status, 200);
+    }
+    assert.equal(state.issues, 3);
+  } finally {
+    restore();
+  }
+});
+
+await test("onRequestPost falls back to an isolate rate limit when KV is absent", async () => {
+  const state = { calls: [], issues: 0, comments: 0 };
+  const restore = mockFetch(state);
+  try {
+    const env = baseEnv(null);
+    for (let n = 0; n < 5; n++) {
+      const res = await report.onRequestPost(postContext(validPayload(), env));
+      assert.equal(res.status, 503); // dedup itself still needs CRASH_INDEX
+    }
+    const denied = await report.onRequestPost(postContext(validPayload(), env));
+    assert.equal(denied.status, 429);
+    assert.equal(state.issues, 0);
   } finally {
     restore();
   }
@@ -464,11 +596,13 @@ await test("onRequestPost requires GITHUB_TOKEN and CRASH_INDEX", async () => {
   const restore = mockFetch(state);
   try {
     const noToken = await report.onRequestPost(postContext(
-      validPayload(), { CRASH_INDEX: kv, GITHUB_REPO: "o/r" }));
+      validPayload(), { CRASH_INDEX: kv, GITHUB_REPO: "o/r",
+        ALLOW_DEV_UNVERIFIED_REPORTS: "1" }));
     assert.equal(noToken.status, 500);
 
     const noKv = await report.onRequestPost(postContext(
-      validPayload(), { GITHUB_TOKEN: "t", GITHUB_REPO: "o/r" }));
+      validPayload(), { GITHUB_TOKEN: "t", GITHUB_REPO: "o/r",
+        ALLOW_DEV_UNVERIFIED_REPORTS: "1" }));
     assert.equal(noKv.status, 503);
   } finally {
     restore();

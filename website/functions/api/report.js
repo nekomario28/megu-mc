@@ -1,18 +1,20 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //
 // POST /api/report — zero-dependency Cloudflare Pages Function.
 //
 // Accepts a compact "megu-report/1" payload (hard cap 4 KiB), redacts
-// sensitive strings server-side, deduplicates crash/bug reports through
-// the CRASH_INDEX KV namespace (one GitHub Issue per fingerprint,
-// milestone-only comments), and files GitHub Issues for everything else.
+// sensitive strings server-side, and deduplicates crash/bug/idea reports
+// through CRASH_INDEX KV (one GitHub Issue per key, milestone comments).
 //
 // Bindings / vars (see website/wrangler.toml):
-//   env.CRASH_INDEX        KV namespace — required for crash/bug dedup
+//   env.CRASH_INDEX        KV namespace — required for dedup; also rate limits
 //   env.GITHUB_TOKEN       secret — fine-grained PAT, issues:write
 //   env.GITHUB_REPO        var    — "owner/name", default nekomario28/mc-spine
-//   env.TURNSTILE_SECRET_KEY secret — optional; when set a valid
-//                          turnstile_token is required (fails closed)
+//   env.TURNSTILE_SECRET_KEY secret — required for production reports;
+//                          every kind must supply a valid turnstile_token
+//   env.ALLOW_DEV_UNVERIFIED_REPORTS var — set exactly '1' to allow local
+//                          development without TURNSTILE_SECRET_KEY only
+// Missing Turnstile configuration returns 503 unless that dev override is set.
 
 const MAX_BODY_BYTES = 4096;
 const MAX_TOP_FRAMES = 6;
@@ -25,6 +27,12 @@ const GITHUB_API = "https://api.github.com";
 const DEFAULT_REPO = "nekomario28/mc-spine";
 const TURNSTILE_VERIFY_URL =
   "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+// Five reports per Cloudflare-provided client IP per ten-minute window.
+// KV is eventually consistent; this isolate-local map also limits bursts and
+// provides a best-effort fallback when KV is absent or temporarily unavailable.
+const RATE_LIMIT = 5;
+const RATE_WINDOW_MS = 10 * 60 * 1000;
+const isolateRates = new Map();
 
 const KINDS = new Set(["crash", "bug", "idea"]);
 const KIND_LABEL = { crash: "auto-crash", bug: "triage", idea: "idea" };
@@ -287,16 +295,21 @@ function fnv1a(text) {
 }
 
 function dedupKeyFor(report) {
-  if (report.fingerprint) return "fp:" + report.fingerprint;
+  if (report.kind !== "idea" && report.fingerprint) {
+    return "fp:" + report.fingerprint;
+  }
   if (report.kind === "bug") {
     return "bug:" + fnv1a(
       [report.summary, report.culprit || "", report.mc_version].join("|"));
   }
-  return null;
+  // Ideas have no fingerprint. Normalize user-authored text so case and
+  // whitespace variations of the same suggestion share a GitHub Issue.
+  const normalized = [report.summary, report.culprit || "",
+    report.subsystem || ""].map(s => s.trim().toLowerCase().replace(/\s+/g, " "));
+  return "idea:" + fnv1a(JSON.stringify(normalized));
 }
 
 async function verifyTurnstile(env, token) {
-  if (!env.TURNSTILE_SECRET_KEY) return true;
   if (typeof token !== "string" || token.length === 0) return false;
   const res = await fetch(TURNSTILE_VERIFY_URL, {
     method: "POST",
@@ -311,6 +324,48 @@ async function verifyTurnstile(env, token) {
   return !!(data && data.success === true);
 }
 
+async function overRateLimit(env, request) {
+  // CF-Connecting-IP is supplied by Cloudflare Pages; requests without it
+  // share one conservative "unknown" bucket rather than bypassing limits.
+  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+  const key = "rl:" + ip;
+  const now = Date.now();
+  let local = isolateRates.get(key);
+  if (!local || local.expires <= now) {
+    local = { count: 0, expires: now + RATE_WINDOW_MS };
+    isolateRates.set(key, local);
+  }
+  if (local.count >= RATE_LIMIT) return true;
+  // Reserve the slot synchronously before KV I/O to limit concurrent bursts
+  // within one isolate. Bound the fallback map's memory usage.
+  local.count++;
+  if (isolateRates.size > 10000) {
+    for (const [oldKey, entry] of isolateRates) {
+      if (entry.expires <= now || isolateRates.size > 10000) {
+        isolateRates.delete(oldKey);
+      }
+      if (isolateRates.size <= 10000) break;
+    }
+  }
+  if (!env.CRASH_INDEX) return false;
+
+  try {
+    const raw = await env.CRASH_INDEX.get(key);
+    let stored = null;
+    try { stored = raw ? JSON.parse(raw) : null; } catch (_) { /* expired/corrupt */ }
+    const count = stored && stored.expires > now &&
+      Number.isInteger(stored.count) && stored.count >= 0 ? stored.count : 0;
+    if (count >= RATE_LIMIT) return true;
+    await env.CRASH_INDEX.put(key, JSON.stringify({
+      count: count + 1,
+      expires: stored && stored.expires > now ? stored.expires : local.expires,
+    }), { expirationTtl: RATE_WINDOW_MS / 1000 });
+  } catch (_) {
+    // KV failure degrades to the isolate-local limiter, never unlimited.
+  }
+  return false;
+}
+
 export {
   MAX_BODY_BYTES,
   MAX_TOP_FRAMES,
@@ -323,6 +378,11 @@ export {
 
 export async function onRequestPost(context) {
   const { request, env } = context;
+
+  if (!env.TURNSTILE_SECRET_KEY &&
+      env.ALLOW_DEV_UNVERIFIED_REPORTS !== "1") {
+    return errorResponse(503, "turnstile is not configured");
+  }
 
   const lenHeader = request.headers.get("content-length");
   if (lenHeader !== null && Number(lenHeader) > MAX_BODY_BYTES) {
@@ -340,11 +400,21 @@ export async function onRequestPost(context) {
     return errorResponse(400, "invalid JSON body");
   }
 
-  // Turnstile is opt-in via secret; when configured it fails closed.
+  if (await overRateLimit(env, request)) {
+    return errorResponse(429, "report rate limit exceeded");
+  }
+
+  // The development override only applies when no secret is configured.
   const turnstileToken = payload && typeof payload === "object" &&
     !Array.isArray(payload) ? payload.turnstile_token : undefined;
-  if (!(await verifyTurnstile(env, turnstileToken))) {
-    return errorResponse(403, "turnstile verification failed");
+  if (env.TURNSTILE_SECRET_KEY) {
+    try {
+      if (!(await verifyTurnstile(env, turnstileToken))) {
+        return errorResponse(403, "turnstile verification failed");
+      }
+    } catch (_) {
+      return errorResponse(403, "turnstile verification failed");
+    }
   }
 
   const checked = validateReportPayload(payload);
@@ -357,7 +427,7 @@ export async function onRequestPost(context) {
   const repo = env.GITHUB_REPO || DEFAULT_REPO;
   const dedupKey = dedupKeyFor(report);
 
-  // --- Dedup path: fingerprinted crash/bug ------------------------------
+  // --- Dedup path: crash, bug, and idea ----------------------------------
   if (dedupKey) {
     if (!env.CRASH_INDEX) {
       return errorResponse(503, "CRASH_INDEX KV binding is not configured");
@@ -425,18 +495,4 @@ export async function onRequestPost(context) {
     });
   }
 
-  // --- Idea path: compact [Idea] issue, no dedup -------------------------
-  let issue;
-  try {
-    issue = await createIssue(env, repo, report);
-  } catch (_) {
-    return errorResponse(502, "github issue creation failed");
-  }
-  return jsonResponse({
-    ok: true,
-    fingerprint: null,
-    issue_url: issue.html_url,
-    duplicate: false,
-    total_reports: 1,
-  });
 }
