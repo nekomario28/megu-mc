@@ -14,6 +14,7 @@ pub mod protocol;
 pub mod recovery;
 pub mod render;
 pub mod render_graph;
+pub mod session;
 pub mod settings;
 pub mod shaderpack_runtime;
 pub mod shaders;

@@ -23,6 +23,10 @@ pub const CHANNEL_MAGIC_V1: &str = "mc-spine:magic_v1";
 pub const CHANNEL_VFX_V1: &str = "mc-spine:vfx_v1";
 pub const CHANNEL_ANIM_V1: &str = "mc-spine:anim_v1";
 pub const CHANNEL_MOTION_V1: &str = "mc-spine:motion_v1";
+pub const CHANNEL_SEASON_V1: &str = "mc-spine:season_v1";
+/// Product-level alias the "megu" custom-payload family is addressed by on
+/// some peers; decoded identically to [`CHANNEL_SEASON_V1`].
+pub const CHANNEL_MEGU_SEASON: &str = "megu:season";
 
 const MAX_MAGIC_COOLDOWNS: usize = 512;
 const MAX_MAGIC_STATUSES: usize = 256;
@@ -93,12 +97,52 @@ pub struct DecodedMotionTrigger {
     pub phase: DecodedMotionPhase,
 }
 
+/// Season sync payload carried by one fixed 19-byte `SSN1` frame on
+/// [`CHANNEL_SEASON_V1`]. The layout is byte-identical to the `SSN1` codec
+/// in `mod-adapter-core::season_primitives` (`encode_ssn1`/`decode_ssn1`):
+/// `SSN1 | u8 version | u8 sub_season | u16 progress_q16 | u16
+/// day_of_season | u16 daylight_q16 | u8 foliage_rgb[3] | u8 grass_rgb[3]
+/// | u8 flags`, all multi-byte fields big-endian.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SeasonWireSync {
+    /// Sub-season calendar index `0..12` (EarlySpring .. LateWinter).
+    pub sub_season_idx: u8,
+    /// Progress through the current sub-season, `0.0..=1.0` (q16 on the wire).
+    pub progress_in_sub_season: f32,
+    /// Whole days elapsed inside the current broad season.
+    pub day_of_season: u16,
+    /// Fraction of the day that is daylight, `0.0..=1.0` (q16 on the wire).
+    pub daylight_fraction: f32,
+    /// Quantized foliage RGB multiplier (`255` = 1.0).
+    pub foliage_rgb: [u8; 3],
+    /// Quantized grass RGB multiplier (`255` = 1.0).
+    pub grass_rgb: [u8; 3],
+    /// Dimension runs wet/dry seasons (tropical climate).
+    pub tropical_dim: bool,
+    /// Calendar is locked server-side.
+    pub frozen_season: bool,
+    /// Seasonal snow/freeze is enabled on this dimension.
+    pub snow_enabled: bool,
+}
+
+pub const SSN1_MAGIC: &[u8; 4] = b"SSN1";
+pub const SSN1_VERSION: u8 = 1;
+/// Exact `SSN1` frame length in bytes.
+pub const SSN1_FRAME_LEN: usize = 19;
+
+const SSN1_FLAG_TROPICAL_DIM: u8 = 1 << 0;
+const SSN1_FLAG_FROZEN_SEASON: u8 = 1 << 1;
+const SSN1_FLAG_SNOW_ENABLED: u8 = 1 << 2;
+const SSN1_FLAG_KNOWN_MASK: u8 =
+    SSN1_FLAG_TROPICAL_DIM | SSN1_FLAG_FROZEN_SEASON | SSN1_FLAG_SNOW_ENABLED;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ClientCustomChannelEvent {
     Vfx(Vec<u8>),
     Anim(Vec<u8>),
     Magic(DecodedMagicSync),
     Motion(DecodedMotionTrigger),
+    Season(SeasonWireSync),
     Unknown { channel: String, payload: Vec<u8> },
 }
 
@@ -249,6 +293,47 @@ pub fn decode_motion_trigger_payload(payload: &[u8]) -> Result<DecodedMotionTrig
     })
 }
 
+/// Decode a fixed 19-byte `SSN1` season sync frame, fail-closed: wrong
+/// length, bad magic, unknown `version`, `sub_season_idx >= 12`, or any
+/// flag bit outside the known mask all reject.
+pub fn decode_season_sync_payload(payload: &[u8]) -> Result<SeasonWireSync, String> {
+    if payload.len() != SSN1_FRAME_LEN {
+        return Err("invalid SSN1 frame length".to_string());
+    }
+    let mut reader = WireReader::new(payload);
+    if reader.take(4)? != SSN1_MAGIC {
+        return Err("invalid SSN1 magic".to_string());
+    }
+    if reader.read_u8()? != SSN1_VERSION {
+        return Err("unsupported SSN1 version".to_string());
+    }
+    let sub_season_idx = reader.read_u8()?;
+    if sub_season_idx >= 12 {
+        return Err("SSN1 sub-season index out of range".to_string());
+    }
+    let progress_in_sub_season = f32::from(reader.read_u16()?) / 65535.0;
+    let day_of_season = reader.read_u16()?;
+    let daylight_fraction = f32::from(reader.read_u16()?) / 65535.0;
+    let foliage_rgb: [u8; 3] = reader.take(3)?.try_into().unwrap();
+    let grass_rgb: [u8; 3] = reader.take(3)?.try_into().unwrap();
+    let flags = reader.read_u8()?;
+    if flags & !SSN1_FLAG_KNOWN_MASK != 0 {
+        return Err("SSN1 unknown flag bits".to_string());
+    }
+    debug_assert_eq!(reader.remaining(), 0);
+    Ok(SeasonWireSync {
+        sub_season_idx,
+        progress_in_sub_season,
+        day_of_season,
+        daylight_fraction,
+        foliage_rgb,
+        grass_rgb,
+        tropical_dim: flags & SSN1_FLAG_TROPICAL_DIM != 0,
+        frozen_season: flags & SSN1_FLAG_FROZEN_SEASON != 0,
+        snow_enabled: flags & SSN1_FLAG_SNOW_ENABLED != 0,
+    })
+}
+
 /// Validate recognized channels before a host is permitted to mutate state.
 pub fn decode_custom_channel_event(
     channel: &str,
@@ -267,10 +352,41 @@ pub fn decode_custom_channel_event(
         CHANNEL_MOTION_V1 => {
             decode_motion_trigger_payload(payload).map(ClientCustomChannelEvent::Motion)
         }
+        CHANNEL_SEASON_V1 | CHANNEL_MEGU_SEASON => {
+            decode_season_sync_payload(payload).map(ClientCustomChannelEvent::Season)
+        }
         _ => Ok(ClientCustomChannelEvent::Unknown {
             channel: channel.to_string(),
             payload: payload.to_vec(),
         }),
+    }
+}
+
+/// One decoded frame from the "megu" custom-payload family (MAG1 / VFX1 /
+/// ANM1 / MOT1 / SSN1). Unlike [`decode_custom_channel_event`], which keeps
+/// host-bound bytes opaque and reports unknown channels, this router
+/// resolves every recognized frame into a typed value and fails closed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MeguCustomPayload {
+    Magic(DecodedMagicSync),
+    Vfx(Vec<u8>),
+    Anim(Vec<u8>),
+    Motion(DecodedMotionTrigger),
+    Season(SeasonWireSync),
+}
+
+/// Decode a "megu" custom-payload frame for live session routing.
+/// Returns `None` — ignored, never an error — on an unrecognized channel
+/// or any malformed payload (unknown version, truncation, out-of-range
+/// fields).
+pub fn decode_megu_custom_payload(channel: &str, data: &[u8]) -> Option<MeguCustomPayload> {
+    match decode_custom_channel_event(channel, data).ok()? {
+        ClientCustomChannelEvent::Magic(sync) => Some(MeguCustomPayload::Magic(sync)),
+        ClientCustomChannelEvent::Vfx(bytes) => Some(MeguCustomPayload::Vfx(bytes)),
+        ClientCustomChannelEvent::Anim(bytes) => Some(MeguCustomPayload::Anim(bytes)),
+        ClientCustomChannelEvent::Motion(trigger) => Some(MeguCustomPayload::Motion(trigger)),
+        ClientCustomChannelEvent::Season(sync) => Some(MeguCustomPayload::Season(sync)),
+        ClientCustomChannelEvent::Unknown { .. } => None,
     }
 }
 
@@ -3011,5 +3127,99 @@ impl<'a> JsonParser<'a> {
                 _ => return Err("expected ',' or '}' in status JSON object".to_string()),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ssn1_frame(sub_season_idx: u8, flags: u8) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(SSN1_FRAME_LEN);
+        frame.extend_from_slice(SSN1_MAGIC);
+        frame.push(SSN1_VERSION);
+        frame.push(sub_season_idx);
+        frame.extend_from_slice(&16_383u16.to_be_bytes()); // progress q16 (~0.25)
+        frame.extend_from_slice(&17u16.to_be_bytes()); // day_of_season
+        frame.extend_from_slice(&32_767u16.to_be_bytes()); // daylight q16 (~0.5)
+        frame.extend_from_slice(&[200, 210, 220]); // foliage_rgb
+        frame.extend_from_slice(&[100, 150, 90]); // grass_rgb
+        frame.push(flags);
+        frame
+    }
+
+    fn framed(channel: &str, payload: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        assert!(channel.len() < 128);
+        body.push(channel.len() as u8);
+        body.extend_from_slice(channel.as_bytes());
+        body.extend_from_slice(payload);
+        body
+    }
+
+    #[test]
+    fn ssn1_frame_decodes_all_wire_fields() {
+        let frame = ssn1_frame(5, 0b101);
+        let sync = decode_season_sync_payload(&frame).unwrap();
+        assert_eq!(sync.sub_season_idx, 5);
+        assert!((sync.progress_in_sub_season - 16_383.0 / 65_535.0).abs() < 1e-6);
+        assert_eq!(sync.day_of_season, 17);
+        assert!((sync.daylight_fraction - 32_767.0 / 65_535.0).abs() < 1e-6);
+        assert_eq!(sync.foliage_rgb, [200, 210, 220]);
+        assert_eq!(sync.grass_rgb, [100, 150, 90]);
+        assert!(sync.tropical_dim);
+        assert!(!sync.frozen_season);
+        assert!(sync.snow_enabled);
+
+        for channel in [CHANNEL_SEASON_V1, CHANNEL_MEGU_SEASON] {
+            let event = decode_custom_channel_event(channel, &frame).unwrap();
+            assert_eq!(event, ClientCustomChannelEvent::Season(sync.clone()));
+            assert_eq!(
+                decode_custom_payload_packet(&framed(channel, &frame)).unwrap(),
+                ClientCustomChannelEvent::Season(sync.clone())
+            );
+            assert_eq!(
+                decode_megu_custom_payload(channel, &frame),
+                Some(MeguCustomPayload::Season(sync.clone()))
+            );
+        }
+    }
+
+    #[test]
+    fn ssn1_fails_closed_on_corrupt_frames() {
+        let valid = ssn1_frame(0, 0);
+        let mut bad_magic = valid.clone();
+        bad_magic[0] = b'X';
+        let mut bad_version = valid.clone();
+        bad_version[4] = 2;
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        let corrupt: Vec<Vec<u8>> = vec![
+            bad_magic,
+            bad_version,
+            valid[..SSN1_FRAME_LEN - 1].to_vec(),
+            trailing,
+            ssn1_frame(12, 0),
+            ssn1_frame(255, 0),
+            ssn1_frame(3, 0b1000),
+            Vec::new(),
+        ];
+        for frame in &corrupt {
+            assert!(
+                decode_season_sync_payload(frame).is_err(),
+                "accepted corrupt SSN1 frame {frame:?}"
+            );
+            assert_eq!(decode_megu_custom_payload(CHANNEL_SEASON_V1, frame), None);
+            assert!(
+                decode_custom_channel_event(CHANNEL_SEASON_V1, frame).is_err(),
+                "router accepted corrupt SSN1 frame"
+            );
+        }
+    }
+
+    #[test]
+    fn megu_router_fails_closed_on_unknown_channels() {
+        assert_eq!(decode_megu_custom_payload("example:unrecognized", b"\x01\x02"), None);
+        assert_eq!(decode_megu_custom_payload(CHANNEL_MAGIC_V1, b"BAD!"), None);
     }
 }
