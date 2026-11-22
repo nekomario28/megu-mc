@@ -5,7 +5,7 @@ edition = "2021"
 license = "LGPL-3.0-or-later"
 [profile.release]
 opt-level = 3
-lto = true
+lto = "thin"
 strip = true
 
 # Line tables keep file:line in backtraces. Full debug info made the suite binary
@@ -13,13 +13,20 @@ strip = true
 # once per isolated test, so its size is paid on every one of those runs.
 [profile.dev]
 debug = "line-tables-only"
+codegen-units = 8
+incremental = false
 
 # The suite is compute-bound, not compile-bound: a cold `cargo test --no-run`
 # took 12.96 s while the suite itself took 623.72 s (measured 2026-11-16). Level 1
 # keeps `debug-assertions` and `overflow-checks` on, so the assertions the tests
 # rely on still fire; it only stops the inner loops from being unoptimised.
+# Bound codegen-units and disable incremental so a single monolithic `rustc --test`
+# stays within ~1.5-2.2 GiB RSS instead of spiking to 6-10 GiB across 256 CGUs.
 [profile.test]
 opt-level = 1
+debug = "line-tables-only"
+codegen-units = 4
+incremental = false
 
 # Optimized but quick-to-link builds for iteration: cargo build --profile fast
 [profile.fast]

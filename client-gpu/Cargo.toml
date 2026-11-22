@@ -18,8 +18,18 @@ path = "src/main.rs"
 # binary, so release builds are fully optimized, LTO'd and stripped.
 [profile.release]
 opt-level = 3
-lto = true
+lto = "thin"
 strip = true
+
+[profile.dev]
+debug = "line-tables-only"
+codegen-units = 8
+incremental = false
+
+[profile.test]
+debug = "line-tables-only"
+codegen-units = 4
+incremental = false
 
 [dependencies]
 mc_spine_client = { package = "mc-spine-client", path = "../client-app" }
