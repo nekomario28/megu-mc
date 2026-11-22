@@ -8,7 +8,7 @@
 //! * [`resolve_render_backend`] picks [`ActiveRenderBackend::MeshShader`]
 //!   (`VK_EXT_mesh_shader`), [`ActiveRenderBackend::ComputeIndirect`] (compute
 //!   cull + `vkCmdDrawIndexedIndirectCount`), [`ActiveRenderBackend::Classic`]
-//!   or [`ActiveRenderBackend::ClassicLowSpec`] (OpenGL 3.3 / Vulkan 1.1
+//!   or [`ActiveRenderBackend::ClassicLowSpec`] (pure wgpu Vulkan 1.1 / DX12 / Metal
 //!   minimal-hardware path for legacy Intel iGPUs) from reported device
 //!   capabilities under an [`RenderBackendPreference`].
 //! * [`pack_section_meshlets`] folds a meshed section's quads into
@@ -65,7 +65,7 @@ pub enum RenderBackendPreference {
     Classic = 3,
     /// Minimal-hardware vertex pipeline for legacy Intel integrated GPUs
     /// (Intel HD 4000-630, UHD 620-630, Gen7-Gen11): assumes only
-    /// OpenGL 3.3 / Vulkan 1.1 core — no `VK_EXT_mesh_shader`, no
+    /// pure wgpu (Vulkan 1.1 / DX12 / Metal) core — no `VK_EXT_mesh_shader`, no
     /// `vkCmdDrawIndexedIndirectCount`, no compute shaders, no SSBO.
     /// Kinetic instances upload through 16 KiB-safe UBO batches instead
     /// (see [`KineticInstancePool::build_ubo_batches`]). Always available.
@@ -144,7 +144,7 @@ impl GpuCapabilities {
     }
 
     /// Legacy Intel integrated profile (HD 4000-630, UHD 620-630,
-    /// Gen7-Gen11): the minimal OpenGL 3.3 / Vulkan 1.1 feature floor —
+    /// Gen7-Gen11): the minimal pure wgpu (Vulkan 1.1 / DX12 / Metal) feature floor —
     /// no mesh shader, no indirect count, no compute, no SSBO.
     /// [`RenderBackendPreference::ClassicLowSpec`] is built for exactly
     /// this shape.
@@ -350,7 +350,7 @@ pub fn resolve_render_backend(
             }
         }
         RenderBackendPreference::Classic => resolution(ActiveRenderBackend::Classic),
-        // Needs nothing beyond a GL 3.3 / Vulkan 1.1 core context, so it is
+        // Needs nothing beyond a pure wgpu (Vulkan 1.1 / DX12 / Metal) core context, so it is
         // honored on every device including the legacy Intel iGPUs it was
         // designed for.
         RenderBackendPreference::ClassicLowSpec => {
@@ -363,8 +363,8 @@ pub fn resolve_render_backend(
 // Memory-aware low-spec render budgets
 // ---------------------------------------------------------------------------
 
-/// Uniform-buffer size every OpenGL 3.3 (`GL_MAX_UNIFORM_BLOCK_SIZE`) and
-/// Vulkan 1.1 (`maxUniformBufferRange`) implementation must expose: 16 KiB.
+/// Uniform-buffer size every pure wgpu (Vulkan 1.1 `maxUniformBufferRange`,
+/// DX12, Metal) implementation must expose: 16 KiB.
 /// [`MAX_INSTANCES_PER_UBO_16KB`] is sized so one UBO batch always fits.
 pub const MIN_GUARANTEED_UBO_BYTES: u32 = 16 * 1024;
 /// Instances per 16 KiB-safe kinetic UBO batch: `256 * 48 B = 12,288 B`,
@@ -435,7 +435,7 @@ pub struct LowSpecRenderBudget {
     pub recommended_lod_chunks: u32,
     /// Whether kinetic contraptions should draw through
     /// [`KineticInstancePool::build_ubo_batches`] UBO batches — the path
-    /// that needs no SSBO on GL 3.3 / Vulkan 1.1 minimal hardware.
+    /// that needs no SSBO on pure wgpu (Vulkan 1.1 / DX12 / Metal) minimal hardware.
     pub use_ubo_kinetic_batches: bool,
 }
 
@@ -969,7 +969,7 @@ impl KineticInstancePool {
     /// `max_instances_per_ubo` instances (`0` is clamped to 1), in
     /// ascending `mesh_kind` order. Pass [`MAX_INSTANCES_PER_UBO_16KB`] —
     /// or [`GpuMemoryProfile::max_instances_per_ubo`] — so each batch fits
-    /// the 16 KiB UBO floor every GL 3.3 / Vulkan 1.1 device guarantees.
+    /// the 16 KiB UBO floor every pure wgpu (Vulkan 1.1 / DX12 / Metal) device guarantees.
     /// Deterministic and lossless: concatenating every batch's
     /// `instances` reproduces the same byte stream
     /// [`Self::build_indirect_batches`] packs.
@@ -1456,7 +1456,7 @@ impl BlockEntityInstancePool {
     /// `max_instances_per_ubo` instances (`0` is clamped to 1), in
     /// ascending `mesh_kind` order. Pass [`MAX_INSTANCES_PER_UBO_16KB`] —
     /// or [`GpuMemoryProfile::max_instances_per_ubo`] — so each batch fits
-    /// the 16 KiB UBO floor every GL 3.3 / Vulkan 1.1 device guarantees.
+    /// the 16 KiB UBO floor every pure wgpu (Vulkan 1.1 / DX12 / Metal) device guarantees.
     /// Deterministic and lossless: concatenating every batch's `instances`
     /// reproduces the same byte stream
     /// [`Self::build_indirect_batches_culled`] packs for the same camera.

@@ -479,7 +479,7 @@ fn instanced_fs(in: InstancedFragment) -> @location(0) vec4<f32> {
 ";
 
 /// [`BLOCK_ENTITY_INSTANCED_WGSL`] re-bound for
-/// `ActiveRenderBackend::ClassicLowSpec` (GL 3.3 / Vulkan 1.1, no SSBO):
+/// `ActiveRenderBackend::ClassicLowSpec` (pure wgpu Vulkan 1.1 / DX12 / Metal, no SSBO):
 /// each 16 KiB-safe UBO batch carries at most
 /// `MAX_INSTANCES_PER_UBO_16KB` (256) 48-byte records — 12,288 B, inside the
 /// 16 KiB floor every Intel HD 4000+/UHD guarantees — so the same

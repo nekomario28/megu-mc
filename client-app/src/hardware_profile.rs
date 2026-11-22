@@ -52,7 +52,7 @@ pub enum GpuVendorClass {
     #[default]
     NoneSoftware,
     /// Legacy Intel integrated GPU (Gen7-Gen11: HD 4000 through UHD 630).
-    /// Only OpenGL 3.3 / Vulkan 1.1 core is safe to assume — the
+    /// Only pure wgpu core (Vulkan 1.1 / DX12 / Metal) is safe to assume — the
     /// `classic-low-spec` pipeline exists for exactly this class.
     IntelLegacyIntegrated,
     /// Modern Intel integrated GPU (Gen12+/Xe: Tiger Lake and newer).
@@ -565,7 +565,7 @@ fn recommend_chunk_cache_mib(hw: &HostHardwareProfile) -> u32 {
 /// Map a probed (or hand-built) profile onto a [`HardwareTuningPlan`].
 ///
 /// Backend policy: no-GPU and legacy Intel iGPUs pin `ClassicLowSpec`
-/// (GL 3.3 / Vulkan 1.1 only); NVIDIA/AMD/Intel Arc run `Auto` so
+/// (pure wgpu Vulkan 1.1 / DX12 / Metal core); NVIDIA/AMD/Intel Arc run `Auto` so
 /// capability negotiation can reach the mesh-shader pipeline;
 /// Apple Silicon takes `ComputeIndirect` (no `VK_EXT_mesh_shader` on
 /// Metal-class hardware). Everything else negotiates `Auto`.

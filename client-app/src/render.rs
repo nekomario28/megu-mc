@@ -92,7 +92,7 @@ pub struct RenderConfig {
     pub background_fps_limit: u16,
     /// GPU pipeline selection forwarded to the hardware backend;
     /// `classic-low-spec` pins the minimal-hardware path for legacy Intel
-    /// integrated GPUs (GL 3.3 / Vulkan 1.1 only).
+    /// integrated GPUs (pure wgpu Vulkan 1.1 / DX12 / Metal core).
     pub gpu_backend: RenderBackendPreference,
     /// Selected shaderpack path forwarded to the shaderpack runtime;
     /// `None` keeps built-in rendering.

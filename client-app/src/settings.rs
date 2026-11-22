@@ -434,7 +434,7 @@ pub struct ClientSettings {
     pub background_fps_limit: u16,
     /// GPU pipeline selection: `auto` negotiates from hardware
     /// capabilities, `classic-low-spec` pins the minimal-hardware path for
-    /// legacy Intel integrated GPUs (GL 3.3 / Vulkan 1.1 only).
+    /// legacy Intel integrated GPUs (pure wgpu Vulkan 1.1 / DX12 / Metal core).
     pub gpu_backend: RenderBackendPreference,
     /// Selected shaderpack: an external OptiFine/Iris/DistantHorizons pack
     /// (zip or directory) or a Megu native WGSL pack (`megu-shader.toml`).

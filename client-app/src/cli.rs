@@ -1187,7 +1187,7 @@ PLAYER SETTINGS:
   --gpu-backend <backend>          GPU pipeline: auto|mesh-shader|
                                    compute-indirect|classic-low-spec|classic
                                    (classic-low-spec targets legacy Intel
-                                   HD/UHD iGPUs: GL 3.3 / Vulkan 1.1 only)
+                                   HD/UHD iGPUs: pure wgpu Vulkan 1.1 / DX12 / Metal)
   --auto-tune                      Seed settings from probed host hardware;
                                    the settings file, options.txt import, and
                                    explicit flags still override
