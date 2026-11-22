@@ -310,11 +310,11 @@ impl PoolCore {
     /// jobs pulled from the injector or a peer deque rather than the
     /// executing worker's private tail.
     fn execute(&self, job: Job, shared: bool) {
-        let _ = catch_unwind(AssertUnwindSafe(job));
-        self.tasks_executed.fetch_add(1, Ordering::Relaxed);
         if shared {
             self.tasks_stolen.fetch_add(1, Ordering::Relaxed);
         }
+        self.tasks_executed.fetch_add(1, Ordering::Release);
+        let _ = catch_unwind(AssertUnwindSafe(job));
     }
 
     /// Run one queued job on the calling thread, preferring `preferred`'s
@@ -585,7 +585,7 @@ impl TaskPoolHandle {
 
     /// Total jobs executed (worker threads and help-stealing callers).
     pub fn tasks_executed(&self) -> usize {
-        self.core.tasks_executed.load(Ordering::Relaxed)
+        self.core.tasks_executed.load(Ordering::Acquire)
     }
 
     /// Jobs executed after being pulled from the shared injector or a peer
