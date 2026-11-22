@@ -10,10 +10,10 @@ use mc_spine_client_mesh::ffi::{
     mc_spine_client_mesh_pack_vertices, mc_spine_client_mesh_sort_translucent, PackedVertex, ABI_OK,
 };
 use mc_spine_client_mesh::{
-    section_index, Block, DirectionBuckets, FaceVisibility, Light, MeshCache, MissingNeighbor,
-    Quad, RenderRegions, Section, SectionCoord, SectionGraph, ALL_FACES, CUTOUT, FLUID_TINTED,
-    LAVA, LIGHT_BYTES, NO_FLUID, OPAQUE, SAME_STATE_CULL, SECTION_CELLS, TINTED, TRANSLUCENT,
-    WATER,
+    section_index, Block, CompressedSection, DirectionBuckets, FaceVisibility, Layer, Light,
+    MeshCache, MissingNeighbor, Quad, ReleasedMeshMeta, RenderRegions, Section, SectionBlocks,
+    SectionCoord, SectionGraph, ALL_FACES, CUTOUT, FLUID_TINTED, LAVA, LIGHT_BYTES, NO_FLUID,
+    OPAQUE, SAME_STATE_CULL, SECTION_CELLS, TINTED, TRANSLUCENT, WATER,
 };
 use mc_spine_kernel::skeletal_anim::{
     decode_animation_trigger, parse_animation_json, parse_geometry_json, parse_jem_model,
@@ -969,6 +969,60 @@ impl StoredSection {
             sky_light: self.sky_light,
         }
     }
+
+    /// The meshing snapshot in [`CompressedSection`] form. A single-state
+    /// palette skips the dense block array entirely, so uniform stone,
+    /// deepslate, water and air sections enter `MeshCache` with zero
+    /// block-storage heap bytes while staying bit-identical to
+    /// [`to_mesh_section`](Self::to_mesh_section) plus the
+    /// `CompressedSection::from` collapse.
+    fn to_compressed_mesh_section(&self, blocks: &BlockTable) -> CompressedSection {
+        if let Some(state) = self.palette.uniform_state() {
+            return CompressedSection {
+                blocks: SectionBlocks::Uniform(blocks.mesh_block(state)),
+                block_light: self.block_light,
+                sky_light: self.sky_light,
+            };
+        }
+        CompressedSection::from(self.to_mesh_section(blocks))
+    }
+}
+
+/// [`FaceVisibility::compute`] for a [`CompressedSection`] block array: a
+/// uniform section resolves in O(1) to `uniform_air`/`sealed_solid` without
+/// materializing the dense block array. `blocks_sight` mirrors the
+/// client-port predicate — only a full-occlusion opaque cube stops sight.
+fn face_visibility_of(blocks: &SectionBlocks) -> FaceVisibility {
+    match blocks {
+        SectionBlocks::Uniform(block) => {
+            if block.flags & OPAQUE != 0 && block.occlusion & ALL_FACES == ALL_FACES {
+                FaceVisibility::sealed_solid()
+            } else {
+                FaceVisibility::uniform_air()
+            }
+        }
+        SectionBlocks::Dense(dense) => FaceVisibility::compute(dense),
+    }
+}
+
+/// Identity key for one translucent quad inside a released mesh: the bit
+/// pattern of its four section-local corner positions plus its face
+/// direction. The greedy mesher never emits two quads covering the same
+/// face of the same cells, so the key is unique per section.
+type TranslucentSlotKey = ([u32; 12], u8);
+
+fn translucent_slot_key(quad: &Quad) -> TranslucentSlotKey {
+    let mut bits = [0u32; 12];
+    for (dst, pos) in bits.as_chunks_mut::<3>().0.iter_mut().zip(quad.positions) {
+        *dst = pos.map(f32::to_bits);
+    }
+    (bits, quad.direction as u8)
+}
+
+/// `client-port`'s crate-private `is_translucent`: the quads the
+/// camera-driven re-sort keeps and reorders — translucent blocks and water.
+fn quad_is_translucent(quad: &Quad) -> bool {
+    quad.layer == Layer::Translucent || (quad.layer == Layer::Fluid && quad.fluid_kind == WATER)
 }
 
 pub struct ChunkColumn {
@@ -1431,7 +1485,26 @@ pub struct WorldState {
     pub columns: HashMap<(i32, i32), ChunkColumn>,
     pub mesh_cache: MeshCache,
     packed_meshes: HashMap<SectionCoord, Vec<PackedVertex>>,
+    /// Monotonic per-section mesh-content revision, bumped on every mesh
+    /// rebuild or translucent re-sort so `client-gpu` detects changes with
+    /// one `u64` compare instead of byte-comparing `Vec<PackedVertex>`
+    /// slices. Entries are removed on chunk unload/evict and survive
+    /// [`WorldState::release_uploaded_section_cpu_copies`] so unchanged
+    /// frames keep matching the VRAM-resident copy.
+    section_mesh_revisions: HashMap<SectionCoord, u64>,
+    /// Source of [`section_mesh_revisions`] values. Starts at 1 so `0`
+    /// stays a usable "never uploaded" sentinel for consumers, and never
+    /// resets — a later section cannot inherit a stale predecessor's
+    /// revision across dimension resets.
+    next_mesh_revision: u64,
     translucent_orders: HashMap<SectionCoord, Vec<u32>>,
+    /// Per-released-section map from a kept translucent quad's position key
+    /// to its index in the grouped (packed) order the GPU uploaded. Lets a
+    /// camera-driven re-sort of a released section re-derive a valid
+    /// `translucent_order` over the VRAM-resident mesh without the deleted
+    /// full CPU copy.
+    released_translucent_slots:
+        HashMap<SectionCoord, HashMap<TranslucentSlotKey, u32>>,
     quad_counts: HashMap<SectionCoord, usize>,
     /// Per-section 6x6 face-to-face visibility graph (including uniform-air
     /// sections) plus the renderable flag fed to `GraphCuller`.
@@ -1563,7 +1636,10 @@ impl WorldState {
             columns: HashMap::new(),
             mesh_cache: MeshCache::new(MissingNeighbor::Air),
             packed_meshes: HashMap::new(),
+            section_mesh_revisions: HashMap::new(),
+            next_mesh_revision: 1,
             translucent_orders: HashMap::new(),
+            released_translucent_slots: HashMap::new(),
             quad_counts: HashMap::new(),
             visibility: HashMap::new(),
             direction_buckets: HashMap::new(),
@@ -1598,7 +1674,9 @@ impl WorldState {
         self.columns.clear();
         self.mesh_cache = MeshCache::new(MissingNeighbor::Air);
         self.packed_meshes.clear();
+        self.section_mesh_revisions.clear();
         self.translucent_orders.clear();
+        self.released_translucent_slots.clear();
         self.quad_counts.clear();
         self.visibility.clear();
         self.direction_buckets.clear();
@@ -1682,9 +1760,9 @@ impl WorldState {
                 StoredSection::from_states(&sec.states, blk, sky, &self.blocks, self.state_count)?;
             let coord = SectionCoord(decoded.cx, min_sy + idx as i32, decoded.cz);
             if stored.has_non_air {
-                let mesh_sec = stored.to_mesh_section(&self.blocks);
-                self.set_section_visibility(coord, FaceVisibility::compute(&mesh_sec.blocks), true);
-                self.mesh_cache.insert(coord, mesh_sec);
+                let mesh_sec = stored.to_compressed_mesh_section(&self.blocks);
+                self.set_section_visibility(coord, face_visibility_of(&mesh_sec.blocks), true);
+                self.mesh_cache.insert_compressed(coord, mesh_sec);
             } else {
                 self.remove_section_mesh(coord);
                 self.set_section_visibility(coord, FaceVisibility::uniform_air(), false);
@@ -1872,12 +1950,12 @@ impl WorldState {
                 let coord = SectionCoord(cx, min_sy + sy as i32, cz);
                 let mesh_sec = match self.columns.get(&(cx, cz)) {
                     Some(col) => match col.sections.get(sy) {
-                        Some(sec) => sec.to_mesh_section(&self.blocks),
+                        Some(sec) => sec.to_compressed_mesh_section(&self.blocks),
                         None => continue,
                     },
                     None => continue,
                 };
-                self.mesh_cache.insert(coord, mesh_sec);
+                self.mesh_cache.insert_compressed(coord, mesh_sec);
             }
         }
     }
@@ -1917,8 +1995,8 @@ impl WorldState {
             }
             if changed && sec.has_non_air {
                 let coord = SectionCoord(cx, min_sy + idx as i32, cz);
-                let mesh_sec = sec.to_mesh_section(&self.blocks);
-                self.mesh_cache.insert(coord, mesh_sec);
+                let mesh_sec = sec.to_compressed_mesh_section(&self.blocks);
+                self.mesh_cache.insert_compressed(coord, mesh_sec);
             }
         }
         Ok(())
@@ -1971,23 +2049,23 @@ impl WorldState {
         if !self.blocks.is_air(clamped) {
             if !sec.has_non_air {
                 sec.has_non_air = true;
-                let mesh_sec = sec.to_mesh_section(&self.blocks);
-                self.set_section_visibility(coord, FaceVisibility::compute(&mesh_sec.blocks), true);
-                self.mesh_cache.insert(coord, mesh_sec);
+                let mesh_sec = sec.to_compressed_mesh_section(&self.blocks);
+                self.set_section_visibility(coord, face_visibility_of(&mesh_sec.blocks), true);
+                self.mesh_cache.insert_compressed(coord, mesh_sec);
             } else if self
                 .mesh_cache
                 .set_cell(coord, [lx, ly, lz], mesh_block, light)
             {
-                let mesh_sec = sec.to_mesh_section(&self.blocks);
-                self.set_section_visibility(coord, FaceVisibility::compute(&mesh_sec.blocks), true);
+                let mesh_sec = sec.to_compressed_mesh_section(&self.blocks);
+                self.set_section_visibility(coord, face_visibility_of(&mesh_sec.blocks), true);
             }
         } else if sec.has_non_air
             && self
                 .mesh_cache
                 .set_cell(coord, [lx, ly, lz], mesh_block, light)
         {
-            let mesh_sec = sec.to_mesh_section(&self.blocks);
-            self.set_section_visibility(coord, FaceVisibility::compute(&mesh_sec.blocks), true);
+            let mesh_sec = sec.to_compressed_mesh_section(&self.blocks);
+            self.set_section_visibility(coord, face_visibility_of(&mesh_sec.blocks), true);
         }
         self.apply_local_light_edit(x, y, z, clamped);
         Ok(())
@@ -2088,7 +2166,9 @@ impl WorldState {
     fn remove_section_mesh(&mut self, coord: SectionCoord) {
         self.mesh_cache.remove(coord);
         self.packed_meshes.remove(&coord);
+        self.section_mesh_revisions.remove(&coord);
         self.translucent_orders.remove(&coord);
+        self.released_translucent_slots.remove(&coord);
         self.quad_counts.remove(&coord);
         self.direction_buckets.remove(&coord);
         self.visibility.remove(&coord);
@@ -2166,12 +2246,29 @@ impl WorldState {
     /// Refresh every renderer-facing artifact for one clean meshed section:
     /// direction-bucket ranges over the grouped quad order, the packed
     /// 16-byte vertices, the shared-arena render-region upload and the
-    /// translucent sort order. Idempotent.
+    /// translucent sort order. Idempotent. Every call issues a new
+    /// [`WorldState::section_mesh_revisions`] value — rebuilds and
+    /// translucent re-sorts both change what the GPU should draw.
     fn derive_section_artifacts(
         &mut self,
         coord: SectionCoord,
         camera: [f32; 3],
     ) -> Result<(), String> {
+        let revision = self.next_mesh_revision;
+        self.next_mesh_revision = self.next_mesh_revision.wrapping_add(1);
+        self.section_mesh_revisions.insert(coord, revision);
+
+        if self.mesh_cache.released_mesh_meta(coord).is_some() {
+            // The opaque CPU payloads are released and the VRAM copy is
+            // authoritative: `mesh(coord)` now holds only the kept
+            // translucent re-sort quads, so re-deriving the full artifacts
+            // would resurrect a translucent-only mesh as if it were the
+            // whole section. Only the translucent order may move here.
+            self.refresh_released_translucent_order(coord);
+            return Ok(());
+        }
+        self.released_translucent_slots.remove(&coord);
+
         let (grouped, buckets) = {
             let quads = self.mesh_cache.mesh(coord).unwrap_or(&[]);
             DirectionBuckets::group(quads)
@@ -2198,6 +2295,32 @@ impl WorldState {
         self.metrics.total_sort_us += t_sort.elapsed().as_micros() as u64;
         self.translucent_orders.insert(coord, order);
         Ok(())
+    }
+
+    /// Re-derive `translucent_orders` for a section whose opaque CPU
+    /// payloads were released to VRAM. `mesh_cache.mesh(coord)` already
+    /// holds the kept translucent quads in the new back-to-front order; the
+    /// [`WorldState::released_translucent_slots`] map translates each kept
+    /// quad back to its index in the grouped mesh the GPU uploaded, so the
+    /// emitted order still indexes the VRAM-resident packed mesh. When the
+    /// release bypassed [`WorldState::release_uploaded_section_cpu_copies`]
+    /// no slot map exists and the previous order is kept — it still indexes
+    /// real translucent quads, only its ordering is stale.
+    fn refresh_released_translucent_order(&mut self, coord: SectionCoord) {
+        let Some(slots) = self.released_translucent_slots.get(&coord) else {
+            return;
+        };
+        let kept = self.mesh_cache.mesh(coord).unwrap_or(&[]);
+        let order = kept
+            .iter()
+            .map(|quad| {
+                slots
+                    .get(&translucent_slot_key(quad))
+                    .copied()
+                    .unwrap_or(u32::MAX)
+            })
+            .collect();
+        self.translucent_orders.insert(coord, order);
     }
 
     /// Visibility-graph nodes for `GraphCuller::search`: every loaded
@@ -2261,6 +2384,70 @@ impl WorldState {
     /// grouped packed-vertex order.
     pub fn translucent_order(&self, coord: SectionCoord) -> Option<&[u32]> {
         self.translucent_orders.get(&coord).map(Vec::as_slice)
+    }
+
+    /// O(1) mesh-change detection for `client-gpu`: the last mesh-content
+    /// revision issued for `coord`, bumped on every rebuild or translucent
+    /// re-sort. `None` when the section is not loaded or was never meshed.
+    /// Replaces byte-comparing `PackedVertex` slices with one `u64` compare.
+    pub fn section_mesh_revision(&self, coord: SectionCoord) -> Option<u64> {
+        self.section_mesh_revisions.get(&coord).copied()
+    }
+
+    /// Number of sections still holding their CPU `Vec<PackedVertex>` copy.
+    /// Sections released through
+    /// [`release_uploaded_section_cpu_copies`](Self::release_uploaded_section_cpu_copies)
+    /// and sections not yet meshed are not counted.
+    pub fn packed_mesh_count(&self) -> usize {
+        self.packed_meshes.len()
+    }
+
+    /// Metadata kept for a section whose opaque CPU quads were released
+    /// after VRAM upload; `None` while the full CPU mesh is still held.
+    /// See [`MeshCache::released_mesh_meta`].
+    pub fn released_mesh_meta(&self, coord: SectionCoord) -> Option<&ReleasedMeshMeta> {
+        self.mesh_cache.released_mesh_meta(coord)
+    }
+
+    /// Post-upload zero-duplication release: once `coord`'s vertex data is
+    /// registered for VRAM upload, drops both CPU copies of its opaque
+    /// geometry — the `Vec<PackedVertex>` and the `MeshCache`'s opaque
+    /// `Vec<Quad>`, which keeps only translucent/water quads for
+    /// camera-driven re-sorts plus a [`ReleasedMeshMeta`].
+    /// [`section_mesh_revisions`](Self::section_mesh_revision) stays intact
+    /// so unchanged frames keep matching the VRAM-resident copy instead of
+    /// re-uploading. A later block edit re-dirties the section and the next
+    /// rebuild re-populates `packed_meshes` under a strictly higher
+    /// revision. Returns the total CPU bytes freed.
+    pub fn release_uploaded_section_cpu_copies(&mut self, coord: SectionCoord) -> usize {
+        // Capture the translucent-quad -> grouped-index map only on the
+        // first release, while the full mesh is still resident:
+        // `mesh(coord)` shrinks to the kept translucent quads afterwards.
+        if self.mesh_cache.released_mesh_meta(coord).is_none() {
+            if let Some(quads) = self.mesh_cache.mesh(coord) {
+                if quads.iter().any(quad_is_translucent) {
+                    let (grouped, _) = DirectionBuckets::group(quads);
+                    let slots: HashMap<TranslucentSlotKey, u32> = grouped
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, quad)| quad_is_translucent(quad))
+                        .map(|(index, quad)| (translucent_slot_key(quad), index as u32))
+                        .collect();
+                    self.released_translucent_slots.insert(coord, slots);
+                }
+            }
+        }
+        let quad_bytes = self.mesh_cache.release_uploaded_opaque_cpu_mesh(coord);
+        let packed_bytes = if self.mesh_cache.released_mesh_meta(coord).is_some() {
+            self.packed_meshes
+                .remove(&coord)
+                .map_or(0, |verts| {
+                    verts.len() * std::mem::size_of::<PackedVertex>()
+                })
+        } else {
+            0
+        };
+        quad_bytes + packed_bytes
     }
 
     fn recompute_live_totals(&mut self) {
