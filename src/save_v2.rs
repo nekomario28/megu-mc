@@ -2550,6 +2550,9 @@ fn save_world_into(f: &mut Vec<u8>) {
         }
     }
     append_dxt_footer(f, &dxt);
+    // SGN1 tucks between DXT1 and WBE1: a world whose signs carry no dye,
+    // glow or wax emits nothing here, keeping the exact pre-record tail.
+    append_sign_meta_footer(f);
     // WBE1 tucks beneath WBD1: a registry with nothing in it emits not one
     // byte, so an untouched world keeps the exact pre-record tail.
     append_wbe_footer(f);
@@ -4119,6 +4122,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         apply_saved_world_border(&border);
     }
     let (payload, wbe_entries) = read_wbe_footer(payload)?;
+    let (payload, sign_meta_records) = read_sign_meta_footer(payload)?;
     let (payload, dxt) = read_dxt_footer(payload)?;
     let (payload, mut mob_dimensions) = read_mob_dimensions_footer(payload)?;
     let (payload, mut brewing) = read_brewing_footer(payload)?;
@@ -5364,6 +5368,16 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
                 .collect(),
         );
     }
+    // SGN1 records name their dimension by canonical key like DXT1's, so they
+    // resolve against the same registry this process is running.
+    if !sign_meta_records.is_empty() {
+        let mut meta = sign_meta().lock().unwrap_or_else(|e| e.into_inner());
+        for (key, x, y, z, record) in sign_meta_records {
+            if let Some(dim) = dxt_dim(&key) {
+                meta.insert((dim, x, y, z), record);
+            }
+        }
+    }
     if let Some(saved) = advancements {
         *adv_done().lock().unwrap_or_else(|e| e.into_inner()) = saved.granted;
         *player_advancements().lock().unwrap_or_else(|e| e.into_inner()) = saved.core;
@@ -5522,6 +5536,194 @@ fn read_brewing_footer(
         return Err("trailing bytes in brewing footer");
     }
     Ok((&payload[..start], stands))
+}
+
+// ---------- sign display metadata footer ----------
+//
+// CREATIVE-P02-SALVAGE-1 gave signs live dye/glow/ink/wax state
+// (`sign_meta()`): both sides' text colour and glow flag plus the block-level
+// wax bit. The sign sections — legacy, DIM1 and DXT1 — carry only the four
+// text lines, so without this footer a restart silently returns every dyed,
+// glowing or waxed sign to vanilla defaults. Written as an SGN1 footer only
+// for entries that differ from those defaults, so a world whose signs were
+// never dressed keeps the exact pre-record byte layout. It sits between DXT1
+// and WBE1 in the file, which puts its peel between `read_wbe_footer` and
+// `read_dxt_footer`.
+//
+// Body: `[schema u8][count u32]` then per entry
+// `[dim key][x i32][y i32][z i32][front colour][front glow][back colour]
+// [back glow][waxed]`, where a colour is `[len u16][utf8]` restricted to the
+// sixteen vanilla dye names and each flag is a single 0/1 byte. Framed
+// `[body][body size u64][SGN1]` like the other save-state footers.
+const SIGN_META_MAGIC: &[u8; 4] = b"SGN1";
+const SIGN_META_SCHEMA: u8 = 1;
+const SIGN_META_FOOTER_LEN: usize = 12;
+/// The dye names vanilla 1.21.1 lets a sign side carry.
+const SIGN_DYE_COLORS: [&str; 16] = [
+    "white", "orange", "magenta", "light_blue", "yellow", "lime", "pink", "gray",
+    "light_gray", "cyan", "purple", "blue", "brown", "green", "red", "black",
+];
+/// `(dim key, x, y, z, meta)` — one sign's non-default display state. The
+/// dimension rides as its canonical key, like DXT1, so a datapack reorder
+/// between restarts cannot move the record.
+type SignMetaRecord = (String, i32, i32, i32, SignBlockMeta);
+
+fn sign_side_is_default(side: &SignSideMeta) -> bool {
+    side.color == "black" && !side.has_glowing_text
+}
+
+fn sign_meta_is_default(meta: &SignBlockMeta) -> bool {
+    sign_side_is_default(&meta.front)
+        && sign_side_is_default(&meta.back)
+        && !meta.is_waxed
+}
+
+fn write_sign_side_meta(out: &mut Vec<u8>, side: &SignSideMeta) {
+    out.extend_from_slice(&(side.color.len() as u16).to_be_bytes());
+    out.extend_from_slice(side.color.as_bytes());
+    out.push(u8::from(side.has_glowing_text));
+}
+
+fn append_sign_meta_footer(out: &mut Vec<u8>) {
+    // Every stored entry is persisted verbatim when it says something the
+    // defaults do not: `sign_meta_at`'s lazy sweep is left to runtime reads so
+    // a sign whose chunk is not currently loaded cannot lose its dye state to
+    // a save-time block probe.
+    let mut entries: Vec<SignMetaRecord> = Vec::new();
+    for (&(dim, x, y, z), meta) in sign_meta()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        if !sign_meta_is_default(meta) {
+            entries.push((dim_key(dim), x, y, z, meta.clone()));
+        }
+    }
+    if entries.is_empty() {
+        return;
+    }
+    entries.sort_by(|a, b| (&a.0, a.1, a.2, a.3).cmp(&(&b.0, b.1, b.2, b.3)));
+    let start = out.len();
+    out.push(SIGN_META_SCHEMA);
+    out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for (key, x, y, z, meta) in &entries {
+        write_dxt_key(out, key);
+        out.extend_from_slice(&x.to_be_bytes());
+        out.extend_from_slice(&y.to_be_bytes());
+        out.extend_from_slice(&z.to_be_bytes());
+        write_sign_side_meta(out, &meta.front);
+        write_sign_side_meta(out, &meta.back);
+        out.push(u8::from(meta.is_waxed));
+    }
+    let size = (out.len() - start) as u64;
+    out.extend_from_slice(&size.to_be_bytes());
+    out.extend_from_slice(SIGN_META_MAGIC);
+}
+
+fn read_sign_side_meta(body: &[u8], p: &mut usize) -> Result<SignSideMeta, &'static str> {
+    let len = u16::from_be_bytes(
+        body.get(*p..*p + 2)
+            .ok_or("truncated sign colour length")?
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    *p += 2;
+    let bytes = body.get(*p..*p + len).ok_or("truncated sign colour")?;
+    *p += len;
+    let color = std::str::from_utf8(bytes)
+        .map_err(|_| "invalid sign colour")?
+        .to_string();
+    if !SIGN_DYE_COLORS.contains(&color.as_str()) {
+        return Err("invalid sign colour");
+    }
+    let has_glowing_text = match body.get(*p) {
+        Some(0) => {
+            *p += 1;
+            false
+        }
+        Some(1) => {
+            *p += 1;
+            true
+        }
+        _ => return Err("invalid sign glow flag"),
+    };
+    Ok(SignSideMeta {
+        color,
+        has_glowing_text,
+    })
+}
+
+fn read_sign_meta_footer(payload: &[u8]) -> Result<(&[u8], Vec<SignMetaRecord>), &'static str> {
+    if !payload.ends_with(SIGN_META_MAGIC) {
+        return Ok((payload, Vec::new()));
+    }
+    let end = payload
+        .len()
+        .checked_sub(SIGN_META_FOOTER_LEN)
+        .ok_or("truncated sign meta footer")?;
+    let size = usize::try_from(u64::from_be_bytes(
+        payload[end..end + 8].try_into().unwrap(),
+    ))
+    .map_err(|_| "invalid sign meta footer size")?;
+    let start = end.checked_sub(size).ok_or("invalid sign meta footer size")?;
+    let body = &payload[start..end];
+    let mut p = 0usize;
+    if body.first() != Some(&SIGN_META_SCHEMA) {
+        return Err("unsupported sign meta footer");
+    }
+    p += 1;
+    let count = u32::from_be_bytes(
+        body.get(p..p + 4)
+            .ok_or("truncated sign meta count")?
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    p += 4;
+    // The smallest legal entry is an empty dim key (2 length bytes), 12
+    // position bytes, two "red" colours at 6 bytes each, and the wax byte:
+    // 27 bytes.
+    if count > body.len().saturating_sub(p) / 27 {
+        return Err("invalid sign meta count");
+    }
+    let mut records = Vec::with_capacity(count);
+    for _ in 0..count {
+        let key = read_dxt_key(body, &mut p)?.to_string();
+        let pos = body
+            .get(p..p + 12)
+            .ok_or("truncated sign meta position")?;
+        p += 12;
+        let x = i32::from_be_bytes(pos[..4].try_into().unwrap());
+        let y = i32::from_be_bytes(pos[4..8].try_into().unwrap());
+        let z = i32::from_be_bytes(pos[8..12].try_into().unwrap());
+        let front = read_sign_side_meta(body, &mut p)?;
+        let back = read_sign_side_meta(body, &mut p)?;
+        let is_waxed = match body.get(p) {
+            Some(0) => {
+                p += 1;
+                false
+            }
+            Some(1) => {
+                p += 1;
+                true
+            }
+            _ => return Err("invalid sign wax flag"),
+        };
+        records.push((
+            key,
+            x,
+            y,
+            z,
+            SignBlockMeta {
+                front,
+                back,
+                is_waxed,
+            },
+        ));
+    }
+    if p != body.len() {
+        return Err("trailing bytes in sign meta footer");
+    }
+    Ok((&payload[..start], records))
 }
 
 // ---------- W-BE mechanism registry footer ----------

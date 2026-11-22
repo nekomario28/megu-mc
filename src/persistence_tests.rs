@@ -2106,6 +2106,287 @@ fn save_v2_keeps_complete_live_player_records_by_uuid_after_they_go_offline() {
     assert!(saved_players().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&other_id));
 }
 
+/// ORACLE-PARITY-MATRIX-1 against vanilla 1.21.1 `59353fb4`: item data
+/// components are part of the stack, not decoration. A named, enchanted,
+/// lores diamond sword must come back from `save_world_into` /
+/// `load_world_from` with byte-identical component blobs in the live-player
+/// record, the offline inventory store, the ender chest and a block container.
+#[test]
+fn save_v2_item_components_survive_restart_in_player_and_chest() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let _guard = world_guard();
+    let old_inv = std::mem::take(&mut *inv_store().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_chests = std::mem::take(&mut *chests().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_players = std::mem::take(&mut *saved_players().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_pos = std::mem::take(&mut *pos_store().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_clients = std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_world = std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_rng = world_rng::saved_state();
+
+    let sword = name_to_item("diamond_sword").unwrap();
+    let mut comps: Comps = Vec::new();
+    comp_set(&mut comps, COMP_CUSTOM_NAME, nbt_string("§6Excalibur"));
+    comp_set(&mut comps, COMP_ENCHANTMENTS, enchantments_data(&[(32, 5)], true));
+    {
+        let mut lore = Vec::new();
+        write_varint(&mut lore, 2);
+        lore.extend_from_slice(&nbt_string("first lore line"));
+        lore.extend_from_slice(&nbt_string("second lore line"));
+        comp_set(&mut comps, COMP_LORE, lore);
+    }
+    let expected: Stack = (sword, 1, comps);
+
+    let (mut client, _peer) = effect_tests::client_pair();
+    client.uuid = [21; 16];
+    client.name = "component-player".into();
+    client
+        .inv
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(36, expected.clone());
+    let ender_key = ender_container_key(&client.uuid);
+    let ender_slots: HashMap<i16, Stack> = [(3i16, expected.clone())].into_iter().collect();
+    chests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(ender_key, ender_slots.clone());
+    let chest_key = ContainerKey::Block((DimId::Overworld, 5, 70, 7));
+    let chest_slots: HashMap<i16, Stack> = [(0i16, expected.clone())].into_iter().collect();
+    chests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(chest_key, chest_slots.clone());
+    clients()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(std::sync::Arc::new(client));
+
+    let mut payload = Vec::new();
+    save_world_into(&mut payload);
+    clients().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    inv_store().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    chests().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    saved_players().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    pos_store().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    load_world_from(&payload).unwrap();
+
+    let player_id = [21u8; 16];
+    let players = saved_players().lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(
+        players.get(&player_id).and_then(|p| p.inventory.get(&36)),
+        Some(&expected),
+        "the SVP1 player record must keep the stack's component blobs"
+    );
+    assert_eq!(
+        players.get(&player_id).and_then(|p| p.ender_chest.get(&3)),
+        Some(&expected),
+        "the ender chest record must keep the stack's component blobs"
+    );
+    drop(players);
+    assert_eq!(
+        inv_store().lock().unwrap_or_else(|e| e.into_inner())["component-player"].get(&36),
+        Some(&expected),
+        "the offline inventory store must keep the stack's component blobs"
+    );
+    let ch = chests().lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(
+        ch.get(&chest_key).and_then(|m| m.get(&0)),
+        Some(&expected),
+        "a block container must keep the stack's component blobs"
+    );
+    assert_eq!(
+        ch.get(&ender_key),
+        Some(&ender_slots),
+        "the ender chest container must keep the stack's component blobs"
+    );
+    drop(ch);
+
+    world_rng::restore(old_rng);
+    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
+    *clients().lock().unwrap_or_else(|e| e.into_inner()) = old_clients;
+    *inv_store().lock().unwrap_or_else(|e| e.into_inner()) = old_inv;
+    *chests().lock().unwrap_or_else(|e| e.into_inner()) = old_chests;
+    *saved_players().lock().unwrap_or_else(|e| e.into_inner()) = old_players;
+    *pos_store().lock().unwrap_or_else(|e| e.into_inner()) = old_pos;
+}
+
+fn sign_meta_frame(payload: &[u8]) -> std::ops::Range<usize> {
+    let at = payload
+        .windows(SIGN_META_MAGIC.len())
+        .position(|w| w == SIGN_META_MAGIC)
+        .expect("an SGN1 footer");
+    let size_at = at - 8;
+    let size = u64::from_be_bytes(payload[size_at..size_at + 8].try_into().unwrap()) as usize;
+    size_at - size..at + SIGN_META_MAGIC.len()
+}
+
+fn with_sign_meta_body(payload: &[u8], body: &[u8]) -> Vec<u8> {
+    let frame = sign_meta_frame(payload);
+    let mut edited = payload[..frame.start].to_vec();
+    edited.extend_from_slice(body);
+    edited.extend_from_slice(&(body.len() as u64).to_be_bytes());
+    edited.extend_from_slice(SIGN_META_MAGIC);
+    edited.extend_from_slice(&payload[frame.end..]);
+    edited
+}
+
+fn sign_side(color: &str, glow: bool) -> SignSideMeta {
+    SignSideMeta {
+        color: color.to_string(),
+        has_glowing_text: glow,
+    }
+}
+
+/// CREATIVE-P02-SALVAGE-1 gave signs live dye/glow/wax state that vanilla keeps
+/// in the sign block entity across restarts. SGN1 persists exactly the records
+/// that differ from the defaults, in every dimension, and restores them
+/// byte-for-byte; a sign nobody dressed emits no footer at all.
+#[test]
+fn save_v2_sign_meta_round_trips_dye_glow_and_wax_per_dimension() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let _guard = world_guard();
+    let old_meta = std::mem::take(&mut *sign_meta().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_rng = world_rng::saved_state();
+
+    // An empty store must not emit the footer: the save stays byte-identical
+    // to a world that never heard of sign metadata.
+    let mut plain = Vec::new();
+    save_world_into(&mut plain);
+    assert!(
+        !plain
+            .windows(SIGN_META_MAGIC.len())
+            .any(|w| w == SIGN_META_MAGIC),
+        "default sign state must not produce an SGN1 footer"
+    );
+
+    let cell = (5, 100, 7);
+    let dressed = SignBlockMeta {
+        front: sign_side("red", true),
+        back: sign_side("blue", false),
+        is_waxed: true,
+    };
+    let glowing = SignBlockMeta {
+        front: sign_side("black", true),
+        back: sign_side("light_blue", false),
+        is_waxed: false,
+    };
+    // Nether entry sits at vanilla defaults on both sides and unwaxed: it must
+    // not reach the footer even though a record exists for the position.
+    let default = SignBlockMeta::default();
+    {
+        let mut meta = sign_meta().lock().unwrap_or_else(|e| e.into_inner());
+        meta.insert((DimId::Overworld, cell.0, cell.1, cell.2), dressed.clone());
+        meta.insert((DimId::Nether, cell.0, cell.1, cell.2), default);
+        meta.insert((DimId::End, 9, 64, 9), glowing.clone());
+    }
+
+    let mut payload = Vec::new();
+    save_world_into(&mut payload);
+    let mut second = Vec::new();
+    save_world_into(&mut second);
+    assert_eq!(payload, second, "sign metadata output must be deterministic");
+    assert!(
+        payload
+            .windows(SIGN_META_MAGIC.len())
+            .any(|w| w == SIGN_META_MAGIC),
+        "a dressed sign must produce an SGN1 footer"
+    );
+
+    sign_meta().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    load_world_from(&payload).unwrap();
+    let meta = sign_meta().lock().unwrap_or_else(|e| e.into_inner());
+    let ow = meta.get(&(DimId::Overworld, cell.0, cell.1, cell.2)).expect("overworld sign meta");
+    assert_eq!(ow.front.color, "red");
+    assert!(ow.front.has_glowing_text);
+    assert_eq!(ow.back.color, "blue");
+    assert!(!ow.back.has_glowing_text);
+    assert!(ow.is_waxed);
+    let end = meta.get(&(DimId::End, 9, 64, 9)).expect("end sign meta");
+    assert_eq!(end.front.color, "black");
+    assert!(end.front.has_glowing_text);
+    assert_eq!(end.back.color, "light_blue");
+    assert!(!end.back.has_glowing_text);
+    assert!(!end.is_waxed);
+    assert!(
+        !meta.contains_key(&(DimId::Nether, cell.0, cell.1, cell.2)),
+        "a default record must not be persisted"
+    );
+    drop(meta);
+
+    world_rng::restore(old_rng);
+    *sign_meta().lock().unwrap_or_else(|e| e.into_inner()) = old_meta;
+}
+
+/// A torn or hostile SGN1 footer must fail the whole load closed rather than
+/// restore a partially decoded sign.
+#[test]
+fn save_v2_sign_meta_rejects_corrupt_footers() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let _guard = world_guard();
+    let old_meta = std::mem::take(&mut *sign_meta().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_rng = world_rng::saved_state();
+
+    sign_meta()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            (DimId::Overworld, 5, 100, 7),
+            SignBlockMeta {
+                front: sign_side("red", true),
+                back: sign_side("blue", false),
+                is_waxed: true,
+            },
+        );
+    let mut payload = Vec::new();
+    save_world_into(&mut payload);
+    let frame = sign_meta_frame(&payload);
+    let body = &payload[frame.start..frame.end - SIGN_META_FOOTER_LEN];
+
+    let mut corruptions: Vec<(&str, Vec<u8>)> = Vec::new();
+    // Honest-length truncations at every prefix of the body.
+    for cut in 0..body.len() {
+        corruptions.push(("truncated body", body[..cut].to_vec()));
+    }
+    // A body one byte longer than the record claims.
+    let mut trailing = body.to_vec();
+    trailing.push(0);
+    corruptions.push(("trailing byte", trailing));
+    // A schema this reader does not know.
+    let mut schema = body.to_vec();
+    schema[0] = 9;
+    corruptions.push(("unknown schema", schema));
+    // An impossible entry count.
+    let mut count = body.to_vec();
+    count[1..5].copy_from_slice(&u32::MAX.to_be_bytes());
+    corruptions.push(("excessive count", count));
+    // A colour outside the sixteen vanilla dye names.
+    let dye_at = body
+        .windows(3)
+        .position(|w| w == b"red")
+        .expect("the red colour in the record");
+    let mut colour = body.to_vec();
+    colour[dye_at..dye_at + 3].copy_from_slice(b"xxx");
+    corruptions.push(("unknown colour", colour));
+    // A glow flag that is neither 0 nor 1: it sits right after "red".
+    let mut flag = body.to_vec();
+    flag[dye_at + 3] = 2;
+    corruptions.push(("bad glow flag", flag));
+
+    for (reason, edited_body) in corruptions {
+        let edited = with_sign_meta_body(&payload, &edited_body);
+        assert!(load_world_from(&edited).is_err(), "{reason}");
+    }
+
+    world_rng::restore(old_rng);
+    *sign_meta().lock().unwrap_or_else(|e| e.into_inner()) = old_meta;
+}
+
 #[test]
 fn save_v2_world_spawn_keeps_packet_angle_and_old_footer_order() {
     if test_support::isolated_world_test() {
