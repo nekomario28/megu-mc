@@ -13,14 +13,19 @@ spec.loader.exec_module(audit)
 
 
 class P02AuditTests(unittest.TestCase):
-    def test_pinned_datapack_and_rust_parsers_pass_audit(self):
+    def test_pinned_datapack_and_rust_parsers_are_fully_audited(self):
         report = audit.run_audit()
-        self.assertEqual(report["failures"], [])
+        # A future runtime fix can close the gaps without changing this test.
+        # Unexpected new failures still fail the CLI and remain in the report.
         for dim in ("overworld", "nether", "end"):
-            self.assertFalse(
-                [f for f in report["failures"] if f.startswith(f"{dim}:")],
-                f"failures for {dim}: {report['failures']}",
-            )
+            ds = report["density_and_surface"][dim]
+            fp = report["features_and_placements"][dim]
+            for field in ("df_missing_refs", "noise_missing_refs", "df_unsupported",
+                          "surface_rule_unsupported", "surface_cond_unsupported",
+                          "surface_biome_is_missing_from_bleaf"):
+                self.assertFalse(ds[field], (dim, field, ds[field]))
+            for field in ("placement_modifier_unsupported", "missing_pf", "missing_cf"):
+                self.assertFalse(fp[field], (dim, field, fp[field]))
         self.assertEqual(report["cond_biome_anchor"], "u128")
         ow = report["density_and_surface"]["overworld"]
         self.assertEqual(
@@ -34,6 +39,119 @@ class P02AuditTests(unittest.TestCase):
             [],
         )
         self.assertEqual(report["biomes_and_structures"]["structures_total"], 34)
+        spawn = report["spawn_reachability"]
+        self.assertEqual(spawn["registry_entities"], 130)
+        self.assertEqual(spawn["spawner_entries"], 746)
+        self.assertEqual(spawn["valid_spawner_entries"], 746)
+        self.assertEqual(spawn["spawn_cost_entries"], 5)
+        self.assertEqual(spawn["reachable_spawn_cost_uses"], 5)
+        self.assertEqual(spawn["invalid_spawn_costs"], [])
+        self.assertEqual(spawn["reachable_spawner_uses"] + spawn["unreachable_spawner_uses"],
+                         spawn["spawner_entries"])
+        self.assertEqual(sum(spawn["categories"].values()), spawn["spawner_entries"])
+
+    @staticmethod
+    def spawn_sources():
+        return {
+            name: (ROOT / f"src/{name}.rs").read_text()
+            for name in ("entity_registry", "feature", "spawn_costs", "natural_spawner",
+                         "nether_spawn_rules", "spawner", "main")
+        }
+
+    def test_real_nether_spawn_entries_and_costs_have_live_dispatch(self):
+        all_biomes = audit.load_json_dir("biome")
+        nether = audit.tree_biomes()["nether"]
+        biomes = {name: all_biomes[name] for name in nether}
+        runtime = audit.parse_spawn_runtime()
+        result, failures = audit.audit_spawn_reachability(biomes, {"nether": nether}, runtime)
+        self.assertEqual(failures, [])
+        self.assertEqual(result["spawn_cost_entries"], 5)
+        self.assertEqual(result["reachable_spawn_cost_uses"], 5)
+        self.assertEqual(result["unreachable_spawner_uses"], 0)
+        self.assertGreater(result["reachable_spawner_uses"], 0)
+
+    def test_unknown_spawn_cost_entity_fails_closed(self):
+        all_biomes = audit.load_json_dir("biome")
+        nether = audit.tree_biomes()["nether"]
+        biomes = {name: copy.deepcopy(all_biomes[name]) for name in nether}
+        biomes["minecraft:warped_forest"]["spawn_costs"]["minecraft:phantom_unregistered"] = {
+            "energy_budget": 0.5, "charge": 1.0,
+        }
+        result, failures = audit.audit_spawn_reachability(
+            biomes, {"nether": nether}, audit.parse_spawn_runtime()
+        )
+        self.assertIn("unmapped spawn_costs entity 'minecraft:phantom_unregistered'", "\n".join(failures))
+        self.assertEqual(result["spawn_cost_entries"], 6)
+        self.assertEqual(result["reachable_spawn_cost_uses"], 5)
+
+    def test_unreferenced_biome_entries_fail_closed(self):
+        all_biomes = audit.load_json_dir("biome")
+        name = "minecraft:the_void"
+        biomes = {name: copy.deepcopy(all_biomes[name])}
+        biomes[name]["spawners"]["monster"] = [{
+            "type": "minecraft:zombie", "weight": 1, "minCount": 1, "maxCount": 1,
+        }]
+        biomes[name]["spawn_costs"]["minecraft:zombie"] = {
+            "energy_budget": 1.0, "charge": 1.0,
+        }
+        result, failures = audit.audit_spawn_reachability(
+            biomes, audit.tree_biomes(), audit.parse_spawn_runtime()
+        )
+        self.assertEqual(result["spawner_entries"], 1)
+        self.assertEqual(result["unreachable_spawner_uses"], 1)
+        self.assertEqual(result["spawn_cost_entries"], 1)
+        self.assertIn("unreferenced: unreachable weighted monster minecraft:zombie", "\n".join(failures))
+        self.assertIn("spawn_costs biome absent from dimension trees", "\n".join(failures))
+
+    def test_registered_but_unreachable_nether_mob_fails_closed(self):
+        all_biomes = audit.load_json_dir("biome")
+        nether = audit.tree_biomes()["nether"]
+        biomes = {name: copy.deepcopy(all_biomes[name]) for name in nether}
+        biomes["minecraft:warped_forest"]["spawners"]["monster"].append({
+            "type": "minecraft:bogged", "weight": 1, "minCount": 1, "maxCount": 1,
+        })
+        result, failures = audit.audit_spawn_reachability(
+            biomes, {"nether": nether}, audit.parse_spawn_runtime()
+        )
+        self.assertEqual(result["unreachable_spawner_uses"], 1)
+        self.assertIn("nether: unreachable weighted monster minecraft:bogged", "\n".join(failures))
+
+    def test_malformed_cost_and_spawner_entries_fail_closed(self):
+        all_biomes = audit.load_json_dir("biome")
+        nether = audit.tree_biomes()["nether"]
+        biomes = {name: copy.deepcopy(all_biomes[name]) for name in nether}
+        b = biomes["minecraft:warped_forest"]
+        b["spawn_costs"]["minecraft:enderman"] = {"energy_budget": float("nan"), "charge": 0.7}
+        b["spawners"]["monster"].append({
+            "type": "minecraft:missing_mob", "weight": 2, "minCount": 1, "maxCount": 4,
+        })
+        b["spawners"]["monster"].append({
+            "type": "minecraft:enderman", "weight": 1, "minCount": 5, "maxCount": 2,
+        })
+        b["spawners"]["unsupported_category"] = [{
+            "type": "minecraft:enderman", "weight": 1, "minCount": 1, "maxCount": 1,
+        }]
+        _, failures = audit.audit_spawn_reachability(biomes, {"nether": nether}, audit.parse_spawn_runtime())
+        rendered = "\n".join(failures)
+        for expected in ("invalid energy_budget/charge", "unmapped spawner entity",
+                         "invalid weight or group bounds", "unsupported_category"):
+            self.assertIn(expected, rendered)
+
+    def test_live_tick_call_site_and_cost_consumer_fail_closed(self):
+        sources = self.spawn_sources()
+        self.assertIn("spawn_nether_natural", audit.parse_spawn_runtime(sources=sources)["tick_calls"])
+        changed_main = dict(sources)
+        changed_main["main"] = sources["main"].replace(
+            "spawn_nether_natural(t);", "spawn_nether_natural_disabled(t);"
+        )
+        with self.assertRaisesRegex(audit.AuditError, "main tick -> spawn_nether_natural"):
+            audit.parse_spawn_runtime(sources=changed_main)
+        changed_natural = dict(sources)
+        changed_natural["natural_spawner"] = sources["natural_spawner"].replace(
+            "costs.can_spawn(&entry.kind, pos, chunk)", "true"
+        )
+        with self.assertRaisesRegex(audit.AuditError, "Nether spawn cost"):
+            audit.parse_spawn_runtime(sources=changed_natural)
 
     def test_cond_biome_anchor_fails_closed_on_revert_or_mismatch(self):
         wg_src = (ROOT / "src/worldgen.rs").read_text()

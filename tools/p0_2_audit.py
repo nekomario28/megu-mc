@@ -12,14 +12,18 @@ parsers in `src/worldgen.rs`, `src/generation_providers.rs`, and `src/feature.rs
   2. Surface rules & conditions + `biome_is` leaf coverage and `< 128` `Cond::Biome(u128)` mask guard.
   3. Placement modifiers (`p_mod`) & configured features (`p_cf`) reachable per dim.
   4. Biome `carvers`, `spawners`, `spawn_costs` and `structure` / `structure_set` totals.
+  5. Every biome mob/weighted group and spawn cost against the 1.21.1 entity
+     registry, parser, actual dimension dispatch and live main tick call chain.
 
 Exits 1 if any reachable `noise_router` density function, `surface_rule`,
 `surface_condition`, `biome_is`, `Cond::Biome(u128)` mask bound, or `placement`
 modifier lacks a parser arm or target reference in the pinned datapack, or when
 the `Cond::Biome(u128)` type anchor is reverted or mismatched in src/worldgen.rs.
+Unmapped, malformed, or unreachable natural spawn entries also fail the audit.
 """
 import argparse
 import json
+import math
 import re
 import sys
 from collections import Counter, defaultdict
@@ -54,6 +58,12 @@ PF_FEATURE_KEYS = {
     "feature_true", "feature_false",
 }
 NOISE_DF_TYPES = {"noise", "shifted_noise", "shift_a", "shift_b", "shift_x", "shift_z", "weird_scaled_sampler"}
+SPAWNER_CATEGORIES = {
+    "monster": "Monster", "creature": "Creature", "ambient": "Ambient",
+    "water_creature": "WaterCreature", "water_ambient": "WaterAmbient",
+    "underground_water_creature": "UndergroundWaterCreature",
+    "axolotls": "Axolotls", "misc": "Misc",
+}
 
 
 class AuditError(Exception):
@@ -401,6 +411,268 @@ def audit_biomes_and_structures(biomes, structures, structure_sets):
     }
 
 
+def rust_function(source, name):
+    """Take a named Rust function body, excluding comments and adjacent functions."""
+    source = re.sub(r"/\*.*?\*/|//[^\n]*", "", source, flags=re.S)
+    match = re.search(r"\bfn\s+" + re.escape(name) + r"\s*\(", source)
+    if not match:
+        raise AuditError(f"missing Rust function anchor: {name}")
+    start = source.find("{", match.end())
+    if start < 0:
+        raise AuditError(f"missing body for Rust function: {name}")
+    depth = 0
+    for offset in range(start, len(source)):
+        if source[offset] == "{":
+            depth += 1
+        elif source[offset] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start:offset + 1]
+    raise AuditError(f"unclosed Rust function: {name}")
+
+
+def require_runtime(body, pattern, label):
+    if not re.search(pattern, body, re.S):
+        raise AuditError(f"missing live spawn anchor: {label}")
+
+
+def parse_spawn_runtime(root=ROOT, sources=None):
+    """Read executable spawn dispatch rather than trusting function names alone."""
+    if sources is None:
+        sources = {
+            name: (root / f"src/{name}.rs").read_text()
+            for name in ("entity_registry", "feature", "spawn_costs", "natural_spawner",
+                         "nether_spawn_rules", "spawner", "main")
+        }
+    registry = {}
+    for entity, category in re.findall(
+        r'entity_spec_1211!\(\s*\d+\s*,\s*"([a-z0-9_]+)"\s*,\s*'
+        r'[^,]+,\s*[^,]+,\s*[^,]+,\s*(\w+)\s*,',
+        sources["entity_registry"],
+    ):
+        key = f"minecraft:{entity}"
+        if key in registry or category not in SPAWNER_CATEGORIES.values():
+            raise AuditError(f"invalid/duplicate entity registry row: {key} ({category})")
+        registry[key] = category
+    if not registry or not re.search(r"ENTITY_REGISTRY_1211:\s*\[EntitySpec;\s*" + str(len(registry)) + r"\]", sources["entity_registry"]):
+        raise AuditError("incomplete ENTITY_REGISTRY_1211 mapping")
+
+    feat = sources["feature"]
+    for fn, anchors in {
+        "p_spawn_cost": (r'jnum\(j,\s*"energy_budget"\)\?', r'jnum\(j,\s*"charge"\)\?'),
+        "p_spawner_data": (r'jstr\(j,\s*"type"\)\?', r'jint\(j,\s*"minCount"',
+                           r'jint\(j,\s*"maxCount"', r'jint\(j,\s*"weight"'),
+        "spawners_for": (r'\.spawners\.get\(biome\)',),
+        "spawn_cost_for": (r'\.spawn_costs\.get\(biome\)',),
+    }.items():
+        body = rust_function(feat, fn)
+        for anchor in anchors:
+            require_runtime(body, anchor, f"feature::{fn} / {anchor}")
+    for anchor in ("p_spawner_data(e)", "p_spawn_cost(cost)", "by_entity.insert", "entries.push"):
+        require_runtime(feat, re.escape(anchor), f"feature registry {anchor}")
+
+    costs = sources["spawn_costs"]
+    for fn, anchor in (("cost_at", "feature::spawn_cost_for"),
+                       ("can_spawn", "self.cost_at"), ("after_spawn", "self.potential.add_charge")):
+        require_runtime(rust_function(costs, fn), re.escape(anchor), f"SpawnCostState::{fn}")
+
+    natural = sources["natural_spawner"]
+    potential_impl = natural.split("impl PotentialCalculator {", 1)
+    if len(potential_impl) != 2:
+        raise AuditError("missing PotentialCalculator implementation")
+    require_runtime(
+        rust_function(potential_impl[1], "can_spawn"),
+        r"self\.get_potential_energy_change\(pos,\s*cost\.charge\)\s*<=\s*cost\.energy_budget",
+        "PotentialCalculator uses both charge and energy_budget",
+    )
+    require_runtime(rust_function(potential_impl[1], "add_charge"),
+                    r"self\.charges\.push\(", "PotentialCalculator accumulates charges")
+    nightly = rust_function(natural, "spawn_nightly_hostile_scratch")
+    nether = rust_function(natural, "spawn_nether_natural_scratch")
+    require_runtime(nightly, r"nightly_monster_spawners\(pos\)", "Overworld biome monster lookup")
+    require_runtime(nightly, r"choose_nightly_spawner\(entries\)", "Overworld weighted monster selection")
+    require_runtime(nightly, r"!\s*matches!\(\s*entry\.kind\.as_str\(\)", "Overworld monster exclusion guard")
+    require_runtime(nether, r"rules\.spawners_at\(", "Nether biome spawner lookup")
+    require_runtime(nether, r"choose_nether_spawner\(entries", "Nether weighted spawner selection")
+    require_runtime(nether, r"entry\.min_count\s*\+\s*rng\.next_bound\(entry\.max_count\s*-\s*entry\.min_count\s*\+\s*1\)",
+                    "Nether weighted group-size sampling")
+    require_runtime(nether, r"NetherSpawnMob::from_id\(&entry\.kind\)", "Nether mob dispatch")
+    for marker in ("SpawnCostState::from_existing", "costs.can_spawn(&entry.kind", "costs.after_spawn(&entry.kind"):
+        require_runtime(nether, re.escape(marker), f"Nether spawn cost {marker}")
+    category_loop = re.search(r"for\s+category\s+in\s+\[([^]]+)\]", nether)
+    if not category_loop:
+        raise AuditError("missing Nether live category loop")
+    nether_categories = set(re.findall(r"MobCategory::(\w+)", category_loop.group(1)))
+
+    nether_rules = rust_function(sources["nether_spawn_rules"], "spawners_at")
+    nether_lookup = {}
+    for category, serialized in re.findall(r'MobCategory::(\w+)\s*=>\s*"([a-z_]+)"', nether_rules):
+        nether_lookup[serialized] = category
+    for category in SPAWNER_CATEGORIES.keys() - {"misc"}:
+        if nether_lookup.get(category) != SPAWNER_CATEGORIES[category]:
+            raise AuditError(f"missing NetherSpawnRules category lookup: {category}")
+    require_runtime(nether_rules, r"feature::spawners_for\(biome,\s*category\)", "Nether rule biome lookup")
+    nether_dispatch = {
+        key for key in re.findall(r'"(minecraft:[a-z_]+)"\s*=>\s*Self::',
+                                  rust_function(sources["nether_spawn_rules"], "from_id"))
+    }
+
+    ow_dispatch_match = re.search(r"entry\.kind\.as_str\(\),\s*(.*?)\s*\)", nightly, re.S)
+    if not ow_dispatch_match:
+        raise AuditError("missing Overworld nightly monster dispatch")
+    overworld_monsters = set(re.findall(r'"(minecraft:[a-z_]+)"', ow_dispatch_match.group(1)))
+    require_runtime(nightly, r"entry\.kind\.as_str\(\)", "Overworld monster kind guard")
+
+    main = sources["main"]
+    tick = rust_function(main, "environment_time_tick")
+    require_runtime(tick, r"GR_MOB_SPAWNING\.load\(Ordering::Relaxed\)\s*==\s*1", "gamerule tick gate")
+    live_calls = ("spawn_nightly_hostile", "spawn_nether_natural", "spawn_passive_natural",
+                  "spawn_aquatic_natural", "spawn_end_natural", "spawn_chunkgen_creatures")
+    for fn in live_calls:
+        require_runtime(tick, rf"\b{fn}\(t\)\s*;", f"main tick -> {fn}(t)")
+        body = rust_function(main if fn not in ("spawn_nightly_hostile", "spawn_nether_natural") else natural, fn)
+        if fn == "spawn_nightly_hostile":
+            require_runtime(body, r"spawn_nightly_hostile_scratch", "nightly wrapper -> scratch")
+        if fn == "spawn_nether_natural":
+            require_runtime(body, r"spawn_nether_natural_scratch", "Nether wrapper -> scratch")
+
+    chunkgen = rust_function(main, "live_chunkgen_run")
+    require_runtime(chunkgen, r"spawner::spawn_mobs_for_chunk_generation\(", "chunkgen -> spawner")
+    require_runtime(chunkgen, r"feature::spawners_for\(b,\s*category\)", "chunkgen biome entry lookup")
+    require_runtime(rust_function(main, "spawn_chunkgen_creatures"), r"live_chunkgen_visit\(", "tick -> chunkgen visit")
+    require_runtime(rust_function(main, "live_chunkgen_visit"), r"live_chunkgen_run\(", "chunkgen visit -> run")
+    require_runtime(rust_function(sources["spawner"], "spawn_mobs_for_chunk_generation"),
+                    r'spawners_for\(center_biome,\s*"creature"\)', "chunkgen creature weighted entries")
+    for anchor in ("choose_creature(&entries", "entry.min_count", "entry.max_count", "world.add_creature"):
+        require_runtime(sources["spawner"], re.escape(anchor), f"chunkgen {anchor}")
+    require_runtime(rust_function(main, "add_creature"), r"live_natural_spawn\(", "live chunkgen insertion")
+    require_runtime(rust_function(main, "live_natural_spawn"), r"entity_spec_by_name\(kind\)", "live entity registry dispatch")
+    require_runtime(rust_function(main, "spawn_passive_natural"),
+                    r'feature::spawners_for\(&biome,\s*"creature"\)', "passive biome spawners")
+
+    return {
+        "registry": registry,
+        "nether_categories": nether_categories,
+        "nether_dispatch": nether_dispatch,
+        "overworld_monsters": overworld_monsters,
+        "tick_calls": list(live_calls),
+    }
+
+
+def audit_spawn_reachability(biomes, dim_biomes, runtime):
+    """Count every biome entry and identify entries with no live weighted dispatch."""
+    failures = []
+    summary = Counter()
+    categories = Counter()
+    unreachable = defaultdict(set)
+    bad_costs = []
+    registry = runtime["registry"]
+    # Biomes may be shared by more than one dimension. Audit each reachable use.
+    dimensions = defaultdict(set)
+    for dim, names in dim_biomes.items():
+        for name in names:
+            dimensions[name].add(dim)
+    for biome, data in sorted(biomes.items()):
+        spawners = data.get("spawners", {})
+        costs = data.get("spawn_costs", {})
+        if not isinstance(spawners, dict) or not isinstance(costs, dict):
+            failures.append(f"{biome}: spawn data must be JSON objects")
+            continue
+        for category, entries in sorted(spawners.items()):
+            if category not in SPAWNER_CATEGORIES or not isinstance(entries, list):
+                failures.append(f"{biome}: unknown or malformed spawner category {category}")
+                continue
+            for index, entry in enumerate(entries):
+                summary["spawner_entries"] += 1
+                categories[category] += 1
+                if not isinstance(entry, dict):
+                    failures.append(f"{biome}/{category}[{index}]: malformed spawner entry")
+                    continue
+                entity = entry.get("type")
+                if not isinstance(entity, str) or not entity.startswith("minecraft:") or entity not in registry:
+                    failures.append(f"{biome}/{category}[{index}]: unmapped spawner entity {entity!r}")
+                    continue
+                expected_category = SPAWNER_CATEGORIES[category]
+                # Vanilla's ocelot has category Creature in the registry but
+                # historically appears under Monster in the jungle biome JSON.
+                # Record the mismatch as a dispatch gap rather than discarding it.
+                if registry[entity] != expected_category:
+                    failures.append(f"{biome}/{category}[{index}]: {entity} registry category "
+                                    f"{registry[entity]} differs from biome {expected_category}")
+                if any(type(entry.get(key)) is not int for key in ("weight", "minCount", "maxCount")) or (
+                    entry.get("weight", 0) <= 0 or entry.get("minCount", 0) <= 0
+                    or entry.get("maxCount", 0) < entry.get("minCount", 0)
+                    or any(entry.get(key, 0) > 2**31 - 1 for key in ("weight", "minCount", "maxCount"))
+                ):
+                    failures.append(f"{biome}/{category}[{index}]: invalid weight or group bounds for {entity}")
+                    continue
+                summary["valid_spawner_entries"] += 1
+                if not dimensions[biome]:
+                    summary["unreachable_spawner_uses"] += 1
+                    unreachable[("unreferenced", category, entity)].add(biome)
+                for dim in sorted(dimensions[biome]):
+                    supported = (
+                        (dim == "nether" and expected_category in runtime["nether_categories"]
+                         and entity in runtime["nether_dispatch"])
+                        or (dim == "overworld" and category == "creature")
+                        or (dim == "overworld" and category == "monster"
+                            and entity in runtime["overworld_monsters"])
+                    )
+                    if supported:
+                        summary["reachable_spawner_uses"] += 1
+                    else:
+                        summary["unreachable_spawner_uses"] += 1
+                        unreachable[(dim, category, entity)].add(biome)
+
+        for entity, cost in sorted(costs.items()):
+            summary["spawn_cost_entries"] += 1
+            if entity not in registry:
+                bad_costs.append(f"{biome}: unmapped spawn_costs entity {entity!r}")
+                continue
+            if not isinstance(cost, dict) or any(
+                type(cost.get(key)) not in (int, float)
+                or not math.isfinite(cost[key]) or cost[key] < 0
+                for key in ("energy_budget", "charge")
+            ):
+                bad_costs.append(f"{biome}: invalid energy_budget/charge for {entity}")
+                continue
+            if not dimensions[biome]:
+                bad_costs.append(f"{biome}: {entity} spawn_costs biome absent from dimension trees")
+            for dim in sorted(dimensions[biome]):
+                paired = any(
+                    entry.get("type") == entity
+                    for entries in spawners.values() if isinstance(entries, list)
+                    for entry in entries if isinstance(entry, dict)
+                )
+                if dim == "nether" and entity in runtime["nether_dispatch"] and paired:
+                    summary["reachable_spawn_cost_uses"] += 1
+                else:
+                    bad_costs.append(f"{biome}: {entity} spawn_costs lacks {dim} live spawn dispatch")
+    failures.extend(bad_costs)
+    gaps = [
+        {"dimension": dim, "category": category, "entity": entity, "biomes": sorted(names)}
+        for (dim, category, entity), names in sorted(unreachable.items())
+    ]
+    failures.extend(
+        f"{gap['dimension']}: unreachable weighted {gap['category']} {gap['entity']} "
+        f"in {len(gap['biomes'])} biome(s): {', '.join(gap['biomes'][:3])}"
+        for gap in gaps
+    )
+    return {
+        "registry_entities": len(registry),
+        "tick_calls": runtime["tick_calls"],
+        "categories": dict(sorted(categories.items())),
+        "spawner_entries": summary["spawner_entries"],
+        "valid_spawner_entries": summary["valid_spawner_entries"],
+        "reachable_spawner_uses": summary["reachable_spawner_uses"],
+        "unreachable_spawner_uses": summary["unreachable_spawner_uses"],
+        "unreachable_spawners": gaps,
+        "spawn_cost_entries": summary["spawn_cost_entries"],
+        "reachable_spawn_cost_uses": summary["reachable_spawn_cost_uses"],
+        "invalid_spawn_costs": bad_costs,
+    }, failures
+
+
 def run_audit(root=ROOT):
     parsers = parse_rust_parsers(root)
     anchor = parse_cond_biome_anchor((root / "src/worldgen.rs").read_text())
@@ -417,6 +689,8 @@ def run_audit(root=ROOT):
     df_surf, f1 = audit_density_and_surface(noise_settings, df_files, noise_files, dim_biomes, parsers)
     feat_pm, f2 = audit_features_and_placements(biomes, placed_features, configured_features, dim_biomes, parsers)
     bio_struct = audit_biomes_and_structures(biomes, structures, structure_sets)
+    spawn_runtime = parse_spawn_runtime(root)
+    spawn, f3 = audit_spawn_reachability(biomes, dim_biomes, spawn_runtime)
 
     return {
         "parsers": {k: len(v) for k, v in parsers.items()},
@@ -424,7 +698,8 @@ def run_audit(root=ROOT):
         "density_and_surface": df_surf,
         "features_and_placements": feat_pm,
         "biomes_and_structures": bio_struct,
-        "failures": f1 + f2,
+        "spawn_reachability": spawn,
+        "failures": f1 + f2 + f3,
     }
 
 
@@ -455,6 +730,15 @@ def format_report(report):
     lines.append(
         f"[structures] sets={bs['structure_sets_total']} definitions={bs['structures_total']} "
         f"types={len(bs['structure_types'])} (P2-1 gap; e.g. minecraft:mineshaft={bs['structure_types'].get('minecraft:mineshaft', [])})"
+    )
+    spawn = report["spawn_reachability"]
+    lines.append(
+        f"[spawn_reachability] registry={spawn['registry_entities']} "
+        f"spawners={spawn['spawner_entries']} valid={spawn['valid_spawner_entries']} "
+        f"reachable_uses={spawn['reachable_spawner_uses']} "
+        f"unreachable_uses={spawn['unreachable_spawner_uses']} "
+        f"spawn_costs={spawn['spawn_cost_entries']} "
+        f"reachable_cost_uses={spawn['reachable_spawn_cost_uses']}"
     )
     if report["failures"]:
         lines.append("FAILURES:")
