@@ -6,7 +6,8 @@ use mc_spine_client::shaders::{
     validate_wgsl_module, WgslStage, TERRAIN_OPAQUE_WGSL, TERRAIN_TRANSLUCENT_WGSL,
 };
 use mc_spine_client_gpu::renderer::{
-    probe_adapters, request_gpu_device, GpuRenderer, RendererError, OFFSCREEN_FORMAT,
+    probe_adapters, request_gpu_device, section_geometry, GpuRenderer, RendererError,
+    OFFSCREEN_FORMAT,
 };
 use mc_spine_client_gpu::{
     aligned_copy_bytes_per_row, build_demo_scene, build_index_buffer, gpu_capabilities_for,
@@ -15,6 +16,7 @@ use mc_spine_client_gpu::{
     translucent_quad_order, ui_rgba_len, wgpu_backends_for, Camera, GpuCliConfig, MoveInput,
     UI_BLIT_WGSL,
 };
+use mc_spine_client_mesh::ffi::PackedVertex;
 use mc_spine_client_mesh::{ActiveRenderBackend, GpuVendor, Layer, RenderBackendPreference};
 use mc_spine_ui::draw::rasterize_draw_list;
 use mc_spine_ui::state::{HudState, Screen, UiState};
@@ -214,6 +216,41 @@ fn split_partition_is_exact() {
     assert_eq!(opaque.len() + translucent.len(), all.len());
 }
 
+#[test]
+fn live_geometry_preserves_diagonals_and_translucent_sort() {
+    let quad = |layer: u32, diagonal: u32| {
+        let vertex = PackedVertex {
+            position: 0,
+            state_id: 1,
+            attributes: (layer << 13) | (diagonal << 17),
+            tint: 0,
+        };
+        [vertex; 4]
+    };
+    let packed: Vec<_> = [quad(0, 0), quad(2, 1), quad(0, 1), quad(2, 0)]
+        .into_iter()
+        .flatten()
+        .collect();
+    let geometry = section_geometry(&packed, &[3, 1]);
+    assert_eq!(geometry.opaque.len(), 8);
+    assert_eq!(geometry.translucent.len(), 8);
+    assert_eq!(
+        geometry.opaque_indices,
+        [0, 1, 2, 0, 2, 3, 4, 5, 7, 5, 6, 7]
+    );
+    assert_eq!(
+        geometry.translucent_indices,
+        [0, 1, 2, 0, 2, 3, 4, 5, 7, 5, 6, 7]
+    );
+
+    // A duplicate or incomplete sort falls back to the original order.
+    let fallback = section_geometry(&packed, &[1, 1]);
+    assert_eq!(
+        fallback.translucent_indices,
+        [0, 1, 3, 1, 2, 3, 4, 5, 6, 4, 6, 7]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Capability mapping (pure; no adapter needed)
 // ---------------------------------------------------------------------------
@@ -400,6 +437,49 @@ fn cli_parse() {
 
     let default_cfg = GpuCliConfig::default();
     assert!(!default_cfg.headless_probe && !default_cfg.offline_demo);
+}
+
+#[test]
+fn live_cli_username_version_and_original_flags() {
+    let defaults = parse_gpu_args::<&str>(&[]).unwrap();
+    assert_eq!(defaults.username, "MeguGpu");
+    assert_eq!(defaults.mc_version, "767");
+
+    let live = parse_gpu_args(&[
+        "--connect",
+        "localhost:25566",
+        "--username=Steve_21",
+        "--mc-version",
+        "777",
+        "--vsync",
+        "off",
+        "--gpu-backend",
+        "classic",
+        "--headless-probe",
+    ])
+    .unwrap();
+    assert_eq!(live.connect, Some(("localhost".to_owned(), 25566)));
+    assert_eq!(live.username, "Steve_21");
+    assert_eq!(live.mc_version, "777");
+    assert!(!live.vsync);
+    assert!(live.headless_probe);
+    assert_eq!(live.gpu_backend, RenderBackendPreference::Classic);
+
+    let offline = parse_gpu_args(&["--offline-demo", "--shader-pack=packs/demo.zip"]).unwrap();
+    assert!(offline.offline_demo);
+    assert_eq!(
+        offline.shader_pack.as_deref(),
+        Some(std::path::Path::new("packs/demo.zip"))
+    );
+    for invalid in [
+        vec!["--username"],
+        vec!["--username="],
+        vec!["--username", "invalid-name"],
+        vec!["--username", "12345678901234567"],
+        vec!["--mc-version", "766"],
+    ] {
+        assert!(parse_gpu_args(&invalid).is_err(), "accepted {invalid:?}");
+    }
 }
 
 // ---------------------------------------------------------------------------

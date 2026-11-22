@@ -32,13 +32,12 @@ fn main() -> ExitCode {
     }
 
     if let Some((host, port)) = &cfg.connect {
-        println!("{CLIENT_GPU_NAME}: target server {host}:{port} (offline demo world until the wire session lands)");
-    }
-    if !cfg.offline_demo {
-        eprintln!(
-            "{CLIENT_GPU_NAME}: no server session is implemented yet; rendering the built-in \
-             offline demo scene (pass --offline-demo to silence this note)"
-        );
+        if !cfg.offline_demo {
+            println!(
+                "{CLIENT_GPU_NAME}: connecting to {host}:{port} as {} ({})",
+                cfg.username, cfg.mc_version
+            );
+        }
     }
 
     match window::run(cfg) {

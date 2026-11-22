@@ -5,13 +5,16 @@
 //! to the built-in pipeline with a human-readable notice.
 
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use bytemuck::{Pod, Zeroable};
 use mc_spine_client::shaders::{
     validate_wgsl_module, WgslStage, TERRAIN_OPAQUE_WGSL, TERRAIN_TRANSLUCENT_WGSL,
 };
+use mc_spine_client::world::WorldState;
 use mc_spine_client_mesh::ffi::PackedVertex;
+use mc_spine_client_mesh::SectionCoord;
 use mc_spine_client_mesh::{
     is_megu_wgsl_pack, BackendResolution, GpuCapabilities, GpuShaderCaps, MeguWgslPack, PassKind,
     PipelineStage, RenderBackendPreference, ShaderPackSource,
@@ -329,6 +332,78 @@ struct TerrainBuffers {
     translucent_index_count: u32,
 }
 
+/// Local mesh vertices and draw indices, keeping translucent quads ordered.
+#[derive(Clone, Debug, Default)]
+pub struct LiveSectionGeometry {
+    pub opaque: Vec<PackedVertex>,
+    pub opaque_indices: Vec<u32>,
+    pub translucent: Vec<PackedVertex>,
+    pub translucent_indices: Vec<u32>,
+}
+
+fn append_live_quad(
+    vertices: &mut Vec<PackedVertex>,
+    indices: &mut Vec<u32>,
+    quad: &[PackedVertex],
+) {
+    let base = vertices.len() as u32;
+    vertices.extend_from_slice(quad);
+    // PackedVertex.attributes bit 17 is the original greedy-mesh diagonal.
+    let corners = if quad[0].attributes & (1 << 17) == 0 {
+        [0, 1, 2, 0, 2, 3]
+    } else {
+        [0, 1, 3, 1, 2, 3]
+    };
+    indices.extend(corners.map(|corner| base + corner));
+}
+
+pub fn section_geometry(packed: &[PackedVertex], translucent_order: &[u32]) -> LiveSectionGeometry {
+    let mut out = LiveSectionGeometry::default();
+    let mut translucent = Vec::new();
+    for quad in packed.as_chunks::<4>().0 {
+        let attrs = quad[0].attributes;
+        let layer = (attrs >> 13) & 3;
+        let fluid = (attrs >> 15) & 3;
+        if layer == 2 || (layer == 3 && fluid == 1) {
+            translucent.push(quad.as_slice());
+        } else {
+            append_live_quad(&mut out.opaque, &mut out.opaque_indices, quad);
+        }
+    }
+    // The world sort refers to the original packed quad indices.
+    let mut ordered = Vec::new();
+    let mut seen = HashSet::new();
+    for &idx in translucent_order {
+        let index = idx as usize;
+        let quad = packed.get(index.saturating_mul(4)..index.saturating_mul(4).saturating_add(4));
+        if let Some(quad) = quad {
+            let layer = (quad[0].attributes >> 13) & 3;
+            let fluid = (quad[0].attributes >> 15) & 3;
+            if seen.insert(index) && (layer == 2 || (layer == 3 && fluid == 1)) {
+                ordered.push(quad);
+                continue;
+            }
+        }
+        ordered.clear();
+        break;
+    }
+    if ordered.len() != translucent.len() {
+        ordered = translucent;
+    }
+    for quad in ordered {
+        append_live_quad(&mut out.translucent, &mut out.translucent_indices, quad);
+    }
+    out
+}
+
+struct LiveTerrainSection {
+    packed: Vec<PackedVertex>,
+    order: Vec<u32>,
+    terrain: TerrainBuffers,
+    _uniform: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
 /// The real `wgpu` renderer: terrain (opaque + translucent), UI blit, depth.
 ///
 /// Owns device-independent state for one color format (`target_format`):
@@ -354,6 +429,7 @@ pub struct GpuRenderer {
     depth_view: Option<wgpu::TextureView>,
     depth_size: (u32, u32),
     scene: Option<TerrainBuffers>,
+    live_sections: HashMap<SectionCoord, LiveTerrainSection>,
     /// The active shaderpack hook verdict (or `None` for built-in).
     pub shaderpack: ShaderpackAttempt,
     /// Latest notice line the HUD/diagnostics can display.
@@ -506,6 +582,7 @@ impl GpuRenderer {
             depth_view: None,
             depth_size: (0, 0),
             scene: None,
+            live_sections: HashMap::new(),
             shaderpack: ShaderpackAttempt::Fallback {
                 notice: "built-in terrain pipeline".to_string(),
             },
@@ -778,6 +855,105 @@ impl GpuRenderer {
         Ok(())
     }
 
+    /// Synchronize real chunk sections. Unchanged sections reuse their existing buffers.
+    /// Unloaded sections are released as soon as the world stops exposing them.
+    pub fn update_live_terrain(&mut self, world: &WorldState) -> usize {
+        let mut uploaded = 0;
+        self.live_sections
+            .retain(|coord, _| world.packed_mesh(*coord).is_some());
+        for (coord, packed) in world.packed_meshes() {
+            let order = world.translucent_order(coord).unwrap_or(&[]);
+            if self
+                .live_sections
+                .get(&coord)
+                .is_some_and(|existing| existing.packed == packed && existing.order == order)
+            {
+                continue;
+            }
+            let geometry = section_geometry(packed, order);
+            let terrain = TerrainBuffers {
+                opaque_index_count: geometry.opaque_indices.len() as u32,
+                translucent_index_count: geometry.translucent_indices.len() as u32,
+                opaque_vertices: vertex_buffer(
+                    &self.ctx.device,
+                    &self.ctx.queue,
+                    "live-opaque-verts",
+                    &geometry.opaque,
+                ),
+                opaque_indices: index_buffer(
+                    &self.ctx.device,
+                    &self.ctx.queue,
+                    "live-opaque-indices",
+                    &geometry.opaque_indices,
+                ),
+                translucent_vertices: vertex_buffer(
+                    &self.ctx.device,
+                    &self.ctx.queue,
+                    "live-translucent-verts",
+                    &geometry.translucent,
+                ),
+                translucent_indices: index_buffer(
+                    &self.ctx.device,
+                    &self.ctx.queue,
+                    "live-translucent-indices",
+                    &geometry.translucent_indices,
+                ),
+            };
+            let uniform = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("live-section-uniform"),
+                size: std::mem::size_of::<SectionUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let section_uniform = SectionUniforms {
+                origin: [
+                    coord.0 as f32 * 16.0,
+                    coord.1 as f32 * 16.0,
+                    coord.2 as f32 * 16.0,
+                ],
+                _pad0: 0.0,
+                biome_tint: [1.0; 3],
+                biome_tint_strength: 0.0,
+            };
+            self.ctx
+                .queue
+                .write_buffer(&uniform, 0, bytemuck::bytes_of(&section_uniform));
+            let bind_group = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("live-section-bind-group"),
+                    layout: &self.frame_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.frame_ubo.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: uniform.as_entire_binding(),
+                        },
+                    ],
+                });
+            self.live_sections.insert(
+                coord,
+                LiveTerrainSection {
+                    packed: packed.to_vec(),
+                    order: order.to_vec(),
+                    terrain,
+                    _uniform: uniform,
+                    bind_group,
+                },
+            );
+            uploaded += 1;
+        }
+        uploaded
+    }
+
+    pub fn live_section_count(&self) -> usize {
+        self.live_sections.len()
+    }
+
     /// Update the `section` uniform (world origin + biome tint).
     pub fn set_section_origin(&self, origin: [f32; 3]) {
         let uniforms = SectionUniforms {
@@ -990,6 +1166,34 @@ impl GpuRenderer {
                         wgpu::IndexFormat::Uint32,
                     );
                     pass.draw_indexed(0..scene.translucent_index_count, 0, 0..1);
+                }
+            }
+            if !self.live_sections.is_empty() {
+                pass.set_pipeline(&self.terrain_pipeline);
+                for section in self.live_sections.values() {
+                    if section.terrain.opaque_index_count == 0 {
+                        continue;
+                    }
+                    pass.set_bind_group(0, &section.bind_group, &[]);
+                    pass.set_vertex_buffer(0, section.terrain.opaque_vertices.slice(..));
+                    pass.set_index_buffer(
+                        section.terrain.opaque_indices.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    pass.draw_indexed(0..section.terrain.opaque_index_count, 0, 0..1);
+                }
+                pass.set_pipeline(&self.translucent_pipeline);
+                for section in self.live_sections.values() {
+                    if section.terrain.translucent_index_count == 0 {
+                        continue;
+                    }
+                    pass.set_bind_group(0, &section.bind_group, &[]);
+                    pass.set_vertex_buffer(0, section.terrain.translucent_vertices.slice(..));
+                    pass.set_index_buffer(
+                        section.terrain.translucent_indices.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    pass.draw_indexed(0..section.terrain.translucent_index_count, 0, 0..1);
                 }
             }
         }

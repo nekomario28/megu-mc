@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use mc_spine_client::render::{FrameBudgetGovernor, RenderConfig};
 use mc_spine_ui::draw::rasterize_draw_list;
+use mc_spine_ui::magic_hud::build_magic_hud_draw_list;
 use mc_spine_ui::state::{Screen, UiAction, UiInputEvent, UiKey, UiState};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -16,6 +17,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
+use crate::live_session::{LiveSession, PlayerMovement, PlayerPose, SessionStatus};
 use crate::renderer::{request_gpu_device, GpuRenderer};
 use crate::{build_demo_scene, present_mode_for, Camera, GpuCliConfig, MoveInput};
 
@@ -62,6 +64,7 @@ impl Keys {
 /// The `ApplicationHandler` `EventLoop::run_app` drives.
 pub struct GpuApp {
     config: GpuCliConfig,
+    live: Option<LiveSession>,
     active: Option<ActiveWindow>,
     camera: Camera,
     keys: Keys,
@@ -81,6 +84,18 @@ pub struct GpuApp {
 impl GpuApp {
     /// Build the app state (no GPU or window yet — `resumed` does that).
     pub fn new(config: GpuCliConfig) -> Self {
+        let live = if config.offline_demo {
+            None
+        } else {
+            config.connect.as_ref().map(|(host, port)| {
+                LiveSession::connect(
+                    host.clone(),
+                    *port,
+                    config.username.clone(),
+                    config.mc_version.clone(),
+                )
+            })
+        };
         let render_config = RenderConfig {
             vsync: config.vsync,
             gpu_backend: config.gpu_backend,
@@ -99,6 +114,7 @@ impl GpuApp {
         ui.hud = mc_spine_ui::state::HudState::demo();
         Self {
             config,
+            live,
             active: None,
             camera,
             keys: Keys::default(),
@@ -192,11 +208,13 @@ impl GpuApp {
         active
             .surface
             .configure(&active.renderer.gpu().device, &config);
-        let scene = build_demo_scene(self.camera.position);
-        active
-            .renderer
-            .upload_scene(&scene)
-            .map_err(|e| e.to_string())?;
+        if self.live.is_none() {
+            let scene = build_demo_scene(self.camera.position);
+            active
+                .renderer
+                .upload_scene(&scene)
+                .map_err(|e| e.to_string())?;
+        }
         if let Some(path) = &self.config.shader_pack {
             active.renderer.load_shaderpack(path);
         }
@@ -211,9 +229,40 @@ impl GpuApp {
         let dt = frame_begin.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = frame_begin;
 
+        if let Some(live) = &mut self.live {
+            live.poll(self.camera.position);
+            if let Some(pose) = live.camera_sync.take() {
+                self.camera.position = [
+                    pose.feet[0] as f32,
+                    pose.feet[1] as f32 + 1.62,
+                    pose.feet[2] as f32,
+                ];
+                self.camera.yaw_deg = (pose.yaw + 180.0).rem_euclid(360.0);
+                self.camera.pitch_deg = (-pose.pitch).clamp(-89.9, 89.9);
+            }
+        }
+
         // Camera movement only applies while unpaused and grabbed.
         if !self.paused {
             self.camera.apply_move(self.keys.move_input(), dt.min(0.1));
+        }
+
+        if let Some(live) = &mut self.live {
+            let input = self.keys.move_input();
+            live.send_movement(PlayerMovement {
+                pose: PlayerPose {
+                    feet: [
+                        self.camera.position[0] as f64,
+                        (self.camera.position[1] - 1.62) as f64,
+                        self.camera.position[2] as f64,
+                    ],
+                    yaw: (self.camera.yaw_deg - 180.0).rem_euclid(360.0),
+                    pitch: -self.camera.pitch_deg,
+                },
+                strafe: if self.paused { 0.0 } else { input.strafe },
+                forward: if self.paused { 0.0 } else { input.forward },
+                jump: !self.paused && input.vertical > 0.0,
+            });
         }
 
         let Some(active) = self.active.as_mut() else {
@@ -221,18 +270,51 @@ impl GpuApp {
         };
         let (w, h) = (active.size.width.max(1), active.size.height.max(1));
 
+        if let Some(live) = &mut self.live {
+            if live.terrain_dirty {
+                active.renderer.update_live_terrain(&live.world);
+                live.terrain_dirty = false;
+            }
+            self.ui.hud = live.hud.clone();
+        }
+
         // HUD/diagnostics through the real client-ui state machine.
         self.ui.hud.actionbar = if self.show_diagnostics {
             format!(
-                "F3 | {} | {} | {:.1} ms",
+                "F3 | {} | {} | {:.1} ms{}",
                 active.renderer.gpu().report.resolution.backend.as_str(),
                 active.renderer.gpu().report.name,
                 self.governor.frame_ms(),
+                self.live
+                    .as_ref()
+                    .map(|live| format!(
+                        " | chunks {} | sections {} | VFX {} | ANM {} (rejected {}) | MOT {:?}",
+                        live.world.loaded_chunks(),
+                        active.renderer.live_section_count(),
+                        live.vfx_admitted,
+                        live.animation_packets,
+                        live.animation_rejected,
+                        live.motion.as_ref().map(|motion| motion.phase),
+                    ))
+                    .unwrap_or_default(),
             )
         } else {
-            String::new()
+            self.live
+                .as_ref()
+                .map_or_else(String::new, |live| match &live.status {
+                    SessionStatus::Connecting => "Connecting to server...".to_owned(),
+                    SessionStatus::Playing => live.hud.actionbar.clone(),
+                    SessionStatus::Disconnected(reason) => format!("Disconnected: {reason}"),
+                })
         };
-        let draw_list = self.ui.render(w, h);
+        let mut draw_list = self.ui.render(w, h);
+        if let Some(live) = &self.live {
+            if !live.magic.is_empty() {
+                draw_list
+                    .commands
+                    .extend(build_magic_hud_draw_list(&live.magic, w, h).commands);
+            }
+        }
         let rgba = rasterize_draw_list(w, h, &draw_list);
         if let Err(e) = active.renderer.update_ui_framebuffer(w, h, &rgba) {
             self.fatal = Some(format!("UI upload: {e}"));

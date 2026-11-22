@@ -15,6 +15,7 @@
 //! quad->buffer conversion, the capability mapping and the CLI parser are
 //! pure functions unit tests exercise without an adapter.
 
+pub mod live_session;
 pub mod renderer;
 pub mod window;
 
@@ -35,12 +36,15 @@ pub const CLIENT_GPU_NAME: &str = "mc-spine-client-gpu";
 // ---------------------------------------------------------------------------
 
 /// Everything `mc-spine-client-gpu` accepts on the command line.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GpuCliConfig {
     /// `--connect <host[:port]>` — the server the window session targets.
-    /// The GPU client currently records the endpoint and reports it on the
-    /// HUD; the wire session is layered in by later lanes.
+    /// Connect to a live offline-authenticated Protocol 767/777 server.
     pub connect: Option<(String, u16)>,
+    /// Offline-mode player name, 1–16 ASCII letters/digits/underscores.
+    pub username: String,
+    /// Minecraft protocol, 767 (1.21.1) or 777 (26.3).
+    pub mc_version: String,
     /// `--shader-pack <path>` — directory or `.zip` holding a
     /// `megu-shader.toml` Megu native WGSL pack (or an OptiFine/Iris pack,
     /// which fails closed to built-in rendering with a notice).
@@ -66,7 +70,26 @@ impl GpuCliConfig {
     fn new() -> Self {
         Self {
             vsync: true,
+            username: "MeguGpu".to_owned(),
+            mc_version: "767".to_owned(),
             ..Self::default()
+        }
+    }
+}
+
+impl Default for GpuCliConfig {
+    fn default() -> Self {
+        Self {
+            connect: None,
+            username: "MeguGpu".into(),
+            mc_version: "767".into(),
+            shader_pack: None,
+            gpu_backend: RenderBackendPreference::default(),
+            offline_demo: false,
+            headless_probe: false,
+            vsync: true,
+            show_help: false,
+            show_version: false,
         }
     }
 }
@@ -103,6 +126,22 @@ pub fn parse_gpu_args<S: AsRef<str>>(args: &[S]) -> Result<GpuCliConfig, String>
                 cfg.connect =
                     Some(parse_host_port(&raw, 25565).map_err(|e| format!("--connect: {e}"))?);
             }
+            "--username" => {
+                let name = take_value(&mut i)?;
+                if !(1..=16).contains(&name.len())
+                    || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                {
+                    return Err(
+                        "--username: expected 1-16 ASCII letters, digits, or underscores".into(),
+                    );
+                }
+                cfg.username = name;
+            }
+            "--mc-version" => {
+                let version = take_value(&mut i)?;
+                mc_spine_client::cli::parse_mc_version(&version)?;
+                cfg.mc_version = version;
+            }
             "--shader-pack" => cfg.shader_pack = Some(PathBuf::from(take_value(&mut i)?)),
             "--gpu-backend" => {
                 let raw = take_value(&mut i)?;
@@ -136,6 +175,8 @@ pub fn gpu_help_text() -> String {
          \n\
          OPTIONS:\n\
          \x20   --connect <host[:port]>     target server (default port 25565)\n\
+         \x20   --username <name>          player username (default: MeguGpu)\n\
+         \x20   --mc-version <767|777>     server protocol (default: 767)\n\
          \x20   --shader-pack <path>        megu-shader.toml WGSL pack (dir or .zip)\n\
          \x20   --gpu-backend <backend>     auto | mesh-shader | compute-indirect |\n\
          \x20                             classic | classic-low-spec (default: auto)\n\
