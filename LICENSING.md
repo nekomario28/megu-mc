@@ -1,8 +1,8 @@
 # LICENSING.md — ライセンスの選択に関する技術的整理 / Engineering notes on the licence choice
 
 > **法的助言でも法的結論でもありません。** リポジトリの中身・依存・上流の表示から読み取れる事実と、そこから言える技術的なリスクの整理です。
-> **Status (2026-11-20 更新): 本体の配布ライセンスは `GPL-3.0-or-later`（[LICENSE](LICENSE) = GNU GPL v3.0 or later）であり、すべての寄稿コードおよびファーストパーティコードは `LGPL-3.0-or-later`（[COPYING.LESSER](COPYING.LESSER)）、`GPL-3.0-or-later`（[LICENSE](LICENSE)）、および `AGPL-3.0-or-later`（[COPYING.AGPL](COPYING.AGPL)）のトリプルライセンス（`LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later`）で提供されます。**
-> これにより、通常は `GPL-3.0-or-later` として運用しつつ、将来いつでも追加の同意取得なしにプロジェクト全体または共通カーネル（`mc-spine-core` 等）を `LGPL-3.0-or-later`、`GPL-3.0-or-later`、`AGPL-3.0-or-later` のいずれの間でも自由に行き来・再ライセンスできます。また、Fabric / NeoForge 互換レイヤ経由で動的ロードされる独立した外部 Mod JAR には本体のコピーレフトを波及させません。
+> **Status (2026-11-22 更新): 本体の配布ライセンスは `LGPL-3.0-or-later` に統一されました（[COPYING.LESSER](COPYING.LESSER) = GNU LGPL v3.0 or later、全 16 の Cargo.toml マニフェストの `license = "LGPL-3.0-or-later"`）。LGPLv3 が要求する GPLv3 付随文として [LICENSE](LICENSE)（GNU GPL v3.0）を同梱します。**
+> これにより、`MIT` / `Apache-2.0` / `BSD` / `LGPL-2.1` / `LGPL-3.0` のコード（C2ME、Lithium、NeoForge、Fabric など）と完全互換であり、LGPLv3 §2 により下流利用者は GPLv3 での利用・再配布も可能です。また、Fabric / NeoForge 互換レイヤ経由で動的ロードされる独立した外部 Mod JAR には本体のコピーレフトを波及させません。
 
 ## 1. 変更の経緯 / License evolution
 
@@ -11,12 +11,13 @@
 | 初期 | `LICENSE` = MIT (`Copyright (c) 2026 nekomario28`) | `Cargo.toml` の `license` フィールド未設定 |
 | 2026-10-26 (#23) | `Apache-2.0` を提案として設定 | `THIRD_PARTY.md` / `LICENSING.md` §5 の来歴整理を並行実施 |
 | 2026-11-19 (Stage F1) | 旧 `assets/pblocks.json`, `assets/properties.json`, `resourcepack.zip` を完全削除 (`git rm`) | `tools/provenance_check.py` で再混入を禁止、`tools/export_public_branch.sh` を整備 |
-| **2026-11-20 (現在)** | **本体 `GPL-3.0-or-later` ＋ 寄稿 `LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later`** に決定 | `LICENSE` (GPL-3.0), `COPYING.LESSER` (LGPL-3.0), `COPYING.AGPL` (AGPL-3.0), `Cargo.toml`, `NOTICE`, `deny.toml`, `CONTRIBUTING.md`, `README.md` を統一。さらに `git filter-repo --invert-paths` により過去全履歴から旧 `pblocks.json`, `properties.json`, `resourcepack.zip`, 不要 `*.storyboard.png`, 誤コミット `.jar`/`.class`/`.pyc` を完全抹消済み |
+| 2026-11-20 | 本体 `GPL-3.0-or-later` ＋ 寄稿 `LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later` | `LICENSE` (GPL-3.0), `COPYING.LESSER` (LGPL-3.0), `COPYING.AGPL` (AGPL-3.0), `Cargo.toml`, `NOTICE`, `deny.toml`, `CONTRIBUTING.md`, `README.md` を統一。さらに `git filter-repo --invert-paths` により過去全履歴から旧 `pblocks.json`, `properties.json`, `resourcepack.zip`, 不要 `*.storyboard.png`, 誤コミット `.jar`/`.class`/`.pyc` を完全抹消済み |
+| **2026-11-22 (現在)** | **本体・寄稿ともに `LGPL-3.0-or-later` 単一ライセンスに統一** | 全 16 `Cargo.toml` の `license` を `LGPL-3.0-or-later` に統一（`tools/offload_ffi_probe`・`tools/storage_bench` は新規追加、ルート・`tools/palette_bench` は `GPL-3.0-or-later` から、各クレートはトリプル表記から変更）。`tools/provenance_check.py` の `LICENSE_MANIFESTS` を全 16 マニフェストに拡張し、`README.md` / `LICENSING.md` / `CONTRIBUTING.md` / `NOTICE` を単一ライセンス表記に更新。`LICENSE` (GPLv3 付随文) と `COPYING.LESSER` (LGPLv3) を同梱 |
 
 ## 2. 互換性の分析 / Compatibility analysis
 
 ### (a) Rust 依存 (78 crate, `cargo metadata --all-features --locked`)
-宣言ライセンスは全て寛容型: MIT (71), Apache-2.0 (66), ISC (5), Unlicense (4, すべて `OR MIT` つき), Zlib (2), BSD-3-Clause (1: subtle), 0BSD (1), Unicode-3.0 (1: unicode-ident, `AND`), LLVM-exception (1), CDLA-Permissive-2.0 (1: webpki-roots, CA データ)。**第三者クレートに GPL / LGPL / AGPL / MPL / EPL は 0 件、ライセンス無しも 0 件。** これら全ての寛容型ライセンスは `LGPL-3.0-or-later`、`GPL-3.0-or-later`、`AGPL-3.0-or-later` の 3 者すべてと完全互換です。
+宣言ライセンスは全て寛容型: MIT (71), Apache-2.0 (66), ISC (5), Unlicense (4, すべて `OR MIT` つき), Zlib (2), BSD-3-Clause (1: subtle), 0BSD (1), Unicode-3.0 (1: unicode-ident, `AND`), LLVM-exception (1), CDLA-Permissive-2.0 (1: webpki-roots, CA データ)。**第三者クレートに GPL / LGPL / AGPL / MPL / EPL は 0 件、ライセンス無しも 0 件。** これら全ての寛容型ライセンスは `LGPL-3.0-or-later`（および LGPLv3 §2 による GPLv3 利用）と完全互換です。
 
 ### (b) JVM 側の部品 (NeoForge / Fabric / Mixin ほか)
 実物を `compat/*/dependencies.json` の URL から取得し、SHA-256 が一致することを確認したうえで、jar 内のメタデータと上流の POM/LICENSE を読んだ結果:
@@ -33,8 +34,8 @@
 | log4j-api 2.23.1 / JetBrains annotations 24.1.0 / typetools 0.6.3 | Apache-2.0 | POM | 同上 |
 | Seed Protect 1.0.0 (Itamio, テスト用 mod) | **不一致**: jar は `LicenseRef-All-Rights-Reserved`、Modrinth ページは MIT | jar 内 `neoforge.mods.toml` / Modrinth API | テスト入力として取得するだけ。**再配布しない** |
 
-**`LGPL-3.0-or-later` / `GPL-3.0-or-later` / `AGPL-3.0-or-later` との互換性**:
-- `LGPL-2.1`（および `LGPL-2.1-only`）は LGPL-2.1 §3 および §6（動的リンク利用）により `LGPL-3.0-or-later` / `GPL-3.0-or-later` / `AGPL-3.0-or-later` のいずれとも互換です。
+**`LGPL-3.0-or-later` との互換性**:
+- `LGPL-2.1`（および `LGPL-2.1-only`）は LGPL-2.1 §3 および §6（動的リンク利用）により `LGPL-3.0-or-later` と互換です。
 - さらに `mc-spine` はこれらの JAR をリポジトリにコミット・再配布せず、ビルド／テスト実行時に利用者の環境（`.cache/`）へ取得します。
 
 ### (c) minecraft-data (PrismarineJS, MIT)
@@ -45,21 +46,17 @@
 - 開発ブランチ（`main` / `perf/worldgen-parallel`）は共同開発およびテスト高速化のため、1.21.1 `server.jar` 由来の datapack、状態表 (`assets/block_states_1211.json`)、テスト TSV、`config_packets.bin` を追跡しています。
 - 外部一般公開・配布用のクリーンな単一ルートコミット（Mojang 由来生成物を一切含まないツリー）を作る場合は、`tools/export_public_branch.sh --out ../mc-spine-public --verify` を実行します。
 
-## 3. 本体 `GPL-3.0-or-later` + 寄稿 `LGPL-3.0-or-later / GPL-3.0-or-later / AGPL-3.0-or-later` トリプルライセンスの設計
+## 3. 単一 `LGPL-3.0-or-later` ライセンスの設計
 
-1. **現在の本体配布ライセンスは `GPL-3.0-or-later`（[LICENSE](LICENSE) / `Cargo.toml`）**:
-   - GPL/LGPL エコシステムとの互換性を確保し、クローズドな商用フォークによる持ち逃げも防ぎます。
-2. **寄稿コードは `LGPL-3.0-or-later`、`GPL-3.0-or-later`、および `AGPL-3.0-or-later` のトリプルライセンス（[CONTRIBUTING.md](CONTRIBUTING.md)）**:
-   - Collaborator からの寄稿を 3 ライセンス（[COPYING.LESSER](COPYING.LESSER) / [LICENSE](LICENSE) / [COPYING.AGPL](COPYING.AGPL)）で受けておくことで、将来いつでも追加同意なしに：
-     - 共通カーネルやクライアント埋め込みライブラリ（`mc-spine-core` / `libmc_spine`）を **`LGPL-3.0-or-later`** として提供する
-     - 通常のサーバー／クライアントフォークとして **`GPL-3.0-or-later`** で配布する
-     - ネットワーク越しのマネージドホスティングにもソース公開を求める場合や AGPLv3 コンポーネントと統合する場合に **`AGPL-3.0-or-later`** で配布する
-     の **3 方向すべてを双方向に自由に行き来**できます。
-3. **C2ME (`MIT`)・Lithium (`LGPL-3.0`)・NeoForge (`LGPL-2.1`) との完全互換と隔離原則**:
-   - **C2ME (`MIT`)** や **Lithium (`LGPL-3.0`)**、**NeoForge (`LGPL-2.1`)**、**Fabric (`Apache-2.0`)** は、`LGPL-3.0-or-later`、`GPL-3.0-or-later`、`AGPL-3.0-or-later` の**3 者すべてと完全互換**です。
-   - 一方、外部の第三者が書いた `GPL-3.0-only` や `AGPL-3.0-only` のコードをファーストパーティのソースファイルに直接コピーすると、そのファイルだけは後から `LGPL-3.0-or-later` に戻せなくなります。そのため、ファーストパーティのファイルには `MIT` / `Apache-2.0` / `BSD` / `LGPL` 互換のコードのみを入れるか、万一外部 AGPL/GPL 専用コードを組み合わせる場合は専用モジュール／オプショナルクレートに分離することで、本体コードの 3 ライセンス双方向性を恒久的に維持します。
-4. **外部 Mod JAR への非波及**:
-   - `compat/`（Fabric / NeoForge 互換レイヤ）やプラグイン機構を通じて実行時にロードされる独立した 3rd-party Mod JAR は `mc-spine` の派生物とはみなさず、Mod 作者自身のライセンス（ARR / MIT / LGPL 等）のまま動作します。
+1. **本体・寄稿ともに `LGPL-3.0-or-later` に統一（[COPYING.LESSER](COPYING.LESSER) / [CONTRIBUTING.md](CONTRIBUTING.md)）**:
+   - 全ワークスペースの `Cargo.toml` は `license = "LGPL-3.0-or-later"` を宣言し、`tools/provenance_check.py` が全 16 マニフェストの `license` 宣言を常時検査します。
+   - LGPLv3 が要求する GPLv3 付随文として [LICENSE](LICENSE) を同梱します。
+   - LGPLv3 §2 は、利用者が本ソフトウェアを GPLv3 の条件で利用・頒布することを認めており、追加の許諾なしに下流での GPLv3 利用が可能です。`or later` により将来の LGPL バージョンへの移行も可能です。
+2. **C2ME (`MIT`)・Lithium (`LGPL-3.0`)・NeoForge (`LGPL-2.1`)・Fabric (`Apache-2.0`) との完全互換と隔離原則**:
+   - **C2ME (`MIT`)** や **Lithium (`LGPL-3.0`)**、**NeoForge (`LGPL-2.1`)**、**Fabric (`Apache-2.0`)** は、`LGPL-3.0-or-later` と**完全互換**です。
+   - 一方、外部の第三者が書いた `GPL-3.0-only` や `AGPL-3.0-only` のコードをファーストパーティのソースファイルに直接コピーすると、そのファイルは `LGPL-3.0-or-later` 単独では頒布できなくなります。そのため、ファーストパーティのファイルには `MIT` / `Apache-2.0` / `BSD` / `LGPL` 互換のコードのみを入れるか、万一外部 GPL/AGPL 専用コードを組み合わせる場合は専用モジュール／オプショナルクレートに分離します。
+3. **外部 Mod JAR への非波及**:
+   - `compat/`（Fabric / NeoForge 互換レイヤ）やプラグイン機構を通じて実行時にロードされる独立した 3rd-party Mod JAR は `mc-spine` の派生物とはみなさず、Mod 作者自身のライセンス（ARR / MIT / LGPL 等）のまま動作します。動的ロードであるため、外部 Mod JAR に mc-spine のコピーレフトは波及しません。
 
 ## 4. 確認・解消済み項目と Git 履歴クリーンアップ済みの記録 (2026-11-20)
 
@@ -96,8 +93,8 @@
 
 | 区分 | ライセンス例 | 扱い |
 |---|---|---|
-| **互換（参照・帰属つき利用可）** | `MIT` / `Apache-2.0` / `BSD` / `ISC` / `Zlib` / `0BSD` / `MPL-2.0` / `LGPL-2.1` / `LGPL-3.0-or-later` | すべて `LGPL-3.0-or-later` / `GPL-3.0-or-later` / `AGPL-3.0-or-later` の 3 者と互換。帰属は [THIRD_PARTY.md](THIRD_PARTY.md) / [NOTICE](NOTICE) に記載 |
-| **概念参照のみ（コード不可）** | 第三者の `GPL-3.0-only` / `AGPL-3.0-only` | ファーストパーティファイルへ直接コピーしない（そのファイルがトリプルライセンスの双方向性を失うため）。必要なら専用モジュール／オプショナルクレートへ分離 |
+| **互換（参照・帰属つき利用可）** | `MIT` / `Apache-2.0` / `BSD` / `ISC` / `Zlib` / `0BSD` / `MPL-2.0` / `LGPL-2.1` / `LGPL-3.0-or-later` | すべて `LGPL-3.0-or-later` と互換（LGPLv3 §2 により下流は GPLv3 でも利用可）。帰属は [THIRD_PARTY.md](THIRD_PARTY.md) / [NOTICE](NOTICE) に記載 |
+| **概念参照のみ（コード不可）** | 第三者の `GPL-3.0-only` / `AGPL-3.0-only` | ファーストパーティファイルへ直接コピーしない（そのファイルが `LGPL-3.0-or-later` 単独で頒布できなくなるため）。必要なら専用モジュール／オプショナルクレートへ分離 |
 | **常時除外（参照自体を禁止）** | `PolyForm Shield`（Sodium 0.6+ 等）、`ARR`（OptiFine 等） | ソースを読まない・コピーしない・移植しない |
 
 なお、歴史的経緯で `specs/client-fork/sodium-culling-architecture.md` というファイル名が残っていますが、これは既存リンク維持のためだけの名前であり、記述されているパイプラインは上記 (a) のクリーンルーム設計です。

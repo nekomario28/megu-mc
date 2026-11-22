@@ -3,7 +3,7 @@ name = "mc-spine-server-files"
 version = "0.1.0"
 edition = "2021"
 publish = false
-license = "LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later"
+license = "LGPL-3.0-or-later"
 description = "Standalone Vanilla server files for mc-spine: server.properties, eula.txt, ops/whitelist/bans, usercache.json and atomic persistence"
 
 # Zero external dependencies by contract: this crate is the clean-room server

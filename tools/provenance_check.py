@@ -71,12 +71,21 @@ STRICT_PUBLIC = (
 # is explicit rather than globbed so a manifest deleted with its crate is a finding, not a pass.
 LICENSE_MANIFESTS = (
     "Cargo.toml",
-    "client-port/Cargo.toml",
-    "client-kernel/Cargo.toml",
     "client-app/Cargo.toml",
-    "mod-offload/Cargo.toml",
-    "mod-adapter-core/Cargo.toml",
+    "client-gpu/Cargo.toml",
+    "client-kernel/Cargo.toml",
+    "client-port/Cargo.toml",
+    "client-ui/Cargo.toml",
+    "core/Cargo.toml",
     "create-adapter/Cargo.toml",
+    "mod-adapter-core/Cargo.toml",
+    "mod-offload/Cargo.toml",
+    "proto/Cargo.toml",
+    "server-files/Cargo.toml",
+    "state-store/Cargo.toml",
+    "tools/offload_ffi_probe/Cargo.toml",
+    "tools/palette_bench/Cargo.toml",
+    "tools/storage_bench/Cargo.toml",
 )
 # License terms a crate in this GPL-family tree cannot be distributed under. Identifiers are
 # matched per '-'-separated token segment so SPDX spellings ("BUSL-1.1", "PolyForm-Shield-1.0.0",

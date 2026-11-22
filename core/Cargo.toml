@@ -3,7 +3,7 @@ name = "mc-spine-core"
 version = "0.1.0"
 edition = "2021"
 publish = false
-license = "LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later"
+license = "LGPL-3.0-or-later"
 description = "Standalone foundational primitives for mc-spine: canonical 1.21.1/26.3 version constants, validated ResourceLocation, Java-exact LegacyRandom/Xoroshiro128++ RNG and vanilla Mth math"
 
 # Zero external dependencies by contract: this crate is the leaf every other

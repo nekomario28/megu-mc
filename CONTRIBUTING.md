@@ -66,8 +66,8 @@ cargo test --locked <test_filter>
 ## データと来歴
 
 - **C2ME (`MIT`) や Lithium (`LGPL-3.0`) などの互換ライセンス実装との関係**:
-  - `mc-spine` 本体は `GPL-3.0-or-later`（寄稿は `LGPL-3.0-or-later`、`GPL-3.0-or-later`、および `AGPL-3.0-or-later` のトリプルライセンス）であるため、**C2ME (`MIT`)** や **Lithium (`LGPL-3.0`)**、**Brigadier (`MIT`)** などの `MIT` / `Apache-2.0` / `BSD` / `LGPL-2.1` / `LGPL-3.0` プロジェクトは 3 ライセンスすべてと 100% ライセンス互換です。
-  - もし他プロジェクト（C2ME / Lithium 等）からアルゴリズムやコードを取り込む場合は、①クリーンルームで仕様から実装する、または②取り込む場合は必ず上流の著作権表示とライセンス（`MIT` / `LGPL-3.0` 等）を [THIRD_PARTY.md](THIRD_PARTY.md) と [NOTICE](NOTICE) に明記します。本体が将来いつでも `LGPL-3.0-or-later` / `GPL-3.0-or-later` / `AGPL-3.0-or-later` の間を自由に行き来できるよう、第三者の `GPL-3.0-only` や `AGPL-3.0-only` のコードをファーストパーティのファイルへ直接コピーすることは避けてください（必要な場合は専用モジュール/クレート境界で分離します）。
+  - `mc-spine` 本体は `LGPL-3.0-or-later` で配布されるため、**C2ME (`MIT`)** や **Lithium (`LGPL-3.0`)**、**Brigadier (`MIT`)** などの `MIT` / `Apache-2.0` / `BSD` / `LGPL-2.1` / `LGPL-3.0` プロジェクトは `LGPL-3.0-or-later` と完全にライセンス互換です（LGPLv3 §2 により下流は GPLv3 としても利用できます）。
+  - もし他プロジェクト（C2ME / Lithium 等）からアルゴリズムやコードを取り込む場合は、①クリーンルームで仕様から実装する、または②取り込む場合は必ず上流の著作権表示とライセンス（`MIT` / `LGPL-3.0` 等）を [THIRD_PARTY.md](THIRD_PARTY.md) と [NOTICE](NOTICE) に明記します。ファーストパーティのファイルには `MIT` / `Apache-2.0` / `BSD` / `LGPL` 互換のコードのみを入れてください。外部の `GPL-3.0-only` や `AGPL-3.0-only` のコードを直接コピーするとそのファイルが `LGPL-3.0-or-later` 単独で頒布できなくなるため、必要な場合は専用モジュール/クレート境界で分離します。
 - Mojang由来のデータ（jar・マッピング・`datapacks/vanilla/`・`config_packets.bin`・javap出力・生成JSON）を**新たに追加しない**。
   必要なデータは手元のjarから [開発ガイド](docs/development.md#22-生成器) の手順で生成し、コミットしない。
 - `--accept-eula` はMinecraft EULAへの同意です。自分が同意するときだけ使い、他人・CIの代わりに付けない。
@@ -76,14 +76,13 @@ cargo test --locked <test_filter>
 
 ## ライセンス
 
-- **本体ライセンス**: `GPL-3.0-or-later`（[LICENSE](LICENSE)）。
-- **寄稿コードは `LGPL-3.0-or-later`、`GPL-3.0-or-later`、および `AGPL-3.0-or-later` のトリプルライセンス（`LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later`）で提供されるものとする。**（[COPYING.LESSER](COPYING.LESSER) / [LICENSE](LICENSE) / [COPYING.AGPL](COPYING.AGPL)）
-- これにより、プロジェクトや共通カーネル（`mc-spine-core` 等）を将来必要に応じて `LGPL-3.0-or-later`、`GPL-3.0-or-later`、`AGPL-3.0-or-later` のいずれの間でも自由に行き来・再配布できます。
-- 自分が書いた、または上記条件でライセンスする権利のあるコードだけを提出してください。
+- **本体ライセンスおよび寄稿コード**: `LGPL-3.0-or-later`（[COPYING.LESSER](COPYING.LESSER)）。全ワークスペースの `Cargo.toml` の `license` フィールドも `LGPL-3.0-or-later` です。LGPLv3 が要求する GPLv3 付随文として [LICENSE](LICENSE) を同梱しています。
+- LGPLv3 §2 により、下流の利用者は本ソフトウェアを GPLv3 の条件で利用・再配布できます。`MIT` / `Apache-2.0` / `BSD` / `LGPL-2.1` / `LGPL-3.0` のコード（C2ME、Lithium、NeoForge、Fabric など）と完全互換であり、実行時に動的ロードされる独立した外部 Mod JAR は派生物とみなさないためコピーレフトは波及しません。
+- 自分が書いた、または `LGPL-3.0-or-later` でライセンスする権利のあるコードだけを提出してください。
 - ライセンスの技術的整理は [LICENSING.md](LICENSING.md)、ファイルごとの出所は [THIRD_PARTY.md](THIRD_PARTY.md)。
 - 秘密情報（`.env`、鍵、トークン）をコミットしない。見つけたら [SECURITY.md](SECURITY.md) へ。
 
 ## English summary
 
-The project is currently distributed under `GPL-3.0-or-later` ([LICENSE](LICENSE)), and all contributed code is provided under a triple license of `LGPL-3.0-or-later`, `GPL-3.0-or-later`, and `AGPL-3.0-or-later` ([COPYING.LESSER](COPYING.LESSER), [LICENSE](LICENSE), and [COPYING.AGPL](COPYING.AGPL)) so the project and its modules can freely transition between LGPLv3+, GPLv3+, and AGPLv3+. Commits must be signed off (`git commit -s`, DCO 1.1).
-When referencing or adapting permissive or LGPL-3.0 projects (such as C2ME under MIT or Lithium under LGPL-3.0), record attribution in [THIRD_PARTY.md](THIRD_PARTY.md) and [NOTICE](NOTICE), and avoid mixing third-party `GPL-3.0-only` or `AGPL-3.0-only` code directly into first-party files so that two-way compatibility with `LGPL-3.0-or-later` is preserved. Do not add Mojang-derived data, mappings, or third-party jars. Run `python3 tools/dev_check.py`, `bash tools/layers_check.sh`, `bash tools/debt_ratchet.sh`, and `python3 tools/provenance_check.py` before opening a PR.
+The project is distributed under `LGPL-3.0-or-later` ([COPYING.LESSER](COPYING.LESSER), with the GPLv3 text in [LICENSE](LICENSE) as the LGPLv3-required companion), and contributed code is provided under `LGPL-3.0-or-later`; LGPLv3 section 2 lets downstream users take the work under GPLv3. Commits must be signed off (`git commit -s`, DCO 1.1).
+When referencing or adapting permissive or LGPL-3.0 projects (such as C2ME under MIT or Lithium under LGPL-3.0), record attribution in [THIRD_PARTY.md](THIRD_PARTY.md) and [NOTICE](NOTICE), and avoid mixing third-party `GPL-3.0-only` or `AGPL-3.0-only` code directly into first-party files so they remain distributable under `LGPL-3.0-or-later`. Do not add Mojang-derived data, mappings, or third-party jars. Run `python3 tools/dev_check.py`, `bash tools/layers_check.sh`, `bash tools/debt_ratchet.sh`, and `python3 tools/provenance_check.py` before opening a PR.

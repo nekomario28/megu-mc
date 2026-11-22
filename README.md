@@ -92,9 +92,9 @@ MC_SPINE_PORT=25699 cargo run --locked
 
 ## ライセンスとデータ
 
-コード本体は **`GPL-3.0-or-later`**（[LICENSE](LICENSE)、[NOTICE](NOTICE)、[LICENSING.md](LICENSING.md)）で配布されています。また、寄稿コードおよびファーストパーティコードは `LGPL-3.0-or-later`（[COPYING.LESSER](COPYING.LESSER)）、`GPL-3.0-or-later`（[LICENSE](LICENSE)）、および `AGPL-3.0-or-later`（[COPYING.AGPL](COPYING.AGPL)）のトリプルライセンスで提供されるものとし、将来 `LGPL-3.0-or-later`・`GPL-3.0-or-later`・`AGPL-3.0-or-later` のいずれの間でも自由に行き来できる柔軟性と、C2ME (`MIT`)・Lithium (`LGPL-3.0`)・NeoForge (`LGPL-2.1`) との完全な互換性を確保しています。Fabric / NeoForge 互換レイヤ経由で動的ロードされる独立した外部 Mod JAR には本体のコピーレフトは波及しません。
+コード本体は **`LGPL-3.0-or-later`**（[COPYING.LESSER](COPYING.LESSER) と、LGPLv3 が要求する GPLv3 付随文の [LICENSE](LICENSE)、[NOTICE](NOTICE)、[LICENSING.md](LICENSING.md)）で配布されています。寄稿コードも `LGPL-3.0-or-later` で提供され、LGPLv3 §2 により下流は GPLv3 として利用・再配布できます。`MIT` / `Apache-2.0` / `BSD` / `LGPL-2.1` / `LGPL-3.0` のコード（C2ME、Lithium、NeoForge、Fabric など）と完全互換です。Fabric / NeoForge 互換レイヤ経由で動的ロードされる独立した外部 Mod JAR は派生物とみなさず、コピーレフトは波及しません。
 
-貢献の条件は、寄稿コードの `LGPL-3.0-or-later` / `GPL-3.0-or-later` / `AGPL-3.0-or-later` トリプルライセンス提供、DCO の `Signed-off-by`（`git commit -s`）、Mojang 逆コンパイルコードや第三者 JAR を混入させないことです。詳細は [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
+貢献の条件は、寄稿コードの `LGPL-3.0-or-later` での提供、DCO の `Signed-off-by`（`git commit -s`）、Mojang 逆コンパイルコードや第三者 JAR を混入させないことです。詳細は [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
 
 ## クリーンルーム実装と設計上の先行技術（Prior Art）
 

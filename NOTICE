@@ -1,16 +1,15 @@
 mc-spine
 Copyright 2026 nekomario28
 
-LICENSE (GNU GPL v3.0 or later) and Cargo.toml (`license = "GPL-3.0-or-later"`) specify
-`GPL-3.0-or-later` as the current outbound distribution license of mc-spine, while all first-party
-and contributed code is provided under a triple license of `LGPL-3.0-or-later` (COPYING.LESSER),
-`GPL-3.0-or-later` (LICENSE), and `AGPL-3.0-or-later` (COPYING.AGPL) so the project or its shared
-kernel modules may freely transition between LGPLv3+, GPLv3+, and AGPLv3+ (independent third-party
-Mod JARs loaded at runtime via the Fabric/NeoForge compatibility layer remain under their own
-licenses). This file records attributions for third-party material that is committed in
-this repository, and lists the components that are fetched or supplied at setup time but are NOT
-distributed here. The full provenance inventory is in THIRD_PARTY.md, and licensing notes are in
-LICENSING.md.
+COPYING.LESSER (GNU Lesser GPL v3.0 or later) and Cargo.toml (`license = "LGPL-3.0-or-later"`) specify
+`LGPL-3.0-or-later` as the distribution license of mc-spine: all first-party code is provided under
+`LGPL-3.0-or-later`. LGPLv3 requires the GPLv3 license text as a companion, so LICENSE (GNU GPL v3.0)
+is included alongside COPYING.LESSER, and LGPLv3 section 2 permits downstream users to convey the
+work under GPLv3. Independent third-party Mod JARs loaded at runtime via the Fabric/NeoForge
+compatibility layer remain under their own licenses. This file records attributions for third-party
+material that is committed in this repository, and lists the components that are fetched or supplied
+at setup time but are NOT distributed here. The full provenance inventory is in THIRD_PARTY.md, and
+licensing notes are in LICENSING.md.
 
 src/brigadier.rs: Brigadier 1.3.10 core, translated to Rust
 ----------------------------------------------------------
@@ -63,8 +62,8 @@ was extracted from wiki.vg and minecraft.gamepedia.com.
 
 Minecraft data (development checkout versus public export)
 ---------------------------------------------------------
-Derived from Minecraft, (c) Mojang Studios / Microsoft; not covered by mc-spine's
-GPL-3.0-or-later / LGPL-3.0-or-later license. Do not redistribute these outputs or the jar. The development
+Derived from Minecraft, (c) Mojang Studios / Microsoft; not covered by mc-spine's LGPL-3.0-or-later
+license. Do not redistribute these outputs or the jar. The development
 branch tracks datapacks/vanilla/, assets/block_states_1211.json, config_packets.bin,
 tests/data/biome_probe_ties_1211.tsv and tests/data/random_next_int_1211.tsv.
 tools/vanilla_data/gen_vanilla_data.sh generates these and tests/data/biome_probe_1211.tsv
