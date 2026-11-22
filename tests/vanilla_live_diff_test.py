@@ -4,12 +4,16 @@
 Two layers, both fully offline and fast (<10s total):
 
   * Codec layer: VarInt/VarLong, compression framing roundtrips, position
-    packing, and every S2C field parser the scenarios rely on.
+    packing, anonymous-NBT component rendering, and every S2C field parser
+    the scenarios rely on.
   * Differential layer: an in-process mock protocol-767 server pair. Two
-    identical "vanilla-faithful" mocks must produce 12/12 MATCH (exit 0 with
-    --strict); a deliberately broken mock (wrong block state id, wrong
+    identical "vanilla-faithful" mocks must produce 18/18 MATCH (exit 0
+    with --strict); a deliberately broken mock (wrong block state id, wrong
     difficulty, wrong health, missing pong) must produce the exact expected
-    DIFF fields (exit 1 with --strict).
+    DIFF fields (exit 1 with --strict). Flaw flags pin the negative
+    controls for the six bedrock scenarios: a missing custom-name 0x58, a
+    persistent mob lost on far teleport, a hostile surviving peaceful, and
+    a wrong block-update state id each force DIFF.
 """
 
 import importlib.util
@@ -42,6 +46,10 @@ def _frame(pid, body=b"", threshold=-1):
     return vld.frame_packet(vld.vint(pid) + body, threshold)
 
 
+def _pos_body(x, y, z):
+    return struct.pack(">Q", vld.pack_position(x, y, z))
+
+
 def _login_play_body():
     """Minimal 0x2b login the client treats as arrived (fields are not parsed)."""
     return (struct.pack(">i", 1) + b"\x00" + vld.vint(1)
@@ -59,10 +67,99 @@ def _slot_body(item, count):
     return vld.vint(count) + vld.vint(item) + vld.vint(0) + vld.vint(0)
 
 
-def command_responses(text, broken):
+def _add_entity_body(eid, etype, x=8.0, y=80.0, z=8.0):
+    return (vld.vint(eid) + bytes(16) + vld.vint(etype)
+            + struct.pack(">ddd", x, y, z) + b"\x00\x00\x00"
+            + vld.vint(0) + struct.pack(">hhh", 0, 0, 0))
+
+
+def _remove_body(eids):
+    return vld.vint(len(eids)) + b"".join(vld.vint(e) for e in eids)
+
+
+def _name_meta_body(eid, name, with_visible=False):
+    """0x58 for a named mob: index 2 OptionalComponent (bare TAG_String, the
+    compact form vanilla picks for a literal component) + index 9 health
+    float. `with_visible` appends index 3 CustomNameVisible (live Megu
+    writes it; vanilla leaves the default off the wire)."""
+    body = (vld.vint(eid) + b"\x02\x06\x01" + b"\x08"
+            + struct.pack(">H", len(name)) + name.encode()
+            + b"\x09\x03" + struct.pack(">f", 20.0))
+    if with_visible:
+        body += b"\x03\x08\x01"
+    return body + b"\xff"
+
+
+def _nbt_text_component(text):
+    return (b"\x0a" + b"\x08" + struct.pack(">H", 4) + b"text"
+            + struct.pack(">H", len(text)) + text.encode() + b"\x00")
+
+
+def _nbt_translate_component(key, args):
+    """Anonymous NBT `{with:[args...], translate:key}` — the wire form vanilla
+    emits for /gamerule feedback and container titles."""
+    body = bytearray(b"\x0a")
+    body += b"\x09" + struct.pack(">H", 4) + b"with"
+    body += b"\x08" + struct.pack(">i", len(args))
+    for arg in args:
+        body += struct.pack(">H", len(arg)) + arg.encode()
+    body += (b"\x08" + struct.pack(">H", 9) + b"translate"
+             + struct.pack(">H", len(key)) + key.encode())
+    body += b"\x00"
+    return bytes(body)
+
+
+def _system_chat(text):
+    return _nbt_text_component(text) + b"\x00"
+
+
+def _translate_chat(key, args):
+    return _nbt_translate_component(key, args) + b"\x00"
+
+
+class _Session:
+    """Per-connection scripted entity/menu state for the mock servers."""
+
+    def __init__(self, broken=False, flaws=()):
+        self.broken = broken
+        self.flaws = set(flaws)
+        self.next_eid = 100
+        self.alive = {}       # eid -> {"type","persistent","name"}
+        self.window = None    # open chest window id
+
+
+def _summon(text, session):
+    """add_entity + optional name metadata for `summon minecraft:<t> .. {nbt}`."""
+    if ":zombie" in text:
+        etype = 124
+    elif ":sheep" in text:
+        etype = 87
+    else:
+        return []
+    name = None
+    if 'CustomName:"' in text:
+        name = text.split('CustomName:"', 1)[1].split('"', 1)[0]
+    persistent = "PersistenceRequired:1b" in text or name is not None
+    eid = session.next_eid
+    session.next_eid += 1
+    session.alive[eid] = {"type": etype, "persistent": persistent,
+                          "name": name}
+    # `~N` summons offset from the bot's 8,80,8 position
+    rel = text.split(" ", 2)[2].split(" ", 1)[0]
+    x = 8.0 + (float(rel[1:]) if rel.startswith("~") and len(rel) > 1 else 0.0)
+    out = [(0x01, _add_entity_body(eid, etype, x=x))]
+    if name is not None and not (name == "jeb_" and "no_jeb" in session.flaws):
+        out.append((0x58, _name_meta_body(eid, name)))
+    return out
+
+
+def command_responses(text, session):
     """S2C (pid, body) answers a vanilla-faithful server sends for `text`.
 
-    `broken` models the defect classes the oracle must catch."""
+    `session.broken` models the original defect classes; `session.flaws`
+    pin the bedrock negative controls."""
+    broken = session.broken
+    flaws = session.flaws
     if text.startswith("time set"):
         return [(0x64, struct.pack(">q", 0) + struct.pack(">q", 6000))]
     if text == "weather rain":
@@ -71,6 +168,20 @@ def command_responses(text, broken):
         return [(0x22, b"\x01" + struct.pack(">f", 0.0))]
     if text == "weather clear":
         return [(0x22, b"\x02" + struct.pack(">f", 0.0))]
+    if text == "difficulty normal":
+        return [(0x0B, b"\x01\x00")]
+    if text == "difficulty peaceful":
+        out = [(0x0B, b"\x00\x00")]
+        if "peaceful_survives" not in flaws:
+            # Vanilla discards every non-persistent hostile (Monster
+            # category) on the switch; passives stay tracked.
+            gone = [eid for eid, mob in session.alive.items()
+                    if mob["type"] == 124 and not mob["persistent"]]
+            for eid in gone:
+                del session.alive[eid]
+            if gone:
+                out.append((0x42, _remove_body(gone)))
+        return out
     if text == "difficulty hard":
         return [(0x0B, bytes([2 if broken else 3]) + b"\x00")]
     if text == "gamemode creative":
@@ -79,14 +190,51 @@ def command_responses(text, broken):
     if text == "gamemode survival":
         return [(0x22, b"\x03" + struct.pack(">f", 0.0)),
                 (0x38, b"\x00" + struct.pack(">ff", 0.05, 0.1))]
+    if text.startswith("gamerule "):
+        _, rule, *rest = text.split()
+        key = "commands.gamerule.query" if not rest else "commands.gamerule.set"
+        value = rest[0] if rest else "true"
+        return [(0x6C, _translate_chat(key, [rule, value]))]
+    if text.startswith("setworldspawn"):
+        return []
     if text.startswith("tp "):
         # Live 1.21.1 centres integer x/z coordinates on block centres.
-        return [(0x40, _position_body(12.5, 100.0, -7.5, teleport_id=42))]
+        x, y, z = (float(t) for t in text.split()[-3:])
+        out = [(0x40, _position_body(
+            x + 0.5 if x.is_integer() else x, y,
+            z + 0.5 if z.is_integer() else z, teleport_id=42))]
+        if abs(x) > 128 or abs(z) > 128:
+            # Tracking loss removes everything; non-persistent hostiles in
+            # a still-ticking chunk are then despawned for real.
+            gone = list(session.alive)
+            for eid in gone:
+                mob = session.alive[eid]
+                if not mob["persistent"] or "despawn_persistent" in flaws:
+                    del session.alive[eid]
+            if gone:
+                out.append((0x42, _remove_body(gone)))
+        else:
+            # Back in range: still-alive entities are re-sent (with their
+            # name metadata), despawned ones never return.
+            for eid, mob in session.alive.items():
+                out.append((0x01, _add_entity_body(eid, mob["type"])))
+                if mob["name"] is not None:
+                    out.append((0x58, _name_meta_body(eid, mob["name"])))
+        return out
     if text == "setblock 4 80 4 minecraft:stone":
-        return [(0x09, struct.pack(">Q", POS_4_80_4)
+        return [(0x09, _pos_body(4, 80, 4)
                  + vld.vint(99 if broken else 1))]
     if text == "setblock 4 80 4 minecraft:oak_planks":
-        return [(0x09, struct.pack(">Q", POS_4_80_4) + vld.vint(15))]
+        return [(0x09, _pos_body(4, 80, 4) + vld.vint(15))]
+    if text == "setblock 6 80 4 minecraft:chest":
+        return [(0x09, _pos_body(6, 80, 4) + vld.vint(2955))]
+    if text == "setblock 8 80 8 minecraft:oak_stairs[facing=east,half=top]":
+        return [(0x09, _pos_body(8, 80, 8)
+                 + vld.vint(2885 if "bad_state" in flaws else 2935))]
+    if text == "setblock 9 80 8 minecraft:redstone_lamp[lit=true]":
+        return [(0x09, _pos_body(9, 80, 8) + vld.vint(7417))]
+    if text == "setblock 10 80 8 minecraft:furnace[facing=south,lit=true]":
+        return [(0x09, _pos_body(10, 80, 8) + vld.vint(4296))]
     if text.startswith("give "):
         return [(0x15, b"\x00" + vld.vint(1) + struct.pack(">h", 36)
                  + _slot_body(838, 1))]
@@ -100,18 +248,27 @@ def command_responses(text, broken):
                  + struct.pack(">f", 5.0))]
     # Live 1.21.1 sends no scoreboard packets to a client with no display
     # slot, so the scoreboard commands intentionally fall through to [].
-    if text.startswith("summon minecraft:zombie"):
-        return [(0x01, vld.vint(2) + bytes(16) + vld.vint(124)
-                 + struct.pack(">ddd", 6.0, 80.0, 6.0) + b"\x00\x00\x00"
-                 + vld.vint(0) + struct.pack(">hhh", 0, 0, 0))]
+    if text.startswith("summon "):
+        return _summon(text, session)
     return []
+
+
+def _open_screen_body(window=1, menu=2, title_key="container.chest"):
+    return (vld.vint(window) + vld.vint(menu)
+            + _nbt_translate_component(title_key, []))
+
+
+def _container_content_body(window=1, slots=63):
+    return (b"\x01"[:0] + bytes([window]) + vld.vint(1) + vld.vint(slots)
+            + bytes(slots) + b"\x00")
 
 
 class MockServer:
     """A scripted protocol-767 server: handshake/status/login/config/play."""
 
-    def __init__(self, broken=False):
+    def __init__(self, broken=False, flaws=()):
         self.broken = broken
+        self.flaws = tuple(flaws)
         self.listener = socket.socket()
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.listener.bind(("127.0.0.1", 0))
@@ -196,15 +353,23 @@ class MockServer:
         conn.sendall(_frame(0x2B, _login_play_body()))
         conn.sendall(_frame(0x40, _position_body()))
         conn.sendall(_frame(0x26, struct.pack(">q", 0xFEED)))
+        session = _Session(self.broken, self.flaws)
         while True:
             pid, body = reader.packet()
             if pid == 0x21 and not self.broken:      # ping_request -> pong
                 conn.sendall(_frame(0x36, body))
             elif pid in (0x04, 0x05):                # chat_command
                 command = _command_text(body)
-                for out_pid, out_body in command_responses(command,
-                                                         self.broken):
+                for out_pid, out_body in command_responses(command, session):
                     conn.sendall(_frame(out_pid, out_body))
+            elif pid == 0x38:                        # use_item_on -> open chest
+                session.window = 1
+                conn.sendall(_frame(0x33, _open_screen_body()))
+                conn.sendall(_frame(0x13, _container_content_body()))
+            elif pid == 0x0F:                        # container_close -> echo
+                if session.window is not None:
+                    conn.sendall(_frame(0x12, bytes([session.window])))
+                    session.window = None
             # teleport confirms, keepalives, pongs and batch acks need no reply
 
 
@@ -337,6 +502,37 @@ class CodecTest(unittest.TestCase):
         self.assertEqual(vld.parse_pong_response(
             struct.pack(">q", 0x1122334455667788)), 0x1122334455667788)
 
+    def test_s2c_bedrock_parsers(self):
+        self.assertEqual(vld.parse_remove_entities(
+            vld.vint(2) + vld.vint(5) + vld.vint(9)), [5, 9])
+        # system_chat: literal text component and a translate component
+        literal = _system_chat("Gamerule keepInventory is now set to: true")
+        self.assertEqual(vld.parse_system_chat(literal)["text"],
+                         "Gamerule keepInventory is now set to: true")
+        trans = _translate_chat("commands.gamerule.query",
+                                ["keepInventory", "true"])
+        self.assertEqual(vld.parse_system_chat(trans)["text"],
+                         "Gamerule keepInventory is currently set to: true")
+        trans_set = _translate_chat("commands.gamerule.set",
+                                    ["doDaylightCycle", "false"])
+        self.assertEqual(vld.parse_system_chat(trans_set)["text"],
+                         "Gamerule doDaylightCycle is now set to: false")
+        # open_screen: window/menu + translate title resolves to text
+        screen = vld.parse_open_screen(
+            vld.vint(1) + vld.vint(2)
+            + _nbt_translate_component("container.chest", []))
+        self.assertEqual(screen, {"window": 1, "menu": 2, "title": "Chest"})
+        # set_entity_data: index 2 optional component + index 3 bool +
+        # an index 9 float that must be skipped by serializer size
+        parsed = vld.parse_set_entity_data(_name_meta_body(77, "jeb_"))
+        self.assertEqual(parsed["entity_id"], 77)
+        self.assertEqual(parsed["meta"][2], "jeb_")
+        self.assertNotIn(3, parsed["meta"])  # vanilla omits the default
+        parsed = vld.parse_set_entity_data(
+            _name_meta_body(78, "Dinnerbone", with_visible=True))
+        self.assertEqual(parsed["meta"][2], "Dinnerbone")
+        self.assertIs(parsed["meta"][3], True)
+
 
 # ---------------------------------------------------------------------------
 # Dual-mock differential engine tests
@@ -361,16 +557,32 @@ class DifferentialTest(unittest.TestCase):
             timeout=60, per_wait=0.5, command_delay=0.005, settle=0.02,
             tail=0.02)
 
+    def test_all_18_scenarios_registered(self):
+        self.assertEqual(vld.SCHEMA, "megu-live-diff/1")
+        names = [name for name, _, _ in vld.SCENARIOS]
+        self.assertEqual(names, [
+            "status_ping", "login_config_play", "ping_request_pong",
+            "time_command", "weather_command", "difficulty_command",
+            "gamemode_abilities", "teleport_sync", "setblock_state_id",
+            "give_item_slot", "effect_and_health", "scoreboard_and_entity",
+            "peaceful_hostile_vs_passive", "easter_egg_custom_name_wire",
+            "persistent_mob_survives_far_teleport",
+            "gamerule_query_and_toggle", "container_chest_open_close",
+            "block_state_properties_parity"])
+        for name, func, expected in vld.SCENARIOS:
+            self.assertTrue(callable(func), name)
+            self.assertIsInstance(expected, dict, name)
+
     def test_identical_servers_match_all(self):
         report = self._run(self.good_a, self.good_b)
         statuses = {e["scenario"]: e["status"] for e in report["results"]}
         self.assertEqual(statuses, {name: "MATCH" for name, _, _ in vld.SCENARIOS})
-        self.assertEqual(report["matched"], 12)
-        self.assertEqual(report["total"], 12)
+        self.assertEqual(report["matched"], 18)
+        self.assertEqual(report["total"], 18)
 
     def test_good_mock_satisfies_reference_expectations(self):
         report = self._run(self.good_a, None)
-        self.assertEqual(report["matched"], 12, repr(report["results"]))
+        self.assertEqual(report["matched"], 18, repr(report["results"]))
 
     def test_broken_server_produces_exact_diffs(self):
         report = self._run(self.broken, self.good_b)
@@ -388,7 +600,49 @@ class DifferentialTest(unittest.TestCase):
         self.assertEqual(matched, {n for n, _, _ in vld.SCENARIOS}
                          - {"ping_request_pong", "difficulty_command",
                             "setblock_state_id", "effect_and_health"})
-        self.assertEqual(report["matched"], 8)
+        self.assertEqual(report["matched"], 14)
+
+    def _run_flaw(self, flaws):
+        server = MockServer(flaws=flaws)
+        self.addCleanup(server.close)
+        return self._run(server, self.good_b)
+
+    def test_missing_custom_name_meta_diffs(self):
+        """A missing 0x58 jeb_/Dinnerbone custom name must DIFF."""
+        report = self._run_flaw({"no_jeb"})
+        entry = {e["scenario"]: e
+                 for e in report["results"]}["easter_egg_custom_name_wire"]
+        self.assertEqual(entry["status"], "DIFF")
+        self.assertEqual(entry["fields"]["names"],
+                         {"megu": ["Dinnerbone"],
+                          "vanilla": ["Dinnerbone", "jeb_"]})
+
+    def test_persistent_mob_lost_on_far_teleport_diffs(self):
+        """A persistent mob disappearing on far teleport must DIFF."""
+        report = self._run_flaw({"despawn_persistent"})
+        entry = {e["scenario"]: e for e in report["results"]}[
+            "persistent_mob_survives_far_teleport"]
+        self.assertEqual(entry["status"], "DIFF")
+        self.assertEqual(entry["fields"]["persistent_resent"],
+                         {"megu": False, "vanilla": True})
+
+    def test_hostile_surviving_peaceful_diffs(self):
+        """A hostile mob surviving /difficulty peaceful must DIFF."""
+        report = self._run_flaw({"peaceful_survives"})
+        entry = {e["scenario"]: e for e in report["results"]}[
+            "peaceful_hostile_vs_passive"]
+        self.assertEqual(entry["status"], "DIFF")
+        self.assertEqual(entry["fields"]["zombie_removed"],
+                         {"megu": False, "vanilla": True})
+
+    def test_wrong_block_update_state_diffs(self):
+        """A wrong 0x09 BlockUpdate state id must DIFF."""
+        report = self._run_flaw({"bad_state"})
+        entry = {e["scenario"]: e for e in report["results"]}[
+            "block_state_properties_parity"]
+        self.assertEqual(entry["status"], "DIFF")
+        self.assertEqual(entry["fields"]["stairs_state"],
+                         {"megu": 2885, "vanilla": 2935})
 
     def test_strict_exit_codes(self):
         import contextlib, io
@@ -409,6 +663,22 @@ class DifferentialTest(unittest.TestCase):
                             "--per-wait", "0.5", "--command-delay", "0.005",
                             "--settle", "0.02", "--tail", "0.02"])
         self.assertEqual(bad, 1)
+
+    def test_strict_exit_one_on_bedrock_flaw(self):
+        """A bedrock defect class also fails --strict end to end."""
+        import contextlib, io
+        flawed = MockServer(flaws={"bad_state"})
+        self.addCleanup(flawed.close)
+        good_ep = f"127.0.0.1:{self.good_b.port}"
+        flaw_ep = f"127.0.0.1:{flawed.port}"
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            rc = vld.main(["--megu-endpoint", flaw_ep,
+                           "--vanilla-endpoint", good_ep, "--strict",
+                           "--format", "json", "--timeout", "60",
+                           "--per-wait", "0.5", "--command-delay", "0.005",
+                           "--settle", "0.02", "--tail", "0.02"])
+        self.assertEqual(rc, 1)
 
 
 if __name__ == "__main__":
