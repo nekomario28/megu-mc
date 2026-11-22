@@ -161,6 +161,12 @@ pub enum Screen {
     Friends,
     /// Explicit consent gate before a server's mod list is applied.
     ModSyncConsent,
+    /// Integrated ModMenu-style Mods & Packs manager — draw and input are
+    /// delegated to [`UiState::mod_menu`].
+    ModMenu,
+    /// JEI-style recipe & resource browser — draw and input are delegated
+    /// to [`UiState::recipe_browser`].
+    RecipeBrowser,
     /// In-game HUD (hotbar, vitals, bossbars, chat, tab list).
     InGameHud,
     /// Pause menu.
@@ -800,6 +806,40 @@ pub struct HudState {
     /// Directional subtitle rows, newest last (drawn only when
     /// [`QolSettings::show_subtitles`] is on).
     pub subtitles: Vec<HudSubtitle>,
+    /// Crafting-conflict switcher: `total_candidates >= 2` draws one
+    /// compact `< k/N >` cycle button; `<= 1` emits nothing at all.
+    pub crafting_conflict: CraftingConflictOverlay,
+}
+
+/// Compact in-HUD recipe-conflict resolver state.
+///
+/// When a crafting station matches more than one recipe for the same
+/// inputs (mod packs regularly create such collisions), the game fills
+/// `total_candidates` and the HUD draws a single tiny cycle button —
+/// the zero-clutter resolution path. `total_candidates <= 1` (or `0`)
+/// emits no draw commands and no hit region, so a conflict-free HUD is
+/// pixel-identical to vanilla.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CraftingConflictOverlay {
+    /// Selected candidate, `0`-based; clicks wrap modulo
+    /// `total_candidates`.
+    pub selected_index: usize,
+    /// Number of conflicting recipes the game reports; the switcher only
+    /// exists while this is `>= 2`.
+    pub total_candidates: usize,
+}
+
+impl CraftingConflictOverlay {
+    /// `true` while the switcher must be drawn (two or more candidates).
+    pub fn is_active(&self) -> bool {
+        self.total_candidates >= 2
+    }
+
+    /// Selected candidate clamped into `0..total_candidates` for display.
+    pub fn selected(&self) -> usize {
+        self.selected_index
+            .min(self.total_candidates.saturating_sub(1))
+    }
 }
 
 impl Default for HudState {
@@ -823,6 +863,7 @@ impl Default for HudState {
             magic: crate::magic_hud::MagicHudState::default(),
             mini_hud_data: MiniHudData::default(),
             subtitles: Vec::new(),
+            crafting_conflict: CraftingConflictOverlay::default(),
         }
     }
 }
@@ -859,6 +900,7 @@ impl HudState {
             magic: crate::magic_hud::MagicHudState::default(),
             mini_hud_data: MiniHudData::default(),
             subtitles: Vec::new(),
+            crafting_conflict: CraftingConflictOverlay::default(),
         }
     }
 }
@@ -926,8 +968,6 @@ pub enum UiAction {
     StartSingleplayer,
     /// Open the server browser / connect flow.
     StartMultiplayer,
-    /// Open the mods & packs browser.
-    OpenModsPacks,
     /// Show the statistics screen (owned by the app layer).
     ShowStatistics,
     /// Open a configured URL in the system browser.
@@ -950,6 +990,17 @@ pub enum UiAction {
     DeclineModSync,
     /// Player explicitly confirmed `"Send OK?"` on the crash screen.
     SubmitCrashReport,
+    /// The integrated Mods & Packs screen produced a host action (apply
+    /// staged toggles, open the mods folder, fetch deps, ...). `Close`
+    /// and `OpenUrl` are flattened into [`UiAction::Back`] /
+    /// [`UiAction::OpenUrl`] instead of appearing here.
+    ModMenu(crate::mod_menu::ModMenuAction),
+    /// The recipe & resource browser produced a host action (crafting
+    /// grid transfer). `Close` is flattened into [`UiAction::Back`].
+    RecipeBrowser(crate::recipe_browser::RecipeBrowserAction),
+    /// Player cycled the crafting-conflict switcher; the new candidate
+    /// is `hud.crafting_conflict.selected_index`.
+    CycleCraftingConflict,
     /// One or more settings changed; app should persist.
     SettingsChanged,
 }
@@ -971,6 +1022,7 @@ pub enum WidgetId {
     // Settings chrome
     SettingsDone,
     SettingsAboutMegu,
+    SettingsMods,
     // About Megu
     AboutBack,
     TabVideo,
@@ -1033,6 +1085,7 @@ pub enum WidgetId {
     PauseBackToGame,
     PauseSettings,
     PauseStatistics,
+    PauseRecipeBrowser,
     PauseInvite,
     PauseSaveQuit,
     PauseReportBug,
@@ -1041,6 +1094,17 @@ pub enum WidgetId {
     CrashReturnTitle,
     ModalOk,
     ModalCancel,
+    // Embedded screens — every region the delegated sub-screens emit is
+    // re-tagged into this id space so the unified router stays in charge.
+    /// A widget inside the integrated Mods & Packs screen.
+    ModMenu(crate::mod_menu::ModMenuWidgetId),
+    /// A widget inside the recipe & resource browser.
+    Recipe(crate::recipe_browser::RecipeWidgetId),
+    /// Native chrome on the recipe browser: the close/back button the
+    /// sub-screen itself does not provide.
+    RecipeBrowserDone,
+    // In-game HUD (present only while a crafting conflict is active)
+    CraftConflictNext,
 }
 
 impl WidgetId {
@@ -1196,11 +1260,24 @@ pub struct UiState {
     /// Current shaderpack profile label, if provided by the host.
     pub active_shaderpack_profile: String,
 
+    /// The integrated ModMenu-style Mods & Packs screen
+    /// ([`Screen::ModMenu`]). The host fills `entries`; `lang`/`ui_scale`
+    /// are re-synced from this state on every [`render`](Self::render).
+    pub mod_menu: crate::mod_menu::ModMenuState,
+    /// The integrated recipe & resource browser
+    /// ([`Screen::RecipeBrowser`]). The host fills `index`/`ponder`;
+    /// `lang`/`ui_scale` are re-synced every frame.
+    pub recipe_browser: crate::recipe_browser::RecipeBrowserState,
+
     invite_counter: u64,
     fps_field_focused: bool,
     fps_field_text: String,
     fps_field_error: bool,
     join_field_focused: bool,
+    /// Physical-pixel viewport of the last [`render`](Self::render), used
+    /// to forward pointer input into the embedded screens.
+    render_w: u32,
+    render_h: u32,
 }
 
 impl Default for UiState {
@@ -1230,11 +1307,15 @@ impl Default for UiState {
             report_url: String::new(),
             active_shaderpack_name: String::new(),
             active_shaderpack_profile: String::new(),
+            mod_menu: crate::mod_menu::ModMenuState::default(),
+            recipe_browser: crate::recipe_browser::RecipeBrowserState::default(),
             invite_counter: 0,
             fps_field_focused: false,
             fps_field_text: String::new(),
             fps_field_error: false,
             join_field_focused: false,
+            render_w: 0,
+            render_h: 0,
         }
     }
 }
@@ -1271,6 +1352,16 @@ impl UiState {
     /// frames emit no text allocations), and `self.hit_regions` is rebuilt
     /// in place keeping its capacity.
     pub fn render_into(&mut self, width: u32, height: u32, out: &mut crate::draw::UiDrawList) {
+        self.render_w = width;
+        self.render_h = height;
+        // The embedded screens own their own language/scale mirrors so
+        // they can also run standalone; when routed through `UiState`
+        // this state is the source of truth.
+        let lang = self.lang();
+        self.mod_menu.lang = lang;
+        self.mod_menu.ui_scale = self.ui_scale;
+        self.recipe_browser.lang = lang;
+        self.recipe_browser.ui_scale = self.ui_scale;
         let mut regions = std::mem::take(&mut self.hit_regions);
         layout::layout_screen_into(self, width, height, out, &mut regions);
         self.hit_regions = regions;
@@ -1311,6 +1402,29 @@ impl UiState {
         self.crash = Some(ctx);
         self.crash_sent = false;
         self.navigate(Screen::CrashRecovery);
+    }
+
+    /// Open the integrated Mods & Packs screen — the Title
+    /// `"Mods & Packs"` button, the Settings `"Mods"` button, or a host
+    /// hotkey. Pushes the nav stack so Back returns to the caller's
+    /// screen; `lang`/`ui_scale` are copied across immediately (and kept
+    /// in sync on every later render).
+    pub fn open_mod_menu(&mut self) -> Vec<UiAction> {
+        self.mod_menu.lang = self.lang();
+        self.mod_menu.ui_scale = self.ui_scale;
+        self.navigate(Screen::ModMenu);
+        vec![UiAction::OpenScreen(Screen::ModMenu)]
+    }
+
+    /// Open the integrated recipe & resource browser — the Pause
+    /// `"Recipe Browser"` button or a host hotkey (`R`/`U` over an item
+    /// is a host-side binding). Pushes the nav stack so Back returns to
+    /// the caller's screen.
+    pub fn open_recipe_browser(&mut self) -> Vec<UiAction> {
+        self.recipe_browser.lang = self.lang();
+        self.recipe_browser.ui_scale = self.ui_scale;
+        self.navigate(Screen::RecipeBrowser);
+        vec![UiAction::OpenScreen(Screen::RecipeBrowser)]
     }
 
     /// The 4 KiB redacted crash report preview shown on
@@ -1373,6 +1487,17 @@ impl UiState {
 
     /// Route one input event; returns the actions the app must perform.
     pub fn handle_input(&mut self, ev: UiInputEvent) -> Vec<UiAction> {
+        // Embedded screens own their hit-testing, search focus, and
+        // scroll state — while one is up (and no modal blocks it) the
+        // raw event is forwarded verbatim and its actions are translated
+        // back into [`UiAction`]s.
+        if self.modal.is_none() {
+            match self.screen {
+                Screen::ModMenu => return self.forward_to_mod_menu(ev),
+                Screen::RecipeBrowser => return self.forward_to_recipe_browser(ev),
+                _ => {}
+            }
+        }
         match ev {
             UiInputEvent::MouseMove { x, y } => {
                 self.hover = self
@@ -1394,6 +1519,90 @@ impl UiState {
                 GamepadButton::East | GamepadButton::Start => self.handle_key(UiKey::Escape),
             },
         }
+    }
+
+    /// Forward `ev` into [`crate::mod_menu::ModMenuState`] and map its
+    /// actions back onto [`UiAction`]. Clicks on native chrome (any
+    /// non-`ModMenu` region) are routed by [`handle_click`](Self::handle_click)
+    /// instead — everything else reaches the sub-screen untouched.
+    fn forward_to_mod_menu(&mut self, ev: UiInputEvent) -> Vec<UiAction> {
+        match ev {
+            UiInputEvent::Click { x, y } => {
+                if let Some(region) = self
+                    .hit_regions
+                    .iter()
+                    .find(|r| r.contains(x, y))
+                    .copied()
+                {
+                    if !matches!(region.id, WidgetId::ModMenu(_)) {
+                        return self.handle_click(x, y);
+                    }
+                }
+            }
+            UiInputEvent::MouseMove { x, y } => {
+                self.hover = self
+                    .hit_regions
+                    .iter()
+                    .find(|r| r.contains(x, y))
+                    .map(|r| r.id);
+            }
+            _ => {}
+        }
+        let acts = self.mod_menu.handle_input(ev, self.render_w, self.render_h);
+        let mut out = Vec::with_capacity(acts.len());
+        for action in acts {
+            match action {
+                crate::mod_menu::ModMenuAction::Close => {
+                    self.back();
+                    out.push(UiAction::Back);
+                }
+                crate::mod_menu::ModMenuAction::OpenUrl(url) => {
+                    out.push(UiAction::OpenUrl(url));
+                }
+                other => out.push(UiAction::ModMenu(other)),
+            }
+        }
+        out
+    }
+
+    /// Recipe-browser counterpart of [`forward_to_mod_menu`](Self::forward_to_mod_menu).
+    fn forward_to_recipe_browser(&mut self, ev: UiInputEvent) -> Vec<UiAction> {
+        match ev {
+            UiInputEvent::Click { x, y } => {
+                if let Some(region) = self
+                    .hit_regions
+                    .iter()
+                    .find(|r| r.contains(x, y))
+                    .copied()
+                {
+                    if !matches!(region.id, WidgetId::Recipe(_)) {
+                        return self.handle_click(x, y);
+                    }
+                }
+            }
+            UiInputEvent::MouseMove { x, y } => {
+                self.hover = self
+                    .hit_regions
+                    .iter()
+                    .find(|r| r.contains(x, y))
+                    .map(|r| r.id);
+            }
+            _ => {}
+        }
+        let acts = self
+            .recipe_browser
+            .handle_input(ev, self.render_w, self.render_h);
+        let mut out = Vec::with_capacity(acts.len());
+        for action in acts {
+            match action {
+                crate::recipe_browser::RecipeBrowserAction::Close => {
+                    self.back();
+                    out.push(UiAction::Back);
+                }
+                other => out.push(UiAction::RecipeBrowser(other)),
+            }
+        }
+        out
     }
 
     fn handle_click(&mut self, x: i32, y: i32) -> Vec<UiAction> {
@@ -1586,7 +1795,7 @@ impl UiState {
                 self.navigate(Screen::Friends);
                 vec![UiAction::OpenScreen(Screen::Friends)]
             }
-            WidgetId::TitleMods => vec![UiAction::OpenModsPacks],
+            WidgetId::TitleMods => self.open_mod_menu(),
             WidgetId::TitleSettings => {
                 let s = Screen::Settings(SettingsTab::Video);
                 self.navigate(s);
@@ -1634,6 +1843,7 @@ impl UiState {
                 self.navigate(Screen::AboutMegu);
                 vec![UiAction::OpenScreen(Screen::AboutMegu)]
             }
+            WidgetId::SettingsMods => self.open_mod_menu(),
             WidgetId::AboutBack => {
                 self.back();
                 vec![UiAction::Back]
@@ -1718,6 +1928,7 @@ impl UiState {
                 vec![UiAction::OpenScreen(s)]
             }
             WidgetId::PauseStatistics => vec![UiAction::ShowStatistics],
+            WidgetId::PauseRecipeBrowser => self.open_recipe_browser(),
             WidgetId::PauseInvite => {
                 self.navigate(Screen::Friends);
                 vec![UiAction::OpenScreen(Screen::Friends)]
@@ -1750,6 +1961,21 @@ impl UiState {
             WidgetId::ModalCancel => {
                 self.modal = None;
                 Vec::new()
+            }
+
+            WidgetId::RecipeBrowserDone => {
+                self.back();
+                vec![UiAction::Back]
+            }
+            WidgetId::CraftConflictNext => {
+                let overlay = &mut self.hud.crafting_conflict;
+                if overlay.is_active() {
+                    overlay.selected_index =
+                        (overlay.selected_index + 1) % overlay.total_candidates;
+                    vec![UiAction::CycleCraftingConflict]
+                } else {
+                    Vec::new()
+                }
             }
 
             // Adjustable widgets activate as a "+1" cycle/slider click.

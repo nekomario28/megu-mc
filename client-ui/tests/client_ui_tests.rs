@@ -7,16 +7,22 @@
 
 use mc_spine_client_ui::draw::{
     encode_png_rgba, font_atlas_rgba, glyph_for, rasterize_draw_list, tessellate_draw_list,
-    text_height, text_width, UiCommand, UiDrawList, UiRect, FONT_ATLAS_HEIGHT, FONT_ATLAS_WIDTH,
+    text_height, text_width, UiColor, UiCommand, UiDrawList, UiRect, FONT_ATLAS_HEIGHT,
+    FONT_ATLAS_WIDTH,
 };
 use mc_spine_client_ui::magic_hud::{
     CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState,
 };
+use mc_spine_client_ui::mod_menu::{ModMenuEntry, ModMenuState, ModMenuWidgetId};
+use mc_spine_client_ui::recipe_browser::{
+    BrowserTab, ItemEntry, PonderScene, PonderStep, RecipeBrowserState, RecipeIndex,
+    RecipeWidgetId,
+};
 use mc_spine_client_ui::state::{
-    invite_code_display, invite_code_parse, CrashReportMode, GamepadButton, HitRegion, HudSubtitle,
-    LanguageSetting, MiniHudPreset, MinimapMode, ModSyncEntry, PlayerRadarScope, Screen,
-    SettingsTab, SubtitleDirection, UiAction, UiInputEvent, UiKey, UiLang, UiModal, UiState,
-    WidgetId, CRASH_PREVIEW_MAX_BYTES,
+    invite_code_display, invite_code_parse, CraftingConflictOverlay, CrashReportMode,
+    GamepadButton, HitRegion, HudSubtitle, LanguageSetting, MiniHudPreset, MinimapMode,
+    ModSyncEntry, PlayerRadarScope, Screen, SettingsTab, SubtitleDirection, UiAction, UiInputEvent,
+    UiKey, UiLang, UiModal, UiState, WidgetId, CRASH_PREVIEW_MAX_BYTES,
 };
 use mc_spine_core::crash_report::CrashContext;
 use mc_spine_core::sys_metrics::{MiniHudAnchor, MiniHudConfig, MiniHudData};
@@ -48,6 +54,8 @@ fn all_screens(ui: &mut UiState) -> Vec<Screen> {
         "1.21.1",
         "contraption NPE at /home/alice/mods/x.jar — Bearer sekret",
     ));
+    ui.mod_menu = demo_mod_menu();
+    ui.recipe_browser = demo_recipe_browser();
     vec![
         Screen::Title,
         Screen::Settings(SettingsTab::Video),
@@ -59,10 +67,28 @@ fn all_screens(ui: &mut UiState) -> Vec<Screen> {
         Screen::AboutMegu,
         Screen::Friends,
         Screen::ModSyncConsent,
+        Screen::ModMenu,
+        Screen::RecipeBrowser,
         Screen::InGameHud,
         Screen::Pause,
         Screen::CrashRecovery,
     ]
+}
+
+/// A two-entry Mods & Packs screen for the integrated-screen tests.
+fn demo_mod_menu() -> ModMenuState {
+    ModMenuState::new(vec![
+        ModMenuEntry::new("create", "Create", "0.5.1f"),
+        ModMenuEntry::new("jei", "Just Enough Items", "15.3.0"),
+    ])
+}
+
+/// A two-item recipe index for the integrated-screen tests.
+fn demo_recipe_browser() -> RecipeBrowserState {
+    let mut index = RecipeIndex::new();
+    index.add_item(ItemEntry::new("minecraft:iron_ingot", "Iron Ingot"));
+    index.add_item(ItemEntry::new("minecraft:stick", "Stick"));
+    RecipeBrowserState::new(index)
 }
 
 fn assert_no_overlaps(regions: &[HitRegion]) {
@@ -1391,5 +1417,186 @@ fn render_into_matches_render_output_on_every_screen() {
             ui.render_into(w, h, &mut reused);
             assert_eq!(reused.commands, allocated.commands, "{screen:?} at {w}x{h}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Integrated ModMenu + recipe browser + crafting-conflict overlay (WIRE-UI-1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mod_menu_opens_from_title_and_settings_and_closes_back() {
+    let mut ui = UiState::new();
+    ui.mod_menu = demo_mod_menu();
+    let (w, h) = (1280u32, 720u32);
+    ui.render(w, h);
+
+    // Title "Mods & Packs" navigates into the embedded screen.
+    let acts = click(&mut ui, WidgetId::TitleMods, w, h);
+    assert_eq!(ui.screen, Screen::ModMenu);
+    assert_eq!(acts, vec![UiAction::OpenScreen(Screen::ModMenu)]);
+
+    // The sub-screen's own widgets are re-tagged into the unified
+    // WidgetId space: search field, filter pills, mod rows, footer Done.
+    let list = ui.render(w, h);
+    assert!(list.commands.iter().any(|c| matches!(
+        c,
+        UiCommand::Text { text, .. } if text.starts_with("Mods & Packs")
+    )));
+    for inner in [
+        ModMenuWidgetId::SearchField,
+        ModMenuWidgetId::FilterAll,
+        ModMenuWidgetId::ModRow(1),
+        ModMenuWidgetId::Done,
+    ] {
+        assert!(
+            ui.hit_regions
+                .iter()
+                .any(|r| r.id == WidgetId::ModMenu(inner)),
+            "missing ModMenu::{inner:?} region"
+        );
+    }
+    assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
+
+    // Embedded widgets are clickable through the router.
+    let acts = click(&mut ui, WidgetId::ModMenu(ModMenuWidgetId::ModRow(1)), w, h);
+    assert!(acts.is_empty());
+    assert_eq!(ui.mod_menu.selected_row(), 1);
+
+    // Done backs out to Title through the nav stack.
+    let acts = click(&mut ui, WidgetId::ModMenu(ModMenuWidgetId::Done), w, h);
+    assert_eq!(acts, vec![UiAction::Back]);
+    assert_eq!(ui.screen, Screen::Title);
+
+    // Settings chrome exposes the same screen.
+    click(&mut ui, WidgetId::TitleSettings, w, h);
+    let acts = click(&mut ui, WidgetId::SettingsMods, w, h);
+    assert_eq!(acts, vec![UiAction::OpenScreen(Screen::ModMenu)]);
+    assert_eq!(ui.screen, Screen::ModMenu);
+
+    // Escape closes via the sub-screen's own Close action.
+    let acts = key(&mut ui, UiKey::Escape);
+    assert_eq!(acts, vec![UiAction::Back]);
+    assert!(matches!(ui.screen, Screen::Settings(SettingsTab::Video)));
+}
+
+#[test]
+fn recipe_browser_opens_from_pause_with_ponder_and_done_back() {
+    let mut ui = UiState::new();
+    ui.recipe_browser = demo_recipe_browser();
+    let (w, h) = (1280u32, 720u32);
+
+    // From in-game: Escape → Pause → "Recipe Browser".
+    ui.navigate(Screen::InGameHud);
+    assert_eq!(
+        key(&mut ui, UiKey::Escape),
+        vec![UiAction::OpenScreen(Screen::Pause)]
+    );
+    let acts = click(&mut ui, WidgetId::PauseRecipeBrowser, w, h);
+    assert_eq!(acts, vec![UiAction::OpenScreen(Screen::RecipeBrowser)]);
+    assert_eq!(ui.screen, Screen::RecipeBrowser);
+
+    // The sub-screen's widgets are re-tagged, and the native Done
+    // chrome sits on top.
+    ui.render(w, h);
+    for inner in [
+        RecipeWidgetId::SearchField,
+        RecipeWidgetId::TabPonder,
+        RecipeWidgetId::ItemSlot(0),
+    ] {
+        assert!(
+            ui.hit_regions
+                .iter()
+                .any(|r| r.id == WidgetId::Recipe(inner)),
+            "missing Recipe::{inner:?} region"
+        );
+    }
+    assert!(ui
+        .hit_regions
+        .iter()
+        .any(|r| r.id == WidgetId::RecipeBrowserDone));
+    assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
+
+    // The 3D Ponder tab renders its isometric scene when loaded.
+    let mut scene = PonderScene::new("Water Wheel");
+    scene.add_block(0, 0, 0, UiColor::rgb(120, 80, 40));
+    scene.add_block(1, 0, 0, UiColor::rgb(120, 80, 40));
+    scene.add_block(0, 1, 0, UiColor::rgb(160, 120, 60));
+    scene.steps.push(PonderStep::new("power the wheel", "動力", 40));
+    ui.recipe_browser.ponder = Some(scene);
+    ui.recipe_browser.tab = BrowserTab::Ponder;
+    let list = ui.render(w, h);
+    assert!(list.commands.iter().any(|c| matches!(
+        c,
+        UiCommand::Text { text, .. } if text.contains("Water Wheel")
+    )));
+    assert!(list.commands.iter().any(|c| matches!(
+        c,
+        UiCommand::Text { text, .. } if text.contains("power the wheel")
+    )));
+    assert!(ui
+        .hit_regions
+        .iter()
+        .any(|r| r.id == WidgetId::Recipe(RecipeWidgetId::PonderNext)));
+
+    // Done returns to the Pause screen (the nav stack remembers it).
+    let acts = click(&mut ui, WidgetId::RecipeBrowserDone, w, h);
+    assert_eq!(acts, vec![UiAction::Back]);
+    assert_eq!(ui.screen, Screen::Pause);
+
+    // The hotkey helper reaches the same screen.
+    let acts = ui.open_recipe_browser();
+    assert_eq!(acts, vec![UiAction::OpenScreen(Screen::RecipeBrowser)]);
+    assert_eq!(ui.screen, Screen::RecipeBrowser);
+    assert_eq!(key(&mut ui, UiKey::Escape), vec![UiAction::Back]);
+}
+
+#[test]
+fn crafting_conflict_overlay_is_zero_clutter_until_two_candidates() {
+    let mut ui = UiState::new();
+    ui.screen = Screen::InGameHud;
+    ui.hud = mc_spine_client_ui::state::HudState::demo();
+    assert_eq!(ui.hud.crafting_conflict.total_candidates, 0);
+    assert!(!ui.hud.crafting_conflict.is_active());
+
+    for &(w, h) in &HIT_SIZES {
+        // Zero and one candidates emit nothing at all.
+        let baseline = ui.render(w, h);
+        assert!(ui.hit_regions.is_empty());
+        ui.hud.crafting_conflict.total_candidates = 1;
+        let one = ui.render(w, h);
+        assert_eq!(one, baseline, "single candidate emitted commands at {w}x{h}");
+        assert!(ui.hit_regions.is_empty());
+
+        // Two or more emit exactly one compact `< k/N >` cycle button.
+        ui.hud.crafting_conflict = CraftingConflictOverlay {
+            selected_index: 0,
+            total_candidates: 3,
+        };
+        let list = ui.render(w, h);
+        assert!(list.commands.iter().any(|c| matches!(
+            c,
+            UiCommand::Text { text, .. } if text == "< 1/3 >"
+        )));
+        assert_eq!(ui.hit_regions.len(), 1);
+        assert_eq!(ui.hit_regions[0].id, WidgetId::CraftConflictNext);
+        assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
+
+        // Clicks cycle with wrap-around.
+        assert_eq!(
+            click(&mut ui, WidgetId::CraftConflictNext, w, h),
+            vec![UiAction::CycleCraftingConflict]
+        );
+        assert_eq!(ui.hud.crafting_conflict.selected_index, 1);
+        ui.hud.crafting_conflict.selected_index = 2;
+        click(&mut ui, WidgetId::CraftConflictNext, w, h);
+        assert_eq!(ui.hud.crafting_conflict.selected_index, 0);
+
+        // Dropping back to a single candidate removes it again.
+        ui.hud.crafting_conflict.total_candidates = 1;
+        let after = ui.render(w, h);
+        assert!(ui.hit_regions.is_empty());
+        assert_eq!(after, baseline);
+        ui.hud.crafting_conflict = CraftingConflictOverlay::default();
     }
 }

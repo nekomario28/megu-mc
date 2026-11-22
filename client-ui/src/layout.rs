@@ -49,6 +49,8 @@ pub fn layout_screen_into(
         regions: std::mem::take(regions),
         w: (width as i32) / s,
         h: (height as i32) / s,
+        pw: width,
+        ph: height,
         s,
         lang: state.lang(),
         state,
@@ -59,6 +61,8 @@ pub fn layout_screen_into(
         Screen::AboutMegu => about_megu(&mut ctx),
         Screen::Friends => friends(&mut ctx),
         Screen::ModSyncConsent => mod_sync(&mut ctx),
+        Screen::ModMenu => embedded_mod_menu(&mut ctx),
+        Screen::RecipeBrowser => embedded_recipe_browser(&mut ctx),
         Screen::InGameHud => hud(&mut ctx),
         Screen::Pause => pause(&mut ctx),
         Screen::CrashRecovery => crash(&mut ctx),
@@ -80,6 +84,10 @@ struct Ctx<'a> {
     regions: Vec<HitRegion>,
     w: i32,
     h: i32,
+    /// Physical-pixel viewport for the embedded sub-screens (they take
+    /// raw framebuffer dims, not logical px).
+    pw: u32,
+    ph: u32,
     s: i32,
     lang: UiLang,
     state: &'a UiState,
@@ -461,12 +469,17 @@ fn settings(ctx: &mut Ctx, active: SettingsTab) {
 
     ctx.btn(
         WidgetId::SettingsDone,
-        lr(cx - 104, ctx.h - 30, 100, 20),
+        lr(cx - 154, ctx.h - 30, 100, 20),
         tr(lang, "Done", "完了"),
     );
     ctx.btn(
+        WidgetId::SettingsMods,
+        lr(cx - 50, ctx.h - 30, 100, 20),
+        tr(lang, "Mods & Packs", "Modとパック"),
+    );
+    ctx.btn(
         WidgetId::SettingsAboutMegu,
-        lr(cx + 4, ctx.h - 30, 100, 20),
+        lr(cx + 54, ctx.h - 30, 100, 20),
         tr(lang, "About Megu", "Meguについて"),
     );
 }
@@ -1199,6 +1212,41 @@ fn mod_sync(ctx: &mut Ctx) {
 }
 
 // ---------------------------------------------------------------------------
+// Embedded screens (ModMenu + recipe browser)
+//
+// Both sub-screens produce their own `(UiDrawList, Vec<..HitRegion>)` in
+// physical pixels. Their draw commands merge verbatim; their regions are
+// re-tagged into the router's [`WidgetId`] space so `UiState` keeps a
+// single, overlap-free hit list — and native chrome (the recipe
+// browser's Done button) can sit on top.
+// ---------------------------------------------------------------------------
+
+fn embedded_mod_menu(ctx: &mut Ctx) {
+    let (list, hits) = ctx.state.mod_menu.render(ctx.pw, ctx.ph);
+    ctx.list.commands.extend(list.commands);
+    ctx.regions.extend(
+        hits.into_iter()
+            .map(|h| HitRegion::new(WidgetId::ModMenu(h.id), h.rect)),
+    );
+}
+
+fn embedded_recipe_browser(ctx: &mut Ctx) {
+    let (list, hits) = ctx.state.recipe_browser.render(ctx.pw, ctx.ph);
+    ctx.list.commands.extend(list.commands);
+    ctx.regions.extend(
+        hits.into_iter()
+            .map(|h| HitRegion::new(WidgetId::Recipe(h.id), h.rect)),
+    );
+    // The sub-screen has no close widget of its own (Esc/gamepad-East
+    // backs out); add a native Done in the header's empty top-right.
+    ctx.btn(
+        WidgetId::RecipeBrowserDone,
+        lr((ctx.w - 60).max(4), 6, 52, 14),
+        tr(ctx.lang, "Done", "完了"),
+    );
+}
+
+// ---------------------------------------------------------------------------
 // In-game HUD (display only — zero interactive hit regions)
 // ---------------------------------------------------------------------------
 
@@ -1280,6 +1328,23 @@ fn hud(ctx: &mut Ctx) {
     );
     if hud.xp_level > 0 {
         ctx.ctext(cx, hy - 14, 1, pal::XP, &hud.xp_level.to_string());
+    }
+
+    // Crafting-conflict switcher: exactly one compact `< k/N >` cycle
+    // button while the game reports two or more candidate recipes.
+    // `total_candidates <= 1` emits no commands and no region at all.
+    if hud.crafting_conflict.is_active() {
+        let label = format!(
+            "< {}/{} >",
+            hud.crafting_conflict.selected() + 1,
+            hud.crafting_conflict.total_candidates
+        );
+        let bw = label.chars().count() as i32 * 8 + 8;
+        ctx.btn(
+            WidgetId::CraftConflictNext,
+            lr(cx - bw / 2, hy - 18, bw, 14),
+            &label,
+        );
     }
 
     if !hud.actionbar.is_empty() {
@@ -1499,6 +1564,12 @@ fn pause(ctx: &mut Ctx) {
         WidgetId::PauseStatistics,
         lr(x, y, bw, 20),
         tr(lang, "Statistics", "統計"),
+    );
+    y += step;
+    ctx.btn(
+        WidgetId::PauseRecipeBrowser,
+        lr(x, y, bw, 20),
+        tr(lang, "Recipe Browser", "レシピブラウザ"),
     );
     y += step;
     ctx.btn(
