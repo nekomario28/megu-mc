@@ -1967,6 +1967,42 @@ impl WorldState {
         self.forget_chunk(cx, cz);
     }
 
+    /// Distance governor: unload every column whose Chebyshev distance from
+    /// `(center_cx, center_cz)` exceeds `view_distance_chunks + 2` — the
+    /// same two-chunk hysteresis margin vanilla keeps past the render
+    /// border so chunks do not thrash while the player hovers near an
+    /// edge. Eviction is RAM-only: the column, its section meshes,
+    /// visibility/render-region artifacts and tracked block entities are
+    /// dropped via [`WorldState::unload_chunk`] with zero disk writes, and
+    /// `chunks_unloaded` accounts for each one. Live entities stay tracked
+    /// — like vanilla, their lifecycle is server-driven (`remove_entities`),
+    /// not chunk-driven. Returns how many columns were evicted; intended
+    /// to run on a slow cadence (about once a second), not per frame.
+    pub fn evict_far_chunks(
+        &mut self,
+        center_cx: i32,
+        center_cz: i32,
+        view_distance_chunks: i32,
+    ) -> usize {
+        let keep_radius = i64::from(view_distance_chunks).saturating_add(2).max(0);
+        let victims: Vec<(i32, i32)> = self
+            .columns
+            .keys()
+            .copied()
+            .filter(|&(cx, cz)| {
+                (i64::from(cx) - i64::from(center_cx))
+                    .abs()
+                    .max((i64::from(cz) - i64::from(center_cz)).abs())
+                    > keep_radius
+            })
+            .collect();
+        let evicted = victims.len();
+        for (cx, cz) in victims {
+            self.unload_chunk(cx, cz);
+        }
+        evicted
+    }
+
     /// Drop every tracked block entity inside chunk column `(cx, cz)`. Runs on
     /// every chunk unload — even when the column itself was absent, since
     /// `block_entity_data` can anchor records to not-yet-loaded chunks — and

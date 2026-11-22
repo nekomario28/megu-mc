@@ -1174,6 +1174,157 @@ impl ClientSettings {
     }
 }
 
+/// Outcome of one [`SettingsSaveGuard::flush_if_dirty`] call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsFlush {
+    /// Nothing changed since the last write — zero bytes hit the disk.
+    Unchanged,
+    /// The serialized content differed; the file was written atomically
+    /// exactly once.
+    Written,
+}
+
+/// Debounced, dirty-only persistence gate for the settings file
+/// (`mc-spine-client.toml`) and any equally serialized blob such as an
+/// exported `options.txt`.
+///
+/// While the player drags sliders or flips toggles, UI code only updates
+/// RAM and calls [`SettingsSaveGuard::mark_dirty`] — that path performs
+/// zero disk I/O. On settings-screen close or process exit the caller runs
+/// [`SettingsSaveGuard::flush_if_dirty`], which serializes once, compares
+/// an FNV-1a digest plus byte length against the last content confirmed on
+/// disk, and writes atomically (temp file + rename) only when the bytes
+/// actually differ. A slider A→B→A roundtrip therefore costs `0 B` of
+/// writes, and any number of flushes over identical content costs at most
+/// one write total.
+#[derive(Clone, Debug, Default)]
+pub struct SettingsSaveGuard {
+    /// `(fnv1a64, len)` of the last content confirmed on disk — written by
+    /// this guard, or read back once on the first dirty flush of a session.
+    last_disk: Option<(u64, usize)>,
+    /// RAM-only "content may have changed" flag; cleared by every flush.
+    dirty: bool,
+    /// Lifetime count of atomic file writes performed (telemetry).
+    disk_writes: u64,
+    /// Lifetime count of dirty flushes skipped because the serialized
+    /// bytes were identical to disk (telemetry).
+    skipped_writes: u64,
+}
+
+impl SettingsSaveGuard {
+    /// A clean guard that has never observed the target file.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mark that the in-RAM settings may have changed. Pure bookkeeping —
+    /// deliberately performs no serialization and no disk I/O, so slider
+    /// drag bursts never touch the disk.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Whether [`mark_dirty`](Self::mark_dirty) was called since the last
+    /// flush.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Lifetime count of atomic file writes performed (telemetry).
+    pub fn disk_writes(&self) -> u64 {
+        self.disk_writes
+    }
+
+    /// Lifetime count of dirty flushes that performed zero writes because
+    /// the serialized bytes matched disk (telemetry).
+    pub fn skipped_writes(&self) -> u64 {
+        self.skipped_writes
+    }
+
+    /// Serialize `settings` once and write `path` only when the bytes
+    /// differ from the last content confirmed on disk. Flushes while
+    /// [`is_dirty`](Self::is_dirty) is `false` return immediately —
+    /// `0 B` written, no serialization. The first dirty flush of a
+    /// session reads the existing file once to seed the comparison, so
+    /// closing an untouched settings screen never rewrites it.
+    pub fn flush_if_dirty(
+        &mut self,
+        settings: &ClientSettings,
+        path: &Path,
+    ) -> Result<SettingsFlush, String> {
+        if !self.dirty {
+            return Ok(SettingsFlush::Unchanged);
+        }
+        self.flush_bytes_if_dirty(settings.to_toml().as_bytes(), path)
+    }
+
+    /// The serialized-bytes core of [`flush_if_dirty`](Self::flush_if_dirty)
+    /// for non-TOML payloads (e.g. a generated `options.txt`).
+    pub fn flush_bytes_if_dirty(
+        &mut self,
+        bytes: &[u8],
+        path: &Path,
+    ) -> Result<SettingsFlush, String> {
+        if !self.dirty {
+            return Ok(SettingsFlush::Unchanged);
+        }
+        self.dirty = false;
+        let digest = (fnv1a64(bytes), bytes.len());
+        let baseline = match self.last_disk {
+            Some(known) => Some(known),
+            None => std::fs::read(path)
+                .ok()
+                .map(|on_disk| (fnv1a64(&on_disk), on_disk.len())),
+        };
+        if baseline == Some(digest) {
+            self.last_disk = baseline;
+            self.skipped_writes += 1;
+            return Ok(SettingsFlush::Unchanged);
+        }
+        write_atomic(path, bytes)?;
+        self.last_disk = Some(digest);
+        self.disk_writes += 1;
+        Ok(SettingsFlush::Written)
+    }
+}
+
+/// FNV-1a over `bytes` — the same 64-bit digest `sound_name_hash` uses for
+/// sound names: cheap, deterministic, and sufficient for "did these exact
+/// bytes change" comparisons between one writer and one file.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Write `bytes` to `path` atomically: a sibling `*.tmp` file is written
+/// first, then renamed over `path`, so a crash mid-write can never leave a
+/// truncated settings file.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
+    }
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("settings path {} has no file name", path.display()))?;
+    let tmp = path.with_file_name(format!("{}.tmp", file_name.to_string_lossy()));
+    std::fs::write(&tmp, bytes).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!(
+            "cannot rename {} to {}: {e}",
+            tmp.display(),
+            path.display()
+        )
+    })
+}
+
 /// Whether `value` is an acceptable `shader_pack`/`shader_profile`
 /// selector: non-empty after trimming and free of `..` path-traversal
 /// components and of characters that would break the settings file format.

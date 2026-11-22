@@ -39,6 +39,12 @@ const MAX_OGG_BYTES: u64 = 64 * 1024 * 1024;
 /// Maximum decoded mono samples per sound (guards the PCM budget).
 const MAX_DECODED_SAMPLES: usize = MIX_SAMPLE_RATE as usize * 300;
 
+/// Hard cap on decoded PCM bytes held by [`SoundLibrary`]'s replay cache.
+/// 48 kHz mono `f32` runs ~11 MiB/minute, so 32 MiB is ~3 minutes of
+/// resident audio — long enough for every repeated sound effect while
+/// keeping long music tracks from ballooning RSS without bound.
+pub const DEFAULT_SOUND_PCM_CACHE_CAP_BYTES: usize = 32 * 1024 * 1024;
+
 /// The `minecraft:sound_event` registry ids mc-spine's server can emit.
 /// `id -> name`; mirrors the `sound_id` table in `src/play_protocol.rs`
 /// (minecraft-data 1.21.1 registration order). Events arriving with an id
@@ -139,13 +145,40 @@ pub struct ResolvedSound {
     pub pitch: f32,
 }
 
+/// One decoded sound held by [`SoundLibrary`]'s LRU replay cache.
+struct CachedPcm {
+    /// Shared decoded 48 kHz mono samples.
+    pcm: Arc<Vec<f32>>,
+    /// `pcm.len() * size_of::<f32>()` — the bytes counted against the cap.
+    bytes: usize,
+    /// Last `lru_clock` tick that inserted or touched this entry; the
+    /// smallest value in the map is the eviction victim.
+    last_used: u64,
+}
+
 /// The parsed asset index + `sounds.json` for one `--assetsDir`/
 /// `--assetIndex` pair, with a decoded-PCM cache so replayed sounds decode
-/// once.
+/// once. The cache is strictly bounded to
+/// [`DEFAULT_SOUND_PCM_CACHE_CAP_BYTES`] (configurable via
+/// [`SoundLibrary::with_pcm_cache_cap_bytes`]) and evicts
+/// least-recently-used entries when an insert would overflow it; a single
+/// clip larger than the whole cap is played without being cached so
+/// resident decoded PCM never exceeds the budget.
 pub struct SoundLibrary {
     objects: HashMap<String, PathBuf>,
     events: HashMap<String, SoundEventDef>,
-    decode_cache: HashMap<PathBuf, Arc<Vec<f32>>>,
+    decode_cache: HashMap<PathBuf, CachedPcm>,
+    /// Byte cap applied to `decode_cache` on every insert.
+    pcm_cache_cap_bytes: usize,
+    /// Sum of `CachedPcm::bytes` currently in `decode_cache`.
+    pcm_cache_bytes: usize,
+    /// Lifetime count of LRU evictions (telemetry).
+    pcm_cache_evictions: u64,
+    /// Lifetime count of `decode` calls served from the cache (telemetry).
+    pcm_cache_hits: u64,
+    /// Monotonic recency counter — never wall time, so eviction order is
+    /// deterministic and identical on every replay of the same call order.
+    lru_clock: u64,
 }
 
 impl SoundLibrary {
@@ -205,12 +238,124 @@ impl SoundLibrary {
             objects,
             events,
             decode_cache: HashMap::new(),
+            pcm_cache_cap_bytes: DEFAULT_SOUND_PCM_CACHE_CAP_BYTES,
+            pcm_cache_bytes: 0,
+            pcm_cache_evictions: 0,
+            pcm_cache_hits: 0,
+            lru_clock: 0,
         })
+    }
+
+    /// Override the decoded-PCM cache byte cap. Builder-style so tests can
+    /// pin a tiny deterministic budget; shrinking below the current
+    /// occupancy evicts least-recently-used entries immediately.
+    pub fn with_pcm_cache_cap_bytes(mut self, cap_bytes: usize) -> Self {
+        self.pcm_cache_cap_bytes = cap_bytes;
+        self.evict_pcm_over_cap();
+        self
     }
 
     /// Number of event definitions loaded from `sounds.json`.
     pub fn event_count(&self) -> usize {
         self.events.len()
+    }
+
+    /// Configured decoded-PCM cache cap in bytes.
+    pub fn pcm_cache_cap_bytes(&self) -> usize {
+        self.pcm_cache_cap_bytes
+    }
+
+    /// Decoded PCM bytes currently held by the replay cache. Never exceeds
+    /// [`SoundLibrary::pcm_cache_cap_bytes`] after an insert returns.
+    pub fn pcm_cache_bytes(&self) -> usize {
+        self.pcm_cache_bytes
+    }
+
+    /// Alias of [`SoundLibrary::pcm_cache_bytes`] kept for call sites that
+    /// describe the same total in cache terms.
+    pub fn cached_pcm_bytes(&self) -> usize {
+        self.pcm_cache_bytes
+    }
+
+    /// Lifetime count of least-recently-used evictions (telemetry).
+    pub fn pcm_cache_evictions(&self) -> u64 {
+        self.pcm_cache_evictions
+    }
+
+    /// Lifetime count of `decode` calls served from cache (telemetry).
+    pub fn pcm_cache_hits(&self) -> u64 {
+        self.pcm_cache_hits
+    }
+
+    /// Whether `path` currently has decoded PCM cached.
+    pub fn is_cached(&self, path: &Path) -> bool {
+        self.decode_cache.contains_key(path)
+    }
+
+    /// Drop least-recently-used entries until `pcm_cache_bytes` fits the
+    /// cap. `last_used` ticks are unique per `decode`/`insert_decoded_pcm`
+    /// call, so the victim choice is deterministic.
+    fn evict_pcm_over_cap(&mut self) {
+        while self.pcm_cache_bytes > self.pcm_cache_cap_bytes {
+            let mut victim: Option<(&PathBuf, u64)> = None;
+            for (key, entry) in &self.decode_cache {
+                let older = match victim {
+                    None => true,
+                    Some((_, best_tick)) => entry.last_used < best_tick,
+                };
+                if older {
+                    victim = Some((key, entry.last_used));
+                }
+            }
+            let Some((key, _)) = victim else {
+                break;
+            };
+            let key = key.clone();
+            if let Some(entry) = self.decode_cache.remove(&key) {
+                self.pcm_cache_bytes -= entry.bytes;
+                self.pcm_cache_evictions += 1;
+            }
+        }
+    }
+
+    /// Insert already-decoded 48 kHz mono PCM under `path`, bounded by the
+    /// same LRU budget [`SoundLibrary::decode`] uses — the prewarm/decode
+    /// worker entry point. Returns `false` without caching when the clip
+    /// alone exceeds the cap, so resident decoded PCM can never overflow
+    /// the budget.
+    pub fn insert_decoded_pcm(&mut self, path: &Path, pcm: Arc<Vec<f32>>) -> bool {
+        self.lru_clock += 1;
+        let tick = self.lru_clock;
+        let bytes = pcm.len() * std::mem::size_of::<f32>();
+        if bytes > self.pcm_cache_cap_bytes {
+            // A single clip bigger than the whole budget is played
+            // uncached; dropping any previous entry keeps the invariant
+            // that cached bytes never exceed the cap.
+            if let Some(entry) = self.decode_cache.remove(path) {
+                self.pcm_cache_bytes -= entry.bytes;
+            }
+            return false;
+        }
+        if let Some(entry) = self.decode_cache.get_mut(path) {
+            self.pcm_cache_bytes -= entry.bytes;
+            entry.pcm = pcm;
+            entry.bytes = bytes;
+            entry.last_used = tick;
+            self.pcm_cache_bytes += bytes;
+            self.evict_pcm_over_cap();
+            return true;
+        }
+        self.decode_cache.insert(
+            path.to_path_buf(),
+            CachedPcm {
+                pcm,
+                bytes,
+                last_used: tick,
+            },
+        );
+        self.pcm_cache_bytes += bytes;
+        self.evict_pcm_over_cap();
+        true
     }
 
     /// Resolve `event_name` (`"entity.player.levelup"` or namespaced) to an
@@ -254,10 +399,19 @@ impl SoundLibrary {
         None
     }
 
-    /// Decode an object-store OGG to 48 kHz mono `f32`, memoized by path.
+    /// Decode an object-store OGG to 48 kHz mono `f32`, memoized by path
+    /// under the bounded LRU replay cache. Cache hits refresh the entry's
+    /// recency; decoded clips that would push the cache over
+    /// [`SoundLibrary::pcm_cache_cap_bytes`] evict least-recently-used
+    /// entries first, and a clip larger than the whole cap is returned
+    /// uncached so resident PCM never exceeds the budget.
     pub fn decode(&mut self, path: &Path) -> Result<Arc<Vec<f32>>, String> {
-        if let Some(hit) = self.decode_cache.get(path) {
-            return Ok(hit.clone());
+        self.lru_clock += 1;
+        let tick = self.lru_clock;
+        if let Some(entry) = self.decode_cache.get_mut(path) {
+            entry.last_used = tick;
+            self.pcm_cache_hits += 1;
+            return Ok(entry.pcm.clone());
         }
         let (pcm, rate) = decode_ogg_mono(path, MAX_OGG_BYTES, MAX_DECODED_SAMPLES)?;
         let pcm = if rate == MIX_SAMPLE_RATE {
@@ -266,7 +420,21 @@ impl SoundLibrary {
             resample_linear(&pcm, rate, MIX_SAMPLE_RATE)
         };
         let shared: Arc<Vec<f32>> = Arc::new(pcm);
-        self.decode_cache.insert(path.to_path_buf(), shared.clone());
+        let bytes = shared.len() * std::mem::size_of::<f32>();
+        if bytes <= self.pcm_cache_cap_bytes {
+            // The new entry is always the most-recently-used, so the
+            // budget pass only ever evicts older clips.
+            self.decode_cache.insert(
+                path.to_path_buf(),
+                CachedPcm {
+                    pcm: shared.clone(),
+                    bytes,
+                    last_used: tick,
+                },
+            );
+            self.pcm_cache_bytes += bytes;
+            self.evict_pcm_over_cap();
+        }
         Ok(shared)
     }
 }
