@@ -1822,18 +1822,11 @@ impl GpuApp {
                 &feed,
             );
             if live.asset_bundle_pending_upload {
-                if let Some(bundle) = &live.asset_bundle {
-                    match active
-                        .renderer
-                        .upload_block_atlas(&bundle.atlas, &bundle.mipmaps)
-                    {
-                        Ok(()) => live.asset_bundle_pending_upload = false,
-                        Err(err) => {
-                            eprintln!("mc-spine-client assets: atlas upload failed: {err}");
-                            live.asset_bundle_pending_upload = false;
-                        }
-                    }
-                }
+                // Dropping the CPU pixel payloads is part of the upload:
+                // after this call VRAM owns the sole copy of the atlas and
+                // `live.pending_atlas_pixels` is `None` (`atlas_meta`
+                // stays resident).
+                live.upload_pending_atlas(&mut active.renderer);
             }
             active.renderer.sync_subworlds(&mut live.subworlds);
             self.ui
@@ -1943,9 +1936,9 @@ impl GpuApp {
                 active.renderer.gpu().queue.present(frame);
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {}
-            wgpu::CurrentSurfaceTexture::Outdated
+            surface_kind @ (wgpu::CurrentSurfaceTexture::Outdated
             | wgpu::CurrentSurfaceTexture::Lost
-            | wgpu::CurrentSurfaceTexture::Validation => {
+            | wgpu::CurrentSurfaceTexture::Validation) => {
                 let caps = active
                     .surface
                     .get_capabilities(&active.renderer.gpu().adapter);
@@ -1960,6 +1953,14 @@ impl GpuApp {
                 active
                     .surface
                     .configure(&active.renderer.gpu().device, &cfg);
+                if matches!(surface_kind, wgpu::CurrentSurfaceTexture::Lost) {
+                    // The atlas pixel payloads were dropped after upload;
+                    // re-derive them on demand instead of keeping a CPU
+                    // duplicate resident for a loss that may never come.
+                    if let Some(live) = &mut self.live {
+                        live.request_atlas_reload();
+                    }
+                }
             }
         }
         let stage = self.governor.observe_frame(frame_begin.elapsed());

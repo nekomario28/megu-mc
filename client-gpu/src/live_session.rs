@@ -22,6 +22,9 @@ use mc_spine_client::session::{AudioStats, WorldAcousticSnapshot};
 use mc_spine_client::spatial_audio::{SpatialSubtitleCue, SubtitleDirection};
 use mc_spine_client::world::{BlockTable, WorldState};
 use mc_spine_client_mesh::asset_pipeline::{CompiledAssetBundle, ResourcePackLayer};
+use mc_spine_client_mesh::atlas::{AtlasMip, PackedAtlas, SpriteAnimation, SpritePlacement};
+use mc_spine_client_mesh::model_baker::blockstate::BlockStateDef;
+use mc_spine_client_mesh::model_baker::ResourcePackModelStack;
 use mc_spine_client_mesh::builtin_shadow_wgsl::BuiltinShadowQuality;
 use mc_spine_client_mesh::entity_rig::{classify_entity_rig, EntityRigSpec};
 use mc_spine_client_mesh::mesher::{
@@ -48,14 +51,10 @@ use mc_spine_ui::magic_hud::{CastBarState, CooldownSlotState, MagicHudState, Sta
 use mc_spine_ui::state::{HudState, MiniHudPreset, UiState};
 use mc_spine_ui::subtitle_hud::{SubtitleArrow, DEFAULT_TTL_SECS};
 
-// client-gpu's manifest cannot be changed in this lane. Reuse the pure-std
-// core implementations until the crate can declare mc-spine-core directly.
-#[allow(dead_code)]
-#[path = "../../core/src/hw_adaptive_engine.rs"]
-pub mod hw_adaptive_engine;
-#[allow(dead_code)]
-#[path = "../../core/src/sys_metrics.rs"]
-pub mod sys_metrics;
+// Re-exported so embedders and tests keep the historical
+// `live_session::{hw_adaptive_engine,sys_metrics}` paths while the crate
+// compiles the canonical `mc-spine-core` sources exactly once.
+pub use mc_spine_core::{hw_adaptive_engine, sys_metrics};
 
 use crate::atmosphere::{
     voxel_clouds_to_geometry, AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker,
@@ -402,6 +401,74 @@ fn axis_angle_to_euler_xyz(axis: [f32; 3], radians: f32) -> [f32; 3] {
     [alpha, beta, gamma]
 }
 
+/// Resident metadata half of a [`CompiledAssetBundle`]: sprite placements,
+/// blockstate defs, the model overlay stack, animations and the skip log —
+/// everything [`GpuRenderer::upload_block_atlas`](crate::GpuRenderer::upload_block_atlas)
+/// does not need. The multi-MiB RGBA payloads live in
+/// [`PendingAtlasPixels`] only until the GPU upload completes, so steady
+/// state holds zero CPU atlas bytes and VRAM is the single source of truth.
+#[derive(Clone, Debug, Default)]
+pub struct CompiledAssetMeta {
+    /// Atlas width in texels (matches the uploaded [`PackedAtlas`]).
+    pub atlas_width: u32,
+    /// Atlas height in texels.
+    pub atlas_height: u32,
+    /// Per-sprite padding border the atlas was built with.
+    pub atlas_padding: u32,
+    /// Sprite name -> pixel rect inside the atlas.
+    pub placements: BTreeMap<String, SpritePlacement>,
+    /// Merged `namespace:block` -> [`BlockStateDef`], highest-priority-wins.
+    pub blockstates: BTreeMap<String, BlockStateDef>,
+    /// Per-layer model documents pushed lowest-to-highest priority.
+    pub model_stack: ResourcePackModelStack,
+    /// Merged `namespace:path` -> [`SpriteAnimation`], highest-priority-wins.
+    pub animations: BTreeMap<String, SpriteAnimation>,
+    /// `(entry id, exact reason)` for every pack entry that failed to parse
+    /// or pack — the load never panics on a single broken file.
+    pub skipped_errors: Vec<(String, String)>,
+}
+
+/// CPU-side pixel payloads awaiting
+/// [`GpuRenderer::upload_block_atlas`](crate::GpuRenderer::upload_block_atlas):
+/// the atlas base image plus its linear-sRGB mip chain. Held only between
+/// bundle build and upload — after the upload the GPU texture owns the
+/// sole copy and this whole struct is dropped.
+#[derive(Debug)]
+pub struct PendingAtlasPixels {
+    /// Packed block atlas (`rgba` is `width * height * 4` bytes).
+    pub atlas: PackedAtlas,
+    /// Gamma-correct linear-sRGB mip chain down to 1x1.
+    pub mipmaps: Vec<AtlasMip>,
+}
+
+/// Splits a compiled bundle into the resident [`CompiledAssetMeta`] and the
+/// [`PendingAtlasPixels`] CPU payloads that exist only until the GPU upload
+/// drops them. Placements are kept in both halves because the upload path
+/// resolves sprite rect indices through [`PackedAtlas::tile_rect`].
+pub fn split_compiled_bundle(
+    bundle: CompiledAssetBundle,
+) -> (CompiledAssetMeta, PendingAtlasPixels) {
+    let CompiledAssetBundle {
+        atlas,
+        mipmaps,
+        blockstates,
+        model_stack,
+        animations,
+        skipped_errors,
+    } = bundle;
+    let meta = CompiledAssetMeta {
+        atlas_width: atlas.width,
+        atlas_height: atlas.height,
+        atlas_padding: atlas.padding,
+        placements: atlas.placements.clone(),
+        blockstates,
+        model_stack,
+        animations,
+        skipped_errors,
+    };
+    (meta, PendingAtlasPixels { atlas, mipmaps })
+}
+
 /// Owns UI-facing world data on the event-loop thread. The worker owns its socket.
 pub struct LiveSession {
     incoming: Receiver<WorkerMessage>,
@@ -479,12 +546,23 @@ pub struct LiveSession {
     /// Tab the server last selected via `select_advancements_tab`, or the
     /// tab we announced when opening the screen.
     pub advancements_tab: Option<String>,
-    /// Lazily compiled resource-pack bundle (atlas + mip chain + blockstates)
-    /// built once when `MC_SPINE_RESOURCE_PACK_DIR` points at a pack root
+    /// Resident metadata of the lazily compiled resource-pack bundle
+    /// (atlas placements + blockstates + model stack + animations) built
+    /// once when `MC_SPINE_RESOURCE_PACK_DIR` points at a pack root
     /// containing `assets/`; absent env keeps the procedural fallback.
-    pub asset_bundle: Option<CompiledAssetBundle>,
+    /// The multi-MiB RGBA payloads never live here — they exist only in
+    /// [`Self::pending_atlas_pixels`] until `upload_block_atlas` drops
+    /// them, so steady state holds zero CPU atlas bytes and VRAM is the
+    /// sole owner of atlas texels.
+    pub atlas_meta: Option<CompiledAssetMeta>,
+    /// CPU-side atlas RGBA + mip chain awaiting
+    /// `GpuRenderer::upload_block_atlas`. Cleared to `None` the moment the
+    /// upload is consumed — the GPU texture is then the only copy. A
+    /// `SurfaceError::Lost` re-derives the payloads on demand through
+    /// [`Self::request_atlas_reload`].
+    pub pending_atlas_pixels: Option<PendingAtlasPixels>,
     asset_bundle_tried: bool,
-    /// Set when `asset_bundle` landed but `GpuRenderer::upload_block_atlas`
+    /// Set when a bundle landed but `GpuRenderer::upload_block_atlas`
     /// has not consumed it yet (window.rs owns the GPU upload).
     pub asset_bundle_pending_upload: bool,
     /// Source-by-source record of the last asset discovery pass — which
@@ -806,7 +884,8 @@ impl LiveSession {
             advancements: BTreeMap::new(),
             advancement_progress: BTreeMap::new(),
             advancements_tab: None,
-            asset_bundle: None,
+            atlas_meta: None,
+            pending_atlas_pixels: None,
             asset_bundle_tried: false,
             asset_bundle_pending_upload: false,
             asset_discovery: AssetDiscovery::default(),
@@ -1646,11 +1725,44 @@ impl LiveSession {
                         bundle.skipped_errors.len()
                     );
                 }
-                self.asset_bundle = Some(bundle);
+                let (meta, pixels) = split_compiled_bundle(bundle);
+                self.atlas_meta = Some(meta);
+                self.pending_atlas_pixels = Some(pixels);
                 self.asset_bundle_pending_upload = true;
             }
             Err(err) => eprintln!("mc-spine-client assets: bundle build failed: {err}"),
         }
+    }
+
+    /// Consumes any pending atlas pixel payloads by uploading them through
+    /// `renderer`, then drops the CPU copies so VRAM holds the sole copy of
+    /// the atlas texels (RAM/VRAM role separation: no resident duplicate).
+    /// [`Self::atlas_meta`] stays intact in both success and failure — a
+    /// failed upload keeps no pixels either and would re-derive them only
+    /// through [`Self::request_atlas_reload`]. Returns `true` once no CPU
+    /// atlas bytes remain resident.
+    pub fn upload_pending_atlas(&mut self, renderer: &mut GpuRenderer) -> bool {
+        let Some(pixels) = self.pending_atlas_pixels.take() else {
+            self.asset_bundle_pending_upload = false;
+            return true;
+        };
+        if let Err(err) = renderer.upload_block_atlas(&pixels.atlas, &pixels.mipmaps) {
+            eprintln!("mc-spine-client assets: atlas upload failed: {err}");
+        }
+        self.asset_bundle_pending_upload = false;
+        self.pending_atlas_pixels.is_none()
+    }
+
+    /// Arms an on-demand atlas rebuild + upload: a `SurfaceError::Lost`
+    /// calls this so the next [`Self::ensure_asset_bundle`] pass
+    /// recompiles the bundle and re-uploads the pixel payloads, instead of
+    /// keeping them RAM-resident for a device loss that may never come.
+    pub fn request_atlas_reload(&mut self) {
+        if self.atlas_meta.is_none() {
+            return;
+        }
+        self.asset_bundle_tried = false;
+        self.asset_bundle_pending_upload = true;
     }
 
     /// Scan `assets/*/optifine/cem/*.jem|*.jpm` in the loaded pack and register

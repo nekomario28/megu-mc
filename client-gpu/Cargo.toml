@@ -14,13 +14,33 @@ path = "src/lib.rs"
 name = "mc-spine-client-gpu"
 path = "src/main.rs"
 
+# Zero-bloat release contract: this manifest produces the shipped GUI client
+# binary, so release builds are fully optimized, LTO'd and stripped.
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+
 [dependencies]
 mc_spine_client = { package = "mc-spine-client", path = "../client-app" }
 mc_spine_client_mesh = { package = "mc-spine-client-mesh", path = "../client-port" }
+mc_spine_core = { package = "mc-spine-core", path = "../core" }
 mc_spine_kernel = { package = "mc-spine-kernel", path = "../client-kernel" }
 mc_spine_proto = { package = "mc-spine-proto", path = "../proto" }
 mc_spine_ui = { package = "mc-spine-client-ui", path = "../client-ui" }
 bytemuck = { version = "1.25", features = ["derive"] }
 pollster = "0.4"
-wgpu = "30.0.1"
+# Pure-wgpu policy: no OpenGL/GLES/EGL/WGL anywhere in the dependency graph.
+# Each OS compiles only its native primary backend(s), so `glow`,
+# `khronos-egl` and `glutin_wgl_sys` never enter the build.
+wgpu = { version = "30.0.1", default-features = false, features = ["wgsl", "std"] }
 winit = "0.30"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { version = "30.0.1", default-features = false, features = ["vulkan"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wgpu = { version = "30.0.1", default-features = false, features = ["dx12", "vulkan"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "30.0.1", default-features = false, features = ["metal"] }

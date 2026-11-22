@@ -43,9 +43,10 @@ use mc_spine_ui::draw::{font_atlas_rgba, UiMesh, FONT_ATLAS_HEIGHT, FONT_ATLAS_W
 use winit::event_loop::OwnedDisplayHandle;
 
 use crate::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
+use crate::gpu_hiz::{CullStats, CullUniforms, GpuHizCuller, IndirectArgs, SectionGpuRecord};
 use crate::live_session::hw_adaptive_engine::{
     detect_universal_hardware_profile, select_compute_strategy, ComputeStrategy,
-    GpuComputeParadigm, MemoryTransferStrategy,
+    GpuComputeParadigm, MemoryFootprintClass, MemoryTransferStrategy,
 };
 use crate::mat4_mul;
 use crate::mesh_pool::{
@@ -484,6 +485,44 @@ fn append_live_quad(
     indices.extend(corners.map(|corner| base + corner));
 }
 
+/// Canonical `[0,1,2,0,2,3]` winding one shared static quad index buffer
+/// repeats for every quad. Opaque draws index it positionally: quad `q`
+/// of a vertex buffer is always drawn by indices `6*q .. 6*q + 6`, so no
+/// per-section or per-region index stream is ever built or uploaded.
+pub const QUAD_INDEX_PATTERN: [u32; 6] = [0, 1, 2, 0, 2, 3];
+
+/// `PackedVertex.attributes` bit 17: the greedy mesher's diagonal-flip
+/// mark. Quads carrying it were historically drawn with the alternate
+/// `[0,1,3,1,2,3]` corner set.
+pub const QUAD_DIAGONAL_FLIP_BIT: u32 = 1 << 17;
+
+/// Rotate every flip-marked opaque quad `[v0,v1,v2,v3] -> [v1,v2,v3,v0]`
+/// once at upload time. Applied before GPU upload, the canonical
+/// `[0,1,2,0,2,3]` index pattern then reproduces the alternate pattern's
+/// exact two triangles (same `(v1,v3)` diagonal, same winding), so 100%
+/// of opaque quads share one static index buffer with identical output.
+pub fn rotate_opaque_quads_for_shared_index(vertices: &mut [PackedVertex]) {
+    for quad in vertices.as_chunks_mut::<4>().0 {
+        if quad[0].attributes & QUAD_DIAGONAL_FLIP_BIT != 0 {
+            quad.rotate_left(1);
+        }
+    }
+}
+
+/// The shared index buffer's contents: [`QUAD_INDEX_PATTERN`] repeated
+/// with a +4 stride per quad so index `i` always selects vertex
+/// `i / 6 * 4 + pat[i % 6]` of the bound vertex buffer. `count` is
+/// rounded up to a whole quad group.
+pub fn quad_index_pattern(count: u32) -> Vec<u32> {
+    let quads = count.div_ceil(6);
+    let mut out = Vec::with_capacity(quads as usize * 6);
+    for quad in 0..quads {
+        let base = quad * 4;
+        out.extend(QUAD_INDEX_PATTERN.map(|corner| base + corner));
+    }
+    out
+}
+
 pub fn section_geometry(packed: &[PackedVertex], translucent_order: &[u32]) -> LiveSectionGeometry {
     let mut out = LiveSectionGeometry::default();
     let mut translucent = Vec::new();
@@ -599,37 +638,40 @@ struct CompletedSectionGeometry {
     opaque_bucket_ranges: Option<[(u32, u32); DIRECTION_BUCKETS]>,
 }
 
-/// One section's contribution to a [`RegionArena`]'s index stream: where
-/// its repacked vertices sit in the shared vertex arena plus the
-/// section-local opaque index ranges per direction bucket.
+/// One section's contribution to a [`RegionArena`]: where its repacked
+/// vertices sit in the shared vertex arena plus the section-local opaque
+/// index spans per direction bucket. No index data is retained — the
+/// canonical [`QUAD_INDEX_PATTERN`] stream maps every quad positionally.
 struct ArenaSlot {
-    /// First vertex of the section inside `RegionArena::vertices`.
+    /// First vertex of the section inside the arena's vertex buffer.
     vertex_offset: u32,
-    /// Vertices this slot occupies in `vertices`.
+    /// Vertices this slot occupies in the vertex buffer.
     vertex_count: u32,
-    /// Section-local opaque indices (into the slot's own vertices).
-    local_indices: Arc<[u32]>,
-    /// `(first, count)` of each bucket inside `local_indices`.
+    /// `(first, count)` of each bucket inside the section's local opaque
+    /// index stream; the shared index buffer keeps these exact ranges —
+    /// a slot's global span is `vertex_offset / 4 * 6 + (first, count)`.
     bucket_ranges: [(u32, u32); DIRECTION_BUCKETS],
 }
 
-/// A contiguous `(coord, index range)` record inside one bucket stream of
-/// a [`RegionArena`]; kept records sharing a fade value merge into a
-/// single `draw_indexed` call at encode time.
+/// A contiguous `(coord, index range)` record in one direction bucket of
+/// a [`RegionArena`], expressed in *shared* quad-index space
+/// ([`GpuRenderer::shared_quad_index_buffer`]); kept records sharing a
+/// fade value merge into a single `draw_indexed` call at encode time.
 struct ArenaDrawRecord {
     coord: SectionCoord,
-    /// First index inside `RegionArena::indices`.
+    /// First index inside the shared quad index buffer.
     start: u32,
-    /// End index inside `RegionArena::indices` (exclusive).
+    /// End index inside the shared quad index buffer (exclusive).
     end: u32,
 }
 
-/// Shared vertex/index arena over one 8x4x8-section region (the
+/// Shared vertex arena over one 8x4x8-section region (the
 /// [`RenderRegions`] grid): 16-byte `PackedVertex` streams upload into
-/// one vertex buffer through slot-range partial `queue.write_buffer`s
-/// (no CPU-side vertex copy is retained), and one index buffer holds
-/// seven contiguous direction-bucket streams so a frame submits a
-/// handful of merged draws per region instead of per-section binds.
+/// one vertex buffer through the persistent [`UploadStagingRing`] as
+/// slot-range DMA copies (no CPU-side vertex copy is retained), and the
+/// single global shared quad index buffer serves every direction-bucket
+/// draw positionally — no per-region index buffer, index rebuild, or
+/// index upload exists at all.
 struct RegionArena {
     /// Vertices appended past the free list (the arena's high-water
     /// vertex count; holes live in `vertex_free`).
@@ -640,26 +682,26 @@ struct RegionArena {
     /// Resident sections in deterministic order.
     slots: BTreeMap<SectionCoord, ArenaSlot>,
     /// Serialized `(byte_offset, bytes)` vertex payloads staged by
-    /// [`Self::insert`] for the next partial upload.
-    pending_vertex_writes: Vec<(u64, Vec<u8>)>,
-    /// Vertices actually present in `vertex_buffer` (for the growth
-    /// copy); tracks `vertex_high_water` once flushes land.
+    /// [`Self::insert`], keyed by coord so a superseded or removed slot
+    /// drops its staged write. Entries present here are *not yet on the
+    /// GPU*: their slots emit no draw records until the per-frame DMA cap
+    /// admits the payload.
+    pending_vertex_writes: BTreeMap<SectionCoord, (u64, Vec<u8>)>,
+    /// Highest vertex offset whose bytes have reached `vertex_buffer`
+    /// (the growth copy preserves exactly this committed prefix).
     flushed_vertex_len: u32,
-    /// Combined index contents: seven contiguous bucket streams —
-    /// rebuild scratch, dropped to the GPU after each flush.
-    indices: Vec<u32>,
-    /// Per-bucket `(coord, start, end)` draw records in `indices` order.
+    /// Per-bucket `(coord, start, end)` draw records in shared-index
+    /// space, covering only slots whose vertex bytes are GPU-resident.
     bucket_records: [Vec<ArenaDrawRecord>; DIRECTION_BUCKETS],
     /// Vertex buffer contents changed since the last GPU write.
     vertex_dirty: bool,
-    /// Slots changed since the last index-stream rebuild.
+    /// Slots or staged writes changed since the last record rebuild.
     index_dirty: bool,
     vertex_buffer: wgpu::Buffer,
     vertex_capacity: usize,
-    index_buffer: wgpu::Buffer,
-    index_capacity: usize,
-    /// Indices written to `index_buffer` on the last flush.
-    index_len: u32,
+    /// Frames the arena stayed empty; the idle-slab reclaim grace in the
+    /// active [`TransferTopologyBudget`] retires it.
+    empty_frames: u32,
     /// `section` uniform holding the region-minimum world origin.
     _uniform: wgpu::Buffer,
     /// `{frame_ubo, region uniform}` on the shared frame layout — serves
@@ -681,12 +723,6 @@ impl RegionArena {
             usage: wgpu::BufferUsages::VERTEX
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("region-arena-indices"),
-            size: 64,
-            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
@@ -727,20 +763,30 @@ impl RegionArena {
             vertex_high_water: 0,
             vertex_free: Vec::new(),
             slots: BTreeMap::new(),
-            pending_vertex_writes: Vec::new(),
+            pending_vertex_writes: BTreeMap::new(),
             flushed_vertex_len: 0,
-            indices: Vec::new(),
             bucket_records: Default::default(),
             vertex_dirty: false,
             index_dirty: false,
             vertex_buffer,
             vertex_capacity: 0,
-            index_buffer,
-            index_capacity: 0,
-            index_len: 0,
+            empty_frames: 0,
             _uniform: uniform,
             bind_group,
         }
+    }
+
+    /// Shared-index offset where the arena's quad `0` lives: the shared
+    /// buffer's index `i` references vertex `i / 6 * 4 + pat[i % 6]`, so
+    /// the arena occupies `0 .. index_extent()` of the shared stream.
+    fn index_extent(&self) -> u32 {
+        self.vertex_high_water / 4 * 6
+    }
+
+    /// Whether the committed record set is empty — every slot either
+    /// absent or still waiting on the DMA cap.
+    fn draw_empty(&self) -> bool {
+        self.bucket_records.iter().all(|records| records.is_empty())
     }
 
     /// Free `offset..offset+len` back into the first-fit list.
@@ -783,14 +829,14 @@ impl RegionArena {
     /// Insert or replace `coord`'s opaque stream: the 16-byte
     /// `PackedVertex` payload serializes straight into a staged partial
     /// write at the slot's byte offset (each vertex's `attributes` gains
-    /// the section-in-region word in its free top byte), and the slot's
-    /// local indices stage for the next bucket-stream rebuild.
+    /// the section-in-region word in its free top byte). The slot draws
+    /// through the shared quad index buffer — no local index stream is
+    /// retained anywhere.
     fn insert(
         &mut self,
         coord: SectionCoord,
         vertices: &[PackedVertex],
         section_word: u32,
-        local_indices: Arc<[u32]>,
         bucket_ranges: [(u32, u32); DIRECTION_BUCKETS],
     ) {
         if let Some(old) = self.slots.remove(&coord) {
@@ -810,92 +856,121 @@ impl RegionArena {
             bytes.extend_from_slice(&v.tint.to_ne_bytes());
         }
         self.pending_vertex_writes
-            .push((u64::from(vertex_offset) * 16, bytes));
+            .insert(coord, (u64::from(vertex_offset) * 16, bytes));
         self.slots.insert(
             coord,
             ArenaSlot {
                 vertex_offset,
                 vertex_count,
-                local_indices,
                 bucket_ranges,
             },
         );
         self.vertex_dirty = true;
         self.index_dirty = true;
+        self.empty_frames = 0;
     }
 
-    /// Drop `coord`'s slab if present; empties retire their region.
+    /// Drop `coord`'s slab if present; empties retire their region after
+    /// the idle-slab reclaim grace.
     fn remove(&mut self, coord: SectionCoord) {
         if let Some(old) = self.slots.remove(&coord) {
             self.release_vertices(old.vertex_offset, old.vertex_count);
             self.index_dirty = true;
         }
+        self.pending_vertex_writes.remove(&coord);
     }
 
-    /// Concatenate every slot's bucket-local indices (rebased by the
-    /// slot's vertex offset) into one stream per direction bucket, then
-    /// lay the seven streams back to back and record per-section spans.
-    fn rebuild_indices(&mut self) {
-        self.indices.clear();
-        for bucket in 0..DIRECTION_BUCKETS {
-            self.bucket_records[bucket].clear();
-            for (&coord, slot) in &self.slots {
-                let (first_index, index_count) = slot.bucket_ranges[bucket];
-                if index_count == 0 {
+    /// Recompute the per-bucket draw records from slot state only: a
+    /// slot's bucket span in shared-index space is its local index range
+    /// shifted by `vertex_offset / 4 * 6`. Slots whose vertex payload is
+    /// still queued behind the DMA cap emit no records yet — drawing them
+    /// would sample unwritten vertex data.
+    fn rebuild_records(&mut self) {
+        for records in &mut self.bucket_records {
+            records.clear();
+        }
+        for (&coord, slot) in &self.slots {
+            if self.pending_vertex_writes.contains_key(&coord) {
+                continue;
+            }
+            let global = slot.vertex_offset / 4 * 6;
+            for (bucket, &(first, count)) in slot.bucket_ranges.iter().enumerate() {
+                if count == 0 {
                     continue;
                 }
-                let start = first_index as usize;
-                let end = start + index_count as usize;
-                let Some(local) = slot.local_indices.get(start..end) else {
-                    continue;
-                };
-                let record_start = self.indices.len() as u32;
-                self.indices
-                    .extend(local.iter().map(|index| index + slot.vertex_offset));
                 self.bucket_records[bucket].push(ArenaDrawRecord {
                     coord,
-                    start: record_start,
-                    end: self.indices.len() as u32,
+                    start: global + first,
+                    end: global + first + count,
                 });
             }
         }
-        self.index_dirty = false;
     }
 
-    /// Upload dirty vertex/index contents. Vertex inserts become
-    /// slot-range partial `queue.write_buffer`s; when the arena outgrows
-    /// the buffer the live slab is preserved by a `copy_buffer_to_buffer`
-    /// (the CPU copy was already dropped), so only the new payload bytes
-    /// ever cross the bus. Returns `(partial vertex writes, buffers
-    /// replaced)` — a replaced vertex/index buffer invalidates any
-    /// recorded `RenderBundle` referencing the old objects.
-    fn flush_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> (u32, bool) {
-        let index_rebuilt = self.index_dirty;
-        if index_rebuilt {
-            self.rebuild_indices();
+    /// Visit the merged shared-index ranges covering every committed slot
+    /// across all buckets — used by passes that draw the whole arena at
+    /// once (shadow casters, the no-camera plain path). Consecutive
+    /// records inside a bucket collapse into one range.
+    fn for_each_live_range(&self, mut emit: impl FnMut(u32, u32)) {
+        for records in &self.bucket_records {
+            let mut run: Option<(u32, u32)> = None;
+            for record in records {
+                match run {
+                    Some((start, end)) if end == record.start => {
+                        run = Some((start, record.end));
+                    }
+                    _ => {
+                        if let Some((start, end)) = run.take() {
+                            emit(start, end);
+                        }
+                        run = Some((record.start, record.end));
+                    }
+                }
+            }
+            if let Some((start, end)) = run {
+                emit(start, end);
+            }
         }
+    }
+
+    /// Flush staged vertex inserts to the GPU through the persistent
+    /// staging ring, honoring this frame's remaining DMA byte budget
+    /// (`dma_remaining` is shared across all arenas so the per-frame cap
+    /// is global). When the arena outgrows its buffer the committed slab
+    /// is preserved by a `copy_buffer_to_buffer` in the caller's encoder —
+    /// the CPU copies are long gone — and the buffer grows in
+    /// `slab_vertex_bytes` granularity so reallocations amortize.
+    /// Returns `(staged partial writes, buffers replaced)` — a replaced
+    /// vertex buffer invalidates recorded `RenderBundle`s referencing it.
+    fn flush_gpu(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        ring: &mut UploadStagingRing,
+        dma_remaining: &mut u64,
+        slab_vertex_bytes: usize,
+    ) -> (u32, bool) {
         let mut buffers_replaced = false;
-        let mut partial_uploads = 0;
+        let mut staged = 0u32;
         if self.vertex_dirty {
             let needed = self.vertex_high_water as usize;
             if needed > self.vertex_capacity {
                 let live_bytes = u64::from(self.flushed_vertex_len) * 16;
-                self.vertex_capacity = needed.max(64) + needed / 2;
+                let slab = slab_vertex_bytes.max(64);
+                let cap_bytes = (needed * 16).max(slab).next_multiple_of(slab);
+                self.vertex_capacity = cap_bytes / 16;
                 let new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("region-arena-vertices"),
-                    size: (self.vertex_capacity * 16) as u64,
+                    size: cap_bytes as u64,
                     usage: wgpu::BufferUsages::VERTEX
                         | wgpu::BufferUsages::COPY_DST
                         | wgpu::BufferUsages::COPY_SRC,
                     mapped_at_creation: false,
                 });
                 if live_bytes > 0 {
-                    // Preserve resident slot payloads before the partial
+                    // Preserve committed slot payloads before the staged
                     // writes land (the CPU copies are long gone).
-                    let mut encoder =
-                        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("region-arena-grow"),
-                        });
                     encoder.copy_buffer_to_buffer(
                         &self.vertex_buffer,
                         0,
@@ -903,41 +978,41 @@ impl RegionArena {
                         0,
                         live_bytes,
                     );
-                    queue.submit([encoder.finish()]);
                 }
                 self.vertex_buffer = new_buffer;
                 buffers_replaced = true;
             }
-            for (byte_offset, bytes) in self.pending_vertex_writes.drain(..) {
-                queue.write_buffer(&self.vertex_buffer, byte_offset, &bytes);
-                partial_uploads += 1;
+            let mut committed = Vec::new();
+            for (&coord, (byte_offset, bytes)) in &self.pending_vertex_writes {
+                let len = bytes.len() as u64;
+                if len > *dma_remaining {
+                    // Over this frame's DMA cap: the write (and every
+                    // later one) defers to the next frame. The slot's
+                    // draw records stay withheld — no partial garbage.
+                    ring.staging_ring_dma_defers += 1;
+                    break;
+                }
+                *dma_remaining -= len;
+                ring.stage_copy(device, queue, encoder, &self.vertex_buffer, *byte_offset, bytes);
+                self.flushed_vertex_len =
+                    self.flushed_vertex_len.max((byte_offset + len) as u32 / 16);
+                committed.push(coord);
+                staged += 1;
             }
-            self.flushed_vertex_len = self.vertex_high_water;
-            self.vertex_dirty = false;
-        }
-        if index_rebuilt {
-            let needed = self.indices.len();
-            if needed > self.index_capacity {
-                self.index_capacity = needed.max(64) + needed / 2;
-                self.index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("region-arena-indices"),
-                    size: (self.index_capacity * std::mem::size_of::<u32>()) as u64,
-                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                buffers_replaced = true;
+            for coord in committed {
+                self.pending_vertex_writes.remove(&coord);
             }
-            if !self.indices.is_empty() {
-                queue.write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&self.indices));
-            }
-            self.index_len = self.indices.len() as u32;
-            // Index scratch is rebuild-only; shrink it so a spike doesn't
-            // linger as resident heap.
-            if self.indices.capacity() > self.indices.len().max(4096) * 2 {
-                self.indices.shrink_to_fit();
+            if self.pending_vertex_writes.is_empty() {
+                self.flushed_vertex_len = self.flushed_vertex_len.max(self.vertex_high_water);
+                self.vertex_dirty = false;
             }
         }
-        (partial_uploads, buffers_replaced)
+        if self.index_dirty || staged > 0 {
+            self.rebuild_records();
+            // Uncommitted inserts still owe records — keep the flag set.
+            self.index_dirty = !self.pending_vertex_writes.is_empty();
+        }
+        (staged, buffers_replaced)
     }
 }
 
@@ -956,6 +1031,190 @@ fn strategy_upload_defaults(strategy: &ComputeStrategy) -> (ChunkUploadBudget, u
         MemoryTransferStrategy::DiscreteStagedArena => ChunkUploadBudget::new(),
     };
     (budget, strategy.workers.foreground_threads)
+}
+
+/// Transfer-layer sizing the memory topology warrants — staging-ring
+/// slot geometry, arena slab growth granularity, empty-arena reclaim
+/// grace and the per-frame DMA byte cap. Quality settings (render scale,
+/// shadow quality) NEVER derive from this: the memory topology tunes how
+/// bytes cross the bus, not how the frame looks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransferTopologyBudget {
+    /// Persistent staging-ring slots in flight.
+    pub staging_ring_slots: u32,
+    /// Bytes per staging slot.
+    pub staging_slot_bytes: u64,
+    /// Minimum growth unit for arena vertex buffers, in bytes.
+    pub arena_slab_bytes: u64,
+    /// Frames an emptied region arena is kept resident before reclaim.
+    pub idle_slab_reclaim_frames: u32,
+    /// Max staged bytes copied to device-local buffers per frame.
+    pub frame_dma_cap_bytes: u64,
+}
+
+impl TransferTopologyBudget {
+    /// Budget for `memory` on a host of `class`, following the design's
+    /// sizing table: discrete VRAM streams 3x8 MiB staging slots with
+    /// 32 MiB arena slabs, a 256-frame empty-arena grace and an 8 MiB
+    /// per-frame DMA cap; unified memory drops to 3x2 MiB / 8 MiB /
+    /// 60 / 3 MiB; a `Constrained` unified host drops further to
+    /// 2x1 MiB / 4 MiB / 15 / 1 MiB.
+    pub fn for_topology(memory: MemoryTransferStrategy, class: MemoryFootprintClass) -> Self {
+        const MIB: u64 = 1024 * 1024;
+        match (memory, class) {
+            (MemoryTransferStrategy::UnifiedZeroCopy, MemoryFootprintClass::Constrained) => Self {
+                staging_ring_slots: 2,
+                staging_slot_bytes: MIB,
+                arena_slab_bytes: 4 * MIB,
+                idle_slab_reclaim_frames: 15,
+                frame_dma_cap_bytes: MIB,
+            },
+            (MemoryTransferStrategy::UnifiedZeroCopy, _) => Self {
+                staging_ring_slots: 3,
+                staging_slot_bytes: 2 * MIB,
+                arena_slab_bytes: 8 * MIB,
+                idle_slab_reclaim_frames: 60,
+                frame_dma_cap_bytes: 3 * MIB,
+            },
+            (MemoryTransferStrategy::DiscreteStagedArena, _) => Self {
+                staging_ring_slots: 3,
+                staging_slot_bytes: 8 * MIB,
+                arena_slab_bytes: 32 * MIB,
+                idle_slab_reclaim_frames: 256,
+                frame_dma_cap_bytes: 8 * MIB,
+            },
+        }
+    }
+}
+
+/// Persistent `MAP_WRITE | COPY_SRC` staging ring backing chunk uploads:
+/// `slot_count` fixed-size staging buffers rotate through staged copies
+/// so steady-state uploads issue zero `create_buffer` calls. Each
+/// [`Self::stage_copy`] maps the next slot, memcpy's the payload, unmaps
+/// and records a `copy_buffer_to_buffer` in the caller's encoder, so
+/// device-local destinations only ever see DMA traffic.
+pub struct UploadStagingRing {
+    slots: Vec<wgpu::Buffer>,
+    next: usize,
+    slot_bytes: u64,
+    /// Slot buffers the ring has allocated (construction +
+    /// reconfiguration only — constant in steady state).
+    pub staging_ring_allocs: u64,
+    /// Payloads staged through the ring, cumulative.
+    pub staging_ring_uploads: u64,
+    /// Staged writes deferred by the per-frame DMA cap, cumulative.
+    pub staging_ring_dma_defers: u64,
+    /// Map failures served by the direct `write_buffer` fallback,
+    /// cumulative (should stay at zero on a healthy device).
+    pub staging_ring_fallbacks: u64,
+}
+
+impl UploadStagingRing {
+    /// Build the ring with `budget` slot geometry.
+    pub fn new(device: &wgpu::Device, budget: &TransferTopologyBudget) -> Self {
+        let mut ring = Self {
+            slots: Vec::new(),
+            next: 0,
+            slot_bytes: 0,
+            staging_ring_allocs: 0,
+            staging_ring_uploads: 0,
+            staging_ring_dma_defers: 0,
+            staging_ring_fallbacks: 0,
+        };
+        ring.rebuild_slots(
+            device,
+            budget.staging_ring_slots.max(1),
+            budget.staging_slot_bytes.max(256),
+        );
+        ring
+    }
+
+    /// (Re)allocate every slot at `slot_count` x `slot_bytes`; resets the
+    /// rotation. Called at construction, on topology-budget changes and
+    /// on the rare oversize-payload growth.
+    fn rebuild_slots(&mut self, device: &wgpu::Device, slot_count: u32, slot_bytes: u64) {
+        self.slots = (0..slot_count)
+            .map(|_| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("upload-staging-ring"),
+                    size: slot_bytes,
+                    usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
+        self.next = 0;
+        self.slot_bytes = slot_bytes;
+        self.staging_ring_allocs += u64::from(slot_count);
+    }
+
+    /// Re-size the ring when the topology budget changes; identical
+    /// geometry keeps the existing slots (no reallocations).
+    pub fn reconfigure(&mut self, device: &wgpu::Device, budget: &TransferTopologyBudget) {
+        let slots = budget.staging_ring_slots.max(1);
+        let bytes = budget.staging_slot_bytes.max(256);
+        if slots as usize == self.slots.len() && bytes == self.slot_bytes {
+            return;
+        }
+        self.rebuild_slots(device, slots, bytes);
+    }
+
+    /// Stage `bytes` for `dst` at `dst_offset` through the next ring slot
+    /// and record the DMA copy in `encoder`. Payloads larger than a slot
+    /// grow the ring's slot size once; a failed map falls back to
+    /// `queue.write_buffer` (counted, never panics).
+    pub fn stage_copy(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        dst: &wgpu::Buffer,
+        dst_offset: u64,
+        bytes: &[u8],
+    ) {
+        if bytes.is_empty() {
+            return;
+        }
+        let len = bytes.len() as u64;
+        if len > self.slot_bytes {
+            let slots = self.slots.len().max(1) as u32;
+            self.rebuild_slots(device, slots, len.next_power_of_two());
+        }
+        let index = self.next;
+        self.next = (self.next + 1) % self.slots.len();
+        let slot = &self.slots[index];
+        let slice = slot.slice(..len);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Write, move |result| {
+            let _ = tx.send(result);
+        });
+        let mapped = device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| e.to_string())
+            .and_then(|_| {
+                rx.recv()
+                    .map_err(|_| "map_async channel closed".to_string())
+                    .and_then(|r| r.map_err(|e| format!("map_async: {e}")))
+            });
+        if mapped.is_err() {
+            // A staging slot that will not map must never stall uploads:
+            // fall back to the queue's own staging path and count it.
+            self.staging_ring_fallbacks += 1;
+            queue.write_buffer(dst, dst_offset, bytes);
+            return;
+        }
+        if let Ok(mut view) = slice.get_mapped_range_mut() {
+            view.copy_from_slice(bytes);
+            drop(view);
+            slot.unmap();
+            encoder.copy_buffer_to_buffer(slot, 0, dst, dst_offset, len);
+            self.staging_ring_uploads += 1;
+        } else {
+            self.staging_ring_fallbacks += 1;
+            slot.unmap();
+            queue.write_buffer(dst, dst_offset, bytes);
+        }
+    }
 }
 
 /// The `HardFloor1000Fps` upload-drain preset: at a 1000 fps pace a
@@ -1146,6 +1405,7 @@ fn encode_opaque_terrain<'a>(
     scene: Option<&'a TerrainBuffers>,
     live_sections: &'a HashMap<SectionCoord, LiveTerrainSection>,
     region_arenas: &'a BTreeMap<[i32; 3], RegionArena>,
+    shared_index: &'a wgpu::Buffer,
     culled_sections: &HashSet<SectionCoord>,
     camera_position: [f32; 3],
     chunk_fades: &ChunkFadeTracker,
@@ -1199,17 +1459,19 @@ fn encode_opaque_terrain<'a>(
         }
     }
     // S4 shared region arena: one bind group + buffer pair per
-    // 8x4x8 region; seven contiguous direction-bucket streams in
-    // a single index buffer merge into a few draws per region.
+    // 8x4x8 region; seven direction-bucket record sets merge into a few
+    // draws per region, all indexed positionally into the one shared
+    // canonical quad index buffer.
     if !region_arenas.is_empty() {
         pass.set_pipeline(region_pipeline);
+        pass.set_index_buffer(shared_index.slice(..), wgpu::IndexFormat::Uint32);
         // Front-to-back: nearest regions rasterize first so hardware
         // Early-Z/Hi-Z rejects occluded far terrain before it shades.
         let mut arena_order: Vec<[i32; 3]> = region_arenas.keys().copied().collect();
         sort_regions_front_to_back(&mut arena_order, camera_position);
         for origin in arena_order {
             let arena = &region_arenas[&origin];
-            if arena.index_len == 0 {
+            if arena.draw_empty() {
                 continue;
             }
             let mut bound = false;
@@ -1243,10 +1505,6 @@ fn encode_opaque_terrain<'a>(
                     if !bound {
                         pass.set_bind_group(0, Some(&arena.bind_group), &[]);
                         pass.set_vertex_buffer(0, Some(arena.vertex_buffer.slice(..)));
-                        pass.set_index_buffer(
-                            arena.index_buffer.slice(..),
-                            wgpu::IndexFormat::Uint32,
-                        );
                         bound = true;
                     }
                     emitted.insert(*coord);
@@ -1281,12 +1539,19 @@ fn encode_opaque_terrain<'a>(
         // Restore the per-section pipeline for the fallback path.
         pass.set_pipeline(opaque_pipeline);
     }
+    let mut per_section_index_bound = false;
     for (coord, section) in live_sections.iter() {
         if section.arena.is_some()
             || culled_sections.contains(coord)
             || section.opaque_index_total == 0
         {
             continue;
+        }
+        if !per_section_index_bound {
+            // The fallback path draws the same canonical pattern — the
+            // shared buffer serves local index space identically.
+            pass.set_index_buffer(shared_index.slice(..), wgpu::IndexFormat::Uint32);
+            per_section_index_bound = true;
         }
         let fade = chunk_fades.fade_alpha(coord.0, coord.2);
         let min = [
@@ -1309,10 +1574,6 @@ fn encode_opaque_terrain<'a>(
                     pass.set_bind_group(0, Some(&section.bind_group), &[]);
                     pass.set_bind_group(1, Some(draw_bg), &[off]);
                     pass.set_vertex_buffer(0, Some(section.terrain.opaque_vertices.slice(..)));
-                    pass.set_index_buffer(
-                        section.terrain.opaque_indices.slice(..),
-                        wgpu::IndexFormat::Uint32,
-                    );
                     pass.draw_indexed(start..start + count, 0, 0..1);
                 }
             }
@@ -1321,10 +1582,6 @@ fn encode_opaque_terrain<'a>(
                 pass.set_bind_group(0, Some(&section.bind_group), &[]);
                 pass.set_bind_group(1, Some(draw_bg), &[off]);
                 pass.set_vertex_buffer(0, Some(section.terrain.opaque_vertices.slice(..)));
-                pass.set_index_buffer(
-                    section.terrain.opaque_indices.slice(..),
-                    wgpu::IndexFormat::Uint32,
-                );
                 pass.draw_indexed(0..section.terrain.opaque_index_count, 0, 0..1);
             }
         }
@@ -1483,12 +1740,45 @@ pub struct GpuRenderer {
     /// emitted for `InstancedPartBatch` streams (per-pass value, not
     /// cumulative): 2,000 same-kind parts still cost 1 draw.
     pub instanced_kinetic_draws: u64,
-    /// Shared vertex/index arenas over `RenderRegions`' 8x4x8 grid feeding
+    /// Shared vertex arenas over `RenderRegions`' 8x4x8 grid feeding
     /// the composed opaque path's merged bucket draws.
     region_arenas: BTreeMap<[i32; 3], RegionArena>,
     /// Region-arena opaque path toggle; `false` falls back to per-section
     /// opaque buffers (A/B pixel comparison and bring-up).
     arena_enabled: bool,
+    /// The one global opaque index stream: [`QUAD_INDEX_PATTERN`]
+    /// repeated with a +4 stride per quad. Every opaque quad draw —
+    /// per-section and arena-resident alike — indexes it positionally
+    /// (`first_index = first_quad * 6`), so no per-section or per-region
+    /// index buffers exist and 100% of opaque quads share this stream.
+    shared_quad_index_buffer: wgpu::Buffer,
+    /// Indices currently resident in `shared_quad_index_buffer`; grows
+    /// geometrically to cover the largest referenced extent.
+    shared_quad_index_capacity: u32,
+    /// Persistent `MAP_WRITE | COPY_SRC` staging ring all chunk/arena
+    /// uploads copy through — zero `create_buffer` calls in steady state.
+    staging_ring: UploadStagingRing,
+    /// GPU compute Hi-Z pyramid + section culler (audit V4), lazily
+    /// created at the frame depth resolution.
+    gpu_hiz: Option<GpuHizCuller>,
+    /// GPU section-cull dispatches run through [`GpuHizCuller`].
+    pub gpu_hiz_cull_calls: u64,
+    /// Sections the GPU culler proved invisible, cumulative.
+    pub gpu_hiz_culled: u64,
+    /// Transfer-layer sizing from the memory topology
+    /// ([`MemoryTransferStrategy`] x [`MemoryFootprintClass`]) — never a
+    /// quality dial.
+    transfer_budget: TransferTopologyBudget,
+    /// Host RAM class feeding [`TransferTopologyBudget::for_topology`];
+    /// seeded from the detected profile at construction.
+    memory_footprint_class: MemoryFootprintClass,
+    /// Payloads staged through [`Self::staging_ring`], cumulative.
+    pub staging_ring_uploads: u64,
+    /// Staging slot buffers allocated, cumulative (warm-up +
+    /// reconfiguration only — constant in steady state).
+    pub staging_ring_allocs: u64,
+    /// Staged writes the per-frame DMA cap deferred, cumulative.
+    pub staging_ring_dma_defers: u64,
     /// Shared 16-byte vertex buffer for arena-resident sections (their
     /// opaque geometry lives in the region arena).
     empty_vertex_buffer: wgpu::Buffer,
@@ -2316,6 +2606,7 @@ fn record_shadow_cascade<'a>(
     live_sections: &'a HashMap<SectionCoord, LiveTerrainSection>,
     region_offsets: &[([i32; 3], u32)],
     region_arenas: &'a BTreeMap<[i32; 3], RegionArena>,
+    shared_index: &'a wgpu::Buffer,
     entry_offsets: &[u32],
     batch_offsets: &[u32],
     subworld_gpu: &'a SubWorldGpuCache,
@@ -2350,17 +2641,15 @@ fn record_shadow_cascade<'a>(
         pass.set_bind_group(1, Some(&section.bind_group), &[]);
         pass.set_bind_group(2, Some(&shadow.draw_bg), &[*offset]);
         pass.set_vertex_buffer(0, Some(section.terrain.opaque_vertices.slice(..)));
-        pass.set_index_buffer(
-            section.terrain.opaque_indices.slice(..),
-            wgpu::IndexFormat::Uint32,
-        );
+        pass.set_index_buffer(shared_index.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..section.terrain.opaque_index_count, 0, 0..1);
     }
     // Arena-resident sections cast through the region depth pipeline:
-    // the light needs every bucket, so the whole flushed index stream
-    // goes in one draw per region.
+    // the light needs every bucket, so the arena's committed live ranges
+    // draw positionally through the shared index buffer.
     if !region_offsets.is_empty() {
         pass.set_pipeline(&shadow.terrain_region_depth);
+        pass.set_index_buffer(shared_index.slice(..), wgpu::IndexFormat::Uint32);
         for (origin, offset) in region_offsets {
             let (min, max) = region_world_aabb(*origin);
             if !aabb_in_cascade(min, max, ortho) {
@@ -2371,8 +2660,9 @@ fn record_shadow_cascade<'a>(
             pass.set_bind_group(1, Some(&arena.bind_group), &[]);
             pass.set_bind_group(2, Some(&shadow.draw_bg), &[*offset]);
             pass.set_vertex_buffer(0, Some(arena.vertex_buffer.slice(..)));
-            pass.set_index_buffer(arena.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..arena.index_len, 0, 0..1);
+            arena.for_each_live_range(|start, end| {
+                pass.draw_indexed(start..end, 0, 0..1);
+            });
         }
     }
     pass.set_pipeline(&shadow.lit_depth);
@@ -3508,8 +3798,31 @@ impl GpuRenderer {
         // depth-store policy consults (`TileBasedTbdr` → depth discard).
         let profile = detect_universal_hardware_profile();
         let caps = profile.base;
-        let (upload_budget, mesh_worker_threads) =
-            strategy_upload_defaults(&select_compute_strategy(&caps));
+        let seeded_strategy = select_compute_strategy(&caps);
+        let (upload_budget, mesh_worker_threads) = strategy_upload_defaults(&seeded_strategy);
+        // Transfer-layer sizing keyed by the detected memory topology x
+        // RAM class — strictly bus parameters, never visual quality.
+        let memory_footprint_class = profile.memory_class;
+        let transfer_budget = TransferTopologyBudget::for_topology(
+            seeded_strategy.memory,
+            memory_footprint_class,
+        );
+        let staging_ring = UploadStagingRing::new(&ctx.device, &transfer_budget);
+        // The shared static quad index buffer starts at one slab of the
+        // canonical `[0,1,2,0,2,3]` pattern; `flush_region_arenas` grows
+        // it geometrically past the largest referenced extent.
+        let shared_quad_index_capacity = 384u32;
+        let shared_quad_index_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shared-quad-indices"),
+            size: u64::from(shared_quad_index_capacity) * 4,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        ctx.queue.write_buffer(
+            &shared_quad_index_buffer,
+            0,
+            bytemuck::cast_slice(&quad_index_pattern(shared_quad_index_capacity)),
+        );
         // Low-core / cache-poor hosts: one background worker keeps
         // far-mesh generation off the render thread without letting the
         // pool compete for the few cores the render thread needs.
@@ -3567,6 +3880,17 @@ impl GpuRenderer {
             instanced_kinetic_draws: 0,
             region_arenas: BTreeMap::new(),
             arena_enabled: true,
+            shared_quad_index_buffer,
+            shared_quad_index_capacity,
+            staging_ring,
+            gpu_hiz: None,
+            gpu_hiz_cull_calls: 0,
+            gpu_hiz_culled: 0,
+            transfer_budget,
+            memory_footprint_class,
+            staging_ring_uploads: 0,
+            staging_ring_allocs: 0,
+            staging_ring_dma_defers: 0,
             empty_vertex_buffer,
             empty_index_buffer,
             mesh_pool: MeshJobPool::new(mesh_worker_threads),
@@ -4480,8 +4804,9 @@ impl GpuRenderer {
             }
             self.invalidate_hiz();
         }
+        let grace = self.transfer_budget.idle_slab_reclaim_frames;
         self.region_arenas
-            .retain(|_, arena| !arena.slots.is_empty());
+            .retain(|_, arena| !arena.slots.is_empty() || arena.empty_frames < grace);
         for (coord, packed) in world.packed_meshes() {
             let order = world.translucent_order(coord).unwrap_or(&[]);
             scheduled += usize::from(self.queue_live_section_upload(world, coord, packed, order));
@@ -4629,8 +4954,9 @@ impl GpuRenderer {
             }
         }
         if !dirty.is_empty() || removed_any {
+            let grace = self.transfer_budget.idle_slab_reclaim_frames;
             self.region_arenas
-                .retain(|_, arena| !arena.slots.is_empty());
+                .retain(|_, arena| !arena.slots.is_empty() || arena.empty_frames < grace);
             self.section_graphs.clear();
             self.section_graphs.extend(world.section_graphs());
             self.cull_graphs_stamp = self.compute_graphs_stamp();
@@ -4680,7 +5006,7 @@ impl GpuRenderer {
         order: Arc<[u32]>,
         buckets: Option<DirectionBuckets>,
         opaque_bucket_ranges: Option<[(u32, u32); DIRECTION_BUCKETS]>,
-        geometry: LiveSectionGeometry,
+        mut geometry: LiveSectionGeometry,
     ) {
         // Retire the previous residency first: a re-upload may switch a
         // section between the arena and per-section storage.
@@ -4694,11 +5020,15 @@ impl GpuRenderer {
             }
         }
         let opaque_index_total = geometry.opaque_indices.len() as u32;
+        // Pre-upload diagonal rotation: flip-marked quads become
+        // canonical `[0,1,2,0,2,3]` draws, so every opaque quad —
+        // arena-resident or per-section — indexes the one shared static
+        // index buffer positionally.
+        rotate_opaque_quads_for_shared_index(&mut geometry.opaque);
         let arena_origin = (self.arena_enabled && opaque_index_total > 0 && buckets.is_some())
             .then(|| {
                 let origin = RenderRegions::origin_of(coord);
                 let ranges = opaque_bucket_ranges.unwrap_or([(0, 0); DIRECTION_BUCKETS]);
-                let local: Arc<[u32]> = geometry.opaque_indices.as_slice().into();
                 let section_word = region_section_word(origin, coord);
                 if !self.region_arenas.contains_key(&origin) {
                     let arena = RegionArena::new(
@@ -4715,7 +5045,7 @@ impl GpuRenderer {
                     // partial write — no CPU vertex copy is retained per
                     // section (previously a 24-byte `RegionVertex` Vec sat
                     // resident in the arena for its whole lifetime).
-                    arena.insert(coord, &geometry.opaque, section_word, local, ranges);
+                    arena.insert(coord, &geometry.opaque, section_word, ranges);
                     self.cpu_opaque_bytes_freed += (geometry.opaque.len() * 16) as u64;
                 }
                 origin
@@ -4727,6 +5057,12 @@ impl GpuRenderer {
                 0,
             )
         } else {
+            // Per-section opaque draws share the global canonical index
+            // buffer too — the local index stream was byte-identical to
+            // the shared pattern, so only the vertex buffer stays
+            // per-section and the index slot keeps the dummy handle
+            // (draw sites bind `self.shared_quad_index_buffer` live so a
+            // growth realloc never leaves a stale slice bound).
             (
                 vertex_buffer(
                     &self.ctx.device,
@@ -4734,12 +5070,7 @@ impl GpuRenderer {
                     "live-opaque-verts",
                     &geometry.opaque,
                 ),
-                index_buffer(
-                    &self.ctx.device,
-                    &self.ctx.queue,
-                    "live-opaque-indices",
-                    &geometry.opaque_indices,
-                ),
+                self.empty_index_buffer.clone(),
                 opaque_index_total,
             )
         };
@@ -4943,16 +5274,94 @@ impl GpuRenderer {
         }
     }
 
-    /// Write dirty region-arena vertex/index streams to their GPU
-    /// buffers. Runs at the upload boundary so the render pass reads
-    /// immutable arena state. Vertex inserts land as slot-range partial
-    /// `write_buffer`s — counted in `region_partial_uploads`.
+    /// Grow the shared quad index buffer past the largest referenced
+    /// extent (arena high-water marks and non-arena sections' index
+    /// counts). The contents are the pure [`QUAD_INDEX_PATTERN`] stream,
+    /// so growth is one geometric re-create + pattern upload. Returns
+    /// whether the buffer was replaced (recorded bundles referencing it
+    /// must re-record).
+    fn ensure_shared_quad_index_capacity(&mut self) -> bool {
+        let mut needed = self
+            .live_sections
+            .values()
+            .map(|section| section.opaque_index_total)
+            .max()
+            .unwrap_or(0);
+        for arena in self.region_arenas.values() {
+            needed = needed.max(arena.index_extent());
+        }
+        if needed <= self.shared_quad_index_capacity {
+            return false;
+        }
+        let quads = needed.div_ceil(6).next_power_of_two().max(64);
+        let capacity = quads * 6;
+        let buffer = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shared-quad-indices"),
+            size: u64::from(capacity) * 4,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.ctx.queue.write_buffer(
+            &buffer,
+            0,
+            bytemuck::cast_slice(&quad_index_pattern(capacity)),
+        );
+        self.shared_quad_index_buffer = buffer;
+        self.shared_quad_index_capacity = capacity;
+        true
+    }
+
+    /// Write dirty region-arena vertex streams to their GPU buffers
+    /// through the persistent staging ring, under this frame's DMA byte
+    /// cap. Runs at the upload boundary so the render pass reads
+    /// immutable arena state. Staged inserts land as slot-range DMA
+    /// copies — counted in `region_partial_uploads` and
+    /// `staging_ring_uploads`. Also ticks the idle-slab reclaim clock:
+    /// an arena empty for `idle_slab_reclaim_frames` retires its
+    /// buffers, and the shared index buffer grows to cover whatever
+    /// committed.
     fn flush_region_arenas(&mut self) {
         let mut replaced = false;
+        let mut encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("region-arena-flush"),
+            });
+        let mut dma_remaining = self.transfer_budget.frame_dma_cap_bytes;
+        let slab = self.transfer_budget.arena_slab_bytes as usize;
         for arena in self.region_arenas.values_mut() {
-            let (partial, buffers_replaced) = arena.flush_gpu(&self.ctx.device, &self.ctx.queue);
+            let (partial, buffers_replaced) = arena.flush_gpu(
+                &self.ctx.device,
+                &self.ctx.queue,
+                &mut encoder,
+                &mut self.staging_ring,
+                &mut dma_remaining,
+                slab,
+            );
             self.region_partial_uploads += u64::from(partial);
             replaced |= buffers_replaced;
+        }
+        self.ctx.queue.submit([encoder.finish()]);
+        self.staging_ring_uploads = self.staging_ring.staging_ring_uploads;
+        self.staging_ring_allocs = self.staging_ring.staging_ring_allocs;
+        self.staging_ring_dma_defers = self.staging_ring.staging_ring_dma_defers;
+        // Idle-slab reclaim: an arena whose slots all left keeps its
+        // buffers for the grace period (a chunk re-entering the region
+        // then reuses them), then retires.
+        let grace = self.transfer_budget.idle_slab_reclaim_frames;
+        for arena in self.region_arenas.values_mut() {
+            if arena.slots.is_empty() {
+                arena.empty_frames += 1;
+            } else {
+                arena.empty_frames = 0;
+            }
+        }
+        self.region_arenas.retain(|_, arena| {
+            !arena.slots.is_empty() || arena.empty_frames < grace
+        });
+        if self.ensure_shared_quad_index_capacity() {
+            replaced = true;
         }
         if replaced {
             // The recorded opaque-terrain bundle still references the
@@ -5201,6 +5610,201 @@ impl GpuRenderer {
         self.cull_result = culled;
     }
 
+    /// The lazily-created GPU Hi-Z pyramid + section culler (audit V4),
+    /// (re)built when `width`x`height` changes. Callers record a pyramid
+    /// build (`build_from_depth` against [`Self::frame_depth_view`] or
+    /// `build_from_r32`) through the returned handle before
+    /// [`Self::gpu_cull_live_sections`] dispatches the cull pass.
+    pub fn gpu_hiz_culler(&mut self, width: u32, height: u32) -> &mut GpuHizCuller {
+        let stale = self
+            .gpu_hiz
+            .as_ref()
+            .is_some_and(|hiz| hiz.resolution() != (width, height));
+        if stale || self.gpu_hiz.is_none() {
+            self.gpu_hiz = Some(GpuHizCuller::new(&self.ctx.device, width, height));
+        }
+        self.gpu_hiz.as_mut().expect("gpu hiz created")
+    }
+
+    /// The frame depth view, when a depth attachment exists — the
+    /// production source for [`GpuHizCuller::build_from_depth`].
+    pub fn frame_depth_view(&self) -> Option<&wgpu::TextureView> {
+        self.depth_view.as_ref()
+    }
+
+    /// Rebuild the GPU Hi-Z pyramid from the frame depth buffer at its
+    /// current resolution — the per-frame step between the opaque pass
+    /// and [`Self::gpu_cull_live_sections`]. Returns `false` until a
+    /// depth attachment exists.
+    pub fn gpu_hiz_build_from_frame_depth(&mut self) -> bool {
+        let Some(view) = self.depth_view.as_ref() else {
+            return false;
+        };
+        let (width, height) = self.depth_size;
+        let stale = self
+            .gpu_hiz
+            .as_ref()
+            .is_some_and(|hiz| hiz.resolution() != (width, height));
+        if stale || self.gpu_hiz.is_none() {
+            self.gpu_hiz = Some(GpuHizCuller::new(&self.ctx.device, width, height));
+        }
+        let device = &self.ctx.device;
+        let culler = self.gpu_hiz.as_mut().expect("gpu hiz created");
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("gpu-hiz-frame-build"),
+        });
+        culler.build_from_depth(device, &mut encoder, view);
+        self.ctx.queue.submit([encoder.finish()]);
+        true
+    }
+
+    /// GPU compute section cull over every drawable live section: packs
+    /// `SectionGpuRecord`s from `live_sections`, dispatches
+    /// `SECTION_CULL_WGSL` against the already-built pyramid and returns
+    /// the coords the GPU proves invisible — the same contract
+    /// [`Self::cull_result`] carries. With no built pyramid this returns
+    /// empty (a zero-initialised pyramid can never produce a false cull).
+    pub fn gpu_cull_live_sections(
+        &mut self,
+        view_proj: &Mat4,
+        camera_position: [f32; 3],
+    ) -> Vec<SectionCoord> {
+        let (mip_count, (hiz_w, hiz_h)) = match &self.gpu_hiz {
+            Some(hiz) if hiz.pyramid_ready() => (hiz.mip_count(), hiz.resolution()),
+            _ => return Vec::new(),
+        };
+        let edge = EDGE as f32;
+        let mut coords = Vec::new();
+        let mut records = Vec::new();
+        for (coord, section) in self.live_sections.iter() {
+            if section.opaque_index_total == 0 && section.terrain.translucent_index_count == 0 {
+                continue;
+            }
+            let min = [
+                coord.0 as f32 * edge,
+                coord.1 as f32 * edge,
+                coord.2 as f32 * edge,
+            ];
+            coords.push(*coord);
+            records.push(SectionGpuRecord {
+                aabb_min: [min[0], min[1], min[2], 0.0],
+                aabb_max: [min[0] + edge, min[1] + edge, min[2] + edge, 0.0],
+                index_count: section.opaque_index_total,
+                first_index: 0,
+                base_vertex: 0,
+                first_instance: 0,
+                _pad: [0; 4],
+            });
+        }
+        if records.is_empty() {
+            return Vec::new();
+        }
+        let count = records.len() as u32;
+        let uniforms = CullUniforms {
+            view_proj: *view_proj,
+            planes: frustum_planes_from_view_proj(view_proj),
+            camera_pos: [camera_position[0], camera_position[1], camera_position[2], 0.0],
+            params: [hiz_w as f32, hiz_h as f32, mip_count as f32, count as f32],
+        };
+        let device = &self.ctx.device;
+        let uniforms_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu-cull-uniforms"),
+            size: std::mem::size_of::<CullUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.ctx
+            .queue
+            .write_buffer(&uniforms_buf, 0, bytemuck::bytes_of(&uniforms));
+        let sections_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu-cull-sections"),
+            size: (records.len() * std::mem::size_of::<SectionGpuRecord>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.ctx
+            .queue
+            .write_buffer(&sections_buf, 0, bytemuck::cast_slice(&records));
+        let args_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu-cull-args"),
+            size: (records.len() * std::mem::size_of::<IndirectArgs>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let stats_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu-cull-stats"),
+            size: std::mem::size_of::<CullStats>() as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.ctx
+            .queue
+            .write_buffer(&stats_buf, 0, bytemuck::bytes_of(&CullStats::default()));
+        let masks_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu-cull-masks"),
+            size: (records.len() * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("gpu-section-cull"),
+        });
+        let culler = self.gpu_hiz.as_mut().expect("gpu hiz ready");
+        culler.encode_cull(
+            device,
+            &mut encoder,
+            &uniforms_buf,
+            &sections_buf,
+            &args_buf,
+            &stats_buf,
+            &masks_buf,
+            count,
+        );
+        self.ctx.queue.submit([encoder.finish()]);
+        // Blocking readback: the render path consumes culled coords
+        // one frame after the dispatch (same latency the CPU Hi-Z path
+        // tolerates), so a synchronous map is acceptable here.
+        let size = (records.len() * std::mem::size_of::<IndirectArgs>()) as u64;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu-cull-readback"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("gpu-cull-readback"),
+        });
+        encoder.copy_buffer_to_buffer(&args_buf, 0, &readback, 0, size);
+        self.ctx.queue.submit([encoder.finish()]);
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let mapped = rx
+            .recv()
+            .ok()
+            .and_then(|r| r.ok())
+            .and_then(|_| slice.get_mapped_range().ok())
+            .map(|view| view.to_vec());
+        readback.unmap();
+        let Some(bytes) = mapped else {
+            return Vec::new();
+        };
+        let args: &[IndirectArgs] = bytemuck::cast_slice(&bytes);
+        let culled: Vec<SectionCoord> = coords
+            .iter()
+            .zip(args.iter())
+            .filter_map(|(coord, arg)| (arg.instance_count == 0).then_some(*coord))
+            .collect();
+        self.gpu_hiz_cull_calls += 1;
+        self.gpu_hiz_culled += culled.len() as u64;
+        culled
+    }
+
     /// The active per-frame chunk-upload budget.
     pub fn upload_budget(&self) -> &ChunkUploadBudget {
         &self.upload_budget
@@ -5241,26 +5845,43 @@ impl GpuRenderer {
     }
 
     /// Push an adaptive [`ComputeStrategy`] into the renderer: the memory
-    /// topology selects the chunk-upload budget preset and mesh-worker
-    /// concurrency hint, while the cache/SIMD tiers pick conservative
-    /// initial render-scale and shadow-negotiation requests (device caps
-    /// still negotiate down inside [`Self::set_shadow_quality`]). Returns
-    /// the negotiated shadow quality.
+    /// topology selects the chunk-upload budget preset, mesh-worker
+    /// concurrency hint and [`TransferTopologyBudget`] (staging-ring
+    /// slots/bytes, arena slab size, idle-slab reclaim grace, per-frame
+    /// DMA cap). Render scale and shadow quality are deliberately NOT
+    /// touched — memory topology is a transfer-layer decision, so UMA
+    /// keeps the user's `Native100` and chosen shadow preset exactly like
+    /// a discrete GPU does. Returns the current negotiated shadow
+    /// quality for callers that still consume it.
     pub fn apply_compute_strategy(&mut self, strategy: &ComputeStrategy) -> BuiltinShadowQuality {
         let (budget, workers) = strategy_upload_defaults(strategy);
         self.upload_budget = budget;
         self.mesh_worker_threads = workers;
         self.mesh_pool.set_threads(workers);
-        self.set_render_scale(match strategy.memory {
-            MemoryTransferStrategy::UnifiedZeroCopy => RenderScalePreset::Balanced75,
-            MemoryTransferStrategy::DiscreteStagedArena => RenderScalePreset::Native100,
-        });
-        let negotiated = self.set_shadow_quality(match strategy.memory {
-            MemoryTransferStrategy::UnifiedZeroCopy => BuiltinShadowQuality::Low,
-            MemoryTransferStrategy::DiscreteStagedArena => BuiltinShadowQuality::Natural,
-        });
+        self.transfer_budget =
+            TransferTopologyBudget::for_topology(strategy.memory, self.memory_footprint_class);
+        self.staging_ring
+            .reconfigure(&self.ctx.device, &self.transfer_budget);
         self.compute_strategy_apply_count += 1;
-        negotiated
+        self.staging_ring_uploads = self.staging_ring.staging_ring_uploads;
+        self.staging_ring_allocs = self.staging_ring.staging_ring_allocs;
+        self.staging_ring_dma_defers = self.staging_ring.staging_ring_dma_defers;
+        self.shadow_quality
+    }
+
+    /// The active [`TransferTopologyBudget`] — staging-ring geometry,
+    /// arena slab size, idle-slab grace and per-frame DMA cap derived
+    /// from the last applied memory topology (never visual settings).
+    pub fn transfer_topology_budget(&self) -> TransferTopologyBudget {
+        self.transfer_budget
+    }
+
+    /// Override the host RAM class used when a strategy's memory topology
+    /// re-derives [`Self::transfer_budget`] (embedders that know the
+    /// profile better than the detector — e.g. tests — set this before
+    /// [`Self::apply_compute_strategy`]).
+    pub fn set_memory_footprint_class(&mut self, class: MemoryFootprintClass) {
+        self.memory_footprint_class = class;
     }
 
     /// Times [`Self::apply_compute_strategy`] has configured the renderer.
@@ -5355,7 +5976,8 @@ impl GpuRenderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         self.depth_view = Some(texture.create_view(&wgpu::TextureViewDescriptor::default()));
@@ -5650,26 +6272,29 @@ impl GpuRenderer {
                     pass.set_bind_group(0, &section.bind_group, &[]);
                     pass.set_vertex_buffer(0, section.terrain.opaque_vertices.slice(..));
                     pass.set_index_buffer(
-                        section.terrain.opaque_indices.slice(..),
+                        self.shared_quad_index_buffer.slice(..),
                         wgpu::IndexFormat::Uint32,
                     );
                     pass.draw_indexed(0..section.terrain.opaque_index_count, 0, 0..1);
                 }
-                // No camera in this path => no facing cull; every flushed
-                // region bucket stream draws in one call per region.
+                // No camera in this path => no facing cull; every
+                // committed live range of each region draws positionally
+                // through the shared index buffer.
                 if !self.region_arenas.is_empty() {
                     pass.set_pipeline(&self.terrain_region_pipeline);
+                    pass.set_index_buffer(
+                        self.shared_quad_index_buffer.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
                     for arena in self.region_arenas.values() {
-                        if arena.index_len == 0 {
+                        if arena.draw_empty() {
                             continue;
                         }
                         pass.set_bind_group(0, &arena.bind_group, &[]);
                         pass.set_vertex_buffer(0, arena.vertex_buffer.slice(..));
-                        pass.set_index_buffer(
-                            arena.index_buffer.slice(..),
-                            wgpu::IndexFormat::Uint32,
-                        );
-                        pass.draw_indexed(0..arena.index_len, 0, 0..1);
+                        arena.for_each_live_range(|start, end| {
+                            pass.draw_indexed(start..end, 0, 0..1);
+                        });
                     }
                 }
                 pass.set_pipeline(&self.translucent_pipeline);
@@ -6160,7 +6785,7 @@ impl GpuRenderer {
         let region_offsets: Vec<_> = self
             .region_arenas
             .iter()
-            .filter(|(_, arena)| arena.index_len > 0)
+            .filter(|(_, arena)| !arena.draw_empty())
             .map(|(origin, _)| (*origin, push_model(identity)))
             .collect();
         let entry_offsets: Vec<_> = self
@@ -6201,14 +6826,16 @@ impl GpuRenderer {
                 u64::from(self.live_sections[coord].opaque_index_total),
             );
         }
+        // The shared index buffer's identity is part of the caster set —
+        // a growth realloc invalidates recorded draws referencing it.
+        fnv1a_u64(&mut casters, u64::from(self.shared_quad_index_capacity));
         for (origin, _) in &region_offsets {
             let arena = &self.region_arenas[origin];
             for v in origin {
                 fnv1a_u32(&mut casters, *v as u32);
             }
-            fnv1a_u64(&mut casters, u64::from(arena.index_len));
+            fnv1a_u64(&mut casters, u64::from(arena.index_extent()));
             fnv1a_u64(&mut casters, arena.vertex_capacity as u64);
-            fnv1a_u64(&mut casters, arena.index_capacity as u64);
         }
         for entry in self
             .subworld_gpu
@@ -6288,6 +6915,7 @@ impl GpuRenderer {
                         &self.live_sections,
                         &region_offsets,
                         &self.region_arenas,
+                        &self.shared_quad_index_buffer,
                         bundle_entry_offsets,
                         bundle_batch_offsets,
                         &self.subworld_gpu,
@@ -6672,6 +7300,7 @@ impl GpuRenderer {
         let scene = &self.scene;
         let live_sections = &self.live_sections;
         let region_arenas = &self.region_arenas;
+        let shared_index = &self.shared_quad_index_buffer;
         let mut skipped_buckets = 0u64;
         let mut arena_draws = 0u64;
         let mut arena_sections = 0usize;
@@ -6772,6 +7401,7 @@ impl GpuRenderer {
                         scene.as_ref(),
                         live_sections,
                         region_arenas,
+                        shared_index,
                         culled_sections,
                         camera_position,
                         chunk_fades,
@@ -6802,6 +7432,7 @@ impl GpuRenderer {
                         scene.as_ref(),
                         live_sections,
                         region_arenas,
+                        shared_index,
                         culled_sections,
                         camera_position,
                         chunk_fades,

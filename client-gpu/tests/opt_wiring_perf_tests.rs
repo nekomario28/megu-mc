@@ -215,13 +215,29 @@ fn compute_strategy_and_kernel_autotuner_are_consumed() {
         expected_max_uploads
     );
 
-    // Initial render-scale / shadow negotiation defaults follow the strategy.
-    let expected_scale = match live.compute_strategy.memory {
-        MemoryTransferStrategy::UnifiedZeroCopy => RenderScalePreset::Balanced75,
-        MemoryTransferStrategy::DiscreteStagedArena => RenderScalePreset::Native100,
-    };
-    assert_eq!(renderer.render_scale, expected_scale);
+    // Memory topology tunes transfer-layer parameters only: render scale
+    // and shadow quality keep their user/device values on BOTH topologies
+    // (no forced UMA downgrade — the returned value is the unchanged
+    // negotiated shadow quality).
+    assert_eq!(renderer.render_scale, RenderScalePreset::Native100);
     assert_eq!(renderer.shadow_quality, negotiated);
+    // The transfer budget still tracks the memory topology (the UMA row
+    // is RAM-class dependent: Standard/Abundant 3x2 MiB, Constrained
+    // 2x1 MiB — both smaller than the discrete 3x8 MiB preset).
+    let budget = renderer.transfer_topology_budget();
+    match live.compute_strategy.memory {
+        MemoryTransferStrategy::UnifiedZeroCopy => {
+            assert!(budget.staging_slot_bytes <= 2 * 1024 * 1024);
+            assert!(budget.frame_dma_cap_bytes <= 3 * 1024 * 1024);
+            assert!(budget.arena_slab_bytes <= 8 * 1024 * 1024);
+        }
+        MemoryTransferStrategy::DiscreteStagedArena => {
+            assert_eq!(budget.staging_ring_slots, 3);
+            assert_eq!(budget.staging_slot_bytes, 8 * 1024 * 1024);
+            assert_eq!(budget.frame_dma_cap_bytes, 8 * 1024 * 1024);
+            assert_eq!(budget.arena_slab_bytes, 32 * 1024 * 1024);
+        }
+    }
 
     // Applying again is idempotent and counted.
     live.apply_compute_strategy(&mut renderer);

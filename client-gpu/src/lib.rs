@@ -3,7 +3,7 @@
 //!
 //! Layers on top of the headless client stack:
 //!
-//! * [`renderer`] — a real `wgpu` backend (Vulkan / Metal / DX12 / GL) that
+//! * [`renderer`] — a real `wgpu` backend (Vulkan / Metal / DX12) that
 //!   uploads `mc_spine_client_mesh` packed quad geometry, compiles the WGSL
 //!   shader suite from `mc_spine_client::shaders`, composites the
 //!   `mc_spine_ui` software-rasterized RGBA framebuffer, and validates Megu
@@ -16,6 +16,7 @@
 //! pure functions unit tests exercise without an adapter.
 
 pub mod atmosphere;
+pub mod gpu_hiz;
 pub mod live_session;
 mod mesh_pool;
 pub mod renderer;
@@ -789,10 +790,10 @@ pub fn gpu_shader_caps_for(
 /// Delegates to [`select_display_presentation_policy`] for the detected
 /// display server so the OS-aware mask reaches `request_gpu_device` and
 /// `probe_adapters`: `Auto`/`MeshShader`/`ComputeIndirect`/`Classic` get
-/// the native modern API first (Vulkan on Linux, DX12 on Windows, Metal
-/// on macOS) with GL kept as the fallback wgpu itself offers;
-/// `ClassicLowSpec` deliberately drops to the GL-only downlevel path the
-/// legacy-Intel profile was built for.
+/// the native modern API (Vulkan on Linux, DX12 on Windows, Metal on
+/// macOS). `wgpu` is built without any GL backend, so there is no GL
+/// fallback on any preference — `ClassicLowSpec` is a feature/limit
+/// budget, not a backend switch.
 pub fn wgpu_backends_for(pref: RenderBackendPreference) -> wgpu::Backends {
     select_display_presentation_policy(detect_display_server_kind(), pref).preferred_backends
 }
