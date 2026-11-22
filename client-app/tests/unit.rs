@@ -1180,6 +1180,7 @@ fn srv_redirect_connect_preserves_original_host_in_handshake() {
             assert_eq!(port, 25565);
             Ok(vec![format!("127.0.0.1:{backend_port}").parse().unwrap()])
         },
+        mc_spine_client::online_auth::OnlineAuthOptions::default(),
     );
     assert!(result.is_err(), "mock server disconnects during login");
     server.join().unwrap();

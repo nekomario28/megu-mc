@@ -11,6 +11,7 @@ pub mod friend_client;
 pub mod hardware_profile;
 pub mod integrated;
 pub mod lod;
+pub mod online_auth;
 pub mod protocol;
 pub mod recovery;
 pub mod render;

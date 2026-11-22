@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use mc_spine_proto::{PacketDir, PacketPhase, ProtocolCodec, RecipeSyncMode};
 
+use crate::online_auth::{self, Aes128Cfb8, OnlineAuthOptions, SessionJoinClient};
 use crate::render::ClientVfxHost;
 use crate::world::WorldAnimationHost;
 use mc_spine_client_mesh::vfx_engine::Vfx1Packet;
@@ -4388,16 +4389,27 @@ pub struct ProtocolClient {
     /// [`crate::audio_out::install_session_audio_config`]); `None` when
     /// audio is off or unconfigured.
     pub audio: Option<crate::audio_out::AudioRuntime>,
+    /// Online-mode login inputs (`--accessToken`, session-join hook, CSPRNG
+    /// override); consumed only if the server sends an Encryption Request.
+    online_auth: OnlineAuthOptions,
+    /// AES-128-CFB8 encryptor armed on every outbound byte once the
+    /// Encryption Response has been sent (online-mode login).
+    cipher_tx: Option<Aes128Cfb8>,
+    /// AES-128-CFB8 decryptor armed on every inbound byte once the
+    /// Encryption Response has been sent.
+    cipher_rx: Option<Aes128Cfb8>,
 }
 
 impl ProtocolClient {
     /// Wrap an already-connected stream at `protocol_version`: the shared
-    /// constructor behind `connect_resolved` (Login path) and
-    /// `ping_server_resolved` (Status path).
+    /// constructor behind `connect_resolved` (Login path, `auth` carries the
+    /// online-mode credentials) and `ping_server_resolved` (Status path,
+    /// always offline).
     fn on_stream(
         stream: TcpStream,
         codec: Arc<dyn ProtocolCodec>,
         protocol_version: mc_spine_proto::ProtocolVersion,
+        auth: OnlineAuthOptions,
     ) -> Self {
         Self {
             stream,
@@ -4418,6 +4430,9 @@ impl ProtocolClient {
             audio: crate::audio_out::session_audio_config()
                 .filter(crate::audio_out::AudioRuntime::enabled)
                 .map(|cfg| crate::audio_out::AudioRuntime::new(&cfg)),
+            online_auth: auth,
+            cipher_tx: None,
+            cipher_rx: None,
         }
     }
 
@@ -4514,6 +4529,34 @@ impl ProtocolClient {
             timeout,
             protocol_version,
             |h, p| mc_spine_proto::resolve_server_address(h, p).map_err(|e| e.to_string()),
+            OnlineAuthOptions::default(),
+        )
+    }
+
+    /// `connect_for_version` with explicit online-mode credentials/hooks: the
+    /// launcher's access token plus (for tests) an injected session-join client
+    /// and deterministic CSPRNG.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_for_version_with_auth(
+        host: &str,
+        port: u16,
+        username: &str,
+        uuid: [u8; 16],
+        view_distance: i8,
+        timeout: Duration,
+        protocol_version: mc_spine_proto::ProtocolVersion,
+        auth: OnlineAuthOptions,
+    ) -> Result<(Self, HandshakeReport), String> {
+        Self::connect_resolved(
+            host,
+            port,
+            username,
+            uuid,
+            view_distance,
+            timeout,
+            protocol_version,
+            |h, p| mc_spine_proto::resolve_server_address(h, p).map_err(|e| e.to_string()),
+            auth,
         )
     }
 
@@ -4530,6 +4573,7 @@ impl ProtocolClient {
         timeout: Duration,
         protocol_version: mc_spine_proto::ProtocolVersion,
         resolve: impl FnOnce(&str, u16) -> Result<Vec<SocketAddr>, String>,
+        auth: OnlineAuthOptions,
     ) -> Result<(Self, HandshakeReport), String> {
         let codec = mc_spine_proto::VersionRouter::with_v767_and_v777()
             .select(protocol_version.number())
@@ -4547,7 +4591,7 @@ impl ProtocolClient {
         let _ = stream.set_read_timeout(Some(timeout));
         let _ = stream.set_write_timeout(Some(timeout));
 
-        let mut client = Self::on_stream(stream, codec, protocol_version);
+        let mut client = Self::on_stream(stream, codec, protocol_version, auth);
 
         // 1. Handshake — original host/port even when the SRV lookup
         //    redirected the TCP target (vanilla ServerNameResolver rule).
@@ -4581,10 +4625,7 @@ impl ProtocolClient {
                     return Err(format!("disconnected during login: {msg}"));
                 }
                 Some("encryption_request") => {
-                    return Err(
-                        "server requested online-mode encryption; offline-mode server required"
-                            .to_string(),
-                    );
+                    client.respond_to_encryption_request(&body)?;
                 }
                 Some("set_compression") | Some("login_compression") => {
                     let threshold = WireReader::new(&body).read_varint()?;
@@ -4785,8 +4826,45 @@ impl ProtocolClient {
         }
     }
 
+    /// Answer a clientbound Login `0x01 Encryption Request`: negotiate the
+    /// shared secret + Mojang session join through
+    /// [`online_auth::plan_encryption_response`], send `0x01 Encryption
+    /// Response` still in plaintext, then arm AES-128-CFB8 on both directions
+    /// — every following frame (`set_compression`, `login_success`,
+    /// configuration, play) rides the cipher exactly like vanilla.
+    fn respond_to_encryption_request(&mut self, body: &[u8]) -> Result<(), String> {
+        if self.cipher_tx.is_some() || self.cipher_rx.is_some() {
+            return Err("duplicate encryption request".to_string());
+        }
+        let fields = online_auth::decode_encryption_request_body(body)?;
+        let mut rng_slot = self.online_auth.rng.take();
+        let mut rng = |buf: &mut [u8]| match &mut rng_slot {
+            Some(f) => f(buf),
+            None => online_auth::fill_os_random(buf),
+        };
+        let join: Arc<dyn SessionJoinClient> = self
+            .online_auth
+            .session_join
+            .clone()
+            .unwrap_or_else(|| Arc::new(online_auth::MojangSessionJoinClient::new()));
+        let plan = online_auth::plan_encryption_response(
+            &fields,
+            self.online_auth.access_token.as_deref(),
+            self.online_auth.profile_uuid,
+            join.as_ref(),
+            &mut rng,
+        )?;
+        self.send_named(PacketPhase::Login, "encryption_response", &plan.response_body)?;
+        self.cipher_tx = Some(Aes128Cfb8::new(&plan.shared_secret, &plan.shared_secret));
+        self.cipher_rx = Some(Aes128Cfb8::new(&plan.shared_secret, &plan.shared_secret));
+        Ok(())
+    }
+
     pub fn send_raw(&mut self, pid: i32, payload: &[u8]) -> Result<(), String> {
-        let frame = encode_packet(pid, payload, self.compression);
+        let mut frame = encode_packet(pid, payload, self.compression);
+        if let Some(tx) = &mut self.cipher_tx {
+            tx.encrypt(&mut frame);
+        }
         self.stream
             .write_all(&frame)
             .map_err(|e| format!("TCP write failed: {e}"))?;
@@ -5443,7 +5521,12 @@ impl ProtocolClient {
             let mut tmp = [0u8; 8192];
             match self.stream.read(&mut tmp) {
                 Ok(0) => return Err("connection closed by peer".to_string()),
-                Ok(n) => self.read_buf.extend_from_slice(&tmp[..n]),
+                Ok(n) => {
+                    if let Some(rx) = &mut self.cipher_rx {
+                        rx.decrypt(&mut tmp[..n]);
+                    }
+                    self.read_buf.extend_from_slice(&tmp[..n]);
+                }
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                     return Ok(None);
                 }
@@ -5709,7 +5792,8 @@ pub fn ping_server_resolved(
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
     let resolved_addr = stream.peer_addr().unwrap_or(addrs[0]);
-    let mut client = ProtocolClient::on_stream(stream, codec, version);
+    let mut client =
+        ProtocolClient::on_stream(stream, codec, version, OnlineAuthOptions::default());
 
     let deadline = Instant::now() + timeout;
 

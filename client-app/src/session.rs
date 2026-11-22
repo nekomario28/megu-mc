@@ -25,7 +25,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use crate::audio_qol::{AudioLimiter, SoundAdmission, SoundKey};
+use crate::cli::CliConfig;
 use crate::crash_reporter::ReportEnv;
+use crate::online_auth::OnlineAuthOptions;
 use crate::protocol::{decode_megu_custom_payload, MeguCustomPayload, SeasonWireSync};
 use crate::recovery::{ContainmentOutcome, CrashCircuitBreaker, CrashGuard, RecoveryAction};
 use crate::sound_assets::{normalize_sound_name, sound_name_hash};
@@ -260,6 +262,23 @@ impl ClientSession {
     /// Whether `subsystem` has been disabled after its breaker tripped.
     pub fn is_subsystem_disabled(&self, subsystem: GuardedSubsystem) -> bool {
         self.disabled_subsystems.contains(&subsystem)
+    }
+}
+
+/// Resolve the connect-time online-mode credentials for a live session: the
+/// launcher's `--accessToken` (only consumed when the server's Encryption
+/// Request carries `should_authenticate`), the default Mojang session-join
+/// client, and the OS CSPRNG. The token is copied into connect state here —
+/// the one place CLI secrets become wire material — and is never logged.
+pub fn online_auth_options(cfg: &CliConfig) -> OnlineAuthOptions {
+    OnlineAuthOptions {
+        access_token: cfg.access_token().map(str::to_string),
+        profile_uuid: cfg
+            .uuid
+            .as_deref()
+            .and_then(|raw| crate::protocol::parse_uuid(raw).ok()),
+        session_join: None,
+        rng: None,
     }
 }
 

@@ -735,7 +735,7 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
         None => offline_uuid(&cfg.username),
     };
     let blocks = BlockTable::load(cfg.assets_json.as_deref());
-    let (mut client, handshake) = ProtocolClient::connect_for_version(
+    let (mut client, handshake) = ProtocolClient::connect_for_version_with_auth(
         &host,
         port,
         &cfg.username,
@@ -743,6 +743,7 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
         cfg.view_distance,
         Duration::from_secs(15),
         cfg.mc_version,
+        crate::session::online_auth_options(cfg),
     )?;
 
     let world = match cfg.version_dir.as_deref() {

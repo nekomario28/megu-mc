@@ -382,6 +382,12 @@ impl CliConfig {
         self.access_token.is_some()
     }
 
+    /// The launcher `--accessToken` value, for the online-mode login path.
+    /// Secret: never log, format, or copy into an error string.
+    pub fn access_token(&self) -> Option<&str> {
+        self.access_token.as_deref()
+    }
+
     pub fn has_xuid(&self) -> bool {
         self.xuid.is_some()
     }
