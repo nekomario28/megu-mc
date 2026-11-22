@@ -16,8 +16,12 @@ use mc_spine_kernel::debug_chords::{
 use mc_spine_client::protocol::encode_slot_stack;
 use mc_spine_client::zsh_command_bar::ZshCommandBar;
 use mc_spine_ui::container_screen::{
-    menu_schema, ContainerScreenState, DragState, UiItemStack,
+    menu_schema, ContainerScreenState, DragState, InventorySortState, UiItemStack,
 };
+use mc_spine_ui::hud_widgets::ScoreboardEntry;
+use mc_spine_ui::magic_hud::LookingAtBlockState;
+use mc_spine_ui::state::{ScoreboardState, TitleOverlayState};
+use crate::live_session::LiveHudFeed;
 use mc_spine_ui::draw::rasterize_draw_list;
 use mc_spine_ui::magic_hud::build_magic_hud_draw_list;
 use mc_spine_ui::state::{
@@ -454,6 +458,12 @@ pub struct GpuApp {
     chat_bar: Option<ZshCommandBar>,
     /// Latest `complete_suggestions` hit for the open chat bar's `/`-input.
     chat_suggestions: Vec<String>,
+    /// QoL container sorter armed by the `SortInventory` keybind.
+    inventory_sort: InventorySortState,
+    /// Last live `title_revision` applied to `ui.hud.title_overlay`.
+    title_seen_rev: u64,
+    /// Fractional-tick accumulator driving `TitleOverlayState::tick` at 20/s.
+    title_tick_accum: f32,
     ui: UiState,
     ui_cache: UiUploadCache,
     render_config: RenderConfig,
@@ -520,6 +530,9 @@ impl GpuApp {
             container_screen: None,
             chat_bar: None,
             chat_suggestions: Vec::new(),
+            inventory_sort: InventorySortState::default(),
+            title_seen_rev: 0,
+            title_tick_accum: 0.0,
             ui,
             ui_cache: UiUploadCache::default(),
             render_config,
@@ -996,6 +1009,79 @@ impl GpuApp {
         }
     }
 
+    /// Mirror the live session's server-driven HUD channels into the UI
+    /// tree so `ui.render` composites them: sidebar `ScoreboardState`
+    /// (display slot 1), `TitleOverlayState` (re-armed on `title_revision`
+    /// edges, ticked at 20 TPS), and the Jade-style `LookingAtBlockState`.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_live_hud(
+        ui: &mut UiState,
+        title_seen_rev: &mut u64,
+        title_tick_accum: &mut f32,
+        dt: f32,
+        feed: &LiveHudFeed,
+    ) {
+        let sidebar_objective = feed.scoreboard.display_slots.get(&1);
+        ui.hud.scoreboard = match sidebar_objective {
+            Some(objective) => ScoreboardState {
+                objective_title: feed
+                    .scoreboard
+                    .objectives
+                    .get(objective)
+                    .and_then(|(nbt, _, _)| nbt.as_ref())
+                    .and_then(|bytes| {
+                        mc_spine_client::protocol::WireReader::new(bytes)
+                            .read_nbt()
+                            .ok()
+                            .map(|value| value.extract_text())
+                    }),
+                entries: feed
+                    .scoreboard
+                    .scores
+                    .iter()
+                    .filter(|((name, _), _)| name == objective)
+                    .map(|((_, owner), score)| ScoreboardEntry {
+                        label: owner.clone(),
+                        score: *score,
+                    })
+                    .collect(),
+                visible: true,
+            },
+            None => ScoreboardState::default(),
+        };
+
+        if feed.title_revision != *title_seen_rev {
+            *title_seen_rev = feed.title_revision;
+            let [fade_in, stay, fade_out] = feed.title_times.unwrap_or([10, 70, 20]);
+            let mut overlay = TitleOverlayState::vanilla();
+            overlay.show(
+                feed.title_text.clone().unwrap_or_default(),
+                feed.subtitle_text.clone().unwrap_or_default(),
+                fade_in.max(0) as u32,
+                stay.max(0) as u32,
+                fade_out.max(0) as u32,
+            );
+            ui.hud.title_overlay = overlay;
+            *title_tick_accum = 0.0;
+        }
+        *title_tick_accum += dt;
+        while *title_tick_accum >= 0.05 {
+            ui.hud.title_overlay.tick();
+            *title_tick_accum -= 0.05;
+        }
+
+        ui.hud.looking_at = match &feed.looking_at_block {
+            Some((position, block_id)) => LookingAtBlockState {
+                enabled: true,
+                block_id: block_id.clone(),
+                display_name: block_id.clone(),
+                position: Some(*position),
+                ..Default::default()
+            },
+            None => LookingAtBlockState::default(),
+        };
+    }
+
     fn render_frame(&mut self) {
         let frame_begin = Instant::now();
         self.frame_start = frame_begin;
@@ -1068,6 +1154,14 @@ impl GpuApp {
             }
             self.ui.hud = live.hud.clone();
             live.record_frame_and_refresh_minihud(dt, &mut self.ui);
+            let feed = live.hud_feed();
+            Self::apply_live_hud(
+                &mut self.ui,
+                &mut self.title_seen_rev,
+                &mut self.title_tick_accum,
+                dt,
+                &feed,
+            );
             if live.asset_bundle_pending_upload {
                 if let Some(bundle) = &live.asset_bundle {
                     match active
@@ -1318,10 +1412,24 @@ impl GpuApp {
                 self.refresh_chat_suggestions();
                 self.set_cursor_grab(false);
             }
-            // These bindings are emitted by the router. Inventory/sort/
+            WindowInputEvent::SortInventory => {
+                // InventoryTweaks-style QoL sort: hovered slot picks its
+                // region (container vs player inventory), otherwise the
+                // schema default applies. Local-only — the next server
+                // `container_set_content` refresh owns the truth.
+                if self.inventory_sort.enabled {
+                    if let Some(screen) = &mut self.container_screen {
+                        let range = match screen.hovered_slot {
+                            Some(index) => self.inventory_sort.slot_range_for(screen, index),
+                            None => self.inventory_sort.default_sort_range(screen),
+                        };
+                        self.inventory_sort.sort_container_range(screen, range);
+                    }
+                }
+            }
+            // These bindings are emitted by the router. Inventory and
             // advancements screens require their own runtime APIs.
             WindowInputEvent::OpenInventory
-            | WindowInputEvent::SortInventory
             | WindowInputEvent::OpenAdvancements => {}
         }
     }

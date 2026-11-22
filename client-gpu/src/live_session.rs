@@ -11,13 +11,16 @@ use mc_spine_client::protocol::{
     decode_item_stack_components, handle_transfer_packet, offline_uuid,
     ClientCustomChannelEvent, ClientPlayEvent, DecodedMagicCastState, DecodedMagicSync,
     DecodedMotionTrigger, DimensionMeta, ItemStackComponents, PlayEvent, PlayerInfoUpdateEntry,
-    ProtocolClient, SeasonWireSync, TeleportSync, TransferTarget, WireSoundEvent, WireStopSound,
+    ProtocolClient, SeasonWireSync, TeleportSync, TransferTarget, WireReader, WireSoundEvent,
+    WireStopSound,
 };
 use mc_spine_kernel::CommandDispatcher;
 use mc_spine_kernel::player_physics::{
     step_player_physics, PlayerInputState, PlayerPhysicsState, SurfaceKind,
 };
-use mc_spine_kernel::raycast::raycast_entities;
+use mc_spine_kernel::raycast::{
+    raycast_blocks, raycast_entities, FluidClipMode, RayBlockShapes,
+};
 use mc_spine_kernel::Aabb;
 use mc_spine_client::render::ClientVfxHost;
 use mc_spine_client::render_graph::GpuPipelineKind;
@@ -206,6 +209,19 @@ pub struct LiveBossBar {
     pub raw_payload: Vec<u8>,
 }
 
+/// Owned snapshot of the server-driven HUD channels handed to the window's
+/// UI sync each frame (`record_frame_and_refresh_minihud` refreshes the
+/// `looking_at_*` picks first).
+#[derive(Clone, Debug)]
+pub struct LiveHudFeed {
+    pub scoreboard: LiveScoreboard,
+    pub title_revision: u64,
+    pub title_times: Option<[i32; 3]>,
+    pub title_text: Option<String>,
+    pub subtitle_text: Option<String>,
+    pub looking_at_block: Option<([i32; 3], String)>,
+}
+
 /// Owns UI-facing world data on the event-loop thread. The worker owns its socket.
 pub struct LiveSession {
     incoming: Receiver<WorkerMessage>,
@@ -242,6 +258,15 @@ pub struct LiveSession {
     pub title_text_nbt: Option<Vec<u8>>,
     /// `set_subtitle_text` raw anonymous-NBT subtitle.
     pub subtitle_text_nbt: Option<Vec<u8>>,
+    /// Decoded plain text of the latest title/subtitle packets.
+    pub title_text: Option<String>,
+    pub subtitle_text: Option<String>,
+    /// Bumped on every title-related packet so the UI can `show()` once on
+    /// the event edge instead of re-arming per frame.
+    pub title_revision: u64,
+    /// Block under the crosshair ray as `(block_pos, registry_name)` —
+    /// the Jade-style looking-at overlay's live feed.
+    pub looking_at_block: Option<([i32; 3], String)>,
     /// `set_action_bar_text` raw anonymous-NBT action-bar line.
     pub actionbar_nbt: Option<Vec<u8>>,
     /// Validated `transfer` reconnect target, if the server issued one.
@@ -401,6 +426,10 @@ impl LiveSession {
             title_times: None,
             title_text_nbt: None,
             subtitle_text_nbt: None,
+            title_text: None,
+            subtitle_text: None,
+            title_revision: 0,
+            looking_at_block: None,
             actionbar_nbt: None,
             pending_transfer: None,
             use_item_sequence: 0,
@@ -1063,6 +1092,52 @@ impl LiveSession {
             .map(|hit| (hit.entity_id, hit.distance))
     }
 
+    /// Block under the crosshair ray (`raycast_blocks`, vanilla 4.5-block
+    /// reach, no fluid hits) — feeds the looking-at overlay alongside
+    /// `crosshair_entity`. Non-air voxels present a full-cube selection
+    /// shape; the face/distance stay honest while exact per-block outline
+    /// shapes are out of scope.
+    pub fn crosshair_block(&self) -> Option<([i32; 3], f64)> {
+        let pose = self.pose?;
+        let eye = [pose.feet[0], pose.feet[1] + 1.62, pose.feet[2]];
+        let yaw = f64::from(pose.yaw).to_radians();
+        let pitch = f64::from(pose.pitch).to_radians();
+        let direction = [
+            -yaw.sin() * pitch.cos(),
+            -pitch.sin(),
+            yaw.cos() * pitch.cos(),
+        ];
+        raycast_blocks(eye, direction, 4.5, FluidClipMode::None, |x, y, z| {
+            match self.world.get_block_state(x, y, z) {
+                Some(0) | None => RayBlockShapes::default(),
+                Some(_) => RayBlockShapes {
+                    boxes: vec![Aabb {
+                        min: [0.0; 3],
+                        max: [1.0; 3],
+                    }],
+                    is_fluid: false,
+                    is_fluid_source: false,
+                },
+            }
+        })
+        .map(|hit| (hit.block_pos, hit.distance))
+    }
+
+    /// Registry name for the block state at `pos` (e.g. `minecraft:oak_log`),
+    /// falling back to the raw state id when the pack registry is absent.
+    fn block_name_at(&self, pos: [i32; 3]) -> String {
+        self.world
+            .get_block_state(pos[0], pos[1], pos[2])
+            .map(|state| {
+                self.world
+                    .registry
+                    .as_ref()
+                    .and_then(|registry| registry.state_name(state).ok().map(str::to_string))
+                    .unwrap_or_else(|| format!("minecraft:state_{state}"))
+            })
+            .unwrap_or_else(|| "minecraft:air".to_string())
+    }
+
     fn refresh_prefetcher(&mut self) {
         let Some(pose) = self.pose else {
             return;
@@ -1156,6 +1231,18 @@ impl LiveSession {
         }
     }
 
+    /// Snapshot the server-driven HUD channels for `GpuApp::sync_live_hud`.
+    pub fn hud_feed(&self) -> LiveHudFeed {
+        LiveHudFeed {
+            scoreboard: self.scoreboard.clone(),
+            title_revision: self.title_revision,
+            title_times: self.title_times,
+            title_text: self.title_text.clone(),
+            subtitle_text: self.subtitle_text.clone(),
+            looking_at_block: self.looking_at_block.clone(),
+        }
+    }
+
     /// Regenerate the layered voxel-cloud sheet from the live camera/world
     /// time and mirror it into `subworlds` for the translucent lit pass.
     /// Cells come from `generate_layered_voxel_clouds`; the pack's
@@ -1199,6 +1286,9 @@ impl LiveSession {
         self.atmosphere_blender.advance(frame_dt_sec);
         self.refresh_subtitle_hud(frame_dt_sec, &mut ui.hud);
         self.looking_at_entity = self.crosshair_entity().map(|(eid, _)| eid);
+        self.looking_at_block = self
+            .crosshair_block()
+            .map(|(pos, _)| (pos, self.block_name_at(pos)));
         self.ensure_asset_bundle();
         self.refresh_voxel_clouds();
 
@@ -1455,12 +1545,17 @@ impl LiveSession {
                 fade_out,
             } => {
                 self.title_times = Some([fade_in, stay, fade_out]);
+                self.title_revision += 1;
             }
             PlayEvent::SetTitleText { nbt_bytes } => {
+                self.title_text = nbt_text(&nbt_bytes);
                 self.title_text_nbt = Some(nbt_bytes);
+                self.title_revision += 1;
             }
             PlayEvent::SetSubtitleText { nbt_bytes } => {
+                self.subtitle_text = nbt_text(&nbt_bytes);
                 self.subtitle_text_nbt = Some(nbt_bytes);
+                self.title_revision += 1;
             }
             PlayEvent::BossEvent {
                 uuid,
@@ -1944,6 +2039,16 @@ fn run_connection(
 /// Reserved `subworlds` id for the layered voxel-cloud sheet (kept clear of
 /// contraption ids, which allocate from 1 upward).
 const CLOUD_SUBWORLD_ID: u64 = u64::MAX;
+
+/// Decode an anonymous-NBT text component (title/subtitle/action-bar payloads)
+/// into plain text via `NbtValue::extract_text`.
+fn nbt_text(nbt_bytes: &[u8]) -> Option<String> {
+    let text = WireReader::new(nbt_bytes)
+        .read_nbt()
+        .ok()?
+        .extract_text();
+    (!text.is_empty()).then_some(text)
+}
 
 /// Seed the session command dispatcher with the vanilla command-name set
 /// (`zsh_command_bar`'s `COMMAND_SPECS`) so `complete_suggestions` answers
@@ -3170,5 +3275,47 @@ mod tests {
             .evaluate_entity_pose(11)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn title_packets_decode_text_and_feed_hud_snapshot() {
+        let (mut live, _tx) = session();
+        // Anonymous NBT compound: {"text": "Hello"} — tag 0x0a root, one
+        // string entry named "text", End terminator.
+        let nbt: Vec<u8> = vec![
+            0x0a, 0x08, 0x00, 0x04, b't', b'e', b'x', b't', 0x00, 0x05, b'H', b'e', b'l', b'l',
+            b'o', 0x00,
+        ];
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetTitle {
+            fade_in: 5,
+            stay: 40,
+            fade_out: 15,
+        }))
+        .unwrap();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetTitleText {
+            nbt_bytes: nbt.clone(),
+        }))
+        .unwrap();
+        assert_eq!(live.title_text.as_deref(), Some("Hello"));
+        assert_eq!(live.title_revision, 2);
+
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetSubtitleText {
+            nbt_bytes: nbt,
+        }))
+        .unwrap();
+        assert_eq!(live.subtitle_text.as_deref(), Some("Hello"));
+        assert_eq!(live.title_revision, 3);
+
+        let feed = live.hud_feed();
+        assert_eq!(feed.title_revision, 3);
+        assert_eq!(feed.title_times, Some([5, 40, 15]));
+        assert_eq!(feed.title_text.as_deref(), Some("Hello"));
+        assert!(feed.looking_at_block.is_none());
+        // Malformed NBT fails closed: text stays None, packet still counted.
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetTitleText {
+            nbt_bytes: vec![0xff, 0x01],
+        }))
+        .unwrap();
+        assert_eq!(live.title_text, None);
     }
 }
