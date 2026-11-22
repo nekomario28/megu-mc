@@ -18,3 +18,7 @@ mc_spine_core = { package = "mc-spine-core", path = "../core" }
 [[bin]]
 name = "mc-spine-voice-relay"
 path = "src/bin/voice_relay.rs"
+
+[[bin]]
+name = "mc-spine-friend-relay"
+path = "src/bin/friend_relay.rs"
