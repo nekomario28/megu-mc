@@ -64,6 +64,7 @@ pub mod crash_report;
 pub mod fault_isolation;
 pub mod hw_adaptive_engine;
 pub mod id;
+pub mod i18n;
 pub mod math;
 pub mod math_opt_foundation;
 pub mod perf_kit;
