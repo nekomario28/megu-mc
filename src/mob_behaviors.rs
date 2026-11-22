@@ -1861,11 +1861,19 @@ impl MobBehaviorState {
                     effects.push(SetOnFire(blaze.on_fire()));
                 }
                 match attack {
-                    Some(BlazeAttack::Melee { target, damage }) => Some(MeleeDamage {
-                        target_eid: target,
-                        amount: damage,
-                        knockback_y: 0.0,
-                    }),
+                    Some(BlazeAttack::Melee { target, damage }) => {
+                        // `BlazeAttackGoal` only strikes once the blaze holds
+                        // its hover station half a block above the target's
+                        // mid-body (`getY(0.5) + 0.5`); players are 1.8 tall.
+                        let on_station = visible_target.is_none_or(|target| {
+                            (ctx.pos[1] - blaze_hover_y(target.pos, 1.8)).abs() <= 2.0
+                        });
+                        on_station.then_some(MeleeDamage {
+                            target_eid: target,
+                            amount: damage,
+                            knockback_y: 0.0,
+                        })
+                    }
                     Some(BlazeAttack::SmallFireball { .. }) => visible_target
                         .map(|target| launch(MobProjectileKind::SmallFireball, target, 0.0)),
                     None => None,
@@ -1976,13 +1984,30 @@ impl MobBehaviorState {
                     }
                 }
                 let hp_before = dragon.hp;
+                // End crystals only exist on the ten spike pillars: anchor the
+                // heal-link candidates to this world's `SpikeCache` spawn
+                // positions so a stray crystal entity cannot feed the dragon.
+                let anchors: Vec<[f64; 3]> = end_crystal_pillars(WORLD_SEED.load(Ordering::Relaxed))
+                    .iter()
+                    .map(|pillar| end_crystal_spawn_position(pillar))
+                    .collect();
+                let anchored: Vec<DragonCrystal> = crystals
+                    .iter()
+                    .copied()
+                    .filter(|crystal| {
+                        anchors.iter().any(|anchor| {
+                            let delta = mob_behavior_delta(crystal.position, *anchor);
+                            mob_behavior_dot(delta, delta) <= 4.0
+                        })
+                    })
+                    .collect();
                 let event = dragon.tick(DragonTick {
                     position: ctx.pos,
                     portal_y,
                     path_complete,
                     strafe_target: target.map(|target| target.eid),
                     strafe_aligned,
-                    crystals,
+                    crystals: &anchored,
                 });
                 let healed = dragon.hp.min(ctx.max_hp) - hp_before;
                 if healed > 0.0 {
@@ -4809,6 +4834,120 @@ mod mob_behaviors_tests {
         assert!(!dragon.crystal_destroyed(nearest.entity));
         assert_eq!(dragon.tick(dragon_tick(&[farther])), None);
         assert_eq!(dragon.linked_crystal, Some(farther.entity));
+    }
+
+    #[test]
+    fn v1211_veh_ai_enderman_water_escape_runs_through_live_step() {
+        let mut state = MobBehaviorState::for_etype(33).unwrap();
+        let mut ctx = dispatch_ctx();
+        ctx.in_water = true;
+        let mut block_at = |[_, y, _]: [i32; 3]| EndermanTeleportBlock {
+            blocks_motion: y == 48,
+            liquid: false,
+        };
+        let mut can_occupy = |[_, y, _]: [f64; 3]| y == 49.0;
+        // Water damage forces the enderman escape teleport through the live
+        // world-aware step, exactly like the rain path.
+        assert!(matches!(
+            state
+                .step_with_world(
+                    &ctx,
+                    MobBehaviorWorldTick::Enderman {
+                        block_at: &mut block_at,
+                        can_occupy: &mut can_occupy,
+                    }
+                )
+                .as_slice(),
+            [MobBehaviorEffect::Teleport { to: [_, 49.0, _] }]
+        ));
+    }
+
+    #[test]
+    fn v1211_veh_ai_blaze_fireball_runs_through_live_step() {
+        use MobBehaviorEffect::*;
+
+        let mut state = MobBehaviorState::for_etype(8).unwrap();
+        let ctx = dispatch_ctx();
+        // The same Idle->Charging->Burst cycle the live mob_tick drives emits
+        // a small fireball launch through step_with_world.
+        let mut saw_fireball = false;
+        for _ in 0..140 {
+            for effect in state.step_with_world(&ctx, MobBehaviorWorldTick::Basic) {
+                if let LaunchProjectile {
+                    kind: MobProjectileKind::SmallFireball,
+                    ..
+                } = effect
+                {
+                    saw_fireball = true;
+                }
+            }
+        }
+        assert!(saw_fireball, "blaze never fired through the live step");
+    }
+
+    #[test]
+    fn v1211_veh_ai_dragon_heals_only_from_spike_anchored_crystals() {
+        use MobBehaviorEffect::*;
+
+        let old_seed = WORLD_SEED.swap(4242, Ordering::Relaxed);
+        let pillars = end_crystal_pillars(4242);
+        let anchor = end_crystal_spawn_position(&pillars[0]);
+        // A crystal entity on the pillar anchor feeds the dragon's regen link;
+        // a stray crystal inside the same 32-block window must not.
+        let anchored_xtal = DragonCrystal {
+            entity: 1,
+            position: anchor,
+        };
+        let stray_xtal = DragonCrystal {
+            entity: 2,
+            position: [anchor[0] + 5.0, anchor[1], anchor[2]],
+        };
+        let mut ctx = dispatch_ctx();
+        ctx.dim = DimId::End;
+        ctx.pos = anchor;
+        ctx.hp = 100.0;
+        ctx.max_hp = 200.0;
+
+        // Stray-only crystals: no pillar anchor, so no heal link ever forms.
+        let mut stray_only = MobBehaviorState::for_etype(31).unwrap();
+        for _ in 0..15 {
+            assert!(
+                !stray_only
+                    .step_with_world(
+                        &ctx,
+                        MobBehaviorWorldTick::EnderDragon {
+                            portal_y: 80,
+                            path_complete: false,
+                            strafe_aligned: false,
+                            crystals: &[stray_xtal],
+                        },
+                    )
+                    .iter()
+                    .any(|e| matches!(e, HealSelf(_))),
+                "unanchored crystal healed the dragon"
+            );
+        }
+
+        // Anchored crystal: the link forms and the tenth fight tick heals.
+        let both = [stray_xtal, anchored_xtal];
+        let mut anchored = MobBehaviorState::for_etype(31).unwrap();
+        let mut healed = false;
+        for _ in 0..15 {
+            healed |= anchored
+                .step_with_world(
+                    &ctx,
+                    MobBehaviorWorldTick::EnderDragon {
+                        portal_y: 80,
+                        path_complete: false,
+                        strafe_aligned: false,
+                        crystals: &both,
+                    },
+                )
+                .iter()
+                .any(|e| matches!(e, HealSelf(_)));
+        }
+        assert!(healed, "spike-anchored crystal never healed the dragon");
+        WORLD_SEED.store(old_seed, Ordering::Relaxed);
     }
 
     #[test]

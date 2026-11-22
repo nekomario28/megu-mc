@@ -60,6 +60,16 @@ pub(crate) trait PathWorld {
     fn waypoint_y(&self, _x: i32, y: i32, _z: i32) -> f64 {
         f64::from(y)
     }
+
+    /// `maxEntityCramming` census around `pos`: `(pushable, non_passengers,
+    /// roll_mod_4)` — entities sharing the cell, those riding nothing, and a
+    /// scripted roll already reduced mod 4 (a multiple of 4 lands the hit).
+    /// Worlds that cannot count neighbouring entities report `None`, which
+    /// keeps cramming damage at zero exactly like the live push engine's
+    /// empty candidate set.
+    fn cramming_census(&self, _x: f64, _y: f64, _z: f64) -> Option<(usize, usize, u32)> {
+        None
+    }
 }
 
 /// Classifies a single state as in 1.21.1 WalkNodeEvaluator.getPathTypeFromState.
@@ -1673,6 +1683,12 @@ pub(crate) struct MobAiProfile {
     pub navigation: PathNavigation,
     pub movement_speed: f64,
     pub eye_height: f64,
+    /// Ticks left in a spider's LeapAtTargetGoal pounce impulse.
+    spider_leap: u8,
+    /// Cooldown before the next leap may start.
+    spider_leap_cooldown: u8,
+    /// Skeleton bow draw countdown in ticks; `u32::MAX` = not yet drawn.
+    bow_charge: u32,
     requested_target: Option<(i32, i32, i32)>,
 }
 
@@ -1691,6 +1707,9 @@ impl MobAiProfile {
             navigation: PathNavigation::default(),
             movement_speed,
             eye_height: spec.map_or(1.53, |spec| f64::from(spec.eye_height)),
+            spider_leap: 0,
+            spider_leap_cooldown: 0,
+            bow_charge: u32::MAX,
             requested_target: None,
         }
     }
@@ -1709,6 +1728,9 @@ pub(crate) struct MobAiStepResult {
     pub attack_target: Option<i32>,
     pub swell: Option<bool>,
     pub breed_target: Option<i32>,
+    /// `maxEntityCramming` damage evaluated for this tick; the live push
+    /// engine applies it through its own hurt path.
+    pub cramming_damage: f32,
 }
 
 /// One tick of scheduling, path-following and intent generation. The caller
@@ -1783,15 +1805,106 @@ pub(crate) fn tick_mob_ai_step(
         (None, None)
     };
 
+    // Hostile-mob velocity helpers (1.21.1): per-tick impulses that replace
+    // the waypoint stride while the matching goal is active. `movement_delta`
+    // is applied verbatim by the live mover, so these run every `mob_tick`.
+    let mut attack_target = goal.attack_target;
+    match profile.etype {
+        // minecraft:spider — LeapAtTargetGoal pounces inside melee reach.
+        100 => {
+            profile.spider_leap_cooldown = profile.spider_leap_cooldown.saturating_sub(1);
+            if profile.spider_leap > 0 {
+                profile.spider_leap -= 1;
+                if let Some(target) = ctx.target {
+                    let leap = spider_leap_velocity(
+                        [ctx.position.0, ctx.position.1, ctx.position.2],
+                        [target.position.0, target.position.1, target.position.2],
+                    );
+                    movement_delta = (leap[0], 0.0, leap[2]);
+                    jump = true;
+                }
+            } else if profile.spider_leap_cooldown == 0
+                && ctx.target.is_some_and(|target| {
+                    target.line_of_sight
+                        && entity_distance_sq(ctx.position, target.position) <= 16.0
+                })
+            {
+                profile.spider_leap = 3;
+                profile.spider_leap_cooldown = 20;
+            }
+        }
+        // minecraft:drowned — DrownedSwimGoal chases through water column.
+        27 if ctx.in_water => {
+            if let Some(point) = goal.move_target {
+                let swim = drowned_swim_chase_velocity(
+                    [ctx.position.0, ctx.position.1, ctx.position.2],
+                    [point.0, point.1, point.2],
+                );
+                movement_delta = (swim[0], 0.0, swim[2]);
+            }
+        }
+        // minecraft:skeleton — RangedBowAttackGoal strafes inside the 5..15
+        // band and only looses once the bow finishes its draw. The plan marks
+        // that goal unavailable, so this arm owns both the draw timer and the
+        // release; `u32::MAX` marks "not yet drawn".
+        91 => {
+            if let Some(target) = ctx.target.filter(|target| target.line_of_sight) {
+                let distance = entity_distance_sq(ctx.position, target.position).sqrt();
+                if (5.0..=15.0).contains(&distance) {
+                    let strafe = skeleton_strafe_velocity(
+                        distance,
+                        profile.etype % 2 == 0,
+                        distance > 10.0,
+                    );
+                    movement_delta = (strafe[0], 0.0, strafe[2]);
+                }
+                let interval = || {
+                    u32::from(skeleton_bow_charge_interval(
+                        DIFFICULTY.load(Ordering::Relaxed) >= 3,
+                    ))
+                };
+                if profile.bow_charge == u32::MAX {
+                    profile.bow_charge = interval();
+                } else {
+                    profile.bow_charge = profile.bow_charge.saturating_sub(1);
+                }
+                if profile.bow_charge == 0 && distance <= 15.0 {
+                    attack_target = Some(target.entity_id);
+                    profile.bow_charge = interval();
+                }
+            } else {
+                profile.bow_charge = u32::MAX;
+            }
+        }
+        _ => {}
+    }
+
+    // `maxEntityCramming`: the live push engine owns the damage application;
+    // the step only reports this tick's evaluation for the caller.
+    let mut cramming_damage = 0.0f32;
+    if let Some(world) = ctx.world {
+        if let Some((pushable, non_passengers, roll_mod_4)) =
+            world.cramming_census(ctx.position.0, ctx.position.1, ctx.position.2)
+        {
+            cramming_damage = eval_entity_cramming_damage(
+                max_entity_cramming_limit(),
+                pushable,
+                non_passengers,
+                roll_mod_4,
+            );
+        }
+    }
+
     MobAiStepResult {
         move_target: goal.move_target,
         movement_delta,
         look_yaw,
         look_pitch,
         jump,
-        attack_target: goal.attack_target,
+        attack_target,
         swell: goal.swell,
         breed_target: goal.breed_target,
+        cramming_damage,
     }
 }
 
@@ -2885,5 +2998,156 @@ mod mob_ai_tests {
         assert_eq!(selector.tick(&view).look_target, Some((3.0, 1.0, 0.0)));
         assert_eq!(selector.tick(&GoalContext::default()).look_target, None);
         assert_eq!(selector.running_count(), 0);
+    }
+
+    struct CrowdedWorld(Option<(usize, usize, u32)>);
+
+    impl PathWorld for CrowdedWorld {
+        fn path_type(&self, _: i32, _: i32, _: i32) -> BlockPathType {
+            BlockPathType::Open
+        }
+        fn is_solid(&self, _: i32, _: i32, _: i32) -> bool {
+            false
+        }
+        fn collision_height(&self, _: i32, _: i32, _: i32) -> f64 {
+            0.0
+        }
+        fn min_y(&self) -> i32 {
+            -64
+        }
+        fn max_y(&self) -> i32 {
+            320
+        }
+        fn cramming_census(&self, _: f64, _: f64, _: f64) -> Option<(usize, usize, u32)> {
+            self.0
+        }
+    }
+
+    #[test]
+    fn v1211_veh_ai_creeper_fuse_and_abort_run_through_live_mob_ai_step() {
+        let mut profile = MobAiProfile::new(23);
+        let near = GoalContext {
+            position: (0.0, 1.0, 0.0),
+            target: Some(target(15, 1.0, 1.0, 0.0)),
+            ..GoalContext::default()
+        };
+        // SwellGoal reports the fuse state the live creeper tick consumes.
+        assert_eq!(tick_mob_ai_step(&mut profile, &near).swell, Some(true));
+        assert_eq!(tick_mob_ai_step(&mut profile, &near).swell, Some(true));
+        let far = GoalContext {
+            position: (0.0, 1.0, 0.0),
+            target: Some(target(15, 30.0, 1.0, 0.0)),
+            ..GoalContext::default()
+        };
+        // Losing the target aborts the lit fuse through the same step result.
+        assert_eq!(tick_mob_ai_step(&mut profile, &far).swell, Some(false));
+    }
+
+    #[test]
+    fn v1211_veh_ai_spider_leap_runs_through_live_mob_ai_step() {
+        let mut profile = MobAiProfile::new(100);
+        let ctx = GoalContext {
+            position: (0.0, 1.0, 0.0),
+            target: Some(target(7, 2.0, 1.0, 0.0)),
+            ..GoalContext::default()
+        };
+        // The first close tick only arms the pounce; the impulse lands on the
+        // following ticks through the same live step.
+        let armed = tick_mob_ai_step(&mut profile, &ctx);
+        assert!(!armed.jump || armed.movement_delta != (0.4, 0.0, 0.0));
+        let leap = tick_mob_ai_step(&mut profile, &ctx);
+        assert!(leap.jump);
+        assert_eq!(leap.movement_delta, (0.4, 0.0, 0.0));
+        assert_eq!(tick_mob_ai_step(&mut profile, &ctx).movement_delta, (0.4, 0.0, 0.0));
+        assert_eq!(tick_mob_ai_step(&mut profile, &ctx).movement_delta, (0.4, 0.0, 0.0));
+        // After the 3-tick impulse and the cooldown the waypoint stride returns.
+        for _ in 0..4 {
+            tick_mob_ai_step(&mut profile, &ctx);
+        }
+        let after = tick_mob_ai_step(&mut profile, &ctx);
+        assert!(!after.jump || after.movement_delta != (0.4, 0.0, 0.0));
+    }
+
+    #[test]
+    fn v1211_veh_ai_skeleton_strafe_and_bow_draw_run_through_live_step() {
+        // Strafe band: a visible target 12 blocks out strafes forward-left.
+        let mut profile = MobAiProfile::new(91);
+        let ctx = GoalContext {
+            position: (0.0, 1.0, 0.0),
+            target: Some(target(9, 12.0, 1.0, 0.0)),
+            ..GoalContext::default()
+        };
+        let step = tick_mob_ai_step(&mut profile, &ctx);
+        // skeleton_strafe_velocity(12, clockwise=false, forward=true).
+        assert_eq!(step.movement_delta, (-0.25, 0.0, 0.25));
+
+        // Bow draw: melee reach keeps attack_target desired, but the shot is
+        // suppressed until skeleton_bow_charge_interval ticks elapse.
+        let mut profile = MobAiProfile::new(91);
+        let close = GoalContext {
+            position: (0.0, 1.0, 0.0),
+            target: Some(target(9, 1.5, 1.0, 0.0)),
+            ..GoalContext::default()
+        };
+        let interval = u32::from(skeleton_bow_charge_interval(
+            DIFFICULTY.load(Ordering::Relaxed) >= 3,
+        ));
+        assert_eq!(tick_mob_ai_step(&mut profile, &close).attack_target, None);
+        assert_eq!(profile.bow_charge, interval);
+        let mut first_shot = None;
+        for tick in 1..=80 {
+            let step = tick_mob_ai_step(&mut profile, &close);
+            if step.attack_target.is_some() {
+                first_shot = Some(tick);
+                break;
+            }
+        }
+        // The arrow looses exactly one draw-interval after the first sighting.
+        assert_eq!(first_shot, Some(interval as usize));
+    }
+
+    #[test]
+    fn v1211_veh_ai_drowned_swim_chase_runs_through_live_mob_ai_step() {
+        let mut profile = MobAiProfile::new(27);
+        let ctx = GoalContext {
+            position: (0.0, 1.0, 0.0),
+            in_water: true,
+            target: Some(target(11, 0.0, 1.0, 8.0)),
+            ..GoalContext::default()
+        };
+        let step = tick_mob_ai_step(&mut profile, &ctx);
+        // drowned_swim_chase_velocity: unit chase * 0.1 replaces the stride.
+        assert_eq!(step.movement_delta, (0.0, 0.0, 0.1));
+        assert!(step.jump);
+        let dry = GoalContext {
+            position: (0.0, 1.0, 0.0),
+            target: Some(target(11, 0.0, 1.0, 8.0)),
+            ..GoalContext::default()
+        };
+        let step = tick_mob_ai_step(&mut profile, &dry);
+        assert_ne!(step.movement_delta, (0.0, 0.0, 0.1));
+    }
+
+    #[test]
+    fn v1211_veh_ai_entity_cramming_runs_through_live_mob_ai_step() {
+        let mut profile = MobAiProfile::new(124);
+        let ctx = GoalContext {
+            position: (0.5, 1.0, 0.5),
+            world: Some(&CrowdedWorld(Some((100, 100, 0)))),
+            ..GoalContext::default()
+        };
+        assert_eq!(tick_mob_ai_step(&mut profile, &ctx).cramming_damage, 6.0);
+        let ctx = GoalContext {
+            position: (0.5, 1.0, 0.5),
+            world: Some(&CrowdedWorld(Some((100, 100, 1)))),
+            ..GoalContext::default()
+        };
+        assert_eq!(tick_mob_ai_step(&mut profile, &ctx).cramming_damage, 0.0);
+        let ctx = GoalContext {
+            position: (0.5, 1.0, 0.5),
+            world: Some(&CrowdedWorld(None)),
+            ..GoalContext::default()
+        };
+        assert_eq!(tick_mob_ai_step(&mut profile, &ctx).cramming_damage, 0.0);
     }
 }

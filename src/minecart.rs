@@ -29,6 +29,12 @@ pub(crate) trait World {
     /// Collision-clipped displacement and the resulting on-ground flag.
     fn move_cart(&mut self, pos: [f64;3], delta: [f64;3]) -> ([f64;3], bool);
     fn conductor(&mut self, at: Pos) -> bool;
+    /// Powered activator rails (`minecraft:activator_rail`) eject every entity
+    /// riding them each tick. The world owns both the block lookup and the
+    /// passenger list, so it decides whether `at` is a powered activator rail
+    /// and returns how many riders were ejected. Plain, detector and unpowered
+    /// activator rails eject nothing; the default reports zero.
+    fn activator_eject(&mut self, _at: Pos) -> usize { 0 }
 }
 fn horizontal_speed(v: [f64;3]) -> f64 { (v[0]*v[0]+v[2]*v[2]).sqrt() }
 fn block(p: [f64;3]) -> Pos { (p[0].floor() as i32,p[1].floor() as i32,p[2].floor() as i32) }
@@ -116,9 +122,145 @@ impl State {
                 NorthSouth=>{if w.conductor((x,y,z-1)){self.velocity[2]=0.02;}else if w.conductor((x,y,z+1)){self.velocity[2] = -0.02;}}, _=>{}
             }}
         }
+        // Detector, activator and plain rails all report `powered: None`; the
+        // world tells them apart and ejects riders off a powered activator rail.
+        let _ejected = w.activator_eject((x, y, z));
     }
 }
 
 #[cfg(test)]
 #[path = "minecart_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod live_rail_tick_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    struct Scene {
+        rails: HashMap<Pos, Rail>,
+        conductors: HashSet<Pos>,
+        eject: bool,
+        eject_calls: Vec<Pos>,
+    }
+
+    impl Scene {
+        fn new() -> Self {
+            Self {
+                rails: HashMap::new(),
+                conductors: HashSet::new(),
+                eject: false,
+                eject_calls: Vec::new(),
+            }
+        }
+    }
+
+    impl World for Scene {
+        fn rail(&mut self, at: Pos) -> Option<Rail> {
+            self.rails.get(&at).copied()
+        }
+        fn conductor(&mut self, at: Pos) -> bool {
+            self.conductors.contains(&at)
+        }
+        fn move_cart(&mut self, _pos: [f64; 3], delta: [f64; 3]) -> ([f64; 3], bool) {
+            (delta, true)
+        }
+        fn activator_eject(&mut self, at: Pos) -> usize {
+            self.eject_calls.push(at);
+            usize::from(self.eject)
+        }
+    }
+
+    fn straight_rails(scene: &mut Scene, powered: Option<bool>, z: std::ops::RangeInclusive<i32>) {
+        for bz in z {
+            scene.rails.insert(
+                (0, 200, bz),
+                Rail {
+                    shape: Shape::NorthSouth,
+                    powered,
+                },
+            );
+        }
+    }
+
+    fn cart_on_rail() -> State {
+        State {
+            pos: [0.5, 200.5, 0.5],
+            velocity: [0.0, 0.0, 0.2],
+            on_ground: true,
+            in_water: false,
+        }
+    }
+
+    #[test]
+    fn v1211_veh_ai_powered_rail_boost_runs_through_live_tick() {
+        let mut powered = Scene::new();
+        straight_rails(&mut powered, Some(true), -8..=64);
+        let mut plain = Scene::new();
+        straight_rails(&mut plain, None, -8..=64);
+        let (mut powered_cart, mut plain_cart) = (cart_on_rail(), cart_on_rail());
+        // The powered rail's 6% per-tick shove must outpace plain-rail drag.
+        for _ in 0..20 {
+            powered_cart.tick(&mut powered, false, 0);
+            plain_cart.tick(&mut plain, false, 0);
+        }
+        assert!(powered_cart.velocity[2] > plain_cart.velocity[2]);
+        assert!(powered_cart.velocity[2] > 0.4);
+        // A stationary cart parked on a powered rail is kicked by its
+        // conductor through the same live tick.
+        let mut parked = Scene::new();
+        straight_rails(&mut parked, Some(true), -8..=64);
+        parked.conductors.insert((0, 200, -1));
+        let mut cart = State {
+            velocity: [0.0; 3],
+            ..cart_on_rail()
+        };
+        cart.tick(&mut parked, false, 0);
+        assert_eq!(cart.velocity[2], 0.02);
+    }
+
+    #[test]
+    fn v1211_veh_ai_curved_rail_turn_runs_through_live_tick() {
+        let mut scene = Scene::new();
+        // SouthEast links the +z and +x exits; a cart rolling +x must be
+        // redirected onto the diagonal through the live projection.
+        scene.rails.insert(
+            (0, 200, 0),
+            Rail {
+                shape: Shape::SouthEast,
+                powered: None,
+            },
+        );
+        let mut cart = State {
+            pos: [0.5, 200.5, 0.5],
+            velocity: [0.2, 0.0, 0.0],
+            on_ground: true,
+            in_water: false,
+        };
+        cart.tick(&mut scene, false, 0);
+        assert!(cart.velocity[0] > 0.0, "curve dropped forward motion");
+        assert!(cart.velocity[2] < 0.0, "curve did not turn the cart");
+    }
+
+    #[test]
+    fn v1211_veh_ai_activator_rail_eject_runs_through_live_tick() {
+        let mut scene = Scene::new();
+        straight_rails(&mut scene, None, -8..=64);
+        scene.eject = true;
+        let mut cart = cart_on_rail();
+        cart.tick(&mut scene, false, 0);
+        // The live tick reports the rail block to the world, which owns the
+        // passenger list and performs the eject.
+        assert!(scene.eject_calls.contains(&(0, 200, 0)));
+        assert_eq!(scene.eject_calls.len(), 1);
+        // Off the rail the tick takes the derail path and never consults the
+        // activator hook.
+        scene.eject_calls.clear();
+        let mut off = State {
+            pos: [40.5, 200.5, 40.5],
+            ..cart_on_rail()
+        };
+        off.tick(&mut scene, false, 0);
+        assert!(scene.eject_calls.is_empty());
+    }
+}
