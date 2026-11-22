@@ -51,12 +51,15 @@ pub enum ExecutionTier {
 /// or derived from — every named optimization is an original clean-room Rust
 /// implementation inside `mc-spine`.
 pub const BUILTIN_SUPERSEDED_PERF_MODS: &[&str] = &[
-    // Rendering / mesh / LOD.
+    // Rendering / mesh / LOD — superseded by mc-spine's native wgpu renderer
+    // (client-gpu / client-port), never loaded as Java mods.
     "sodium",
     "embeddium",
     "rubidium",
     "xenon",
     "magnesium",
+    "vulkanmod",
+    "nvidium",
     "immediatelyfast",
     "entityculling",
     "moreculling",
@@ -73,6 +76,7 @@ pub const BUILTIN_SUPERSEDED_PERF_MODS: &[&str] = &[
     "radium",
     "canary",
     "starlight",
+    "scalablelux",
     "phosphor",
     "scalpel",
     "ferritecore",

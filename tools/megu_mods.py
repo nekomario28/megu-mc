@@ -99,11 +99,12 @@ SLUG_RE = re.compile(r"^[a-z0-9_-]{1,64}$")
 BUILTIN_SUPERSEDED_PERF_MODS = (
     # Rendering / mesh / LOD.
     "sodium", "embeddium", "rubidium", "xenon", "magnesium",
+    "vulkanmod", "nvidium",
     "immediatelyfast", "entityculling", "moreculling", "distanthorizons",
     "voxy", "bobby", "farsight", "indium", "reeses-sodium-options",
     "sodium-extra", "embeddium_extra",
     # Server tick / lighting / memory / startup.
-    "lithium", "radium", "canary", "starlight", "phosphor", "scalpel",
+    "lithium", "radium", "canary", "starlight", "scalablelux", "phosphor", "scalpel",
     "ferritecore", "modernfix", "noisium", "c2me", "krypton", "lazydfu",
     "memoryleakfix", "alternate-current", "clumps", "saturn",
     "smoothboot", "fastload", "dashloader", "servercore",

@@ -327,10 +327,11 @@ class ClassifierUnitTests(unittest.TestCase):
         self.assertFalse(
             mod_launcher.is_builtin_superseded(_fake_mod("create")))
         # Required catalog coverage (mirrors fallback.rs 1:1).
-        for mod_id in ("sodium", "embeddium", "immediatelyfast", "entityculling",
+        for mod_id in ("sodium", "embeddium", "vulkanmod", "nvidium",
+                       "immediatelyfast", "entityculling",
                        "moreculling", "distanthorizons", "voxy", "krypton",
                        "lazydfu", "memoryleakfix", "alternate-current", "clumps",
-                       "lithium", "starlight", "ferritecore", "modernfix",
+                       "lithium", "starlight", "scalablelux", "ferritecore", "modernfix",
                        "noisium", "c2me"):
             self.assertIn(mod_id, mod_launcher.BUILTIN_SUPERSEDED_PERF_MODS)
 

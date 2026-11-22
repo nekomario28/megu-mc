@@ -121,18 +121,31 @@ fn auto_adapter_classifies_vulkan_and_filename_fallback() {
         &AutoAdaptOptions::default(),
     )
     .unwrap();
+    assert_eq!(result.tier, AdaptationTier::AutoSkipped);
     assert_eq!(
         result.engine_compat,
         EngineCompatDisposition::NativeAccelerated {
-            native_subsystem: "vulkan_render_backend"
+            native_subsystem: "wgpu_render_backend"
         }
     );
     assert!(result
         .to_json()
-        .contains("\"native_subsystem\": \"vulkan_render_backend\""));
+        .contains("\"native_subsystem\": \"wgpu_render_backend\""));
     assert!(result
         .format_human()
-        .contains("native_accelerated:vulkan_render_backend"));
+        .contains("native_accelerated:wgpu_render_backend"));
+
+    // Filename-inferred vulkanmod/nvidium JARs are skipped before bytecode read
+    // and cleanly fall back to the native wgpu renderer.
+    let by_name =
+        auto_adapt_jar_bytes(&[], "vulkanmod-1.21.1.jar", &AutoAdaptOptions::default()).unwrap();
+    assert_eq!(by_name.tier, AdaptationTier::AutoSkipped);
+    assert_eq!(
+        by_name.engine_compat,
+        EngineCompatDisposition::NativeAccelerated {
+            native_subsystem: "wgpu_render_backend"
+        }
+    );
 
     let fallback = auto_adapt_jar_bytes(
         &synthetic_jar(""),
@@ -160,7 +173,7 @@ fn auto_adapter_classifies_vulkan_and_filename_fallback() {
     );
     assert!(unknown.requires_fallback());
     assert!(
-        auto_adapt_jar_bytes(&[], "vulkanmod.jar", &AutoAdaptOptions::default()).is_err(),
+        auto_adapt_jar_bytes(&[], "corrupt-addon.jar", &AutoAdaptOptions::default()).is_err(),
         "malformed archives must still fail closed"
     );
 }
@@ -202,7 +215,7 @@ fn mods_dir_surfaces_hard_mod_strategies_including_distant_horizons() {
         (
             "vulkanmod",
             EngineCompatDisposition::NativeAccelerated {
-                native_subsystem: "vulkan_render_backend",
+                native_subsystem: "wgpu_render_backend",
             },
         ),
         (
@@ -752,7 +765,7 @@ fn classifier_covers_carryon_vulkan_ultralight_and_bridge_archetypes() {
         );
     }
     for (id, native_subsystem) in [
-        ("vulkanmod", "vulkan_render_backend"),
+        ("vulkanmod", "wgpu_render_backend"),
         ("nvidium", "mesh_shader_renderer"),
         ("sodium", "chunk_renderer"),
         ("embeddium", "chunk_renderer"),

@@ -931,7 +931,7 @@ pub fn classify_perf_or_render_mod_compat(mod_id: &str) -> EngineCompatDispositi
             engine: "CollapsedLogisticsNetwork",
         },
         "vulkanmod" => NativeAccelerated {
-            native_subsystem: "vulkan_render_backend",
+            native_subsystem: "wgpu_render_backend",
         },
         "nvidium" => NativeAccelerated {
             native_subsystem: "mesh_shader_renderer",

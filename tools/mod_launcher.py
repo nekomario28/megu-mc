@@ -119,11 +119,12 @@ REASON_SUPERSEDED = "already covered by mc-spine built-in optimizations"
 BUILTIN_SUPERSEDED_PERF_MODS = frozenset({
     # Rendering / mesh / LOD.
     "sodium", "embeddium", "rubidium", "xenon", "magnesium",
+    "vulkanmod", "nvidium",
     "immediatelyfast", "entityculling", "moreculling", "distanthorizons",
     "voxy", "bobby", "farsight", "indium", "reeses-sodium-options",
     "sodium-extra", "embeddium_extra",
     # Server tick / lighting / memory / startup.
-    "lithium", "radium", "canary", "starlight", "phosphor", "scalpel",
+    "lithium", "radium", "canary", "starlight", "scalablelux", "phosphor", "scalpel",
     "ferritecore", "modernfix", "noisium", "c2me", "krypton", "lazydfu",
     "memoryleakfix", "alternate-current", "clumps", "saturn", "smoothboot",
     "fastload", "dashloader", "servercore",
