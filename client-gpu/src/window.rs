@@ -882,6 +882,33 @@ impl GpuApp {
         true
     }
 
+    /// The six view-frustum planes of the current render camera, in the
+    /// `box_in_frustum` form `LiveSession::poll` orders mesh rebuilds
+    /// with. `None` while no active surface exists (poll then degrades to
+    /// pure distance ordering).
+    fn view_frustum_planes(&self) -> Option<[[f32; 4]; 6]> {
+        Self::frustum_planes_for(
+            &self.camera_controller,
+            &self.camera,
+            self.active.as_ref().map(|a| a.size),
+        )
+    }
+
+    /// [`Self::view_frustum_planes`] over disjoint field borrows so it can
+    /// run inside `&mut self.live` scopes.
+    fn frustum_planes_for(
+        camera_controller: &CameraController,
+        camera: &Camera,
+        size: Option<PhysicalSize<u32>>,
+    ) -> Option<[[f32; 4]; 6]> {
+        let size = size?;
+        let aspect = size.width.max(1) as f32 / size.height.max(1) as f32;
+        let camera = camera_controller.view_camera(camera);
+        Some(crate::renderer::frustum_planes_from_view_proj(
+            &camera.view_projection(aspect),
+        ))
+    }
+
     /// While a container screen is open: hover highlight, plus vanilla
     /// quick-craft (`mode = 5`) slot painting while the left button is held
     /// after a `DragState` has been armed.
@@ -1088,8 +1115,12 @@ impl GpuApp {
         let dt = frame_begin.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = frame_begin;
 
+        let planes = self.view_frustum_planes();
         if let Some(live) = &mut self.live {
-            live.poll(self.camera.position);
+            live.poll(
+                self.camera.position,
+                planes.as_ref().map_or(&[][..], |p| &p[..]),
+            );
             if let Some(pose) = live.camera_sync.take() {
                 self.camera.position = [
                     pose.feet[0] as f32,
@@ -1640,7 +1671,15 @@ impl ApplicationHandler for GpuApp {
             // Zero-GPU sleep: no redraw requests at all. A slow tick keeps
             // the live session polled until the surface un-occludes.
             if let Some(live) = &mut self.live {
-                live.poll(self.camera.position);
+                let planes = Self::frustum_planes_for(
+                    &self.camera_controller,
+                    &self.camera,
+                    self.active.as_ref().map(|a| a.size),
+                );
+                live.poll(
+                    self.camera.position,
+                    planes.as_ref().map_or(&[][..], |p| &p[..]),
+                );
             }
             let wake = Instant::now() + OCCLUDED_TICK;
             event_loop.set_control_flow(ControlFlow::WaitUntil(wake));

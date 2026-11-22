@@ -17,6 +17,7 @@
 
 pub mod atmosphere;
 pub mod live_session;
+mod mesh_pool;
 pub mod renderer;
 pub mod subworld_render;
 pub mod window;

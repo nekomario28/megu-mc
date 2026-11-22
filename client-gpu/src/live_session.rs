@@ -305,6 +305,10 @@ pub struct LiveSession {
     pub pose: Option<PlayerPose>,
     pub camera_sync: Option<PlayerPose>,
     pub terrain_dirty: bool,
+    /// Lifetime count of sections meshed by the camera-frustum +
+    /// distance-ordered dirty drain in [`Self::poll`] — proves the
+    /// ordered rebuild path executes live.
+    pub ordered_rebuilds_count: u64,
     pub vfx_admitted: u64,
     pub vfx_rejected: u64,
     pub animation_packets: u64,
@@ -481,6 +485,7 @@ impl LiveSession {
             pose: None,
             camera_sync: None,
             terrain_dirty: false,
+            ordered_rebuilds_count: 0,
             vfx_admitted: 0,
             vfx_rejected: 0,
             animation_packets: 0,
@@ -810,8 +815,12 @@ impl LiveSession {
         self.tactile_event_tick
     }
 
-    /// Limit main-thread packet work per frame. No reads, writes or DNS on this thread.
-    pub fn poll(&mut self, camera_position: [f32; 3]) {
+    /// Limit main-thread packet work per frame. No reads, writes or DNS on
+    /// this thread. `frustum_planes` are the six view planes in
+    /// `box_in_frustum` form (`dot(n, p) + d >= 0` inside); they order the
+    /// dirty-mesh drain so visible nearby sections mesh first — an empty
+    /// slice degrades to pure distance ordering.
+    pub fn poll(&mut self, camera_position: [f32; 3], frustum_planes: &[[f32; 4]]) {
         for _ in 0..32 {
             match self.incoming.try_recv() {
                 Ok(WorkerMessage::Connected) => self.status = SessionStatus::Playing,
@@ -840,11 +849,15 @@ impl LiveSession {
         // Preserve the last received terrain even if the peer closes immediately
         // after sending chunk data.
         let had_pending = self.world.pending_mesh_sections() > 0;
-        match self
-            .world
-            .rebuild_dirty_bounded(self.mesh_rebuild_budget(), camera_position)
-        {
-            Ok(rebuilt) => self.terrain_dirty |= rebuilt != 0 || had_pending,
+        match self.world.rebuild_dirty_bounded_ordered(
+            self.mesh_rebuild_budget(),
+            camera_position,
+            frustum_planes,
+        ) {
+            Ok(rebuilt) => {
+                self.terrain_dirty |= rebuilt != 0 || had_pending;
+                self.ordered_rebuilds_count += rebuilt as u64;
+            }
             Err(error) if !matches!(self.status, SessionStatus::Disconnected(_)) => {
                 self.status = SessionStatus::Disconnected(format!("mesh: {error}"));
             }
@@ -2551,7 +2564,7 @@ mod tests {
             LiveSession::connect("127.0.0.1".into(), port, "Loopback".into(), "767".into());
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            live.poll([8.0, 20.0, 30.0]);
+            live.poll([8.0, 20.0, 30.0], &[]);
             if live.world.loaded_chunks() == 1
                 && live.magic.mana == 9.0
                 && live.vfx_admitted == 1
@@ -2633,14 +2646,14 @@ mod tests {
             },
         )))
         .unwrap();
-        live.poll([0.0; 3]);
+        live.poll([0.0; 3], &[]);
         assert_eq!(live.status, SessionStatus::Playing);
         assert_eq!(live.hud.health, 14.0);
         assert_eq!(live.hud.hunger, 12);
         assert_eq!(live.hud.chat_lines.last().unwrap(), "server ready");
         tx.send(WorkerMessage::Closed("test disconnect".into()))
             .unwrap();
-        live.poll([0.0; 3]);
+        live.poll([0.0; 3], &[]);
         assert_eq!(
             live.status,
             SessionStatus::Disconnected("test disconnect".into())
@@ -2742,7 +2755,7 @@ mod tests {
             decode_chunk_packet(&chunk_body, 24, 64).unwrap(),
         ))))
         .unwrap();
-        live.poll([8.0, 8.0, 24.0]);
+        live.poll([8.0, 8.0, 24.0], &[]);
         assert_eq!(live.world.loaded_chunks(), 1);
         let mesh = live
             .world

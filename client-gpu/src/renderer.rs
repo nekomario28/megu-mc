@@ -8,6 +8,7 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
@@ -27,7 +28,9 @@ use mc_spine_client_mesh::ffi::PackedVertex;
 use mc_spine_client_mesh::vanilla_plus_3d::ExtrudedMesh;
 use mc_spine_client_mesh::vfx_engine::DynamicColoredLight;
 use mc_spine_client_mesh::{
-    box_in_frustum, ChunkUploadBudget, GraphCuller, HiZPyramid, SectionCoord, SectionGraph, EDGE,
+    box_facing_mask, box_in_frustum, bucket_draw_mask, ChunkUploadBudget, Direction,
+    DirectionBuckets, GraphCuller, HiZPyramid, RenderRegions, SectionCoord, SectionGraph,
+    DIRECTION_BUCKETS, EDGE,
 };
 use mc_spine_client_mesh::{
     is_megu_wgsl_pack, BackendResolution, GpuCapabilities, GpuShaderCaps, MeguWgslPack, PassKind,
@@ -40,6 +43,9 @@ use winit::event_loop::OwnedDisplayHandle;
 use crate::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
 use crate::live_session::hw_adaptive_engine::{
     detect_host_hardware_caps, select_compute_strategy, ComputeStrategy, MemoryTransferStrategy,
+};
+use crate::mesh_pool::{
+    compute_opaque_bucket_ranges, HiZSplatSection, MeshJob, MeshJobPool, MeshResult,
 };
 use crate::mat4_mul;
 use crate::subworld_render::{
@@ -298,6 +304,54 @@ pub const TERRAIN_VERTEX_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::Verte
     attributes: &TERRAIN_ATTRS,
 };
 
+/// Opaque terrain vertex for the shared 8x4x8-section region arena: a
+/// region-local `f32` position plus the three packed attribute words of
+/// [`PackedVertex`] (24-byte stride). Keeping the position in floats lets
+/// merged draws span whole regions without repacking coordinates into the
+/// section-local 5/5/22-bit word — the region WGSL feeds `pos` straight
+/// into `section.origin + pos`, where `section.origin` is the region
+/// minimum. Positions decode exactly like the packed path
+/// (`y_fixed / 1024`, power-of-two scale) so rasterization stays
+/// pixel-identical.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct RegionVertex {
+    position: [f32; 3],
+    state_id: u32,
+    attributes: u32,
+    tint: u32,
+}
+
+const REGION_ATTRS: [wgpu::VertexAttribute; 4] = [
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x3,
+        offset: 0,
+        shader_location: 0,
+    },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Uint32,
+        offset: 12,
+        shader_location: 1,
+    },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Uint32,
+        offset: 16,
+        shader_location: 2,
+    },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Uint32,
+        offset: 20,
+        shader_location: 3,
+    },
+];
+
+/// 24-byte `RegionVertex` stride -> `vec3<f32>` + three `u32` inputs.
+const REGION_VERTEX_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+    array_stride: std::mem::size_of::<RegionVertex>() as wgpu::BufferAddress,
+    step_mode: wgpu::VertexStepMode::Vertex,
+    attributes: &REGION_ATTRS,
+};
+
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Offscreen/UI-framebuffer pixel format.
 pub const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -423,9 +477,26 @@ pub fn section_geometry(packed: &[PackedVertex], translucent_order: &[u32]) -> L
 }
 
 struct LiveTerrainSection {
-    packed: Vec<PackedVertex>,
-    order: Vec<u32>,
+    /// Grouped packed quads, shared with speculative worker jobs and the
+    /// Hi-Z splat inputs (`Arc` avoids re-cloning per job).
+    packed: Arc<[PackedVertex]>,
+    order: Arc<[u32]>,
+    /// Per-section geometry streams. Opaque buffers are the shared dummy
+    /// pair when `arena` routes the section into a region arena.
     terrain: TerrainBuffers,
+    /// Logical opaque index count regardless of where the indices live —
+    /// the visibility/cull gate needs this even for arena-resident
+    /// sections whose per-section opaque buffers are empty.
+    opaque_index_total: u32,
+    /// Per-bucket `(first, count)` spans of the section-local opaque index
+    /// stream; `Some` whenever the world published [`DirectionBuckets`],
+    /// so the per-section fallback path can bucket-cull too.
+    opaque_bucket_ranges: Option<[(u32, u32); DIRECTION_BUCKETS]>,
+    /// Quad-level direction buckets of `packed`, for the Hi-Z splat job.
+    buckets: Option<DirectionBuckets>,
+    /// Containing region origin when the opaque stream lives in
+    /// [`GpuRenderer::region_arenas`].
+    arena: Option<[i32; 3]>,
     _uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
 }
@@ -435,8 +506,11 @@ struct LiveTerrainSection {
 /// packed payload is cloned once at queue time so the `WorldState` borrow
 /// ends before the deferred GPU work runs.
 struct PendingSectionUpload {
-    packed: Vec<PackedVertex>,
-    order: Vec<u32>,
+    packed: Arc<[PackedVertex]>,
+    order: Arc<[u32]>,
+    /// Direction buckets mirrored at queue time — they decide whether the
+    /// admitted section routes into a region arena or per-section buffers.
+    buckets: Option<DirectionBuckets>,
     /// Estimated GPU payload bytes charged against the budget.
     upload_bytes: usize,
     /// Estimated upload-side CPU cost in microseconds.
@@ -444,22 +518,318 @@ struct PendingSectionUpload {
 }
 
 impl PendingSectionUpload {
-    fn new(packed: &[PackedVertex], order: &[u32]) -> Self {
+    fn new(
+        packed: Arc<[PackedVertex]>,
+        order: Arc<[u32]>,
+        buckets: Option<DirectionBuckets>,
+    ) -> Self {
         // `section_geometry` emits at most one output vertex per packed
         // vertex (16 B each) and six u32 indices per quad (~6 B per packed
         // vertex); the slack covers the section uniform/bind-group work.
         let upload_bytes = packed.len() * (std::mem::size_of::<PackedVertex>() + 6) + 256;
         let cost_us = 32 + upload_bytes as u64 / 256;
         Self {
-            packed: packed.to_vec(),
-            order: order.to_vec(),
+            packed,
+            order,
+            buckets,
             upload_bytes,
             cost_us,
         }
     }
 
     fn matches(&self, packed: &[PackedVertex], order: &[u32]) -> bool {
-        self.packed == packed && self.order == order
+        self.packed.as_ref() == packed && self.order.as_ref() == order
+    }
+}
+
+/// Speculative `section_geometry` output produced by the mesh worker pool
+/// for a still-pending upload. Matched back to the queue entry by
+/// `Arc` pointer identity so a superseded mesh never installs stale
+/// geometry.
+struct CompletedSectionGeometry {
+    packed: Arc<[PackedVertex]>,
+    geometry: LiveSectionGeometry,
+    opaque_bucket_ranges: Option<[(u32, u32); DIRECTION_BUCKETS]>,
+}
+
+/// One section's contribution to a [`RegionArena`]'s index stream: where
+/// its repacked vertices sit in the shared vertex arena plus the
+/// section-local opaque index ranges per direction bucket.
+struct ArenaSlot {
+    /// First vertex of the section inside `RegionArena::vertices`.
+    vertex_offset: u32,
+    /// Vertices this slot occupies in `vertices`.
+    vertex_count: u32,
+    /// Section-local opaque indices (into the slot's own vertices).
+    local_indices: Arc<[u32]>,
+    /// `(first, count)` of each bucket inside `local_indices`.
+    bucket_ranges: [(u32, u32); DIRECTION_BUCKETS],
+}
+
+/// A contiguous `(coord, index range)` record inside one bucket stream of
+/// a [`RegionArena`]; kept records sharing a fade value merge into a
+/// single `draw_indexed` call at encode time.
+struct ArenaDrawRecord {
+    coord: SectionCoord,
+    /// First index inside `RegionArena::indices`.
+    start: u32,
+    /// End index inside `RegionArena::indices` (exclusive).
+    end: u32,
+}
+
+/// Shared vertex/index arena over one 8x4x8-section region (the
+/// [`RenderRegions`] grid): repacked opaque vertices live in one vertex
+/// buffer, and one index buffer holds seven contiguous direction-bucket
+/// streams so a frame submits a handful of merged draws per region
+/// instead of per-section buffer binds.
+struct RegionArena {
+    /// Region-local opaque vertices (holes tracked in `vertex_free`).
+    vertices: Vec<RegionVertex>,
+    /// First-fit free list of `(offset, len)` vertex holes, coalesced —
+    /// the same discipline `client-port`'s arena uses.
+    vertex_free: Vec<(u32, u32)>,
+    /// Resident sections in deterministic order.
+    slots: BTreeMap<SectionCoord, ArenaSlot>,
+    /// Combined index contents: seven contiguous bucket streams.
+    indices: Vec<u32>,
+    /// Per-bucket `(coord, start, end)` draw records in `indices` order.
+    bucket_records: [Vec<ArenaDrawRecord>; DIRECTION_BUCKETS],
+    /// Vertex buffer contents changed since the last GPU write.
+    vertex_dirty: bool,
+    /// Slots changed since the last index-stream rebuild.
+    index_dirty: bool,
+    vertex_buffer: wgpu::Buffer,
+    vertex_capacity: usize,
+    index_buffer: wgpu::Buffer,
+    index_capacity: usize,
+    /// Indices written to `index_buffer` on the last flush.
+    index_len: u32,
+    /// `section` uniform holding the region-minimum world origin.
+    _uniform: wgpu::Buffer,
+    /// `{frame_ubo, region uniform}` on the shared frame layout — serves
+    /// the simple, composite, and shadow-caster pipelines alike.
+    bind_group: wgpu::BindGroup,
+}
+
+impl RegionArena {
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame_layout: &wgpu::BindGroupLayout,
+        frame_ubo: &wgpu::Buffer,
+        origin: [i32; 3],
+    ) -> Self {
+        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("region-arena-vertices"),
+            size: 64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("region-arena-indices"),
+            size: 64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("region-arena-uniform"),
+            size: std::mem::size_of::<SectionUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(
+            &uniform,
+            0,
+            bytemuck::bytes_of(&SectionUniforms {
+                origin: [
+                    origin[0] as f32 * EDGE as f32,
+                    origin[1] as f32 * EDGE as f32,
+                    origin[2] as f32 * EDGE as f32,
+                ],
+                _pad0: 0.0,
+                biome_tint: [1.0; 3],
+                biome_tint_strength: 0.0,
+            }),
+        );
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("region-arena-bind-group"),
+            layout: frame_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: frame_ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: uniform.as_entire_binding(),
+                },
+            ],
+        });
+        Self {
+            vertices: Vec::new(),
+            vertex_free: Vec::new(),
+            slots: BTreeMap::new(),
+            indices: Vec::new(),
+            bucket_records: Default::default(),
+            vertex_dirty: false,
+            index_dirty: false,
+            vertex_buffer,
+            vertex_capacity: 0,
+            index_buffer,
+            index_capacity: 0,
+            index_len: 0,
+            _uniform: uniform,
+            bind_group,
+        }
+    }
+
+    /// Free `offset..offset+len` back into the first-fit list.
+    fn release_vertices(&mut self, offset: u32, len: u32) {
+        if len == 0 {
+            return;
+        }
+        self.vertex_free.push((offset, len));
+        self.vertex_free.sort_unstable();
+        // Coalesce adjacent holes so large slabs stay findable.
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(self.vertex_free.len());
+        for &(off, l) in &self.vertex_free {
+            match merged.last_mut() {
+                Some((mo, ml)) if *mo + *ml == off => *ml += l,
+                _ => merged.push((off, l)),
+            }
+        }
+        self.vertex_free = merged;
+    }
+
+    /// First-fit allocation of `len` vertices, appending at the end when no
+    /// hole is big enough. Returns the slot's vertex offset.
+    fn alloc_vertices(&mut self, len: u32) -> u32 {
+        if let Some(index) = self
+            .vertex_free
+            .iter()
+            .position(|&(_, hole_len)| hole_len >= len)
+        {
+            let (offset, hole_len) = self.vertex_free.remove(index);
+            if hole_len > len {
+                self.vertex_free.push((offset + len, hole_len - len));
+            }
+            return offset;
+        }
+        let offset = self.vertices.len() as u32;
+        self.vertices.resize(offset as usize + len as usize, RegionVertex::zeroed());
+        offset
+    }
+
+    /// Insert or replace `coord`'s opaque stream: vertices repacked into
+    /// region space, indices staged for the next bucket-stream rebuild.
+    fn insert(
+        &mut self,
+        coord: SectionCoord,
+        vertices: &[RegionVertex],
+        local_indices: Arc<[u32]>,
+        bucket_ranges: [(u32, u32); DIRECTION_BUCKETS],
+    ) {
+        if let Some(old) = self.slots.remove(&coord) {
+            self.release_vertices(old.vertex_offset, old.vertex_count);
+        }
+        let vertex_count = vertices.len() as u32;
+        let vertex_offset = self.alloc_vertices(vertex_count);
+        let start = vertex_offset as usize;
+        self.vertices[start..start + vertices.len()].copy_from_slice(vertices);
+        self.slots.insert(
+            coord,
+            ArenaSlot {
+                vertex_offset,
+                vertex_count,
+                local_indices,
+                bucket_ranges,
+            },
+        );
+        self.vertex_dirty = true;
+        self.index_dirty = true;
+    }
+
+    /// Drop `coord`'s slab if present; empties retire their region.
+    fn remove(&mut self, coord: SectionCoord) {
+        if let Some(old) = self.slots.remove(&coord) {
+            self.release_vertices(old.vertex_offset, old.vertex_count);
+            self.index_dirty = true;
+        }
+    }
+
+    /// Concatenate every slot's bucket-local indices (rebased by the
+    /// slot's vertex offset) into one stream per direction bucket, then
+    /// lay the seven streams back to back and record per-section spans.
+    fn rebuild_indices(&mut self) {
+        self.indices.clear();
+        for bucket in 0..DIRECTION_BUCKETS {
+            self.bucket_records[bucket].clear();
+            for (&coord, slot) in &self.slots {
+                let (first_index, index_count) = slot.bucket_ranges[bucket];
+                if index_count == 0 {
+                    continue;
+                }
+                let start = first_index as usize;
+                let end = start + index_count as usize;
+                let Some(local) = slot.local_indices.get(start..end) else {
+                    continue;
+                };
+                let record_start = self.indices.len() as u32;
+                self.indices
+                    .extend(local.iter().map(|index| index + slot.vertex_offset));
+                self.bucket_records[bucket].push(ArenaDrawRecord {
+                    coord,
+                    start: record_start,
+                    end: self.indices.len() as u32,
+                });
+            }
+        }
+        self.index_dirty = false;
+    }
+
+    /// Upload dirty vertex/index contents, growing the GPU buffers past
+    /// the required capacity in one step.
+    fn flush_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let index_rebuilt = self.index_dirty;
+        if index_rebuilt {
+            self.rebuild_indices();
+        }
+        if self.vertex_dirty {
+            let needed = self.vertices.len();
+            if needed > self.vertex_capacity {
+                self.vertex_capacity = needed.max(64) + needed / 2;
+                self.vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("region-arena-vertices"),
+                    size: (self.vertex_capacity * std::mem::size_of::<RegionVertex>()) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            if !self.vertices.is_empty() {
+                queue.write_buffer(
+                    &self.vertex_buffer,
+                    0,
+                    bytemuck::cast_slice(&self.vertices),
+                );
+            }
+            self.vertex_dirty = false;
+        }
+        if index_rebuilt {
+            let needed = self.indices.len();
+            if needed > self.index_capacity {
+                self.index_capacity = needed.max(64) + needed / 2;
+                self.index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("region-arena-indices"),
+                    size: (self.index_capacity * std::mem::size_of::<u32>()) as u64,
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            if !self.indices.is_empty() {
+                queue.write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&self.indices));
+            }
+            self.index_len = self.indices.len() as u32;
+        }
     }
 }
 
@@ -485,7 +855,7 @@ fn strategy_upload_defaults(strategy: &ComputeStrategy) -> (ChunkUploadBudget, u
 /// inside half-space `dot(n, p) + d >= 0`. Covers NDC x/y in `[-1, 1]`
 /// and z in `[0, 1]` — the wgpu clip convention `Camera::view_projection`
 /// produces.
-fn frustum_planes_from_view_proj(view_proj: &Mat4) -> [[f32; 4]; 6] {
+pub fn frustum_planes_from_view_proj(view_proj: &Mat4) -> [[f32; 4]; 6] {
     // clip = view_proj * [x, y, z, 1]; with `m[col][row]` storage the
     // coefficients of clip component `i` over world (x, y, z, 1) are
     // `[m[0][i], m[1][i], m[2][i], m[3][i]]`.
@@ -518,8 +888,135 @@ fn frustum_planes_from_view_proj(view_proj: &Mat4) -> [[f32; 4]; 6] {
 
 /// Transpose the column-major `Mat4` into the row-major `[[f32; 4]; 4]`
 /// layout [`HiZPyramid::cull_world_aabb`] expects (`clip = vp * corner`).
-fn view_proj_row_major(view_proj: &Mat4) -> [[f32; 4]; 4] {
+pub(crate) fn view_proj_row_major(view_proj: &Mat4) -> [[f32; 4]; 4] {
     std::array::from_fn(|row| std::array::from_fn(|col| view_proj[col][row]))
+}
+
+/// Per-axis boundary sides in `box_facing_mask` order: `(axis, low, high)`
+/// mapped from the same (West/East, Down/Up, North/South) pairing.
+const FACING_AXIS_SIDES: [(usize, Direction, Direction); 3] = [
+    (0, Direction::West, Direction::East),
+    (1, Direction::Down, Direction::Up),
+    (2, Direction::North, Direction::South),
+];
+
+/// The buckets a section may draw this frame. Starts from
+/// [`bucket_draw_mask`] of the boundary sides facing the camera (which
+/// always keeps the unassigned bucket), then re-adds both directions on
+/// every axis the camera sits *inside* — an interior face can front-face
+/// a camera embedded in the section's span, so only the strict far-side
+/// opposite buckets drop. The skipped set is therefore exactly the
+/// back-facing direction buckets the S3 audit targets (a camera strictly
+/// west skips every `+X`/East bucket), never a face that could show.
+fn section_draw_mask(min: [f32; 3], camera: [f32; 3]) -> u8 {
+    let facing = box_facing_mask(min, camera);
+    let mut draw = bucket_draw_mask(facing);
+    for &(axis, low, high) in &FACING_AXIS_SIDES {
+        if camera[axis] >= min[axis] && camera[axis] <= min[axis] + EDGE as f32 {
+            draw |= low.bit() | high.bit();
+        }
+    }
+    draw
+}
+
+/// Repack the section-local opaque `PackedVertex` stream into
+/// [`RegionVertex`] positions relative to `origin` (the containing
+/// 8x4x8 region's minimum section coordinate). The decode mirrors the
+/// shader's packed decode bit-for-bit; only the block offset changes.
+fn repack_opaque_for_region(
+    origin: [i32; 3],
+    coord: SectionCoord,
+    verts: &[PackedVertex],
+) -> Vec<RegionVertex> {
+    let base = [
+        ((coord.0 - origin[0]) * EDGE as i32) as f32,
+        ((coord.1 - origin[1]) * EDGE as i32) as f32,
+        ((coord.2 - origin[2]) * EDGE as i32) as f32,
+    ];
+    verts
+        .iter()
+        .map(|v| RegionVertex {
+            position: [
+                (v.position & 31) as f32 + base[0],
+                (v.position >> 10) as f32 / 1024.0 + base[1],
+                ((v.position >> 5) & 31) as f32 + base[2],
+            ],
+            state_id: v.state_id,
+            attributes: v.attributes,
+            tint: v.tint,
+        })
+        .collect()
+}
+
+/// Rewrite the packed-position opaque vertex decode of `source` (one of
+/// the built-in terrain WGSL modules) into the [`REGION_VERTEX_LAYOUT`]
+/// `vec3<f32>` region-local position. Only the `TerrainVertex` input and
+/// the first `terrain_*_vs` entry change — the translucent entry keeps
+/// its own `TranslucentVertex` packed layout, so fragment stages and
+/// every other entry stay byte-identical. Panics on anchor drift: a
+/// silently wrong layout is worse than a loud build failure.
+fn region_opaque_wgsl(source: &str) -> String {
+    let out = source
+        .replacen(
+            "struct TerrainVertex {\n    @location(0) packed_pos: u32,",
+            "struct TerrainVertex {\n    @location(0) pos: vec3<f32>,",
+            1,
+        )
+        .replacen(
+            "let lx = f32(in.packed_pos & 0x1fu);\n    let lz = f32((in.packed_pos >> 5u) & 0x1fu);\n    let ly = f32(in.packed_pos >> 10u) / 1024.0;",
+            "let local = in.pos;",
+            1,
+        )
+        .replacen(
+            "section.origin + vec3<f32>(lx, ly, lz)",
+            "section.origin + local",
+            1,
+        )
+        .replacen(
+            "tiled_uv(vec3<f32>(lx, ly, lz), direction)",
+            "tiled_uv(local, direction)",
+            1,
+        );
+    for anchor in [
+        "@location(0) pos: vec3<f32>,",
+        "let local = in.pos;",
+        "section.origin + local",
+    ] {
+        assert!(out.contains(anchor), "region WGSL anchor missing: {anchor}");
+    }
+    // `packed_pos` must not survive inside the *opaque* vertex struct or
+    // the opaque vs decode; the translucent entry keeps its own struct.
+    assert!(
+        !out.contains("struct TerrainVertex {\n    @location(0) packed_pos"),
+        "opaque vertex struct kept packed_pos"
+    );
+    out
+}
+
+/// Same transform for the shadow-caster module's `vs_terrain` entry:
+/// the region vertex position arrives as a `vec3<f32>` and replaces the
+/// packed-word unpack.
+fn region_caster_wgsl(caster_source: &str) -> String {
+    let out = caster_source
+        .replacen(
+            "fn vs_terrain(@location(0) packed_pos: u32)",
+            "fn vs_terrain(@location(0) pos: vec3<f32>)",
+            1,
+        )
+        .replacen(
+            "let local = vec3<f32>(f32(packed_pos & 31u),\n        f32(packed_pos >> 10u) / 1024.0, f32((packed_pos >> 5u) & 31u));",
+            "let local = pos;",
+            1,
+        );
+    assert!(
+        out.contains("fn vs_terrain(@location(0) pos: vec3<f32>)"),
+        "region caster anchor missing"
+    );
+    assert!(
+        !out.contains("packed_pos"),
+        "region caster kept packed_pos decode"
+    );
+    out
 }
 
 /// The real `wgpu` renderer: terrain (opaque + translucent), UI blit, depth.
@@ -536,6 +1033,9 @@ pub struct GpuRenderer {
     section_ubo: wgpu::Buffer,
     terrain_pipeline: wgpu::RenderPipeline,
     translucent_pipeline: wgpu::RenderPipeline,
+    /// Region-vertex variant of `terrain_pipeline` for the no-camera
+    /// plain path's arena draws.
+    terrain_region_pipeline: wgpu::RenderPipeline,
     ui_pipeline: wgpu::RenderPipeline,
     ui_layout: wgpu::BindGroupLayout,
     ui_bind_group: Option<wgpu::BindGroup>,
@@ -562,10 +1062,42 @@ pub struct GpuRenderer {
     /// [`Self::update_live_terrain`] pass; feeds the composed frame's
     /// [`GraphCuller`] search. Empty until the first terrain sync.
     section_graphs: HashMap<SectionCoord, SectionGraph>,
-    /// Optional Hi-Z occlusion pyramid an embedder installs from a previous
-    /// frame's depth buffer; consulted after the graph/frustum test in the
-    /// composed pass. `None` keeps the conservative graph/frustum path.
+    /// Hi-Z occlusion pyramid consulted after the graph/frustum test in
+    /// the composed pass. The background worker pool rebuilds it from each
+    /// frame's drawn occluder depth (`hiz_source_vp` records the
+    /// view-projection it was splatted with); an embedder may also install
+    /// one manually via [`Self::set_hiz_pyramid`], which pauses automatic
+    /// updates until cleared.
     hiz_pyramid: Option<HiZPyramid>,
+    /// View-projection the auto-built pyramid was splatted with. `Some`
+    /// only for worker-produced pyramids — the pyramid is applied to
+    /// frames with the identical matrix so a stale camera never
+    /// false-culls. `None` marks an embedder-installed pyramid, which is
+    /// applied unconditionally.
+    hiz_source_vp: Option<Mat4>,
+    /// An embedder-installed (`set_hiz_pyramid(Some)`) pyramid is present:
+    /// automatic rebuild jobs pause and installs skip until `set_hiz_pyramid(None)`.
+    hiz_manual: bool,
+    /// Terrain residency changed since the last Hi-Z job — occluders moved.
+    hiz_dirty: bool,
+    /// Shared vertex/index arenas over `RenderRegions`' 8x4x8 grid feeding
+    /// the composed opaque path's merged bucket draws.
+    region_arenas: BTreeMap<[i32; 3], RegionArena>,
+    /// Region-arena opaque path toggle; `false` falls back to per-section
+    /// opaque buffers (A/B pixel comparison and bring-up).
+    arena_enabled: bool,
+    /// Shared 16-byte vertex buffer for arena-resident sections (their
+    /// opaque geometry lives in the region arena).
+    empty_vertex_buffer: wgpu::Buffer,
+    /// Shared 16-byte index buffer for arena-resident sections.
+    empty_index_buffer: wgpu::Buffer,
+    /// Bounded worker pool speculatively building section geometry and
+    /// the live Hi-Z pyramid (`mesh_worker_threads` sized).
+    mesh_pool: MeshJobPool,
+    /// Worker-built geometry for uploads still pending admission, keyed
+    /// by section; stale entries (superseded packed payloads) are dropped
+    /// at drain time.
+    completed_geometry: HashMap<SectionCoord, CompletedSectionGeometry>,
     /// Rendered-frame intervals (ms) feeding [`ChunkUploadBudget::adapt`].
     upload_frame_ms: VecDeque<f64>,
     /// Instant of the previous rendered frame for interval measurement.
@@ -584,6 +1116,24 @@ pub struct GpuRenderer {
     pub last_frame_culled_sections: usize,
     /// Lifetime total of sections skipped before GPU draw submission.
     pub culled_sections: u64,
+    /// Section-geometry jobs handed to the background pool, cumulative.
+    pub bg_mesh_jobs_submitted: u64,
+    /// Worker results drained by the render thread, cumulative — proves
+    /// the background mesh path actually executed.
+    pub bg_mesh_jobs_completed: u64,
+    /// Live Hi-Z pyramids installed from worker splats, cumulative.
+    pub hiz_frames_updated: u64,
+    /// Sections culled by the Hi-Z pyramid, cumulative.
+    pub hiz_culled_sections: u64,
+    /// Non-empty (section, direction-bucket) draws skipped by the facing
+    /// mask before GPU submission, cumulative.
+    pub direction_buckets_skipped: u64,
+    /// Merged `draw_indexed` calls the region-arena opaque path emitted,
+    /// cumulative.
+    pub region_arena_draws: u64,
+    /// Group-0 bind switches the arena path saved relative to one bind
+    /// per drawn section, cumulative.
+    pub bind_group_switches_saved: u64,
     composite: CompositeGpu,
     debug_line_pipeline: wgpu::RenderPipeline,
     debug_lines: Option<(wgpu::Buffer, u32)>,
@@ -694,6 +1244,8 @@ fn append_dynamic_quad(
 /// pass binds every draw.
 struct CompositeGpu {
     terrain_opaque_pipeline: wgpu::RenderPipeline,
+    /// `terrain_opaque_pipeline`'s region-vertex variant for arena draws.
+    terrain_region_pipeline: wgpu::RenderPipeline,
     terrain_alpha_pipeline: wgpu::RenderPipeline,
     lit_pipeline: wgpu::RenderPipeline,
     lit_alpha_pipeline: wgpu::RenderPipeline,
@@ -772,9 +1324,14 @@ struct ShadowGpu {
     draw_bg: wgpu::BindGroup,
     draw_capacity: usize,
     terrain_depth: wgpu::RenderPipeline,
+    /// `vs_terrain` variant reading the region-vertex layout for
+    /// arena-resident shadow casters.
+    terrain_region_depth: wgpu::RenderPipeline,
     lit_depth: wgpu::RenderPipeline,
     instanced_depth: wgpu::RenderPipeline,
     terrain_color: wgpu::RenderPipeline,
+    /// Shadow-sampling `terrain_vs` variant for region-arena draws.
+    terrain_region_color: wgpu::RenderPipeline,
     lit_color: wgpu::RenderPipeline,
     lit_alpha_color: wgpu::RenderPipeline,
     instanced_color: wgpu::RenderPipeline,
@@ -1003,12 +1560,21 @@ impl ShadowGpu {
             label: Some("shadow-caster-module"),
             source: wgpu::ShaderSource::Wgsl(Cow::Owned(caster_source)),
         });
-        let depth_pipeline = |label, entry, buffers: &[Option<wgpu::VertexBufferLayout<'_>>]| {
+        let caster_region_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("shadow-caster-region-module"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(region_caster_wgsl(
+                &format!("{MEGU_SHADOW_DEPTH_WGSL}\n{MEGU_SHADOW_CASTERS_WGSL}"),
+            ))),
+        });
+        let depth_pipeline = |label,
+                              module: &wgpu::ShaderModule,
+                              entry,
+                              buffers: &[Option<wgpu::VertexBufferLayout<'_>>]| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&caster_pipeline_layout),
                 vertex: wgpu::VertexState {
-                    module: &caster_module,
+                    module,
                     entry_point: Some(entry),
                     compilation_options: Default::default(),
                     buffers,
@@ -1033,12 +1599,25 @@ impl ShadowGpu {
         };
         let terrain_depth = depth_pipeline(
             "shadow-packed-terrain",
+            &caster_module,
             "vs_terrain",
             &[Some(TERRAIN_VERTEX_LAYOUT)],
         );
-        let lit_depth = depth_pipeline("shadow-lit", "vs_lit", &[Some(LIT_VERTEX_LAYOUT)]);
+        let terrain_region_depth = depth_pipeline(
+            "shadow-region-terrain",
+            &caster_region_module,
+            "vs_terrain",
+            &[Some(REGION_VERTEX_LAYOUT)],
+        );
+        let lit_depth = depth_pipeline(
+            "shadow-lit",
+            &caster_module,
+            "vs_lit",
+            &[Some(LIT_VERTEX_LAYOUT)],
+        );
         let instanced_depth = depth_pipeline(
             "shadow-instanced",
+            &caster_module,
             "vs_inst",
             &[Some(LIT_VERTEX_LAYOUT), Some(PART_INSTANCE_LAYOUT)],
         );
@@ -1067,6 +1646,13 @@ impl ShadowGpu {
             label: Some("shadowed-terrain"),
             source: wgpu::ShaderSource::Wgsl(Cow::Owned(composed_shadow_wgsl(
                 COMPOSITE_TERRAIN_WGSL,
+                true,
+            ))),
+        });
+        let terrain_region_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("shadowed-terrain-region"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(composed_shadow_wgsl(
+                &region_opaque_wgsl(COMPOSITE_TERRAIN_WGSL),
                 true,
             ))),
         });
@@ -1117,6 +1703,16 @@ impl ShadowGpu {
             None,
             true,
         );
+        let terrain_region_color = color_pipeline(
+            "shadowed-terrain-region-color",
+            &terrain_layout,
+            &terrain_region_module,
+            "terrain_vs",
+            "terrain_fs",
+            &[Some(REGION_VERTEX_LAYOUT)],
+            None,
+            true,
+        );
         let lit_color = color_pipeline(
             "shadowed-lit-color",
             &lit_layout,
@@ -1159,9 +1755,11 @@ impl ShadowGpu {
             draw_bg,
             draw_capacity,
             terrain_depth,
+            terrain_region_depth,
             lit_depth,
             instanced_depth,
             terrain_color,
+            terrain_region_color,
             lit_color,
             lit_alpha_color,
             instanced_color,
@@ -1472,6 +2070,20 @@ impl GpuRenderer {
             Self::build_terrain_pipeline(&ctx.device, &pipeline_layout, target_format, false);
         let translucent_pipeline =
             Self::build_terrain_pipeline(&ctx.device, &pipeline_layout, target_format, true);
+        let terrain_region_pipeline =
+            Self::build_terrain_region_pipeline(&ctx.device, &pipeline_layout, target_format);
+        let empty_vertex_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("empty-vertex"),
+            size: 16,
+            usage: wgpu::BufferUsages::VERTEX,
+            mapped_at_creation: false,
+        });
+        let empty_index_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("empty-index"),
+            size: 16,
+            usage: wgpu::BufferUsages::INDEX,
+            mapped_at_creation: false,
+        });
 
         let ui_layout = ctx
             .device
@@ -1606,6 +2218,7 @@ impl GpuRenderer {
             section_ubo,
             terrain_pipeline,
             translucent_pipeline,
+            terrain_region_pipeline,
             ui_pipeline,
             ui_layout,
             ui_bind_group: None,
@@ -1623,6 +2236,15 @@ impl GpuRenderer {
             pending_uploads: BTreeMap::new(),
             section_graphs: HashMap::new(),
             hiz_pyramid: None,
+            hiz_source_vp: None,
+            hiz_manual: false,
+            hiz_dirty: true,
+            region_arenas: BTreeMap::new(),
+            arena_enabled: true,
+            empty_vertex_buffer,
+            empty_index_buffer,
+            mesh_pool: MeshJobPool::new(mesh_worker_threads),
+            completed_geometry: HashMap::new(),
             upload_frame_ms: VecDeque::new(),
             last_render_instant: None,
             mesh_worker_threads,
@@ -1631,6 +2253,13 @@ impl GpuRenderer {
             deferred_uploads: 0,
             last_frame_culled_sections: 0,
             culled_sections: 0,
+            bg_mesh_jobs_submitted: 0,
+            bg_mesh_jobs_completed: 0,
+            hiz_frames_updated: 0,
+            hiz_culled_sections: 0,
+            direction_buckets_skipped: 0,
+            region_arena_draws: 0,
+            bind_group_switches_saved: 0,
             composite,
             debug_line_pipeline,
             debug_lines: None,
@@ -1879,6 +2508,12 @@ impl GpuRenderer {
             label: Some("composite-terrain"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(COMPOSITE_TERRAIN_WGSL)),
         });
+        let terrain_region_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("composite-terrain-region"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(region_opaque_wgsl(
+                COMPOSITE_TERRAIN_WGSL,
+            ))),
+        });
         let lit_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("composite-lit"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(COMPOSITE_LIT_WGSL)),
@@ -1925,6 +2560,16 @@ impl GpuRenderer {
             "terrain_vs",
             "terrain_fs",
             &terrain_buffers,
+            None,
+            true,
+        );
+        let terrain_region_pipeline = composite_pipeline(
+            "composite-terrain-region",
+            &terrain_layout,
+            &terrain_region_module,
+            "terrain_vs",
+            "terrain_fs",
+            &[Some(REGION_VERTEX_LAYOUT)],
             None,
             true,
         );
@@ -2105,6 +2750,7 @@ impl GpuRenderer {
         });
         CompositeGpu {
             terrain_opaque_pipeline,
+            terrain_region_pipeline,
             terrain_alpha_pipeline,
             lit_pipeline,
             lit_alpha_pipeline,
@@ -2150,17 +2796,45 @@ impl GpuRenderer {
             target_format,
             &module,
             (vs_entry, fs_entry),
+            &[Some(TERRAIN_VERTEX_LAYOUT)],
             translucent,
             label,
         )
     }
 
+    /// The simple-path region variant: `TERRAIN_OPAQUE_WGSL` with the
+    /// [`REGION_VERTEX_LAYOUT`] decode substituted in.
+    fn build_terrain_region_pipeline(
+        device: &wgpu::Device,
+        layout: &wgpu::PipelineLayout,
+        target_format: wgpu::TextureFormat,
+    ) -> wgpu::RenderPipeline {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("terrain-region-opaque"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(region_opaque_wgsl(
+                TERRAIN_OPAQUE_WGSL,
+            ))),
+        });
+        Self::terrain_pipeline_from_module(
+            device,
+            layout,
+            target_format,
+            &module,
+            ("terrain_opaque_vs", "terrain_opaque_fs"),
+            &[Some(REGION_VERTEX_LAYOUT)],
+            false,
+            "terrain-region-opaque",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn terrain_pipeline_from_module(
         device: &wgpu::Device,
         layout: &wgpu::PipelineLayout,
         target_format: wgpu::TextureFormat,
         module: &wgpu::ShaderModule,
         (vs_entry, fs_entry): (&str, &str),
+        buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
         translucent: bool,
         label: &str,
     ) -> wgpu::RenderPipeline {
@@ -2171,7 +2845,7 @@ impl GpuRenderer {
                 module,
                 entry_point: Some(vs_entry),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[Some(TERRAIN_VERTEX_LAYOUT)],
+                buffers,
             },
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -2265,6 +2939,7 @@ impl GpuRenderer {
                         self.target_format,
                         &module,
                         (&vs, &fs),
+                        &[Some(TERRAIN_VERTEX_LAYOUT)],
                         false,
                         "megu-pack-terrain",
                     )
@@ -2400,31 +3075,59 @@ impl GpuRenderer {
     /// queued mesh data changed.
     pub fn update_live_terrain(&mut self, world: &WorldState) -> usize {
         let mut scheduled = 0;
-        let previous_count = self.live_sections.len();
-        self.live_sections
-            .retain(|coord, _| world.packed_mesh(*coord).is_some());
+        let mut removed: Vec<(SectionCoord, Option<[i32; 3]>)> = Vec::new();
+        self.live_sections.retain(|coord, section| {
+            let keep = world.packed_mesh(*coord).is_some();
+            if !keep {
+                removed.push((*coord, section.arena));
+            }
+            keep
+        });
         self.pending_uploads
             .retain(|coord, _| world.packed_mesh(*coord).is_some());
-        let removed = self.live_sections.len() != previous_count;
         self.section_graphs.clear();
         self.section_graphs.extend(world.section_graphs());
+        for (coord, origin) in removed {
+            if let Some(origin) = origin {
+                if let Some(arena) = self.region_arenas.get_mut(&origin) {
+                    arena.remove(coord);
+                }
+            }
+            self.invalidate_hiz();
+        }
+        self.region_arenas.retain(|_, arena| !arena.slots.is_empty());
         for (coord, packed) in world.packed_meshes() {
             let order = world.translucent_order(coord).unwrap_or(&[]);
             let up_to_date = match self.pending_uploads.get(&coord) {
                 Some(pending) => pending.matches(packed, order),
-                None => self
-                    .live_sections
-                    .get(&coord)
-                    .is_some_and(|existing| existing.packed == packed && existing.order == order),
+                None => self.live_sections.get(&coord).is_some_and(|existing| {
+                    existing.packed.as_ref() == packed && existing.order.as_ref() == order
+                }),
             };
             if up_to_date {
                 continue;
             }
-            self.pending_uploads
-                .insert(coord, PendingSectionUpload::new(packed, order));
+            let packed: Arc<[PackedVertex]> = packed.into();
+            let order: Arc<[u32]> = order.into();
+            let buckets = world.direction_buckets(coord);
+            self.pending_uploads.insert(
+                coord,
+                PendingSectionUpload::new(packed.clone(), order.clone(), buckets),
+            );
+            // Speculative geometry build off the render thread: the drain
+            // prefers this result when the worker finishes before the
+            // budget admits the section; a full queue falls back inline.
+            if self.mesh_pool.try_submit(MeshJob::SectionGeometry {
+                coord,
+                packed,
+                order,
+                buckets,
+            }) {
+                self.bg_mesh_jobs_submitted += 1;
+            }
             scheduled += 1;
         }
-        if removed {
+        if scheduled > 0 {
             self.shadow_cache.invalidate();
         }
         scheduled
@@ -2432,29 +3135,106 @@ impl GpuRenderer {
 
     /// Build the GPU buffers, section uniform and bind group for one
     /// section and make it resident, replacing any previous upload for
-    /// `coord`.
+    /// `coord`. When the world published [`DirectionBuckets`] and the
+    /// region-arena path is enabled, the opaque stream is repacked into
+    /// the containing 8x4x8 [`RegionArena`] instead of per-section
+    /// buffers; translucent geometry and the section uniform stay
+    /// per-section either way.
     fn install_live_section(
         &mut self,
         coord: SectionCoord,
-        packed: &[PackedVertex],
-        order: &[u32],
+        packed: &Arc<[PackedVertex]>,
+        order: &Arc<[u32]>,
+        buckets: Option<DirectionBuckets>,
     ) {
         let geometry = section_geometry(packed, order);
+        let opaque_bucket_ranges =
+            buckets.map(|b| compute_opaque_bucket_ranges(packed, b));
+        self.install_live_section_geometry(
+            coord,
+            packed.clone(),
+            order.clone(),
+            buckets,
+            opaque_bucket_ranges,
+            geometry,
+        );
+    }
+
+    /// The install body shared by the inline path and worker-built
+    /// geometry results.
+    #[allow(clippy::too_many_arguments)]
+    fn install_live_section_geometry(
+        &mut self,
+        coord: SectionCoord,
+        packed: Arc<[PackedVertex]>,
+        order: Arc<[u32]>,
+        buckets: Option<DirectionBuckets>,
+        opaque_bucket_ranges: Option<[(u32, u32); DIRECTION_BUCKETS]>,
+        geometry: LiveSectionGeometry,
+    ) {
+        // Retire the previous residency first: a re-upload may switch a
+        // section between the arena and per-section storage.
+        if let Some(origin) = self
+            .live_sections
+            .get(&coord)
+            .and_then(|section| section.arena)
+        {
+            if let Some(arena) = self.region_arenas.get_mut(&origin) {
+                arena.remove(coord);
+            }
+        }
+        let opaque_index_total = geometry.opaque_indices.len() as u32;
+        let arena_origin = (self.arena_enabled
+            && opaque_index_total > 0
+            && buckets.is_some())
+        .then(|| {
+            let origin = RenderRegions::origin_of(coord);
+            let ranges = opaque_bucket_ranges.unwrap_or([(0, 0); DIRECTION_BUCKETS]);
+            let local: Arc<[u32]> = geometry.opaque_indices.as_slice().into();
+            let verts = repack_opaque_for_region(origin, coord, &geometry.opaque);
+            if !self.region_arenas.contains_key(&origin) {
+                let arena = RegionArena::new(
+                    &self.ctx.device,
+                    &self.ctx.queue,
+                    &self.frame_layout,
+                    &self.frame_ubo,
+                    origin,
+                );
+                self.region_arenas.insert(origin, arena);
+            }
+            if let Some(arena) = self.region_arenas.get_mut(&origin) {
+                arena.insert(coord, &verts, local, ranges);
+            }
+            origin
+        });
+        let (opaque_vertices, opaque_indices, opaque_index_count) = if arena_origin.is_some() {
+            (
+                self.empty_vertex_buffer.clone(),
+                self.empty_index_buffer.clone(),
+                0,
+            )
+        } else {
+            (
+                vertex_buffer(
+                    &self.ctx.device,
+                    &self.ctx.queue,
+                    "live-opaque-verts",
+                    &geometry.opaque,
+                ),
+                index_buffer(
+                    &self.ctx.device,
+                    &self.ctx.queue,
+                    "live-opaque-indices",
+                    &geometry.opaque_indices,
+                ),
+                opaque_index_total,
+            )
+        };
         let terrain = TerrainBuffers {
-            opaque_index_count: geometry.opaque_indices.len() as u32,
+            opaque_index_count,
             translucent_index_count: geometry.translucent_indices.len() as u32,
-            opaque_vertices: vertex_buffer(
-                &self.ctx.device,
-                &self.ctx.queue,
-                "live-opaque-verts",
-                &geometry.opaque,
-            ),
-            opaque_indices: index_buffer(
-                &self.ctx.device,
-                &self.ctx.queue,
-                "live-opaque-indices",
-                &geometry.opaque_indices,
-            ),
+            opaque_vertices,
+            opaque_indices,
             translucent_vertices: vertex_buffer(
                 &self.ctx.device,
                 &self.ctx.queue,
@@ -2507,13 +3287,137 @@ impl GpuRenderer {
         self.live_sections.insert(
             coord,
             LiveTerrainSection {
-                packed: packed.to_vec(),
-                order: order.to_vec(),
+                packed,
+                order,
                 terrain,
+                opaque_index_total,
+                opaque_bucket_ranges,
+                buckets,
+                arena: arena_origin,
                 _uniform: uniform,
                 bind_group,
             },
         );
+        // Occluders changed: the installed pyramid (if any) is stale.
+        self.invalidate_hiz();
+    }
+
+    /// Drop the worker-built pyramid when terrain residency shifts; an
+    /// embedder-installed pyramid (no `hiz_source_vp`) is the caller's
+    /// responsibility and stays.
+    fn invalidate_hiz(&mut self) {
+        if self.hiz_source_vp.is_some() {
+            self.hiz_pyramid = None;
+            self.hiz_source_vp = None;
+        }
+        self.hiz_dirty = true;
+    }
+
+    /// Pull finished worker results: geometry completions are parked for
+    /// the pending-upload drain, Hi-Z pyramids install directly.
+    fn drain_mesh_results(&mut self) {
+        let mut results = Vec::new();
+        self.mesh_pool.drain(|result| results.push(result));
+        for result in results {
+            match result {
+                MeshResult::SectionGeometry {
+                    coord,
+                    packed,
+                    geometry,
+                    opaque_bucket_ranges,
+                } => {
+                    self.bg_mesh_jobs_completed += 1;
+                    self.completed_geometry.insert(
+                        coord,
+                        CompletedSectionGeometry {
+                            packed,
+                            geometry,
+                            opaque_bucket_ranges,
+                        },
+                    );
+                }
+                MeshResult::HiZDepth {
+                    view_proj,
+                    pyramid,
+                } => {
+                    // `hiz_dirty` means residency moved after the job was
+                    // submitted — its pyramid may still hold occluders that
+                    // no longer exist, so drop it and let the next frame
+                    // rebuild from current sections.
+                    if let (Some(pyramid), false, false) =
+                        (pyramid, self.hiz_manual, self.hiz_dirty)
+                    {
+                        self.hiz_pyramid = Some(pyramid);
+                        self.hiz_source_vp = Some(view_proj);
+                        self.hiz_frames_updated += 1;
+                    }
+                }
+            }
+        }
+        // Drop completions whose pending upload was superseded (a newer
+        // packed payload re-queued the section).
+        let pending = &self.pending_uploads;
+        self.completed_geometry.retain(|coord, done| {
+            pending
+                .get(coord)
+                .is_some_and(|p| Arc::ptr_eq(&p.packed, &done.packed))
+        });
+    }
+
+    /// Queue the next Hi-Z splat job over this frame's drawn opaque
+    /// quads. Skipped while an embedder-installed pyramid is active or
+    /// the installed pyramid already matches this view and residency.
+    fn submit_hiz_job(&mut self, view_proj: &Mat4, camera_position: [f32; 3], culled: &HashSet<SectionCoord>) {
+        if self.hiz_manual {
+            return;
+        }
+        if !self.hiz_dirty
+            && self
+                .hiz_source_vp
+                .is_some_and(|source| source == *view_proj)
+        {
+            return;
+        }
+        let mut sections = Vec::with_capacity(self.live_sections.len());
+        for (coord, section) in &self.live_sections {
+            if culled.contains(coord) || section.opaque_index_total == 0 {
+                continue;
+            }
+            let min = [
+                coord.0 as f32 * EDGE as f32,
+                coord.1 as f32 * EDGE as f32,
+                coord.2 as f32 * EDGE as f32,
+            ];
+            sections.push(HiZSplatSection {
+                origin: min,
+                packed: section.packed.clone(),
+                buckets: section.buckets,
+                draw_mask: section_draw_mask(min, camera_position),
+            });
+        }
+        if self.mesh_pool.try_submit(MeshJob::HiZDepth {
+            view_proj: *view_proj,
+            sections,
+        }) {
+            self.hiz_dirty = false;
+        }
+    }
+
+    /// Write dirty region-arena vertex/index streams to their GPU
+    /// buffers. Runs at the upload boundary so the render pass reads
+    /// immutable arena state.
+    fn flush_region_arenas(&mut self) {
+        for arena in self.region_arenas.values_mut() {
+            arena.flush_gpu(&self.ctx.device, &self.ctx.queue);
+        }
+    }
+
+    /// Enable/disable the shared region-arena opaque path; `false` keeps
+    /// per-section opaque buffers (still bucket-culled when ranges
+    /// exist). Sections already installed keep their storage — the flag
+    /// applies to new installs.
+    pub fn set_region_arena_enabled(&mut self, enabled: bool) {
+        self.arena_enabled = enabled;
     }
 
     /// Per-rendered-frame upload boundary: measure the frame interval for
@@ -2522,6 +3426,7 @@ impl GpuRenderer {
     /// P95, then drain queued section uploads through it. Runs once per
     /// composed or plain world pass.
     fn begin_render_upload_frame(&mut self) {
+        self.drain_mesh_results();
         let now = Instant::now();
         if let Some(last) = self.last_render_instant.replace(now) {
             let ms = now.duration_since(last).as_secs_f64() * 1_000.0;
@@ -2535,6 +3440,7 @@ impl GpuRenderer {
         self.upload_budget.begin_frame();
         self.upload_budget.adapt(self.upload_frame_p95_us());
         self.drain_pending_uploads();
+        self.flush_region_arenas();
     }
 
     /// Windowed P95 of recent rendered-frame intervals, in microseconds —
@@ -2573,7 +3479,28 @@ impl GpuRenderer {
                 .remove(&coord)
                 .expect("pending checked");
             self.admitted_uploads += 1;
-            self.install_live_section(coord, &pending.packed, &pending.order);
+            // Prefer the worker-built geometry when it is still for this
+            // exact packed payload; otherwise convert inline.
+            let completed = self
+                .completed_geometry
+                .remove(&coord)
+                .filter(|done| Arc::ptr_eq(&done.packed, &pending.packed));
+            match completed {
+                Some(done) => self.install_live_section_geometry(
+                    coord,
+                    pending.packed,
+                    pending.order,
+                    pending.buckets,
+                    done.opaque_bucket_ranges,
+                    done.geometry,
+                ),
+                None => self.install_live_section(
+                    coord,
+                    &pending.packed,
+                    &pending.order,
+                    pending.buckets,
+                ),
+            }
             admitted += 1;
         }
         if admitted > 0 {
@@ -2589,7 +3516,7 @@ impl GpuRenderer {
     /// installed — the conservative depth test on top of both. Only
     /// sections with drawable indices are considered.
     fn cull_live_sections(
-        &self,
+        &mut self,
         view_proj: &Mat4,
         camera_position: [f32; 3],
     ) -> HashSet<SectionCoord> {
@@ -2613,12 +3540,20 @@ impl GpuRenderer {
                 .into_iter()
                 .collect::<HashSet<_>>()
         });
-        let hiz_rows = self
-            .hiz_pyramid
-            .as_ref()
-            .map(|_| view_proj_row_major(view_proj));
+        // A worker-built pyramid only applies to the exact view it was
+        // splatted with — a stale camera can't false-cull. Embedder
+        // pyramids (`hiz_source_vp == None`) always apply.
+        let hiz_rows = match self.hiz_source_vp {
+            Some(source) if source == *view_proj => Some(view_proj_row_major(view_proj)),
+            Some(_) => None,
+            None => self
+                .hiz_pyramid
+                .as_ref()
+                .map(|_| view_proj_row_major(view_proj)),
+        };
+        let mut hiz_culled = 0u64;
         for (coord, section) in self.live_sections.iter() {
-            if section.terrain.opaque_index_count == 0
+            if section.opaque_index_total == 0
                 && section.terrain.translucent_index_count == 0
             {
                 continue;
@@ -2628,6 +3563,22 @@ impl GpuRenderer {
                 coord.1 as f32 * EDGE as f32,
                 coord.2 as f32 * EDGE as f32,
             ];
+            // Hi-Z runs before graph/frustum culling: a view-matched pyramid
+            // only reports occlusion the previous frame's drawn occluders
+            // prove, so a depth-culled section stays culled regardless of
+            // which conservative test fires first.
+            if let (Some(hiz), Some(rows)) = (&self.hiz_pyramid, &hiz_rows) {
+                let max = [
+                    min[0] + EDGE as f32,
+                    min[1] + EDGE as f32,
+                    min[2] + EDGE as f32,
+                ];
+                if hiz.cull_world_aabb(rows, min, max) {
+                    culled.insert(*coord);
+                    hiz_culled += 1;
+                    continue;
+                }
+            }
             let visible = if self.section_graphs.contains_key(coord) {
                 graph_visible
                     .as_ref()
@@ -2637,19 +3588,9 @@ impl GpuRenderer {
             };
             if !visible {
                 culled.insert(*coord);
-                continue;
-            }
-            if let (Some(hiz), Some(rows)) = (&self.hiz_pyramid, &hiz_rows) {
-                let max = [
-                    min[0] + EDGE as f32,
-                    min[1] + EDGE as f32,
-                    min[2] + EDGE as f32,
-                ];
-                if hiz.cull_world_aabb(rows, min, max) {
-                    culled.insert(*coord);
-                }
             }
         }
+        self.hiz_culled_sections += hiz_culled;
         culled
     }
 
@@ -2670,8 +3611,11 @@ impl GpuRenderer {
 
     /// Install or clear the Hi-Z occlusion pyramid consulted by the
     /// composed world pass (`None` keeps the conservative graph/frustum
-    /// path).
+    /// path). An embedder-installed pyramid pauses the automatic worker
+    /// rebuild until `set_hiz_pyramid(None)` hands control back.
     pub fn set_hiz_pyramid(&mut self, pyramid: Option<HiZPyramid>) {
+        self.hiz_manual = pyramid.is_some();
+        self.hiz_source_vp = None;
         self.hiz_pyramid = pyramid;
     }
 
@@ -2690,6 +3634,7 @@ impl GpuRenderer {
         let (budget, workers) = strategy_upload_defaults(strategy);
         self.upload_budget = budget;
         self.mesh_worker_threads = workers;
+        self.mesh_pool.set_threads(workers);
         self.set_render_scale(match strategy.memory {
             MemoryTransferStrategy::UnifiedZeroCopy => RenderScalePreset::Balanced75,
             MemoryTransferStrategy::DiscreteStagedArena => RenderScalePreset::Native100,
@@ -2974,7 +3919,7 @@ impl GpuRenderer {
             if !self.live_sections.is_empty() {
                 pass.set_pipeline(&self.terrain_pipeline);
                 for section in self.live_sections.values() {
-                    if section.terrain.opaque_index_count == 0 {
+                    if section.arena.is_some() || section.terrain.opaque_index_count == 0 {
                         continue;
                     }
                     pass.set_bind_group(0, &section.bind_group, &[]);
@@ -2984,6 +3929,23 @@ impl GpuRenderer {
                         wgpu::IndexFormat::Uint32,
                     );
                     pass.draw_indexed(0..section.terrain.opaque_index_count, 0, 0..1);
+                }
+                // No camera in this path => no facing cull; every flushed
+                // region bucket stream draws in one call per region.
+                if !self.region_arenas.is_empty() {
+                    pass.set_pipeline(&self.terrain_region_pipeline);
+                    for arena in self.region_arenas.values() {
+                        if arena.index_len == 0 {
+                            continue;
+                        }
+                        pass.set_bind_group(0, &arena.bind_group, &[]);
+                        pass.set_vertex_buffer(0, arena.vertex_buffer.slice(..));
+                        pass.set_index_buffer(
+                            arena.index_buffer.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
+                        pass.draw_indexed(0..arena.index_len, 0, 0..1);
+                    }
                 }
                 pass.set_pipeline(&self.translucent_pipeline);
                 for section in self.live_sections.values() {
@@ -3078,7 +4040,10 @@ impl GpuRenderer {
         self.write_frame_uniforms(&camera, aspect, atmo.fog_rgb, sky.fog_start, sky.fog_end);
         // Pending uploads may all be admitted by this frame's drain inside
         // `encode_composed_world`, so reserve draw slots for them too.
-        let draws = (self.live_sections.len() + self.pending_uploads.len()) * 2
+        // A bucketed section submits up to `DIRECTION_BUCKETS` opaque
+        // draws on the fallback path (arena records merge into fewer).
+        let draws = (self.live_sections.len() + self.pending_uploads.len())
+            * (DIRECTION_BUCKETS + 1)
             + 2
             + self.subworld_gpu.entry_count()
             + self.subworld_gpu.batch_count()
@@ -3374,8 +4339,16 @@ impl GpuRenderer {
         let section_offsets: Vec<_> = self
             .live_sections
             .iter()
-            .filter(|(_, section)| section.terrain.opaque_index_count > 0)
+            .filter(|(_, section)| {
+                section.arena.is_none() && section.opaque_index_total > 0
+            })
             .map(|(coord, _)| (*coord, push_model(identity)))
+            .collect();
+        let region_offsets: Vec<_> = self
+            .region_arenas
+            .iter()
+            .filter(|(_, arena)| arena.index_len > 0)
+            .map(|(origin, _)| (*origin, push_model(identity)))
             .collect();
         let entry_offsets: Vec<_> = self
             .subworld_gpu
@@ -3432,6 +4405,23 @@ impl GpuRenderer {
                     wgpu::IndexFormat::Uint32,
                 );
                 pass.draw_indexed(0..section.terrain.opaque_index_count, 0, 0..1);
+            }
+            // Arena-resident sections cast through the region depth
+            // pipeline: the light needs every bucket, so the whole
+            // flushed index stream goes in one draw per region.
+            if !region_offsets.is_empty() {
+                pass.set_pipeline(&shadow.terrain_region_depth);
+                for (origin, offset) in &region_offsets {
+                    let arena = &self.region_arenas[origin];
+                    pass.set_bind_group(1, &arena.bind_group, &[]);
+                    pass.set_bind_group(2, &shadow.draw_bg, &[*offset]);
+                    pass.set_vertex_buffer(0, arena.vertex_buffer.slice(..));
+                    pass.set_index_buffer(
+                        arena.index_buffer.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    pass.draw_indexed(0..arena.index_len, 0, 0..1);
+                }
             }
             pass.set_pipeline(&shadow.lit_depth);
             pass.set_bind_group(1, &self.frame_bind_group, &[]);
@@ -3706,12 +4696,21 @@ impl GpuRenderer {
         let culled_sections = self.cull_live_sections(&view_proj, camera_position);
         self.culled_sections += culled_sections.len() as u64;
         self.last_frame_culled_sections = culled_sections.len();
+        // Hand the drawn occluder set to the worker pool while the GPU
+        // encodes: the finished Hi-Z pyramid lands on a later frame's
+        // upload boundary.
+        self.submit_hiz_job(&view_proj, camera_position, &culled_sections);
         // Split disjoint field borrows so the scratch writer and the GPU
         // handles can coexist inside the render pass.
         let gpu = &mut self.composite;
         let shadow = self.shadow.as_ref().filter(|_| self.shadow_active);
         let scene = &self.scene;
         let live_sections = &self.live_sections;
+        let region_arenas = &self.region_arenas;
+        let mut skipped_buckets = 0u64;
+        let mut arena_draws = 0u64;
+        let mut arena_sections = 0usize;
+        let mut arena_regions = 0usize;
         let subworld_gpu = &self.subworld_gpu;
         let entity_ber = &self.entity_ber;
         let particles = &self.particles;
@@ -3773,8 +4772,10 @@ impl GpuRenderer {
                 pass.set_bind_group(3, &shadow.receiver_bg, &[]);
             }
 
-            // Opaque terrain: the demo scene plus every live section, each
-            // with its chunk-column fade.
+            // Opaque terrain: the demo scene, then every live section —
+            // arena-resident sections as merged per-region bucket draws,
+            // the rest through per-section buffers with the same facing
+            // cull applied per bucket.
             pass.set_pipeline(shadow.map_or(&gpu.terrain_opaque_pipeline, |s| &s.terrain_color));
             if let Some(scene) = scene {
                 if scene.opaque_index_count > 0 {
@@ -3789,20 +4790,138 @@ impl GpuRenderer {
                     pass.draw_indexed(0..scene.opaque_index_count, 0, 0..1);
                 }
             }
+            // S4 shared region arena: one bind group + buffer pair per
+            // 8x4x8 region; seven contiguous direction-bucket streams in
+            // a single index buffer merge into a few draws per region.
+            if !region_arenas.is_empty() {
+                pass.set_pipeline(
+                    shadow.map_or(&gpu.terrain_region_pipeline, |s| &s.terrain_region_color),
+                );
+                for arena in region_arenas.values() {
+                    if arena.index_len == 0 {
+                        continue;
+                    }
+                    let mut bound = false;
+                    let mut emitted: HashSet<SectionCoord> = HashSet::new();
+                    for (bucket, records) in arena.bucket_records.iter().enumerate() {
+                        // Merged run of consecutive kept records sharing
+                        // one fade value: (start, end, fade_bits).
+                        let mut run: Option<(u32, u32, u32)> = None;
+                        for record in records {
+                            let coord = &record.coord;
+                            let culled = culled_sections.contains(coord);
+                            let min = [
+                                coord.0 as f32 * EDGE as f32,
+                                coord.1 as f32 * EDGE as f32,
+                                coord.2 as f32 * EDGE as f32,
+                            ];
+                            let kept = !culled
+                                && section_draw_mask(min, camera_position) >> bucket & 1 != 0;
+                            if !kept {
+                                if !culled {
+                                    skipped_buckets += 1;
+                                }
+                                if let Some((start, end, fade_bits)) = run.take() {
+                                    let off = slot(identity, f32::from_bits(fade_bits), 1.0);
+                                    pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+                                    pass.draw_indexed(start..end, 0, 0..1);
+                                    arena_draws += 1;
+                                }
+                                continue;
+                            }
+                            if !bound {
+                                pass.set_bind_group(0, &arena.bind_group, &[]);
+                                pass.set_vertex_buffer(0, arena.vertex_buffer.slice(..));
+                                pass.set_index_buffer(
+                                    arena.index_buffer.slice(..),
+                                    wgpu::IndexFormat::Uint32,
+                                );
+                                bound = true;
+                            }
+                            emitted.insert(*coord);
+                            let fade = chunk_fades.fade_alpha(coord.0, coord.2);
+                            match run {
+                                Some((start, end, bits))
+                                    if end == record.start && bits == fade.to_bits() =>
+                                {
+                                    run = Some((start, record.end, bits));
+                                }
+                                _ => {
+                                    if let Some((start, end, bits)) = run.take() {
+                                        let off = slot(identity, f32::from_bits(bits), 1.0);
+                                        pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+                                        pass.draw_indexed(start..end, 0, 0..1);
+                                        arena_draws += 1;
+                                    }
+                                    run = Some((record.start, record.end, fade.to_bits()));
+                                }
+                            }
+                        }
+                        if let Some((start, end, bits)) = run.take() {
+                            let off = slot(identity, f32::from_bits(bits), 1.0);
+                            pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+                            pass.draw_indexed(start..end, 0, 0..1);
+                            arena_draws += 1;
+                        }
+                    }
+                    arena_sections += emitted.len();
+                    arena_regions += usize::from(bound);
+                }
+                // Restore the per-section pipeline for the fallback path.
+                pass.set_pipeline(
+                    shadow.map_or(&gpu.terrain_opaque_pipeline, |s| &s.terrain_color),
+                );
+            }
             for (coord, section) in live_sections.iter() {
-                if culled_sections.contains(coord) || section.terrain.opaque_index_count == 0 {
+                if section.arena.is_some()
+                    || culled_sections.contains(coord)
+                    || section.opaque_index_total == 0
+                {
                     continue;
                 }
                 let fade = chunk_fades.fade_alpha(coord.0, coord.2);
-                let off = slot(identity, fade, 1.0);
-                pass.set_bind_group(0, &section.bind_group, &[]);
-                pass.set_bind_group(1, &gpu.draw_bg, &[off]);
-                pass.set_vertex_buffer(0, section.terrain.opaque_vertices.slice(..));
-                pass.set_index_buffer(
-                    section.terrain.opaque_indices.slice(..),
-                    wgpu::IndexFormat::Uint32,
-                );
-                pass.draw_indexed(0..section.terrain.opaque_index_count, 0, 0..1);
+                let min = [
+                    coord.0 as f32 * EDGE as f32,
+                    coord.1 as f32 * EDGE as f32,
+                    coord.2 as f32 * EDGE as f32,
+                ];
+                match section.opaque_bucket_ranges {
+                    Some(ranges) => {
+                        let draw_mask = section_draw_mask(min, camera_position);
+                        for (bucket, &(start, count)) in ranges.iter().enumerate() {
+                            if count == 0 {
+                                continue;
+                            }
+                            if draw_mask >> bucket & 1 == 0 {
+                                skipped_buckets += 1;
+                                continue;
+                            }
+                            let off = slot(identity, fade, 1.0);
+                            pass.set_bind_group(0, &section.bind_group, &[]);
+                            pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+                            pass.set_vertex_buffer(
+                                0,
+                                section.terrain.opaque_vertices.slice(..),
+                            );
+                            pass.set_index_buffer(
+                                section.terrain.opaque_indices.slice(..),
+                                wgpu::IndexFormat::Uint32,
+                            );
+                            pass.draw_indexed(start..start + count, 0, 0..1);
+                        }
+                    }
+                    None => {
+                        let off = slot(identity, fade, 1.0);
+                        pass.set_bind_group(0, &section.bind_group, &[]);
+                        pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+                        pass.set_vertex_buffer(0, section.terrain.opaque_vertices.slice(..));
+                        pass.set_index_buffer(
+                            section.terrain.opaque_indices.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
+                        pass.draw_indexed(0..section.terrain.opaque_index_count, 0, 0..1);
+                    }
+                }
             }
 
             // Translucent terrain (water, stained glass) through the
@@ -3928,6 +5047,11 @@ impl GpuRenderer {
                 pass.draw(0..*count, 0..1);
             }
         }
+        self.direction_buckets_skipped += skipped_buckets;
+        self.region_arena_draws += arena_draws;
+        // One bind group per emitting region replaces one per emitting
+        // section; the difference is real `set_bind_group` traffic saved.
+        self.bind_group_switches_saved += arena_sections.saturating_sub(arena_regions) as u64;
         // Upload the recorded draw uniforms ahead of this frame's submit.
         let gpu = &self.composite;
         self.ctx
@@ -3972,9 +5096,11 @@ impl GpuRenderer {
         let view = camera.far.clamp(16.0, 2048.0);
         self.write_frame_uniforms(camera, aspect, atmo.fog_rgb, view * 0.6, view);
         self.write_env_uniforms(frame);
-        // Worst case: one slot per live section + pending uploads admitted
-        // by this frame's drain + scene + subworlds + batches.
-        let draw_count = (self.live_sections.len() + self.pending_uploads.len()) * 2
+        // Worst case: `DIRECTION_BUCKETS` opaque buckets + one translucent
+        // draw per live section + pending uploads admitted by this frame's
+        // drain + scene + subworlds + batches.
+        let draw_count = (self.live_sections.len() + self.pending_uploads.len())
+            * (DIRECTION_BUCKETS + 1)
             + 2
             + self.subworld_gpu.entry_count()
             + self.subworld_gpu.batch_count()

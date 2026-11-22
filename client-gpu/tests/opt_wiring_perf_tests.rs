@@ -350,3 +350,220 @@ fn composed_pass_culls_off_screen_sections_before_draw_submission() {
         "Hi-Z occlusion must cull every resident section"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 5. Lane OPT-C4C5C6 proofs: ordered mesh drain, background mesh workers,
+//    live Hi-Z feedback, and facing-bucket + region-arena batching.
+// ---------------------------------------------------------------------------
+
+/// Ingest chunk packets but leave them dirty so `poll` performs the
+/// ordered rebuild itself.
+fn session_with_dirty_stone_chunks(chunks: &[(i32, i32)]) -> LiveSession {
+    let mut live = LiveSession::offline_with_null_audio();
+    live.apply_event(ClientPlayEvent::Play(PlayEvent::Teleport(TeleportSync {
+        x: 8.0,
+        y: 20.0,
+        z: 24.0,
+        yaw: 0.0,
+        pitch: -20.0,
+        flags: 0,
+        teleport_id: 1,
+    })))
+    .unwrap();
+    for &(cx, cz) in chunks {
+        let chunk =
+            decode_chunk_packet(&chunk_body(cx, cz, 4), 24, 64).expect("decoded real chunk");
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ChunkData(Box::new(chunk))))
+            .unwrap();
+    }
+    live
+}
+
+#[test]
+fn c4c5c6_poll_drains_dirty_meshes_through_ordered_rebuild() {
+    let mut live = session_with_dirty_stone_chunks(&[(0, -2), (0, -1), (0, 0)]);
+    assert!(live.world.pending_mesh_sections() > 0);
+    assert_eq!(live.ordered_rebuilds_count, 0);
+
+    // A real frustum: camera at the teleport position looking -Z.
+    let camera = Camera {
+        position: [8.0, 20.0, 24.0],
+        yaw_deg: 0.0,
+        pitch_deg: -20.0,
+        ..Camera::default()
+    };
+    let planes = mc_spine_client_gpu::renderer::frustum_planes_from_view_proj(
+        &camera.view_projection(16.0 / 9.0),
+    );
+    live.poll(camera.position, &planes);
+
+    assert!(
+        live.ordered_rebuilds_count > 0,
+        "the ordered drain must mesh dirty sections on poll"
+    );
+    assert_eq!(
+        live.world.pending_mesh_sections(),
+        0,
+        "one poll must drain the whole dirty queue under the default budget"
+    );
+    // Every rebuilt section became a renderer-visible packed mesh with
+    // direction buckets (drives bucket culling + arena residency).
+    assert_eq!(live.world.packed_meshes().count(), 3);
+}
+
+#[test]
+fn c4c5c6_background_mesh_jobs_submit_and_drain() {
+    let live = session_with_stone_chunks(&[(0, -2), (0, -1), (0, 0)]);
+    let Some(mut renderer) = try_gpu_renderer() else {
+        return;
+    };
+
+    assert_eq!(renderer.update_live_terrain(&live.world), 3);
+    assert_eq!(renderer.bg_mesh_jobs_completed, 0);
+    assert!(
+        renderer.bg_mesh_jobs_submitted >= 1,
+        "queued uploads must offer speculative jobs to the worker pool"
+    );
+
+    let camera = Camera {
+        position: [8.0, 20.0, 24.0],
+        yaw_deg: 0.0,
+        pitch_deg: -20.0,
+        ..Camera::default()
+    };
+    // Worker-built geometry drains at the upload boundary of a later
+    // frame; bounded spin keeps the test deterministic on slow hosts.
+    for _ in 0..32 {
+        renderer
+            .render_offscreen_rgba(64, 64, &camera, None)
+            .expect("offscreen drain frame");
+        if renderer.bg_mesh_jobs_completed >= renderer.bg_mesh_jobs_submitted {
+            break;
+        }
+    }
+    assert!(
+        renderer.bg_mesh_jobs_completed >= 1,
+        "worker pool must complete submitted geometry jobs"
+    );
+    assert!(renderer.bg_mesh_jobs_completed <= renderer.bg_mesh_jobs_submitted);
+    assert_eq!(renderer.live_section_count(), 3);
+    assert_eq!(renderer.pending_upload_count(), 0);
+}
+
+#[test]
+fn c4c5c6_live_hiz_pyramid_builds_and_culls_occluded_sections() {
+    // Solid wall one chunk in front of the camera; two sections directly
+    // behind it must disappear into the worker-built pyramid's occlusion.
+    let live = session_with_stone_chunks(&[(0, -2), (0, -1), (0, 0)]);
+    let Some(mut renderer) = try_gpu_renderer() else {
+        return;
+    };
+    assert_eq!(renderer.update_live_terrain(&live.world), 3);
+    assert_eq!(renderer.hiz_frames_updated, 0);
+    assert_eq!(renderer.hiz_culled_sections, 0);
+
+    // Four blocks in front of the wall: the 16x16 near face covers the
+    // whole screen at fov 70, so both far sections project inside it.
+    let camera = Camera {
+        position: [8.0, 10.0, 20.0],
+        yaw_deg: 0.0,
+        pitch_deg: 0.0,
+        ..Camera::default()
+    };
+    for _ in 0..16 {
+        renderer
+            .render_offscreen_rgba(128, 128, &camera, None)
+            .expect("offscreen hiz frame");
+        if renderer.hiz_frames_updated >= 1 && renderer.hiz_culled_sections >= 1 {
+            break;
+        }
+    }
+    assert!(
+        renderer.hiz_frames_updated >= 1,
+        "the live pyramid must be built and installed by real frames"
+    );
+    assert!(
+        renderer.hiz_pyramid().is_some(),
+        "auto-built pyramid must be installed on the renderer"
+    );
+    assert!(
+        renderer.hiz_culled_sections >= 1,
+        "sections hidden behind the wall must be Hi-Z culled, got {}",
+        renderer.hiz_culled_sections
+    );
+    // The wall itself stays visible: only the hidden sections cull.
+    assert!(
+        renderer.last_frame_culled_sections < 3,
+        "the occluding wall must not cull itself"
+    );
+}
+
+#[test]
+fn c4c5c6_facing_buckets_and_region_arena_execute_live() {
+    // Four adjacent same-column chunks: two share one 8x4x8 region, so
+    // merged arena draws save real bind-group switches every frame.
+    let live = session_with_stone_chunks(&[(0, -2), (0, -1), (0, 0), (0, 2)]);
+    let Some(mut renderer) = try_gpu_renderer() else {
+        return;
+    };
+    assert_eq!(renderer.update_live_terrain(&live.world), 4);
+
+    let camera = Camera {
+        position: [8.0, 20.0, 24.0],
+        yaw_deg: 0.0,
+        pitch_deg: -20.0,
+        ..Camera::default()
+    };
+    renderer
+        .render_offscreen_rgba(128, 128, &camera, None)
+        .expect("offscreen bucket frame");
+
+    assert!(
+        renderer.direction_buckets_skipped > 0,
+        "opposite-facing buckets of visible sections must be skipped"
+    );
+    assert!(
+        renderer.region_arena_draws > 0,
+        "arena-resident sections must draw through the shared buffers"
+    );
+    assert!(
+        renderer.bind_group_switches_saved > 0,
+        "merged region draws must save real bind-group switches"
+    );
+}
+
+#[test]
+fn c4c5c6_region_arena_matches_per_section_pixels() {
+    let live = session_with_stone_chunks(&[(0, -2), (0, -1), (0, 0)]);
+    let Some(mut arena_renderer) = try_gpu_renderer() else {
+        return;
+    };
+    let Some(mut flat_renderer) = try_gpu_renderer() else {
+        return;
+    };
+    assert_eq!(arena_renderer.update_live_terrain(&live.world), 3);
+    flat_renderer.set_region_arena_enabled(false);
+    assert_eq!(flat_renderer.update_live_terrain(&live.world), 3);
+
+    let camera = Camera {
+        position: [8.0, 20.0, 24.0],
+        yaw_deg: 0.0,
+        pitch_deg: -20.0,
+        ..Camera::default()
+    };
+    // Drain uploads through a few frames so both residency modes settle.
+    let mut arena_pixels = Vec::new();
+    let mut flat_pixels = Vec::new();
+    for _ in 0..4 {
+        arena_pixels = arena_renderer
+            .render_offscreen_rgba(128, 128, &camera, None)
+            .expect("arena frame");
+        flat_pixels = flat_renderer
+            .render_offscreen_rgba(128, 128, &camera, None)
+            .expect("per-section frame");
+    }
+    assert_eq!(
+        arena_pixels, flat_pixels,
+        "shared region arenas must rasterize the same pixels as per-section buffers"
+    );
+}
