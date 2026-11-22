@@ -266,6 +266,38 @@ def _mask_test_spans(skel):
             break
         if k >= n:
             continue
+        # A cfg-gated struct field or struct-literal initializer ends at its
+        # own comma. Scanning for the next `;`/`{` would mask the surrounding
+        # production function, including real packet send sites.
+        if re.match(r"[A-Za-z_]\w*\s*:", skel[k:]):
+            par = brk = brace = angle = 0
+            end = -1
+            for i in range(k, n):
+                c = skel[i]
+                if c == "(":
+                    par += 1
+                elif c == ")":
+                    par -= 1
+                elif c == "[":
+                    brk += 1
+                elif c == "]":
+                    brk -= 1
+                elif c == "{":
+                    brace += 1
+                elif c == "}":
+                    if brace == 0:
+                        end = i
+                        break
+                    brace -= 1
+                elif c == "<":
+                    angle += 1
+                elif c == ">" and angle:
+                    angle -= 1
+                elif c == "," and par == brk == brace == angle == 0:
+                    end = i + 1
+                    break
+            spans.append((m.start(), end if end >= 0 else n))
+            continue
         # find the item end: first top-level ';' (unit item) or '{' (block)
         par = brk = 0
         i = k
@@ -890,11 +922,16 @@ _SEND_RE = re.compile(r"\b(send_packet|send_broadcast_frame|SharedBroadcastFrame
 # `return (ID, ..)`, `let x = (ID, ..)` and line-leading tail tuples.
 _TUPLE_RE = re.compile(r"\(\s*(0x[0-9a-fA-F]+|[A-Za-z_][A-Za-z0-9_]*)\s*,")
 _WRITE_VARINT_RE = re.compile(r"\bwrite_varint\s*\(")
-_S2C_CONST_RE = re.compile(
-    r"\b[A-Za-z_][A-Za-z0-9_]*S2C[A-Za-z0-9_]*\b|\bCB_[A-Za-z0-9_]+\b")
 _LET_RE = re.compile(
     r"\blet\s+(?:mut\s+)?([a-zA-Z_]\w*)\s*=\s*"
     r"(0x[0-9a-fA-F]+|[0-9]+|[A-Z][A-Z0-9_]{2,})\s*;")
+_MATCH_ID_BIND_RE = re.compile(
+    r"\blet\s+(?:mut\s+)?([a-zA-Z_]\w*)\s*(?::\s*i(?:32|64))?\s*=\s*"
+    r"match\s+[^;{}]+\{([^{}]*)\}\s*;", re.S)
+_MATCH_ARM_ID_RE = re.compile(r"=>\s*(0x[0-9a-fA-F]+|\d+|-\d+)\b")
+_TUPLE_ID_BIND_RE = re.compile(
+    r"\blet\s*\(\s*([a-zA-Z_]\w*)\s*,\s*[a-zA-Z_]\w*\s*\)\s*=\s*"
+    r"([a-zA-Z_]\w*(?:(?:::|\.)[a-zA-Z_]\w*)*)\s*\(")
 _FN_DEF_RE = re.compile(
     r"\b(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?(?:const\s+)?"
     r"fn\s+([A-Za-z_]\w*)\s*\(")
@@ -949,9 +986,13 @@ def _call_args(skel, open_idx):
 
 
 def _arg_id_token(skel, span):
-    """First token of a call argument, or None."""
+    """Packet-id expression of a call argument, or None."""
     a, b = span
-    m = _ARG_TOKEN_RE.match(skel[a:b].lstrip())
+    expr = skel[a:b].strip()
+    # Keep the qualified constant inside the integer conversion intact.
+    if re.fullmatch(r"i64::from\s*\(\s*[\w:]+\s*\)", expr):
+        return expr
+    m = _ARG_TOKEN_RE.match(expr)
     if not m:
         return None
     return m.group(1)
@@ -962,6 +1003,10 @@ def _resolve_packet_id(tok, consts, letmap, allow_dec=True):
     if tok is None:
         return None
     tok = tok.strip()
+    wrapped = re.fullmatch(r"i64::from\s*\(\s*([\w:]+)\s*\)", tok)
+    if wrapped:
+        tok = wrapped.group(1)
+    tok = tok.rsplit("::", 1)[-1]
     if tok.startswith(_NON_PLAY_PREFIXES):
         return None
     if re.fullmatch(r"0x[0-9a-fA-F]+", tok):
@@ -971,6 +1016,233 @@ def _resolve_packet_id(tok, consts, letmap, allow_dec=True):
     if tok in letmap:
         return letmap[tok]
     return consts.get(tok)
+
+
+def _packet_function_returns(per_file, consts):
+    """Literal packet tuples returned by named packet encoders.
+
+    Only inspect the body of a function with an explicit packet-tuple return
+    type. A standalone constant or an unrelated tuple cannot create coverage.
+    """
+    result = {}
+    for sk, _live, _letmap, _letmap_hex, fns in per_file.values():
+        for pos, name, _pub in fns:
+            if not name.startswith("encode_"):
+                continue
+            brace = sk.find("{", pos)
+            if brace < 0 or "WorldMechanismsPacket" not in sk[pos:brace]:
+                continue
+            end = match_bracket(sk, brace)
+            if end < 0:
+                continue
+            ids = set()
+            for m in _TUPLE_RE.finditer(sk, brace, end):
+                if (_tuple_context_ok(sk, m.start())
+                        or not sk[brace + 1:m.start()].strip()):
+                    pid = _resolve_packet_id(m.group(1), consts, {}, False)
+                    if pid is not None:
+                        ids.add(pid)
+            if len(ids) == 1:
+                result[name] = ids
+    return result
+
+
+def _packet_method_returns(per_file, consts):
+    """Packet tuples returned by methods, keyed by their enclosing impl type.
+
+    The method must actually return a packet tuple. The resulting IDs are
+    only evidence when a separate call/data-flow reaches a wire sink.
+    """
+    result = {}
+    for sk, _live, _letmap, _letmap_hex, fns in per_file.values():
+        impls = []
+        for m in re.finditer(r"\bimpl\s+(\w+)\s*\{", sk):
+            end = match_bracket(sk, m.end() - 1)
+            if end >= 0:
+                impls.append((m.end(), end, m.group(1)))
+        for pos, name, _pub in fns:
+            brace = sk.find("{", pos)
+            if brace < 0:
+                continue
+            header = sk[pos:brace]
+            if "WorldMechanismsPacket" not in header and not re.search(
+                    r"->\s*Option\s*<\s*\(\s*i64\s*,\s*Vec\s*<\s*u8", header):
+                continue
+            end = match_bracket(sk, brace)
+            if end < 0:
+                continue
+            body = sk[brace + 1:end]
+            ids = set()
+            for m in _TUPLE_RE.finditer(body):
+                pid = _resolve_packet_id(m.group(1), consts, {}, False)
+                if pid is not None:
+                    ids.add(pid)
+            # Relative movement returns either a literal tuple or a ternary
+            # packet ID inside the first tuple field.
+            for m in re.finditer(
+                    r"\(\s*if\s+\w+\s*\{\s*(0x[\da-fA-F]+)\s*\}"
+                    r"\s*else\s*\{\s*(0x[\da-fA-F]+)\s*\}", body):
+                ids.update((int(m.group(1), 16), int(m.group(2), 16)))
+            # For `let id = match ...; (id, payload)`, accept only arm-tail
+            # literals. Other numbers inside the match are payload data.
+            m = re.search(r"\blet\s+id\s*=\s*match\b[^\{]*\{", body)
+            if m and re.search(r"\(\s*id\s*,", body[m.end():]):
+                match_end = match_bracket(body, m.end() - 1)
+                if match_end >= 0:
+                    arms = body[m.end():match_end]
+                    for arm in re.finditer(r"(?m)^\s*(0x[\da-fA-F]+)\s*$", arms):
+                        ids.add(int(arm.group(1), 16))
+            if ids:
+                owners = [owner for start, stop, owner in impls if start <= pos < stop]
+                if owners:
+                    result.setdefault((owners[-1], name), []).append(ids)
+    # Ambiguous overloaded method definitions cannot establish a packet ID.
+    return {key: ids[0] for key, ids in result.items() if len(ids) == 1}
+
+
+def _function_bodies(per_file):
+    """Unique, non-test function bodies used for bounded wire-path checks."""
+    functions = {}
+    for sk, _live, _letmap, _letmap_hex, fns in per_file.values():
+        for pos, name, _pub in fns:
+            brace = sk.find("{", pos)
+            if brace >= 0:
+                end = match_bracket(sk, brace)
+                if end >= 0:
+                    functions.setdefault(name, []).append(sk[brace + 1:end])
+    return {name: bodies[0] for name, bodies in functions.items()
+            if len(bodies) == 1}
+
+
+def _indirect_wire_ids(per_file, methods, fn_live):
+    """Trace packet rewrites, field fanouts, and preframed packet writers.
+
+    All three require a concrete live writer and a producer-to-writer path;
+    unused encoders, constants and raw packet tuples provide no evidence.
+    """
+    results = []
+    bodies = _function_bodies(per_file)
+    send = bodies.get("send_packet", "")
+    rewrite = re.search(r"\b\w+\.(\w+)\s*\(\s*&mut\s+id\s*,\s*&mut\s+payload\s*,", send)
+    if rewrite:
+        updater = bodies.get(rewrite.group(1), "")
+        if re.search(r"\(\s*\*id\s*,\s*\*payload\s*\)\s*=\s*packet", updater):
+            for method in re.findall(r"\blet\s+Some\s*\(\s*packet\s*\)\s*=\s*"
+                                     r"[\w.]+\.(\w+)\s*\(", updater):
+                candidates = [ids for (owner, name), ids in methods.items() if name == method]
+                if len(candidates) == 1:
+                    results.extend((pid, "send:rewrite") for pid in candidates[0])
+
+    # Field-carrying results from a command are sent by broadcast when a
+    # matching Option<(id, payload)> is unpacked and passed as the callback.
+    wired_fields = set()
+    for sk, _live, _letmap, _letmap_hex, _fns in per_file.values():
+        for m in re.finditer(
+                r"if\s+let\s+Some\s*\(\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*\)"
+                r"\s*=\s*(\w+)\.(\w+)\s*\{", sk):
+            end = match_bracket(sk, m.end() - 1)
+            if end < 0:
+                continue
+            sink = sk[m.end():end]
+            id_name, payload_name, result_name, field = m.groups()
+            if re.search(r"\bbroadcast\s*\([^;]*\(\s*" + re.escape(id_name)
+                         + r"\s*,\s*" + re.escape(payload_name) + r"\.clone\(\)\s*\)", sink):
+                # The field's result must be constructed by a called method.
+                prelude = sk[max(0, m.start() - 900):m.start()]
+                origin = re.search(r"\blet\s+" + re.escape(result_name)
+                                   + r"\s*=\s*(\w+)::parse\s*\(.*?\.execute\s*\(",
+                                   prelude, re.S)
+                if origin:
+                    wired_fields.add((origin.group(1), field))
+    if wired_fields:
+        for sk, _live, _letmap, _letmap_hex, _fns in per_file.values():
+            for m in re.finditer(r"\bimpl\s+(\w+)\s*\{", sk):
+                owner = m.group(1)
+                if not any(candidate == owner for candidate, _field in wired_fields):
+                    continue
+                impl_end = match_bracket(sk, m.end() - 1)
+                if impl_end < 0:
+                    continue
+                implementation = sk[m.end():impl_end]
+                for function in _FN_DEF_RE.finditer(implementation):
+                    if function.group(1) != "execute":
+                        continue
+                    brace = implementation.find("{", function.end())
+                    if brace < 0:
+                        continue
+                    end = match_bracket(implementation, brace)
+                    if end < 0:
+                        continue
+                    body = implementation[brace + 1:end]
+                    for wired_owner, field in wired_fields:
+                        if wired_owner != owner:
+                            continue
+                        pattern = (r"\b" + re.escape(field)
+                                   + r"\s*:\s*\w+\.map\s*\(\s*(\w+)::(\w+)\s*\)")
+                        for producer in re.finditer(pattern, body):
+                            for pid in methods.get(producer.groups(), ()):
+                                results.append((pid, "broadcast:result_field"))
+
+    # When a function's result is passed to a real raw-frame writer, follow
+    # only its direct helper calls to a `body` builder that prefixes the wire
+    # packet ID and appends the supplied payload.
+    writer = bodies.get("write_shared_frame", "")
+    if re.search(r"\.write_all\s*\(\s*frame\s*\)", writer):
+        def prefixed_ids(helper, visited, depth):
+            if depth == 0 or helper in visited:
+                return set()
+            body = bodies.get(helper, "")
+            if not body:
+                return set()
+            ids = set()
+            if (re.search(r"\bbody\.extend_from_slice\s*\(\s*payload\s*\)", body)
+                    and re.search(r"\bbody\s*$", body)):
+                for m in re.finditer(r"\bwrite_varint\s*\(\s*&mut\s+body\s*,\s*"
+                                     r"(0x[\da-fA-F]+)\s*\)", body):
+                    ids.add(int(m.group(1), 16))
+            for m in re.finditer(r"\b(\w+)\s*\(", body):
+                if m.group(1) in bodies:
+                    ids.update(prefixed_ids(m.group(1), visited | {helper}, depth - 1))
+            return ids
+
+        for name, body in bodies.items():
+            if not fn_live(name):
+                continue
+            for m in re.finditer(r"\blet\s+(\w+)\s*=\s*(\w+)\s*\(", body):
+                variable, producer = m.groups()
+                if re.search(r"\bwrite_shared_frame\s*\([^;]*&\s*"
+                             + re.escape(variable) + r"\s*\)", body[m.end():]):
+                    results.extend((pid, "send:preframed")
+                                   for pid in prefixed_ids(producer, set(), 4))
+    return results
+
+
+def _local_send_ids(sk, pos, fn_start, argument, consts, returns):
+    """Resolve only bindings preceding this send in its enclosing function."""
+    direct = _resolve_packet_id(argument, consts, {})
+    if direct is not None:
+        return {direct}
+    if not re.fullmatch(r"[a-zA-Z_]\w*", argument or ""):
+        return set()
+    # Rust variable names can recur in unrelated functions; do not use a
+    # file-global letmap as evidence for a particular send.
+    scope = sk[fn_start:pos]
+    bindings = []
+    for m in _LET_RE.finditer(scope):
+        if m.group(1) == argument:
+            pid = _resolve_packet_id(m.group(2), consts, {})
+            bindings.append((m.start(), {pid} if pid is not None else set()))
+    for m in _MATCH_ID_BIND_RE.finditer(scope):
+        if m.group(1) == argument:
+            ids = {_resolve_packet_id(arm.group(1), consts, {})
+                   for arm in _MATCH_ARM_ID_RE.finditer(m.group(2))}
+            bindings.append((m.start(), {pid for pid in ids if pid is not None}))
+    for m in _TUPLE_ID_BIND_RE.finditer(scope):
+        if m.group(1) == argument:
+            # Function return tuples are usable only at a concrete assignment
+            # whose extracted id flows to the send site.
+            bindings.append((m.start(), returns.get(m.group(2).split(".")[-1], set())))
+    return max(bindings, default=(-1, set()), key=lambda item: item[0])[1]
 
 
 def _tuple_context_ok(skel, pos):
@@ -1068,6 +1340,15 @@ def audit_s2c(repo, texts):
                 pub_fns.add(name)
         per_file[rel] = (sk, live, letmap, letmap_hex, fns)
 
+    packet_returns = _packet_function_returns(per_file, consts)
+    packet_methods = _packet_method_returns(per_file, consts)
+    method_names = {}
+    for (_owner, name), ids in packet_methods.items():
+        method_names.setdefault(name, []).append(ids)
+    for name, candidates in method_names.items():
+        if len(candidates) == 1:
+            packet_returns[name] = candidates[0]
+
     def fn_live(name):
         # live-wired = has non-def `name(` occurrences in live code, or is pub
         return call_counts.get(name, 0) - def_counts.get(name, 0) > 0 \
@@ -1109,6 +1390,10 @@ def audit_s2c(repo, texts):
         # 1) direct send-helper call sites: id argument position
         for m in _SEND_RE.finditer(sk):
             pos = m.start()
+            if re.search(r"\bfn\s+$", sk[max(0, pos - 25):pos]):
+                # A sender's definition declares a generic packet ID; it is
+                # not a call site and has no concrete ID to resolve.
+                continue
             if in_nonplay(pos):
                 excluded_sites += 1
                 continue
@@ -1118,24 +1403,16 @@ def audit_s2c(repo, texts):
                 unresolved_sites += 1
                 continue
             tok = _arg_id_token(sk, args[idx])
-            pid = _resolve_packet_id(tok, consts, letmap)
-            if pid is None:
+            fn = enclosing(pos)
+            ids = _local_send_ids(sk, pos, fn[0] if fn else 0,
+                                  tok, consts, packet_returns)
+            if not ids:
                 unresolved_sites += 1
             else:
-                note(pid, "send:" + m.group(1))
+                for pid in ids:
+                    note(pid, "send:" + m.group(1))
 
-        # 2) S2C/CB packet-id constants used anywhere in live code
-        for m in _S2C_CONST_RE.finditer(live):
-            name = m.group(0)
-            if "S2C" not in name and not name.startswith("CB_"):
-                continue
-            if name.startswith(_NON_PLAY_PREFIXES):
-                continue
-            pid = consts.get(name)
-            if pid is not None:
-                note(pid, "const:" + name)
-
-        # 3) packet-tuple producers `(ID, payload)` in live-wired fns
+        # 2) packet-tuple producers `(ID, payload)` in live-wired fns
         for m in _TUPLE_RE.finditer(sk):
             pos = m.start()
             if in_nonplay(pos) or not _tuple_context_ok(sk, pos):
@@ -1150,7 +1427,7 @@ def audit_s2c(repo, texts):
             if pid is not None:
                 note(pid, "tuple")
 
-        # 4) write_varint-embedded packet ids inside encode_* builders
+        # 3) write_varint-embedded packet ids inside encode_* builders
         for m in _WRITE_VARINT_RE.finditer(sk):
             pos = m.start()
             if in_nonplay(pos):
@@ -1167,6 +1444,9 @@ def audit_s2c(repo, texts):
             pid = _resolve_packet_id(tok, consts, letmap_hex, allow_dec=False)
             if pid is not None:
                 note(pid, "encode_varint")
+
+    for packet_id, via in _indirect_wire_ids(per_file, packet_methods, fn_live):
+        note(packet_id, via)
 
     emitted_list = []
     unemitted = []

@@ -52,6 +52,401 @@ fn write_pos(out: &mut Vec<u8>, x: i32, y: i32, z: i32) {
     let v = ((x as i64 & 0x3ffffff) << 38) | ((z as i64 & 0x3ffffff) << 12) | (y as i64 & 0xfff);
     out.extend_from_slice(&v.to_be_bytes());
 }
+
+// Protocol 767 (Java 1.21.1) clientbound Play payload encoders.
+// Each result contains a packet ID and its unframed payload. Callers decide
+// whether and when to send the packet; construction alone is not emission.
+#[allow(dead_code)]
+fn encode_play_bundle_delimiter() -> (i64, Vec<u8>) {
+    (0x00, Vec::new())
+}
+
+#[allow(dead_code)]
+fn encode_play_add_experience_orb(
+    entity_id: i32,
+    x: f64,
+    y: f64,
+    z: f64,
+    count: i16,
+) -> (i64, Vec<u8>) {
+    let mut out = Vec::new();
+    write_varint(&mut out, i64::from(entity_id));
+    for coord in [x, y, z] {
+        out.extend_from_slice(&coord.to_be_bytes());
+    }
+    out.extend_from_slice(&count.to_be_bytes());
+    (0x02, out)
+}
+
+#[allow(dead_code)]
+fn encode_play_block_destruction(
+    entity_id: i32,
+    position: (i32, i32, i32),
+    stage: i8,
+) -> (i64, Vec<u8>) {
+    let mut out = Vec::new();
+    write_varint(&mut out, i64::from(entity_id));
+    write_pos(&mut out, position.0, position.1, position.2);
+    out.push(stage as u8);
+    (0x06, out)
+}
+
+#[allow(dead_code)]
+fn encode_play_chunks_biomes(chunks: &[(i32, i32, &[u8])]) -> (i64, Vec<u8>) {
+    let mut out = Vec::new();
+    write_varint(&mut out, chunks.len() as i64);
+    for &(x, z, data) in chunks {
+        // ChunkPos uses big-endian Z then X in the packed 64-bit value.
+        out.extend_from_slice(&z.to_be_bytes());
+        out.extend_from_slice(&x.to_be_bytes());
+        write_varint(&mut out, data.len() as i64);
+        out.extend_from_slice(data);
+    }
+    (0x0e, out)
+}
+
+#[allow(dead_code)]
+fn encode_play_cookie_request(key: &str) -> (i64, Vec<u8>) {
+    let mut out = Vec::new();
+    write_str(&mut out, key);
+    (0x16, out)
+}
+
+#[allow(dead_code)]
+enum PlayChatDeletion<'a> {
+    Signature(&'a [u8; 256]),
+    Indexed(u32),
+}
+
+#[allow(dead_code)]
+fn encode_play_delete_chat(target: PlayChatDeletion<'_>) -> Option<(i64, Vec<u8>)> {
+    let mut out = Vec::new();
+    match target {
+        PlayChatDeletion::Signature(signature) => {
+            write_varint(&mut out, 0);
+            out.extend_from_slice(signature);
+        }
+        PlayChatDeletion::Indexed(index) => {
+            write_varint(&mut out, i64::from(index.checked_add(1)?));
+        }
+    }
+    Some((0x1c, out))
+}
+
+#[allow(dead_code)]
+fn encode_play_horse_screen_open(
+    container_id: u8,
+    slots: u32,
+    entity_id: i32,
+) -> (i64, Vec<u8>) {
+    let mut out = vec![container_id];
+    write_varint(&mut out, i64::from(slots));
+    out.extend_from_slice(&entity_id.to_be_bytes());
+    (0x23, out)
+}
+
+#[allow(dead_code)]
+struct PlayMapIcon<'a> {
+    kind: i32,
+    x: i8,
+    z: i8,
+    direction: u8,
+    name_nbt: Option<&'a [u8]>,
+}
+
+#[allow(dead_code)]
+struct PlayMapPatch<'a> {
+    columns: u8,
+    rows: u8,
+    x: u8,
+    y: u8,
+    colors: &'a [u8],
+}
+
+#[allow(dead_code)]
+fn encode_play_map_item_data(
+    map_id: i32,
+    scale: i8,
+    locked: bool,
+    icons: Option<&[PlayMapIcon<'_>]>,
+    patch: Option<&PlayMapPatch<'_>>,
+) -> Option<(i64, Vec<u8>)> {
+    if map_id < 0 {
+        return None;
+    }
+    let mut out = Vec::new();
+    write_varint(&mut out, i64::from(map_id));
+    out.extend_from_slice(&[scale as u8, u8::from(locked), u8::from(icons.is_some())]);
+    if let Some(icons) = icons {
+        write_varint(&mut out, icons.len() as i64);
+        for icon in icons {
+            if icon.kind < 0 {
+                return None;
+            }
+            write_varint(&mut out, i64::from(icon.kind));
+            out.extend_from_slice(&[icon.x as u8, icon.z as u8, icon.direction]);
+            out.push(u8::from(icon.name_nbt.is_some()));
+            if let Some(name) = icon.name_nbt {
+                out.extend_from_slice(name);
+            }
+        }
+    }
+    if let Some(patch) = patch {
+        if patch.columns == 0
+            || patch.rows == 0
+            || u16::from(patch.x) + u16::from(patch.columns) > 128
+            || u16::from(patch.y) + u16::from(patch.rows) > 128
+            || patch.colors.len() != usize::from(patch.columns) * usize::from(patch.rows)
+        {
+            return None;
+        }
+        out.extend_from_slice(&[patch.columns, patch.rows, patch.x, patch.y]);
+        write_varint(&mut out, patch.colors.len() as i64);
+        out.extend_from_slice(patch.colors);
+    } else {
+        out.push(0); // Zero columns omits the remaining map patch fields.
+    }
+    Some((0x2c, out))
+}
+
+#[allow(dead_code)]
+fn encode_play_move_vehicle(
+    position: (f64, f64, f64),
+    yaw: f32,
+    pitch: f32,
+) -> (i64, Vec<u8>) {
+    let mut out = Vec::with_capacity(32);
+    for coord in [position.0, position.1, position.2] {
+        out.extend_from_slice(&coord.to_be_bytes());
+    }
+    out.extend_from_slice(&yaw.to_be_bytes());
+    out.extend_from_slice(&pitch.to_be_bytes());
+    (0x31, out)
+}
+
+#[allow(dead_code)]
+fn encode_play_open_book(hand: u8) -> Option<(i64, Vec<u8>)> {
+    if hand > 1 {
+        return None;
+    }
+    let mut out = Vec::new();
+    write_varint(&mut out, i64::from(hand));
+    Some((0x32, out))
+}
+
+#[allow(dead_code)]
+fn encode_play_ping(id: i32) -> (i64, Vec<u8>) {
+    (0x35, id.to_be_bytes().to_vec())
+}
+
+#[allow(dead_code)]
+fn encode_play_place_ghost_recipe(container_id: u8, recipe: &str) -> (i64, Vec<u8>) {
+    let mut out = vec![container_id];
+    write_str(&mut out, recipe);
+    (0x37, out)
+}
+
+#[allow(dead_code)]
+fn encode_play_player_combat_end(duration: u32) -> (i64, Vec<u8>) {
+    let mut out = Vec::new();
+    write_varint(&mut out, i64::from(duration));
+    (0x3a, out)
+}
+
+#[allow(dead_code)]
+fn encode_play_player_combat_enter() -> (i64, Vec<u8>) {
+    (0x3b, Vec::new())
+}
+
+#[allow(dead_code)]
+fn encode_play_player_combat_kill(player_id: i32, message: &str) -> (i64, Vec<u8>) {
+    let mut out = Vec::new();
+    write_varint(&mut out, i64::from(player_id));
+    out.extend_from_slice(&chat_nbt(message));
+    (0x3c, out)
+}
+
+#[allow(dead_code)]
+fn encode_play_player_look_at(
+    source_anchor: u8,
+    target: (f64, f64, f64),
+    target_entity: Option<(i32, u8)>,
+) -> Option<(i64, Vec<u8>)> {
+    if source_anchor > 1 || target_entity.is_some_and(|(_, anchor)| anchor > 1) {
+        return None;
+    }
+    let mut out = Vec::new();
+    write_varint(&mut out, i64::from(source_anchor));
+    for coord in [target.0, target.1, target.2] {
+        out.extend_from_slice(&coord.to_be_bytes());
+    }
+    out.push(u8::from(target_entity.is_some()));
+    if let Some((entity_id, anchor)) = target_entity {
+        write_varint(&mut out, i64::from(entity_id));
+        write_varint(&mut out, i64::from(anchor));
+    }
+    Some((0x3f, out))
+}
+
+#[allow(dead_code)]
+fn encode_play_resource_pack_pop(id: Option<[u8; 16]>) -> (i64, Vec<u8>) {
+    let mut out = vec![u8::from(id.is_some())];
+    if let Some(id) = id {
+        out.extend_from_slice(&id);
+    }
+    (0x45, out)
+}
+
+#[allow(dead_code)]
+fn encode_play_select_advancements_tab(tab: Option<&str>) -> (i64, Vec<u8>) {
+    let mut out = vec![u8::from(tab.is_some())];
+    if let Some(tab) = tab {
+        write_str(&mut out, tab);
+    }
+    (0x4a, out)
+}
+
+#[allow(dead_code)]
+fn encode_play_server_data(motd: &str, favicon_png: Option<&[u8]>) -> (i64, Vec<u8>) {
+    let mut out = chat_nbt(motd);
+    out.push(u8::from(favicon_png.is_some()));
+    if let Some(icon) = favicon_png {
+        write_varint(&mut out, icon.len() as i64);
+        out.extend_from_slice(icon);
+    }
+    (0x4b, out)
+}
+
+#[allow(dead_code)]
+enum PlaySound<'a> {
+    Registered(u32),
+    Custom { identifier: &'a str, fixed_range: Option<f32> },
+}
+
+#[allow(dead_code)]
+fn encode_play_sound_entity(
+    sound: PlaySound<'_>,
+    source: u32,
+    entity_id: i32,
+    volume: f32,
+    pitch: f32,
+    seed: i64,
+) -> Option<(i64, Vec<u8>)> {
+    let mut out = Vec::new();
+    match sound {
+        PlaySound::Registered(id) => write_varint(&mut out, i64::from(id) + 1),
+        PlaySound::Custom { identifier, fixed_range } => {
+            if fixed_range.is_some_and(|range| !range.is_finite() || range < 0.0) {
+                return None;
+            }
+            write_varint(&mut out, 0);
+            write_str(&mut out, identifier);
+            out.push(u8::from(fixed_range.is_some()));
+            if let Some(range) = fixed_range {
+                out.extend_from_slice(&range.to_be_bytes());
+            }
+        }
+    }
+    write_varint(&mut out, i64::from(source));
+    write_varint(&mut out, i64::from(entity_id));
+    out.extend_from_slice(&volume.to_be_bytes());
+    out.extend_from_slice(&pitch.to_be_bytes());
+    out.extend_from_slice(&seed.to_be_bytes());
+    Some((0x67, out))
+}
+
+#[allow(dead_code)]
+fn encode_play_start_configuration() -> (i64, Vec<u8>) {
+    (0x69, Vec::new())
+}
+
+#[allow(dead_code)]
+fn encode_play_store_cookie(key: &str, value: &[u8]) -> Option<(i64, Vec<u8>)> {
+    if value.len() > 5120 {
+        return None;
+    }
+    let mut out = Vec::new();
+    write_str(&mut out, key);
+    write_varint(&mut out, value.len() as i64);
+    out.extend_from_slice(value);
+    Some((0x6b, out))
+}
+
+#[allow(dead_code)]
+struct PlayTag<'a> {
+    name: &'a str,
+    entries: &'a [i32],
+}
+
+#[allow(dead_code)]
+struct PlayTagRegistry<'a> {
+    name: &'a str,
+    tags: &'a [PlayTag<'a>],
+}
+
+#[allow(dead_code)]
+fn encode_play_update_tags(registries: &[PlayTagRegistry<'_>]) -> (i64, Vec<u8>) {
+    let mut out = Vec::new();
+    write_varint(&mut out, registries.len() as i64);
+    for registry in registries {
+        write_str(&mut out, registry.name);
+        write_varint(&mut out, registry.tags.len() as i64);
+        for tag in registry.tags {
+            write_str(&mut out, tag.name);
+            write_varint(&mut out, tag.entries.len() as i64);
+            for &entry in tag.entries {
+                write_varint(&mut out, i64::from(entry));
+            }
+        }
+    }
+    (0x78, out)
+}
+
+#[allow(dead_code)]
+fn encode_play_set_projectile_power(entity_id: i32, acceleration: f64) -> (i64, Vec<u8>) {
+    let mut out = Vec::new();
+    write_varint(&mut out, i64::from(entity_id));
+    out.extend_from_slice(&acceleration.to_be_bytes());
+    (0x79, out)
+}
+
+#[allow(dead_code)]
+fn encode_play_custom_report_details(details: &[(&str, &str)]) -> (i64, Vec<u8>) {
+    let mut out = Vec::new();
+    write_varint(&mut out, details.len() as i64);
+    for &(key, value) in details {
+        write_str(&mut out, key);
+        write_str(&mut out, value);
+    }
+    (0x7a, out)
+}
+
+#[allow(dead_code)]
+enum PlayServerLinkLabel<'a> {
+    BuiltIn(u32),
+    Custom(&'a [u8]), // Anonymous NBT text component.
+}
+
+#[allow(dead_code)]
+fn encode_play_server_links(links: &[(PlayServerLinkLabel<'_>, &str)]) -> (i64, Vec<u8>) {
+    let mut out = Vec::new();
+    write_varint(&mut out, links.len() as i64);
+    for (label, url) in links {
+        match label {
+            PlayServerLinkLabel::BuiltIn(id) => {
+                out.push(1);
+                write_varint(&mut out, i64::from(*id));
+            }
+            PlayServerLinkLabel::Custom(nbt) => {
+                out.push(0);
+                out.extend_from_slice(nbt);
+            }
+        }
+        write_str(&mut out, url);
+    }
+    (0x7b, out)
+}
+
 fn read_pos(b: &[u8]) -> (i32, i32, i32) {
     let v = i64::from_be_bytes(b[..8].try_into().unwrap());
     let x = (v >> 38) as i32;
@@ -2455,6 +2850,7 @@ fn spawn_mob(m: &Mob) -> Vec<u8> {
     p.extend_from_slice(&[0u8; 6]);
     p
 }
+#[allow(clippy::too_many_arguments)]
 fn spawn_entity_pkt(
     eid: i32,
     etype: u32,
@@ -3146,8 +3542,8 @@ fn cull_chunk_light(packet: &mut Vec<u8>, dim: DimId) {
         let (raw, rest) = light.split_at(count * 8);
         *light = rest;
         Some(
-            raw.chunks_exact(8)
-                .map(|w| u64::from_be_bytes(w.try_into().unwrap()))
+            raw.as_chunks::<8>().0.iter()
+                .map(|w| u64::from_be_bytes(*w))
                 .collect(),
         )
     };
@@ -3191,7 +3587,7 @@ fn cull_chunk_light(packet: &mut Vec<u8>, dim: DimId) {
     let bands = lists.each_ref().map(|arrays| {
         let nonempty: Vec<_> = arrays
             .iter()
-            .map(|section| section[0] != 0 || uniform_section(*section) != Some(0))
+            .map(|section| section[0] != 0 || uniform_section(section) != Some(0))
             .collect();
         // Full light-engine band, including the two boundary sections. A
         // nonzero light array can belong to an all-air block section.
@@ -3367,6 +3763,7 @@ fn cached_chunk_frame(
         .expect("a freshly inserted chunk packet must frame")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stream_chunks(
     s: &mut TcpStream,
     sent: &mut std::collections::HashSet<(i32, i32)>,
@@ -3613,8 +4010,11 @@ fn chat_sessions() -> &'static Mutex<HashMap<i32, ChatSessionMeta>> {
 /// identifier. `ClientboundStoreCookiePacket` state lives here until the
 /// connection drops.
 #[allow(dead_code)]
-fn client_cookies() -> &'static Mutex<HashMap<i32, HashMap<String, Option<Vec<u8>>>>> {
-    static COOKIES: OnceLock<Mutex<HashMap<i32, HashMap<String, Option<Vec<u8>>>>>> =
+type ClientCookies = HashMap<i32, HashMap<String, Option<Vec<u8>>>>;
+
+#[allow(dead_code)]
+fn client_cookies() -> &'static Mutex<ClientCookies> {
+    static COOKIES: OnceLock<Mutex<ClientCookies>> =
         OnceLock::new();
     COOKIES.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -3645,8 +4045,11 @@ fn client_abilities_flying() -> &'static Mutex<HashMap<i32, bool>> {
 /// `ServerboundSeenAdvancementsPacket` state: `(action, opened tab)` where
 /// action `0 = OpenedTab` carries the tab identifier, `1 = ClosedScreen` none.
 #[allow(dead_code)]
-fn seen_advancement_state() -> &'static Mutex<HashMap<i32, (i64, Option<String>)>> {
-    static SEEN: OnceLock<Mutex<HashMap<i32, (i64, Option<String>)>>> = OnceLock::new();
+type SeenAdvancementState = HashMap<i32, (i64, Option<String>)>;
+
+#[allow(dead_code)]
+fn seen_advancement_state() -> &'static Mutex<SeenAdvancementState> {
+    static SEEN: OnceLock<Mutex<SeenAdvancementState>> = OnceLock::new();
     SEEN.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -4998,6 +5401,7 @@ fn nether_portal_target(dim: DimId, bx: i32, by: i32, bz: i32) -> Option<(DimId,
 
 /// Complete one portal trip. `st` is the block the player stood in, which decides whether
 /// this is an Overworld<->Nether trip (1:8 horizontal scaling) or an End trip.
+#[allow(clippy::too_many_arguments)]
 fn enter_portal(
     me: &Arc<Client>,
     st: u32,
@@ -5183,6 +5587,7 @@ fn try_end_portal_activation(
 /// `EndPortalFrameBlock.useItemOn`: an `ender_eye` used on an eyeless frame sets
 /// its eye — consuming one outside creative — then tries the ring activation.
 /// Returns whether the click was handled (the caller owes the use ack).
+#[allow(clippy::too_many_arguments)]
 fn try_insert_ender_eye(
     me: &Arc<Client>,
     dim: DimId,
@@ -6927,7 +7332,7 @@ fn stat_increment(me: &Client, category: StatCategory, stat_id: i32, delta: i32)
         .lock()
         .unwrap()
         .entry(me.uuid)
-        .or_insert_with(PlayerStats::new)
+        .or_default()
         .increment(category, stat_id, delta);
 }
 
@@ -6938,7 +7343,7 @@ fn player_recipe_book(uuid: [u8; 16]) -> PlayerRecipeBook {
         .lock()
         .unwrap()
         .entry(uuid)
-        .or_insert_with(PlayerRecipeBook::new)
+        .or_default()
         .clone()
 }
 
@@ -10070,7 +10475,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         .lock()
                         .unwrap()
                         .entry(me.uuid)
-                        .or_insert_with(PlayerRecipeBook::new)
+                        .or_default()
                         .apply_book_settings(s.book_type, s.book_open, s.filter_active);
                 }
             }
@@ -10082,7 +10487,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         .lock()
                         .unwrap()
                         .entry(me.uuid)
-                        .or_insert_with(PlayerRecipeBook::new)
+                        .or_default()
                         .seen_recipe(&id);
                 }
             }
@@ -10101,7 +10506,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 if action == Some(1) && sl.is_empty() {
                     let body = {
                         let mut stats = player_stats().lock().unwrap_or_else(|e| e.into_inner());
-                        let stats = stats.entry(me.uuid).or_insert_with(PlayerStats::new);
+                        let stats = stats.entry(me.uuid).or_default();
                         // P8b-2: the protocol-767 `award_stats` payload comes
                         // from the P8b-2 codec over the live counter book —
                         // same `(category, stat, value)` triples the save codec
@@ -12092,7 +12497,7 @@ fn pet_collar_or_parrot_interact(client: &Client, target: i32, slot: i16) -> boo
                 // vanilla Parrot.mobInteract: each seed is eaten, taming lands
                 // one roll in ten.
                 consume = true;
-                if world_rng::next_u64() % 10 == 0 {
+                if world_rng::next_u64().is_multiple_of(10) {
                     pet.owner = Some(client.uuid);
                     pet.sitting = true;
                     pet.hp = *mob.hp.lock().unwrap_or_else(|e| e.into_inner());
@@ -12577,6 +12982,204 @@ mod connection_slot_tests {
 #[cfg(test)]
 mod handshake_security_tests {
     use super::*;
+
+    #[test]
+    fn protocol767_play_empty_and_scalar_packet_bytes() {
+        assert_eq!(encode_play_bundle_delimiter(), (0x00, vec![]));
+        assert_eq!(encode_play_start_configuration(), (0x69, vec![]));
+        assert_eq!(encode_play_player_combat_enter(), (0x3b, vec![]));
+        assert_eq!(encode_play_open_book(1), Some((0x32, vec![1])));
+        assert_eq!(encode_play_open_book(2), None);
+        assert_eq!(encode_play_ping(-2), (0x35, vec![0xff, 0xff, 0xff, 0xfe]));
+        assert_eq!(encode_play_player_combat_end(300), (0x3a, vec![0xac, 0x02]));
+        assert_eq!(encode_play_resource_pack_pop(None), (0x45, vec![0]));
+        let mut expected = vec![1];
+        expected.extend_from_slice(&[7; 16]);
+        assert_eq!(encode_play_resource_pack_pop(Some([7; 16])), (0x45, expected));
+        assert_eq!(encode_play_select_advancements_tab(None), (0x4a, vec![0]));
+        assert_eq!(
+            encode_play_select_advancements_tab(Some("a")),
+            (0x4a, vec![1, 1, b'a'])
+        );
+        assert_eq!(encode_play_cookie_request("a"), (0x16, vec![1, b'a']));
+        assert_eq!(
+            encode_play_store_cookie("a", &[0x12, 0x34]),
+            Some((0x6b, vec![1, b'a', 2, 0x12, 0x34]))
+        );
+        assert_eq!(encode_play_store_cookie("a", &[0; 5121]), None);
+        assert_eq!(
+            encode_play_place_ghost_recipe(7, "a"),
+            (0x37, vec![7, 1, b'a'])
+        );
+        assert_eq!(
+            encode_play_horse_screen_open(3, 128, -2),
+            (0x23, vec![3, 0x80, 1, 0xff, 0xff, 0xff, 0xfe])
+        );
+    }
+
+    #[test]
+    fn protocol767_play_coordinates_and_entity_packets() {
+        let mut experience = vec![2];
+        for coord in [1.0f64, -2.0, 3.5] {
+            experience.extend_from_slice(&coord.to_be_bytes());
+        }
+        experience.extend_from_slice(&12i16.to_be_bytes());
+        assert_eq!(
+            encode_play_add_experience_orb(2, 1.0, -2.0, 3.5, 12),
+            (0x02, experience)
+        );
+
+        let mut block_break = vec![0x05];
+        block_break.extend_from_slice(&((1i64 << 38) | (0x3ffffffi64 << 12) | 64).to_be_bytes());
+        block_break.push(9);
+        assert_eq!(
+            encode_play_block_destruction(5, (1, 64, -1), 9),
+            (0x06, block_break)
+        );
+
+        assert_eq!(
+            encode_play_chunks_biomes(&[(-2, 3, &[0xab, 0xcd])]),
+            (0x0e, vec![1, 0, 0, 0, 3, 0xff, 0xff, 0xff, 0xfe, 2, 0xab, 0xcd])
+        );
+        let mut vehicle = Vec::new();
+        for coord in [1.0f64, -2.0, 3.0] {
+            vehicle.extend_from_slice(&coord.to_be_bytes());
+        }
+        vehicle.extend_from_slice(&90f32.to_be_bytes());
+        vehicle.extend_from_slice(&(-45f32).to_be_bytes());
+        assert_eq!(
+            encode_play_move_vehicle((1.0, -2.0, 3.0), 90.0, -45.0),
+            (0x31, vehicle)
+        );
+
+        let mut look = vec![1];
+        for coord in [1.0f64, 2.0, 3.0] {
+            look.extend_from_slice(&coord.to_be_bytes());
+        }
+        look.extend_from_slice(&[1, 42, 0]);
+        assert_eq!(
+            encode_play_player_look_at(1, (1.0, 2.0, 3.0), Some((42, 0))),
+            Some((0x3f, look.clone()))
+        );
+        assert_eq!(
+            encode_play_player_look_at(1, (1.0, 2.0, 3.0), None),
+            Some((0x3f, look[..look.len() - 3].iter().copied().chain([0]).collect()))
+        );
+        assert_eq!(encode_play_player_look_at(2, (0.0, 0.0, 0.0), None), None);
+
+        let mut power = vec![7];
+        power.extend_from_slice(&1.25f64.to_be_bytes());
+        assert_eq!(encode_play_set_projectile_power(7, 1.25), (0x79, power));
+    }
+
+    #[test]
+    fn protocol767_play_chat_and_combat_packet_bytes() {
+        assert_eq!(
+            encode_play_delete_chat(PlayChatDeletion::Indexed(0)),
+            Some((0x1c, vec![1]))
+        );
+        assert_eq!(encode_play_delete_chat(PlayChatDeletion::Indexed(u32::MAX)), None);
+        let mut signed = vec![0];
+        signed.extend_from_slice(&[0x23u8; 256]);
+        assert_eq!(
+            encode_play_delete_chat(PlayChatDeletion::Signature(&[0x23; 256])),
+            Some((0x1c, signed))
+        );
+        let nbt = [10, 8, 0, 4, b't', b'e', b'x', b't', 0, 3, b'b', b'y', b'e', 0];
+        let mut killed = vec![7];
+        killed.extend_from_slice(&nbt);
+        assert_eq!(encode_play_player_combat_kill(7, "bye"), (0x3c, killed));
+
+        let mut data = nbt.to_vec();
+        data.extend_from_slice(&[1, 2, 0xab, 0xcd]);
+        assert_eq!(encode_play_server_data("bye", Some(&[0xab, 0xcd])), (0x4b, data));
+        let mut data = nbt.to_vec();
+        data.push(0);
+        assert_eq!(encode_play_server_data("bye", None), (0x4b, data));
+    }
+
+    #[test]
+    fn protocol767_play_map_optional_and_patch_wire_bytes() {
+        let icons = [PlayMapIcon {
+            kind: 2, x: -1, z: 2, direction: 3, name_nbt: None,
+        }];
+        let patch = PlayMapPatch {
+            columns: 2, rows: 1, x: 4, y: 5, colors: &[9, 8],
+        };
+        assert_eq!(
+            encode_play_map_item_data(1, 0, true, Some(&icons), Some(&patch)),
+            Some((0x2c, vec![
+                1, 0, 1, 1, 1, 2, 0xff, 2, 3, 0, 2, 1, 4, 5, 2, 9, 8,
+            ]))
+        );
+        assert_eq!(
+            encode_play_map_item_data(1, 0, false, None, None),
+            Some((0x2c, vec![1, 0, 0, 0, 0]))
+        );
+        let named = [PlayMapIcon {
+            kind: 0, x: 0, z: 0, direction: 1, name_nbt: Some(&[10, 0]),
+        }];
+        assert_eq!(
+            encode_play_map_item_data(0, 0, false, Some(&named), None),
+            Some((0x2c, vec![0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 10, 0, 0]))
+        );
+        let broken = PlayMapPatch {
+            columns: 2, rows: 2, x: 0, y: 0, colors: &[1],
+        };
+        assert_eq!(encode_play_map_item_data(1, 0, false, None, Some(&broken)), None);
+    }
+
+    #[test]
+    fn protocol767_play_sound_and_tags_wire_bytes() {
+        let mut registered = vec![3, 2, 4];
+        registered.extend_from_slice(&1f32.to_be_bytes());
+        registered.extend_from_slice(&0.5f32.to_be_bytes());
+        registered.extend_from_slice(&(-2i64).to_be_bytes());
+        assert_eq!(
+            encode_play_sound_entity(PlaySound::Registered(2), 2, 4, 1.0, 0.5, -2),
+            Some((0x67, registered))
+        );
+        let mut custom = vec![0, 1, b'a', 1];
+        custom.extend_from_slice(&8f32.to_be_bytes());
+        custom.extend_from_slice(&[2, 4]);
+        custom.extend_from_slice(&1f32.to_be_bytes());
+        custom.extend_from_slice(&0.5f32.to_be_bytes());
+        custom.extend_from_slice(&(-2i64).to_be_bytes());
+        assert_eq!(
+            encode_play_sound_entity(
+                PlaySound::Custom { identifier: "a", fixed_range: Some(8.0) },
+                2, 4, 1.0, 0.5, -2,
+            ),
+            Some((0x67, custom))
+        );
+        assert!(encode_play_sound_entity(
+            PlaySound::Custom { identifier: "a", fixed_range: Some(-1.0) },
+            2, 4, 1.0, 0.5, 2,
+        ).is_none());
+
+        let tags = [PlayTag { name: "a", entries: &[0, 128] }];
+        let registries = [PlayTagRegistry { name: "b", tags: &tags }];
+        assert_eq!(
+            encode_play_update_tags(&registries),
+            (0x78, vec![1, 1, b'b', 1, 1, b'a', 2, 0, 0x80, 1])
+        );
+    }
+
+    #[test]
+    fn protocol767_play_custom_report_details_and_server_links() {
+        assert_eq!(
+            encode_play_custom_report_details(&[("a", "b")]),
+            (0x7a, vec![1, 1, b'a', 1, b'b'])
+        );
+        assert_eq!(
+            encode_play_server_links(&[
+                (PlayServerLinkLabel::BuiltIn(2), "x"),
+                (PlayServerLinkLabel::Custom(&[10, 0]), "y"),
+            ]),
+            (0x7b, vec![2, 1, 2, 1, b'x', 0, 10, 0, 1, b'y'])
+        );
+    }
+
     #[test]
     fn valid_handshake_and_login_identity() {
         let mut h = Vec::new();
@@ -13453,9 +14056,9 @@ mod w3_tests {
         write_varint(&mut interact, 0);
         send_packet(&mut cli, 0x16, interact).unwrap();
         let body = w3_read_until(&mut cli, 0x5f).expect("set passengers on mount");
-        let mut rest = &body[..];
+        let rest = &body[..];
         assert_eq!(
-            decode_set_passengers(&mut rest),
+            decode_set_passengers(rest),
             Some((boat_eid, vec![me.eid])),
             "mount must broadcast the rider on the vehicle"
         );
@@ -13489,9 +14092,9 @@ mod w3_tests {
         input.push(0x02);
         send_packet(&mut cli, 0x26, input).unwrap();
         let body = w3_read_until(&mut cli, 0x5f).expect("set passengers on dismount");
-        let mut rest = &body[..];
+        let rest = &body[..];
         assert_eq!(
-            decode_set_passengers(&mut rest),
+            decode_set_passengers(rest),
             Some((boat_eid, Vec::new())),
             "dismount must broadcast an empty passenger list"
         );
@@ -14935,8 +15538,7 @@ mod p5c_live_tests {
 
         // The diff encoder emits only changed slots — and an emptied slot
         // still rides the wire, which is how trackers see a piece come off.
-        let mut after = EntityEquipment::default();
-        after.slots = eq.slots.clone();
+        let mut after = EntityEquipment { slots: eq.slots.clone() };
         after.slots[EquipmentSlot::Head as usize] = (0, 0, Vec::new());
         let packet = encode_set_equipment_changes(me.eid, &eq, &after).expect("one change");
         let (eid, entries) = decode_set_equipment(&packet).expect("decodes");
@@ -16445,6 +17047,11 @@ mod bot_net2_tests {
 
     /// The world/globals the pet-follow and auto-unload fixtures replace, put
     /// back on drop so a failed assert cannot leak state into the next test.
+    type EvictedChunkSnapshot = HashMap<
+        (DimId, i32, i32),
+        std::collections::BTreeMap<(i32, i32), EvictedChunkArchive>,
+    >;
+
     struct BotNet2World {
         clients: Vec<Arc<Client>>,
         mobs: Vec<Arc<Mob>>,
@@ -16455,10 +17062,7 @@ mod bot_net2_tests {
         spawn: (f64, f64, f64, f32),
         tick_idx: u64,
         tickets: HashMap<DimChunkKey, u64>,
-        evicted: HashMap<
-            (DimId, i32, i32),
-            std::collections::BTreeMap<(i32, i32), EvictedChunkArchive>,
-        >,
+        evicted: EvictedChunkSnapshot,
         env_unload: Option<String>,
         env_anvil: Option<String>,
     }
@@ -17270,7 +17874,7 @@ mod parity_58_c2s_tests {
         gamerule_watch_tick();
         let (id, body) = p58_frame(&mut peer).expect("status 22");
         assert_eq!(id, 0x1f);
-        assert_eq!(body.last().copied(), Some(22u8 as u8));
+        assert_eq!(body.last().copied(), Some(22u8));
 
         command_gamerules()
             .lock()

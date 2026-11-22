@@ -69,6 +69,133 @@ def _pick_proto_packet(phase="play", direction="serverbound", skip=0):
     return packets[skip]
 
 
+class S2CResolverTest(unittest.TestCase):
+    """Synthetic send paths test static ID tracing without file-global guesses."""
+
+    @staticmethod
+    def _audit(*sources):
+        texts = {}
+        for index, source in enumerate(sources):
+            live, tests = vpa.mask_test_regions(vpa.live_text(source), vpa.code_skeleton(source))
+            texts[f"src/probe_{index}.rs"] = (
+                live, tests, vpa.code_skeleton(live))
+        return vpa.audit_s2c(REPO, texts)["s2c_play_packets"]
+
+    def test_test_only_fields_do_not_hide_following_live_send(self):
+        result = self._audit("""
+            struct State {
+                #[cfg(test)]
+                legacy: HashMap<String, Vec<u8>>,
+                active: i32,
+            }
+            fn actual_send(socket: &mut Socket) {
+                let state = State {
+                    #[cfg(test)]
+                    legacy: HashMap::new(),
+                    active: 4,
+                };
+                send_packet(socket, 0x25, vec![]);
+            }
+            #[cfg(test)]
+            fn test_only(socket: &mut Socket) { send_packet(socket, 0x16, vec![]); }
+        """)
+        self.assertIn(0x25, {p["id"] for p in result["emitted"]})
+        self.assertNotIn(0x16, {p["id"] for p in result["emitted"]})
+
+    def test_method_packet_requires_consumed_return_value(self):
+        result = self._audit("""
+            type WorldMechanismsPacket = (i64, Vec<u8>);
+            struct Sender;
+            impl Sender {
+                fn initialize_packet(&self) -> WorldMechanismsPacket { (0x25, vec![]) }
+                fn unused_packet(&self) -> WorldMechanismsPacket { (0x16, vec![]) }
+            }
+            fn actual_send(socket: &mut Socket, sender: Sender) {
+                let (id, payload) = sender.initialize_packet();
+                send_packet(socket, id, payload);
+            }
+        """)
+        self.assertIn(0x25, {p["id"] for p in result["emitted"]})
+        self.assertNotIn(0x16, {p["id"] for p in result["emitted"]})
+
+    def test_command_result_packet_requires_broadcast_consumer(self):
+        source = """
+            struct Update;
+            impl Update {
+                fn into_packet(self) -> WorldMechanismsPacket { (0x4e, vec![]) }
+            }
+            struct WorldBorderCommand;
+            impl WorldBorderCommand {
+                fn execute(&self) -> BorderResult {
+                    BorderResult { packet: update.map(Update::into_packet) }
+                }
+            }
+            fn unrelated() {
+                let result = WorldBorderCommand::parse(args)
+                    .and_then(|cmd| cmd.execute(border));
+            }
+        """
+        without_send = self._audit(source)
+        self.assertNotIn(0x4e, {p["id"] for p in without_send["emitted"]})
+
+        sent = self._audit(source + """
+            fn handler() {
+                let result = WorldBorderCommand::parse(args)
+                    .and_then(|cmd| cmd.execute(border));
+                if let Some((id, body)) = result.packet {
+                    broadcast(-1, |_| (id, body.clone()));
+                }
+            }
+        """)
+        self.assertIn(0x4e, {p["id"] for p in sent["emitted"]})
+
+    def test_qualified_constant_and_match_arms_reach_send(self):
+        result = self._audit("""
+            const CLIENTBOUND_COMMANDS: i32 = 0x11;
+            fn actual_send(socket: &mut Socket, mode: &str) {
+                send_packet(socket, i64::from(brigadier_wire::CLIENTBOUND_COMMANDS), vec![]);
+                let pkt_id: i64 = match mode {
+                    "title" => 0x65, "subtitle" => 0x63, "actionbar" => 0x4c, _ => -1
+                };
+                if pkt_id >= 0 { send_packet(socket, pkt_id, vec![]); }
+            }
+        """)
+        ids = {p["id"] for p in result["emitted"]}
+        self.assertTrue({0x11, 0x65, 0x63, 0x4c}.issubset(ids))
+        self.assertEqual(result["unresolved_send_sites"], 0)
+
+    def test_return_tuple_only_counts_when_bound_to_send(self):
+        result = self._audit("""
+            type WorldMechanismsPacket = (i64, Vec<u8>);
+            fn encode_scoreboard_score() -> WorldMechanismsPacket { (0x61, vec![]) }
+            fn actual_send(socket: &mut Socket) {
+                let (id, body) = encode_scoreboard_score();
+                send_packet(socket, id, body);
+            }
+            fn dead_encoder() -> WorldMechanismsPacket { (0x02, vec![]) }
+        """)
+        ids = {p["id"] for p in result["emitted"]}
+        self.assertIn(0x61, ids)
+        self.assertNotIn(0x02, ids)
+        self.assertEqual(result["unresolved_send_sites"], 0)
+
+    def test_dead_constants_and_other_function_bindings_are_not_emitted(self):
+        result = self._audit("""
+            const S2C_UNUSED_PACKET: i64 = 0x16;
+            const CB_UNUSED_PACKET: i64 = 0x6b;
+            fn unused(socket: &mut Socket) {
+                let id = S2C_UNUSED_PACKET;
+            }
+            fn live_send(socket: &mut Socket) {
+                send_packet(socket, 0x35, vec![]);
+                send_packet(socket, id, vec![]);
+            }
+        """)
+        ids = {p["id"] for p in result["emitted"]}
+        self.assertEqual(ids, {0x35})
+        self.assertEqual(result["unresolved_send_sites"], 1)
+
+
 class ModeATest(unittest.TestCase):
     """Mode A against the real repository (offline, no external files)."""
 
