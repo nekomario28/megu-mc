@@ -2872,8 +2872,14 @@ impl EquineKind {
 
     /// `AbstractChestedHorse`: donkeys, mules and llamas take a chest; horses
     /// take body armor instead.
-    fn can_chest(self) -> bool {
+    fn can_carry_chest(self) -> bool {
         matches!(self, Self::Donkey | Self::Mule | Self::Llama)
+    }
+
+    /// `isSaddleable`: horses, donkeys and mules take a saddle. Llamas can
+    /// never be saddled in vanilla — their body slot accepts carpets instead.
+    fn can_wear_saddle(self) -> bool {
+        matches!(self, Self::Horse | Self::Donkey | Self::Mule)
     }
 
     /// `Horse.mobInteract`/`isEquippableInSlot(BODY)`: only horses wear the
@@ -3012,6 +3018,16 @@ struct EquineState {
     chested: bool,
     /// Horse body armor: 0 none, 1 leather, 2 iron, 3 gold, 4 diamond.
     armor_tier: u8,
+    /// Vanilla `Llama.strength` clamped to `1..=5` (`Llama.setStrength`); the
+    /// chest inventory is `3 * strength` columns. Always `0` on non-llamas.
+    llama_strength: u8,
+    /// Wool carpet on a llama's body slot (`0..=15` dye index). Vanilla has
+    /// no carpet slot on Horse/Donkey/Mule, so it is always `None` there.
+    carpet_color: Option<u8>,
+    /// `AbstractChestedHorse.inventory`: the chest contents, allocated only
+    /// while `chested` — 15 slots on donkey/mule, `3 * llama_strength` on a
+    /// llama, always empty on a horse (which cannot carry a chest).
+    chest_slots: Vec<Option<(String, u8)>>,
     jump_strength: f64,
     move_speed: f64,
     health: f32,
@@ -3038,6 +3054,9 @@ impl EquineState {
             saddled: false,
             chested: false,
             armor_tier: 0,
+            llama_strength: if kind == EquineKind::Llama { 1 } else { 0 },
+            carpet_color: None,
+            chest_slots: Vec::new(),
             jump_strength: 0.7,
             move_speed: 0.225,
             health: 30.0,
@@ -3155,21 +3174,57 @@ impl EquineState {
         }
     }
 
-    /// `isSaddleable` + `equipSaddle`: tamed adult without a saddle already.
+    /// The live `AbstractChestedHorse` chest column count for this kind:
+    /// 15 on donkey/mule (`AbstractChestedHorse.getInventoryColumns`), the
+    /// llama's `3 * strength` (`Llama.getInventorySize`), 0 on a horse.
+    fn chest_capacity(&self) -> usize {
+        match self.kind {
+            EquineKind::Donkey | EquineKind::Mule => 15,
+            EquineKind::Llama => 3 * self.llama_strength as usize,
+            EquineKind::Horse => 0,
+        }
+    }
+
+    /// `Llama.setStrength`: `Math.max(1, Math.min(5, value))`, llama only.
+    /// Like vanilla `createInventory`, resizing a chested llama re-allocates
+    /// the container — slots that no longer fit are dropped from the
+    /// inventory, never copied twice.
+    fn set_llama_strength(&mut self, strength: u8) -> bool {
+        if self.kind != EquineKind::Llama {
+            return false;
+        }
+        self.llama_strength = strength.clamp(1, 5);
+        if self.chested {
+            self.chest_slots.resize(self.chest_capacity(), None);
+        }
+        true
+    }
+
+    /// `isSaddleable` + `equipSaddle`: tamed adult of a saddle-wearing kind
+    /// without a saddle already. Llamas have no saddle slot — a tamed llama
+    /// still refuses a saddle exactly like vanilla.
     fn equip_saddle(&mut self) -> bool {
-        if !(self.tamed && !self.is_baby() && !self.saddled) {
+        if !(self.kind.can_wear_saddle() && self.tamed && !self.is_baby() && !self.saddled) {
             return false;
         }
         self.saddled = true;
         true
     }
 
-    /// `AbstractChestedHorse.equipChest`: tamed adult of a chested kind only.
+    /// `AbstractChestedHorse.equipChest` + `createInventory`: tamed adult of
+    /// a chested kind only. Success allocates the exact vanilla slot count —
+    /// a second chest is refused before anything is allocated, so the chest
+    /// inventory can never be duplicated or re-created over live contents.
     fn equip_chest(&mut self) -> bool {
-        if !(self.kind.can_chest() && self.tamed && !self.is_baby() && !self.chested) {
+        if !(self.kind.can_carry_chest()
+            && self.tamed
+            && !self.is_baby()
+            && !self.chested)
+        {
             return false;
         }
         self.chested = true;
+        self.chest_slots = vec![None; self.chest_capacity()];
         true
     }
 
@@ -3189,9 +3244,104 @@ impl EquineState {
         true
     }
 
+    /// `Llama` carpet slot (`Llama.mobInteract` over `ItemTags.WOOL_CARPETS`
+    /// plus `setWoolCarpet`): only a tamed adult llama takes a carpet, and
+    /// the slot swaps atomically — the previously worn color is returned so
+    /// a carpet swap can never lose or duplicate one. `None` removes the
+    /// carpet. Every rejection leaves the state untouched.
+    fn equip_llama_carpet(&mut self, color: Option<u8>) -> Result<Option<u8>, ()> {
+        if self.kind != EquineKind::Llama || !self.tamed || self.is_baby() {
+            return Err(());
+        }
+        if color.is_some_and(|c| c >= 16) {
+            return Err(());
+        }
+        Ok(std::mem::replace(&mut self.carpet_color, color))
+    }
+
+    /// Chest-inventory write: only into an in-bounds, currently empty slot.
+    /// Out-of-range (past `3 * strength` on a llama) or occupied slots fail
+    /// closed — never overwriting or losing a stored stack, and never
+    /// writing while `!chested` (the vec is empty then anyway).
+    fn put_chest_slot(&mut self, slot: usize, item: (String, u8)) -> bool {
+        let Some(cell) = self.chest_slots.get_mut(slot) else {
+            return false;
+        };
+        if cell.is_some() {
+            return false;
+        }
+        *cell = Some(item);
+        true
+    }
+
+    /// Removes and returns one stack; out-of-range fails closed to `None`.
+    fn take_chest_slot(&mut self, slot: usize) -> Option<(String, u8)> {
+        self.chest_slots.get_mut(slot)?.take()
+    }
+
+    /// `AbstractChestedHorse`/`Llama` death drops as an idempotent drain:
+    /// saddle, horse armor, carpet, chest and every stored stack are yielded
+    /// exactly once, then the equipment fields are cleared — a second call
+    /// returns empty, so the classic donkey/llama death- or portal-dupe
+    /// cannot produce the same items twice.
+    fn collect_death_drops(&mut self) -> Vec<(String, u8)> {
+        let mut drops = Vec::new();
+        if std::mem::take(&mut self.saddled) {
+            drops.push(("saddle".to_string(), 1));
+        }
+        if let Some(armor) = match self.armor_tier {
+            1 => Some("leather_horse_armor"),
+            2 => Some("iron_horse_armor"),
+            3 => Some("golden_horse_armor"),
+            4 => Some("diamond_horse_armor"),
+            _ => None,
+        } {
+            drops.push((armor.to_string(), 1));
+        }
+        self.armor_tier = 0;
+        if let Some(color) = self.carpet_color.take() {
+            drops.push((format!("{}_carpet", wool_carpet_color_name(color)), 1));
+        }
+        if self.chested {
+            self.chested = false;
+            drops.push(("chest".to_string(), 1));
+            for slot in &mut self.chest_slots {
+                if let Some(item) = slot.take() {
+                    drops.push(item);
+                }
+            }
+            self.chest_slots.clear();
+        }
+        drops
+    }
+
     /// `canJump`: only a saddled mount answers the jump bar.
     fn can_jump(&self) -> bool {
         self.saddled
+    }
+}
+
+/// `DyeColor` names in vanilla dye-index order — llama carpet items drop as
+/// `<color>_carpet`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wool_carpet_color_name(color: u8) -> &'static str {
+    match color {
+        0 => "white",
+        1 => "orange",
+        2 => "magenta",
+        3 => "light_blue",
+        4 => "yellow",
+        5 => "lime",
+        6 => "pink",
+        7 => "gray",
+        8 => "light_gray",
+        9 => "cyan",
+        10 => "purple",
+        11 => "blue",
+        12 => "brown",
+        13 => "green",
+        14 => "red",
+        _ => "black",
     }
 }
 
@@ -6552,6 +6702,310 @@ mod vanilla_horse_tests {
         // Untamed horse refuses.
         let mut wild = EquineState::new(EquineKind::Horse);
         assert!(!wild.equip_armor(2));
+    }
+
+    // ---- Llama strength / carpets, chest slots & death-drop conservation -----
+
+    #[test]
+    fn vanilla_llama_strength_clamps_into_vanilla_range() {
+        let mut llama = adult_tamed(EquineKind::Llama);
+        assert_eq!(llama.llama_strength, 1);
+        // setStrength clamps to 1..=5 like vanilla.
+        for (input, expected) in [(0u8, 1u8), (1, 1), (3, 3), (5, 5), (6, 5), (255, 5)] {
+            assert!(llama.set_llama_strength(input));
+            assert_eq!(llama.llama_strength, expected, "strength {input}");
+        }
+        // Non-llamas have no strength slot and refuse the setter.
+        for kind in [EquineKind::Horse, EquineKind::Donkey, EquineKind::Mule] {
+            let mut state = adult_tamed(kind);
+            assert_eq!(state.llama_strength, 0);
+            assert!(!state.set_llama_strength(5), "{kind:?} has no strength");
+            assert_eq!(state.llama_strength, 0);
+        }
+    }
+
+    #[test]
+    fn vanilla_donkey_mule_chest_is_exactly_15_slots() {
+        for kind in [EquineKind::Donkey, EquineKind::Mule] {
+            let mut state = adult_tamed(kind);
+            assert!(state.equip_chest(), "{kind:?} should chest");
+            assert_eq!(state.chest_slots.len(), 15, "{kind:?} slot count");
+            assert!(state.chest_slots.iter().all(Option::is_none));
+            // Double-chest refused and cannot re-allocate over live contents.
+            state.chest_slots[0] = Some(("diamond".to_string(), 3));
+            assert!(!state.equip_chest(), "{kind:?} double-chest refused");
+            assert_eq!(state.chest_slots[0], Some(("diamond".to_string(), 3)));
+        }
+        // Baby and wild adults refuse; the horse can never chest at all.
+        for kind in [EquineKind::Donkey, EquineKind::Mule] {
+            let mut baby = adult_tamed(kind);
+            baby.age_ticks = -100;
+            assert!(!baby.equip_chest(), "{kind:?} baby chest refused");
+            assert!(baby.chest_slots.is_empty());
+            let mut wild = EquineState::new(kind);
+            assert!(!wild.equip_chest(), "{kind:?} untamed chest refused");
+        }
+        let mut horse = adult_tamed(EquineKind::Horse);
+        assert!(!horse.equip_chest());
+        assert!(horse.chest_slots.is_empty());
+    }
+
+    #[test]
+    fn vanilla_llama_chest_slots_scale_with_strength() {
+        for (strength, slots) in [(1u8, 3usize), (2, 6), (3, 9), (4, 12), (5, 15)] {
+            let mut llama = adult_tamed(EquineKind::Llama);
+            assert!(llama.set_llama_strength(strength));
+            assert!(llama.equip_chest());
+            assert_eq!(llama.chest_slots.len(), slots, "strength {strength}");
+        }
+    }
+
+    #[test]
+    fn vanilla_horse_never_allocates_chest_slots() {
+        let mut horse = adult_tamed(EquineKind::Horse);
+        assert!(!horse.equip_chest());
+        assert!(!horse.put_chest_slot(0, ("diamond".to_string(), 1)));
+        assert_eq!(horse.take_chest_slot(0), None);
+        assert!(horse.chest_slots.is_empty());
+    }
+
+    #[test]
+    fn vanilla_chest_slots_fail_closed_without_chest() {
+        let mut donkey = adult_tamed(EquineKind::Donkey);
+        // Not chested: every read and write fails closed.
+        assert!(!donkey.put_chest_slot(0, ("apple".to_string(), 5)));
+        assert_eq!(donkey.take_chest_slot(0), None);
+        assert!(donkey.chest_slots.is_empty());
+    }
+
+    #[test]
+    fn vanilla_chest_put_and_take_conserve_stacks() {
+        let mut donkey = adult_tamed(EquineKind::Donkey);
+        assert!(donkey.equip_chest());
+        // The full 15-slot inventory is addressable; slot 15 is out of range.
+        assert!(donkey.put_chest_slot(14, ("wheat".to_string(), 64)));
+        assert!(!donkey.put_chest_slot(15, ("wheat".to_string(), 64)));
+        // An occupied slot refuses an overwrite instead of losing the stack.
+        assert!(!donkey.put_chest_slot(14, ("apple".to_string(), 1)));
+        // Take removes the exact stored stack; a second take sees the empty slot.
+        assert_eq!(donkey.take_chest_slot(14), Some(("wheat".to_string(), 64)));
+        assert_eq!(donkey.take_chest_slot(14), None);
+        // And now the slot accepts a new stack again.
+        assert!(donkey.put_chest_slot(14, ("apple".to_string(), 1)));
+    }
+
+    #[test]
+    fn vanilla_llama_out_of_range_slot_write_fails_closed() {
+        let mut llama = adult_tamed(EquineKind::Llama);
+        assert!(llama.set_llama_strength(2));
+        assert!(llama.equip_chest());
+        assert_eq!(llama.chest_slots.len(), 6);
+        // Slots 0..=5 are writable; slot 6 is past the strength-2 capacity.
+        assert!(llama.put_chest_slot(5, ("dirt".to_string(), 1)));
+        assert!(!llama.put_chest_slot(6, ("dirt".to_string(), 1)));
+        assert_eq!(llama.take_chest_slot(6), None);
+        assert_eq!(llama.take_chest_slot(usize::MAX), None);
+    }
+
+    #[test]
+    fn vanilla_llama_carpet_swaps_without_loss() {
+        let mut llama = adult_tamed(EquineKind::Llama);
+        assert_eq!(llama.equip_llama_carpet(Some(4)), Ok(None));
+        assert_eq!(llama.carpet_color, Some(4));
+        // Swapping returns the worn carpet — zero lost, zero fabricated.
+        assert_eq!(llama.equip_llama_carpet(Some(15)), Ok(Some(4)));
+        assert_eq!(llama.carpet_color, Some(15));
+        // `None` removes the carpet and hands it back.
+        assert_eq!(llama.equip_llama_carpet(None), Ok(Some(15)));
+        assert_eq!(llama.carpet_color, None);
+        assert_eq!(llama.equip_llama_carpet(None), Ok(None));
+    }
+
+    #[test]
+    fn vanilla_llama_accepts_all_sixteen_carpet_colors() {
+        let mut llama = adult_tamed(EquineKind::Llama);
+        for color in 0..16u8 {
+            assert_eq!(
+                llama.equip_llama_carpet(Some(color)),
+                Ok(color.checked_sub(1)),
+                "carpet color {color}"
+            );
+            assert_eq!(llama.carpet_color, Some(color));
+        }
+        // Colors outside the 16 wool dyes are rejected and change nothing.
+        for bad in [16u8, 100, u8::MAX] {
+            assert_eq!(llama.equip_llama_carpet(Some(bad)), Err(()));
+        }
+        assert_eq!(llama.carpet_color, Some(15));
+    }
+
+    #[test]
+    fn vanilla_non_llamas_never_wear_carpets() {
+        for kind in [EquineKind::Horse, EquineKind::Donkey, EquineKind::Mule] {
+            let mut state = adult_tamed(kind);
+            assert_eq!(state.equip_llama_carpet(Some(0)), Err(()));
+            assert_eq!(state.carpet_color, None, "{kind:?} carpet stayed None");
+        }
+        // Untamed and baby llamas refuse too, leaving the slot untouched.
+        let mut wild = EquineState::new(EquineKind::Llama);
+        assert_eq!(wild.equip_llama_carpet(Some(0)), Err(()));
+        let mut baby = adult_tamed(EquineKind::Llama);
+        baby.age_ticks = -10;
+        assert_eq!(baby.equip_llama_carpet(Some(0)), Err(()));
+    }
+
+    #[test]
+    fn vanilla_llama_rejects_saddle_and_horse_armor() {
+        // Llamas have a carpet slot, not a saddle slot: `isSaddleable` is
+        // false for them in vanilla.
+        let mut llama = adult_tamed(EquineKind::Llama);
+        assert!(!llama.equip_saddle());
+        assert!(!llama.saddled);
+        assert!(!llama.can_jump());
+        assert!(!llama.equip_armor(1));
+        assert_eq!(llama.armor_tier, 0);
+        // Every other kind saddles normally.
+        for kind in [EquineKind::Horse, EquineKind::Donkey, EquineKind::Mule] {
+            let mut state = adult_tamed(kind);
+            assert!(state.equip_saddle(), "{kind:?} should saddle");
+        }
+    }
+
+    #[test]
+    fn vanilla_baby_and_wild_llama_reject_chest_and_carpet() {
+        let mut baby = adult_tamed(EquineKind::Llama);
+        baby.age_ticks = -50;
+        assert!(!baby.equip_chest());
+        assert_eq!(baby.equip_llama_carpet(Some(2)), Err(()));
+        assert!(baby.chest_slots.is_empty());
+        let mut wild = EquineState::new(EquineKind::Llama);
+        assert!(!wild.equip_chest());
+        assert_eq!(wild.equip_llama_carpet(Some(2)), Err(()));
+    }
+
+    #[test]
+    fn vanilla_death_drops_drain_saddle_armor_chest_exactly() {
+        // A kitted horse: saddle + diamond armor drop, nothing else.
+        let mut horse = adult_tamed(EquineKind::Horse);
+        assert!(horse.equip_saddle());
+        assert!(horse.equip_armor(4));
+        assert_eq!(
+            horse.collect_death_drops(),
+            vec![
+                ("saddle".to_string(), 1),
+                ("diamond_horse_armor".to_string(), 1)
+            ]
+        );
+        assert!(!horse.saddled);
+        assert_eq!(horse.armor_tier, 0);
+
+        // A chested mule with contents: chest + stacks + no phantom items.
+        let mut mule = adult_tamed(EquineKind::Mule);
+        assert!(mule.equip_chest());
+        assert!(mule.put_chest_slot(0, ("bread".to_string(), 6)));
+        assert!(mule.put_chest_slot(14, ("emerald".to_string(), 1)));
+        assert_eq!(
+            mule.collect_death_drops(),
+            vec![
+                ("chest".to_string(), 1),
+                ("bread".to_string(), 6),
+                ("emerald".to_string(), 1)
+            ]
+        );
+        assert!(!mule.chested);
+        assert!(mule.chest_slots.is_empty());
+    }
+
+    #[test]
+    fn vanilla_llama_death_drops_drain_carpet_chest_exactly() {
+        let mut llama = adult_tamed(EquineKind::Llama);
+        assert!(llama.set_llama_strength(5));
+        assert_eq!(llama.equip_llama_carpet(Some(9)), Ok(None));
+        assert!(llama.equip_chest());
+        assert!(llama.put_chest_slot(0, ("hay_block".to_string(), 2)));
+        assert!(llama.put_chest_slot(14, ("cactus".to_string(), 7)));
+        assert_eq!(
+            llama.collect_death_drops(),
+            vec![
+                ("cyan_carpet".to_string(), 1),
+                ("chest".to_string(), 1),
+                ("hay_block".to_string(), 2),
+                ("cactus".to_string(), 7)
+            ]
+        );
+        assert_eq!(llama.carpet_color, None);
+        assert!(!llama.chested);
+        assert!(llama.chest_slots.is_empty());
+    }
+
+    #[test]
+    fn vanilla_death_drops_are_idempotent_no_dupe() {
+        // The classic dupe kills: a death event that somehow fires the drop
+        // path twice must produce the items exactly once.
+        let mut donkey = adult_tamed(EquineKind::Donkey);
+        assert!(donkey.equip_saddle());
+        assert!(donkey.equip_chest());
+        assert!(donkey.put_chest_slot(3, ("iron_ingot".to_string(), 42)));
+        let first = donkey.collect_death_drops();
+        assert_eq!(
+            first,
+            vec![
+                ("saddle".to_string(), 1),
+                ("chest".to_string(), 1),
+                ("iron_ingot".to_string(), 42)
+            ]
+        );
+        assert!(donkey.collect_death_drops().is_empty());
+        assert!(donkey.collect_death_drops().is_empty());
+
+        let mut llama = adult_tamed(EquineKind::Llama);
+        assert_eq!(llama.equip_llama_carpet(Some(14)), Ok(None));
+        assert!(llama.equip_chest());
+        assert!(llama.put_chest_slot(0, ("stick".to_string(), 3)));
+        assert_eq!(
+            llama.collect_death_drops(),
+            vec![
+                ("red_carpet".to_string(), 1),
+                ("chest".to_string(), 1),
+                ("stick".to_string(), 3)
+            ]
+        );
+        assert!(llama.collect_death_drops().is_empty());
+        // A bare animal drops nothing twice either.
+        let mut plain = adult_tamed(EquineKind::Horse);
+        assert!(plain.collect_death_drops().is_empty());
+    }
+
+    #[test]
+    fn vanilla_llama_strength_shrink_truncates_slots_no_dupe() {
+        // `createInventory` on setStrength keeps what fits; items past the
+        // new capacity leave the inventory rather than duplicating later.
+        let mut llama = adult_tamed(EquineKind::Llama);
+        assert!(llama.set_llama_strength(5));
+        assert!(llama.equip_chest());
+        assert!(llama.put_chest_slot(2, ("apple".to_string(), 4)));
+        assert!(llama.put_chest_slot(14, ("diamond".to_string(), 1)));
+        assert!(llama.set_llama_strength(1));
+        assert_eq!(llama.chest_slots.len(), 3);
+        assert_eq!(llama.chest_slots[2], Some(("apple".to_string(), 4)));
+        // The dropped stack is gone from the inventory — not duplicated by
+        // a later death-drop drain.
+        assert_eq!(
+            llama.collect_death_drops(),
+            vec![
+                ("chest".to_string(), 1),
+                ("apple".to_string(), 4)
+            ]
+        );
+
+        // Growing strength re-allocates with empty new cells, no dupes.
+        let mut llama = adult_tamed(EquineKind::Llama);
+        assert!(llama.equip_chest());
+        assert!(llama.put_chest_slot(2, ("apple".to_string(), 4)));
+        assert!(llama.set_llama_strength(5));
+        assert_eq!(llama.chest_slots.len(), 15);
+        assert_eq!(llama.chest_slots[2], Some(("apple".to_string(), 4)));
+        assert_eq!(llama.chest_slots[14], None);
     }
 
     // ---- Jump bar ------------------------------------------------------------

@@ -889,9 +889,10 @@ fn rs_wire_connection(world: &impl RedstoneWorld, pos: RsPos, dir: RsDir) -> RsW
         };
     }
 
+    // Vanilla `connectsTo`: only a repeater is directional; every other
+    // signal source — observer included — connects dust on all four sides.
     let connects = match block {
         RsBlock::Repeater(repeater) => repeater.facing == dir || repeater.facing == dir.opposite(),
-        RsBlock::Observer { facing, .. } => facing == dir,
         _ => block.is_signal_source(),
     };
     if connects
@@ -1718,6 +1719,18 @@ trait RedstoneUpdates: RedstoneWorld {
     ) -> bool {
         false
     }
+
+    /// Vanilla `blockEvent` fires once per `neighborChanged` pass: a piston
+    /// event whose resolve could not move is consumed and only re-arms on the
+    /// next update, never in a tight same-tick loop. Hosts that simulate the
+    /// device event queue track the consumed positions for the current tick.
+    fn piston_event_consumed(&self, _pos: RsPos) -> bool {
+        false
+    }
+
+    /// Record that `pos`'s piston event ran and failed to apply; suppresses
+    /// re-scheduling until the host's next update pass clears the mark.
+    fn consume_piston_event(&mut self, _pos: RsPos) {}
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1747,6 +1760,10 @@ struct RedstoneSimGrid {
     pending: BTreeMap<RsPos, u64>,
     torches: BTreeMap<RsPos, RsTorchHistory>,
     dispense_events: Vec<RsPos>,
+    /// Pistons whose `triggerEvent` resolve failed in the current game tick —
+    /// the vanilla "event consumed" rule that stops a powered-but-stuck
+    /// piston from re-arming (and re-failing) inside the same tick.
+    consumed_piston_events: BTreeSet<RsPos>,
     // Host-surface state the live world serves through `RedstoneBlockWorld`:
     // the sim exposes the same hooks so the canonical engine can exercise the
     // analog, sensor, tripwire and piston paths end to end.
@@ -1805,6 +1822,9 @@ impl RedstoneWorld for RedstoneSimGrid {
 #[cfg_attr(not(test), allow(dead_code))]
 impl RedstoneSimGrid {
     fn set_block(&mut self, pos: RsPos, block: RsBlock) {
+        // A new placement is a fresh `neighborChanged` pass: consumed piston
+        // events re-arm, exactly like vanilla re-checking `checkIfExtend`.
+        self.consumed_piston_events.clear();
         if std::mem::discriminant(&self.redstone_block(pos)) != std::mem::discriminant(&block) {
             self.pending.remove(&pos);
             self.torches.remove(&pos);
@@ -1829,11 +1849,33 @@ impl RedstoneSimGrid {
                 continue;
             }
             self.pending.remove(&pos);
+            if due > self.now {
+                self.consumed_piston_events.clear();
+            }
             self.now = due;
+            self.tick_moving_pistons();
             rs_run_tick(self, pos, due);
             self.settle();
         }
+        if target > self.now {
+            self.consumed_piston_events.clear();
+        }
         self.now = target;
+        self.tick_moving_pistons();
+    }
+
+    /// `PistonMovingBlockEntity.tick`: `progress += 0.5` per game tick and the
+    /// moved block lands as a real block at 1.0 — keeping `last_ticked` and
+    /// `progress` honest for the sticky retraction drop check.
+    fn tick_moving_pistons(&mut self) {
+        let now = self.now;
+        self.moving_pistons.retain(|_, moving| {
+            if moving.last_ticked < now {
+                moving.progress += 0.5 * (now - moving.last_ticked) as f32;
+                moving.last_ticked = now;
+            }
+            moving.progress < 1.0
+        });
     }
 
     fn take_dispense_events(&mut self) -> Vec<RsPos> {
@@ -1880,6 +1922,14 @@ impl RedstoneUpdates for RedstoneSimGrid {
         self.tripwire_cells.insert(pos, wire);
     }
 
+    fn piston_event_consumed(&self, pos: RsPos) -> bool {
+        self.consumed_piston_events.contains(&pos)
+    }
+
+    fn consume_piston_event(&mut self, pos: RsPos) {
+        self.consumed_piston_events.insert(pos);
+    }
+
     fn apply_piston_plan(
         &mut self,
         pos: RsPos,
@@ -1906,14 +1956,36 @@ impl RedstoneUpdates for RedstoneSimGrid {
         for &cell in &plan.to_destroy {
             self.blocks.remove(&cell);
         }
-        for &cell in &plan.to_move {
-            self.blocks.remove(&cell);
-        }
-        for (dst, block) in moved {
-            if block == RsBlock::Air {
-                self.blocks.remove(&dst);
-            } else {
-                self.blocks.insert(dst, block);
+        if drop_pulled {
+            // Event 2 leaves the pushed block where it landed: the cells stay
+            // put and the mid-flight marker is consumed, so a short-pulsed
+            // sticky piston can never delete the block it pushed.
+            for &cell in &plan.to_move {
+                self.moving_pistons.remove(&cell);
+            }
+        } else {
+            for &cell in &plan.to_move {
+                self.blocks.remove(&cell);
+            }
+            for (dst, block) in moved {
+                if block == RsBlock::Air {
+                    self.blocks.remove(&dst);
+                } else {
+                    self.blocks.insert(dst, block);
+                }
+                if extending {
+                    // Vanilla moves every pushed cell as a `moving_piston`
+                    // block entity: `progress` 0.0 and `last_ticked` now —
+                    // the exact state the sticky-drop check reads on a
+                    // same-tick or next-tick retraction.
+                    self.moving_pistons.insert(
+                        dst,
+                        RsMovingPiston {
+                            progress: 0.0,
+                            last_ticked: self.now,
+                        },
+                    );
+                }
             }
         }
         true
@@ -2093,8 +2165,13 @@ fn rs_update_device(world: &mut impl RedstoneUpdates, pos: RsPos, block: RsBlock
         } => {
             // Vanilla `PistonBaseBlock.checkIfExtend` — the QC-aware signal read
             // decides whether the block event runs; `rs_run_tick` performs the
-            // resolve + apply when it fires.
-            if is_piston_powered(world, pos, facing) != extended {
+            // resolve + apply when it fires. An event this tick already
+            // consumed (failed resolve or apply) does not re-arm until the
+            // next update pass, matching vanilla's once-per-neighborChanged
+            // blockEvent.
+            if is_piston_powered(world, pos, facing) != extended
+                && !world.piston_event_consumed(pos)
+            {
                 world.schedule(pos, RS_PISTON_EVENT_TICKS, RsTickPriority::Normal);
             }
             block
@@ -2253,13 +2330,20 @@ fn rs_run_tick(world: &mut impl RedstoneUpdates, pos: RsPos, now: u64) {
             sticky,
             extended,
         } => {
-            if is_piston_powered(world, pos, facing) != extended
-                && rs_piston_apply(world, pos, sticky, facing, !extended, now)
-            {
-                RsBlock::Piston {
-                    facing,
-                    sticky,
-                    extended: !extended,
+            if is_piston_powered(world, pos, facing) != extended {
+                if rs_piston_apply(world, pos, sticky, facing, !extended, now) {
+                    RsBlock::Piston {
+                        facing,
+                        sticky,
+                        extended: !extended,
+                    }
+                } else {
+                    // The event ran and could not move the structure (a line
+                    // over the 12-block cap, an immovable block, or a host
+                    // that cannot rewrite cells): mark it consumed so
+                    // `rs_update_device` cannot re-arm it inside this tick.
+                    world.consume_piston_event(pos);
+                    block
                 }
             } else {
                 block
@@ -4709,6 +4793,55 @@ mod p4b_parity_tests {
     }
 
     #[test]
+    fn p4b_parity_piston_refuses_moves_outside_build_bounds() {
+        // `isPushable`'s world-edge rule: a block cannot be pushed below
+        // min_y or above max_y - 1, so the resolver fails at the boundary.
+        struct Bounded {
+            cells: std::collections::BTreeMap<RsPos, RsPushBlock>,
+        }
+        impl RsPistonWorld for Bounded {
+            fn piston_block(&self, pos: RsPos) -> RsPushBlock {
+                self.cells.get(&pos).copied().unwrap_or(RsPushBlock {
+                    air: true,
+                    ..Default::default()
+                })
+            }
+            fn build_height(&self) -> (i32, i32) {
+                (0, 4)
+            }
+        }
+        // Block at min_y pushed down: resolve fails.
+        let mut cells = std::collections::BTreeMap::new();
+        push_cell(&mut cells, 0, 0, 0, movable());
+        let world = Bounded { cells };
+        assert_eq!(
+            rs_piston_resolve(&world, RsPos(0, 1, 0), RsDir::Down, true),
+            None,
+            "cannot push a block below min_y"
+        );
+        // Block at max_y - 1 pushed up: resolve fails.
+        let mut cells = std::collections::BTreeMap::new();
+        push_cell(&mut cells, 0, 3, 0, movable());
+        let world = Bounded { cells };
+        assert_eq!(
+            rs_piston_resolve(&world, RsPos(0, 2, 0), RsDir::Up, true),
+            None,
+            "cannot push a block past max_y - 1"
+        );
+        // The same block moving down off the ceiling is fine.
+        assert!(rs_piston_resolve(&world, RsPos(0, 4, 0), RsDir::Down, true).is_some());
+        // A cell already outside the world is not pushable at all.
+        let mut cells = std::collections::BTreeMap::new();
+        push_cell(&mut cells, 0, 4, 0, movable());
+        let world = Bounded { cells };
+        assert_eq!(
+            rs_piston_resolve(&world, RsPos(0, 3, 0), RsDir::Up, true),
+            None,
+            "a block above the build height never moves"
+        );
+    }
+
+    #[test]
     fn p4b_parity_observer_two_tick_pulse() {
         let mut grid = RedstoneSimGrid::default();
         let obs = RsPos(0, 0, 0);
@@ -4962,6 +5095,10 @@ mod p6c_redstone_parity_tests {
         grid.set_block(RsPos(0, 0, 1), RsBlock::RedstoneBlock);
         grid.advance(0);
         assert_eq!(grid.redstone_block(RsPos(2, 0, 0)), RsBlock::Solid);
+        // The pushed block is a `moving_piston` for two game ticks — a
+        // retraction before it finishes would drop the block instead of
+        // pulling it, so the pull path needs the extension to complete.
+        grid.advance(2);
         grid.set_block(RsPos(0, 0, 1), RsBlock::Air);
         grid.advance(0);
         // The retract resolver pulls the block from face+2 back onto the head
@@ -5091,5 +5228,172 @@ mod p6c_redstone_parity_tests {
                 powered: true
             })
         );
+    }
+
+    #[test]
+    fn bedrock_dust_connects_to_observer_on_every_side() {
+        // Vanilla `RedStoneWireBlock.connectsTo` is directional only for
+        // repeaters: an observer is a signal source, so dust connects to it
+        // on all four horizontal sides — the watched face included.
+        let mut grid = RedstoneSimGrid::default();
+        grid.set_block(
+            RsPos(0, 0, 0),
+            RsBlock::Observer {
+                facing: RsDir::East,
+                powered: false,
+            },
+        );
+        for (pos, dir) in [
+            (RsPos(1, 0, 0), RsDir::West),
+            (RsPos(-1, 0, 0), RsDir::East),
+            (RsPos(0, 0, 1), RsDir::North),
+            (RsPos(0, 0, -1), RsDir::South),
+        ] {
+            assert_eq!(
+                rs_wire_connection(&grid, pos, dir),
+                RsWireConnection::Side,
+                "dust at {pos:?} must connect to the observer"
+            );
+        }
+        // The observer still emits only out its back (opposite `facing`).
+        assert_eq!(
+            RsBlock::Observer {
+                facing: RsDir::East,
+                powered: true
+            }
+            .weak_signal(RsDir::West),
+            15
+        );
+        assert_eq!(
+            RsBlock::Observer {
+                facing: RsDir::East,
+                powered: true
+            }
+            .weak_signal(RsDir::East),
+            0
+        );
+    }
+
+    #[test]
+    fn bedrock_sticky_piston_one_tick_pulse_drops_block() {
+        // The classic sticky-piston pulse: power for a single game tick and
+        // the pushed block is left at its destination — the mid-flight
+        // `moving_piston` check fires event 2 (drop), not a pull.
+        let mut grid = RedstoneSimGrid::default();
+        let piston = RsPos(0, 0, 0);
+        grid.set_block(
+            piston,
+            RsBlock::Piston {
+                sticky: true,
+                facing: RsDir::East,
+                extended: false,
+            },
+        );
+        grid.set_block(RsPos(1, 0, 0), RsBlock::Solid);
+        grid.set_block(RsPos(0, 0, 1), RsBlock::RedstoneBlock);
+        grid.advance(0);
+        assert_eq!(
+            grid.redstone_block(piston),
+            RsBlock::Piston {
+                sticky: true,
+                facing: RsDir::East,
+                extended: true
+            }
+        );
+        assert_eq!(grid.redstone_block(RsPos(2, 0, 0)), RsBlock::Solid);
+
+        // One game tick later the extension is still in flight (progress
+        // 0.5 / ticked this tick): unpowering now must drop, not pull.
+        grid.advance(1);
+        grid.set_block(RsPos(0, 0, 1), RsBlock::Air);
+        grid.advance(0);
+        assert_eq!(
+            grid.redstone_block(piston),
+            RsBlock::Piston {
+                sticky: true,
+                facing: RsDir::East,
+                extended: false
+            }
+        );
+        assert_eq!(
+            grid.redstone_block(RsPos(2, 0, 0)),
+            RsBlock::Solid,
+            "the 1-tick pulse leaves the pushed block at its destination"
+        );
+        assert_eq!(grid.redstone_block(RsPos(1, 0, 0)), RsBlock::Air);
+        // And the drop consumed the mid-flight marker: nothing lingers.
+        assert!(grid.moving_pistons.is_empty());
+    }
+
+    #[test]
+    fn bedrock_sticky_piston_zero_tick_pulse_also_drops() {
+        // Powered and unpowered within the same game tick — the strongest
+        // form of the same bedrock rule (progress < 0.5).
+        let mut grid = RedstoneSimGrid::default();
+        let piston = RsPos(0, 0, 0);
+        grid.set_block(
+            piston,
+            RsBlock::Piston {
+                sticky: true,
+                facing: RsDir::East,
+                extended: false,
+            },
+        );
+        grid.set_block(RsPos(1, 0, 0), RsBlock::Solid);
+        grid.set_block(RsPos(0, 0, 1), RsBlock::RedstoneBlock);
+        grid.advance(0);
+        grid.set_block(RsPos(0, 0, 1), RsBlock::Air);
+        grid.advance(0);
+        assert_eq!(grid.redstone_block(RsPos(2, 0, 0)), RsBlock::Solid);
+        assert_eq!(grid.redstone_block(RsPos(1, 0, 0)), RsBlock::Air);
+        assert!(grid.moving_pistons.is_empty());
+    }
+
+    #[test]
+    fn bedrock_piston_thirteen_block_line_refuses_to_extend() {
+        // `PistonBaseBlock#MAX_PUSH` end-to-end: a powered piston facing a
+        // 13-block line stays retracted — the resolver fails and `extended`
+        // never flips. At exactly 12 it extends and moves the whole line.
+        let mut grid = RedstoneSimGrid::default();
+        let piston = RsPos(0, 0, 0);
+        grid.set_block(
+            piston,
+            RsBlock::Piston {
+                sticky: false,
+                facing: RsDir::East,
+                extended: false,
+            },
+        );
+        for x in 1..=13 {
+            grid.set_block(RsPos(x, 0, 0), RsBlock::Solid);
+        }
+        grid.set_block(RsPos(0, 0, 1), RsBlock::RedstoneBlock);
+        grid.advance(0);
+        assert_eq!(
+            grid.redstone_block(piston),
+            RsBlock::Piston {
+                sticky: false,
+                facing: RsDir::East,
+                extended: false
+            },
+            "13 blocks must refuse the block event"
+        );
+        // Nothing moved either.
+        for x in 1..=13 {
+            assert_eq!(grid.redstone_block(RsPos(x, 0, 0)), RsBlock::Solid);
+        }
+
+        grid.set_block(RsPos(13, 0, 0), RsBlock::Air);
+        grid.advance(0);
+        assert_eq!(
+            grid.redstone_block(piston),
+            RsBlock::Piston {
+                sticky: false,
+                facing: RsDir::East,
+                extended: true
+            },
+            "12 blocks is exactly the vanilla push cap"
+        );
+        assert_eq!(grid.redstone_block(RsPos(13, 0, 0)), RsBlock::Solid);
     }
 }
