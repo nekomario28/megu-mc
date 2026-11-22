@@ -641,6 +641,8 @@ struct SocketWireState {
     compression: Option<usize>,
     play: Option<PlayWireState>,
     cipher: Option<Arc<ConnCipher>>,
+    tx_queue: Option<Arc<connection_limits::ClientTxQueue>>,
+    tx_writer: Option<std::thread::JoinHandle<()>>,
 }
 
 /// The AES-128-CFB8 pair one online-mode connection runs under. Registered per
@@ -892,16 +894,30 @@ fn send_packet(s: &mut TcpStream, mut id: i64, mut payload: Vec<u8>) -> std::io:
         }
     }
     let mut send = true;
-    let compression = SOCKET_WIRE.get().and_then(|states| {
+    let (compression, queued) = SOCKET_WIRE.get().and_then(|states| {
         let mut states = states.lock().unwrap_or_else(|e| e.into_inner());
         let state = states.get_mut(&socket_key(s))?;
         if let Some(play) = &mut state.play {
             send = play.update_packet(&mut id, &mut payload, TICK_IDX.load(Ordering::Relaxed));
         }
-        state.compression
-    });
+        // Keep the baseline update, compression and AES keystream advance in
+        // one producer critical section. FIFO enqueue preserves that order
+        // even if multiple tick/broadcast threads produce concurrently.
+        let queued = if send && state.tx_queue.is_some() {
+            let mut body = Vec::with_capacity(payload.len() + 5);
+            write_varint(&mut body, id);
+            body.extend_from_slice(&payload);
+            queue_play_frame(state, Arc::from(encoded_frame(&body, state.compression)))
+        } else {
+            None
+        };
+        Some((state.compression, queued))
+    }).unwrap_or((None, None));
     if !send {
         return Ok(());
+    }
+    if let Some(result) = queued {
+        return queued_send_result(s, result);
     }
     let mut body = Vec::new();
     write_varint(&mut body, id);
@@ -909,8 +925,8 @@ fn send_packet(s: &mut TcpStream, mut id: i64, mut payload: Vec<u8>) -> std::io:
     write_frame(s, &body, compression)
 }
 
-fn write_frame(s: &mut TcpStream, body: &[u8], compression: Option<usize>) -> std::io::Result<()> {
-    let mut frame = match compression {
+fn encoded_frame(body: &[u8], compression: Option<usize>) -> Vec<u8> {
+    match compression {
         Some(threshold) => connection_limits::encode_compressed_frame(body, threshold),
         None => {
             let mut frame = Vec::new();
@@ -918,7 +934,64 @@ fn write_frame(s: &mut TcpStream, body: &[u8], compression: Option<usize>) -> st
             frame.extend_from_slice(body);
             frame
         }
-    };
+    }
+}
+
+/// Queue already-framed bytes while holding `SOCKET_WIRE`. Encryption must
+/// precede FIFO enqueue: AES-CFB8 is a stream cipher, so rearranging the
+/// producer-side cipher advances would corrupt every later packet. Concatenating
+/// encrypted frames in the writer's coalescer is byte-preserving.
+fn queue_play_frame(
+    state: &SocketWireState,
+    mut frame: Arc<[u8]>,
+) -> Option<Result<(), connection_limits::TxQueueError>> {
+    let queue = state.tx_queue.as_ref()?;
+    if let Some(cipher) = &state.cipher {
+        let mut bytes = frame.to_vec();
+        cipher.tx.lock().unwrap_or_else(|e| e.into_inner()).encrypt(&mut bytes);
+        frame = Arc::from(bytes);
+    }
+    let result = queue.try_enqueue(frame);
+    if result == Err(connection_limits::TxQueueError::BackpressureSlowClient) {
+        queue.close();
+    }
+    Some(result)
+}
+
+/// A saturated outbound queue closes only the offending socket; its producers
+/// never perform network writes and therefore cannot stall a broadcast loop.
+fn queued_send_result(
+    s: &TcpStream,
+    result: Result<(), connection_limits::TxQueueError>,
+) -> std::io::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(connection_limits::TxQueueError::Closed) => Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        Err(connection_limits::TxQueueError::BackpressureSlowClient) => {
+            eprintln!("[spine] disconnecting slow client: outbound queue full");
+            let _ = s.shutdown(std::net::Shutdown::Both);
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+    }
+}
+
+fn write_frame(s: &mut TcpStream, body: &[u8], compression: Option<usize>) -> std::io::Result<()> {
+    // Login/status/configuration sockets have no TX queue and keep their
+    // synchronous handshake writes. Once Play is armed, all entry points use
+    // the same produce-order serialization, including direct frame writers.
+    let queued = SOCKET_WIRE.get().and_then(|states| {
+        let states = states.lock().unwrap_or_else(|e| e.into_inner());
+        let state = states.get(&socket_key(s))?;
+        if state.tx_queue.is_some() {
+            queue_play_frame(state, Arc::from(encoded_frame(body, compression)))
+        } else {
+            None
+        }
+    });
+    if let Some(result) = queued {
+        return queued_send_result(s, result);
+    }
+    let mut frame = encoded_frame(body, compression);
     if let Some(cipher) = conn_cipher(s) {
         cipher.tx.lock().unwrap_or_else(|e| e.into_inner()).encrypt(&mut frame);
     }
@@ -936,6 +1009,14 @@ fn write_frame(s: &mut TcpStream, body: &[u8], compression: Option<usize>) -> st
 /// connection encrypts a scratch copy rather than mutating the shared
 /// allocation the other recipients still have to send.
 fn write_raw_frame(s: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
+    let queued = SOCKET_WIRE.get().and_then(|states| {
+        let states = states.lock().unwrap_or_else(|e| e.into_inner());
+        let state = states.get(&socket_key(s))?;
+        queue_play_frame(state, Arc::from(frame))
+    });
+    if let Some(result) = queued {
+        return queued_send_result(s, result);
+    }
     let result = if let Some(cipher) = conn_cipher(s) {
         let mut bytes = frame.to_vec();
         cipher
@@ -1013,7 +1094,7 @@ fn send_broadcast_frame(
     }
     let mut send = true;
     let mut rewritten: Option<Vec<u8>> = None;
-    let compression = SOCKET_WIRE.get().and_then(|states| {
+    let (compression, queued) = SOCKET_WIRE.get().and_then(|states| {
         let mut states = states.lock().unwrap_or_else(|e| e.into_inner());
         let state = states.get_mut(&socket_key(s))?;
         if let Some(play) = &mut state.play {
@@ -1029,10 +1110,26 @@ fn send_broadcast_frame(
                 rewritten = Some(scratch);
             }
         }
-        state.compression
-    });
+        let queued = if send && state.tx_queue.is_some() {
+            let frame = if let Some(payload) = &rewritten {
+                let mut body = Vec::with_capacity(payload.len() + 5);
+                write_varint(&mut body, id);
+                body.extend_from_slice(payload);
+                Arc::from(encoded_frame(&body, state.compression))
+            } else {
+                broadcast_frame(cache, id, payload).frame_for(state.compression)
+            };
+            queue_play_frame(state, frame)
+        } else {
+            None
+        };
+        Some((state.compression, queued))
+    }).unwrap_or((None, None));
     if !send {
         return Ok(());
+    }
+    if let Some(result) = queued {
+        return queued_send_result(s, result);
     }
     if let Some(payload) = rewritten {
         let mut body = Vec::with_capacity(payload.len() + 5);
@@ -1164,8 +1261,45 @@ impl Client {
         &self,
         compression: Option<usize>,
         chunk_delivery: connection_limits::ChunkDelivery,
-    ) {
-        let key = socket_key(&self.sock.lock().unwrap_or_else(|e| e.into_inner()));
+    ) -> bool {
+        // Some synthetic clients have no reader/handler for a failed socket.
+        // Log the setup error here while allowing their existing call sites
+        // to ignore the status; the real connection handler checks it.
+        match self.try_enter_play_wire(compression, chunk_delivery) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("[spine] {} play writer setup failed: {error}", self.name);
+                false
+            }
+        }
+    }
+
+    fn try_enter_play_wire(
+        &self,
+        compression: Option<usize>,
+        chunk_delivery: connection_limits::ChunkDelivery,
+    ) -> std::io::Result<()> {
+        let (key, mut stream) = {
+            let socket = self.sock.lock().unwrap_or_else(|e| e.into_inner());
+            (socket_key(&socket), socket.try_clone()?)
+        };
+        // The Play writer uses its own fd. Login/config and initial Join Game
+        // have already been synchronously sent on the original socket.
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        let queue = Arc::new(connection_limits::ClientTxQueue::default());
+        let writer_queue = Arc::clone(&queue);
+        let name = self.name.clone();
+        let writer = std::thread::Builder::new()
+            .name(format!("spine-tx-{}", self.eid))
+            .spawn(move || {
+                if let Err(error) = writer_queue.writer_loop(&mut stream) {
+                    eprintln!("[spine] {name} writer failed: {error}");
+                    writer_queue.close();
+                    // A partial encrypted write invalidates the socket stream.
+                    // Wake the read loop so its normal cleanup path runs.
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                }
+            })?;
         let mut states = socket_wire().lock().unwrap_or_else(|e| e.into_inner());
         // Merge, not overwrite: the encryption handshake may have armed a
         // cipher on this writer fd before the play state existed.
@@ -1175,6 +1309,33 @@ impl Client {
             chunk_delivery,
             ..PlayWireState::default()
         });
+        state.tx_queue = Some(queue);
+        state.tx_writer = Some(writer);
+        Ok(())
+    }
+
+    /// Closing keeps queued Play Disconnect packets ahead of writer shutdown;
+    /// joining here ensures no detached per-client writer survives teardown.
+    fn close_play_writer(&self) {
+        let key = {
+            let socket = self.sock.lock().unwrap_or_else(|e| e.into_inner());
+            socket_key(&socket)
+        };
+        let (queue, writer) = {
+            let mut states = socket_wire().lock().unwrap_or_else(|e| e.into_inner());
+            match states.get_mut(&key) {
+                Some(state) => (state.tx_queue.clone(), state.tx_writer.take()),
+                None => (None, None),
+            }
+        };
+        if let Some(queue) = queue {
+            queue.close();
+        }
+        if let Some(writer) = writer {
+            if writer.join().is_err() {
+                eprintln!("[spine] {} writer panicked", self.name);
+            }
+        }
     }
 
     fn is_spectator(&self) -> bool {
@@ -1190,6 +1351,8 @@ impl Client {
 
 impl std::ops::Drop for Client {
     fn drop(&mut self) {
+        // Also covers early exits before the online-client cleanup guard exists.
+        self.close_play_writer();
         ac_forget(self.eid);
         let socket = self.sock.get_mut().unwrap_or_else(|e| e.into_inner());
         unregister_socket_wire(socket_key(socket));
@@ -3831,21 +3994,9 @@ fn socket_compression(s: &TcpStream) -> Option<usize> {
 /// Write an already-framed packet (bytes shared from `ChunkPacketCache`) with
 /// `write_frame`'s failure contract: a partial write kills the socket.
 fn write_shared_frame(s: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
-    let encrypted;
-    let frame = match conn_cipher(s) {
-        Some(cipher) => {
-            let mut v = frame.to_vec();
-            cipher.tx.lock().unwrap_or_else(|e| e.into_inner()).encrypt(&mut v);
-            encrypted = v;
-            &encrypted[..]
-        }
-        None => frame,
-    };
-    let result = s.write_all(frame);
-    if result.is_err() {
-        let _ = s.shutdown(std::net::Shutdown::Both);
-    }
-    result
+    // Cached chunks share the exact same producer order and encryption path
+    // as tracker broadcasts. The writer receives opaque, fully encoded bytes.
+    write_raw_frame(s, frame)
 }
 
 /// The shared `0x27` frame for `(dim, cx, cz)` at its current world revision.
@@ -6843,9 +6994,18 @@ fn play_disconnect(s: &mut TcpStream, reason: &str) {
 }
 
 fn disconnect_all_clients(reason: &str) {
-    for client in client_snapshot() {
+    let connected = client_snapshot();
+    for client in &connected {
         let mut socket = client.sock.lock().unwrap_or_else(|error| error.into_inner());
         play_disconnect(&mut socket, reason);
+    }
+    // Send all Disconnect frames first so the per-client writer threads can
+    // drain concurrently; shutting down before they drain loses the message.
+    for client in &connected {
+        client.close_play_writer();
+    }
+    for client in connected {
+        let socket = client.sock.lock().unwrap_or_else(|error| error.into_inner());
         let _ = socket.shutdown(std::net::Shutdown::Both);
     }
 }
@@ -8142,12 +8302,14 @@ impl std::ops::Drop for ConnectionCleanupGuard {
             // teardown under its own isolation and let `forget_live_client`'s
             // residual sweep in `handle` cover anything it could not finish.
             let peer = self.peer.clone();
+            let cleanup_client = Arc::clone(&client);
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                disconnect_cleanup(&client, &peer);
+                disconnect_cleanup(&cleanup_client, &peer);
             }));
         } else {
             disconnect_cleanup(&client, &self.peer);
         }
+        client.close_play_writer();
     }
 }
 
@@ -8648,7 +8810,9 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         mark_authenticated(me.eid);
     }
     let mut retry_chunks = chunk_delivery.has_pending();
-    me.enter_play_wire(compression, chunk_delivery);
+    if !me.enter_play_wire(compression, chunk_delivery) {
+        return;
+    }
     {
         let border = world_border().lock().unwrap_or_else(|e| e.into_inner());
         let board = scoreboard().lock().unwrap_or_else(|e| e.into_inner());
@@ -8783,6 +8947,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     // Play-state packet inactivity is tracked separately from the keep-alive deadline.
     let mut last_rx = Instant::now();
     let mut chat_throttle = connection_limits::ChatThrottle::new(Instant::now());
+    let mut packet_rate = connection_limits::PacketRateLimit::new(Instant::now());
     let mut read_timeout = None;
     let mut last_chunk_retry_tick = TICK_IDX.load(Ordering::Relaxed);
     'conn: loop {
@@ -8876,6 +9041,18 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
             }
         };
         drop_player_items_on_death(&me);
+
+        // Count every decoded Play packet before any downstream parsing or
+        // dispatch: a movement flood otherwise multiplies tracker fanout.
+        let received_at = Instant::now();
+        if !packet_rate.allow(received_at) {
+            if packet_rate.should_disconnect(received_at) {
+                eprintln!("[spine] {} disconnected after {} rate-limited play packets", me.name, packet_rate.dropped());
+                play_disconnect(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), "Packet rate limit exceeded");
+                break 'conn;
+            }
+            continue 'conn;
+        }
 
         // vanilla refuses a movement update whose position is not finite or is
         // outside the world; letting it through carries the value into worldgen,
@@ -18139,6 +18316,55 @@ mod bot_net2_tests {
         for client in [&a, &b, &c] {
             clear_socket_wire(client);
         }
+    }
+
+    #[test]
+    fn bot_net3_tx_queue_encrypts_mixed_play_sends_in_producer_order() {
+        use std::io::{ErrorKind, Read};
+
+        let (client, mut peer) = bot_client(31);
+        let queue = Arc::new(connection_limits::ClientTxQueue::default());
+        let secret = [0x5au8; 16];
+        let packets = [
+            (0x26, vec![0x42, 0x43]),
+            (0x27, vec![0x11; 256]),
+            (0x6c, vec![0x20, 0x21, 0x22]),
+        ];
+        let mut expected = Vec::new();
+        for (id, payload) in &packets {
+            let mut body = Vec::new();
+            write_varint(&mut body, *id);
+            body.extend_from_slice(payload);
+            expected.extend_from_slice(&encoded_frame(&body, Some(256)));
+        }
+        Aes128Cfb8::new(&secret, &secret).encrypt(&mut expected);
+
+        {
+            let mut socket = client.sock.lock().unwrap_or_else(|e| e.into_inner());
+            enable_conn_encryption(&socket, &secret);
+            let mut states = socket_wire().lock().unwrap_or_else(|e| e.into_inner());
+            let state = states.get_mut(&socket_key(&socket)).unwrap();
+            state.compression = Some(256);
+            state.play = Some(PlayWireState::default());
+            state.tx_queue = Some(Arc::clone(&queue));
+            drop(states);
+
+            send_packet(&mut socket, packets[0].0, packets[0].1.clone()).unwrap();
+            let mut body = Vec::new();
+            write_varint(&mut body, packets[1].0);
+            body.extend_from_slice(&packets[1].1);
+            write_shared_frame(&mut socket, &encoded_frame(&body, Some(256))).unwrap();
+            send_broadcast_frame(&mut socket, &mut None, packets[2].0, &packets[2].1).unwrap();
+        }
+
+        // All three producers returned before the writer did any socket I/O.
+        peer.set_nonblocking(true).unwrap();
+        assert_eq!(peer.read(&mut [0u8; 1]).unwrap_err().kind(), ErrorKind::WouldBlock);
+        queue.close();
+        let mut written = Vec::new();
+        queue.writer_loop(&mut written).unwrap();
+        assert_eq!(written, expected, "the writer preserves the encrypted byte stream");
+        clear_socket_wire(&client);
     }
 
     /// The world/globals the pet-follow and auto-unload fixtures replace, put

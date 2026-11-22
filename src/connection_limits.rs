@@ -556,13 +556,11 @@ impl ChunkPacketCache {
 /// 64 KiB). Paired with `TCP_NODELAY` the bytes still leave at the end-of-tick
 /// `flush`, so delivery latency is identical while a burst of small packets
 /// costs one syscall instead of one per packet.
-#[allow(dead_code)] // wired into the shared Play writer by the protocol lane
 pub(crate) struct PacketCoalescer {
     buf: Vec<u8>,
     capacity: usize,
 }
 
-#[allow(dead_code)]
 impl PacketCoalescer {
     /// Default auto-flush threshold.
     pub(crate) const DEFAULT_CAPACITY: usize = 64 * 1024;
@@ -629,7 +627,6 @@ impl PacketCoalescer {
 /// compressed slot is keyed by its threshold: the server negotiates a single
 /// threshold for every compressed client, and a different request rebuilds
 /// (counting as another encode) rather than retaining both forms.
-#[allow(dead_code)] // wired into the broadcast path by the protocol lane
 pub(crate) struct SharedBroadcastFrame {
     /// `varint(packet_id)` + payload — what `encode_compressed_frame`
     /// compresses and `plain_frame` prefixes. Immutable once built.
@@ -642,7 +639,6 @@ pub(crate) struct SharedBroadcastFrame {
     encode_count: usize,
 }
 
-#[allow(dead_code)]
 impl SharedBroadcastFrame {
     pub(crate) fn new(packet_id: i64, payload: &[u8]) -> Self {
         let mut body = Vec::with_capacity(payload.len() + 5);
@@ -691,13 +687,13 @@ impl SharedBroadcastFrame {
 
     /// How many wire forms were actually built. A broadcast that served every
     /// client at one compression mode keeps this at 1.
+    #[cfg(test)]
     pub(crate) fn encode_count(&self) -> usize {
         self.encode_count
     }
 }
 
 /// Why `ClientTxQueue::try_enqueue` refused a frame.
-#[allow(dead_code)] // wired in alongside ClientTxQueue
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TxQueueError {
     /// The byte budget is full: this client's TCP send buffer is not
@@ -721,7 +717,6 @@ pub(crate) enum TxQueueError {
 /// `Condvar` wakes it on the empty→non-empty transition, it drains the batch,
 /// feeds every frame through `PacketCoalescer`, and flushes once per batch.
 /// `close` wakes it one last time so it drains and exits — no leaked thread.
-#[allow(dead_code)] // wired into the per-client writer by the protocol lane
 pub(crate) struct ClientTxQueue {
     inner: Mutex<TxQueueInner>,
     /// Signalled on the empty→non-empty transition and by `close`.
@@ -737,7 +732,6 @@ struct TxQueueInner {
     closed: bool,
 }
 
-#[allow(dead_code)]
 impl ClientTxQueue {
     /// The default per-client budget: 4 MiB of outbound frames. Generous
     /// enough that a healthy client never sees it; small enough that a
@@ -792,6 +786,7 @@ impl ClientTxQueue {
     }
 
     /// Bytes currently queued — the budget `try_enqueue` enforces.
+    #[cfg(test)]
     pub(crate) fn queued_bytes(&self) -> usize {
         lock(&self.inner).queued_bytes
     }
@@ -826,7 +821,6 @@ impl ClientTxQueue {
     }
 }
 
-#[allow(dead_code)]
 impl Default for ClientTxQueue {
     fn default() -> Self {
         Self::new(Self::DEFAULT_MAX_QUEUED_BYTES)
@@ -1346,6 +1340,68 @@ impl ChatThrottle {
     }
 }
 
+/// Per-play-connection packet budget. The 1,200-packet burst admits several
+/// ticks of teleport/chunk-ack responses and creative inventory operations;
+/// 500 packets/s replenishment is well above normal movement (20-60/s).
+/// Sustained overage is tracked independently of occasional admitted packets,
+/// so a flood cannot avoid disconnection by mixing accepted and dropped frames.
+pub(crate) struct PacketRateLimit {
+    tokens: f64,
+    last: Instant,
+    over_limit_since: Option<Instant>,
+    last_denied: Option<Instant>,
+    dropped: u64,
+}
+
+impl PacketRateLimit {
+    const CAPACITY: f64 = 1200.0;
+    const REFILL_PER_SEC: f64 = 500.0;
+    const OVER_LIMIT_WINDOW: Duration = Duration::from_secs(2);
+    const DENIAL_GAP: Duration = Duration::from_millis(500);
+
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            tokens: Self::CAPACITY,
+            last: now,
+            over_limit_since: None,
+            last_denied: None,
+            dropped: 0,
+        }
+    }
+
+    /// Debit one decoded play packet. Denied frames cost no CPU-heavy dispatch
+    /// or broadcast work, while real elapsed time always restores capacity.
+    pub(crate) fn allow(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * Self::REFILL_PER_SEC).min(Self::CAPACITY);
+        self.last = now;
+        if self.last_denied.is_some_and(|last| now.saturating_duration_since(last) > Self::DENIAL_GAP) {
+            self.over_limit_since = None;
+            self.last_denied = None;
+        }
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            self.dropped = self.dropped.saturating_add(1);
+            self.over_limit_since.get_or_insert(now);
+            self.last_denied = Some(now);
+            false
+        }
+    }
+
+    /// Disconnect only after two seconds of continually rejected traffic.
+    /// A quiet client recovers the full burst budget without a wall-clock wait.
+    pub(crate) fn should_disconnect(&self, now: Instant) -> bool {
+        self.over_limit_since
+            .is_some_and(|start| now.saturating_duration_since(start) >= Self::OVER_LIMIT_WINDOW)
+    }
+
+    pub(crate) fn dropped(&self) -> u64 {
+        self.dropped
+    }
+}
+
 // ----------------------------------------------------------------------- RCON
 
 /// Constant-time byte comparison; also hides which byte differs, and compares
@@ -1699,6 +1755,63 @@ mod tests {
         }
         assert!(t.allow(t0 + Duration::from_secs(1)));
         assert!(!t.allow(t0 + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn packet_rate_limit_admits_teleport_ack_and_creative_bursts() {
+        let now = Instant::now();
+        let mut limit = PacketRateLimit::new(now);
+        for i in 0..1200 {
+            assert!(limit.allow(now), "burst packet {i}");
+        }
+        assert!(!limit.allow(now));
+        assert_eq!(limit.dropped(), 1);
+        assert!(!limit.should_disconnect(now));
+    }
+
+    #[test]
+    fn packet_rate_limit_refills_precisely_with_injected_time() {
+        let now = Instant::now();
+        let mut limit = PacketRateLimit::new(now);
+        for _ in 0..1200 {
+            assert!(limit.allow(now));
+        }
+        let quarter = now + Duration::from_millis(250);
+        for _ in 0..125 {
+            assert!(limit.allow(quarter));
+        }
+        assert!(!limit.allow(quarter));
+        let restored = now + Duration::from_secs(3);
+        for _ in 0..1200 {
+            assert!(limit.allow(restored));
+        }
+        assert!(!limit.allow(restored));
+    }
+
+    #[test]
+    fn packet_rate_limit_disconnects_sustained_flood_but_recovers_after_quiet() {
+        let now = Instant::now();
+        let mut limit = PacketRateLimit::new(now);
+        for _ in 0..1200 {
+            assert!(limit.allow(now));
+        }
+        for ms in (0..=2100).step_by(10) {
+            let at = now + Duration::from_millis(ms);
+            // 100 packets per 10ms overwhelms the 500/s replenishment;
+            // occasional admitted packets must not reset the overage window.
+            for _ in 0..100 {
+                limit.allow(at);
+            }
+            if ms < 2000 {
+                assert!(!limit.should_disconnect(at));
+            }
+        }
+        assert!(limit.should_disconnect(now + Duration::from_millis(2100)));
+        assert!(limit.dropped() > 10_000);
+
+        let later = now + Duration::from_secs(5);
+        assert!(limit.allow(later));
+        assert!(!limit.should_disconnect(later));
     }
 
     #[test]
