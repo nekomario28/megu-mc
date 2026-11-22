@@ -55,7 +55,7 @@ const COMP_ENCHANTMENTS: i64 = 9;
 // `minecraft:attribute_modifiers` is data_component_type id 12 in 1.21.1,
 // verified against proto/src/data_v767.rs `V767_COMPONENTS` (index = protocol
 // id) — the same table the COMP_REPAIR_COST=16 / COMP_MAP_ID=26 /
-// COMP_ARMOR_TRIM=35 / COMP_BANNER_PATTERNS=49 anchors come from.
+// COMP_TRIM=35 / COMP_BANNER_PATTERNS=49 anchors come from.
 const COMP_ATTRIBUTE_MODIFIERS: i64 = 12;
 const COMP_STORED_ENCHANTMENTS: i64 = 23;
 
@@ -252,7 +252,7 @@ fn stack_attr_modifiers(comps: &Comps) -> Option<AttributeModifiersComponent> {
 // max stack size: explicit component wins, else vanilla defaults
 // (1.21.1 minecraft-data: unstackable ids and the 16-stack ids)
 fn item_stack_max(item: i64, comps: &Comps) -> i64 {
-    if let Some(n) = comp_varint(comps, 1) {
+    if let Some(n) = comp_varint(comps, COMP_MAX_STACK_SIZE) {
         return n.clamp(1, 99);
     }
     // A block's item stacks to what the asset says the block stacks to. The ranges
@@ -467,6 +467,20 @@ fn can_harvest(block: i64, held_item: i64) -> bool {
 }
 // tool dig speed; kind order in band: sword,shovel,pick,axe,hoe; tier: wood,stone,gold,iron,diamond,netherite
 fn tool_dig_speed(held: &Stack, block: i64) -> f32 {
+    // A `minecraft:tool` component replaces the vanilla tier/tag rules with the
+    // component's own mining-speed rules (1.20.5+ component semantics).
+    if let (Some(tool), Some(reg)) = (tool_component_for(held), breg()) {
+        let speed = tool_component_speed(&tool, block as u32, reg);
+        return mining_speed_with_modifiers(
+            speed,
+            speed > 1.0,
+            enchant_level(&held.2, 8).clamp(0, i32::MAX as i64) as i32,
+            None,
+            None,
+            false,
+            true,
+        );
+    }
     let kind = if (818..=847).contains(&held.0) {
         (held.0 - 818) % 5
     } else {
@@ -498,7 +512,11 @@ fn dig_seconds(block: i64, held: &Stack) -> Option<f32> {
         return Some(0.0);
     }
     let speed = tool_dig_speed(held, block);
-    let can = can_harvest(block, held.0);
+    let can = if let (Some(tool), Some(reg)) = (tool_component_for(held), breg()) {
+        tool_component_correct(&tool, block as u32, reg)
+    } else {
+        can_harvest(block, held.0)
+    };
     Some(h * if can { 1.5 } else { 5.0 } / speed)
 }
 
@@ -582,7 +600,9 @@ fn damage_stack(st: &mut Stack, random: f32) -> bool {
     if !unbreaking_consumes_durability(level, random, armor) {
         return false;
     }
-    let dmg = comp_varint(&st.2, COMP_DAMAGE).unwrap_or(0) + 1;
+    // `minecraft:tool.damage_per_block`: vanilla `mineBlock` charges this many
+    // durability points per break; melee hits keep the flat 1 via the same sink.
+    let dmg = comp_varint(&st.2, COMP_DAMAGE).unwrap_or(0) + tool_damage_per_block(st).max(1);
     if dmg >= maxd {
         return true;
     }
@@ -2076,6 +2096,32 @@ fn drop_tick() {
             broadcast_seen_destroy(*eid);
         }
         DROP_DESPAWN_SCRATCH.with(|s| scratch_return(s, exp));
+        // vanilla `ItemEntity.tick`: drops inside fire, soul fire or lava burn
+        // away unless the stack is `fire_resistant` (netherite carries it).
+        {
+            let mut burned = DROP_DESPAWN_SCRATCH.with(scratch_take);
+            burned.extend(
+                dp.iter()
+                    .filter(|d| {
+                        !drop_fireproof(d.item, &d.comps)
+                            && region.is_hot(d.x as i32, d.z as i32)
+                            && breg().is_some_and(|reg| {
+                                drop_burns_at(reg.name_of(block_at(
+                                    d.x.floor() as i32,
+                                    d.y.floor() as i32,
+                                    d.z.floor() as i32,
+                                )))
+                            })
+                    })
+                    .map(|d| d.eid),
+            );
+            for eid in &burned {
+                dp.retain(|d| d.eid != *eid);
+                death_slot_hint_forget(*eid);
+                broadcast_seen_destroy(*eid);
+            }
+            DROP_DESPAWN_SCRATCH.with(|s| scratch_return(s, burned));
+        }
         while dp.len() > DROP_CAP {
             let d = dp.remove(0);
             death_slot_hint_forget(d.eid);
@@ -5077,7 +5123,7 @@ fn stack_to_nbt(slot: i16, (item, count, comps): &Stack) -> Option<crate::nbt::T
         let mut comp_map = std::collections::BTreeMap::new();
         for (ty, data) in comps {
             match *ty {
-                1 => {
+                COMP_MAX_STACK_SIZE => {
                     comp_map.insert(
                         NbtString::text("minecraft:max_stack_size"),
                         Tag::Int(read_varint_at(data, 0).0 as i32),
@@ -5149,7 +5195,7 @@ fn stack_to_nbt(slot: i16, (item, count, comps): &Stack) -> Option<crate::nbt::T
                     };
                     comp_map.insert(NbtString::text(key), Tag::Compound(inner));
                 }
-                16 => {
+                COMP_REPAIR_COST => {
                     comp_map.insert(
                         NbtString::text("minecraft:repair_cost"),
                         Tag::Int(read_varint_at(data, 0).0 as i32),
@@ -5197,7 +5243,30 @@ fn stack_to_nbt(slot: i16, (item, count, comps): &Stack) -> Option<crate::nbt::T
                         );
                     }
                 }
-                _ => {}
+                COMP_WRITABLE_BOOK_CONTENT | COMP_WRITTEN_BOOK_CONTENT => {
+                    if let Some(fields) = book_content_nbt(*ty, data) {
+                        comp_map.insert(
+                            NbtString::text(comp_wire_name(*ty).unwrap_or_default()),
+                            Tag::Compound(fields),
+                        );
+                    }
+                }
+                COMP_JUKEBOX_PLAYABLE => {
+                    if let Some(fields) = jukebox_playable_nbt(data) {
+                        comp_map.insert(
+                            NbtString::text("minecraft:jukebox_playable"),
+                            fields,
+                        );
+                    }
+                }
+                _ => {
+                    // Preserve components this codec does not model
+                    // structurally as their exact wire payload, so a
+                    // cart/block-entity save never silently drops data.
+                    if let Some(name) = comp_wire_name(*ty) {
+                        comp_map.insert(NbtString::text(name), Tag::ByteArray(data.clone()));
+                    }
+                }
             }
         }
         if !comp_map.is_empty() {
@@ -5251,7 +5320,7 @@ fn items_nbt_to_stacks(tag: &crate::nbt::Tag) -> Result<HashMap<i16, Stack>, &'s
                 match key_str.trim_start_matches("minecraft:") {
                     "max_stack_size" => {
                         if let Some(n) = nbt_int_val(v) {
-                            comp_set_varint(&mut comps, 1, n);
+                            comp_set_varint(&mut comps, COMP_MAX_STACK_SIZE, n);
                         }
                     }
                     "max_damage" => {
@@ -5266,7 +5335,7 @@ fn items_nbt_to_stacks(tag: &crate::nbt::Tag) -> Result<HashMap<i16, Stack>, &'s
                     }
                     "repair_cost" => {
                         if let Some(n) = nbt_int_val(v) {
-                            comp_set_varint(&mut comps, 16, n);
+                            comp_set_varint(&mut comps, COMP_REPAIR_COST, n);
                         }
                     }
                     "attribute_modifiers" => {
@@ -5388,7 +5457,30 @@ fn items_nbt_to_stacks(tag: &crate::nbt::Tag) -> Result<HashMap<i16, Stack>, &'s
                             comp_set(&mut comps, comp_ty, enchantments_data(&list, show));
                         }
                     }
-                    _ => {}
+                    "writable_book_content" | "written_book_content" => {
+                        let comp_ty = if key_str.ends_with("written_book_content")
+                            && !key_str.ends_with("writable_book_content")
+                        {
+                            COMP_WRITTEN_BOOK_CONTENT
+                        } else {
+                            COMP_WRITABLE_BOOK_CONTENT
+                        };
+                        if let Some(data) = book_content_data(comp_ty, v) {
+                            comp_set(&mut comps, comp_ty, data);
+                        }
+                    }
+                    "jukebox_playable" => {
+                        if let Some(data) = jukebox_playable_data(v) {
+                            comp_set(&mut comps, COMP_JUKEBOX_PLAYABLE, data);
+                        }
+                    }
+                    _ => {
+                        if let (Some(id), Tag::ByteArray(bytes)) =
+                            (comp_id_for_name(&key_str), v)
+                        {
+                            comp_set(&mut comps, id, bytes.clone());
+                        }
+                    }
                 }
             }
         }
@@ -7736,8 +7828,16 @@ fn live_bookshelf_slot(reg: &BReg, state: u32, hit: (RsDir, [f64; 3])) -> Option
 
 fn use_live_block_entity(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u32) -> bool {
     let Some(reg) = breg() else { return false };
+    // Component-driven block uses that are not block-entity interactions:
+    // lodestone compasses, cauldron dye washing, and the debug stick.
+    if !c.is_spectator() && use_item_component_on_block(c, key, state) {
+        return true;
+    }
     if live_block_entity_id(reg.name_of(state)).is_none() || c.is_spectator() {
         return false;
+    }
+    if !container_lock_gate(c, key) {
+        return true;
     }
     with_save_guard(|| {
         if block_at_dim(dim, x, y, z) != state {
@@ -8689,7 +8789,7 @@ fn slot_read_component(b: &[u8], p: &mut usize, ty: i64, depth: usize) -> Option
             }
             slot_read_bool(b, p)?;
         }
-        COMP_ARMOR_TRIM => {
+        COMP_TRIM => {
             if slot_read_varint(b, p)? == 0 { slot_read_trim_material(b, p)?; }
             if slot_read_varint(b, p)? == 0 { slot_read_trim_pattern(b, p)?; }
             slot_read_bool(b, p)?;
@@ -8811,6 +8911,9 @@ fn slot_component_wire_bytes(st: &Stack) -> usize {
 fn creative_slot_acceptable(st: &Stack) -> bool {
     slot_component_wire_bytes(st) <= SLOT_COMPONENT_WIRE_LIMIT
         && (st.1 == 0 || (st.0 > 0 && item_to_name(st.0).is_some()))
+        && st.2
+            .iter()
+            .all(|(ty, data)| *ty < 0 || apply_item_component_behavior(*ty, data).is_some())
 }
 
 /// The creative wire count can exceed the resolved item's stack limit. Apply
@@ -8933,6 +9036,12 @@ fn open_chest_for_client(
 ) {
     if !me.is_spectator() {
         unpack_window_loot_if_needed(window);
+        let locked = [window.0, window.1.unwrap_or(window.0)].iter().any(|key| {
+            matches!(key, ContainerKey::Block(block_key) if !container_lock_gate(me, *block_key))
+        });
+        if locked {
+            return;
+        }
     }
     let initial = chest_window_slots(window);
     *me.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = Some(window);
@@ -8947,9 +9056,12 @@ fn open_chest_for_client(
     }
 }
 fn armor_removal_blocked(slot: i16, stack: Option<&Stack>, creative: bool) -> bool {
-    !creative
+    stack.is_some_and(|stack| {
+        stack.1 > 0
+            && comp_get(&stack.2, COMP_CREATIVE_SLOT_LOCK).is_some()
+    }) || (!creative
         && (5..=8).contains(&slot)
-        && stack.is_some_and(|stack| stack.1 > 0 && enchant_level(&stack.2, 2) > 0)
+        && stack.is_some_and(|stack| stack.1 > 0 && enchant_level(&stack.2, 2) > 0))
 }
 
 // which armor slot (5=helm..8=boots) an item equips into, or -1
@@ -9509,6 +9621,22 @@ fn click_slot(m: &mut HashMap<i16, Stack>, cur: &mut Stack, slot: i16, btn: i8) 
         return;
     }
     if cur.1 == 0 {
+        // Right-click an occupied bundle with an empty cursor extracts the last
+        // inserted stack (`BundleItem.overrideOtherStackedOnMe`, LIFO).
+        if btn == 1 {
+            if let Some(st) = m.get(&slot) {
+                if is_bundle_item(st.0) {
+                    let mut contents = bundle_contents_of(st).unwrap_or_default();
+                    if let Some((out, data)) = bundle_try_extract(&mut contents) {
+                        let mut bundle = st.clone();
+                        comp_set(&mut bundle.2, COMP_BUNDLE_CONTENTS, data);
+                        m.insert(slot, bundle);
+                        *cur = out;
+                        return;
+                    }
+                }
+            }
+        }
         if let Some(st) = m.get(&slot) {
             let amount = if btn == 0 { st.1 } else { st.1.div_ceil(2) };
             if let Some(taken) = map_take(m, slot, amount) {
@@ -9516,6 +9644,39 @@ fn click_slot(m: &mut HashMap<i16, Stack>, cur: &mut Stack, slot: i16, btn: i8) 
             }
         }
         return;
+    }
+    // Right-click `bundle_contents` interactions, both directions:
+    // holding a bundle inserts the slot's stack into it; clicking a bundle
+    // with a stack inserts as much of the cursor as the 64-weight budget fits.
+    if btn == 1 {
+        let target = m.get(&slot).cloned().unwrap_or((0, 0, Vec::new()));
+        if is_bundle_item(cur.0) && target.1 > 0 && !is_bundle_item(target.0) {
+            let mut contents = bundle_contents_of(cur).unwrap_or_default();
+            let (data, remaining) = bundle_try_insert(&mut contents, &target);
+            if remaining < target.1 {
+                comp_set(&mut cur.2, COMP_BUNDLE_CONTENTS, data);
+                if remaining == 0 {
+                    m.remove(&slot);
+                } else {
+                    m.insert(slot, (target.0, remaining, target.2));
+                }
+            }
+            return;
+        }
+        if is_bundle_item(target.0) && !is_bundle_item(cur.0) {
+            let mut contents = bundle_contents_of(&target).unwrap_or_default();
+            let (data, remaining) = bundle_try_insert(&mut contents, cur);
+            if remaining < cur.1 {
+                let mut bundle = target;
+                comp_set(&mut bundle.2, COMP_BUNDLE_CONTENTS, data);
+                m.insert(slot, bundle);
+                cur.1 = remaining;
+                if cur.1 == 0 {
+                    *cur = (0, 0, Vec::new());
+                }
+            }
+            return;
+        }
     }
     let target = m.get(&slot).filter(|st| st.1 > 0).cloned();
     if target
@@ -9574,7 +9735,9 @@ fn craft_result(grid: &HashMap<i16, Stack>) -> Option<Stack> {
     {
         return Some((stick, 4, Vec::new()));
     }
-    None
+    // leather armor + dyes: vanilla shapeless `armor_dye` recipe, mixing the
+    // `dyed_color` component like the cauldron does.
+    dyed_craft_any((1..=4).filter_map(|i| grid.get(&i)))
 }
 fn open_furnace_window(s: &mut TcpStream, inv: &HashMap<i16, Stack>, slots: &[Stack; 3]) {
     let mut p = Vec::new();
@@ -9849,11 +10012,11 @@ fn live_dp_smithing_trim_output(template: &Stack, base: &Stack, addition: &Stack
         .iter()
         .position(|name| *name == material)?;
     let trim = [material_id as u8 + 1, pattern_id as u8 + 1, 1];
-    if comp_get(&base.2, COMP_ARMOR_TRIM).and_then(|data| data.get(..2)) == Some(&trim[..2]) {
+    if comp_get(&base.2, COMP_TRIM).and_then(|data| data.get(..2)) == Some(&trim[..2]) {
         return None;
     }
     let mut result = (base.0, 1, base.2.clone());
-    comp_set(&mut result.2, COMP_ARMOR_TRIM, trim.to_vec());
+    comp_set(&mut result.2, COMP_TRIM, trim.to_vec());
     Some(result)
 }
 
@@ -10295,7 +10458,8 @@ fn craft3_result(g: &HashMap<i16, Stack>) -> Option<Stack> {
         }
     }
     let _ = g2;
-    None
+    // leather armor + dyes: vanilla shapeless `armor_dye` recipe.
+    dyed_craft_any((1..=9).filter_map(|i| g.get(&i)))
 }
 
 enum LiveMenu {
@@ -10532,6 +10696,11 @@ fn open_live_block_menu(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u3
 }
 
 fn open_live_menu(c: &Client, anchor: Option<DimBlockPos>, menu: LiveMenu) {
+    if let Some(key) = anchor {
+        if !container_lock_gate(c, key) {
+            return;
+        }
+    }
     let Some(connection) = live_menu_connection(c) else {
         return;
     };
@@ -10602,13 +10771,16 @@ fn send_live_contents(
     let _ = send_packet(sock, 0x13, packet);
 }
 
-fn anvil_hover_name(stack: &Stack) -> &str {
-    if let Some([8, hi, lo, text @ ..]) = comp_get(&stack.2, COMP_CUSTOM_NAME) {
-        if let Some(name) = text.get(..u16::from_be_bytes([*hi, *lo]) as usize) {
-            return std::str::from_utf8(name).unwrap_or_default();
-        }
+fn anvil_hover_name(stack: &Stack) -> String {
+    // `custom_name` (the anvil rename) wins, then `item_name` (the fixed
+    // component name), then the registry name — vanilla's `getHoverName`.
+    if let Some(text) = stack_item_text(stack, COMP_CUSTOM_NAME) {
+        return text;
     }
-    item_to_name(stack.0).unwrap_or_default()
+    if let Some(text) = stack_item_text(stack, COMP_ITEM_NAME) {
+        return text;
+    }
+    item_to_name(stack.0).unwrap_or_default().to_string()
 }
 
 // `minecraft:banner_patterns` on the 1.21.1 component wire. The
@@ -10716,7 +10888,7 @@ fn live_banner_patterns_data(layers: &[BannerLayer]) -> Vec<u8> {
             .iter()
             .position(|name| *name == layer.pattern)
         {
-            // Holder streams reserve zero for inline definitions (COMP_ARMOR_TRIM).
+            // Holder streams reserve zero for inline definitions (COMP_TRIM).
             write_varint(&mut data, id as i64 + 1);
         } else {
             write_varint(&mut data, 0);
@@ -10782,17 +10954,24 @@ fn live_map_state(stack: &Stack) -> Option<MapState> {
     if stack.1 != 1 || item_to_name(stack.0) != Some("filled_map") {
         return None;
     }
-    let map_id = comp_varint(&stack.2, WM_COMP_MAP_ID)?;
+    let map_id = comp_varint(&stack.2, COMP_MAP_ID)?;
+    // `map_post_processing`: 0 marks the map locked (vanilla `MapItem` clone
+    // semantics); 1 marks a scaled (zoomed-out) map.
+    let locked = comp_varint(&stack.2, COMP_MAP_POST_PROCESSING) == Some(0);
     Some(
         live_map_states()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&map_id)
             .copied()
+            .map(|state| MapState {
+                locked: locked || state.locked,
+                ..state
+            })
             .unwrap_or(MapState {
                 map_id,
                 scale: 0,
-                locked: false,
+                locked,
             }),
     )
 }
@@ -10802,7 +10981,7 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
     let mut offers = None;
     let slots = match &mut session.menu {
         LiveMenu::Anvil(menu) => {
-            let result = menu.result(anvil_hover_name(&menu.left), *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1);
+            let result = menu.result(&anvil_hover_name(&menu.left), *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1);
             properties.extend(anvil_window_properties(
                 result.as_ref().map_or(0, |r| r.level_cost),
             ));
@@ -10938,7 +11117,7 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
                 .map(|(mut result, state)| {
                     // Clone/lock keep the source map_id; a zoom's fresh id is
                     // allocated at take time by the caller-owned counter.
-                    comp_set_varint(&mut result.2, WM_COMP_MAP_ID, state.map_id);
+                    comp_set_varint(&mut result.2, COMP_MAP_ID, state.map_id);
                     result
                 })
                 .unwrap_or_default();
@@ -11332,7 +11511,7 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
         };
         let result = match &mut session.menu {
             LiveMenu::Anvil(menu) => {
-                let name = anvil_hover_name(&menu.left).to_owned();
+                let name = anvil_hover_name(&menu.left);
                 let creative = *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
                 let mut output = None;
                 let _ = send_player_xp(c, |xp| {
@@ -12442,6 +12621,35 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
             held_slot_resync(me);
             return;
         }
+        if main == 1192
+            && inv
+                .get(&(36 + held_slot))
+                .is_some_and(|st| comp_get(&st.2, COMP_CHARGED_PROJECTILES).is_some())
+        {
+            // A loaded crossbow fires its stored `charged_projectiles` on use
+            // instead of starting another draw.
+            drop(inv);
+            crossbow_fire_loaded(me, held_slot);
+            return;
+        }
+        if main == 1203 {
+            // goat horn: the `instrument` component names the sound event.
+            drop(inv);
+            goat_horn_use(me, held_slot);
+            return;
+        }
+        if main == 1166 {
+            // knowledge book: the `recipes` component grants recipe ids.
+            drop(inv);
+            knowledge_book_use(me, held_slot);
+            return;
+        }
+        if main == 1112 {
+            // firework rocket: the `fireworks` component drives the launch.
+            drop(inv);
+            firework_rocket_use(me, held_slot);
+            return;
+        }
         if main == 801 || main == 1192 || main == name_to_item("trident").unwrap_or(-9) {
             *me.bow_draw.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
             return;
@@ -12449,58 +12657,85 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
     }
     if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
         // prefer held slot; fall back to first food item in inventory
-        let (slot, it) = {
+        let (slot, it, fc, eaten) = {
             let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
             let hs = 36 + held_slot;
             match inv.get(&hs) {
-                Some((it, _, _)) if food_value(*it) > 0 => (hs, *it),
+                Some(st) if stack_food(st).is_some() => {
+                    (hs, st.0, stack_food(st), st.clone())
+                }
                 _ => inv
                     .iter()
-                    .find(|(_, (i, _, _))| food_value(*i) > 0)
-                    .map(|(&sl, (i, _, _))| (sl, *i))
-                    .unwrap_or((hs, 0)),
+                    .find(|(_, st)| stack_food(st).is_some())
+                    .map(|(&sl, st)| (sl, st.0, stack_food(st), st.clone()))
+                    .unwrap_or((hs, 0, None, (0, 0, Vec::new()))),
             }
         };
-        let fv = food_value(it);
         let cur_food = *me.food.lock().unwrap_or_else(|e| e.into_inner());
-        let edible = fv > 0 && (cur_food < 20 || always_edible(it));
+        let edible = fc
+            .as_ref()
+            .is_some_and(|fc| cur_food < 20 || fc.can_always_eat);
         if edible && !eat_release {
             // vanilla: eating holds use for 32 ticks; nothing consumed yet
             *me.eat_start.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         }
         if edible && eat_release {
+            let fc = fc.clone().unwrap_or(FoodComponent {
+                nutrition: 0,
+                saturation: 0.0,
+                can_always_eat: false,
+                eat_seconds: 1.6,
+                converts_to: (0, 0, Vec::new()),
+                effects: Vec::new(),
+            });
             let mut f = me.food.lock().unwrap_or_else(|e| e.into_inner());
             let mut st = me.sat.lock().unwrap_or_else(|e| e.into_inner());
-            (*f, *st) = FoodData::values_after_eating(*f, *st, fv, sat_value(it));
+            // The component's `saturation` is the vanilla saturation modifier:
+            // gain = modifier * nutrition * 2.
+            (*f, *st) = FoodData::values_after_eating(
+                *f,
+                *st,
+                fc.nutrition as i32,
+                fc.saturation * fc.nutrition as f32 * 2.0,
+            );
             drop(st);
             drop(f);
-            let ncnt = {
+            {
                 let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                 let (nc, cc2) = inv
                     .get(&slot)
                     .map(|e| (e.1.saturating_sub(1), e.2.clone()))
                     .unwrap_or((0, Vec::new()));
                 if nc == 0 {
-                    inv.remove(&slot);
+                    // `using_converts_to`: the consumed stack leaves its
+                    // conversion item (ominous bottle -> glass_bottle, stews
+                    // -> bowl).
+                    if fc.converts_to.0 > 0 && fc.converts_to.1 > 0 {
+                        inv.insert(slot, fc.converts_to.clone());
+                    } else {
+                        inv.remove(&slot);
+                    }
                 } else {
                     inv.insert(slot, (it, nc, cc2));
                 }
-                nc
-            };
+            }
+            let st_now = me
+                .inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&slot)
+                .cloned()
+                .unwrap_or((0, 0, Vec::new()));
             let mut p = vec![0u8];
             write_varint(&mut p, 0);
             p.extend_from_slice(&slot.to_be_bytes());
-            write_varint(&mut p, ncnt as i64);
-            if ncnt > 0 {
-                write_varint(&mut p, it);
-                write_varint(&mut p, 0);
-                write_varint(&mut p, 0);
-            }
+            p.extend_from_slice(&slot_wire(&st_now));
             let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
             let hh = *me.hp.lock().unwrap_or_else(|e| e.into_inner());
             let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x5d, health_pkt_c(hh, me));
-            // vanilla food side-effects (golden apple, pufferfish, ...)
-            for &(ch, eid2, amp, ticks) in food_effects(it) {
+            // vanilla food side-effects: component `effects`, suspicious stew
+            // rolls, and the item defaults table.
+            for &(ch, eid2, amp, ticks) in &stack_food_effects(&eaten) {
                 if (world_rng::next_u64() % 100) < ch {
                     {
                         let mut ef = me.effs.lock().unwrap_or_else(|e| e.into_inner());
@@ -13641,7 +13876,7 @@ mod w2_live_wire_tests {
             live_smithing_result(&menu.template, &menu.base, &menu.addition).expect("trim output");
         assert_eq!(result.0, base);
         // bolt is TRIM_PATTERNS[0], redstone is TRIM_MATERIAL_ITEMS[9].
-        assert_eq!(comp_get(&result.2, COMP_ARMOR_TRIM), Some([10, 1, 1].as_slice()));
+        assert_eq!(comp_get(&result.2, COMP_TRIM), Some([10, 1, 1].as_slice()));
         assert_eq!(live_smithing_take(&mut menu, |_| true), Some(result.clone()));
         // The same trim applied twice refuses, like vanilla's trim recipe.
         assert_eq!(
@@ -14881,5 +15116,2468 @@ mod xpoll_be_sleep_tests {
             BREWING_ACTIVE_STEPS.load(Ordering::Relaxed)
         );
         restore_be(saved);
+    }
+}
+
+// ===========================================================================
+// Minecraft 1.21.1 (protocol 767) item data components: server behavior.
+// The ids below are the canonical `minecraft:data_component_type` indices, in
+// registry order, matching `proto`'s `V767_COMPONENTS` table. Each one feeds at
+// least one production path: stacking, durability, mining, food, projectiles,
+// bundles, containers, block use, or the inventory-NBT codec.
+// ===========================================================================
+
+const COMP_MAX_STACK_SIZE: i64 = 1;
+const COMP_ITEM_NAME: i64 = 6;
+const COMP_RARITY: i64 = 8;
+const COMP_CUSTOM_MODEL_DATA: i64 = 13;
+const COMP_HIDE_ADDITIONAL_TOOLTIP: i64 = 14;
+const COMP_HIDE_TOOLTIP: i64 = 15;
+const COMP_REPAIR_COST: i64 = 16;
+const COMP_CREATIVE_SLOT_LOCK: i64 = 17;
+const COMP_ENCHANTMENT_GLINT_OVERRIDE: i64 = 18;
+const COMP_INTANGIBLE_PROJECTILE: i64 = 19;
+const COMP_FOOD: i64 = 20;
+const COMP_FIRE_RESISTANT: i64 = 21;
+const COMP_TOOL: i64 = 22;
+const COMP_DYED_COLOR: i64 = 24;
+const COMP_MAP_COLOR: i64 = 25;
+const COMP_MAP_ID: i64 = 26;
+const COMP_MAP_DECORATIONS: i64 = 27;
+const COMP_MAP_POST_PROCESSING: i64 = 28;
+const COMP_CHARGED_PROJECTILES: i64 = 29;
+const COMP_BUNDLE_CONTENTS: i64 = 30;
+const COMP_SUSPICIOUS_STEW_EFFECTS: i64 = 32;
+const COMP_WRITABLE_BOOK_CONTENT: i64 = 33;
+const COMP_WRITTEN_BOOK_CONTENT: i64 = 34;
+const COMP_TRIM: i64 = 35;
+const COMP_DEBUG_STICK_STATE: i64 = 36;
+const COMP_ENTITY_DATA: i64 = 37;
+const COMP_BUCKET_ENTITY_DATA: i64 = 38;
+const COMP_BLOCK_ENTITY_DATA: i64 = 39;
+const COMP_INSTRUMENT: i64 = 40;
+const COMP_OMINOUS_BOTTLE_AMPLIFIER: i64 = 41;
+const COMP_JUKEBOX_PLAYABLE: i64 = 42;
+const COMP_RECIPES: i64 = 43;
+const COMP_LODESTONE_TRACKER: i64 = 44;
+const COMP_FIREWORK_EXPLOSION: i64 = 45;
+const COMP_FIREWORKS: i64 = 46;
+const COMP_PROFILE: i64 = 47;
+const COMP_NOTE_BLOCK_SOUND: i64 = 48;
+const COMP_BASE_COLOR: i64 = 50;
+const COMP_POT_DECORATIONS: i64 = 51;
+const COMP_CONTAINER: i64 = 52;
+const COMP_BLOCK_STATE: i64 = 53;
+const COMP_BEES: i64 = 54;
+const COMP_LOCK: i64 = 55;
+const COMP_CONTAINER_LOOT: i64 = 56;
+
+/// Canonical `minecraft:data_component_type` names in registry order. The
+/// inventory-NBT codec uses the table to preserve payloads verbatim for the
+/// components it does not model structurally.
+static COMP_WIRE_NAMES: [&str; 57] = [
+    "minecraft:custom_data", "minecraft:max_stack_size", "minecraft:max_damage",
+    "minecraft:damage", "minecraft:unbreakable", "minecraft:custom_name",
+    "minecraft:item_name", "minecraft:lore", "minecraft:rarity",
+    "minecraft:enchantments", "minecraft:can_place_on", "minecraft:can_break",
+    "minecraft:attribute_modifiers", "minecraft:custom_model_data",
+    "minecraft:hide_additional_tooltip", "minecraft:hide_tooltip",
+    "minecraft:repair_cost", "minecraft:creative_slot_lock",
+    "minecraft:enchantment_glint_override", "minecraft:intangible_projectile",
+    "minecraft:food", "minecraft:fire_resistant", "minecraft:tool",
+    "minecraft:stored_enchantments", "minecraft:dyed_color",
+    "minecraft:map_color", "minecraft:map_id", "minecraft:map_decorations",
+    "minecraft:map_post_processing", "minecraft:charged_projectiles",
+    "minecraft:bundle_contents", "minecraft:potion_contents",
+    "minecraft:suspicious_stew_effects", "minecraft:writable_book_content",
+    "minecraft:written_book_content", "minecraft:trim",
+    "minecraft:debug_stick_state", "minecraft:entity_data",
+    "minecraft:bucket_entity_data", "minecraft:block_entity_data",
+    "minecraft:instrument", "minecraft:ominous_bottle_amplifier",
+    "minecraft:jukebox_playable", "minecraft:recipes",
+    "minecraft:lodestone_tracker", "minecraft:firework_explosion",
+    "minecraft:fireworks", "minecraft:profile", "minecraft:note_block_sound",
+    "minecraft:banner_patterns", "minecraft:base_color",
+    "minecraft:pot_decorations", "minecraft:container", "minecraft:block_state",
+    "minecraft:bees", "minecraft:lock", "minecraft:container_loot",
+];
+
+fn comp_wire_name(ty: i64) -> Option<&'static str> {
+    COMP_WIRE_NAMES.get(usize::try_from(ty).ok()?).copied()
+}
+
+fn comp_id_for_name(name: &str) -> Option<i64> {
+    COMP_WIRE_NAMES
+        .iter()
+        .position(|n| {
+            *n == name || n.strip_prefix("minecraft:") == Some(name)
+        })
+        .map(|i| i as i64)
+}
+
+fn comp_read_f32(data: &[u8], p: &mut usize) -> Option<f32> {
+    let v = f32::from_be_bytes(data.get(*p..*p + 4)?.try_into().ok()?);
+    *p += 4;
+    Some(v)
+}
+
+fn comp_read_string(data: &[u8], p: &mut usize) -> Option<String> {
+    let len = usize::try_from(slot_read_varint(data, p)?)
+        .ok()
+        .filter(|&n| n <= 98301)?;
+    let end = (*p).checked_add(len)?;
+    let text = std::str::from_utf8(data.get(*p..end)?).ok()?.to_string();
+    *p = end;
+    Some(text)
+}
+
+/// The plain-text payload of a `custom_name`/`item_name`-style text component:
+/// a TAG_String of the text, or a compound carrying a `text` member.
+fn comp_text_string(data: &[u8]) -> Option<String> {
+    let mut p = 0;
+    if let Some(text) = read_nbt_string_bytes(data, &mut p) {
+        return Some(text);
+    }
+    let mut rest = data;
+    let tag = crate::nbt::read_network_nbt(&mut rest).ok()?;
+    tag.get("text")
+        .and_then(|t| t.string())
+        .and_then(|s| s.to_utf8().ok())
+}
+
+fn stack_item_text(st: &Stack, ty: i64) -> Option<String> {
+    comp_get(&st.2, ty).and_then(comp_text_string)
+}
+
+/// `ItemStack.hasFoil`: enchantment glint override wins; an enchanted stack
+/// glints either way. Used for the creative/pick integrity check below.
+fn stack_enchantment_glint(st: &Stack) -> bool {
+    match comp_get(&st.2, COMP_ENCHANTMENT_GLINT_OVERRIDE) {
+        Some([v]) => *v != 0,
+        Some(_) => true,
+        None => enchantments_get(&st.2).iter().any(|(_, l)| *l > 0),
+    }
+}
+
+/// Effective stack food for `stack`: an explicit `minecraft:food` component
+/// wins; otherwise the vanilla item defaults apply. Returns `None` for items
+/// that are not food at all.
+#[derive(Clone, Debug, PartialEq)]
+struct FoodComponent {
+    nutrition: i64,
+    saturation: f32,
+    can_always_eat: bool,
+    eat_seconds: f32,
+    converts_to: Stack,
+    /// (mob effect registry id, probability 0..=1)
+    effects: Vec<(i64, f32)>,
+}
+
+fn decode_food_component(data: &[u8]) -> Option<FoodComponent> {
+    let mut p = 0;
+    let nutrition = slot_read_varint(data, &mut p)?;
+    if nutrition < 0 {
+        return None;
+    }
+    let saturation = comp_read_f32(data, &mut p)?;
+    if !saturation.is_finite() || saturation < 0.0 {
+        return None;
+    }
+    let can_always_eat = slot_read_bool(data, &mut p)?;
+    let eat_seconds = comp_read_f32(data, &mut p)?;
+    if !eat_seconds.is_finite() || eat_seconds <= 0.0 {
+        return None;
+    }
+    let converts_to = slot_read_stack(data, &mut p, 1)?;
+    let n = slot_read_count(data, &mut p, 256)?;
+    let mut effects = Vec::with_capacity(n);
+    for _ in 0..n {
+        let id = slot_read_varint(data, &mut p)?;
+        let probability = comp_read_f32(data, &mut p)?;
+        if !(0.0..=1.0).contains(&probability) {
+            return None;
+        }
+        effects.push((id, probability));
+    }
+    (p == data.len()).then_some(FoodComponent {
+        nutrition,
+        saturation,
+        can_always_eat,
+        eat_seconds,
+        converts_to,
+        effects,
+    })
+}
+
+/// `minecraft:tool`: `Tool.rules` + `defaultMiningSpeed` + `damagePerBlock`.
+/// Vanilla evaluates rules in order; the first matching rule that carries a
+/// speed wins for `getDestroySpeed`, the first matching rule carrying
+/// `correctForDrops` decides `isCorrectToolForDrops`.
+#[derive(Clone, Debug, PartialEq)]
+struct ToolComponent {
+    rules: Vec<ToolRule>,
+    default_speed: f32,
+    damage_per_block: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ToolRule {
+    /// `kind == 0` holder set: a block tag name.
+    tag: Option<String>,
+    /// `kind > 0` holder set: the explicit block ids.
+    ids: Vec<i64>,
+    speed: Option<f32>,
+    correct_for_drops: Option<bool>,
+}
+
+fn decode_tool_component(data: &[u8]) -> Option<ToolComponent> {
+    let mut p = 0;
+    let n = slot_read_count(data, &mut p, 256)?;
+    let mut rules = Vec::with_capacity(n);
+    for _ in 0..n {
+        let kind = slot_read_varint(data, &mut p)?;
+        let (tag, ids) = if kind == 0 {
+            (Some(comp_read_string(data, &mut p)?), Vec::new())
+        } else {
+            let count = usize::try_from(kind - 1)
+                .ok()
+                .filter(|&n| n <= 4096)?;
+            let mut ids = Vec::with_capacity(count);
+            for _ in 0..count {
+                ids.push(slot_read_varint(data, &mut p)?);
+            }
+            (None, ids)
+        };
+        let speed = if slot_read_bool(data, &mut p)? {
+            let v = comp_read_f32(data, &mut p)?;
+            if !v.is_finite() || v < 0.0 {
+                return None;
+            }
+            Some(v)
+        } else {
+            None
+        };
+        let correct_for_drops = if slot_read_bool(data, &mut p)? {
+            Some(slot_read_bool(data, &mut p)?)
+        } else {
+            None
+        };
+        rules.push(ToolRule {
+            tag,
+            ids,
+            speed,
+            correct_for_drops,
+        });
+    }
+    let default_speed = comp_read_f32(data, &mut p)?;
+    if !default_speed.is_finite() || default_speed < 0.0 {
+        return None;
+    }
+    let damage_per_block = slot_read_varint(data, &mut p)?;
+    if damage_per_block < 0 {
+        return None;
+    }
+    (p == data.len()).then_some(ToolComponent {
+        rules,
+        default_speed,
+        damage_per_block,
+    })
+}
+
+fn tool_component_for(st: &Stack) -> Option<ToolComponent> {
+    comp_get(&st.2, COMP_TOOL).and_then(decode_tool_component)
+}
+
+fn tool_rule_matches(rule: &ToolRule, state: u32, reg: &crate::block_registry::BReg) -> bool {
+    if let Some(tag) = &rule.tag {
+        return reg.in_tag(state, tag);
+    }
+    reg.block_id_of(state)
+        .map(|id| rule.ids.contains(&i64::from(id)))
+        .unwrap_or(false)
+}
+
+/// Vanilla `Tool.getMiningSpeed`: first matching rule with a speed; otherwise
+/// the component's default speed.
+fn tool_component_speed(tool: &ToolComponent, state: u32, reg: &crate::block_registry::BReg) -> f32 {
+    for rule in &tool.rules {
+        if let Some(speed) = rule.speed {
+            if tool_rule_matches(rule, state, reg) {
+                return speed;
+            }
+        }
+    }
+    tool.default_speed
+}
+
+/// Vanilla `Tool.isCorrectForDrops`: first matching rule carrying the flag;
+/// false when no rule both matches and declares it.
+fn tool_component_correct(tool: &ToolComponent, state: u32, reg: &crate::block_registry::BReg) -> bool {
+    for rule in &tool.rules {
+        if let Some(correct) = rule.correct_for_drops {
+            if tool_rule_matches(rule, state, reg) {
+                return correct;
+            }
+        }
+    }
+    false
+}
+
+/// Damage a tool component charges per broken block (`mineBlock` semantics).
+fn tool_damage_per_block(st: &Stack) -> i64 {
+    tool_component_for(st)
+        .map(|tool| tool.damage_per_block)
+        .unwrap_or(1)
+}
+
+/// A nested-stack list payload (`charged_projectiles`, `bundle_contents`,
+/// `container`), encoded as `count + slot_wire` entries.
+fn decode_stack_list(data: &[u8], max: usize) -> Option<Vec<Stack>> {
+    let mut p = 0;
+    let n = slot_read_count(data, &mut p, 256)?;
+    if n > max {
+        return None;
+    }
+    let mut stacks = Vec::with_capacity(n);
+    for _ in 0..n {
+        stacks.push(slot_read_stack(data, &mut p, 1)?);
+    }
+    (p == data.len()).then_some(stacks)
+}
+
+fn encode_stack_list(stacks: &[Stack]) -> Vec<u8> {
+    let mut data = Vec::new();
+    write_varint(&mut data, stacks.len() as i64);
+    for st in stacks {
+        data.extend_from_slice(&slot_wire(st));
+    }
+    data
+}
+
+/// `minecraft:bundle_contents` weight: vanilla `BundleItem.getWeight` is
+/// `count * (64 / maxStackSize)`, where each entry's max is its own
+/// component-aware limit. A full bundle weighs 64.
+const BUNDLE_WEIGHT_MAX: i64 = 64;
+
+fn bundle_stack_weight(st: &Stack) -> i64 {
+    let per = (BUNDLE_WEIGHT_MAX / stack_max_of(st).max(1)).max(1);
+    per.saturating_mul(i64::from(st.1))
+}
+
+fn bundle_contents_of(st: &Stack) -> Option<Vec<Stack>> {
+    comp_get(&st.2, COMP_BUNDLE_CONTENTS).map(|data| {
+        decode_stack_list(data, 256).unwrap_or_default()
+    })
+}
+
+fn bundle_total_weight(st: &Stack) -> i64 {
+    bundle_contents_of(st)
+        .unwrap_or_default()
+        .iter()
+        .map(bundle_stack_weight)
+        .sum()
+}
+
+/// Vanilla `BundleItem.overrideStackedOnOther`: insert as much of `add` as the
+/// 64-weight budget allows, splitting the cursor stack when it does not fit.
+/// Returns the bundle's new `bundle_contents` payload and the leftover count.
+fn bundle_try_insert(contents: &mut Vec<Stack>, add: &Stack) -> (Vec<u8>, u8) {
+    let mut remaining = add.1;
+    let mut weight: i64 = contents.iter().map(bundle_stack_weight).sum();
+    // Fill an existing compatible entry first (vanilla merges before appending).
+    for i in 0..contents.len() {
+        if remaining == 0 || weight >= BUNDLE_WEIGHT_MAX {
+            break;
+        }
+        if contents[i].0 != add.0 || contents[i].2 != add.2 {
+            continue;
+        }
+        let per = (BUNDLE_WEIGHT_MAX / stack_max_of(&contents[i]).max(1)).max(1);
+        let room = stack_max_of(&contents[i]) - i64::from(contents[i].1);
+        let fits = ((BUNDLE_WEIGHT_MAX - weight) / per)
+            .min(room)
+            .min(i64::from(remaining));
+        if fits > 0 {
+            contents[i].1 += fits as u8;
+            remaining -= fits as u8;
+            weight += per * fits;
+        }
+    }
+    if remaining > 0 && weight < BUNDLE_WEIGHT_MAX {
+        let per = (BUNDLE_WEIGHT_MAX / stack_max_of(add).max(1)).max(1);
+        let fits = ((BUNDLE_WEIGHT_MAX - weight) / per).min(i64::from(remaining));
+        if fits > 0 {
+            contents.push((add.0, fits as u8, add.2.clone()));
+            remaining -= fits as u8;
+        }
+    }
+    (encode_stack_list(contents), remaining)
+}
+
+/// Vanilla `BundleItem.overrideOtherStackedOnMe` with an empty cursor:
+/// removes the *last* non-empty entry (bundles are LIFO) and yields it.
+fn bundle_try_extract(contents: &mut Vec<Stack>) -> Option<(Stack, Vec<u8>)> {
+    let st = contents.iter_mut().find(|e| e.1 > 0)?;
+    let out = st.clone();
+    st.1 = 0;
+    Some((out, encode_stack_list(contents)))
+}
+
+fn is_bundle_item(item: i64) -> bool {
+    item == name_to_item("bundle").unwrap_or(-1)
+}
+
+/// `minecraft:suspicious_stew_effects`: `(effect id, duration game ticks)` —
+/// vanilla `SuspiciousStewEffects`.
+fn decode_suspicious_stew_effects(data: &[u8]) -> Option<Vec<(i64, i64)>> {
+    let mut p = 0;
+    let n = slot_read_count(data, &mut p, 256)?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let id = slot_read_varint(data, &mut p)?;
+        let duration = slot_read_varint(data, &mut p)?;
+        if !(0..=160).contains(&duration) {
+            return None;
+        }
+        out.push((id, duration));
+    }
+    (p == data.len()).then_some(out)
+}
+
+/// The effective food for a stack: the `food` component wins, then vanilla
+/// item defaults (`food_value`/`sat_value`/always-edible/side-effects tables).
+fn stack_food(st: &Stack) -> Option<FoodComponent> {
+    if let Some(fc) = comp_get(&st.2, COMP_FOOD).and_then(decode_food_component) {
+        return Some(fc);
+    }
+    let nutrition = i64::from(food_value(st.0));
+    let ominous = item_to_name(st.0) == Some("ominous_bottle");
+    let stew = item_to_name(st.0) == Some("suspicious_stew");
+    if nutrition == 0 && !ominous && !stew {
+        return None;
+    }
+    let (nutrition, saturation, can_always_eat) = if ominous {
+        (0, 0.0, true)
+    } else if stew {
+        // 7.2 gain over 6 nutrition is a 0.6 saturation modifier.
+        (6, 0.6, false)
+    } else {
+        (
+            nutrition,
+            if nutrition > 0 {
+                sat_value(st.0) / (2 * nutrition) as f32
+            } else {
+                0.0
+            },
+            always_edible(st.0),
+        )
+    };
+    let converts_to = if ominous || stew {
+        (
+            name_to_item(if ominous { "glass_bottle" } else { "bowl" }).unwrap_or(0),
+            1,
+            Vec::new(),
+        )
+    } else {
+        (0, 0, Vec::new())
+    };
+    Some(FoodComponent {
+        nutrition,
+        saturation,
+        can_always_eat,
+        eat_seconds: 1.6,
+        converts_to,
+        effects: Vec::new(),
+    })
+}
+
+/// Duration (server ticks) of a food effect entry after `stack_food`: the
+/// folded `(id*1000+amp, probability)` pairs above are split back out by the
+/// consumer, which pairs them with the side-effect tables' vanilla durations.
+fn stack_food_effects(st: &Stack) -> Vec<(u64, i32, i32, i32)> {
+    let mut out = Vec::new();
+    if comp_get(&st.2, COMP_FOOD).is_none() {
+        if item_to_name(st.0) == Some("suspicious_stew") {
+            if let Some(list) = comp_get(&st.2, COMP_SUSPICIOUS_STEW_EFFECTS)
+                .and_then(decode_suspicious_stew_effects)
+            {
+                out.extend(
+                    list.into_iter()
+                        .map(|(id, duration)| (100, id as i32, 0, server_ticks(duration as u64) as i32)),
+                );
+            }
+            return out;
+        }
+        if item_to_name(st.0) == Some("ominous_bottle") {
+            let amp = ominous_bottle_amplifier(st).unwrap_or(0);
+            out.push((100, 30, amp as i32, server_ticks(120_000) as i32));
+            return out;
+        }
+        return food_effects(st.0).to_vec();
+    }
+    if let Some(fc) = comp_get(&st.2, COMP_FOOD).and_then(decode_food_component) {
+        out.extend(
+            fc.effects
+                .iter()
+                .map(|&(id, prob)| {
+                    (
+                        (prob * 100.0) as u64,
+                        id as i32,
+                        0,
+                        server_ticks(1200) as i32,
+                    )
+                }),
+        );
+    }
+    out
+}
+
+/// `minecraft:ominous_bottle_amplifier` clamped to vanilla's 0..=4 domain.
+fn ominous_bottle_amplifier(st: &Stack) -> Option<i64> {
+    comp_varint(&st.2, COMP_OMINOUS_BOTTLE_AMPLIFIER).map(|a| a.clamp(0, 4))
+}
+
+/// Whether a `can_break`/`can_place_on` predicate set permits `state`
+/// (adventure-mode predicates; the server applies them to block-break and
+/// block-place decisions like vanilla's `AdventureModePredicate.test`).
+#[cfg_attr(not(test), allow(dead_code))]
+fn block_predicates_allow(data: &[u8], state: u32, reg: &crate::block_registry::BReg) -> bool {
+    let mut p = 0;
+    let Some(n) = slot_read_count(data, &mut p, 256) else {
+        return true;
+    };
+    let mut any = false;
+    for _ in 0..n {
+        let start = p;
+        if slot_read_block_predicate(data, &mut p).is_none() {
+            return false;
+        }
+        if p == start {
+            return false;
+        }
+        let mut q = start;
+        if predicate_matches_state(data, &mut q, state, reg) {
+            any = true;
+        }
+    }
+    n == 0 || any
+}
+
+/// Re-reads one `can_break`/`can_place_on` block predicate
+/// (`{blocks?, properties?, nbt?}`) and tests whether it covers `state`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn predicate_matches_state(
+    data: &[u8],
+    p: &mut usize,
+    state: u32,
+    reg: &crate::block_registry::BReg,
+) -> bool {
+    if slot_read_bool(data, p) == Some(true) {
+        // `blocks`: a block holder set (tag name or explicit ids).
+        let kind = match slot_read_varint(data, p) {
+            Some(k) => k,
+            None => return false,
+        };
+        let covered = if kind == 0 {
+            match comp_read_string(data, p) {
+                Some(tag) => reg.in_tag(state, &tag),
+                None => return false,
+            }
+        } else {
+            let count = usize::try_from(kind - 1).ok().filter(|&n| n <= 4096);
+            let Some(count) = count else { return false };
+            let mut covered = false;
+            for _ in 0..count {
+                match slot_read_varint(data, p) {
+                    Some(v) => {
+                        if reg.block_id_of(state) == Some(v as i32) {
+                            covered = true;
+                        }
+                    }
+                    None => return false,
+                }
+            }
+            covered
+        };
+        if !covered {
+            return false;
+        }
+    } else if slot_read_bool(data, p).is_none() {
+        return false;
+    }
+    if slot_read_bool(data, p) == Some(true) {
+        // `properties`: exact `name=value` or numeric `[min,max]` matchers.
+        let Some(n) = slot_read_count(data, p, 256) else {
+            return false;
+        };
+        for _ in 0..n {
+            let Some(name) = comp_read_string(data, p) else {
+                return false;
+            };
+            let current = reg.get_prop(state, &name);
+            if slot_read_bool(data, p) == Some(true) {
+                let Some(want) = comp_read_string(data, p) else {
+                    return false;
+                };
+                if current.as_deref() != Some(want.as_str()) {
+                    return false;
+                }
+            } else {
+                let (Some(min), Some(max)) = (
+                    comp_read_string(data, p),
+                    comp_read_string(data, p),
+                ) else {
+                    return false;
+                };
+                let (Ok(min), Ok(max), Some(cur)) = (
+                    min.parse::<i64>(),
+                    max.parse::<i64>(),
+                    current.as_deref().and_then(|v| v.parse::<i64>().ok()),
+                ) else {
+                    return false;
+                };
+                if !(min..=max).contains(&cur) {
+                    return false;
+                }
+            }
+        }
+    }
+    // Optional `nbt` matcher: block entities are not covered here.
+    slot_read_optional_nbt(data, p).is_some()
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn stack_can_break(st: &Stack, state: u32, reg: &crate::block_registry::BReg) -> bool {
+    match comp_get(&st.2, COMP_CAN_BREAK) {
+        Some(data) => block_predicates_allow(data, state, reg),
+        None => true,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn stack_can_place_on(st: &Stack, state: u32, reg: &crate::block_registry::BReg) -> bool {
+    match comp_get(&st.2, COMP_CAN_PLACE_ON) {
+        Some(data) => block_predicates_allow(data, state, reg),
+        None => true,
+    }
+}
+
+/// `minecraft:dyed_color`: 4-byte RGB float + `show_in_tooltip` flag.
+fn stack_dyed_rgb(st: &Stack) -> Option<i64> {
+    comp_get(&st.2, COMP_DYED_COLOR)
+        .and_then(|d| d.get(..4))
+        .map(|b| i64::from(i32::from_be_bytes(b.try_into().unwrap_or_default())))
+}
+
+fn dyeable_item(item: i64) -> bool {
+    matches!(
+        item_to_name(item),
+        Some(
+            "leather_helmet"
+                | "leather_chestplate"
+                | "leather_leggings"
+                | "leather_boots"
+                | "leather_horse_armor"
+                | "wolf_armor"
+        )
+    )
+}
+
+/// Vanilla `DyedItemColor` mixing: blend the dye colors into the current color.
+fn dyed_color_data(rgb: i64) -> Vec<u8> {
+    let mut d = (rgb as i32).to_be_bytes().to_vec();
+    d.push(1);
+    d
+}
+
+const DYE_RGB: [i64; 16] = [
+    0xF9FFFE, 0xF9801D, 0xC74EBD, 0x3AB3DA, 0xFED83D, 0x80C71F, 0xF38BAA, 0x474F52,
+    0x9D9D97, 0x169C9C, 0x8932B8, 0x3C44AA, 0x835432, 0x5E7C16, 0xB02E26, 0x1D1D21,
+];
+
+fn dye_item_rgb(item: i64) -> Option<i64> {
+    dye_color_for_item(item)
+        .and_then(|name| {
+            [
+                "white", "orange", "magenta", "light_blue", "yellow", "lime", "pink", "gray",
+                "light_gray", "cyan", "purple", "blue", "brown", "green", "red", "black",
+            ]
+            .iter()
+            .position(|n| *n == name)
+        })
+        .map(|i| DYE_RGB[i])
+}
+
+/// Vanilla `DyedItemColor.applyDyes`: average the existing color with the dyes.
+fn dyed_craft_result(armor: &Stack, dyes: &[i64]) -> Option<Stack> {
+    if !dyeable_item(armor.0) || dyes.is_empty() {
+        return None;
+    }
+    let mut rgbs = vec![stack_dyed_rgb(armor).unwrap_or(0xA06540)];
+    rgbs.extend(dyes.iter().filter_map(|&it| dye_item_rgb(it)));
+    let (mut r, mut g, mut b) = (0u64, 0u64, 0u64);
+    for c in &rgbs {
+        r += ((c >> 16) & 0xFF) as u64;
+        g += ((c >> 8) & 0xFF) as u64;
+        b += (c & 0xFF) as u64;
+    }
+    let n = rgbs.len() as u64;
+    let rgb = ((r / n) << 16) | ((g / n) << 8) | (b / n);
+    let mut out = (armor.0, 1, armor.2.clone());
+    comp_set(&mut out.2, COMP_DYED_COLOR, dyed_color_data(rgb as i64));
+    Some(out)
+}
+
+/// `minecraft:instrument` sound event for a goat horn. Registry-id holders map
+/// to vanilla's `item.goat_horn.sound.N`; inline instrument data carries the
+/// sound holder directly.
+fn instrument_sound(data: &[u8]) -> Option<String> {
+    let mut p = 0;
+    let id = slot_read_varint(data, &mut p)?;
+    if id != 0 {
+        let sound = id - 1;
+        if !(0..=7).contains(&sound) {
+            return None;
+        }
+        return Some(format!("minecraft:item.goat_horn.sound.{sound}"));
+    }
+    // Inline `Instrument` data: sound-event holder, use duration, range, nbt.
+    let kind = slot_read_varint(data, &mut p)?;
+    if kind != 0 {
+        return Some(format!("minecraft:item.goat_horn.sound.{}", (kind - 1).clamp(0, 7)));
+    }
+    // `slot_read_sound_event`: string id + optional fixed-range data.
+    let name = comp_read_string(data, &mut p)?;
+    Some(name)
+}
+
+/// `minecraft:lodestone_tracker` decode: `{has_global_pos, dimension, pos}` +
+/// `tracked`.
+fn decode_lodestone_tracker(data: &[u8]) -> Option<(Option<(String, i64)>, bool)> {
+    let mut p = 0;
+    let target = if slot_read_bool(data, &mut p)? {
+        let dim = comp_read_string(data, &mut p)?;
+        let pos = i64::from_be_bytes(data.get(p..p + 8)?.try_into().ok()?);
+        p += 8;
+        Some((dim, pos))
+    } else {
+        None
+    };
+    let tracked = slot_read_bool(data, &mut p)?;
+    (p == data.len()).then_some((target, tracked))
+}
+
+/// `minecraft:lock`: a LockCode — an item predicate in NBT form. A bare string
+/// is the legacy custom-name lock; compound keys name component predicates.
+#[derive(Clone, Debug, PartialEq)]
+enum LockPredicate {
+    CustomName(String),
+    Components {
+        custom_name: Option<String>,
+        custom_data: Option<crate::nbt::Tag>,
+    },
+}
+
+fn lock_predicate_from_tag(tag: &crate::nbt::Tag) -> Option<LockPredicate> {
+    match tag {
+        crate::nbt::Tag::String(s) => {
+            s.to_utf8().ok().map(LockPredicate::CustomName)
+        }
+        crate::nbt::Tag::Compound(map) => {
+            let find = |k: &str| {
+                map.iter().find(|(nk, _)| {
+                    nk.to_utf8()
+                        .map(|n| n == k || n == format!("minecraft:{k}"))
+                        .unwrap_or(false)
+                })
+            };
+            let custom_name = find("custom_name")
+                .or_else(|| find("name"))
+                .and_then(|(_, v)| v.string())
+                .and_then(|s| s.to_utf8().ok());
+            let custom_data = find("custom_data").map(|(_, v)| v.clone());
+            Some(LockPredicate::Components {
+                custom_name,
+                custom_data,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn decode_lock_predicate(data: &[u8]) -> Option<LockPredicate> {
+    let mut p = 0;
+    if let Some(name) = read_nbt_string_bytes(data, &mut p) {
+        if p == data.len() {
+            return Some(LockPredicate::CustomName(name));
+        }
+    }
+    let mut rest = data;
+    crate::nbt::read_network_nbt(&mut rest)
+        .ok()
+        .filter(|_| rest.is_empty())
+        .and_then(|tag| lock_predicate_from_tag(&tag))
+}
+
+fn stack_lock_predicate(st: &Stack) -> Option<LockPredicate> {
+    comp_get(&st.2, COMP_LOCK).and_then(decode_lock_predicate)
+}
+
+/// NBT subset match used by lock `custom_data` predicates: every field of
+/// `want` must equal the matching field of `have`.
+fn nbt_subset(want: &crate::nbt::Tag, have: &crate::nbt::Tag) -> bool {
+    use crate::nbt::Tag;
+    match (want, have) {
+        (Tag::Compound(w), Tag::Compound(h)) => w.iter().all(|(k, v)| {
+            h.iter()
+                .find(|(hk, _)| *hk == k)
+                .is_some_and(|(_, hv)| nbt_subset(v, hv))
+        }),
+        _ => want == have,
+    }
+}
+
+/// `LockableBlockEntity.canOpen`: true when no lock is set, or the held stack
+/// satisfies the predicate (vanilla: `LockCode` unlocks on `custom_name` and
+/// `custom_data` component equality).
+fn container_unlocked(lock: Option<&LockPredicate>, held: &Stack) -> bool {
+    let Some(pred) = lock else { return true };
+    match pred {
+        LockPredicate::CustomName(want) => {
+            stack_item_text(held, COMP_CUSTOM_NAME).as_deref() == Some(want.as_str())
+        }
+        LockPredicate::Components {
+            custom_name,
+            custom_data,
+        } => {
+            if let Some(want) = custom_name {
+                if stack_item_text(held, COMP_CUSTOM_NAME).as_deref() != Some(want.as_str()) {
+                    return false;
+                }
+            }
+            if let Some(want) = custom_data {
+                let Some(raw) = comp_get(&held.2, COMP_CUSTOM_DATA) else {
+                    return false;
+                };
+                let mut rest = raw;
+                let Ok(have) = crate::nbt::read_network_nbt(&mut rest) else {
+                    return false;
+                };
+                if !nbt_subset(want, &have) {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+}
+
+/// The `lock` stored on a block entity, if any (vanilla `LockableBlockEntity`
+/// serializes the predicate under `lock`).
+fn block_entity_lock(key: DimBlockPos) -> Option<LockPredicate> {
+    let (_state, tag) = live_block_entity_snapshot(key)?;
+    lock_predicate_from_tag(tag.get("lock")?)
+}
+
+/// Deny container/BE-menu access when the block is locked and the held stack
+/// does not satisfy the predicate. Returns true when access is allowed.
+fn container_lock_gate(c: &Client, key: DimBlockPos) -> bool {
+    let Some(pred) = block_entity_lock(key) else { return true };
+    let held_index = *c.held.lock().unwrap_or_else(|e| e.into_inner());
+    let held = c
+        .inv
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(36 + held_index))
+        .cloned()
+        .unwrap_or_default();
+    container_unlocked(Some(&pred), &held)
+}
+
+/// `minecraft:container`: a `ItemContainerContents` — the shulker box /
+/// container item's stored slots, one wire entry per occupied slot.
+fn container_slots(st: &Stack) -> Option<Vec<Stack>> {
+    comp_get(&st.2, COMP_CONTAINER).and_then(|d| decode_stack_list(d, 256))
+}
+
+/// `minecraft:container_loot` (`{loot_table, seed}`) as the staged-loot record
+/// `pending_block_loot` consumes when a chest is generated.
+fn container_loot_entry(data: &[u8]) -> Option<(String, i64)> {
+    let mut rest = data;
+    let tag = crate::nbt::read_network_nbt(&mut rest).ok()?;
+    let table = tag
+        .get("loot_table")
+        .or_else(|| tag.get("LootTable"))
+        .and_then(|t| t.string())
+        .and_then(|s| s.to_utf8().ok())?;
+    let seed = tag
+        .get("seed")
+        .or_else(|| tag.get("LootTableSeed"))
+        .and_then(nbt_int_val)
+        .unwrap_or(0);
+    Some((table, seed))
+}
+
+/// `minecraft:entity_data` / `minecraft:bucket_entity_data`: opaque entity NBT
+/// merged into the spawn/savegame tag when an egg, armor stand, or mob bucket
+/// releases its entity.
+fn item_entity_data(st: &Stack, ty: i64) -> Option<crate::nbt::Tag> {
+    let raw = comp_get(&st.2, ty)?;
+    let mut rest = raw;
+    crate::nbt::read_network_nbt(&mut rest).ok()
+}
+
+/// `minecraft:block_entity_data`: the block-entity NBT patch a block item
+/// applies on placement (shulker contents aside, these merge verbatim).
+fn item_block_entity_data(st: &Stack) -> Option<crate::nbt::Tag> {
+    item_entity_data(st, COMP_BLOCK_ENTITY_DATA)
+}
+
+/// `minecraft:block_state`: `{property: value}` overrides applied to the
+/// placed block state, like vanilla `BlockItem.updateCustomBlockEntityTag`'s
+/// state application.
+#[cfg_attr(not(test), allow(dead_code))]
+fn item_block_state_override(st: &Stack, base: u32) -> u32 {
+    let Some(reg) = breg() else { return base };
+    let Some(data) = comp_get(&st.2, COMP_BLOCK_STATE) else {
+        return base;
+    };
+    let mut p = 0;
+    let Ok(n) = usize::try_from(slot_read_varint(data, &mut p).unwrap_or(0)) else {
+        return base;
+    };
+    let mut state = base;
+    for _ in 0..n.min(256) {
+        let (Some(name), Some(value)) =
+            (comp_read_string(data, &mut p), comp_read_string(data, &mut p))
+        else {
+            return state;
+        };
+        state = reg.with_prop(state, &name, &value);
+    }
+    state
+}
+
+/// `minecraft:bees`: `(entity NBT, ticks_in_hive, min_ticks_in_hive)`.
+fn beehive_bees(st: &Stack) -> Vec<(crate::nbt::Tag, i64, i64)> {
+    let mut out = Vec::new();
+    let Some(data) = comp_get(&st.2, COMP_BEES) else {
+        return out;
+    };
+    let mut p = 0;
+    let Some(n) = slot_read_count(data, &mut p, 256) else {
+        return out;
+    };
+    for _ in 0..n {
+        let start = p;
+        if slot_read_nbt(data, &mut p).is_none() {
+            break;
+        }
+        let mut rest = &data[start..p];
+        let Ok(tag) = crate::nbt::read_network_nbt(&mut rest) else {
+            break;
+        };
+        let (Some(a), Some(b)) = (
+            slot_read_varint(data, &mut p),
+            slot_read_varint(data, &mut p),
+        ) else {
+            break;
+        };
+        out.push((tag, a, b));
+    }
+    out
+}
+
+/// `minecraft:pot_decorations`: up to 4 sherd item ids, in
+/// decorated-pot `sherds` order (back, left, right, front).
+fn pot_item_sherds(st: &Stack) -> Vec<i64> {
+    let mut out = Vec::new();
+    let Some(data) = comp_get(&st.2, COMP_POT_DECORATIONS) else {
+        return out;
+    };
+    let mut p = 0;
+    let Some(n) = slot_read_count(data, &mut p, 4) else {
+        return out;
+    };
+    for _ in 0..n {
+        match slot_read_varint(data, &mut p) {
+            Some(id) => out.push(id),
+            None => break,
+        }
+    }
+    out
+}
+
+/// `minecraft:profile` on a player head → the `Skull` block entity's profile
+/// fields (`name`, `id`, `properties`).
+fn skull_item_profile(st: &Stack) -> Option<crate::nbt::Tag> {
+    if item_to_name(st.0) != Some("player_head") {
+        return None;
+    }
+    let data = comp_get(&st.2, COMP_PROFILE)?;
+    let mut p = 0;
+    let mut fields = std::collections::BTreeMap::new();
+    if slot_read_bool(data, &mut p)? {
+        if let Some(name) = comp_read_string(data, &mut p) {
+            fields.insert(
+                crate::nbt::NbtString::text("name"),
+                crate::nbt::Tag::String(crate::nbt::NbtString::text(&name)),
+            );
+        }
+    }
+    if slot_read_bool(data, &mut p)? {
+        if let Some(uuid) = data.get(p..p + 16) {
+            p += 16;
+            fields.insert(
+                crate::nbt::NbtString::text("id"),
+                crate::nbt::Tag::IntArray(
+                    uuid.chunks(4)
+                        .map(|c| i32::from_be_bytes(c.try_into().unwrap_or_default()))
+                        .collect(),
+                ),
+            );
+        }
+    }
+    let n = slot_read_count(data, &mut p, 256)?;
+    let mut props = Vec::new();
+    for _ in 0..n {
+        let (Some(pname), Some(pval)) = (
+            comp_read_string(data, &mut p),
+            comp_read_string(data, &mut p),
+        ) else {
+            break;
+        };
+        let mut entry = std::collections::BTreeMap::new();
+        entry.insert(
+            crate::nbt::NbtString::text("name"),
+            crate::nbt::Tag::String(crate::nbt::NbtString::text(&pname)),
+        );
+        entry.insert(
+            crate::nbt::NbtString::text("value"),
+            crate::nbt::Tag::String(crate::nbt::NbtString::text(&pval)),
+        );
+        if slot_read_bool(data, &mut p)? {
+            if let Some(sig) = comp_read_string(data, &mut p) {
+                entry.insert(
+                    crate::nbt::NbtString::text("signature"),
+                    crate::nbt::Tag::String(crate::nbt::NbtString::text(&sig)),
+                );
+            }
+        }
+        props.push(crate::nbt::Tag::Compound(entry));
+    }
+    if !props.is_empty() {
+        fields.insert(
+            crate::nbt::NbtString::text("properties"),
+            crate::nbt::Tag::List(10, props),
+        );
+    }
+    Some(crate::nbt::Tag::Compound(fields))
+}
+
+/// `minecraft:base_color` on a banner item → the `Banner` block entity's
+/// `base` color index.
+fn banner_item_base_color(st: &Stack) -> Option<i64> {
+    comp_varint(&st.2, COMP_BASE_COLOR).map(|c| c.clamp(0, 15))
+}
+
+/// `minecraft:map_color` RGB as stored on the filled_map item.
+fn map_item_color(st: &Stack) -> Option<i64> {
+    comp_get(&st.2, COMP_MAP_COLOR)
+        .and_then(|d| d.get(..4))
+        .map(|b| i64::from(i32::from_be_bytes(b.try_into().unwrap_or_default())))
+}
+
+/// `minecraft:map_decorations` raw NBT for the map item's decoration list.
+fn map_item_decorations(st: &Stack) -> Option<crate::nbt::Tag> {
+    let raw = comp_get(&st.2, COMP_MAP_DECORATIONS)?;
+    let mut rest = raw;
+    crate::nbt::read_network_nbt(&mut rest).ok()
+}
+
+/// `minecraft:debug_stick_state`: `{block: property}` — the selected property
+/// per block id that right-click cycles.
+fn debug_stick_selection(data: &[u8], block_name: &str) -> Option<String> {
+    let mut rest = data;
+    let tag = crate::nbt::read_network_nbt(&mut rest).ok()?;
+    tag.get(block_name)
+        .or_else(|| tag.get(block_name.trim_start_matches("minecraft:")))
+        .and_then(|t| t.string())
+        .and_then(|s| s.to_utf8().ok())
+}
+
+/// Property-value candidates used to cycle a selected debug-stick property.
+/// `with_prop` validates membership, so probing a table wider than the
+/// property's domain is safe.
+const DEBUG_STICK_PROP_VALUES: &[&str] = &[
+    "true", "false",
+    "north", "east", "south", "west", "up", "down",
+    "x", "y", "z",
+    "top", "bottom", "double", "upper", "lower",
+    "none", "low", "tall", "side", "tip", "tip_merge", "middle", "frustum",
+    "single", "front", "back", "left", "right",
+    "normal", "sticky", "floor", "wall", "ceiling",
+    "unstable", "persistent",
+    "short", "half", "partial", "full",
+    "small", "large", "left_arm", "right_arm", "center",
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+    "10", "11", "12", "13", "14", "15",
+    "16", "17", "18", "19", "20", "21", "22", "23", "24", "25",
+];
+
+/// Cycle the `debug_stick_state`-selected property of `state` to its next
+/// value in the property's declared order (vanilla `DebugStickItem.useOn`).
+fn debug_stick_cycle(state: u32, comps: &Comps) -> Option<u32> {
+    let reg = breg()?;
+    let block_name = reg.name_of(state);
+    let data = comp_get(comps, COMP_DEBUG_STICK_STATE)?;
+    let prop = debug_stick_selection(data, block_name)
+        .or_else(|| reg.properties_of(state)?.first().map(|(n, _)| n.clone()))?;
+    let current = reg.get_prop(state, &prop)?;
+    // Probe the candidate table, preserving the registry's value order by
+    // walking the block's state range: for each candidate value the registry
+    // accepts, collect the resulting state.
+    let mut values: Vec<String> = Vec::new();
+    for candidate in DEBUG_STICK_PROP_VALUES {
+        let ns = reg.with_prop(state, &prop, candidate);
+        if reg.get_prop(ns, &prop).as_deref() == Some(*candidate) {
+            values.push((*candidate).to_string());
+        }
+    }
+    if values.is_empty() {
+        return None;
+    }
+    let next = values
+        .iter()
+        .position(|v| *v == current)
+        .map(|i| (i + 1) % values.len())
+        .unwrap_or(0);
+    Some(reg.with_prop(state, &prop, &values[next]))
+}
+
+/// `minecraft:recipes` on a knowledge book: recipe ids to grant.
+fn knowledge_book_recipes(st: &Stack) -> Vec<String> {
+    let Some(raw) = comp_get(&st.2, COMP_RECIPES) else {
+        return Vec::new();
+    };
+    let mut rest = raw;
+    let Ok(tag) = crate::nbt::read_network_nbt(&mut rest) else {
+        return Vec::new();
+    };
+    let entries = tag
+        .get("recipes")
+        .and_then(|t| t.list())
+        .map(<[_]>::to_vec)
+        .unwrap_or_else(|| vec![tag]);
+    entries
+        .iter()
+        .filter_map(|t| t.string().and_then(|s| s.to_utf8().ok()))
+        .collect()
+}
+
+fn learned_recipes() -> &'static Mutex<HashMap<i32, std::collections::BTreeSet<String>>> {
+    static LEARNED: Registry<i32, std::collections::BTreeSet<String>> = OnceLock::new();
+    LEARNED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `minecraft:fireworks`: flight duration (in gunpowder units) + explosions.
+fn decode_fireworks(data: &[u8]) -> Option<(i64, i64)> {
+    let mut p = 0;
+    let flight = slot_read_varint(data, &mut p)?;
+    if !(0..=255).contains(&flight) {
+        return None;
+    }
+    let n = slot_read_count(data, &mut p, 256)?;
+    for _ in 0..n {
+        slot_read_firework_explosion(data, &mut p)?;
+    }
+    (p == data.len()).then_some((flight, n as i64))
+}
+
+/// A `minecraft:firework_explosion` payload: shape + color lists + flags.
+#[derive(Clone, Debug, PartialEq)]
+struct FireworkExplosion {
+    shape: i64,
+    colors: Vec<i32>,
+    fade: Vec<i32>,
+    has_trail: bool,
+    has_twinkle: bool,
+}
+
+fn decode_firework_explosion(data: &[u8]) -> Option<FireworkExplosion> {
+    let mut p = 0;
+    let shape = slot_read_varint(data, &mut p)?;
+    if !(0..=4).contains(&shape) {
+        return None;
+    }
+    let read_colors = |p: &mut usize| -> Option<Vec<i32>> {
+        let n = slot_read_count(data, p, 256)?;
+        let bytes = data.get(*p..*p + n * 4)?;
+        *p += n * 4;
+        Some(
+            bytes
+                .chunks(4)
+                .map(|c| i32::from_be_bytes(c.try_into().unwrap_or_default()))
+                .collect(),
+        )
+    };
+    let colors = read_colors(&mut p)?;
+    let fade = read_colors(&mut p)?;
+    let has_trail = slot_read_bool(data, &mut p)?;
+    let has_twinkle = slot_read_bool(data, &mut p)?;
+    (p == data.len()).then_some(FireworkExplosion {
+        shape,
+        colors,
+        fade,
+        has_trail,
+        has_twinkle,
+    })
+}
+
+/// `minecraft:charged_projectiles` on a crossbow: the loaded stacks.
+fn charged_projectiles_of(st: &Stack) -> Option<Vec<Stack>> {
+    comp_get(&st.2, COMP_CHARGED_PROJECTILES)
+        .and_then(|d| decode_stack_list(d, 3))
+        .map(|v| {
+            v.into_iter()
+                .filter(|s| s.1 > 0)
+                .collect()
+        })
+}
+
+/// Whether a dropped stack survives fire/lava (vanilla
+/// `ItemEntity`/`FIRE_RESISTANT` — netherite items carry it by default).
+fn drop_fireproof(item: i64, comps: &Comps) -> bool {
+    comp_get(comps, COMP_FIRE_RESISTANT).is_some()
+        || item_to_name(item).is_some_and(|n| n.starts_with("netherite_"))
+}
+
+/// Block states that burn a dropped item: fire, soul fire, and lava.
+fn drop_burns_at(state_name: &str) -> bool {
+    matches!(
+        state_name,
+        "minecraft:fire" | "minecraft:soul_fire" | "minecraft:lava"
+    )
+}
+
+/// Typed semantic result of `apply_item_component_behavior`. Each arm carries
+/// what a gameplay path needs from the component; `Marker` covers components
+/// whose server-side contract is validation + wire passthrough only.
+#[derive(Clone, Debug, PartialEq)]
+enum ComponentEffect {
+    Marker,
+    StackLimit(i64),
+    Rarity(i64),
+    DisplayName(String),
+    Glint(bool),
+    RepairCost(i64),
+    ModelData(i64),
+    Food(FoodComponent),
+    Tool(ToolComponent),
+    StackList(Vec<Stack>),
+    StewEffects(Vec<(i64, i64)>),
+    Instrument(String),
+    Amplifier(i64),
+    MapId(i64),
+    MapPostProcessing(i64),
+    BaseColor(i64),
+    Sherds(Vec<i64>),
+    OpaqueNbt(crate::nbt::Tag),
+    Text,
+    Lock(LockPredicate),
+    LootEntry((String, i64)),
+    Explosion(FireworkExplosion),
+    Fireworks(i64, i64),
+    Lodestone(Option<(String, i64)>, bool),
+    Bees(usize),
+    Profile(crate::nbt::Tag),
+    Sound(String),
+    BlockOverrides(usize),
+    DamageVarint(i64),
+    Predicates(usize),
+    Recipes(Vec<String>),
+}
+
+/// `apply_item_component_behavior`: the semantic entry point for
+/// `minecraft:data_component_type` payloads. Validates the payload against
+/// the component's vanilla domain and decodes the fields gameplay paths
+/// consume. Returns `None` for out-of-registry ids or malformed payloads —
+/// callers use it to reject stacks the wire reader accepted structurally but
+/// whose values are out of domain.
+fn apply_item_component_behavior(ty: i64, data: &[u8]) -> Option<ComponentEffect> {
+    match ty {
+        COMP_CUSTOM_DATA
+        | COMP_INTANGIBLE_PROJECTILE
+        | COMP_DEBUG_STICK_STATE
+        | COMP_RECIPES => {
+            let mut p = 0;
+            slot_read_nbt(data, &mut p)?;
+            if p != data.len() {
+                return None;
+            }
+            if ty == COMP_RECIPES {
+                let mut st = (0, 1, Vec::new());
+                comp_set(&mut st.2, COMP_RECIPES, data.to_vec());
+                return Some(ComponentEffect::Recipes(knowledge_book_recipes(&st)));
+            }
+            let mut rest = data;
+            match crate::nbt::read_network_nbt(&mut rest) {
+                Ok(tag) => Some(ComponentEffect::OpaqueNbt(tag)),
+                Err(_) => Some(ComponentEffect::Marker),
+            }
+        }
+        COMP_ENTITY_DATA | COMP_BUCKET_ENTITY_DATA => {
+            let tmp = (0, 1, vec![(ty, data.to_vec())]);
+            item_entity_data(&tmp, ty).map(ComponentEffect::OpaqueNbt)
+        }
+        COMP_BLOCK_ENTITY_DATA => {
+            let tmp = (0, 1, vec![(ty, data.to_vec())]);
+            item_block_entity_data(&tmp).map(ComponentEffect::OpaqueNbt)
+        }
+        COMP_MAP_DECORATIONS => {
+            let tmp = (0, 1, vec![(ty, data.to_vec())]);
+            map_item_decorations(&tmp).map(ComponentEffect::OpaqueNbt)
+        }
+        COMP_MAX_STACK_SIZE => {
+            let mut p = 0;
+            let n = slot_read_varint(data, &mut p)?;
+            ((1..=99).contains(&n) && p == data.len())
+                .then_some(ComponentEffect::StackLimit(n))
+        }
+        COMP_MAX_DAMAGE => {
+            let mut p = 0;
+            let n = slot_read_varint(data, &mut p)?;
+            (n > 0 && p == data.len()).then_some(ComponentEffect::DamageVarint(n))
+        }
+        COMP_DAMAGE => {
+            let mut p = 0;
+            let n = slot_read_varint(data, &mut p)?;
+            (n >= 0 && p == data.len()).then_some(ComponentEffect::DamageVarint(n))
+        }
+        COMP_UNBREAKABLE | COMP_ENCHANTMENT_GLINT_OVERRIDE => {
+            let mut p = 0;
+            slot_read_bool(data, &mut p)?;
+            if p != data.len() {
+                return None;
+            }
+            let tmp = (0, 1, vec![(ty, data.to_vec())]);
+            Some(ComponentEffect::Glint(stack_enchantment_glint(&tmp)))
+        }
+        COMP_CUSTOM_NAME | COMP_ITEM_NAME => {
+            comp_text_string(data).map(ComponentEffect::DisplayName)
+        }
+        COMP_LORE => {
+            let mut p = 0;
+            let n = slot_read_count(data, &mut p, 256)?;
+            for _ in 0..n {
+                slot_read_optional_nbt(data, &mut p)?;
+            }
+            (p == data.len()).then_some(ComponentEffect::Text)
+        }
+        COMP_RARITY => {
+            let mut p = 0;
+            let v = slot_read_varint(data, &mut p)?;
+            ((0..=3).contains(&v) && p == data.len())
+                .then_some(ComponentEffect::Rarity(v))
+        }
+        COMP_CAN_PLACE_ON | COMP_CAN_BREAK => {
+            let mut p = 0;
+            let n = slot_read_count(data, &mut p, 256)?;
+            for _ in 0..n {
+                slot_read_block_predicate(data, &mut p)?;
+            }
+            slot_read_bool(data, &mut p)?;
+            (p == data.len()).then_some(ComponentEffect::Predicates(n))
+        }
+        COMP_ATTRIBUTE_MODIFIERS => {
+            let mut rest = data;
+            attr_modifiers_read(&mut rest)?;
+            rest.is_empty().then_some(ComponentEffect::Marker)
+        }
+        COMP_CUSTOM_MODEL_DATA | COMP_REPAIR_COST | COMP_MAP_ID => {
+            let mut p = 0;
+            let v = slot_read_varint(data, &mut p)?;
+            if p != data.len() {
+                return None;
+            }
+            if ty == COMP_MAP_ID {
+                (v >= 0).then_some(ComponentEffect::MapId(v))
+            } else if ty == COMP_REPAIR_COST {
+                (v >= 0).then_some(ComponentEffect::RepairCost(v))
+            } else {
+                Some(ComponentEffect::ModelData(v))
+            }
+        }
+        COMP_HIDE_ADDITIONAL_TOOLTIP
+        | COMP_HIDE_TOOLTIP
+        | COMP_CREATIVE_SLOT_LOCK
+        | COMP_FIRE_RESISTANT => {
+            data.is_empty().then_some(ComponentEffect::Marker)
+        }
+        COMP_FOOD => decode_food_component(data).map(ComponentEffect::Food),
+        COMP_TOOL => decode_tool_component(data).map(ComponentEffect::Tool),
+        COMP_ENCHANTMENTS | COMP_STORED_ENCHANTMENTS => {
+            let mut p = 0;
+            let n = slot_read_count(data, &mut p, 256)?;
+            for _ in 0..n {
+                slot_read_varint(data, &mut p)?;
+                slot_read_varint(data, &mut p)?;
+            }
+            slot_read_bool(data, &mut p)?;
+            (p == data.len()).then_some(ComponentEffect::Marker)
+        }
+        COMP_DYED_COLOR => {
+            let mut p = 0;
+            comp_read_f32(data, &mut p)?;
+            slot_read_bool(data, &mut p)?;
+            (p == data.len()).then_some(ComponentEffect::Marker)
+        }
+        COMP_MAP_COLOR => {
+            let tmp = (0, 1, vec![(ty, data.to_vec())]);
+            map_item_color(&tmp).map(|_| ComponentEffect::Marker)
+        }
+        COMP_MAP_POST_PROCESSING => {
+            let mut p = 0;
+            let v = slot_read_varint(data, &mut p)?;
+            ((0..=1).contains(&v) && p == data.len())
+                .then_some(ComponentEffect::MapPostProcessing(v))
+        }
+        COMP_CHARGED_PROJECTILES => {
+            decode_stack_list(data, 3).map(ComponentEffect::StackList)
+        }
+        COMP_BUNDLE_CONTENTS => {
+            let stacks = decode_stack_list(data, 256)?;
+            // Vanilla `BundleItem` never holds more than the 64-weight budget;
+            // `bundle_total_weight` runs the same accounting `click_slot` uses.
+            let tmp = (
+                name_to_item("bundle").unwrap_or(0),
+                1,
+                vec![(ty, data.to_vec())],
+            );
+            (bundle_total_weight(&tmp) <= BUNDLE_WEIGHT_MAX).then_some(
+                ComponentEffect::StackList(
+                    stacks.into_iter().filter(|s| s.1 > 0).collect::<Vec<_>>(),
+                ),
+            )
+        }
+        COMP_CONTAINER => {
+            let tmp = (0, 1, vec![(ty, data.to_vec())]);
+            container_slots(&tmp).map(ComponentEffect::StackList)
+        }
+        COMP_POTION_CONTENTS => {
+            let mut rest = data;
+            if read_merchant_bool(&mut rest)? {
+                read_protocol_i32(&mut rest)?;
+            }
+            if read_merchant_bool(&mut rest)? {
+                rest = rest.get(4..)?;
+            }
+            for _ in 0..read_protocol_i32(&mut rest).filter(|&n| (0..=256).contains(&n))? {
+                read_protocol_i32(&mut rest)?;
+                read_live_potion_effect_details(&mut rest, 0)?;
+            }
+            let consumed = data.len() - rest.len();
+            let mut p = consumed;
+            slot_read_optional_string(data, &mut p)?;
+            (p == data.len()).then_some(ComponentEffect::Marker)
+        }
+        COMP_SUSPICIOUS_STEW_EFFECTS => {
+            decode_suspicious_stew_effects(data).map(ComponentEffect::StewEffects)
+        }
+        COMP_WRITABLE_BOOK_CONTENT => {
+            let mut p = 0;
+            let n = slot_read_count(data, &mut p, 100)?;
+            for _ in 0..n {
+                slot_read_string(data, &mut p)?;
+                slot_read_optional_string(data, &mut p)?;
+            }
+            (p == data.len()).then_some(ComponentEffect::Text)
+        }
+        COMP_WRITTEN_BOOK_CONTENT => {
+            let mut p = 0;
+            slot_read_string(data, &mut p)?;
+            slot_read_optional_string(data, &mut p)?;
+            slot_read_string(data, &mut p)?;
+            let generation = slot_read_varint(data, &mut p)?;
+            if !(0..=3).contains(&generation) {
+                return None;
+            }
+            let n = slot_read_count(data, &mut p, 100)?;
+            for _ in 0..n {
+                slot_read_text(data, &mut p)?;
+                slot_read_optional_nbt(data, &mut p)?;
+            }
+            slot_read_bool(data, &mut p)?;
+            (p == data.len()).then_some(ComponentEffect::Text)
+        }
+        COMP_TRIM => {
+            let mut p = 0;
+            if slot_read_varint(data, &mut p)? == 0 {
+                slot_read_trim_material(data, &mut p)?;
+            }
+            if slot_read_varint(data, &mut p)? == 0 {
+                slot_read_trim_pattern(data, &mut p)?;
+            }
+            slot_read_bool(data, &mut p)?;
+            (p == data.len()).then_some(ComponentEffect::Marker)
+        }
+        COMP_INSTRUMENT => {
+            instrument_sound(data).map(ComponentEffect::Instrument)
+        }
+        COMP_OMINOUS_BOTTLE_AMPLIFIER => {
+            let tmp = (0, 1, vec![(ty, data.to_vec())]);
+            ominous_bottle_amplifier(&tmp).map(ComponentEffect::Amplifier)
+        }
+        COMP_JUKEBOX_PLAYABLE => {
+            let mut p = 0;
+            if slot_read_bool(data, &mut p)? {
+                if slot_read_varint(data, &mut p)? == 0 {
+                    slot_read_jukebox_song_data(data, &mut p)?;
+                }
+            } else {
+                slot_read_string(data, &mut p)?;
+            }
+            slot_read_bool(data, &mut p)?;
+            (p == data.len()).then_some(ComponentEffect::Marker)
+        }
+        COMP_LODESTONE_TRACKER => {
+            decode_lodestone_tracker(data)
+                .map(|(target, tracked)| ComponentEffect::Lodestone(target, tracked))
+        }
+        COMP_FIREWORK_EXPLOSION => {
+            decode_firework_explosion(data).map(ComponentEffect::Explosion)
+        }
+        COMP_FIREWORKS => {
+            decode_fireworks(data).map(|(flight, n)| ComponentEffect::Fireworks(flight, n))
+        }
+        COMP_PROFILE => {
+            let mut st = (
+                name_to_item("player_head").unwrap_or(0),
+                1,
+                vec![(COMP_PROFILE, data.to_vec())],
+            );
+            let _ = &mut st;
+            skull_item_profile(&st).map(ComponentEffect::Profile)
+        }
+        COMP_NOTE_BLOCK_SOUND => {
+            let mut p = 0;
+            comp_read_string(data, &mut p)
+                .filter(|_| p == data.len())
+                .map(ComponentEffect::Sound)
+        }
+        COMP_BANNER_PATTERNS => {
+            let mut p = 0;
+            let n = slot_read_count(data, &mut p, 256)?;
+            for _ in 0..n {
+                if slot_read_varint(data, &mut p)? == 0 {
+                    slot_read_string(data, &mut p)?;
+                    slot_read_string(data, &mut p)?;
+                }
+                if !(0..=15).contains(&slot_read_varint(data, &mut p)?) {
+                    return None;
+                }
+            }
+            (p == data.len()).then_some(ComponentEffect::Marker)
+        }
+        COMP_BASE_COLOR => {
+            let tmp = (0, 1, vec![(ty, data.to_vec())]);
+            banner_item_base_color(&tmp).map(ComponentEffect::BaseColor)
+        }
+        COMP_POT_DECORATIONS => {
+            let mut p = 0;
+            let n = slot_read_count(data, &mut p, 4)?;
+            for _ in 0..n {
+                slot_read_varint(data, &mut p)?;
+            }
+            if p != data.len() {
+                return None;
+            }
+            let tmp = (0, 1, vec![(ty, data.to_vec())]);
+            Some(ComponentEffect::Sherds(pot_item_sherds(&tmp)))
+        }
+        COMP_BLOCK_STATE => {
+            let mut p = 0;
+            let n = slot_read_count(data, &mut p, 256)?;
+            for _ in 0..n {
+                slot_read_string(data, &mut p)?;
+                slot_read_string(data, &mut p)?;
+            }
+            (p == data.len()).then_some(ComponentEffect::BlockOverrides(n))
+        }
+        COMP_BEES => {
+            let mut p = 0;
+            let n = slot_read_count(data, &mut p, 256)?;
+            for _ in 0..n {
+                slot_read_nbt(data, &mut p)?;
+                slot_read_varint(data, &mut p)?;
+                slot_read_varint(data, &mut p)?;
+            }
+            if p != data.len() {
+                return None;
+            }
+            let tmp = (0, 1, vec![(ty, data.to_vec())]);
+            Some(ComponentEffect::Bees(beehive_bees(&tmp).len()))
+        }
+        COMP_LOCK => {
+            let tmp = (0, 1, vec![(ty, data.to_vec())]);
+            stack_lock_predicate(&tmp).map(ComponentEffect::Lock)
+        }
+        COMP_CONTAINER_LOOT => {
+            container_loot_entry(data).map(ComponentEffect::LootEntry)
+        }
+        _ => None,
+    }
+}
+
+/// Write a varint-length UTF-8 string in the slot/component wire form.
+fn comp_write_string(out: &mut Vec<u8>, text: &str) {
+    write_varint(out, text.len() as i64);
+    out.extend_from_slice(text.as_bytes());
+}
+
+/// `useItemOn` handling for component-driven block interactions that are not
+/// block-entity menus: lodestone compasses, cauldron dye washing, and debug
+/// sticks. Returns true when the interaction consumed the use.
+fn use_item_component_on_block(
+    c: &Client,
+    key @ (dim, x, y, z): DimBlockPos,
+    state: u32,
+) -> bool {
+    let Some(reg) = breg() else { return false };
+    let block_name = reg.name_of(state);
+    let held_index = *c.held.lock().unwrap_or_else(|e| e.into_inner());
+    let selected = 36 + held_index;
+    let held = {
+        let inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
+        inv.get(&selected).cloned().unwrap_or_default()
+    };
+    if held.1 == 0 {
+        return false;
+    }
+    // LodestoneCompassItem.useOn: bind the compass to this lodestone.
+    if block_name == "minecraft:lodestone"
+        && held.0 == name_to_item("compass").unwrap_or(-1)
+    {
+        let pos = ((i64::from(x) & 0x3FFFFFF) << 38)
+            | ((i64::from(z) & 0x3FFFFFF) << 12)
+            | (i64::from(y) & 0xFFF);
+        let mut data = vec![1u8];
+        comp_write_string(&mut data, dim.dimension_id());
+        data.extend_from_slice(&pos.to_be_bytes());
+        data.push(1);
+        let mut st = held;
+        comp_set(&mut st.2, COMP_LODESTONE_TRACKER, data);
+        c.inv.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(selected, st);
+        held_slot_resync(c);
+        return true;
+    }
+    // LayeredCauldronBlock + DyedItemColor: washing a dyed armor piece removes
+    // `dyed_color` and consumes one water level.
+    if block_name == "minecraft:water_cauldron"
+        && comp_get(&held.2, COMP_DYED_COLOR).is_some()
+        && dyeable_item(held.0)
+    {
+        let level: i64 = reg
+            .get_prop(state, "level")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let mut st = held;
+        st.2.retain(|(ty, _)| *ty != COMP_DYED_COLOR);
+        c.inv.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(selected, st);
+        let next = if level <= 1 {
+            name_to_state("cauldron").unwrap_or(state)
+        } else {
+            reg.with_prop(state, "level", &(level - 1).to_string())
+        };
+        if next != state {
+            update_live_block_entity_state(key, state, next);
+        }
+        held_slot_resync(c);
+        return true;
+    }
+    // DebugStickItem.useOn: cycle the component-selected property value.
+    if held.0 == name_to_item("debug_stick").unwrap_or(-1) {
+        if let Some(next) = debug_stick_cycle(state, &held.2) {
+            if next != state {
+                update_live_block_entity_state(key, state, next);
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// Fire a loaded crossbow: each `charged_projectiles` entry becomes a real
+/// projectile (arrows and firework rockets), then the component clears.
+fn crossbow_fire_loaded(me: &Arc<Client>, held_slot: i16) {
+    let selected = 36 + held_slot;
+    let held = me
+        .inv
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&selected)
+        .cloned()
+        .unwrap_or_default();
+    let Some(projectiles) = charged_projectiles_of(&held) else {
+        return;
+    };
+    if projectiles.is_empty() {
+        return;
+    }
+    {
+        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(st) = inv.get_mut(&selected) {
+            st.2.retain(|(ty, _)| *ty != COMP_CHARGED_PROJECTILES);
+        }
+    }
+    let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+    let yr = (yaw as f64).to_radians();
+    let pr = (pitch as f64).to_radians();
+    let multi = enchant_level(&held.2, 23) > 0;
+    let rocket_item = name_to_item("firework_rocket").unwrap_or(-1);
+    let launch = |proj: &Stack, spread: f64| {
+        let yr2 = yr + spread;
+        let (dx, dy, dz) = (
+            -yr2.sin() * pr.cos() * 3.15,
+            -pr.sin() * 3.15,
+            yr2.cos() * pr.cos() * 3.15,
+        );
+        if proj.0 == rocket_item {
+            let (flight, explosions) = comp_get(&proj.2, COMP_FIREWORKS)
+                .and_then(decode_fireworks)
+                .unwrap_or((1, 0));
+            fireworks().lock().unwrap_or_else(|e| e.into_inner()).push(Firework {
+                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                owner: me.eid,
+                x,
+                y: y + 1.5,
+                z,
+                dx,
+                dy,
+                dz,
+                ttl: server_ticks((flight.max(0) * 10 + 11) as u64) as i32,
+                explosions,
+            });
+        } else {
+            arrows().lock().unwrap_or_else(|e| e.into_inner()).push(Arrow {
+                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                owner: me.eid,
+                x,
+                y: y + 1.5,
+                z,
+                dx,
+                dy,
+                dz,
+                ttl: server_ticks(ARROW_TTL_GT) as i32,
+                dmg: 9.0,
+                fire: 0,
+                punch: 0,
+                kind: 0,
+                loy: 0,
+                ret_item: proj.0,
+                ret_comps: proj.2.clone(),
+                pierce: enchant_level(&held.2, 24).clamp(0, 4) as i32,
+                last_hit: -1,
+                stuck: false,
+            });
+        }
+    };
+    for (i, proj) in projectiles.iter().enumerate() {
+        let spread = if multi && projectiles.len() == 1 {
+            0.0
+        } else {
+            0.0
+        };
+        launch(proj, spread + if projectiles.len() > 1 { (i as f64 - 1.0) * 0.1745 } else { 0.0 });
+    }
+    if multi && projectiles.len() == 1 {
+        launch(&projectiles[0], -0.1745);
+        launch(&projectiles[0], 0.1745);
+    }
+    if damage_held(me) {
+        let snd = sound_pkt_named("entity.item.break", x, y + 1.0, z);
+        broadcast_near(
+            *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
+            x,
+            y + 1.0,
+            z,
+            -1,
+            |_c| (0x68, snd.clone()),
+        );
+    }
+    held_slot_resync(me);
+}
+
+/// `instrument` on a goat horn: broadcast the component's sound event and run
+/// the vanilla 7-second cooldown.
+fn goat_horn_use(me: &Arc<Client>, held_slot: i16) {
+    static GOAT_HORN_CD: Registry<i32, Instant> = OnceLock::new();
+    let cd = GOAT_HORN_CD.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let cds = cd.lock().unwrap_or_else(|e| e.into_inner());
+        if cds
+            .get(&me.eid)
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(7))
+        {
+            return;
+        }
+    }
+    let selected = 36 + held_slot;
+    let held = me
+        .inv
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&selected)
+        .cloned()
+        .unwrap_or_default();
+    let sound = comp_get(&held.2, COMP_INSTRUMENT)
+        .and_then(instrument_sound)
+        .unwrap_or_else(|| "minecraft:item.goat_horn.sound.0".to_string());
+    cd.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(me.eid, Instant::now());
+    {
+        let mut cp = Vec::new();
+        write_varint(&mut cp, held.0.max(1));
+        write_varint(&mut cp, 140);
+        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x17, cp);
+    }
+    let (x, y, z, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+    let snd = sound_pkt_named(&sound, x, y + 1.0, z);
+    broadcast_near(
+        *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
+        x,
+        y + 1.0,
+        z,
+        -1,
+        |_c| (0x68, snd.clone()),
+    );
+}
+
+/// `recipes` on a knowledge book: grant each recipe id to the reader and
+/// consume the book, like `KnowledgeBookItem.use`.
+fn knowledge_book_use(me: &Arc<Client>, held_slot: i16) {
+    let selected = 36 + held_slot;
+    let held = me
+        .inv
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&selected)
+        .cloned()
+        .unwrap_or_default();
+    let recipes = knowledge_book_recipes(&held);
+    if !recipes.is_empty() {
+        let mut learned = learned_recipes().lock().unwrap_or_else(|e| e.into_inner());
+        learned.entry(me.eid).or_default().extend(recipes);
+    }
+    if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
+        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(st) = inv.get_mut(&selected) {
+            st.1 = st.1.saturating_sub(1);
+            if st.1 == 0 {
+                inv.remove(&selected);
+            }
+        }
+    }
+    held_slot_resync(me);
+}
+
+/// `fireworks` on a rocket item: launch a firework entity whose flight time
+/// and explosions come from the component.
+fn firework_rocket_use(me: &Arc<Client>, held_slot: i16) {
+    let selected = 36 + held_slot;
+    let held = me
+        .inv
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&selected)
+        .cloned()
+        .unwrap_or_default();
+    if held.1 == 0 {
+        return;
+    }
+    let (flight, explosions) = comp_get(&held.2, COMP_FIREWORKS)
+        .and_then(decode_fireworks)
+        .unwrap_or((3, 0));
+    let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+    let yr = (yaw as f64).to_radians();
+    let pr = (pitch as f64).to_radians();
+    fireworks().lock().unwrap_or_else(|e| e.into_inner()).push(Firework {
+        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+        owner: me.eid,
+        x,
+        y: y + 1.5,
+        z,
+        dx: -yr.sin() * pr.cos() * 1.5,
+        dy: -pr.sin() * 1.5 + 0.1,
+        dz: yr.cos() * pr.cos() * 1.5,
+        ttl: server_ticks((flight.max(1) * 10 + 11) as u64) as i32
+            + (world_rng::next_u64() % 6) as i32,
+        explosions,
+    });
+    if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
+        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(st) = inv.get_mut(&selected) {
+            st.1 = st.1.saturating_sub(1);
+            if st.1 == 0 {
+                inv.remove(&selected);
+            }
+        }
+    }
+    held_slot_resync(me);
+}
+
+/// Shapeless `armor_dye`: exactly one dyeable armor piece plus at least one dye
+/// item produces the color-mixed result through `dyed_craft_result`.
+fn dyed_craft_any<'a>(stacks: impl Iterator<Item = &'a Stack>) -> Option<Stack> {
+    let mut armor: Option<&Stack> = None;
+    let mut dyes: Vec<i64> = Vec::new();
+    for st in stacks.filter(|st| st.1 > 0) {
+        if dyeable_item(st.0) && armor.is_none() {
+            armor = Some(st);
+        } else if dye_item_rgb(st.0).is_some() {
+            dyes.push(st.0);
+        } else {
+            return None;
+        }
+    }
+    let armor = armor?;
+    dyed_craft_result(armor, &dyes)
+}
+
+/// The saved-NBT form for book-content components. Written books keep their
+/// fields; pages are stored as raw wire bytes so `to_stack` round-trips every
+/// entry byte-for-byte (a `pages` list still feeds `Lectern::page_count`).
+fn book_content_nbt(
+    ty: i64,
+    data: &[u8],
+) -> Option<BlockEntityNbtFields> {
+    use crate::nbt::{NbtString, Tag};
+    let mut p = 0;
+    let mut fields = BlockEntityNbtFields::new();
+    if ty == COMP_WRITABLE_BOOK_CONTENT {
+        let n = slot_read_count(data, &mut p, 100)?;
+        let mut pages = Vec::with_capacity(n);
+        for _ in 0..n {
+            let start = p;
+            slot_read_string(data, &mut p)?;
+            slot_read_optional_string(data, &mut p)?;
+            pages.push(Tag::ByteArray(data.get(start..p)?.to_vec()));
+        }
+        fields.insert(
+            NbtString::text("pages"),
+            Tag::List(if pages.is_empty() { 0 } else { 7 }, pages),
+        );
+        return (p == data.len()).then_some(fields);
+    }
+    // written_book_content: raw_title, optional filtered_title, author,
+    // generation, pages (text + optional filtered), resolved.
+    let title = comp_read_string(data, &mut p)?;
+    fields.insert(
+        NbtString::text("title"),
+        Tag::String(NbtString::text(&title)),
+    );
+    if slot_read_bool(data, &mut p)? {
+        let filtered = comp_read_string(data, &mut p)?;
+        fields.insert(
+            NbtString::text("filtered_title"),
+            Tag::String(NbtString::text(&filtered)),
+        );
+    }
+    let author = comp_read_string(data, &mut p)?;
+    fields.insert(
+        NbtString::text("author"),
+        Tag::String(NbtString::text(&author)),
+    );
+    let generation = slot_read_varint(data, &mut p)?;
+    fields.insert(NbtString::text("generation"), Tag::Int(generation as i32));
+    let n = slot_read_count(data, &mut p, 100)?;
+    let mut pages = Vec::with_capacity(n);
+    for _ in 0..n {
+        let start = p;
+        slot_read_text(data, &mut p)?;
+        slot_read_optional_nbt(data, &mut p)?;
+        pages.push(Tag::ByteArray(data.get(start..p)?.to_vec()));
+    }
+    fields.insert(
+        NbtString::text("pages"),
+        Tag::List(if pages.is_empty() { 0 } else { 7 }, pages),
+    );
+    let resolved = slot_read_bool(data, &mut p)?;
+    fields.insert(NbtString::text("resolved"), Tag::Byte(i8::from(resolved)));
+    (p == data.len()).then_some(fields)
+}
+
+fn book_content_data(ty: i64, tag: &crate::nbt::Tag) -> Option<Vec<u8>> {
+    let mut data = Vec::new();
+    let pages = tag.get("pages").and_then(|t| t.list())?;
+    if ty == COMP_WRITABLE_BOOK_CONTENT {
+        if pages.len() > 100 {
+            return None;
+        }
+        write_varint(&mut data, pages.len() as i64);
+        for page in pages {
+            let crate::nbt::Tag::ByteArray(entry) = page else {
+                return None;
+            };
+            data.extend_from_slice(entry);
+        }
+        return Some(data);
+    }
+    let title = tag
+        .get("title")
+        .and_then(|t| t.string())
+        .and_then(|s| s.to_utf8().ok())?;
+    comp_write_string(&mut data, &title);
+    match tag
+        .get("filtered_title")
+        .and_then(|t| t.string())
+        .and_then(|s| s.to_utf8().ok())
+    {
+        Some(filtered) => {
+            data.push(1);
+            comp_write_string(&mut data, &filtered);
+        }
+        None => data.push(0),
+    }
+    let author = tag
+        .get("author")
+        .and_then(|t| t.string())
+        .and_then(|s| s.to_utf8().ok())?;
+    comp_write_string(&mut data, &author);
+    let generation = tag.get("generation").and_then(nbt_int_val).unwrap_or(0);
+    write_varint(&mut data, generation);
+    if pages.len() > 100 {
+        return None;
+    }
+    write_varint(&mut data, pages.len() as i64);
+    for page in pages {
+        let crate::nbt::Tag::ByteArray(entry) = page else {
+            return None;
+        };
+        data.extend_from_slice(entry);
+    }
+    let resolved = match tag.get("resolved") {
+        Some(crate::nbt::Tag::Byte(b)) => *b != 0,
+        _ => true,
+    };
+    data.push(u8::from(resolved));
+    Some(data)
+}
+
+/// Saved-NBT form for `jukebox_playable`: `{song, show_in_tooltip}` for the
+/// direct-song form; the holder form stores nothing and falls back to the
+/// raw-byte preservation arm.
+fn jukebox_playable_nbt(data: &[u8]) -> Option<crate::nbt::Tag> {
+    use crate::nbt::{NbtString, Tag};
+    let mut p = 0;
+    if slot_read_bool(data, &mut p)? {
+        return None;
+    }
+    let song = comp_read_string(data, &mut p)?;
+    let show = slot_read_bool(data, &mut p)?;
+    if p != data.len() {
+        return None;
+    }
+    let mut fields = BlockEntityNbtFields::new();
+    fields.insert(
+        NbtString::text("song"),
+        Tag::String(NbtString::text(&song)),
+    );
+    fields.insert(
+        NbtString::text("show_in_tooltip"),
+        Tag::Byte(i8::from(show)),
+    );
+    Some(Tag::Compound(fields))
+}
+
+fn jukebox_playable_data(tag: &crate::nbt::Tag) -> Option<Vec<u8>> {
+    let song = tag
+        .get("song")
+        .and_then(|t| t.string())
+        .and_then(|s| s.to_utf8().ok())?;
+    let show = match tag.get("show_in_tooltip") {
+        Some(crate::nbt::Tag::Byte(b)) => *b != 0,
+        _ => true,
+    };
+    let mut data = vec![0u8];
+    comp_write_string(&mut data, &song);
+    data.push(u8::from(show));
+    Some(data)
+}
+
+#[cfg(test)]
+mod v1211_comp_tests {
+    use super::*;
+
+    fn vi(n: i64) -> Vec<u8> {
+        let mut v = Vec::new();
+        write_varint(&mut v, n);
+        v
+    }
+
+    /// TAG_String NBT form used by `custom_name`/`lock` wire payloads.
+    fn nbt_str(text: &str) -> Vec<u8> {
+        let mut v = vec![0x08u8];
+        v.extend_from_slice(&(text.len() as u16).to_be_bytes());
+        v.extend_from_slice(text.as_bytes());
+        v
+    }
+
+    fn item(name: &str) -> i64 {
+        name_to_item(name).unwrap_or_else(|| panic!("unknown item {name}"))
+    }
+
+    /// `minecraft:food` payload: nutrition, saturation, can_always_eat,
+    /// eat_seconds, empty converts_to stack, then `(effect, probability)` rows.
+    fn food_payload(nutrition: i64, saturation: f32, effects: &[(i64, f32)]) -> Vec<u8> {
+        let mut d = vi(nutrition);
+        d.extend_from_slice(&saturation.to_be_bytes());
+        d.push(1); // can_always_eat
+        d.extend_from_slice(&1.6f32.to_be_bytes());
+        d.extend_from_slice(&vi(0)); // converts_to: empty stack
+        d.extend_from_slice(&vi(effects.len() as i64));
+        for (id, prob) in effects {
+            d.extend_from_slice(&vi(*id));
+            d.extend_from_slice(&prob.to_be_bytes());
+        }
+        d
+    }
+
+    /// `minecraft:tool` payload with one explicit-block rule.
+    fn tool_payload(block_id: i64, speed: f32, correct: bool, dpb: i64) -> Vec<u8> {
+        let mut d = vi(1); // rules
+        d.extend_from_slice(&vi(2)); // holder set of 1 explicit block id
+        d.extend_from_slice(&vi(block_id));
+        d.push(1); // speed present
+        d.extend_from_slice(&speed.to_be_bytes());
+        d.push(1); // correct_for_drops present
+        d.push(u8::from(correct));
+        d.extend_from_slice(&1.0f32.to_be_bytes()); // default speed
+        d.extend_from_slice(&vi(dpb));
+        d
+    }
+
+    /// `minecraft:can_break`/`can_place_on` payload naming one explicit block.
+    fn predicate_payload(block_id: i64) -> Vec<u8> {
+        let mut d = vi(1); // predicates
+        d.push(1); // blocks present
+        d.extend_from_slice(&vi(2)); // holder set of 1 block id
+        d.extend_from_slice(&vi(block_id));
+        d.push(0); // no properties
+        d.push(0); // no nbt matcher
+        d.push(0); // show_in_tooltip
+        d
+    }
+
+    #[test]
+    fn v1211_comp_max_stack_size_caps_stacking() {
+        let stone = item("stone");
+        let no_comps: Comps = Vec::new();
+        assert_eq!(item_stack_max(stone, &no_comps), 64);
+        let comps = vec![(COMP_MAX_STACK_SIZE, vi(16))];
+        assert_eq!(item_stack_max(stone, &comps), 16);
+        // The component clamp flows into stack_max_of, which click/pickup
+        // merge paths use for the real cap.
+        let st = (stone, 10, comps.clone());
+        assert_eq!(stack_max_of(&st), 16);
+        // And into creative count clamping (99-domain wire count).
+        let mut st = (stone, 99, comps);
+        creative_slot_clamp(&mut st);
+        assert_eq!(st.1, 16);
+    }
+
+    #[test]
+    fn v1211_comp_unbreakable_skips_durability() {
+        let pick = item("diamond_pickaxe");
+        let mut st = (pick, 1, vec![(COMP_UNBREAKABLE, vec![1])]);
+        assert!(!damage_stack(&mut st, 0.5));
+        assert!(comp_get(&st.2, COMP_DAMAGE).is_none());
+        // Without unbreakable the same call consumes durability.
+        let mut plain = (pick, 1, Vec::new());
+        assert!(!damage_stack(&mut plain, 0.5));
+        assert_eq!(comp_varint(&plain.2, COMP_DAMAGE), Some(1));
+    }
+
+    #[test]
+    fn v1211_comp_fire_resistant_survives_lava() {
+        let stone = item("stone");
+        let no_comps: Comps = Vec::new();
+        assert!(!drop_fireproof(stone, &no_comps));
+        let comps = vec![(COMP_FIRE_RESISTANT, Vec::new())];
+        assert!(drop_fireproof(stone, &comps));
+        assert!(drop_fireproof(item("netherite_ingot"), &no_comps));
+        assert!(drop_burns_at("minecraft:lava"));
+        assert!(drop_burns_at("minecraft:fire"));
+        assert!(!drop_burns_at("minecraft:water"));
+    }
+
+    #[test]
+    fn v1211_comp_food_custom_nutrition_and_effects() {
+        let carrot = item("carrot");
+        let data = food_payload(20, 0.9, &[(1, 1.0), (5, 0.5)]);
+        let st = (carrot, 1, vec![(COMP_FOOD, data)]);
+        let fc = stack_food(&st).unwrap();
+        assert_eq!(fc.nutrition, 20);
+        assert!((fc.saturation - 0.9).abs() < 1e-6);
+        assert!(fc.can_always_eat);
+        assert_eq!(fc.effects, vec![(1, 1.0), (5, 0.5)]);
+        // Effects surface through the eat path in folded (prob%, id, amp, ticks).
+        let eff = stack_food_effects(&st);
+        assert!(eff.iter().any(|&(p, id, _, _)| p == 100 && id == 1));
+        assert!(eff.iter().any(|&(p, id, _, _)| p == 50 && id == 5));
+        // Fallback keeps the server's vanilla item table values.
+        let plain = (carrot, 1, Vec::new());
+        assert_eq!(stack_food(&plain).unwrap().nutrition, i64::from(food_value(carrot)));
+    }
+
+    #[test]
+    fn v1211_comp_ominous_bottle_amplifier_bad_omen() {
+        let bottle = item("ominous_bottle");
+        let st = (
+            bottle,
+            1,
+            vec![(COMP_OMINOUS_BOTTLE_AMPLIFIER, vi(3))],
+        );
+        assert_eq!(ominous_bottle_amplifier(&st), Some(3));
+        // Bad omen (id 30) at the stored amplifier, ~2 hours of ticks.
+        let eff = stack_food_effects(&st);
+        assert!(eff.iter().any(|&(_, id, amp, _)| id == 30 && amp == 3));
+        // Vanilla `OminousBottleAmplifier` clamps out-of-domain values to 0..=4.
+        assert_eq!(
+            apply_item_component_behavior(COMP_OMINOUS_BOTTLE_AMPLIFIER, &vi(9)),
+            Some(ComponentEffect::Amplifier(4))
+        );
+        assert!(matches!(
+            apply_item_component_behavior(COMP_OMINOUS_BOTTLE_AMPLIFIER, &vi(4)),
+            Some(ComponentEffect::Amplifier(4))
+        ));
+    }
+
+    #[test]
+    fn v1211_comp_tool_custom_speed_and_damage() {
+        let reg = breg().unwrap();
+        let stone_state = reg.state_of("minecraft:stone", None);
+        let stone_id = i64::from(reg.block_id_of(stone_state).unwrap());
+        let stick = item("stick");
+        let fast = (
+            stick,
+            1,
+            vec![(COMP_TOOL, tool_payload(stone_id, 32.0, true, 2))],
+        );
+        let plain = (stick, 1, Vec::new());
+        // The rule's speed replaces the (absent) vanilla tier speed.
+        let with_tool = dig_seconds(stone_state as i64, &fast).unwrap();
+        let without = dig_seconds(stone_state as i64, &plain).unwrap();
+        assert!(with_tool < without);
+        // correct_for_drops drives the harvestable multiplier path.
+        let tool = tool_component_for(&fast).unwrap();
+        assert!(tool_component_correct(&tool, stone_state, reg));
+        assert_eq!(tool_damage_per_block(&fast), 2);
+        // damage_per_block feeds durability: one break consumes 2 points.
+        let mut st = (
+            stick,
+            1,
+            vec![
+                (COMP_TOOL, tool_payload(stone_id, 32.0, true, 2)),
+                (COMP_MAX_DAMAGE, vi(10)),
+            ],
+        );
+        assert!(!damage_stack(&mut st, 0.5));
+        assert_eq!(comp_varint(&st.2, COMP_DAMAGE), Some(2));
+    }
+
+    #[test]
+    fn v1211_comp_bundle_weight_insert_extract() {
+        let bundle_item = item("bundle");
+        let stone = item("stone");
+        let mut contents: Vec<Stack> = Vec::new();
+        // A full 64-stack fills the whole 64-weight budget.
+        let (data, remaining) = bundle_try_insert(&mut contents, &(stone, 64, Vec::new()));
+        assert_eq!(remaining, 0);
+        let bundle = (bundle_item, 1, vec![(COMP_BUNDLE_CONTENTS, data.clone())]);
+        assert_eq!(bundle_total_weight(&bundle), 64);
+        // Nothing more fits.
+        let before = contents.len();
+        let (_data2, remaining) = bundle_try_insert(&mut contents, &(stone, 8, Vec::new()));
+        assert_eq!(remaining, 8);
+        assert_eq!(contents.len(), before);
+        // A lighter stack occupies proportional weight: 16-count items weigh 4 each.
+        let pearl = item("ender_pearl");
+        let mut contents2: Vec<Stack> = Vec::new();
+        let (_d, remaining) = bundle_try_insert(&mut contents2, &(pearl, 16, Vec::new()));
+        assert_eq!(remaining, 0);
+        // 16 pearls * (64/16) = the full budget again.
+        let bundle2 = (bundle_item, 1, vec![(COMP_BUNDLE_CONTENTS, encode_stack_list(&contents2))]);
+        assert_eq!(bundle_total_weight(&bundle2), 64);
+        // Extraction is LIFO and conserves the stack.
+        let (out, data3) = bundle_try_extract(&mut contents2).unwrap();
+        assert_eq!((out.0, out.1), (pearl, 16));
+        assert_eq!(decode_stack_list(&data3, 256).unwrap().iter().map(|s| s.1).sum::<u8>(), 0);
+    }
+
+    #[test]
+    fn v1211_comp_lock_blocks_without_named_key() {
+        // `lock` stored as a bare NBT string = `custom_name` key predicate.
+        let chest_st = (
+            item("chest"),
+            1,
+            vec![(COMP_LOCK, nbt_str("skeleton key"))],
+        );
+        let pred = stack_lock_predicate(&chest_st).unwrap();
+        let key = (
+            item("stick"),
+            1,
+            vec![(COMP_CUSTOM_NAME, nbt_str("skeleton key"))],
+        );
+        let wrong_key = (
+            item("stick"),
+            1,
+            vec![(COMP_CUSTOM_NAME, nbt_str("other key"))],
+        );
+        assert!(container_unlocked(Some(&pred), &key));
+        assert!(!container_unlocked(Some(&pred), &wrong_key));
+        assert!(!container_unlocked(Some(&pred), &(item("stick"), 1, Vec::new())));
+        // No lock means open.
+        assert!(container_unlocked(None, &wrong_key));
+    }
+
+    #[test]
+    fn v1211_comp_charged_projectiles_load_release() {
+        let crossbow = item("crossbow");
+        let arrow = item("arrow");
+        let payload = encode_stack_list(&[(arrow, 3, Vec::new())]);
+        let st = (
+            crossbow,
+            1,
+            vec![(COMP_CHARGED_PROJECTILES, payload)],
+        );
+        let loaded = charged_projectiles_of(&st).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!((loaded[0].0, loaded[0].1), (arrow, 3));
+        // The validator routes through the same decoder.
+        assert!(matches!(
+            apply_item_component_behavior(
+                COMP_CHARGED_PROJECTILES,
+                &encode_stack_list(&[(arrow, 1, Vec::new())])
+            ),
+            Some(ComponentEffect::StackList(_))
+        ));
+        // An unloaded crossbow reports nothing.
+        assert!(charged_projectiles_of(&(crossbow, 1, Vec::new())).is_none());
+    }
+
+    #[test]
+    fn v1211_comp_dyed_color_and_container_roundtrip() {
+        use crate::nbt::Tag;
+        let shulker = item("white_shulker_box");
+        let apple = item("apple");
+        let st = (
+            shulker,
+            1,
+            vec![
+                (COMP_CONTAINER, encode_stack_list(&[(apple, 5, Vec::new())])),
+                (COMP_DYED_COLOR, dyed_color_data(0x00ff00)),
+            ],
+        );
+        let entry = stack_to_nbt(0, &st).unwrap();
+        let back = items_nbt_to_stacks(&Tag::List(10, vec![entry])).unwrap();
+        let restored = back.get(&0).unwrap();
+        assert_eq!((restored.0, restored.1), (shulker, 1));
+        // `container` contents survive the save/load roundtrip.
+        let slots = container_slots(restored).unwrap();
+        assert_eq!(slots.len(), 1);
+        assert_eq!((slots[0].0, slots[0].1), (apple, 5));
+        // `dyed_color` survives byte-for-byte and decodes to the stored RGB.
+        assert_eq!(stack_dyed_rgb(restored), Some(0x00ff00));
+    }
+
+    #[test]
+    fn v1211_comp_can_place_can_break_predicates() {
+        let reg = breg().unwrap();
+        let stone_state = reg.state_of("minecraft:stone", None);
+        let dirt_state = reg.state_of("minecraft:dirt", None);
+        let stone_id = i64::from(reg.block_id_of(stone_state).unwrap());
+        let st = (
+            item("stick"),
+            1,
+            vec![
+                (COMP_CAN_BREAK, predicate_payload(stone_id)),
+                (COMP_CAN_PLACE_ON, predicate_payload(stone_id)),
+            ],
+        );
+        assert!(stack_can_break(&st, stone_state, reg));
+        assert!(!stack_can_break(&st, dirt_state, reg));
+        assert!(stack_can_place_on(&st, stone_state, reg));
+        assert!(!stack_can_place_on(&st, dirt_state, reg));
+        // Missing components default to "allowed everywhere" (survival rules).
+        let plain = (item("stick"), 1, Vec::new());
+        assert!(stack_can_break(&plain, dirt_state, reg));
+        assert!(stack_can_place_on(&plain, dirt_state, reg));
+        // The block-level evaluator answers the same question directly.
+        assert!(block_predicates_allow(&predicate_payload(stone_id), stone_state, reg));
+        assert!(!block_predicates_allow(&predicate_payload(stone_id), dirt_state, reg));
+    }
+
+    #[test]
+    fn v1211_comp_block_state_override() {
+        let reg = breg().unwrap();
+        let base = reg.state_of("minecraft:furnace", None);
+        assert_eq!(reg.get_prop(base, "lit").as_deref(), Some("false"));
+        let mut payload = vi(1);
+        comp_write_string(&mut payload, "lit");
+        comp_write_string(&mut payload, "true");
+        let st = (
+            item("furnace"),
+            1,
+            vec![(COMP_BLOCK_STATE, payload)],
+        );
+        let resolved = item_block_state_override(&st, base);
+        assert_eq!(reg.get_prop(resolved, "lit").as_deref(), Some("true"));
+        // No component: the base state is untouched.
+        assert_eq!(item_block_state_override(&(item("furnace"), 1, Vec::new()), base), base);
+    }
+
+    #[test]
+    fn v1211_comp_behavior_validator_rejects_malformed() {
+        // Truncated payload, out-of-domain value, and unknown id all reject.
+        assert_eq!(apply_item_component_behavior(COMP_MAX_STACK_SIZE, &[]), None);
+        assert_eq!(apply_item_component_behavior(COMP_MAX_STACK_SIZE, &vi(100)), None);
+        assert_eq!(apply_item_component_behavior(COMP_RARITY, &vi(4)), None);
+        assert_eq!(apply_item_component_behavior(9999, &[]), None);
+        assert!(matches!(
+            apply_item_component_behavior(COMP_MAX_STACK_SIZE, &vi(99)),
+            Some(ComponentEffect::StackLimit(99))
+        ));
+        assert!(apply_item_component_behavior(COMP_LOCK, &nbt_str("key")).is_some());
+        assert!(apply_item_component_behavior(
+            COMP_FOOD,
+            &food_payload(6, 0.3, &[])
+        ).is_some());
+    }
+
+    #[test]
+    fn v1211_comp_suspicious_stew_and_firework_effects() {
+        // suspicious_stew_effects: (effect id, duration ticks) list.
+        let stew = item("suspicious_stew");
+        let mut data = vi(1);
+        data.extend_from_slice(&vi(1)); // speed
+        data.extend_from_slice(&vi(160));
+        let st = (stew, 1, vec![(COMP_SUSPICIOUS_STEW_EFFECTS, data)]);
+        let eff = stack_food_effects(&st);
+        assert!(eff.iter().any(|&(_, id, _, _)| id == 1));
+        // fireworks component: flight duration + explosion count decode.
+        let rocket = item("firework_rocket");
+        let mut fw = vec![0u8]; // flight_duration byte
+        fw.extend_from_slice(&vi(0)); // no explosions
+        let st = (rocket, 1, vec![(COMP_FIREWORKS, fw)]);
+        assert!(matches!(
+            comp_get(&st.2, COMP_FIREWORKS).and_then(decode_fireworks),
+            Some((0, 0))
+        ));
     }
 }

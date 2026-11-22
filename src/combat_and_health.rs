@@ -88,6 +88,25 @@ struct Snowball {
     ttl: i32,
     egg: bool,
 }
+/// A firework rocket in flight (`charged_projectiles` and `firework_rocket`
+/// item uses). `explosions` is the count of `firework_explosion` stars, which
+/// vanilla turns into `5 + 2 * n` blast damage on detonation.
+pub(crate) struct Firework {
+    pub(crate) eid: i32,
+    pub(crate) owner: i32,
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    pub(crate) z: f64,
+    pub(crate) dx: f64,
+    pub(crate) dy: f64,
+    pub(crate) dz: f64,
+    pub(crate) ttl: i32,
+    pub(crate) explosions: i64,
+}
+static FIREWORKS: OnceLock<Mutex<Vec<Firework>>> = OnceLock::new();
+pub(crate) fn fireworks() -> &'static Mutex<Vec<Firework>> {
+    FIREWORKS.get_or_init(|| Mutex::new(Vec::new()))
+}
 static SNOWBALLS: OnceLock<Mutex<Vec<Snowball>>> = OnceLock::new();
 fn snowballs() -> &'static Mutex<Vec<Snowball>> {
     SNOWBALLS.get_or_init(|| Mutex::new(Vec::new()))
@@ -880,7 +899,19 @@ fn wind_charge_note_neighbors(dim: DimId, x: i32, y: i32, z: i32) {
         if !played {
             continue;
         }
-        let sound = format!("block.note_block.{}", instrument.state_name());
+        // Custom heads play the skull's `note_block_sound` component instead
+        // of an instrument name (vanilla NoteBlock + skull sound override).
+        let sound = if instrument.state_name() == "custom_head" {
+            live_block_entity_snapshot((dim, pos.0, pos.1 + 1, pos.2))
+                .and_then(|(_, tag)| {
+                    tag.get("note_block_sound")
+                        .and_then(|t| t.string())
+                        .and_then(|s| s.to_utf8().ok())
+                })
+                .unwrap_or_else(|| "block.note_block.imitate.custom_head".to_string())
+        } else {
+            format!("block.note_block.{}", instrument.state_name())
+        };
         let packet = sound_pkt_named(
             &sound,
             f64::from(pos.0) + 0.5,
@@ -1029,6 +1060,74 @@ fn combat2_state_tick() {
         .unwrap_or_else(|e| e.into_inner())
         .retain(|eid, _| live.contains(eid));
     wind_charge_projectile_step();
+    fireworks_step();
+}
+
+/// Move each in-flight firework and detonate it when its component-derived
+/// fuse expires. Vanilla firework explosions damage entities only — they do
+/// not break blocks.
+fn fireworks_step() {
+    let mut expired = Vec::new();
+    {
+        let mut fws = fireworks().lock().unwrap_or_else(|e| e.into_inner());
+        for f in fws.iter_mut() {
+            f.ttl -= 1;
+            f.x += f.dx;
+            f.y += f.dy;
+            f.z += f.dz;
+            if f.ttl <= 0 {
+                expired.push((f.eid, f.owner, f.x, f.y, f.z, f.explosions));
+            }
+        }
+        fws.retain(|f| !expired.iter().any(|(e, ..)| *e == f.eid));
+    }
+    for (eid, _owner, x, y, z, explosions) in expired {
+        firework_explode(x, y, z, explosions);
+        broadcast_seen_destroy(eid);
+    }
+}
+
+/// Vanilla `FireworkRocketEntity.explode`: `5 + 2 * explosions` blast damage
+/// inside a ~5-block radius, no block destruction.
+fn firework_explode(x: f64, y: f64, z: f64, explosions: i64) {
+    let packet = explosion_pkt_with_power(x, y, z, 1.0, &[]);
+    broadcast(-1, |_c| (0x20, packet.clone()));
+    if explosions <= 0 {
+        return;
+    }
+    let power = (5.0 + 2.0 * explosions as f64) as f32;
+    for cl in client_snapshot() {
+        let (px, py, pz, ..) = *cl.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let dd = ((px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2)).sqrt();
+        if dd < 5.0 && *cl.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
+            let raw = ((5.0 - dd) * (f64::from(power) / 5.0)) as f32;
+            let Some((accepted, _)) = damage_after_invulnerability(&cl, raw) else {
+                continue;
+            };
+            let mut h = cl.hp.lock().unwrap_or_else(|e| e.into_inner());
+            *h = (*h - hurt_absorb(&cl, dmg_after(&cl, accepted, 2))).max(0.0);
+            if *h <= 0.0 {
+                drop(h);
+                totem_check(&cl);
+                h = cl.hp.lock().unwrap_or_else(|e| e.into_inner());
+            }
+            let hh = *h;
+            drop(h);
+            damage_armor(&cl, raw);
+            if let Ok(mut w) = cl.sock.lock() {
+                let _ = send_packet(&mut w, 0x24, hurt_anim(cl.eid));
+                let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, &cl));
+            }
+        }
+    }
+    for mob in mobs().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let dd = ((mx - x).powi(2) + (my - y).powi(2) + (mz - z).powi(2)).sqrt();
+        if dd < 5.0 {
+            let mut hp = mob.hp.lock().unwrap_or_else(|e| e.into_inner());
+            *hp = (*hp - power * (5.0 - dd) as f32 / 5.0).max(0.0);
+        }
+    }
 }
 
 /// Per-mob age for `wind_charge`/`breeze_wind_charge` projectile entities.
@@ -2404,6 +2503,11 @@ fn arrow_tick() {
                 a.ttl -= 1;
                 if a.ttl <= 0 {
                     dead.push(eid);
+                    continue;
+                }
+                // `intangible_projectile` arrows (pillager shots) are never
+                // picked up: vanilla `AbstractArrow.tryPickup` refuses them.
+                if comp_get(&a.ret_comps, COMP_INTANGIBLE_PROJECTILE).is_some() {
                     continue;
                 }
                 // Vanilla: a stuck arrow is picked up on contact (survival only).
