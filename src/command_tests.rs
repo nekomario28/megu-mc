@@ -156,6 +156,7 @@ fn unknown_setblock_name_does_not_resolve_to_air() {
 
 #[test]
 fn summon_uses_the_mobs_initial_health() {
+    let _guard = crate::world_guard();
     if crate::test_support::isolated_world_test() {
         return;
     }
@@ -379,6 +380,7 @@ fn zip_datapack_bounds_claimed_sizes_and_inflated_output() {
 
 #[test]
 fn operators_persist_and_gate_player_commands() {
+    let _guard = crate::world_guard();
     if crate::test_support::isolated_world_test() {
         return;
     }
@@ -429,6 +431,7 @@ fn operators_persist_and_gate_player_commands() {
 
 #[test]
 fn datapack_reload_replaces_caches_and_replays_the_load_hook() {
+    let _guard = crate::world_guard();
     if crate::test_support::isolated_world_test() {
         return;
     }

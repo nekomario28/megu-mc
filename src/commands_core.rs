@@ -9247,6 +9247,7 @@ mod p5f_parity_tests {
 
     #[test]
     fn p5f_parity_setblock_keep_destroy_replace_and_snbt() {
+        let _guard = crate::world_guard();
         if crate::test_support::isolated_world_test() {
             return;
         }
@@ -9659,6 +9660,7 @@ mod p5f_parity_tests {
 
     #[test]
     fn p5f_parity_loot_insert_replace_block_and_mine() {
+        let _guard = crate::world_guard();
         if crate::test_support::isolated_world_test() {
             return;
         }
@@ -10256,6 +10258,7 @@ mod issue225_parity_tests {
     // into their own bands, not the same slot.
     #[test]
     fn item_replace_writes_hotbar_and_inventory_to_different_slots() {
+        let _guard = crate::world_guard();
         let ctx = c225_ctx(None);
         let (client, _rx) = c225_client(7201, "c225-item");
         clients()
@@ -10295,6 +10298,7 @@ mod issue225_parity_tests {
     // and a trailing SNBT merges onto the live mob.
     #[test]
     fn summon_defaults_to_executor_position_and_applies_nbt() {
+        let _guard = crate::world_guard();
         let ctx = c225_ctx(None);
         let before = mobs().lock().unwrap_or_else(|e| e.into_inner()).len();
         assert_eq!(
@@ -10398,6 +10402,7 @@ mod issue225_parity_tests {
     // on the wire.
     #[test]
     fn title_clear_reset_and_json_component() {
+        let _guard = crate::world_guard();
         let ctx = c225_ctx(None);
         let (client, mut rx) = c225_client(7203, "c225-title");
         clients()
@@ -10468,6 +10473,7 @@ mod issue225_parity_tests {
     // players, and applies sustained effects to non-player mob targets.
     #[test]
     fn effect_infinite_hidden_player_and_mob_targets() {
+        let _guard = crate::world_guard();
         let ctx = c225_ctx(None);
         let (client, mut rx) = c225_client(7204, "c225-eff");
         clients()
@@ -10565,6 +10571,7 @@ mod issue225_parity_tests {
     // store alongside remove and `modifier value get`.
     #[test]
     fn attribute_modifier_accepts_1211_operation_names() {
+        let _guard = crate::world_guard();
         let ctx = c225_ctx(None);
         let (client, _rx) = c225_client(7205, "c225-attr");
         clients()
@@ -10632,6 +10639,7 @@ mod issue225_parity_tests {
     // points, and the level↔total formulas match the vanilla ranges.
     #[test]
     fn experience_query_reports_level_and_rounded_progress() {
+        let _guard = crate::world_guard();
         let ctx = c225_ctx(None);
         let (client, _rx) = c225_client(7206, "c225-xp");
         clients()
@@ -10685,6 +10693,7 @@ mod issue225_parity_tests {
     // flags, `extra`/`with` become component lists, `translate` stays a string.
     #[test]
     fn tellraw_serializes_structured_json_components() {
+        let _guard = crate::world_guard();
         let ctx = c225_ctx(None);
         let (client, mut rx) = c225_client(7207, "c225-tell");
         clients()
@@ -10760,6 +10769,7 @@ mod issue225_parity_tests {
     // of 0 counts without removing.
     #[test]
     fn clear_matches_component_predicates_and_dry_counts() {
+        let _guard = crate::world_guard();
         let ctx = c225_ctx(None);
         let (client, _rx) = c225_client(7208, "c225-clear");
         clients()
@@ -10825,6 +10835,7 @@ mod issue225_parity_tests {
     // fails closed on malformed positions, and requires single-entity sources.
     #[test]
     fn damage_accepts_at_and_by_source_clauses() {
+        let _guard = crate::world_guard();
         let ctx = c225_ctx(None);
         let (client, _rx) = c225_client(7209, "c225-dmg");
         clients()
@@ -10862,6 +10873,7 @@ mod issue225_parity_tests {
     // the flags byte; `*` leaves the source open.
     #[test]
     fn stopsound_encodes_source_and_sound_filters() {
+        let _guard = crate::world_guard();
         let ctx = c225_ctx(None);
         let (client, mut rx) = c225_client(7210, "c225-stop");
         clients()
@@ -10909,6 +10921,7 @@ mod issue225_parity_tests {
     // force-range viewers while `normal` stays inside the 32-block bubble.
     #[test]
     fn particle_full_form_reaches_force_viewers() {
+        let _guard = crate::world_guard();
         let ctx = c225_ctx(None);
         let (viewer, mut rx) = c225_client(7211, "c225-pv");
         *viewer.pos.lock().unwrap_or_else(|e| e.into_inner()) = (40.5, 16.0, 0.5, 0.0, 0.0, true);
@@ -10937,6 +10950,7 @@ mod issue225_parity_tests {
     // #225.10 — `/playsound` explicit volume/pitch/minVolume land on the wire.
     #[test]
     fn playsound_writes_volume_pitch_min_volume() {
+        let _guard = crate::world_guard();
         let ctx = c225_ctx(None);
         let (client, mut rx) = c225_client(7212, "c225-snd");
         *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 16.0, 0.5, 0.0, 0.0, true);
@@ -10971,6 +10985,7 @@ mod issue225_parity_tests {
     // and boss entities.
     #[test]
     fn difficulty_peaceful_keeps_persistent_and_boss_mobs() {
+        let _guard = crate::world_guard();
         let ctx = c225_ctx(None);
         // Two hostiles: one persistent, one not; plus the Wither boss.
         assert_eq!(

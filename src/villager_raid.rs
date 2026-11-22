@@ -5586,6 +5586,7 @@ mod villager_raid_tests {
     /// real site trades, so the `farmer_merchant` fallback never applies.
     #[test]
     fn live_poi_assigns_non_farmer_villager_profession_and_trades() {
+        let _guard = crate::world_guard();
         let lectern = (50_000, 70, 50_000);
         let old = block_at(lectern.0, lectern.1, lectern.2);
         set_block(
@@ -5698,6 +5699,7 @@ mod villager_raid_tests {
     /// killing them advances the raid to its next wave.
     #[test]
     fn live_raid_starts_on_bad_omen_and_spawns_and_advances_waves() {
+        let _guard = crate::world_guard();
         let mut fixture = LiveRaidFixture::new();
         let _ = &mut fixture;
         let bad_omen = live_effect_id("bad_omen").expect("bad_omen effect id");

@@ -267,6 +267,7 @@ fn container_pickup_respects_component_limits_on_empty_slots_and_swaps() {
 /// block cannot hold and the item would be unreachable.
 #[test]
 fn container_loot_roll_stays_inside_the_block_its_table_came_from() {
+    let _guard = crate::world_guard();
     use crate::generation_payload::{ContainerKind, GenerationPayload};
     let redstone = name_to_item("minecraft:redstone").unwrap();
     let table = "spinetest:one_item";
@@ -1169,6 +1170,7 @@ mod block_entity_helpers {
 
     #[test]
     fn vault_charges_a_matching_key_once_and_resumes_reward_ejection_after_save() {
+        let _guard = crate::world_guard();
         let player = 0x0000_0001_0000_0002_0000_0003_0000_0004_u128.to_be_bytes();
         let previous = 0x0000_0004_0000_0003_0000_0002_0000_0001_u128.to_be_bytes();
         let nearby = 5_u128.to_be_bytes();

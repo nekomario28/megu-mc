@@ -336,6 +336,7 @@ mod live_server_perf_bridge_tests {
 
     #[test]
     fn live_perf_bridge_chunk_cache_shares_and_invalidates_epochs() {
+        let _guard = crate::world_guard();
         let (dim, cx, cz) = (300, 910, 920);
         let first = live_chunk_packet_cache_get_or_encode(dim, cx, cz, 1, 0, || vec![1, 2, 3]);
         let shared = live_chunk_packet_cache_get_or_encode(dim, cx, cz, 1, 0, || {
@@ -3394,6 +3395,7 @@ mod wire_mods_tests {
 
     #[test]
     fn live_mod_bridge_auto_registers_native_bundles_on_boot() {
+        let _guard = crate::world_guard();
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = lmb_temp_dir("bundle-boot");
         let adapted = dir.join("adapted");
@@ -3434,6 +3436,7 @@ mod wire_mods_tests {
 
     #[test]
     fn live_mod_bridge_auto_adapts_jars_on_boot() {
+        let _guard = crate::world_guard();
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = lmb_temp_dir("jar-boot");
         std::fs::write(dir.join("sodium-0.6.jar"), lmb_test_jar(&[("x.bin", b"x")])).unwrap();
@@ -3744,6 +3747,7 @@ mod wire_mods_tests {
 
     #[test]
     fn live_mod_bridge_dispatch_hook_answers_lifted_bindings_after_boot() {
+        let _guard = crate::world_guard();
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
         let dir = lmb_temp_dir("dispatch");
@@ -3847,6 +3851,7 @@ mod wire_mods_tests {
 
     #[test]
     fn live_mod_bridge_season_sync_is_ssn1_and_suppressed_per_player() {
+        let _guard = crate::world_guard();
         use mod_adapter_core::season_primitives::{decode_ssn1, SSN1_FRAME_LEN, SSN1_MAGIC};
 
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());

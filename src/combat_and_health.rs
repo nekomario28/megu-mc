@@ -5682,6 +5682,7 @@ mod vanilla_combat2_tests {
 
     #[test]
     fn vanilla_combat2_shield_axe_disable_100_ticks() {
+        let _guard = crate::world_guard();
         // Disabling mobs (Vindicator/Piglin Brute etypes) always apply the full
         // 100-tick cooldown — no roll.
         assert!(mob_can_disable_shield(79));

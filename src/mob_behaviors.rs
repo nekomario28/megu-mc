@@ -4335,6 +4335,7 @@ mod mob_behaviors_tests {
 
     #[test]
     fn dispatch_dragon_animation_awards_the_portal_only_once() {
+        let _guard = crate::world_guard();
         let mut state = MobBehaviorState::for_etype(31).unwrap();
         let mut ctx = dispatch_ctx();
         ctx.dim = DimId::End;
@@ -4363,6 +4364,7 @@ mod mob_behaviors_tests {
 
     #[test]
     fn dispatch_witch_finishes_drinking_before_applying_a_potion() {
+        let _guard = crate::world_guard();
         let mut state = MobBehaviorState::for_etype(118).unwrap();
         let mut ctx = dispatch_ctx();
         ctx.in_water = true;
@@ -5494,6 +5496,7 @@ mod mob_behaviors_tests {
 
     #[test]
     fn witch_dispatch_heals_four_at_half_health_and_only_while_still_hurt() {
+        let _guard = crate::world_guard();
         use MobBehaviorEffect::*;
         let world = || MobBehaviorWorldTick::Witch {
             eid: 42,

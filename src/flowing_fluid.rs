@@ -854,6 +854,7 @@ mod tests {
     /// the i32 edge wraps to the other edge instead of panicking.
     #[test]
     fn bughunt_root_neighbour_math_wraps_at_i32_edges() {
+        let _guard = crate::world_guard();
         struct OpenWorld(HashMap<Pos, Cell>);
         impl Reader for OpenWorld {
             type Error = Pos;

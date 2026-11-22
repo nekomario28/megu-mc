@@ -4029,6 +4029,7 @@ mod anvil_io_tests {
 
     #[test]
     fn p4a_anvil_world_dir_from_env_arms_live_storage_mode() {
+        let _guard = crate::world_guard();
         std::env::remove_var("MC_SPINE_ANVIL_WORLD_DIR");
         assert_eq!(anvil_world_dir_from_env(), None);
         assert_eq!(anvil_storage_mode(), AnvilStorageMode::Disabled);

@@ -761,6 +761,7 @@ mod mob_despawn_tests {
 
     #[test]
     fn live_discard_ignores_spectators_and_frees_the_cap_and_tracker() {
+        let _guard = crate::world_guard();
         if crate::test_support::isolated_world_test() {
             return;
         }
@@ -814,6 +815,7 @@ mod mob_despawn_tests {
 
     #[test]
     fn live_random_despawn_waits_for_601_ai_steps() {
+        let _guard = crate::world_guard();
         if crate::test_support::isolated_world_test() {
             return;
         }
@@ -849,6 +851,7 @@ mod mob_despawn_tests {
 
     #[test]
     fn bughunt_root_despawn_custom_dimension_hostile_keeps_ticking() {
+        let _guard = crate::world_guard();
         if crate::test_support::isolated_world_test() {
             return;
         }
@@ -871,6 +874,7 @@ mod mob_despawn_tests {
 
     #[test]
     fn live_peaceful_discard_runs_without_players() {
+        let _guard = crate::world_guard();
         if crate::test_support::isolated_world_test() {
             return;
         }

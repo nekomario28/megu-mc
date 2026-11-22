@@ -1839,6 +1839,7 @@ mod entity_fluid_tests {
 
     #[test]
     fn xpoll_entity_scratch_fluid_sweep_matches_scalar_sweeps_with_zero_growth() {
+        let _guard = crate::world_guard();
         crate::test_support::require_vanilla_data();
         // Synthetic pool: a water source ringed by flowing levels, a lava
         // pocket behind stone, a solid floor. State ids are the synthetic
