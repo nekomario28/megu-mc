@@ -7,6 +7,7 @@ pub mod atlas;
 pub mod ber_instancing;
 pub mod builtin_shadow_wgsl;
 mod cache;
+pub mod classic_ores;
 mod column;
 mod cull;
 mod culler;
