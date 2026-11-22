@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use crate::cull::box_in_frustum;
 use crate::packed::{depth_key, is_translucent, pack_quad, PackedVertex};
+use crate::upload_budget::ChunkUploadBudget;
 use crate::{
     edge_corner_index, mesh_section, Block, CompressedSection, Direction, DirectionBuckets,
     Light, MissingNeighbor, Quad, Sample, Section, SectionBlocks, SectionView, EDGE,
@@ -326,6 +327,8 @@ pub struct MeshCache {
     sort_origin: Option<[f32; 3]>,
     /// Camera displacement in blocks that forces the next sort.
     resort_threshold: f32,
+    /// Admission allowance for sections passed to the render upload path.
+    upload_budget: ChunkUploadBudget,
 }
 
 impl Default for MeshCache {
@@ -340,6 +343,7 @@ impl Default for MeshCache {
             missing: MissingNeighbor::default(),
             sort_origin: None,
             resort_threshold: DEFAULT_RESORT_THRESHOLD,
+            upload_budget: ChunkUploadBudget::default(),
         }
     }
 }
@@ -489,6 +493,17 @@ impl MeshCache {
         self.rebuilt.drain(..).collect()
     }
 
+    /// Feed the windowed frame-time P95 measured by the render loop. This
+    /// changes the upload count admitted on subsequent ordered rebuilds.
+    pub fn report_frame_time_p95_us(&mut self, p95_us: f64) {
+        self.upload_budget.adapt(p95_us);
+    }
+
+    /// Current adaptive chunk-mesh upload allowance.
+    pub fn upload_budget(&self) -> &ChunkUploadBudget {
+        &self.upload_budget
+    }
+
     /// Rebuilds at most `limit` loaded sections in coordinate order and
     /// returns the rebuilt coordinates.
     pub fn rebuild_dirty(&mut self, limit: usize) -> Vec<SectionCoord> {
@@ -507,28 +522,58 @@ impl MeshCache {
     }
 
     /// Rebuilds at most `limit` dirty sections, in-frustum and near-camera
-    /// first. `camera` is a world block position and `planes` the frustum
-    /// planes in `box_in_frustum` form. Sections outside the frustum still
-    /// rebuild, but only after every closer in-frustum section.
+    /// first, subject to the per-call mesh upload budget. Each invocation
+    /// opens a new frame's upload allowance. Rejected sections remain dirty
+    /// for the next invocation and retain their priority.
+    /// `camera` is a world block position and `planes` the frustum planes
+    /// in `box_in_frustum` form. Sections outside the frustum still rebuild,
+    /// but only after every closer in-frustum section.
     pub fn rebuild_dirty_ordered(
         &mut self,
         limit: usize,
         camera: [f32; 3],
         planes: &[[f32; 4]],
     ) -> Vec<SectionCoord> {
+        self.upload_budget.begin_frame();
+        let normal_byte_cap = self.upload_budget.max_upload_bytes_per_frame;
+        let normal_work_cap = self.upload_budget.max_upload_work_us_per_frame;
         let mut order: Vec<SectionCoord> = self.dirty.iter().copied().collect();
         order.sort_by(|a, b| {
             Self::queue_key(*a, camera, planes).cmp(&Self::queue_key(*b, camera, planes))
         });
         let mut rebuilt = Vec::new();
-        for coord in order.into_iter().take(limit) {
-            self.dirty.remove(&coord);
+        for coord in order {
+            if rebuilt.len() >= limit || self.upload_budget.remaining_uploads() == 0 {
+                break;
+            }
             let mesh = self.build(coord);
+            // RenderRegion uploads four packed vertices and six u32 indices
+            // for each quad. Budget the actual payload rather than the in-RAM
+            // size of a Quad, with a conservative CPU transfer estimate.
+            let bytes_per_quad = 4 * std::mem::size_of::<crate::packed::PackedVertex>()
+                + 6 * std::mem::size_of::<u32>();
+            let bytes = mesh.len().saturating_mul(bytes_per_quad);
+            let cost_us = u64::try_from(bytes.div_ceil(2_048)).unwrap_or(u64::MAX);
+            // A single oversized section must still make forward progress.
+            // Admit it as the sole upload when its payload exceeds the usual
+            // cap, charging the full payload to this frame.
+            if self.upload_budget.used_uploads() == 0 {
+                self.upload_budget.max_upload_bytes_per_frame =
+                    self.upload_budget.max_upload_bytes_per_frame.max(bytes);
+                self.upload_budget.max_upload_work_us_per_frame =
+                    self.upload_budget.max_upload_work_us_per_frame.max(cost_us);
+            }
+            if !self.upload_budget.try_schedule(bytes, cost_us) {
+                continue;
+            }
+            self.dirty.remove(&coord);
             self.meshes.insert(coord, mesh);
             self.released_meta.remove(&coord);
             self.note_rebuilt(coord);
             rebuilt.push(coord);
         }
+        self.upload_budget.max_upload_bytes_per_frame = normal_byte_cap;
+        self.upload_budget.max_upload_work_us_per_frame = normal_work_cap;
         rebuilt
     }
 
@@ -909,6 +954,35 @@ mod tests {
         let out = cache.rebuild_dirty_ordered(2, [8.0, 8.0, 8.0], &planes);
         assert_eq!(out, [near, mid]);
         assert_eq!(cache.pending(), 2);
+    }
+
+    #[test]
+    fn ordered_rebuild_retries_deferred_uploads_and_adapts_to_frame_p95() {
+        let mut cache = MeshCache::default();
+        for x in 0..17 {
+            cache.insert(
+                SectionCoord(x * 2, 0, 0),
+                Section::filled(Block::AIR, Light::new(0, 15)),
+            );
+        }
+
+        let rebuilt = cache.rebuild_dirty_ordered(17, [0.0; 3], &[]);
+        assert_eq!(rebuilt.len(), 8);
+        assert_eq!(cache.upload_budget().used_uploads(), 8);
+        assert_eq!(cache.pending(), 9);
+        assert!(rebuilt.iter().all(|&coord| cache.mesh(coord).is_some()));
+
+        cache.report_frame_time_p95_us(30_000.0);
+        assert_eq!(cache.upload_budget().uploads_per_frame(), 4);
+        let rebuilt = cache.rebuild_dirty_ordered(17, [0.0; 3], &[]);
+        assert_eq!(rebuilt.len(), 4);
+        assert_eq!(cache.pending(), 5);
+
+        cache.report_frame_time_p95_us(5_000.0);
+        assert_eq!(cache.upload_budget().uploads_per_frame(), 5);
+        let rebuilt = cache.rebuild_dirty_ordered(17, [0.0; 3], &[]);
+        assert_eq!(rebuilt.len(), 5);
+        assert_eq!(cache.pending(), 0);
     }
 
     #[test]

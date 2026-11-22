@@ -68,7 +68,7 @@ pub struct RegionWork {
 /// [`WAVE_COUNT`] waves by checkerboard color. Regions land in each wave in
 /// `(rx, rz)` order and each region's chunks are sorted — the partition is a
 /// pure function of the input set, independent of input order or duplicates.
-fn partition_waves(chunks: &[ChunkCoord]) -> Vec<Vec<RegionWork>> {
+pub(crate) fn partition_waves(chunks: &[ChunkCoord]) -> Vec<Vec<RegionWork>> {
     let mut regions: BTreeMap<RegionCoord, Vec<ChunkCoord>> = BTreeMap::new();
     for &chunk in chunks {
         regions

@@ -346,7 +346,9 @@ impl PregenJob {
     /// One server tick of pregen: take at most `max_chunks` spiral chunks,
     /// materialize their (empty) overlays in `dimension` so the chunk set is
     /// resident and visible to the unloader, run `generate(cx, cz)` for each,
-    /// and mark the batch done. Returns how many chunks were processed.
+    /// and mark the batch done. Process the admitted chunks in deterministic
+    /// checkerboard waves, grouped by their 8x8-chunk regions.
+    /// Returns how many chunks were processed.
     pub fn drive_tick(
         &mut self,
         ctx: &ServerContext,
@@ -363,13 +365,18 @@ impl PregenJob {
             .iter()
             .map(|&(cx, cz)| ChunkCoord::new(cx, cz))
             .collect();
+        let waves = crate::region_tick::partition_waves(&coords);
         dim.with_chunks_write(&coords, |set| {
             for &coord in &coords {
                 let _ = set.get_mut(coord);
             }
         });
-        for &(cx, cz) in &batch {
-            generate(cx, cz);
+        for wave in waves {
+            for region in wave {
+                for coord in region.chunks {
+                    generate(coord.cx, coord.cz);
+                }
+            }
         }
         let n = batch.len();
         self.mark_done(n);
@@ -665,6 +672,53 @@ impl ChunkTicketLruUnloader {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn drive_tick_follows_region_waves_without_losing_spiral_chunks() {
+        let ctx = ServerContext::new();
+        let mut job = PregenJob::new(-7, -7, 9, PregenShape::Square);
+        let mut reference = PregenJob::new(-7, -7, 9, PregenShape::Square);
+        let mut visited = Vec::new();
+
+        loop {
+            let expected_batch = reference.take_batch(19);
+            if expected_batch.is_empty() {
+                break;
+            }
+            let coords: Vec<_> = expected_batch
+                .iter()
+                .map(|&(cx, cz)| ChunkCoord::new(cx, cz))
+                .collect();
+            let expected_order: Vec<_> = crate::region_tick::partition_waves(&coords)
+                .into_iter()
+                .flatten()
+                .flat_map(|region| region.chunks)
+                .map(|coord| (coord.cx, coord.cz))
+                .collect();
+            let mut actual_order = Vec::new();
+            assert_eq!(
+                job.drive_tick(&ctx, "minecraft:overworld", 19, |cx, cz| {
+                    actual_order.push((cx, cz));
+                }),
+                expected_batch.len()
+            );
+            assert_eq!(actual_order, expected_order);
+            visited.extend(actual_order);
+        }
+
+        assert_eq!(visited.len(), 19 * 19);
+        assert_eq!(
+            visited.iter().copied().collect::<HashSet<_>>().len(),
+            19 * 19
+        );
+        assert_eq!(
+            ctx.dimension("minecraft:overworld")
+                .unwrap()
+                .overlay_count(),
+            19 * 19
+        );
+        assert_eq!(job.progress().state, PregenState::Completed);
+    }
 
     #[test]
     fn square_spiral_is_outward_and_covers_each_chunk_once() {

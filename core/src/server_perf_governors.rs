@@ -26,14 +26,16 @@
 //!   [`Arc`]-shared immutable slices to every viewer: O(1) fan-out with zero
 //!   re-serialization, zero re-compression, zero heap copy.
 //!
-//! Everything here is pure `std`, allocation-bounded, clock-free
-//! (`debt_ratchet` contract), panic-free on hostile input, and fully
-//! deterministic: eviction and striding order are driven by monotonic
-//! sequence numbers and integer arithmetic, never by wall-clock time or
-//! thread scheduling.
+//! Eviction and striding order are driven by monotonic sequence numbers and
+//! integer arithmetic. Chunk packet cache retention measures its own work
+//! with a monotonic clock for fault isolation; packet contents and ordering
+//! stay independent of that timing.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::Instant;
+
+use crate::fault_isolation::{CircuitState, ExecutionPermit, FaultIsolationRouter, SubsystemScope};
 
 // ===========================================================================
 // 1. VelocityViewGovernor — anisotropic velocity-adaptive view-cone
@@ -544,6 +546,11 @@ pub struct CompressedChunkPacketCache {
     hits: u64,
     misses: u64,
     bytes_saved_by_sharing: u64,
+    /// Fault protection for the optional retention path. Packet encoding and
+    /// delivery always run, even when retention is isolated.
+    retention_faults: FaultIsolationRouter,
+    retention_scope: SubsystemScope,
+    retention_operation: u64,
 }
 
 impl CompressedChunkPacketCache {
@@ -557,7 +564,17 @@ impl CompressedChunkPacketCache {
             hits: 0,
             misses: 0,
             bytes_saved_by_sharing: 0,
+            retention_faults: FaultIsolationRouter::default(),
+            retention_scope: SubsystemScope::BuiltinSubsystem(
+                "chunk_packet_cache_retention".into(),
+            ),
+            retention_operation: 0,
         }
+    }
+
+    /// Circuit state of optional packet retention, for diagnostics.
+    pub fn retention_circuit_state(&self) -> CircuitState {
+        self.retention_faults.circuit_state(&self.retention_scope)
     }
 
     /// Configured capacity.
@@ -648,6 +665,18 @@ impl CompressedChunkPacketCache {
         if self.max_entries == 0 {
             return packet;
         }
+        // Count actual retention attempts as monotonic fault-router ticks.
+        // An isolated cache still returns the freshly encoded packet.
+        self.retention_operation = self.retention_operation.saturating_add(1);
+        let tick = self.retention_operation;
+        if matches!(
+            self.retention_faults
+                .should_execute(&self.retention_scope, tick),
+            ExecutionPermit::SkipThrottled | ExecutionPermit::SkipIsolated { .. }
+        ) {
+            return packet;
+        }
+        let started = Instant::now();
         self.next_seq += 1;
         self.lru.insert(self.next_seq, key);
         self.entries.insert(
@@ -663,6 +692,9 @@ impl CompressedChunkPacketCache {
             };
             self.entries.remove(&victim);
         }
+        let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        self.retention_faults
+            .record_success(&self.retention_scope, tick, elapsed_us);
         packet
     }
 
@@ -683,5 +715,42 @@ impl CompressedChunkPacketCache {
             }
         }
         removed
+    }
+}
+
+#[cfg(test)]
+mod retention_fault_integration_tests {
+    use super::*;
+
+    #[test]
+    fn isolation_skips_optional_retention_and_clean_probe_restores_it() {
+        let mut cache = CompressedChunkPacketCache::new(4);
+        let scope = cache.retention_scope.clone();
+        cache.retention_faults.manual_quarantine(&scope, 0);
+        assert!(matches!(
+            cache.retention_circuit_state(),
+            CircuitState::OpenIsolated { .. }
+        ));
+
+        let key = ChunkPacketCacheKey {
+            dim: 0,
+            cx: 0,
+            cz: 0,
+            dirty_epoch: 1,
+            antixray_profile: 0,
+        };
+        let first = cache.get_or_encode(key, || vec![1, 2, 3]);
+        assert_eq!(&*first, &[1, 2, 3]);
+        assert_eq!(cache.len(), 0);
+
+        cache.retention_operation = 200;
+        let second = cache.get_or_encode(key, || vec![4, 5, 6]);
+        assert_eq!(&*second, &[4, 5, 6]);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.retention_circuit_state(), CircuitState::Closed);
+        assert_eq!(
+            &*cache.get_or_encode(key, || panic!("cache hit must not encode")),
+            &[4, 5, 6]
+        );
     }
 }
