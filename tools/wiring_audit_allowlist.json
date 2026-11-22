@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "symbol": "BUILTIN_SHADOW_SHADERS",
+      "file": "client-port/src/builtin_shadow_wgsl.rs",
+      "reason": "owned by lane AV-SHADOW-1 / AV-AUDIO-1 / AV-VFX-1, 2026-11-22",
+      "date": "2026-11-22"
+    },
+    {
+      "symbol": "MEGU_SHADOW_DEPTH_WGSL",
+      "file": "client-port/src/builtin_shadow_wgsl.rs",
+      "reason": "owned by lane AV-SHADOW-1 / AV-AUDIO-1 / AV-VFX-1, 2026-11-22",
+      "date": "2026-11-22"
+    },
+    {
+      "symbol": "MEGU_TERRAIN_LIT_WGSL",
+      "file": "client-port/src/builtin_shadow_wgsl.rs",
+      "reason": "owned by lane AV-SHADOW-1 / AV-AUDIO-1 / AV-VFX-1, 2026-11-22",
+      "date": "2026-11-22"
+    },
+    {
+      "symbol": "MEGU_SKY_ATMOSPHERE_WGSL",
+      "file": "client-port/src/builtin_shadow_wgsl.rs",
+      "reason": "owned by lane AV-SHADOW-1 / AV-AUDIO-1 / AV-VFX-1, 2026-11-22",
+      "date": "2026-11-22"
+    },
+    {
+      "symbol": "MEGU_WATER_SURFACE_WGSL",
+      "file": "client-port/src/builtin_shadow_wgsl.rs",
+      "reason": "owned by lane AV-SHADOW-1 / AV-AUDIO-1 / AV-VFX-1, 2026-11-22",
+      "date": "2026-11-22"
+    },
+    {
+      "symbol": "MEGU_SPATIAL_SHARPEN_WGSL",
+      "file": "client-port/src/builtin_shadow_wgsl.rs",
+      "reason": "owned by lane AV-SHADOW-1 / AV-AUDIO-1 / AV-VFX-1, 2026-11-22",
+      "date": "2026-11-22"
+    },
+    {
+      "symbol": "build_shadow_uniforms",
+      "file": "client-port/src/builtin_shadow_wgsl.rs",
+      "reason": "owned by lane AV-SHADOW-1 / AV-AUDIO-1 / AV-VFX-1, 2026-11-22",
+      "date": "2026-11-22"
+    },
+    {
+      "symbol": "build_shadow_uniforms_celestial",
+      "file": "client-port/src/builtin_shadow_wgsl.rs",
+      "reason": "owned by lane AV-SHADOW-1 / AV-AUDIO-1 / AV-VFX-1, 2026-11-22",
+      "date": "2026-11-22"
+    },
+    {
+      "symbol": "AudioLimiter",
+      "file": "client-app/src/audio_qol.rs",
+      "reason": "owned by lane AV-SHADOW-1 / AV-AUDIO-1 / AV-VFX-1, 2026-11-22",
+      "date": "2026-11-22"
+    },
+    {
+      "symbol": "limit_mix_buffer",
+      "file": "client-app/src/audio_qol.rs",
+      "reason": "owned by lane AV-SHADOW-1 / AV-AUDIO-1 / AV-VFX-1, 2026-11-22",
+      "date": "2026-11-22"
+    },
+    {
+      "symbol": "subtitle_cue",
+      "file": "client-app/src/spatial_audio.rs",
+      "reason": "owned by lane AV-SHADOW-1 / AV-AUDIO-1 / AV-VFX-1, 2026-11-22",
+      "date": "2026-11-22"
+    },
+    {
+      "symbol": "SpatialSubtitleCue",
+      "file": "client-app/src/spatial_audio.rs",
+      "reason": "owned by lane AV-SHADOW-1 / AV-AUDIO-1 / AV-VFX-1, 2026-11-22",
+      "date": "2026-11-22"
+    },
+    {
+      "symbol": "latest_audio_hint",
+      "file": "client-gpu/src/live_session.rs",
+      "reason": "owned by lane AV-SHADOW-1 / AV-AUDIO-1 / AV-VFX-1, 2026-11-22",
+      "date": "2026-11-22"
+    },
+    {
+      "symbol": "EnvironmentAudioHint",
+      "file": "client-port/src/tactile_effects.rs",
+      "reason": "owned by lane AV-SHADOW-1 / AV-AUDIO-1 / AV-VFX-1, 2026-11-22",
+      "date": "2026-11-22"
+    }
+  ]
+}

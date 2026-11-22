@@ -335,6 +335,228 @@ def audit(root):
     }
 
 
+def is_av_test_path(rel):
+    parts = Path(rel).parts
+    if "tests" in parts[:-1]:
+        return True
+    stem = Path(rel).stem
+    return stem == "tests" or stem.endswith("_test") or stem.endswith("_tests")
+
+
+def av_source_files(root):
+    for path in sorted(root.rglob("*.rs")):
+        rel = path.relative_to(root).as_posix()
+        parts = Path(rel).parts
+        if any(part.startswith(".") or part == "target" for part in parts[:-1]):
+            continue
+        yield rel
+
+
+def strip_imports(code):
+    """Remove `use` declarations so imports/reexports are not call sites."""
+    return re.sub(r"\b(?:pub\s*(?:\([^)]*\)\s*)?)?use\s+[^;]*;", " ", code)
+
+
+def _load_av_json(path, label):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"missing {label}: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON in {label} {path}: {exc}") from exc
+
+
+def _normalize_av_features(doc):
+    entries = doc.get("features") if isinstance(doc, dict) else None
+    if not isinstance(entries, list):
+        raise ValueError("AV features file must contain a 'features' list")
+    features = []
+    errors = []
+    for idx, raw in enumerate(entries):
+        if not isinstance(raw, dict):
+            errors.append(f"AV feature #{idx} is not an object")
+            continue
+        symbol = raw.get("symbol")
+        file = raw.get("file")
+        consumers = raw.get("consumers")
+        via = raw.get("via", [])
+        if not symbol or not file or not isinstance(consumers, list) or not consumers:
+            errors.append(f"AV feature #{idx} missing symbol/file/consumers")
+            continue
+        if not isinstance(via, list):
+            errors.append(f"AV feature {symbol} has non-list 'via'")
+            continue
+        features.append({
+            "symbol": str(symbol),
+            "file": str(file),
+            "consumers": [str(item) for item in consumers],
+            "via": [str(item) for item in via],
+        })
+    return features, errors
+
+
+def _normalize_av_allowlist(doc):
+    entries = doc.get("entries", []) if isinstance(doc, dict) else []
+    if not isinstance(entries, list):
+        raise ValueError("AV allowlist must contain an 'entries' list")
+    normalized = []
+    errors = []
+    seen = set()
+    for idx, raw in enumerate(entries):
+        if not isinstance(raw, dict):
+            errors.append(f"AV allowlist entry #{idx} is not an object")
+            continue
+        symbol = raw.get("symbol")
+        file = raw.get("file")
+        reason = raw.get("reason")
+        date = raw.get("date")
+        if not symbol or not file or not reason or not date:
+            errors.append(f"AV allowlist entry #{idx} missing symbol/file/reason/date")
+            continue
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(date)):
+            errors.append(f"AV allowlist entry {symbol} ({file}) has non-ISO date {date!r}")
+            continue
+        key = (str(file), str(symbol))
+        if key in seen:
+            errors.append(f"duplicate AV allowlist entry {symbol} ({file})")
+            continue
+        seen.add(key)
+        normalized.append({
+            "symbol": str(symbol), "file": str(file),
+            "reason": str(reason), "date": str(date),
+        })
+    return normalized, errors
+
+
+def audit_av(root, features_path=None, allowlist_path=None):
+    """Audit declared AV feature entry symbols for live consumer reachability."""
+    root = Path(root)
+    features_path = Path(features_path) if features_path else root / "tools/wiring_audit_features.json"
+    allowlist_path = (Path(allowlist_path) if allowlist_path
+                      else root / "tools/wiring_audit_allowlist.json")
+    features_doc = _load_av_json(features_path, "AV features file")
+    allow_doc = (_load_av_json(allowlist_path, "AV allowlist")
+                 if allowlist_path.is_file() else {"entries": []})
+    features, errors = _normalize_av_features(features_doc)
+    allow_entries, allow_errors = _normalize_av_allowlist(allow_doc)
+    errors.extend(allow_errors)
+    seen_features = set()
+    for feature in features:
+        key = (feature["file"], feature["symbol"])
+        if key in seen_features:
+            errors.append(f"duplicate AV feature {feature['symbol']} ({feature['file']})")
+        seen_features.add(key)
+
+    interesting = {f["symbol"] for f in features}
+    for feature in features:
+        interesting.update(feature["via"])
+
+    all_files = list(av_source_files(root))
+    raw_sources = {}
+    test_only = set()
+    for rel in all_files:
+        text = (root / rel).read_text(encoding="utf-8")
+        raw_sources[rel] = text
+        for match in re.finditer(
+                r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*mod\s+(\w+)\s*;", text):
+            test_only.add((Path(rel).parent / f"{match.group(1)}.rs").as_posix())
+
+    def is_test(rel):
+        return is_av_test_path(rel) or rel in test_only
+
+    refs = defaultdict(set)
+    for rel in all_files:
+        if is_test(rel):
+            continue
+        code = strip_imports(production_code(raw_sources[rel]))
+        hits = set(IDENT.findall(code)) & interesting
+        for symbol in hits:
+            refs[symbol].add(rel)
+
+    allow_by_key = {(e["file"], e["symbol"]): e for e in allow_entries}
+    feature_by_key = {(f["file"], f["symbol"]): f for f in features}
+    for feature in features:
+        symbol = feature["symbol"]
+        file = feature["file"]
+        consumers = set(feature["consumers"])
+        direct = refs.get(symbol, set())
+        via_refs = set()
+        for via in feature["via"]:
+            via_refs.update(refs.get(via, set()))
+        effective = direct | via_refs
+        feature["refs"] = sorted(direct - {file})
+        feature["consumer_refs"] = sorted(
+            path for path in effective if path in consumers and path != file)
+        feature["status"] = "wired" if feature["consumer_refs"] else "unreachable"
+        feature["allowlisted"] = (file, symbol) in allow_by_key
+        if not (root / file).is_file():
+            errors.append(f"AV feature {symbol}: missing owner file {file}")
+        elif file not in direct:
+            errors.append(f"AV feature {symbol}: owner file {file} has no production reference")
+        for consumer in feature["consumers"]:
+            if is_test(consumer):
+                errors.append(f"AV feature {symbol}: consumer root {consumer} is a test path")
+            elif not (root / consumer).is_file():
+                errors.append(f"AV feature {symbol}: missing consumer root {consumer}")
+
+    unreachable_unallowlisted = [
+        f for f in features
+        if f["status"] == "unreachable" and not f["allowlisted"]
+    ]
+    stale_allowlist = [
+        e for key, e in allow_by_key.items()
+        if feature_by_key.get(key) is None
+        or feature_by_key[key]["status"] != "unreachable"
+    ]
+    wired = sum(1 for f in features if f["status"] == "wired")
+    unreachable = len(features) - wired
+    return {
+        "root": str(root),
+        "features_path": str(features_path),
+        "allowlist_path": str(allowlist_path),
+        "summary": {
+            "features_total": len(features),
+            "features_wired": wired,
+            "features_unreachable": unreachable,
+            "allowlist_entries": len(allow_entries),
+            "unreachable_unallowlisted": len(unreachable_unallowlisted),
+            "stale_allowlist_entries": len(stale_allowlist),
+            "errors": len(errors),
+        },
+        "features": features,
+        "allowlist": {
+            "entries": allow_entries,
+            "stale": stale_allowlist,
+            "unreachable_unallowlisted": [
+                {"symbol": f["symbol"], "file": f["file"]} for f in unreachable_unallowlisted
+            ],
+        },
+        "errors": errors,
+    }
+
+
+def print_av_text(report):
+    summary = report["summary"]
+    print(f"AV reachability: {summary['features_wired']}/{summary['features_total']} wired, "
+          f"{summary['features_unreachable']} unreachable")
+    if summary["allowlist_entries"]:
+        print(f"AV allowlist: {summary['allowlist_entries']} entries, "
+              f"{summary['stale_allowlist_entries']} stale")
+    for error in report["errors"]:
+        print(f"ERROR {error}")
+    for feature in report["features"]:
+        suffix = " (allowlisted)" if feature["allowlisted"] else ""
+        consumers = ",".join(feature["consumers"])
+        print(f"{feature['status']:<11} {feature['symbol']:<36} {feature['file']:<48} "
+              f"consumers={consumers}{suffix}")
+        if feature["consumer_refs"]:
+            print(f"           live refs: {', '.join(feature['consumer_refs'])}")
+        elif feature["refs"]:
+            print(f"           non-root refs: {', '.join(feature['refs'])}")
+    for entry in report["allowlist"]["stale"]:
+        print(f"STALE allowlist {entry['symbol']} ({entry['file']})")
+
+
 def print_text(report):
     summary = report["summary"]
     print(f"Module wiring: {summary['modules_wired']}/{summary['modules_total']} wired, "
@@ -357,10 +579,33 @@ def main():
     parser.add_argument("--strict", action="store_true", help="fail for unwired modules or contracts")
     parser.add_argument("--strict-contracts", action="store_true", help="fail for pending wiring contracts")
     parser.add_argument("--report-only", action="store_true", help="report pending wiring without failing")
+    parser.add_argument("--av-reachability", action="store_true",
+                        help="audit declared audiovisual feature entry symbols for live consumers")
+    parser.add_argument("--av-features", type=Path, default=None,
+                        help="AV feature list (default <root>/tools/wiring_audit_features.json)")
+    parser.add_argument("--av-allowlist", type=Path, default=None,
+                        help="AV allowlist (default <root>/tools/wiring_audit_allowlist.json)")
     args = parser.parse_args()
     root = args.root.resolve()
     if not (root / "src").is_dir():
         parser.error(f"missing Rust source directory: {root / 'src'}")
+    if args.av_reachability:
+        try:
+            report = audit_av(root, args.av_features, args.av_allowlist)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if args.format == "json":
+            print(json.dumps(report, indent=2))
+        else:
+            print_av_text(report)
+        summary = report["summary"]
+        if args.strict and (
+            summary["unreachable_unallowlisted"]
+            or summary["stale_allowlist_entries"]
+            or summary["errors"]
+        ):
+            return 1
+        return 0
     report = audit(root)
     if args.format == "json":
         print(json.dumps(report, indent=2))

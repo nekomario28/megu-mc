@@ -1,0 +1,164 @@
+{
+  "version": 1,
+  "features": [
+    {
+      "symbol": "BUILTIN_SHADOW_SHADERS",
+      "file": "client-port/src/builtin_shadow_wgsl.rs",
+      "consumers": [
+        "client-gpu/src/renderer.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/subworld_render.rs",
+        "client-app/src/shaderpack_runtime.rs",
+        "client-port/src/mesher.rs"
+      ]
+    },
+    {
+      "symbol": "MEGU_SHADOW_DEPTH_WGSL",
+      "file": "client-port/src/builtin_shadow_wgsl.rs",
+      "consumers": [
+        "client-gpu/src/renderer.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/subworld_render.rs",
+        "client-app/src/shaderpack_runtime.rs",
+        "client-port/src/mesher.rs"
+      ],
+      "via": ["BUILTIN_SHADOW_SHADERS"]
+    },
+    {
+      "symbol": "MEGU_TERRAIN_LIT_WGSL",
+      "file": "client-port/src/builtin_shadow_wgsl.rs",
+      "consumers": [
+        "client-gpu/src/renderer.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/subworld_render.rs",
+        "client-app/src/shaderpack_runtime.rs",
+        "client-port/src/mesher.rs"
+      ],
+      "via": ["BUILTIN_SHADOW_SHADERS"]
+    },
+    {
+      "symbol": "MEGU_SKY_ATMOSPHERE_WGSL",
+      "file": "client-port/src/builtin_shadow_wgsl.rs",
+      "consumers": [
+        "client-gpu/src/renderer.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/subworld_render.rs",
+        "client-app/src/shaderpack_runtime.rs",
+        "client-port/src/mesher.rs"
+      ],
+      "via": ["BUILTIN_SHADOW_SHADERS"]
+    },
+    {
+      "symbol": "MEGU_WATER_SURFACE_WGSL",
+      "file": "client-port/src/builtin_shadow_wgsl.rs",
+      "consumers": [
+        "client-gpu/src/renderer.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/subworld_render.rs",
+        "client-app/src/shaderpack_runtime.rs",
+        "client-port/src/mesher.rs"
+      ],
+      "via": ["BUILTIN_SHADOW_SHADERS"]
+    },
+    {
+      "symbol": "MEGU_SPATIAL_SHARPEN_WGSL",
+      "file": "client-port/src/builtin_shadow_wgsl.rs",
+      "consumers": [
+        "client-gpu/src/renderer.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/subworld_render.rs",
+        "client-app/src/shaderpack_runtime.rs",
+        "client-port/src/mesher.rs"
+      ],
+      "via": ["BUILTIN_SHADOW_SHADERS"]
+    },
+    {
+      "symbol": "build_shadow_uniforms",
+      "file": "client-port/src/builtin_shadow_wgsl.rs",
+      "consumers": [
+        "client-gpu/src/renderer.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/subworld_render.rs",
+        "client-port/src/mesher.rs"
+      ]
+    },
+    {
+      "symbol": "build_shadow_uniforms_celestial",
+      "file": "client-port/src/builtin_shadow_wgsl.rs",
+      "consumers": [
+        "client-gpu/src/renderer.rs",
+        "client-gpu/src/live_session.rs",
+        "client-gpu/src/subworld_render.rs",
+        "client-port/src/mesher.rs"
+      ]
+    },
+    {
+      "symbol": "AudioLimiter",
+      "file": "client-app/src/audio_qol.rs",
+      "consumers": [
+        "client-app/src/session.rs",
+        "client-app/src/render.rs",
+        "client-app/src/main.rs",
+        "client-gpu/src/window.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "symbol": "limit_mix_buffer",
+      "file": "client-app/src/audio_qol.rs",
+      "consumers": [
+        "client-app/src/session.rs",
+        "client-app/src/render.rs",
+        "client-app/src/main.rs",
+        "client-gpu/src/window.rs",
+        "client-gpu/src/renderer.rs"
+      ],
+      "via": ["limit_mix"]
+    },
+    {
+      "symbol": "subtitle_cue",
+      "file": "client-app/src/spatial_audio.rs",
+      "consumers": [
+        "client-app/src/session.rs",
+        "client-app/src/render.rs",
+        "client-app/src/main.rs",
+        "client-gpu/src/window.rs",
+        "client-gpu/src/renderer.rs"
+      ]
+    },
+    {
+      "symbol": "SpatialSubtitleCue",
+      "file": "client-app/src/spatial_audio.rs",
+      "consumers": [
+        "client-app/src/session.rs",
+        "client-app/src/render.rs",
+        "client-app/src/main.rs",
+        "client-gpu/src/window.rs",
+        "client-gpu/src/renderer.rs"
+      ],
+      "via": ["subtitle_cue"]
+    },
+    {
+      "symbol": "latest_audio_hint",
+      "file": "client-gpu/src/live_session.rs",
+      "consumers": [
+        "client-gpu/src/window.rs",
+        "client-gpu/src/renderer.rs",
+        "client-gpu/src/lib.rs",
+        "client-gpu/src/main.rs"
+      ]
+    },
+    {
+      "symbol": "EnvironmentAudioHint",
+      "file": "client-port/src/tactile_effects.rs",
+      "consumers": [
+        "client-gpu/src/window.rs",
+        "client-gpu/src/renderer.rs",
+        "client-app/src/session.rs",
+        "client-app/src/spatial_audio.rs",
+        "client-app/src/render.rs"
+      ],
+      "via": ["latest_audio_hint"]
+    }
+  ]
+}
