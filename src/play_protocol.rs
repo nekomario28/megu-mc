@@ -12886,6 +12886,7 @@ fn leash_name_tag_interact(client: &Client, target: i32, slot: i16) -> bool {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(target, name.clone());
+        mark_mob_named_persistent(target);
         broadcast_mob_custom_name(target, &name);
         consume_one_item(client, slot);
         return true;

@@ -2042,3 +2042,195 @@ fn unpack_section_lights(
     }
     (sky_out, block_out)
 }
+
+// ---------------------------------------------------------------------------
+// Vanilla 1.21.1 name-tag easter eggs (entity visuals)
+// ---------------------------------------------------------------------------
+
+/// Visual overrides a 1.21.1 client derives from an entity's exact custom
+/// name: `LivingEntityRenderer.isEntityUpsideDown` flips "Dinnerbone"/"Grumm"
+/// models, `Sheep` fades a "jeb_" sheep's wool through the dye palette, and a
+/// "Toast" rabbit swaps to the memorial black-and-white texture.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct EntityEasterEggVisual {
+    /// Render the entity upside down ("Dinnerbone" or "Grumm").
+    pub upside_down: bool,
+    /// Per-frame wool tint for a "jeb_" sheep, `None` for normal dye color.
+    pub rainbow_sheep_rgb: Option<[f32; 3]>,
+    /// Use the Toast rabbit texture ("Toast" on a rabbit only).
+    pub toast_rabbit: bool,
+}
+
+/// `DyeColor` texture-diffuse colors in declaration order — the exact wool
+/// palette `Sheep.getFleeceColor` cycles for a jeb_ sheep (0xRRGGBB).
+const SHEEP_WOOL_RGB: [[u8; 3]; 16] = [
+    [0xf9, 0xff, 0xfe], // white
+    [0xf9, 0x80, 0x1d], // orange
+    [0xc7, 0x4e, 0xbd], // magenta
+    [0x3a, 0xb3, 0xda], // light_blue
+    [0xfe, 0xd8, 0x3d], // yellow
+    [0x80, 0xc7, 0x1f], // lime
+    [0xf3, 0x8b, 0xaa], // pink
+    [0x47, 0x4f, 0x52], // gray
+    [0x9d, 0x9d, 0x97], // light_gray
+    [0x16, 0x9c, 0x9c], // cyan
+    [0x89, 0x32, 0xb8], // purple
+    [0x3c, 0x44, 0xaa], // blue
+    [0x83, 0x54, 0x32], // brown
+    [0x5e, 0x7c, 0x16], // green
+    [0xb0, 0x2e, 0x26], // red
+    [0x1d, 0x1d, 0x21], // black
+];
+
+/// One 25-tick color per palette slot, lerping into the next — the vanilla
+/// `getFleeceColor` fade `(tickCount % 25 + partialTick) / 25`.
+fn jeb_wool_rgb(world_tick: u64) -> [f32; 3] {
+    let phase = ((world_tick / 25) % 16) as usize;
+    let next = (phase + 1) % SHEEP_WOOL_RGB.len();
+    let fade = (world_tick % 25) as f32 / 25.0;
+    let from = SHEEP_WOOL_RGB[phase].map(f32::from);
+    let to = SHEEP_WOOL_RGB[next].map(f32::from);
+    [
+        (from[0] * (1.0 - fade) + to[0] * fade) / 255.0,
+        (from[1] * (1.0 - fade) + to[1] * fade) / 255.0,
+        (from[2] * (1.0 - fade) + to[2] * fade) / 255.0,
+    ]
+}
+
+/// Resolve the vanilla name-tag easter eggs for one entity. `entity_type`
+/// accepts `minecraft:name` or the bare name, and `custom_name` is the exact
+/// name-tag string: every vanilla comparison is case-sensitive, so
+/// "dinnerbone"/"JEB_"/`None` produce no visual.
+pub fn evaluate_entity_easter_egg(
+    entity_type: &str,
+    custom_name: Option<&str>,
+    world_tick: u64,
+) -> EntityEasterEggVisual {
+    let mut visual = EntityEasterEggVisual::default();
+    let Some(name) = custom_name else {
+        return visual;
+    };
+    // isEntityUpsideDown ignores the entity type entirely.
+    if name == "Dinnerbone" || name == "Grumm" {
+        visual.upside_down = true;
+    }
+    match (
+        entity_type
+            .strip_prefix("minecraft:")
+            .unwrap_or(entity_type),
+        name,
+    ) {
+        ("sheep", "jeb_") => visual.rainbow_sheep_rgb = Some(jeb_wool_rgb(world_tick)),
+        ("rabbit", "Toast") => visual.toast_rabbit = true,
+        _ => {}
+    }
+    visual
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dinnerbone_and_grumm_flip_any_entity_type() {
+        for name in ["Dinnerbone", "Grumm"] {
+            for ty in [
+                "minecraft:sheep",
+                "sheep",
+                "minecraft:rabbit",
+                "minecraft:vindicator",
+                "zombie",
+                "minecraft:player",
+            ] {
+                let visual = evaluate_entity_easter_egg(ty, Some(name), 0);
+                assert!(visual.upside_down, "{ty} named {name}");
+                assert!(visual.rainbow_sheep_rgb.is_none());
+                assert!(!visual.toast_rabbit);
+            }
+        }
+    }
+
+    #[test]
+    fn jeb_sheep_fades_smoothly_through_the_wool_palette() {
+        let first = evaluate_entity_easter_egg("minecraft:sheep", Some("jeb_"), 0)
+            .rainbow_sheep_rgb
+            .expect("jeb_ sheep tints its wool");
+        let white = [
+            f32::from(0xf9u8) / 255.0,
+            f32::from(0xffu8) / 255.0,
+            f32::from(0xfeu8) / 255.0,
+        ];
+        for (got, want) in first.iter().zip(white) {
+            assert!((got - want).abs() < 1e-6);
+        }
+        // At each 25-tick boundary the fade lands exactly on a dye color.
+        let orange = [
+            f32::from(0xf9u8) / 255.0,
+            f32::from(0x80u8) / 255.0,
+            f32::from(0x1du8) / 255.0,
+        ];
+        let tick25 = evaluate_entity_easter_egg("sheep", Some("jeb_"), 25)
+            .rainbow_sheep_rgb
+            .unwrap();
+        for (got, want) in tick25.iter().zip(orange) {
+            assert!((got - want).abs() < 1e-6);
+        }
+        // Two full 16-color cycles: finite RGB inside [0, 1] at every tick.
+        let mut last = first;
+        let mut changed = 0u32;
+        for tick in 0..800 {
+            let rgb = evaluate_entity_easter_egg("minecraft:sheep", Some("jeb_"), tick)
+                .rainbow_sheep_rgb
+                .unwrap();
+            assert!(rgb.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)));
+            if rgb != last {
+                changed += 1;
+                last = rgb;
+            }
+        }
+        assert!(changed > 0, "the jeb_ tint cycles over time");
+        // Mid-cycle ticks interpolate instead of hard-switching colors.
+        let mid = evaluate_entity_easter_egg("sheep", Some("jeb_"), 12)
+            .rainbow_sheep_rgb
+            .unwrap();
+        assert_ne!(mid, first);
+        assert_ne!(mid, tick25);
+    }
+
+    #[test]
+    fn toast_texture_is_rabbit_only() {
+        for ty in ["minecraft:rabbit", "rabbit"] {
+            let visual = evaluate_entity_easter_egg(ty, Some("Toast"), 0);
+            assert!(visual.toast_rabbit);
+            assert!(!visual.upside_down);
+            assert!(visual.rainbow_sheep_rgb.is_none());
+        }
+        assert!(!evaluate_entity_easter_egg("minecraft:sheep", Some("Toast"), 0).toast_rabbit);
+        assert!(!evaluate_entity_easter_egg("minecraft:chicken", Some("Toast"), 0).toast_rabbit);
+    }
+
+    #[test]
+    fn case_sensitive_names_and_mismatched_types_give_no_visual() {
+        for (ty, name) in [
+            ("minecraft:sheep", "JEB_"),
+            ("minecraft:sheep", "jeb"),
+            ("minecraft:sheep", "dinnerbone"),
+            ("minecraft:sheep", " Dinnerbone"),
+            ("minecraft:sheep", "Dinnerbone "),
+            ("minecraft:rabbit", "toast"),
+            ("minecraft:zombie", "jeb_"),
+            ("minecraft:rabbit", "jeb_"),
+            ("other:sheep", "jeb_"),
+            ("minecraft:sheep", ""),
+        ] {
+            let visual = evaluate_entity_easter_egg(ty, Some(name), 0);
+            assert!(!visual.upside_down, "{ty} named {name}");
+            assert!(visual.rainbow_sheep_rgb.is_none());
+            assert!(!visual.toast_rabbit);
+        }
+        let visual = evaluate_entity_easter_egg("minecraft:sheep", None, 0);
+        assert!(!visual.upside_down);
+        assert!(visual.rainbow_sheep_rgb.is_none());
+        assert!(!visual.toast_rabbit);
+    }
+}

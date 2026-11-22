@@ -43,6 +43,154 @@ fn set_mob_persistence_flags(eid: i32, flags: MobPersistenceFlags) {
     }
 }
 
+/// Read-modify-write one mob's flags through the exempt-or-remove contract
+/// of `set_mob_persistence_flags`.
+fn update_mob_persistence_flags(eid: i32, mutate: impl FnOnce(&mut MobPersistenceFlags)) {
+    let mut flags = mob_persistence_flags()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&eid)
+        .copied()
+        .unwrap_or_default();
+    mutate(&mut flags);
+    set_mob_persistence_flags(eid, flags);
+}
+
+/// `NameTagItem.mobInteract` sets `PersistenceRequired` together with the
+/// custom name, so a name-tagged mob stays exempt even past the 128-block
+/// instant-despawn radius or after 600 idle ticks.
+pub(crate) fn mark_mob_named_persistent(eid: i32) {
+    update_mob_persistence_flags(eid, |flags| {
+        flags.custom_named = true;
+        flags.persistence_required = true;
+    });
+}
+
+/// Items a live mob picked up off the ground (entity id -> item id). Vanilla
+/// `Mob`/`Fox`/`Allay` pickup implies `PersistenceRequired`: a mob carrying a
+/// found item never despawns.
+pub(crate) fn mob_picked_up_items() -> &'static Mutex<HashMap<i32, u32>> {
+    static ITEMS: OnceLock<Mutex<HashMap<i32, u32>>> = OnceLock::new();
+    ITEMS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record one picked-up item and set `PersistenceRequired`, matching the
+/// vanilla pickup path (`Mob.setItemSlot` + `canPickUpLoot`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn mark_mob_picked_up_item(eid: i32, item_id: u32) {
+    mob_picked_up_items()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(eid, item_id);
+    update_mob_persistence_flags(eid, |flags| flags.persistence_required = true);
+}
+
+/// `canPickUpLoot`/item-holding types in the pinned 1.21.1 registry: zombies
+/// and their variants, skeletons and their variants, piglins, and the
+/// item-carrying fox and allay. A mob not in this list drops nothing into
+/// `mob_picked_up_items` and keeps the normal despawn schedule.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn mob_can_pick_up_dropped_item(etype: i64) -> bool {
+    let Some(spec) = entity_spec_by_id(etype) else {
+        return false;
+    };
+    matches!(
+        spec.name,
+        "minecraft:allay"
+            | "minecraft:bogged"
+            | "minecraft:drowned"
+            | "minecraft:fox"
+            | "minecraft:husk"
+            | "minecraft:piglin"
+            | "minecraft:skeleton"
+            | "minecraft:stray"
+            | "minecraft:wither_skeleton"
+            | "minecraft:zombie"
+            | "minecraft:zombie_villager"
+            | "minecraft:zombified_piglin"
+    )
+}
+
+/// A mob takes one dropped item only when its type picks items up and it is
+/// not already carrying a found one. The pickup marks the mob persistent, so
+/// a zombie/husk/drowned/skeleton/piglin holding an item never despawns.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn try_mob_pickup_item(mob: &Mob, item_id: u32) -> bool {
+    if !mob_can_pick_up_dropped_item(mob.etype)
+        || mob_picked_up_items()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&mob.eid)
+    {
+        return false;
+    }
+    mark_mob_picked_up_item(mob.eid, item_id);
+    true
+}
+
+/// Drop every despawn-immunity record for a removed or dead mob.
+pub(crate) fn clear_mob_persistence_state(eid: i32) {
+    mob_persistence_flags()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&eid);
+    mob_picked_up_items()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&eid);
+}
+
+/// Vanilla name-tag easter eggs, resolved from the entity type plus the exact
+/// custom name. Every name check is case-sensitive, matching
+/// `LivingEntityRenderer.isEntityUpsideDown` and the per-type name compares.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NameTagEasterEgg {
+    /// "Dinnerbone" or "Grumm" flips the model of any named living entity.
+    UpsideDown,
+    /// "jeb_" sheep fades its wool through the 16 dye colors.
+    RainbowSheep,
+    /// "Toast" rabbits render with the memorial black-and-white texture.
+    ToastRabbit,
+    /// "Johnny" vindicators attack every non-illager entity in range.
+    JohnnyVindicator,
+}
+
+/// The upside-down names apply to every living entity; the other eggs bind
+/// one name to one entity type. Exact, case-sensitive matching only.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn classify_name_tag_easter_egg(
+    etype: i64,
+    custom_name: &str,
+) -> Option<NameTagEasterEgg> {
+    if matches!(custom_name, "Dinnerbone" | "Grumm") {
+        return Some(NameTagEasterEgg::UpsideDown);
+    }
+    let egg = match (
+        entity_spec_by_id(etype).map(|spec| spec.name),
+        custom_name,
+    ) {
+        (Some("minecraft:sheep"), "jeb_") => NameTagEasterEgg::RainbowSheep,
+        (Some("minecraft:rabbit"), "Toast") => NameTagEasterEgg::ToastRabbit,
+        (Some("minecraft:vindicator"), "Johnny") => NameTagEasterEgg::JohnnyVindicator,
+        _ => return None,
+    };
+    Some(egg)
+}
+
+/// Live lookup for AI targeting: a vindicator carrying the "Johnny" custom
+/// name is hostile to every non-illager entity (vanilla `Vindicator` JOHNNY).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn vindicator_is_johnny(eid: i32, etype: i64) -> bool {
+    mob_custom_names()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&eid)
+        .is_some_and(|name| {
+            classify_name_tag_easter_egg(etype, name) == Some(NameTagEasterEgg::JohnnyVindicator)
+        })
+}
+
 fn live_despawn_exempt(mob: &Mob) -> bool {
     let mut flags = mob_persistence_flags()
         .lock()
@@ -59,6 +207,20 @@ fn live_despawn_exempt(mob: &Mob) -> bool {
             _ => None,
         })
         .is_some();
+    // The live registries are authoritative even when nobody set a stored
+    // flag: a name tag, a lead tether or a held found item each exempt.
+    flags.custom_named |= mob_custom_names()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&mob.eid);
+    flags.leashed |= entity_tethers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&mob.eid);
+    flags.persistence_required |= mob_picked_up_items()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&mob.eid);
     // Live mounting is authoritative. A passenger or a ridden mob cannot
     // despawn merely because nobody explicitly set the persistence bit.
     let mounts = mounts().lock().unwrap_or_else(|e| e.into_inner());
@@ -304,7 +466,7 @@ fn discard_natural_hostiles(discarded: &HashMap<i32, Arc<Mob>>) {
         removed
     });
     for eid in removed {
-        mob_persistence_flags().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+        clear_mob_persistence_state(eid);
         broadcast_seen_destroy(eid);
     }
 }
@@ -347,11 +509,15 @@ mod mob_despawn_tests {
     }
 
     fn zombie_in(eid: i32, pos: (f64, f64, f64), dim: DimId) -> Arc<Mob> {
+        mob_named(eid, pos, dim, "zombie")
+    }
+
+    fn mob_named(eid: i32, pos: (f64, f64, f64), dim: DimId, name: &str) -> Arc<Mob> {
         let past = Instant::now() - Duration::from_secs(10);
         Arc::new(Mob {
             dim,
             eid,
-            etype: name_to_etype("zombie").unwrap(),
+            etype: name_to_etype(name).unwrap(),
             uuid: [0; 16],
             pos: Mutex::new((pos.0, pos.1, pos.2, 0.0, 0.0)),
             hp: Mutex::new(20.0),
@@ -565,5 +731,202 @@ mod mob_despawn_tests {
         push_natural_hostile(&mut mobs().lock().unwrap_or_else(|e| e.into_inner()), zombie(40, (0.0, 70.0, 0.0)));
         tick_natural_hostile_despawn();
         assert!(mobs().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+    }
+
+    #[test]
+    fn named_pickup_and_leashed_mobs_survive_the_instant_despawn_radius() {
+        // Past 128 blocks an unprotected monster discards immediately.
+        let far = Some(200.0_f64.powi(2));
+
+        // A name tag lands both persistence bits the moment it is applied.
+        let named = zombie(77_001, (0.0, 70.0, 0.0));
+        mob_custom_names()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(named.eid, "Clyde".to_string());
+        mark_mob_named_persistent(named.eid);
+        let flags = mob_persistence_flags()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&named.eid)
+            .copied()
+            .unwrap_or_default();
+        assert!(flags.custom_named && flags.persistence_required);
+        let mut hostile = NaturalHostile::new(&named, ZERO_ROLL_SEED);
+        hostile.no_action_time = 2000;
+        assert!(!hostile.check_despawn(false, far));
+        assert!(!hostile.check_despawn(false, far));
+
+        // A zombie holding a found item never despawns.
+        let holder = zombie(77_002, (0.0, 70.0, 0.0));
+        assert!(try_mob_pickup_item(&holder, 42));
+        assert!(!try_mob_pickup_item(&holder, 43), "one held item per mob");
+        assert!(live_despawn_exempt(&holder));
+        let mut hostile = NaturalHostile::new(&holder, ZERO_ROLL_SEED);
+        hostile.no_action_time = 2000;
+        assert!(!hostile.check_despawn(false, far));
+
+        // A live lead tether exempts with no stored flag at all.
+        let leashed = zombie(77_003, (0.0, 70.0, 0.0));
+        entity_tethers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                leashed.eid,
+                vanilla_lead_tether(leashed.eid, TetherAnchor::Entity(77_900)),
+            );
+        assert!(live_despawn_exempt(&leashed));
+        let mut hostile = NaturalHostile::new(&leashed, ZERO_ROLL_SEED);
+        hostile.no_action_time = 2000;
+        assert!(!hostile.check_despawn(false, far));
+
+        // A plain zombie at the same distance still discards instantly: the
+        // exemptions did not weaken the gate.
+        let plain = zombie(77_004, (0.0, 70.0, 0.0));
+        let mut hostile = NaturalHostile::new(&plain, ZERO_ROLL_SEED);
+        hostile.no_action_time = 2000;
+        assert!(hostile.check_despawn(false, far));
+
+        // Peaceful still removes named/pickup/leashed hostiles, matching
+        // vanilla Mob.checkDespawn's difficulty branch before persistence.
+        let named = NaturalHostile::new(&named, ZERO_ROLL_SEED).check_despawn(true, None);
+        let holder = NaturalHostile::new(&holder, ZERO_ROLL_SEED).check_despawn(true, None);
+        assert!(named && holder);
+
+        mob_custom_names()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&77_001);
+        entity_tethers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&77_003);
+        clear_mob_persistence_state(77_001);
+        clear_mob_persistence_state(77_002);
+    }
+
+    #[test]
+    fn item_pickup_gates_on_type_and_clears_with_the_mob() {
+        for name in [
+            "zombie",
+            "zombie_villager",
+            "husk",
+            "drowned",
+            "skeleton",
+            "stray",
+            "bogged",
+            "wither_skeleton",
+            "piglin",
+            "zombified_piglin",
+            "fox",
+            "allay",
+        ] {
+            assert!(mob_can_pick_up_dropped_item(name_to_etype(name).unwrap()), "{name}");
+        }
+        for name in ["cow", "creeper", "piglin_brute", "villager", "item"] {
+            assert!(!mob_can_pick_up_dropped_item(name_to_etype(name).unwrap()), "{name}");
+        }
+        assert!(!mob_can_pick_up_dropped_item(i64::MAX));
+
+        // A mob whose type never picks up items cannot take one.
+        let cow = mob_named(77_005, (0.0, 70.0, 0.0), DimId::Overworld, "cow");
+        assert!(!try_mob_pickup_item(&cow, 7));
+        assert!(!live_despawn_exempt(&cow));
+
+        // mark + clear round-trips both the held item and the flag.
+        mark_mob_picked_up_item(77_006, 7);
+        assert_eq!(
+            mob_picked_up_items()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&77_006),
+            Some(&7)
+        );
+        clear_mob_persistence_state(77_006);
+        assert!(!mob_picked_up_items()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&77_006));
+        assert!(!mob_persistence_flags()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&77_006));
+    }
+
+    #[test]
+    fn name_tag_easter_eggs_match_vanilla_type_and_case() {
+        let sheep = name_to_etype("sheep").unwrap();
+        let rabbit = name_to_etype("rabbit").unwrap();
+        let vindicator = name_to_etype("vindicator").unwrap();
+        let zombie_t = name_to_etype("zombie").unwrap();
+
+        // Dinnerbone/Grumm flips every living entity, whatever its type.
+        for name in ["Dinnerbone", "Grumm"] {
+            for etype in [sheep, rabbit, vindicator, zombie_t] {
+                assert_eq!(
+                    classify_name_tag_easter_egg(etype, name),
+                    Some(NameTagEasterEgg::UpsideDown)
+                );
+            }
+        }
+        // The other eggs bind one name to exactly one entity type.
+        assert_eq!(
+            classify_name_tag_easter_egg(sheep, "jeb_"),
+            Some(NameTagEasterEgg::RainbowSheep)
+        );
+        assert_eq!(classify_name_tag_easter_egg(rabbit, "jeb_"), None);
+        assert_eq!(classify_name_tag_easter_egg(zombie_t, "jeb_"), None);
+        assert_eq!(
+            classify_name_tag_easter_egg(rabbit, "Toast"),
+            Some(NameTagEasterEgg::ToastRabbit)
+        );
+        assert_eq!(classify_name_tag_easter_egg(sheep, "Toast"), None);
+        assert_eq!(
+            classify_name_tag_easter_egg(vindicator, "Johnny"),
+            Some(NameTagEasterEgg::JohnnyVindicator)
+        );
+        assert_eq!(classify_name_tag_easter_egg(zombie_t, "Johnny"), None);
+        assert_eq!(classify_name_tag_easter_egg(vindicator, "Toast"), None);
+
+        // Vanilla compares the name exactly: wrong case or whitespace is no egg.
+        for name in [
+            "dinnerbone", "DINNERBONE", "grumm", "JEB_", "jeb", "toast", "johnny", " Dinnerbone",
+            "Dinnerbone ", "jeb__", "",
+        ] {
+            for etype in [sheep, rabbit, vindicator, zombie_t] {
+                assert_eq!(classify_name_tag_easter_egg(etype, name), None, "{name}");
+            }
+        }
+        // An unknown type still gets the name-only upside-down egg.
+        assert_eq!(
+            classify_name_tag_easter_egg(i64::MAX, "Grumm"),
+            Some(NameTagEasterEgg::UpsideDown)
+        );
+        assert_eq!(classify_name_tag_easter_egg(i64::MAX, "jeb_"), None);
+    }
+
+    #[test]
+    fn johnny_vindicator_reads_the_live_custom_name() {
+        let vindicator = name_to_etype("vindicator").unwrap();
+        let zombie_t = name_to_etype("zombie").unwrap();
+        mob_custom_names()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(77_007, "Johnny".to_string());
+        assert!(vindicator_is_johnny(77_007, vindicator));
+        // The egg checks the type too: a "Johnny" zombie is not one.
+        assert!(!vindicator_is_johnny(77_007, zombie_t));
+        // No custom name at all.
+        assert!(!vindicator_is_johnny(77_008, vindicator));
+        // Case-sensitive: lowercase johnny does not trigger it.
+        mob_custom_names()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(77_007, "johnny".to_string());
+        assert!(!vindicator_is_johnny(77_007, vindicator));
+        mob_custom_names()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&77_007);
     }
 }
