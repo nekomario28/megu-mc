@@ -654,3 +654,757 @@ mod layout_tests {
         assert_eq!(offset_of!(BerInstanceData, tint_rgba), 36);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Vanilla block-entity geometry
+// ---------------------------------------------------------------------------
+
+use crate::vanilla_plus_3d::{ExtrudedMesh, ExtrudedQuad, MAX_UPGRADE_QUADS};
+use std::collections::VecDeque;
+
+/// Vanilla block-entity renderer families supported by [`build_ber_mesh`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VanillaBerKind {
+    Chest,
+    Sign,
+    Banner,
+    Beacon,
+    Bed,
+    Skull,
+    ItemFrame,
+    Campfire,
+    BrewingStand,
+    Lectern,
+    DecoratedPot,
+    ShulkerBox,
+}
+
+/// Direction in block coordinates, where Y points upward and south is +Z.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VanillaBerFacing {
+    #[default]
+    North,
+    South,
+    East,
+    West,
+    Up,
+    Down,
+}
+
+/// Per-family geometry state. Yaw and sway are radians unless named `*_deg`.
+/// All generated vertices remain in one block's `0..=1` local volume.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VanillaBerState {
+    Chest {
+        lid_open: f32,
+        double: bool,
+        facing: VanillaBerFacing,
+    },
+    Sign {
+        wall: bool,
+        hanging: bool,
+        glowing: bool,
+        facing_yaw: f32,
+    },
+    Banner {
+        wall: bool,
+        sway_rad: f32,
+        facing_yaw: f32,
+    },
+    Beacon {
+        beam_height: f32,
+        active: bool,
+        rgb: [f32; 3],
+    },
+    Bed {
+        is_head: bool,
+        facing: VanillaBerFacing,
+    },
+    Skull {
+        wall: bool,
+        yaw_deg: f32,
+    },
+    ItemFrame {
+        facing: VanillaBerFacing,
+        glow: bool,
+        rotation: u8,
+    },
+    Campfire {
+        lit: bool,
+        item_count: u8,
+    },
+    BrewingStand {
+        bottle_mask: u8,
+    },
+    Lectern {
+        has_book: bool,
+        facing: VanillaBerFacing,
+    },
+    DecoratedPot {
+        facing: VanillaBerFacing,
+        wobble: f32,
+    },
+    ShulkerBox {
+        open_progress: f32,
+        facing: VanillaBerFacing,
+    },
+}
+
+impl VanillaBerState {
+    pub fn kind(self) -> VanillaBerKind {
+        match self {
+            Self::Chest { .. } => VanillaBerKind::Chest,
+            Self::Sign { .. } => VanillaBerKind::Sign,
+            Self::Banner { .. } => VanillaBerKind::Banner,
+            Self::Beacon { .. } => VanillaBerKind::Beacon,
+            Self::Bed { .. } => VanillaBerKind::Bed,
+            Self::Skull { .. } => VanillaBerKind::Skull,
+            Self::ItemFrame { .. } => VanillaBerKind::ItemFrame,
+            Self::Campfire { .. } => VanillaBerKind::Campfire,
+            Self::BrewingStand { .. } => VanillaBerKind::BrewingStand,
+            Self::Lectern { .. } => VanillaBerKind::Lectern,
+            Self::DecoratedPot { .. } => VanillaBerKind::DecoratedPot,
+            Self::ShulkerBox { .. } => VanillaBerKind::ShulkerBox,
+        }
+    }
+}
+
+fn ber_unit(value: f32) -> f32 {
+    if value.is_nan() {
+        0.0
+    } else {
+        value.clamp(0.0, 1.0)
+    }
+}
+
+fn ber_angle(angle: f32, limit: f32) -> f32 {
+    if angle.is_finite() {
+        angle.clamp(-limit, limit)
+    } else {
+        0.0
+    }
+}
+
+fn ber_yaw(angle: f32) -> f32 {
+    if angle.is_finite() {
+        angle.rem_euclid(std::f32::consts::TAU)
+    } else {
+        0.0
+    }
+}
+
+/// Emit one CCW face, dropping invalid and degenerate geometry.
+fn ber_face(mesh: &mut ExtrudedMesh, points: [[f32; 3]; 4], tint_index: i32) {
+    if mesh.quads.len() >= MAX_UPGRADE_QUADS
+        || !points
+            .iter()
+            .flatten()
+            .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+    {
+        return;
+    }
+    let a = [
+        points[1][0] - points[0][0],
+        points[1][1] - points[0][1],
+        points[1][2] - points[0][2],
+    ];
+    let b = [
+        points[2][0] - points[0][0],
+        points[2][1] - points[0][1],
+        points[2][2] - points[0][2],
+    ];
+    let cross = [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ];
+    let len = (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt();
+    if len <= 1e-8 {
+        return;
+    }
+    mesh.quads.push(ExtrudedQuad {
+        positions: points,
+        normal: cross.map(|n| n / len),
+        uv: [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+        tint_index,
+    });
+}
+
+/// Six outward-facing axis-aligned faces. Coordinates are local block units.
+fn ber_box(mesh: &mut ExtrudedMesh, from: [f32; 3], to: [f32; 3], tint: i32) {
+    let [x, y, z] = from;
+    let [xx, yy, zz] = to;
+    if x >= xx || y >= yy || z >= zz {
+        return;
+    }
+    ber_face(
+        mesh,
+        [[x, y, zz], [xx, y, zz], [xx, yy, zz], [x, yy, zz]],
+        tint,
+    );
+    ber_face(mesh, [[xx, y, z], [x, y, z], [x, yy, z], [xx, yy, z]], tint);
+    ber_face(
+        mesh,
+        [[xx, y, zz], [xx, y, z], [xx, yy, z], [xx, yy, zz]],
+        tint,
+    );
+    ber_face(mesh, [[x, y, z], [x, y, zz], [x, yy, zz], [x, yy, z]], tint);
+    ber_face(
+        mesh,
+        [[x, yy, zz], [xx, yy, zz], [xx, yy, z], [x, yy, z]],
+        tint,
+    );
+    ber_face(mesh, [[x, y, z], [xx, y, z], [xx, y, zz], [x, y, zz]], tint);
+}
+
+/// Right-handed rotations preserve both the face winding and the normals.
+fn ber_rotate_y(mesh: &mut ExtrudedMesh, angle: f32) {
+    let (s, c) = angle.sin_cos();
+    mesh.affine(
+        [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]],
+        [0.5, 0.0, 0.5],
+        [0.5, 0.0, 0.5],
+    );
+}
+
+fn ber_rotate_x(mesh: &mut ExtrudedMesh, angle: f32, pivot: [f32; 3]) {
+    let (s, c) = angle.sin_cos();
+    mesh.affine([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]], pivot, pivot);
+}
+
+/// Turn south-facing geometry into the requested facing. Up/down are useful
+/// for item frames and shulker boxes attached to ceilings or floors.
+fn ber_orient(mesh: &mut ExtrudedMesh, facing: VanillaBerFacing) {
+    match facing {
+        VanillaBerFacing::South => {}
+        VanillaBerFacing::North => ber_rotate_y(mesh, std::f32::consts::PI),
+        VanillaBerFacing::East => ber_rotate_y(mesh, std::f32::consts::FRAC_PI_2),
+        VanillaBerFacing::West => ber_rotate_y(mesh, -std::f32::consts::FRAC_PI_2),
+        VanillaBerFacing::Up => ber_rotate_x(mesh, -std::f32::consts::FRAC_PI_2, [0.5; 3]),
+        VanillaBerFacing::Down => ber_rotate_x(mesh, std::f32::consts::FRAC_PI_2, [0.5; 3]),
+    }
+}
+
+/// Construct bounded, outward-CCW Vanilla 1.21.1 BER family geometry.
+/// Material/texture selection is carried by `tint_index`; the beacon beam
+/// stores its 24-bit RGB in that field. A beam taller than one block is
+/// represented by its first local segment for instance-side repetition.
+/// A mismatched `(kind, state)` pair returns an empty mesh.
+pub fn build_ber_mesh(kind: VanillaBerKind, state: VanillaBerState) -> ExtrudedMesh {
+    let mut mesh = ExtrudedMesh::new();
+    if state.kind() != kind {
+        return mesh;
+    }
+
+    match state {
+        VanillaBerState::Chest {
+            lid_open,
+            double,
+            facing,
+        } => {
+            let inset = if double { 0.025 } else { 0.07 };
+            ber_box(
+                &mut mesh,
+                [inset, 0.05, 0.09],
+                [1.0 - inset, 0.59, 0.91],
+                -1,
+            );
+            let mut lid = ExtrudedMesh::new();
+            ber_box(&mut lid, [inset, 0.59, 0.17], [1.0 - inset, 0.70, 0.81], -1);
+            // A block-local articulation keeps the opening lid inside the cell.
+            ber_rotate_x(&mut lid, -0.46 * ber_unit(lid_open), [0.5, 0.59, 0.17]);
+            mesh.append(&lid);
+            ber_box(&mut mesh, [0.46, 0.40, 0.91], [0.54, 0.57, 0.96], 1);
+            if double {
+                ber_box(&mut mesh, [0.492, 0.06, 0.911], [0.508, 0.58, 0.921], 1);
+            }
+            ber_orient(&mut mesh, facing);
+        }
+        VanillaBerState::Sign {
+            wall,
+            hanging,
+            glowing,
+            facing_yaw,
+        } => {
+            ber_box(
+                &mut mesh,
+                [0.24, 0.43, 0.46],
+                [0.76, 0.71, 0.54],
+                if glowing { 1 } else { -1 },
+            );
+            if hanging {
+                for x in [0.33, 0.66] {
+                    ber_box(
+                        &mut mesh,
+                        [x - 0.015, 0.71, 0.48],
+                        [x + 0.015, 0.92, 0.52],
+                        2,
+                    );
+                }
+            } else if wall {
+                ber_box(&mut mesh, [0.45, 0.50, 0.36], [0.55, 0.57, 0.46], 2);
+            } else {
+                ber_box(&mut mesh, [0.475, 0.05, 0.475], [0.525, 0.43, 0.525], 2);
+            }
+            ber_rotate_y(&mut mesh, ber_yaw(facing_yaw));
+        }
+        VanillaBerState::Banner {
+            wall,
+            sway_rad,
+            facing_yaw,
+        } => {
+            if wall {
+                ber_box(&mut mesh, [0.27, 0.85, 0.38], [0.73, 0.89, 0.53], 2);
+            } else {
+                ber_box(&mut mesh, [0.48, 0.11, 0.48], [0.52, 0.96, 0.52], 2);
+                ber_box(&mut mesh, [0.28, 0.83, 0.47], [0.72, 0.87, 0.53], 2);
+            }
+            let mut cloth = ExtrudedMesh::new();
+            ber_box(&mut cloth, [0.29, 0.21, 0.475], [0.71, 0.83, 0.525], -1);
+            ber_rotate_x(&mut cloth, ber_angle(sway_rad, 0.12), [0.5, 0.83, 0.5]);
+            mesh.append(&cloth);
+            ber_rotate_y(&mut mesh, ber_yaw(facing_yaw));
+        }
+        VanillaBerState::Beacon {
+            beam_height,
+            active,
+            rgb,
+        } => {
+            ber_box(&mut mesh, [0.08, 0.06, 0.08], [0.92, 0.19, 0.92], 2);
+            ber_box(&mut mesh, [0.16, 0.19, 0.16], [0.84, 0.68, 0.84], -1);
+            ber_box(&mut mesh, [0.28, 0.68, 0.28], [0.72, 0.72, 0.72], 2);
+            let height = if beam_height.is_nan() {
+                0.0
+            } else {
+                beam_height.clamp(0.0, 384.0)
+            };
+            if active && height > 0.0 {
+                let tint = rgb.map(|c| (ber_unit(c) * 255.0).round() as i32);
+                let packed = (tint[0] << 16) | (tint[1] << 8) | tint[2];
+                ber_box(
+                    &mut mesh,
+                    [0.44, 0.72, 0.44],
+                    [0.56, (0.72 + height).min(1.0), 0.56],
+                    packed,
+                );
+            }
+        }
+        VanillaBerState::Bed { is_head, facing } => {
+            ber_box(&mut mesh, [0.12, 0.13, 0.08], [0.88, 0.43, 0.92], -1);
+            ber_box(&mut mesh, [0.13, 0.43, 0.09], [0.87, 0.53, 0.91], 1);
+            if is_head {
+                ber_box(&mut mesh, [0.22, 0.53, 0.14], [0.78, 0.60, 0.42], 2);
+                ber_box(&mut mesh, [0.13, 0.11, 0.08], [0.87, 0.29, 0.14], 2);
+            } else {
+                ber_box(&mut mesh, [0.13, 0.11, 0.85], [0.87, 0.29, 0.91], 2);
+            }
+            ber_orient(&mut mesh, facing);
+        }
+        VanillaBerState::Skull { wall, yaw_deg } => {
+            ber_box(&mut mesh, [0.27, 0.37, 0.27], [0.73, 0.78, 0.73], -1);
+            // Recessed face markings and jaw make the direction visible.
+            for x in [0.36, 0.59] {
+                ber_box(&mut mesh, [x, 0.55, 0.73], [x + 0.05, 0.61, 0.745], 1);
+            }
+            ber_box(&mut mesh, [0.42, 0.39, 0.73], [0.58, 0.48, 0.745], 1);
+            if wall {
+                ber_box(&mut mesh, [0.44, 0.48, 0.14], [0.56, 0.61, 0.27], 2);
+            } else {
+                ber_box(&mut mesh, [0.41, 0.28, 0.41], [0.59, 0.37, 0.59], 2);
+            }
+            let radians = ber_yaw(yaw_deg.to_radians());
+            ber_rotate_y(&mut mesh, radians);
+        }
+        VanillaBerState::ItemFrame {
+            facing,
+            glow,
+            rotation,
+        } => {
+            ber_box(
+                &mut mesh,
+                [0.22, 0.22, 0.88],
+                [0.78, 0.78, 0.91],
+                if glow { 1 } else { -1 },
+            );
+            ber_box(&mut mesh, [0.18, 0.18, 0.87], [0.82, 0.25, 0.94], 2);
+            ber_box(&mut mesh, [0.18, 0.75, 0.87], [0.82, 0.82, 0.94], 2);
+            ber_box(&mut mesh, [0.18, 0.25, 0.87], [0.25, 0.75, 0.94], 2);
+            ber_box(&mut mesh, [0.75, 0.25, 0.87], [0.82, 0.75, 0.94], 2);
+            let mut needle = ExtrudedMesh::new();
+            ber_box(&mut needle, [0.48, 0.49, 0.94], [0.52, 0.73, 0.955], 1);
+            let angle = f32::from(rotation % 8) * std::f32::consts::FRAC_PI_4;
+            let (s, c) = angle.sin_cos();
+            needle.affine(
+                [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]],
+                [0.5, 0.5, 0.5],
+                [0.5, 0.5, 0.5],
+            );
+            mesh.append(&needle);
+            ber_orient(&mut mesh, facing);
+        }
+        VanillaBerState::Campfire { lit, item_count } => {
+            for angle in [std::f32::consts::FRAC_PI_4, -std::f32::consts::FRAC_PI_4] {
+                let mut log = ExtrudedMesh::new();
+                ber_box(&mut log, [0.22, 0.08, 0.44], [0.78, 0.23, 0.56], 2);
+                ber_rotate_y(&mut log, angle);
+                mesh.append(&log);
+            }
+            if lit {
+                for (height, width) in [(0.55, 0.10), (0.77, 0.045)] {
+                    ber_box(
+                        &mut mesh,
+                        [0.5 - width, 0.23, 0.5 - width],
+                        [0.5 + width, height, 0.5 + width],
+                        1,
+                    );
+                }
+            }
+            for i in 0..usize::from(item_count.min(4)) {
+                let x = 0.30 + (i % 2) as f32 * 0.30;
+                let z = 0.30 + (i / 2) as f32 * 0.30;
+                ber_box(&mut mesh, [x, 0.25, z], [x + 0.13, 0.29, z + 0.13], 3);
+            }
+        }
+        VanillaBerState::BrewingStand { bottle_mask } => {
+            ber_box(&mut mesh, [0.31, 0.04, 0.31], [0.69, 0.12, 0.69], 2);
+            ber_box(&mut mesh, [0.46, 0.12, 0.46], [0.54, 0.87, 0.54], -1);
+            for (i, (x, z)) in [(0.25_f32, 0.29_f32), (0.75, 0.29), (0.50, 0.76)]
+                .iter()
+                .copied()
+                .enumerate()
+            {
+                let min = [x.min(0.5) - 0.02, 0.22, z.min(0.5) - 0.02];
+                let max = [x.max(0.5) + 0.02, 0.29, z.max(0.5) + 0.02];
+                ber_box(&mut mesh, min, max, 2);
+                if bottle_mask & (1 << i) != 0 {
+                    ber_box(
+                        &mut mesh,
+                        [x - 0.09, 0.10, z - 0.09],
+                        [x + 0.09, 0.28, z + 0.09],
+                        1,
+                    );
+                    ber_box(
+                        &mut mesh,
+                        [x - 0.035, 0.28, z - 0.035],
+                        [x + 0.035, 0.37, z + 0.035],
+                        1,
+                    );
+                }
+            }
+        }
+        VanillaBerState::Lectern { has_book, facing } => {
+            ber_box(&mut mesh, [0.22, 0.03, 0.22], [0.78, 0.14, 0.78], 2);
+            ber_box(&mut mesh, [0.41, 0.14, 0.41], [0.59, 0.65, 0.59], -1);
+            let mut desk = ExtrudedMesh::new();
+            ber_box(&mut desk, [0.22, 0.64, 0.24], [0.78, 0.70, 0.76], 2);
+            if has_book {
+                ber_box(&mut desk, [0.29, 0.70, 0.30], [0.71, 0.73, 0.70], 1);
+                ber_box(&mut desk, [0.49, 0.73, 0.31], [0.51, 0.75, 0.69], -1);
+            }
+            ber_rotate_x(&mut desk, -0.18, [0.5, 0.66, 0.5]);
+            mesh.append(&desk);
+            ber_orient(&mut mesh, facing);
+        }
+        VanillaBerState::DecoratedPot { facing, wobble } => {
+            ber_box(&mut mesh, [0.29, 0.06, 0.29], [0.71, 0.15, 0.71], 2);
+            ber_box(&mut mesh, [0.21, 0.15, 0.21], [0.79, 0.76, 0.79], -1);
+            ber_box(&mut mesh, [0.27, 0.76, 0.27], [0.73, 0.85, 0.73], 2);
+            ber_box(&mut mesh, [0.32, 0.85, 0.32], [0.68, 0.88, 0.68], 1);
+            ber_rotate_x(&mut mesh, ber_angle(wobble, 0.1), [0.5, 0.1, 0.5]);
+            ber_orient(&mut mesh, facing);
+        }
+        VanillaBerState::ShulkerBox {
+            open_progress,
+            facing,
+        } => {
+            ber_box(&mut mesh, [0.12, 0.09, 0.12], [0.88, 0.55, 0.88], -1);
+            let lift = ber_unit(open_progress) * 0.16;
+            ber_box(
+                &mut mesh,
+                [0.10, 0.50 + lift, 0.10],
+                [0.90, 0.79 + lift, 0.90],
+                1,
+            );
+            ber_orient(&mut mesh, facing);
+        }
+    }
+
+    // Floating-point rotations can produce tiny excursions at exact 90°.
+    // Clamp these round-off errors and update the normal from the CCW winding.
+    for quad in &mut mesh.quads {
+        for vertex in &mut quad.positions {
+            for coord in vertex {
+                *coord = coord.clamp(0.0, 1.0);
+            }
+        }
+    }
+    mesh
+}
+
+// ---------------------------------------------------------------------------
+// Bounded, deterministic Vanilla particle simulation
+// ---------------------------------------------------------------------------
+
+/// Maximum number of live Vanilla particles, including in a single burst.
+pub const MAX_VANILLA_PARTICLES: usize = 4096;
+
+/// Particle sprite/shader families. Emission is deterministic and caller-owned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VanillaParticleKind {
+    BlockBreak,
+    BlockDig,
+    Flame,
+    Smoke,
+    WaterSplash,
+    Bubble,
+    RainDrop,
+    SnowFlake,
+    LightningFlash,
+    PotionSwirl,
+    Crit,
+    Explosion,
+}
+
+impl VanillaParticleKind {
+    /// Linear drag in inverse seconds and upward-positive gravity in blocks/s².
+    fn physics(self) -> (f64, f64) {
+        match self {
+            Self::BlockBreak | Self::BlockDig => (1.1, -9.8),
+            Self::Flame => (1.8, 0.6),
+            Self::Smoke => (0.8, 0.15),
+            Self::WaterSplash => (0.7, -9.8),
+            Self::Bubble => (1.0, 1.0),
+            Self::RainDrop => (0.05, -16.0),
+            Self::SnowFlake => (0.4, -1.6),
+            Self::LightningFlash => (0.0, 0.0),
+            Self::PotionSwirl => (1.2, -0.1),
+            Self::Crit => (0.6, -6.0),
+            Self::Explosion => (1.4, 0.0),
+        }
+    }
+
+    /// Billboard half-size in blocks, prior to lifetime scaling.
+    fn radius(self) -> f32 {
+        match self {
+            Self::BlockBreak | Self::BlockDig => 0.07,
+            Self::Flame => 0.09,
+            Self::Smoke => 0.14,
+            Self::WaterSplash | Self::Bubble => 0.06,
+            Self::RainDrop => 0.035,
+            Self::SnowFlake => 0.065,
+            Self::LightningFlash => 0.48,
+            Self::PotionSwirl => 0.09,
+            Self::Crit => 0.075,
+            Self::Explosion => 0.35,
+        }
+    }
+}
+
+/// One live particle's state, exposed for direct GPU staging and inspection.
+/// Original values are retained in f64 so integration never accumulates
+/// position/velocity error across different frame partitions.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VanillaParticle {
+    pub kind: VanillaParticleKind,
+    pub pos: [f32; 3],
+    pub vel: [f32; 3],
+    pub color: [f32; 4],
+    pub age_secs: f32,
+    pub max_age_secs: f32,
+    origin: [f64; 3],
+    initial_velocity: [f64; 3],
+    elapsed: f64,
+}
+
+/// A camera-aligned CCW quad, ready for GPU vertex expansion or upload.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VanillaParticleQuad {
+    pub kind: VanillaParticleKind,
+    pub positions: [[f32; 3]; 4],
+    pub uv: [[f32; 2]; 4],
+    pub color: [f32; 4],
+}
+
+/// FIFO particle pool. Identical calls produce identical meshes and states.
+/// The oldest live particle is evicted when a spawn exceeds the fixed cap.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VanillaParticleWorld {
+    particles: VecDeque<VanillaParticle>,
+}
+
+impl VanillaParticleWorld {
+    pub fn new() -> Self {
+        Self {
+            particles: VecDeque::with_capacity(MAX_VANILLA_PARTICLES),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.particles.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.particles.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.particles.clear();
+    }
+
+    pub fn particles(&self) -> &VecDeque<VanillaParticle> {
+        &self.particles
+    }
+
+    /// Add a particle. Invalid positions, velocities and lifetimes are rejected.
+    /// Colors are clamped to [0,1], with non-finite channels replaced by zero.
+    /// Returns whether the spawn was accepted.
+    pub fn spawn(
+        &mut self,
+        kind: VanillaParticleKind,
+        pos: [f32; 3],
+        vel: [f32; 3],
+        color: [f32; 4],
+        max_age_secs: f32,
+    ) -> bool {
+        if !pos.iter().chain(vel.iter()).all(|v| v.is_finite())
+            || !max_age_secs.is_finite()
+            || max_age_secs <= 0.0
+        {
+            return false;
+        }
+        if self.particles.len() == MAX_VANILLA_PARTICLES {
+            self.particles.pop_front();
+        }
+        self.particles.push_back(VanillaParticle {
+            kind,
+            pos,
+            vel,
+            color: color.map(ber_unit),
+            age_secs: 0.0,
+            max_age_secs,
+            origin: pos.map(f64::from),
+            initial_velocity: vel.map(f64::from),
+            elapsed: 0.0,
+        });
+        true
+    }
+
+    /// Advance analytically under `dv/dt = -drag*v + gravity`, using the
+    /// exact exponential for drag. Invalid, negative or zero dt is a no-op.
+    /// Every update derives from the original spawn so 30 FPS and 120 FPS
+    /// have the same trajectory for the same elapsed time (within float
+    /// rounding). Expired and numerically overflowed particles are removed.
+    pub fn step(&mut self, dt_secs: f32) {
+        if !dt_secs.is_finite() || dt_secs <= 0.0 {
+            return;
+        }
+        let dt = f64::from(dt_secs);
+        self.particles.retain_mut(|particle| {
+            particle.elapsed += dt;
+            if particle.elapsed >= f64::from(particle.max_age_secs) {
+                return false;
+            }
+            let t = particle.elapsed;
+            let (drag, gravity) = particle.kind.physics();
+            let (velocity_scale, distance_scale, gravity_displacement) = if drag > 0.0 {
+                // exp_m1 is accurate for very small time steps.
+                let one_minus_decay = -(-drag * t).exp_m1();
+                let position_integral = one_minus_decay / drag;
+                (
+                    1.0 - one_minus_decay,
+                    position_integral,
+                    gravity / drag * (t - position_integral),
+                )
+            } else {
+                (1.0, t, gravity * t * t * 0.5)
+            };
+            for axis in 0..3 {
+                let acceleration = if axis == 1 { gravity } else { 0.0 };
+                let velocity = if drag > 0.0 {
+                    particle.initial_velocity[axis] * velocity_scale
+                        + acceleration / drag * (1.0 - velocity_scale)
+                } else {
+                    particle.initial_velocity[axis] + acceleration * t
+                };
+                let position = particle.origin[axis]
+                    + particle.initial_velocity[axis] * distance_scale
+                    + if axis == 1 { gravity_displacement } else { 0.0 };
+                particle.vel[axis] = velocity as f32;
+                particle.pos[axis] = position as f32;
+            }
+            particle.age_secs = t as f32;
+            particle
+                .pos
+                .iter()
+                .chain(particle.vel.iter())
+                .all(|v| v.is_finite())
+        });
+    }
+
+    /// Build screen-facing quads in oldest-to-newest spawn order. Degenerate
+    /// camera axes use world-space fallbacks; non-finite quads are omitted.
+    pub fn billboard_quads(
+        &self,
+        camera_right: [f32; 3],
+        camera_up: [f32; 3],
+    ) -> Vec<VanillaParticleQuad> {
+        let right = particle_normalize(camera_right).unwrap_or([1.0, 0.0, 0.0]);
+        let up_dot = particle_dot(right, camera_up);
+        let orthogonal_up = [
+            camera_up[0] - right[0] * up_dot,
+            camera_up[1] - right[1] * up_dot,
+            camera_up[2] - right[2] * up_dot,
+        ];
+        let fallback_up = if right[1].abs() < 0.9 {
+            [0.0, 1.0, 0.0]
+        } else {
+            [0.0, 0.0, 1.0]
+        };
+        let up = particle_normalize(orthogonal_up).unwrap_or_else(|| {
+            let projection = particle_dot(right, fallback_up);
+            particle_normalize([
+                fallback_up[0] - right[0] * projection,
+                fallback_up[1] - right[1] * projection,
+                fallback_up[2] - right[2] * projection,
+            ])
+            .unwrap_or([0.0, 1.0, 0.0])
+        });
+        let mut quads = Vec::with_capacity(self.particles.len());
+        for particle in &self.particles {
+            let remaining = (1.0 - particle.age_secs / particle.max_age_secs).clamp(0.0, 1.0);
+            let size = particle.kind.radius() * (0.25 + 0.75 * remaining);
+            let corners = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
+            let positions = corners.map(|(x, y)| {
+                [
+                    particle.pos[0] + size * (x * right[0] + y * up[0]),
+                    particle.pos[1] + size * (x * right[1] + y * up[1]),
+                    particle.pos[2] + size * (x * right[2] + y * up[2]),
+                ]
+            });
+            if positions.iter().flatten().all(|value| value.is_finite()) {
+                quads.push(VanillaParticleQuad {
+                    kind: particle.kind,
+                    positions,
+                    uv: [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+                    color: particle.color,
+                });
+            }
+        }
+        quads
+    }
+}
+
+fn particle_dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn particle_normalize(v: [f32; 3]) -> Option<[f32; 3]> {
+    if !v.iter().all(|c| c.is_finite()) {
+        return None;
+    }
+    let length = particle_dot(v, v).sqrt();
+    if !length.is_finite() || length < 1e-8 {
+        return None;
+    }
+    Some(v.map(|c| c / length))
+}
