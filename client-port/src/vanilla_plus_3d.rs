@@ -440,10 +440,6 @@ fn norm(a: [f32; 3]) -> f32 {
     dot(a, a).sqrt()
 }
 
-fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
-    norm(sub(a, b))
-}
-
 fn normalize_or(a: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
     let l = norm(a);
     if l > 1e-12 {
@@ -471,6 +467,44 @@ struct Frustum {
     v1: [f32; 3],
 }
 
+/// Model-projected UVs for one frustum face: each vertex's UV is its actual
+/// block-local position projected onto the face's dominant axis plane and
+/// clamped to `0..=1`, the same projection a block-model baker applies to
+/// element faces. Side faces map `(u, v) = (horizontal tangent, 1 - y)` —
+/// `u` increases toward the viewer's right and `v = 0` sits at the texture
+/// top — while horizontal faces map `(u, v) = (x, z)`. A centred fixture
+/// therefore samples the centre of its texture instead of anchoring every
+/// face at the `(0, 0)` corner.
+fn projected_face_uvs(p: &[[f32; 3]; 4]) -> [[f32; 2]; 4] {
+    let n = quad_normal(p).unwrap_or([0.0, 0.0, 1.0]);
+    let (ax, ay, az) = (n[0].abs(), n[1].abs(), n[2].abs());
+    let uv_at = |pt: [f32; 3]| -> [f32; 2] {
+        let uv = if ay >= ax && ay >= az {
+            [pt[0], pt[2]]
+        } else if az >= ax {
+            // Normal mostly +/-z: `u` along x, mirrored on the north (-z)
+            // side so the texture is never seen backwards.
+            [
+                if n[2] < 0.0 { 1.0 - pt[0] } else { pt[0] },
+                1.0 - pt[1],
+            ]
+        } else {
+            // Normal mostly +/-x: `u` along z, mirrored on the east (+x)
+            // side so the texture is never seen backwards.
+            [
+                if n[0] > 0.0 { 1.0 - pt[2] } else { pt[2] },
+                1.0 - pt[1],
+            ]
+        };
+        [uv[0].clamp(0.0, 1.0), uv[1].clamp(0.0, 1.0)]
+    };
+    let mut uv = [[0.0; 2]; 4];
+    for (i, pt) in p.iter().enumerate() {
+        uv[i] = uv_at(*pt);
+    }
+    uv
+}
+
 /// Emits one frustum: 4 side quads + 2 end caps, all outward-CCW. Equal end
 /// widths produce an ordinary (possibly sloped) box; shrunken ends produce a
 /// tapered pixel-art facet.
@@ -491,34 +525,22 @@ fn emit_frustum(mesh: &mut ExtrudedMesh, f: &Frustum, tint_index: i32) {
     };
     let r0 = ring(f.c0, u0, f.v0);
     let r1 = ring(f.c1, u1, f.v1);
-    let len = dist(f.c0, f.c1).min(1.0);
 
     for i in 0..4 {
         let j = (i + 1) % 4;
-        let w = dist(r0[i], r0[j]).min(1.0);
-        mesh.push(
-            [r0[i], r0[j], r1[j], r1[i]],
-            [[0.0, 0.0], [w, 0.0], [w, len], [0.0, len]],
-            tint_index,
-        );
+        let positions = [r0[i], r0[j], r1[j], r1[i]];
+        mesh.push(positions, projected_face_uvs(&positions), tint_index);
     }
-    let w1a = dist(r1[0], r1[1]).min(1.0);
-    let w1b = dist(r1[1], r1[2]).min(1.0);
-    mesh.push(
-        [r1[0], r1[1], r1[2], r1[3]],
-        [[0.0, 0.0], [w1a, 0.0], [w1a, w1b], [0.0, w1b]],
-        tint_index,
-    );
-    let w0a = dist(r0[0], r0[1]).min(1.0);
-    let w0b = dist(r0[1], r0[2]).min(1.0);
-    mesh.push(
-        [r0[3], r0[2], r0[1], r0[0]],
-        [[0.0, 0.0], [w0a, 0.0], [w0a, w0b], [0.0, w0b]],
-        tint_index,
-    );
+    let cap1 = [r1[0], r1[1], r1[2], r1[3]];
+    mesh.push(cap1, projected_face_uvs(&cap1), tint_index);
+    let cap0 = [r0[3], r0[2], r0[1], r0[0]];
+    mesh.push(cap0, projected_face_uvs(&cap0), tint_index);
 }
 
 /// Emits an axis-aligned box (`from`/`to` corners), all six faces outward.
+/// Every face's UVs are projected from its actual `[from, to]` coordinates
+/// (clamped to `0..=1`) via [`projected_face_uvs`], so a small centred box
+/// samples the centre of its texture rather than the `(0, 0)` corner.
 fn push_box(mesh: &mut ExtrudedMesh, from: [f32; 3], to: [f32; 3], tint_index: i32) {
     let cx = (from[0] + to[0]) * 0.5;
     let cz = (from[2] + to[2]) * 0.5;
@@ -655,8 +677,12 @@ fn block_jitter(block: [i32; 3]) -> [f32; 2] {
 // Generic texel-grid sprite extruder
 // ---------------------------------------------------------------------------
 
-/// Extrudes a `16x16` alpha/opacity mask (`alpha[y * 16 + x]`, row 0 = sprite
-/// top) into a plate `t` blocks thick lying in `z in [0, t]`.
+/// Largest sprite dimension [`extrude_alpha_mask`] accepts: covers the
+/// classic 16x16 packs and 32/64-texel HD packs while staying bounded.
+pub const MAX_MASK_DIMENSION: usize = 128;
+
+/// Extrudes a `width x height` alpha/opacity mask (`alpha[y * width + x]`,
+/// row 0 = sprite top) into a plate `t` blocks thick lying in `z in [0, t]`.
 ///
 /// Front and back faces are greedy-merged over the opaque mask; side rim
 /// quads are emitted only along opaque->transparent boundaries and merged
@@ -664,31 +690,40 @@ fn block_jitter(block: [i32; 3]) -> [f32; 2] {
 /// yields exactly 6 quads; a solid sprite yields exactly 6 quads. Works for
 /// any vanilla or modded sprite mask — no hand-authored JSON needed.
 ///
-/// `t` is clamped to `0..=1`; `TEXEL` (one texel) is the pixel-consistent
-/// default thickness.
-pub fn extrude_alpha_mask_16x16(alpha: &[u8; 256], t: f32) -> ExtrudedMesh {
+/// `width`/`height` must each be in `1..=128` and `alpha.len()` must equal
+/// `width * height`; anything else fails closed to an empty mesh. `t` is
+/// clamped to `0..=1`; `TEXEL`-scale thickness remains the caller's choice.
+pub fn extrude_alpha_mask(width: usize, height: usize, alpha: &[u8], t: f32) -> ExtrudedMesh {
     let mut mesh = ExtrudedMesh::new();
     let t = t.clamp(0.0, 1.0);
-    if t <= 0.0 {
+    if t <= 0.0
+        || width == 0
+        || height == 0
+        || width > MAX_MASK_DIMENSION
+        || height > MAX_MASK_DIMENSION
+        || alpha.len() != width * height
+    {
         return mesh;
     }
-    let opaque = |x: usize, y: usize| alpha[y * 16 + x] >= ALPHA_CUTOFF;
+    let texel_w = 1.0 / width as f32;
+    let texel_h = 1.0 / height as f32;
+    let opaque = |x: usize, y: usize| alpha[y * width + x] >= ALPHA_CUTOFF;
 
     // Greedy-merge opaque rectangles; emit front + back faces per rectangle.
-    let mut done = [false; 256];
-    for ty in 0..16 {
-        for tx in 0..16 {
-            if !opaque(tx, ty) || done[ty * 16 + tx] {
+    let mut done = vec![false; width * height];
+    for ty in 0..height {
+        for tx in 0..width {
+            if !opaque(tx, ty) || done[ty * width + tx] {
                 continue;
             }
             let mut w = 1usize;
-            while tx + w < 16 && opaque(tx + w, ty) && !done[ty * 16 + tx + w] {
+            while tx + w < width && opaque(tx + w, ty) && !done[ty * width + tx + w] {
                 w += 1;
             }
             let mut h = 1usize;
-            'grow: while ty + h < 16 {
+            'grow: while ty + h < height {
                 for xx in tx..tx + w {
-                    if !opaque(xx, ty + h) || done[(ty + h) * 16 + xx] {
+                    if !opaque(xx, ty + h) || done[(ty + h) * width + xx] {
                         break 'grow;
                     }
                 }
@@ -696,15 +731,15 @@ pub fn extrude_alpha_mask_16x16(alpha: &[u8; 256], t: f32) -> ExtrudedMesh {
             }
             for yy in ty..ty + h {
                 for xx in tx..tx + w {
-                    done[yy * 16 + xx] = true;
+                    done[yy * width + xx] = true;
                 }
             }
-            let x0 = tx as f32 * TEXEL;
-            let x1 = (tx + w) as f32 * TEXEL;
-            let y_hi = 1.0 - ty as f32 * TEXEL;
-            let y_lo = 1.0 - (ty + h) as f32 * TEXEL;
+            let x0 = tx as f32 * texel_w;
+            let x1 = (tx + w) as f32 * texel_w;
+            let y_hi = 1.0 - ty as f32 * texel_h;
+            let y_lo = 1.0 - (ty + h) as f32 * texel_h;
             let (u0, u1) = (x0, x1);
-            let (v0, v1) = (ty as f32 * TEXEL, (ty + h) as f32 * TEXEL);
+            let (v0, v1) = (ty as f32 * texel_h, (ty + h) as f32 * texel_h);
             // Front (z = 0, normal -Z); UVs mirrored like vanilla's far side.
             mesh.push(
                 [
@@ -731,29 +766,32 @@ pub fn extrude_alpha_mask_16x16(alpha: &[u8; 256], t: f32) -> ExtrudedMesh {
     }
 
     // Vertical rims: per column, runs of cells whose left/right neighbour is
-    // transparent merge into one quad each.
-    for tx in 0..16 {
+    // transparent merge into one quad each. UVs sample inside column `tx`
+    // (`tx * texel_w .. (tx + 1) * texel_w`) so the rim shows the texels it
+    // bounds instead of the sprite's transparent left margin.
+    for tx in 0..width {
         for &left_side in &[true, false] {
             let mut run: Option<usize> = None;
-            for ty in 0..=16 {
-                let edge = ty < 16
+            for ty in 0..=height {
+                let edge = ty < height
                     && opaque(tx, ty)
                     && if left_side {
                         tx == 0 || !opaque(tx - 1, ty)
                     } else {
-                        tx == 15 || !opaque(tx + 1, ty)
+                        tx == width - 1 || !opaque(tx + 1, ty)
                     };
                 match (edge, run) {
                     (true, None) => run = Some(ty),
                     (false, Some(start)) => {
                         let x_e = if left_side {
-                            tx as f32 * TEXEL
+                            tx as f32 * texel_w
                         } else {
-                            (tx + 1) as f32 * TEXEL
+                            (tx + 1) as f32 * texel_w
                         };
-                        let y_hi = 1.0 - start as f32 * TEXEL;
-                        let y_lo = 1.0 - ty as f32 * TEXEL;
-                        let (v0, v1) = (start as f32 * TEXEL, ty as f32 * TEXEL);
+                        let y_hi = 1.0 - start as f32 * texel_h;
+                        let y_lo = 1.0 - ty as f32 * texel_h;
+                        let (v0, v1) = (start as f32 * texel_h, ty as f32 * texel_h);
+                        let (u0, u1) = (tx as f32 * texel_w, (tx + 1) as f32 * texel_w);
                         let quad = if left_side {
                             [
                                 [x_e, y_lo, t],
@@ -769,7 +807,7 @@ pub fn extrude_alpha_mask_16x16(alpha: &[u8; 256], t: f32) -> ExtrudedMesh {
                                 [x_e, y_lo, t],
                             ]
                         };
-                        mesh.push(quad, [[0.0, v1], [0.0, v0], [t, v0], [t, v1]], -1);
+                        mesh.push(quad, [[u0, v1], [u0, v0], [u1, v0], [u1, v1]], -1);
                         run = None;
                     }
                     _ => {}
@@ -779,28 +817,31 @@ pub fn extrude_alpha_mask_16x16(alpha: &[u8; 256], t: f32) -> ExtrudedMesh {
     }
 
     // Horizontal rims: per row, runs of cells whose top/bottom neighbour is
-    // transparent merge into one quad each.
-    for ty in 0..16 {
+    // transparent merge into one quad each. UVs sample inside row `ty`
+    // (`ty * texel_h .. (ty + 1) * texel_h`) so the rim shows the texels it
+    // bounds instead of the sprite's transparent top margin.
+    for ty in 0..height {
         for &top_side in &[true, false] {
             let mut run: Option<usize> = None;
-            for tx in 0..=16 {
-                let edge = tx < 16
+            for tx in 0..=width {
+                let edge = tx < width
                     && opaque(tx, ty)
                     && if top_side {
                         ty == 0 || !opaque(tx, ty - 1)
                     } else {
-                        ty == 15 || !opaque(tx, ty + 1)
+                        ty == height - 1 || !opaque(tx, ty + 1)
                     };
                 match (edge, run) {
                     (true, None) => run = Some(tx),
                     (false, Some(start)) => {
                         let y_e = if top_side {
-                            1.0 - ty as f32 * TEXEL
+                            1.0 - ty as f32 * texel_h
                         } else {
-                            1.0 - (ty + 1) as f32 * TEXEL
+                            1.0 - (ty + 1) as f32 * texel_h
                         };
-                        let x0 = start as f32 * TEXEL;
-                        let x1 = tx as f32 * TEXEL;
+                        let x0 = start as f32 * texel_w;
+                        let x1 = tx as f32 * texel_w;
+                        let (v0, v1) = (ty as f32 * texel_h, (ty + 1) as f32 * texel_h);
                         let quad = if top_side {
                             [
                                 [x0, y_e, 0.0],
@@ -818,7 +859,7 @@ pub fn extrude_alpha_mask_16x16(alpha: &[u8; 256], t: f32) -> ExtrudedMesh {
                         };
                         mesh.push(
                             quad,
-                            [[x0, 0.0], [x0, t], [x1, t], [x1, 0.0]],
+                            [[x0, v0], [x0, v1], [x1, v1], [x1, v0]],
                             -1,
                         );
                         run = None;
@@ -830,6 +871,15 @@ pub fn extrude_alpha_mask_16x16(alpha: &[u8; 256], t: f32) -> ExtrudedMesh {
     }
 
     mesh
+}
+
+/// Extrudes a `16x16` alpha/opacity mask (`alpha[y * 16 + x]`, row 0 =
+/// sprite top) into a plate `t` blocks thick lying in `z in [0, t]`.
+///
+/// Thin wrapper over [`extrude_alpha_mask`] for the classic sprite size;
+/// see it for the full contract.
+pub fn extrude_alpha_mask_16x16(alpha: &[u8; 256], t: f32) -> ExtrudedMesh {
+    extrude_alpha_mask(16, 16, alpha, t)
 }
 
 // ---------------------------------------------------------------------------
@@ -865,14 +915,23 @@ pub fn build_3d_cross_mesh(
             // Blade length chosen so rotated corners plus the jitter margin
             // still land strictly inside the block.
             let s = 2.0 * SQRT_2 * (0.5 - JITTER_AMP - 0.01) - TEXEL;
-            for &sgn in &[1.0f32, -1.0] {
+            for (bi, &sgn) in [1.0f32, -1.0].iter().enumerate() {
+                // The two diagonal blades intersect at the block centre;
+                // lift the second one by `+0.0005` and shrink its height by
+                // `0.001` (y -> 0.0005 + 0.999 * y) so their faces never sit
+                // coplanar while every vertex stays inside `0..=1`.
+                let (y_row, y_target) = if bi == 1 {
+                    ([0.0, 0.999, 0.0], 0.0005)
+                } else {
+                    ([0.0, 1.0, 0.0], 0.0)
+                };
                 let m = [
                     [s * c, 0.0, sgn * c],
-                    [0.0, 1.0, 0.0],
+                    y_row,
                     [-sgn * s * c, 0.0, c],
                 ];
                 let mut blade = sprite.clone();
-                blade.affine(m, [0.5, 0.0, TEXEL * 0.5], [0.5 + jx, 0.0, 0.5 + jz]);
+                blade.affine(m, [0.5, 0.0, TEXEL * 0.5], [0.5 + jx, y_target, 0.5 + jz]);
                 mesh.append(&blade);
             }
         }
@@ -979,6 +1038,9 @@ const RAIL_BAR_Y: f32 = 0.10;
 const RAIL_TIE_W: f32 = 0.15;
 const RAIL_TIE_H: f32 = 0.07;
 const RAIL_TIE_Y: f32 = 0.035;
+/// Tiny lift applied to curved-rail chord beams so their horizontal faces
+/// never share a plane with the straight segments they join.
+const RAIL_CHORD_LIFT: f32 = 0.0005;
 
 /// Straight east-west track: two raised bars plus five sleepers.
 fn rail_straight_ew(mesh: &mut ExtrudedMesh, tint: i32) {
@@ -1016,17 +1078,28 @@ fn rail_ascending_east(mesh: &mut ExtrudedMesh, tint: i32) {
 /// each rail is a straight segment, a 45-degree chord, then another straight.
 fn rail_curve_se(mesh: &mut ExtrudedMesh, tint: i32) {
     let (inner, outer) = (0.5 - RAIL_GAUGE, 0.5 + RAIL_GAUGE);
+    // The chord beams cross the straight segments' end caps; lift them by
+    // `RAIL_CHORD_LIFT` so their top/bottom faces never share a plane with
+    // the straights' (coplanar overlap would z-fight).
+    let chord_y = RAIL_BAR_Y + RAIL_CHORD_LIFT;
     // Inner rail hugs the block centre.
     emit_beam(mesh, [inner, RAIL_BAR_Y, 0.99], [inner, RAIL_BAR_Y, 0.60], RAIL_BAR_W, RAIL_BAR_H, tint);
-    emit_beam(mesh, [inner, RAIL_BAR_Y, 0.60], [0.60, RAIL_BAR_Y, inner], RAIL_BAR_W, RAIL_BAR_H, tint);
+    emit_beam(mesh, [inner, chord_y, 0.60], [0.60, chord_y, inner], RAIL_BAR_W, RAIL_BAR_H, tint);
     emit_beam(mesh, [0.60, RAIL_BAR_Y, inner], [0.99, RAIL_BAR_Y, inner], RAIL_BAR_W, RAIL_BAR_H, tint);
-    // Outer rail bends wider.
-    emit_beam(mesh, [outer, RAIL_BAR_Y, 0.99], [outer, RAIL_BAR_Y, 0.40], RAIL_BAR_W, RAIL_BAR_H, tint);
-    emit_beam(mesh, [outer, RAIL_BAR_Y, 0.40], [0.40, RAIL_BAR_Y, outer], RAIL_BAR_W, RAIL_BAR_H, tint);
-    emit_beam(mesh, [0.40, RAIL_BAR_Y, outer], [0.99, RAIL_BAR_Y, outer], RAIL_BAR_W, RAIL_BAR_H, tint);
-    // Ties: one per straight leg plus a diagonal tie under the bend.
-    emit_beam(mesh, [0.15, RAIL_TIE_Y, 0.86], [0.86, RAIL_TIE_Y, 0.86], RAIL_TIE_W, RAIL_TIE_H, -1);
-    emit_beam(mesh, [0.86, RAIL_TIE_Y, 0.15], [0.86, RAIL_TIE_Y, 0.86], RAIL_TIE_W, RAIL_TIE_H, -1);
+    // Outer rail bends tighter, hugging the block corner: short legs plus a
+    // small chord. The previous wide chord forced both legs to span the
+    // `(outer, outer)` corner square, where they overlapped volumetrically
+    // and shared coplanar top/bottom faces (z-fighting).
+    emit_beam(mesh, [outer, RAIL_BAR_Y, 0.99], [outer, RAIL_BAR_Y, 0.80], RAIL_BAR_W, RAIL_BAR_H, tint);
+    emit_beam(mesh, [outer, chord_y, 0.80], [0.80, chord_y, outer], RAIL_BAR_W, RAIL_BAR_H, tint);
+    emit_beam(mesh, [0.80, RAIL_BAR_Y, outer], [0.99, RAIL_BAR_Y, outer], RAIL_BAR_W, RAIL_BAR_H, tint);
+    // Ties: one per straight leg plus a diagonal tie under the bend. Both
+    // straight ties stop at `0.86 - RAIL_TIE_W` so their half-widths never
+    // overlap near the `(0.86, 0.86)` corner — overlapping sleepers would
+    // share coplanar top/bottom faces and z-fight.
+    let tie_end = 0.86 - RAIL_TIE_W;
+    emit_beam(mesh, [0.15, RAIL_TIE_Y, 0.86], [tie_end, RAIL_TIE_Y, 0.86], RAIL_TIE_W, RAIL_TIE_H, -1);
+    emit_beam(mesh, [0.86, RAIL_TIE_Y, 0.15], [0.86, RAIL_TIE_Y, tie_end], RAIL_TIE_W, RAIL_TIE_H, -1);
     emit_beam(mesh, [0.30, RAIL_TIE_Y, 0.30], [0.70, RAIL_TIE_Y, 0.70], RAIL_TIE_W, RAIL_TIE_H, -1);
 }
 
@@ -1081,20 +1154,32 @@ pub fn build_3d_rail_mesh(shape: RailShape, powered: bool) -> ExtrudedMesh {
     mesh
 }
 
-/// Builds a 3D ladder: two stiles plus four rungs as a thin plate against the
-/// `facing` side of the block (`North` -> plate near `z = 0`, and so on).
-/// `Up`/`Down` are not valid wall facings and fall back to `North`/`South`.
+/// Builds a 3D ladder: two stiles plus four rungs as a thin plate against
+/// the wall *opposite* `facing` — vanilla `facing` names the direction the
+/// ladder faces (and the direction a player faces while climbing), so
+/// `North` attaches to the south wall (`z = 1.0 - depth .. 1.0`) and fronts
+/// north, `South` attaches to the north wall, and so on. `Up`/`Down` are
+/// not valid wall facings and fall back to `North`/`South`.
 pub fn build_3d_ladder_mesh(facing: Direction) -> ExtrudedMesh {
     let mut mesh = ExtrudedMesh::new();
     let depth = TEXEL;
-    // Stiles.
-    push_box(&mut mesh, [0.09, 0.0, 0.0], [0.19, 1.0, depth], -1);
-    push_box(&mut mesh, [0.81, 0.0, 0.0], [0.91, 1.0, depth], -1);
-    // Rungs.
+    // Stiles: plate hugging the z = 1 (south) wall in local space.
+    push_box(&mut mesh, [0.09, 0.0, 1.0 - depth], [0.19, 1.0, 1.0], -1);
+    push_box(&mut mesh, [0.81, 0.0, 1.0 - depth], [0.91, 1.0, 1.0], -1);
+    // Rungs: recessed behind the front face exactly like the stiles' depth.
     for i in 0..4 {
         let y0 = 0.11 + i as f32 * 0.25;
-        push_box(&mut mesh, [0.19, y0, 0.0], [0.81, y0 + 0.07, depth * 0.8], -1);
+        push_box(
+            &mut mesh,
+            [0.19, y0, 1.0 - depth * 0.8],
+            [0.81, y0 + 0.07, 1.0],
+            -1,
+        );
     }
+    // Quarter turns about the block centre swing the south-wall plate onto
+    // the wall opposite each facing: `North` keeps it on the south wall,
+    // `South` flips it to the north wall, `West` swings it onto the east
+    // wall and `East` onto the west wall.
     let turns = match facing {
         Direction::East => 3,
         Direction::South => 2,
@@ -1118,51 +1203,82 @@ pub enum FixtureKind {
     Lantern,
 }
 
+/// Small overlap inset (block units) applied wherever two fixture boxes
+/// cross or stack: intersecting boxes keep a volumetric joint but their
+/// faces never share a plane, so no coplanar pair can z-fight. `0.001` is
+/// far below one texel (`1/16`) — invisible at any watchable distance.
+const FIXTURE_JOINT_INSET: f32 = 0.001;
+
 /// Builds a generic 3D fixture centred in the block. Wall-mounted variants
 /// are produced by the caller yawing/orienting the returned mesh.
 pub fn build_3d_fixture_mesh(kind: FixtureKind) -> ExtrudedMesh {
     let mut mesh = ExtrudedMesh::new();
+    let i = FIXTURE_JOINT_INSET;
     match kind {
         FixtureKind::Chain => {
-            // Central link column plus three alternating cross plates.
+            // Central link column plus three alternating cross plates. Each
+            // plate's thin dimension is inset by `i` on both sides so its
+            // faces stay strictly inside the column — the joint is volumetric
+            // but no two faces are ever coplanar.
             push_box(&mut mesh, [0.44, 0.0, 0.44], [0.56, 1.0, 0.56], -1);
-            for (i, &along_x) in [true, false, true].iter().enumerate() {
-                let y0 = 0.17 + i as f32 * 0.33;
+            for (k, &along_x) in [true, false, true].iter().enumerate() {
+                let y0 = 0.17 + k as f32 * 0.33;
                 if along_x {
-                    push_box(&mut mesh, [0.31, y0, 0.44], [0.69, y0 + 0.07, 0.56], -1);
+                    push_box(
+                        &mut mesh,
+                        [0.31, y0, 0.44 + i],
+                        [0.69, y0 + 0.07, 0.56 - i],
+                        -1,
+                    );
                 } else {
-                    push_box(&mut mesh, [0.44, y0, 0.31], [0.56, y0 + 0.07, 0.69], -1);
+                    push_box(
+                        &mut mesh,
+                        [0.44 + i, y0, 0.31],
+                        [0.56 - i, y0 + 0.07, 0.69],
+                        -1,
+                    );
                 }
             }
         }
         FixtureKind::IronBars => {
-            // Pane: two horizontal cross bars plus four vertical posts.
+            // Pane: two horizontal cross bars plus four vertical posts. The
+            // vertical bars' height and the posts' cross-section are inset
+            // by `i` so crossing boxes never share a face plane.
             push_box(&mut mesh, [0.0, 0.30, 0.47], [1.0, 0.40, 0.53], -1);
             push_box(&mut mesh, [0.0, 0.70, 0.47], [1.0, 0.80, 0.53], -1);
-            push_box(&mut mesh, [0.47, 0.30, 0.0], [0.53, 0.40, 1.0], -1);
-            push_box(&mut mesh, [0.47, 0.70, 0.0], [0.53, 0.80, 1.0], -1);
+            push_box(&mut mesh, [0.47, 0.30 + i, 0.0], [0.53, 0.40 - i, 1.0], -1);
+            push_box(&mut mesh, [0.47, 0.70 + i, 0.0], [0.53, 0.80 - i, 1.0], -1);
             for &(px, pz) in &[(0.22f32, 0.5f32), (0.78, 0.5), (0.5, 0.22), (0.5, 0.78)] {
                 push_box(
                     &mut mesh,
-                    [px - 0.03, 0.0, pz - 0.03],
-                    [px + 0.03, 1.0, pz + 0.03],
+                    [px - 0.03 + i, 0.0, pz - 0.03 + i],
+                    [px + 0.03 - i, 1.0, pz + 0.03 - i],
                     -1,
                 );
             }
         }
         FixtureKind::Torch => {
-            // Handle plus a slightly wider flame head.
+            // Handle plus a slightly wider flame head; the head's base dips
+            // `i` into the handle so the joint faces never coincide.
             push_box(&mut mesh, [0.44, 0.0, 0.44], [0.56, 0.62, 0.56], -1);
-            push_box(&mut mesh, [0.37, 0.62, 0.37], [0.63, 0.76, 0.63], 0);
+            push_box(&mut mesh, [0.37, 0.62 - i, 0.37], [0.63, 0.76, 0.63], 0);
         }
         FixtureKind::Lantern => {
+            // Each stacked section overlaps the one below by `i`, and the
+            // hanging ring's bars are inset the same way, so no two boxes
+            // share a face plane anywhere in the fixture.
             push_box(&mut mesh, [0.34, 0.0, 0.34], [0.66, 0.09, 0.66], -1);
-            push_box(&mut mesh, [0.37, 0.09, 0.37], [0.63, 0.50, 0.63], -1);
+            push_box(&mut mesh, [0.37, 0.09 - i, 0.37], [0.63, 0.50 + i, 0.63], -1);
             push_box(&mut mesh, [0.34, 0.50, 0.34], [0.66, 0.60, 0.66], -1);
             // Hanging ring: two side bars and a top bar.
-            push_box(&mut mesh, [0.41, 0.60, 0.47], [0.47, 0.78, 0.53], -1);
-            push_box(&mut mesh, [0.53, 0.60, 0.47], [0.59, 0.78, 0.53], -1);
-            push_box(&mut mesh, [0.41, 0.78, 0.47], [0.59, 0.84, 0.53], -1);
+            push_box(&mut mesh, [0.41, 0.60 - i, 0.47], [0.47, 0.78, 0.53], -1);
+            push_box(&mut mesh, [0.53, 0.60 - i, 0.47], [0.59, 0.78, 0.53], -1);
+            push_box(
+                &mut mesh,
+                [0.41 + i, 0.78 - i, 0.47 + i],
+                [0.59 - i, 0.84, 0.53 - i],
+                -1,
+            );
         }
     }
     mesh

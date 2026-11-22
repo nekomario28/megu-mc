@@ -223,36 +223,36 @@ fn crop_golden_fingerprints_pin_every_stage() {
     const GOLDENS: [[u64; 8]; 3] = [
         // SheafStalk stages 0..=7
         [
-            0xbcea_9347_b5af_7871,
-            0xd565_aa6f_3385_cd11,
-            0xaae8_1d4d_6a44_c701,
-            0x8ead_e68d_d593_1265,
-            0xfb03_8a1a_e69d_8dc9,
-            0x8438_9b50_9427_eda9,
-            0x6c33_99d2_c9c5_df11,
-            0xf34f_1c72_e992_6ce1,
+            0x7159_fc99_57f4_dfab,
+            0x0df8_06a8_6308_2b90,
+            0xd2b8_e3ce_83df_c354,
+            0x57e1_2326_d3c8_76ef,
+            0xadb2_2247_a802_6927,
+            0xd91a_afee_95f9_288c,
+            0x8d49_cbd3_c89f_2c11,
+            0x387c_d69e_0687_e4d6,
         ],
         // BulbLeaf stages 0..=7
         [
-            0xbaf7_f44d_4237_b4c9,
-            0xea43_46fd_12b2_99f5,
-            0x88e0_3910_c081_a6b9,
-            0x759c_1919_c6f6_8c59,
-            0xc7b0_80ba_0bfc_c6a5,
-            0x1f7b_01f8_cb3c_f2dd,
-            0x8aa0_2aa7_26ec_0c05,
-            0x938c_5eb9_13b1_8ba5,
+            0x3636_434d_9446_c34e,
+            0xcf46_ffe4_5f52_7df6,
+            0xd433_6bdb_636a_7b92,
+            0x12a0_2a50_c960_8465,
+            0x297c_711e_b63a_7b8b,
+            0x0b99_1418_3192_6262,
+            0xa733_a25e_cbac_cfee,
+            0xb920_4826_599f_d568,
         ],
         // VineFruit stages 0..=7
         [
-            0x994a_b12d_906f_c1a1,
-            0x8760_38fc_c37d_8271,
-            0x4765_a7fa_be05_b511,
-            0x6a6b_1de3_ee36_78f9,
-            0x39d9_edd2_61b5_ec75,
-            0x5613_9373_da1c_6905,
-            0x1c4d_34ae_fb32_780d,
-            0x2197_fdac_7a76_44e1,
+            0x2450_c191_f52f_4421,
+            0x0f41_a2c6_b611_1ef9,
+            0xfdbd_f237_451c_3875,
+            0xfd73_5689_cbea_ae5d,
+            0xcba0_7075_50a3_228d,
+            0xe81d_d4bb_b1dc_f3d9,
+            0x787f_3da8_7e7f_33b5,
+            0xb223_94ef_eb7a_2b89,
         ],
     ];
     for (row, arch) in [
@@ -358,9 +358,9 @@ fn ore_relief_is_deterministic_and_well_formed() {
         }
     }
     // Golden pins for the standard vein fixture.
-    assert_eq!(mesh_fingerprint(&a), 0xa1da_e31c_0097_46dd);
+    assert_eq!(mesh_fingerprint(&a), 0xf001_31dc_bb07_8b1d);
     let up_only = build_3d_ore_relief(&vein_mask(), Direction::Up.bit());
-    assert_eq!(mesh_fingerprint(&up_only), 0x0c47_e059_704c_a795);
+    assert_eq!(mesh_fingerprint(&up_only), 0x1143_f836_42d6_a895);
 }
 
 #[test]
