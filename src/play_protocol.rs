@@ -1056,6 +1056,9 @@ struct PendingDig {
     state: u32,
     started: Instant,
     seconds: f32,
+    /// The last crack stage broadcast to viewers (`-1` = none yet) —
+    /// vanilla `destroyBlockProgress` emits only on stage changes.
+    last_stage: i8,
 }
 
 struct Client {
@@ -2034,7 +2037,11 @@ fn interest_tick() {
                 x,
                 y,
                 z,
-                Box::new(move || vec![(0x02, xp_orb_pkt(eid, x, y, z, val))]),
+                Box::new(move || {
+                    let (id, body) = encode_play_add_experience_orb(eid, x, y, z, val);
+                    debug_assert_eq!(body, xp_orb_pkt(eid, x, y, z, val));
+                    vec![(id, body)]
+                }),
             ),
         );
     }
@@ -2068,6 +2075,7 @@ fn interest_tick() {
         sync_entity_interest(client, &ents);
     }
     dig_progress_tick(&cls);
+    combat_tick(&cls);
     // Death is a server-tick event (vanilla LivingEntity.die): an idle
     // victim's own read loop may not wake for seconds, so the tick sweep
     // drives drop_player_items_on_death — it emits the 0x1f death event and
@@ -2077,11 +2085,35 @@ fn interest_tick() {
     }
 }
 
+/// `Level.destroyBlockProgress`: the dig's crack stage goes to every viewer
+/// within the vanilla 32-block update radius in the dig's dimension —
+/// excluding the breaker, whose own client plays the local crack animation.
+/// `stage` `-1` clears the cracks on a cancelled dig.
+fn broadcast_block_destroy(cls: &[Arc<Client>], dim: DimId, pos: (i32, i32, i32), breaker: i32, stage: i8) {
+    let (_, payload) = encode_play_block_destruction(breaker, pos, stage);
+    let (x, y, z) = pos;
+    for c in cls {
+        if c.eid == breaker || *c.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
+            continue;
+        }
+        let (px, py, pz, ..) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let (dx, dy, dz) = (px - x as f64 - 0.5, py - y as f64 - 0.5, pz - z as f64 - 0.5);
+        if dx * dx + dy * dy + dz * dz <= 32.0 * 32.0 {
+            let _ = send_packet(
+                &mut c.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                0x06,
+                payload.clone(),
+            );
+        }
+    }
+}
+
 /// Server-side mining completion: a pending START_DESTROY_BLOCK whose block
 /// still matches and whose dig duration has elapsed breaks, exactly as
 /// `ServerPlayerGameMode.tick` advancing `destroyProgress` past 1.0 would. A
 /// changed or removed block, a cancelled dig, or a client disconnect clears the
-/// pending state instead.
+/// pending state instead. While a dig is pending, its crack stage broadcasts
+/// `block_destruction` to nearby viewers on every stage change.
 fn dig_progress_tick(cls: &[Arc<Client>]) {
     for c in cls {
         let Some(dig) = *c.dig.lock().unwrap_or_else(|e| e.into_inner()) else {
@@ -2093,9 +2125,77 @@ fn dig_progress_tick(cls: &[Arc<Client>]) {
             *c.dig.lock().unwrap_or_else(|e| e.into_inner()) = None;
             continue;
         }
+        let stage =
+            ((dig.started.elapsed().as_secs_f32() / dig.seconds) * 10.0).clamp(0.0, 9.0) as i8;
+        if stage != dig.last_stage {
+            if let Some(d) = c.dig.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                d.last_stage = stage;
+            }
+            broadcast_block_destroy(cls, dim, (x, y, z), c.eid, stage);
+        }
         if dig.started.elapsed().as_secs_f32() >= dig.seconds {
             *c.dig.lock().unwrap_or_else(|e| e.into_inner()) = None;
             finish_block_break(c, dim, x, y, z, dig.state);
+        }
+    }
+}
+
+/// Per-player `CombatTracker` mirrors — `(first damage, last damage)` keyed by
+/// player eid. Vanilla opens the combat window on the first accepted hit and
+/// closes it 100 ticks (5 seconds) after the most recent one.
+fn combat_sessions() -> &'static Mutex<HashMap<i32, (Instant, Instant)>> {
+    static COMBAT: OnceLock<Mutex<HashMap<i32, (Instant, Instant)>>> = OnceLock::new();
+    COMBAT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `CombatTracker.recordDamage`: the first hit opens the victim's combat
+/// window (`player_combat_enter` to the victim); every accepted hit refreshes
+/// the five-second end timer.
+fn combat_note_damage(victim: &Client) {
+    let mut sessions = combat_sessions().lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    match sessions.get_mut(&victim.eid) {
+        Some((_, last)) => *last = now,
+        None => {
+            sessions.insert(victim.eid, (now, now));
+            drop(sessions);
+            let _ = send_packet(
+                &mut victim.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                0x3b,
+                encode_play_player_combat_enter().1,
+            );
+        }
+    }
+}
+
+/// `CombatTracker.tick`: five quiet seconds after the last damage the combat
+/// window closes with `player_combat_end` carrying the open duration in
+/// ticks; a dead player's window closes silently — `player_combat_kill`
+/// carries the death instead.
+fn combat_tick(cls: &[Arc<Client>]) {
+    for c in cls {
+        let alive = *c.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0;
+        let ended = {
+            let mut sessions = combat_sessions().lock().unwrap_or_else(|e| e.into_inner());
+            match sessions.get(&c.eid) {
+                Some(&(started, last)) if alive && last.elapsed() >= Duration::from_secs(5) => {
+                    sessions.remove(&c.eid);
+                    Some(started.elapsed())
+                }
+                Some(_) if !alive => {
+                    sessions.remove(&c.eid);
+                    None
+                }
+                _ => None,
+            }
+        };
+        if let Some(duration) = ended {
+            let ticks = (duration.as_millis() / 50) as u32;
+            let _ = send_packet(
+                &mut c.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                0x3a,
+                encode_play_player_combat_end(ticks).1,
+            );
         }
     }
 }
@@ -2570,13 +2670,28 @@ fn sync_entity_interest(client: &Client, entities: &[TrackedSpawn]) {
         }
     }
     for eid in added {
-        for (id, body) in eligible[&eid]() {
+        // vanilla `ServerEntity.sendPairingData` wraps an entity's spawn
+        // group (spawn + data + equipment) in a bundle so the client applies
+        // the burst atomically.
+        let packets = eligible[&eid]();
+        let bundled = packets.len() > 1;
+        if bundled
+            && send_packet(&mut socket, 0x00, encode_play_bundle_delimiter().1).is_err()
+        {
+            return;
+        }
+        for (id, body) in packets {
             if id == 0x01 {
                 with_play_wire(&socket, |play| play.remember_spawn(&body));
             }
             if send_packet(&mut socket, id, body).is_err() {
                 return;
             }
+        }
+        if bundled
+            && send_packet(&mut socket, 0x00, encode_play_bundle_delimiter().1).is_err()
+        {
+            return;
         }
         seen.insert(eid);
     }
@@ -6364,6 +6479,16 @@ fn system_chat(text: &str) -> Vec<u8> {
     p.push(0);
     p
 }
+/// `{"translate":"<key>"}` as anonymousNbt compound — the components
+/// `displayClientMessage(key, true)` puts on the `set_action_bar_text` wire.
+fn translate_component_nbt(key: &str) -> Vec<u8> {
+    let mut v = vec![10u8];
+    v.push(8); // TAG_String
+    nbt_str(&mut v, "translate");
+    nbt_str(&mut v, key);
+    v.push(0);
+    v
+}
 // tellraw: build anonymousNbt compound from a flat json component
 // (scalar fields only — nested arrays/components documented gap)
 fn json_component_nbt(json: &str) -> Vec<u8> {
@@ -7094,7 +7219,17 @@ fn step_live_vehicle(me: &Arc<Client>, pkt: &MoveVehiclePacket) {
         live.registry.register_rider(vehicle, from);
         live.registry.step_vehicle_move(vehicle, pkt, &env)
     };
-    let Ok(step) = step else { return };
+    let Ok(step) = step else {
+        // vanilla `handleMoveVehicle`: a rejected move snaps the client's
+        // predicted vehicle back to the server's authoritative transform.
+        let p = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = send_packet(
+            &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+            0x31,
+            encode_play_move_vehicle((p.0, p.1, p.2), p.3, p.4).1,
+        );
+        return;
+    };
     {
         let mut p = mob.pos.lock().unwrap_or_else(|e| e.into_inner());
         p.0 = step.pos[0];
@@ -7236,8 +7371,12 @@ fn live_chat_validate(
 }
 
 /// Relay one admitted envelope: `0x39` Player Chat forwards the signature
-/// end-to-end; an unsigned line goes out as `0x1e` Disguised Chat — the
-/// vanilla relay path — with the sender-decorated component as its content.
+/// end-to-end; an unsigned line goes out per-recipient — `0x39` Player Chat
+/// (null signature, the message as unsigned display content) to clients that
+/// established a chat session via C2S `chat_session_update`, and `0x6c`
+/// System Chat carrying the decorated `<sender> message` line to clients
+/// with no session, matching how vanilla relays unsigned chat to
+/// session-capable clients while session-less clients still see the text.
 fn live_chat_relay(me: &Arc<Client>, env: &ChatMessageEnvelope, m: &str, verdict: ChatVerdict) {
     match verdict {
         ChatVerdict::Signed => {
@@ -7250,23 +7389,41 @@ fn live_chat_relay(me: &Arc<Client>, env: &ChatMessageEnvelope, m: &str, verdict
             );
             // The encoder emits `id + body`; `send_packet` wants them split.
             let mut body = frame.as_slice();
-            let id = read_varint(&mut body).unwrap_or(S2C_PLAYER_CHAT_767);
+            let _ = read_varint(&mut body);
             let payload = body.to_vec();
-            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), id, payload.clone());
-            broadcast(me.eid, |_c| (id, payload.clone()));
+            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x39, payload.clone());
+            broadcast(me.eid, |_c| (0x39, payload.clone()));
         }
         ChatVerdict::Disguised => {
-            let frame = {
-                // Deep indent keeps the line decoration byte-identical for
-                // the mutation anchor that pins this exact statement.
-                    let line = format!("<{}> {}", me.name, m);
-                encode_disguised_chat_0x1e(&chat_nbt(&line), live_chat_type_index(), &me.name)
-            };
-            let mut body = frame.as_slice();
-            let id = read_varint(&mut body).unwrap_or(S2C_DISGUISED_CHAT_767);
-            let payload = body.to_vec();
-            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), id, payload.clone());
-            broadcast(me.eid, |_c| (id, payload.clone()));
+            let session_eids: HashSet<i32> = chat_sessions()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys()
+                .copied()
+                .collect();
+            let player_frame = encode_player_chat_0x39(
+                env,
+                next_chat_message_index(),
+                Some(&chat_nbt(m)),
+                live_chat_type_index(),
+                &me.name,
+            );
+            let mut player_body = player_frame.as_slice();
+            let _ = read_varint(&mut player_body);
+            let player_payload = player_body.to_vec();
+            let system_payload = system_chat(&format!("<{}> {}", me.name, m));
+            if session_eids.contains(&me.eid) {
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x39, player_payload.clone());
+            } else {
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x6c, system_payload.clone());
+            }
+            broadcast(me.eid, |c| {
+                if session_eids.contains(&c.eid) {
+                    (0x39, player_payload.clone())
+                } else {
+                    (0x6c, system_payload.clone())
+                }
+            });
         }
     }
 }
@@ -7557,6 +7714,14 @@ fn place_live_recipe(me: &Arc<Client>, place: &PlaceRecipe) {
     .unwrap_or((0, 0, Vec::new()));
     let wid = place.window_id as u8;
     let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
+    // vanilla `ServerPlaceRecipe.recipeClicked`: once the recipe resolves the
+    // server confirms it back to the requester as a ghost-recipe overlay on
+    // the same window, then the container echoes below resync the slots.
+    let _ = send_packet(
+        &mut sock,
+        0x37,
+        encode_play_place_ghost_recipe(wid, &place.recipe_id).1,
+    );
     let mut echo = |slot: i16, st: &Stack| {
         let mut p = vec![wid];
         write_varint(&mut p, 0);
@@ -7871,6 +8036,22 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     let initial_held = saved_player.as_ref().map_or(0, |save| save.held.clamp(0, 8));
     if send_packet(&mut s, 0x2b, join_game(saved_dim, initial_gm, player_eid)).is_err() {
         return;
+    }
+    // vanilla `PlayerList.placeNewPlayer` follows Join Game with
+    // `ClientboundServerDataPacket`: the MOTD component plus the optional
+    // server icon (raw PNG bytes when `server-icon.png` validated).
+    {
+        let motd = std::env::var("MC_SPINE_MOTD").unwrap_or_else(|_| "mc-spine".to_owned());
+        let icon = if status_favicon().is_some() {
+            std::fs::read("server-icon.png").ok()
+        } else {
+            None
+        };
+        let _ = send_packet(
+            &mut s,
+            0x4b,
+            encode_play_server_data(&motd, icon.as_deref()).1,
+        );
     }
     send_view_distance(&mut s, client_view.clamp(2, SERVER_VIEW_DISTANCE));
     let login_admin = player_is_admin(&name);
@@ -8233,6 +8414,18 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
             KeepaliveAction::Send(id) => {
                 if send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x26, id.to_be_bytes().to_vec())
                     .is_err()
+                {
+                    break 'conn;
+                }
+                // vanilla `ServerGamePacketListenerImpl.tick` also probes the
+                // client with ClientboundPingPacket on its connection-alive
+                // cadence; the C2S 0x27 answer lands on `last_client_pongs`.
+                if send_packet(
+                    &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                    0x35,
+                    encode_play_ping(id as i32).1,
+                )
+                .is_err()
                 {
                     break 'conn;
                 }
@@ -8918,8 +9111,18 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     }
                 }
                 if status == 1 {
-                    *me.dig.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                } // aborted dig
+                    // aborted dig: `Level.destroyBlockProgress(-1)` clears the
+                    // cracks on every viewer the stage broadcasts reached.
+                    if let Some(dig) = me.dig.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                        broadcast_block_destroy(
+                            &client_snapshot(),
+                            dig.pos.0,
+                            (dig.pos.1, dig.pos.2, dig.pos.3),
+                            me.eid,
+                            -1,
+                        );
+                    }
+                }
                 if status == 0 || status == 2 {
                     // vanilla block_interaction_range: 4.5 survival / 5.0 creative
                     let (px, py, pz, _, _, on_ground) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
@@ -8992,6 +9195,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     state: old,
                                     started: Instant::now(),
                                     seconds: t,
+                                    last_stage: -1,
                                 });
                             } else {
                                 let t0 = me.dig.lock().unwrap_or_else(|e| e.into_inner()).and_then(|d| {
@@ -9392,7 +9596,14 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     let bed_works = dim == DimId::Overworld
                         || crate::worldgen::dimension_spec(dim)
                             .is_some_and(|spec| spec.bed_works);
-                    if bed_works && sleep_ok {
+                    let occupied = client_snapshot().iter().any(|c| {
+                        c.eid != me.eid
+                            && c.sleeping
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .is_some_and(|s| s.bed == (x, y, z))
+                    });
+                    if bed_works && sleep_ok && !occupied {
                         let angle = me.pos.lock().unwrap_or_else(|e| e.into_inner()).3;
                         let position = (x as f64 + 0.5, y as f64 + 1.0, z as f64 + 0.5);
                         {
@@ -9420,6 +9631,20 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         // players have slept 100 ticks
                         // (playersSleepingPercentage).
                         enter_bed(&me, x, y, z);
+                    } else if bed_works {
+                        // vanilla `BedBlock`/`BedSleepingProblem` posts the
+                        // refusal to the action bar: occupied beats "can only
+                        // sleep at night or during thunderstorms".
+                        let key = if occupied {
+                            "block.minecraft.bed.occupied"
+                        } else {
+                            "block.minecraft.bed.no_sleep"
+                        };
+                        let _ = send_packet(
+                            &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                            0x4c,
+                            translate_component_nbt(key),
+                        );
                     }
                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     continue;
@@ -9608,6 +9833,22 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 let mut sl = &b[..];
                 let _h = read_varint(&mut sl);
                 let seq = read_varint(&mut sl).unwrap_or(0);
+                // vanilla `WrittenBookItem.use` → `openItemGui` sends
+                // `ClientboundOpenBookPacket` for the used hand.
+                let held_item = {
+                    let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                    let slot = if _h == Some(1) { 45 } else { 36 + held_slot };
+                    inv.get(&slot).map(|v| v.0).unwrap_or(0)
+                };
+                if held_item == name_to_item("written_book").unwrap_or(-1) {
+                    if let Some((_, pl)) = encode_play_open_book(_h.unwrap_or(0) as u8) {
+                        let _ = send_packet(
+                            &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                            0x32,
+                            pl,
+                        );
+                    }
+                }
                 if !try_use_ender_eye(&me, held_slot, seq) {
                     air_use_item(&me, held_slot, seq, _h, false);
                 }
@@ -10014,6 +10255,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                         continue;
                                     };
                                     let dmg = accepted;
+                                    // vanilla `CombatTracker.recordDamage`:
+                                    // opens or refreshes the victim's combat
+                                    // window (`0x3b` on the first hit).
+                                    combat_note_damage(v);
                                     *me.walk_acc.lock().unwrap_or_else(|e| e.into_inner()) += 0.1;
                                     // vanilla: an axe hit disables a raised shield for 5s
                                     if kind == 3 && *v.blocking.lock().unwrap_or_else(|e| e.into_inner()) {
@@ -10116,15 +10361,27 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 let victim = {
                                     clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.eid == veid).cloned()
                                 };
-                                if let Some(victim) = victim {
-                                    drop_player_items_on_death(&victim);
+                                if let Some(victim) = &victim {
+                                    drop_player_items_on_death(victim);
                                 }
                                 if GR_SHOW_DEATH_MESSAGES.load(Ordering::Relaxed) != 0 {
-                                    let line = system_chat(&format!(
+                                    let message = format!(
                                         "{} was slain by {}",
                                         vname, me.name
-                                    ));
+                                    );
+                                    let line = system_chat(&message);
                                     broadcast(-1, |_c| (0x6c, line.clone()));
+                                    // vanilla `ServerPlayer.die`: under
+                                    // showDeathMessages the combat tracker's
+                                    // death message also rides
+                                    // `player_combat_kill` to the dying client.
+                                    if let Some(victim) = &victim {
+                                        let _ = send_packet(
+                                            &mut victim.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                                            0x3c,
+                                            encode_play_player_combat_kill(veid, &message).1,
+                                        );
+                                    }
                                 }
                             }
                             continue;
@@ -12146,7 +12403,15 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     seen_advancement_state()
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .insert(me.eid, state);
+                        .insert(me.eid, state.clone());
+                    // vanilla `PlayerAdvancements.setSelectedTab` answers the
+                    // request: OpenedTab echoes the tab, ClosedScreen sends
+                    // an empty selection.
+                    let _ = send_packet(
+                        &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                        0x4a,
+                        encode_play_select_advancements_tab(state.1.as_deref()).1,
+                    );
                 }
             }
             0x30 => {
@@ -12350,6 +12615,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         last_client_pongs().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
         client_abilities_flying().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
         seen_advancement_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
+        combat_sessions().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
         reconfigure_acked().lock().unwrap_or_else(|e| e.into_inner()).remove(&me_cleanup.eid);
         // A disconnecting player drops both sides of `ServerPlayer.camera`: the
         // entry naming their own view and any spectator still watching them.
@@ -15783,7 +16049,7 @@ mod p5c_live_tests {
     }
 
     #[test]
-    fn w1_live_wire_signed_chat_relays_0x39_and_0x1e() {
+    fn w1_live_wire_signed_chat_relays_0x39_and_session_fallback() {
         let _guard = world_guard();
         let (sender, _sender_peer) = loopback_client("w1sender", 0x7101);
         let (recv, mut recv_peer) = loopback_client("w1recv", 0x7102);
@@ -15804,12 +16070,29 @@ mod p5c_live_tests {
             .expect("signed envelope must pass admission");
         let (id, _) = read_frame(&mut recv_peer).expect("receiver must get a chat frame");
         assert_eq!(id, S2C_PLAYER_CHAT_767, "signed chat must relay as 0x39");
-        // Offline mode allows the unsigned envelope through the vanilla
-        // Disguised Chat relay.
+        // Offline mode allows the unsigned envelope through; a recipient with
+        // no chat session sees it as `0x6c` System Chat (#132 session path).
         live_chat_message(&sender, &w1_chat_body("w1 plain", false), &mut throttle)
             .expect("unsigned offline envelope must pass admission");
         let (id, _) = read_frame(&mut recv_peer).expect("receiver must get a chat frame");
-        assert_eq!(id, S2C_DISGUISED_CHAT_767, "unsigned chat must relay as 0x1e");
+        assert_eq!(id, 0x6c, "unsigned chat to a session-less client relays as 0x6c");
+        // A recipient that established a chat session via `chat_session_update`
+        // gets the vanilla unsigned `0x39` Player Chat (null signature +
+        // unsigned display content) instead.
+        chat_sessions().lock().unwrap_or_else(|e| e.into_inner()).insert(
+            recv.eid,
+            ChatSessionMeta {
+                session: [0; 16],
+                expires_at: 0,
+                key_len: 0,
+                sig_len: 0,
+            },
+        );
+        live_chat_message(&sender, &w1_chat_body("w1 session", false), &mut throttle)
+            .expect("unsigned offline envelope must pass admission");
+        let (id, _) = read_frame(&mut recv_peer).expect("receiver must get a chat frame");
+        assert_eq!(id, S2C_PLAYER_CHAT_767, "unsigned chat to a session client relays as 0x39");
+        chat_sessions().lock().unwrap_or_else(|e| e.into_inner()).remove(&recv.eid);
     }
 
     #[test]
