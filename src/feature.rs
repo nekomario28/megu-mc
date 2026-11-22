@@ -10058,7 +10058,7 @@ fn build_origin_grid(g: &mut Gen, claims: &[(i32, i32)], jobs: usize) -> OriginG
         let owner: &Gen = &*g;
         let per = missing.len().div_ceil(jobs).max(1);
         let mut resolved: Vec<OriginCarvers> = vec![None; missing.len()];
-        std::thread::scope(|s| {
+        bg_scope!(|s| {
             for (chunk, out) in missing.chunks(per).zip(resolved.chunks_mut(per)) {
                 s.spawn(move || {
                     let mut scratch = Gen::fresh_scratch(owner.data.clone());
@@ -10505,7 +10505,7 @@ pub(crate) fn carve_batch(g: &mut Gen, order: &[(i32, i32)], jobs: usize) {
         let grid_ref: &OriginGrid = &grid;
         let per = claims.len().div_ceil(jobs).max(1);
         let mut start = 0usize;
-        std::thread::scope(|s| {
+        bg_scope!(|s| {
             for slice in results.chunks_mut(per) {
                 let cslice = &claims[start..start + slice.len()];
                 start += slice.len();
@@ -10513,7 +10513,7 @@ pub(crate) fn carve_batch(g: &mut Gen, order: &[(i32, i32)], jobs: usize) {
                     #[cfg(test)]
                     CARVE_RING_WORKERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     // M3 P1a M1/M4: everything this thread does is off-owner work.
-                    crate::worldgen::m3_set_worker(true);
+                    let _m3w = crate::worldgen::M3WorkerScope::enter();
                     let mut gen = Gen::fresh_scratch(owner.data.clone());
                     gen.starts_round = owner.starts_round;
                     if let Some(resolver) = owner.beard_resolver() {
@@ -11015,13 +11015,13 @@ pub(crate) fn populate_parallel(g: &mut Gen, pending: &[(i32, i32)], jobs: usize
         {
             let owner: &Gen = &*g;
             let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::scope(|s| {
+            bg_scope!(|s| {
                 for slice in idxs.chunks(per) {
                     let coords: Vec<usize> = slice.to_vec();
                     let tx = tx.clone();
                     let order = &order;
                     s.spawn(move || {
-                        crate::worldgen::m3_set_worker(true);
+                        let _m3w = crate::worldgen::M3WorkerScope::enter();
                         // One scratch generator per worker (not per chunk): the structure
                         // starts, columns and memos it warms are reused by the next chunk on
                         // this thread, which is where the per-chunk arm paid most of its cost.

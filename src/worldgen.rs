@@ -3225,6 +3225,26 @@ pub(crate) fn m3_set_worker(on: bool) {
     M3_WORKER.with(|c| c.set(on));
 }
 
+/// Scope guard for [`m3_set_worker`], entered at the top of a scoped-batch job.
+/// A `std::thread::scope` worker died holding the flag, but a resident pool
+/// worker — or the scope's own caller when it help-steals a job — keeps its
+/// thread-locals afterwards, so the flag must be restored on drop or later
+/// work on that thread attributes to the worker bucket.
+pub(crate) struct M3WorkerScope;
+
+impl M3WorkerScope {
+    pub(crate) fn enter() -> Self {
+        m3_set_worker(true);
+        M3WorkerScope
+    }
+}
+
+impl Drop for M3WorkerScope {
+    fn drop(&mut self) {
+        m3_set_worker(false);
+    }
+}
+
 #[inline]
 pub(crate) fn m3_in_feature_read() -> bool {
     M3_FEATURE_READ.with(|c| c.get() > 0)
@@ -9582,6 +9602,38 @@ pub fn chunk_cols_scratch(
 #[cfg(test)]
 type PrefetchedCols = Vec<((i32, i32), Option<std::sync::Arc<ChunkCols>>)>;
 
+/// The resident background task pool every scoped worldgen/feature batch shares
+/// under `mod-suite` (§1.1/§1.2 of
+/// `audit/full-multithreading-server-client-parallel-architecture-20261123.md`).
+/// `std::thread::scope` pays an OS `clone`/`join` pair per call — several per
+/// generation round — while these workers spawn once at first use and
+/// `scope_blocking` only queues jobs, the caller help-stealing instead of
+/// sleeping. Lane B (Background) is where the audit routes chunk generation
+/// and feature placement.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn bg_task_pool() -> &'static mc_spine_core::task_pool::MeguTaskPool {
+    static POOL: std::sync::OnceLock<mc_spine_core::task_pool::MeguTaskPool> =
+        std::sync::OnceLock::new();
+    POOL.get_or_init(mc_spine_core::task_pool::MeguTaskPool::for_host)
+}
+
+/// Run `f` in a scoped parallel batch: the resident background task pool under
+/// `mod-suite`, per-call OS threads otherwise. Both arms hand `f` a scope whose
+/// `spawn` accepts `FnOnce() + Send + 'scope`, so call sites read exactly like
+/// `std::thread::scope` and spawn identically-shaped jobs on either executor.
+macro_rules! bg_scope {
+    ($f:expr) => {{
+        #[cfg(feature = "mod-suite")]
+        let r = $crate::worldgen::bg_task_pool()
+            .scope_blocking(mc_spine_core::task_pool::TaskLane::Background, $f);
+        #[cfg(not(feature = "mod-suite"))]
+        let r = ::std::thread::scope($f);
+        r
+    }};
+}
+
+pub(crate) use bg_scope;
+
 /// Compute `keys` with up to `workers` scratch generators, returned in the caller's order.
 /// `workers <= 1` runs inline, which is the reference path; every worker count must give
 /// the same `ChunkCols` because `cols` is pure (the determinism test pins that).
@@ -9629,12 +9681,12 @@ pub(crate) fn prefetch_cols_with(
         return out;
     }
     let per = keys.len().div_ceil(workers);
-    std::thread::scope(|s| {
+    bg_scope!(|s| {
         for (kslice, slice) in keys.chunks(per).zip(out.chunks_mut(per)) {
             s.spawn(move || {
                 // M3 P1a M1: a column built here is off-owner work, and at `jobs=1` the same
                 // build happens on the caller's thread instead (`workers <= 1` above).
-                m3_set_worker(true);
+                let _m3w = M3WorkerScope::enter();
                 let mut g = Gen::fresh_scratch(data.clone());
                 g.starts_round = starts_round;
                 if let Some(resolver) = resolver {
@@ -9759,7 +9811,7 @@ pub(crate) fn prefetch_terrain(
     // Each worker claims one contiguous slice, so a chunk's columns and its result slot are
     // addressed by the same index and nothing is shared.
     let per = keys.len().div_ceil(jobs).max(1);
-    std::thread::scope(|s| {
+    bg_scope!(|s| {
         for (i, oslice) in out.chunks_mut(per).enumerate() {
             let start = i * per;
             let end = (start + per).min(keys.len());
@@ -9767,7 +9819,7 @@ pub(crate) fn prefetch_terrain(
             let cslice = &cols[start..end];
             s.spawn(move || {
                 // M3 P1a M1/M4: everything this thread does is off-owner terrain work.
-                m3_set_worker(true);
+                let _m3w = M3WorkerScope::enter();
                 let mut g = Gen::fresh_scratch(data.clone());
                 g.starts_round = starts_round;
                 if let Some(resolver) = resolver {
@@ -19423,6 +19475,77 @@ mod wg_tests {
                         keys[i], row.key.1
                     );
                 }
+            }
+        }
+    }
+
+    /// Lane BETA-SERVER-MT-SCOPE: the scoped batch rides the resident background
+    /// pool under `mod-suite` and per-call OS threads otherwise; either executor
+    /// must return the serial arm's columns and rows bit-for-bit.
+    #[test]
+    fn worldgen_pool_batch_matches_serial_bit_for_bit() {
+        crate::test_support::require_vanilla_data();
+        // A local generator, not `init`: the fixture needs only `GenData`, and a
+        // process-wide re-init here would flake unrelated tests (see the
+        // prefetched-terrain test above for the measured reasoning).
+        let local = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld)
+            .expect("generator for the fixture seed");
+        let data = std::sync::Arc::clone(&local.data);
+        let keys: Vec<(i32, i32)> = vec![(-2, -2), (0, 0), (2, 0), (0, 2), (2, 2), (-2, 2)];
+        let lo = min_y();
+        let hi = min_y() + (max_y() + 1 - min_y()) / 16 * 16 - 16;
+        // Reference: one scratch generator filling rows inline, no batch anywhere.
+        let mut reference = Gen::fresh_scratch(data.clone());
+        let mut want_cols = Vec::new();
+        let mut want_rows = Vec::new();
+        for &(cx, cz) in &keys {
+            let (cc, rows) = reference
+                .build_terrain_rows(cx, cz, lo, hi, None)
+                .expect("reference rows");
+            want_cols.push(cols_fingerprint(&mut reference, &cc));
+            want_rows.push(rows);
+        }
+        // `jobs = 4` keeps the batch above the serial fallback on both arms.
+        #[cfg(feature = "mod-suite")]
+        let executed_before = bg_task_pool().tasks_executed();
+        let cols = prefetch_cols_with(&data, None, &keys, 4, None);
+        let got = prefetch_terrain(&data, None, &keys, &cols, lo, hi, 4, None);
+        // Identical bytes are produced by the serial fallback too, so the pool
+        // arm must prove it actually ran rather than silently taking the other
+        // executor (rules CV1).
+        #[cfg(feature = "mod-suite")]
+        assert!(
+            bg_task_pool().tasks_executed() > executed_before,
+            "the scoped batch ran on the resident pool"
+        );
+        let mut fp_gen = Gen::fresh_scratch(data.clone());
+        assert_eq!(got.len(), keys.len());
+        for (i, chunk) in got.iter().enumerate() {
+            let chunk = chunk
+                .as_ref()
+                .unwrap_or_else(|| panic!("no rows for {:?}", keys[i]));
+            assert_eq!(chunk.key, keys[i]);
+            assert_eq!(
+                cols_fingerprint(&mut fp_gen, &chunk.cols),
+                want_cols[i],
+                "columns diverged at {:?}",
+                keys[i]
+            );
+            assert_eq!(chunk.rows.len(), want_rows[i].len());
+            for (row, want) in chunk.rows.iter().zip(&want_rows[i]) {
+                assert_eq!(row.key, want.key, "section key");
+                assert_eq!(
+                    row.arr.as_slice(),
+                    want.arr.as_slice(),
+                    "section bytes diverged at {:?} section {}",
+                    keys[i],
+                    row.key.1
+                );
+                assert_eq!(
+                    row.marks, want.marks,
+                    "terrain marks diverged at {:?} section {}",
+                    keys[i], row.key.1
+                );
             }
         }
     }
