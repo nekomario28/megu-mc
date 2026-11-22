@@ -1753,16 +1753,23 @@ pub fn inspect_anvil_world_dir(dir: &Path) -> Result<AnvilWorldReport, AnvilInsp
             message: e.to_string(),
         })?;
 
-    const DIMENSIONS: [(&str, &str); 3] = [
-        ("overworld", "region"),
-        ("nether", "DIM-1/region"),
-        ("end", "DIM1/region"),
+    let mut dim_dirs: Vec<(String, String)> = vec![
+        ("overworld".to_string(), "region".to_string()),
+        ("nether".to_string(), "DIM-1/region".to_string()),
+        ("end".to_string(), "DIM1/region".to_string()),
     ];
+    let custom_dims_root = dir.join("dimensions");
+    if custom_dims_root.is_dir() {
+        let mut custom_dims = Vec::new();
+        collect_custom_dimension_region_dirs(&custom_dims_root, &mut Vec::new(), 0, &mut custom_dims)?;
+        custom_dims.sort();
+        dim_dirs.extend(custom_dims);
+    }
     let mut dimensions = Vec::new();
     let mut region_file_count = 0usize;
     let mut populated_chunk_count = 0usize;
-    for (dimension, rel) in DIMENSIONS {
-        let region_dir = dir.join(rel);
+    for (dimension, rel) in dim_dirs {
+        let region_dir = dir.join(&rel);
         if !region_dir.is_dir() {
             continue;
         }
@@ -1802,8 +1809,8 @@ pub fn inspect_anvil_world_dir(dir: &Path) -> Result<AnvilWorldReport, AnvilInsp
         region_file_count += regions.len();
         populated_chunk_count += populated_chunks;
         dimensions.push(AnvilDimensionReport {
-            dimension: dimension.to_string(),
-            region_dir: rel.to_string(),
+            dimension,
+            region_dir: rel,
             regions,
             populated_chunks,
         });
@@ -1815,6 +1822,53 @@ pub fn inspect_anvil_world_dir(dir: &Path) -> Result<AnvilWorldReport, AnvilInsp
         region_file_count,
         populated_chunk_count,
     })
+}
+
+fn collect_custom_dimension_region_dirs(
+    cur: &Path,
+    segs: &mut Vec<String>,
+    depth: usize,
+    out: &mut Vec<(String, String)>,
+) -> Result<(), AnvilInspectError> {
+    const MAX_DIM_DEPTH: usize = 6;
+    const MAX_CUSTOM_DIMS: usize = 256;
+    if depth >= MAX_DIM_DEPTH || out.len() >= MAX_CUSTOM_DIMS {
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(cur).map_err(|e| io_error(cur, e))?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| io_error(cur, e))?;
+        let path = entry.path();
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| io_error(&path, e))?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            continue;
+        }
+        if let Some(name) = entry.file_name().to_str() {
+            if !name.is_empty() && name != "." && name != ".." {
+                names.push((name.to_string(), path));
+            }
+        }
+    }
+    names.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, path) in names {
+        if out.len() >= MAX_CUSTOM_DIMS {
+            break;
+        }
+        if name == "region" && segs.len() >= 2 {
+            let dim_id = format!("{}:{}", segs[0], segs[1..].join("/"));
+            let rel = format!("dimensions/{}/region", segs.join("/"));
+            out.push((dim_id, rel));
+            continue;
+        }
+        if matches!(name.as_str(), "region" | "entities" | "poi" | "data") {
+            continue;
+        }
+        segs.push(name);
+        collect_custom_dimension_region_dirs(&path, segs, depth + 1, out)?;
+        segs.pop();
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------- tests
@@ -2820,5 +2874,27 @@ mod tests {
         let report = inspect_anvil_world_dir(&dir.0).unwrap();
         assert_eq!(report.region_file_count, 0);
         assert!(report.to_human().contains("no region files"));
+    }
+
+    #[test]
+    fn inspect_anvil_discovers_custom_mod_dimension_regions() {
+        let dir = TestDir::new("world-custom-dims");
+        let nbt = encode_data_value_to_nbt("", &level_doc(3955, "ModWorld", "1.21.1", 7)).unwrap();
+        std::fs::write(dir.join("level.dat"), nbt).unwrap();
+        let custom_dir = dir.join("dimensions/aether/the_aether/region");
+        std::fs::create_dir_all(&custom_dir).unwrap();
+        let mca = McaFixture::new()
+            .chunk(0, 2, 1, 12, 2, 1_700_000_000)
+            .bytes;
+        std::fs::write(custom_dir.join("r.0.0.mca"), mca).unwrap();
+        let report = inspect_anvil_world_dir(&dir.0).unwrap();
+        assert_eq!(report.region_file_count, 1);
+        assert_eq!(report.populated_chunk_count, 1);
+        assert_eq!(report.dimensions.len(), 1);
+        assert_eq!(report.dimensions[0].dimension, "aether:the_aether");
+        assert_eq!(
+            report.dimensions[0].region_dir,
+            "dimensions/aether/the_aether/region"
+        );
     }
 }
