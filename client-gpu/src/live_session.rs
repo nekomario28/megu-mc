@@ -8,11 +8,13 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use mc_spine_client::audio_out::{AudioRuntime, AudioSessionConfig, AudioSinkKind};
+use mc_spine_client::online_auth::OnlineAuthOptions;
 use mc_spine_client::protocol::{
-    decode_item_stack_components, handle_transfer_packet, offline_uuid, ClientCustomChannelEvent,
-    ClientPlayEvent, DecodedMagicCastState, DecodedMagicSync, DecodedMotionTrigger, DimensionMeta,
-    ItemStackComponents, PlayEvent, PlayerInfoUpdateEntry, ProtocolClient, SeasonWireSync,
-    TeleportSync, TransferTarget, WireReader, WireSoundEvent, WireStopSound,
+    decode_item_stack_components, handle_transfer_packet, offline_uuid, parse_uuid,
+    ClientCustomChannelEvent, ClientPlayEvent, DecodedMagicCastState, DecodedMagicSync,
+    DecodedMotionTrigger, DimensionMeta, ItemStackComponents, PlayEvent, PlayerInfoUpdateEntry,
+    ProtocolClient, SeasonWireSync, TeleportSync, TransferTarget, WireReader, WireSoundEvent,
+    WireStopSound,
 };
 use mc_spine_client::render::ClientVfxHost;
 use mc_spine_client::render_graph::GpuPipelineKind;
@@ -57,7 +59,11 @@ use crate::atmosphere::{
     voxel_clouds_to_geometry, AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker,
     CLOUD_RENDER_ALPHA,
 };
-use crate::subworld_render::{SubWorldRenderBank, SubWorldRenderEntry, SubWorldTransform};
+use crate::subworld_render::{
+    quat_from_axis_angle, InstancedPartBatch, InstancedPartRecord, SubWorldRenderBank,
+    SubWorldRenderEntry, SubWorldTransform, TerrainVertex,
+};
+use crate::SecretString;
 use hw_adaptive_engine::{
     detect_host_hardware_caps, select_compute_strategy, ComputeKernelMode, ComputeStrategy,
     HostHardwareCaps, KernelAutotuner, PagedSectionPool, SpeculativeChunkPrefetcher,
@@ -323,6 +329,76 @@ pub struct LiveHudFeed {
     pub looking_at_block: Option<([i32; 3], String)>,
 }
 
+/// One registered Create-style kinetic part (shaft / cog / belt) resolved
+/// to a [`InstancedPartRecord`] each [`LiveSession::sync_kinetic_network_rpm`].
+/// The rotation phase advances analytically — `theta = phase0 + omega * t`
+/// with `omega = network_rpm * ratio * TAU/60` — so the shared template
+/// mesh is never rebuilt on the CPU; only the 48-byte instance record
+/// changes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KineticPartSpec {
+    /// Shared mesh template id the part's [`InstancedPartBatch`] batches
+    /// under (see [`LiveSession::register_kinetic_template`]).
+    pub mesh_kind: u32,
+    /// Instance origin in the batch's model space (blocks).
+    pub position: [f32; 3],
+    /// Unit rotation axis in model space (`x`/`y`/`z` cardinals for
+    /// shafts; arbitrary axes decompose through the same math).
+    pub axis: [f32; 3],
+    /// Speed ratio against the shared network RPM — gear reductions and
+    /// sign flips (counter-rotating cog pairs) live here.
+    pub ratio: f32,
+    /// Phase offset in radians at network time `t = 0`.
+    pub phase0: f32,
+    /// Uniform model-space scale.
+    pub scale: f32,
+    /// Packed block|sky light nibbles for the instance record.
+    pub packed_light: u32,
+    /// RGBA instance tint, one byte per channel (R in bits 0..8).
+    pub tint_rgba: u32,
+    /// Sub-world slot the instance draws into; `0` is the static world.
+    pub subworld_id: u32,
+}
+
+impl KineticPartSpec {
+    /// A unit-ratio shaft spinning about `axis` at `position`.
+    pub fn shaft(mesh_kind: u32, position: [f32; 3], axis: [f32; 3]) -> Self {
+        Self {
+            mesh_kind,
+            position,
+            axis,
+            ratio: 1.0,
+            phase0: 0.0,
+            scale: 1.0,
+            packed_light: 0xf0,
+            tint_rgba: 0xffff_ffff,
+            subworld_id: 0,
+        }
+    }
+}
+
+/// Axis-angle `(axis, radians)` → XYZ-Euler triplet matching the instanced
+/// vertex shader's "applied X then Y then Z" order (`R = Rz·Ry·Rx`).
+fn axis_angle_to_euler_xyz(axis: [f32; 3], radians: f32) -> [f32; 3] {
+    let [x, y, z, w] = quat_from_axis_angle(axis, radians);
+    // Column-major rotation matrix from the quaternion (unit or zero).
+    let m00 = 1.0 - 2.0 * (y * y + z * z);
+    let m10 = 2.0 * (x * y + z * w);
+    let m20 = 2.0 * (x * z - y * w);
+    let m21 = 2.0 * (y * z + x * w);
+    let m22 = 1.0 - 2.0 * (x * x + y * y);
+    let beta = (-m20).clamp(-1.0, 1.0).asin();
+    let (alpha, gamma) = if beta.cos().abs() > 1e-6 {
+        (m21.atan2(m22), m10.atan2(m00))
+    } else {
+        // Gimbal lock: collapse roll into yaw.
+        let m01 = 2.0 * (x * y - z * w);
+        let m11 = 1.0 - 2.0 * (x * x + z * z);
+        (0.0, (-m01).atan2(m11))
+    };
+    [alpha, beta, gamma]
+}
+
 /// Owns UI-facing world data on the event-loop thread. The worker owns its socket.
 pub struct LiveSession {
     incoming: Receiver<WorkerMessage>,
@@ -457,6 +533,31 @@ pub struct LiveSession {
     pub atmosphere_blender: BiomeAtmosphereBlender,
     pub chunk_fades: ChunkFadeTracker,
     pub subworlds: SubWorldRenderBank,
+    /// Monotone revision bumped whenever any HUD-visible field mutates
+    /// (chat, scoreboard, actionbar, title, health/hunger/hotbar,
+    /// subtitle, magic HUD). The window's sync skips the `HudState`
+    /// clone while the revision is unchanged.
+    pub hud_revision: u64,
+    /// The last `hud_revision` the window consumed via
+    /// [`Self::sync_hud_to`]; `u64::MAX` until the first sync.
+    pub last_synced_hud_revision: u64,
+    /// Lifetime count of skipped HUD clones — proves the revision gate
+    /// fires on idle frames.
+    pub hud_sync_skips: u64,
+    /// Registered kinetic parts keyed by stable part id; resolved into
+    /// [`InstancedPartRecord`]s by [`Self::sync_kinetic_network_rpm`].
+    kinetic_parts: BTreeMap<u32, KineticPartSpec>,
+    /// Per-`mesh_kind` scratch record lists retained between syncs — the
+    /// swap in `sync_kinetic_network_rpm` trades the fresh list for the
+    /// batch's stale one, so steady-state frames allocate nothing.
+    kinetic_scratch: BTreeMap<u32, Vec<InstancedPartRecord>>,
+    /// Current shared kinetic network speed in RPM.
+    pub kinetic_network_rpm: f32,
+    /// Seconds of accumulated network run time; `phase = phase0 +
+    /// rpm * ratio * TAU/60 * t` reads from it.
+    kinetic_time_secs: f32,
+    /// Allocating counter for `register_kinetic_part` return ids.
+    next_kinetic_part_id: u32,
     pub vanilla_plus_cfg: VanillaPlusPipelineConfig,
     pub nature_mod_registry: NatureModRegistry,
     /// The latest decoded `SSN1` season sync, or `None` before the first
@@ -523,9 +624,44 @@ impl LiveSession {
         version: String,
         paths: SessionPaths,
     ) -> Self {
+        Self::connect_with_paths_and_auth(host, port, username, version, paths, None, None)
+    }
+
+    /// [`Self::connect_with_paths`] with the launcher's online-mode
+    /// credentials forwarded to the worker's encryption-response path:
+    /// `access_token` (`--accessToken`, [`SecretString`]-wrapped at the
+    /// CLI) plus the account `--uuid` used both as the session-join
+    /// `selectedProfile` and — only when a token is actually present —
+    /// the login-start UUID. Offline joins keep `offline_uuid(username)`
+    /// exactly as before. The token is moved straight into
+    /// [`OnlineAuthOptions`]; it is never logged or exposed on `self`.
+    pub fn connect_with_paths_and_auth(
+        host: String,
+        port: u16,
+        username: String,
+        version: String,
+        paths: SessionPaths,
+        access_token: Option<SecretString>,
+        account_uuid: Option<String>,
+    ) -> Self {
+        let auth = OnlineAuthOptions {
+            access_token: access_token
+                .filter(|token| token.is_present())
+                .map(|token| token.reveal().to_owned()),
+            profile_uuid: account_uuid
+                .as_deref()
+                .and_then(|raw| parse_uuid(raw).ok()),
+            ..OnlineAuthOptions::default()
+        };
+        let login_uuid = match (auth.access_token.is_some(), auth.profile_uuid) {
+            (true, Some(uuid)) => uuid,
+            _ => offline_uuid(&username),
+        };
         let (tx, incoming) = mpsc::sync_channel(256);
         let (outgoing, rx) = mpsc::sync_channel(8);
-        std::thread::spawn(move || run_worker(host, port, username, version, tx, rx));
+        std::thread::spawn(move || {
+            run_worker(host, port, username, version, login_uuid, auth, tx, rx)
+        });
         Self::with_channels_and_sink(incoming, outgoing, AudioSinkKind::Auto, paths)
     }
 
@@ -671,6 +807,14 @@ impl LiveSession {
             atmosphere_blender: BiomeAtmosphereBlender::new(AtmosphereParams::default()),
             chunk_fades: ChunkFadeTracker::new(),
             subworlds: SubWorldRenderBank::new(),
+            hud_revision: 0,
+            last_synced_hud_revision: u64::MAX,
+            hud_sync_skips: 0,
+            kinetic_parts: BTreeMap::new(),
+            kinetic_scratch: BTreeMap::new(),
+            kinetic_network_rpm: 0.0,
+            kinetic_time_secs: 0.0,
+            next_kinetic_part_id: 0,
             vanilla_plus_cfg: VanillaPlusPipelineConfig::default(),
             nature_mod_registry: NatureModRegistry::default(),
             latest_season: None,
@@ -1541,6 +1685,161 @@ impl LiveSession {
         self.subworlds.upsert(entry);
     }
 
+    /// Mirror `self.hud` into `hud` only when it changed since the last
+    /// call — server packets and local edits bump `hud_revision`, idle
+    /// frames hit the revision gate and cost one counter increment
+    /// (`hud_sync_skips`) instead of a full `HudState` clone.
+    /// Returns `true` when the clone ran.
+    pub fn sync_hud_to(&mut self, hud: &mut HudState) -> bool {
+        if self.hud_revision == self.last_synced_hud_revision {
+            self.hud_sync_skips += 1;
+            return false;
+        }
+        *hud = self.hud.clone();
+        self.last_synced_hud_revision = self.hud_revision;
+        true
+    }
+
+    /// Upload-key the shared mesh template for a kinetic `mesh_kind`:
+    /// creates the [`InstancedPartBatch`] every [`KineticPartSpec`] with
+    /// that kind instances against. Re-registering an existing kind is a
+    /// no-op — the template geometry stays resident and in-flight
+    /// instances are preserved.
+    pub fn register_kinetic_template(
+        &mut self,
+        mesh_kind: u32,
+        template_vertices: Vec<TerrainVertex>,
+        template_indices: Vec<u32>,
+    ) {
+        if self
+            .subworlds
+            .batches()
+            .any(|batch| batch.mesh_kind == mesh_kind)
+        {
+            return;
+        }
+        self.subworlds.upsert_batch(InstancedPartBatch::new(
+            mesh_kind,
+            template_vertices,
+            template_indices,
+        ));
+    }
+
+    /// Register one rotating kinetic part; returns the stable part id
+    /// [`Self::remove_kinetic_part`] accepts. Records resolve on the next
+    /// [`Self::sync_kinetic_network_rpm`].
+    pub fn register_kinetic_part(&mut self, spec: KineticPartSpec) -> u32 {
+        let id = self.next_kinetic_part_id;
+        self.next_kinetic_part_id += 1;
+        self.kinetic_parts.insert(id, spec);
+        id
+    }
+
+    /// Drop a registered kinetic part. `false` for an unknown id.
+    pub fn remove_kinetic_part(&mut self, id: u32) -> bool {
+        self.kinetic_parts.remove(&id).is_some()
+    }
+
+    /// Registered kinetic part count (diagnostics/tests).
+    pub fn kinetic_part_count(&self) -> usize {
+        self.kinetic_parts.len()
+    }
+
+    /// Set the shared network speed and advance it by `dt_secs`, then
+    /// re-resolve every part's [`InstancedPartRecord`]. Rotation is
+    /// analytic — `theta = phase0 + rpm * ratio * TAU/60 * t` — so the
+    /// CPU writes only the 48-byte records (and only when they actually
+    /// changed); template geometry is never rebuilt.
+    pub fn sync_kinetic_network_rpm(&mut self, rpm: f32, dt_secs: f32) {
+        self.kinetic_time_secs += dt_secs.max(0.0);
+        self.kinetic_network_rpm = rpm;
+        for records in self.kinetic_scratch.values_mut() {
+            records.clear();
+        }
+        let omega_base = rpm * std::f32::consts::TAU / 60.0;
+        let t = self.kinetic_time_secs;
+        for spec in self.kinetic_parts.values() {
+            let theta = spec.phase0 + omega_base * spec.ratio * t;
+            let euler = axis_angle_to_euler_xyz(spec.axis, theta);
+            self.kinetic_scratch
+                .entry(spec.mesh_kind)
+                .or_default()
+                .push(InstancedPartRecord {
+                    pos_scale: [
+                        spec.position[0],
+                        spec.position[1],
+                        spec.position[2],
+                        spec.scale,
+                    ],
+                    rot_uv_frame: [euler[0], euler[1], euler[2], 0.0],
+                    packed_light: spec.packed_light,
+                    tint_rgba: spec.tint_rgba,
+                    mesh_kind: spec.mesh_kind,
+                    subworld_id: spec.subworld_id,
+                });
+        }
+        // Swap each batch's stale record list with the fresh scratch copy;
+        // the replaced list keeps its capacity for next frame's write.
+        let scratch = &mut self.kinetic_scratch;
+        for batch in self.subworlds.batches_mut() {
+            match scratch.get_mut(&batch.mesh_kind) {
+                Some(records) if batch.instances != *records => {
+                    std::mem::swap(&mut batch.instances, records);
+                    batch.instances_dirty = true;
+                }
+                Some(_) => {}
+                None => {
+                    if !batch.instances.is_empty() {
+                        batch.instances.clear();
+                        batch.instances_dirty = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Register or replace a live 6-DOF contraption / airship sub-world.
+    /// The mesh uploads once on the next `sync_subworlds`; re-upserting
+    /// identical geometry refreshes the transform only, so an existing
+    /// entry's GPU buffers stay resident.
+    pub fn upsert_live_contraption_subworld(
+        &mut self,
+        contraption_id: u64,
+        transform: SubWorldTransform,
+        vertices: Vec<TerrainVertex>,
+        indices: Vec<u32>,
+    ) {
+        match self.subworlds.get(contraption_id) {
+            Some(existing)
+                if existing.vertices == vertices && existing.indices == indices =>
+            {
+                self.subworlds.set_transform(contraption_id, transform);
+            }
+            Some(_) => {
+                self.subworlds
+                    .set_geometry(contraption_id, vertices, indices);
+                self.subworlds.set_transform(contraption_id, transform);
+            }
+            None => self.subworlds.upsert(SubWorldRenderEntry::new(
+                contraption_id,
+                transform,
+                vertices,
+                indices,
+            )),
+        }
+    }
+
+    /// Pose-only contraption update: writes the new 64-byte model
+    /// transform for the next composed frame without touching geometry.
+    /// `false` for an unknown `contraption_id`.
+    pub fn update_contraption_pose(
+        &mut self,
+        contraption_id: u64,
+        transform: SubWorldTransform,
+    ) -> bool {
+        self.subworlds.set_transform(contraption_id, transform)
+    }
+
     /// Per-poll dirty-mesh rebuild budget: the base slice scaled by the
     /// adaptive strategy's foreground worker count — the meshing critical
     /// path — clamped so a many-core host cannot spike one poll.
@@ -1648,6 +1947,7 @@ impl LiveSession {
     /// post-clone `hud` gets the updated snapshot mirrored back.
     fn refresh_subtitle_hud(&mut self, frame_dt_sec: f32, hud: &mut HudState) {
         self.hud.subtitle_hud.tick(frame_dt_sec);
+        let mut pushed = false;
         for cue in self.drain_subtitle_cues() {
             let id = if cue.label.is_empty() {
                 "sound.event".to_owned()
@@ -1663,6 +1963,10 @@ impl LiveSession {
             self.hud
                 .subtitle_hud
                 .push(id.clone(), subtitle_label(&id), arrow, DEFAULT_TTL_SECS);
+            pushed = true;
+        }
+        if pushed {
+            self.hud_revision += 1;
         }
         hud.subtitle_hud = self.hud.subtitle_hud.clone();
     }
@@ -1799,6 +2103,7 @@ impl LiveSession {
                     // without an `open_screen`, so the `E`-key screen has a
                     // live slot source of its own.
                     self.player_inventory_state_id = state_id;
+                    self.hud_revision += 1;
                     let mut offset = 0usize;
                     for index in 0..slot_count {
                         let tail = &raw_payload[offset.min(raw_payload.len())..];
@@ -1850,6 +2155,7 @@ impl LiveSession {
             } => {
                 if window_id == 0 {
                     self.player_inventory_state_id = state_id;
+                    self.hud_revision += 1;
                     match decode_item_stack_components(&raw_item) {
                         Ok((stack, _)) => {
                             if slot < 0 {
@@ -1947,6 +2253,7 @@ impl LiveSession {
             PlayEvent::SetHealth { health, food, .. } => {
                 self.hud.health = health;
                 self.hud.hunger = food.clamp(0, 20) as u8;
+                self.hud_revision += 1;
             }
             PlayEvent::SystemChat { text, overlay } => {
                 if overlay {
@@ -1958,9 +2265,11 @@ impl LiveSession {
                     }
                 }
                 self.chat_message = Some(text);
+                self.hud_revision += 1;
             }
             PlayEvent::SetActionBarText { nbt_bytes } => {
                 self.actionbar_nbt = Some(nbt_bytes);
+                self.hud_revision += 1;
             }
             PlayEvent::SetTitle {
                 fade_in,
@@ -1969,16 +2278,19 @@ impl LiveSession {
             } => {
                 self.title_times = Some([fade_in, stay, fade_out]);
                 self.title_revision += 1;
+                self.hud_revision += 1;
             }
             PlayEvent::SetTitleText { nbt_bytes } => {
                 self.title_text = nbt_text(&nbt_bytes);
                 self.title_text_nbt = Some(nbt_bytes);
                 self.title_revision += 1;
+                self.hud_revision += 1;
             }
             PlayEvent::SetSubtitleText { nbt_bytes } => {
                 self.subtitle_text = nbt_text(&nbt_bytes);
                 self.subtitle_text_nbt = Some(nbt_bytes);
                 self.title_revision += 1;
+                self.hud_revision += 1;
             }
             PlayEvent::BossEvent {
                 uuid,
@@ -1996,6 +2308,7 @@ impl LiveSession {
                         },
                     );
                 }
+                self.hud_revision += 1;
             }
             PlayEvent::PlayerInfo { actions, entries } => {
                 for update in &entries {
@@ -2031,11 +2344,13 @@ impl LiveSession {
                         entry.display_name_nbt = update.display_name_nbt.clone();
                     }
                 }
+                self.hud_revision += 1;
             }
             PlayEvent::PlayerInfoRemove { uuids } => {
                 for uuid in &uuids {
                     self.player_info.remove(uuid);
                 }
+                self.hud_revision += 1;
             }
             PlayEvent::SetObjective {
                 objective,
@@ -2063,6 +2378,7 @@ impl LiveSession {
                         ),
                     );
                 }
+                self.hud_revision += 1;
             }
             PlayEvent::SetScore {
                 owner,
@@ -2071,17 +2387,22 @@ impl LiveSession {
                 ..
             } => {
                 self.scoreboard.scores.insert((objective, owner), value);
+                self.hud_revision += 1;
             }
             PlayEvent::SetDisplayObjective { slot, objective } => {
                 self.scoreboard.display_slots.insert(slot, objective);
+                self.hud_revision += 1;
             }
-            PlayEvent::ResetScore { owner, objective } => match objective {
-                Some(objective) => self
-                    .scoreboard
-                    .scores
-                    .retain(|(obj, who), _| obj != &objective || who != &owner),
-                None => self.scoreboard.scores.retain(|(_, who), _| who != &owner),
-            },
+            PlayEvent::ResetScore { owner, objective } => {
+                match objective {
+                    Some(objective) => self
+                        .scoreboard
+                        .scores
+                        .retain(|(obj, who), _| obj != &objective || who != &owner),
+                    None => self.scoreboard.scores.retain(|(_, who), _| who != &owner),
+                }
+                self.hud_revision += 1;
+            }
             PlayEvent::Transfer { host, port } => match handle_transfer_packet(&host, port) {
                 Ok(target) => self.pending_transfer = Some(target),
                 Err(reason) => {
@@ -2280,37 +2601,44 @@ pub fn magic_hud_from_sync(sync: &DecodedMagicSync) -> MagicHudState {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_worker(
     host: String,
     port: u16,
     username: String,
     version: String,
+    login_uuid: [u8; 16],
+    auth: OnlineAuthOptions,
     tx: SyncSender<WorkerMessage>,
     rx: Receiver<WorkerCommand>,
 ) {
-    let result = run_connection(&host, port, &username, &version, &tx, rx);
+    let result = run_connection(&host, port, &username, &version, login_uuid, auth, &tx, rx);
     if let Err(error) = result {
         let _ = tx.send(WorkerMessage::Closed(error));
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_connection(
     host: &str,
     port: u16,
     username: &str,
     version: &str,
+    login_uuid: [u8; 16],
+    auth: OnlineAuthOptions,
     tx: &SyncSender<WorkerMessage>,
     rx: Receiver<WorkerCommand>,
 ) -> Result<(), String> {
     let protocol = mc_spine_client::cli::parse_mc_version(version)?;
-    let (mut client, _) = ProtocolClient::connect_for_version(
+    let (mut client, _) = ProtocolClient::connect_for_version_with_auth(
         host,
         port,
         username,
-        offline_uuid(username),
+        login_uuid,
         10,
         Duration::from_secs(8),
         protocol,
+        auth,
     )?;
     // GPU session owns the sink and spatial world. Prevent any global
     // headless audio configuration from creating a second active playback.

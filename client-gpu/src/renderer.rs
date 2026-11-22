@@ -38,6 +38,7 @@ use mc_spine_client_mesh::{
 };
 use mc_spine_kernel::debug_chords::DebugLine;
 use mc_spine_kernel::entity_interp::{evaluate_sky_and_fog, SkyFogInput, SkyFogOutput};
+use mc_spine_ui::draw::{font_atlas_rgba, UiMesh, FONT_ATLAS_HEIGHT, FONT_ATLAS_WIDTH};
 use winit::event_loop::OwnedDisplayHandle;
 
 use crate::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
@@ -1019,6 +1020,68 @@ fn region_caster_wgsl(caster_source: &str) -> String {
     out
 }
 
+/// Inputs that decide [`GpuRenderer::cull_live_sections`]: the camera's
+/// containing section (the [`GraphCuller`] BFS root), the view-projection
+/// bit pattern (frustum planes + Hi-Z view-match), the live-section
+/// residency/graph revision, and the installed Hi-Z pyramid revision.
+/// Identical inputs reuse the retained culled set verbatim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CullCacheKey {
+    camera_section: (i32, i32, i32),
+    view_proj_bits: [u32; 16],
+    world_revision: u64,
+    hiz_revision: u64,
+}
+
+/// GPU state for the tessellated-quad UI overlay ([`UI_QUAD_WGSL`]):
+/// screen-size uniform + static font atlas bound at group 0, grow-only
+/// vertex/index buffers carrying `tessellate_draw_list` output.
+struct UiQuadGpu {
+    pipeline: wgpu::RenderPipeline,
+    bind_group: wgpu::BindGroup,
+    uniform: wgpu::Buffer,
+    _font_texture: wgpu::Texture,
+    vertices: wgpu::Buffer,
+    indices: wgpu::Buffer,
+    vertex_capacity: u64,
+    index_capacity: u64,
+    index_count: u32,
+}
+
+/// Pod mirror of `mc_spine_ui::draw::UiVertex` (pixel-space position,
+/// atlas uv, straight-alpha color): 32 bytes, bound at locations 0-2.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+struct UiQuadVertex {
+    position: [f32; 2],
+    uv: [f32; 2],
+    color: [f32; 4],
+}
+
+const UI_QUAD_VERTEX_ATTRS: [wgpu::VertexAttribute; 3] = [
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x2,
+        offset: 0,
+        shader_location: 0,
+    },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x2,
+        offset: 8,
+        shader_location: 1,
+    },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x4,
+        offset: 16,
+        shader_location: 2,
+    },
+];
+
+const UI_QUAD_VERTEX_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+    array_stride: std::mem::size_of::<UiQuadVertex>() as wgpu::BufferAddress,
+    step_mode: wgpu::VertexStepMode::Vertex,
+    attributes: &UI_QUAD_VERTEX_ATTRS,
+};
+
 /// The real `wgpu` renderer: terrain (opaque + translucent), UI blit, depth.
 ///
 /// Owns device-independent state for one color format (`target_format`):
@@ -1043,6 +1106,19 @@ pub struct GpuRenderer {
     ui_view: Option<wgpu::TextureView>,
     ui_sampler: wgpu::Sampler,
     ui_size: (u32, u32),
+    /// GPU tessellated-quad UI overlay: `tessellate_draw_list` output
+    /// uploaded as small vertex/index buffers instead of a per-frame
+    /// `w*h*4` CPU raster + texture write.
+    ui_quad: UiQuadGpu,
+    /// Scratch converting `UiVertex` into the Pod vertex layout — retained
+    /// so identical-size frames never reallocate.
+    ui_quad_vertex_scratch: Vec<UiQuadVertex>,
+    /// Composed frames that drew the UI via the GPU quad pipeline.
+    pub ui_gpu_quad_frames: u64,
+    /// Frames that wrote a CPU-rasterized RGBA framebuffer texture
+    /// ([`Self::update_ui_framebuffer`]); the live window path keeps this
+    /// at zero once the quad pipeline carries the UI.
+    pub ui_cpu_raster_uploads: u64,
     depth_texture: Option<wgpu::Texture>,
     depth_view: Option<wgpu::TextureView>,
     depth_size: (u32, u32),
@@ -1080,6 +1156,34 @@ pub struct GpuRenderer {
     hiz_manual: bool,
     /// Terrain residency changed since the last Hi-Z job — occluders moved.
     hiz_dirty: bool,
+    /// Revision counter bumped whenever the installed-pyramid inputs to the
+    /// cull pass change (`hiz_pyramid`/`hiz_source_vp`/`hiz_manual`).
+    hiz_revision: u64,
+    /// Revision counter bumped whenever live-section residency or the
+    /// mirrored visibility-graph set changes; part of the cull cache key.
+    cull_world_revision: u64,
+    /// Order-independent stamp of `section_graphs` keys from the last
+    /// [`Self::update_live_terrain`] — detects graph-only world changes.
+    cull_graphs_stamp: u64,
+    /// Retained culled-section set: the cached result while
+    /// `cull_cache_key` is `Some`, and the zero-alloc scratch the next
+    /// recompute refills. [`Self::cull_live_sections`] hands it to the
+    /// caller via `mem::take`; `encode_composed_world` returns it.
+    cull_result: HashSet<SectionCoord>,
+    /// Retained scratch for the graph-culler visible set — cleared and
+    /// refilled on cache misses instead of a fresh `HashSet` each frame.
+    cull_graph_scratch: HashSet<SectionCoord>,
+    /// Inputs that produced `cull_result`: unchanged inputs reuse the
+    /// cached set directly (`cull_cache_hits += 1`, ~0 µs).
+    cull_cache_key: Option<CullCacheKey>,
+    /// Hi-Z culled count associated with `cull_result`.
+    cull_hiz_count: u64,
+    /// Composed frames that reused the cached cull result verbatim.
+    pub cull_cache_hits: u64,
+    /// Instanced `draw_indexed` calls the most recent composed pass
+    /// emitted for `InstancedPartBatch` streams (per-pass value, not
+    /// cumulative): 2,000 same-kind parts still cost 1 draw.
+    pub instanced_kinetic_draws: u64,
     /// Shared vertex/index arenas over `RenderRegions`' 8x4x8 grid feeding
     /// the composed opaque path's merged bucket draws.
     region_arenas: BTreeMap<[i32; 3], RegionArena>,
@@ -1152,7 +1256,10 @@ pub struct GpuRenderer {
     shadow: Option<ShadowGpu>,
     shadow_active: bool,
     last_shadow_camera: Option<[f32; 9]>,
-    last_shadow_casters: Vec<u32>,
+    /// Zero-alloc FNV-1a digest of the caster set the shadow pass last saw
+    /// ([`subworld_caster_digest`]); `EMPTY_CASTER_DIGEST` until a sync
+    /// records real caster state.
+    last_shadow_casters: u64,
     /// Number of shadow depth passes completed (one per cache re-render).
     pub shadow_rerender_count: u64,
     /// Number of composed frames that reused an existing shadow texture.
@@ -1388,31 +1495,56 @@ pub fn composed_shadow_wgsl(source: &str, terrain: bool) -> String {
     format!("{shader}\n{MEGU_SHADOW_SAMPLING_WGSL}")
 }
 
+const FNV1A_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV1A_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv1a_u64(hash: &mut u64, value: u64) {
+    *hash ^= value;
+    *hash = hash.wrapping_mul(FNV1A_PRIME);
+}
+
+fn fnv1a_u32(hash: &mut u64, value: u32) {
+    fnv1a_u64(hash, u64::from(value));
+}
+
+/// Digest of the empty bank — the `last_shadow_casters` seed, so a bank
+/// that never gains casters produces no spurious invalidation.
+const EMPTY_CASTER_DIGEST: u64 = FNV1A_OFFSET;
+
 /// Snapshot caster identities, transforms and visibility across composed
-/// frames. Geometry and instance uploads also invalidate via their dirty flags
-/// before GPU synchronization clears those flags.
-fn subworld_caster_signature(bank: &SubWorldRenderBank) -> Vec<u32> {
-    let mut signature = Vec::new();
+/// frames as a deterministic `u64` FNV-1a digest — zero allocation, same
+/// field set the old `Vec<u32>` signature hashed. Geometry and instance
+/// uploads also invalidate via their dirty flags before GPU
+/// synchronization clears those flags.
+pub fn subworld_caster_digest(bank: &SubWorldRenderBank) -> u64 {
+    let mut hash = FNV1A_OFFSET;
     for entry in bank.entries() {
-        signature.extend([entry.id as u32, (entry.id >> 32) as u32]);
-        signature.extend(entry.transform.position.map(f32::to_bits));
-        signature.extend(entry.transform.quaternion.map(f32::to_bits));
-        signature.push(entry.transform.scale.to_bits());
-        signature.push(entry.alpha.to_bits());
-        signature.extend([entry.vertices.len() as u32, entry.indices.len() as u32]);
+        fnv1a_u64(&mut hash, entry.id);
+        for v in entry.transform.position {
+            fnv1a_u32(&mut hash, v.to_bits());
+        }
+        for v in entry.transform.quaternion {
+            fnv1a_u32(&mut hash, v.to_bits());
+        }
+        fnv1a_u32(&mut hash, entry.transform.scale.to_bits());
+        fnv1a_u32(&mut hash, entry.alpha.to_bits());
+        fnv1a_u64(&mut hash, entry.vertices.len() as u64);
+        fnv1a_u64(&mut hash, entry.indices.len() as u64);
     }
     for batch in bank.batches() {
-        signature.push(batch.mesh_kind);
-        signature.extend(batch.transform.position.map(f32::to_bits));
-        signature.extend(batch.transform.quaternion.map(f32::to_bits));
-        signature.push(batch.transform.scale.to_bits());
-        signature.extend([
-            batch.template_vertices.len() as u32,
-            batch.template_indices.len() as u32,
-            batch.instances.len() as u32,
-        ]);
+        fnv1a_u32(&mut hash, batch.mesh_kind);
+        for v in batch.transform.position {
+            fnv1a_u32(&mut hash, v.to_bits());
+        }
+        for v in batch.transform.quaternion {
+            fnv1a_u32(&mut hash, v.to_bits());
+        }
+        fnv1a_u32(&mut hash, batch.transform.scale.to_bits());
+        fnv1a_u64(&mut hash, batch.template_vertices.len() as u64);
+        fnv1a_u64(&mut hash, batch.template_indices.len() as u64);
+        fnv1a_u64(&mut hash, batch.instances.len() as u64);
     }
-    signature
+    hash
 }
 
 fn subworld_casters_dirty(bank: &SubWorldRenderBank) -> bool {
@@ -2158,6 +2290,166 @@ impl GpuRenderer {
             min_filter: wgpu::FilterMode::Nearest,
             ..wgpu::SamplerDescriptor::default()
         });
+        // GPU UI quad path: `UI_QUAD_WGSL` + the static built-in font atlas
+        // uploaded once — `update_ui_mesh` only rewrites the small dynamic
+        // vertex/index buffers and the screen-size uniform.
+        let ui_quad_layout =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("ui-quad-layout"),
+                    entries: &[
+                        uniform_entry(0),
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float {
+                                    filterable: true,
+                                },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
+        let ui_quad_pipeline_layout =
+            ctx.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("ui-quad-pipeline-layout"),
+                    bind_group_layouts: &[Some(&ui_quad_layout)],
+                    immediate_size: 0,
+                });
+        let ui_quad_module = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("ui-quad"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(mc_spine_ui::draw::UI_QUAD_WGSL)),
+            });
+        let ui_quad_pipeline = ctx
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("ui-quad-pipeline"),
+                layout: Some(&ui_quad_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &ui_quad_module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[Some(UI_QUAD_VERTEX_LAYOUT)],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..wgpu::PrimitiveState::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &ui_quad_module,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: Some(ALPHA_BLEND),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+        let ui_quad_uniform = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ui-quad-uniform"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let ui_font_texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ui-font-atlas"),
+            size: wgpu::Extent3d {
+                width: FONT_ATLAS_WIDTH,
+                height: FONT_ATLAS_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        ctx.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &ui_font_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &font_atlas_rgba(),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(FONT_ATLAS_WIDTH * 4),
+                rows_per_image: Some(FONT_ATLAS_HEIGHT),
+            },
+            wgpu::Extent3d {
+                width: FONT_ATLAS_WIDTH,
+                height: FONT_ATLAS_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+        );
+        let ui_font_view = ui_font_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let ui_font_sampler = ctx.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("ui-font-sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..wgpu::SamplerDescriptor::default()
+        });
+        let ui_quad_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ui-quad-bind-group"),
+            layout: &ui_quad_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ui_quad_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&ui_font_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&ui_font_sampler),
+                },
+            ],
+        });
+        let ui_quad_vertices = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ui-quad-vertices"),
+            size: 4096,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let ui_quad_indices = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ui-quad-indices"),
+            size: 4096,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let ui_quad = UiQuadGpu {
+            pipeline: ui_quad_pipeline,
+            bind_group: ui_quad_bind_group,
+            uniform: ui_quad_uniform,
+            _font_texture: ui_font_texture,
+            vertices: ui_quad_vertices,
+            indices: ui_quad_indices,
+            vertex_capacity: 4096,
+            index_capacity: 4096,
+            index_count: 0,
+        };
         let composite = Self::build_composite(&ctx, target_format, &frame_layout, &frame_ubo);
         let debug_line_module = ctx
             .device
@@ -2226,6 +2518,10 @@ impl GpuRenderer {
             ui_view: None,
             ui_sampler,
             ui_size: (0, 0),
+            ui_quad,
+            ui_quad_vertex_scratch: Vec::new(),
+            ui_gpu_quad_frames: 0,
+            ui_cpu_raster_uploads: 0,
             depth_texture: None,
             depth_view: None,
             depth_size: (0, 0),
@@ -2239,6 +2535,15 @@ impl GpuRenderer {
             hiz_source_vp: None,
             hiz_manual: false,
             hiz_dirty: true,
+            hiz_revision: 0,
+            cull_world_revision: 0,
+            cull_graphs_stamp: 0,
+            cull_result: HashSet::new(),
+            cull_graph_scratch: HashSet::new(),
+            cull_cache_key: None,
+            cull_hiz_count: 0,
+            cull_cache_hits: 0,
+            instanced_kinetic_draws: 0,
             region_arenas: BTreeMap::new(),
             arena_enabled: true,
             empty_vertex_buffer,
@@ -2274,7 +2579,7 @@ impl GpuRenderer {
             shadow: None,
             shadow_active: false,
             last_shadow_camera: None,
-            last_shadow_casters: Vec::new(),
+            last_shadow_casters: EMPTY_CASTER_DIGEST,
             shadow_rerender_count: 0,
             shadow_reuse_count: 0,
             last_shadow_decision: ShadowCacheDecision::Rerender(
@@ -3087,6 +3392,18 @@ impl GpuRenderer {
             .retain(|coord, _| world.packed_mesh(*coord).is_some());
         self.section_graphs.clear();
         self.section_graphs.extend(world.section_graphs());
+        // Order-independent stamp of the mirrored graph set — a graph-only
+        // world change must still invalidate the composed-frame cull cache.
+        let mut graphs_stamp = self.section_graphs.len() as u64;
+        for coord in self.section_graphs.keys() {
+            graphs_stamp = graphs_stamp.wrapping_add(
+                (coord.0 as u64)
+                    .wrapping_mul(0x9e37_79b9)
+                    .wrapping_add((coord.1 as u64).wrapping_mul(0x85eb_ca6b))
+                    .wrapping_add((coord.2 as u64).wrapping_mul(0xc2b2_ae35)),
+            );
+        }
+        let removed_any = !removed.is_empty();
         for (coord, origin) in removed {
             if let Some(origin) = origin {
                 if let Some(arena) = self.region_arenas.get_mut(&origin) {
@@ -3129,6 +3446,10 @@ impl GpuRenderer {
         }
         if scheduled > 0 {
             self.shadow_cache.invalidate();
+        }
+        if scheduled > 0 || removed_any || graphs_stamp != self.cull_graphs_stamp {
+            self.cull_world_revision += 1;
+            self.cull_graphs_stamp = graphs_stamp;
         }
         scheduled
     }
@@ -3300,6 +3621,7 @@ impl GpuRenderer {
         );
         // Occluders changed: the installed pyramid (if any) is stale.
         self.invalidate_hiz();
+        self.cull_world_revision += 1;
     }
 
     /// Drop the worker-built pyramid when terrain residency shifts; an
@@ -3309,6 +3631,7 @@ impl GpuRenderer {
         if self.hiz_source_vp.is_some() {
             self.hiz_pyramid = None;
             self.hiz_source_vp = None;
+            self.hiz_revision += 1;
         }
         self.hiz_dirty = true;
     }
@@ -3350,6 +3673,7 @@ impl GpuRenderer {
                         self.hiz_pyramid = Some(pyramid);
                         self.hiz_source_vp = Some(view_proj);
                         self.hiz_frames_updated += 1;
+                        self.hiz_revision += 1;
                     }
                 }
             }
@@ -3365,9 +3689,10 @@ impl GpuRenderer {
     }
 
     /// Queue the next Hi-Z splat job over this frame's drawn opaque
-    /// quads. Skipped while an embedder-installed pyramid is active or
-    /// the installed pyramid already matches this view and residency.
-    fn submit_hiz_job(&mut self, view_proj: &Mat4, camera_position: [f32; 3], culled: &HashSet<SectionCoord>) {
+    /// quads (`self.cull_result` supplies the skip set). Skipped while an
+    /// embedder-installed pyramid is active or the installed pyramid
+    /// already matches this view and residency.
+    fn submit_hiz_job(&mut self, view_proj: &Mat4, camera_position: [f32; 3]) {
         if self.hiz_manual {
             return;
         }
@@ -3380,7 +3705,7 @@ impl GpuRenderer {
         }
         let mut sections = Vec::with_capacity(self.live_sections.len());
         for (coord, section) in &self.live_sections {
-            if culled.contains(coord) || section.opaque_index_total == 0 {
+            if self.cull_result.contains(coord) || section.opaque_index_total == 0 {
                 continue;
             }
             let min = [
@@ -3509,89 +3834,114 @@ impl GpuRenderer {
         admitted
     }
 
-    /// Sections the composed pass will skip this frame: the
-    /// [`GraphCuller`]'s frustum+occlusion result for graph-covered coords,
-    /// the plain six-plane frustum test for coords the world never
-    /// published a visibility graph for, and — when a Hi-Z pyramid is
-    /// installed — the conservative depth test on top of both. Only
-    /// sections with drawable indices are considered.
-    fn cull_live_sections(
-        &mut self,
-        view_proj: &Mat4,
-        camera_position: [f32; 3],
-    ) -> HashSet<SectionCoord> {
-        let mut culled = HashSet::new();
-        if self.live_sections.is_empty() {
-            return culled;
+    /// Refresh `self.cull_result`: sections the composed pass will skip
+    /// this frame — the [`GraphCuller`]'s frustum+occlusion result for
+    /// graph-covered coords, the plain six-plane frustum test for coords
+    /// the world never published a visibility graph for, and — when a Hi-Z
+    /// pyramid is installed — the conservative depth test on top of both.
+    /// Only sections with drawable indices are considered.
+    ///
+    /// §4 F3: identical `(camera_section, view_proj bits, world revision,
+    /// hiz revision)` inputs replay the cached result in ~0 µs
+    /// (`cull_cache_hits += 1`); a miss refills the retained
+    /// `cull_result`/`cull_graph_scratch` buffers instead of allocating
+    /// fresh `HashSet`s every frame.
+    fn cull_live_sections(&mut self, view_proj: &Mat4, camera_position: [f32; 3]) {
+        let camera_section = SectionCoord(
+            (camera_position[0] / EDGE as f32).floor() as i32,
+            (camera_position[1] / EDGE as f32).floor() as i32,
+            (camera_position[2] / EDGE as f32).floor() as i32,
+        );
+        let mut view_proj_bits = [0u32; 16];
+        for (dst, src) in view_proj_bits.iter_mut().zip(view_proj.iter().flatten()) {
+            *dst = src.to_bits();
         }
-        let planes = frustum_planes_from_view_proj(view_proj);
-        // One graph-culler BFS per frame over the mirrored visibility set.
-        // Coords absent from the snapshot (mesh-only worlds) fall back to
-        // the frustum test rather than being treated as unreachable.
-        let graph_visible = (!self.section_graphs.is_empty()).then(|| {
-            let camera_section = SectionCoord(
-                (camera_position[0] / EDGE as f32).floor() as i32,
-                (camera_position[1] / EDGE as f32).floor() as i32,
-                (camera_position[2] / EDGE as f32).floor() as i32,
-            );
-            GraphCuller::new(camera_section, &planes)
-                .search(self.section_graphs.iter().map(|(&c, &g)| (c, g)))
-                .visible
-                .into_iter()
-                .collect::<HashSet<_>>()
-        });
-        // A worker-built pyramid only applies to the exact view it was
-        // splatted with — a stale camera can't false-cull. Embedder
-        // pyramids (`hiz_source_vp == None`) always apply.
-        let hiz_rows = match self.hiz_source_vp {
-            Some(source) if source == *view_proj => Some(view_proj_row_major(view_proj)),
-            Some(_) => None,
-            None => self
-                .hiz_pyramid
-                .as_ref()
-                .map(|_| view_proj_row_major(view_proj)),
+        let key = CullCacheKey {
+            camera_section: (camera_section.0, camera_section.1, camera_section.2),
+            view_proj_bits,
+            world_revision: self.cull_world_revision,
+            hiz_revision: self.hiz_revision,
         };
+        if self.cull_cache_key == Some(key) {
+            self.cull_cache_hits += 1;
+            self.hiz_culled_sections += self.cull_hiz_count;
+            return;
+        }
+        // Miss: refill the retained sets (steady frames keep their
+        // capacity, so the recompute allocates nothing).
+        let mut culled = std::mem::take(&mut self.cull_result);
+        culled.clear();
         let mut hiz_culled = 0u64;
-        for (coord, section) in self.live_sections.iter() {
-            if section.opaque_index_total == 0
-                && section.terrain.translucent_index_count == 0
-            {
-                continue;
+        if !self.live_sections.is_empty() {
+            let planes = frustum_planes_from_view_proj(view_proj);
+            // One graph-culler BFS per frame over the mirrored visibility
+            // set. Coords absent from the snapshot (mesh-only worlds) fall
+            // back to the frustum test rather than being treated as
+            // unreachable.
+            let has_graphs = !self.section_graphs.is_empty();
+            let mut graph_scratch = std::mem::take(&mut self.cull_graph_scratch);
+            graph_scratch.clear();
+            if has_graphs {
+                graph_scratch.extend(
+                    GraphCuller::new(camera_section, &planes)
+                        .search(self.section_graphs.iter().map(|(&c, &g)| (c, g)))
+                        .visible,
+                );
             }
-            let min = [
-                coord.0 as f32 * EDGE as f32,
-                coord.1 as f32 * EDGE as f32,
-                coord.2 as f32 * EDGE as f32,
-            ];
-            // Hi-Z runs before graph/frustum culling: a view-matched pyramid
-            // only reports occlusion the previous frame's drawn occluders
-            // prove, so a depth-culled section stays culled regardless of
-            // which conservative test fires first.
-            if let (Some(hiz), Some(rows)) = (&self.hiz_pyramid, &hiz_rows) {
-                let max = [
-                    min[0] + EDGE as f32,
-                    min[1] + EDGE as f32,
-                    min[2] + EDGE as f32,
-                ];
-                if hiz.cull_world_aabb(rows, min, max) {
-                    culled.insert(*coord);
-                    hiz_culled += 1;
+            let graph_visible = has_graphs.then_some(&graph_scratch);
+            // A worker-built pyramid only applies to the exact view it was
+            // splatted with — a stale camera can't false-cull. Embedder
+            // pyramids (`hiz_source_vp == None`) always apply.
+            let hiz_rows = match self.hiz_source_vp {
+                Some(source) if source == *view_proj => Some(view_proj_row_major(view_proj)),
+                Some(_) => None,
+                None => self
+                    .hiz_pyramid
+                    .as_ref()
+                    .map(|_| view_proj_row_major(view_proj)),
+            };
+            for (coord, section) in self.live_sections.iter() {
+                if section.opaque_index_total == 0
+                    && section.terrain.translucent_index_count == 0
+                {
                     continue;
                 }
+                let min = [
+                    coord.0 as f32 * EDGE as f32,
+                    coord.1 as f32 * EDGE as f32,
+                    coord.2 as f32 * EDGE as f32,
+                ];
+                // Hi-Z runs before graph/frustum culling: a view-matched
+                // pyramid only reports occlusion the previous frame's
+                // drawn occluders prove, so a depth-culled section stays
+                // culled regardless of which conservative test fires first.
+                if let (Some(hiz), Some(rows)) = (&self.hiz_pyramid, &hiz_rows) {
+                    let max = [
+                        min[0] + EDGE as f32,
+                        min[1] + EDGE as f32,
+                        min[2] + EDGE as f32,
+                    ];
+                    if hiz.cull_world_aabb(rows, min, max) {
+                        culled.insert(*coord);
+                        hiz_culled += 1;
+                        continue;
+                    }
+                }
+                let visible = if self.section_graphs.contains_key(coord) {
+                    graph_visible.is_some_and(|set| set.contains(coord))
+                } else {
+                    box_in_frustum(min, &planes)
+                };
+                if !visible {
+                    culled.insert(*coord);
+                }
             }
-            let visible = if self.section_graphs.contains_key(coord) {
-                graph_visible
-                    .as_ref()
-                    .is_some_and(|set| set.contains(coord))
-            } else {
-                box_in_frustum(min, &planes)
-            };
-            if !visible {
-                culled.insert(*coord);
-            }
+            self.cull_graph_scratch = graph_scratch;
         }
         self.hiz_culled_sections += hiz_culled;
-        culled
+        self.cull_hiz_count = hiz_culled;
+        self.cull_cache_key = Some(key);
+        self.cull_result = culled;
     }
 
     /// The active per-frame chunk-upload budget.
@@ -3617,6 +3967,7 @@ impl GpuRenderer {
         self.hiz_manual = pyramid.is_some();
         self.hiz_source_vp = None;
         self.hiz_pyramid = pyramid;
+        self.hiz_revision += 1;
     }
 
     /// The installed Hi-Z pyramid, if any.
@@ -3809,7 +4160,62 @@ impl GpuRenderer {
                 depth_or_array_layers: 1,
             },
         );
+        self.ui_cpu_raster_uploads += 1;
         Ok(())
+    }
+
+    /// Upload a [`tessellate_draw_list`](mc_spine_ui::draw::tessellate_draw_list)
+    /// mesh for the GPU-quad UI overlay: rewrites only the 16-byte
+    /// screen-size uniform plus the dynamic vertex/index buffers (grown,
+    /// never shrunk). The static font atlas uploaded at construction is
+    /// bound every draw. Empty meshes disable the overlay draw.
+    pub fn update_ui_mesh(&mut self, width: u32, height: u32, mesh: &UiMesh) {
+        let uniforms = [width.max(1) as f32, height.max(1) as f32, 0.0, 0.0];
+        self.ctx
+            .queue
+            .write_buffer(&self.ui_quad.uniform, 0, bytemuck::cast_slice(&uniforms));
+        self.ui_quad.index_count = mesh.indices.len() as u32;
+        if self.ui_quad.index_count == 0 {
+            return;
+        }
+        self.ui_quad_vertex_scratch.clear();
+        self.ui_quad_vertex_scratch
+            .extend(mesh.vertices.iter().map(|v| UiQuadVertex {
+                position: v.position,
+                uv: v.uv,
+                color: v.color,
+            }));
+        let vbytes = (self.ui_quad_vertex_scratch.len() * 32) as u64;
+        if vbytes > self.ui_quad.vertex_capacity {
+            self.ui_quad.vertex_capacity = vbytes * 2;
+            self.ui_quad.vertices = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ui-quad-vertices"),
+                size: self.ui_quad.vertex_capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        let ibytes = (mesh.indices.len() * 4) as u64;
+        if ibytes > self.ui_quad.index_capacity {
+            self.ui_quad.index_capacity = ibytes * 2;
+            self.ui_quad.indices = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ui-quad-indices"),
+                size: self.ui_quad.index_capacity,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        let quad = &self.ui_quad;
+        self.ctx.queue.write_buffer(
+            &quad.vertices,
+            0,
+            bytemuck::cast_slice(&self.ui_quad_vertex_scratch),
+        );
+        self.ctx.queue.write_buffer(
+            &quad.indices,
+            0,
+            bytemuck::cast_slice(&mesh.indices),
+        );
     }
 
     /// Encode one frame into `view`: sky clear + opaque + translucent +
@@ -3962,8 +4368,37 @@ impl GpuRenderer {
                 }
             }
         }
-        // Second pass: the UI blit (no depth attachment; pipeline is depthless).
-        if let Some(ui_bind_group) = &self.ui_bind_group {
+        // Second pass: the UI overlay — tessellated GPU quads when
+        // `update_ui_mesh` installed a mesh, else the legacy CPU-blit
+        // framebuffer (no depth attachment; both pipelines are depthless).
+        let mut drew_quad_ui = false;
+        if self.ui_quad.index_count > 0 {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ui-overlay"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.ui_quad.pipeline);
+            pass.set_bind_group(0, &self.ui_quad.bind_group, &[]);
+            pass.set_vertex_buffer(0, self.ui_quad.vertices.slice(..));
+            pass.set_index_buffer(
+                self.ui_quad.indices.slice(..),
+                wgpu::IndexFormat::Uint32,
+            );
+            pass.draw_indexed(0..self.ui_quad.index_count, 0, 0..1);
+            drew_quad_ui = true;
+        } else if let Some(ui_bind_group) = &self.ui_bind_group {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("ui-overlay"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3983,6 +4418,9 @@ impl GpuRenderer {
             pass.set_pipeline(&self.ui_pipeline);
             pass.set_bind_group(0, ui_bind_group, &[]);
             pass.draw(0..3, 0..1);
+        }
+        if drew_quad_ui {
+            self.ui_gpu_quad_frames += 1;
         }
         self.ctx.queue.submit([encoder.finish()]);
     }
@@ -4503,13 +4941,20 @@ impl GpuRenderer {
     /// Mirror a [`SubWorldRenderBank`] onto the device: uploads only dirty
     /// geometry/instance payloads and clears the bank's dirty flags.
     pub fn sync_subworlds(&mut self, bank: &mut SubWorldRenderBank) {
-        if subworld_casters_dirty(bank)
-            || subworld_caster_signature(bank) != self.last_shadow_casters
-        {
+        let digest = subworld_caster_digest(bank);
+        if subworld_casters_dirty(bank) || digest != self.last_shadow_casters {
             self.shadow_cache.invalidate();
         }
         self.subworld_gpu
             .sync(&self.ctx.device, &self.ctx.queue, bank);
+        self.last_shadow_casters = digest;
+    }
+
+    /// The `u64` caster digest recorded by the last sub-world sync
+    /// ([`subworld_caster_digest`]) — changes only when caster geometry,
+    /// transforms, or instance streams actually change.
+    pub fn shadow_caster_digest(&self) -> u64 {
+        self.last_shadow_casters
     }
 
     /// Number of GPU-resident sub-world entries (for diagnostics/tests).
@@ -4693,15 +5138,16 @@ impl GpuRenderer {
         } = *target;
         self.ensure_depth(width, height);
         self.begin_render_upload_frame();
-        let culled_sections = self.cull_live_sections(&view_proj, camera_position);
-        self.culled_sections += culled_sections.len() as u64;
-        self.last_frame_culled_sections = culled_sections.len();
+        self.cull_live_sections(&view_proj, camera_position);
+        self.culled_sections += self.cull_result.len() as u64;
+        self.last_frame_culled_sections = self.cull_result.len();
         // Hand the drawn occluder set to the worker pool while the GPU
         // encodes: the finished Hi-Z pyramid lands on a later frame's
         // upload boundary.
-        self.submit_hiz_job(&view_proj, camera_position, &culled_sections);
+        self.submit_hiz_job(&view_proj, camera_position);
         // Split disjoint field borrows so the scratch writer and the GPU
         // handles can coexist inside the render pass.
+        let culled_sections = &self.cull_result;
         let gpu = &mut self.composite;
         let shadow = self.shadow.as_ref().filter(|_| self.shadow_active);
         let scene = &self.scene;
@@ -4711,6 +5157,7 @@ impl GpuRenderer {
         let mut arena_draws = 0u64;
         let mut arena_sections = 0usize;
         let mut arena_regions = 0usize;
+        let mut instanced_draws = 0u64;
         let subworld_gpu = &self.subworld_gpu;
         let entity_ber = &self.entity_ber;
         let particles = &self.particles;
@@ -4998,6 +5445,7 @@ impl GpuRenderer {
                     wgpu::IndexFormat::Uint32,
                 );
                 pass.draw_indexed(0..batch.index_count, 0, 0..batch.instance_count);
+                instanced_draws += 1;
             }
             let mut drew_alpha = false;
             for entry in subworld_gpu.entries() {
@@ -5049,6 +5497,7 @@ impl GpuRenderer {
         }
         self.direction_buckets_skipped += skipped_buckets;
         self.region_arena_draws += arena_draws;
+        self.instanced_kinetic_draws = instanced_draws;
         // One bind group per emitting region replaces one per emitting
         // section; the difference is real `set_bind_group` traffic saved.
         self.bind_group_switches_saved += arena_sections.saturating_sub(arena_regions) as u64;
@@ -5073,13 +5522,14 @@ impl GpuRenderer {
     ) -> Result<Vec<u8>, RendererError> {
         let width = width.max(1);
         let height = height.max(1);
-        if subworld_casters_dirty(frame.subworlds)
-            || subworld_caster_signature(frame.subworlds) != self.last_shadow_casters
+        let caster_digest = subworld_caster_digest(frame.subworlds);
+        if subworld_casters_dirty(frame.subworlds) || caster_digest != self.last_shadow_casters
         {
             self.shadow_cache.invalidate();
         }
         self.subworld_gpu
             .sync(&self.ctx.device, &self.ctx.queue, frame.subworlds);
+        self.last_shadow_casters = caster_digest;
         if let Some(rgba) = frame.ui_rgba {
             self.update_ui_framebuffer(width, height, rgba)?;
         }
@@ -5140,7 +5590,6 @@ impl GpuRenderer {
         if self.shadow_active {
             if matches!(decision, ShadowCacheDecision::Rerender(_)) {
                 self.encode_shadow_map(&mut encoder, camera, aspect, frame.world_time_ticks);
-                self.last_shadow_casters = subworld_caster_signature(frame.subworlds);
             } else {
                 self.shadow_reuse_count += 1;
             }
@@ -5201,8 +5650,36 @@ impl GpuRenderer {
                 },
             );
         }
-        // UI overlay at native resolution.
-        if let Some(ui_bind_group) = &self.ui_bind_group {
+        // UI overlay at native resolution: tessellated GPU quads when
+        // `update_ui_mesh` installed a mesh, else the legacy CPU-blit.
+        let mut drew_quad_ui = false;
+        if self.ui_quad.index_count > 0 {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ui-overlay"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &native_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.ui_quad.pipeline);
+            pass.set_bind_group(0, &self.ui_quad.bind_group, &[]);
+            pass.set_vertex_buffer(0, self.ui_quad.vertices.slice(..));
+            pass.set_index_buffer(
+                self.ui_quad.indices.slice(..),
+                wgpu::IndexFormat::Uint32,
+            );
+            pass.draw_indexed(0..self.ui_quad.index_count, 0, 0..1);
+            drew_quad_ui = true;
+        } else if let Some(ui_bind_group) = &self.ui_bind_group {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("ui-overlay"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -5222,6 +5699,9 @@ impl GpuRenderer {
             pass.set_pipeline(&self.ui_pipeline);
             pass.set_bind_group(0, ui_bind_group, &[]);
             pass.draw(0..3, 0..1);
+        }
+        if drew_quad_ui {
+            self.ui_gpu_quad_frames += 1;
         }
 
         let padded_bpr = crate::aligned_copy_bytes_per_row(width);

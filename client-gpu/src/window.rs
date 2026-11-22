@@ -22,7 +22,7 @@ use mc_spine_ui::container_screen::{
     menu_schema, ContainerScreenState, DragState, InventorySortState, MenuScreenSchema, SlotDef,
     SlotKind, UiItemStack,
 };
-use mc_spine_ui::draw::rasterize_draw_list;
+use mc_spine_ui::draw::tessellate_draw_list;
 use mc_spine_ui::draw::{UiColor, UiRect};
 use mc_spine_ui::hud_widgets::ScoreboardEntry;
 use mc_spine_ui::magic_hud::build_magic_hud_draw_list;
@@ -564,21 +564,25 @@ impl GpuApp {
             None
         } else if let Some(server) = &singleplayer_server {
             let addr = server.addr();
-            Some(LiveSession::connect_with_paths(
+            Some(LiveSession::connect_with_paths_and_auth(
                 addr.ip().to_string(),
                 addr.port(),
                 config.username.clone(),
                 config.mc_version.clone(),
                 session_paths.clone(),
+                config.access_token.clone(),
+                config.uuid.clone(),
             ))
         } else {
             config.connect.as_ref().map(|(host, port)| {
-                LiveSession::connect_with_paths(
+                LiveSession::connect_with_paths_and_auth(
                     host.clone(),
                     *port,
                     config.username.clone(),
                     config.mc_version.clone(),
                     session_paths.clone(),
+                    config.access_token.clone(),
+                    config.uuid.clone(),
                 )
             })
         };
@@ -917,17 +921,20 @@ impl GpuApp {
         }
         if let Some(live) = &mut self.live {
             live.hud.chat_lines.push(message);
+            live.hud_revision += 1;
         }
     }
 
     /// Spawn a session against `host:port` and switch the UI into gameplay.
     fn connect_to(&mut self, host: String, port: u16) {
-        self.live = Some(LiveSession::connect_with_paths(
+        self.live = Some(LiveSession::connect_with_paths_and_auth(
             host,
             port,
             self.config.username.clone(),
             self.config.mc_version.clone(),
             self.session_paths.clone(),
+            self.config.access_token.clone(),
+            self.config.uuid.clone(),
         ));
         self.ui.screen = Screen::InGameHud;
         self.ui.hud = mc_spine_ui::state::HudState::default();
@@ -1745,7 +1752,9 @@ impl GpuApp {
                 active.renderer.update_live_terrain(&live.world);
                 live.terrain_dirty = false;
             }
-            self.ui.hud = live.hud.clone();
+            // Revision-gated HUD sync: unchanged server state skips the
+            // `HudState` clone entirely (`live.hud_sync_skips` counts hits).
+            live.sync_hud_to(&mut self.ui.hud);
             live.record_frame_and_refresh_minihud(dt, &mut self.ui);
             let feed = live.hud_feed();
             Self::apply_live_hud(
@@ -1827,15 +1836,14 @@ impl GpuApp {
                 &mut draw_list,
             );
         }
-        // Dirty-only upload: unchanged HUD frames skip the `w*h*4` rasterize
-        // and the texture upload instead of burning GB/s of PCIe bandwidth.
+        // Dirty-only upload: unchanged HUD frames skip even the quad
+        // tessellation; changed frames upload only the small dynamic
+        // vertex/index buffers — never a `w*h*4` CPU raster + texture
+        // write (`renderer.ui_cpu_raster_uploads` stays at zero).
         let fingerprint = fingerprint_draw_list(w, h, &draw_list);
         if self.ui_cache.should_upload(w, h, fingerprint) {
-            let rgba = rasterize_draw_list(w, h, &draw_list);
-            if let Err(e) = active.renderer.update_ui_framebuffer(w, h, &rgba) {
-                self.fatal = Some(format!("UI upload: {e}"));
-                return;
-            }
+            let mesh = tessellate_draw_list(w, h, &draw_list);
+            active.renderer.update_ui_mesh(w, h, &mesh);
         }
         let render_camera = self.camera_controller.view_camera(&self.camera);
         let sky = active
@@ -1850,8 +1858,13 @@ impl GpuApp {
                 active.renderer.render_to_view(&view, w, h, &sky);
                 // Wayland `wl_surface.frame` pacing: notify the compositor
                 // right before present so frame callbacks align with the
-                // actual swap (a no-op everywhere else; the policy gates it).
-                if self.policy.call_pre_present_notify {
+                // actual swap (a no-op everywhere else; the policy gates
+                // it). `--vsync off` skips the notify entirely — an
+                // `Immediate`/`Mailbox` swap must not wait on a frame
+                // callback the compositor only schedules for vsync clients.
+                if self.policy.call_pre_present_notify
+                    && crate::should_call_pre_present_notify(self.config.vsync)
+                {
                     active.window.pre_present_notify();
                 }
                 active.renderer.gpu().queue.present(frame);
@@ -1984,6 +1997,7 @@ impl GpuApp {
                         self.ui.hud.chat_lines.clear();
                         if let Some(live) = &mut self.live {
                             live.hud.chat_lines.clear();
+                            live.hud_revision += 1;
                         }
                     }
                     _ => {}
@@ -2001,12 +2015,14 @@ impl GpuApp {
                 self.ui.hud.selected_slot = usize::from(slot);
                 if let Some(live) = &mut self.live {
                     live.hud.selected_slot = usize::from(slot);
+                    live.hud_revision += 1;
                 }
             }
             WindowInputEvent::SetTabListVisible(visible) => {
                 self.ui.hud.show_player_list = visible;
                 if let Some(live) = &mut self.live {
                     live.hud.show_player_list = visible;
+                    live.hud_revision += 1;
                 }
             }
             WindowInputEvent::SwapOffhand => {

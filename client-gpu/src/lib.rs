@@ -799,15 +799,33 @@ pub fn wgpu_backends_for(pref: RenderBackendPreference) -> wgpu::Backends {
 
 /// Present mode a `vsync` toggle should use, preferring the exact mode the
 /// surface advertises and degrading gracefully through `AutoVsync`/`AutoNoVsync`.
-pub fn present_mode_for(vsync: bool, supported: &[wgpu::PresentMode]) -> wgpu::PresentMode {
+/// Uncapped mode wants the lowest latency swap the surface supports:
+/// `Immediate` → `Mailbox` → `AutoNoVsync` → `Fifo`.
+pub fn select_present_mode(vsync: bool, supported: &[wgpu::PresentMode]) -> wgpu::PresentMode {
     let prefer = |mode: wgpu::PresentMode| supported.contains(&mode).then_some(mode);
     if vsync {
         prefer(wgpu::PresentMode::Fifo).unwrap_or(wgpu::PresentMode::AutoVsync)
     } else {
-        prefer(wgpu::PresentMode::Mailbox)
-            .or_else(|| prefer(wgpu::PresentMode::Immediate))
+        prefer(wgpu::PresentMode::Immediate)
+            .or_else(|| prefer(wgpu::PresentMode::Mailbox))
+            .or_else(|| prefer(wgpu::PresentMode::AutoNoVsync))
+            .or_else(|| prefer(wgpu::PresentMode::Fifo))
             .unwrap_or(wgpu::PresentMode::AutoNoVsync)
     }
+}
+
+/// Whether the frame loop should call `window.pre_present_notify()`: only
+/// under vsync, where compositor pacing applies. With `--vsync off` the
+/// `Immediate`/`Mailbox` swap must not wait on a `wl_surface.frame`
+/// callback, so the notify is skipped entirely.
+pub fn should_call_pre_present_notify(vsync: bool) -> bool {
+    vsync
+}
+
+/// Present mode a `vsync` toggle should use — kept for existing callers;
+/// implemented by [`select_present_mode`].
+pub fn present_mode_for(vsync: bool, supported: &[wgpu::PresentMode]) -> wgpu::PresentMode {
+    select_present_mode(vsync, supported)
 }
 
 /// Composite alpha mode a surface should prefer: [`Opaque`](wgpu::CompositeAlphaMode::Opaque)
