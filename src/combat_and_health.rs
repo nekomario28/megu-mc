@@ -32,6 +32,7 @@ fn arrows() -> &'static Mutex<Vec<Arrow>> {
 }
 // left: server ticks of fuse remaining. Vanilla holds the fuse in game ticks
 // (80 for ordinary TNT), so a loaded world cannot shift it under tick lag.
+#[derive(Clone, Copy)]
 struct Primed {
     eid: i32,
     x: f64,
@@ -126,6 +127,206 @@ struct Xp {
 static XPS: OnceLock<Mutex<Vec<Xp>>> = OnceLock::new();
 fn xps() -> &'static Mutex<Vec<Xp>> {
     XPS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+// ---------- fresh-orb merge on spawn/tick (MEGA-SCALE §3.2) ----------
+// Orbs spawned through `xp_spawn` since the last `drop_tick` merge pass. The
+// per-eid marker lets a spawn storm collapse inside the tick it lands in —
+// before the O(pool) env merge or the pickup scan ever sees 2,000 fresh
+// entities — while orbs that already existed keep the env pass's pinned
+// keep/eat decision.
+static XP_PENDING: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+fn xp_pending() -> &'static Mutex<HashSet<i32>> {
+    XP_PENDING.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// The pool size at which merging fresh spawns pays. Below it the per-tick
+/// env merge is already cheap, so staying inert there adds nothing and keeps
+/// this path unobservable to the pinned save-payload fixture.
+const XP_MERGE_FLOOR: usize = 256;
+/// One orb may not exceed the `i16` wire value; an over-valued survivor emits
+/// the conserved remainder as additional bounded orbs instead of overflowing.
+const XP_ORB_MAX_VAL: u64 = i16::MAX as u64;
+
+/// Spawn an experience orb, marking it merge-pending so the next `drop_tick`
+/// pass can collapse a spawn burst inside the same tick.
+fn xp_spawn(x: f64, y: f64, z: f64, val: i16) -> i32 {
+    let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+    xps().lock().unwrap_or_else(|e| e.into_inner()).push(Xp {
+        eid,
+        x,
+        y,
+        z,
+        val,
+        age: 0,
+    });
+    xp_pending()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(eid);
+    eid
+}
+
+/// The merge kernel over one partitioned pool (keepers first, donors after,
+/// both in `xps` order, parallel `vals`). Under `mod-suite` this is
+/// `mod_offload::entity_spatial::merge_xp_orbs` directly; the local build runs
+/// the same cell-bucketed scan — cell size 2.0, radius 1.0, every orb feeding
+/// its whole value to the earliest surviving candidate — so both builds agree.
+#[cfg(feature = "mod-suite")]
+fn xp_merge_run(pool: &[usize], xs: &[Xp], vals: &mut [u64]) {
+    let mut orbs: Vec<mod_offload::entity_spatial::XpOrb> = pool
+        .iter()
+        .enumerate()
+        .map(|(k, &i)| mod_offload::entity_spatial::XpOrb {
+            id: k as u32,
+            pos: [xs[i].x, xs[i].y, xs[i].z],
+            vel: [0.0; 3],
+            value: vals[k],
+        })
+        .collect();
+    mod_offload::entity_spatial::merge_xp_orbs(&mut orbs);
+    for o in &orbs {
+        vals[o.id as usize] = o.value;
+    }
+}
+
+#[cfg(not(feature = "mod-suite"))]
+fn xp_merge_run(pool: &[usize], xs: &[Xp], vals: &mut [u64]) {
+    const CELL: f64 = 2.0;
+    let mut cells: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::with_capacity(vals.len());
+    let mut candidates: Vec<usize> = Vec::new();
+    for i in 0..vals.len() {
+        if vals[i] == 0 {
+            continue;
+        }
+        let (px, py, pz) = (xs[pool[i]].x, xs[pool[i]].y, xs[pool[i]].z);
+        let (cx, cy, cz) = (
+            (px / CELL).floor() as i32,
+            (py / CELL).floor() as i32,
+            (pz / CELL).floor() as i32,
+        );
+        candidates.clear();
+        for dx in -1..=1i32 {
+            for dy in -1..=1i32 {
+                for dz in -1..=1i32 {
+                    if let (Some(kx), Some(ky), Some(kz)) = (
+                        cx.checked_add(dx),
+                        cy.checked_add(dy),
+                        cz.checked_add(dz),
+                    ) {
+                        if let Some(list) = cells.get(&(kx, ky, kz)) {
+                            candidates.extend_from_slice(list);
+                        }
+                    }
+                }
+            }
+        }
+        candidates.sort_unstable();
+        let mut merged = false;
+        for &j in &candidates {
+            let (qx, qy, qz) = (xs[pool[j]].x, xs[pool[j]].y, xs[pool[j]].z);
+            if (px - qx).powi(2) + (py - qy).powi(2) + (pz - qz).powi(2) <= 1.0 {
+                vals[j] = vals[j].saturating_add(vals[i]);
+                vals[i] = 0;
+                merged = true;
+                break;
+            }
+        }
+        if !merged {
+            cells.entry((cx, cy, cz)).or_default().push(i);
+        }
+    }
+}
+
+/// Merge `pending` donor eids into the locked orb pool. Keepers (pre-existing
+/// orbs) precede donors in the pool, so a fresh orb feeds the earliest
+/// surviving neighbour within 1.0 and donors collapse left-to-right when none
+/// is in range. Tombstoned orbs are removed in one `retain` pass; an
+/// over-valued survivor is clamped to `i16::MAX` and the conserved remainder
+/// respawns as fresh bounded orbs. Returns the absorbed eids in merge order,
+/// which is the order the destroy packets go out in.
+fn xp_merge_pending_locked(xs: &mut Vec<Xp>, pending: &HashSet<i32>) -> Vec<i32> {
+    let mut pool: Vec<usize> = Vec::with_capacity(xs.len());
+    pool.extend(
+        xs.iter()
+            .enumerate()
+            .filter(|(_, x)| !pending.contains(&x.eid) && x.val > 0)
+            .map(|(i, _)| i),
+    );
+    pool.extend(
+        xs.iter()
+            .enumerate()
+            .filter(|(_, x)| pending.contains(&x.eid) && x.val > 0)
+            .map(|(i, _)| i),
+    );
+    if pool.len() < 2 {
+        return Vec::new();
+    }
+    let mut vals: Vec<u64> = pool.iter().map(|&i| xs[i].val as u64).collect();
+    xp_merge_run(&pool, xs, &mut vals);
+    let mut eaten = HashSet::new();
+    let mut order = Vec::new();
+    let mut spill = Vec::new();
+    for (k, &i) in pool.iter().enumerate() {
+        if vals[k] == 0 {
+            if eaten.insert(xs[i].eid) {
+                order.push(xs[i].eid);
+            }
+        } else {
+            let keep = vals[k].min(XP_ORB_MAX_VAL);
+            let excess = vals[k] - keep;
+            xs[i].val = keep as i16;
+            if excess > 0 {
+                spill.push((xs[i].x, xs[i].y, xs[i].z, excess));
+            }
+        }
+    }
+    if !eaten.is_empty() {
+        xs.retain(|x| !eaten.contains(&x.eid));
+    }
+    for (x, y, z, mut left) in spill {
+        while left > 0 {
+            let take = left.min(XP_ORB_MAX_VAL) as i16;
+            xs.push(Xp {
+                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                x,
+                y,
+                z,
+                val: take,
+                age: 0,
+            });
+            left -= u64::from(take as u16);
+        }
+    }
+    order
+}
+
+/// Collapse freshly spawned orbs into their older neighbours — the merge the
+/// env pass would do, done the same tick the storm lands so a farm's 2,000
+/// orbs reach the pickup scan as a handful. Runs only once `xps()` outgrows
+/// `XP_MERGE_FLOOR`: below it the env merge is already cheap, and the pinned
+/// save-payload fixture — which never routes a spawn through `xp_spawn` —
+/// cannot observe this path at all.
+///
+/// The `xps` store is the Overworld orb list, so merged orbs are same-dimension
+/// by construction and the 1.0-block radius is the only spatial gate.
+fn xp_merge_pending() {
+    let pending: HashSet<i32> = {
+        let mut p = xp_pending().lock().unwrap_or_else(|e| e.into_inner());
+        if p.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *p)
+    };
+    let mut xs = xps().lock().unwrap_or_else(|e| e.into_inner());
+    if xs.len() <= XP_MERGE_FLOOR {
+        return;
+    }
+    let eaten = xp_merge_pending_locked(&mut xs, &pending);
+    drop(xs);
+    for eid in eaten {
+        broadcast_seen_destroy(eid);
+    }
 }
 
 // vanilla 1.9+ attack cooldown: seconds per full charge by tool kind.
@@ -1725,29 +1926,9 @@ fn kill_mob(deid: i32, etype: i64, mx: f64, my: f64, mz: f64) {
         .filter(|st| !(was_sheared && st.0 == 202))
         .filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1)
     {
-        let d = Drop {
-            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-            x: mx,
-            y: my,
-            z: mz,
-            item,
-            cnt,
-            comps,
-            age: 0,
-            target: None,
-            thrower: None,
-        };
-        drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
+        drop_spawn(mx, my, mz, item, cnt, comps, 0, None, None);
     }
-    let xeid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-    xps().lock().unwrap_or_else(|e| e.into_inner()).push(Xp {
-        eid: xeid,
-        x: mx,
-        y: my,
-        z: mz,
-        val: mob_xp(etype),
-        age: 0,
-    });
+    xp_spawn(mx, my, mz, mob_xp(etype));
     // spawn streams via interest_tick
 }
 
@@ -1763,18 +1944,7 @@ fn mob_env_die(deid: i32, etype: i64, mx: f64, my: f64, mz: f64, burning: bool) 
         .into_iter()
         .filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1)
     {
-        drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
-            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-            x: mx,
-            y: my,
-            z: mz,
-            item,
-            cnt,
-            comps,
-            age: 0,
-            target: None,
-            thrower: None,
-        });
+        drop_spawn(mx, my, mz, item, cnt, comps, 0, None, None);
     }
 }
 static LOOT_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -2800,18 +2970,7 @@ fn arrow_tick() {
             } else {
                 (lx, ly, lz)
             };
-            drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
-                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                x: tx,
-                y: ty,
-                z: tz,
-                item: ri,
-                cnt: 1,
-                comps: rc,
-                age: 0,
-                target: None,
-                thrower: None,
-            });
+            drop_spawn(tx, ty, tz, ri, 1, rc, 0, None, None);
         }
     }
     for (deid, etype, mx, my, mz) in mob_dead {
@@ -2871,35 +3030,724 @@ fn arrow_tick() {
         }
     }
 }
-fn explode_at(ex: f64, ey: f64, ez: f64, power: f64) {
-    let (bx, by, bz) = (ex.floor() as i32, ey.floor() as i32, ez.floor() as i32);
-    let mut offs: Vec<(i8, i8, i8)> = Vec::new();
-    for dx in -2..=2 {
-        for dy in -1..=2 {
-            for dz in -2..=2 {
-                if dx * dx + dy * dy + dz * dz <= 5 {
-                    let (tx, ty, tz) = (bx + dx, by + dy, bz + dz);
-                    // vanilla: TNT destroyed by an explosion primes itself —
-                    // short fuse (0.5-1.5s), this is what makes chains work
-                    if (2094..=2095).contains(&block_at(tx, ty, tz)) {
-                        let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                        let jitter =
-                            ((tx.wrapping_mul(31) ^ tz.wrapping_mul(17) ^ ty) & 0x3ff) as u64;
-                        primed().lock().unwrap_or_else(|e| e.into_inner()).push(Primed {
-                            eid,
-                            x: tx as f64 + 0.5,
-                            y: ty as f64,
-                            z: tz as f64 + 0.5,
-                            left: chain_fuse_left(jitter) as i32,
-                        });
-                    }
-                    offs.push((dx as i8, dy as i8, dz as i8));
-                    set_block(tx, ty, tz, 0);
-                }
+// ---------- MEGA-SCALE T1: power-aware batched & tick-sliced explosions ----------
+
+/// One tick's block-removal ceiling for a queued mega-blast slice. An ordinary
+/// TNT (power 4) destroys a few dozen cells and never reaches it; a modded
+/// power-24+ blast drains at this rate per `primed_tick`, so no single tick
+/// ever freezes.
+const MEGA_BLAST_MAX_PER_TICK: usize = 16_384;
+/// Explosions at or below this power (vanilla TNT=4, creeper=3, end crystal=6)
+/// apply in the same call with the exact vanilla `Explosion.collectBlocks`
+/// march. Anything larger — and any blast whose destroyed set would not fit
+/// one slice — queues concentric rings instead.
+const MEGA_BLAST_IMMEDIATE_POWER: f64 = 8.0;
+/// The scrubbed power ceiling. Larger requests still compute against the
+/// clamped volume; a blast box beyond the kernel's own cell bound fails
+/// closed with zero removals instead of allocating without bound.
+const MEGA_BLAST_MAX_POWER: f64 = 64.0;
+/// Pending blast plans retained across ticks. A fuller queue fails the newest
+/// blast closed rather than letting continuations pile up without bound.
+const MEGA_BLAST_QUEUE_CAP: usize = 64;
+/// Stack size coalesced explosion drops are chunked to: at most 1/64 of the
+/// naive one-entity-per-block count, with every item conserved.
+const MEGA_BLAST_STACK: u32 = 64;
+/// Vanilla's never-recorded resistance tier (`bedrock`, `barrier`, end portal
+/// frames, command blocks): no ray can afford the cell anyway, but the flag
+/// keeps the destroyed set honest regardless of float state.
+const BLAST_INDESTRUCTIBLE_RESISTANCE: f32 = 3_600_000.0;
+/// Fluid resistance floor for fluid-bearing states — vanilla's
+/// `max(blockResistance, fluidResistance)` in `Explosion`.
+const BLAST_FLUID_RESISTANCE: f32 = 100.0;
+
+/// Per-state blast resistance, parsed once from the `resistance` column of
+/// the same `blocks_1211.json` `breg` loads (the registry keeps `hardness`
+/// but not this field, so the explosion kernel reads its own copy). A missing
+/// or corrupt asset falls back to `hardness`, mapping the negative
+/// unbreakable sentinel to vanilla's 3.6M immovable tier so the fail state
+/// stays safe.
+fn blast_resistance_of(st: u32) -> f32 {
+    static TABLE: OnceLock<Option<Vec<f32>>> = OnceLock::new();
+    match TABLE.get_or_init(blast_resistance_table).as_ref() {
+        Some(t) => t.get(st as usize).copied().unwrap_or(0.6),
+        None => {
+            let h = breg().map(|r| r.hardness_of(st)).unwrap_or(0.6);
+            if h < 0.0 {
+                BLAST_INDESTRUCTIBLE_RESISTANCE
+            } else {
+                h
             }
         }
     }
-    broadcast(-1, |_c| (0x20, explosion_pkt(ex, ey, ez, &offs)));
+}
+
+fn blast_resistance_table() -> Option<Vec<f32>> {
+    let paths = crate::block_registry::VersionAssetPaths::resolve();
+    let md = crate::json::jparse(&std::fs::read(&paths.blocks).ok()?)?
+        .as_arr()?
+        .clone();
+    let count = md
+        .iter()
+        .filter_map(|b| crate::json::jnum(b, "maxStateId"))
+        .fold(0.0, f64::max) as usize
+        + 1;
+    let mut table = vec![0.6f32; count];
+    for b in &md {
+        let resistance = crate::json::jnum(b, "resistance").unwrap_or(0.6) as f32;
+        let lo = crate::json::jnum(b, "minStateId")? as usize;
+        let hi = (crate::json::jnum(b, "maxStateId")? as usize).min(count - 1);
+        for slot in &mut table[lo..=hi] {
+            *slot = resistance;
+        }
+    }
+    Some(table)
+}
+
+/// One sampled world cell for the blast kernels. `state == 0` is air — the
+/// ray pays only the step drain. A fluid-bearing cell resists at
+/// `max(block, fluid)` like vanilla's `Explosion` fluid branch; `liquid()`
+/// states (water/lava/bubble columns) and the 3.6M-resistance tier attenuate
+/// rays but are never recorded destroyed.
+#[derive(Clone, Copy)]
+struct BlastSample {
+    state: u32,
+    resistance: f32,
+    indestructible: bool,
+}
+
+fn blast_cell_at(x: i32, y: i32, z: i32) -> BlastSample {
+    let st = block_at(x, y, z);
+    if st == 0 {
+        return BlastSample {
+            state: 0,
+            resistance: 0.0,
+            indestructible: false,
+        };
+    }
+    let mut resistance = blast_resistance_of(st);
+    let mut indestructible = resistance >= BLAST_INDESTRUCTIBLE_RESISTANCE;
+    if let Some(reg) = breg() {
+        if reg.is_liquid(st) {
+            resistance = resistance.max(BLAST_FLUID_RESISTANCE);
+            indestructible |= reg.is_liquid_block(st);
+        }
+    }
+    BlastSample {
+        state: st,
+        resistance,
+        indestructible,
+    }
+}
+
+/// One destroyed block recorded by a blast raycast.
+#[derive(Clone, Copy)]
+struct BlastRemoval {
+    pos: [i32; 3],
+}
+
+/// The destroyed-cell set of one explosion, as the active kernel returned it.
+enum BlastOut {
+    #[cfg(feature = "mod-suite")]
+    Offload(mod_offload::explosion_batch::BlastResult),
+    #[cfg(not(feature = "mod-suite"))]
+    Local(Vec<BlastRemoval>),
+}
+
+impl BlastOut {
+    fn removal_count(&self) -> usize {
+        match self {
+            #[cfg(feature = "mod-suite")]
+            Self::Offload(r) => r.cells.len(),
+            #[cfg(not(feature = "mod-suite"))]
+            Self::Local(v) => v.len(),
+        }
+    }
+
+    fn into_removals(self) -> Vec<BlastRemoval> {
+        match self {
+            #[cfg(feature = "mod-suite")]
+            Self::Offload(r) => r
+                .cells
+                .iter()
+                .map(|c| BlastRemoval { pos: c.pos })
+                .collect(),
+            #[cfg(not(feature = "mod-suite"))]
+            Self::Local(v) => v,
+        }
+    }
+}
+
+/// Compute one explosion's destroyed-cell set: the
+/// `mod_offload::explosion_batch` kernel (snapshot cache + the 1,352-ray
+/// vanilla march) under `mod-suite`, or the equivalent pure-std kernel
+/// otherwise. `None` fails closed — the blast volume exceeded the bounded
+/// cache and zero cells are removed.
+#[cfg(feature = "mod-suite")]
+fn blast_compute(origin: [f64; 3], power: f32, seed: u64) -> Option<BlastOut> {
+    let source = |x: i32, y: i32, z: i32| {
+        let s = blast_cell_at(x, y, z);
+        mod_offload::explosion_batch::BlastCell {
+            block_id: s.state,
+            drop_item: 0,
+            blast_resistance: s.resistance,
+            drop_count: 0,
+            flags: if s.indestructible {
+                mod_offload::explosion_batch::FLAG_INDESTRUCTIBLE
+            } else {
+                0
+            },
+        }
+    };
+    blast_engine()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .blast(&source, origin, power, seed)
+        .ok()
+        .map(BlastOut::Offload)
+}
+
+#[cfg(feature = "mod-suite")]
+fn blast_engine() -> &'static Mutex<mod_offload::explosion_batch::ExplosionBatch> {
+    static E: OnceLock<Mutex<mod_offload::explosion_batch::ExplosionBatch>> = OnceLock::new();
+    E.get_or_init(|| Mutex::new(mod_offload::explosion_batch::ExplosionBatch::new()))
+}
+
+#[cfg(not(feature = "mod-suite"))]
+fn blast_compute(origin: [f64; 3], power: f32, seed: u64) -> Option<BlastOut> {
+    let mut engine = blast_engine().lock().unwrap_or_else(|e| e.into_inner());
+    if !(power.is_finite() && power > 0.0) || !engine.prepare(origin, power) {
+        return if engine.prepared_empty() {
+            Some(BlastOut::Local(Vec::new()))
+        } else {
+            None
+        };
+    }
+    Some(BlastOut::Local(engine.march(origin, power, seed)))
+}
+
+#[cfg(not(feature = "mod-suite"))]
+fn blast_engine() -> &'static Mutex<LocalBlastCache> {
+    static E: OnceLock<Mutex<LocalBlastCache>> = OnceLock::new();
+    E.get_or_init(|| Mutex::new(LocalBlastCache::default()))
+}
+
+// The local kernel is the same bounded snapshot + vanilla march the
+// mod-offload engine runs: a flat cell array over the blast box, 1,352
+// surface rays of the 16x16x16 direction grid, per-ray power
+// `power * (0.7 + rand * 0.6)`, `0.3`-block steps paying
+// `(resistance + 0.3) * 0.3` per non-air cell plus an unconditional `0.225`
+// drain, and a per-cell density grid so duplicates collapse to one removal.
+#[cfg(not(feature = "mod-suite"))]
+const BLAST_RAY_GRID: i32 = 16;
+#[cfg(not(feature = "mod-suite"))]
+const BLAST_RAY_STEP: f64 = 0.3;
+#[cfg(not(feature = "mod-suite"))]
+const BLAST_STEP_DRAIN: f32 = 0.225;
+#[cfg(not(feature = "mod-suite"))]
+const BLAST_BLOCK_COST: f32 = 0.3;
+#[cfg(not(feature = "mod-suite"))]
+const BLAST_REACH_FACTOR: f64 = 1.75;
+#[cfg(not(feature = "mod-suite"))]
+const BLAST_BOUNDS_MARGIN: i64 = 2;
+/// The fail-closed bound on the sampled blast volume.
+#[cfg(not(feature = "mod-suite"))]
+const BLAST_MAX_CACHE_CELLS: usize = 6_000_000;
+/// Per-ray step cap; unreachable for finite powers (each step drains
+/// `BLAST_STEP_DRAIN`) and only guards against pathological float states.
+#[cfg(not(feature = "mod-suite"))]
+const BLAST_MAX_RAY_STEPS: u32 = 1 << 20;
+
+#[cfg(not(feature = "mod-suite"))]
+fn local_blast_bounds(origin: [f64; 3], power: f32) -> Option<([i64; 3], [i64; 3])> {
+    if !origin.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let extent =
+        (f64::from(power) * BLAST_REACH_FACTOR).ceil() as i64 + BLAST_BOUNDS_MARGIN;
+    let mut min = [0i64; 3];
+    let mut max = [0i64; 3];
+    for axis in 0..3 {
+        let center = origin[axis].floor() as i64;
+        min[axis] = center.saturating_sub(extent);
+        max[axis] = center.saturating_add(extent);
+    }
+    Some((min, max))
+}
+
+/// Deterministic xorshift64* identical to the mod-offload stream, so a given
+/// `(world, origin, power, seed)` marches identically in both builds.
+#[cfg(not(feature = "mod-suite"))]
+struct LocalBlastRng(u64);
+
+#[cfg(not(feature = "mod-suite"))]
+impl LocalBlastRng {
+    fn new(seed: u64) -> Self {
+        let mut state = seed
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(0xD1B5_4A32_D192_ED03);
+        if state == 0 {
+            state = 0x2545_F491_4F6C_DD1D;
+        }
+        Self(state)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn next_f32(&mut self) -> f32 {
+        ((self.next_u64() >> 40) as f32) * (1.0 / 16_777_216.0)
+    }
+}
+
+#[cfg(not(feature = "mod-suite"))]
+#[derive(Default)]
+struct LocalBlastCache {
+    min: [i64; 3],
+    dims: [usize; 3],
+    cells: Vec<BlastSample>,
+    density: Vec<f32>,
+}
+
+#[cfg(not(feature = "mod-suite"))]
+impl LocalBlastCache {
+    /// Rebuild the snapshot; `false` when the volume exceeds
+    /// `BLAST_MAX_CACHE_CELLS` — the caller fails closed with zero removals.
+    fn prepare(&mut self, origin: [f64; 3], power: f32) -> bool {
+        let Some((min, max)) = local_blast_bounds(origin, power) else {
+            self.dims = [0; 3];
+            self.cells.clear();
+            return true;
+        };
+        let mut dims = [0usize; 3];
+        let mut volume = 1usize;
+        for axis in 0..3 {
+            dims[axis] = (max[axis] - min[axis] + 1).max(0) as usize;
+            volume = volume.saturating_mul(dims[axis]);
+        }
+        if volume > BLAST_MAX_CACHE_CELLS {
+            return false;
+        }
+        self.min = min;
+        self.dims = dims;
+        self.cells.clear();
+        self.cells.reserve(volume);
+        for lz in 0..dims[2] {
+            for ly in 0..dims[1] {
+                for lx in 0..dims[0] {
+                    self.cells.push(blast_cell_at(
+                        min[0].saturating_add(lx as i64) as i32,
+                        min[1].saturating_add(ly as i64) as i32,
+                        min[2].saturating_add(lz as i64) as i32,
+                    ));
+                }
+            }
+        }
+        true
+    }
+
+    fn prepared_empty(&self) -> bool {
+        self.cells.is_empty()
+    }
+
+    #[inline]
+    fn index_of(&self, x: i32, y: i32, z: i32) -> Option<usize> {
+        let (lx, ly, lz) = (
+            x as i64 - self.min[0],
+            y as i64 - self.min[1],
+            z as i64 - self.min[2],
+        );
+        if lx < 0
+            || ly < 0
+            || lz < 0
+            || lx >= self.dims[0] as i64
+            || ly >= self.dims[1] as i64
+            || lz >= self.dims[2] as i64
+        {
+            return None;
+        }
+        Some((lz * self.dims[1] as i64 + ly) as usize * self.dims[0] + lx as usize)
+    }
+
+    /// March all 1,352 surface rays and return the destroyed cells sorted by
+    /// `(x, y, z)` — out-of-cache positions read as air and are never
+    /// recorded, matching the bounded blast domain exactly.
+    fn march(&mut self, origin: [f64; 3], power: f32, seed: u64) -> Vec<BlastRemoval> {
+        self.density.clear();
+        self.density.resize(self.cells.len(), 0.0);
+        let mut rng = LocalBlastRng::new(seed);
+        let grid = BLAST_RAY_GRID as usize;
+        for i in 0..grid {
+            for j in 0..grid {
+                for k in 0..grid {
+                    let (iu, ju, ku) = (i as i32, j as i32, k as i32);
+                    if iu != 0
+                        && iu != BLAST_RAY_GRID - 1
+                        && ju != 0
+                        && ju != BLAST_RAY_GRID - 1
+                        && ku != 0
+                        && ku != BLAST_RAY_GRID - 1
+                    {
+                        continue;
+                    }
+                    let mut dx = (f64::from(iu) / 15.0) * 2.0 - 1.0;
+                    let mut dy = (f64::from(ju) / 15.0) * 2.0 - 1.0;
+                    let mut dz = (f64::from(ku) / 15.0) * 2.0 - 1.0;
+                    let len = (dx * dx + dy * dy + dz * dz).sqrt();
+                    dx /= len;
+                    dy /= len;
+                    dz /= len;
+                    let mut remaining = power * (0.7 + rng.next_f32() * 0.6);
+                    let (mut px, mut py, mut pz) = (origin[0], origin[1], origin[2]);
+                    let mut steps = 0u32;
+                    while remaining > 0.0 && steps < BLAST_MAX_RAY_STEPS {
+                        steps += 1;
+                        let (bx, by, bz) =
+                            (px.floor() as i32, py.floor() as i32, pz.floor() as i32);
+                        let idx = self.index_of(bx, by, bz);
+                        let cell = idx
+                            .map(|at| self.cells[at])
+                            .unwrap_or(BlastSample {
+                                state: 0,
+                                resistance: 0.0,
+                                indestructible: false,
+                            });
+                        if cell.state != 0 {
+                            let resistance = if cell.resistance.is_nan() {
+                                0.0
+                            } else {
+                                cell.resistance.max(0.0)
+                            };
+                            remaining -= (resistance + BLAST_BLOCK_COST) * BLAST_BLOCK_COST;
+                        }
+                        if remaining > 0.0 && cell.state != 0 && !cell.indestructible {
+                            if let Some(at) = idx {
+                                let slot = &mut self.density[at];
+                                if remaining > *slot {
+                                    *slot = remaining;
+                                }
+                            }
+                        }
+                        px += dx * BLAST_RAY_STEP;
+                        py += dy * BLAST_RAY_STEP;
+                        pz += dz * BLAST_RAY_STEP;
+                        remaining -= BLAST_STEP_DRAIN;
+                    }
+                }
+            }
+        }
+        let (sx, sy) = (self.dims[0], self.dims[0] * self.dims[1]);
+        let mut out: Vec<BlastRemoval> = self
+            .density
+            .iter()
+            .enumerate()
+            .filter(|(_, &d)| d > 0.0)
+            .map(|(idx, _)| {
+                let lz = idx / sy;
+                let rem = idx % sy;
+                BlastRemoval {
+                    pos: [
+                        self.min[0].saturating_add((rem % sx) as i64) as i32,
+                        self.min[1].saturating_add((rem / sx) as i64) as i32,
+                        self.min[2].saturating_add(lz as i64) as i32,
+                    ],
+                }
+            })
+            .collect();
+        out.sort_by_key(|r| r.pos);
+        out
+    }
+}
+
+/// Concentric-ring slicing of a big destroyed set — `MegaBlastPlan` under
+/// `mod-suite`, the same distance-sorted cursor otherwise. Each
+/// `next_slice` emits at most `MEGA_BLAST_MAX_PER_TICK` removals.
+struct MegaBlastSlices {
+    #[cfg(feature = "mod-suite")]
+    plan: mod_offload::explosion_batch::MegaBlastPlan,
+    #[cfg(not(feature = "mod-suite"))]
+    plan: LocalBlastPlan,
+}
+
+#[cfg(not(feature = "mod-suite"))]
+struct LocalBlastPlan {
+    removals: Vec<(f64, BlastRemoval)>,
+    cursor: usize,
+    budget: usize,
+}
+
+#[cfg(not(feature = "mod-suite"))]
+impl LocalBlastPlan {
+    fn new(center: [f64; 3], mut removals: Vec<BlastRemoval>, budget: usize) -> Self {
+        let mut keyed: Vec<(f64, BlastRemoval)> = removals
+            .drain(..)
+            .map(|r| {
+                let dx = f64::from(r.pos[0]) + 0.5 - center[0];
+                let dy = f64::from(r.pos[1]) + 0.5 - center[1];
+                let dz = f64::from(r.pos[2]) + 0.5 - center[2];
+                (dx * dx + dy * dy + dz * dz, r)
+            })
+            .collect();
+        // Concentric rings: nearest first, deterministic position tiebreak.
+        keyed.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.pos.cmp(&b.1.pos)));
+        Self {
+            removals: keyed,
+            cursor: 0,
+            budget: budget.max(1),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.cursor >= self.removals.len()
+    }
+
+    fn next_slice(&mut self) -> Option<Vec<BlastRemoval>> {
+        if self.is_complete() {
+            return None;
+        }
+        let end = (self.cursor + self.budget).min(self.removals.len());
+        let out = self.removals[self.cursor..end]
+            .iter()
+            .map(|&(_, r)| r)
+            .collect();
+        self.cursor = end;
+        Some(out)
+    }
+}
+
+/// One queued mega-blast: its plan plus the origin and power the per-slice
+/// explosion packets carry.
+struct MegaBlastJob {
+    center: [f64; 3],
+    power: f32,
+    slices: MegaBlastSlices,
+}
+
+impl MegaBlastJob {
+    fn new(center: [f64; 3], power: f32, out: BlastOut) -> Self {
+        let slices = match out {
+            #[cfg(feature = "mod-suite")]
+            BlastOut::Offload(result) => MegaBlastSlices {
+                plan: mod_offload::explosion_batch::MegaBlastPlan::new(
+                    &result,
+                    MEGA_BLAST_MAX_PER_TICK,
+                ),
+            },
+            #[cfg(not(feature = "mod-suite"))]
+            BlastOut::Local(removals) => MegaBlastSlices {
+                plan: LocalBlastPlan::new(center, removals, MEGA_BLAST_MAX_PER_TICK),
+            },
+        };
+        Self {
+            center,
+            power,
+            slices,
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.slices.plan.is_complete()
+    }
+
+    fn next_slice(&mut self) -> Option<Vec<BlastRemoval>> {
+        #[cfg(feature = "mod-suite")]
+        {
+            self.slices.plan.next_slice().map(|s| {
+                s.removals
+                    .iter()
+                    .map(|r| BlastRemoval { pos: r.pos })
+                    .collect()
+            })
+        }
+        #[cfg(not(feature = "mod-suite"))]
+        {
+            self.slices.plan.next_slice()
+        }
+    }
+}
+
+/// Pending mega-blast ring plans, drained one bounded slice per
+/// `primed_tick`.
+fn mega_blast_queue() -> &'static Mutex<std::collections::VecDeque<MegaBlastJob>> {
+    static Q: OnceLock<Mutex<std::collections::VecDeque<MegaBlastJob>>> = OnceLock::new();
+    Q.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
+}
+
+/// Collapse `(item, count)` pairs into <= `MEGA_BLAST_STACK` stacks in
+/// ascending item order — `coalesce_item_counts` under `mod-suite`, the
+/// same aggregate-and-chunk otherwise — conserving every dropped item.
+#[cfg(feature = "mod-suite")]
+fn coalesce_drop_counts(counts: &HashMap<i64, u64>) -> Vec<(i64, u32)> {
+    mod_offload::explosion_batch::coalesce_item_counts(
+        counts
+            .iter()
+            .map(|(&item, &count)| (item as u32, count.min(u64::from(u32::MAX)) as u32)),
+        MEGA_BLAST_STACK,
+    )
+    .into_iter()
+    .map(|s| (i64::from(s.item_id), s.count))
+    .collect()
+}
+
+#[cfg(not(feature = "mod-suite"))]
+fn coalesce_drop_counts(counts: &HashMap<i64, u64>) -> Vec<(i64, u32)> {
+    let mut items: Vec<(i64, u64)> = counts.iter().map(|(&i, &c)| (i, c)).collect();
+    items.sort_unstable();
+    let mut out = Vec::new();
+    for (item, mut left) in items {
+        while left > 0 {
+            let take = left.min(u64::from(MEGA_BLAST_STACK)) as u32;
+            out.push((item, take));
+            left -= u64::from(take);
+        }
+    }
+    out
+}
+
+/// Apply one removal slice to the live world: re-read each cell (a chain
+/// detonation or an earlier slice may have beaten us to it), prime live TNT
+/// with the vanilla 0.5-1.5s chain fuse, coalesce the surviving drops into
+/// `MEGA_BLAST_STACK` chunks, and return the packet offsets relative to
+/// `base` (the explosion's floored origin cell).
+fn apply_blast_slice(base: [i32; 3], removals: &[BlastRemoval]) -> Vec<(i8, i8, i8)> {
+    let mut offs: Vec<(i8, i8, i8)> = Vec::with_capacity(removals.len());
+    let mut counts: HashMap<i64, u64> = HashMap::new();
+    let mut first_pos: HashMap<i64, [i32; 3]> = HashMap::new();
+    let mut primed_new: Vec<[i32; 3]> = Vec::new();
+    let tile_drops = GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0;
+    for r in removals {
+        let [x, y, z] = r.pos;
+        let st = block_at(x, y, z);
+        if st == 0 {
+            continue;
+        }
+        // vanilla: TNT destroyed by an explosion primes itself — short fuse
+        // (0.5-1.5s), this is what makes chains work
+        if (2094..=2095).contains(&st) {
+            primed_new.push([x, y, z]);
+        } else if tile_drops && w1_explosion_drop_allowed() {
+            for item in block_drops(st) {
+                if item > 0 {
+                    *counts.entry(item).or_insert(0) += 1;
+                    first_pos.entry(item).or_insert([x, y, z]);
+                }
+            }
+        }
+        set_block(x, y, z, 0);
+        offs.push((
+            (x - base[0]).clamp(-128, 127) as i8,
+            (y - base[1]).clamp(-128, 127) as i8,
+            (z - base[2]).clamp(-128, 127) as i8,
+        ));
+    }
+    for [tx, ty, tz] in primed_new {
+        let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+        let jitter = ((tx.wrapping_mul(31) ^ tz.wrapping_mul(17) ^ ty) & 0x3ff) as u64;
+        primed().lock().unwrap_or_else(|e| e.into_inner()).push(Primed {
+            eid,
+            x: tx as f64 + 0.5,
+            y: ty as f64,
+            z: tz as f64 + 0.5,
+            left: chain_fuse_left(jitter) as i32,
+        });
+    }
+    // One item entity per full stack, at the first destroyed cell of its
+    // item, instead of one entity per block.
+    for (item, count) in coalesce_drop_counts(&counts) {
+        if let Some(&[px, py, pz]) = first_pos.get(&item) {
+            drop_spawn(
+                px as f64 + 0.5,
+                py as f64 + 0.5,
+                pz as f64 + 0.5,
+                item,
+                count as u8,
+                Vec::new(),
+                0,
+                None,
+                None,
+            );
+        }
+    }
+    offs
+}
+
+/// Apply at most one bounded slice from the oldest queued mega-blast and
+/// emit its explosion packet. Runs at the top of every `primed_tick` — and
+/// once after each `explode_at` enqueue — so a 100,000-cell modded blast
+/// drains across ticks like vanilla entity processing instead of stalling a
+/// single tick.
+fn mega_blast_tick_drain() {
+    let (center, power, removals) = {
+        let mut q = mega_blast_queue().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(job) = q.front_mut() else {
+            return;
+        };
+        let Some(removals) = job.next_slice() else {
+            q.pop_front();
+            return;
+        };
+        let (center, power) = (job.center, job.power);
+        if job.is_complete() {
+            q.pop_front();
+        }
+        (center, power, removals)
+    };
+    if removals.is_empty() {
+        return;
+    }
+    let base = [
+        center[0].floor() as i32,
+        center[1].floor() as i32,
+        center[2].floor() as i32,
+    ];
+    let offs = apply_blast_slice(base, &removals);
+    broadcast(-1, |_c| {
+        (
+            0x20,
+            explosion_pkt_with_power(center[0], center[1], center[2], power, &offs),
+        )
+    });
+}
+
+fn explode_at(ex: f64, ey: f64, ez: f64, power: f64) {
+    // Fail closed: non-finite or non-positive input mutates nothing — a
+    // NaN/infinite, zero or negative power is a no-op, not a hole in the world.
+    if !(ex.is_finite() && ey.is_finite() && ez.is_finite() && power.is_finite() && power > 0.0)
+    {
+        return;
+    }
+    let power = power.min(MEGA_BLAST_MAX_POWER);
+    let origin = [ex, ey, ez];
+    let Some(out) = blast_compute(origin, power as f32, world_rng::next_u64()) else {
+        // A blast volume beyond the kernel's bounded cache fails closed:
+        // nothing is destroyed and nothing is queued.
+        return;
+    };
+    if power > MEGA_BLAST_IMMEDIATE_POWER || out.removal_count() > MEGA_BLAST_MAX_PER_TICK {
+        // Queue the concentric-ring plan, then take this tick's slice — the
+        // first ring still lands immediately when the queue was empty.
+        let job = MegaBlastJob::new(origin, power as f32, out);
+        {
+            let mut q = mega_blast_queue().lock().unwrap_or_else(|e| e.into_inner());
+            if q.len() < MEGA_BLAST_QUEUE_CAP {
+                q.push_back(job);
+            }
+        }
+        mega_blast_tick_drain();
+    } else {
+        let base = [
+            origin[0].floor() as i32,
+            origin[1].floor() as i32,
+            origin[2].floor() as i32,
+        ];
+        let offs = apply_blast_slice(base, &out.into_removals());
+        broadcast(-1, |_c| (0x20, explosion_pkt(ex, ey, ez, &offs)));
+    }
     ac_note_explosion(DimId::Overworld, [ex, ey, ez], power);
     let cs: Vec<Arc<Client>> = client_snapshot();
     for cl in cs {
@@ -2932,23 +3780,36 @@ fn explode_at(ex: f64, ey: f64, ez: f64, power: f64) {
 }
 
 fn primed_tick() {
+    // Continuations first: one bounded slice from the oldest queued
+    // mega-blast drains each tick, so a modded mega-TNT spreads across ticks
+    // instead of stalling one.
+    mega_blast_tick_drain();
     let mut boom: Vec<Primed> = Vec::new();
     {
         let mut pl = primed().lock().unwrap_or_else(|e| e.into_inner());
         let region = region_guard();
-        let mut i = 0;
-        while i < pl.len() {
-            if !region.is_hot(pl[i].x as i32, pl[i].z as i32) {
-                i += 1; // fuse pauses while cold: no tick, no decrement
+        // Single stable partition: fuse counts down only while the chunk is
+        // hot, survivors keep their order, and detonating entries are moved
+        // out once — a 10,000-strong chain costs one pass instead of an
+        // O(N^2) `Vec::remove` shift per blast.
+        let mut w = 0;
+        for r in 0..pl.len() {
+            let mut p = pl[r];
+            if !region.is_hot(p.x as i32, p.z as i32) {
+                // fuse pauses while cold: no tick, no decrement
+                pl[w] = p;
+                w += 1;
             } else {
-                pl[i].left -= 1;
-                if pl[i].left <= 0 {
-                    boom.push(pl.remove(i));
+                p.left -= 1;
+                if p.left <= 0 {
+                    boom.push(p);
                 } else {
-                    i += 1;
+                    pl[w] = p;
+                    w += 1;
                 }
             }
         }
+        pl.truncate(w);
     }
     for p in boom {
         broadcast_seen_destroy(p.eid);
@@ -5482,5 +6343,345 @@ mod vanilla_combat2_tests {
             ((a.x - 16.0).powi(2) + (a.y - 70.9).powi(2)).sqrt()
         };
         assert!(after < before, "loyalty trident returns through arrow_tick");
+    }
+}
+
+/// MEGA-SCALE T1 + T3 fixtures: a large power-aware blast slices into bounded
+/// per-tick rings, invalid input fails closed without a mutation, and a
+/// 2,000-strong primed-TNT wave ticks in one pass.
+#[cfg(test)]
+mod mega_scale_t1t3_tests {
+    use super::*;
+
+    /// Save/restore for every shared store the blast and primed-TNT fixtures
+    /// touch. Restored on `Drop`, so a failed assertion still leaves the next
+    /// test a clean world.
+    struct MegaWorld {
+        world: HashMap<DimChunkKey, HashMap<u32, u32>>,
+        primed: Vec<Primed>,
+        drops: Vec<Drop>,
+        drop_pending: HashSet<i32>,
+        xps: Vec<Xp>,
+        xp_pending: HashSet<i32>,
+        queue: std::collections::VecDeque<MegaBlastJob>,
+        clients: Vec<Arc<Client>>,
+        forced: HashSet<(i32, i32)>,
+        region: RegionSets,
+        rng: u64,
+        tile_drops: u8,
+        scheduled: scheduled_ticks::ScheduledTicks,
+    }
+
+    impl MegaWorld {
+        fn take() -> Self {
+            let tile_drops = GR_DO_TILE_DROPS.swap(1, Ordering::Relaxed);
+            Self {
+                world: std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner())),
+                primed: std::mem::take(&mut *primed().lock().unwrap_or_else(|e| e.into_inner())),
+                drops: std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner())),
+                drop_pending: std::mem::take(
+                    &mut *drop_pending().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                xps: std::mem::take(&mut *xps().lock().unwrap_or_else(|e| e.into_inner())),
+                xp_pending: std::mem::take(
+                    &mut *xp_pending().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                queue: std::mem::take(
+                    &mut *mega_blast_queue().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                clients: std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner())),
+                forced: std::mem::take(
+                    &mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                region: test_region(),
+                rng: world_rng::saved_state(),
+                tile_drops,
+                scheduled: std::mem::replace(
+                    &mut *block_ticks().lock().unwrap_or_else(|e| e.into_inner()),
+                    scheduled_ticks::ScheduledTicks::new(),
+                ),
+            }
+        }
+    }
+
+    impl std::ops::Drop for MegaWorld {
+        fn drop(&mut self) {
+            *world().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.world);
+            *primed().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.primed);
+            *drops().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.drops);
+            *drop_pending().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.drop_pending);
+            *xps().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.xps);
+            *xp_pending().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.xp_pending);
+            *mega_blast_queue().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.queue);
+            *clients().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.clients);
+            *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.forced);
+            set_test_region(self.region.0.clone(), self.region.1.clone());
+            world_rng::restore(self.rng);
+            GR_DO_TILE_DROPS.store(self.tile_drops, Ordering::Relaxed);
+            *block_ticks().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::replace(
+                &mut self.scheduled,
+                scheduled_ticks::ScheduledTicks::new(),
+            );
+        }
+    }
+
+    /// Write `st` into every cell of the `(2*half+1)^3` cube centred on `at`,
+    /// bypassing `set_block` so explicit entries — including air — stay in the
+    /// overlay and `block_at` never evaluates worldgen inside the blast bounds.
+    fn fill_cube(at: (i32, i32, i32), half: i32, st: u32) {
+        let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+        for x in at.0 - half..=at.0 + half {
+            for z in at.2 - half..=at.2 + half {
+                let c = w.entry((DimId::Overworld, x >> 4, z >> 4)).or_default();
+                for y in at.1 - half..=at.1 + half {
+                    c.insert(local_idx(x, y, z), st);
+                }
+            }
+        }
+    }
+
+    /// Count cells still holding `st` inside the same cube, reading the overlay
+    /// under one lock (a destroyed cell reads `Some(0)` or no entry at all).
+    fn count_in_cube(at: (i32, i32, i32), half: i32, st: u32) -> usize {
+        let w = world().lock().unwrap_or_else(|e| e.into_inner());
+        let mut n = 0usize;
+        for x in at.0 - half..=at.0 + half {
+            for z in at.2 - half..=at.2 + half {
+                let Some(c) = w.get(&(DimId::Overworld, x >> 4, z >> 4)) else {
+                    continue;
+                };
+                for y in at.1 - half..=at.1 + half {
+                    if c.get(&local_idx(x, y, z)) == Some(&st) {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    /// A power-24 blast over a resistance-0 field destroys more than one
+    /// `MEGA_BLAST_MAX_PER_TICK` slice can carry: the job queues, each tick
+    /// removes a bounded ring, bedrock survives, and the coalesced drops
+    /// conserve every item in stacks no larger than 64.
+    #[test]
+    fn mega_scale_t1_mega_blast_slices_across_ticks_and_coalesces_drops() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _w = MegaWorld::take();
+        // Deterministic ray rolls: the per-ray power factors draw from the
+        // world stream, so seeding pins the whole destroyed set.
+        world_rng::seed(0x5eed_b1a57);
+        let reg = breg().unwrap();
+        // red_mushroom: blast resistance 0.0 (rays reach their full ~16-30
+        // block envelope at power 24), drops exactly one of itself, emits no
+        // light and is neither fluid nor leaf — the cleanest mass fill.
+        let mushroom = reg.state_of("minecraft:red_mushroom", None);
+        let bedrock = reg.state_of("minecraft:bedrock", None);
+        let drop_item = reg.block_drop(mushroom).unwrap();
+        let at = (500_032, 100, -500_032);
+        // The kernel snapshots origin ±(power*1.75 + 2); fill that whole box so
+        // `block_at` only ever reads the overlay.
+        let half = (24.0f64 * 1.75).ceil() as i32 + 2;
+        fill_cube(at, half, mushroom);
+        let bedrock_cells = [
+            (at.0 + 1, at.1, at.2),
+            (at.0 - 2, at.1 + 1, at.2),
+            (at.0, at.1 - 1, at.2 + 3),
+            (at.0 + 4, at.1 + 4, at.2 - 4),
+        ];
+        for &(x, y, z) in &bedrock_cells {
+            set_block(x, y, z, bedrock);
+        }
+        let before = count_in_cube(at, half, mushroom);
+        explode_at(at.0 as f64 + 0.5, at.1 as f64, at.2 as f64 + 0.5, 24.0);
+        let mut prev = count_in_cube(at, half, mushroom);
+        let mut deltas = vec![before - prev];
+        // The queue must still hold the continuation rings after the call.
+        assert!(
+            !mega_blast_queue()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "a >{MEGA_BLAST_MAX_PER_TICK}-cell blast must leave queued rings"
+        );
+        for _ in 0..128 {
+            if mega_blast_queue()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+            {
+                break;
+            }
+            // The production drain point: one bounded ring per primed_tick.
+            primed_tick();
+            let cur = count_in_cube(at, half, mushroom);
+            deltas.push(prev - cur);
+            prev = cur;
+        }
+        assert!(
+            mega_blast_queue()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "the ring queue must drain to completion across ticks"
+        );
+        let destroyed = before - prev;
+        assert!(
+            destroyed > MEGA_BLAST_MAX_PER_TICK,
+            "power 24 over resistance-0 blocks must destroy more than one \
+             tick slice ({destroyed} cells)"
+        );
+        assert!(
+            deltas.iter().all(|&d| d <= MEGA_BLAST_MAX_PER_TICK),
+            "no tick may remove more than {MEGA_BLAST_MAX_PER_TICK} cells: {deltas:?}"
+        );
+        for &(x, y, z) in &bedrock_cells {
+            assert_eq!(block_at(x, y, z), bedrock, "bedrock at {x},{y},{z} was destroyed");
+        }
+        // Every destroyed cell dropped exactly one item, coalesced into full
+        // stacks: total conserved, every stack <= 64.
+        let dp = drops().lock().unwrap_or_else(|e| e.into_inner());
+        let blast_drops: Vec<&Drop> = dp.iter().filter(|d| d.item == drop_item).collect();
+        assert!(!blast_drops.is_empty(), "the blast produced no drops");
+        assert!(
+            blast_drops.iter().all(|d| d.cnt <= MEGA_BLAST_STACK as u8),
+            "a coalesced stack exceeds {MEGA_BLAST_STACK}"
+        );
+        let total: u64 = blast_drops.iter().map(|d| u64::from(d.cnt)).sum();
+        assert_eq!(total, destroyed as u64, "dropped items must equal destroyed cells");
+        assert!(
+            dp.iter().all(|d| d.item == drop_item),
+            "mushroom field must not produce foreign drops"
+        );
+    }
+
+    /// NaN, infinite, zero and negative power — and non-finite origins — are
+    /// inert: no cell mutates, nothing queues, no drop spawns.
+    #[test]
+    fn mega_scale_t1_nan_and_negative_power_fail_closed() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _w = MegaWorld::take();
+        let reg = breg().unwrap();
+        let mushroom = reg.state_of("minecraft:red_mushroom", None);
+        let at = (600_032, 100, 600_032);
+        let (half, cells) = (6, 13 * 13 * 13);
+        fill_cube(at, half, mushroom);
+        let assert_inert = |label: &str| {
+            assert_eq!(
+                count_in_cube(at, half, mushroom),
+                cells,
+                "{label} mutated cells"
+            );
+            assert!(
+                mega_blast_queue()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty(),
+                "{label} queued a ring plan"
+            );
+            assert!(
+                drops()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty(),
+                "{label} spawned drops"
+            );
+        };
+        let (ox, oy, oz) = (at.0 as f64 + 0.5, at.1 as f64, at.2 as f64 + 0.5);
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -4.0] {
+            explode_at(ox, oy, oz, bad);
+            assert_inert(&format!("power {bad}"));
+        }
+        for (x, y, z) in [
+            (f64::NAN, oy, oz),
+            (ox, f64::INFINITY, oz),
+            (ox, oy, f64::NEG_INFINITY),
+        ] {
+            explode_at(x, y, z, 4.0);
+            assert_inert(&format!("origin ({x}, {y}, {z})"));
+        }
+        // Sanity that the path is armed at all: a finite positive power must
+        // actually remove cells.
+        explode_at(ox, oy, oz, 4.0);
+        assert!(
+            count_in_cube(at, half, mushroom) < cells,
+            "a valid power-4 blast removed nothing"
+        );
+    }
+
+    /// 2,000 primed TNTs share one fuse clock: every `primed_tick` decrements
+    /// each survivor exactly once, and the detonation pass removes all 2,000
+    /// in a single stable partition — no quadratic `Vec::remove` shifting.
+    /// TNT blocks caught in the blasts prime with the vanilla 0.5-1.5s chain
+    /// fuse, proving chains still work through the new path.
+    #[test]
+    fn mega_scale_t3_primed_tnt_2000_chain_ticks_linear_without_quadratic_stall() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _w = MegaWorld::take();
+        let reg = breg().unwrap();
+        let tnt = reg.state_of("minecraft:tnt", None);
+        let at = (700_000, 100, -700_000);
+        // Explicit air: each power-4 blast snapshots a 19^3 box of overlay
+        // cells instead of evaluating worldgen per cell.
+        fill_cube(at, 12, 0);
+        // Live TNT blocks inside the blast envelope chain-prime once each.
+        let tnt_cells = [
+            (at.0 + 1, at.1, at.2),
+            (at.0 - 2, at.1, at.2),
+            (at.0, at.1, at.2 + 1),
+        ];
+        for &(x, y, z) in &tnt_cells {
+            set_block(x, y, z, tnt);
+        }
+        let chunk = (at.0 >> 4, at.2 >> 4);
+        set_test_region(HashSet::from([chunk]), HashSet::from([chunk]));
+        const N: i32 = 2000;
+        {
+            let mut pl = primed().lock().unwrap_or_else(|e| e.into_inner());
+            for i in 0..N {
+                pl.push(Primed {
+                    eid: 7_000_000 + i,
+                    x: at.0 as f64 + 0.5,
+                    y: at.1 as f64,
+                    z: at.2 as f64 + 0.5,
+                    left: 3,
+                });
+            }
+        }
+        for expected in [2, 1] {
+            primed_tick();
+            let pl = primed().lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(pl.len(), N as usize, "a fuse of {expected} must not detonate early");
+            assert!(
+                pl.iter().all(|p| p.left == expected),
+                "every fuse must decrement exactly once per tick"
+            );
+        }
+        primed_tick();
+        let pl = primed().lock().unwrap_or_else(|e| e.into_inner());
+        // Only the chain-primed TNTs survive the wave; each destroyed TNT
+        // block produced exactly one.
+        let chained = tnt_cells
+            .iter()
+            .filter(|&&(x, y, z)| block_at(x, y, z) == 0)
+            .count();
+        assert!(chained >= 1, "at least one TNT block must chain-prime");
+        assert_eq!(
+            pl.len(),
+            chained,
+            "every destroyed TNT block primes exactly once"
+        );
+        let (lo, hi) = (server_ticks(10) as i32, server_ticks(30) as i32);
+        assert!(
+            pl.iter().all(|p| (lo..=hi).contains(&p.left)),
+            "chain fuses must stay inside the vanilla 0.5-1.5s window"
+        );
     }
 }

@@ -996,6 +996,234 @@ fn merge_drops(dp: &mut [Drop]) -> Vec<i32> {
 
 type DropPickupSnapshot = (i32, f64, f64, Option<[u8; 16]>, EntityAabb);
 
+// ---------- fresh-drop merge on spawn/tick (MEGA-SCALE §3.2) ----------
+// Mirrors the `xp_pending`/`xp_merge_pending` design: drops spawned through
+// `drop_spawn` are marked so a spawn burst (a mega-blast's coalesced stacks,
+// a farm's loot stream) collapses inside the tick it lands in, ahead of the
+// per-tick `merge_drops` pass.
+static DROP_PENDING: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+fn drop_pending() -> &'static Mutex<HashSet<i32>> {
+    DROP_PENDING.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// The pool size at which merging fresh drops pays; below it the per-tick
+/// `merge_drops` pass is already cheap and this path stays unobservable.
+const DROP_MERGE_FLOOR: usize = 256;
+
+/// Spawn an item entity, marking it merge-pending so the next `drop_tick`
+/// pass can collapse a spawn burst inside the same tick.
+fn drop_spawn(
+    x: f64,
+    y: f64,
+    z: f64,
+    item: i64,
+    cnt: u8,
+    comps: Comps,
+    age: i32,
+    target: Option<[u8; 16]>,
+    thrower: Option<[u8; 16]>,
+) -> i32 {
+    let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+    drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
+        eid,
+        x,
+        y,
+        z,
+        item,
+        cnt,
+        comps,
+        age,
+        target,
+        thrower,
+    });
+    drop_pending()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(eid);
+    eid
+}
+
+/// Stable FNV-1a over a drop's merge key (component blob + pickup target):
+/// the `component_hash` `merge_item_stacks` partitions by under `mod-suite`.
+/// `thrower` does not join the key — `merge_drops` does not compare it.
+#[cfg(feature = "mod-suite")]
+fn drop_merge_hash(comps: &Comps, target: &Option<[u8; 16]>) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut mix = |b: u8| {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+    };
+    for (ty, data) in comps {
+        for b in ty.to_be_bytes() {
+            mix(b);
+        }
+        for &b in data {
+            mix(b);
+        }
+    }
+    match target {
+        Some(t) => {
+            for &b in t {
+                mix(b);
+            }
+        }
+        None => mix(0xff),
+    }
+    h
+}
+
+/// The merge kernel over one partitioned pool (keepers first, donors after,
+/// both in `drops` order, parallel `cnts`/`maxes`). Under `mod-suite` this is
+/// `mod_offload::entity_spatial::merge_item_stacks` directly; the local build
+/// runs the same cell-bucketed scan — cell size 2.0, radius 0.5, same
+/// item+key, bounded by both stack sizes — so both builds agree.
+#[cfg(feature = "mod-suite")]
+fn drop_merge_run(pool: &[usize], dp: &[Drop], cnts: &mut [u32], maxes: &[u32]) {
+    let mut items: Vec<mod_offload::entity_spatial::DroppedItem> = pool
+        .iter()
+        .enumerate()
+        .map(|(k, &i)| mod_offload::entity_spatial::DroppedItem {
+            id: k as u32,
+            pos: [dp[i].x, dp[i].y, dp[i].z],
+            vel: [0.0; 3],
+            item_id: dp[i].item.max(0) as u32,
+            component_hash: drop_merge_hash(&dp[i].comps, &dp[i].target),
+            count: cnts[k],
+            max_stack_size: maxes[k],
+        })
+        .collect();
+    mod_offload::entity_spatial::merge_item_stacks(&mut items);
+    for d in &items {
+        cnts[d.id as usize] = d.count;
+    }
+}
+
+#[cfg(not(feature = "mod-suite"))]
+fn drop_merge_run(pool: &[usize], dp: &[Drop], cnts: &mut [u32], maxes: &[u32]) {
+    const CELL: f64 = 2.0;
+    let mut cells: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::with_capacity(cnts.len());
+    let mut candidates: Vec<usize> = Vec::new();
+    for i in 0..cnts.len() {
+        if cnts[i] == 0 {
+            continue;
+        }
+        let (px, py, pz) = (dp[pool[i]].x, dp[pool[i]].y, dp[pool[i]].z);
+        let (cx, cy, cz) = (
+            (px / CELL).floor() as i32,
+            (py / CELL).floor() as i32,
+            (pz / CELL).floor() as i32,
+        );
+        candidates.clear();
+        for dx in -1..=1i32 {
+            for dy in -1..=1i32 {
+                for dz in -1..=1i32 {
+                    if let (Some(kx), Some(ky), Some(kz)) = (
+                        cx.checked_add(dx),
+                        cy.checked_add(dy),
+                        cz.checked_add(dz),
+                    ) {
+                        if let Some(list) = cells.get(&(kx, ky, kz)) {
+                            candidates.extend_from_slice(list);
+                        }
+                    }
+                }
+            }
+        }
+        candidates.sort_unstable();
+        let mut alive = true;
+        for &j in &candidates {
+            let (qx, qy, qz) = (dp[pool[j]].x, dp[pool[j]].y, dp[pool[j]].z);
+            let a = &dp[pool[i]];
+            let b = &dp[pool[j]];
+            if a.item == b.item
+                && a.target == b.target
+                && a.comps == b.comps
+                && (px - qx).powi(2) + (py - qy).powi(2) + (pz - qz).powi(2) <= 0.25
+            {
+                let max = maxes[j].min(maxes[i]);
+                let transfer = cnts[i].min(max.saturating_sub(cnts[j]));
+                cnts[j] += transfer;
+                cnts[i] -= transfer;
+                if cnts[i] == 0 {
+                    alive = false;
+                    break;
+                }
+            }
+        }
+        if alive {
+            cells.entry((cx, cy, cz)).or_default().push(i);
+        }
+    }
+}
+
+/// Merge `pending` donor eids into the locked drop pool. Keepers (pre-existing
+/// drops) precede donors in the pool, so a fresh drop feeds the earliest
+/// compatible neighbour within 0.5 up to `item_stack_max`; tombstoned drops
+/// are removed in one `retain` pass. Returns the absorbed eids in merge order.
+fn drop_merge_pending_locked(dp: &mut Vec<Drop>, pending: &HashSet<i32>) -> Vec<i32> {
+    let mut pool: Vec<usize> = Vec::with_capacity(dp.len());
+    pool.extend(
+        dp.iter()
+            .enumerate()
+            .filter(|(_, d)| !pending.contains(&d.eid) && d.cnt > 0)
+            .map(|(i, _)| i),
+    );
+    pool.extend(
+        dp.iter()
+            .enumerate()
+            .filter(|(_, d)| pending.contains(&d.eid) && d.cnt > 0)
+            .map(|(i, _)| i),
+    );
+    if pool.len() < 2 {
+        return Vec::new();
+    }
+    let mut cnts: Vec<u32> = pool.iter().map(|&i| u32::from(dp[i].cnt)).collect();
+    let maxes: Vec<u32> = pool
+        .iter()
+        .map(|&i| item_stack_max(dp[i].item, &dp[i].comps).max(1) as u32)
+        .collect();
+    drop_merge_run(&pool, dp, &mut cnts, &maxes);
+    let mut eaten = HashSet::new();
+    let mut order = Vec::new();
+    for (k, &i) in pool.iter().enumerate() {
+        if cnts[k] == 0 {
+            if eaten.insert(dp[i].eid) {
+                order.push(dp[i].eid);
+            }
+        } else {
+            dp[i].cnt = cnts[k].min(u32::from(u8::MAX)) as u8;
+        }
+    }
+    if !eaten.is_empty() {
+        dp.retain(|d| !eaten.contains(&d.eid));
+    }
+    order
+}
+
+/// Collapse freshly spawned drops into their older neighbours — the merge the
+/// `merge_drops` pass would do, done the same tick the burst lands. Runs only
+/// once `drops()` outgrows `DROP_MERGE_FLOOR`, so the path cannot fire on the
+/// pinned save-payload fixture (which never spawns through `drop_spawn`).
+fn drop_merge_pending() {
+    let pending: HashSet<i32> = {
+        let mut p = drop_pending().lock().unwrap_or_else(|e| e.into_inner());
+        if p.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *p)
+    };
+    let mut dp = drops().lock().unwrap_or_else(|e| e.into_inner());
+    if dp.len() <= DROP_MERGE_FLOOR {
+        return;
+    }
+    let eaten = drop_merge_pending_locked(&mut dp, &pending);
+    drop(dp);
+    for eid in eaten {
+        death_slot_hint_forget(eid);
+        broadcast_seen_destroy(eid);
+    }
+}
+
 fn furnace_tick() {
     let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
     if fs.is_empty() {
@@ -1897,6 +2125,9 @@ fn drop_tick() {
     let __prof = tickprof::enabled();
     let mut __t = __prof.then(std::time::Instant::now);
     let region = region_guard();
+    // A spawn burst (explosion coalesced stacks, a farm's loot stream)
+    // collapses into its older neighbours before the pickup scan sees it.
+    drop_merge_pending();
     // 1.21.1 Player.aiStep() touch box + !isSpectator() + ItemEntity.target match
     let mut taken: Vec<(i32, Arc<Client>)> = vec![];
     {
@@ -1935,6 +2166,9 @@ fn drop_tick() {
     __t = __prof.then(std::time::Instant::now);
     // xp orbs float to nearby players and grant xp
     {
+        // A farm's orb burst collapses before the pickup scan — same-tick
+        // merging instead of one entity per kill all the way to XP_CAP.
+        xp_merge_pending();
         let mut collected: Vec<(i32, i32, i16)> = vec![];
         {
             let xs = xps().lock().unwrap_or_else(|e| e.into_inner());
@@ -1952,10 +2186,17 @@ fn drop_tick() {
                 }
             }
         }
-        for (xeid, ceid, val) in collected {
-            xps().lock().unwrap_or_else(|e| e.into_inner()).retain(|x| x.eid != xeid);
+        if !collected.is_empty() {
+            // One audience snapshot and one retain pass for the whole batch:
+            // the per-orb `retain` + `client_snapshot` pair this replaces was
+            // O(orbs * pool + orbs * clients) on a 2,000-orb farm.
             let cls: Vec<Arc<Client>> = client_snapshot();
-            if let Some(c) = cls.iter().find(|c| c.eid == ceid) {
+            let mut picked: HashSet<i32> = HashSet::with_capacity(collected.len());
+            for (xeid, ceid, val) in collected {
+                picked.insert(xeid);
+                let Some(c) = cls.iter().find(|c| c.eid == ceid) else {
+                    continue;
+                };
                 // mending: xp first repairs damaged mending gear (2 dur per xp)
                 let mut val = val as i64;
                 {
@@ -1982,9 +2223,12 @@ fn drop_tick() {
                     }
                 }
                 let _ = send_player_xp(c, |xp| add_player_xp_points(xp, val as i32));
-                drop(cls);
                 broadcast_seen_destroy(xeid);
             }
+            xps()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|x| !picked.contains(&x.eid));
         }
     }
     if let Some(t) = __t {
@@ -2090,8 +2334,13 @@ fn drop_tick() {
         }
         let mut exp = DROP_DESPAWN_SCRATCH.with(scratch_take);
         exp.extend(dp.iter().filter(|d| d.age >= life).map(|d| d.eid));
+        // One retain pass for the whole expired set, then the per-eid
+        // notifications in the same order they always went out.
+        {
+            let gone: HashSet<i32> = exp.iter().copied().collect();
+            dp.retain(|d| !gone.contains(&d.eid));
+        }
         for eid in &exp {
-            dp.retain(|d| d.eid != *eid);
             death_slot_hint_forget(*eid);
             broadcast_seen_destroy(*eid);
         }
@@ -2115,8 +2364,11 @@ fn drop_tick() {
                     })
                     .map(|d| d.eid),
             );
+            {
+                let gone: HashSet<i32> = burned.iter().copied().collect();
+                dp.retain(|d| !gone.contains(&d.eid));
+            }
             for eid in &burned {
-                dp.retain(|d| d.eid != *eid);
                 death_slot_hint_forget(*eid);
                 broadcast_seen_destroy(*eid);
             }
@@ -2133,8 +2385,11 @@ fn drop_tick() {
         __t = __prof.then(std::time::Instant::now);
         let merged = merge_drops(&mut dp);
         __t = __prof.then(std::time::Instant::now);
+        {
+            let gone: HashSet<i32> = merged.iter().copied().collect();
+            dp.retain(|d| !gone.contains(&d.eid));
+        }
         for eid in &merged {
-            dp.retain(|d| d.eid != *eid);
             death_slot_hint_forget(*eid);
             broadcast_seen_destroy(*eid);
         }
@@ -2268,14 +2523,7 @@ fn furnace_xp_pop(f: &mut Furnace, px: f64, py: f64, pz: f64) {
         };
     f.xp = 0.0;
     if whole > 0 {
-        xps().lock().unwrap_or_else(|e| e.into_inner()).push(Xp {
-            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-            x: px,
-            y: py + 1.0,
-            z: pz,
-            val: whole,
-            age: 0,
-        });
+        xp_spawn(px, py + 1.0, pz, whole);
     }
 }
 fn fuel_ticks(item: i64) -> i32 {
@@ -9413,19 +9661,17 @@ fn spawn_death_drop(
     if stack.1 == 0 {
         return -1;
     }
-    let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-    drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
-        eid,
+    let eid = drop_spawn(
         x,
         y,
         z,
-        item: stack.0,
-        cnt: stack.1,
-        comps: stack.2,
-        age: -(server_ticks(30) as i32),
-        target: None,
-        thrower: None,
-    });
+        stack.0,
+        stack.1,
+        stack.2,
+        -(server_ticks(30) as i32),
+        None,
+        None,
+    );
     death_slot_hint_record(eid, owner_name, original_slot);
     eid
 }
@@ -11183,18 +11429,17 @@ fn drop_live_stack((x, y, z): (f64, f64, f64), stack: Stack) {
     if stack.1 == 0 {
         return;
     }
-    drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
-        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+    drop_spawn(
         x,
         y,
         z,
-        item: stack.0,
-        cnt: stack.1,
-        comps: stack.2,
-        age: -(server_ticks(30) as i32),
-        target: None,
-        thrower: None,
-    });
+        stack.0,
+        stack.1,
+        stack.2,
+        -(server_ticks(30) as i32),
+        None,
+        None,
+    );
 }
 
 fn return_live_inputs(c: &Client, stacks: impl IntoIterator<Item = Stack>) {
@@ -11786,14 +12031,7 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
     }
     if offer_changed {
         let (x, y, z, ..) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
-        xps().lock().unwrap_or_else(|e| e.into_inner()).push(Xp {
-            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-            x,
-            y: y + 1.0,
-            z,
-            val: (3 + world_rng::next_u64() % 4) as i16,
-            age: 0,
-        });
+        xp_spawn(x, y + 1.0, z, (3 + world_rng::next_u64() % 4) as i16);
     }
 }
 
@@ -17579,5 +17817,138 @@ mod v1211_comp_tests {
             comp_get(&st.2, COMP_FIREWORKS).and_then(decode_fireworks),
             Some((0, 0))
         ));
+    }
+}
+
+/// MEGA-SCALE §3.2 fixture: a 2,000-orb spawn burst collapses through the
+/// pending merge before the pickup scan, conserving every XP point, and the
+/// whole batch collects in one pass.
+#[cfg(test)]
+mod mega_scale_xp_tests {
+    use super::*;
+    use crate::effect_tests::client_pair;
+
+    /// Save/restore for every shared store the XP merge/collection fixture
+    /// touches. Restored on `Drop`, so a failed assertion still leaves the
+    /// next test a clean world.
+    struct MegaXpWorld {
+        clients: Vec<Arc<Client>>,
+        drops: Vec<Drop>,
+        drop_pending: HashSet<i32>,
+        xps: Vec<Xp>,
+        xp_pending: HashSet<i32>,
+        sessions: HashMap<i32, PlayerMechanismSession>,
+        region: RegionSets,
+    }
+
+    impl MegaXpWorld {
+        fn take() -> Self {
+            Self {
+                clients: std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner())),
+                drops: std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner())),
+                drop_pending: std::mem::take(
+                    &mut *drop_pending().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                xps: std::mem::take(&mut *xps().lock().unwrap_or_else(|e| e.into_inner())),
+                xp_pending: std::mem::take(
+                    &mut *xp_pending().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                sessions: std::mem::take(
+                    &mut *player_mechanism_sessions()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                ),
+                region: test_region(),
+            }
+        }
+    }
+
+    impl std::ops::Drop for MegaXpWorld {
+        fn drop(&mut self) {
+            *clients().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.clients);
+            *drops().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.drops);
+            *drop_pending().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.drop_pending);
+            *xps().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.xps);
+            *xp_pending().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.xp_pending);
+            *player_mechanism_sessions()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.sessions);
+            set_test_region(self.region.0.clone(), self.region.1.clone());
+        }
+    }
+
+    /// 2,000 orbs spawned in one burst merge into the handful the wire cap
+    /// allows — over-valued survivors spill bounded remainder orbs — and a
+    /// nearby player then collects the entire conserved total in a single
+    /// `drop_tick` pass.
+    #[test]
+    fn mega_scale_xp_2000_orbs_merge_and_collect_conserving_exact_xp() {
+        let _guard = world_guard();
+        let _w = MegaXpWorld::take();
+        const N: usize = 2000;
+        const VAL: i64 = 100;
+        let total_expected: u64 = N as u64 * VAL as u64;
+        let at = (10.0, 80.0, 10.0);
+        for i in 0..N {
+            // A tight farm cluster: every orb inside merge radius of every
+            // other, all well inside the 1.6-block pickup reach.
+            xp_spawn(
+                at.0 + (i % 4) as f64 * 0.1,
+                at.1,
+                at.2 + ((i / 4) % 4) as f64 * 0.1,
+                VAL as i16,
+            );
+        }
+        drop_tick();
+        {
+            let xs = xps().lock().unwrap_or_else(|e| e.into_inner());
+            let total: u64 = xs.iter().map(|x| u64::from(x.val as u16)).sum();
+            assert_eq!(total, total_expected, "merging must conserve every XP point");
+            assert!(
+                xs.len() <= 16,
+                "2,000 clustered orbs must collapse to a bounded few, got {}",
+                xs.len()
+            );
+            assert!(
+                xs.iter().all(|x| x.val > 0),
+                "no zero-value tombstone may survive the merge"
+            );
+        }
+        // A live client on the cluster collects the merged batch next tick.
+        let (mut client, _rx) = client_pair();
+        client.eid = 777_001;
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (at.0, at.1, at.2, 0.0, 0.0, true);
+        let client = Arc::new(client);
+        player_mechanism_sessions()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                client.eid,
+                PlayerMechanismSession {
+                    xp_bar: (0, 0.0),
+                    food_timer: 0,
+                    menus: Arc::new(LiveMenuConnection {
+                        active: Mutex::new(None),
+                        next_id: std::sync::atomic::AtomicU8::new(4),
+                        enchantment_seed: Mutex::new(0),
+                    }),
+                },
+            );
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(client.clone());
+        drop_tick();
+        assert!(
+            xps().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "every merged orb inside pickup reach must be collected"
+        );
+        assert_eq!(
+            *client.xp.lock().unwrap_or_else(|e| e.into_inner()),
+            total_expected as i64,
+            "the player must receive the exact conserved XP total"
+        );
     }
 }
