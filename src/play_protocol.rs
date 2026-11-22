@@ -1608,6 +1608,57 @@ fn resend_container_content(me: &Client, wid: u8) {
     }
 }
 
+/// Click-mode 5 (vanilla drag paint): button 0/4 begins a left/right drag,
+/// 1/5 records a painted window slot, 2/6 ends the drag and distributes the
+/// carried stack across the recorded slots.
+fn drag_paint_click(me: &Client, slot: i16, button: i32) {
+    let mut dr = me.drag.lock().unwrap_or_else(|e| e.into_inner());
+    match button {
+        0 | 4 => {
+            dr.0 = button;
+            dr.1.clear();
+        }
+        1 | 5 => {
+            if dr.0 >= 0 && dr.0 + 1 == button && !dr.1.contains(&slot) {
+                dr.1.push(slot);
+            }
+        }
+        2 | 6 if dr.0 >= 0 && dr.0 + 2 == button => {
+            let slots_taken = std::mem::take(&mut dr.1);
+            dr.0 = -1;
+            drop(dr);
+            let mut cur = me.cursor.lock().unwrap_or_else(|e| e.into_inner());
+            if cur.1 > 0 && !slots_taken.is_empty() {
+                let right = dr_btn_right(button);
+                // vanilla right-drag paints exactly 1 item per slot, and can
+                // never consume more slots than the cursor holds
+                let per = if right {
+                    1
+                } else {
+                    (cur.1 as usize / slots_taken.len()) as u8
+                };
+                if per > 0 {
+                    let slots_taken = if right {
+                        slots_taken[..slots_taken.len().min(cur.1 as usize)].to_vec()
+                    } else {
+                        slots_taken
+                    };
+                    for wsl in slots_taken {
+                        if cur.1 == 0 {
+                            break;
+                        }
+                        paint_slot(me, wsl, per, &mut cur);
+                    }
+                    if cur.1 == 0 {
+                        *cur = (0, 0, Vec::new());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Entity metadata for pose 6 (`SLEEPING`) + LivingEntity's optional sleeping
 /// bed position at index 14. Vanilla broadcasts the full entity data on pose
 /// changes; for parity of the sleep animation these two entries suffice.
@@ -2225,141 +2276,102 @@ fn combat_tick(cls: &[Arc<Client>]) {
     }
 }
 
-/// Step a ray from the eye along the look vector and return the first cell
-/// that is not air — the crosshair block `pick_item` resolves. Vanilla's
-/// `ProjectileUtil.getHitResultOnViewVector` is a block-grid traversal; a
-/// 0.1-length walk reaches the same cells inside the ~5-block interaction
-/// range without a hit-box model.
-fn ray_pick_block(
-    dim: DimId,
-    ex: f64,
-    ey: f64,
-    ez: f64,
-    yaw: f32,
-    pitch: f32,
-    reach: f64,
-) -> Option<(i32, i32, i32)> {
-    let yaw = f64::from(yaw).to_radians();
-    let pitch = f64::from(pitch).to_radians();
-    let (dx, dy, dz) = (-yaw.sin() * pitch.cos(), -pitch.sin(), yaw.cos() * pitch.cos());
-    let (mut x, mut y, mut z) = (ex, ey, ez);
-    let mut last = (i32::MIN, i32::MIN, i32::MIN);
-    let mut walked = 0.0;
-    while walked <= reach {
-        let cell = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
-        if cell != last {
-            last = cell;
-            if block_at_dim(dim, cell.0, cell.1, cell.2) != 0 {
-                return Some(cell);
-            }
-        }
-        x += dx * 0.1;
-        y += dy * 0.1;
-        z += dz * 0.1;
-        walked += 0.1;
-    }
-    None
-}
-
-/// `Inventory.pick`'s decision over menu slot numbers, split out so the
-/// packet handler only moves stacks. The match compares item id and empty
-/// components, mirroring `isSameItemSameComponents` against the plain block
-/// stack the server resolved.
-#[derive(Debug, PartialEq, Eq)]
-enum PickItemPlan {
-    /// The match already sits on the hotbar: select that slot.
-    Select(i16),
-    /// A main-inventory slot swaps contents with the selected hotbar slot.
-    Swap(i16),
-    /// Creative invents a copy of the picked stack in the selected slot.
-    FillCreative,
-}
-
-fn pick_item_plan(
-    inv: &HashMap<i16, Stack>,
-    item: i64,
-    creative: bool,
-) -> Option<PickItemPlan> {
-    let plain = |st: &Stack| st.0 == item && st.1 > 0 && st.2.is_empty();
-    for slot in 36..=44 {
-        if inv.get(&slot).is_some_and(plain) {
-            return Some(PickItemPlan::Select(slot));
+/// `Inventory.getSuitableHotbarSlot` (1.21.1 `cmw.i()`): scan forward from the
+/// held slot for an empty hotbar slot, then for an unenchanted one
+/// (`ItemStack.isEnchanted` == a non-empty `enchantments` component), else
+/// keep the held slot. Hotbar slots are menu slots 36..=44.
+fn suitable_hotbar_slot(inv: &HashMap<i16, Stack>, held: i16) -> i16 {
+    for i in 0..9i16 {
+        let cand = (held + i) % 9;
+        let empty = inv
+            .get(&(36 + cand))
+            .is_none_or(|st| st.0 == 0 || st.1 == 0);
+        if empty {
+            return cand;
         }
     }
-    for slot in 9..=35 {
-        if inv.get(&slot).is_some_and(plain) {
-            return Some(PickItemPlan::Swap(slot));
+    for i in 0..9i16 {
+        let cand = (held + i) % 9;
+        let enchanted = inv
+            .get(&(36 + cand))
+            .is_some_and(|st| !enchantments_get(&st.2).is_empty());
+        if !enchanted {
+            return cand;
         }
     }
-    creative.then_some(PickItemPlan::FillCreative)
+    held
 }
 
-/// `ServerGamePacketListenerImpl.handlePickItem`: ray-trace the looked-at
-/// block, `Inventory.pick` its stack into the selection, then resync the
-/// touched slots and the carried-item index the way vanilla's packet does.
-fn pick_item(me: &Arc<Client>, held_slot: &mut i16) {
-    let (px, py, pz, yaw, pitch, _) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
-    let creative = *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
-    let reach = if creative { 5.6f64 } else { 4.9 };
-    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-    let Some((bx, by, bz)) = ray_pick_block(dim, px, py + 1.62, pz, yaw, pitch, reach)
-    else {
+/// `ClientboundContainerSetSlotPacket` on the `-2` (`PLAYER_INVENTORY`)
+/// window `handlePickItem` uses: slot numbers are `Inventory.items` indices
+/// (0..=8 hotbar, 9..=35 main inventory), not menu slots.
+fn send_pick_slot(me: &Client, items_slot: i16, st: &Stack) {
+    let mut p = vec![0xFEu8]; // containerId -2
+    write_varint(&mut p, 0);
+    p.extend_from_slice(&items_slot.to_be_bytes());
+    p.extend_from_slice(&slot_wire(st));
+    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
+}
+
+/// `ServerGamePacketListenerImpl.handlePickItem` + `Inventory.pickSlot`
+/// (1.21.1): the client resolves the middle-clicked block to an
+/// `Inventory.items` index — 0..=8 hotbar, 9..=35 main inventory — and the
+/// server swaps that stack into the suitable hotbar slot. Vanilla clients
+/// only ever send main-inventory hits (hotbar matches select locally), but
+/// the handler is written for the full `items` index space; out-of-range
+/// slots are dropped fail-closed. Both touched slots are resent on the `-2`
+/// window followed by `SetCarriedItem`.
+fn pick_item(me: &Arc<Client>, held_slot: &mut i16, slot: i64) {
+    if !(0..36).contains(&slot) {
         return;
-    };
-    let Some(reg) = block_registry::breg() else {
+    }
+    let slot = slot as i16;
+    if slot < 9 {
+        // Hotbar index: select it — the same visible result the vanilla
+        // client produces locally for a hotbar match.
+        *held_slot = slot;
+        *me.held.lock().unwrap_or_else(|e| e.into_inner()) = slot;
+        let _ = send_packet(
+            &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+            0x53,
+            vec![slot as u8],
+        );
         return;
-    };
-    let name = reg.name_of(block_at_dim(dim, bx, by, bz));
-    let Some(item) = name_to_item(name.trim_start_matches("minecraft:")) else {
-        return;
-    };
-    let selected = 36 + *held_slot;
-    let plan = {
+    }
+    let hslot = {
         let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-        pick_item_plan(&inv, item, creative)
+        suitable_hotbar_slot(&inv, *held_slot)
     };
-    match plan {
-        Some(PickItemPlan::Select(slot)) => {
-            *held_slot = slot - 36;
-            *me.held.lock().unwrap_or_else(|e| e.into_inner()) = *held_slot;
+    // items index -> menu slot: hotbar i -> 36+i, main i -> i
+    let hot_menu = 36 + hslot;
+    let (st_hot, st_main) = {
+        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+        let displaced = inv.get(&hot_menu).cloned().unwrap_or((0, 0, Vec::new()));
+        let picked = inv.get(&slot).cloned().unwrap_or((0, 0, Vec::new()));
+        if picked.0 != 0 && picked.1 > 0 {
+            inv.insert(hot_menu, picked);
+        } else {
+            inv.remove(&hot_menu);
         }
-        Some(PickItemPlan::Swap(slot)) => {
-            let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-            let held_stack = inv.get(&selected).cloned().unwrap_or((0, 0, Vec::new()));
-            let match_stack = inv.get(&slot).cloned().unwrap_or((0, 0, Vec::new()));
-            inv.insert(selected, match_stack);
-            if held_stack.1 > 0 {
-                inv.insert(slot, held_stack);
-            } else {
-                inv.remove(&slot);
-            }
-            drop(inv);
-            let stacks: Vec<(i16, Stack)> = [selected, slot]
-                .into_iter()
-                .map(|wslot| {
-                    (
-                        wslot,
-                        me.inv
-                            .lock()
-                            .unwrap()
-                            .get(&wslot)
-                            .cloned()
-                            .unwrap_or((0, 0, Vec::new())),
-                    )
-                })
-                .collect();
-            for (wslot, st) in stacks {
-                resync_slot(me, 0, wslot, &st);
-            }
+        if displaced.0 != 0 && displaced.1 > 0 {
+            inv.insert(slot, displaced);
+        } else {
+            inv.remove(&slot);
         }
-        Some(PickItemPlan::FillCreative) => {
-            me.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(selected, (item, 1, Vec::new()));
-            held_slot_resync(me);
-        }
-        None => return,
-    }
-    // Vanilla closes `handlePickItem` with ClientboundSetHeldSlotPacket.
-    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x53, vec![*held_slot as u8]);
+        (
+            inv.get(&hot_menu).cloned().unwrap_or((0, 0, Vec::new())),
+            inv.get(&slot).cloned().unwrap_or((0, 0, Vec::new())),
+        )
+    };
+    *held_slot = hslot;
+    *me.held.lock().unwrap_or_else(|e| e.into_inner()) = hslot;
+    send_pick_slot(me, hslot, &st_hot);
+    send_pick_slot(me, slot, &st_main);
+    let _ = send_packet(
+        &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+        0x53,
+        vec![hslot as u8],
+    );
 }
 
 /// `can_place_on`/`can_break` component ids (protocol 767 data-component
@@ -4003,9 +4015,17 @@ fn stream_chunks(
             for n in light_dirty_for_dim(dim, gen, *cx, *cz) {
                 dirty.insert(n);
             }
+            // one block-entity packet per sign position; it carries both
+            // sides' lines plus dye/glow/wax state from `sign_entity_pkt`
             let snap = signs_in_chunk(dim, *cx, *cz);
-            for ((_, sx, sy, sz, front), lines) in snap {
-                let _ = send_packet(s, 0x07, sign_entity_pkt(sx, sy, sz, front, &lines));
+            let mut positions: Vec<(i32, i32, i32)> = Vec::new();
+            for ((_, sx, sy, sz, _), _) in snap {
+                if !positions.contains(&(sx, sy, sz)) {
+                    positions.push((sx, sy, sz));
+                }
+            }
+            for (sx, sy, sz) in positions {
+                let _ = send_packet(s, 0x07, sign_entity_pkt(dim, sx, sy, sz));
             }
         }
     }
@@ -6175,6 +6195,73 @@ fn signs_in_chunk(dim: DimId, cx: i32, cz: i32) -> Vec<(SignKey, SignLines)> {
         .map(|(k, v)| (*k, v.clone()))
         .collect()
 }
+/// One sign side's dye state, mirroring `SignText`'s `color` and
+/// `hasGlowingText`. Vanilla defaults are `black` and `false`.
+#[derive(Clone)]
+struct SignSideMeta {
+    color: String,
+    has_glowing_text: bool,
+}
+impl Default for SignSideMeta {
+    fn default() -> Self {
+        Self {
+            color: "black".to_string(),
+            has_glowing_text: false,
+        }
+    }
+}
+/// `SignBlockEntity` display state Save v2 does not persist: both sides' dye
+/// state plus the block-level wax flag. Keyed by block position only — the
+/// wax flag belongs to the sign block, not to either side.
+#[derive(Clone, Default)]
+struct SignBlockMeta {
+    front: SignSideMeta,
+    back: SignSideMeta,
+    is_waxed: bool,
+}
+static SIGN_META: Registry<(DimId, i32, i32, i32), SignBlockMeta> = OnceLock::new();
+fn sign_meta() -> &'static LockedMap<(DimId, i32, i32, i32), SignBlockMeta> {
+    SIGN_META.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// The sign's display metadata, or vanilla defaults when none was applied.
+/// A position whose block stopped being a sign drops its entry on read, so a
+/// sign placed over an old one never inherits wax or dye.
+fn sign_meta_at(dim: DimId, x: i32, y: i32, z: i32) -> SignBlockMeta {
+    let key = (dim, x, y, z);
+    if !is_sign_block_state(block_at_dim(dim, x, y, z)) {
+        sign_meta()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+        return SignBlockMeta::default();
+    }
+    sign_meta()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+        .unwrap_or_default()
+}
+fn sign_meta_update(dim: DimId, x: i32, y: i32, z: i32, f: impl FnOnce(&mut SignBlockMeta)) {
+    f(sign_meta()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry((dim, x, y, z))
+        .or_default());
+}
+/// Both sides' stored text lines for one sign position; a missing side is the
+/// all-empty `SignLines` vanilla shows for an untouched side.
+fn sign_lines_at(dim: DimId, x: i32, y: i32, z: i32) -> ([String; 4], [String; 4]) {
+    let g = signs().lock().unwrap_or_else(|e| e.into_inner());
+    (
+        g.get(&(dim, x, y, z, 1))
+            .cloned()
+            .unwrap_or_else(|| Default::default()),
+        g.get(&(dim, x, y, z, 0))
+            .cloned()
+            .unwrap_or_else(|| Default::default()),
+    )
+}
 fn is_sign_block_state(state: u32) -> bool {
     crate::block_registry::breg().is_some_and(|reg| {
         let name = reg.canonical_state(state);
@@ -6226,10 +6313,19 @@ fn json_text(s: &str) -> String {
 /// `filtered_messages` present. A tag without that list loads as empty text natively, so
 /// writing the shorter shape here would make a client show blank lines.
 fn sign_side_nbt(v: &mut Vec<u8>, name: &str, lines: &[String; 4]) {
+    sign_side_nbt_meta(v, name, lines, "white", false)
+}
+fn sign_side_nbt_meta(
+    v: &mut Vec<u8>,
+    name: &str,
+    lines: &[String; 4],
+    color: &str,
+    has_glowing_text: bool,
+) {
     v.push(10);
     nbt_str(v, name); // TAG_Compound <name>
-    nbt_named_str(v, "color", "white");
-    nbt_named_byte(v, "has_glowing_text", 0);
+    nbt_named_str(v, "color", color);
+    nbt_named_byte(v, "has_glowing_text", u8::from(has_glowing_text));
     for list in ["filtered_messages", "messages"] {
         v.push(9);
         nbt_str(v, list); // TAG_List<String>
@@ -6242,23 +6338,161 @@ fn sign_side_nbt(v: &mut Vec<u8>, name: &str, lines: &[String; 4]) {
     }
     v.push(0);
 }
-fn sign_entity_pkt(x: i32, y: i32, z: i32, front: u8, lines: &[String; 4]) -> Vec<u8> {
-    // 0x07 tile_entity_data
-    let empty: [String; 4] = [String::new(), String::new(), String::new(), String::new()];
-    let (fl, bl) = if front != 0 {
-        (lines, &empty)
-    } else {
-        (&empty, lines)
-    };
+/// The `0x07` block-entity packet for one sign, carrying both sides' stored
+/// lines plus the dye/glow/wax state `SignBlockEntity` would report. `dim` is
+/// needed because `signs()` and `SIGN_META` are dimension-scoped.
+fn sign_entity_pkt(dim: DimId, x: i32, y: i32, z: i32) -> Vec<u8> {
+    let (fl, bl) = sign_lines_at(dim, x, y, z);
+    let meta = sign_meta_at(dim, x, y, z);
     let mut p = Vec::new();
     write_pos(&mut p, x, y, z);
     write_varint(&mut p, 7); // block entity type: sign
     p.push(10); // root compound (anonymousNbt)
-    sign_side_nbt(&mut p, "front_text", fl);
-    sign_side_nbt(&mut p, "back_text", bl);
-    nbt_named_byte(&mut p, "is_waxed", 0);
+    sign_side_nbt_meta(
+        &mut p,
+        "front_text",
+        &fl,
+        &meta.front.color,
+        meta.front.has_glowing_text,
+    );
+    sign_side_nbt_meta(
+        &mut p,
+        "back_text",
+        &bl,
+        &meta.back.color,
+        meta.back.has_glowing_text,
+    );
+    nbt_named_byte(&mut p, "is_waxed", u8::from(meta.is_waxed));
     p.push(0);
     p
+}
+/// The sign's facing in degrees, from its block state: `rotation` on standing
+/// and ceiling-hanging signs (`n * 22.5`), `facing` on wall signs (vanilla
+/// `Direction.toYRot`: south 0, west 90, north 180, east 270).
+fn sign_yaw_degrees(st: u32) -> f64 {
+    let Some(reg) = crate::block_registry::breg() else {
+        return 0.0;
+    };
+    if let Some(rot) = reg.get_prop(st, "rotation") {
+        return rot.parse::<f64>().unwrap_or(0.0) * 22.5;
+    }
+    match reg.get_prop(st, "facing").as_deref() {
+        Some("south") => 0.0,
+        Some("west") => 90.0,
+        Some("north") => 180.0,
+        Some("east") => 270.0,
+        _ => 0.0,
+    }
+}
+/// Vanilla `SignBlock.isFacingFrontText`: the player sees the front side when
+/// the horizontal angle from the sign's facing to the player is within 90°.
+fn sign_facing_front(x: i32, z: i32, st: u32, px: f64, pz: f64) -> bool {
+    let dx = px - (x as f64 + 0.5);
+    let dz = pz - (z as f64 + 0.5);
+    if dx == 0.0 && dz == 0.0 {
+        return true;
+    }
+    let angle = dz.atan2(dx).to_degrees() - 90.0 - sign_yaw_degrees(st);
+    let wrapped = (angle + 180.0).rem_euclid(360.0) - 180.0;
+    wrapped.abs() <= 90.0
+}
+/// `SignBlock.useItemOn`/`useWithoutItem` plus the sign applicators
+/// (`minecraft:dye`, `glow_ink_sac`, `ink_sac`, `honeycomb`) on the side the
+/// player faces. Returns true when the click was consumed — a waxed sign
+/// answers any item with the fail sound and never opens the editor. False
+/// falls through to the sign editor open, matching vanilla `PASS`.
+fn use_sign_item(
+    me: &Arc<Client>,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    held_slot: i16,
+    seq: i64,
+) -> bool {
+    let st = block_at_dim(dim, x, y, z);
+    if !is_sign_block_state(st) {
+        return false;
+    }
+    let inv_slot = 36 + held_slot;
+    let held = me
+        .inv
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&inv_slot)
+        .cloned()
+        .unwrap_or((0, 0, Vec::new()));
+    let pos = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+    // Waxed: `useWithoutItem` plays WAXED_SIGN_INTERACT_FAIL and succeeds;
+    // no dye, no editor.
+    if sign_meta_at(dim, x, y, z).is_waxed {
+        let snd = sound_pkt_named("block.waxed_sign_interact_fail", pos.0, pos.1, pos.2);
+        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x68, snd);
+        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+        return true;
+    }
+    let item = held.0;
+    let dye = dye_color_for_item(item);
+    let is_glow_ink = item == 942;
+    let is_ink = item == 941;
+    let is_honeycomb = item == 1221;
+    if dye.is_none() && !is_glow_ink && !is_ink && !is_honeycomb {
+        return false;
+    }
+    let front = sign_facing_front(x, z, st, pos.0, pos.2);
+    // `SignApplicator.canApplyToSign`: dye and ink sacs need a non-empty
+    // message on the faced side; honeycomb always applies.
+    let (fl, bl) = sign_lines_at(dim, x, y, z);
+    let side_lines = if front { &fl } else { &bl };
+    if !is_honeycomb && !side_lines.iter().any(|l| !l.is_empty()) {
+        return false;
+    }
+    let meta = sign_meta_at(dim, x, y, z);
+    let side_meta = if front { &meta.front } else { &meta.back };
+    // `tryApplyToSign` only succeeds when the state actually changes;
+    // otherwise vanilla falls through to `useWithoutItem` (editor open).
+    enum SignApply {
+        Dye(String),
+        Glow(bool),
+        Wax,
+    }
+    let apply = if let Some(color) = dye {
+        (side_meta.color != color).then(|| SignApply::Dye(color.to_string()))
+    } else if is_glow_ink {
+        (!side_meta.has_glowing_text).then_some(SignApply::Glow(true))
+    } else if is_ink {
+        side_meta.has_glowing_text.then_some(SignApply::Glow(false))
+    } else {
+        (!meta.is_waxed).then_some(SignApply::Wax)
+    };
+    let Some(apply) = apply else {
+        return false;
+    };
+    sign_meta_update(dim, x, y, z, |m| match &apply {
+        SignApply::Dye(color) => {
+            let side = if front { &mut m.front } else { &mut m.back };
+            side.color = color.clone();
+        }
+        SignApply::Glow(on) => {
+            let side = if front { &mut m.front } else { &mut m.back };
+            side.has_glowing_text = *on;
+        }
+        SignApply::Wax => m.is_waxed = true,
+    });
+    // consume one item in survival/ adventure; creative keeps the stack
+    if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
+        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+        if held.1 > 1 {
+            inv.insert(inv_slot, (held.0, held.1 - 1, held.2));
+        } else {
+            inv.remove(&inv_slot);
+        }
+    }
+    broadcast_chunk_dim(dim, x.div_euclid(16), z.div_euclid(16), |_c| {
+        (0x07, sign_entity_pkt(dim, x, y, z))
+    });
+    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+    true
 }
 fn sign_base_for_item(item: i64) -> Option<u32> {
     Some(match item {
@@ -8896,10 +9130,14 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 }
             }
             0x20 => {
-                // pick_item: the server ray-traces the block under the
-                // crosshair itself and runs `Inventory.pick` on its item —
-                // the one-byte includeData flag needs no parse.
-                pick_item(&me, &mut held_slot);
+                // ServerboundPickItemPacket: one VarInt `slot` — an
+                // `Inventory.items` index the client already resolved
+                // (0..=8 hotbar, 9..=35 main inventory). The server runs
+                // `Inventory.pickSlot`; out-of-range values drop fail-closed.
+                let mut sl = &b[..];
+                if let Some(slot) = read_varint(&mut sl) {
+                    pick_item(&me, &mut held_slot, slot);
+                }
             }
             0x1d => {
                 // flying: onGround only
@@ -9543,6 +9781,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             continue;
                         }
                     }
+                }
+                // sign applicators (dye / glow ink / ink sac / honeycomb) run
+                // before the editor-open path, exactly like vanilla's
+                // `useItemOn` -> `useWithoutItem` order.
+                if use_sign_item(&me, dim, x, y, z, held_slot, seq) {
+                    continue;
                 }
                 // existing sign: right-click reopens the editor (front text)
                 if (4302..=4589).contains(&block_at_dim(dim, x, y, z))
@@ -11025,6 +11269,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     if !matches!(*me.gm.lock().unwrap_or_else(|e| e.into_inner()), 0 | 1)
                         || !sign_edit_in_range((pos.0, pos.1, pos.2), sx, sy, sz)
                         || !is_sign_block_state(block_at_dim(dim, sx, sy, sz))
+                        // a waxed sign's text is frozen; vanilla drops the edit
+                        || sign_meta_at(dim, sx, sy, sz).is_waxed
                     {
                         continue;
                     }
@@ -11033,7 +11279,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         .unwrap_or_else(|e| e.into_inner())
                         .insert((dim, sx, sy, sz, front), lines.clone());
                     broadcast_chunk_dim(dim, sx.div_euclid(16), sz.div_euclid(16), |_c| {
-                        (0x07, sign_entity_pkt(sx, sy, sz, front, &lines))
+                        (0x07, sign_entity_pkt(dim, sx, sy, sz))
                     });
                 }
             }
@@ -11046,6 +11292,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     // Player inventory menu slots are crafting output/input, armor,
                     // inventory, hotbar and offhand (0..=45).
                     if !creative_inventory_slot(slot) {
+                        continue;
+                    }
+                    // fail-closed bomb guard: a stack whose added components
+                    // exceed the wire bound is dropped before it can be
+                    // stored, echoed, or re-broadcast through drops/pickups
+                    if !creative_slot_acceptable(&st) {
                         continue;
                     }
                     if st.1 > 0 {
@@ -12022,37 +12274,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             }
                         } else if mode == 5 {
                             // drag-paint: btn 0/4 start (left/right), 1/5 add slot, 2/6 end
-                            let bt = btn as i32;
-                            let mut dr = me.drag.lock().unwrap_or_else(|e| e.into_inner());
-                            match bt {
-                                0 | 4 => {
-                                    dr.0 = bt;
-                                    dr.1.clear();
-                                }
-                                1 | 5 => {
-                                    if dr.0 >= 0 && dr.0 + 1 == bt {
-                                        dr.1.push(slot);
-                                    }
-                                }
-                                2 | 6
-                                    if dr.0 >= 0 && dr.0 + 2 == bt => {
-                                        let slots_taken = std::mem::take(&mut dr.1);
-                                        dr.0 = -1;
-                                        drop(dr);
-                                        let mut cur = me.cursor.lock().unwrap_or_else(|e| e.into_inner());
-                                        if cur.1 > 0 && !slots_taken.is_empty() {
-                                            let per = (cur.1 as usize / slots_taken.len()) as u8;
-                                            // vanilla right-drag paints exactly 1 per slot
-                                            let per = if dr_btn_right(bt) { 1 } else { per };
-                                            if per > 0 {
-                                                for wsl in slots_taken {
-                                                    paint_slot(&me, wsl, per, &mut cur);
-                                                }
-                                            }
-                                        }
-                                    }
-                                _ => {}
-                            }
+                            drag_paint_click(&me, slot, btn as i32);
                         } else if mode == 4 || mode == 1 {
                             // vanilla click modes: 4=throw hovered slot (btn 0=one,
                             // 1=whole stack); 1=shift-move between regions
@@ -16157,33 +16379,467 @@ mod p5c_live_tests {
     }
 
     #[test]
-    fn p5c_live_pick_item_plan_selects_swaps_or_fills() {
+    fn p5c_pick_item_suitable_hotbar_slot_order() {
+        let dirt = name_to_item("dirt").unwrap();
+        let mut inv = HashMap::new();
+        // Held slot itself empty -> stays put.
+        assert_eq!(suitable_hotbar_slot(&inv, 3), 3);
+        // Occupied held -> next empty scanning forward.
+        inv.insert(39i16, (dirt, 1, Vec::new())); // hotbar 3
+        assert_eq!(suitable_hotbar_slot(&inv, 3), 4);
+        // Scan wraps: held 8 and hotbar 0 taken -> hotbar 1.
+        let mut inv = HashMap::new();
+        inv.insert(44i16, (dirt, 1, Vec::new()));
+        inv.insert(36i16, (dirt, 1, Vec::new()));
+        assert_eq!(suitable_hotbar_slot(&inv, 8), 1);
+        // Full plain hotbar -> the held slot itself.
+        let mut inv = HashMap::new();
+        for i in 0..9i16 {
+            inv.insert(36 + i, (dirt, 1, Vec::new()));
+        }
+        assert_eq!(suitable_hotbar_slot(&inv, 4), 4);
+        // Full hotbar with the first candidate enchanted -> first
+        // unenchanted slot wins over the held fallback.
+        let ench = enchantments_data(&[(17, 3)], true);
+        inv.insert(36i16, (dirt, 1, vec![(COMP_ENCHANTMENTS, ench)]));
+        assert_eq!(suitable_hotbar_slot(&inv, 0), 1);
+        // Every slot enchanted -> held.
+        for i in 0..9i16 {
+            inv.insert(
+                36 + i,
+                (
+                    dirt,
+                    1,
+                    vec![(COMP_ENCHANTMENTS, enchantments_data(&[(17, 3)], true))],
+                ),
+            );
+        }
+        assert_eq!(suitable_hotbar_slot(&inv, 0), 0);
+    }
+
+    /// `read_frame` assumes one packet per `read()`; TCP coalesces the
+    /// back-to-back resyncs `pick_item`/`use_sign_item` emit, so tests that
+    /// assert on several frames in a row need a buffered reader.
+    struct FrameReader<'a> {
+        stream: &'a mut std::net::TcpStream,
+        buf: Vec<u8>,
+    }
+    impl<'a> FrameReader<'a> {
+        fn new(stream: &'a mut std::net::TcpStream) -> Self {
+            Self {
+                stream,
+                buf: Vec::new(),
+            }
+        }
+        /// Next `(packet id, body)`; `None` on a 5s read timeout.
+        fn next(&mut self) -> Option<(i64, Vec<u8>)> {
+            loop {
+                if let Some((used, id, body)) = parse_wire_frame(&self.buf) {
+                    self.buf.drain(..used);
+                    return Some((id, body));
+                }
+                let mut tmp = [0u8; 8192];
+                self.stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .ok()?;
+                let n = self.stream.read(&mut tmp).ok()?;
+                if n == 0 {
+                    return None;
+                }
+                self.buf.extend_from_slice(&tmp[..n]);
+            }
+        }
+    }
+    /// One length-prefixed frame out of `buf`: returns
+    /// `(consumed bytes, packet id, body)` when a whole frame is present.
+    fn parse_wire_frame(buf: &[u8]) -> Option<(usize, i64, Vec<u8>)> {
+        let mut rest = buf;
+        let len = usize::try_from(read_varint(&mut rest)?).ok()?;
+        if rest.len() < len {
+            return None;
+        }
+        let mut frame = &rest[..len];
+        let id = read_varint(&mut frame)?;
+        let consumed = buf.len() - rest.len() + len;
+        Some((consumed, id, frame.to_vec()))
+    }
+
+    /// Decode the stack half of a `-2`-window `0x15` body:
+    /// `[0xFE][varint stateId][i16 slot][slot_wire stack]`.
+    fn pick_slot_wire(body: &[u8]) -> (i16, Stack) {
+        assert_eq!(body[0], 0xFE, "pick-item resync uses the -2 window");
+        let mut v = body[2..4].to_vec();
+        v.extend_from_slice(&body[4..]);
+        slot_read_wire(&v).expect("set-slot body parses")
+    }
+
+    #[test]
+    fn p5c_live_pick_item_swaps_main_into_hotbar() {
+        let _guard = world_guard();
+        let (me, mut peer) = loopback_client("PickSwap", 42010);
+        let _cleanup = LiveCleanup {
+            eid: me.eid,
+            difficulty: DIFFICULTY.load(Ordering::Relaxed),
+        };
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(me.clone());
+        let dirt = name_to_item("dirt").unwrap();
+        // items index 20 == menu slot 20 (main inventory); hotbar is empty.
+        me.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(20, (dirt, 7, Vec::new()));
+        let mut held = 0i16;
+        pick_item(&me, &mut held, 20);
+        assert_eq!(held, 0, "empty hotbar keeps the held slot");
+        {
+            let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(inv.get(&36), Some(&(dirt, 7, Vec::new())));
+            assert!(
+                inv.get(&20).is_none_or(|st| st.1 == 0),
+                "main slot was swapped out"
+            );
+        }
+        let mut fr = FrameReader::new(&mut peer);
+        let (id1, b1) = fr.next().expect("hotbar set slot");
+        assert_eq!(id1, 0x15);
+        let (s1, st1) = pick_slot_wire(&b1);
+        assert_eq!(s1, 0, "hotbar resync uses the items index");
+        assert_eq!(st1, (dirt, 7, Vec::new()));
+        let (id2, b2) = fr.next().expect("main set slot");
+        assert_eq!(id2, 0x15);
+        let (s2, st2) = pick_slot_wire(&b2);
+        assert_eq!(s2, 20);
+        assert_eq!(st2, (0, 0, Vec::new()));
+        let (id3, b3) = fr.next().expect("carried item");
+        assert_eq!(id3, 0x53);
+        assert_eq!(b3, vec![0u8]);
+    }
+
+    #[test]
+    fn p5c_live_pick_item_full_hotbar_swaps_held() {
+        let _guard = world_guard();
+        let (me, mut peer) = loopback_client("PickFull", 42011);
+        let _cleanup = LiveCleanup {
+            eid: me.eid,
+            difficulty: DIFFICULTY.load(Ordering::Relaxed),
+        };
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(me.clone());
+        let dirt = name_to_item("dirt").unwrap();
         let stone = name_to_item("stone").unwrap();
-        let mut inv = HashMap::new();
-        // Hotbar hit: the slot is merely selected.
-        inv.insert(38i16, (stone, 3, Vec::new()));
+        {
+            let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+            for i in 0..9i16 {
+                inv.insert(36 + i, (dirt, 1, Vec::new()));
+            }
+            inv.insert(15, (stone, 4, Vec::new()));
+        }
+        let mut held = 2i16;
+        pick_item(&me, &mut held, 15);
+        assert_eq!(held, 2, "full plain hotbar falls back to held");
+        {
+            let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(inv.get(&38), Some(&(stone, 4, Vec::new())));
+            assert_eq!(inv.get(&15), Some(&(dirt, 1, Vec::new())));
+        }
+        let mut fr = FrameReader::new(&mut peer);
+        let (id1, b1) = fr.next().expect("hotbar set slot");
+        assert_eq!(id1, 0x15);
+        let (s1, _) = pick_slot_wire(&b1);
+        assert_eq!(s1, 2);
+        let (id2, _) = fr.next().expect("main set slot");
+        assert_eq!(id2, 0x15);
+        let (id3, b3) = fr.next().expect("carried item");
+        assert_eq!(id3, 0x53);
+        assert_eq!(b3, vec![2u8]);
+    }
+
+    #[test]
+    fn p5c_live_pick_item_hotbar_select_and_fail_closed() {
+        let _guard = world_guard();
+        let (me, mut peer) = loopback_client("PickHot", 42012);
+        let _cleanup = LiveCleanup {
+            eid: me.eid,
+            difficulty: DIFFICULTY.load(Ordering::Relaxed),
+        };
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(me.clone());
+        let mut held = 1i16;
+        pick_item(&me, &mut held, 6);
+        assert_eq!(held, 6);
+        assert_eq!(*me.held.lock().unwrap_or_else(|e| e.into_inner()), 6);
+        let mut fr = FrameReader::new(&mut peer);
+        let (id, body) = fr.next().expect("carried item only");
+        assert_eq!(id, 0x53);
+        assert_eq!(body, vec![6u8]);
+        // Out-of-range and malformed slots are dropped before any mutation.
+        for bad in [-1i64, 36, 100, i64::MAX] {
+            pick_item(&me, &mut held, bad);
+        }
+        assert_eq!(held, 6);
+        assert!(me.inv.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        assert!(fr.next().is_none(), "no resync for bad slots");
+    }
+
+    /// The anonymous-NBT root of a `0x07` sign block-entity body.
+    fn sign_update_tag(body: &[u8]) -> crate::nbt::Tag {
+        let mut rest = &body[8..];
+        read_varint(&mut rest).expect("block entity type");
+        crate::nbt::read_network_nbt(&mut rest).expect("sign nbt")
+    }
+    fn sign_side<'a>(tag: &'a crate::nbt::Tag, name: &str) -> &'a crate::nbt::Tag {
+        tag.get(name).expect("sign side compound")
+    }
+    fn nbt_str(tag: &crate::nbt::Tag) -> String {
+        tag.string()
+            .expect("nbt string")
+            .to_utf8()
+            .expect("utf8")
+    }
+    fn nbt_byte(tag: &crate::nbt::Tag) -> i8 {
+        match tag {
+            crate::nbt::Tag::Byte(v) => *v,
+            other => panic!("expected byte, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn p5c_live_sign_dye_glow_ink_wax_and_waxed_edit() {
+        let _guard = world_guard();
+        crate::test_support::require_vanilla_data();
+        let reg = crate::block_registry::breg().unwrap();
+        let sign = reg.state_of("minecraft:oak_sign", None);
+        if !is_sign_block_state(sign) {
+            return;
+        }
+        let (sx, sy, sz) = (12, 70, 12);
+        set_block_dim(DimId::Overworld, sx, sy, sz, sign);
+        signs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                (DimId::Overworld, sx, sy, sz, 1),
+                ["hi".to_string(), String::new(), String::new(), String::new()],
+            );
+        let (me, mut peer) = loopback_client("SignDye", 42013);
+        let _cleanup = LiveCleanup {
+            eid: me.eid,
+            difficulty: DIFFICULTY.load(Ordering::Relaxed),
+        };
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(me.clone());
+        // South of the sign -> the front side for rotation=0.
+        *me.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+            (12.5, 71.0, 14.5, 0.0, 0.0, true);
+        let held_slot = 0i16;
+        let mut fr = FrameReader::new(&mut peer);
+        let give = |me: &Arc<Client>, item: i64| {
+            me.inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(36, (item, 1, Vec::new()));
+        };
+        // red_dye recolors the faced side and consumes one in survival.
+        let red = name_to_item("red_dye").unwrap();
+        give(&me, red);
+        assert!(use_sign_item(&me, DimId::Overworld, sx, sy, sz, held_slot, 1));
+        assert!(me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&36).is_none());
+        assert_eq!(sign_meta_at(DimId::Overworld, sx, sy, sz).front.color, "red");
+        let (id, body) = fr.next().expect("0x07 after dye");
+        assert_eq!(id, 0x07);
+        let tag = sign_update_tag(&body);
+        let front = sign_side(&tag, "front_text");
+        assert_eq!(nbt_str(front.get("color").unwrap()), "red");
+        assert_eq!(nbt_byte(front.get("has_glowing_text").unwrap()), 0);
+        assert_eq!(nbt_byte(tag.get("is_waxed").unwrap()), 0);
+        assert_eq!(fr.next().map(|(id, _)| id), Some(0x05));
+
+        // glow_ink_sac toggles glow on; ink_sac toggles it back off.
+        give(&me, 942);
+        assert!(use_sign_item(&me, DimId::Overworld, sx, sy, sz, held_slot, 2));
+        assert!(sign_meta_at(DimId::Overworld, sx, sy, sz).front.has_glowing_text);
+        let (id, body) = fr.next().expect("0x07 after glow ink");
+        assert_eq!(id, 0x07);
+        let tag = sign_update_tag(&body);
         assert_eq!(
-            pick_item_plan(&inv, stone, false),
-            Some(PickItemPlan::Select(38))
+            nbt_byte(sign_side(&tag, "front_text").get("has_glowing_text").unwrap()),
+            1
         );
-        // Main-inventory hit swaps into the selected slot.
-        let mut inv = HashMap::new();
-        inv.insert(20i16, (stone, 3, Vec::new()));
+        assert_eq!(fr.next().map(|(id, _)| id), Some(0x05));
+
+        give(&me, 941);
+        assert!(use_sign_item(&me, DimId::Overworld, sx, sy, sz, held_slot, 3));
+        assert!(!sign_meta_at(DimId::Overworld, sx, sy, sz).front.has_glowing_text);
+        let (id, body) = fr.next().expect("0x07 after ink sac");
+        assert_eq!(id, 0x07);
+        let tag = sign_update_tag(&body);
         assert_eq!(
-            pick_item_plan(&inv, stone, false),
-            Some(PickItemPlan::Swap(20))
+            nbt_byte(sign_side(&tag, "front_text").get("has_glowing_text").unwrap()),
+            0
         );
-        // No hit: only creative invents the stack.
-        let inv = HashMap::new();
-        assert_eq!(pick_item_plan(&inv, stone, false), None);
-        assert_eq!(
-            pick_item_plan(&inv, stone, true),
-            Some(PickItemPlan::FillCreative)
+        assert_eq!(fr.next().map(|(id, _)| id), Some(0x05));
+
+        // Re-apply glow, then honeycomb waxes the whole sign.
+        give(&me, 942);
+        assert!(use_sign_item(&me, DimId::Overworld, sx, sy, sz, held_slot, 4));
+        assert_eq!(fr.next().map(|(id, _)| id), Some(0x07));
+        assert_eq!(fr.next().map(|(id, _)| id), Some(0x05));
+        give(&me, 1221);
+        assert!(use_sign_item(&me, DimId::Overworld, sx, sy, sz, held_slot, 5));
+        assert!(sign_meta_at(DimId::Overworld, sx, sy, sz).is_waxed);
+        let (id, body) = fr.next().expect("0x07 after wax");
+        assert_eq!(id, 0x07);
+        let tag = sign_update_tag(&body);
+        assert_eq!(nbt_byte(tag.get("is_waxed").unwrap()), 1);
+        assert_eq!(fr.next().map(|(id, _)| id), Some(0x05));
+
+        // Waxed: any item is consumed as the interact-fail no-op — sound and
+        // ack, never a 0x07 and never the editor.
+        give(&me, 955); // blue_dye
+        assert!(use_sign_item(&me, DimId::Overworld, sx, sy, sz, held_slot, 6));
+        let (id1, _) = fr.next().expect("waxed sound");
+        assert_eq!(id1, 0x68);
+        let (id2, _) = fr.next().expect("waxed ack");
+        assert_eq!(id2, 0x05);
+        // The gate the 0x35 handler applies before storing edits.
+        assert!(sign_meta_at(DimId::Overworld, sx, sy, sz).is_waxed);
+
+        // Cleanup: no sign state may leak into other tests.
+        set_block_dim(DimId::Overworld, sx, sy, sz, 0);
+        signs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(DimId::Overworld, sx, sy, sz, 1));
+        sign_meta()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(DimId::Overworld, sx, sy, sz));
+    }
+
+    #[test]
+    fn p5c_sign_item_noop_cases_fall_through() {
+        let _guard = world_guard();
+        crate::test_support::require_vanilla_data();
+        let reg = crate::block_registry::breg().unwrap();
+        let sign = reg.state_of("minecraft:oak_sign", None);
+        if !is_sign_block_state(sign) {
+            return;
+        }
+        let (sx, sy, sz) = (12, 70, 13);
+        set_block_dim(DimId::Overworld, sx, sy, sz, sign);
+        // No text on either side: dye and ink sacs cannot apply (vanilla
+        // canApplyToSign needs a message) -> editor path, returns false.
+        let (me, _peer) = loopback_client("SignEmpty", 42014);
+        let _cleanup = LiveCleanup {
+            eid: me.eid,
+            difficulty: DIFFICULTY.load(Ordering::Relaxed),
+        };
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(me.clone());
+        *me.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+            (12.5, 71.0, 15.5, 0.0, 0.0, true);
+        let red = name_to_item("red_dye").unwrap();
+        me.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, (red, 1, Vec::new()));
+        assert!(!use_sign_item(&me, DimId::Overworld, sx, sy, sz, 0, 1));
+        // A non-applicator item also falls through.
+        let dirt = name_to_item("dirt").unwrap();
+        me.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, (dirt, 1, Vec::new()));
+        assert!(!use_sign_item(&me, DimId::Overworld, sx, sy, sz, 0, 2));
+        // With text present, re-dyeing the same color is a no-op -> false.
+        signs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                (DimId::Overworld, sx, sy, sz, 1),
+                ["hi".to_string(), String::new(), String::new(), String::new()],
+            );
+        let red = name_to_item("red_dye").unwrap();
+        me.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, (red, 1, Vec::new()));
+        assert!(use_sign_item(&me, DimId::Overworld, sx, sy, sz, 0, 3));
+        me.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, (red, 1, Vec::new()));
+        assert!(!use_sign_item(&me, DimId::Overworld, sx, sy, sz, 0, 4));
+        set_block_dim(DimId::Overworld, sx, sy, sz, 0);
+        signs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(DimId::Overworld, sx, sy, sz, 1));
+        sign_meta()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(DimId::Overworld, sx, sy, sz));
+    }
+
+    /// A `custom_name` component payload: an NBT string of `len` bytes.
+    fn creative_name_payload(len: usize) -> Vec<u8> {
+        let mut payload = vec![8u8]; // NBT string tag
+        payload.extend_from_slice(&(len as u16).to_be_bytes());
+        payload.extend(std::iter::repeat(b'a').take(len));
+        payload
+    }
+
+    /// A `0x32`-shaped wire body: stack `count=1 item=stone` carrying
+    /// `components` `(type, payload)` pairs as added components.
+    fn creative_wire(slot: i16, components: &[(i64, Vec<u8>)]) -> Vec<u8> {
+        let mut wire = slot.to_be_bytes().to_vec();
+        write_varint(&mut wire, 1); // count
+        write_varint(&mut wire, 1); // item: stone
+        write_varint(&mut wire, components.len() as i64);
+        write_varint(&mut wire, 0); // removed components
+        for (ty, payload) in components {
+            write_varint(&mut wire, *ty);
+            wire.extend_from_slice(payload);
+        }
+        wire
+    }
+
+    #[test]
+    fn p5c_creative_slot_component_bomb_guard() {
+        // >8 KiB of component payload parses fine structurally but must be
+        // refused before it can be stored or re-broadcast.
+        let wire = creative_wire(5, &[(5, creative_name_payload(9000))]);
+        let (slot, st) = slot_read_wire(&wire).expect("oversized stack still parses");
+        assert_eq!(slot, 5);
+        assert!(slot_component_wire_bytes(&st) > SLOT_COMPONENT_WIRE_LIMIT);
+        assert!(!creative_slot_acceptable(&st));
+        // The bound is on the summed payloads: two ~5 KiB components also
+        // exceed it even though each alone would pass.
+        let wire = creative_wire(
+            5,
+            &[(5, creative_name_payload(5000)), (5, creative_name_payload(5000))],
         );
-        // A component-bearing stack does not match a plain block pick.
-        let mut inv = HashMap::new();
-        inv.insert(38i16, (stone, 3, vec![(COMP_CUSTOM_NAME, vec![0])]));
-        assert_eq!(pick_item_plan(&inv, stone, false), None);
+        let (_, st) = slot_read_wire(&wire).expect("two-component stack parses");
+        assert!(!creative_slot_acceptable(&st));
+        // Valid components round-trip byte-identically through the slot wire.
+        let wire = creative_wire(5, &[(5, creative_name_payload(100))]);
+        let (_, st) = slot_read_wire(&wire).expect("valid stack parses");
+        assert!(creative_slot_acceptable(&st));
+        let mut back = 5i16.to_be_bytes().to_vec();
+        back.extend_from_slice(&slot_wire(&st));
+        let (_, rt) = slot_read_wire(&back).expect("roundtrip parses");
+        assert_eq!(rt, st, "component payload bytes are preserved");
     }
     // ---------- Lane W1: proofs the built evaluators run through the live loop ----------
 
@@ -18808,5 +19464,106 @@ mod security_hardening_tests {
             "exactly the burst allowance reaches the socket; {} dropped",
             flood - LOD_V1_REQ_BURST
         );
+    }
+}
+
+#[cfg(test)]
+mod play_protocol_drag_paint_tests {
+    use super::*;
+    use crate::effect_tests::client_pair;
+
+    /// Every item unit the client holds: cursor stack plus all inventory cells.
+    fn held_units(client: &Client) -> u64 {
+        let cur = client.cursor.lock().unwrap_or_else(|e| e.into_inner());
+        let inv = client.inv.lock().unwrap_or_else(|e| e.into_inner());
+        u64::from(cur.1) + inv.values().map(|st| u64::from(st.1)).sum::<u64>()
+    }
+
+    /// P0-2 regression: right-drag (click-mode 5, buttons 4/5/6) paints exactly
+    /// one item per slot. A single item on the cursor dragged across 7 slots
+    /// (one repeated) must neither panic nor wrap `cur.1` — the item lands in
+    /// the first painted slot only and the cursor empties.
+    #[test]
+    fn right_drag_single_item_over_many_slots_never_underflows() {
+        let (client, _peer) = client_pair();
+        let dirt = name_to_item("dirt").unwrap();
+        *client.cursor.lock().unwrap_or_else(|e| e.into_inner()) = (dirt, 1, Vec::new());
+
+        drag_paint_click(&client, 9, 4); // right-drag start (slot not painted)
+        for wsl in [9i16, 10, 11, 12, 13, 14, 15, 10] {
+            drag_paint_click(&client, wsl, 5); // painted slots; 10 repeats
+        }
+        drag_paint_click(&client, 15, 6); // right-drag end
+
+        let inv = client.inv.lock().unwrap_or_else(|e| e.into_inner());
+        let mut painted: Vec<(i16, u8)> = inv
+            .iter()
+            .filter(|(_, st)| st.1 > 0)
+            .map(|(&k, st)| (k, st.1))
+            .collect();
+        painted.sort_unstable();
+        assert_eq!(
+            painted,
+            vec![(9, 1)],
+            "only the first painted slot receives the single item"
+        );
+        drop(inv);
+        let cur = client.cursor.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            *cur,
+            (0, 0, Vec::new()),
+            "cursor empties — no u8 wrap to 255, no phantom stack"
+        );
+        drop(cur);
+        assert_eq!(held_units(&client), 1, "total item count conserved");
+    }
+
+    /// Painted slots dedup: a slot the drag crosses twice counts once, so
+    /// right-drag's one-per-slot budget and left-drag's even split both divide
+    /// across UNIQUE slots only.
+    #[test]
+    fn drag_paint_dedups_repeated_window_slots() {
+        let (client, _peer) = client_pair();
+        let dirt = name_to_item("dirt").unwrap();
+
+        // Right-drag 3 items over [9, 10, 9]: unique slots 9 and 10 take one
+        // each; without dedup slot 9 would be painted twice and take two.
+        *client.cursor.lock().unwrap_or_else(|e| e.into_inner()) = (dirt, 3, Vec::new());
+        drag_paint_click(&client, 9, 4);
+        for wsl in [9i16, 10, 9] {
+            drag_paint_click(&client, wsl, 5);
+        }
+        drag_paint_click(&client, 9, 6);
+        {
+            let inv = client.inv.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(inv.get(&9).map(|st| st.1), Some(1), "slot 9 painted once");
+            assert_eq!(inv.get(&10).map(|st| st.1), Some(1), "slot 10 painted once");
+        }
+        assert_eq!(
+            client.cursor.lock().unwrap_or_else(|e| e.into_inner()).1,
+            1,
+            "the third item stays on the cursor"
+        );
+        assert_eq!(held_units(&client), 3, "right-drag conserves every unit");
+
+        // Left-drag 4 items over [20, 21, 20]: two unique slots -> 2 each.
+        let (client, _peer) = client_pair();
+        *client.cursor.lock().unwrap_or_else(|e| e.into_inner()) = (dirt, 4, Vec::new());
+        drag_paint_click(&client, 20, 0);
+        for wsl in [20i16, 21, 20] {
+            drag_paint_click(&client, wsl, 1);
+        }
+        drag_paint_click(&client, 20, 2);
+        {
+            let inv = client.inv.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(inv.get(&20).map(|st| st.1), Some(2), "slot 20 gets the even share");
+            assert_eq!(inv.get(&21).map(|st| st.1), Some(2), "slot 21 gets the even share");
+        }
+        assert_eq!(
+            client.cursor.lock().unwrap_or_else(|e| e.into_inner()).1,
+            0,
+            "left-drag empties the cursor exactly"
+        );
+        assert_eq!(held_units(&client), 4, "every painted unit accounted for");
     }
 }

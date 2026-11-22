@@ -9,6 +9,10 @@ use std::time::{Duration, Instant};
 use mc_spine_client::audio_qol::{ZoomState, DEFAULT_ZOOM_SMOOTHING_RATE};
 use mc_spine_client::render::{FrameBudgetGovernor, RenderConfig};
 use mc_spine_client_mesh::builtin_shadow_wgsl::{BuiltinShadowQuality, RenderScalePreset};
+use mc_spine_kernel::debug_chords::{
+    finish_gamemode_switcher, handle_f3_chord, DebugChordAction, DebugChordContext,
+    DebugChordState, DebugTarget, F3Chord, PlayerDebugInfo,
+};
 use mc_spine_ui::draw::rasterize_draw_list;
 use mc_spine_ui::magic_hud::build_magic_hud_draw_list;
 use mc_spine_ui::state::{
@@ -39,6 +43,166 @@ const OCCLUDED_TICK: Duration = Duration::from_millis(50);
 const THIRD_PERSON_DISTANCE: f32 = 4.0;
 const SPRINT_FOV_BOOST: f32 = 0.10;
 const SPRINT_FOV_SMOOTHING_RATE: f32 = 12.0;
+
+/// Display-independent output of the Minecraft keyboard bindings.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WindowInputEvent {
+    DebugChord(DebugChordAction),
+    SetDebugOverlayVisible(bool),
+    SelectHotbar(u8),
+    SwapOffhand,
+    DropItem { entire_stack: bool },
+    OpenInventory,
+    OpenChat { slash_prefill: bool },
+    SetTabListVisible(bool),
+    SortInventory,
+    OpenAdvancements,
+}
+
+/// Pure input router shared by the window loop and display-free tests.
+#[derive(Clone, Debug, Default)]
+pub struct WindowInputRouter {
+    pub debug_chords: DebugChordState,
+    pub f3_held: bool,
+    pub f3_chord_consumed: bool,
+    pub active_hotbar_slot: u8,
+    pub tab_list_held: bool,
+}
+
+impl WindowInputRouter {
+    /// Process a physical key transition. `ctrl` is the current modifier state.
+    pub fn route_key(
+        &mut self,
+        key: KeyCode,
+        state: ElementState,
+        ctrl: bool,
+    ) -> Vec<WindowInputEvent> {
+        self.route_key_with_context(key, state, ctrl, None, None, false)
+    }
+
+    /// Supply authoritative player/target data when available for F3+C/I/N/F4.
+    pub fn route_key_with_context(
+        &mut self,
+        key: KeyCode,
+        state: ElementState,
+        ctrl: bool,
+        player: Option<PlayerDebugInfo<'_>>,
+        target: Option<DebugTarget<'_>>,
+        has_permission_level_2: bool,
+    ) -> Vec<WindowInputEvent> {
+        let pressed = state == ElementState::Pressed;
+        if key == KeyCode::F3 {
+            if pressed {
+                if !self.f3_held {
+                    self.f3_chord_consumed = false;
+                }
+                self.f3_held = true;
+                return Vec::new();
+            }
+            if !self.f3_held {
+                return Vec::new();
+            }
+            self.f3_held = false;
+            let consumed = std::mem::take(&mut self.f3_chord_consumed);
+            let mut events = Vec::new();
+            if let Some(mode) = player.map(|info| info.gamemode) {
+                if let Some(action) = finish_gamemode_switcher(&mut self.debug_chords, mode) {
+                    events.push(WindowInputEvent::DebugChord(action));
+                }
+            } else {
+                self.debug_chords.gamemode_switcher = None;
+            }
+            if !consumed {
+                self.debug_chords.toggle_debug_overlay();
+                events.push(WindowInputEvent::SetDebugOverlayVisible(
+                    self.debug_chords.show_debug_overlay,
+                ));
+            }
+            return events;
+        }
+
+        if self.f3_held && pressed {
+            if let Some(chord) = f3_chord_for_key(key) {
+                self.f3_chord_consumed = true;
+                let mut context = DebugChordContext::new(&mut self.debug_chords);
+                context.player = player;
+                context.target = target;
+                context.has_permission_level_2 = has_permission_level_2;
+                let action = handle_f3_chord(chord, &mut context);
+                return vec![WindowInputEvent::DebugChord(action)];
+            }
+        }
+
+        if key == KeyCode::Tab {
+            if self.tab_list_held != pressed {
+                self.tab_list_held = pressed;
+                return vec![WindowInputEvent::SetTabListVisible(pressed)];
+            }
+            return Vec::new();
+        }
+        if !pressed {
+            return Vec::new();
+        }
+
+        let event = match key {
+            KeyCode::Digit1 => WindowInputEvent::SelectHotbar(0),
+            KeyCode::Digit2 => WindowInputEvent::SelectHotbar(1),
+            KeyCode::Digit3 => WindowInputEvent::SelectHotbar(2),
+            KeyCode::Digit4 => WindowInputEvent::SelectHotbar(3),
+            KeyCode::Digit5 => WindowInputEvent::SelectHotbar(4),
+            KeyCode::Digit6 => WindowInputEvent::SelectHotbar(5),
+            KeyCode::Digit7 => WindowInputEvent::SelectHotbar(6),
+            KeyCode::Digit8 => WindowInputEvent::SelectHotbar(7),
+            KeyCode::Digit9 => WindowInputEvent::SelectHotbar(8),
+            KeyCode::KeyF => WindowInputEvent::SwapOffhand,
+            KeyCode::KeyQ => WindowInputEvent::DropItem { entire_stack: ctrl },
+            KeyCode::KeyE => WindowInputEvent::OpenInventory,
+            KeyCode::KeyT => WindowInputEvent::OpenChat {
+                slash_prefill: false,
+            },
+            KeyCode::Slash => WindowInputEvent::OpenChat {
+                slash_prefill: true,
+            },
+            KeyCode::KeyR => WindowInputEvent::SortInventory,
+            KeyCode::KeyL => WindowInputEvent::OpenAdvancements,
+            _ => return Vec::new(),
+        };
+        if let WindowInputEvent::SelectHotbar(slot) = event {
+            self.active_hotbar_slot = slot;
+        }
+        vec![event]
+    }
+
+    /// A lost focus must not leave F3 or Tab logically held.
+    pub fn release_held_keys(&mut self) -> Option<WindowInputEvent> {
+        self.f3_held = false;
+        self.f3_chord_consumed = false;
+        self.debug_chords.gamemode_switcher = None;
+        let tab_was_held = std::mem::take(&mut self.tab_list_held);
+        tab_was_held.then_some(WindowInputEvent::SetTabListVisible(false))
+    }
+}
+
+fn f3_chord_for_key(key: KeyCode) -> Option<F3Chord> {
+    Some(match key {
+        KeyCode::KeyA => F3Chord::A,
+        KeyCode::KeyB => F3Chord::B,
+        KeyCode::KeyC => F3Chord::C,
+        KeyCode::KeyD => F3Chord::D,
+        KeyCode::F4 => F3Chord::F4,
+        KeyCode::KeyG => F3Chord::G,
+        KeyCode::KeyH => F3Chord::H,
+        KeyCode::KeyI => F3Chord::I,
+        KeyCode::KeyN => F3Chord::N,
+        KeyCode::KeyP => F3Chord::P,
+        KeyCode::KeyQ => F3Chord::Q,
+        KeyCode::KeyT => F3Chord::T,
+        KeyCode::Digit1 => F3Chord::Key1,
+        KeyCode::Digit2 => F3Chord::Key2,
+        KeyCode::Digit3 => F3Chord::Key3,
+        _ => return None,
+    })
+}
 
 /// The three Minecraft camera views in F5 cycling order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -271,6 +435,8 @@ pub struct GpuApp {
     camera: Camera,
     camera_controller: CameraController,
     keys: Keys,
+    input_router: WindowInputRouter,
+    debug_messages: Vec<String>,
     focused: bool,
     occluded: bool,
     scale_factor: f64,
@@ -331,6 +497,8 @@ impl GpuApp {
             camera,
             camera_controller: CameraController::new(render_config.fov_deg as f32, 1.0, 4.0),
             keys: Keys::default(),
+            input_router: WindowInputRouter::default(),
+            debug_messages: Vec::new(),
             focused: true,
             occluded: false,
             scale_factor: 1.0,
@@ -584,6 +752,10 @@ impl GpuApp {
             }
             self.ui.hud = live.hud.clone();
             live.record_frame_and_refresh_minihud(dt, &mut self.ui);
+            self.ui
+                .hud
+                .chat_lines
+                .extend(self.debug_messages.iter().cloned());
         }
 
         // HUD/diagnostics through the real client-ui state machine.
@@ -678,6 +850,23 @@ impl GpuApp {
 
     fn handle_key(&mut self, code: KeyCode, state: ElementState, event_loop: &ActiveEventLoop) {
         let pressed = state == ElementState::Pressed;
+        let f3_chord_pressed =
+            pressed && self.input_router.f3_held && f3_chord_for_key(code).is_some();
+        for event in self.input_router.route_key(code, state, self.keys.sprint) {
+            if !self.paused
+                || matches!(
+                    event,
+                    WindowInputEvent::DebugChord(_)
+                        | WindowInputEvent::SetDebugOverlayVisible(_)
+                        | WindowInputEvent::SetTabListVisible(false)
+                )
+            {
+                self.apply_window_input(event);
+            }
+        }
+        if code == KeyCode::F3 || f3_chord_pressed {
+            return;
+        }
         match code {
             KeyCode::KeyW => self.keys.forward = pressed,
             KeyCode::KeyS => self.keys.back = pressed,
@@ -690,11 +879,13 @@ impl GpuApp {
             KeyCode::F5 if pressed && !self.paused => {
                 self.camera_controller.cycle_mode();
             }
-            KeyCode::F3 if pressed => self.show_diagnostics = !self.show_diagnostics,
             KeyCode::Escape if pressed => {
                 self.paused = !self.paused;
                 if self.paused {
                     self.camera_controller.set_zoomed(false);
+                    if let Some(event) = self.input_router.release_held_keys() {
+                        self.apply_window_input(event);
+                    }
                 }
                 if self.paused {
                     self.ui.navigate(Screen::Pause);
@@ -718,6 +909,67 @@ impl GpuApp {
                     }
                 }
             }
+        }
+    }
+
+    fn apply_window_input(&mut self, event: WindowInputEvent) {
+        match event {
+            WindowInputEvent::SetDebugOverlayVisible(visible) => {
+                self.show_diagnostics = visible;
+            }
+            WindowInputEvent::DebugChord(action) => {
+                self.show_diagnostics = self.input_router.debug_chords.show_debug_overlay;
+                match action {
+                    DebugChordAction::ChatFeedback(message) => {
+                        if self.live.is_none() {
+                            self.ui.hud.chat_lines.push(message.clone());
+                        }
+                        self.debug_messages.push(message);
+                    }
+                    DebugChordAction::HelpLines(lines) => {
+                        if self.live.is_none() {
+                            self.ui.hud.chat_lines.extend(lines.iter().cloned());
+                        }
+                        self.debug_messages.extend(lines);
+                    }
+                    DebugChordAction::ClearChat => {
+                        self.debug_messages.clear();
+                        self.ui.hud.chat_lines.clear();
+                        if let Some(live) = &mut self.live {
+                            live.hud.chat_lines.clear();
+                        }
+                    }
+                    _ => {}
+                }
+                if self.debug_messages.len() > 100 {
+                    let excess = self.debug_messages.len() - 100;
+                    self.debug_messages.drain(..excess);
+                }
+                if self.live.is_none() && self.ui.hud.chat_lines.len() > 100 {
+                    let excess = self.ui.hud.chat_lines.len() - 100;
+                    self.ui.hud.chat_lines.drain(..excess);
+                }
+            }
+            WindowInputEvent::SelectHotbar(slot) => {
+                self.ui.hud.selected_slot = usize::from(slot);
+                if let Some(live) = &mut self.live {
+                    live.hud.selected_slot = usize::from(slot);
+                }
+            }
+            WindowInputEvent::SetTabListVisible(visible) => {
+                self.ui.hud.show_player_list = visible;
+                if let Some(live) = &mut self.live {
+                    live.hud.show_player_list = visible;
+                }
+            }
+            // These bindings are emitted by the router. Inventory/chat screens
+            // and server-side item operations require their own runtime APIs.
+            WindowInputEvent::SwapOffhand
+            | WindowInputEvent::DropItem { .. }
+            | WindowInputEvent::OpenInventory
+            | WindowInputEvent::OpenChat { .. }
+            | WindowInputEvent::SortInventory
+            | WindowInputEvent::OpenAdvancements => {}
         }
     }
 
@@ -848,6 +1100,9 @@ impl ApplicationHandler for GpuApp {
                 self.focused = focused;
                 if !focused {
                     self.keys = Keys::default();
+                    if let Some(event) = self.input_router.release_held_keys() {
+                        self.apply_window_input(event);
+                    }
                     self.camera_controller.set_zoomed(false);
                     self.set_cursor_grab(false);
                 } else if !self.paused {

@@ -4787,6 +4787,30 @@ fn name_to_item(n: &str) -> Option<i64> {
         _ => return None,
     })
 }
+
+/// Vanilla `DyeColor` name for a `*_dye` item id; `None` for non-dyes. Item
+/// ids mirror the `name_to_item` table above (white_dye=944 .. black_dye=959).
+fn dye_color_for_item(item: i64) -> Option<&'static str> {
+    Some(match item {
+        944 => "white",
+        945 => "orange",
+        946 => "magenta",
+        947 => "light_blue",
+        948 => "yellow",
+        949 => "lime",
+        950 => "pink",
+        951 => "gray",
+        952 => "light_gray",
+        953 => "cyan",
+        954 => "purple",
+        955 => "blue",
+        956 => "brown",
+        957 => "green",
+        958 => "red",
+        959 => "black",
+        _ => return None,
+    })
+}
 static ITEM_NAMES: [&str; 1333] = [
     "air", "stone", "granite", "polished_granite", "diorite", "polished_diorite",
     "andesite", "polished_andesite", "deepslate", "cobbled_deepslate", "polished_deepslate", "calcite",
@@ -8766,6 +8790,28 @@ fn slot_read_wire(b: &[u8]) -> Option<(i16, Stack)> {
     (position == b.len()).then_some((slot, stack))
 }
 
+/// Bound on the summed payload bytes of a stack's added components. Each
+/// component is structurally validated during `slot_read_wire`, but without a
+/// total cap a creative-slot packet could store (and re-broadcast through
+/// `0x15`, drops, and pickups) a multi-megabyte component blob per stack.
+const SLOT_COMPONENT_WIRE_LIMIT: usize = 8192;
+
+/// Total wire bytes of a stack's added-component payloads — the same bytes
+/// `slot_wire` would emit for `st.2` entries with nonnegative type ids.
+fn slot_component_wire_bytes(st: &Stack) -> usize {
+    st.2.iter()
+        .filter(|(ty, _)| *ty >= 0)
+        .map(|(_, data)| data.len())
+        .sum()
+}
+
+/// `0x32` admission check: a parsed stack is stored, echoed, and later
+/// re-broadcast through drops/pickups only while its component payloads fit
+/// the bound — anything larger is dropped fail-closed before mutation.
+fn creative_slot_acceptable(st: &Stack) -> bool {
+    slot_component_wire_bytes(st) <= SLOT_COMPONENT_WIRE_LIMIT
+}
+
 fn creative_inventory_slot(slot: i16) -> bool {
     (0..=45).contains(&slot)
 }
@@ -9289,6 +9335,11 @@ fn quick_move_chest(
 // drag-paint one slot: place `per` items of the cursor stack into the
 // resolved window slot (merging if compatible), then resync
 fn paint_slot(me: &Client, wsl: i16, per: u8, cur: &mut Stack) {
+    // Never paint more than the cursor holds: every arm below mutates the
+    // destination and then does `cur.1 -= per`, which must not underflow.
+    if per == 0 || cur.1 < per {
+        return;
+    }
     let chest_pos = *me.open_chest.lock().unwrap_or_else(|e| e.into_inner());
     let furnace_pos = *me.open_furnace.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((cp, cp2)) = chest_pos {

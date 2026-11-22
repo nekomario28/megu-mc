@@ -5,7 +5,11 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use mc_spine_kernel::{collide, fluid_impulse, Aabb, FluidKind, FluidQuery};
+use mc_spine_kernel::player_physics::{
+    step_player_physics, PlayerInputState, PlayerPhysicsState, SurfaceKind,
+};
+use mc_spine_kernel::raycast::{raycast_blocks, RayBlockShapes};
+use mc_spine_kernel::{Aabb, FluidClipMode, RayHit};
 
 use crate::cli::{CliConfig, ScriptMode};
 use crate::lod::LodManager;
@@ -28,6 +32,8 @@ pub struct TickInput {
     pub jump: bool,
     pub yaw_delta: f32,
     pub pitch_delta: f32,
+    pub sneak: bool,
+    pub sprint: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -50,6 +56,46 @@ pub struct PlayerPhysics {
     pub on_ground: bool,
     pub in_water: bool,
     pub in_lava: bool,
+    kernel_state: PlayerPhysicsState,
+}
+
+fn surface_kind(world: &WorldState, pos: [i32; 3]) -> SurfaceKind {
+    let Some(state_id) = world.get_block_state(pos[0], pos[1], pos[2]) else {
+        return SurfaceKind::Normal;
+    };
+    let name = world
+        .registry
+        .as_ref()
+        .and_then(|registry| registry.state_name(state_id).ok());
+    match name {
+        Some("minecraft:ice") => SurfaceKind::Ice,
+        Some("minecraft:packed_ice") => SurfaceKind::PackedIce,
+        Some("minecraft:blue_ice") => SurfaceKind::BlueIce,
+        Some("minecraft:slime_block") => SurfaceKind::Slime,
+        Some("minecraft:honey_block") => SurfaceKind::Honey,
+        Some("minecraft:soul_sand") => SurfaceKind::SoulSand,
+        Some("minecraft:cobweb") => SurfaceKind::Cobweb,
+        Some("minecraft:ladder") => SurfaceKind::Ladder,
+        Some("minecraft:vine") => SurfaceKind::Vine,
+        Some("minecraft:scaffolding") => SurfaceKind::Scaffolding,
+        Some("minecraft:powder_snow") => SurfaceKind::PowderSnow,
+        _ => match state_id {
+            // Vanilla 1.21.1 state ids used by BlockTable::builtin() when the
+            // version-pack registry is unavailable.
+            5780 => SurfaceKind::Ice,
+            10746 => SurfaceKind::PackedIce,
+            12941 => SurfaceKind::BlueIce,
+            10364 => SurfaceKind::Slime,
+            19445 => SurfaceKind::Honey,
+            5850 => SurfaceKind::SoulSand,
+            2004 => SurfaceKind::Cobweb,
+            4654..=4661 => SurfaceKind::Ladder,
+            6837..=6868 => SurfaceKind::Vine,
+            18372..=18403 => SurfaceKind::Scaffolding,
+            22318 => SurfaceKind::PowderSnow,
+            _ => SurfaceKind::Normal,
+        },
+    }
 }
 
 impl PlayerPhysics {
@@ -62,6 +108,10 @@ impl PlayerPhysics {
             on_ground: false,
             in_water: false,
             in_lava: false,
+            kernel_state: PlayerPhysicsState {
+                pos,
+                ..PlayerPhysicsState::default()
+            },
         }
     }
 
@@ -116,6 +166,13 @@ impl PlayerPhysics {
             self.pitch = tp.pitch;
         }
         self.vel = [0.0; 3];
+        self.in_water = false;
+        self.in_lava = false;
+        self.kernel_state = PlayerPhysicsState {
+            pos: self.pos,
+            on_ground: self.on_ground,
+            ..PlayerPhysicsState::default()
+        };
         let dx = self.pos[0] - prev[0];
         let dy = self.pos[1] - prev[1];
         let dz = self.pos[2] - prev[2];
@@ -143,112 +200,113 @@ impl PlayerPhysics {
             });
         }
 
-        let box_now = self.aabb();
-        let water_imp = fluid_impulse(
-            box_now,
-            FluidQuery {
-                kind: FluidKind::Water,
-                ultra_warm: false,
-                pushed_by_fluid: true,
-                is_player: true,
-                velocity: self.vel,
-            },
-            |x, y, z| Ok(world.fluid_cell_at(x, y, z)),
-        )
-        .map_err(|e| format!("fluid_impulse(water) failed: {e:?}"))?;
-
-        let lava_imp = fluid_impulse(
-            box_now,
-            FluidQuery {
-                kind: FluidKind::Lava,
-                ultra_warm: world.dimension.name == "minecraft:the_nether",
-                pushed_by_fluid: true,
-                is_player: true,
-                velocity: self.vel,
-            },
-            |x, y, z| Ok(world.fluid_cell_at(x, y, z)),
-        )
-        .map_err(|e| format!("fluid_impulse(lava) failed: {e:?}"))?;
-
-        self.in_water = water_imp.in_fluid;
-        self.in_lava = lava_imp.in_fluid;
-        for axis in 0..3 {
-            self.vel[axis] += water_imp.push[axis] + lava_imp.push[axis];
-        }
-
-        let yaw_rad = f64::from(self.yaw).to_radians();
-        let forward_x = -yaw_rad.sin();
-        let forward_z = yaw_rad.cos();
-        let right_x = -forward_z;
-        let right_z = forward_x;
-
-        let in_fluid = self.in_water || self.in_lava;
-        let horiz_scale = if in_fluid { 0.45 } else { 1.0 };
-        let dx = (forward_x * input.forward + right_x * input.strafe) * horiz_scale;
-        let dz = (forward_z * input.forward + right_z * input.strafe) * horiz_scale;
-
-        let vy = if in_fluid {
-            if input.jump {
-                self.vel[1] + 0.04
-            } else {
-                self.vel[1]
-            }
-        } else if self.on_ground && input.jump {
-            JUMP_VELOCITY
-        } else {
-            (self.vel[1] - GRAVITY) * AIR_DRAG_Y
-        };
-
-        let delta = [dx, vy, dz];
+        // Include the entire velocity sweep, jump impulse, step-up clearance,
+        // and the support probes used by the kernel's sneak edge protection.
+        let bounds = self.aabb();
+        let margin = self.vel.map(|velocity| velocity.abs() + 1.0);
         let sweep = Aabb {
-            min: [
-                box_now.min[0] + delta[0].min(0.0),
-                box_now.min[1] + delta[1].min(0.0),
-                box_now.min[2] + delta[2].min(0.0),
-            ],
-            max: [
-                box_now.max[0] + delta[0].max(0.0),
-                box_now.max[1] + delta[1].max(0.0) + f64::from(PLAYER_MAX_UP_STEP),
-                box_now.max[2] + delta[2].max(0.0),
-            ],
+            min: std::array::from_fn(|axis| bounds.min[axis] - margin[axis]),
+            max: std::array::from_fn(|axis| bounds.max[axis] + margin[axis]),
         };
         let shapes = world.collect_collision_aabbs(sweep);
-        let col = collide(box_now, delta, self.on_ground, PLAYER_MAX_UP_STEP, &shapes)
-            .map_err(|e| format!("collide failed: {e:?}"))?;
 
-        self.pos[0] += col.delta[0];
-        self.pos[1] += col.delta[1];
-        self.pos[2] += col.delta[2];
-        self.on_ground = col.vertical_collision_below;
+        let feet = self.pos.map(|v| v.floor() as i32);
+        let inside = surface_kind(world, feet);
+        let surface = if matches!(
+            inside,
+            SurfaceKind::Ladder
+                | SurfaceKind::Vine
+                | SurfaceKind::Scaffolding
+                | SurfaceKind::Cobweb
+                | SurfaceKind::PowderSnow
+        ) {
+            inside
+        } else {
+            surface_kind(
+                world,
+                [feet[0], (self.pos[1] - 0.500_000_1).floor() as i32, feet[2]],
+            )
+        };
 
-        self.vel[0] = if col.horizontal_collision {
-            0.0
-        } else {
-            col.delta[0] * 0.546
+        let state = PlayerPhysicsState {
+            pos: self.pos,
+            vel: self.vel,
+            on_ground: self.on_ground,
+            ultra_warm: world.dimension.name == "minecraft:the_nether",
+            ..self.kernel_state
         };
-        self.vel[2] = if col.horizontal_collision {
-            0.0
-        } else {
-            col.delta[2] * 0.546
-        };
-        self.vel[1] = if col.vertical_collision {
-            0.0
-        } else if self.in_water {
-            col.delta[1] * WATER_VERTICAL_DRAG - GRAVITY / 16.0
-        } else if self.in_lava {
-            col.delta[1] * 0.5 - GRAVITY / 4.0
-        } else {
-            vy
-        };
+        let result = step_player_physics(
+            state,
+            PlayerInputState {
+                // TickInput historically expressed movement in blocks/tick.
+                // Convert that scale to the kernel's normalized controls.
+                forward: (input.forward * 5.0) as f32,
+                strafe: (input.strafe * 5.0) as f32,
+                jump: input.jump,
+                sneak: input.sneak,
+                sprint: input.sprint,
+                yaw_deg: self.yaw,
+                pitch_deg: self.pitch,
+                ..PlayerInputState::default()
+            },
+            surface,
+            &shapes,
+            |x, y, z| Ok(world.fluid_cell_at(x, y, z)),
+        )
+        .map_err(|e| format!("step_player_physics failed: {e:?}"))?;
+
+        self.kernel_state = result.state;
+        self.pos = result.state.pos;
+        self.vel = result.state.vel;
+        self.on_ground = result.state.on_ground;
+        self.in_water = result.state.in_water;
+        self.in_lava = result.state.in_lava;
 
         Ok(StepOutcome {
             pos: self.pos,
             yaw: self.yaw,
             pitch: self.pitch,
             on_ground: self.on_ground,
-            in_fluid,
-            horizontal_collision: col.horizontal_collision,
-            stepped_up: col.stepped_up,
+            in_fluid: self.in_water || self.in_lava,
+            horizontal_collision: result.collided_horizontal,
+            stepped_up: result.stepped_up,
+        })
+    }
+
+    pub fn pick_target_block(
+        &self,
+        world: &WorldState,
+        max_distance: f64,
+        fluid_mode: FluidClipMode,
+    ) -> Option<RayHit> {
+        let origin = [self.pos[0], self.pos[1] + PLAYER_EYE_HEIGHT, self.pos[2]];
+        let yaw = f64::from(self.yaw).to_radians();
+        let pitch = f64::from(self.pitch).to_radians();
+        let direction = [
+            -yaw.sin() * pitch.cos(),
+            -pitch.sin(),
+            yaw.cos() * pitch.cos(),
+        ];
+
+        raycast_blocks(origin, direction, max_distance, fluid_mode, |x, y, z| {
+            let Some(state) = world.get_block_state(x, y, z) else {
+                return RayBlockShapes::default();
+            };
+            let mut boxes = Vec::new();
+            world.blocks.push_collision_aabbs(state, x, y, z, &mut boxes);
+            for shape in &mut boxes {
+                for axis in 0..3 {
+                    let offset = f64::from([x, y, z][axis]);
+                    shape.min[axis] -= offset;
+                    shape.max[axis] -= offset;
+                }
+            }
+            let fluid = world.fluid_cell_at(x, y, z);
+            RayBlockShapes {
+                boxes,
+                is_fluid: fluid.kind.is_some(),
+                is_fluid_source: fluid.kind.is_some() && fluid.amount == 8 && !fluid.falling,
+            }
         })
     }
 }
@@ -262,6 +320,7 @@ pub fn script_input(mode: ScriptMode, tick: u32, on_ground: bool) -> TickInput {
         },
         ScriptMode::Sprint => TickInput {
             forward: 0.25,
+            sprint: true,
             ..TickInput::default()
         },
         ScriptMode::Jump => TickInput {

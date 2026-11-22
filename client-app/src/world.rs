@@ -2,7 +2,7 @@
 //! Live Protocol 767 world cache, block-state classification, `client-port`
 //! greedy meshing + vertex packing + translucent sorting, and collision lookup.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -24,7 +24,9 @@ use mc_spine_kernel::{
     PalettedSection, Registry, STATE_COUNT,
 };
 
-use crate::protocol::{bitset_get, DecodedChunk, DecodedLightData, DimensionMeta};
+use crate::protocol::{
+    bitset_get, DecodedBlockEntity, DecodedChunk, DecodedLightData, DimensionMeta, PlayEvent,
+};
 
 // ---------------------------------------------------------------------------
 // Safe Rust wrappers over client-port vertex packing and translucent sorting
@@ -1229,6 +1231,126 @@ impl WorldAnimationHost {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Live entity / block-entity / sky / block-break tracking (Protocol 767 S2C)
+// ---------------------------------------------------------------------------
+
+/// Upper bound on simultaneously tracked live entities. Spawn packets past
+/// the cap are ignored so a hostile server cannot grow the map unboundedly.
+pub const MAX_TRACKED_ENTITIES: usize = 4096;
+/// Upper bound on tracked block entities across every loaded column.
+pub const MAX_TRACKED_BLOCK_ENTITIES: usize = 8192;
+/// Upper bound on concurrent block-break crack overlays (one per breaker).
+pub const MAX_BLOCK_DESTRUCTIONS: usize = 256;
+/// Vanilla hurt-flash duration in ticks (`Entity#animateHurt` /
+/// `hurt_animation`); `entity_event` status 2 sets the same timer.
+const HURT_FLASH_TICKS: u8 = 10;
+/// `VecDeltaCodec` scale: positions quantize to 1/4096 block on the wire.
+const POS_Q_PER_BLOCK: f64 = 4096.0;
+/// `game_event` ids for the weather family (vanilla `GameEvent` ordinals).
+const GAME_EVENT_START_RAINING: u8 = 1;
+const GAME_EVENT_STOP_RAINING: u8 = 2;
+const GAME_EVENT_RAIN_LEVEL_CHANGE: u8 = 7;
+const GAME_EVENT_THUNDER_LEVEL_CHANGE: u8 = 8;
+
+/// Non-finite wire floats read as `0.0` — the same sanitize convention the
+/// kernel's sky/fog evaluator uses — so NaN/inf can never poison tracked
+/// entity or weather state.
+fn clean_f64(v: f64) -> f64 {
+    if v.is_finite() {
+        v
+    } else {
+        0.0
+    }
+}
+
+fn clean_f32(v: f32) -> f32 {
+    if v.is_finite() {
+        v
+    } else {
+        0.0
+    }
+}
+
+/// Weather levels clamp to `0.0..=1.0`; non-finite input reads as `0.0`.
+fn clean_weather_level(v: f32) -> f32 {
+    clean_f32(v).clamp(0.0, 1.0)
+}
+
+/// Round a block-space value (coordinate or delta) to 1/4096-block units —
+/// the same round-half-up the server's `VecDeltaCodec` move encoder uses
+/// (`floor(s) + (frac >= 0.5)`), so `pos_q` mirrors the wire quantization.
+/// Wire move deltas arrive as `raw / 4096.0`, so `quantize_pos_4096(delta)`
+/// recovers the exact i16; absolute sets quantize the coordinate itself.
+fn quantize_pos_4096(v: f64) -> i64 {
+    let scaled = v * POS_Q_PER_BLOCK;
+    if !scaled.is_finite() {
+        return 0;
+    }
+    let floor = scaled.floor();
+    (floor + f64::from(scaled - floor >= 0.5)) as i64
+}
+
+/// One live entity tracked from the Protocol 767 S2C entity packets
+/// (`add_entity`, the `move_entity_*` family, `teleport_entity`,
+/// `rotate_head`, `set_entity_motion`, `hurt_animation`, `entity_event`,
+/// `set_equipment`, `remove_entities`). Only `add_entity` creates rows;
+/// every other packet updates an already-tracked id or is ignored.
+#[derive(Clone, Debug)]
+pub struct TrackedEntity {
+    /// Server entity id.
+    pub eid: i32,
+    /// Spawn UUID exactly as received on `add_entity`.
+    pub uuid: [u8; 16],
+    /// Entity-type registry id from `add_entity`.
+    pub entity_type: i32,
+    /// Position in 1/4096-block fixed point — the client-side `VecDeltaCodec`
+    /// accumulator. Absolute sets quantize the coordinate; relative moves add
+    /// the decoded delta, so accumulation is exact integer arithmetic.
+    pub pos_q: [i64; 3],
+    /// Position in blocks — vanilla keeps full f64 precision here.
+    pub pos: [f64; 3],
+    /// Velocity in blocks/tick (`set_entity_motion`, wire i16 / 8000).
+    pub vel: [f64; 3],
+    /// Body yaw in degrees (`byte * 360 / 256` on the wire).
+    pub yaw_deg: f32,
+    /// Pitch in degrees.
+    pub pitch_deg: f32,
+    /// Head yaw in degrees (`rotate_head`, spawn, `*_pos_rot`, teleport).
+    pub head_yaw_deg: f32,
+    pub on_ground: bool,
+    /// Remaining hurt-flash ticks; set to [`HURT_FLASH_TICKS`] by
+    /// `hurt_animation`/`entity_event` status 2 and counted down by
+    /// [`WorldState::tick_entities`].
+    pub hurt_ticks: u8,
+    /// Bitmask of equipment slot ids seen in `set_equipment` (bits 0..=7;
+    /// vanilla equipment slots are a small fixed enum, higher wire ids are
+    /// not representable and ignored).
+    pub equipment_slots: u8,
+}
+
+/// One block entity tracked from chunk payloads and `block_entity_data`
+/// updates, keyed by world `[x, y, z]` in [`WorldState::block_entities`].
+#[derive(Clone, Debug)]
+pub struct TrackedBlockEntity {
+    /// Wire block-entity type id.
+    pub kind: i32,
+    /// Raw anonymous-NBT payload exactly as received on the wire (empty when
+    /// the packet carried the absent-NBT marker).
+    pub nbt_bytes: Vec<u8>,
+}
+
+/// Crack-overlay state for one block being mined, keyed by breaker entity id
+/// in [`WorldState::block_destructions`].
+#[derive(Clone, Copy, Debug)]
+pub struct BlockBreakProgress {
+    /// Block position being mined.
+    pub pos: [i32; 3],
+    /// Break stage `0..=9` — higher is more cracked. The overlay clears at
+    /// stage `>= 10` or the wire `-1` sentinel (255 as `u8`).
+    pub stage: u8,
+}
+
 pub struct WorldState {
     pub dimension: DimensionMeta,
     pub blocks: BlockTable,
@@ -1265,6 +1387,24 @@ pub struct WorldState {
     pub metrics: MeshMetrics,
     /// Skeletal animation models and live entity controllers.
     pub animations: WorldAnimationHost,
+    /// Live entities tracked from S2C entity packets, bounded by
+    /// [`MAX_TRACKED_ENTITIES`].
+    pub entities: BTreeMap<i32, TrackedEntity>,
+    /// Block entities retained from chunk payloads and `block_entity_data`
+    /// updates, keyed by world `[x, y, z]`, bounded by
+    /// [`MAX_TRACKED_BLOCK_ENTITIES`].
+    pub block_entities: BTreeMap<[i32; 3], TrackedBlockEntity>,
+    /// World age in game ticks (`set_time`).
+    pub world_age: i64,
+    /// Time of day in game ticks (`set_time`); consumers reduce mod 24000.
+    pub time_of_day: i64,
+    /// Rain level `0.0..=1.0` driven by weather `game_event`s.
+    pub rain_level: f32,
+    /// Thunder level `0.0..=1.0` driven by weather `game_event`s.
+    pub thunder_level: f32,
+    /// Block-break crack overlays keyed by breaker entity id, bounded by
+    /// [`MAX_BLOCK_DESTRUCTIONS`].
+    pub block_destructions: BTreeMap<i32, BlockBreakProgress>,
 }
 
 /// Candidate directories holding the pinned `assets/` pair, mirroring
@@ -1373,12 +1513,25 @@ impl WorldState {
             local_light_edits: 0,
             metrics: MeshMetrics::default(),
             animations: WorldAnimationHost::new(),
+            entities: BTreeMap::new(),
+            block_entities: BTreeMap::new(),
+            world_age: 0,
+            time_of_day: 0,
+            rain_level: 0.0,
+            thunder_level: 0.0,
+            block_destructions: BTreeMap::new(),
         }
     }
 
     pub fn reset_dimension(&mut self, dimension: DimensionMeta) {
         self.dimension = dimension;
         self.animations.clear_entities();
+        // Dimension changes invalidate live entity, block-entity and
+        // block-break state; the world clock (age/time/weather) persists
+        // across respawns exactly like vanilla's shared `ClientLevel` data.
+        self.entities.clear();
+        self.block_entities.clear();
+        self.block_destructions.clear();
         self.light_engine = light_engine_for(&self.dimension, self.registry.is_some());
         self.columns.clear();
         self.mesh_cache = MeshCache::new(MissingNeighbor::Air);
@@ -1441,6 +1594,13 @@ impl WorldState {
     }
 
     pub fn apply_chunk(&mut self, decoded: DecodedChunk) -> Result<(), String> {
+        self.apply_chunk_borrowed(&decoded)
+    }
+
+    /// Shared chunk-ingest path behind [`Self::apply_chunk`] and the
+    /// `ChunkData` arm of [`Self::apply_play_event`]; borrows the decoded
+    /// column so event routing does not clone section payloads.
+    fn apply_chunk_borrowed(&mut self, decoded: &DecodedChunk) -> Result<(), String> {
         let section_count = decoded.sections.len();
         let default_sky = if self.dimension.has_skylight {
             [0xffu8; LIGHT_BYTES]
@@ -1478,6 +1638,7 @@ impl WorldState {
                 sections: stored_sections,
             },
         );
+        self.refresh_chunk_block_entities(decoded.cx, decoded.cz, &decoded.block_entities);
         self.chunks_decoded += 1;
         self.load_light_chunk(decoded.cx, decoded.cz);
         Ok(())
@@ -1727,9 +1888,16 @@ impl WorldState {
         let cell_idx = section_index(lx, ly, lz);
         let clamped = state_id
             .min(u32::try_from(self.state_count.saturating_sub(1)).unwrap_or(u32::MAX));
+        let previous = sec.palette.get(cell_idx).ok();
         sec.palette
             .set(cell_idx, clamped)
             .map_err(|e| format!("PalettedSection::set failed: {e:?}"))?;
+        if previous != Some(clamped) {
+            // A real block-state change retires any block entity anchored at
+            // the cell (chest broken, sign replaced); `block_entity_data`
+            // re-adds it when the server still considers one present.
+            self.block_entities.remove(&pos);
+        }
 
         let coord = SectionCoord(cx, self.dimension.min_section_y() + sec_idx as i32, cz);
         let mesh_block = self.blocks.mesh_block(clamped);
@@ -1771,6 +1939,51 @@ impl WorldState {
             }
             self.chunks_unloaded += 1;
             self.recompute_live_totals();
+        }
+        self.forget_chunk(cx, cz);
+    }
+
+    /// Drop every tracked block entity inside chunk column `(cx, cz)`. Runs on
+    /// every chunk unload — even when the column itself was absent, since
+    /// `block_entity_data` can anchor records to not-yet-loaded chunks — and
+    /// internally before a chunk payload replaces its block-entity set, so
+    /// block entities never outlive their column.
+    pub fn forget_chunk(&mut self, cx: i32, cz: i32) {
+        self.block_entities
+            .retain(|pos, _| pos[0].div_euclid(16) != cx || pos[2].div_euclid(16) != cz);
+    }
+
+    /// Replace the tracked block-entity set of column `(cx, cz)` with the
+    /// records carried by a freshly applied chunk payload. The wire format
+    /// packs chunk-local X/Z into one byte (`x = packed >> 4`,
+    /// `z = packed & 0x0f`) and carries absolute world Y as `i16`.
+    fn refresh_chunk_block_entities(
+        &mut self,
+        cx: i32,
+        cz: i32,
+        entities: &[DecodedBlockEntity],
+    ) {
+        self.forget_chunk(cx, cz);
+        for be in entities {
+            if self.block_entities.len() >= MAX_TRACKED_BLOCK_ENTITIES {
+                break;
+            }
+            // Saturating: `cx`/`cz` are server-controlled i32s, so `cx * 16`
+            // can overflow for absurd coordinates; saturation keeps the
+            // position deterministic instead of panicking in debug builds.
+            let x = cx
+                .saturating_mul(16)
+                .saturating_add(i32::from(be.packed_xz >> 4));
+            let z = cz
+                .saturating_mul(16)
+                .saturating_add(i32::from(be.packed_xz & 0x0f));
+            self.block_entities.insert(
+                [x, i32::from(be.y), z],
+                TrackedBlockEntity {
+                    kind: be.kind,
+                    nbt_bytes: be.nbt_bytes.clone(),
+                },
+            );
         }
     }
 
@@ -1989,6 +2202,291 @@ impl WorldState {
         self.get_block_state(x, y, z)
             .map(|s| self.blocks.fluid_cell(s))
             .unwrap_or_default()
+    }
+
+    /// Unified ingestion for decoded Protocol 767 play events: routes every
+    /// world-relevant family — chunks, block/light updates, entities, block
+    /// entities, world time/weather, and block-break overlays — into the live
+    /// [`WorldState`] deterministically. Player/session concerns (teleport,
+    /// health, chat, containers, HUD, particles) and unrecognized payloads
+    /// are acknowledged and ignored; the caller keeps owning those.
+    pub fn apply_play_event(&mut self, event: &PlayEvent) -> Result<(), String> {
+        match event {
+            PlayEvent::JoinGame { dimension, .. } | PlayEvent::Respawn { dimension } => {
+                self.reset_dimension(dimension.clone());
+            }
+            PlayEvent::ChunkData(chunk) => self.apply_chunk_borrowed(chunk)?,
+            PlayEvent::UpdateLight { cx, cz, light } => {
+                self.apply_light_update(*cx, *cz, light)?;
+            }
+            PlayEvent::BlockUpdate { pos, state_id } => {
+                self.apply_block_update(*pos, *state_id)?;
+            }
+            PlayEvent::SectionBlocksUpdate(updates) => {
+                for (pos, state_id) in updates {
+                    self.apply_block_update(*pos, *state_id)?;
+                }
+            }
+            PlayEvent::UnloadChunk { cx, cz } => self.unload_chunk(*cx, *cz),
+            PlayEvent::AddEntity {
+                eid,
+                uuid,
+                entity_type,
+                x,
+                y,
+                z,
+                pitch,
+                yaw,
+                head_yaw,
+                vx,
+                vy,
+                vz,
+                ..
+            } => {
+                // Bounded: a full table ignores excess spawns; re-spawning a
+                // tracked id replaces its row without growing the map.
+                if self.entities.contains_key(eid)
+                    || self.entities.len() < MAX_TRACKED_ENTITIES
+                {
+                    let pos = [clean_f64(*x), clean_f64(*y), clean_f64(*z)];
+                    self.entities.insert(
+                        *eid,
+                        TrackedEntity {
+                            eid: *eid,
+                            uuid: *uuid,
+                            entity_type: *entity_type,
+                            pos_q: pos.map(quantize_pos_4096),
+                            pos,
+                            vel: [clean_f64(*vx), clean_f64(*vy), clean_f64(*vz)],
+                            yaw_deg: clean_f32(*yaw),
+                            pitch_deg: clean_f32(*pitch),
+                            head_yaw_deg: clean_f32(*head_yaw),
+                            on_ground: false,
+                            hurt_ticks: 0,
+                            equipment_slots: 0,
+                        },
+                    );
+                }
+            }
+            PlayEvent::RemoveEntities { eids } => {
+                for &eid in eids {
+                    self.entities.remove(&eid);
+                    // A removed breaker stops cracking blocks.
+                    self.block_destructions.remove(&eid);
+                }
+            }
+            PlayEvent::MoveEntityPos {
+                eid,
+                dx,
+                dy,
+                dz,
+                on_ground,
+            } => self.move_tracked_entity(*eid, [*dx, *dy, *dz], None, *on_ground),
+            PlayEvent::MoveEntityPosRot {
+                eid,
+                dx,
+                dy,
+                dz,
+                yaw,
+                pitch,
+                on_ground,
+            } => self.move_tracked_entity(
+                *eid,
+                [*dx, *dy, *dz],
+                Some((*yaw, *pitch)),
+                *on_ground,
+            ),
+            PlayEvent::MoveEntityRot {
+                eid,
+                yaw,
+                pitch,
+                on_ground,
+            } => self.move_tracked_entity(*eid, [0.0; 3], Some((*yaw, *pitch)), *on_ground),
+            PlayEvent::TeleportEntity {
+                eid,
+                x,
+                y,
+                z,
+                yaw,
+                pitch,
+                on_ground,
+            } => self.teleport_tracked_entity(*eid, [*x, *y, *z], *yaw, *pitch, *on_ground),
+            PlayEvent::RotateHead { eid, head_yaw } => {
+                if let Some(entity) = self.entities.get_mut(eid) {
+                    entity.head_yaw_deg = clean_f32(*head_yaw);
+                }
+            }
+            PlayEvent::SetEntityMotion { eid, vx, vy, vz } => {
+                if let Some(entity) = self.entities.get_mut(eid) {
+                    entity.vel = [clean_f64(*vx), clean_f64(*vy), clean_f64(*vz)];
+                }
+            }
+            // `entity_event` status 2 is the vanilla hurt flash.
+            PlayEvent::EntityEvent { eid, status } if *status == 2 => {
+                if let Some(entity) = self.entities.get_mut(eid) {
+                    entity.hurt_ticks = HURT_FLASH_TICKS;
+                }
+            }
+            PlayEvent::HurtAnimation { eid, .. } => {
+                if let Some(entity) = self.entities.get_mut(eid) {
+                    entity.hurt_ticks = HURT_FLASH_TICKS;
+                }
+            }
+            PlayEvent::SetEquipment { eid, entries } => {
+                if let Some(entity) = self.entities.get_mut(eid) {
+                    for entry in entries {
+                        if entry.slot < 8 {
+                            entity.equipment_slots |= 1u8 << entry.slot;
+                        }
+                    }
+                }
+            }
+            PlayEvent::SetTime {
+                world_age,
+                time_of_day,
+            } => {
+                self.world_age = *world_age;
+                self.time_of_day = *time_of_day;
+            }
+            PlayEvent::GameEvent { event, value } => {
+                self.apply_game_event(*event, *value);
+            }
+            PlayEvent::BlockDestruction {
+                breaker_eid,
+                pos,
+                stage,
+            } => self.apply_block_destruction(*breaker_eid, *pos, *stage),
+            PlayEvent::BlockEntityData {
+                pos,
+                kind,
+                nbt_bytes,
+            } => self.apply_block_entity_data(*pos, *kind, nbt_bytes),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Relative-move family (`move_entity_pos`, `move_entity_pos_rot`,
+    /// `move_entity_rot`): accumulate the decoded block delta onto the f64
+    /// position and the 1/4096 fixed-point `pos_q` mirror — the client side
+    /// of vanilla's `VecDeltaCodec`. Unknown ids are ignored; only
+    /// `add_entity` creates rows.
+    fn move_tracked_entity(
+        &mut self,
+        eid: i32,
+        delta: [f64; 3],
+        rot: Option<(f32, f32)>,
+        on_ground: bool,
+    ) {
+        let Some(entity) = self.entities.get_mut(&eid) else {
+            return;
+        };
+        for ((pos, pos_q), &d) in entity
+            .pos
+            .iter_mut()
+            .zip(entity.pos_q.iter_mut())
+            .zip(delta.iter())
+        {
+            let d = clean_f64(d);
+            *pos = clean_f64(*pos + d);
+            *pos_q = pos_q.saturating_add(quantize_pos_4096(d));
+        }
+        if let Some((yaw, pitch)) = rot {
+            entity.yaw_deg = clean_f32(yaw);
+            entity.pitch_deg = clean_f32(pitch);
+        }
+        entity.on_ground = on_ground;
+    }
+
+    /// `teleport_entity`: absolute overwrite of position (f64 + fixed-point
+    /// mirror), yaw/pitch, and on-ground. Unknown ids are ignored.
+    fn teleport_tracked_entity(
+        &mut self,
+        eid: i32,
+        pos_in: [f64; 3],
+        yaw: f32,
+        pitch: f32,
+        on_ground: bool,
+    ) {
+        let Some(entity) = self.entities.get_mut(&eid) else {
+            return;
+        };
+        let pos = [
+            clean_f64(pos_in[0]),
+            clean_f64(pos_in[1]),
+            clean_f64(pos_in[2]),
+        ];
+        entity.pos_q = pos.map(quantize_pos_4096);
+        entity.pos = pos;
+        entity.yaw_deg = clean_f32(yaw);
+        entity.pitch_deg = clean_f32(pitch);
+        entity.on_ground = on_ground;
+    }
+
+    /// Weather `game_event`s: start/stop rain set the level to 1.0/0.0;
+    /// rain/thunder level changes carry the level as a float clamped
+    /// NaN-safe to `0.0..=1.0`. All other game events are ignored.
+    fn apply_game_event(&mut self, event: u8, value: f32) {
+        match event {
+            GAME_EVENT_START_RAINING => self.rain_level = 1.0,
+            GAME_EVENT_STOP_RAINING => self.rain_level = 0.0,
+            GAME_EVENT_RAIN_LEVEL_CHANGE => self.rain_level = clean_weather_level(value),
+            GAME_EVENT_THUNDER_LEVEL_CHANGE => self.thunder_level = clean_weather_level(value),
+            _ => {}
+        }
+    }
+
+    /// `block_destruction`: stage `0..=9` records/updates the crack overlay;
+    /// `>= 10` or the wire `-1` sentinel (255 as `u8`) clears it. Bounded —
+    /// new breakers past [`MAX_BLOCK_DESTRUCTIONS`] are ignored while
+    /// updates to already-tracked breakers always land.
+    fn apply_block_destruction(&mut self, breaker_eid: i32, pos: [i32; 3], stage: i8) {
+        let stage = stage as u8;
+        if stage > 9 {
+            self.block_destructions.remove(&breaker_eid);
+            return;
+        }
+        if !self.block_destructions.contains_key(&breaker_eid)
+            && self.block_destructions.len() >= MAX_BLOCK_DESTRUCTIONS
+        {
+            return;
+        }
+        self.block_destructions
+            .insert(breaker_eid, BlockBreakProgress { pos, stage });
+    }
+
+    /// `block_entity_data`: upsert the block entity at `pos` — the live
+    /// update path for signs, chests, spawners, etc., complementing the
+    /// chunk-payload population in [`Self::refresh_chunk_block_entities`].
+    /// Bounded by [`MAX_TRACKED_BLOCK_ENTITIES`].
+    fn apply_block_entity_data(&mut self, pos: [i32; 3], kind: i32, nbt_bytes: &[u8]) {
+        match self.block_entities.get_mut(&pos) {
+            Some(entry) => {
+                entry.kind = kind;
+                entry.nbt_bytes.clear();
+                entry.nbt_bytes.extend_from_slice(nbt_bytes);
+            }
+            None => {
+                if self.block_entities.len() >= MAX_TRACKED_BLOCK_ENTITIES {
+                    return;
+                }
+                self.block_entities.insert(
+                    pos,
+                    TrackedBlockEntity {
+                        kind,
+                        nbt_bytes: nbt_bytes.to_vec(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Advance per-tick entity bookkeeping once per client tick: the
+    /// hurt-flash timer counts down on every tracked entity.
+    pub fn tick_entities(&mut self) {
+        for entity in self.entities.values_mut() {
+            entity.hurt_ticks = entity.hurt_ticks.saturating_sub(1);
+        }
     }
 }
 
