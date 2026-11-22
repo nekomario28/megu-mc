@@ -1002,3 +1002,25 @@ fn nibble_max_handles_edge_patterns() {
         }
     }
 }
+
+#[test]
+fn fx6_shadow_procedural3d_and_vfx_domains_route_through_unified_plan() {
+    let mut hybrid = synthetic_desktop();
+    hybrid.core_layout = CoreHeterogeneity::Hybrid {
+        p_cores: 8,
+        e_cores: 8,
+    };
+    let plan = build_unified_optimization_plan(&hybrid, None);
+    let shadow = plan.for_domain(DomainKind::ShadowRendering);
+    let p3d = plan.for_domain(DomainKind::Procedural3dAndBer);
+    let vfx = plan.for_domain(DomainKind::VfxAndAtmosphere);
+    let audio = plan.for_domain(DomainKind::SpatialAudio);
+
+    assert_eq!(shadow.core_affinity, CoreAffinityHint::Performance);
+    assert_eq!(p3d.core_affinity, CoreAffinityHint::Efficiency);
+    assert_eq!(vfx.core_affinity, CoreAffinityHint::Efficiency);
+    assert_eq!(audio.core_affinity, CoreAffinityHint::Efficiency);
+    assert!(shadow.worker_threads >= 1);
+    assert!(p3d.worker_threads >= 1);
+    assert!(vfx.worker_threads >= 1);
+}

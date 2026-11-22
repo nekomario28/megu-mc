@@ -1022,6 +1022,9 @@ pub enum DomainKind {
     PhysicsAndContraptions,
     NetworkBroadcast,
     SpatialAudio,
+    ShadowRendering,
+    Procedural3dAndBer,
+    VfxAndAtmosphere,
 }
 
 /// Scheduling preference; the engine's worker scheduler applies affinity.
@@ -1100,11 +1103,16 @@ impl UnifiedOptimizationPlan {
     pub fn for_domain(&self, domain: DomainKind) -> DomainSpecializationPlan {
         let critical = matches!(
             domain,
-            DomainKind::Lighting | DomainKind::PhysicsAndContraptions
+            DomainKind::Lighting | DomainKind::PhysicsAndContraptions | DomainKind::ShadowRendering
         );
         let background = matches!(
             domain,
-            DomainKind::Worldgen | DomainKind::Meshing | DomainKind::NetworkBroadcast
+            DomainKind::Worldgen
+                | DomainKind::Meshing
+                | DomainKind::NetworkBroadcast
+                | DomainKind::SpatialAudio
+                | DomainKind::Procedural3dAndBer
+                | DomainKind::VfxAndAtmosphere
         );
         let core_affinity = match self.profile.core_layout {
             CoreHeterogeneity::Hybrid { .. } if critical => CoreAffinityHint::Performance,
