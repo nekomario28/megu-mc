@@ -374,11 +374,6 @@ fn malicious_class_constants_are_quarantined_with_exact_member_and_kind() {
             SecurityThreatKind::JndiLookup,
         ),
         (
-            "java/lang/foreign/Linker",
-            "java/lang/foreign/Linker",
-            SecurityThreatKind::NativeLibraryLoad,
-        ),
-        (
             "sun/misc/Unsafe",
             "sun/misc/Unsafe",
             SecurityThreatKind::UnsafeMemoryAccess,
@@ -420,27 +415,34 @@ fn malicious_class_constants_are_quarantined_with_exact_member_and_kind() {
 
 #[test]
 fn direct_network_and_heap_memory_segment_do_not_falsely_quarantine_mods() {
-    let lucene_class = class_with_pool(|cp| {
+    let lucene_vec = class_with_pool(|cp| {
         cp.class("java/lang/foreign/MemorySegment");
+    });
+    let lucene_posix = class_with_pool(|cp| {
+        cp.class("java/lang/foreign/Linker");
     });
     let net_class = class_with_pool(|cp| {
         cp.class("java/net/URLConnection");
     });
     let bytes = jar(&[
-        ("org/apache/lucene/VectorScorer.class", &lucene_class),
+        ("org/apache/lucene/VectorScorer.class", &lucene_vec),
+        ("org/apache/lucene/store/PosixNativeAccess.class", &lucene_posix),
         ("example/Credits.class", &net_class),
     ]);
     let result = adapt(&bytes, "benign-top-mod.jar");
     assert!(
         !matches!(result.route, ModRouteDecision::SecurityQuarantine { .. }),
-        "MemorySegment and URLConnection must not hard-quarantine a mod: {:?}",
+        "MemorySegment, JDK-restricted Linker, and URLConnection must not hard-quarantine a mod: {:?}",
         result.route
     );
-    assert_eq!(result.security_threats.len(), 1);
-    assert_eq!(
-        result.security_threats[0].kind,
-        SecurityThreatKind::DirectNetworkAccess
-    );
+    assert!(result
+        .security_threats
+        .iter()
+        .any(|t| t.kind == SecurityThreatKind::DirectNetworkAccess));
+    assert!(result
+        .security_threats
+        .iter()
+        .any(|t| t.kind == SecurityThreatKind::ForeignLinkerAccess));
     assert!(result
         .audit_notes
         .iter()

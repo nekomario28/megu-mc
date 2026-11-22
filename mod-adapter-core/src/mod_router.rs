@@ -23,6 +23,7 @@ pub enum SecurityThreatKind {
     EmbeddedNativeOrExecutable,
     ProcessExecution,
     NativeLibraryLoad,
+    ForeignLinkerAccess,
     UnsafeMemoryAccess,
     DirectNetworkAccess,
     DynamicCodeLoading,
@@ -35,6 +36,7 @@ impl SecurityThreatKind {
             Self::EmbeddedNativeOrExecutable => "embedded_native_or_executable",
             Self::ProcessExecution => "process_execution",
             Self::NativeLibraryLoad => "native_library_load",
+            Self::ForeignLinkerAccess => "foreign_linker_access",
             Self::UnsafeMemoryAccess => "unsafe_memory_access",
             Self::DirectNetworkAccess => "direct_network_access",
             Self::DynamicCodeLoading => "dynamic_code_loading",
@@ -44,11 +46,13 @@ impl SecurityThreatKind {
 
     /// Returns `true` when this finding must hard-quarantine the entire JAR.
     /// `DirectNetworkAccess` (update checkers, patreon credits, shaded Lucene
-    /// sockets) is instead surfaced as a sandbox-enforced advisory so benign
-    /// mods (Supplementaries, Xaero's Minimap, Ars Nouveau, etc.) remain
-    /// adaptable while outbound networking stays disabled in the sandbox.
+    /// sockets) and `ForeignLinkerAccess` (`java.lang.foreign.Linker` /
+    /// `SymbolLookup`, which JDK 21+ blocks by default unless
+    /// `--enable-native-access` is granted — used by shaded Apache Lucene
+    /// `PosixNativeAccess` in JEI and Ars Nouveau) are surfaced as
+    /// sandbox-enforced advisories rather than hard-quarantining benign mods.
     pub fn is_hard_quarantine(self) -> bool {
-        !matches!(self, Self::DirectNetworkAccess)
+        !matches!(self, Self::DirectNetworkAccess | Self::ForeignLinkerAccess)
     }
 }
 
@@ -628,11 +632,11 @@ fn detect_security_threats(
         ("com/sun/jna/", SecurityThreatKind::NativeLibraryLoad),
         (
             "java/lang/foreign/Linker",
-            SecurityThreatKind::NativeLibraryLoad,
+            SecurityThreatKind::ForeignLinkerAccess,
         ),
         (
             "java/lang/foreign/SymbolLookup",
-            SecurityThreatKind::NativeLibraryLoad,
+            SecurityThreatKind::ForeignLinkerAccess,
         ),
         ("sun/misc/Unsafe", SecurityThreatKind::UnsafeMemoryAccess),
         (
