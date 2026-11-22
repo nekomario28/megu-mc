@@ -2,7 +2,7 @@
 //! Zero-dependency Minecraft 1.21.1 (Protocol 767) TCP wire codec, RFC 1950 zlib,
 //! and Handshake -> Login -> Configuration -> Play state machine.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, OnceLock};
@@ -10,10 +10,301 @@ use std::time::{Duration, Instant};
 
 use mc_spine_proto::{PacketDir, PacketPhase, ProtocolCodec, RecipeSyncMode};
 
+use crate::render::ClientVfxHost;
+use crate::world::WorldAnimationHost;
+use mc_spine_client_mesh::vfx_engine::Vfx1Packet;
+use mc_spine_kernel::skeletal_anim::decode_animation_trigger;
+
 /// Protocol 767 / Minecraft 1.21.1 — the single canonical version constant,
 /// sourced from `mc-spine-proto` rather than a local literal.
 pub const PROTOCOL_767: i32 = mc_spine_proto::ProtocolVersion::V1_21_1.number();
 pub const MAX_PACKET_SIZE: usize = 16 * 1024 * 1024;
+pub const CHANNEL_MAGIC_V1: &str = "mc-spine:magic_v1";
+pub const CHANNEL_VFX_V1: &str = "mc-spine:vfx_v1";
+pub const CHANNEL_ANIM_V1: &str = "mc-spine:anim_v1";
+pub const CHANNEL_MOTION_V1: &str = "mc-spine:motion_v1";
+
+const MAX_MAGIC_COOLDOWNS: usize = 512;
+const MAX_MAGIC_STATUSES: usize = 256;
+const MAX_MAGIC_ID_LEN: usize = 128;
+
+/// The two active MAG1 wire cast variants. An instant cast has no wire progress.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DecodedMagicCastState {
+    CastTime {
+        total_ticks: u32,
+        elapsed_ticks: u32,
+    },
+    Channeled {
+        interval_ticks: u32,
+        max_ticks: u32,
+        elapsed_ticks: u32,
+        mana_per_pulse: f32,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecodedMagicCast {
+    pub spell_id: String,
+    pub state: DecodedMagicCastState,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecodedMagicStatus {
+    pub id: String,
+    pub amplifier: u8,
+    pub remaining_ticks: u32,
+    pub absorption_remaining: f32,
+}
+
+/// Complete MAG1 state, matching the server's `MagicSyncState` wire fields.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecodedMagicSync {
+    pub mana: f32,
+    pub max_mana: f32,
+    pub cast: Option<DecodedMagicCast>,
+    pub cooldowns: BTreeMap<String, u32>,
+    pub statuses: Vec<DecodedMagicStatus>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodedMotionHand {
+    MainHand,
+    OffHand,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodedMotionPhase {
+    Idle,
+    Anticipation,
+    ActiveHitWindow,
+    Recovery,
+}
+
+/// MOT1 fixed-width combat trigger. Multi-byte integers use network byte order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DecodedMotionTrigger {
+    pub entity_id: u64,
+    pub action_id: u32,
+    pub combo_index: u16,
+    pub hand: DecodedMotionHand,
+    pub speed_multiplier: f32,
+    pub elapsed_ticks: u32,
+    pub phase: DecodedMotionPhase,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ClientCustomChannelEvent {
+    Vfx(Vec<u8>),
+    Anim(Vec<u8>),
+    Magic(DecodedMagicSync),
+    Motion(DecodedMotionTrigger),
+    Unknown { channel: String, payload: Vec<u8> },
+}
+
+fn magic_f32(reader: &mut WireReader<'_>) -> Result<f32, String> {
+    let value = f32::from_le_bytes(reader.take(4)?.try_into().unwrap());
+    if !value.is_finite() {
+        return Err("non-finite MAG1 float".to_string());
+    }
+    Ok(value)
+}
+
+fn magic_id(reader: &mut WireReader<'_>) -> Result<String, String> {
+    let id = reader.read_string(MAX_MAGIC_ID_LEN)?;
+    if id.is_empty() {
+        return Err("empty MAG1 identifier".to_string());
+    }
+    Ok(id)
+}
+
+// The upstream MAG1 codec writes unsigned u32 Minecraft VarInts.
+fn magic_varint(reader: &mut WireReader<'_>) -> Result<u32, String> {
+    Ok(reader.read_varint()? as u32)
+}
+
+pub fn decode_magic_sync_payload(payload: &[u8]) -> Result<DecodedMagicSync, String> {
+    let mut reader = WireReader::new(payload);
+    if reader.take(4)? != b"MAG1" {
+        return Err("invalid MAG1 magic".to_string());
+    }
+    let mana = magic_f32(&mut reader)?;
+    let max_mana = magic_f32(&mut reader)?;
+    let cast = match reader.read_u8()? {
+        0 => None,
+        tag @ (1 | 2) => {
+            let spell_id = magic_id(&mut reader)?;
+            let state = if tag == 1 {
+                let total_ticks = magic_varint(&mut reader)?;
+                let elapsed_ticks = magic_varint(&mut reader)?;
+                if total_ticks == 0 {
+                    return Err("zero MAG1 cast duration".to_string());
+                }
+                DecodedMagicCastState::CastTime {
+                    total_ticks,
+                    elapsed_ticks,
+                }
+            } else {
+                let interval_ticks = magic_varint(&mut reader)?;
+                let max_ticks = magic_varint(&mut reader)?;
+                let elapsed_ticks = magic_varint(&mut reader)?;
+                let mana_per_pulse = magic_f32(&mut reader)?;
+                if interval_ticks == 0 || max_ticks == 0 {
+                    return Err("zero MAG1 channel duration".to_string());
+                }
+                DecodedMagicCastState::Channeled {
+                    interval_ticks,
+                    max_ticks,
+                    elapsed_ticks,
+                    mana_per_pulse,
+                }
+            };
+            Some(DecodedMagicCast { spell_id, state })
+        }
+        _ => return Err("invalid MAG1 cast tag".to_string()),
+    };
+
+    let cooldown_count = magic_varint(&mut reader)? as usize;
+    if cooldown_count > MAX_MAGIC_COOLDOWNS {
+        return Err("MAG1 cooldown count exceeds limit".to_string());
+    }
+    let mut cooldowns = BTreeMap::new();
+    for _ in 0..cooldown_count {
+        let id = magic_id(&mut reader)?;
+        if cooldowns
+            .last_key_value()
+            .is_some_and(|(previous, _)| id <= *previous)
+        {
+            return Err("noncanonical MAG1 cooldown ids".to_string());
+        }
+        cooldowns.insert(id, magic_varint(&mut reader)?);
+    }
+
+    let status_count = magic_varint(&mut reader)? as usize;
+    if status_count > MAX_MAGIC_STATUSES {
+        return Err("MAG1 status count exceeds limit".to_string());
+    }
+    let mut statuses: Vec<DecodedMagicStatus> = Vec::with_capacity(status_count);
+    for _ in 0..status_count {
+        let id = magic_id(&mut reader)?;
+        if statuses.last().is_some_and(|previous| id <= previous.id) {
+            return Err("noncanonical MAG1 status ids".to_string());
+        }
+        let amplifier = reader.read_u8()?;
+        let remaining_ticks = magic_varint(&mut reader)?;
+        let absorption_remaining = magic_f32(&mut reader)?;
+        statuses.push(DecodedMagicStatus {
+            id,
+            amplifier,
+            remaining_ticks,
+            absorption_remaining,
+        });
+    }
+
+    if reader.remaining() != 0 {
+        return Err("trailing MAG1 bytes".to_string());
+    }
+    Ok(DecodedMagicSync {
+        mana,
+        max_mana,
+        cast,
+        cooldowns,
+        statuses,
+    })
+}
+
+pub fn decode_motion_trigger_payload(payload: &[u8]) -> Result<DecodedMotionTrigger, String> {
+    if payload.len() != 28 || &payload[..4] != b"MOT1" {
+        return Err("invalid MOT1 packet length or magic".to_string());
+    }
+    let mut reader = WireReader::new(&payload[4..]);
+    let entity_id = reader.read_u64()?;
+    let action_id = u32::from_be_bytes(reader.take(4)?.try_into().unwrap());
+    let combo_index = reader.read_u16()?;
+    let hand = match reader.read_u8()? {
+        0 => DecodedMotionHand::MainHand,
+        1 => DecodedMotionHand::OffHand,
+        _ => return Err("invalid MOT1 hand".to_string()),
+    };
+    let speed_multiplier = reader.read_f32()?;
+    if !speed_multiplier.is_finite() || !(0.25..=4.0).contains(&speed_multiplier) {
+        return Err("invalid MOT1 speed".to_string());
+    }
+    let elapsed_ticks = u32::from_be_bytes(reader.take(4)?.try_into().unwrap());
+    let phase = match reader.read_u8()? {
+        0 => DecodedMotionPhase::Idle,
+        1 => DecodedMotionPhase::Anticipation,
+        2 => DecodedMotionPhase::ActiveHitWindow,
+        3 => DecodedMotionPhase::Recovery,
+        _ => return Err("invalid MOT1 phase".to_string()),
+    };
+    Ok(DecodedMotionTrigger {
+        entity_id,
+        action_id,
+        combo_index,
+        hand,
+        speed_multiplier,
+        elapsed_ticks,
+        phase,
+    })
+}
+
+/// Validate recognized channels before a host is permitted to mutate state.
+pub fn decode_custom_channel_event(
+    channel: &str,
+    payload: &[u8],
+) -> Result<ClientCustomChannelEvent, String> {
+    match channel {
+        CHANNEL_VFX_V1 => {
+            Vfx1Packet::decode(payload).map_err(|err| format!("invalid VFX1: {err:?}"))?;
+            Ok(ClientCustomChannelEvent::Vfx(payload.to_vec()))
+        }
+        CHANNEL_ANIM_V1 => {
+            decode_animation_trigger(payload).map_err(|err| format!("invalid ANM1: {err:?}"))?;
+            Ok(ClientCustomChannelEvent::Anim(payload.to_vec()))
+        }
+        CHANNEL_MAGIC_V1 => decode_magic_sync_payload(payload).map(ClientCustomChannelEvent::Magic),
+        CHANNEL_MOTION_V1 => {
+            decode_motion_trigger_payload(payload).map(ClientCustomChannelEvent::Motion)
+        }
+        _ => Ok(ClientCustomChannelEvent::Unknown {
+            channel: channel.to_string(),
+            payload: payload.to_vec(),
+        }),
+    }
+}
+
+/// Apply VFX1/ANM1 to the respective host and return decoded non-host events.
+pub fn dispatch_custom_channel_to_hosts(
+    channel: &str,
+    payload: &[u8],
+    vfx_host: &mut ClientVfxHost,
+    anim_host: &mut WorldAnimationHost,
+) -> Result<ClientCustomChannelEvent, String> {
+    let event = decode_custom_channel_event(channel, payload)?;
+    match &event {
+        ClientCustomChannelEvent::Vfx(data) => {
+            vfx_host
+                .ingest_vfx1_payload(data)
+                .map_err(|err| format!("VFX1 host rejected payload: {err:?}"))?;
+        }
+        ClientCustomChannelEvent::Anim(data) => {
+            anim_host
+                .ingest_anm1_payload(data)
+                .map_err(|err| format!("ANM1 host rejected payload: {err:?}"))?;
+        }
+        _ => {}
+    }
+    Ok(event)
+}
+
+/// Decode the body of a clientbound `custom_payload` packet (VarInt-length
+/// channel identifier followed by unframed channel bytes).
+pub fn decode_custom_payload_packet(body: &[u8]) -> Result<ClientCustomChannelEvent, String> {
+    let mut reader = WireReader::new(body);
+    let channel = reader.read_string(32767)?;
+    decode_custom_channel_event(&channel, reader.rest())
+}
 const MAX_NBT_DEPTH: usize = 64;
 const MAX_NBT_ARRAY: usize = 1_048_576;
 /// Upper bound on the section count a `level_chunk_with_light` /
@@ -1278,6 +1569,13 @@ pub enum PlayEvent {
     Other(i32),
 }
 
+/// Opt-in play receiver result with decoded clientbound custom payloads.
+#[derive(Clone, Debug)]
+pub enum ClientPlayEvent {
+    Play(PlayEvent),
+    CustomChannel(ClientCustomChannelEvent),
+}
+
 // ---------------------------------------------------------------------------
 // TCP Protocol 767 Client
 // ---------------------------------------------------------------------------
@@ -1839,6 +2137,25 @@ impl ProtocolClient {
             return Ok(None);
         };
         self.decode_play_event(pid, &body).map(Some)
+    }
+
+    /// Opt-in receiver for custom channels alongside ordinary play packets.
+    /// The established `recv_play` API retains its original event behavior.
+    pub fn recv_play_with_custom_channels(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<ClientPlayEvent>, String> {
+        let Some((pid, body)) = self.recv_raw(timeout)? else {
+            return Ok(None);
+        };
+        if self.s2c_name(PacketPhase::Play, pid).as_deref() == Some("custom_payload") {
+            return decode_custom_payload_packet(&body)
+                .map(ClientPlayEvent::CustomChannel)
+                .map(Some);
+        }
+        self.decode_play_event(pid, &body)
+            .map(ClientPlayEvent::Play)
+            .map(Some)
     }
 
     fn decode_play_event(&mut self, pid: i32, body: &[u8]) -> Result<PlayEvent, String> {
