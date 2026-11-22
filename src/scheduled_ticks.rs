@@ -626,6 +626,581 @@ mod tests {
         assert_eq!(rest[0].pos, (512, 0, 0));
         assert!(!queue.has_pending_matching(|_| true));
     }
+
+    /// `LevelTicks` drains each ready chunk in its own (triggerTick,
+    /// priority, subTickOrder) order and merges the per-chunk heads by
+    /// INTRA_TICK_DRAIN_ORDER — priority first, subTickOrder breaking ties —
+    /// so equal-priority ticks interleave strictly by insertion order across
+    /// chunk boundaries.
+    #[test]
+    fn intra_tick_merge_orders_priority_then_sub_order_across_chunks() {
+        // Four chunks at one due/priority: distinct sub-orders make the
+        // expected merge exactly the sub-order sort.
+        let mut queue = ScheduledTicks::new();
+        let mut expected = Vec::new();
+        for sub_order in 0..12i64 {
+            let chunk = (sub_order % 4) as i32;
+            let pos = (chunk * 16 + (sub_order / 4) as i32, 64, 0);
+            expected.push(pos);
+            assert!(queue.schedule(ScheduledTick {
+                pos,
+                block: 1,
+                due: 5,
+                priority: 0,
+                sub_order,
+            }));
+        }
+        let out = queue.collect(5, 100, |_| true);
+        assert_eq!(
+            out.iter().map(|t| t.pos).collect::<Vec<_>>(),
+            expected,
+            "equal-priority ticks must interleave by subTickOrder alone"
+        );
+
+        // Mixed priorities at one due: the merge is the global
+        // (priority, sub_order) sort across chunk boundaries.
+        let mut queue = ScheduledTicks::new();
+        for (pos, priority, sub_order) in [
+            ((0i32, 64, 0), -3i8, 4i64),
+            ((16, 64, 0), -3, 1),
+            ((1, 64, 0), 0, 2),
+            ((17, 64, 0), 0, 0),
+            ((32, 64, 0), 3, 3),
+        ] {
+            assert!(queue.schedule(ScheduledTick {
+                pos,
+                block: 1,
+                due: 5,
+                priority,
+                sub_order,
+            }));
+        }
+        let out = queue.collect(5, 100, |_| true);
+        assert_eq!(
+            out.iter().map(|t| t.sub_order).collect::<Vec<_>>(),
+            vec![1, 4, 0, 2, 3],
+            "priority must lead sub-order in the cross-chunk merge"
+        );
+    }
+
+    /// The merge is not a flat (priority, sub_order) sort: each chunk's own
+    /// heap pops in (triggerTick, priority, subTickOrder), so inside one
+    /// chunk an earlier-due lower-priority tick keeps its slot ahead of a
+    /// later-due EXTREMELY_HIGH tick — the exact shape the pinned native
+    /// wave shows for {VERY_LOW@100, EXTREMELY_LOW@100, EXTREMELY_HIGH@102}
+    /// delivered in that order at game time 102.
+    #[test]
+    fn a_chunk_drains_in_trigger_order_not_flat_priority_order() {
+        let mut queue = ScheduledTicks::new();
+        for tick in [
+            // Chunk (0,0): due 5 LOW then due 7 EXTREMELY_HIGH.
+            ScheduledTick {
+                pos: (0, 64, 0),
+                block: 1,
+                due: 5,
+                priority: 1,
+                sub_order: 1,
+            },
+            ScheduledTick {
+                pos: (1, 64, 0),
+                block: 2,
+                due: 7,
+                priority: -3,
+                sub_order: 0,
+            },
+            // Chunk (1,0): a NORMAL head between them in priority.
+            ScheduledTick {
+                pos: (16, 64, 0),
+                block: 3,
+                due: 6,
+                priority: 0,
+                sub_order: 2,
+            },
+        ] {
+            assert!(queue.schedule(tick));
+        }
+        let out = queue.collect(10, 10, |_| true);
+        assert_eq!(
+            out.iter().map(|t| (t.pos, t.priority)).collect::<Vec<_>>(),
+            vec![((16, 64, 0), 0), ((0, 64, 0), 1), ((1, 64, 0), -3)],
+            "chunk (0,0) must keep its own trigger order under the merge"
+        );
+
+        // Due gating is per chunk head: a future-due chunk is skipped whole;
+        // once due, its EXTREMELY_HIGH head outranks a lower-priority
+        // competitor regardless of the competitor's earlier triggerTick.
+        let mut queue = ScheduledTicks::new();
+        for tick in [
+            ScheduledTick {
+                pos: (0, 64, 0),
+                block: 1,
+                due: 9,
+                priority: -3,
+                sub_order: 0,
+            },
+            ScheduledTick {
+                pos: (16, 64, 0),
+                block: 2,
+                due: 5,
+                priority: 3,
+                sub_order: 1,
+            },
+        ] {
+            assert!(queue.schedule(tick));
+        }
+        assert_eq!(
+            queue.collect(9, 10, |_| true).iter().map(|t| t.pos).collect::<Vec<_>>(),
+            vec![(0, 64, 0), (16, 64, 0)],
+            "cross-chunk the due EH head must precede the due EL head"
+        );
+        // The same pair, collected before the EH tick comes due: only the
+        // due tick runs, and the retained future tick is neither dropped nor
+        // pulled forward.
+        let mut queue = ScheduledTicks::new();
+        for tick in [
+            ScheduledTick {
+                pos: (0, 64, 0),
+                block: 1,
+                due: 9,
+                priority: -3,
+                sub_order: 0,
+            },
+            ScheduledTick {
+                pos: (16, 64, 0),
+                block: 2,
+                due: 5,
+                priority: 3,
+                sub_order: 1,
+            },
+        ] {
+            assert!(queue.schedule(tick));
+        }
+        assert_eq!(
+            queue.collect(7, 10, |_| true).iter().map(|t| t.pos).collect::<Vec<_>>(),
+            vec![(16, 64, 0)],
+            "the due<=7 pass must skip the future chunk head entirely"
+        );
+        assert_eq!(
+            queue.collect(9, 10, |_| true).iter().map(|t| t.pos).collect::<Vec<_>>(),
+            vec![(0, 64, 0)]
+        );
+    }
+
+    /// `tickCheck` gates collection per game tick: an ineligible chunk is
+    /// skipped without being dropped or rescheduled, keeps its original
+    /// triggerTick, and drains in its original order the first tick it
+    /// becomes eligible — merging against whatever came due in the meantime.
+    #[test]
+    fn ineligible_chunks_retain_and_deliver_on_eligibility() {
+        let mut queue = ScheduledTicks::new();
+        for (pos, sub_order) in [
+            ((0, 64, 0), 0i64),
+            ((1, 64, 0), 1),
+            ((2, 64, 0), 2),
+            ((16, 64, 0), 3),
+            ((17, 64, 0), 4),
+        ] {
+            assert!(queue.schedule(ScheduledTick {
+                pos,
+                block: 1,
+                due: 10,
+                priority: 0,
+                sub_order,
+            }));
+        }
+        let cold = HashSet::from([(0, 0)]);
+        let out = queue.collect(10, 10, |c| !cold.contains(&c));
+        assert_eq!(
+            out.iter().map(|t| t.sub_order).collect::<Vec<_>>(),
+            vec![3, 4],
+            "only the eligible chunk may drain"
+        );
+        // Repeated ineligible collects do not drop or reschedule the rest.
+        assert!(queue.collect(11, 10, |c| !cold.contains(&c)).is_empty());
+        assert!(queue.has_pending_matching(|t| t.sub_order <= 2));
+        let out = queue.collect(12, 10, |_| true);
+        assert_eq!(
+            out.iter().map(|t| (t.due, t.sub_order)).collect::<Vec<_>>(),
+            vec![(10, 0), (10, 1), (10, 2)],
+            "the retained chunk drains in order with its original dues"
+        );
+        assert!(!queue.has_pending_matching(|_| true));
+
+        // A chunk that becomes eligible merges against ticks that arrived
+        // while it was cold: sub-order still decides, not arrival time.
+        let mut queue = ScheduledTicks::new();
+        for (pos, sub_order) in [((0, 64, 0), 0i64), ((16, 64, 0), 1), ((32, 64, 0), 2)] {
+            assert!(queue.schedule(ScheduledTick {
+                pos,
+                block: 1,
+                due: 10,
+                priority: 0,
+                sub_order,
+            }));
+        }
+        let cold = HashSet::from([(0, 0)]);
+        assert_eq!(queue.collect(11, 10, |c| !cold.contains(&c)).len(), 2);
+        assert!(queue.schedule(ScheduledTick {
+            pos: (33, 64, 0),
+            block: 1,
+            due: 12,
+            priority: 0,
+            sub_order: 3,
+        }));
+        let out = queue.collect(12, 10, |_| true);
+        assert_eq!(
+            out.iter().map(|t| t.sub_order).collect::<Vec<_>>(),
+            vec![0, 3],
+            "the held-back chunk's overdue tick still leads by sub-order"
+        );
+    }
+
+    /// The per-tick callback bound (vanilla's 65,536) truncates the drain
+    /// mid-merge; nothing past the bound is dropped or reordered — the next
+    /// collect resumes exactly where the bound cut, including inside a
+    /// chunk, and a zero bound delivers nothing while losing nothing.
+    #[test]
+    fn per_tick_cap_spills_over_in_exact_order() {
+        // One chunk, one wave: the bound cuts inside the chunk.
+        let mut queue = ScheduledTicks::new();
+        for sub_order in 0..8i64 {
+            assert!(queue.schedule(ScheduledTick {
+                pos: (sub_order as i32, 64, 0),
+                block: 1,
+                due: 10,
+                priority: 0,
+                sub_order,
+            }));
+        }
+        let first = queue.collect(10, 3, |_| true);
+        assert_eq!(
+            first.iter().map(|t| t.sub_order).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        let second = queue.collect(10, 3, |_| true);
+        assert_eq!(
+            second.iter().map(|t| t.sub_order).collect::<Vec<_>>(),
+            vec![3, 4, 5],
+            "spillover must resume the same chunk at the cut point"
+        );
+        let rest = queue.collect(11, 10, |_| true);
+        assert_eq!(
+            rest.iter().map(|t| t.sub_order).collect::<Vec<_>>(),
+            vec![6, 7]
+        );
+
+        // Across chunks the bound cuts mid-merge; limit zero loses nothing.
+        let mut queue = ScheduledTicks::new();
+        for (x, sub_order) in [(0i32, 0i64), (17, 1), (2, 2), (19, 3), (4, 4)] {
+            assert!(queue.schedule(ScheduledTick {
+                pos: (x, 64, 0),
+                block: 1,
+                due: 10,
+                priority: 0,
+                sub_order,
+            }));
+        }
+        assert!(queue.collect(10, 0, |_| true).is_empty());
+        assert!(queue.has_pending_matching(|_| true));
+        let first = queue.collect(10, 3, |_| true);
+        assert_eq!(
+            first.iter().map(|t| t.sub_order).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        let second = queue.collect(11, 10, |_| true);
+        assert_eq!(
+            second.iter().map(|t| t.sub_order).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert!(!queue.has_pending_matching(|_| true));
+    }
+
+    /// Save → decode → unpack at the load game time keeps every tick's
+    /// remaining delay, priority and position in the drain: the reloaded
+    /// queue delivers the identical (pos, block, due, priority) stream as
+    /// the uninterrupted original. Native restart replaces sub-orders per
+    /// chunk, so the workload keeps every (due, priority) pair unique to
+    /// pin exactly one stream.
+    #[test]
+    fn save_reload_preserves_relative_delays_and_merge_order() {
+        let spec: [(Pos, i64, i8); 7] = [
+            ((0, 64, 0), 10, 0),
+            ((1, 64, 0), 11, -3),
+            ((16, 64, 0), 10, -1),
+            ((17, 64, 0), 12, 0),
+            ((32, 64, 0), 11, 1),
+            ((33, 64, 0), 10, 3),
+            ((0, 64, 15), 13, -2),
+        ];
+        let mut original = ScheduledTicks::new();
+        for (i, &(pos, due, priority)) in spec.iter().enumerate() {
+            assert!(original.schedule(ScheduledTick {
+                pos,
+                block: 1 + i as u32,
+                due,
+                priority,
+                sub_order: i as i64,
+            }));
+        }
+        // Deliver part of wave 10, then snapshot the queue mid-flight.
+        assert_eq!(original.collect(10, 2, |_| true).len(), 2);
+        let mut bytes = Vec::new();
+        original.encode(&mut bytes);
+        let mut input = &bytes[..];
+        let mut loaded = ScheduledTicks::decode(&mut input)
+            .expect("encode output decodes")
+            .unpack_saved(10);
+        assert!(input.is_empty());
+        let render = |ticks: Vec<ScheduledTick>| {
+            ticks
+                .into_iter()
+                .map(|t| (t.pos, t.block, t.due, t.priority))
+                .collect::<Vec<_>>()
+        };
+        for now in 10..=14 {
+            assert_eq!(
+                render(original.collect(now, 3, |_| true)),
+                render(loaded.collect(now, 3, |_| true)),
+                "reloaded queue diverged at game time {now}"
+            );
+        }
+        assert!(!original.has_pending_matching(|_| true));
+        assert!(!loaded.has_pending_matching(|_| true));
+    }
+
+    /// Block and fluid ticks live in separate `LevelTicks` namespaces: the
+    /// same (pos, id) can pend in both, identity suppression never crosses
+    /// queues, and each drains by its own cap, eligibility and merge order.
+    #[test]
+    fn block_and_fluid_queues_are_independent_namespaces() {
+        let mut blocks = ScheduledTicks::new();
+        let mut fluids = ScheduledTicks::new();
+        let shared = ScheduledTick {
+            pos: (1, 64, 1),
+            block: 7,
+            due: 10,
+            priority: 0,
+            sub_order: 0,
+        };
+        assert!(blocks.schedule(shared));
+        assert!(
+            fluids.schedule(shared),
+            "the fluid namespace must not be suppressed by the block queue"
+        );
+        // A refused duplicate in one queue does not disturb the other.
+        assert!(!blocks.schedule(ScheduledTick {
+            due: 12,
+            sub_order: 9,
+            ..shared
+        }));
+        assert!(fluids.schedule(ScheduledTick {
+            pos: (5, 64, 1),
+            block: 9,
+            due: 10,
+            priority: -3,
+            sub_order: 1,
+        }));
+        assert!(blocks.schedule(ScheduledTick {
+            pos: (2, 64, 1),
+            block: 8,
+            due: 10,
+            priority: 0,
+            sub_order: 2,
+        }));
+        // Independent caps and merge orders: the fluid queue drains its own
+        // HIGH head first; the block queue's cap holds back only its tail.
+        assert_eq!(
+            fluids.collect(10, 10, |_| true).iter().map(|t| t.pos).collect::<Vec<_>>(),
+            vec![(5, 64, 1), (1, 64, 1)]
+        );
+        assert_eq!(blocks.collect(10, 1, |_| true), vec![shared]);
+        assert_eq!(
+            blocks.collect(10, 10, |_| true).iter().map(|t| t.pos).collect::<Vec<_>>(),
+            vec![(2, 64, 1)]
+        );
+        // Delivery released only the fluid identity; the block queue's copy
+        // was already re-collected above, so both namespaces are free to
+        // schedule the identity again.
+        assert!(fluids.schedule(ScheduledTick {
+            due: 20,
+            ..shared
+        }));
+        assert!(!blocks.has_pending_matching(|_| true));
+        assert_eq!(fluids.collect(20, 10, |_| true).len(), 1);
+        // Independent eligibility: one queue held back, the other drained.
+        for pos in [(30, 64, 0), (31, 64, 0)] {
+            assert!(blocks.schedule(ScheduledTick {
+                pos,
+                block: 1,
+                due: 30,
+                priority: 0,
+                sub_order: 10,
+            }));
+            assert!(fluids.schedule(ScheduledTick {
+                pos,
+                block: 2,
+                due: 30,
+                priority: 0,
+                sub_order: 10,
+            }));
+        }
+        let cold = HashSet::from([(1, 0)]);
+        assert_eq!(blocks.collect(30, 10, |_| true).len(), 2);
+        assert!(
+            fluids.collect(30, 10, |c| !cold.contains(&c)).is_empty(),
+            "the fluid queue holds its whole wave back"
+        );
+        assert_eq!(fluids.collect(31, 10, |_| true).len(), 2);
+    }
+
+    /// `hasScheduledTick` suppression ends at delivery: a delivered (pos,
+    /// id) schedules again, while a still-pending duplicate keeps the
+    /// original entry untouched.
+    #[test]
+    fn delivery_releases_the_identity_for_rescheduling() {
+        let mut queue = ScheduledTicks::new();
+        let first = ScheduledTick {
+            pos: (1, 64, 1),
+            block: 7,
+            due: 10,
+            priority: 0,
+            sub_order: 0,
+        };
+        assert!(queue.schedule(first));
+        assert!(!queue.schedule(ScheduledTick {
+            due: 12,
+            sub_order: 1,
+            ..first
+        }));
+        assert_eq!(queue.collect(10, 10, |_| true), vec![first]);
+        let second = ScheduledTick {
+            due: 20,
+            priority: -3,
+            sub_order: 5,
+            ..first
+        };
+        assert!(
+            queue.schedule(second),
+            "a delivered identity must schedule again"
+        );
+        assert_eq!(queue.collect(20, 10, |_| true), vec![second]);
+        assert!(!queue.has_pending_matching(|_| true));
+    }
+
+    /// Cross-check the heap/table emulation against a naive reference merge
+    /// on randomized workloads: globally unique sub-orders make the
+    /// reference order fully determined, so any divergence in per-chunk
+    /// trigger order, cross-chunk merge, cap spillover, deadline-table
+    /// tracking or eligibility retention shows up as an exact diff.
+    #[test]
+    fn randomized_workload_matches_reference_merge() {
+        struct Model {
+            chunks: HashMap<ChunkPos, std::collections::VecDeque<ScheduledTick>>,
+            waiting: HashSet<(Pos, u32)>,
+        }
+        impl Model {
+            fn schedule(&mut self, tick: ScheduledTick) -> bool {
+                if !self.waiting.insert((tick.pos, tick.block)) {
+                    return false;
+                }
+                let heap = self
+                    .chunks
+                    .entry((tick.pos.0 >> 4, tick.pos.2 >> 4))
+                    .or_default();
+                let i = heap.partition_point(|x| full_order(x, &tick) == Ordering::Less);
+                heap.insert(i, tick);
+                true
+            }
+            fn collect(
+                &mut self,
+                now: i64,
+                limit: usize,
+                eligible: impl Fn(ChunkPos) -> bool,
+            ) -> Vec<ScheduledTick> {
+                let mut out = Vec::new();
+                while out.len() < limit {
+                    let mut best: Option<(ChunkPos, ScheduledTick)> = None;
+                    for (&chunk, heap) in &self.chunks {
+                        if !eligible(chunk) {
+                            continue;
+                        }
+                        let Some(&head) = heap.front() else {
+                            continue;
+                        };
+                        if head.due > now {
+                            continue;
+                        }
+                        if best.is_none_or(|(_, b)| within_tick(&head, &b) == Ordering::Less) {
+                            best = Some((chunk, head));
+                        }
+                    }
+                    let Some((chunk, _)) = best else {
+                        break;
+                    };
+                    let tick = self.chunks.get_mut(&chunk).unwrap().pop_front().unwrap();
+                    self.waiting.remove(&(tick.pos, tick.block));
+                    out.push(tick);
+                }
+                out
+            }
+            fn pending(&self) -> bool {
+                self.chunks.values().any(|heap| !heap.is_empty())
+            }
+        }
+        for seed in 0..24u64 {
+            let mut state = seed
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(0x85EB_CA6B_7855_51F5);
+            let mut rng = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let mut port = ScheduledTicks::new();
+            let mut model = Model {
+                chunks: HashMap::new(),
+                waiting: HashSet::new(),
+            };
+            let mut now = 0i64;
+            let mut order = 0i64;
+            for _ in 0..300 {
+                if rng() % 5 < 3 {
+                    let tick = ScheduledTick {
+                        pos: (
+                            (rng() % 80) as i32 - 40,
+                            (rng() % 8) as i32,
+                            (rng() % 80) as i32 - 40,
+                        ),
+                        block: (rng() % 6) as u32,
+                        due: now + (rng() % 9) as i64 - 2,
+                        priority: (rng() % 7) as i8 - 3,
+                        sub_order: order,
+                    };
+                    order += 1;
+                    assert_eq!(
+                        port.schedule(tick),
+                        model.schedule(tick),
+                        "dedup mismatch on {tick:?}"
+                    );
+                }
+                now += (rng() % 3) as i64;
+                let limit = (rng() % 9) as usize;
+                let cold: HashSet<ChunkPos> = (-3..=2i32)
+                    .flat_map(|x| (-3..=2i32).map(move |z| (x, z)))
+                    .filter(|_| rng() % 10 < 3)
+                    .collect();
+                let a = port.collect(now, limit, |c| !cold.contains(&c));
+                let b = model.collect(now, limit, |c| !cold.contains(&c));
+                assert!(a.iter().all(|t| t.due <= now), "early callback");
+                assert_eq!(a, b, "drain mismatch at now {now} limit {limit}");
+            }
+            let a = port.collect(i64::MAX / 4, usize::MAX, |_| true);
+            let b = model.collect(i64::MAX / 4, usize::MAX, |_| true);
+            assert_eq!(a, b, "final drain mismatch");
+            assert_eq!(port.has_pending_matching(|_| true), model.pending());
+        }
+    }
 }
 
 #[cfg(test)]
