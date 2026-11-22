@@ -18,6 +18,7 @@ mod json;
 mod light;
 pub mod occlusion_table;
 mod physics;
+pub mod raycast;
 mod registry;
 mod section;
 pub mod skeletal_anim;
@@ -47,6 +48,9 @@ pub use occlusion_table::{
 };
 pub use physics::{
     collide, fluid_impulse, Aabb, Collision, FluidCell, FluidImpulse, FluidKind, FluidQuery,
+};
+pub use raycast::{
+    raycast_blocks, raycast_entities, BlockHitFace, EntityRayHit, FluidClipMode, RayHit,
 };
 // The C-ABI entry points are also callable from Rust so integration tests can
 // pin the pointer/length contract against the checked API bit-for-bit.
