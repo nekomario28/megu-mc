@@ -7,11 +7,24 @@ use crate::gpu_pipeline::{GpuCapabilities, GpuVendor};
 use crate::vfx_engine::DynamicColoredLight;
 use std::f32::consts::{PI, TAU};
 
+/// Ordering is a capability/cost rank for `negotiate_builtin_shadow_quality`:
+/// `Feather` sits below `Low` so it never negotiates up to a shadow-map preset,
+/// while `Natural` sits between `Low` and `Medium`. The serialized `index()`
+/// values of `Off`/`Low`/`Medium`/`High` (0, 1, 2, 3) are unchanged; the two
+/// new presets append at 4 and 5 for backward compatibility.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, PartialOrd, Ord)]
 pub enum BuiltinShadowQuality {
     #[default]
     Off,
+    /// Zero shadow-map cascades and zero shadow draw calls: purely analytical
+    /// block-face directional shading, hemisphere sky/ground bounce, crisp
+    /// natural water, horizon aerial fog, and VFX1 dynamic colored lights.
+    Feather,
     Low,
+    /// Recommended Vanilla+ preset: block-faithful soft PCF shadows, voxel
+    /// cloud shading, natural clear water, hemisphere bounce, dynamic lights,
+    /// subtle vanilla-faithful pixel stars, and zero camera post-FX gimmicks.
+    Natural,
     Medium,
     High,
 }
@@ -20,7 +33,9 @@ impl BuiltinShadowQuality {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
+            Self::Feather => "feather",
             Self::Low => "low",
+            Self::Natural => "natural",
             Self::Medium => "medium",
             Self::High => "high",
         }
@@ -32,15 +47,19 @@ impl BuiltinShadowQuality {
             Self::Low => 1,
             Self::Medium => 2,
             Self::High => 3,
+            Self::Feather => 4,
+            Self::Natural => 5,
         }
     }
 
     pub const fn config(self) -> CascadeConfig {
         match self {
-            Self::Off => CascadeConfig::new(self, 0, 0, 0, 0),
-            Self::Low => CascadeConfig::new(self, 1, 1024, 4, 8),
-            Self::Medium => CascadeConfig::new(self, 2, 2048, 9, 32),
-            Self::High => CascadeConfig::new(self, 3, 2048, 16, 64),
+            Self::Off => CascadeConfig::new(self, 0, 0, 0, 0, 0, false),
+            Self::Feather => CascadeConfig::new(self, 0, 0, 0, 16, 2, false),
+            Self::Low => CascadeConfig::new(self, 1, 1024, 4, 8, 1, false),
+            Self::Natural => CascadeConfig::new(self, 2, 1536, 9, 32, 2, false),
+            Self::Medium => CascadeConfig::new(self, 2, 2048, 9, 32, 2, false),
+            Self::High => CascadeConfig::new(self, 3, 2048, 16, 64, 3, true),
         }
     }
 }
@@ -70,6 +89,7 @@ pub fn negotiate_builtin_shadow_quality(
 }
 
 /// Per-preset static budgets. A 32-bit depth array is assumed.
+/// `cascade_count == 0` (Off and Feather) produces no shadow map or draw call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CascadeConfig {
     pub quality: BuiltinShadowQuality,
@@ -77,6 +97,13 @@ pub struct CascadeConfig {
     pub map_resolution: u32,
     pub pcf_taps: u32,
     pub max_dynamic_lights: u32,
+    /// Feature tier written to `render_params.x`: PCF kernel selection,
+    /// water/sky detail, and the dynamic-light cap. Matches `index()` for
+    /// Off/Low/Medium/High; Feather and Natural reuse established tiers.
+    pub shader_tier: u32,
+    /// Cinematic post effects (tonemap grade, sun-shaft hint). Always false
+    /// for the Vanilla+ presets: no lens flare, motion blur, DoF, or bloom.
+    pub camera_post_fx: bool,
 }
 
 impl CascadeConfig {
@@ -86,6 +113,8 @@ impl CascadeConfig {
         map_resolution: u32,
         pcf_taps: u32,
         max_dynamic_lights: u32,
+        shader_tier: u32,
+        camera_post_fx: bool,
     ) -> Self {
         Self {
             quality,
@@ -93,6 +122,8 @@ impl CascadeConfig {
             map_resolution,
             pcf_taps,
             max_dynamic_lights,
+            shader_tier,
+            camera_post_fx,
         }
     }
 
@@ -174,8 +205,10 @@ pub struct ShadowUniforms {
     pub camera_up: [f32; 4],
     /// Depth-map resolution, cascade count, PCF samples, active depth layer.
     pub shadow_params: [f32; 4],
-    /// Quality index, tick-based day phase, fog density, exposure.
+    /// Shader feature tier, tick-based day phase, fog density, exposure.
     pub render_params: [f32; 4],
+    /// Star visibility, eclipse corona boost, lunar shadow strength, eclipse dim.
+    pub celestial_params: [f32; 4],
 }
 
 impl ShadowUniforms {
@@ -274,6 +307,267 @@ fn normalize(a: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
     }
 }
 
+fn smooth01(t: f32) -> f32 {
+    let t = if t.is_finite() {
+        t.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Opt-in eclipse lighting. `None` preserves the 100% vanilla sun/moon orbit.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum EclipseMode {
+    /// Vanilla orbit: eclipses never occur.
+    #[default]
+    None,
+    /// The moon occludes the sun. `coverage` is 0 (no eclipse) to 1 (total).
+    SolarEclipse { coverage: f32 },
+    /// The moon passes through Earth's shadow. `progress` is 0 to 1 over the
+    /// event; mid-progress is totality (the blood-moon tint).
+    TotalLunarEclipse { progress: f32 },
+}
+
+/// CPU-side celestial light state shared by every builtin pass.
+/// All fields are finite multipliers/tints in the 0.0..=1.0 visual range.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CelestialLightingState {
+    /// Daylight multiplier (1.0 normally; dips during a solar eclipse).
+    pub sun_illuminance: f32,
+    /// Cool-silver moonlight tint; shifts copper during a lunar eclipse.
+    pub moon_color: [f32; 3],
+    /// Moonlight strength from the 8-phase lunar cycle (1.0 full, ~0 new).
+    pub moon_illuminance: f32,
+    /// How strongly the shared shadow map darkens moonlit surfaces.
+    pub lunar_shadow_strength: f32,
+    /// Extra PCF softening while a solar eclipse dims the disc.
+    pub shadow_softness: f32,
+    /// Solar-eclipse corona ring intensity, peaking at totality.
+    pub corona_boost: f32,
+    /// Crisp pixel-star intensity: 0 by day, rising at night and during a
+    /// total solar eclipse.
+    pub star_visibility: f32,
+    /// Overall eclipse dimming of sky and ambient light (0..=1).
+    pub eclipse_dim: f32,
+}
+
+/// Vanilla 8-phase lunar cycle: `moon_phase` wraps modulo 8 like the vanilla
+/// `level.getMoonPhase()` (0 = full moon, 4 = new moon).
+pub fn compute_celestial_lighting(
+    world_time_ticks: u64,
+    moon_phase: u8,
+    eclipse: EclipseMode,
+) -> CelestialLightingState {
+    const PHASE_LIGHT: [f32; 8] = [1.0, 0.78, 0.55, 0.32, 0.06, 0.32, 0.55, 0.78];
+    let phase_strength = PHASE_LIGHT[(moon_phase % 8) as usize];
+    let sun = compute_sun_direction(world_time_ticks);
+    let mut state = CelestialLightingState {
+        sun_illuminance: 1.0,
+        moon_color: [0.62, 0.70, 0.92],
+        moon_illuminance: phase_strength,
+        lunar_shadow_strength: 0.55 * phase_strength,
+        shadow_softness: 0.0,
+        corona_boost: 0.0,
+        star_visibility: smooth01((0.06 - sun[1]) / 0.24),
+        eclipse_dim: 0.0,
+    };
+    match eclipse {
+        EclipseMode::None => {}
+        EclipseMode::SolarEclipse { coverage } => {
+            let occlusion = smooth01((coverage.clamp(0.0, 1.0) - 0.5) / 0.5);
+            state.sun_illuminance = 1.0 - 0.94 * occlusion;
+            state.shadow_softness = occlusion;
+            state.corona_boost = smooth01((coverage.clamp(0.0, 1.0) - 0.9) / 0.1);
+            state.eclipse_dim = occlusion * 0.75;
+            state.star_visibility = state.star_visibility.max(occlusion * 0.85);
+        }
+        EclipseMode::TotalLunarEclipse { progress } => {
+            let p = progress.clamp(0.0, 1.0);
+            let copper = smooth01(p);
+            state.moon_color = [
+                0.62 + (0.85 - 0.62) * copper,
+                0.70 + (0.30 - 0.70) * copper,
+                0.92 + (0.13 - 0.92) * copper,
+            ];
+            state.moon_illuminance *= 1.0 - 0.55 * copper;
+            state.lunar_shadow_strength *= 1.0 - 0.5 * copper;
+        }
+    }
+    state
+}
+
+/// Why a cached shadow map can no longer be reused this frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShadowDirtyReason {
+    /// No frame has rendered into the cache yet.
+    FirstFrame,
+    /// The active quality preset changed since the last shadow render.
+    PresetChanged,
+    /// `world_revision` advanced: blocks inside the shadow radius changed.
+    WorldEdited,
+    /// The sun moved at least `angle_threshold_deg` from the cached pass.
+    SunMoved,
+    /// The camera crossed into a different snapped chunk region.
+    CameraCrossedSnapRegion,
+}
+
+/// Result of [`DirtyOnlyShadowCache::should_rerender_shadow_map`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShadowCacheDecision {
+    /// The previous depth pass still covers this frame; skip it entirely.
+    ReuseCached,
+    /// The depth pass must run again for the recorded reason.
+    Rerender(ShadowDirtyReason),
+}
+
+/// Dirty-only shadow map cache. Skipping the depth pass whenever the sun,
+/// camera snap region, and world edits allow it structurally cuts shadow
+/// cost by 4x-8x on a typical play session. Sun drift accumulates against
+/// the *rendered* direction, so slow motion still refreshes at the angular
+/// threshold; nothing in here reads a wall clock.
+#[derive(Clone, Debug)]
+pub struct DirtyOnlyShadowCache {
+    /// Normalized sun direction used by the last rendered depth pass.
+    pub last_sun_dir: [f32; 3],
+    /// Snapped camera cell used by the last rendered depth pass.
+    pub last_camera_chunk: [i32; 3],
+    /// World revision counter used by the last rendered depth pass.
+    pub last_world_revision: u64,
+    /// Angular movement required before the sun invalidates the cache.
+    pub angle_threshold_deg: f32,
+    last_quality: BuiltinShadowQuality,
+    primed: bool,
+}
+
+impl Default for DirtyOnlyShadowCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DirtyOnlyShadowCache {
+    /// Default angular threshold: 0.75 degrees of sun travel.
+    pub const DEFAULT_ANGLE_THRESHOLD_DEG: f32 = 0.75;
+
+    pub fn new() -> Self {
+        Self {
+            last_sun_dir: [0.0; 3],
+            last_camera_chunk: [0; 3],
+            last_world_revision: 0,
+            angle_threshold_deg: Self::DEFAULT_ANGLE_THRESHOLD_DEG,
+            last_quality: BuiltinShadowQuality::Off,
+            primed: false,
+        }
+    }
+
+    /// Force the next call to return `Rerender(FirstFrame)`, e.g. after the
+    /// depth array was resized or re-created.
+    pub fn invalidate(&mut self) {
+        self.primed = false;
+    }
+
+    /// Decide whether the shadow depth pass must run this frame.
+    /// `camera_chunk` is the camera position already snapped by the caller
+    /// (e.g. block position divided by the snap radius). `world_revision`
+    /// increments whenever blocks inside the shadow radius change. On
+    /// `Rerender` the supplied values become the new cached frame.
+    pub fn should_rerender_shadow_map(
+        &mut self,
+        sun_dir: [f32; 3],
+        camera_chunk: [i32; 3],
+        world_revision: u64,
+        quality: BuiltinShadowQuality,
+    ) -> ShadowCacheDecision {
+        let decision = self.decide(sun_dir, camera_chunk, world_revision, quality);
+        if let ShadowCacheDecision::Rerender(_) = decision {
+            self.last_sun_dir = sun_dir;
+            self.last_camera_chunk = camera_chunk;
+            self.last_world_revision = world_revision;
+            self.last_quality = quality;
+            self.primed = true;
+        }
+        decision
+    }
+
+    fn decide(
+        &self,
+        sun_dir: [f32; 3],
+        camera_chunk: [i32; 3],
+        world_revision: u64,
+        quality: BuiltinShadowQuality,
+    ) -> ShadowCacheDecision {
+        if !self.primed {
+            return ShadowCacheDecision::Rerender(ShadowDirtyReason::FirstFrame);
+        }
+        if quality != self.last_quality {
+            return ShadowCacheDecision::Rerender(ShadowDirtyReason::PresetChanged);
+        }
+        if world_revision != self.last_world_revision {
+            return ShadowCacheDecision::Rerender(ShadowDirtyReason::WorldEdited);
+        }
+        // Zero-cascade presets own no shadow map, so drift is irrelevant.
+        if quality.config().cascade_count == 0 {
+            return ShadowCacheDecision::ReuseCached;
+        }
+        let threshold = if self.angle_threshold_deg.is_finite() && self.angle_threshold_deg > 0.0 {
+            self.angle_threshold_deg
+        } else {
+            Self::DEFAULT_ANGLE_THRESHOLD_DEG
+        };
+        if !sun_dir.iter().all(|v| v.is_finite()) {
+            return ShadowCacheDecision::Rerender(ShadowDirtyReason::SunMoved);
+        }
+        let a = normalize(self.last_sun_dir, [1.0, 0.0, 0.0]);
+        let b = normalize(sun_dir, [1.0, 0.0, 0.0]);
+        if dot(a, b).clamp(-1.0, 1.0).acos().to_degrees() >= threshold {
+            return ShadowCacheDecision::Rerender(ShadowDirtyReason::SunMoved);
+        }
+        if camera_chunk != self.last_camera_chunk {
+            return ShadowCacheDecision::Rerender(ShadowDirtyReason::CameraCrossedSnapRegion);
+        }
+        ShadowCacheDecision::ReuseCached
+    }
+}
+
+/// Fixed render-scale presets. Deterministic by design: there is no dynamic
+/// resolution feedback loop, only these five steps.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RenderScalePreset {
+    /// 100% - default, UI and world both at native resolution.
+    #[default]
+    Native100,
+    /// 85%
+    Quality85,
+    /// 75%
+    Balanced75,
+    /// 67%
+    Performance67,
+    /// 50%
+    UltraPerf50,
+}
+
+impl RenderScalePreset {
+    pub const fn percent(self) -> u32 {
+        match self {
+            Self::Native100 => 100,
+            Self::Quality85 => 85,
+            Self::Balanced75 => 75,
+            Self::Performance67 => 67,
+            Self::UltraPerf50 => 50,
+        }
+    }
+
+    /// Deterministic floor-scaled render target size, clamped to at least
+    /// 1x1. Never upscales because every preset is at or under 100%.
+    pub fn scaled_dimensions(self, width: u32, height: u32) -> (u32, u32) {
+        let pct = self.percent() as u64;
+        let w = (width as u64 * pct / 100).clamp(1, u32::MAX as u64);
+        let h = (height as u64 * pct / 100).clamp(1, u32::MAX as u64);
+        (w as u32, h as u32)
+    }
+}
+
 fn camera_axes(camera: &ShadowCamera) -> ([f32; 3], [f32; 3], [f32; 3]) {
     let forward = normalize(camera.forward, [0.0, 0.0, 1.0]);
     let desired_up = normalize(camera.up, [0.0, 1.0, 0.0]);
@@ -333,10 +627,32 @@ fn camera_matrix(
 
 /// Stable frustum-fitted light projections snapped to whole shadow texels.
 /// No wall-clock input, allocation of GPU resources, or unsafe type casting.
+/// The moon phase follows the vanilla `day % 8` cycle; eclipses stay opt-in
+/// through [`build_shadow_uniforms_celestial`].
 pub fn build_shadow_uniforms(
     camera: ShadowCamera,
     config: CascadeConfig,
     world_time_ticks: u64,
+) -> ShadowUniforms {
+    let moon_phase = ((world_time_ticks / 24_000) % 8) as u8;
+    build_shadow_uniforms_celestial(
+        camera,
+        config,
+        world_time_ticks,
+        moon_phase,
+        EclipseMode::None,
+    )
+}
+
+/// [`build_shadow_uniforms`] with an explicit 8-phase moon and an opt-in
+/// eclipse mode. Everything [`compute_celestial_lighting`] derives is folded
+/// into the uniform block here, so the shaders stay branch-light.
+pub fn build_shadow_uniforms_celestial(
+    camera: ShadowCamera,
+    config: CascadeConfig,
+    world_time_ticks: u64,
+    moon_phase: u8,
+    eclipse: EclipseMode,
 ) -> ShadowUniforms {
     let position = if camera.position.iter().all(|v| v.is_finite()) {
         camera.position
@@ -428,9 +744,11 @@ pub fn build_shadow_uniforms(
         split_uniform[index] = end;
     }
 
+    let celestial = compute_celestial_lighting(world_time_ticks, moon_phase, eclipse);
     let daylight = ((sun[1] + 0.12) / 0.24).clamp(0.0, 1.0);
     let twilight = (1.0 - (sun[1].abs() / 0.25).min(1.0)) * 0.35;
     let day_phase = (world_time_ticks % 24_000) as f32 / 24_000.0;
+    let moon_strength = (1.0 - daylight) * celestial.moon_illuminance;
     ShadowUniforms {
         light_view_proj: matrices,
         camera_view_proj: camera_matrix(
@@ -444,12 +762,17 @@ pub fn build_shadow_uniforms(
         cascade_splits: split_uniform,
         sun_direction: [sun[0], sun[1], sun[2], 0.0],
         sun_color: [
-            (0.95 + twilight) * daylight,
-            (0.92 - twilight * 0.3) * daylight,
-            (0.85 - twilight * 0.6) * daylight,
+            (0.95 + twilight) * daylight * celestial.sun_illuminance,
+            (0.92 - twilight * 0.3) * daylight * celestial.sun_illuminance,
+            (0.85 - twilight * 0.6) * daylight * celestial.sun_illuminance,
             1.0,
         ],
-        moon_color: [0.12, 0.17, 0.31, 1.0 - daylight],
+        moon_color: [
+            celestial.moon_color[0] * 0.19,
+            celestial.moon_color[1] * 0.24,
+            celestial.moon_color[2] * 0.34,
+            moon_strength,
+        ],
         camera_position: [position[0], position[1], position[2], 1.0],
         camera_forward: [forward[0], forward[1], forward[2], 0.0],
         camera_right: [right[0], right[1], right[2], tan_half_fov * aspect],
@@ -460,7 +783,13 @@ pub fn build_shadow_uniforms(
             config.pcf_taps as f32,
             0.0,
         ],
-        render_params: [config.quality.index() as f32, day_phase, 0.012, 1.0],
+        render_params: [config.shader_tier as f32, day_phase, 0.012, 1.0],
+        celestial_params: [
+            celestial.star_visibility,
+            celestial.corona_boost,
+            celestial.lunar_shadow_strength,
+            celestial.eclipse_dim,
+        ],
     }
 }
 
@@ -479,6 +808,7 @@ struct ShadowUniforms {
     camera_up: vec4<f32>,
     shadow_params: vec4<f32>,
     render_params: vec4<f32>,
+    celestial_params: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> shadow: ShadowUniforms;
 
@@ -510,6 +840,7 @@ struct ShadowUniforms {
     camera_up: vec4<f32>,
     shadow_params: vec4<f32>,
     render_params: vec4<f32>,
+    celestial_params: vec4<f32>,
 };
 struct PointLight {
     position_radius: vec4<f32>,
@@ -556,7 +887,9 @@ fn poisson(i: u32) -> vec2<f32> {
 }
 fn sample_cascade(position: vec3<f32>, normal: vec3<f32>, cascade: u32) -> f32 {
     let quality = u32(shadow.render_params.x);
-    let texel = 1.0 / max(shadow.shadow_params.x, 1.0);
+    // A solar eclipse softens penumbrae by widening the filter footprint.
+    let texel = (1.0 + shadow.celestial_params.w * 1.5)
+        / max(shadow.shadow_params.x, 1.0);
     let incidence = abs(dot(normal, normalize(shadow.sun_direction.xyz)));
     let receiver = position + normal * (0.012 + 0.06 * (1.0 - incidence));
     let clip = shadow.light_view_proj[cascade] * vec4<f32>(receiver, 1.0);
@@ -633,8 +966,14 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
                           vec3<f32>(0.31, 0.37, 0.50), max(normal.y, 0.0));
     let bounce = mix(vec3<f32>(0.19, 0.12, 0.09), vec3<f32>(0.0),
                       max(normal.y, 0.0));
-    var light = sky_ambient + bounce + shadow.sun_color.xyz * sun_power * visibility
-                + shadow.moon_color.xyz * moon_power * shadow.moon_color.w;
+    // An eclipse dims hemisphere ambient too, not just the disc light.
+    let ambient_dim = 1.0 - shadow.celestial_params.w * 0.55;
+    // Lunar shadow strength lets moonlight share the shadow map softly.
+    let lunar_visibility = mix(1.0, visibility, shadow.celestial_params.z);
+    var light = (sky_ambient + bounce) * ambient_dim
+                + shadow.sun_color.xyz * sun_power * visibility
+                + shadow.moon_color.xyz * moon_power * shadow.moon_color.w
+                  * lunar_visibility;
     var limit = 8u;
     if (shadow.render_params.x >= 2.0) { limit = 32u; }
     if (shadow.render_params.x >= 3.0) { limit = 64u; }
@@ -668,7 +1007,8 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
 "#;
 
 /// Screen-filling atmospheric dome with Rayleigh/Mie phase approximations,
-/// warm twilight, sun disc, moon disc and an inexpensive Low gradient.
+/// warm twilight, sun disc, moon disc, blocky voxel clouds, crisp pixel
+/// stars, opt-in eclipse dimming/corona and an inexpensive Low gradient.
 pub const MEGU_SKY_ATMOSPHERE_WGSL: &str = r#"
 struct ShadowUniforms {
     light_view_proj: array<mat4x4<f32>, 3>,
@@ -683,6 +1023,7 @@ struct ShadowUniforms {
     camera_up: vec4<f32>,
     shadow_params: vec4<f32>,
     render_params: vec4<f32>,
+    celestial_params: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> shadow: ShadowUniforms;
 
@@ -721,14 +1062,50 @@ fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
         let mie = (1.0 - mie_g * mie_g) / pow(denom, 1.5);
         color += vec3<f32>(0.025, 0.072, 0.15) * rayleigh * day;
         color += vec3<f32>(0.10, 0.075, 0.045) * mie * day * 0.1;
+        // Blocky voxel clouds drifting on the dome stay faithful to the
+        // voxel world instead of adding a smooth billboard layer.
+        if (view.y > 0.04 && view.y < 0.75) {
+            let drift = shadow.render_params.y * 6.2831853 * 0.006;
+            let uv = view.xz / (view.y + 0.28) * 0.35 + vec2<f32>(drift, 0.0);
+            let cell = floor(uv * 7.0);
+            let roll = fract(sin(dot(cell, vec2<f32>(17.13, 91.77))) * 31313.7);
+            if (roll > 0.72) {
+                let fade = smoothstep(0.04, 0.18, view.y)
+                    * (1.0 - smoothstep(0.45, 0.75, view.y));
+                let lit = mix(vec3<f32>(0.10, 0.12, 0.19),
+                              vec3<f32>(0.92, 0.94, 1.0), day);
+                color = mix(color, lit, fade * 0.55);
+            }
+        }
     }
     let twilight = 1.0 - smoothstep(0.0, 0.28, abs(sun.y));
     let toward_sun = pow(max(mu, 0.0), 12.0);
     color += vec3<f32>(0.66, 0.18, 0.045) * twilight * horizon * toward_sun;
+    // A solar eclipse dims the whole dome with the occluded disc.
+    color *= 1.0 - shadow.celestial_params.w * 0.55;
+    // Crisp pixel stars: chunky direction cells, no smooth sparkle noise.
+    if (shadow.celestial_params.x > 0.001 && view.y > 0.02) {
+        let cell = floor(view * 42.0);
+        let roll = fract(sin(dot(cell, vec3<f32>(12.99, 78.23, 37.72)))
+                         * 43758.55);
+        if (roll > 0.996) {
+            let bright = (roll - 0.996) / 0.004;
+            color += vec3<f32>(0.90, 0.93, 1.0) * bright
+                     * shadow.celestial_params.x * 0.85;
+        }
+    }
     let sun_disc = smoothstep(0.9998, 0.99998, mu);
     let moon_disc = smoothstep(0.99984, 0.99996, dot(view, -sun));
-    color += vec3<f32>(3.2, 2.55, 1.65) * day * sun_disc;
-    color += vec3<f32>(0.55, 0.67, 0.88) * (1.0 - day) * moon_disc;
+    color += vec3<f32>(3.2, 2.55, 1.65) * day * sun_disc
+             * (1.0 - shadow.celestial_params.w);
+    // The eclipse corona appears as a pale ring once the disc is covered.
+    if (shadow.celestial_params.y > 0.001) {
+        let ring = pow(max(mu, 0.0), 260.0);
+        color += vec3<f32>(1.0, 0.92, 0.78) * ring
+                 * shadow.celestial_params.y * 1.6;
+    }
+    color += vec3<f32>(0.55, 0.67, 0.88) * (1.0 - day) * moon_disc
+             * (1.0 - shadow.celestial_params.w * 0.4);
     return vec4<f32>(pow(max(color, vec3<f32>(0.0)),
                          vec3<f32>(1.0 / 2.2)), 1.0);
 }
@@ -750,6 +1127,7 @@ struct ShadowUniforms {
     camera_up: vec4<f32>,
     shadow_params: vec4<f32>,
     render_params: vec4<f32>,
+    celestial_params: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> shadow: ShadowUniforms;
 
@@ -800,7 +1178,8 @@ fn fs_main(input: WaterOutput) -> @location(0) vec4<f32> {
     let reflected = reflect(-view, normal);
     let sky = mix(vec3<f32>(0.02, 0.035, 0.085),
                   vec3<f32>(0.18, 0.44, 0.78), day);
-    let sky_reflection = mix(sky * 0.6, sky, clamp(reflected.y, 0.0, 1.0));
+    let sky_reflection = mix(sky * 0.6, sky, clamp(reflected.y, 0.0, 1.0))
+        * (1.0 - shadow.celestial_params.w * 0.55);
     let half_vector = view + shadow.sun_direction.xyz;
     let halfway = half_vector / max(length(half_vector), 0.0001);
     let sparkle = pow(max(dot(normal, halfway), 0.0), 180.0);
@@ -817,12 +1196,79 @@ fn fs_main(input: WaterOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Edge-adaptive 5-tap spatial sharpening for a fixed render-scale preset.
+/// A fullscreen triangle upscales the sub-native scene target; sharpening
+/// is gated by local luma contrast and halo-clamped so it crisps block
+/// edges without ringing. The UI stays at native 100% on top.
+pub const MEGU_SPATIAL_SHARPEN_WGSL: &str = r#"
+struct SharpenUniforms {
+    // xy: 1.0 / scene target size, z: strength, w: halo clamp.
+    texel_strength: vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> sharpen: SharpenUniforms;
+@group(0) @binding(1) var scene_tex: texture_2d<f32>;
+@group(0) @binding(2) var scene_sampler: sampler;
+
+struct SharpenOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> SharpenOutput {
+    let points = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0)
+    );
+    var out: SharpenOutput;
+    let clip = points[vertex_index];
+    out.position = vec4<f32>(clip, 0.0, 1.0);
+    out.uv = clip * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
+    return out;
+}
+
+fn luma(c: vec3<f32>) -> f32 {
+    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+@fragment
+fn fs_main(input: SharpenOutput) -> @location(0) vec4<f32> {
+    let texel = sharpen.texel_strength.xy;
+    let strength = sharpen.texel_strength.z;
+    let halo = sharpen.texel_strength.w;
+    let center = textureSampleLevel(scene_tex, scene_sampler,
+                                    input.uv, 0.0).rgb;
+    let north = textureSampleLevel(scene_tex, scene_sampler,
+        input.uv + vec2<f32>(0.0, -texel.y), 0.0).rgb;
+    let south = textureSampleLevel(scene_tex, scene_sampler,
+        input.uv + vec2<f32>(0.0, texel.y), 0.0).rgb;
+    let west = textureSampleLevel(scene_tex, scene_sampler,
+        input.uv + vec2<f32>(-texel.x, 0.0), 0.0).rgb;
+    let east = textureSampleLevel(scene_tex, scene_sampler,
+        input.uv + vec2<f32>(texel.x, 0.0), 0.0).rgb;
+    let cross_avg = (north + south + west + east) * 0.25;
+    // High-contrast neighborhoods already look sharp; backing off there
+    // removes halos while flat areas still recover upscaled detail.
+    let contrast = abs(luma(cross_avg) - luma(center));
+    let adaptive = max(strength, 0.0) / (1.0 + contrast * 12.0);
+    var detail = (center - cross_avg) * adaptive;
+    let cap = max(halo, 0.0);
+    detail = clamp(detail, vec3<f32>(-cap), vec3<f32>(cap));
+    let sharpened = center + detail;
+    // Clamping into the 5-tap neighborhood range is a second halo guard:
+    // the output can never overshoot past a color the scene already had.
+    let lo = min(center, min(min(north, south), min(west, east)));
+    let hi = max(center, max(max(north, south), max(west, east)));
+    return vec4<f32>(clamp(sharpened, lo, hi), 1.0);
+}
+"#;
+
 /// File names and sources accepted by the native shaderpack loader.
-pub const BUILTIN_SHADOW_SHADERS: [(&str, &str); 4] = [
+pub const BUILTIN_SHADOW_SHADERS: [(&str, &str); 5] = [
     ("shadow_depth.wgsl", MEGU_SHADOW_DEPTH_WGSL),
     ("terrain_lit.wgsl", MEGU_TERRAIN_LIT_WGSL),
     ("sky_atmosphere.wgsl", MEGU_SKY_ATMOSPHERE_WGSL),
     ("water_surface.wgsl", MEGU_WATER_SURFACE_WGSL),
+    ("spatial_sharpen.wgsl", MEGU_SPATIAL_SHARPEN_WGSL),
 ];
 
 /// Existing native loader schema, with metadata for the selected preset.
@@ -860,6 +1306,12 @@ targets = ["colortex0"]
 stage = "translucent"
 kind = "graphics"
 file = "water_surface.wgsl"
+targets = ["colortex0"]
+
+[pass.spatial_sharpen]
+stage = "final"
+kind = "graphics"
+file = "spatial_sharpen.wgsl"
 targets = ["colortex0"]
 "#,
         quality.as_str()

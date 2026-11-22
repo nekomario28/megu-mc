@@ -25,9 +25,35 @@ fn default_off_has_zero_shadow_work() {
 }
 
 #[test]
+fn preset_indices_stay_backward_compatible() {
+    for (quality, index) in [
+        (BuiltinShadowQuality::Off, 0),
+        (BuiltinShadowQuality::Low, 1),
+        (BuiltinShadowQuality::Medium, 2),
+        (BuiltinShadowQuality::High, 3),
+        (BuiltinShadowQuality::Feather, 4),
+        (BuiltinShadowQuality::Natural, 5),
+    ] {
+        assert_eq!(quality.index(), index);
+    }
+    for (quality, name) in [
+        (BuiltinShadowQuality::Off, "off"),
+        (BuiltinShadowQuality::Feather, "feather"),
+        (BuiltinShadowQuality::Low, "low"),
+        (BuiltinShadowQuality::Natural, "natural"),
+        (BuiltinShadowQuality::Medium, "medium"),
+        (BuiltinShadowQuality::High, "high"),
+    ] {
+        assert_eq!(quality.as_str(), name);
+    }
+}
+
+#[test]
 fn presets_have_expected_budgets() {
     for (quality, cascades, pixels, taps, lights) in [
+        (BuiltinShadowQuality::Feather, 0, 0, 0, 16),
         (BuiltinShadowQuality::Low, 1, 1024, 4, 8),
+        (BuiltinShadowQuality::Natural, 2, 1536, 9, 32),
         (BuiltinShadowQuality::Medium, 2, 2048, 9, 32),
         (BuiltinShadowQuality::High, 3, 2048, 16, 64),
     ] {
@@ -44,8 +70,36 @@ fn presets_have_expected_budgets() {
 }
 
 #[test]
+fn feather_is_shadow_map_free_and_natural_has_no_camera_post_fx() {
+    let feather = BuiltinShadowQuality::Feather.config();
+    assert_eq!(feather.cascade_count, 0);
+    assert_eq!(feather.map_resolution, 0);
+    assert_eq!(feather.depth_array_bytes(), 0);
+    assert!(feather.max_dynamic_lights > 0, "Feather keeps VFX1 lights");
+    assert!(!feather.camera_post_fx);
+
+    let natural = BuiltinShadowQuality::Natural.config();
+    assert!(natural.cascade_count > 0, "Natural keeps soft PCF shadows");
+    assert!(!natural.camera_post_fx, "Vanilla+ has no camera gimmicks");
+    for quality in [
+        BuiltinShadowQuality::Off,
+        BuiltinShadowQuality::Feather,
+        BuiltinShadowQuality::Low,
+        BuiltinShadowQuality::Natural,
+        BuiltinShadowQuality::Medium,
+        BuiltinShadowQuality::High,
+    ] {
+        assert_eq!(
+            quality.config().camera_post_fx,
+            quality.config().shader_tier >= 3,
+            "{quality:?}"
+        );
+    }
+}
+
+#[test]
 fn low_spec_never_receives_expensive_quality() {
-    use BuiltinShadowQuality::{High, Low, Medium, Off};
+    use BuiltinShadowQuality::{Feather, High, Low, Medium, Natural, Off};
     let legacy = GpuCapabilities::intel_hd_legacy();
     let integrated = GpuCapabilities::intel_iris_xe();
     let software = GpuCapabilities::software();
@@ -57,6 +111,23 @@ fn low_spec_never_receives_expensive_quality() {
     assert_eq!(negotiate_builtin_shadow_quality(Low, &legacy), Low);
     assert_eq!(negotiate_builtin_shadow_quality(High, &software), Off);
     assert_eq!(negotiate_builtin_shadow_quality(High, &discrete), High);
+    // Feather never negotiates up into a shadow-map preset and never off on
+    // real iGPUs; only a compute-less software rasterizer drops it to Off.
+    assert_eq!(
+        negotiate_builtin_shadow_quality(Feather, &discrete),
+        Feather
+    );
+    assert_eq!(
+        negotiate_builtin_shadow_quality(Feather, &integrated),
+        Feather
+    );
+    assert_eq!(negotiate_builtin_shadow_quality(Feather, &software), Off);
+    // Natural degrades gracefully on weak parts, keeps its rank elsewhere.
+    assert_eq!(negotiate_builtin_shadow_quality(Natural, &integrated), Low);
+    assert_eq!(
+        negotiate_builtin_shadow_quality(Natural, &discrete),
+        Natural
+    );
     assert_eq!(
         negotiate_builtin_shadow_quality(High, &GpuCapabilities::apple_silicon()),
         Medium
@@ -166,13 +237,14 @@ fn directional_depth_maps_put_sunward_occluders_in_front() {
 fn uniforms_match_wgsl_std140_alignment_and_byte_offsets() {
     assert_eq!(align_of::<ShadowUniforms>(), 16);
     assert_eq!(size_of::<ShadowUniforms>() % 16, 0);
-    assert_eq!(size_of::<ShadowUniforms>(), 416);
+    assert_eq!(size_of::<ShadowUniforms>(), 432);
     assert_eq!(offset_of!(ShadowUniforms, light_view_proj), 0);
     assert_eq!(offset_of!(ShadowUniforms, camera_view_proj), 192);
     assert_eq!(offset_of!(ShadowUniforms, cascade_splits), 256);
     assert_eq!(offset_of!(ShadowUniforms, camera_position), 320);
     assert_eq!(offset_of!(ShadowUniforms, shadow_params), 384);
     assert_eq!(offset_of!(ShadowUniforms, render_params), 400);
+    assert_eq!(offset_of!(ShadowUniforms, celestial_params), 416);
 }
 
 #[test]
@@ -196,7 +268,9 @@ fn vfx1_colored_lights_pack_into_bounded_uniform_layout() {
         0
     );
     for (quality, expected) in [
+        (BuiltinShadowQuality::Feather, 16),
         (BuiltinShadowQuality::Low, 8),
+        (BuiltinShadowQuality::Natural, 32),
         (BuiltinShadowQuality::Medium, 32),
         (BuiltinShadowQuality::High, 64),
     ] {
@@ -267,6 +341,7 @@ fn all_builtin_shaders_have_valid_entrypoint_and_uniform_structure() {
         "camera_up:",
         "shadow_params:",
         "render_params:",
+        "celestial_params:",
     ];
     for (path, src) in BUILTIN_SHADOW_SHADERS {
         assert!(path.ends_with(".wgsl"));
@@ -279,25 +354,32 @@ fn all_builtin_shaders_have_valid_entrypoint_and_uniform_structure() {
             src.contains("@fragment") && src.contains("fn fs_main("),
             "{path}"
         );
-        assert!(src.contains("struct ShadowUniforms {"), "{path}");
-        assert!(
-            src.contains("@group(0) @binding(0) var<uniform> shadow: ShadowUniforms;"),
-            "{path}"
-        );
-        let fields: Vec<&str> = src
-            .split("struct ShadowUniforms {")
-            .nth(1)
-            .unwrap()
-            .split("};")
-            .next()
-            .unwrap()
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .collect();
-        assert_eq!(fields.len(), expected_fields.len(), "{path}");
-        for (line, field) in fields.iter().zip(expected_fields) {
-            assert!(line.starts_with(field), "{path} field {field} differs");
+        if src.contains("struct ShadowUniforms {") {
+            // The four scene passes share the ShadowUniforms layout.
+            assert!(
+                src.contains("@group(0) @binding(0) var<uniform> shadow: ShadowUniforms;"),
+                "{path}"
+            );
+            let fields: Vec<&str> = src
+                .split("struct ShadowUniforms {")
+                .nth(1)
+                .unwrap()
+                .split("};")
+                .next()
+                .unwrap()
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect();
+            assert_eq!(fields.len(), expected_fields.len(), "{path}");
+            for (line, field) in fields.iter().zip(expected_fields) {
+                assert!(line.starts_with(field), "{path} field {field} differs");
+            }
+        } else {
+            // The post pass owns its own uniform block instead.
+            assert_eq!(path, "spatial_sharpen.wgsl");
+            assert!(src.contains("struct SharpenUniforms {"), "{path}");
+            assert!(src.contains("texture_2d<f32>"), "{path}");
         }
         let lower = src.to_ascii_lowercase();
         for forbidden in [
@@ -314,18 +396,22 @@ fn all_builtin_shaders_have_valid_entrypoint_and_uniform_structure() {
             );
         }
     }
+    assert_eq!(BUILTIN_SHADOW_SHADERS.len(), 5);
     assert!(MEGU_TERRAIN_LIT_WGSL.contains("textureSampleCompareLevel"));
     assert!(MEGU_TERRAIN_LIT_WGSL.contains("array<PointLight, 64>"));
     assert!(MEGU_SKY_ATMOSPHERE_WGSL.contains("rayleigh"));
     assert!(MEGU_SKY_ATMOSPHERE_WGSL.contains("mie"));
     assert!(MEGU_WATER_SURFACE_WGSL.contains("fresnel"));
+    assert!(MEGU_SPATIAL_SHARPEN_WGSL.contains("textureSampleLevel"));
 }
 
 #[test]
 fn native_toml_loader_accepts_every_quality_manifest() {
     for quality in [
         BuiltinShadowQuality::Off,
+        BuiltinShadowQuality::Feather,
         BuiltinShadowQuality::Low,
+        BuiltinShadowQuality::Natural,
         BuiltinShadowQuality::Medium,
         BuiltinShadowQuality::High,
     ] {
@@ -336,7 +422,7 @@ fn native_toml_loader_accepts_every_quality_manifest() {
         let pack = load_megu_wgsl_pack(&source, &GpuShaderCaps::legacy_opengl()).unwrap();
         assert_eq!(pack.name, "Megu Enhanced");
         assert_eq!(pack.api_version, 1);
-        assert_eq!(pack.passes.len(), 4);
+        assert_eq!(pack.passes.len(), 5);
         assert!(pack.is_compatible());
         assert!(!pack.requires_compute);
         assert!(!pack.requires_ssbo);
@@ -351,4 +437,257 @@ fn native_toml_loader_accepts_every_quality_manifest() {
         );
         assert!(manifest.contains(&format!("quality = \"{}\"", quality.as_str())));
     }
+}
+
+#[test]
+fn dirty_only_cache_skips_clean_frames_and_catches_every_dirty_kind() {
+    let mut cache = DirtyOnlyShadowCache::default();
+    assert_eq!(
+        cache.angle_threshold_deg,
+        DirtyOnlyShadowCache::DEFAULT_ANGLE_THRESHOLD_DEG
+    );
+    let sun = compute_sun_direction(6000);
+    let chunk = [0, 4, 0];
+    let quality = BuiltinShadowQuality::Natural;
+
+    // First frame must render; afterwards a quiet frame reuses the cache.
+    assert_eq!(
+        cache.should_rerender_shadow_map(sun, chunk, 7, quality),
+        ShadowCacheDecision::Rerender(ShadowDirtyReason::FirstFrame)
+    );
+    assert_eq!(
+        cache.should_rerender_shadow_map(sun, chunk, 7, quality),
+        ShadowCacheDecision::ReuseCached
+    );
+
+    // A block edit inside the shadow radius forces a rerender.
+    assert_eq!(
+        cache.should_rerender_shadow_map(sun, chunk, 8, quality),
+        ShadowCacheDecision::Rerender(ShadowDirtyReason::WorldEdited)
+    );
+    // A preset change forces a rerender.
+    assert_eq!(
+        cache.should_rerender_shadow_map(sun, chunk, 8, BuiltinShadowQuality::High),
+        ShadowCacheDecision::Rerender(ShadowDirtyReason::PresetChanged)
+    );
+    // Crossing a snap boundary forces a rerender.
+    assert_eq!(
+        cache.should_rerender_shadow_map(sun, [1, 4, 0], 8, BuiltinShadowQuality::High),
+        ShadowCacheDecision::Rerender(ShadowDirtyReason::CameraCrossedSnapRegion)
+    );
+
+    // Small sun drift stays cached; cumulative drift past 0.75 deg rerenders.
+    // 24000 ticks = 360 deg, so 50 ticks = 0.75 deg.
+    assert_eq!(
+        cache.should_rerender_shadow_map(
+            compute_sun_direction(6000 + 49),
+            [1, 4, 0],
+            8,
+            BuiltinShadowQuality::High,
+        ),
+        ShadowCacheDecision::ReuseCached
+    );
+    assert_eq!(
+        cache.should_rerender_shadow_map(
+            compute_sun_direction(6000 + 49 + 60),
+            [1, 4, 0],
+            8,
+            BuiltinShadowQuality::High,
+        ),
+        ShadowCacheDecision::Rerender(ShadowDirtyReason::SunMoved)
+    );
+
+    // Feather and Off own no shadow map: they always reuse once primed.
+    assert_eq!(
+        cache.should_rerender_shadow_map(sun, [1, 4, 0], 8, BuiltinShadowQuality::Feather),
+        ShadowCacheDecision::Rerender(ShadowDirtyReason::PresetChanged)
+    );
+    assert_eq!(
+        cache.should_rerender_shadow_map(
+            compute_sun_direction(18_000),
+            [9, 9, 9],
+            8,
+            BuiltinShadowQuality::Feather,
+        ),
+        ShadowCacheDecision::ReuseCached
+    );
+
+    // invalidate() resets to the first-frame path.
+    cache.invalidate();
+    assert_eq!(
+        cache.should_rerender_shadow_map(sun, chunk, 8, quality),
+        ShadowCacheDecision::Rerender(ShadowDirtyReason::FirstFrame)
+    );
+
+    // A non-finite sun vector fails safe by rerendering.
+    assert_eq!(
+        cache.should_rerender_shadow_map(sun, chunk, 8, quality),
+        ShadowCacheDecision::ReuseCached
+    );
+    assert_eq!(
+        cache.should_rerender_shadow_map([f32::NAN; 3], chunk, 8, quality),
+        ShadowCacheDecision::Rerender(ShadowDirtyReason::SunMoved)
+    );
+}
+
+#[test]
+fn render_scale_presets_are_fixed_and_deterministic() {
+    assert_eq!(RenderScalePreset::default(), RenderScalePreset::Native100);
+    for (preset, percent) in [
+        (RenderScalePreset::Native100, 100),
+        (RenderScalePreset::Quality85, 85),
+        (RenderScalePreset::Balanced75, 75),
+        (RenderScalePreset::Performance67, 67),
+        (RenderScalePreset::UltraPerf50, 50),
+    ] {
+        assert_eq!(preset.percent(), percent);
+    }
+    assert_eq!(
+        RenderScalePreset::Balanced75.scaled_dimensions(1920, 1080),
+        (1440, 810)
+    );
+    assert_eq!(
+        RenderScalePreset::UltraPerf50.scaled_dimensions(1920, 1080),
+        (960, 540)
+    );
+    assert_eq!(
+        RenderScalePreset::Native100.scaled_dimensions(640, 360),
+        (640, 360)
+    );
+    // Never upscales, never zero, deterministic across calls.
+    for preset in [
+        RenderScalePreset::Native100,
+        RenderScalePreset::Quality85,
+        RenderScalePreset::Balanced75,
+        RenderScalePreset::Performance67,
+        RenderScalePreset::UltraPerf50,
+    ] {
+        let (w, h) = preset.scaled_dimensions(1, 1);
+        assert_eq!((w, h), (1, 1));
+        let (w, h) = preset.scaled_dimensions(u32::MAX, 3);
+        assert!(w > 0 && h >= 1);
+        assert_eq!(
+            preset.scaled_dimensions(1920, 1080),
+            preset.scaled_dimensions(1920, 1080)
+        );
+    }
+}
+
+#[test]
+fn eight_phase_moonlight_and_opt_in_eclipses() {
+    // Vanilla orbit: no eclipse is the default.
+    assert_eq!(EclipseMode::default(), EclipseMode::None);
+    // Full moon at midnight: gentle silver moonlight + soft lunar shadow.
+    let full = compute_celestial_lighting(18_000, 0, EclipseMode::None);
+    assert!(full.moon_illuminance > 0.9);
+    assert!(full.lunar_shadow_strength > 0.4);
+    assert!(full.star_visibility > 0.9, "stars out at midnight");
+    // New moon: near-zero lunar contribution, darker night.
+    let new = compute_celestial_lighting(18_000, 4, EclipseMode::None);
+    assert!(new.moon_illuminance < 0.1);
+    assert!(new.lunar_shadow_strength < 0.05);
+    assert!(new.moon_illuminance < full.moon_illuminance);
+    // Daytime: no stars.
+    let noon = compute_celestial_lighting(6000, 0, EclipseMode::None);
+    assert_eq!(noon.star_visibility, 0.0);
+    assert_eq!(noon.sun_illuminance, 1.0);
+
+    // Solar eclipse dims daylight, softens shadows, boosts corona, and lets
+    // stars show even at noon.
+    let totality = compute_celestial_lighting(6000, 0, EclipseMode::SolarEclipse { coverage: 1.0 });
+    assert!(totality.sun_illuminance < 0.1);
+    assert_eq!(totality.shadow_softness, 1.0);
+    assert_eq!(totality.corona_boost, 1.0);
+    assert!(totality.star_visibility > 0.8);
+    assert!(totality.eclipse_dim > 0.5);
+    let partial = compute_celestial_lighting(6000, 0, EclipseMode::SolarEclipse { coverage: 0.4 });
+    assert!(partial.sun_illuminance > totality.sun_illuminance);
+    assert!(partial.corona_boost < totality.corona_boost);
+
+    // Total lunar eclipse shifts moonlight toward copper and dims it.
+    let blood =
+        compute_celestial_lighting(18_000, 0, EclipseMode::TotalLunarEclipse { progress: 1.0 });
+    assert!(blood.moon_color[0] > full.moon_color[0]);
+    assert!(blood.moon_color[2] < full.moon_color[2]);
+    assert!(blood.moon_illuminance < full.moon_illuminance);
+    let penumbral =
+        compute_celestial_lighting(18_000, 0, EclipseMode::TotalLunarEclipse { progress: 0.0 });
+    assert_eq!(penumbral.moon_color, full.moon_color);
+
+    // Every combination stays finite and inside the 0..=1 visual range.
+    for time in [0, 3000, 6000, 12_000, 18_000, 23_999, u64::MAX] {
+        for phase in [0u8, 1, 4, 7, 8, 200, u8::MAX] {
+            for eclipse in [
+                EclipseMode::None,
+                EclipseMode::SolarEclipse { coverage: 0.5 },
+                EclipseMode::SolarEclipse { coverage: f32::NAN },
+                EclipseMode::TotalLunarEclipse { progress: 0.75 },
+                EclipseMode::TotalLunarEclipse {
+                    progress: f32::INFINITY,
+                },
+            ] {
+                let s = compute_celestial_lighting(time, phase, eclipse);
+                assert!(s.sun_illuminance.is_finite());
+                assert!(s.moon_color.iter().all(|v| v.is_finite()));
+                assert!(s.moon_illuminance.is_finite());
+                assert!(s.lunar_shadow_strength.is_finite());
+                assert!(s.shadow_softness.is_finite());
+                assert!(s.corona_boost.is_finite());
+                assert!((0.0..=1.0).contains(&s.star_visibility));
+                assert!(s.eclipse_dim.is_finite());
+            }
+        }
+    }
+}
+
+#[test]
+fn celestial_state_reaches_shadow_uniforms() {
+    let config = BuiltinShadowQuality::Natural.config();
+    let camera = ShadowCamera::default();
+    // Vanilla path derives the moon phase from the world day (day 4 = new moon).
+    let vanilla = build_shadow_uniforms(camera, config, 4 * 24_000 + 18_000);
+    assert!(
+        vanilla.celestial_params[0] > 0.9,
+        "star visibility at midnight"
+    );
+    // Opt-in solar eclipse: coverage drives corona boost and eclipse dim.
+    let eclipsed = build_shadow_uniforms_celestial(
+        camera,
+        config,
+        6000,
+        0,
+        EclipseMode::SolarEclipse { coverage: 1.0 },
+    );
+    assert_eq!(eclipsed.celestial_params[1], 1.0, "corona boost");
+    assert!(eclipsed.celestial_params[3] > 0.5, "eclipse dim");
+    let plain = build_shadow_uniforms(camera, config, 6000);
+    assert!(eclipsed.sun_color[0] < plain.sun_color[0] * 0.2);
+    // Lunar eclipse tints the moon channel copper.
+    let blood = build_shadow_uniforms_celestial(
+        camera,
+        config,
+        18_000,
+        0,
+        EclipseMode::TotalLunarEclipse { progress: 1.0 },
+    );
+    assert!(blood.moon_color[0] > vanilla.moon_color[0]);
+    assert!(blood.moon_color[2] < vanilla.moon_color[2]);
+    for field in [
+        vanilla.celestial_params,
+        eclipsed.celestial_params,
+        blood.celestial_params,
+    ] {
+        assert!(field.iter().all(|v| v.is_finite()));
+    }
+}
+
+#[test]
+fn spatial_sharpen_shader_is_compact_fullscreen_post() {
+    let lines = MEGU_SPATIAL_SHARPEN_WGSL.lines().count();
+    assert!(
+        (55..=110).contains(&lines),
+        "sharpen pass should stay compact (~60-90 lines), got {lines}"
+    );
+    assert!(MEGU_SPATIAL_SHARPEN_WGSL.contains("@builtin(vertex_index)"));
+    assert!(MEGU_SPATIAL_SHARPEN_WGSL.contains("SharpenUniforms"));
 }
