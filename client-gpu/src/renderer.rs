@@ -13,7 +13,12 @@ use mc_spine_client::shaders::{
     validate_wgsl_module, WgslStage, TERRAIN_OPAQUE_WGSL, TERRAIN_TRANSLUCENT_WGSL,
 };
 use mc_spine_client::world::WorldState;
+use mc_spine_client_mesh::builtin_shadow_wgsl::{
+    compute_sun_direction, negotiate_builtin_shadow_quality, pack_vfx1_lights,
+    BuiltinShadowQuality, DirtyOnlyShadowCache, RenderScalePreset, ShadowCacheDecision,
+};
 use mc_spine_client_mesh::ffi::PackedVertex;
+use mc_spine_client_mesh::vfx_engine::DynamicColoredLight;
 use mc_spine_client_mesh::SectionCoord;
 use mc_spine_client_mesh::{
     is_megu_wgsl_pack, BackendResolution, GpuCapabilities, GpuShaderCaps, MeguWgslPack, PassKind,
@@ -22,9 +27,16 @@ use mc_spine_client_mesh::{
 use mc_spine_kernel::entity_interp::{evaluate_sky_and_fog, SkyFogInput, SkyFogOutput};
 use winit::event_loop::OwnedDisplayHandle;
 
+use crate::atmosphere::{BiomeAtmosphereBlender, ChunkFadeTracker};
+use crate::mat4_mul;
+use crate::subworld_render::{
+    CompositeDrawUniforms, CompositeEnvUniforms, SubWorldGpuCache, SubWorldRenderBank,
+    VfxLightsGpu, COMPOSITE_LIT_WGSL, COMPOSITE_TERRAIN_WGSL, DRAW_UNIFORM_STRIDE,
+    LIT_VERTEX_LAYOUT, PART_INSTANCE_LAYOUT,
+};
 use crate::{
     build_index_buffer, gpu_capabilities_for, gpu_shader_caps_for, negotiate_pipeline,
-    pack_quads_to_vertices, wgpu_backends_for, Camera, DemoScene,
+    pack_quads_to_vertices, wgpu_backends_for, Camera, DemoScene, Mat4,
 };
 
 // ---------------------------------------------------------------------------
@@ -430,10 +442,87 @@ pub struct GpuRenderer {
     depth_size: (u32, u32),
     scene: Option<TerrainBuffers>,
     live_sections: HashMap<SectionCoord, LiveTerrainSection>,
+    composite: CompositeGpu,
+    subworld_gpu: SubWorldGpuCache,
+    scaled_target: Option<ScaledTarget>,
+    /// The negotiated built-in shadow quality (`negotiate_builtin_shadow_quality`
+    /// output); `Off` unless [`Self::set_shadow_quality`] ran.
+    pub shadow_quality: BuiltinShadowQuality,
+    /// Render-scale preset for the composed world pass (`Native100` = the
+    /// world and the UI overlay both render at target resolution).
+    pub render_scale: RenderScalePreset,
+    shadow_cache: DirtyOnlyShadowCache,
+    /// Decision the [`DirtyOnlyShadowCache`] returned for the most recent
+    /// composed frame (`FirstFrame` until one renders).
+    pub last_shadow_decision: ShadowCacheDecision,
     /// The active shaderpack hook verdict (or `None` for built-in).
     pub shaderpack: ShaderpackAttempt,
     /// Latest notice line the HUD/diagnostics can display.
     pub notice: Option<String>,
+}
+
+/// GPU state for the composed pass: the fade/light-aware terrain pipeline,
+/// the lit `TerrainVertex` pipelines (opaque + alpha), the instanced-part
+/// pipeline, the dynamic-offset draw-uniform pool, and the shared
+/// environment/lights uniforms. All pipelines share group layouts so one
+/// pass binds every draw.
+struct CompositeGpu {
+    terrain_opaque_pipeline: wgpu::RenderPipeline,
+    terrain_alpha_pipeline: wgpu::RenderPipeline,
+    lit_pipeline: wgpu::RenderPipeline,
+    lit_alpha_pipeline: wgpu::RenderPipeline,
+    instanced_pipeline: wgpu::RenderPipeline,
+    lit_frame_bg: wgpu::BindGroup,
+    draw_layout: wgpu::BindGroupLayout,
+    draw_bg: wgpu::BindGroup,
+    draw_ubo: wgpu::Buffer,
+    draw_capacity: u64,
+    draw_scratch: Vec<CompositeDrawUniforms>,
+    env_ubo: wgpu::Buffer,
+    lights_ubo: wgpu::Buffer,
+    env_bg: wgpu::BindGroup,
+}
+
+/// The reduced-resolution world target + its UI-blit-style bind group used
+/// to upscale back to native resolution when `render_scale < 100%`.
+struct ScaledTarget {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
+    size: (u32, u32),
+}
+
+/// One composed world-pass invocation: the color view to draw into, its
+/// pixel size and matching `view_proj`, the atmosphere clear color, and the
+/// chunk-fade ages consulted per live section.
+struct ComposedWorldTarget<'a> {
+    view: &'a wgpu::TextureView,
+    size: (u32, u32),
+    view_proj: Mat4,
+    clear_rgb: [f32; 3],
+    chunk_fades: &'a ChunkFadeTracker,
+}
+
+/// Everything [`GpuRenderer::render_offscreen_composed_frame`] needs beyond
+/// the camera: the authoritative sub-world bank (synced + drawn),
+/// atmosphere state for clear/fog/env uniforms, VFX1 dynamic lights, the
+/// chunk-fade tracker, the native-resolution UI framebuffer, and the
+/// counters the shadow cache consults.
+pub struct ComposedFrame<'a> {
+    /// Authoritative sub-world scene (GPU mirror refreshes during render).
+    pub subworlds: &'a mut SubWorldRenderBank,
+    /// VFX1 dynamic colored lights for this frame.
+    pub lights: &'a [DynamicColoredLight],
+    /// Blended atmosphere for the frame (clear color, fog, env uniforms).
+    pub atmosphere: &'a BiomeAtmosphereBlender,
+    /// Per-chunk-column fade ages.
+    pub chunk_fades: &'a ChunkFadeTracker,
+    /// `client-ui` RGBA framebuffer at native `width`×`height`, or `None`.
+    pub ui_rgba: Option<&'a [u8]>,
+    /// World edit counter for the dirty-only shadow cache.
+    pub world_revision: u64,
+    /// World time in ticks (sun direction, shadow cache input).
+    pub world_time_ticks: u64,
 }
 
 impl GpuRenderer {
@@ -562,6 +651,7 @@ impl GpuRenderer {
             min_filter: wgpu::FilterMode::Nearest,
             ..wgpu::SamplerDescriptor::default()
         });
+        let composite = Self::build_composite(&ctx, target_format, &frame_layout, &frame_ubo);
         Self {
             ctx,
             target_format,
@@ -583,10 +673,231 @@ impl GpuRenderer {
             depth_size: (0, 0),
             scene: None,
             live_sections: HashMap::new(),
+            composite,
+            subworld_gpu: SubWorldGpuCache::new(),
+            scaled_target: None,
+            shadow_quality: BuiltinShadowQuality::Off,
+            render_scale: RenderScalePreset::default(),
+            shadow_cache: DirtyOnlyShadowCache::new(),
+            last_shadow_decision: ShadowCacheDecision::Rerender(
+                mc_spine_client_mesh::builtin_shadow_wgsl::ShadowDirtyReason::FirstFrame,
+            ),
             shaderpack: ShaderpackAttempt::Fallback {
                 notice: "built-in terrain pipeline".to_string(),
             },
             notice: None,
+        }
+    }
+
+    /// Build the composed-pass pipelines and shared uniforms. Group layout:
+    /// `0` = terrain `frame_layout` (composite terrain) or frame-only
+    /// (lit/instanced), `1` = dynamic-offset draw uniforms,
+    /// `2` = environment + VFX light uniforms.
+    fn build_composite(
+        ctx: &GpuDevice,
+        target_format: wgpu::TextureFormat,
+        frame_layout: &wgpu::BindGroupLayout,
+        frame_ubo: &wgpu::Buffer,
+    ) -> CompositeGpu {
+        let device = &ctx.device;
+        let draw_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("composite-draw-layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: wgpu::BufferSize::new(
+                        std::mem::size_of::<CompositeDrawUniforms>() as u64,
+                    ),
+                },
+                count: None,
+            }],
+        });
+        let env_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("composite-env-layout"),
+            entries: &[uniform_entry(0), uniform_entry(1)],
+        });
+        let lit_frame_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("lit-frame-layout"),
+                entries: &[uniform_entry(0)],
+            });
+
+        let terrain_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("composite-terrain-layout"),
+            bind_group_layouts: &[Some(frame_layout), Some(&draw_layout), Some(&env_layout)],
+            immediate_size: 0,
+        });
+        let lit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("composite-lit-layout"),
+            bind_group_layouts: &[Some(&lit_frame_layout), Some(&draw_layout), Some(&env_layout)],
+            immediate_size: 0,
+        });
+
+        let terrain_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("composite-terrain"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(COMPOSITE_TERRAIN_WGSL)),
+        });
+        let lit_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("composite-lit"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(COMPOSITE_LIT_WGSL)),
+        });
+
+        let composite_pipeline = |label, layout, module, vs, fs, buffers, blend, depth_write| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some(vs),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers,
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..wgpu::PrimitiveState::default()
+                },
+                depth_stencil: Some(depth_state(depth_write)),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some(fs),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let terrain_buffers = [Some(TERRAIN_VERTEX_LAYOUT)];
+        let lit_buffers = [Some(LIT_VERTEX_LAYOUT)];
+        let instanced_buffers = [Some(LIT_VERTEX_LAYOUT), Some(PART_INSTANCE_LAYOUT)];
+        let terrain_opaque_pipeline = composite_pipeline(
+            "composite-terrain-opaque",
+            &terrain_layout,
+            &terrain_module,
+            "terrain_vs",
+            "terrain_fs",
+            &terrain_buffers,
+            None,
+            true,
+        );
+        let terrain_alpha_pipeline = composite_pipeline(
+            "composite-terrain-alpha",
+            &terrain_layout,
+            &terrain_module,
+            "terrain_translucent_vs",
+            "terrain_translucent_fs",
+            &terrain_buffers,
+            Some(ALPHA_BLEND),
+            false,
+        );
+        let lit_pipeline = composite_pipeline(
+            "composite-lit-opaque",
+            &lit_layout,
+            &lit_module,
+            "lit_vs",
+            "lit_fs",
+            &lit_buffers,
+            None,
+            true,
+        );
+        let lit_alpha_pipeline = composite_pipeline(
+            "composite-lit-alpha",
+            &lit_layout,
+            &lit_module,
+            "lit_vs",
+            "lit_fs",
+            &lit_buffers,
+            Some(ALPHA_BLEND),
+            false,
+        );
+        let instanced_pipeline = composite_pipeline(
+            "composite-instanced",
+            &lit_layout,
+            &lit_module,
+            "inst_vs",
+            "lit_fs",
+            &instanced_buffers,
+            None,
+            true,
+        );
+
+        let lit_frame_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lit-frame-bind-group"),
+            layout: &lit_frame_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: frame_ubo.as_entire_binding(),
+            }],
+        });
+        let env_ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("composite-env"),
+            size: std::mem::size_of::<CompositeEnvUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let lights_ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("composite-lights"),
+            size: std::mem::size_of::<VfxLightsGpu>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let env_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("composite-env-bind-group"),
+            layout: &env_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: env_ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: lights_ubo.as_entire_binding(),
+                },
+            ],
+        });
+        let draw_capacity = u64::from(DRAW_UNIFORM_STRIDE) * 64;
+        let draw_ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("composite-draw-uniforms"),
+            size: draw_capacity,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let draw_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("composite-draw-bind-group"),
+            layout: &draw_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &draw_ubo,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(u64::from(DRAW_UNIFORM_STRIDE)),
+                }),
+            }],
+        });
+        CompositeGpu {
+            terrain_opaque_pipeline,
+            terrain_alpha_pipeline,
+            lit_pipeline,
+            lit_alpha_pipeline,
+            instanced_pipeline,
+            lit_frame_bg,
+            draw_layout,
+            draw_bg,
+            draw_ubo,
+            draw_capacity,
+            draw_scratch: Vec::with_capacity(64),
+            env_ubo,
+            lights_ubo,
+            env_bg,
         }
     }
 
@@ -1291,7 +1602,17 @@ impl GpuRenderer {
             },
         );
         self.ctx.queue.submit([encoder.finish()]);
+        self.map_readback_buffer(&buffer, width, padded_bpr, height)
+    }
 
+    /// Map a `COPY_DST` readback buffer and un-pad rows into a tight RGBA vec.
+    fn map_readback_buffer(
+        &self,
+        buffer: &wgpu::Buffer,
+        width: u32,
+        padded_bpr: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, RendererError> {
         let (tx, rx) = std::sync::mpsc::channel();
         buffer.map_async(wgpu::MapMode::Read, .., move |result| {
             let _ = tx.send(result);
@@ -1315,6 +1636,605 @@ impl GpuRenderer {
         drop(mapped);
         buffer.unmap();
         Ok(rgba)
+    }
+
+    // ---------------------------------------------------------------------
+    // Composed frame: terrain + 6-DOF sub-worlds + instanced parts +
+    // clouds/planets + VFX lights + atmosphere + UI at native scale
+    // ---------------------------------------------------------------------
+
+    /// Negotiate and activate a built-in shadow quality preset. Returns the
+    /// quality the GPU actually supports; a change invalidates the
+    /// dirty-only shadow cache so the next composed frame re-renders.
+    pub fn set_shadow_quality(&mut self, requested: BuiltinShadowQuality) -> BuiltinShadowQuality {
+        let negotiated =
+            negotiate_builtin_shadow_quality(requested, &self.ctx.report.caps);
+        if negotiated != self.shadow_quality {
+            self.shadow_cache.invalidate();
+        }
+        self.shadow_quality = negotiated;
+        negotiated
+    }
+
+    /// Set the render-scale preset for the composed world pass. The scaled
+    /// intermediate target is (re)created lazily on the next frame.
+    pub fn set_render_scale(&mut self, preset: RenderScalePreset) {
+        if preset != self.render_scale {
+            self.render_scale = preset;
+            self.scaled_target = None;
+        }
+    }
+
+    /// Consult the dirty-only shadow cache for this frame's inputs. The
+    /// decision is recorded in [`Self::last_shadow_decision`]; zero-cascade
+    /// presets (`Off`, `Feather`) always resolve `ReuseCached` once primed.
+    pub fn shadow_decision(
+        &mut self,
+        camera: &Camera,
+        world_revision: u64,
+        world_time_ticks: u64,
+    ) -> ShadowCacheDecision {
+        let sun = compute_sun_direction(world_time_ticks);
+        let chunk = [
+            (camera.position[0] / 16.0).floor() as i32,
+            (camera.position[1] / 16.0).floor() as i32,
+            (camera.position[2] / 16.0).floor() as i32,
+        ];
+        self.last_shadow_decision = self.shadow_cache.should_rerender_shadow_map(
+            sun,
+            chunk,
+            world_revision,
+            self.shadow_quality,
+        );
+        self.last_shadow_decision
+    }
+
+    /// Mirror a [`SubWorldRenderBank`] onto the device: uploads only dirty
+    /// geometry/instance payloads and clears the bank's dirty flags.
+    pub fn sync_subworlds(&mut self, bank: &mut SubWorldRenderBank) {
+        self.subworld_gpu
+            .sync(&self.ctx.device, &self.ctx.queue, bank);
+    }
+
+    /// Number of GPU-resident sub-world entries (for diagnostics/tests).
+    pub fn subworld_gpu_entry_count(&self) -> usize {
+        self.subworld_gpu.entry_count()
+    }
+
+    /// Number of GPU-resident instanced batches (for diagnostics/tests).
+    pub fn subworld_gpu_batch_count(&self) -> usize {
+        self.subworld_gpu.batch_count()
+    }
+
+    /// Write the frame uniform from an explicit fog state instead of the
+    /// vanilla `evaluate_sky_and_fog` — the composed pass takes its fog
+    /// color and distances from the atmosphere blender.
+    fn write_frame_uniforms(
+        &self,
+        camera: &Camera,
+        aspect: f32,
+        fog_rgb: [f32; 3],
+        fog_start: f32,
+        fog_end: f32,
+    ) {
+        let uniforms = FrameUniforms {
+            view_proj: camera.view_projection(aspect),
+            camera_pos: camera.position,
+            fog_start,
+            fog_color: fog_rgb,
+            fog_end,
+            _pad: [0.0; 4],
+        };
+        self.ctx
+            .queue
+            .write_buffer(&self.frame_ubo, 0, bytemuck::bytes_of(&uniforms));
+    }
+
+    /// Write the shared environment + VFX-light uniforms for one composed
+    /// frame from the blender's current atmosphere.
+    fn write_env_uniforms(&self, frame: &ComposedFrame<'_>) {
+        let atmo = frame.atmosphere.current();
+        let sun_dir = compute_sun_direction(frame.world_time_ticks);
+        let env = CompositeEnvUniforms {
+            sun: [sun_dir[0], sun_dir[1], sun_dir[2], atmo.sun_intensity],
+            ambient: [
+                atmo.ambient_rgb[0],
+                atmo.ambient_rgb[1],
+                atmo.ambient_rgb[2],
+                1.0,
+            ],
+            atmo: [atmo.fog_density, 0.0, 0.0, 0.0],
+            depth_tint: [
+                atmo.depth_tint_rgb[0],
+                atmo.depth_tint_rgb[1],
+                atmo.depth_tint_rgb[2],
+                atmo.depth_tint_strength,
+            ],
+        };
+        self.ctx
+            .queue
+            .write_buffer(&self.composite.env_ubo, 0, bytemuck::bytes_of(&env));
+        let lights = pack_vfx1_lights(frame.lights, self.shadow_quality);
+        let packed = VfxLightsGpu::from(&lights);
+        self.ctx.queue.write_buffer(
+            &self.composite.lights_ubo,
+            0,
+            bytemuck::bytes_of(&packed),
+        );
+    }
+
+    /// Grow the dynamic-offset draw-uniform pool past `needed` records
+    /// (rebuilds the buffer + bind group; steady frames never hit this).
+    fn ensure_draw_capacity(&mut self, needed: usize) {
+        let bytes = needed as u64 * u64::from(DRAW_UNIFORM_STRIDE);
+        if bytes <= self.composite.draw_capacity {
+            return;
+        }
+        let records = (needed as u64).max(64) + needed as u64 / 2;
+        let capacity = records * u64::from(DRAW_UNIFORM_STRIDE);
+        let draw_ubo = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("composite-draw-uniforms"),
+            size: capacity,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let draw_bg = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("composite-draw-bind-group"),
+                layout: &self.composite.draw_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &draw_ubo,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(u64::from(DRAW_UNIFORM_STRIDE)),
+                    }),
+                }],
+            });
+        self.composite.draw_ubo = draw_ubo;
+        self.composite.draw_bg = draw_bg;
+        self.composite.draw_capacity = capacity;
+    }
+
+    /// Ensure the reduced-resolution world target exists at `size`
+    /// (only used when `render_scale < Native100`).
+    fn ensure_scaled_target(&mut self, width: u32, height: u32) {
+        if self
+            .scaled_target
+            .as_ref()
+            .is_some_and(|t| t.size == (width, height))
+        {
+            return;
+        }
+        let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("scaled-world-target"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.target_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = self.ctx.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("scaled-upscale-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..wgpu::SamplerDescriptor::default()
+        });
+        let bind_group = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("scaled-upscale-bind-group"),
+                layout: &self.ui_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                ],
+            });
+        self.scaled_target = Some(ScaledTarget {
+            _texture: texture,
+            view,
+            bind_group,
+            size: (width, height),
+        });
+    }
+
+    /// Encode the whole world pass (terrain + sub-worlds + instanced parts)
+    /// into `target.view` at `target.size`, clearing to the atmosphere
+    /// horizon. `target.view_proj` must already match the target aspect.
+    fn encode_composed_world(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &ComposedWorldTarget<'_>,
+    ) {
+        let ComposedWorldTarget {
+            view,
+            size: (width, height),
+            view_proj,
+            clear_rgb,
+            chunk_fades,
+        } = *target;
+        self.ensure_depth(width, height);
+        // Split disjoint field borrows so the scratch writer and the GPU
+        // handles can coexist inside the render pass.
+        let gpu = &mut self.composite;
+        let scene = &self.scene;
+        let live_sections = &self.live_sections;
+        let subworld_gpu = &self.subworld_gpu;
+        let frame_bind_group = &self.frame_bind_group;
+        let depth_view = self.depth_view.as_ref().expect("depth ensured");
+        gpu.draw_scratch.clear();
+        let scratch = &mut gpu.draw_scratch;
+        let mut slot = |model: Mat4, fade: f32, alpha: f32| -> u32 {
+            let index = scratch.len();
+            scratch.push(CompositeDrawUniforms {
+                mvp: mat4_mul(&view_proj, &model),
+                model,
+                params: [fade, alpha, 0.0, 0.0],
+                params2: [0.0; 4],
+                _stride_pad: [0.0; 24],
+            });
+            index as u32 * DRAW_UNIFORM_STRIDE
+        };
+        let identity: Mat4 = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("composed-world"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: f64::from(clear_rgb[0]),
+                            g: f64::from(clear_rgb[1]),
+                            b: f64::from(clear_rgb[2]),
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_bind_group(2, &gpu.env_bg, &[]);
+
+            // Opaque terrain: the demo scene plus every live section, each
+            // with its chunk-column fade.
+            pass.set_pipeline(&gpu.terrain_opaque_pipeline);
+            if let Some(scene) = scene {
+                if scene.opaque_index_count > 0 {
+                    let off = slot(identity, 1.0, 1.0);
+                    pass.set_bind_group(0, frame_bind_group, &[]);
+                    pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+                    pass.set_vertex_buffer(0, scene.opaque_vertices.slice(..));
+                    pass.set_index_buffer(
+                        scene.opaque_indices.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    pass.draw_indexed(0..scene.opaque_index_count, 0, 0..1);
+                }
+            }
+            for (coord, section) in live_sections.iter() {
+                if section.terrain.opaque_index_count == 0 {
+                    continue;
+                }
+                let fade = chunk_fades.fade_alpha(coord.0, coord.2);
+                let off = slot(identity, fade, 1.0);
+                pass.set_bind_group(0, &section.bind_group, &[]);
+                pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+                pass.set_vertex_buffer(0, section.terrain.opaque_vertices.slice(..));
+                pass.set_index_buffer(
+                    section.terrain.opaque_indices.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                pass.draw_indexed(0..section.terrain.opaque_index_count, 0, 0..1);
+            }
+
+            // Translucent terrain (water, stained glass) through the
+            // alpha-blended composite variant.
+            pass.set_pipeline(&gpu.terrain_alpha_pipeline);
+            if let Some(scene) = scene {
+                if scene.translucent_index_count > 0 {
+                    let off = slot(identity, 1.0, 1.0);
+                    pass.set_bind_group(0, frame_bind_group, &[]);
+                    pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+                    pass.set_vertex_buffer(0, scene.translucent_vertices.slice(..));
+                    pass.set_index_buffer(
+                        scene.translucent_indices.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    pass.draw_indexed(0..scene.translucent_index_count, 0, 0..1);
+                }
+            }
+            for (coord, section) in live_sections.iter() {
+                if section.terrain.translucent_index_count == 0 {
+                    continue;
+                }
+                let fade = chunk_fades.fade_alpha(coord.0, coord.2);
+                let off = slot(identity, fade, 1.0);
+                pass.set_bind_group(0, &section.bind_group, &[]);
+                pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+                pass.set_vertex_buffer(0, section.terrain.translucent_vertices.slice(..));
+                pass.set_index_buffer(
+                    section.terrain.translucent_indices.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                pass.draw_indexed(0..section.terrain.translucent_index_count, 0, 0..1);
+            }
+
+            // 6-DOF sub-worlds, opaque first (airship hulls, planets,
+            // contraptions), then instanced mechanical parts, then the
+            // alpha-blended entries (cloud shells).
+            let mut drew_opaque_subworld = false;
+            for entry in subworld_gpu.entries() {
+                if entry.index_count == 0 || entry.alpha < 0.999 {
+                    continue;
+                }
+                if !drew_opaque_subworld {
+                    pass.set_pipeline(&gpu.lit_pipeline);
+                    pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
+                    drew_opaque_subworld = true;
+                }
+                let model = entry.transform.model_matrix();
+                let off = slot(model, 1.0, entry.alpha);
+                pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+                pass.set_vertex_buffer(0, entry.vertex_buffer().slice(..));
+                pass.set_index_buffer(entry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..entry.index_count, 0, 0..1);
+            }
+            let mut drew_instanced = false;
+            for batch in subworld_gpu.batches() {
+                if batch.index_count == 0 || batch.instance_count == 0 {
+                    continue;
+                }
+                if !drew_instanced {
+                    pass.set_pipeline(&gpu.instanced_pipeline);
+                    pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
+                    drew_instanced = true;
+                }
+                let model = batch.transform.model_matrix();
+                let off = slot(model, 1.0, 1.0);
+                pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+                pass.set_vertex_buffer(0, batch.template_vertex_buffer().slice(..));
+                pass.set_vertex_buffer(1, batch.instance_buffer().slice(..));
+                pass.set_index_buffer(
+                    batch.template_index_buffer().slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                pass.draw_indexed(0..batch.index_count, 0, 0..batch.instance_count);
+            }
+            let mut drew_alpha = false;
+            for entry in subworld_gpu.entries() {
+                if entry.index_count == 0 || entry.alpha >= 0.999 {
+                    continue;
+                }
+                if !drew_alpha {
+                    pass.set_pipeline(&gpu.lit_alpha_pipeline);
+                    pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
+                    drew_alpha = true;
+                }
+                let model = entry.transform.model_matrix();
+                let off = slot(model, 1.0, entry.alpha);
+                pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+                pass.set_vertex_buffer(0, entry.vertex_buffer().slice(..));
+                pass.set_index_buffer(entry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..entry.index_count, 0, 0..1);
+            }
+        }
+        // Upload the recorded draw uniforms ahead of this frame's submit.
+        let gpu = &self.composite;
+        self.ctx.queue.write_buffer(
+            &gpu.draw_ubo,
+            0,
+            bytemuck::cast_slice(&gpu.draw_scratch),
+        );
+    }
+
+    /// Render a full composed frame offscreen and read the pixels back:
+    /// terrain with smooth chunk fade + atmosphere clear/fog, 6-DOF
+    /// sub-worlds, instanced mechanical parts, VFX1 colored lights, and the
+    /// UI overlay at native resolution. `render_scale < 100%` renders the
+    /// world into a smaller target and upscales before the UI pass.
+    pub fn render_offscreen_composed_frame(
+        &mut self,
+        width: u32,
+        height: u32,
+        camera: &Camera,
+        frame: &mut ComposedFrame<'_>,
+    ) -> Result<Vec<u8>, RendererError> {
+        let width = width.max(1);
+        let height = height.max(1);
+        self.subworld_gpu
+            .sync(&self.ctx.device, &self.ctx.queue, frame.subworlds);
+        if let Some(rgba) = frame.ui_rgba {
+            self.update_ui_framebuffer(width, height, rgba)?;
+        }
+        let (world_w, world_h) = self.render_scale.scaled_dimensions(width, height);
+        let scaled = (world_w, world_h) != (width, height);
+        if scaled {
+            self.ensure_scaled_target(world_w, world_h);
+        }
+        self.shadow_decision(camera, frame.world_revision, frame.world_time_ticks);
+
+        let atmo = frame.atmosphere.current();
+        let view = camera.far.clamp(16.0, 2048.0);
+        self.write_frame_uniforms(
+            camera,
+            world_w as f32 / world_h as f32,
+            atmo.fog_rgb,
+            view * 0.6,
+            view,
+        );
+        self.write_env_uniforms(frame);
+        // Worst case: one slot per live section + scene + subworlds + batches.
+        let draw_count = self.live_sections.len() * 2
+            + 2
+            + self.subworld_gpu.entry_count()
+            + self.subworld_gpu.batch_count();
+        self.ensure_draw_capacity(draw_count.max(8));
+
+        // The world pass renders into the scaled target (or straight into
+        // the readback texture at native scale).
+        let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("composed-target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.target_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let native_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view_proj = camera.view_projection(world_w as f32 / world_h as f32);
+        let clear_rgb = [
+            atmo.sky_horizon_rgb[0].max(atmo.fog_rgb[0] * 0.8),
+            atmo.sky_horizon_rgb[1].max(atmo.fog_rgb[1] * 0.8),
+            atmo.sky_horizon_rgb[2].max(atmo.fog_rgb[2] * 0.8),
+        ];
+        let mut encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("composed-frame"),
+            });
+        if scaled {
+            let target_view = self
+                .scaled_target
+                .as_ref()
+                .map(|t| t.view.clone())
+                .expect("ensured above");
+            self.encode_composed_world(
+                &mut encoder,
+                &ComposedWorldTarget {
+                    view: &target_view,
+                    size: (world_w, world_h),
+                    view_proj,
+                    clear_rgb,
+                    chunk_fades: frame.chunk_fades,
+                },
+            );
+            // Upscale the reduced-res world to native before the UI pass.
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("scaled-upscale"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &native_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.ui_pipeline);
+                pass.set_bind_group(0, &self.scaled_target.as_ref().expect("ensured").bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+        } else {
+            self.encode_composed_world(
+                &mut encoder,
+                &ComposedWorldTarget {
+                    view: &native_view,
+                    size: (width, height),
+                    view_proj,
+                    clear_rgb,
+                    chunk_fades: frame.chunk_fades,
+                },
+            );
+        }
+        // UI overlay at native resolution.
+        if let Some(ui_bind_group) = &self.ui_bind_group {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ui-overlay"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &native_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.ui_pipeline);
+            pass.set_bind_group(0, ui_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        let padded_bpr = crate::aligned_copy_bytes_per_row(width);
+        let buffer = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("composed-readback"),
+            size: u64::from(padded_bpr) * u64::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bpr),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.ctx.queue.submit([encoder.finish()]);
+        self.map_readback_buffer(&buffer, width, padded_bpr, height)
     }
 }
 

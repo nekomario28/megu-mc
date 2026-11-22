@@ -15,8 +15,10 @@
 //! quad->buffer conversion, the capability mapping and the CLI parser are
 //! pure functions unit tests exercise without an adapter.
 
+pub mod atmosphere;
 pub mod live_session;
 pub mod renderer;
+pub mod subworld_render;
 pub mod window;
 
 use std::path::PathBuf;
