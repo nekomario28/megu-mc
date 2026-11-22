@@ -563,7 +563,7 @@ pub(crate) fn encode_s3_request_batch(
     out[4..8].copy_from_slice(&(requests.len() as u32).to_le_bytes());
     out[8..16].copy_from_slice(&sequence.to_le_bytes());
     for (out, request) in out[S3_HEADER_SIZE..len]
-        .chunks_exact_mut(S3_REQUEST_SIZE)
+        .as_chunks_mut::<S3_REQUEST_SIZE>().0.iter_mut()
         .zip(requests)
     {
         out[0] = request.activation as u8;
@@ -1162,7 +1162,7 @@ impl S4ContainerSnapshot {
         }
         let (results, slots) = wire.split_at(3 * ops.len());
         let results = results
-            .chunks_exact(3)
+            .as_chunks::<3>().0.iter()
             .map(|value| {
                 Ok(S4SlotResult {
                     limit: u8::try_from(value[0])
@@ -1175,7 +1175,7 @@ impl S4ContainerSnapshot {
             .collect::<Result<Vec<_>, &'static str>>()?;
         let mut mutations = Vec::new();
         let writes = ops.iter().any(|op| op.writes());
-        for (slot, (wire, &expected)) in slots.chunks_exact(2).zip(&self.slots).enumerate() {
+        for (slot, (wire, &expected)) in slots.as_chunks::<2>().0.iter().zip(&self.slots).enumerate() {
             let replacement = S4ItemStack::decode(wire, self.slot_limit)?;
             if replacement != expected {
                 if !writes {

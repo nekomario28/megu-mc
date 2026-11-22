@@ -457,7 +457,7 @@ impl<'a, W: RedstoneBlockWorld> RedstoneWorldAdapter<'a, W> {
         rs_extend_neighborhood(&mut inspect, origins.iter().copied());
         let network = self.wire_network(&inspect);
         rs_settle_wires(self, network.iter().copied());
-        rs_extend_neighborhood(&mut inspect, network.into_iter());
+        rs_extend_neighborhood(&mut inspect, network);
         for pos in inspect {
             let block = self.redstone_block(pos);
             rs_update_device(self, pos, block);

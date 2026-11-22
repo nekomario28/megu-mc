@@ -3173,7 +3173,8 @@ mod anvil_io_tests {
             (-1, -1)
         );
         assert_eq!((-1i32).div_euclid(32), -1);
-        assert_eq!(((-1 & 31) + (-1 & 31) * 32), 1023);
+        let negative_chunk = anvil_region_coords(&dir.join("r.-1.-1.mca")).unwrap().0;
+        assert_eq!((negative_chunk & 31) + (negative_chunk & 31) * 32, 1023);
 
         let mut region_neg = AnvilRegion::default();
         region_neg.chunks.insert(

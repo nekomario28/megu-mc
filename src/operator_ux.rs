@@ -1470,7 +1470,7 @@ mod operator_ux_tests {
             None,
             "a 6-byte datagram has no full session id"
         );
-        assert_eq!(
+        assert!(
             handler.handle_datagram(
                 ip_a,
                 &p4a_gs4_handshake(7),
@@ -1478,7 +1478,6 @@ mod operator_ux_tests {
                 &no_snap,
             )
             .is_some(),
-            true,
             "control: a real handshake answers"
         );
         // Re-handshake above consumed the first issuance; mint a stable token
@@ -1849,7 +1848,7 @@ impl ProfilerReport {
                 format!(
                     "{{\"dim\":\"{}\",\"cx\":{},\"cz\":{},\"x\":{},\"z\":{},\
                      \"total_us\":{},\"ms_per_tick\":{:.2},\"subsystem\":\"{}\"}}",
-                    status_json_text(&spot.dim.dimension_id()),
+                    status_json_text(spot.dim.dimension_id()),
                     spot.chunk_x,
                     spot.chunk_z,
                     spot.block_x,

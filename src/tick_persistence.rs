@@ -27,7 +27,9 @@ pub(crate) struct TickState {
 ///
 /// One parser owns the footer, so the two consumers below cannot disagree about
 /// where the section starts.
-fn framed(payload: &[u8]) -> Result<Option<(&[u8], &[u8])>, &'static str> {
+type FramedPayload<'a> = Option<(&'a [u8], &'a [u8])>;
+
+fn framed(payload: &[u8]) -> Result<FramedPayload<'_>, &'static str> {
     if !payload.ends_with(MAGIC) {
         return Ok(None);
     }

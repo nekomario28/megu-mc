@@ -848,17 +848,17 @@ impl AcMoveState {
         if excess > MOVE_TOLERANCE {
             return Some(excess);
         }
-        for i in 0..3 {
-            let from_bonus = need[i].min(self.bonus[i]);
-            self.bonus[i] -= from_bonus;
-            self.credit[i] = (self.credit[i] - (need[i] - from_bonus)).max(-MOVE_TOLERANCE);
+        for ((need, bonus), credit) in need.iter().zip(&mut self.bonus).zip(&mut self.credit) {
+            let from_bonus = need.min(*bonus);
+            *bonus -= from_bonus;
+            *credit = (*credit - (need - from_bonus)).max(-MOVE_TOLERANCE);
         }
         None
     }
 
     fn grant(&mut self, extra: [f64; 3], now: Instant) {
-        for i in 0..3 {
-            self.bonus[i] = (self.bonus[i] + extra[i]).min(BONUS_CAP);
+        for (bonus, extra) in self.bonus.iter_mut().zip(extra) {
+            *bonus = (*bonus + extra).min(BONUS_CAP);
         }
         self.bonus_until = Some(now + Duration::from_secs_f64(BONUS_SECS));
     }

@@ -1613,7 +1613,7 @@ fn p2_3_s2b_chests_furnaces_and_crops_stay_isolated_per_dimension_and_round_trip
         .unwrap()
         .entry((DimId::Overworld, pos.0 >> 4, pos.2 >> 4))
         .or_default()
-        .insert(local_idx(pos.0, pos.1, pos.2), 4278 + 0);
+        .insert(local_idx(pos.0, pos.1, pos.2), 4278);
     let uuid = [7u8; 16];
     let ender = ender_container_key(&uuid);
     assert!(

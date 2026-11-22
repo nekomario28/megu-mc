@@ -1576,7 +1576,7 @@ mod p6a_persist_tests {
             .enumerate()
             .filter(|(_, w)| *w == [0, 2])
             .map(|(i, _)| i)
-            .last()
+            .next_back()
             .expect("count prefix");
         oversized[needle] = 0xff;
         oversized[needle + 1] = 0xff;

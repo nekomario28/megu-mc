@@ -297,6 +297,8 @@ impl StrongholdGen {
 /// `BoundingBox.orientBox`: the box is laid out from the piece's origin so that
 /// `direction` points into the piece. West/East swap the width onto the Z axis and
 /// run the depth along X.
+// Mirrors BoundingBox.orientBox with its explicit origin, offset and size axes.
+#[allow(clippy::too_many_arguments)]
 fn stronghold_orient_box(
     x: i32,
     y: i32,
@@ -423,6 +425,8 @@ fn create_straight<R: StructureRng + ?Sized>(
     Some(piece)
 }
 
+// Piece selection retains the individual native generation coordinates.
+#[allow(clippy::too_many_arguments)]
 fn create_turn<R: StructureRng + ?Sized>(
     kind: StrongholdKind,
     gen: &StrongholdGen,
@@ -567,6 +571,8 @@ fn create_portal_room(
     Some(piece)
 }
 
+// Shared native piece constructor used by the stronghold generation branches.
+#[allow(clippy::too_many_arguments)]
 fn create_piece<R: StructureRng + ?Sized>(
     kind: StrongholdKind,
     gen: &StrongholdGen,

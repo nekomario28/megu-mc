@@ -108,12 +108,14 @@ pub(crate) enum FrequencyReduction {
 /// two halves in one function is what lets a caller resolve a single ring index
 /// lazily without drifting from the eager [`concentric_rings`] path: the latter
 /// delegates here, so both consume the identical `next_f64`/`nextLong` stream.
+type RingCandidate = ((i32, i32), u64);
+
 pub(crate) fn concentric_ring_candidates(
     seed: u64,
     distance: i32,
     initial_spread: i32,
     count: i32,
-) -> Result<Vec<((i32, i32), u64)>, &'static str> {
+) -> Result<Vec<RingCandidate>, &'static str> {
     if !(0..=1023).contains(&distance)
         || !(0..=1023).contains(&initial_spread)
         || !(0..=4095).contains(&count)
@@ -181,6 +183,8 @@ pub(crate) fn concentric_rings(
 ///
 /// Returns the matching block position (`QuartPos.toBlock`), not a chunk.
 #[cfg_attr(not(test), allow(dead_code))]
+// Direct port of the biome search contract, including RNG and closest-match mode.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn find_biome_horizontal<B: Copy>(
     x: i32,
     y: i32,

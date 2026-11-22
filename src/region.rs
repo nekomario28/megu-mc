@@ -321,10 +321,7 @@ impl IncrementalSaveQueue {
         mut flush: impl FnMut(&QueuedChunkSave) -> Result<AnvilChunkFlushOutcome, String>,
     ) -> Result<IncrementalDrainStats, String> {
         let mut stats = IncrementalDrainStats::default();
-        loop {
-            let Some(front) = self.pending.front() else {
-                break;
-            };
+        while let Some(front) = self.pending.front() {
             if stats.chunks_flushed >= self.budget.max_chunks_per_tick {
                 break;
             }
@@ -468,6 +465,8 @@ fn anvil_recover_world_staging(dir: &std::path::Path) -> Result<usize, String> {
 
 /// Decode one populated location-table slot. `Ok(None)` is an empty slot;
 /// `Err` carries the same message `read_region_file` would have aborted with.
+type RegionChunkRecord = ((i32, i32), AnvilChunkRecord);
+
 fn anvil_region_slot(
     file: &[u8],
     timestamps: &[u8],
@@ -475,7 +474,7 @@ fn anvil_region_slot(
     rx: i32,
     rz: i32,
     path: &std::path::Path,
-) -> Result<Option<((i32, i32), AnvilChunkRecord)>, String> {
+) -> Result<Option<RegionChunkRecord>, String> {
     let le = &file[slot * 4..slot * 4 + 4];
     let offset = (usize::from(le[0]) << 16) | (usize::from(le[1]) << 8) | usize::from(le[2]);
     let sectors = usize::from(le[3]);

@@ -250,8 +250,8 @@ pub(crate) fn tick(tag:&mut Tag,origin:Pos,world:&mut impl World,random:&mut Lcg
     for _ in 0..count {
         let mut p=[0.;3];
         // Native order is X (two doubles), Y (bounded int), Z (two doubles).
-        for i in 0..3 {
-            p[i]=if let Some(Tag::Double(v))=fixed.get(i){f64::from_bits(*v)}else{match i {
+        for (i, coordinate) in p.iter_mut().enumerate() {
+            *coordinate=if let Some(Tag::Double(v))=fixed.get(i){f64::from_bits(*v)}else{match i {
                 0=>origin.0 as f64+(random.next_f64()-random.next_f64())*range as f64+0.5,
                 1=>(origin.1+random.next_bound(3)-1) as f64,
                 _=>origin.2 as f64+(random.next_f64()-random.next_f64())*range as f64+0.5,

@@ -459,6 +459,8 @@ impl Writer<'_, '_> {
     }
 }
 
+// Piece placement preserves the positional inputs of the native generation pipeline.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn place(
     ctx: &mut FC,
     random: &mut Xor,

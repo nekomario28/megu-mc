@@ -310,11 +310,10 @@ impl Hasher for TagHasher {
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
         let mut hash = self.0;
-        let mut chunks = bytes.chunks_exact(8);
-        for c in &mut chunks {
-            hash = Self::add(hash, u64::from_ne_bytes(c.try_into().unwrap()));
+        let (chunks, rem) = bytes.as_chunks::<8>();
+        for c in chunks {
+            hash = Self::add(hash, u64::from_ne_bytes(*c));
         }
-        let rem = chunks.remainder();
         if !rem.is_empty() {
             let mut buf = [0u8; 8];
             buf[..rem.len()].copy_from_slice(rem);
@@ -704,7 +703,7 @@ impl BReg {
         }
         // Each expanded set becomes a packed block-index bitset: `in_tag` then
         // costs one bit test, with no HashSet probe or string work per call.
-        let words = (reg.bname.len() + 63) / 64;
+        let words = reg.bname.len().div_ceil(64);
         let mut tag_ids = HashMap::with_capacity_and_hasher(done_sets.len(), TagBuild::default());
         reg.tag_names.reserve(done_sets.len());
         reg.tag_bits.reserve(done_sets.len());
@@ -1565,9 +1564,8 @@ impl BReg {
     /// recycled allocation — costs a miss, never a wrong answer.
     #[inline]
     fn tag_id(&self, tag: &str) -> Option<u32> {
-        let slot = ((tag.as_ptr() as usize).wrapping_mul(0x9e37_79b9_7f4a_7c15)
-            >> (usize::BITS as usize - TAG_CACHE_SLOTS.trailing_zeros() as usize))
-            as usize;
+        let slot = (tag.as_ptr() as usize).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            >> (usize::BITS - TAG_CACHE_SLOTS.trailing_zeros());
         let entry = self.tag_cache[slot].load(Ordering::Relaxed);
         if entry != 0 {
             let id = (entry - 1) as usize;

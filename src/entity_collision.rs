@@ -533,8 +533,8 @@ mod entity_collision_tests {
         }
     }
 
-    fn slice_boxes<'a>(
-        all: &'a [([f64; 3], [f64; 3])],
+    fn slice_boxes(
+        all: &[([f64; 3], [f64; 3])],
         sweep: EntityAabb,
     ) -> Vec<([f64; 3], [f64; 3])> {
         let smin = sweep.min();

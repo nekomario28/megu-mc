@@ -69,8 +69,8 @@ impl Cart {
             (
                 "UUID",
                 Tag::IntArray(
-                    uuid.chunks_exact(4)
-                        .map(|v| i32::from_be_bytes(v.try_into().unwrap()))
+                    uuid.as_chunks::<4>().0.iter()
+                        .map(|v| i32::from_be_bytes(*v))
                         .collect(),
                 ),
             ),
@@ -217,8 +217,8 @@ impl Frame {
             (
                 "UUID",
                 Tag::IntArray(
-                    uuid.chunks_exact(4)
-                        .map(|v| i32::from_be_bytes(v.try_into().unwrap()))
+                    uuid.as_chunks::<4>().0.iter()
+                        .map(|v| i32::from_be_bytes(*v))
                         .collect(),
                 ),
             ),

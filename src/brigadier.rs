@@ -3573,6 +3573,8 @@ pub struct CommandContext<S> {
 }
 
 impl<S> CommandContext<S> {
+    // Mirrors Brigadier's command-context constructor and its parsed state.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         source: S,
         input: impl Into<String>,
@@ -3879,9 +3881,7 @@ impl<'a, S: Clone> ContextChain<'a, S> {
         loop {
             match current.child() {
                 None => {
-                    if current.command().is_none() {
-                        return None;
-                    }
+                    current.command()?;
                     return Some(Self {
                         modifiers,
                         executable: current,
@@ -5122,7 +5122,7 @@ impl<S: Clone> CommandDispatcher<S> {
     /// `getPath(node)`: a path from the root to `node`, or empty when it is not in this tree.
     pub fn get_path(&self, target: &CommandNode<S>) -> Vec<String> {
         let mut paths: Vec<Vec<CommandNode<S>>> = Vec::new();
-        collect_paths(&self.root, &mut paths, &mut Vec::new());
+        collect_paths(&self.root, &mut paths, &[]);
         for path in paths {
             if path.last().is_some_and(|node| node.same_node(target)) {
                 return path
@@ -5148,14 +5148,13 @@ impl<S: Clone> CommandDispatcher<S> {
 fn collect_paths<S>(
     node: &CommandNode<S>,
     result: &mut Vec<Vec<CommandNode<S>>>,
-    parents: &mut Vec<CommandNode<S>>,
+    parents: &[CommandNode<S>],
 ) {
-    let mut current = parents.clone();
+    let mut current = parents.to_vec();
     current.push(node.clone());
     result.push(current.clone());
     for child in node.children() {
-        let mut next = current.clone();
-        collect_paths(&child, result, &mut next);
+        collect_paths(&child, result, &current);
     }
 }
 

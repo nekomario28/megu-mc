@@ -1121,16 +1121,20 @@ impl ExecuteNbtPath {
                     true
                 }
                 (All, ExecTag::List(_, entries)) => {
-                    entries.iter_mut().fold(false, |changed, entry| {
-                        set_at(entry, rest, value) || changed
-                    })
+                    let mut changed = false;
+                    for entry in entries {
+                        // Every matching element must be updated, even after the first change.
+                        changed = set_at(entry, rest, value) || changed;
+                    }
+                    changed
                 }
-                (Match(pattern, true), ExecTag::List(_, entries)) if !rest.is_empty() => entries
-                    .iter_mut()
-                    .filter(|entry| execute_nbt_matches(pattern, entry))
-                    .fold(false, |changed, entry| {
-                        set_at(entry, rest, value) || changed
-                    }),
+                (Match(pattern, true), ExecTag::List(_, entries)) if !rest.is_empty() => {
+                    let mut changed = false;
+                    for entry in entries.iter_mut().filter(|entry| execute_nbt_matches(pattern, entry)) {
+                        changed = set_at(entry, rest, value) || changed;
+                    }
+                    changed
+                },
                 (Match(pattern, false), entry)
                     if !rest.is_empty() && execute_nbt_matches(pattern, entry) =>
                 {

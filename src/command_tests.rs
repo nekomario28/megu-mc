@@ -60,7 +60,7 @@ fn help_reports_specific_usage_and_alias_is_read_only() {
 #[test]
 fn forceload_can_query_negative_chunk_and_remove_all() {
     let _world = world_guard();
-    let previous = std::mem::replace(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()), HashSet::new());
+    let previous = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let ctx = command_context(None);
     let added = run_command_ctx(&ctx, "/forceload add -1 -1", &mut None);
     let queried = run_command_ctx(&ctx, "/forceload query -1 -1", &mut None);
@@ -1136,8 +1136,7 @@ fn playsound_validates_arguments_and_encodes_sound_packets() {
     let (sid, used) = {
         let mut v = 0i64;
         let mut n = 0;
-        for i in 0..5 {
-            let b = payload[i];
+        for (i, &b) in payload.iter().enumerate().take(5) {
             v |= ((b & 0x7f) as i64) << (7 * i);
             n = i + 1;
             if b & 0x80 == 0 {
@@ -1167,8 +1166,7 @@ fn playsound_validates_arguments_and_encodes_sound_packets() {
     let (sid, used) = {
         let mut v = 0i64;
         let mut n = 0;
-        for i in 0..5 {
-            let b = payload[i];
+        for (i, &b) in payload.iter().enumerate().take(5) {
             v |= ((b & 0x7f) as i64) << (7 * i);
             n = i + 1;
             if b & 0x80 == 0 {

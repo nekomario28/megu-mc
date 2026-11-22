@@ -637,7 +637,8 @@ where
 // secret negotiated in the Encryption Response. `Plain` costs one match arm
 // per call; `Encrypted` adds an in-place cipher pass per read/write.
 
-#[allow(dead_code)]
+// Keep the encrypted stream inline to retain the existing connection layout.
+#[allow(dead_code, clippy::large_enum_variant)]
 pub(crate) enum ConnStream {
     Plain(TcpStream),
     Encrypted {
@@ -920,7 +921,7 @@ impl AsyncSaveWorker {
             g = cv.wait(g).unwrap();
         }
         match g.last_error.take() {
-            Some(message) => Err(std::io::Error::new(std::io::ErrorKind::Other, message)),
+            Some(message) => Err(std::io::Error::other(message)),
             None => Ok(()),
         }
     }
@@ -983,7 +984,7 @@ pub(crate) fn rotate_world_backups(
     let path = dir.join(format!("{marker}{seq:08}.bak"));
     write_bytes_atomic(&path, bytes)?;
     existing.push((seq, path.clone()));
-    existing.sort_by(|a, b| b.0.cmp(&a.0));
+    existing.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     for (_, old) in existing.into_iter().skip(max_keep) {
         let _ = std::fs::remove_file(old);
     }
@@ -1415,6 +1416,7 @@ impl DeltaWalJournal {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)
             .map_err(|e| format!("delta WAL: open {}: {e}", path.display()))?;
         std::io::Seek::seek(&mut file, std::io::SeekFrom::End(0))

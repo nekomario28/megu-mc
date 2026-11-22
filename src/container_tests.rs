@@ -268,7 +268,7 @@ fn container_pickup_respects_component_limits_on_empty_slots_and_swaps() {
 #[test]
 fn container_loot_roll_stays_inside_the_block_its_table_came_from() {
     use crate::generation_payload::{ContainerKind, GenerationPayload};
-    let redstone = name_to_item("minecraft:redstone").unwrap() as i64;
+    let redstone = name_to_item("minecraft:redstone").unwrap();
     let table = "spinetest:one_item";
     loot_tables().lock().unwrap_or_else(|e| e.into_inner()).insert(
         table.to_owned(),

@@ -2587,14 +2587,12 @@ struct LeafShape {
 
 impl LeafShape {
     fn positions(&self) -> impl Iterator<Item = P3> + '_ {
-        self.filled.iter().enumerate().filter_map(|(i, &filled)| {
-            filled.then(|| {
-                (
-                    self.min.0 + (i / (self.ys * self.zs)) as i32,
-                    self.min.1 + (i / self.zs % self.ys) as i32,
-                    self.min.2 + (i % self.zs) as i32,
-                )
-            })
+        self.filled.iter().enumerate().filter(|&(_, &filled)| filled).map(|(i, _)| {
+            (
+                self.min.0 + (i / (self.ys * self.zs)) as i32,
+                self.min.1 + (i / self.zs % self.ys) as i32,
+                self.min.2 + (i % self.zs) as i32,
+            )
         })
     }
 }

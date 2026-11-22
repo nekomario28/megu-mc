@@ -171,7 +171,7 @@ fn push_entities_step_indexed(
 
     let cramming_damage = if max_cramming > 0
         && pushable_buf.len() > (max_cramming - 1) as usize
-        && (roll_cramming() % 4) == 0
+        && roll_cramming().is_multiple_of(4)
     {
         let non_passengers = pushable_buf
             .iter()
@@ -403,6 +403,8 @@ mod entity_push_tests {
         }
     }
 
+    // Test fixture exposes every entity pushability and passenger-state switch.
+    #[allow(clippy::too_many_arguments)]
     fn make_spatial(
         idx: usize,
         eid: i32,

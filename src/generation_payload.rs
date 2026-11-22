@@ -20,7 +20,7 @@ pub(crate) enum ContainerKind {
     Furnace,
     /// A block container the runtime also keeps in `chests()` but whose native menu is
     /// smaller than a chest's 27 slots: dispenser/dropper/crafter 9, hopper 5, decorated pot
-    /// 1. No window opens on these, yet the store is read by position anyway — the hopper
+    /// one slot. No window opens on these, yet the store is read by position anyway — the hopper
     /// tick draws from a hopper, `fire_dispenser` draws from a dispenser, and a broken block
     /// spills its entry — so the contents are materialized rather than dropped. The number is
     /// the native container size, which is how many slots the loot roll may fill.

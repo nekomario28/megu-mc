@@ -23,6 +23,8 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+type CachedChunkLookup = (Arc<Vec<u8>>, Vec<((i32, i32, i32), u8)>);
+
 // ----------------------------------------------------------- protocol codecs
 
 /// Login packet 0x03 payload; send before enabling compressed framing.
@@ -443,7 +445,7 @@ impl ChunkPacketCache {
         key: (crate::DimId, i32, i32, bool),
         revision: u64,
         compression: Option<usize>,
-    ) -> Option<(Arc<Vec<u8>>, Vec<((i32, i32, i32), u8)>)> {
+    ) -> Option<CachedChunkLookup> {
         self.sync_generation(generation);
         let entry = self.map.get_mut(&key)?;
         if entry.revision != revision {

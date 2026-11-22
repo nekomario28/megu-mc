@@ -517,7 +517,8 @@ mod nether_spawn_tests {
     #[test]
     fn nether_spawn_biome_lists_and_weighted_picks() {
         // Orders and group sizes from the pinned MobSpawnSettings biome oracle.
-        let cases: &[(&str, &[(&str, i32, i32, i32)])] = &[
+        type BiomeSpawnCase<'a> = (&'a str, &'a [(&'a str, i32, i32, i32)]);
+        let cases: &[BiomeSpawnCase<'_>] = &[
             (
                 "minecraft:nether_wastes",
                 &[

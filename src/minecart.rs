@@ -78,7 +78,7 @@ impl State {
         }
         let mut dx=(b[0]-a[0]) as f64;let mut dz=(b[2]-a[2]) as f64;
         let length=(dx*dx+dz*dz).sqrt();
-        if self.velocity[0]*dx+self.velocity[2]*dz<0. {dx=-dx;dz=-dz;}
+        if self.velocity[0]*dx+self.velocity[2]*dz<0. {dx = -dx;dz = -dz;}
         let speed=2f64.min(horizontal_speed(self.velocity));
         self.velocity[0]=speed*dx/length;self.velocity[2]=speed*dz/length;
         if rail.powered==Some(false) {
@@ -112,8 +112,8 @@ impl State {
             let speed=horizontal_speed(self.velocity);
             if speed>0.01 {self.velocity[0]+=self.velocity[0]/speed*0.06;self.velocity[2]+=self.velocity[2]/speed*0.06;}
             else {match rail.shape {
-                EastWest=>{if w.conductor((x-1,y,z)){self.velocity[0]=0.02;}else if w.conductor((x+1,y,z)){self.velocity[0]=-0.02;}},
-                NorthSouth=>{if w.conductor((x,y,z-1)){self.velocity[2]=0.02;}else if w.conductor((x,y,z+1)){self.velocity[2]=-0.02;}}, _=>{}
+                EastWest=>{if w.conductor((x-1,y,z)){self.velocity[0]=0.02;}else if w.conductor((x+1,y,z)){self.velocity[0] = -0.02;}},
+                NorthSouth=>{if w.conductor((x,y,z-1)){self.velocity[2]=0.02;}else if w.conductor((x,y,z+1)){self.velocity[2] = -0.02;}}, _=>{}
             }}
         }
     }

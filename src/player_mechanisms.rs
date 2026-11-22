@@ -752,6 +752,8 @@ fn sweeping_edge_damage(level: i32, base_attack_damage: f32) -> f32 {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+// Combat predicate keeps its individual native attack-state inputs.
+#[allow(clippy::too_many_arguments)]
 fn sweeping_attack(
     attack_strength: f32,
     on_ground: bool,
@@ -2369,7 +2371,7 @@ fn apply_advancement_rewards(client: &Arc<Client>, rewards: &AdvancementRewards)
             let mut books = recipe_books().lock().unwrap_or_else(|e| e.into_inner());
             let book = books
                 .entry(client.uuid)
-                .or_insert_with(PlayerRecipeBook::new);
+                .or_default();
             rewards
                 .recipes
                 .iter()
@@ -4918,7 +4920,7 @@ impl CopperBlockState {
 /// de-oxidizes one stage: 1.0 adjacent, falling linearly to 0 at the radius.
 #[cfg_attr(not(test), allow(dead_code))]
 fn copper_lightning_deoxidize_chance(distance: i32) -> f32 {
-    if distance < 0 || distance > COPPER_LIGHTNING_RADIUS {
+    if !(0..=COPPER_LIGHTNING_RADIUS).contains(&distance) {
         return 0.0;
     }
     1.0 - distance as f32 / (COPPER_LIGHTNING_RADIUS as f32 + 1.0)

@@ -1891,10 +1891,10 @@ mod entity_fluid_tests {
         let fresh_us = fresh_start.elapsed().as_micros();
 
         let pooled_start = Instant::now();
-        for i in 0..500usize {
+        for (i, expected) in expected.iter().enumerate().take(500) {
             let probe = aabb.offset((i % 5) as f64 * 0.5, 0.0, -((i % 3) as f64) * 0.5);
             let actual = fluid_sweep_states(probe, vel, &world);
-            assert_eq!(expected[i], actual, "sweep #{i} must be bit-identical");
+            assert_eq!(*expected, actual, "sweep #{i} must be bit-identical");
         }
         let pooled_us = pooled_start.elapsed().as_micros();
         eprintln!(

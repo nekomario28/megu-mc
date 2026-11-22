@@ -42,6 +42,9 @@ impl SpatialScratch {
     }
 }
 
+type SpatialCellRanges = HashMap<(i32, i32), (u32, u32)>;
+type ChunkViewDelta = (Vec<(i32, i32)>, Vec<(i32, i32)>);
+
 struct EntitySpatialGrid {
     entities: Vec<SpatialEntity>,
     cells: HashMap<(i32, i32), (u32, u32)>,
@@ -93,7 +96,7 @@ thread_local! {
 
 /// Take the pooled cell map and entry array (empty, capacity retained) for a
 /// grid rebuild.
-fn spatial_pool_take_cells() -> (HashMap<(i32, i32), (u32, u32)>, Vec<u32>) {
+fn spatial_pool_take_cells() -> (SpatialCellRanges, Vec<u32>) {
     SPATIAL_POOL.with(|pool| {
         pool.try_borrow_mut()
             .map(|mut pool| {
@@ -523,7 +526,7 @@ fn compute_tracking_diff(previous: &[i32], eligible: &[i32]) -> (Vec<i32>, Vec<i
 /// chunk-tracking shape; callers must supply the appropriate actual tracked set.
 #[allow(dead_code)]
 fn chunk_view_diff(old: (i32, i32), new: (i32, i32), radius: u32)
-    -> (Vec<(i32, i32)>, Vec<(i32, i32)>)
+    -> ChunkViewDelta
 {
     fn window(center: (i32, i32), radius: u32) -> std::collections::BTreeSet<(i32, i32)> {
         let r = i64::from(radius);

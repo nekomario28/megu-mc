@@ -144,8 +144,7 @@ fn decode_cells<F: Fn(u32) -> u32>(
     let bits = bits as usize;
     let per = 64 / bits;
     let mask = (1u64 << bits) - 1;
-    for w in start / per..end.div_ceil(per) {
-        let word = words[w];
+    for (w, word) in (start / per..end.div_ceil(per)).map(|w| (w, words[w])) {
         let base = w * per;
         for i in start.saturating_sub(base)..(end - base).min(per) {
             dst[base + i - start] = map(((word >> (i * bits)) & mask) as u32);
@@ -175,7 +174,7 @@ fn promote_indirect8_to_direct(entries: &[u32], old_words: &[u64]) -> Box<[u64]>
     let mut indices = [0u8; 4096];
     unpack_all_const::<8>(old_words, &mut indices);
     let mut words = vec![0u64; 1024].into_boxed_slice();
-    for (w, chunk) in indices.chunks_exact(4).enumerate() {
+    for (w, chunk) in indices.as_chunks::<4>().0.iter().enumerate() {
         let mut word = 0u64;
         for (j, &idx) in chunk.iter().enumerate() {
             word |= ((entries[idx as usize] as u64) & 0x7fff) << (j * 15);
@@ -314,7 +313,7 @@ impl PalettedSection {
         let mut non_air = 0u16;
         let mut all_opaque = true;
         let mut has_hidden = false;
-        for (w, chunk) in states.chunks_exact(4).enumerate() {
+        for (w, chunk) in states.as_chunks::<4>().0.iter().enumerate() {
             let mut word = 0u64;
             for (j, &st) in chunk.iter().enumerate() {
                 if !is_air_state(st) {
@@ -977,9 +976,9 @@ mod paletted_tests {
 
         for &(distinct, expected_bits, base_offset) in cases {
             let mut states = [0u32; 4096];
-            for i in 0..4096 {
+            for (i, state) in states.iter_mut().enumerate() {
                 let k = i % distinct;
-                states[i] = if k == 0 && distinct > 1 {
+                *state = if k == 0 && distinct > 1 {
                     0
                 } else {
                     base_offset + k as u32

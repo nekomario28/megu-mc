@@ -741,19 +741,19 @@ fn condition_holds(
     condition: &J,
     ctx: &LootContext,
     rng: &mut Lcg,
-    res: &LootResolvers<'_>,
+    _res: &LootResolvers<'_>,
 ) -> bool {
     let id = jstr(condition, "condition").unwrap_or_default();
     match id.trim_start_matches("minecraft:") {
         "inverted" => !condition
             .get("term")
-            .map(|t| condition_holds(t, ctx, rng, res))
+            .map(|t| condition_holds(t, ctx, rng, _res))
             .unwrap_or(false),
         "any_of" => jarr(condition, "terms")
-            .map(|terms| terms.iter().any(|t| condition_holds(t, ctx, rng, res)))
+            .map(|terms| terms.iter().any(|t| condition_holds(t, ctx, rng, _res)))
             .unwrap_or(false),
         "all_of" => jarr(condition, "terms")
-            .map(|terms| terms.iter().all(|t| condition_holds(t, ctx, rng, res)))
+            .map(|terms| terms.iter().all(|t| condition_holds(t, ctx, rng, _res)))
             .unwrap_or(true),
         "random_chance" => rng.next_f32() < jnum(condition, "chance").unwrap_or(0.0) as f32,
         "random_chance_with_enchanted_bonus" => {
