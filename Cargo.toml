@@ -48,6 +48,7 @@ mod-suite = [
     "dep:create-adapter",
     "dep:mod-offload",
     "dep:mc-spine-core",
+    "dep:mc-spine-state-store",
 ]
 
 [dependencies]
@@ -56,6 +57,7 @@ jni = { version = "0.21.1", features = ["invocation"], optional = true }
 mod-adapter-core = { path = "mod-adapter-core", optional = true }
 create-adapter = { path = "create-adapter", optional = true }
 mc-spine-core = { path = "core", optional = true }
+mc-spine-state-store = { path = "state-store", optional = true }
 mod-offload = { path = "mod-offload", optional = true }
 ureq = { version = "3.4.2", features = ["rustls"] }
 

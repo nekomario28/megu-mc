@@ -65,6 +65,174 @@ enum LiveProgressionVerdict {
     },
 }
 
+// Performance governors are opt-in and retain one bounded cache and crowd
+// density map for the server. Callers gate only idle AI with the crowd result;
+// movement, gravity, combat and damage remain on the regular tick path.
+#[cfg(feature = "mod-suite")]
+struct LiveServerPerfBridge {
+    velocity: mc_spine_core::server_perf_governors::VelocityViewGovernor,
+    crowd: mc_spine_core::server_perf_governors::CrowdTickGuard,
+    chunks: mc_spine_core::server_perf_governors::CompressedChunkPacketCache,
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_server_perf_bridge() -> &'static Mutex<LiveServerPerfBridge> {
+    static BRIDGE: OnceLock<Mutex<LiveServerPerfBridge>> = OnceLock::new();
+    BRIDGE.get_or_init(|| {
+        Mutex::new(LiveServerPerfBridge {
+            velocity: mc_spine_core::server_perf_governors::VelocityViewGovernor::new(10),
+            crowd: mc_spine_core::server_perf_governors::CrowdTickGuard::default(),
+            chunks: mc_spine_core::server_perf_governors::CompressedChunkPacketCache::new(1024),
+        })
+    })
+}
+
+/// Select the current tick's outgoing chunks, keeping forward Elytra reach.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code, clippy::too_many_arguments)]
+fn live_plan_velocity_chunks(
+    view_distance: u8,
+    player_chunk_x: i32,
+    player_chunk_z: i32,
+    velocity_x: f32,
+    velocity_z: f32,
+    load_scale: f32,
+    max_chunks_per_tick: usize,
+) -> Vec<(i32, i32)> {
+    let mut bridge = live_server_perf_bridge()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    bridge.velocity.set_view_distance(view_distance);
+    bridge.velocity.plan_chunk_sends(
+        player_chunk_x,
+        player_chunk_z,
+        velocity_x,
+        velocity_z,
+        load_scale,
+        max_chunks_per_tick,
+    )
+}
+
+/// Only idle AI may be deferred. Physics, damage and combat always run.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_should_tick_crowd_mob_ai(
+    entity_id: i64,
+    chunk_x: i32,
+    chunk_z: i32,
+    tick: u64,
+    chunk_entity_count: u32,
+    is_critical: bool,
+) -> bool {
+    use mc_spine_core::server_perf_governors::EntityTickClass;
+
+    let mut bridge = live_server_perf_bridge()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    bridge
+        .crowd
+        .set_chunk_entity_count(chunk_x, chunk_z, chunk_entity_count);
+    let class = if is_critical {
+        EntityTickClass::Critical
+    } else {
+        EntityTickClass::CrowdMob
+    };
+    let decision = bridge.crowd.decide(class, entity_id, chunk_x, chunk_z, tick);
+    debug_assert!(decision.run_physics_and_damage());
+    decision.run_idle_ai()
+}
+
+/// Cache the compressed chunk payload across recipients at the same epoch.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_chunk_packet_cache_get_or_encode<F>(
+    dim: i32,
+    cx: i32,
+    cz: i32,
+    dirty_epoch: u64,
+    antixray_profile: u8,
+    encode_fn: F,
+) -> Arc<[u8]>
+where
+    F: FnOnce() -> Vec<u8>,
+{
+    use mc_spine_core::server_perf_governors::ChunkPacketCacheKey;
+
+    live_server_perf_bridge()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .chunks
+        .get_or_encode(
+            ChunkPacketCacheKey {
+                dim,
+                cx,
+                cz,
+                dirty_epoch,
+                antixray_profile,
+            },
+            encode_fn,
+        )
+}
+
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_chunk_packet_cache_invalidate(dim: i32, cx: i32, cz: i32) -> usize {
+    live_server_perf_bridge()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .chunks
+        .invalidate_chunk(dim, cx, cz)
+}
+
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code, clippy::too_many_arguments)]
+fn live_plan_velocity_chunks(
+    _view_distance: u8,
+    _player_chunk_x: i32,
+    _player_chunk_z: i32,
+    _velocity_x: f32,
+    _velocity_z: f32,
+    _load_scale: f32,
+    _max_chunks_per_tick: usize,
+) -> Vec<(i32, i32)> {
+    Vec::new()
+}
+
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code)]
+fn live_should_tick_crowd_mob_ai(
+    _entity_id: i64,
+    _chunk_x: i32,
+    _chunk_z: i32,
+    _tick: u64,
+    _chunk_entity_count: u32,
+    _is_critical: bool,
+) -> bool {
+    true
+}
+
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code)]
+fn live_chunk_packet_cache_get_or_encode<F>(
+    _dim: i32,
+    _cx: i32,
+    _cz: i32,
+    _dirty_epoch: u64,
+    _antixray_profile: u8,
+    encode_fn: F,
+) -> Arc<[u8]>
+where
+    F: FnOnce() -> Vec<u8>,
+{
+    Arc::from(encode_fn())
+}
+
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code)]
+fn live_chunk_packet_cache_invalidate(_dim: i32, _cx: i32, _cz: i32) -> usize {
+    0
+}
+
 // ===========================================================================
 // mod-suite implementation
 // ===========================================================================
@@ -130,6 +298,58 @@ const LIVE_MOD_MC_TARGET: McVersion = McVersion::V1_21_1;
 #[cfg(feature = "mod-suite")]
 fn live_mod_flagship_ids() -> BTreeSet<String> {
     BTreeSet::from(["create".to_string()])
+}
+
+#[cfg(all(test, feature = "mod-suite"))]
+mod live_server_perf_bridge_tests {
+    use super::*;
+
+    #[test]
+    fn live_perf_bridge_elytra_cone_retains_forward_distance() {
+        let planned = live_plan_velocity_chunks(12, 0, 0, 1.4, 0.0, 0.35, 1024);
+        assert!(planned.contains(&(12, 0)));
+        assert!(!planned.contains(&(-12, 0)));
+        assert!(planned.len() <= 1024);
+    }
+
+    #[test]
+    fn live_perf_bridge_crowd_ai_strides_without_skipping_physics() {
+        use mc_spine_core::server_perf_governors::{EntityTickClass, TickDecision};
+
+        let entity_id = 203;
+        let (cx, cz) = (900, 901);
+        let ticks: Vec<bool> = (0..15)
+            .map(|tick| live_should_tick_crowd_mob_ai(entity_id, cx, cz, tick, 40, false))
+            .collect();
+        assert_eq!(ticks.iter().filter(|&&t| t).count(), 5);
+        assert!(live_should_tick_crowd_mob_ai(entity_id, cx, cz, 0, 40, true));
+        assert_eq!(
+            live_server_perf_bridge()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .crowd
+                .decide(EntityTickClass::CrowdMob, entity_id, cx, cz, 0),
+            TickDecision::PhysicsOnly
+        );
+        assert!(TickDecision::PhysicsOnly.run_physics_and_damage());
+    }
+
+    #[test]
+    fn live_perf_bridge_chunk_cache_shares_and_invalidates_epochs() {
+        let (dim, cx, cz) = (300, 910, 920);
+        let first = live_chunk_packet_cache_get_or_encode(dim, cx, cz, 1, 0, || vec![1, 2, 3]);
+        let shared = live_chunk_packet_cache_get_or_encode(dim, cx, cz, 1, 0, || {
+            panic!("cache hit must not encode again")
+        });
+        assert!(Arc::ptr_eq(&first, &shared));
+        let next_epoch = live_chunk_packet_cache_get_or_encode(dim, cx, cz, 2, 0, || vec![4, 5]);
+        assert_eq!(&*next_epoch, &[4, 5]);
+        assert_eq!(live_chunk_packet_cache_invalidate(dim, cx, cz), 2);
+        let reencoded =
+            live_chunk_packet_cache_get_or_encode(dim, cx, cz, 1, 0, || vec![6, 7]);
+        assert_eq!(&*reencoded, &[6, 7]);
+        assert!(!Arc::ptr_eq(&first, &reencoded));
+    }
 }
 
 /// Audit record for one scanned mod JAR: the `auto_adapter` verdict and the

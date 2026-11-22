@@ -355,6 +355,7 @@ def main():
     parser.add_argument("--root", type=Path, default=REPO_ROOT, help="repository directory")
     parser.add_argument("--format", choices=("text", "json"), default="text")
     parser.add_argument("--strict", action="store_true", help="fail for unwired modules or contracts")
+    parser.add_argument("--strict-contracts", action="store_true", help="fail for pending wiring contracts")
     parser.add_argument("--report-only", action="store_true", help="report pending wiring without failing")
     args = parser.parse_args()
     root = args.root.resolve()
@@ -366,7 +367,10 @@ def main():
     else:
         print_text(report)
     summary = report["summary"]
-    if args.strict and not args.report_only and (summary["modules_unwired"] or summary["contracts_pending"]):
+    if not args.report_only and (
+        (args.strict and (summary["modules_unwired"] or summary["contracts_pending"]))
+        or (args.strict_contracts and summary["contracts_pending"])
+    ):
         return 1
     return 0
 

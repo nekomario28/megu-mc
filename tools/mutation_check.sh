@@ -51,7 +51,7 @@ case "${MUTATION_STABILITY:-0}" in
 # The manifest also resolves three optional path crates (`create-offload`), so their
 # manifests travel with the copy or cargo cannot read the dependency graph at all.
 INPUTS=(Cargo.toml Cargo.lock rust-toolchain.toml src tests tools assets datapacks evidence \
-    core proto mod-adapter-core create-adapter mod-offload)
+    core proto mod-adapter-core create-adapter mod-offload state-store)
 RUNTIME_INPUTS=(config_packets.bin)
 
 fail() {

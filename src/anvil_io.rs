@@ -25,6 +25,84 @@ const ANVIL_SECTOR: usize = 4096;
 const ANVIL_CHUNK_NBT_BUDGET: usize = 64 << 20;
 const ANVIL_LEVEL_NBT_BUDGET: usize = 256 << 20;
 
+/// Capture the on-disk Anvil world before importing or migrating it. The
+/// caller supplies the timestamp so snapshot identities are deterministic.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn anvil_take_world_snapshot(
+    world_root: &std::path::Path,
+    backup_root: &std::path::Path,
+    label: &str,
+    timestamp_secs: u64,
+) -> Result<String, String> {
+    use mc_spine_state_store::world_snapshot::{SnapshotReason, WorldSnapshotStore};
+
+    let store = WorldSnapshotStore::new(world_root, backup_root).map_err(|e| e.to_string())?;
+    // A damaged or incomplete world must still be recoverable from a snapshot.
+    // Record an unknown version instead of attributing it to this server's
+    // default Anvil release when level.dat cannot be read.
+    let mc_version = read_level_dat_path(&world_root.join("level.dat"))
+        .map(|level| {
+            AnvilSchemaVersion::from_data_version(level.data_version())
+                .release_name()
+                .to_string()
+        })
+        .unwrap_or_else(|_| "unknown".to_string());
+    let manifest = store
+        .create_snapshot(
+            SnapshotReason::PreModChange {
+                summary: label.to_string(),
+            },
+            &mc_version,
+            timestamp_secs,
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(manifest.snapshot_id)
+}
+
+/// Validate the stored content hashes before restoring the complete world.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn anvil_verify_and_restore_world_snapshot(
+    world_root: &std::path::Path,
+    backup_root: &std::path::Path,
+    snapshot_id: &str,
+    timestamp_secs: u64,
+) -> Result<(), String> {
+    use mc_spine_state_store::world_snapshot::WorldSnapshotStore;
+
+    let store = WorldSnapshotStore::new(world_root, backup_root).map_err(|e| e.to_string())?;
+    store
+        .verify_snapshot(snapshot_id)
+        .map_err(|e| e.to_string())?;
+    store
+        .restore_snapshot(snapshot_id, timestamp_secs)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code)]
+fn anvil_take_world_snapshot(
+    _world_root: &std::path::Path,
+    _backup_root: &std::path::Path,
+    _label: &str,
+    _timestamp_secs: u64,
+) -> Result<String, String> {
+    Err("world snapshots require --features mod-suite".to_string())
+}
+
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code)]
+fn anvil_verify_and_restore_world_snapshot(
+    _world_root: &std::path::Path,
+    _backup_root: &std::path::Path,
+    _snapshot_id: &str,
+    _timestamp_secs: u64,
+) -> Result<(), String> {
+    Err("world snapshots require --features mod-suite".to_string())
+}
+
 // ---------- DataVersion schema table ----------
 //
 // Vanilla stamps every `level.dat` and chunk record with a `DataVersion`
@@ -3024,6 +3102,66 @@ mod anvil_io_tests {
                 ])]),
             ),
         ])
+    }
+
+    #[cfg(feature = "mod-suite")]
+    #[test]
+    fn anvil_take_world_snapshot_roundtrip() {
+        let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tmp")
+            .join(format!("anvil-world-snapshot-{}", std::process::id()));
+        let world_root = scratch.join("world");
+        let backup_root = scratch.join("backups");
+        let region_path = world_root.join("region/r.0.0.mca");
+        std::fs::create_dir_all(region_path.parent().unwrap()).unwrap();
+        write_level_dat_path(
+            &world_root.join("level.dat"),
+            &anvil_level_dat_from_state("snapshot-test", ANVIL_DATA_VERSION),
+        )
+        .unwrap();
+        let mut region = AnvilRegion::default();
+        region.chunks.insert(
+            (0, 0),
+            AnvilChunkRecord {
+                timestamp: 17,
+                compression: 2,
+                nbt: sample_chunk_nbt(0, 0),
+            },
+        );
+        write_region_file(&region_path, &region).unwrap();
+        let initial_region = std::fs::read(&region_path).unwrap();
+
+        let snapshot_id = anvil_take_world_snapshot(&world_root, &backup_root, "pre-import", 100)
+            .unwrap();
+        let store = mc_spine_state_store::world_snapshot::WorldSnapshotStore::new(
+            &world_root,
+            &backup_root,
+        )
+        .unwrap();
+        assert_eq!(store.verify_snapshot(&snapshot_id).unwrap().files_verified, 2);
+        assert_eq!(store.load_manifest(&snapshot_id).unwrap().mc_version, "1.21.1");
+
+        std::fs::write(&region_path, b"modified region").unwrap();
+        std::fs::write(world_root.join("post-snapshot.dat"), b"new file").unwrap();
+        anvil_verify_and_restore_world_snapshot(&world_root, &backup_root, &snapshot_id, 101)
+            .unwrap();
+        assert_eq!(std::fs::read(&region_path).unwrap(), initial_region);
+        assert_eq!(read_region_file(&region_path).unwrap(), region);
+        assert!(!world_root.join("post-snapshot.dat").exists());
+        assert_eq!(store.verify_snapshot(&snapshot_id).unwrap().files_verified, 2);
+
+        write_level_dat_path(
+            &world_root.join("level.dat"),
+            &anvil_level_dat_from_state("snapshot-test", 5023),
+        )
+        .unwrap();
+        let latest_snapshot_id =
+            anvil_take_world_snapshot(&world_root, &backup_root, "pre-migration", 102).unwrap();
+        assert_eq!(
+            store.load_manifest(&latest_snapshot_id).unwrap().mc_version,
+            "26.3"
+        );
+        std::fs::remove_dir_all(scratch).unwrap();
     }
 
     #[test]

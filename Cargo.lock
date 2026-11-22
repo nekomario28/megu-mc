@@ -221,6 +221,7 @@ dependencies = [
  "flate2",
  "jni",
  "mc-spine-core",
+ "mc-spine-state-store",
  "mod-adapter-core",
  "mod-offload",
  "signal-hook",
@@ -230,6 +231,13 @@ dependencies = [
 [[package]]
 name = "mc-spine-core"
 version = "0.1.0"
+
+[[package]]
+name = "mc-spine-state-store"
+version = "0.1.0"
+dependencies = [
+ "mc-spine-core",
+]
 
 [[package]]
 name = "memchr"
