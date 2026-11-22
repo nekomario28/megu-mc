@@ -9,6 +9,7 @@ pub mod builtin_shadow_wgsl;
 mod cache;
 pub mod classic_ores;
 mod column;
+pub mod crop_archetype;
 mod cull;
 mod culler;
 pub mod draw_order;
