@@ -593,6 +593,175 @@ impl IncrementalLighting {
         self.stash_scratch(scratch);
     }
 
+    /// Insert chunks that newly entered the window without rebuilding the
+    /// settled ones.
+    ///
+    /// Each new chunk gets the same private state `from_chunks` computes —
+    /// refreshed skylight columns, emitter seeds, and the lateral-sky seed
+    /// pass over its own columns (covering pairs inside the inserted set and
+    /// pairs that reach into already-settled terrain). For the opposite
+    /// direction, every settled cell sharing a border face with a new chunk is
+    /// queued with its current level: that stored value is the fixpoint level
+    /// a `from_chunks` over the union would carry across the same face, and
+    /// re-emitting it replays exactly the wavefront that crosses the
+    /// boundary. Propagation is monotone and adding chunks only adds light
+    /// paths, so the seed superset converges to the union's fixpoint — pinned
+    /// cell-for-cell by `perf_light_incremental_insert_matches_full_from_chunks`.
+    pub fn insert_chunks_incremental(&mut self, new_chunks: Vec<(Chunk, Vec<LightBlock>)>) {
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.queue.clear();
+        scratch.frontier.clear();
+        let mut inserted: Vec<Chunk> = Vec::with_capacity(new_chunks.len());
+        for (key @ (cx, cz), blocks) in new_chunks {
+            if self.chunks.contains_key(&key) {
+                continue;
+            }
+            let mut chunk = LightingChunk::new(self.min_y, self.height, blocks);
+            if self.has_skylight {
+                for i in 0..256 {
+                    Self::refresh_column(self.min_y, self.height, &mut chunk, i, &mut |_| {});
+                }
+                chunk.sky.copy_from_slice(&chunk.direct_sky);
+            }
+            for (i, state) in chunk.blocks.iter().enumerate() {
+                if state.emission > 0 {
+                    chunk.block[i] = state.emission;
+                    scratch.queue.push_back((
+                        Position::new(
+                            cx * 16 + (i & 15) as i32,
+                            self.min_y + (i >> 8) as i32,
+                            cz * 16 + ((i >> 4) & 15) as i32,
+                        ),
+                        state.emission,
+                    ));
+                }
+            }
+            self.chunks.insert(key, chunk);
+            inserted.push(key);
+        }
+        // Already-settled cells that touch a new chunk replay their light into
+        // it: the border cell already holds the level the union's build would
+        // produce there, so queuing it reproduces the crossing wavefront. New
+        // chunks seed their own emitters above; settled chunks are never
+        // rescanned — `rebuild`'s pair seeding is replayed below only for
+        // columns that live in an inserted chunk.
+        for &(cx, cz) in &inserted {
+            for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                let neighbor @ (nx, nz) = (cx + dx, cz + dz);
+                if inserted.contains(&neighbor) {
+                    continue;
+                }
+                let Some(chunk) = self.chunks.get(&neighbor) else {
+                    continue;
+                };
+                for edge in 0..16i32 {
+                    let (lx, lz) = match (dx, dz) {
+                        (1, 0) => (0, edge),
+                        (-1, 0) => (15, edge),
+                        (0, 1) => (edge, 0),
+                        _ => (edge, 15),
+                    };
+                    let column = ((lz as usize) << 4) | lx as usize;
+                    for dy in 0..self.height {
+                        let index = ((dy as usize) << 8) | column;
+                        let block = chunk.block[index];
+                        if block > 1 {
+                            scratch.queue.push_back((
+                                Position::new(nx * 16 + lx, self.min_y + dy, nz * 16 + lz),
+                                block,
+                            ));
+                        }
+                        let sky = chunk.sky[index];
+                        if sky > 1 {
+                            scratch.frontier.push_back((
+                                Position::new(nx * 16 + lx, self.min_y + dy, nz * 16 + lz),
+                                sky,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        self.propagate(LightKind::Block, &mut scratch.queue, None);
+        if self.has_skylight {
+            for &(cx, cz) in &inserted {
+                let Some(chunk) = self.chunks.get(&(cx, cz)) else {
+                    continue;
+                };
+                for i in 0..256 {
+                    let x = cx * 16 + (i & 15) as i32;
+                    let z = cz * 16 + (i >> 4) as i32;
+                    for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                        let nx = x + dx;
+                        let nz = z + dz;
+                        let Some(other) = self.chunks.get(&(nx >> 4, nz >> 4)) else {
+                            continue;
+                        };
+                        let ni = ((nz & 15) << 4 | (nx & 15)) as usize;
+                        for y in self.min_y..=other.sky_top[ni] {
+                            let offset = ((y - self.min_y) as usize) << 8;
+                            let from = chunk.direct_sky[offset | i];
+                            if from > other.direct_sky[offset | ni] + 1 {
+                                scratch
+                                    .frontier
+                                    .push_back((Position::new(x, y, z), from));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.propagate(LightKind::Sky, &mut scratch.frontier, None);
+        self.stash_scratch(scratch);
+    }
+
+    /// Drop chunks from the window and settle the border ring that lost their
+    /// contribution, without rebuilding the rest.
+    ///
+    /// Light reaching a surviving cell through a removed chunk fades at least
+    /// one step per hop, so every cell the removal can darken sits within 14
+    /// Manhattan steps of the hole — the same radius `relight_patch` already
+    /// invalidates. Cells beyond it hold values no hole path could produce.
+    pub fn remove_chunks(&mut self, removed: &[Chunk]) {
+        let mut changed: Vec<Position> = Vec::new();
+        for &(cx, cz) in removed {
+            if !self.chunks.contains_key(&(cx, cz)) {
+                continue;
+            }
+            for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                let neighbor @ (nx, nz) = (cx + dx, cz + dz);
+                if !self.chunks.contains_key(&neighbor) || removed.contains(&neighbor) {
+                    continue;
+                }
+                for edge in 0..16i32 {
+                    let (lx, lz) = match (dx, dz) {
+                        (1, 0) => (0, edge),
+                        (-1, 0) => (15, edge),
+                        (0, 1) => (edge, 0),
+                        _ => (edge, 15),
+                    };
+                    for dy in 0..self.height {
+                        changed.push(Position::new(
+                            nx * 16 + lx,
+                            self.min_y + dy,
+                            nz * 16 + lz,
+                        ));
+                    }
+                }
+            }
+        }
+        self.chunks.retain(|key, _| !removed.contains(key));
+        if changed.is_empty() {
+            return;
+        }
+        let mut scratch = std::mem::take(&mut self.scratch);
+        self.relight_patch(LightKind::Block, &changed, &mut scratch);
+        if self.has_skylight {
+            self.relight_patch(LightKind::Sky, &changed, &mut scratch);
+        }
+        self.stash_scratch(scratch);
+    }
+
     /// Computes direct skylight independently of the lateral light field.
     fn refresh_column(
         min_y: i32,
@@ -1342,6 +1511,108 @@ mod incremental_lighting_tests {
                 }
             }
         }
+    }
+
+    /// PERF-BEAT-VANILLA-1 lane: `apply_queued_light_updates` grows the live
+    /// engine one missing chunk at a time instead of rebuilding the window, so
+    /// the incremental insert path must land on the same fixpoint a
+    /// `from_chunks` over the union does — every cell, both layers.
+    #[test]
+    fn perf_light_incremental_insert_matches_full_from_chunks() {
+        const HEIGHT: i32 = 64;
+        let mut state = 0x9e37_79b9u32;
+        let mut rng = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state
+        };
+        // A 5x5 window of randomized terrain: varying floors, sparse roofs and
+        // emitters make both kinds cross chunk borders.
+        let mut terrain: Vec<(Chunk, Vec<LightBlock>)> = Vec::new();
+        for cx in 0..5 {
+            for cz in 0..5 {
+                let mut blocks = vec![AIR; HEIGHT as usize * 256];
+                for i in 0..256usize {
+                    let floor = 8 + (rng() % 24) as usize;
+                    for y in 0..floor {
+                        blocks[y * 256 + i] = STONE;
+                    }
+                    match rng() % 17 {
+                        0 => blocks[floor * 256 + i] = TORCH,
+                        1 => blocks[floor * 256 + i] = LANTERN,
+                        2 => blocks[(floor + 5).min(HEIGHT as usize - 1) * 256 + i] = STONE,
+                        3 => blocks[(floor + 2).min(HEIGHT as usize - 1) * 256 + i] =
+                            LightBlock::new(2, 0),
+                        _ => {}
+                    }
+                }
+                terrain.push(((cx, cz), blocks));
+            }
+        }
+        let oracle =
+            IncrementalLighting::from_chunks(0, HEIGHT, true, terrain.iter().cloned());
+        let mut keys: Vec<Chunk> = terrain.iter().map(|(key, _)| *key).collect();
+        for i in (1..keys.len()).rev() {
+            keys.swap(i, (rng() % (i as u32 + 1)) as usize);
+        }
+        let mut engine = IncrementalLighting::from_chunks(0, HEIGHT, true, []);
+        let mut cursor = 0;
+        while cursor < keys.len() {
+            let take = 1 + (rng() % 4) as usize;
+            let batch: Vec<_> = keys[cursor..(cursor + take).min(keys.len())]
+                .iter()
+                .map(|key| (*key, terrain.iter().find(|(k, _)| k == key).unwrap().1.clone()))
+                .collect();
+            cursor += batch.len();
+            engine.insert_chunks_incremental(batch);
+        }
+        let assert_window_matches = |engine: &IncrementalLighting,
+                                     oracle: &IncrementalLighting| {
+            assert_eq!(engine.chunks.len(), oracle.chunks.len());
+            for (key, chunk) in &engine.chunks {
+                let rebuilt = &oracle.chunks[key];
+                for (name, actual, expected) in [
+                    ("block", &chunk.block, &rebuilt.block),
+                    ("sky", &chunk.sky, &rebuilt.sky),
+                    ("direct sky", &chunk.direct_sky, &rebuilt.direct_sky),
+                ] {
+                    assert!(
+                        actual == expected,
+                        "incremental {name} light diverged in {key:?}"
+                    );
+                }
+            }
+        };
+        assert_window_matches(&engine, &oracle);
+
+        // Evictions relight the ring a hole leaves behind; the survivors must
+        // match a fresh build of the remainder.
+        let mut removed: Vec<Chunk> = keys
+            .iter()
+            .copied()
+            .filter(|_| rng() % 3 == 0)
+            .collect();
+        if removed.len() == keys.len() {
+            removed.pop();
+        }
+        engine.remove_chunks(&removed);
+        let survivors = IncrementalLighting::from_chunks(
+            0,
+            HEIGHT,
+            true,
+            terrain
+                .iter()
+                .filter(|(key, _)| !removed.contains(key))
+                .cloned(),
+        );
+        assert_window_matches(&engine, &survivors);
+        // Re-insert the evicted set as one batch and land back on the union.
+        let reinserted: Vec<_> = terrain
+            .iter()
+            .filter(|(key, _)| removed.contains(key))
+            .cloned()
+            .collect();
+        engine.insert_chunks_incremental(reinserted);
+        assert_window_matches(&engine, &oracle);
     }
 
     /// PERF-MEM-ZERO-ALLOC lane benchmark: settled light is rebuilt and

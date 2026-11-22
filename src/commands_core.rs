@@ -4889,15 +4889,288 @@ fn adv_prog() -> &'static Mutex<Advancements> {
 /// visiting the matching ones is equivalent. The index follows the datapack revision.
 type AdvancementEventIndex = HashMap<String, Vec<(String, String)>>;
 
+/// Cached view of what an `adv_event(pname, "tick", None)` call can touch,
+/// rebuilt lazily when the advancement set moves.
+struct TickAdvIndex {
+    /// `content_revision()` at the last re-derivation.
+    revision: u64,
+    /// `adv_key_fingerprint(advancements())` then: a republish bumps
+    /// `revision`, but the tests that edit the map directly
+    /// (`advancements().insert`, a whole-map snapshot swap) do not — the id-set
+    /// fingerprint still betrays insert/remove/rename, even a same-length
+    /// swap a `len()` check cannot see.
+    advs_fp: u64,
+    /// `(advancement id, criteria the etype=None call can record, all criteria)`
+    /// for every advancement holding at least one recordable criterion — the
+    /// only advancements the call can `touched`-mark and therefore grant. The
+    /// full criterion list decides whether a replay would grant: an
+    /// advancement whose criteria already all sit in `adv_prog` but not in
+    /// `adv_done` (a revoked one) is granted again by the next call.
+    candidates: Vec<(String, Vec<String>, Vec<String>)>,
+    /// Whether any advancement carries a "tick" criterion at all — including
+    /// etype-typed ones an `etype=None` call can never record. When none do,
+    /// the full path returns before its `adv_prog` row creation and so must
+    /// this verdict.
+    any_tick: bool,
+}
+
+static TICK_ADV_INDEX: Mutex<TickAdvIndex> = Mutex::new(TickAdvIndex {
+    revision: u64::MAX,
+    advs_fp: u64::MAX,
+    candidates: Vec::new(),
+    any_tick: false,
+});
+
+/// Order-independent FNV-1a fingerprint of the advancement id set: an
+/// insert/remove/rename changes it with or without a `content_revision()`
+/// bump and regardless of the map length, so a same-length swap cannot hide
+/// from the index the way `len()` would. `0` for an empty map.
+fn adv_key_fingerprint(advs: &HashMap<String, Advancement>) -> u64 {
+    advs.keys().fold(0u64, |acc, id| {
+        acc ^ id
+            .as_bytes()
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+                (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)
+            })
+    })
+}
+
+/// The `(id, recordable criteria, all criteria)` triples an `etype=None`
+/// "tick" event can mark for each advancement that has any — exactly the
+/// `tr == event && (want.is_none() || *want == etype)` match the full path
+/// applies — plus whether "tick" appears at all (etype-typed criteria
+/// included).
+fn tick_adv_candidates(
+    advs: &HashMap<String, Advancement>,
+) -> (Vec<(String, Vec<String>, Vec<String>)>, bool) {
+    let mut any_tick = false;
+    let candidates = advs
+        .iter()
+        .filter_map(|(id, advancement)| {
+            let mut recordable = Vec::new();
+            for (criterion, trigger, want) in &advancement.criteria {
+                if trigger == "tick" {
+                    any_tick = true;
+                    if want.is_none() {
+                        recordable.push(criterion.clone());
+                    }
+                }
+            }
+            if recordable.is_empty() {
+                return None;
+            }
+            let all: Vec<String> = advancement
+                .criteria
+                .iter()
+                .map(|(criterion, _, _)| criterion.clone())
+                .collect();
+            Some((id.clone(), recordable, all))
+        })
+        .collect();
+    (candidates, any_tick)
+}
+
+/// Fast verdict for the per-player-per-tick `adv_event(pname, "tick", None)`
+/// call. Returns `true` only when replaying the full path could not record a
+/// criterion or grant anything for this player: either no advancement can
+/// fire on "tick" at all, or every tick criterion the call could record is
+/// already in `adv_prog` (and every grantable advancement already in
+/// `adv_done`). The verdict reads the same tables the full path does on every
+/// call — `content_revision()` plus the id-set fingerprint for
+/// `advancements()`, and `adv_prog()`/`adv_done()` directly — so
+/// `/advancement grant|revoke`, a
+/// datapack republish, a save load or a direct test-side mutation is seen on
+/// the very next call.
+fn tick_adv_settled(pname: &str) -> bool {
+    let revision = content_revision();
+    let mut index = TICK_ADV_INDEX.lock().unwrap_or_else(|e| e.into_inner());
+    let advs = match advancements().try_lock() {
+        Ok(advs) => advs,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        // The map is being republished under us; take the full path.
+        Err(std::sync::TryLockError::WouldBlock) => return false,
+    };
+    let advs_fp = adv_key_fingerprint(&advs);
+    if index.revision != revision || advs_fp != index.advs_fp {
+        index.revision = revision;
+        index.advs_fp = advs_fp;
+        (index.candidates, index.any_tick) = tick_adv_candidates(&advs);
+    }
+    if !index.any_tick {
+        // `by_event.get("tick")` is empty: the full path returns before even
+        // the per-player `adv_prog` row exists.
+        return true;
+    }
+    // The full path's all-granted early-out, checked with the same lock held —
+    // it returns without touching `adv_prog`.
+    let all_done = adv_done()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(pname)
+        .map(|g| g.len() >= advs.len() && advs.keys().all(|id| g.contains(id)))
+        .unwrap_or(false);
+    if all_done {
+        return true;
+    }
+    drop(advs);
+    // Lock order matches the full path (`adv_prog` before `adv_done`).
+    let mut prog = adv_prog().lock().unwrap_or_else(|e| e.into_inner());
+    let done = adv_done().lock().unwrap_or_else(|e| e.into_inner());
+    let earned = done.get(pname);
+    let progress = prog.get(pname);
+    let settled = index
+        .candidates
+        .iter()
+        .all(|(id, recordable, all)| {
+            if earned.is_some_and(|grants| grants.contains(id)) {
+                return true;
+            }
+            let Some(marked) = progress.and_then(|p| p.get(id)) else {
+                return false;
+            };
+            // A replay is a no-op only when it can neither record a new
+            // criterion nor grant: all recordable criteria already marked,
+            // and at least one criterion of the advancement still missing
+            // (otherwise the grant scan would award it right now).
+            recordable.iter().all(|criterion| marked.contains(criterion))
+                && !all.iter().all(|criterion| marked.contains(criterion))
+        });
+    if settled {
+        // The full path's only unconditional side effect past the candidate
+        // check is the per-player progress row; keep it identical.
+        prog.entry(pname.to_string()).or_default();
+    }
+    settled
+}
+
+#[cfg(test)]
+mod perf_adv_tick_tests {
+    use super::*;
+
+    fn cleanup(pname: &str, id: &str) {
+        advancements()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+        adv_prog()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(pname);
+        adv_done()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(pname);
+    }
+
+    /// `/advancement revoke` clears `adv_done` but leaves the criteria
+    /// `adv_event` recorded in `adv_prog`; the next tick call must notice a
+    /// replay would grant again rather than treating the player as settled.
+    #[test]
+    fn tick_adv_settled_replays_a_revoked_full_progress_grant() {
+        let _guard = crate::world_guard();
+        let id = "test:tick_rev";
+        let pname = "TickRevTester";
+        cleanup(pname, id);
+        advancements().lock().unwrap_or_else(|e| e.into_inner()).insert(
+            id.to_string(),
+            Advancement {
+                title: "tick_rev".to_string(),
+                criteria: vec![("seen".to_string(), "tick".to_string(), None)],
+            },
+        );
+        assert!(!tick_adv_settled(pname));
+        adv_event(pname, "tick", None);
+        assert!(
+            adv_done().lock().unwrap_or_else(|e| e.into_inner())[pname].contains(id)
+        );
+        assert!(tick_adv_settled(pname));
+        // The command path clears the grant but keeps `adv_prog`: replaying
+        // marks nothing new yet still grants — the verdict must say unsettled.
+        adv_done()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(pname)
+            .unwrap()
+            .remove(id);
+        assert!(!tick_adv_settled(pname));
+        adv_event(pname, "tick", None);
+        assert!(
+            adv_done().lock().unwrap_or_else(|e| e.into_inner())[pname].contains(id)
+        );
+        assert!(tick_adv_settled(pname));
+        cleanup(pname, id);
+    }
+
+    /// The one shape the settled verdict may fast-return on: every tick
+    /// criterion recorded and at least one criterion a tick call can never
+    /// complete, so a replay records nothing and grants nothing. Once the
+    /// missing criterion lands through its own event the verdict must turn
+    /// unsettled until the grant is applied.
+    #[test]
+    fn tick_adv_settled_on_unfinishable_progress() {
+        let _guard = crate::world_guard();
+        let id = "test:tick_partial";
+        let pname = "TickPartialTester";
+        cleanup(pname, id);
+        advancements().lock().unwrap_or_else(|e| e.into_inner()).insert(
+            id.to_string(),
+            Advancement {
+                title: "tick_partial".to_string(),
+                criteria: vec![
+                    ("seen".to_string(), "tick".to_string(), None),
+                    ("placed".to_string(), "place".to_string(), None),
+                ],
+            },
+        );
+        adv_event(pname, "tick", None);
+        {
+            let prog = adv_prog().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(prog[pname][id].contains("seen"));
+            assert!(!prog[pname][id].contains("placed"));
+        }
+        assert!(!adv_done().lock().unwrap_or_else(|e| e.into_inner()).contains_key(pname));
+        assert!(tick_adv_settled(pname));
+        adv_prog()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(pname)
+            .unwrap()
+            .get_mut(id)
+            .unwrap()
+            .insert("placed".to_string());
+        assert!(!tick_adv_settled(pname));
+        adv_event(pname, "tick", None);
+        assert!(
+            adv_done().lock().unwrap_or_else(|e| e.into_inner())[pname].contains(id)
+        );
+        assert!(tick_adv_settled(pname));
+        cleanup(pname, id);
+    }
+}
+
 fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
-    static INDEX: Mutex<Option<(u64, AdvancementEventIndex)>> = Mutex::new(None);
+    static INDEX: Mutex<Option<(u64, u64, AdvancementEventIndex)>> = Mutex::new(None);
     let __t = tickprof::enabled().then(std::time::Instant::now);
+    if event == "tick" && etype.is_none() && tick_adv_settled(pname) {
+        if let Some(t) = __t {
+            tickprof::add("adv/total", t.elapsed());
+        }
+        return;
+    }
     let mut grants: Vec<String> = Vec::new();
     {
         let advs = advancements().lock().unwrap_or_else(|e| e.into_inner());
         let revision = content_revision();
         let mut index = INDEX.lock().unwrap_or_else(|e| e.into_inner());
-        if index.as_ref().is_none_or(|(cached, _)| *cached != revision) {
+        // A datapack republish bumps `revision`; tests and command paths that
+        // edit the map directly do not, so the id-set fingerprint is the
+        // second key — an insert/remove/rename at any length still re-derives.
+        let advs_fp = adv_key_fingerprint(&advs);
+        if index
+            .as_ref()
+            .is_none_or(|(cached, fp, _)| *cached != revision || *fp != advs_fp)
+        {
             let mut by_event = AdvancementEventIndex::new();
             for (id, advancement) in advs.iter() {
                 for (criterion, trigger, _) in &advancement.criteria {
@@ -4907,9 +5180,9 @@ fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
                         .push((id.clone(), criterion.clone()));
                 }
             }
-            *index = Some((revision, by_event));
+            *index = Some((revision, advs_fp, by_event));
         }
-        let Some(candidates) = index.as_ref().and_then(|(_, by_event)| by_event.get(event)) else {
+        let Some(candidates) = index.as_ref().and_then(|(_, _, by_event)| by_event.get(event)) else {
             return;
         };
         if adv_done()

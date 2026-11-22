@@ -7851,11 +7851,27 @@ fn read_states_batched(positions: &[(i32, i32, i32)]) -> Vec<u32> {
     // The chunk band first: it is the states `chunk_data` already evaluated, so a leaf's
     // neighbours cost an array read instead of a worldgen evaluation. Falls back to the
     // live overlay, then to a batched worldgen pass for cells the band does not cover.
+    // `band_state` takes the band-cache lock and clones the `Arc` per cell; this
+    // loop resolves ~28k cells per tick, so the lock and the map lookup are
+    // taken once per touched chunk instead.
     let mut unresolved: Vec<usize> = Vec::new();
-    for (i, &(x, y, z)) in positions.iter().enumerate() {
-        match band_state(x, y, z) {
-            Some(st) => out[i] = st,
-            None => unresolved.push(i),
+    if !worldgen::enabled() {
+        unresolved.extend(0..positions.len());
+    } else {
+        let mut bands = op_bands().lock().unwrap_or_else(|e| e.into_inner());
+        let mut per_chunk: HashMap<(i32, i32), Option<std::sync::Arc<OpBand>>> = HashMap::new();
+        for (i, &(x, y, z)) in positions.iter().enumerate() {
+            let key = (x >> 4, z >> 4);
+            let band = per_chunk
+                .entry(key)
+                .or_insert_with(|| bands.get((DimId::Overworld, key.0, key.1)));
+            match band
+                .as_ref()
+                .and_then(|band| band.get(y, (x & 15) as usize, (z & 15) as usize))
+            {
+                Some(st) => out[i] = st,
+                None => unresolved.push(i),
+            }
         }
     }
     let generated: Vec<usize> = unresolved
@@ -13108,10 +13124,6 @@ fn band_patch_dim(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
         st;
 }
 
-fn band_state(x: i32, y: i32, z: i32) -> Option<u32> {
-    band_state_dim(DimId::Overworld, x, y, z)
-}
-
 fn band_state_dim(dim: DimId, x: i32, y: i32, z: i32) -> Option<u32> {
     if !worldgen::enabled() {
         return None;
@@ -15225,16 +15237,22 @@ fn pre_edit_light_chunk(
 /// engine is incremental (`edit_batch`/`relight_patch`; the
 /// `assert_matches_full_rebuild` test oracle pins incremental==rebuild), so
 /// keeping it across calls reduces the steady-state cost to the edits
-/// themselves. It is rebuilt from `neighbors` whenever a fresh build could
-/// disagree: the generator changed, a needed neighbour is missing (a missing
-/// chunk is a hard light boundary, not a correct-but-stale one), or the engine
-/// grew past the cap — extra chunks only add accurate propagation context, but
-/// bounding it keeps memory steady.
+/// themselves. Chunks the window needs but the engine has never seen are
+/// inserted incrementally (`insert_chunks_incremental`, pinned cell-for-cell
+/// against `from_chunks` by `perf_light_incremental_insert_matches_full_from_chunks`)
+/// instead of forcing a rebuild — a missing neighbour used to discard the
+/// whole engine every other tick whenever two chunks alternated in and out of
+/// the halo. A full rebuild still happens only when a fresh build could
+/// disagree: the generator changed. Beyond `neighbors` the engine may hold
+/// recently loaded chunks — extra chunks only add accurate propagation
+/// context — and `order` evicts the oldest outside the window past the cap.
 struct LiveLightEngine {
     generation: u64,
     /// Chunks the engine was built with. `engine.chunks` is not publicly
     /// inspectable, so coverage is tracked here.
     chunks: HashSet<Chunk>,
+    /// Insertion order of `chunks` for LRU eviction past the cap.
+    order: VecDeque<Chunk>,
     engine: IncrementalLighting,
 }
 
@@ -15265,28 +15283,51 @@ fn apply_queued_light_updates() {
         let edits = std::mem::take(&mut *pending_light_edits().lock().unwrap_or_else(|e| e.into_inner()));
         let mut props = HashMap::new();
         for (dim, edits) in edits {
-            let Some(held) = held.get(&dim) else { continue };
             let (old, new): (HashMap<_, _>, Vec<_>) = edits
                 .into_iter()
                 .filter(|(_, (old, new))| old != new)
                 .map(|(pos, (old, new))| ((pos, old), (pos, new)))
                 .unzip();
             let targets: Vec<_> = held
-                .iter()
-                .copied()
-                .filter(|chunk| {
-                    new.iter()
-                        .any(|(pos, _)| chunk_in_light_reach(*chunk, *pos))
+                .get(&dim)
+                .map(|held| {
+                    held.iter()
+                        .copied()
+                        .filter(|chunk| {
+                            new.iter()
+                                .any(|(pos, _)| chunk_in_light_reach(*chunk, *pos))
+                        })
+                        .collect()
                 })
-                .collect();
+                .unwrap_or_default();
             if targets.is_empty() {
+                // Nobody holds a chunk these edits can light, so no update is
+                // sent — but an edit inside a chunk the persisted engine
+                // covers must still reach it, or its stored blocks go stale
+                // against the world and the next visit relights a lie.
+                let needs_sync = live_light_engines()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&dim)
+                    .is_some_and(|entry| {
+                        entry.generation == generation
+                            && new
+                                .iter()
+                                .any(|(pos, _)| entry.chunks.contains(&pos.chunk()))
+                    });
+                if needs_sync {
+                    work.push((dim, targets, Vec::new(), HashSet::new(), false, None, new));
+                }
                 continue;
             }
             // Only visit terrain that streaming or a block write already
             // opened. Lighting must not advance world generation at the border.
             let edited: HashSet<_> = new.iter().map(|(pos, _)| pos.chunk()).collect();
             let neighbors: HashSet<_> = light_halo(targets.iter().copied())
-                .filter(|chunk| held.contains(chunk) || edited.contains(chunk))
+                .filter(|chunk| {
+                    held.get(&dim).is_some_and(|held| held.contains(chunk))
+                        || edited.contains(chunk)
+                })
                 .collect();
             let snapshots: Vec<_> = targets
                 .iter()
@@ -15294,22 +15335,37 @@ fn apply_queued_light_updates() {
                 .filter(|chunk| light_halo([*chunk]).all(|neighbor| neighbors.contains(&neighbor)))
                 .map(|(cx, cz)| ((cx, cz), chunk_versions_3x3(dim, cx, cz)))
                 .collect();
-            // Reuse the persisted engine when it covers every chunk a fresh
-            // build would visit; otherwise rebuild it from exactly `neighbors`,
-            // as before. A chunk's LightBlock array changes only through
+            // Reuse the persisted engine; a fresh build could disagree only
+            // when the generator changed, which is the one case that still
+            // rebuilds from exactly `neighbors`. On the same generation the
+            // engine only lacks `missing` chunks — insert them incrementally
+            // (0 on a steady tick) rather than throwing the settled window
+            // away. A chunk's LightBlock array changes only through
             // `note_light_edit`, and each such change arrives in `edits`, so a
             // covered engine is still current.
-            let covered = live_light_engines()
+            let (fresh, missing) = live_light_engines()
                 .lock()
                 .unwrap()
                 .get(&dim)
-                .is_some_and(|entry| {
-                    entry.generation == generation
-                        && entry.chunks.len() <= LIVE_LIGHT_ENGINE_CAP
-                        && neighbors.iter().all(|chunk| entry.chunks.contains(chunk))
-                });
-            let terrain = (!covered).then(|| {
-                neighbors
+                .map_or_else(
+                    || (true, neighbors.iter().copied().collect::<Vec<_>>()),
+                    |entry| {
+                        if entry.generation == generation {
+                            (
+                                false,
+                                neighbors
+                                    .iter()
+                                    .copied()
+                                    .filter(|chunk| !entry.chunks.contains(chunk))
+                                    .collect(),
+                            )
+                        } else {
+                            (true, neighbors.iter().copied().collect())
+                        }
+                    },
+                );
+            let terrain = (!missing.is_empty()).then(|| {
+                missing
                     .iter()
                     .copied()
                     .map(|chunk| {
@@ -15320,16 +15376,17 @@ fn apply_queued_light_updates() {
                     })
                     .collect::<Vec<_>>()
             });
-            work.push((dim, targets, snapshots, neighbors, terrain, new));
+            work.push((dim, targets, snapshots, neighbors, fresh, terrain, new));
         }
         work
     });
 
     let mut engines = live_light_engines().lock().unwrap_or_else(|e| e.into_inner());
-    for (dim, targets, snapshots, neighbors, terrain, new) in work {
+    for (dim, targets, snapshots, neighbors, fresh, terrain, new) in work {
         let entry = engines.entry(dim).or_insert_with(|| LiveLightEngine {
             generation,
             chunks: HashSet::new(),
+            order: VecDeque::new(),
             engine: IncrementalLighting::from_chunks(
                 dim.min_y(),
                 dim.height(),
@@ -15337,15 +15394,49 @@ fn apply_queued_light_updates() {
                 Vec::new(),
             ),
         });
-        if let Some(terrain) = terrain {
-            entry.engine = IncrementalLighting::from_chunks(
-                dim.min_y(),
-                dim.height(),
-                worldgen::has_skylight(dim),
-                terrain,
-            );
-            entry.chunks = neighbors;
-            entry.generation = generation;
+        match (fresh, terrain) {
+            (true, Some(terrain)) => {
+                entry.engine = IncrementalLighting::from_chunks(
+                    dim.min_y(),
+                    dim.height(),
+                    worldgen::has_skylight(dim),
+                    terrain,
+                );
+                entry.chunks = neighbors.iter().copied().collect();
+                entry.order = neighbors.iter().copied().collect();
+                entry.generation = generation;
+            }
+            (false, Some(terrain)) => {
+                for (key, _) in &terrain {
+                    if entry.chunks.insert(*key) {
+                        entry.order.push_back(*key);
+                    }
+                }
+                entry.engine.insert_chunks_incremental(terrain);
+            }
+            _ => {}
+        }
+        // Past the cap, evict the oldest chunks outside this tick's window and
+        // relight only the rings they leave — never the whole engine.
+        if entry.chunks.len() > LIVE_LIGHT_ENGINE_CAP {
+            let mut evicted = Vec::new();
+            for _ in 0..entry.order.len() {
+                if entry.chunks.len() <= LIVE_LIGHT_ENGINE_CAP {
+                    break;
+                }
+                let Some(chunk) = entry.order.pop_front() else {
+                    break;
+                };
+                if neighbors.contains(&chunk) {
+                    entry.order.push_back(chunk);
+                } else {
+                    entry.chunks.remove(&chunk);
+                    evicted.push(chunk);
+                }
+            }
+            if !evicted.is_empty() {
+                entry.engine.remove_chunks(&evicted);
+            }
         }
         let held_targets = targets.clone();
         let updates = entry.engine.edit_batch(new, targets);
@@ -15405,7 +15496,12 @@ fn apply_queued_light_updates() {
         // antifullbright: an edit that opened a sealed pocket does not change the light in
         // it, so the update above may not cover the sections the client holds as zero.
         // Re-send the chunks around each opening in full; they are no longer sealed.
-        let reveals = light_reveals().lock().unwrap_or_else(|e| e.into_inner()).remove(&dim).unwrap_or_default();
+        // With no targets the queue is left for the tick that can send.
+        let reveals = if held_targets.is_empty() {
+            Vec::new()
+        } else {
+            light_reveals().lock().unwrap_or_else(|e| e.into_inner()).remove(&dim).unwrap_or_default()
+        };
         if !reveals.is_empty() {
             for &chunk @ (cx, cz) in &held_targets {
                 if !reveals.iter().any(|p| chunk_in_light_reach(chunk, *p)) {
