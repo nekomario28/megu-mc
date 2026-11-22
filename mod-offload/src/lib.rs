@@ -2,6 +2,7 @@
 
 #![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
 
+pub mod combat_motion;
 pub mod contraption;
 pub mod entity_spatial;
 pub mod explosion_batch;
