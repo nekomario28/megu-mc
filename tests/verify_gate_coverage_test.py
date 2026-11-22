@@ -29,6 +29,7 @@ EXPECTED_CRATES = (
     "client-kernel",
     "client-app",
     "client-ui",
+    "client-gpu",
     "mod-offload",
     "mod-adapter-core",
     "create-adapter",
