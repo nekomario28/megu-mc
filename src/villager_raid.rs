@@ -3740,7 +3740,6 @@ fn eval_insomnia_spawn(time_since_rest: u64, night: bool, above_surface: bool, s
     time_since_rest >= 72_000 && night && above_surface && sky_visible
 }
 
-#[derive(Default)]
 #[cfg_attr(not(test), allow(dead_code))]
 struct SpecialSpawnState {
     /// Next game tick a patrol attempt is due (`PatrolSpawner.nextTick`).
@@ -3757,6 +3756,25 @@ struct SpecialSpawnState {
     time_since_rest: HashMap<VillageUuid, u64>,
     /// Per-player shrieker warning level (`WardenSpawnTracker`), 0..4.
     warden_warnings: HashMap<VillageUuid, u8>,
+}
+
+impl Default for SpecialSpawnState {
+    fn default() -> Self {
+        Self {
+            patrol_next: 0,
+            // `WanderingTraderSpawner`'s constructor always opens the
+            // 1200-tick slot countdown, and a fresh save's persisted
+            // delay/chance read 0/0 — vanilla resets them to 24000/25.
+            // All-zero timers here drained into a spawn attempt on the
+            // world's first tick.
+            trader_tick_delay: 1200,
+            trader_spawn_delay: 24_000,
+            trader_spawn_chance: 25,
+            insomnia_next: 0,
+            time_since_rest: HashMap::new(),
+            warden_warnings: HashMap::new(),
+        }
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3934,6 +3952,8 @@ fn live_special_spawn_tick(clients: &[Arc<Client>]) {
 
     // `WanderingTraderSpawner`: 1200-tick delay slots drain a 24000-tick
     // spawn delay; each failed attempt raises the chance by 25 to a 75 cap.
+    // Vanilla's `tick` gates the attempt on `doMobSpawning` as well as
+    // `doTraderSpawning`.
     if state.trader_tick_delay > 0 {
         state.trader_tick_delay -= 1;
     } else {
@@ -3941,7 +3961,10 @@ fn live_special_spawn_tick(clients: &[Arc<Client>]) {
         state.trader_spawn_delay = state.trader_spawn_delay.saturating_sub(1200);
         if state.trader_spawn_delay == 0 {
             state.trader_spawn_delay = 24_000;
-            if gamerule_live_value("doTraderSpawning") != 0 && !overworld_players.is_empty() {
+            if gamerule_live_value("doTraderSpawning") != 0
+                && gamerule_live_value("doMobSpawning") != 0
+                && !overworld_players.is_empty()
+            {
                 state.trader_spawn_chance = (state.trader_spawn_chance + 25).min(75);
                 if eval_trader_spawn_attempt(state.trader_spawn_chance, world_rng::next_below(100))
                 {
@@ -5976,6 +5999,135 @@ mod p2_parity_village_tests {
             mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|mob| mob.etype == phantom),
             "doInsomnia=true must spawn phantoms for a 100k-tick insomniac"
         );
+    }
+
+    /// Fresh-world regression for `WanderingTraderSpawner`: vanilla's
+    /// constructor opens with `tickDelay=1200`, `spawnDelay=24000` and
+    /// `spawnChance=25`, so the first tick of a new world cannot spawn a
+    /// trader. The trader and its two llamas only land after the full
+    /// 24000-tick delay drains with `doMobSpawning` and `doTraderSpawning`
+    /// both on; `doMobSpawning=false` blocks the attempt and leaves the
+    /// chance where it was.
+    #[test]
+    fn p2_parity_trader_fresh_state_waits_out_the_spawn_delay() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let Some(trader) = name_to_etype("wandering_trader") else {
+            return;
+        };
+        let Some(llama) = name_to_etype("trader_llama") else {
+            return;
+        };
+
+        let old_clients = std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner()));
+        let old_mobs = std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner()));
+        let old_time = WORLD_TIME.swap(1_000, Ordering::Relaxed);
+        // A tick that is not a multiple of 20 keeps the warden arm parked for
+        // the whole run; patrol and insomnia park on `u64::MAX` next-ticks, so
+        // the trader arm owns the only RNG draws.
+        let old_tick = TICK.swap(7, Ordering::Relaxed);
+        let old_rng = world_rng::saved_state();
+        let old_spawn = {
+            let mut state = special_spawn_state().lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *state)
+        };
+        struct Restore(
+            Vec<Arc<Client>>,
+            Vec<Arc<Mob>>,
+            u64,
+            u64,
+            u64,
+            SpecialSpawnState,
+        );
+        impl std::ops::Drop for Restore {
+            fn drop(&mut self) {
+                *clients().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.0);
+                *mobs().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.1);
+                WORLD_TIME.store(self.2, Ordering::Relaxed);
+                TICK.store(self.3, Ordering::Relaxed);
+                world_rng::restore(self.4);
+                *special_spawn_state().lock().unwrap_or_else(|e| e.into_inner()) =
+                    std::mem::take(&mut self.5);
+            }
+        }
+        let _restore = Restore(old_clients, old_mobs, old_time, old_tick, old_rng, old_spawn);
+
+        let (client, _receiver) = effect_tests::client_pair();
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 70.0, 0.5, 0.0, 0.0, true);
+        let client = Arc::new(client);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&client));
+        let roster = [Arc::clone(&client)];
+
+        let mob_kinds = || {
+            let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
+            (
+                mobs.iter().filter(|mob| mob.etype == trader).count(),
+                mobs.iter().filter(|mob| mob.etype == llama).count(),
+            )
+        };
+        let fresh_state = || {
+            let mut state = special_spawn_state().lock().unwrap_or_else(|e| e.into_inner());
+            *state = SpecialSpawnState {
+                patrol_next: u64::MAX,
+                insomnia_next: u64::MAX,
+                ..SpecialSpawnState::default()
+            };
+        };
+
+        let _mob_rule = Rules::take(&["doMobSpawning"]);
+        let _stored = StoredRules::take(&["doTraderSpawning", "doWardenSpawning"]);
+        gamerule_atomic_store("doMobSpawning", 1);
+        _stored.set("doTraderSpawning", 1);
+        _stored.set("doWardenSpawning", 0);
+
+        // The pinned stream makes the first `next_below(100)` roll a 0, so the
+        // first drain attempt lands the trader deterministically.
+        world_rng::restore(42);
+        fresh_state();
+        {
+            let state = special_spawn_state().lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(state.trader_tick_delay, 1_200, "the 1200-tick slot countdown opens fresh");
+            assert_eq!(state.trader_spawn_delay, 24_000, "a fresh world opens with a full spawn delay");
+            assert_eq!(state.trader_spawn_chance, 25, "a fresh world opens at the 25 first-attempt chance");
+        }
+
+        // Tick 1 of a fresh world: the countdown just starts — no trader.
+        live_special_spawn_tick(&roster);
+        assert_eq!(mob_kinds(), (0, 0), "tick 1 of a fresh world must not spawn a wandering trader");
+
+        // Well past the first 1200-tick slot the delay is still draining.
+        for _ in 0..20_000 {
+            live_special_spawn_tick(&roster);
+        }
+        assert_eq!(mob_kinds(), (0, 0), "the trader waits out the full 24000-tick delay");
+
+        let mut landed = false;
+        for _ in 0..30_000 {
+            live_special_spawn_tick(&roster);
+            let (traders, llamas) = mob_kinds();
+            if traders > 0 {
+                landed = true;
+                assert_eq!(llamas, 2, "a landed trader trails exactly two trader llamas");
+                break;
+            }
+        }
+        assert!(landed, "doMobSpawning && doTraderSpawning must spawn the trader after the delay");
+
+        // `doMobSpawning=false` blocks the attempt: a fresh state run through
+        // the whole window leaves no trader and never advances the chance.
+        gamerule_atomic_store("doMobSpawning", 0);
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        fresh_state();
+        world_rng::restore(42);
+        for _ in 0..30_000 {
+            live_special_spawn_tick(&roster);
+        }
+        assert_eq!(mob_kinds(), (0, 0), "doMobSpawning=false must block the wandering trader");
+        {
+            let state = special_spawn_state().lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(state.trader_spawn_chance, 25, "a blocked attempt must not advance the chance");
+        }
+        gamerule_atomic_store("doMobSpawning", 1);
     }
 }
 
