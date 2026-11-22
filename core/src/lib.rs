@@ -33,6 +33,14 @@
 //!   [`perf_kit::CoalescedDeltaBatch`] last-write-wins delta collapser, and
 //!   an [`perf_kit::AdaptiveLoadGovernor`] hysteresis budget scale — all
 //!   generic so any vanilla or modded subsystem can plug in.
+//! * [`server_perf_governors`] — deterministic single-node server
+//!   optimization governors surpassing Storia/Pumpkin-style tradeoffs
+//!   without breaking vanilla parity: a [`server_perf_governors::VelocityViewGovernor`]
+//!   anisotropic forward-cone chunk-send planner, a
+//!   [`server_perf_governors::CrowdTickGuard`] prime-stride idle-AI guard
+//!   that never skips physics/damage, and a
+//!   [`server_perf_governors::CompressedChunkPacketCache`] epoch-tagged
+//!   zero-copy shared packet cache with bounded LRU eviction.
 //! * [`sys_metrics`] — a fail-safe system & performance telemetry
 //!   snapshotter for the opt-in Advanced MiniHUD and server TUI: pure
 //!   `/proc` + `/sys/class/drm` parsers for RAM/CPU/GPU with `None`
@@ -50,5 +58,6 @@ pub mod id;
 pub mod math;
 pub mod perf_kit;
 pub mod random;
+pub mod server_perf_governors;
 pub mod sys_metrics;
 pub mod version;
