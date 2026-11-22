@@ -241,22 +241,35 @@ impl BiomeAtmosphereBlender {
     }
 
     /// `true` when `current` is within `eps` of `target` on every channel.
+    /// The channel lists live on the stack — no heap allocation.
     pub fn is_settled(&self, eps: f32) -> bool {
-        let channels = |p: &AtmosphereParams| -> Vec<f32> {
-            let mut v = Vec::with_capacity(17);
-            v.extend(p.sky_zenith_rgb);
-            v.extend(p.sky_horizon_rgb);
-            v.extend(p.fog_rgb);
-            v.push(p.fog_density);
-            v.extend(p.depth_tint_rgb);
-            v.push(p.depth_tint_strength);
-            v.extend(p.ambient_rgb);
-            v.push(p.sun_intensity);
-            v
-        };
-        channels(&self.current)
+        fn channels(p: &AtmosphereParams) -> [f32; 18] {
+            [
+                p.sky_zenith_rgb[0],
+                p.sky_zenith_rgb[1],
+                p.sky_zenith_rgb[2],
+                p.sky_horizon_rgb[0],
+                p.sky_horizon_rgb[1],
+                p.sky_horizon_rgb[2],
+                p.fog_rgb[0],
+                p.fog_rgb[1],
+                p.fog_rgb[2],
+                p.fog_density,
+                p.depth_tint_rgb[0],
+                p.depth_tint_rgb[1],
+                p.depth_tint_rgb[2],
+                p.depth_tint_strength,
+                p.ambient_rgb[0],
+                p.ambient_rgb[1],
+                p.ambient_rgb[2],
+                p.sun_intensity,
+            ]
+        }
+        let current = channels(&self.current);
+        let target = channels(&self.target);
+        current
             .iter()
-            .zip(channels(&self.target).iter())
+            .zip(target.iter())
             .all(|(a, b)| (a - b).abs() <= eps)
     }
 

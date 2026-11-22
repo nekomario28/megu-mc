@@ -1081,7 +1081,8 @@ struct TerrainFragment {
     @location(2) albedo: vec3<f32>,
     @location(3) illum: f32,
     @location(4) uv: vec2<f32>,
-    @location(5) @interpolate(flat) sprite_id: u32,
+    @location(5) @interpolate(flat) atlas_rect: vec4<f32>,
+    @location(6) fog: f32,
 };
 
 const FACE_SHADE = array<f32, 6>(0.45, 1.0, 0.75, 0.85, 0.7, 0.95);
@@ -1131,20 +1132,42 @@ fn tiled_uv(p: vec3<f32>, direction: u32) -> vec2<f32> {
     return p.zy;
 }
 
-fn atlas_sample(state_id: u32, uv: vec2<f32>) -> vec3<f32> {
+// Per-quad sprite lookup hoisted into the vertex stage: one `atlas_states`
+// + `atlas_rects` fetch per vertex replaces two storage reads per pixel.
+// A zero-area rect encodes the out-of-range fallback (`vec3(1.0)`).
+fn atlas_rect_for(state_id: u32) -> vec4<f32> {
     if state_id >= arrayLength(&atlas_states.sprites) {
-        return vec3<f32>(1.0);
+        return vec4<f32>(0.0);
     }
     let sprite_id = atlas_states.sprites[state_id];
     if sprite_id >= arrayLength(&atlas_rects.rects) {
+        return vec4<f32>(0.0);
+    }
+    return atlas_rects.rects[sprite_id];
+}
+
+fn atlas_sample_rect(rect: vec4<f32>, uv: vec2<f32>) -> vec3<f32> {
+    if rect.z <= 0.0 || rect.w <= 0.0 {
         return vec3<f32>(1.0);
     }
-    let rect = atlas_rects.rects[sprite_id];
     return textureSampleGrad(
         atlas_tex, atlas_sampler,
         rect.xy + fract(uv) * rect.zw,
         dpdx(uv) * rect.zw, dpdy(uv) * rect.zw,
     ).rgb;
+}
+
+// Fog share the vertex stage computes once per vertex; the fragment stage
+// consumes the interpolated factor instead of `distance`/`exp` per pixel.
+fn fog_factor_at(world: vec3<f32>) -> f32 {
+    let dist = distance(world, frame.camera_pos);
+    let linear = clamp(
+        (dist - frame.fog_start) / max(frame.fog_end - frame.fog_start, 0.001),
+        0.0,
+        1.0,
+    );
+    let expo = 1.0 - exp(-dist * env.atmo.x);
+    return clamp(max(linear, expo), 0.0, 1.0);
 }
 
 // Apply one luminance-independent shoulder to preserve highlight chromaticity.
@@ -1189,7 +1212,8 @@ fn terrain_vs(in: TerrainVertex) -> TerrainFragment {
     out.albedo = albedo * shade;
     out.illum = shade;
     out.uv = tiled_uv(vec3<f32>(lx, ly, lz), direction);
-    out.sprite_id = in.state_id;
+    out.atlas_rect = atlas_rect_for(in.state_id);
+    out.fog = fog_factor_at(world);
     return out;
 }
 
@@ -1207,7 +1231,8 @@ struct TranslucentFragment {
     @location(2) albedo: vec3<f32>,
     @location(3) alpha: f32,
     @location(4) uv: vec2<f32>,
-    @location(5) @interpolate(flat) sprite_id: u32,
+    @location(5) @interpolate(flat) atlas_rect: vec4<f32>,
+    @location(6) fog: f32,
 };
 
 @vertex
@@ -1253,14 +1278,15 @@ fn terrain_translucent_vs(in: TranslucentVertex) -> TranslucentFragment {
     out.albedo = albedo * shade;
     out.alpha = alpha;
     out.uv = tiled_uv(vec3<f32>(lx, ly, lz), direction);
-    out.sprite_id = in.state_id;
+    out.atlas_rect = atlas_rect_for(in.state_id);
+    out.fog = fog_factor_at(world);
     return out;
 }
 
 @fragment
 fn terrain_fs(in: TerrainFragment) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
-    let texel = atlas_sample(in.sprite_id, in.uv);
+    let texel = atlas_sample_rect(in.atlas_rect, in.uv);
     var color = in.albedo;
     let surface = in.albedo * texel;
     color *= texel;
@@ -1277,14 +1303,7 @@ fn terrain_fs(in: TerrainFragment) -> @location(0) vec4<f32> {
             * diffuse * falloff;
     }
     color = mix(color, color * env.depth_tint.rgb, env.depth_tint.w);
-    let dist = distance(in.world, frame.camera_pos);
-    let linear = clamp(
-        (dist - frame.fog_start) / max(frame.fog_end - frame.fog_start, 0.001),
-        0.0,
-        1.0,
-    );
-    let expo = 1.0 - exp(-dist * env.atmo.x);
-    color = mix(color, frame.fog_color, clamp(max(linear, expo), 0.0, 1.0));
+    color = mix(color, frame.fog_color, in.fog);
     let fade = clamp(draw.params.x, 0.0, 1.0);
     color = mix(frame.fog_color, color, fade);
     return vec4<f32>(filmic(color), 1.0);
@@ -1293,7 +1312,7 @@ fn terrain_fs(in: TerrainFragment) -> @location(0) vec4<f32> {
 @fragment
 fn terrain_translucent_fs(in: TranslucentFragment) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
-    let surface = in.albedo * atlas_sample(in.sprite_id, in.uv);
+    let surface = in.albedo * atlas_sample_rect(in.atlas_rect, in.uv);
     var color = surface;
     let count = min(dyn_lights.light_count.x, 64u);
     for (var i = 0u; i < count; i = i + 1u) {
@@ -1308,15 +1327,7 @@ fn terrain_translucent_fs(in: TranslucentFragment) -> @location(0) vec4<f32> {
             * diffuse * falloff;
     }
     color = mix(color, color * env.depth_tint.rgb, env.depth_tint.w);
-    let dist = distance(in.world, frame.camera_pos);
-    let linear = clamp(
-        (dist - frame.fog_start) / max(frame.fog_end - frame.fog_start, 0.001),
-        0.0,
-        1.0,
-    );
-    let expo = 1.0 - exp(-dist * env.atmo.x);
-    let fog = clamp(max(linear, expo), 0.0, 1.0);
-    let fog_smooth = fog * fog * (3.0 - 2.0 * fog);
+    let fog_smooth = in.fog * in.fog * (3.0 - 2.0 * in.fog);
     color = mix(color, frame.fog_color, fog_smooth);
     let fade = clamp(draw.params.x, 0.0, 1.0);
     color = mix(frame.fog_color, color, fade);

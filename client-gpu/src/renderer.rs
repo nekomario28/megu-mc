@@ -19,10 +19,11 @@ use mc_spine_client::world::WorldState;
 use mc_spine_client_mesh::atlas::{AtlasMip, PackedAtlas};
 use mc_spine_client_mesh::ber_instancing::{VanillaParticleQuad, VanillaParticleWorld};
 use mc_spine_client_mesh::builtin_shadow_wgsl::{
-    build_shadow_uniforms_celestial, compute_sun_direction, negotiate_builtin_shadow_quality,
-    pack_vfx1_lights, BuiltinShadowQuality, CascadeConfig, DirtyOnlyShadowCache, EclipseMode,
-    RenderScalePreset, ShadowCacheDecision, ShadowCamera, ShadowUniforms, MEGU_SHADOW_CASTERS_WGSL,
-    MEGU_SHADOW_DEPTH_WGSL, MEGU_SHADOW_SAMPLING_WGSL,
+    build_shadow_uniforms_celestial, compute_cascade_splits, compute_sun_direction,
+    negotiate_builtin_shadow_quality, pack_vfx1_lights, BuiltinShadowQuality, CascadeConfig,
+    DirtyOnlyShadowCache, EclipseMode, RenderScalePreset, ShadowCacheDecision, ShadowCamera,
+    ShadowDirtyReason, ShadowUniforms, MEGU_SHADOW_CASTERS_WGSL, MEGU_SHADOW_DEPTH_WGSL,
+    MEGU_SHADOW_SAMPLING_WGSL, MEGU_SKY_ATMOSPHERE_WGSL,
 };
 use mc_spine_client_mesh::ffi::PackedVertex;
 use mc_spine_client_mesh::vanilla_plus_3d::ExtrudedMesh;
@@ -30,7 +31,7 @@ use mc_spine_client_mesh::vfx_engine::DynamicColoredLight;
 use mc_spine_client_mesh::{
     box_facing_mask, box_in_frustum, bucket_draw_mask, ChunkUploadBudget, Direction,
     DirectionBuckets, GraphCuller, HiZPyramid, RenderRegions, SectionCoord, SectionGraph,
-    DIRECTION_BUCKETS, EDGE,
+    DIRECTION_BUCKETS, EDGE, REGION_X, REGION_Y, REGION_Z,
 };
 use mc_spine_client_mesh::{
     is_megu_wgsl_pack, BackendResolution, GpuCapabilities, GpuShaderCaps, MeguWgslPack, PassKind,
@@ -43,7 +44,8 @@ use winit::event_loop::OwnedDisplayHandle;
 
 use crate::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
 use crate::live_session::hw_adaptive_engine::{
-    detect_host_hardware_caps, select_compute_strategy, ComputeStrategy, MemoryTransferStrategy,
+    detect_universal_hardware_profile, select_compute_strategy, ComputeStrategy,
+    GpuComputeParadigm, MemoryTransferStrategy,
 };
 use crate::mat4_mul;
 use crate::mesh_pool::{
@@ -234,10 +236,11 @@ pub fn request_gpu_device(
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("mc-spine-client-gpu"),
         required_features: wgpu::Features::empty(),
-        // The adapter's own limits: guaranteed grantable, and low-spec
-        // adapters keep their clamped ceilings instead of the inflated
-        // `Limits::default()` a discrete-GPU bucket would request.
-        required_limits: adapter.limits(),
+        // The adapter's own limits, clamped to sane engine ceilings:
+        // guaranteed grantable, and low-spec adapters keep their clamped
+        // ceilings instead of the inflated `Limits::default()` a
+        // discrete-GPU bucket would request.
+        required_limits: negotiated_device_limits(&adapter),
         ..wgpu::DeviceDescriptor::default()
     }))
     .map_err(|e| RendererError::Device(e.to_string()))?;
@@ -248,6 +251,80 @@ pub fn request_gpu_device(
         queue,
         report,
     })
+}
+
+/// Clamp a `wgpu::Limits` request to the ceilings the renderer actually
+/// uses. Every clamp only *lowers* the request below what the adapter
+/// advertised — `request_device` can never over-ask — while pathological
+/// driver reports (u32::MAX binding sizes on old Vulkan 1.1 / DX12 /
+/// Metal iGPUs) come down to values the engine can actually exploit.
+/// High-end GPUs keep their full ceilings wherever they matter.
+pub fn clamp_requested_limits(limits: wgpu::Limits) -> wgpu::Limits {
+    let mut l = limits;
+    l.max_texture_dimension_1d = l.max_texture_dimension_1d.min(16384);
+    l.max_texture_dimension_2d = l.max_texture_dimension_2d.min(16384);
+    l.max_texture_dimension_3d = l.max_texture_dimension_3d.min(4096);
+    l.max_texture_array_layers = l.max_texture_array_layers.min(2048);
+    l.max_bind_groups = l.max_bind_groups.min(8);
+    l.max_bind_groups_plus_vertex_buffers = l.max_bind_groups_plus_vertex_buffers.min(32);
+    l.max_bindings_per_bind_group = l.max_bindings_per_bind_group.min(1000);
+    l.max_dynamic_uniform_buffers_per_pipeline_layout =
+        l.max_dynamic_uniform_buffers_per_pipeline_layout.min(16);
+    l.max_dynamic_storage_buffers_per_pipeline_layout =
+        l.max_dynamic_storage_buffers_per_pipeline_layout.min(8);
+    l.max_sampled_textures_per_shader_stage = l.max_sampled_textures_per_shader_stage.min(64);
+    l.max_samplers_per_shader_stage = l.max_samplers_per_shader_stage.min(32);
+    l.max_storage_buffers_per_shader_stage = l.max_storage_buffers_per_shader_stage.min(32);
+    l.max_storage_textures_per_shader_stage = l.max_storage_textures_per_shader_stage.min(16);
+    l.max_uniform_buffers_per_shader_stage = l.max_uniform_buffers_per_shader_stage.min(24);
+    l.max_binding_array_elements_per_shader_stage =
+        l.max_binding_array_elements_per_shader_stage.min(1_000_000);
+    l.max_binding_array_acceleration_structure_elements_per_shader_stage = l
+        .max_binding_array_acceleration_structure_elements_per_shader_stage
+        .min(1_000_000);
+    l.max_binding_array_sampler_elements_per_shader_stage =
+        l.max_binding_array_sampler_elements_per_shader_stage.min(1_000_000);
+    l.max_uniform_buffer_binding_size = l.max_uniform_buffer_binding_size.min(1 << 30);
+    l.max_storage_buffer_binding_size = l.max_storage_buffer_binding_size.min(1 << 31);
+    l.max_vertex_buffers = l.max_vertex_buffers.min(16);
+    l.max_buffer_size = l.max_buffer_size.min(4 << 30);
+    l.max_vertex_attributes = l.max_vertex_attributes.min(32);
+    l.max_vertex_buffer_array_stride = l.max_vertex_buffer_array_stride.min(4096);
+    l.max_inter_stage_shader_variables = l.max_inter_stage_shader_variables.min(32);
+    l.max_color_attachments = l.max_color_attachments.min(8);
+    l.max_color_attachment_bytes_per_sample = l.max_color_attachment_bytes_per_sample.min(64);
+    l.max_compute_workgroup_storage_size = l.max_compute_workgroup_storage_size.min(32768);
+    l.max_compute_invocations_per_workgroup = l.max_compute_invocations_per_workgroup.min(1024);
+    l.max_compute_workgroup_size_x = l.max_compute_workgroup_size_x.min(1024);
+    l.max_compute_workgroup_size_y = l.max_compute_workgroup_size_y.min(1024);
+    l.max_compute_workgroup_size_z = l.max_compute_workgroup_size_z.min(64);
+    l.max_compute_workgroups_per_dimension = l.max_compute_workgroups_per_dimension.min(65535);
+    l
+}
+
+/// The device limits to request for `adapter`: the adapter's own report
+/// (always grantable, so no Vulkan 1.1 / DX12 / Metal iGPU can fail
+/// device creation), clamped to sane engine ceilings.
+pub fn negotiated_device_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
+    clamp_requested_limits(adapter.limits())
+}
+
+/// Depth-store policy for the final world pass. Tile-based deferred
+/// renderers keep the depth attachment in on-chip tile memory: when no
+/// later pass or readback consumes it, `Discard` skips the depth
+/// writeback entirely. Everywhere else (and whenever a consumer exists)
+/// the attachment is stored as before.
+pub fn select_depth_store_op(
+    paradigm: GpuComputeParadigm,
+    needs_depth_readback: bool,
+) -> wgpu::StoreOp {
+    if needs_depth_readback {
+        return wgpu::StoreOp::Store;
+    }
+    match paradigm {
+        GpuComputeParadigm::TileBasedTbdr => wgpu::StoreOp::Discard,
+        _ => wgpu::StoreOp::Store,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1126,7 +1203,12 @@ fn encode_opaque_terrain<'a>(
     // a single index buffer merge into a few draws per region.
     if !region_arenas.is_empty() {
         pass.set_pipeline(region_pipeline);
-        for arena in region_arenas.values() {
+        // Front-to-back: nearest regions rasterize first so hardware
+        // Early-Z/Hi-Z rejects occluded far terrain before it shades.
+        let mut arena_order: Vec<[i32; 3]> = region_arenas.keys().copied().collect();
+        sort_regions_front_to_back(&mut arena_order, camera_position);
+        for origin in arena_order {
+            let arena = &region_arenas[&origin];
             if arena.index_len == 0 {
                 continue;
             }
@@ -1501,9 +1583,15 @@ pub struct GpuRenderer {
     composite: CompositeGpu,
     debug_line_pipeline: wgpu::RenderPipeline,
     debug_lines: Option<(wgpu::Buffer, u32)>,
-    entity_ber: Option<DynamicLitGpu>,
-    particles: Option<DynamicLitGpu>,
+    entity_ber: Option<DynamicGeometryRing>,
+    particles: Option<DynamicGeometryRing>,
     particle_alphas: Vec<f32>,
+    /// Steady frames served from already-allocated dynamic-geometry
+    /// ring buffers (`stage_dynamic_geometry` reuse hits).
+    pub dynamic_ring_reuses: u64,
+    /// Vertex/index buffer objects the dynamic rings have created
+    /// (warm-up + capacity growth only — constant in steady state).
+    pub dynamic_buffer_allocs: u64,
     subworld_gpu: SubWorldGpuCache,
     scaled_target: Option<ScaledTarget>,
     /// The negotiated built-in shadow quality (`negotiate_builtin_shadow_quality`
@@ -1520,6 +1608,11 @@ pub struct GpuRenderer {
     /// ([`subworld_caster_digest`]); `EMPTY_CASTER_DIGEST` until a sync
     /// records real caster state.
     last_shadow_casters: u64,
+    /// Epoch bumped whenever `subworld_gpu.sync` lands real geometry or
+    /// instance changes — recorded cascade bundles fold it into their
+    /// key because buffer replacement leaves recorded slices stale even
+    /// when counts/transforms match.
+    subworld_gpu_epoch: u64,
     /// Number of shadow depth passes completed (one per cache re-render).
     pub shadow_rerender_count: u64,
     /// Number of composed frames that reused an existing shadow texture.
@@ -1527,6 +1620,36 @@ pub struct GpuRenderer {
     /// Decision the [`DirtyOnlyShadowCache`] returned for the most recent
     /// composed frame (`FirstFrame` until one renders).
     pub last_shadow_decision: ShadowCacheDecision,
+    /// Rotation-invariant shadow state built for the current frame
+    /// ([`build_stable_shadow_uniforms`] — light orthos depend on camera
+    /// position, sun, and clip planes only, never yaw/pitch).
+    frame_stable_shadow: Option<StableShadow>,
+    /// Light-space ortho volumes each cascade's depth map was last
+    /// rendered with — sampling matrices and the per-cascade caster AABB
+    /// cull both come from these, not the live frame's values.
+    rendered_orthos: [CascadeOrtho; 3],
+    /// Light view-proj matrices matching the rendered depth maps, per
+    /// cascade; written into the receiver uniform every frame so spread
+    /// updates keep unrendered cascades sampling their own maps.
+    rendered_lvp: [[[f32; 4]; 4]; 3],
+    /// Cascades whose ortho drifted since their last render — bit per
+    /// layer, drained one per frame on non-emergency updates.
+    pending_cascade_layers: u8,
+    /// Composed frames where a pure yaw/pitch camera rotation (static
+    /// position, sun, world) reused the shadow map — the
+    /// rotation-invariant orthos make the reuse bit-exact.
+    pub shadow_rotation_reuses: u64,
+    /// Caster draws skipped by the per-cascade light-space AABB test
+    /// (region arenas and loose sections outside the cascade volume).
+    pub shadow_regions_culled: u64,
+    /// Fullscreen depth-equal sky pass drawn after opaque terrain.
+    sky: SkyGpu,
+    /// GPU paradigm from host hardware detection — drives depth-store
+    /// policy (TBDR discard) for the composed pass.
+    gpu_paradigm: GpuComputeParadigm,
+    /// Composed frames whose depth attachment was `Discard`ed after use
+    /// (TBDR on-chip tile depth, no writeback).
+    pub tbdr_depth_discards: u64,
     /// The active shaderpack hook verdict (or `None` for built-in).
     pub shaderpack: ShaderpackAttempt,
     /// Latest notice line the HUD/diagnostics can display.
@@ -1536,39 +1659,109 @@ pub struct GpuRenderer {
 pub const MAX_DEBUG_LINES: usize = 65_536;
 const MAX_DYNAMIC_QUADS: usize = 16_384;
 
-struct DynamicLitGpu {
+/// Grow-only persistent vertex/index buffer pair for per-frame dynamic
+/// geometry (entities, block-entity renders, particles). After the
+/// warm-up allocation every steady update is a `queue.write_buffer` into
+/// the same buffers — zero `create_buffer` calls in steady state.
+/// Capacity only ever grows; an empty upload keeps the buffers and just
+/// zeroes the draw count so the next non-empty frame still reuses them.
+struct DynamicGeometryRing {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
+    vertex_capacity: usize,
+    index_capacity: usize,
+    /// Index count of the currently staged frame (`0` = nothing drawn).
     index_count: u32,
 }
 
-impl DynamicLitGpu {
-    fn upload(ctx: &GpuDevice, vertices: &[TerrainVertex], indices: &[u32]) -> Option<Self> {
-        if indices.is_empty() {
-            return None;
+fn dynamic_geometry_buffers(
+    ctx: &GpuDevice,
+    vertex_capacity: usize,
+    index_capacity: usize,
+) -> (wgpu::Buffer, wgpu::Buffer) {
+    let vertices = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dynamic-geometry-vertices"),
+        size: (vertex_capacity * std::mem::size_of::<TerrainVertex>()).max(64) as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let indices = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dynamic-geometry-indices"),
+        size: (index_capacity * std::mem::size_of::<u32>()).max(64) as u64,
+        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    (vertices, indices)
+}
+
+/// Upload `vertices`/`indices` into `ring`, allocating on first use and
+/// re-allocating only when the payload outgrows capacity. Returns
+/// `(buffer_allocs, ring_reuses)` for the renderer counters: warm-up and
+/// growth are allocs; a same-buffer upload is a reuse.
+fn stage_dynamic_geometry(
+    ctx: &GpuDevice,
+    ring: &mut Option<DynamicGeometryRing>,
+    vertices: &[TerrainVertex],
+    indices: &[u32],
+) -> (u64, u64) {
+    if indices.is_empty() {
+        if let Some(r) = ring.as_mut() {
+            r.index_count = 0;
         }
-        let vertices_gpu = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("dynamic-lit-vertices"),
-            size: std::mem::size_of_val(vertices) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let indices_gpu = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("dynamic-lit-indices"),
-            size: std::mem::size_of_val(indices) as u64,
-            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        ctx.queue
-            .write_buffer(&vertices_gpu, 0, bytemuck::cast_slice(vertices));
-        ctx.queue
-            .write_buffer(&indices_gpu, 0, bytemuck::cast_slice(indices));
-        Some(Self {
-            vertices: vertices_gpu,
-            indices: indices_gpu,
-            index_count: indices.len() as u32,
-        })
+        return (0, 0);
     }
+    let allocated = match ring.as_mut() {
+        Some(r) if r.vertex_capacity >= vertices.len() && r.index_capacity >= indices.len() => {
+            false
+        }
+        slot => {
+            let vertex_capacity = vertices
+                .len()
+                .max(slot.as_ref().map_or(256, |r| r.vertex_capacity * 2));
+            let index_capacity = indices
+                .len()
+                .max(slot.map_or(384, |r| r.index_capacity * 2));
+            let (vertex_buffer, index_buffer) =
+                dynamic_geometry_buffers(ctx, vertex_capacity, index_capacity);
+            *ring = Some(DynamicGeometryRing {
+                vertices: vertex_buffer,
+                indices: index_buffer,
+                vertex_capacity,
+                index_capacity,
+                index_count: 0,
+            });
+            true
+        }
+    };
+    let r = ring.as_mut().expect("ring ensured above");
+    ctx.queue
+        .write_buffer(&r.vertices, 0, bytemuck::cast_slice(vertices));
+    ctx.queue
+        .write_buffer(&r.indices, 0, bytemuck::cast_slice(indices));
+    r.index_count = indices.len() as u32;
+    if allocated {
+        (1, 0)
+    } else {
+        (0, 1)
+    }
+}
+
+/// FNV-1a digest of the staged dynamic geometry draw state — part of the
+/// per-cascade shadow bundle key. Capacities track buffer replacement:
+/// a recorded bundle replays the live buffer handle, so a reallocated
+/// ring must re-record.
+fn dynamic_geometry_digest(ring: &Option<DynamicGeometryRing>) -> u64 {
+    let mut hash = 0u64;
+    if let Some(r) = ring {
+        hash ^= u64::from(r.index_count) << 1;
+        hash = hash
+            .wrapping_mul(0x100_0000_01b3)
+            .wrapping_add(r.vertex_capacity as u64);
+        hash = hash
+            .wrapping_mul(0x100_0000_01b3)
+            .wrapping_add(r.index_capacity as u64);
+    }
+    hash
 }
 
 fn append_dynamic_quad(
@@ -1706,6 +1899,13 @@ struct ShadowGpu {
     lit_color: wgpu::RenderPipeline,
     lit_alpha_color: wgpu::RenderPipeline,
     instanced_color: wgpu::RenderPipeline,
+    /// Epoch bumped every time `draw_ubo`/`draw_bg` are rebuilt —
+    /// recorded cascade bundles bake dynamic offsets into the pool and
+    /// must re-record after a resize.
+    draw_pool_epoch: u64,
+    /// Recorded per-cascade caster passes, one per depth-array layer:
+    /// replayed while the [`CascadeBundleKey`] inputs hold.
+    cascade_bundles: [Option<CascadeBundle>; 3],
 }
 
 fn shadow_uniform_bytes(value: &ShadowUniforms) -> Vec<u8> {
@@ -1783,6 +1983,12 @@ const EMPTY_CASTER_DIGEST: u64 = FNV1A_OFFSET;
 pub fn subworld_caster_digest(bank: &SubWorldRenderBank) -> u64 {
     let mut hash = FNV1A_OFFSET;
     for entry in bank.entries() {
+        // Translucent sheets (voxel clouds, water planes) never draw into
+        // the depth map — excluding them keeps their transform-only drift
+        // from churning the shadow-cache key.
+        if entry.alpha < 0.999 {
+            continue;
+        }
         fnv1a_u64(&mut hash, entry.id);
         for v in entry.transform.position {
             fnv1a_u32(&mut hash, v.to_bits());
@@ -1817,6 +2023,386 @@ fn subworld_casters_dirty(bank: &SubWorldRenderBank) -> bool {
         || bank
             .batches()
             .any(|batch| batch.geometry_dirty || batch.instances_dirty)
+}
+
+// ---------------------------------------------------------------------------
+// Rotation-invariant CSM ortho + sky uniform machinery
+// ---------------------------------------------------------------------------
+
+fn v3_dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn v3_cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn v3_scale(a: [f32; 3], k: f32) -> [f32; 3] {
+    [a[0] * k, a[1] * k, a[2] * k]
+}
+
+fn v3_add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn v3_norm(a: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
+    let sq = v3_dot(a, a);
+    if sq.is_finite() && sq > 1.0e-12 {
+        v3_scale(a, sq.sqrt().recip())
+    } else {
+        fallback
+    }
+}
+
+/// World-space volume one shadow cascade covers: a texel-snapped
+/// light-space ortho box expressed back in world axes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CascadeOrtho {
+    /// World-space center of the ortho box (texel-snapped light center).
+    pub center: [f32; 3],
+    /// Half extent along `light_right`/`light_up` (shared radius).
+    pub radius: f32,
+    /// Half extent along the sun axis.
+    pub depth_radius: f32,
+    /// Light basis `(light_right, light_up, sun)`.
+    pub axes: [[f32; 3]; 3],
+}
+
+/// Conservative world-space AABB of one cascade's ortho volume — used to
+/// cull caster regions/sections that cannot touch the cascade.
+pub fn cascade_world_aabb(ortho: &CascadeOrtho) -> ([f32; 3], [f32; 3]) {
+    let [right, up, sun] = ortho.axes;
+    let mut min = ortho.center;
+    let mut max = ortho.center;
+    for i in 0..3 {
+        let half = ortho.radius * (right[i].abs() + up[i].abs())
+            + ortho.depth_radius * sun[i].abs();
+        min[i] -= half;
+        max[i] += half;
+    }
+    (min, max)
+}
+
+/// `true` when the world AABB `[min, max]` intersects the cascade's
+/// conservative world AABB — the per-cascade caster cull test.
+pub fn aabb_in_cascade(min: [f32; 3], max: [f32; 3], ortho: &CascadeOrtho) -> bool {
+    let (cmin, cmax) = cascade_world_aabb(ortho);
+    min[0] <= cmax[0]
+        && max[0] >= cmin[0]
+        && min[1] <= cmax[1]
+        && max[1] >= cmin[1]
+        && min[2] <= cmax[2]
+        && max[2] >= cmin[2]
+}
+
+/// [`ShadowUniforms`] plus the per-cascade light-space ortho volumes the
+/// matrices were built from — the culler needs the volumes, the depth
+/// passes need the matrices.
+#[derive(Clone, Copy)]
+struct StableShadow {
+    uniforms: ShadowUniforms,
+    orthos: [CascadeOrtho; 3],
+}
+
+/// Rotation-invariant shadow uniforms: identical to
+/// `build_shadow_uniforms_celestial` except each cascade's light ortho
+/// centers on a bounding sphere around the camera *position* covering
+/// every point the frustum can see within the split distance — yaw and
+/// pitch cannot move it, so a pure look rotation never changes the
+/// rendered depth map (no shimmer, full cache reuse).
+fn build_stable_shadow_uniforms(
+    camera: &Camera,
+    aspect: f32,
+    config: CascadeConfig,
+    world_time_ticks: u64,
+    moon_phase: u8,
+) -> StableShadow {
+    let shadow_camera = ShadowCamera {
+        position: camera.position,
+        forward: camera.forward_vector(),
+        up: [0.0, 1.0, 0.0],
+        fov_y_radians: camera.fov_deg.to_radians(),
+        aspect_ratio: aspect,
+        near: camera.near,
+        far: camera.far,
+    };
+    let mut uniforms = build_shadow_uniforms_celestial(
+        shadow_camera,
+        config,
+        world_time_ticks,
+        moon_phase,
+        EclipseMode::None,
+    );
+    let position = if camera.position.iter().all(|v| v.is_finite()) {
+        camera.position
+    } else {
+        [0.0; 3]
+    };
+    let near = if camera.near.is_finite() {
+        camera.near.max(0.01)
+    } else {
+        0.1
+    };
+    let far = if camera.far.is_finite() {
+        camera.far.max(near + 1.0)
+    } else {
+        192.0
+    };
+    let fov = if camera.fov_deg.is_finite() {
+        camera.fov_deg.to_radians().clamp(0.1, std::f32::consts::PI - 0.1)
+    } else {
+        std::f32::consts::PI / 3.0
+    };
+    let aspect = if aspect.is_finite() {
+        aspect.clamp(0.25, 8.0)
+    } else {
+        16.0 / 9.0
+    };
+    let tan_half_fov = (fov * 0.5).tan();
+    let sun = compute_sun_direction(world_time_ticks);
+    let light_right = v3_norm(v3_cross([0.0, 0.0, 1.0], sun), [1.0, 0.0, 0.0]);
+    let light_up = v3_cross(sun, light_right);
+    let count = config.cascade_count.min(3);
+    let splits = compute_cascade_splits(near, far, count, 0.65);
+    let mut orthos = [CascadeOrtho {
+        center: [0.0; 3],
+        radius: 0.0,
+        depth_radius: 0.0,
+        axes: [light_right, light_up, sun],
+    }; 3];
+    for (index, &end) in splits.iter().enumerate() {
+        // Bounding sphere centered on the camera covering the whole
+        // frustum slice out to `end` — the far-face corner is the
+        // farthest reachable point and carries no forward-axis term,
+        // so the volume is identical under any camera rotation.
+        let h = tan_half_fov * end;
+        let w = h * aspect;
+        let reach = (end * end + w * w + h * h).sqrt();
+        // Stable extent quantized to a sixteenth of a world block.
+        let radius = (reach * 16.0).ceil().max(16.0) / 16.0;
+        let texel = 2.0 * radius / config.map_resolution.max(1) as f32;
+        let snap = |coordinate: f32| (coordinate / texel).round() * texel;
+        let cx = snap(v3_dot(position, light_right));
+        let cy = snap(v3_dot(position, light_up));
+        let cz = snap(v3_dot(position, sun));
+        let depth_radius = radius * 4.0;
+        let inverse_depth = 1.0 / (2.0 * depth_radius);
+        uniforms.light_view_proj[index] = [
+            [
+                light_right[0] / radius,
+                light_up[0] / radius,
+                -sun[0] * inverse_depth,
+                0.0,
+            ],
+            [
+                light_right[1] / radius,
+                light_up[1] / radius,
+                -sun[1] * inverse_depth,
+                0.0,
+            ],
+            [
+                light_right[2] / radius,
+                light_up[2] / radius,
+                -sun[2] * inverse_depth,
+                0.0,
+            ],
+            [-cx / radius, -cy / radius, (depth_radius + cz) * inverse_depth, 1.0],
+        ];
+        orthos[index] = CascadeOrtho {
+            center: v3_add(
+                v3_add(v3_scale(light_right, cx), v3_scale(light_up, cy)),
+                v3_scale(sun, cz),
+            ),
+            radius,
+            depth_radius,
+            axes: [light_right, light_up, sun],
+        };
+    }
+    StableShadow { uniforms, orthos }
+}
+
+/// Squared distance from `camera` to the center of the 8x4x8-section
+/// region rooted at `origin` (region-local section coords × 16 blocks).
+pub fn region_center_dist2(origin: [i32; 3], camera: [f32; 3]) -> f32 {
+    let center = [
+        origin[0] as f32 * EDGE as f32 + (EDGE * 4) as f32,
+        origin[1] as f32 * EDGE as f32 + (EDGE * 2) as f32,
+        origin[2] as f32 * EDGE as f32 + (EDGE * 4) as f32,
+    ];
+    (0..3)
+        .map(|i| (center[i] - camera[i]) * (center[i] - camera[i]))
+        .sum()
+}
+
+/// Sort region origins ascending by squared camera distance —
+/// front-to-back, so hardware Early-Z/Hi-Z rejects occluded far terrain
+/// instead of shading it first.
+pub fn sort_regions_front_to_back(origins: &mut [[i32; 3]], camera: [f32; 3]) {
+    origins.sort_by_key(|origin| region_center_dist2(*origin, camera).to_bits());
+}
+
+/// Inputs that decide whether a recorded per-cascade shadow `RenderBundle`
+/// still applies: the caster residency/scene/subworld revisions, the
+/// shadow draw-pool epoch (buffer replacement invalidates recorded
+/// offsets), and a digest of the snapped ortho parameters the recorded
+/// cull set depends on.
+#[derive(Clone, Copy, PartialEq)]
+struct CascadeBundleKey {
+    layer: u32,
+    world_rev: u64,
+    scene_rev: u64,
+    draw_pool: u64,
+    casters: u64,
+    ortho_hash: u64,
+}
+
+/// One recorded cascade pass plus the key it was captured under.
+struct CascadeBundle {
+    key: CascadeBundleKey,
+    bundle: wgpu::RenderBundle,
+}
+
+/// FNV-1a digest of every field of a [`CascadeOrtho`] — the recorded
+/// caster cull set changes exactly when this changes.
+fn cascade_ortho_hash(ortho: &CascadeOrtho) -> u64 {
+    let mut hash = FNV1A_OFFSET;
+    for v in ortho.center {
+        fnv1a_u32(&mut hash, v.to_bits());
+    }
+    fnv1a_u32(&mut hash, ortho.radius.to_bits());
+    fnv1a_u32(&mut hash, ortho.depth_radius.to_bits());
+    for axis in ortho.axes {
+        for v in axis {
+            fnv1a_u32(&mut hash, v.to_bits());
+        }
+    }
+    hash
+}
+
+/// World-space AABB of the 8x4x8-section region rooted at `origin`
+/// (region-local section coords × 16 blocks).
+pub fn region_world_aabb(origin: [i32; 3]) -> ([f32; 3], [f32; 3]) {
+    let min = [
+        origin[0] as f32 * EDGE as f32,
+        origin[1] as f32 * EDGE as f32,
+        origin[2] as f32 * EDGE as f32,
+    ];
+    let max = [
+        min[0] + (REGION_X * EDGE) as f32,
+        min[1] + (REGION_Y * EDGE) as f32,
+        min[2] + (REGION_Z * EDGE) as f32,
+    ];
+    (min, max)
+}
+
+/// Record one cascade's caster draws into `pass` (a live `RenderPass` or
+/// a `RenderBundleEncoder` — identical streams). Sections and region
+/// arenas outside the cascade's texel-snapped light-space AABB are
+/// skipped; the return value is the number of skipped casters for
+/// `shadow_regions_culled`. Offsets index the shared shadow draw pool —
+/// culled casters keep their slot so the pool layout stays stable.
+#[allow(clippy::too_many_arguments)]
+fn record_shadow_cascade<'a>(
+    pass: &mut impl wgpu::util::RenderEncoder<'a>,
+    shadow: &'a ShadowGpu,
+    frame_bind_group: &'a wgpu::BindGroup,
+    ortho: &CascadeOrtho,
+    scene: Option<(&'a TerrainBuffers, u32)>,
+    section_offsets: &[(SectionCoord, u32)],
+    live_sections: &'a HashMap<SectionCoord, LiveTerrainSection>,
+    region_offsets: &[([i32; 3], u32)],
+    region_arenas: &'a BTreeMap<[i32; 3], RegionArena>,
+    entry_offsets: &[u32],
+    batch_offsets: &[u32],
+    subworld_gpu: &'a SubWorldGpuCache,
+    layer: u32,
+) -> u64 {
+    let mut culled = 0u64;
+    pass.set_bind_group(0, Some(&shadow.caster_bgs[layer as usize]), &[]);
+    pass.set_pipeline(&shadow.terrain_depth);
+    if let Some((scene, offset)) = scene {
+        pass.set_bind_group(1, Some(frame_bind_group), &[]);
+        pass.set_bind_group(2, Some(&shadow.draw_bg), &[offset]);
+        pass.set_vertex_buffer(0, Some(scene.opaque_vertices.slice(..)));
+        pass.set_index_buffer(scene.opaque_indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..scene.opaque_index_count, 0, 0..1);
+    }
+    for (coord, offset) in section_offsets {
+        let min = [
+            coord.0 as f32 * EDGE as f32,
+            coord.1 as f32 * EDGE as f32,
+            coord.2 as f32 * EDGE as f32,
+        ];
+        let max = [
+            min[0] + EDGE as f32,
+            min[1] + EDGE as f32,
+            min[2] + EDGE as f32,
+        ];
+        if !aabb_in_cascade(min, max, ortho) {
+            culled += 1;
+            continue;
+        }
+        let section = &live_sections[coord];
+        pass.set_bind_group(1, Some(&section.bind_group), &[]);
+        pass.set_bind_group(2, Some(&shadow.draw_bg), &[*offset]);
+        pass.set_vertex_buffer(0, Some(section.terrain.opaque_vertices.slice(..)));
+        pass.set_index_buffer(
+            section.terrain.opaque_indices.slice(..),
+            wgpu::IndexFormat::Uint32,
+        );
+        pass.draw_indexed(0..section.terrain.opaque_index_count, 0, 0..1);
+    }
+    // Arena-resident sections cast through the region depth pipeline:
+    // the light needs every bucket, so the whole flushed index stream
+    // goes in one draw per region.
+    if !region_offsets.is_empty() {
+        pass.set_pipeline(&shadow.terrain_region_depth);
+        for (origin, offset) in region_offsets {
+            let (min, max) = region_world_aabb(*origin);
+            if !aabb_in_cascade(min, max, ortho) {
+                culled += 1;
+                continue;
+            }
+            let arena = &region_arenas[origin];
+            pass.set_bind_group(1, Some(&arena.bind_group), &[]);
+            pass.set_bind_group(2, Some(&shadow.draw_bg), &[*offset]);
+            pass.set_vertex_buffer(0, Some(arena.vertex_buffer.slice(..)));
+            pass.set_index_buffer(arena.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..arena.index_len, 0, 0..1);
+        }
+    }
+    pass.set_pipeline(&shadow.lit_depth);
+    pass.set_bind_group(1, Some(frame_bind_group), &[]);
+    for (entry, offset) in subworld_gpu
+        .entries()
+        .filter(|entry| entry.index_count > 0 && entry.alpha >= 0.999)
+        .zip(entry_offsets)
+    {
+        pass.set_bind_group(2, Some(&shadow.draw_bg), &[*offset]);
+        pass.set_vertex_buffer(0, Some(entry.vertex_buffer().slice(..)));
+        pass.set_index_buffer(entry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..entry.index_count, 0, 0..1);
+    }
+    pass.set_pipeline(&shadow.instanced_depth);
+    for (batch, offset) in subworld_gpu
+        .batches()
+        .filter(|batch| batch.index_count > 0 && batch.instance_count > 0)
+        .zip(batch_offsets)
+    {
+        pass.set_bind_group(2, Some(&shadow.draw_bg), &[*offset]);
+        pass.set_vertex_buffer(0, Some(batch.template_vertex_buffer().slice(..)));
+        pass.set_vertex_buffer(1, Some(batch.instance_buffer().slice(..)));
+        pass.set_index_buffer(
+            batch.template_index_buffer().slice(..),
+            wgpu::IndexFormat::Uint32,
+        );
+        pass.draw_indexed(0..batch.index_count, 0, 0..batch.instance_count);
+    }
+    culled
 }
 
 impl ShadowGpu {
@@ -1977,7 +2563,10 @@ impl ShadowGpu {
                         buffers,
                     },
                     primitive: wgpu::PrimitiveState {
-                        cull_mode: None,
+                        // Back-face rasterization for casters: front
+                        // faces cull in hardware so the depth map holds
+                        // rear-surface depth — cheaper and less acne.
+                        cull_mode: Some(wgpu::Face::Front),
                         ..Default::default()
                     },
                     depth_stencil: Some(wgpu::DepthStencilState {
@@ -2165,6 +2754,8 @@ impl ShadowGpu {
             lit_color,
             lit_alpha_color,
             instanced_color,
+            draw_pool_epoch: 0,
+            cascade_bundles: [None, None, None],
         }
     }
 
@@ -2204,6 +2795,119 @@ impl ShadowGpu {
             mapped_at_creation: false,
         });
         self.draw_bg = Self::draw_bind_group(device, layout, &self.draw_ubo);
+        self.draw_pool_epoch += 1;
+        // The recorded dynamic offsets address the old pool — every
+        // cached cascade bundle must re-record against `draw_bg`.
+        self.cascade_bundles = [None, None, None];
+    }
+}
+
+/// Fullscreen sky pass: `MEGU_SKY_ATMOSPHERE_WGSL` draws one depth-1.0
+/// triangle after all opaque geometry. `DepthCompare::Equal` (depth ==
+/// 1.0 only, no depth write) means terrain-occluded pixels skip the
+/// fragment stage entirely while untouched sky pixels get the full
+/// atmospheric dome — the final image is unchanged versus a clear color.
+/// Kept as a constant so the pipeline descriptor and the diagnostics
+/// accessor can never drift apart.
+pub const SKY_DEPTH_COMPARE: wgpu::CompareFunction = wgpu::CompareFunction::Equal;
+
+struct SkyGpu {
+    pipeline: wgpu::RenderPipeline,
+    uniform: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+impl SkyGpu {
+    fn new(ctx: &GpuDevice, format: wgpu::TextureFormat) -> Self {
+        let module = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("sky-atmosphere"),
+                source: wgpu::ShaderSource::Wgsl(MEGU_SKY_ATMOSPHERE_WGSL.into()),
+            });
+        let layout = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("sky-shadow-layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(
+                            std::mem::size_of::<ShadowUniforms>() as u64,
+                        ),
+                    },
+                    count: None,
+                }],
+            });
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("sky-pipeline-layout"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+        let pipeline = ctx
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("sky-atmosphere-pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..wgpu::PrimitiveState::default()
+                },
+                // Sky pixels sit at depth 1.0 and only fill fragments the
+                // opaque world left untouched — occluded pixels never
+                // reach the fragment stage.
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(SKY_DEPTH_COMPARE),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+        let uniform = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sky-shadow-uniform"),
+            size: std::mem::size_of::<ShadowUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sky-shadow-bind-group"),
+            layout: &layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform.as_entire_binding(),
+            }],
+        });
+        Self {
+            pipeline,
+            uniform,
+            bind_group,
+        }
     }
 }
 
@@ -2799,8 +3503,11 @@ impl GpuRenderer {
         // Seed the non-visual strategy outputs at construction: the same
         // pure `select_compute_strategy` the live session runs, so the
         // upload-budget preset and mesh-worker hint match the session's
-        // `compute_strategy` without a window-loop call site.
-        let caps = detect_host_hardware_caps();
+        // `compute_strategy` without a window-loop call site. The
+        // universal profile additionally carries the GPU paradigm the
+        // depth-store policy consults (`TileBasedTbdr` → depth discard).
+        let profile = detect_universal_hardware_profile();
+        let caps = profile.base;
         let (upload_budget, mesh_worker_threads) =
             strategy_upload_defaults(&select_compute_strategy(&caps));
         // Low-core / cache-poor hosts: one background worker keeps
@@ -2813,6 +3520,8 @@ impl GpuRenderer {
         } else {
             mesh_worker_threads
         };
+        let gpu_paradigm = profile.gpu_paradigm;
+        let sky = SkyGpu::new(&ctx, target_format);
         Self {
             ctx,
             target_format,
@@ -2901,6 +3610,8 @@ impl GpuRenderer {
             entity_ber: None,
             particles: None,
             particle_alphas: Vec::new(),
+            dynamic_ring_reuses: 0,
+            dynamic_buffer_allocs: 0,
             subworld_gpu: SubWorldGpuCache::new(),
             scaled_target: None,
             shadow_quality: BuiltinShadowQuality::Off,
@@ -2910,8 +3621,23 @@ impl GpuRenderer {
             shadow_active: false,
             last_shadow_camera: None,
             last_shadow_casters: EMPTY_CASTER_DIGEST,
+            subworld_gpu_epoch: 0,
             shadow_rerender_count: 0,
             shadow_reuse_count: 0,
+            frame_stable_shadow: None,
+            rendered_orthos: [CascadeOrtho {
+                center: [0.0; 3],
+                radius: 0.0,
+                depth_radius: 0.0,
+                axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            }; 3],
+            rendered_lvp: [[[0.0; 4]; 4]; 3],
+            pending_cascade_layers: 0,
+            shadow_rotation_reuses: 0,
+            shadow_regions_culled: 0,
+            sky,
+            gpu_paradigm,
+            tbdr_depth_discards: 0,
             last_shadow_decision: ShadowCacheDecision::Rerender(
                 mc_spine_client_mesh::builtin_shadow_wgsl::ShadowDirtyReason::FirstFrame,
             ),
@@ -2994,7 +3720,10 @@ impl GpuRenderer {
                 );
             }
         }
-        self.entity_ber = DynamicLitGpu::upload(&self.ctx, &vertices, &indices);
+        let (allocs, reuses) =
+            stage_dynamic_geometry(&self.ctx, &mut self.entity_ber, &vertices, &indices);
+        self.dynamic_buffer_allocs += allocs;
+        self.dynamic_ring_reuses += reuses;
     }
 
     /// Upload precomputed camera-facing particle quads with individual alpha.
@@ -3037,7 +3766,10 @@ impl GpuRenderer {
                 self.particle_alphas.push(quad.color[3].clamp(0.0, 1.0));
             }
         }
-        self.particles = DynamicLitGpu::upload(&self.ctx, &vertices, &indices);
+        let (allocs, reuses) =
+            stage_dynamic_geometry(&self.ctx, &mut self.particles, &vertices, &indices);
+        self.dynamic_buffer_allocs += allocs;
+        self.dynamic_ring_reuses += reuses;
     }
 
     /// Convert the Vanilla particle simulation to camera-facing quads.
@@ -3097,9 +3829,12 @@ impl GpuRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // Bindings 4-5 are visible to the vertex stage too: the
+                // composed terrain shaders hoist the per-quad atlas
+                // state/rect lookup into `terrain_vs`/`terrain_translucent_vs`.
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
@@ -3109,7 +3844,7 @@ impl GpuRenderer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 5,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
@@ -5019,13 +5754,7 @@ impl GpuRenderer {
         const NOON: u64 = 6000;
         self.prepare_shadow(&camera, aspect, NOON);
         let decision = self.shadow_decision(&camera, 0, NOON);
-        if self.shadow_active {
-            if matches!(decision, ShadowCacheDecision::Rerender(_)) {
-                self.encode_shadow_map(encoder, &camera, aspect, NOON);
-            } else {
-                self.shadow_reuse_count += 1;
-            }
-        }
+        self.dispatch_shadow_work(encoder, &camera, aspect, decision);
 
         let atmo = atmosphere.current();
         let sun = compute_sun_direction(NOON);
@@ -5214,6 +5943,14 @@ impl GpuRenderer {
             self.shadow = None;
             self.shadow_active = false;
             self.last_shadow_camera = None;
+            self.pending_cascade_layers = 0;
+            self.rendered_orthos = [CascadeOrtho {
+                center: [0.0; 3],
+                radius: 0.0,
+                depth_radius: 0.0,
+                axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            }; 3];
+            self.rendered_lvp = [[[0.0; 4]; 4]; 3];
         }
         self.shadow_quality = negotiated;
         negotiated
@@ -5229,6 +5966,16 @@ impl GpuRenderer {
 
     fn prepare_shadow(&mut self, camera: &Camera, aspect: f32, world_time_ticks: u64) {
         let sun = compute_sun_direction(world_time_ticks);
+        // The rotation-invariant state is rebuilt every frame: its camera
+        // vectors feed the sky dome even while cascades are off, and the
+        // texel-snapped orthos drive the pending-cascade drain.
+        self.frame_stable_shadow = Some(build_stable_shadow_uniforms(
+            camera,
+            aspect,
+            self.shadow_quality.config(),
+            world_time_ticks,
+            ((world_time_ticks / 24_000) % 8) as u8,
+        ));
         let valid_camera = camera.position.iter().all(|v| v.is_finite())
             && [
                 camera.yaw_deg,
@@ -5265,7 +6012,64 @@ impl GpuRenderer {
             ));
             self.shadow_cache.invalidate();
         }
-        let signature = [
+        // Yaw and pitch deliberately absent: the bounding-sphere orthos
+        // cannot see them, so a pure look rotation marks nothing dirty.
+        if let Some(stable) = &self.frame_stable_shadow {
+            for (layer, ortho) in stable.orthos.iter().enumerate() {
+                if layer < 3 && self.rendered_orthos[layer] != *ortho {
+                    self.pending_cascade_layers |= 1 << layer;
+                }
+            }
+        }
+        self.shadow_active = true;
+    }
+
+    /// Run this frame's shadow depth work. Emergency invalidations
+    /// (first frame, preset, world edit, sun move) render every stale
+    /// cascade at once; position-only movement (`CameraCrossedSnapRegion`
+    /// and pending texel drift) drains ONE cascade per frame so walking
+    /// never pays the whole array in a single frame. Pure rotation falls
+    /// through to reuse and bumps `shadow_rotation_reuses`.
+    fn dispatch_shadow_work(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        camera: &Camera,
+        aspect: f32,
+        decision: ShadowCacheDecision,
+    ) {
+        if !self.shadow_active {
+            return;
+        }
+        let count = self.shadow_quality.config().cascade_count.min(3);
+        let all = (1u8 << count).wrapping_sub(1);
+        let mask = match decision {
+            ShadowCacheDecision::Rerender(ShadowDirtyReason::CameraCrossedSnapRegion) => {
+                self.pending_cascade_layers |= all;
+                self.pending_cascade_layers
+                    & self.pending_cascade_layers.wrapping_neg()
+            }
+            ShadowCacheDecision::Rerender(_) => {
+                self.pending_cascade_layers |= all;
+                all
+            }
+            ShadowCacheDecision::ReuseCached => {
+                self.pending_cascade_layers & self.pending_cascade_layers.wrapping_neg()
+            }
+        };
+        if mask != 0 {
+            self.encode_shadow_map(encoder, mask);
+        } else {
+            self.shadow_reuse_count += 1;
+            if let Some(last) = self.last_shadow_camera {
+                if (camera.yaw_deg - last[3]).abs() > f32::EPSILON
+                    || (camera.pitch_deg - last[4]).abs() > f32::EPSILON
+                {
+                    self.shadow_rotation_reuses += 1;
+                }
+            }
+        }
+        self.write_shadow_receiver_uniform();
+        self.last_shadow_camera = Some([
             camera.position[0],
             camera.position[1],
             camera.position[2],
@@ -5275,54 +6079,54 @@ impl GpuRenderer {
             camera.near,
             camera.far,
             aspect,
-        ];
-        if let Some(last) = self.last_shadow_camera {
-            // The light projection depends on camera orientation, clip planes,
-            // aspect, and position. Keep stable small translations cached.
-            if signature
-                .iter()
-                .zip(last)
-                .enumerate()
-                .any(|(i, (a, b))| (a - b).abs() > if i < 3 { 0.5 } else { 0.05 })
-            {
-                self.shadow_cache.invalidate();
-            }
-        }
-        self.shadow_active = true;
+        ]);
     }
 
-    fn encode_shadow_map(
-        &mut self,
-        encoder: &mut wgpu::CommandEncoder,
-        camera: &Camera,
-        aspect: f32,
-        world_time_ticks: u64,
-    ) {
-        let shadow = self.shadow.as_mut().expect("shadow resources prepared");
-        let forward = camera.forward_vector();
-        let uniform = build_shadow_uniforms_celestial(
-            ShadowCamera {
-                position: camera.position,
-                forward,
-                up: [0.0, 1.0, 0.0],
-                fov_y_radians: camera.fov_deg.to_radians(),
-                aspect_ratio: aspect,
-                near: camera.near,
-                far: camera.far,
-            },
-            shadow.config,
-            world_time_ticks,
-            ((world_time_ticks / 24_000) % 8) as u8,
-            EclipseMode::None,
-        );
+    /// Refresh the receiver uniform the composed pass samples with:
+    /// camera fields come from this frame's build (rotation-current
+    /// cascade selection) while each cascade's light matrix stays pinned
+    /// to the depth map it actually rendered — spread updates and pure
+    /// rotation reuse can never desync the pair.
+    fn write_shadow_receiver_uniform(&mut self) {
+        let (Some(shadow), Some(stable)) =
+            (self.shadow.as_ref(), self.frame_stable_shadow.as_ref())
+        else {
+            return;
+        };
+        let mut uniforms = stable.uniforms;
+        for (index, lvp) in self.rendered_lvp.iter().enumerate() {
+            uniforms.light_view_proj[index] = *lvp;
+        }
         self.ctx
             .queue
-            .write_buffer(&shadow.receiver_uniform, 0, &shadow_uniform_bytes(&uniform));
+            .write_buffer(&shadow.receiver_uniform, 0, &shadow_uniform_bytes(&uniforms));
+    }
+
+    /// Record + execute shadow caster depth for every cascade in `mask`
+    /// (a bitmask over array layers). Each rendered layer refreshes its
+    /// entry in `rendered_orthos`/`rendered_lvp` and clears its pending
+    /// bit; unrendered layers keep sampling the maps they were rendered
+    /// with. Per-cascade AABB culling skips casters outside the snapped
+    /// light volume and counted draws go through cached `RenderBundle`s
+    /// keyed on the true recorded inputs.
+    fn encode_shadow_map(&mut self, encoder: &mut wgpu::CommandEncoder, mask: u8) {
+        let stable = *self
+            .frame_stable_shadow
+            .as_ref()
+            .expect("prepare_shadow builds the frame state");
+        let count = self
+            .shadow
+            .as_ref()
+            .map_or(0, |s| s.config.cascade_count.min(3) as usize);
+        let shadow = self.shadow.as_mut().expect("shadow resources prepared");
         for (layer, buffer) in shadow.caster_uniforms.iter().enumerate() {
+            if mask & (1 << layer) == 0 {
+                continue;
+            }
             self.ctx.queue.write_buffer(
                 buffer,
                 0,
-                &shadow_uniform_bytes(&uniform.with_active_cascade(layer as u32)),
+                &shadow_uniform_bytes(&stable.uniforms.with_active_cascade(layer as u32)),
             );
         }
         let identity: Mat4 = [
@@ -5379,7 +6183,130 @@ impl GpuRenderer {
         self.ctx
             .queue
             .write_buffer(&shadow.draw_ubo, 0, bytemuck::cast_slice(&draws));
+        // Digest the full candidate caster set: the recorded bundle's
+        // draws are a pure function of this set plus the ortho (which
+        // selects the AABB-culled subset), both pinned in the key.
+        let mut casters = FNV1A_OFFSET;
+        if scene_offset.is_some() {
+            if let Some(scene) = &self.scene {
+                fnv1a_u64(&mut casters, u64::from(scene.opaque_index_count));
+            }
+        }
+        for (coord, _) in &section_offsets {
+            fnv1a_u32(&mut casters, coord.0 as u32);
+            fnv1a_u32(&mut casters, coord.1 as u32);
+            fnv1a_u32(&mut casters, coord.2 as u32);
+            fnv1a_u64(
+                &mut casters,
+                u64::from(self.live_sections[coord].opaque_index_total),
+            );
+        }
+        for (origin, _) in &region_offsets {
+            let arena = &self.region_arenas[origin];
+            for v in origin {
+                fnv1a_u32(&mut casters, *v as u32);
+            }
+            fnv1a_u64(&mut casters, u64::from(arena.index_len));
+            fnv1a_u64(&mut casters, arena.vertex_capacity as u64);
+            fnv1a_u64(&mut casters, arena.index_capacity as u64);
+        }
+        for entry in self
+            .subworld_gpu
+            .entries()
+            .filter(|entry| entry.index_count > 0 && entry.alpha >= 0.999)
+        {
+            fnv1a_u64(&mut casters, u64::from(entry.index_count));
+            fnv1a_u32(&mut casters, entry.alpha.to_bits());
+            for v in entry.transform.position {
+                fnv1a_u32(&mut casters, v.to_bits());
+            }
+            for v in entry.transform.quaternion {
+                fnv1a_u32(&mut casters, v.to_bits());
+            }
+            fnv1a_u32(&mut casters, entry.transform.scale.to_bits());
+        }
+        for batch in self
+            .subworld_gpu
+            .batches()
+            .filter(|batch| batch.index_count > 0 && batch.instance_count > 0)
+        {
+            fnv1a_u64(&mut casters, u64::from(batch.mesh_kind));
+            fnv1a_u64(&mut casters, u64::from(batch.index_count));
+            fnv1a_u64(&mut casters, u64::from(batch.instance_count));
+            for v in batch.transform.position {
+                fnv1a_u32(&mut casters, v.to_bits());
+            }
+        }
+        fnv1a_u64(&mut casters, dynamic_geometry_digest(&self.entity_ber));
+        fnv1a_u64(&mut casters, dynamic_geometry_digest(&self.particles));
+        // Buffer replacement under identical content — the epoch covers
+        // every sync that touched real GPU objects.
+        fnv1a_u64(&mut casters, self.subworld_gpu_epoch);
+        let frame_bind_group = &self.frame_bind_group;
+        let mut culled_total = 0u64;
         for (layer, view) in shadow.layer_views.iter().enumerate() {
+            if layer >= count || mask & (1 << layer) == 0 {
+                continue;
+            }
+            let ortho = &stable.orthos[layer];
+            let key = CascadeBundleKey {
+                layer: layer as u32,
+                world_rev: self.cull_world_revision,
+                scene_rev: self.scene_revision,
+                draw_pool: shadow.draw_pool_epoch,
+                casters,
+                ortho_hash: cascade_ortho_hash(ortho),
+            };
+            let bundle = match &shadow.cascade_bundles[layer] {
+                Some(cached) if cached.key == key => None,
+                _ => {
+                    let mut bundle_encoder =
+                        self.ctx
+                            .device
+                            .create_render_bundle_encoder(
+                                &wgpu::RenderBundleEncoderDescriptor {
+                                    label: Some("shadow-cascade-bundle"),
+                                    color_formats: &[],
+                                    depth_stencil: Some(wgpu::RenderBundleDepthStencil {
+                                        format: DEPTH_FORMAT,
+                                        depth_read_only: false,
+                                        stencil_read_only: true,
+                                    }),
+                                    sample_count: 1,
+                                    multiview: None,
+                                },
+                            );
+                    let (bundle_entry_offsets, bundle_batch_offsets) =
+                        (entry_offsets.as_slice(), batch_offsets.as_slice());
+                    culled_total += record_shadow_cascade(
+                        &mut bundle_encoder,
+                        shadow,
+                        frame_bind_group,
+                        ortho,
+                        self.scene.as_ref().zip(scene_offset),
+                        &section_offsets,
+                        &self.live_sections,
+                        &region_offsets,
+                        &self.region_arenas,
+                        bundle_entry_offsets,
+                        bundle_batch_offsets,
+                        &self.subworld_gpu,
+                        layer as u32,
+                    );
+                    Some(CascadeBundle {
+                        key,
+                        bundle: bundle_encoder.finish(&wgpu::RenderBundleDescriptor {
+                            label: Some("shadow-cascade-bundle"),
+                        }),
+                    })
+                }
+            };
+            if let Some(recorded) = bundle {
+                shadow.cascade_bundles[layer] = Some(recorded);
+            }
+            let bundle_ref = shadow.cascade_bundles[layer]
+                .as_ref()
+                .expect("bundle recorded or hit");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("cascaded-shadow-depth"),
                 color_attachments: &[],
@@ -5395,82 +6322,40 @@ impl GpuRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_bind_group(0, &shadow.caster_bgs[layer], &[]);
-            pass.set_pipeline(&shadow.terrain_depth);
-            if let (Some(scene), Some(offset)) = (&self.scene, scene_offset) {
-                pass.set_bind_group(1, &self.frame_bind_group, &[]);
-                pass.set_bind_group(2, &shadow.draw_bg, &[offset]);
-                pass.set_vertex_buffer(0, scene.opaque_vertices.slice(..));
-                pass.set_index_buffer(scene.opaque_indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..scene.opaque_index_count, 0, 0..1);
-            }
-            for (coord, offset) in &section_offsets {
-                let section = &self.live_sections[coord];
-                pass.set_bind_group(1, &section.bind_group, &[]);
-                pass.set_bind_group(2, &shadow.draw_bg, &[*offset]);
-                pass.set_vertex_buffer(0, section.terrain.opaque_vertices.slice(..));
-                pass.set_index_buffer(
-                    section.terrain.opaque_indices.slice(..),
-                    wgpu::IndexFormat::Uint32,
-                );
-                pass.draw_indexed(0..section.terrain.opaque_index_count, 0, 0..1);
-            }
-            // Arena-resident sections cast through the region depth
-            // pipeline: the light needs every bucket, so the whole
-            // flushed index stream goes in one draw per region.
-            if !region_offsets.is_empty() {
-                pass.set_pipeline(&shadow.terrain_region_depth);
-                for (origin, offset) in &region_offsets {
-                    let arena = &self.region_arenas[origin];
-                    pass.set_bind_group(1, &arena.bind_group, &[]);
-                    pass.set_bind_group(2, &shadow.draw_bg, &[*offset]);
-                    pass.set_vertex_buffer(0, arena.vertex_buffer.slice(..));
-                    pass.set_index_buffer(arena.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..arena.index_len, 0, 0..1);
-                }
-            }
-            pass.set_pipeline(&shadow.lit_depth);
-            pass.set_bind_group(1, &self.frame_bind_group, &[]);
-            for (entry, offset) in self
-                .subworld_gpu
-                .entries()
-                .filter(|entry| entry.index_count > 0 && entry.alpha >= 0.999)
-                .zip(&entry_offsets)
-            {
-                pass.set_bind_group(2, &shadow.draw_bg, &[*offset]);
-                pass.set_vertex_buffer(0, entry.vertex_buffer().slice(..));
-                pass.set_index_buffer(entry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..entry.index_count, 0, 0..1);
-            }
-            pass.set_pipeline(&shadow.instanced_depth);
-            for (batch, offset) in self
-                .subworld_gpu
-                .batches()
-                .filter(|batch| batch.index_count > 0 && batch.instance_count > 0)
-                .zip(&batch_offsets)
-            {
-                pass.set_bind_group(2, &shadow.draw_bg, &[*offset]);
-                pass.set_vertex_buffer(0, batch.template_vertex_buffer().slice(..));
-                pass.set_vertex_buffer(1, batch.instance_buffer().slice(..));
-                pass.set_index_buffer(
-                    batch.template_index_buffer().slice(..),
-                    wgpu::IndexFormat::Uint32,
-                );
-                pass.draw_indexed(0..batch.index_count, 0, 0..batch.instance_count);
-            }
+            pass.execute_bundles(std::iter::once(&bundle_ref.bundle));
+            drop(pass);
+            self.rendered_orthos[layer] = stable.orthos[layer];
+            self.rendered_lvp[layer] = stable.uniforms.light_view_proj[layer];
+            self.pending_cascade_layers &= !(1 << layer);
         }
-        self.last_shadow_camera = Some([
-            camera.position[0],
-            camera.position[1],
-            camera.position[2],
-            camera.yaw_deg,
-            camera.pitch_deg,
-            camera.fov_deg,
-            camera.near,
-            camera.far,
-            aspect,
-        ]);
+        self.shadow_regions_culled += culled_total;
         self.shadow_rerender_count += 1;
+    }
+
+    /// The active depth-store policy for the composed world pass —
+    /// `TileBasedTbdr` adapters drop the on-chip depth tile after the
+    /// pass instead of writing it back.
+    fn depth_store_op(&self) -> wgpu::StoreOp {
+        select_depth_store_op(self.gpu_paradigm, false)
+    }
+
+    /// Report the negotiated [`GpuComputeParadigm`] (host detection at
+    /// construction; `LiveSession` re-pushes its caps).
+    pub fn gpu_paradigm(&self) -> GpuComputeParadigm {
+        self.gpu_paradigm
+    }
+
+    /// The depth comparison the post-opaque sky pipeline runs with —
+    /// always [`SKY_DEPTH_COMPARE`]; exposed so tests pin the policy to
+    /// the live pipeline descriptor rather than a re-declared literal.
+    pub fn sky_depth_compare(&self) -> wgpu::CompareFunction {
+        SKY_DEPTH_COMPARE
+    }
+
+    /// Override the depth-store driver's paradigm — `LiveSession` pushes
+    /// its authoritative detection result here.
+    pub fn set_gpu_paradigm(&mut self, paradigm: GpuComputeParadigm) {
+        self.gpu_paradigm = paradigm;
     }
 
     /// Set the render-scale preset for the composed world pass. The scaled
@@ -5512,6 +6397,7 @@ impl GpuRenderer {
         let digest = subworld_caster_digest(bank);
         if subworld_casters_dirty(bank) || digest != self.last_shadow_casters {
             self.shadow_cache.invalidate();
+            self.subworld_gpu_epoch += 1;
         }
         self.subworld_gpu
             .sync(&self.ctx.device, &self.ctx.queue, bank);
@@ -5774,6 +6660,10 @@ impl GpuRenderer {
             None
         };
         let bundle_stats = self.terrain_bundle_stats;
+        let depth_store = self.depth_store_op();
+        if depth_store == wgpu::StoreOp::Discard {
+            self.tbdr_depth_discards += 1;
+        }
         // Split disjoint field borrows so the scratch writer and the GPU
         // handles can coexist inside the render pass.
         let culled_sections = &self.cull_result;
@@ -5795,6 +6685,16 @@ impl GpuRenderer {
         let debug_line_pipeline = &self.debug_line_pipeline;
         let frame_bind_group = &self.frame_bind_group;
         let depth_view = self.depth_view.as_ref().expect("depth ensured");
+        let sky = &self.sky;
+        if let Some(stable) = &self.frame_stable_shadow {
+            // The dome reads only camera vectors, sun, render/celestial
+            // params — all carried by the frame's stable uniform build.
+            self.ctx.queue.write_buffer(
+                &sky.uniform,
+                0,
+                &shadow_uniform_bytes(&stable.uniforms),
+            );
+        }
         gpu.draw_scratch.clear();
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -5817,7 +6717,7 @@ impl GpuRenderer {
                     view: depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
+                        store: depth_store,
                     }),
                     stencil_ops: None,
                 }),
@@ -5923,6 +6823,13 @@ impl GpuRenderer {
             if let Some(shadow) = shadow {
                 pass.set_bind_group(3, &shadow.receiver_bg, &[]);
             }
+            // Sky dome behind all opaque geometry: the depth-1.0
+            // fullscreen triangle passes `CompareFunction::Equal` only on
+            // untouched pixels, so terrain-occluded sky never runs a
+            // fragment — identical final image, minimal sky shading.
+            pass.set_pipeline(&sky.pipeline);
+            pass.set_bind_group(0, &sky.bind_group, &[]);
+            pass.draw(0..3, 0..1);
             // Non-terrain draws continue in `draw_scratch` past the
             // terrain slice so one `write_buffer` covers the whole frame.
             let scratch = &mut gpu.draw_scratch;
@@ -6111,6 +7018,7 @@ impl GpuRenderer {
         let caster_digest = subworld_caster_digest(frame.subworlds);
         if subworld_casters_dirty(frame.subworlds) || caster_digest != self.last_shadow_casters {
             self.shadow_cache.invalidate();
+            self.subworld_gpu_epoch += 1;
         }
         self.subworld_gpu
             .sync(&self.ctx.device, &self.ctx.queue, frame.subworlds);
@@ -6172,13 +7080,7 @@ impl GpuRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("composed-frame"),
             });
-        if self.shadow_active {
-            if matches!(decision, ShadowCacheDecision::Rerender(_)) {
-                self.encode_shadow_map(&mut encoder, camera, aspect, frame.world_time_ticks);
-            } else {
-                self.shadow_reuse_count += 1;
-            }
-        }
+        self.dispatch_shadow_work(&mut encoder, camera, aspect, decision);
         if scaled {
             let target_view = self
                 .scaled_target

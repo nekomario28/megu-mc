@@ -34,7 +34,8 @@ use mc_spine_client_mesh::tactile_effects::{
 };
 use mc_spine_client_mesh::vanilla_plus_nature::{
     compute_cloud_lighting, generate_layered_voxel_clouds, tick_nature_ambience, ActiveSeasonKind,
-    NatureAmbienceEnv, NatureAmbienceState, NatureModRegistry, SeasonAmbienceInput,
+    CloudLighting, NatureAmbienceEnv, NatureAmbienceState, NatureModRegistry, SeasonAmbienceInput,
+    CLOUD_CELL_BLOCKS, CLOUD_SCROLL_BLOCKS_PER_TICK,
 };
 use mc_spine_client_mesh::SectionCoord;
 use mc_spine_kernel::player_physics::{
@@ -66,8 +67,9 @@ use crate::subworld_render::{
 };
 use crate::SecretString;
 use hw_adaptive_engine::{
-    detect_host_hardware_caps, select_compute_strategy, ComputeKernelMode, ComputeStrategy,
-    HostHardwareCaps, KernelAutotuner, PagedSectionPool, SpeculativeChunkPrefetcher,
+    detect_host_hardware_caps, detect_universal_hardware_profile, select_compute_strategy,
+    ComputeKernelMode, ComputeStrategy, HostHardwareCaps, KernelAutotuner, PagedSectionPool,
+    SpeculativeChunkPrefetcher,
 };
 use sys_metrics::{sample_host_metrics, CpuSampler, FrameTimingStats};
 
@@ -549,6 +551,19 @@ pub struct LiveSession {
     /// Times [`Self::apply_compute_strategy`] pushed the session strategy
     /// into a renderer.
     compute_strategy_apply_count: u64,
+    /// Integer-cell key the layered voxel-cloud mesh was last generated
+    /// for: `(cloud_cx, cloud_cz, scroll_cell, cloud_layers,
+    /// cloud_height_bits)`. Between key hits only the sub-cell X offset
+    /// changes, which slides through the existing `SubWorld` model
+    /// matrix instead of rebuilding the mesh.
+    cloud_mesh_key: Option<(i64, i64, i64, u32, u32)>,
+    /// Quantized (1/32) cloud-lighting key for the cached mesh: weather
+    /// or day-phase shifts that change the baked tint force a
+    /// regenerate even inside one cell.
+    cloud_mesh_lighting_key: Option<[u32; 10]>,
+    /// Composed frames that reused the cached cloud mesh with a
+    /// matrix-only sub-cell scroll slide.
+    pub cloud_mesh_reuses: u64,
     pub atmosphere_blender: BiomeAtmosphereBlender,
     pub chunk_fades: ChunkFadeTracker,
     pub subworlds: SubWorldRenderBank,
@@ -827,6 +842,9 @@ impl LiveSession {
             sys_sample_count: 0,
             kernel_autotuner,
             compute_strategy_apply_count: 0,
+            cloud_mesh_key: None,
+            cloud_mesh_lighting_key: None,
+            cloud_mesh_reuses: 0,
             atmosphere_blender: BiomeAtmosphereBlender::new(AtmosphereParams::default()),
             chunk_fades: ChunkFadeTracker::new(),
             subworlds: SubWorldRenderBank::new(),
@@ -1688,18 +1706,50 @@ impl LiveSession {
     /// Cells come from `generate_layered_voxel_clouds`; the pack's
     /// `enabled`/`layered_voxel_clouds` toggles gate emission (an empty set
     /// removes the sheet instead of leaving a stale frame).
-    fn refresh_voxel_clouds(&mut self) {
+    ///
+    /// The mesh is cached on the integer cell grid `(cloud_cx, cloud_cz,
+    /// scroll_cell, cloud_layers, cloud_height)`: `generate` bakes
+    /// `cx*cell - scroll` into `min.x`, so feeding the cell-aligned
+    /// canonical tick produces a mesh whose only drift inside one cell is
+    /// the sub-cell X remainder — applied to the existing `SubWorld`
+    /// model matrix via `set_transform` instead of a geometry rebuild.
+    /// `cloud_mesh_reuses` counts the matrix-only slides.
+    pub fn refresh_voxel_clouds(&mut self) {
         let (cam_x, cam_z) = self
             .pose
             .map(|pose| (pose.feet[0] as f32, pose.feet[2] as f32))
             .unwrap_or((0.0, 0.0));
         let time = self.world.time_of_day.max(0) as u64;
-        let cells =
-            generate_layered_voxel_clouds(&self.vanilla_plus_cfg.nature, cam_x, cam_z, time);
-        if cells.is_empty() {
-            self.subworlds.remove(CLOUD_SUBWORLD_ID);
-            return;
-        }
+        let cell = f64::from(CLOUD_CELL_BLOCKS);
+        let scroll_rate = f64::from(CLOUD_SCROLL_BLOCKS_PER_TICK);
+        let scroll = time as f64 * scroll_rate;
+        let scroll_cell = (scroll / cell).floor() as i64;
+        // Canonical tick whose baked scroll lands on the cell grid:
+        // `generate` computes `min.x = cx*cell - ticks*rate`, so this tick
+        // makes the cached mesh carry only whole-cell offsets.
+        let canon_ticks = ((scroll_cell as f64 * cell) / scroll_rate)
+            .round()
+            .clamp(0.0, u64::MAX as f64) as u64;
+        let canon_scroll = canon_ticks as f64 * scroll_rate;
+        let cam_x = if cam_x.is_finite() { cam_x } else { 0.0 };
+        let cam_z = if cam_z.is_finite() { cam_z } else { 0.0 };
+        let cloud_cx = ((f64::from(cam_x) + canon_scroll) / cell).floor() as i64;
+        let cloud_cz = (f64::from(cam_z) / cell).floor() as i64;
+        let nature = &self.vanilla_plus_cfg.nature;
+        let key = (
+            cloud_cx,
+            cloud_cz,
+            scroll_cell,
+            u32::from(nature.effective_cloud_layers()),
+            nature.effective_cloud_height().to_bits(),
+        );
+        // Sub-cell drift this frame: the model matrix slides the cached
+        // mesh by the fraction of a cell scrolled since the last boundary.
+        let slide_x = -((scroll - canon_scroll) as f32);
+        let transform = SubWorldTransform {
+            position: [slide_x, 0.0, 0.0],
+            ..SubWorldTransform::IDENTITY
+        };
         // Vanilla celestial angle: 0 = sunrise, 6000 = noon, 18000 = midnight.
         let sun_elevation = ((time % 24_000) as f32 * (std::f32::consts::TAU / 24_000.0)).sin();
         let lighting = compute_cloud_lighting(
@@ -1707,15 +1757,29 @@ impl LiveSession {
             self.world.rain_level,
             self.world.thunder_level,
         );
+        let lighting_key = cloud_lighting_key(&lighting);
+        if self.cloud_mesh_key == Some(key)
+            && self.cloud_mesh_lighting_key == Some(lighting_key)
+            && self.subworlds.get(CLOUD_SUBWORLD_ID).is_some()
+        {
+            self.subworlds.set_transform(CLOUD_SUBWORLD_ID, transform);
+            self.cloud_mesh_reuses += 1;
+            return;
+        }
+        let cells = generate_layered_voxel_clouds(nature, cam_x, cam_z, canon_ticks);
+        if cells.is_empty() {
+            self.subworlds.remove(CLOUD_SUBWORLD_ID);
+            self.cloud_mesh_key = None;
+            self.cloud_mesh_lighting_key = None;
+            return;
+        }
         let (vertices, indices) = voxel_clouds_to_geometry(&cells, &lighting);
-        let mut entry = SubWorldRenderEntry::new(
-            CLOUD_SUBWORLD_ID,
-            SubWorldTransform::IDENTITY,
-            vertices,
-            indices,
-        );
+        let mut entry =
+            SubWorldRenderEntry::new(CLOUD_SUBWORLD_ID, transform, vertices, indices);
         entry.alpha = CLOUD_RENDER_ALPHA;
         self.subworlds.upsert(entry);
+        self.cloud_mesh_key = Some(key);
+        self.cloud_mesh_lighting_key = Some(lighting_key);
     }
 
     /// Mirror `self.hud` into `hud` only when it changed since the last
@@ -1893,6 +1957,9 @@ impl LiveSession {
     /// negotiated render-scale/shadow defaults. Returns the negotiated
     /// shadow quality.
     pub fn apply_compute_strategy(&mut self, renderer: &mut GpuRenderer) -> BuiltinShadowQuality {
+        // The universal profile's GPU paradigm drives the renderer's
+        // depth-store policy (TBDR adapters drop the depth tile).
+        renderer.set_gpu_paradigm(detect_universal_hardware_profile().gpu_paradigm);
         let negotiated = renderer.apply_compute_strategy(&self.compute_strategy);
         self.compute_strategy_apply_count += 1;
         negotiated
@@ -2878,7 +2945,32 @@ fn run_connection(
 
 /// Reserved `subworlds` id for the layered voxel-cloud sheet (kept clear of
 /// contraption ids, which allocate from 1 upward).
-const CLOUD_SUBWORLD_ID: u64 = u64::MAX;
+pub const CLOUD_SUBWORLD_ID: u64 = u64::MAX;
+
+/// Quantize one [`CloudLighting`] state to 1/32 steps for the cloud-mesh
+/// cache key: the tint is baked into vertex albedo, so a real change must
+/// regenerate the mesh while sub-step drift keeps the cached frame.
+fn cloud_lighting_key(lighting: &CloudLighting) -> [u32; 10] {
+    let q = |v: f32| {
+        if v.is_finite() {
+            (v * 32.0).round() as i64 as u32
+        } else {
+            0
+        }
+    };
+    [
+        q(lighting.top_rgb[0]),
+        q(lighting.top_rgb[1]),
+        q(lighting.top_rgb[2]),
+        q(lighting.side_rgb[0]),
+        q(lighting.side_rgb[1]),
+        q(lighting.side_rgb[2]),
+        q(lighting.bottom_rgb[0]),
+        q(lighting.bottom_rgb[1]),
+        q(lighting.bottom_rgb[2]),
+        q(lighting.rim_warmth),
+    ]
+}
 
 /// Candidate client-JAR version ids, `--version` id first: `1.21.1` stays
 /// a fallback because a launcher that omits `--version` still keeps the
