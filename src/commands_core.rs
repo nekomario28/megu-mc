@@ -226,6 +226,21 @@ fn state_from_arg(arg: &str) -> Option<u32> {
         }
         return Some(st);
     }
+    // Generic `[k=v,...]` handling: families above have non-state quirks
+    // (piston arithmetic, door half packing); every other block resolves
+    // declared properties straight from the registry's state table.
+    if let Some(reg) = breg() {
+        let props: Vec<(String, String)> = props
+            .split(',')
+            .filter_map(|kv| {
+                let (k, v) = kv.split_once('=')?;
+                Some((k.trim().to_string(), v.trim().to_string()))
+            })
+            .collect();
+        if let Some(st) = reg.checked_state(&format!("minecraft:{name}"), &props) {
+            return Some(st);
+        }
+    }
     Some(base)
 }
 pub(crate) fn name_to_state(n: &str) -> Option<u32> {

@@ -1261,7 +1261,16 @@ impl BReg {
         }
         // The isolated post remains raised in this case. Do not silently
         // overwrite tall/multi-sided wall shape geometry with a guessed post.
+        // This cleanup exists only for neighbors `wall_after_full_neighbor`
+        // cannot classify; cubes, walls and air are already decided there, and
+        // overriding their "low"/"none" verdicts here makes two adjacent walls
+        // alternately disconnect and reconnect each other forever.
+        let cube = self.is_template_solid(neighbor) == Some(true)
+            && self.is_collision_shape_full_block(neighbor)
+            && self.is_solid_render(neighbor);
+        let unclassified = !cube && !other.ends_with("_wall") && !self.is_air(neighbor);
         if name.ends_with("_wall")
+            && unclassified
             && self.is_air(above)
             && self.get_prop(state, "up").as_deref() == Some("true")
             && self.get_prop(state, key).as_deref() == Some("low")

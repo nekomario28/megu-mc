@@ -11052,92 +11052,791 @@ fn use_redstone_component(c: &Client, (dim, x, y, z): DimBlockPos, state: u32) -
     true
 }
 
-fn live_placement_state(reg: &BReg, item: i64, face: RsDir, yaw: f32, pitch: f32) -> Option<u32> {
-    let item_name = item_to_name(item)?;
-    let block_name = match item_name {
-        "redstone" => "redstone_wire",
-        "redstone_torch" if RsDir::HORIZONTAL.contains(&face) => "redstone_wall_torch",
-        other => other,
-    };
-    let state = reg.state_of(&format!("minecraft:{block_name}"), None);
-    if !matches!(
-        block_name,
-        "anvil"
-            | "chipped_anvil"
-            | "damaged_anvil"
-            | "enchanting_table"
-            | "brewing_stand"
-            | "smithing_table"
-            | "bookshelf"
-    ) && !redstone_component(reg, state)
+// ---------- vanilla-style BlockItem placement ----------
+// `BlockItem.place` -> `getStateForPlacement`: the held item resolves to a
+// block (with the wall-variant renames vanilla performs), the target cell
+// comes from vanilla's `canBeReplaced` (replaceable clicked block, or the
+// same-slab absorb), then family-specific placement state is computed.
+
+/// The placement input: which cell was clicked, on which face, with what
+/// cursor point and player orientation. `target` is filled by
+/// `placement_target` before `placement_states` runs.
+#[derive(Clone, Copy)]
+struct PlacementCtx {
+    dim: DimId,
+    clicked: (i32, i32, i32),
+    face: u8, // native 0..=5 (down..east)
+    cursor: (f32, f32, f32),
+    yaw: f32,
+    pitch: f32,
+    sneaking: bool,
+    target: (i32, i32, i32),
+    target_old: u32,
+}
+
+fn placement_look(yaw: f32) -> RsDir {
+    [RsDir::South, RsDir::West, RsDir::North, RsDir::East]
+        [((yaw / 90.0).round() as i32).rem_euclid(4) as usize]
+}
+fn placement_near(yaw: f32, pitch: f32) -> RsDir {
+    if pitch > 45.0 {
+        RsDir::Down
+    } else if pitch < -45.0 {
+        RsDir::Up
+    } else {
+        placement_look(yaw)
+    }
+}
+
+/// A read-only world view over the live dimension for the redstone engine's
+/// signal queries (wire shape, `hasNeighborSignal`, side inputs).
+struct PlacementWorld<'a> {
+    dim: DimId,
+    reg: &'a BReg,
+}
+impl PlacementWorld<'_> {
+    fn state(&self, RsPos(x, y, z): RsPos) -> u32 {
+        block_at_dim(self.dim, x, y, z)
+    }
+}
+impl RedstoneWorld for PlacementWorld<'_> {
+    fn redstone_block(&self, pos: RsPos) -> RsBlock {
+        rs_block_from_state(self.reg, self.state(pos))
+    }
+    fn is_redstone_conductor(&self, pos: RsPos) -> bool {
+        self.reg.is_redstone_conductor(self.state(pos))
+    }
+    fn is_face_sturdy(&self, pos: RsPos, face: RsDir) -> bool {
+        self.reg
+            .is_face_sturdy(self.state(pos), face as u8, Support::Full)
+    }
+    fn container_analog_signal(&self, pos: RsPos) -> Option<u8> {
+        let RsPos(x, y, z) = pos;
+        live_comparator_signal_at(self.dim, x, y, z)
+    }
+}
+
+fn placement_world(reg: &BReg, dim: DimId) -> PlacementWorld<'_> {
+    PlacementWorld { dim, reg }
+}
+
+fn placement_powered(world: &PlacementWorld, pos: (i32, i32, i32)) -> bool {
+    rs_neighbor_signal(world, RsPos(pos.0, pos.1, pos.2), true) != 0
+}
+
+/// `ItemUtils.isSameStack` on the block id: the clicked slab absorbs only an
+/// identical slab item (`SlabBlock.canBeReplaced`).
+fn slab_absorbs(reg: &BReg, clicked_state: u32, block_name: &str, ctx: &PlacementCtx) -> bool {
+    if reg.name_of(clicked_state) != format!("minecraft:{block_name}")
+        || reg.get_prop(clicked_state, "type").as_deref() == Some("double")
     {
+        return false;
+    }
+    let bottom = reg.get_prop(clicked_state, "type").as_deref() == Some("bottom");
+    let horizontal = ctx.face >= 2;
+    let above_mid = ctx.cursor.1 > 0.5;
+    if bottom {
+        ctx.face == 1 || (horizontal && above_mid)
+    } else {
+        ctx.face == 0 || (horizontal && !above_mid)
+    }
+}
+
+/// `BlockPlaceContext`: the write target. The clicked cell absorbs the block
+/// when it is replaceable or an absorbing same-slab; otherwise the click is
+/// offset one cell along the face.
+fn placement_target(
+    reg: &BReg,
+    item_name: &str,
+    mut ctx: PlacementCtx,
+) -> Option<PlacementCtx> {
+    let (x, y, z) = ctx.clicked;
+    let clicked = block_at_dim(ctx.dim, x, y, z);
+    let name = placement_block_name(item_name, ctx.face)?;
+    let absorb = slab_absorbs(reg, clicked, &name, &ctx);
+    let (dx, dy, dz) = RsDir::ALL[ctx.face as usize].offset();
+    if absorb || reg.is_replaceable(clicked) {
+        ctx.target = ctx.clicked;
+    } else {
+        ctx.target = (x + dx, y + dy, z + dz);
+    }
+    ctx.target_old = block_at_dim(ctx.dim, ctx.target.0, ctx.target.1, ctx.target.2);
+    if !absorb && !reg.is_replaceable(ctx.target_old) {
+        return Some(ctx); // occupied target: attempt, no write
+    }
+    Some(ctx)
+}
+
+/// `BlockItem.getBlockName` plus the wall-variant renames vanilla's
+/// `BlockItem` subclasses apply (`StandingAndWallBlockItem`).
+fn placement_block_name(item_name: &str, face: u8) -> Option<String> {
+    let named: String = match item_name {
+        "redstone" => "redstone_wire".into(),
+        "string" => "tripwire".into(),
+        "kelp" => "kelp".into(),
+        "cocoa_beans" => "cocoa".into(),
+        "sweet_berries" => "sweet_berry_bush".into(),
+        "nether_wart" => "nether_wart".into(),
+        "wheat_seeds" => "wheat".into(),
+        "carrot" => "carrots".into(),
+        "potato" => "potatoes".into(),
+        "beetroot_seeds" => "beetroots".into(),
+        "melon_seeds" => "melon_stem".into(),
+        "pumpkin_seeds" => "pumpkin_stem".into(),
+        "torchflower_seeds" => "torchflower_crop".into(),
+        "pitcher_pod" => "pitcher_crop".into(),
+        "powder_snow_bucket" => "powder_snow".into(),
+        other => other.into(),
+    };
+    if (2..=5).contains(&face) {
+        if named == "torch" {
+            return Some("wall_torch".into());
+        }
+        for (suffix, wall_suffix) in [
+            ("_torch", "_wall_torch"),
+            ("_sign", "_wall_sign"),
+            ("_coral_fan", "_coral_wall_fan"),
+            ("_skull", "_wall_skull"),
+            ("_head", "_wall_head"),
+        ] {
+            if let Some(base) = named.strip_suffix(suffix) {
+                return Some(format!("{base}{wall_suffix}"));
+            }
+        }
+    }
+    Some(named)
+}
+
+/// `canSurvive` for the placement families the engine places: the bounded
+/// support contracts from vanilla's `Block.canSurvive` overrides.
+fn placement_can_survive(reg: &BReg, dim: DimId, ctx: &PlacementCtx, st: u32) -> bool {
+    let name = reg.name_of(st);
+    let (tx, ty, tz) = ctx.target;
+    let below = block_at_dim(dim, tx, ty - 1, tz);
+    let up_sturdy =
+        |state: u32| reg.is_face_sturdy(state, 1, Support::Full);
+    if name.ends_with("_lantern") || name == "minecraft:lantern" {
+        return if reg.get_prop(st, "hanging").as_deref() == Some("true") {
+            reg.is_face_sturdy(block_at_dim(dim, tx, ty + 1, tz), 0, Support::Center)
+        } else {
+            up_sturdy(below)
+        };
+    }
+    if name.ends_with("_door")
+        || name.ends_with("_rail")
+        || name == "minecraft:rail"
+        || name.ends_with("_pressure_plate")
+        || name == "minecraft:bell"
+    {
+        return up_sturdy(below);
+    }
+    match name {
+        "minecraft:redstone_wire"
+        | "minecraft:repeater"
+        | "minecraft:comparator" => {
+            up_sturdy(below) || reg.name_of(below) == "minecraft:hopper"
+        }
+        "minecraft:torch" | "minecraft:soul_torch" | "minecraft:redstone_torch" => up_sturdy(below),
+        "minecraft:redstone_wall_torch" | "minecraft:wall_torch" | "minecraft:soul_wall_torch"
+        | "minecraft:ladder" => {
+            let (x, y, z) = ctx.clicked;
+            reg.is_face_sturdy(block_at_dim(dim, x, y, z), ctx.face, Support::Center)
+        }
+        "minecraft:lever" | "minecraft:grindstone" => {
+            let (x, y, z) = ctx.clicked;
+            reg.is_face_sturdy(block_at_dim(dim, x, y, z), ctx.face, Support::Center)
+        }
+        _ if reg.in_tag(st, "minecraft:buttons") => {
+            let (x, y, z) = ctx.clicked;
+            reg.is_face_sturdy(block_at_dim(dim, x, y, z), ctx.face, Support::Center)
+        }
+        _ if reg.in_tag(st, "minecraft:flowers")
+            || reg.in_tag(st, "minecraft:saplings")
+            || name == "minecraft:sweet_berry_bush"
+            || name == "minecraft:tall_grass"
+            || name == "minecraft:large_fern"
+            || name == "minecraft:fern" =>
+        {
+            reg.in_tag(below, "minecraft:dirt")
+                || matches!(
+                    reg.name_of(below),
+                    "minecraft:farmland"
+                        | "minecraft:dirt_path"
+                        | "minecraft:moss_block"
+                        | "minecraft:mud"
+                        | "minecraft:podzol"
+                        | "minecraft:mycelium"
+                        | "minecraft:coarse_dirt"
+                        | "minecraft:rooted_dirt"
+                        | "minecraft:grass_block"
+                )
+        }
+        _ => true,
+    }
+}
+
+/// The vanilla door-hinge rule (`DoorBlock.getHinge`), probed against live
+/// 1.21.1: solid neighbours lean the hinge, an existing aligned door forces
+/// it, and the cursor click point breaks the tie.
+fn placement_door_hinge(
+    reg: &BReg,
+    door_name: &str,
+    ctx: &PlacementCtx,
+    facing: RsDir,
+) -> &'static str {
+    let (tx, ty, tz) = ctx.target;
+    let get = |pos: (i32, i32, i32)| block_at_dim(ctx.dim, pos.0, pos.1, pos.2);
+    let at = |dir: RsDir, up: i32| {
+        let (dx, _, dz) = dir.offset();
+        (tx + dx, ty + up, tz + dz)
+    };
+    let conductor = |pos: (i32, i32, i32)| reg.is_redstone_conductor(get(pos));
+    let i = (conductor(at(facing.left(), 0)) as i32 * -1)
+        + (conductor(at(facing.left(), 1)) as i32 * -1)
+        + conductor(at(facing.right(), 0)) as i32
+        + conductor(at(facing.right(), 1)) as i32;
+    let same_door = |pos: (i32, i32, i32)| {
+        let s = get(pos);
+        reg.name_of(s) == door_name
+            && reg.get_prop(s, "facing").and_then(|v| RsDir::from_property(&v)) == Some(facing)
+            && reg.get_prop(s, "half").as_deref() == Some("lower")
+    };
+    let ccw_door = same_door(at(facing.left(), 0));
+    let cw_door = same_door(at(facing.right(), 0));
+    if (ccw_door && !cw_door) || i > 0 {
+        return "right";
+    }
+    if (cw_door && !ccw_door) || i < 0 {
+        return "left";
+    }
+    let (step_x, _, step_z) = facing.offset();
+    // Click location within the target cell.
+    let (cdx, _, cdz) = RsDir::ALL[ctx.face as usize].offset();
+    let x = f64::from(ctx.cursor.0) - f64::from(cdx);
+    let z = f64::from(ctx.cursor.2) - f64::from(cdz);
+    if (step_x >= 0 || z < 0.5)
+        && (step_x <= 0 || z > 0.5)
+        && (step_z >= 0 || x < 0.5)
+        && (step_z <= 0 || x > 0.5)
+    {
+        "right"
+    } else {
+        "left"
+    }
+}
+
+/// Vanilla `RailShape`: rails connect to a same-level rail, to a rail on top
+/// of a sturdy neighbour, or down to a rail below a non-sturdy neighbour.
+fn rail_connections(
+    reg: &BReg,
+    get: &dyn Fn((i32, i32, i32)) -> u32,
+    pos: (i32, i32, i32),
+) -> Vec<(RsDir, bool)> {
+    let is_rail = |st: u32| {
+        let n = reg.name_of(st);
+        n == "minecraft:rail" || n.ends_with("_rail")
+    };
+    let mut out = Vec::new();
+    for dir in RsDir::HORIZONTAL {
+        let (dx, _, dz) = dir.offset();
+        let npos = (pos.0 + dx, pos.1, pos.2 + dz);
+        let nst = get(npos);
+        if is_rail(nst) {
+            out.push((dir, false));
+        } else if reg.is_face_sturdy(nst, 1, Support::Full)
+            && is_rail(get((npos.0, npos.1 + 1, npos.2)))
+        {
+            out.push((dir, true));
+        } else if !reg.is_face_sturdy(nst, 1, Support::Full)
+            && is_rail(get((npos.0, npos.1 - 1, npos.2)))
+        {
+            out.push((dir, false));
+        }
+    }
+    out
+}
+
+fn rail_shape_for(
+    reg: &BReg,
+    st: u32,
+    conns: &[(RsDir, bool)],
+) -> Option<&'static str> {
+    let straight = matches!(
+        reg.name_of(st),
+        "minecraft:powered_rail" | "minecraft:detector_rail" | "minecraft:activator_rail"
+    );
+    let has = |d: RsDir| conns.iter().any(|&(dir, _)| dir == d);
+    let pair = |a: RsDir, b: RsDir| has(a) && has(b);
+    if !straight {
+        if pair(RsDir::North, RsDir::East) {
+            return Some("north_east");
+        }
+        if pair(RsDir::North, RsDir::West) {
+            return Some("north_west");
+        }
+        if pair(RsDir::South, RsDir::East) {
+            return Some("south_east");
+        }
+        if pair(RsDir::South, RsDir::West) {
+            return Some("south_west");
+        }
+    }
+    if let Some(&(dir, _)) = conns.iter().find(|&&(_, a)| a && !straight) {
+        return Some(match dir {
+            RsDir::North => "ascending_north",
+            RsDir::South => "ascending_south",
+            RsDir::West => "ascending_west",
+            RsDir::East => "ascending_east",
+            _ => "north_south",
+        });
+    }
+    if straight {
+        if let Some(&(dir, a)) = conns.first() {
+            if a {
+                return Some(match dir {
+                    RsDir::North => "ascending_north",
+                    RsDir::South => "ascending_south",
+                    RsDir::West => "ascending_west",
+                    RsDir::East => "ascending_east",
+                    _ => "north_south",
+                });
+            }
+        }
+    }
+    if pair(RsDir::East, RsDir::West) || (has(RsDir::East) || has(RsDir::West)) && !has(RsDir::North) && !has(RsDir::South) {
+        return Some("east_west");
+    }
+    Some("north_south")
+}
+
+/// Vanilla `RailState.updateConnections` — the rail shape recomputes for each
+/// placed/broken neighbour, cascading one step along connected rails.
+fn rail_update_at(reg: &BReg, dim: DimId, pos: (i32, i32, i32)) {
+    let st = block_at_dim(dim, pos.0, pos.1, pos.2);
+    let st_name = reg.name_of(st);
+    if st_name != "minecraft:rail" && !st_name.ends_with("_rail") {
+        return;
+    }
+    let conns = rail_connections(reg, &|p| block_at_dim(dim, p.0, p.1, p.2), pos);
+    if let Some(shape) = rail_shape_for(reg, st, &conns) {
+        let next = reg.with_prop(st, "shape", shape);
+        if next != st {
+            set_block_if_dim(dim, pos.0, pos.1, pos.2, next, Some(st));
+            note_block_update_dim(dim, pos.0, pos.1, pos.2, next);
+        }
+    }
+}
+
+/// `getStateForPlacement`: compute the write set for the resolved block name.
+/// The returned vector holds the cells to write in order (main block first,
+/// second halves after). `None` means the item does not resolve to a block.
+fn placement_states(reg: &BReg, item_name: &str, ctx: &PlacementCtx) -> Option<Vec<((i32, i32, i32), u32)>> {
+    let name = placement_block_name(item_name, ctx.face)?;
+    let full = format!("minecraft:{name}");
+    let st0 = reg.state_of(&full, None);
+    if reg.name_of(st0) != full.as_str() {
         return None;
     }
-    let look = [RsDir::South, RsDir::West, RsDir::North, RsDir::East]
-        [((yaw / 90.0).round() as i32).rem_euclid(4) as usize];
-    let updated = match rs_block_from_state(reg, state) {
-        RsBlock::Lever { .. } | RsBlock::Button { .. } => {
-            let (mount, facing) = match face {
-                RsDir::Up => ("floor", look),
-                RsDir::Down => ("ceiling", look),
-                wall => ("wall", wall),
-            };
-            reg.with_prop(
-                reg.with_prop(state, "face", mount),
-                "facing",
-                facing.property(),
-            )
+    let (tx, ty, tz) = ctx.target;
+    let get = |p: (i32, i32, i32)| block_at_dim(ctx.dim, p.0, p.1, p.2);
+    let look = placement_look(ctx.yaw);
+    let near = placement_near(ctx.yaw, ctx.pitch);
+    let fdir = RsDir::ALL[ctx.face as usize];
+    let world = placement_world(reg, ctx.dim);
+    let mut st = st0;
+    if reg.has_prop(&full, "waterlogged") {
+        let wet = reg.fluid_name(ctx.target_old) == "water";
+        st = reg.with_prop(st, "waterlogged", if wet { "true" } else { "false" });
+    }
+    // (x,y) within the target cell for click-point rules.
+    let (_fdx, fdy, _fdz) = fdir.offset();
+    let cy = ctx.cursor.1 - fdy as f32;
+    let mut extra: Vec<((i32, i32, i32), u32)> = Vec::new();
+    let n = name.as_str();
+    // `is("_x")` covers both prefixed variants (`oak_x`) and the unprefixed base
+    // block (`x`) — a bare `ends_with` would miss the base block.
+    let is = |suffix: &str| n.ends_with(suffix) || suffix.strip_prefix('_') == Some(n);
+
+    if is("_stairs") {
+        st = reg.with_prop(st, "facing", look.property());
+        let half = if ctx.face == 0 {
+            "top"
+        } else if ctx.face == 1 {
+            "bottom"
+        } else if cy > 0.5 {
+            "top"
+        } else {
+            "bottom"
+        };
+        st = reg.with_prop(st, "half", half);
+        if let Some(shaped) = reg.stair_after_neighbors(st, (tx, ty, tz), |p| get(p)) {
+            st = shaped;
         }
-        RsBlock::WallTorch(_) => reg.with_prop(state, "facing", face.property()),
-        RsBlock::Repeater(_) | RsBlock::Comparator(_) => {
-            reg.with_prop(state, "facing", look.opposite().property())
+    } else if is("_slab") {
+        // The absorbing case is handled by the target pass writing `double` at
+        // the clicked cell; here the slab lands at the offset target.
+        let slab_type = if ctx.face == 0 {
+            "top"
+        } else if ctx.face == 1 {
+            "bottom"
+        } else if cy > 0.5 {
+            "top"
+        } else {
+            "bottom"
+        };
+        st = reg.with_prop(st, "type", slab_type);
+    } else if is("_door") && reg.has_prop(&full, "hinge") {
+        if !reg.is_replaceable(get((tx, ty + 1, tz))) {
+            return Some(Vec::new());
         }
-        RsBlock::Observer { .. } => {
-            let direction = if pitch > 45.0 {
-                RsDir::Down
-            } else if pitch < -45.0 {
-                RsDir::Up
+        let facing = look;
+        let powered = placement_powered(&world, (tx, ty, tz))
+            || placement_powered(&world, (tx, ty + 1, tz));
+        let hinge = placement_door_hinge(reg, &full, ctx, facing);
+        for (half, pos) in [("lower", (tx, ty, tz)), ("upper", (tx, ty + 1, tz))] {
+            let mut half_st = st;
+            half_st = reg.with_prop(half_st, "facing", facing.property());
+            half_st = reg.with_prop(half_st, "half", half);
+            half_st = reg.with_prop(half_st, "open", "false");
+            half_st = reg.with_prop(half_st, "hinge", hinge);
+            half_st = reg.with_prop(half_st, "powered", if powered { "true" } else { "false" });
+            if pos == (tx, ty, tz) {
+                st = half_st;
             } else {
-                look
-            };
-            reg.with_prop(state, "facing", direction.opposite().property())
+                extra.push((pos, half_st));
+            }
         }
-        _ if matches!(block_name, "anvil" | "chipped_anvil" | "damaged_anvil") => {
-            reg.with_prop(state, "facing", look.right().property())
+    } else if matches!(n, "chest" | "trapped_chest" | "ender_chest") {
+        st = chest_placement_state_dim(ctx.dim, &full, (tx, ty, tz), ctx.yaw, ctx.sneaking, ctx.face);
+    } else if is("_trapdoor") {
+        let facing = if ctx.face >= 2 { fdir } else { look.opposite() };
+        st = reg.with_prop(st, "facing", facing.property());
+        let half = if ctx.face == 0 {
+            "top"
+        } else if ctx.face == 1 {
+            "bottom"
+        } else if cy > 0.5 {
+            "top"
+        } else {
+            "bottom"
+        };
+        st = reg.with_prop(st, "half", half);
+        st = reg.with_prop(st, "open", "false");
+    } else if is("_fence_gate") {
+        st = reg.with_prop(st, "facing", look.property());
+        let in_wall = [look.left(), look.right()].iter().any(|&d| {
+            let (dx, _, dz) = d.offset();
+            reg.name_of(get((tx + dx, ty, tz + dz))).ends_with("_wall")
+        });
+        st = reg.with_prop(st, "in_wall", if in_wall { "true" } else { "false" });
+        st = reg.with_prop(st, "open", "false");
+        let powered = placement_powered(&world, (tx, ty, tz));
+        st = reg.with_prop(st, "powered", if powered { "true" } else { "false" });
+    } else if (is("_fence") || n == "nether_brick_fence") && reg.has_prop(&full, "north") {
+        for dir in RsDir::HORIZONTAL {
+            let (dx, _, dz) = dir.offset();
+            let nst = get((tx + dx, ty, tz + dz));
+            let nname = reg.name_of(nst);
+            let connect = reg.is_face_sturdy(nst, dir.opposite() as u8, Support::Full)
+                || (nname.ends_with("_fence")
+                    && (nname == "minecraft:nether_brick_fence")
+                        == (n == "nether_brick_fence"))
+                || nname.ends_with("_fence_gate");
+            st = reg.with_prop(
+                st,
+                dir.property(),
+                if connect { "true" } else { "false" },
+            );
         }
-        _ => state,
-    };
-    Some(updated)
+    } else if (is("_pane") || n == "iron_bars") && reg.has_prop(&full, "north") {
+        for dir in RsDir::HORIZONTAL {
+            let (dx, _, dz) = dir.offset();
+            let nst = get((tx + dx, ty, tz + dz));
+            let nname = reg.name_of(nst);
+            let connect = reg.is_face_sturdy(nst, dir.opposite() as u8, Support::Full)
+                || nname.ends_with("_pane")
+                || nname == "minecraft:iron_bars";
+            st = reg.with_prop(
+                st,
+                dir.property(),
+                if connect { "true" } else { "false" },
+            );
+        }
+    } else if is("_wall") && reg.has_prop(&full, "up") {
+        for dir in RsDir::HORIZONTAL {
+            let (dx, _, dz) = dir.offset();
+            let nst = get((tx + dx, ty, tz + dz));
+            let nname = reg.name_of(nst);
+            let connect = nname.ends_with("_wall")
+                || reg.in_tag(nst, "minecraft:leaves")
+                || reg.is_face_sturdy(nst, dir.opposite() as u8, Support::Full);
+            st = reg.with_prop(st, dir.property(), if connect { "low" } else { "none" });
+        }
+        let v = |d: RsDir| reg.get_prop(st, d.property()).as_deref() == Some("low");
+        let straight = (v(RsDir::North) && v(RsDir::South) && !v(RsDir::East) && !v(RsDir::West))
+            || (v(RsDir::East) && v(RsDir::West) && !v(RsDir::North) && !v(RsDir::South));
+        let covered = reg.is_face_sturdy(get((tx, ty + 1, tz)), 0, Support::Full);
+        st = reg.with_prop(st, "up", if straight && !covered { "false" } else { "true" });
+    } else if n == "rail" || is("_rail") {
+        let conns = rail_connections(reg, &get, (tx, ty, tz));
+        if let Some(shape) = rail_shape_for(reg, st, &conns) {
+            st = reg.with_prop(st, "shape", shape);
+        }
+    } else if n == "redstone_wire" {
+        let wire = RedStoneWireBlock::default().with_connections(&world, RsPos(tx, ty, tz));
+        let mut props = vec![];
+        for (dir, conn) in RsDir::HORIZONTAL.iter().zip(wire.connections) {
+            props.push((dir.property().to_string(), conn.property().to_string()));
+        }
+        props.push(("power".to_string(), "0".to_string()));
+        if let Some(wst) = reg.checked_state(&full, &props) {
+            st = wst;
+        }
+    } else if n == "repeater" || n == "comparator" {
+        st = reg.with_prop(st, "facing", look.opposite().property());
+    } else if n == "observer" {
+        st = reg.with_prop(st, "facing", near.property());
+        st = reg.with_prop(st, "powered", "false");
+    } else if matches!(n, "piston" | "sticky_piston" | "dispenser" | "dropper" | "barrel") {
+        st = reg.with_prop(st, "facing", near.opposite().property());
+    } else if n == "hopper" {
+        let facing = if ctx.face == 1 { RsDir::Down } else { fdir.opposite() };
+        st = reg.with_prop(st, "facing", facing.property());
+    } else if n == "lever" || n == "grindstone" || reg.in_tag(st0, "minecraft:buttons") {
+        let (mount, facing) = match fdir {
+            RsDir::Up => ("floor", look),
+            RsDir::Down => ("ceiling", look),
+            wall => ("wall", wall),
+        };
+        st = reg.with_prop(st, "face", mount);
+        st = reg.with_prop(st, "facing", facing.property());
+    } else if is("_lantern") {
+        st = reg.with_prop(st, "hanging", if ctx.face == 0 { "true" } else { "false" });
+    } else if n == "ladder" || is("_wall_torch") {
+        if ctx.face < 2 {
+            return Some(Vec::new());
+        }
+        st = reg.with_prop(st, "facing", fdir.property());
+    } else if n.contains("_wall_") && reg.has_prop(&full, "facing") {
+        if ctx.face < 2 {
+            return Some(Vec::new());
+        }
+        st = reg.with_prop(st, "facing", fdir.property());
+    } else if n == "bell" {
+        let attachment = match ctx.face {
+            1 => "floor",
+            0 => "ceiling",
+            _ => "single_wall",
+        };
+        st = reg.with_prop(st, "attachment", attachment);
+        let facing = if ctx.face >= 2 { fdir.opposite() } else { look };
+        st = reg.with_prop(st, "facing", facing.property());
+    } else if n == "campfire" || n == "soul_campfire" {
+        st = reg.with_prop(st, "facing", look.property());
+        st = reg.with_prop(st, "lit", "true");
+        let signal_fire = reg.name_of(get((tx, ty - 1, tz))) == "minecraft:hay_block";
+        st = reg.with_prop(st, "signal_fire", if signal_fire { "true" } else { "false" });
+    } else if is("_bed") {
+        if !reg.is_replaceable(get((tx, ty, tz))) {
+            return Some(Vec::new());
+        }
+        let (hx, _, hz) = look.offset();
+        let head = (tx + hx, ty, tz + hz);
+        if !reg.is_replaceable(get(head)) {
+            return Some(Vec::new());
+        }
+        st = reg.with_prop(st, "facing", look.property());
+        st = reg.with_prop(st, "part", "foot");
+        let head_st = reg.with_prop(st, "part", "head");
+        extra.push((head, head_st));
+    } else if reg.has_prop(&full, "half")
+        && matches!(
+            n,
+            "tall_grass" | "large_fern" | "sunflower" | "lilac" | "rose_bush" | "peony"
+                | "pitcher_plant"
+        )
+    {
+        if !reg.is_replaceable(get((tx, ty + 1, tz))) {
+            return Some(Vec::new());
+        }
+        st = reg.with_prop(st, "half", "lower");
+        extra.push(((tx, ty + 1, tz), reg.with_prop(st, "half", "upper")));
+    } else if is("_pressure_plate") {
+        st = reg.with_prop(st, "powered", "false");
+    } else if is("_candle") {
+        st = reg.with_prop(st, "candles", "1");
+        st = reg.with_prop(st, "lit", "false");
+    } else if n == "sea_pickle" {
+        st = reg.with_prop(st, "pickles", "1");
+    } else if n == "turtle_egg" {
+        st = reg.with_prop(st, "eggs", "1");
+        st = reg.with_prop(st, "hatch", "0");
+    } else if n == "snow" {
+        st = reg.with_prop(st, "layers", "1");
+    } else if n == "pointed_dripstone" {
+        let dir = match ctx.face {
+            0 => "up",
+            1 => "down",
+            _ => "down",
+        };
+        st = reg.with_prop(st, "tip_direction", dir);
+    } else if matches!(n, "lightning_rod" | "end_rod" | "amethyst_cluster")
+        || is("_amethyst_bud")
+    {
+        st = reg.with_prop(st, "facing", fdir.property());
+    } else if reg.has_prop(&full, "rotation") {
+        let rot = ((ctx.yaw as f64 * 16.0 / 360.0 + 0.5).floor() as i64) & 15;
+        st = reg.with_prop(st, "rotation", &rot.to_string());
+    } else if matches!(
+        n,
+        "lectern" | "loom" | "stonecutter" | "furnace" | "smoker" | "blast_furnace"
+            | "carved_pumpkin" | "jack_o_lantern" | "end_portal_frame" | "bee_nest"
+            | "beehive" | "chiseled_bookshelf" | "decorated_pot" | "big_dripleaf"
+            | "small_dripleaf" | "mangrove_roots" | "jukebox"
+    ) || (n.ends_with("_glazed_terracotta") && reg.has_prop(&full, "facing"))
+    {
+        st = reg.with_prop(st, "facing", look.opposite().property());
+    } else if matches!(n, "anvil" | "chipped_anvil" | "damaged_anvil") {
+        st = reg.with_prop(st, "facing", look.right().property());
+    } else if is("_copper_bulb") {
+        let powered = placement_powered(&world, (tx, ty, tz));
+        st = reg.with_prop(st, "powered", if powered { "true" } else { "false" });
+        st = reg.with_prop(st, "lit", "false");
+    } else if reg.has_prop(&full, "axis") {
+        let axis = match fdir.axis() {
+            RsAxis::X => "x",
+            RsAxis::Y => "y",
+            RsAxis::Z => "z",
+        };
+        st = reg.with_prop(st, "axis", axis);
+    }
+    let mut writes = vec![((tx, ty, tz), st)];
+    writes.extend(extra);
+    Some(writes)
 }
 
 fn try_live_block_placement(
     c: &Client,
     (dim, x, y, z): DimBlockPos,
     face: usize,
+    cursor: (f32, f32, f32),
     held: i16,
     item: i64,
     _against: u32,
 ) -> bool {
     let Some(reg) = breg() else { return false };
+    let Some(item_name) = item_to_name(item) else { return false };
+    if placement_block_name(item_name, face as u8).is_none() {
+        return false;
+    }
+    let name = placement_block_name(item_name, face as u8).unwrap();
+    let full = format!("minecraft:{name}");
+    let st0 = reg.state_of(&full, None);
+    if reg.name_of(st0) != full {
+        return false;
+    }
     let (_, _, _, yaw, pitch, _) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(state) = live_placement_state(reg, item, RsDir::ALL[face], yaw, pitch) else {
+    let sneaking = *c.sneaking.lock().unwrap_or_else(|e| e.into_inner());
+    let ctx = PlacementCtx {
+        dim,
+        clicked: (x, y, z),
+        face: face as u8,
+        cursor,
+        yaw,
+        pitch,
+        sneaking,
+        target: (x, y, z),
+        target_old: 0,
+    };
+    let prof = {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("MC_SPINE_PLACE_PROF").is_some())
+    };
+    let Some(ctx) = placement_target(reg, item_name, ctx) else {
+        if prof {
+            eprintln!("[place-prof] {item_name} clicked=({x},{y},{z}) face={face} target-none");
+        }
         return false;
     };
     let game_mode = *c.gm.lock().unwrap_or_else(|e| e.into_inner());
     if game_mode == 2 || game_mode == 3 {
         return true;
     }
-    let old = block_at_dim(dim, x, y, z);
-    if !reg.is_replaceable(old) {
+    // The slab-absorb special case writes `double` over the clicked cell.
+    let (tx, ty, tz) = ctx.target;
+    let clicked_st = block_at_dim(dim, x, y, z);
+    if slab_absorbs(reg, clicked_st, &name, &ctx) {
+        let doubled = reg.with_prop(clicked_st, "type", "double");
+        with_save_guard(|| {
+            if set_block_if_inner_dim(dim, x, y, z, doubled, Some(clicked_st)) {
+                note_block_update_dim(dim, x, y, z, doubled);
+                if game_mode != 1 {
+                    let mut inventory = c.inv.lock().unwrap_or_else(|e| e.into_inner());
+                    map_take(&mut inventory, 36 + held, 1);
+                    let mut packet = vec![0];
+                    write_varint(&mut packet, 0);
+                    packet.extend_from_slice(&(36 + held).to_be_bytes());
+                    packet.extend_from_slice(&slot_wire(
+                        inventory.get(&(36 + held)).unwrap_or(&Stack::default()),
+                    ));
+                    let _ = send_packet(
+                        &mut c.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                        0x15,
+                        packet,
+                    );
+                }
+            }
+        });
         return true;
+    }
+    let Some(writes) = placement_states(reg, item_name, &ctx) else {
+        if prof {
+            eprintln!("[place-prof] {item_name} target=({tx},{ty},{tz}) states-none");
+        }
+        return false;
+    };
+    if writes.is_empty() || !reg.is_replaceable(ctx.target_old) {
+        if prof {
+            eprintln!("[place-prof] {item_name} target=({tx},{ty},{tz}) writes={} old={} reject",
+                writes.len(), reg.name_of(ctx.target_old));
+        }
+        return true;
+    }
+    if !placement_can_survive(reg, dim, &ctx, writes[0].1) {
+        if prof {
+            eprintln!("[place-prof] {item_name} target=({tx},{ty},{tz}) no-support");
+        }
+        return true;
+    }
+    if prof {
+        eprintln!("[place-prof] {item_name} target=({tx},{ty},{tz}) writes={}", writes.len());
     }
     #[cfg(feature = "neoforge-events")]
-    if !neoforge_place_allowed(c, (dim, x, y, z), old, state, _against) {
+    if !neoforge_place_allowed(c, (dim, tx, ty, tz), ctx.target_old, writes[0].1, _against) {
         return true;
     }
+    let __pt = prof.then(Instant::now);
     with_save_guard(|| {
-        if set_block_if_inner_dim(dim, x, y, z, state, Some(old)) {
-            note_block_update_dim(dim, x, y, z, block_at_dim(dim, x, y, z));
+        if let Some(t) = __pt {
+            eprintln!("[place-prof] {item_name} target=({tx},{ty},{tz}) guard-wait {:?}", t.elapsed());
+        }
+        let mut wrote = false;
+        for ((wx, wy, wz), state) in &writes {
+            let old = block_at_dim(dim, *wx, *wy, *wz);
+            if set_block_if_inner_dim(dim, *wx, *wy, *wz, *state, Some(old)) {
+                note_block_update_dim(dim, *wx, *wy, *wz, block_at_dim(dim, *wx, *wy, *wz));
+                wrote = true;
+            }
+        }
+        if wrote {
+            // Neighbor updateShape for the rail family: vanilla's RailState
+            // cascades the shape recompute across connected cells.
+            for (dx, dy, dz) in [
+                (1i32, 0, 0), (-1, 0, 0), (0, 0, 1), (0, 0, -1), (0, 1, 0), (0, -1, 0),
+            ] {
+                rail_update_at(reg, dim, (tx + dx, ty + dy, tz + dz));
+            }
+            rail_update_at(reg, dim, (tx, ty, tz));
             if game_mode != 1 {
                 let mut inventory = c.inv.lock().unwrap_or_else(|e| e.into_inner());
                 map_take(&mut inventory, 36 + held, 1);
@@ -11672,10 +12371,70 @@ fn note_connected_shapes(x: i32, y: i32, z: i32) {
         if let Some(new_state) = updated {
             // Avoid stale read/modified/written races: another update may have
             // touched this neighbor after `old` was read.
-            set_block_if(q.0, q.1, q.2, new_state, Some(old));
+            if set_block_if(q.0, q.1, q.2, new_state, Some(old)) {
+                note_block_update(q.0, q.1, q.2, new_state);
+            }
         }
     }
     schedule_waterlogged_positions(wet);
+}
+
+/// Door halves are a paired shape: when the cell on a half's pairing side
+/// stops being the same door's other half it pops off, and while the pair is
+/// intact the interactive props mirror it (vanilla `DoorBlock.updateShape`).
+fn note_doors(x: i32, y: i32, z: i32) {
+    let Some(reg) = crate::block_registry::breg() else {
+        return;
+    };
+    let changed = block_at(x, y, z);
+    for (dx, dy, dz, toward) in [(0i32, 1, 0, 0u8), (0, -1, 0, 1)] {
+        let (qx, qy, qz) = (x + dx, y + dy, z + dz);
+        if qy < MIN_Y || qy >= MIN_Y + 384 {
+            continue;
+        }
+        let st = block_at(qx, qy, qz);
+        let name = reg.name_of(st);
+        if !name.ends_with("door") || name.ends_with("trapdoor") {
+            continue;
+        }
+        // The pair sits on the half's pairing side: upper looks down, lower up.
+        let (mine, want) = if toward == 0 { ("upper", "lower") } else { ("lower", "upper") };
+        if reg.get_prop(st, "half").as_deref() != Some(mine) {
+            continue;
+        }
+        if reg.name_of(changed) == name
+            && reg.get_prop(changed, "half").as_deref() == Some(want)
+        {
+            let mut next = st;
+            for p in ["facing", "open", "hinge", "powered"] {
+                if let Some(v) = reg.get_prop(changed, p) {
+                    next = reg.with_prop(next, p, &v);
+                }
+            }
+            if next != st && set_block_if(qx, qy, qz, next, Some(st)) {
+                note_block_update(qx, qy, qz, next);
+            }
+        } else if set_block_if(qx, qy, qz, 0, Some(st)) {
+            note_block_update(qx, qy, qz, 0);
+            if let Some(item) = reg
+                .block_drop(st)
+                .filter(|_| GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0)
+            {
+                drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
+                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                    x: qx as f64 + 0.5,
+                    y: qy as f64 + 0.5,
+                    z: qz as f64 + 0.5,
+                    item,
+                    cnt: 1,
+                    comps: Vec::new(),
+                    age: 0,
+                    target: None,
+                    thrower: None,
+                });
+            }
+        }
+    }
 }
 
 fn block_updated_inner(x: i32, y: i32, z: i32) {
@@ -11684,6 +12443,19 @@ fn block_updated_inner(x: i32, y: i32, z: i32) {
     note_falling(x, y, z);
     note_fragile_supports(x, y, z);
     note_connected_shapes(x, y, z);
+    note_doors(x, y, z);
+    if let Some(reg) = breg() {
+        // Rails recompute on direct and ±1-level diagonal neighbours: vanilla
+        // RailState cascades shape updates to every cell a rail could
+        // connect to, including the diagonal-above run of a slope.
+        for (dx, dy, dz) in [
+            (1, 0, 0), (-1, 0, 0), (0, 0, 1), (0, 0, -1),
+            (1, 1, 0), (-1, 1, 0), (0, 1, 1), (0, 1, -1),
+            (1, -1, 0), (-1, -1, 0), (0, -1, 1), (0, -1, -1),
+        ] {
+            rail_update_at(reg, DimId::Overworld, (x + dx, y + dy, z + dz));
+        }
+    }
     // piston eval: changed cell + its 6 neighbors
     for (dx, dy, dz) in [
         (0, 0, 0),
@@ -11699,6 +12471,30 @@ fn block_updated_inner(x: i32, y: i32, z: i32) {
         if (2011..=2022).contains(&st) || (1992..=2003).contains(&st) {
             let p = piston_powered(bx, by, bz);
             piston_set_extended(bx, by, bz, st, p);
+        }
+        // CopperBulbBlock.neighborChanged: POWERED mirrors hasNeighborSignal;
+        // the LIT bit toggles only on the rising edge. The plain variant's name
+        // ends in ":copper_bulb", so the match must not require a leading '_'.
+        if let Some(reg) = breg() {
+            if reg.name_of(st).ends_with("copper_bulb") {
+                let powered = rs_neighbor_signal(
+                    &placement_world(reg, DimId::Overworld),
+                    RsPos(bx, by, bz),
+                    true,
+                ) != 0;
+                let was = reg.get_prop(st, "powered").as_deref() == Some("true");
+                if powered != was {
+                    let mut next =
+                        reg.with_prop(st, "powered", if powered { "true" } else { "false" });
+                    if powered {
+                        let lit = reg.get_prop(st, "lit").as_deref() == Some("true");
+                        next = reg.with_prop(next, "lit", if lit { "false" } else { "true" });
+                    }
+                    if set_block_if(bx, by, bz, next, Some(st)) {
+                        note_block_update(bx, by, bz, next);
+                    }
+                }
+            }
         }
         // tnt ignite: tnt next to a power source (direct adjacency — vanilla TNT has no QC)
         if (2094..=2095).contains(&st)
@@ -15455,10 +16251,59 @@ fn live_light_engines() -> &'static Mutex<HashMap<DimId, LiveLightEngine>> {
     ENGINES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Kick the dedicated light worker. The pass itself runs off the tick
+/// thread: a full terrain snapshot visits ~98k cells per neighbour chunk
+/// (`pre_edit_light_chunk`), which took `SAVE_LOCK` for hundreds of ms,
+/// stalling every `set_block` behind it and delaying the next
+/// `block_updates` flush just as long. The worker serializes passes itself,
+/// so this stage call is a single nonblocking send.
 fn apply_queued_light_updates() {
     if pending_light_edits().lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
         return;
     }
+    let _ = light_worker().send(());
+}
+
+fn light_worker() -> &'static std::sync::mpsc::Sender<()> {
+    static KICK: OnceLock<std::sync::mpsc::Sender<()>> = OnceLock::new();
+    KICK.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        thread::Builder::new()
+            .name("spine-light".into())
+            .spawn(move || {
+                while rx.recv().is_ok() {
+                    while !pending_light_edits()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_empty()
+                    {
+                        light_pass_once();
+                    }
+                    // Kicks that arrived during the pass carry no extra work.
+                    while rx.try_recv().is_ok() {}
+                }
+            })
+            .expect("light worker");
+        tx
+    })
+}
+
+/// Per-dimension plan for one light pass: which edits to apply and which
+/// neighbour chunks' terrain the engine still needs.
+struct LightPassPlan {
+    dim: DimId,
+    targets: Vec<Chunk>,
+    neighbors: HashSet<Chunk>,
+    /// Chunks needing a fresh terrain snapshot: every neighbour on a rebuild,
+    /// only the uncovered neighbours when the engine grows incrementally.
+    needed: HashSet<Chunk>,
+    full: bool,
+    old: HashMap<Position, LightBlock>,
+    new: Vec<(Position, LightBlock)>,
+}
+
+fn light_pass_once() {
+    let mut pending = std::mem::take(&mut *pending_light_edits().lock().unwrap_or_else(|e| e.into_inner()));
     let audience = client_snapshot();
     let mut held: HashMap<DimId, HashSet<Chunk>> = HashMap::new();
     for client in &audience {
@@ -15470,111 +16315,206 @@ fn apply_queued_light_updates() {
     }
     let Some(reg) = breg() else { return };
     let generation = current_gen_seq();
-    let work = with_save_guard(|| {
-        let mut work = Vec::new();
-        let edits = std::mem::take(&mut *pending_light_edits().lock().unwrap_or_else(|e| e.into_inner()));
-        let mut props = HashMap::new();
-        for (dim, edits) in edits {
-            let (old, new): (HashMap<_, _>, Vec<_>) = edits
-                .into_iter()
-                .filter(|(_, (old, new))| old != new)
-                .map(|(pos, (old, new))| ((pos, old), (pos, new)))
-                .unzip();
-            let targets: Vec<_> = held
-                .get(&dim)
-                .map(|held| {
-                    held.iter()
-                        .copied()
-                        .filter(|chunk| {
-                            new.iter()
-                                .any(|(pos, _)| chunk_in_light_reach(*chunk, *pos))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if targets.is_empty() {
-                // Nobody holds a chunk these edits can light, so no update is
-                // sent — but an edit inside a chunk the persisted engine
-                // covers must still reach it, or its stored blocks go stale
-                // against the world and the next visit relights a lie.
-                let needs_sync = live_light_engines()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+    let mut props = HashMap::new();
+    let mut plans: Vec<LightPassPlan> = Vec::new();
+    let mut terrain: HashMap<DimChunkKey, (u64, Vec<LightBlock>)> = HashMap::new();
+    let mut snapshots: Vec<Vec<(Chunk, [u64; 9])>> = Vec::new();
+    // Terrain reads are too heavy for `SAVE_LOCK` (~98k cells per chunk), so
+    // they run unlocked against the chunk-version counter instead: a write
+    // landing mid-read bumps the chunk's version (`bump_world_epoch_dim`),
+    // which the short verification hold then catches. Entries that survive a
+    // retry keep their snapshot when the version still matches. After bounded
+    // retries the read falls back to a single locked pass, as before.
+    for attempt in 0.. {
+        plans.clear();
+        {
+            let engines = live_light_engines().lock().unwrap_or_else(|e| e.into_inner());
+            for (&dim, edits) in &pending {
+                let (old, new): (HashMap<_, _>, Vec<_>) = edits
+                    .iter()
+                    .filter(|(_, (old, new))| old != new)
+                    .map(|(pos, (old, new))| ((*pos, *old), (*pos, *new)))
+                    .unzip();
+                let targets: Vec<_> = held
                     .get(&dim)
-                    .is_some_and(|entry| {
+                    .map(|held| {
+                        held.iter()
+                            .copied()
+                            .filter(|chunk| {
+                                new.iter()
+                                    .any(|(pos, _)| chunk_in_light_reach(*chunk, *pos))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if targets.is_empty() {
+                    // Nobody holds a chunk these edits can light, so no update is
+                    // sent — but an edit inside a chunk the persisted engine
+                    // covers must still reach it, or its stored blocks go stale
+                    // against the world and the next visit relights a lie.
+                    let needs_sync = engines.get(&dim).is_some_and(|entry| {
                         entry.generation == generation
                             && new
                                 .iter()
                                 .any(|(pos, _)| entry.chunks.contains(&pos.chunk()))
                     });
-                if needs_sync {
-                    work.push((dim, targets, Vec::new(), HashSet::new(), false, None, new));
+                    if needs_sync {
+                        plans.push(LightPassPlan {
+                            dim,
+                            targets,
+                            neighbors: HashSet::new(),
+                            needed: HashSet::new(),
+                            full: false,
+                            old,
+                            new,
+                        });
+                    }
+                    continue;
                 }
-                continue;
+                // Only visit terrain that streaming or a block write already
+                // opened. Lighting must not advance world generation at the
+                // border.
+                let edited: HashSet<_> = new.iter().map(|(pos, _)| pos.chunk()).collect();
+                let neighbors: HashSet<_> = light_halo(targets.iter().copied())
+                    .filter(|chunk| {
+                        held.get(&dim).is_some_and(|held| held.contains(chunk))
+                            || edited.contains(chunk)
+                    })
+                    .collect();
+                // Reuse the persisted engine; a fresh build could disagree only
+                // when the generator changed, which is the one case that still
+                // rebuilds from exactly `neighbors`. On the same generation the
+                // engine only lacks the uncovered neighbours — insert them
+                // incrementally rather than throwing the settled window away.
+                // A chunk's LightBlock array changes only through
+                // `note_light_edit`, and each such change arrives in `edits`, so
+                // a covered engine is still current.
+                let (full, needed) = match engines.get(&dim) {
+                    Some(entry) if entry.generation == generation => (
+                        false,
+                        neighbors.difference(&entry.chunks).copied().collect(),
+                    ),
+                    _ => (true, neighbors.clone()),
+                };
+                plans.push(LightPassPlan {
+                    dim,
+                    targets,
+                    neighbors,
+                    needed,
+                    full,
+                    old,
+                    new,
+                });
             }
-            // Only visit terrain that streaming or a block write already
-            // opened. Lighting must not advance world generation at the border.
-            let edited: HashSet<_> = new.iter().map(|(pos, _)| pos.chunk()).collect();
-            let neighbors: HashSet<_> = light_halo(targets.iter().copied())
-                .filter(|chunk| {
-                    held.get(&dim).is_some_and(|held| held.contains(chunk))
-                        || edited.contains(chunk)
+        }
+        for plan in &plans {
+            for &chunk @ (cx, cz) in &plan.needed {
+                let version = chunk_version_dim(plan.dim, cx, cz);
+                if terrain
+                    .get(&(plan.dim, cx, cz))
+                    .is_some_and(|(v, _)| *v == version)
+                {
+                    continue;
+                }
+                let blocks =
+                    pre_edit_light_chunk(plan.dim, chunk, reg, &mut props, &plan.old);
+                terrain.insert((plan.dim, cx, cz), (version, blocks));
+            }
+        }
+        let consistent = with_save_guard(|| {
+            let ok = plans.iter().all(|plan| {
+                plan.needed.iter().all(|&(cx, cz)| {
+                    terrain
+                        .get(&(plan.dim, cx, cz))
+                        .is_some_and(|(v, _)| *v == chunk_version_dim(plan.dim, cx, cz))
+                })
+            });
+            if ok {
+                snapshots = plans
+                    .iter()
+                    .map(|plan| {
+                        plan.targets
+                            .iter()
+                            .copied()
+                            .filter(|chunk| {
+                                light_halo([*chunk])
+                                    .all(|neighbor| plan.neighbors.contains(&neighbor))
+                            })
+                            .map(|(cx, cz)| ((cx, cz), chunk_versions_3x3(plan.dim, cx, cz)))
+                            .collect()
+                    })
+                    .collect();
+            }
+            ok
+        });
+        if consistent {
+            break;
+        }
+        if attempt == 5 {
+            // The world kept moving under the read; fall back to a locked
+            // snapshot, but hold SAVE_LOCK for only one ~98k-cell chunk read
+            // at a time so writers interleave between chunks instead of
+            // waiting behind the whole neighbour set. Each (version, terrain)
+            // pair is still self-consistent: writers bump the version under
+            // the same lock.
+            for plan in &plans {
+                for &chunk @ (cx, cz) in &plan.needed {
+                    with_save_guard(|| {
+                        let version = chunk_version_dim(plan.dim, cx, cz);
+                        let blocks =
+                            pre_edit_light_chunk(plan.dim, chunk, reg, &mut props, &plan.old);
+                        terrain.insert((plan.dim, cx, cz), (version, blocks));
+                    });
+                    // A bare unlock re-acquires almost immediately on this
+                    // thread; the tiny sleep is what actually lets a queued
+                    // writer take SAVE_LOCK between chunk reads.
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            snapshots = plans
+                .iter()
+                .map(|plan| {
+                    plan.targets
+                        .iter()
+                        .copied()
+                        .filter(|chunk| {
+                            light_halo([*chunk])
+                                .all(|neighbor| plan.neighbors.contains(&neighbor))
+                        })
+                        .map(|(cx, cz)| ((cx, cz), chunk_versions_3x3(plan.dim, cx, cz)))
+                        .collect()
                 })
                 .collect();
-            let snapshots: Vec<_> = targets
-                .iter()
-                .copied()
-                .filter(|chunk| light_halo([*chunk]).all(|neighbor| neighbors.contains(&neighbor)))
-                .map(|(cx, cz)| ((cx, cz), chunk_versions_3x3(dim, cx, cz)))
-                .collect();
-            // Reuse the persisted engine; a fresh build could disagree only
-            // when the generator changed, which is the one case that still
-            // rebuilds from exactly `neighbors`. On the same generation the
-            // engine only lacks `missing` chunks — insert them incrementally
-            // (0 on a steady tick) rather than throwing the settled window
-            // away. A chunk's LightBlock array changes only through
-            // `note_light_edit`, and each such change arrives in `edits`, so a
-            // covered engine is still current.
-            let (fresh, missing) = live_light_engines()
-                .lock()
-                .unwrap()
-                .get(&dim)
-                .map_or_else(
-                    || (true, neighbors.iter().copied().collect::<Vec<_>>()),
-                    |entry| {
-                        if entry.generation == generation {
-                            (
-                                false,
-                                neighbors
-                                    .iter()
-                                    .copied()
-                                    .filter(|chunk| !entry.chunks.contains(chunk))
-                                    .collect(),
-                            )
-                        } else {
-                            (true, neighbors.iter().copied().collect())
-                        }
-                    },
-                );
-            let terrain = (!missing.is_empty()).then(|| {
-                missing
-                    .iter()
-                    .copied()
-                    .map(|chunk| {
-                        (
-                            chunk,
-                            pre_edit_light_chunk(dim, chunk, reg, &mut props, &old),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            });
-            work.push((dim, targets, snapshots, neighbors, fresh, terrain, new));
+            break;
         }
-        work
-    });
+        // Fold in edits queued while reading so the retry plans for them too.
+        let more = std::mem::take(&mut *pending_light_edits().lock().unwrap_or_else(|e| e.into_inner()));
+        for (dim, edits) in more {
+            pending.entry(dim).or_default().extend(edits);
+        }
+    }
 
     let mut engines = live_light_engines().lock().unwrap_or_else(|e| e.into_inner());
-    for (dim, targets, snapshots, neighbors, fresh, terrain, new) in work {
+    for (plan, snapshots) in plans.into_iter().zip(snapshots) {
+        let LightPassPlan {
+            dim,
+            targets,
+            neighbors,
+            needed,
+            full,
+            new,
+            ..
+        } = plan;
+        let mut terrain_for = |chunks: &HashSet<Chunk>| -> Vec<(Chunk, Vec<LightBlock>)> {
+            chunks
+                .iter()
+                .filter_map(|&(cx, cz)| {
+                    terrain
+                        .remove(&(dim, cx, cz))
+                        .map(|(_, blocks)| ((cx, cz), blocks))
+                })
+                .collect()
+        };
         let entry = engines.entry(dim).or_insert_with(|| LiveLightEngine {
             generation,
             chunks: HashSet::new(),
@@ -15586,27 +16526,24 @@ fn apply_queued_light_updates() {
                 Vec::new(),
             ),
         });
-        match (fresh, terrain) {
-            (true, Some(terrain)) => {
-                entry.engine = IncrementalLighting::from_chunks(
-                    dim.min_y(),
-                    dim.height(),
-                    worldgen::has_skylight(dim),
-                    terrain,
-                );
-                entry.chunks = neighbors.iter().copied().collect();
-                entry.order = neighbors.iter().copied().collect();
-                entry.generation = generation;
-            }
-            (false, Some(terrain)) => {
-                for (key, _) in &terrain {
-                    if entry.chunks.insert(*key) {
-                        entry.order.push_back(*key);
-                    }
+        if full {
+            entry.engine = IncrementalLighting::from_chunks(
+                dim.min_y(),
+                dim.height(),
+                worldgen::has_skylight(dim),
+                terrain_for(&neighbors),
+            );
+            entry.chunks = neighbors.iter().copied().collect();
+            entry.order = neighbors.iter().copied().collect();
+            entry.generation = generation;
+        } else {
+            let inserted = terrain_for(&needed);
+            for (key, _) in &inserted {
+                if entry.chunks.insert(*key) {
+                    entry.order.push_back(*key);
                 }
-                entry.engine.insert_chunks_incremental(terrain);
             }
-            _ => {}
+            entry.engine.insert_chunks_incremental(inserted);
         }
         // Past the cap, evict the oldest chunks outside this tick's window and
         // relight only the rings they leave — never the whole engine.

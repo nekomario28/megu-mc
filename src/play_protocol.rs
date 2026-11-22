@@ -4685,6 +4685,10 @@ fn write_shared_frame(s: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
 /// `occluded` selects the anti-xray lane: `true` is the surface player's
 /// masked chunk, `false` the real one. The lanes are separate cache keys, so
 /// every surface reader shares one `Arc` and every underground reader another.
+fn conn_prof() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MC_SPINE_CONN_PROF").is_some())
+}
 fn cached_chunk_frame(
     compression: Option<usize>,
     gen: &mut GenSources,
@@ -4862,9 +4866,19 @@ fn stream_chunks(
     let compression = socket_compression(s);
     let mut failed = false;
     'delivery: for chunk_group in news.chunks(terrain_group(delivery_workers)) {
+        let __pf = Instant::now();
         prefetch_terrain_group_dim(dim, chunk_group, lo, hi, delivery_workers, delivery_round);
+        let __pfe = __pf.elapsed();
+        if conn_prof() && __pfe > Duration::from_millis(50) {
+            eprintln!("[conn-prof] prefetch_terrain {:?}", __pfe);
+        }
         for (cx, cz) in chunk_group {
+            let __cf = Instant::now();
             let frame = cached_chunk_frame(compression, gen, dim, *cx, *cz, occluded);
+            let __cfe = __cf.elapsed();
+            if conn_prof() && __cfe > Duration::from_millis(50) {
+                eprintln!("[conn-prof] chunk_frame ({cx},{cz}) {:?}", __cfe);
+            }
             if write_shared_frame(s, &frame).is_err() {
                 failed = true;
                 break 'delivery;
@@ -6058,43 +6072,154 @@ fn resend_loaded_chunks(me: &Client, occluded: bool) {
         let (dx, dz) = (cx - pcx, cz - pcz);
         dx * dx + dz * dz
     });
-    // Lock order matches `pump_client_chunks`: gen_sources before sock.
-    let mut gen = me.gen_sources.lock().unwrap_or_else(|e| e.into_inner());
-    let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
-    let compression = socket_compression(&sock);
+    let compression = socket_compression(&me.sock.lock().unwrap_or_else(|e| e.into_inner()));
+    // Both `gen_sources` and `sock` are taken only around one frame each so
+    // the connection's own pump/sends interleave between chunks instead of
+    // waiting behind the whole resend.
     for (cx, cz) in ordered {
-        let frame = cached_chunk_frame(compression, &mut gen, dim, cx, cz, occluded);
+        let frame = {
+            let mut gen = me.gen_sources.lock().unwrap_or_else(|e| e.into_inner());
+            cached_chunk_frame(compression, &mut gen, dim, cx, cz, occluded)
+        };
+        let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
         if write_shared_frame(&mut sock, &frame).is_err() {
             return;
         }
     }
 }
 
-/// Evaluate the player's occlusion lane after a position or game-mode change.
-/// Returns the lane to stream in; on a flip it also re-sends every held chunk
-/// in the new lane so the transition is seamless both ways (descend: caves and
-/// strongholds appear; resurface: anti-cave-xray re-arms).
-fn update_underground_lane(me: &Client) -> bool {
-    let (dim, px, py, pz, ..) = client_dim_pos(me);
-    let gm = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
-    let surface = height_at_dim(dim, px.floor() as i32, pz.floor() as i32);
+/// The lane decision once a surface height is known. Flipping the lane
+/// re-sends every held chunk in the new lane so the transition is seamless
+/// both ways (descend: caves and strongholds appear; resurface: anti-cave-xray
+/// re-arms).
+fn apply_underground_lane(me: &Client, dim: DimId, py: f64, surface: i32, gm: u8) -> bool {
     let revealed = me.underground_revealed.load(Ordering::Relaxed);
     let occluded = should_occlude_underground(dim, py, surface, gm, revealed);
     if occluded == !revealed {
         return occluded;
     }
     me.underground_revealed.store(!occluded, Ordering::Relaxed);
-    resend_loaded_chunks(me, occluded);
+    queue_lane_work(me.eid, LaneWork::Resend(occluded));
     occluded
 }
 
+/// One unit of lane work: `Probe` re-reads the surface height for the
+/// player's current position, `Resend` streams the held set in the given lane
+/// after a flip. The worker absorbs the chunk-column build / generation-lock
+/// wait / re-encode so packet dispatch never does.
+enum LaneWork {
+    Probe,
+    Resend(bool),
+}
+
+fn lane_probe_queue() -> &'static (
+    Mutex<std::collections::VecDeque<(i32, LaneWork)>>,
+    std::sync::Condvar,
+) {
+    static Q: OnceLock<(
+        Mutex<std::collections::VecDeque<(i32, LaneWork)>>,
+        std::sync::Condvar,
+    )> = OnceLock::new();
+    Q.get_or_init(|| {
+        (
+            Mutex::new(std::collections::VecDeque::new()),
+            std::sync::Condvar::new(),
+        )
+    })
+}
+
+fn queue_lane_work(eid: i32, work: LaneWork) {
+    static WORKER: OnceLock<()> = OnceLock::new();
+    WORKER.get_or_init(|| {
+        let _ = thread::Builder::new()
+            .name("spine-lane".into())
+            .spawn(lane_probe_loop);
+    });
+    let (q, cv) = lane_probe_queue();
+    let mut g = q.lock().unwrap_or_else(|e| e.into_inner());
+    let dup_probe = matches!(work, LaneWork::Probe)
+        && g.iter().any(|&(e, ref w)| e == eid && matches!(w, LaneWork::Probe));
+    if !dup_probe {
+        g.push_back((eid, work));
+        cv.notify_one();
+    }
+}
+
+fn lane_probe_loop() {
+    let (q, cv) = lane_probe_queue();
+    let mut g = q.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        while g.is_empty() {
+            g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        let (eid, work) = g.pop_front().unwrap();
+        drop(g);
+        if let Some(me) = client_snapshot().into_iter().find(|c| c.eid == eid) {
+            match work {
+                LaneWork::Probe => evaluate_underground_lane(&me),
+                LaneWork::Resend(occluded) => resend_loaded_chunks(&me, occluded),
+            }
+        }
+        g = q.lock().unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// The full lane evaluation with a real surface height; only the probe worker
+/// calls it, since `height_at_dim` can build a chunk column behind the
+/// generation lock.
+fn evaluate_underground_lane(me: &Client) {
+    let (dim, px, py, pz, ..) = client_dim_pos(me);
+    let gm = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
+    let surface = height_at_dim(dim, px.floor() as i32, pz.floor() as i32);
+    apply_underground_lane(me, dim, py, surface, gm);
+}
+
+/// Evaluate the player's occlusion lane after a position or game-mode change.
+/// Returns the lane to stream in; on a flip it also re-sends every held chunk
+/// in the new lane so the transition is seamless both ways (descend: caves and
+/// strongholds appear; resurface: anti-cave-xray re-arms). When the column's
+/// surface height is not already built — or the generation lock is contended —
+/// the real evaluation runs on the `spine-lane` probe thread and this returns
+/// the lane as last decided.
+fn update_underground_lane(me: &Client) -> bool {
+    let (dim, px, py, pz, ..) = client_dim_pos(me);
+    let gm = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
+    if !ac_underground_occlusion_enabled() || !dim.has_skylight() || gm == 3 {
+        // `should_occlude_underground`'s own early-outs, hoisted: the surface
+        // read is the only expensive input and the lane never engages without
+        // these, so an occluded player still gets the real-lane resend.
+        return apply_underground_lane(me, dim, py, 0, gm);
+    }
+    let (x, z) = (px.floor() as i32, pz.floor() as i32);
+    let surface = if dim != DimId::Overworld {
+        match worldgen::custom_surface_height(dim) {
+            Some(h) => Some(h),
+            None if !worldgen::enabled() => Some(dim.min_y()),
+            None => None,
+        }
+    } else if worldgen::enabled() {
+        worldgen::peek_cols_dim(dim, x >> 4, z >> 4)
+            .map(|cols| cols.surface((x & 15) as usize, (z & 15) as usize))
+    } else {
+        Some(height_at_dim(dim, x, z))
+    };
+    let Some(surface) = surface else {
+        queue_lane_work(me.eid, LaneWork::Probe);
+        return !me.underground_revealed.load(Ordering::Relaxed);
+    };
+    apply_underground_lane(me, dim, py, surface, gm)
+}
+
 fn pump_client_chunks(client: &Client, announce_center: bool) -> bool {
+    let __t = Instant::now();
     let occluded = update_underground_lane(client);
+    let __t0 = __t.elapsed();
     let mut ack = client.chunk_ack.lock().unwrap_or_else(|e| e.into_inner());
     let view = *client.view.lock().unwrap_or_else(|e| e.into_inner());
     let mut chunks = client.chunks.lock().unwrap_or_else(|e| e.into_inner());
     let mut gen = client.gen_sources.lock().unwrap_or_else(|e| e.into_inner());
     let mut socket = client.sock.lock().unwrap_or_else(|e| e.into_inner());
+    let __t1 = __t.elapsed();
     // Same-dimension teleports also hold the writer while changing position.
     let (dim, x, _, z, yaw, _) = client_dim_pos(client);
     stream_chunks(
@@ -6110,6 +6235,10 @@ fn pump_client_chunks(client: &Client, announce_center: bool) -> bool {
         occluded,
         !client.is_spectator() || gamerule_live_value("spectatorsGenerateChunks") != 0,
     );
+    let __t2 = __t.elapsed();
+    if conn_prof() && __t2 > Duration::from_millis(50) {
+        eprintln!("[conn-prof] pump stages lane={__t0:?} locks={:?} stream={:?}", __t1 - __t0, __t2 - __t1);
+    }
     !ack.awaiting()
         && with_play_wire(&socket, |play| play.chunk_delivery.has_pending()).unwrap_or(false)
 }
@@ -9817,7 +9946,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         // gets another chance on the next tick, even during continuous input.
         let tick = TICK_IDX.load(Ordering::Relaxed);
         if retry_chunks && tick != last_chunk_retry_tick {
+            let __p0 = Instant::now();
             retry_chunks = pump_client_chunks(&me, false);
+            let __pe = __p0.elapsed();
+            if conn_prof() && __pe > std::time::Duration::from_millis(50) {
+                eprintln!("[conn-prof] pump_client_chunks {:?}", __pe);
+            }
             last_chunk_retry_tick = tick;
         }
         let timeout = if retry_chunks {
@@ -9853,7 +9987,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 // create a backlog even while this connection is idle.
                 let tick = TICK_IDX.load(Ordering::Relaxed);
                 if tick != last_chunk_retry_tick {
+                    let __p0 = Instant::now();
                     retry_chunks = pump_client_chunks(&me, false);
+                    let __pe = __p0.elapsed();
+                    if conn_prof() && __pe > std::time::Duration::from_millis(50) {
+                        eprintln!("[conn-prof] idle pump_client_chunks {:?}", __pe);
+                    }
                     last_chunk_retry_tick = tick;
                 }
                 continue;
@@ -9885,6 +10024,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
             break 'conn;
         }
 
+        let __d1 = Instant::now();
         match pid {
             0x00 => {
                 let mut payload = b.as_slice();
@@ -10666,7 +10806,17 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 };
                 let mut s2 = &sl[8.min(sl.len())..];
                 let face = read_varint(&mut s2).unwrap_or(1);
-                let _ = &s2[..13.min(s2.len())]; // cursor+inside
+                // cursor (3x f32) + inside-block byte feed the placement
+                // family's click-point rules (slab absorb, door hinge).
+                let cursor = if s2.len() >= 13 {
+                    (
+                        f32::from_be_bytes(s2[0..4].try_into().unwrap()),
+                        f32::from_be_bytes(s2[4..8].try_into().unwrap()),
+                        f32::from_be_bytes(s2[8..12].try_into().unwrap()),
+                    )
+                } else {
+                    (0.5, 0.5, 0.5)
+                };
                 let seq = if s2.len() >= 13 {
                     let mut s3 = &s2[13..];
                     read_varint(&mut s3).unwrap_or(0)
@@ -10687,13 +10837,13 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 {
                     let (px, py, pz, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
                     let reach = if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
-                        5.6f64
+                        6.0f64
                     } else {
-                        4.9
+                        5.5
                     };
                     let (rx, ry, rz) = (
                         x as f64 + 0.5 - px,
-                        y as f64 + 0.5 - (py + 1.62),
+                        y as f64 + 0.5 - py,
                         z as f64 + 0.5 - pz,
                     );
                     if rx * rx + ry * ry + rz * rz > reach * reach {
@@ -10827,8 +10977,9 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     if let Some(item) = held {
                         if try_live_block_placement(
                             &me,
-                            (dim, tx, ty, tz),
+                            (dim, x, y, z),
                             face.clamp(0, 5) as usize,
+                            cursor,
                             held_slot,
                             item,
                             clicked,
@@ -11238,8 +11389,9 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     }
                     if try_live_block_placement(
                         &me,
-                        (dim, tx, ty, tz),
+                        (dim, x, y, z),
                         face.clamp(0, 5) as usize,
+                        cursor,
                         held_slot,
                         item,
                         clicked,
@@ -13947,7 +14099,16 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
             }
             _ => {}
         }
+        let __dd = __d1.elapsed();
+        if conn_prof() && __dd > std::time::Duration::from_millis(50) {
+            eprintln!("[conn-prof] dispatch pid={pid:#x} {:?}", __dd);
+        }
+        let __d0 = Instant::now();
         apply_queued_block_updates();
+        let __de = __d0.elapsed();
+        if conn_prof() && __de > std::time::Duration::from_millis(50) {
+            eprintln!("[conn-prof] post-dispatch flush pid={pid:#x} {:?}", __de);
+        }
     }
     // The `_disconnect_guard` armed at registration runs `disconnect_cleanup`
     // here — and on any panic unwind — so every exit takes the same teardown.
