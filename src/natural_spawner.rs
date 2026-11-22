@@ -456,6 +456,391 @@ fn monster_spawn_light_allows(
     block_light.max(sky_light - sky_darken) <= sample_spawn_light_limit()
 }
 
+// Overworld natural-spawn dispatch from the pinned 1.21.1 server
+// (59353fb40c36d304f2035d51e7d6e6baa98dc05c). See SpawnPlacements and the
+// per-type check*SpawnRules methods decompiled for this lane.
+
+/// Every entity in the pinned 1.21.1 Overworld biome spawner tables that is
+/// not dispatched through a "creature" list - creature-table animals keep the
+/// existing live paths. The ocelot appears here because the jungle tables
+/// file it under "monster" even though its registry category is Creature.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum OverworldSpawnMob {
+    // "monster" table entries.
+    Bogged,
+    Creeper,
+    Drowned,
+    Enderman,
+    Husk,
+    Ocelot,
+    Skeleton,
+    Slime,
+    Spider,
+    Stray,
+    Witch,
+    Zombie,
+    ZombieVillager,
+    // "ambient" table entries.
+    Bat,
+    // "axolotls" table entries.
+    Axolotl,
+    // "underground_water_creature" table entries.
+    GlowSquid,
+    // "water_creature" table entries.
+    Dolphin,
+    Squid,
+    // "water_ambient" table entries.
+    Cod,
+    Pufferfish,
+    Salmon,
+    TropicalFish,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl OverworldSpawnMob {
+    pub(crate) fn from_id(id: &str) -> Option<Self> {
+        Some(match id {
+            "minecraft:bogged" => Self::Bogged,
+            "minecraft:creeper" => Self::Creeper,
+            "minecraft:drowned" => Self::Drowned,
+            "minecraft:enderman" => Self::Enderman,
+            "minecraft:husk" => Self::Husk,
+            "minecraft:ocelot" => Self::Ocelot,
+            "minecraft:skeleton" => Self::Skeleton,
+            "minecraft:slime" => Self::Slime,
+            "minecraft:spider" => Self::Spider,
+            "minecraft:stray" => Self::Stray,
+            "minecraft:witch" => Self::Witch,
+            "minecraft:zombie" => Self::Zombie,
+            "minecraft:zombie_villager" => Self::ZombieVillager,
+            "minecraft:bat" => Self::Bat,
+            "minecraft:axolotl" => Self::Axolotl,
+            "minecraft:glow_squid" => Self::GlowSquid,
+            "minecraft:dolphin" => Self::Dolphin,
+            "minecraft:squid" => Self::Squid,
+            "minecraft:cod" => Self::Cod,
+            "minecraft:pufferfish" => Self::Pufferfish,
+            "minecraft:salmon" => Self::Salmon,
+            "minecraft:tropical_fish" => Self::TropicalFish,
+            _ => return None,
+        })
+    }
+
+    /// The placement and heightmap registered by SpawnPlacements.
+    pub(crate) const fn placement(self) -> (SpawnPlacementType, HeightmapKind) {
+        let placement = match self {
+            Self::Axolotl
+            | Self::Cod
+            | Self::Dolphin
+            | Self::Drowned
+            | Self::GlowSquid
+            | Self::Pufferfish
+            | Self::Salmon
+            | Self::Squid
+            | Self::TropicalFish => SpawnPlacementType::InWater,
+            // SpawnPlacements registers the bat against NO_RESTRICTIONS so it
+            // can hang in unlit caves; its own rule gates the position.
+            Self::Bat => SpawnPlacementType::NoRestrictions,
+            _ => SpawnPlacementType::OnGround,
+        };
+        let heightmap = match self {
+            // SpawnPlacements registers the ocelot against MOTION_BLOCKING;
+            // every other natural spawn uses MOTION_BLOCKING_NO_LEAVES.
+            Self::Ocelot => HeightmapKind::MotionBlocking,
+            _ => HeightmapKind::MotionBlockingNoLeaves,
+        };
+        (placement, heightmap)
+    }
+}
+
+/// BiomeTags.ALLOWS_SURFACE_SLIME_SPAWNS in the pinned tag file.
+#[cfg_attr(not(test), allow(dead_code))]
+const ALLOWS_SURFACE_SLIME_SPAWNS: [&str; 2] = ["minecraft:mangrove_swamp", "minecraft:swamp"];
+
+/// BiomeTags.ALLOWS_TROPICAL_FISH_SPAWNS_AT_ANY_HEIGHT in the pinned tag file.
+#[cfg_attr(not(test), allow(dead_code))]
+const ALLOWS_TROPICAL_FISH_SPAWNS_AT_ANY_HEIGHT: [&str; 1] = ["minecraft:lush_caves"];
+
+/// BiomeTags.MORE_FREQUENT_DROWNED_SPAWNS in the pinned tag file (is_river).
+#[cfg_attr(not(test), allow(dead_code))]
+const MORE_FREQUENT_DROWNED_SPAWNS: [&str; 2] = ["minecraft:frozen_river", "minecraft:river"];
+
+/// BlockTags.AXOLOTLS_SPAWNABLE_ON in the pinned tag file.
+#[cfg_attr(not(test), allow(dead_code))]
+const AXOLOTLS_SPAWNABLE_ON: &str = "minecraft:axolotls_spawnable_on";
+
+/// DimensionType.MOON_BRIGHTNESS_PER_PHASE, indexed by the 8-phase cycle.
+#[cfg_attr(not(test), allow(dead_code))]
+const MOON_BRIGHTNESS_PER_PHASE: [f32; 8] = [1.0, 0.75, 0.5, 0.25, 0.0, 0.25, 0.5, 0.75];
+
+/// WorldgenRandom.seedSlimeChunk's seed mix: signed int products widened to
+/// long, summed onto the world seed, then XORed with the salt.
+#[cfg_attr(not(test), allow(dead_code))]
+fn slime_chunk_seed(x: i32, z: i32, seed: u64, salt: u64) -> u64 {
+    seed
+        .wrapping_add(x.wrapping_mul(x).wrapping_mul(4_987_142) as i64 as u64)
+        .wrapping_add(x.wrapping_mul(5_947_611) as i64 as u64)
+        .wrapping_add((z.wrapping_mul(z) as i64).wrapping_mul(4_392_871) as u64)
+        .wrapping_add(z.wrapping_mul(389_711) as i64 as u64)
+        ^ salt
+}
+
+/// The world state the 1.21.1 spawn predicates read. The live adapter answers
+/// from Overworld tick state; tests answer from a table.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) trait OverworldSpawnQueries {
+    fn is_peaceful(&self) -> bool;
+    /// MobSpawnType.isSpawner — false on the natural pass.
+    fn spawn_is_spawner(&self) -> bool;
+    /// MobSpawnType.ignoresLightRequirements — false for MobSpawnType.NATURAL.
+    fn ignores_light_requirements(&self) -> bool;
+    /// level instanceof WorldGenLevel — false on the live tick; only the
+    /// chunk-generation path spawns below the slime chunk ceiling.
+    fn is_world_gen(&self) -> bool;
+    /// Holder<Biome> at pos, or None when the column has no generator.
+    fn biome_id(&self, pos: NaturalSpawnPos) -> Option<String>;
+    fn block_id(&self, pos: NaturalSpawnPos) -> &str;
+    /// BlockState.is(tag).
+    fn block_in_tag(&self, pos: NaturalSpawnPos, tag: &str) -> bool;
+    /// FluidState.is(FluidTags.WATER): source or flowing water.
+    fn fluid_is_water(&self, pos: NaturalSpawnPos) -> bool;
+    /// BlockState.isValidSpawn for the supporting block.
+    fn is_valid_spawn(&self, pos: NaturalSpawnPos) -> bool;
+    /// The raw sky-light nibble, 0-15, before ambient darkening.
+    fn sky_light(&self, pos: NaturalSpawnPos) -> i32;
+    /// The raw block-light nibble, 0-15.
+    fn block_light(&self, pos: NaturalSpawnPos) -> i32;
+    /// Level.getSkyDarken without the thunder adjustment.
+    fn sky_darken(&self) -> i32;
+    fn thundering(&self) -> bool;
+    /// DimensionType.getMoonBrightness for the current phase.
+    fn moon_brightness(&self) -> f32;
+    fn sea_level(&self) -> i32;
+    /// SharedConstants.isAroundHalloween (LocalDate, Oct 20 through Nov 3).
+    fn is_halloween(&self) -> bool;
+    /// WorldGenLevel.getSeed, for the seeded slime-chunk roll.
+    fn world_seed(&self) -> u64;
+}
+
+/// The RandomSource draws the 1.21.1 spawn predicates consume.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) trait OverworldSpawnDraws {
+    /// nextInt(bound): a value in 0..bound.
+    fn next_int(&mut self, bound: i32) -> i32;
+    fn next_f32(&mut self) -> f32;
+    fn next_bool(&mut self) -> bool;
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct OverworldSpawnRules {
+    light: OverworldMonsterLight,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl OverworldSpawnRules {
+    pub(crate) fn vanilla() -> Self {
+        Self {
+            light: OverworldMonsterLight::vanilla(),
+        }
+    }
+
+    /// Monster.isDarkEnoughToSpawn for MobSpawnType.NATURAL: one skylight roll
+    /// and one monster_spawn_light_level sample, in the vanilla draw order.
+    fn dark_enough(
+        &self,
+        pos: NaturalSpawnPos,
+        world: &impl OverworldSpawnQueries,
+        draws: &mut dyn OverworldSpawnDraws,
+    ) -> bool {
+        let sky_darken = if world.thundering() {
+            10
+        } else {
+            world.sky_darken()
+        };
+        monster_spawn_light_allows(
+            world.sky_light(pos),
+            draws.next_int(32),
+            self.light.block_limit,
+            || world.block_light(pos),
+            sky_darken,
+            || self.light.min + draws.next_int(self.light.max - self.light.min + 1),
+        )
+    }
+
+    /// Level.getMaxLocalRawBrightness: max(blockLight, skyLight - skyDarken).
+    fn max_local_raw_brightness(pos: NaturalSpawnPos, world: &impl OverworldSpawnQueries) -> i32 {
+        world
+            .block_light(pos)
+            .max(world.sky_light(pos) - world.sky_darken())
+    }
+
+    /// LevelReader.getRawBrightness(pos, 0): max(blockLight, skyLight).
+    fn raw_brightness(pos: NaturalSpawnPos, world: &impl OverworldSpawnQueries) -> i32 {
+        world.block_light(pos).max(world.sky_light(pos))
+    }
+
+    /// LevelReader.canSeeSky: the sky-light nibble reaches getMaxLightLevel.
+    fn can_see_sky(pos: NaturalSpawnPos, world: &impl OverworldSpawnQueries) -> bool {
+        world.sky_light(pos) >= 15
+    }
+
+    /// SpawnPlacements.checkSpawnRules for MobSpawnType.NATURAL: the
+    /// per-type predicate each entity's SpawnPlacements entry registered.
+    pub(crate) fn allows(
+        &self,
+        mob: OverworldSpawnMob,
+        pos: NaturalSpawnPos,
+        world: &impl OverworldSpawnQueries,
+        draws: &mut dyn OverworldSpawnDraws,
+    ) -> bool {
+        let below = NaturalSpawnPos {
+            y: pos.y - 1,
+            ..pos
+        };
+        let above = NaturalSpawnPos {
+            y: pos.y + 1,
+            ..pos
+        };
+        // Mob.checkMobSpawnRules for a natural spawn is the support check.
+        let mob_rules = || world.is_valid_spawn(below);
+        // Monster.checkMonsterSpawnRules for MobSpawnType.NATURAL.
+        let monster_rules = |draws: &mut dyn OverworldSpawnDraws| {
+            !world.is_peaceful()
+                && (world.ignores_light_requirements()
+                    || self.dark_enough(pos, world, draws))
+                && mob_rules()
+        };
+        match mob {
+            // Monster.checkMonsterSpawnRules.
+            OverworldSpawnMob::Bogged
+            | OverworldSpawnMob::Creeper
+            | OverworldSpawnMob::Enderman
+            | OverworldSpawnMob::Skeleton
+            | OverworldSpawnMob::Spider
+            | OverworldSpawnMob::Witch
+            | OverworldSpawnMob::Zombie
+            | OverworldSpawnMob::ZombieVillager => monster_rules(draws),
+            // Husk.checkHuskSpawnRules.
+            OverworldSpawnMob::Husk => {
+                monster_rules(draws)
+                    && (world.spawn_is_spawner() || Self::can_see_sky(pos, world))
+            }
+            // Stray.checkStraySpawnRules: climb the powder-snow column first.
+            OverworldSpawnMob::Stray => {
+                let mut top = pos;
+                while world.block_id(top) == "minecraft:powder_snow" {
+                    top.y += 1;
+                }
+                monster_rules(draws)
+                    && (world.spawn_is_spawner() || Self::can_see_sky(top, world))
+            }
+            // Drowned.checkDrownedSpawnRules.
+            OverworldSpawnMob::Drowned => {
+                if !world.fluid_is_water(below) && !world.spawn_is_spawner() {
+                    return false;
+                }
+                let flag = !world.is_peaceful()
+                    && (world.ignores_light_requirements()
+                        || self.dark_enough(pos, world, draws))
+                    && (world.spawn_is_spawner() || world.fluid_is_water(pos));
+                if flag && world.spawn_is_spawner() {
+                    return true;
+                }
+                if world.biome_id(pos).is_some_and(|biome| {
+                    MORE_FREQUENT_DROWNED_SPAWNS.contains(&biome.as_str())
+                }) {
+                    return draws.next_int(15) == 0 && flag;
+                }
+                // isDeepEnoughToSpawn: y < seaLevel - 5.
+                draws.next_int(40) == 0 && pos.y < world.sea_level() - 5 && flag
+            }
+            // Slime.checkSlimeSpawnRules.
+            OverworldSpawnMob::Slime => {
+                if world.spawn_is_spawner() || world.is_peaceful() {
+                    return world.spawn_is_spawner() && mob_rules();
+                }
+                if world.biome_id(pos).is_some_and(|biome| {
+                    ALLOWS_SURFACE_SLIME_SPAWNS.contains(&biome.as_str())
+                }) && pos.y > 50
+                    && pos.y < 70
+                    && draws.next_f32() < 0.5
+                    && draws.next_f32() < world.moon_brightness()
+                    && Self::max_local_raw_brightness(pos, world) <= draws.next_int(8)
+                {
+                    return mob_rules();
+                }
+                if !world.is_world_gen() {
+                    return false;
+                }
+                // WorldgenRandom.seedSlimeChunk(cx, cz, seed, 987234911L).
+                let slime_chunk = Lcg::new(slime_chunk_seed(
+                    pos.x >> 4,
+                    pos.z >> 4,
+                    world.world_seed(),
+                    987_234_911,
+                ))
+                .next_bound(10)
+                    == 0;
+                draws.next_int(10) == 0 && slime_chunk && pos.y < 40 && mob_rules()
+            }
+            // Ocelot.checkOcelotSpawnRules: a two-in-three roll only.
+            OverworldSpawnMob::Ocelot => draws.next_int(3) != 0,
+            // Bat.checkBatSpawnRules.
+            OverworldSpawnMob::Bat => {
+                if pos.y >= world.sea_level() {
+                    return false;
+                }
+                let bound = if world.is_halloween() {
+                    7
+                } else {
+                    if draws.next_bool() {
+                        return false;
+                    }
+                    4
+                };
+                Self::max_local_raw_brightness(pos, world) <= draws.next_int(bound)
+                    && mob_rules()
+            }
+            // Axolotl.checkAxolotlSpawnRules.
+            OverworldSpawnMob::Axolotl => world.block_in_tag(below, AXOLOTLS_SPAWNABLE_ON),
+            // GlowSquid.checkGlowSquidSpawnRules.
+            OverworldSpawnMob::GlowSquid => {
+                pos.y <= world.sea_level() - 33
+                    && Self::raw_brightness(pos, world) == 0
+                    && world.block_id(pos) == "minecraft:water"
+            }
+            // WaterAnimal.checkSurfaceWaterAnimalSpawnRules.
+            OverworldSpawnMob::Cod
+            | OverworldSpawnMob::Dolphin
+            | OverworldSpawnMob::Pufferfish
+            | OverworldSpawnMob::Salmon
+            | OverworldSpawnMob::Squid => {
+                let sea = world.sea_level();
+                pos.y >= sea - 13
+                    && pos.y <= sea
+                    && world.fluid_is_water(below)
+                    && world.block_id(above) == "minecraft:water"
+            }
+            // TropicalFish.checkTropicalFishSpawnRules.
+            OverworldSpawnMob::TropicalFish => {
+                if !(world.fluid_is_water(below)
+                    && world.block_id(above) == "minecraft:water")
+                {
+                    return false;
+                }
+                if world.biome_id(pos).is_some_and(|biome| {
+                    ALLOWS_TROPICAL_FISH_SPAWNS_AT_ANY_HEIGHT.contains(&biome.as_str())
+                }) {
+                    return true;
+                }
+                let sea = world.sea_level();
+                pos.y >= sea - 13 && pos.y <= sea
+            }
+        }
+    }
+}
+
 /// Selected biome spawner entry, with type-specific darkness and cluster rules.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug)]
@@ -616,22 +1001,27 @@ fn has_room_for_nightly_monster(mobs: &[Arc<Mob>], monster_cap: usize) -> bool {
             < monster_cap
 }
 
-fn nightly_spawn_placement_allows(bx: i32, by: i32, bz: i32) -> bool {
-    let Some(reg) = crate::block_registry::breg() else {
-        return false;
-    };
+fn natural_spawn_placement_allows(
+    reg: &BReg,
+    dim: DimId,
+    mob: OverworldSpawnMob,
+    pos: NaturalSpawnPos,
+) -> bool {
     let clear = |state| {
         !reg.is_collision_shape_full_block(state)
             && !reg.is_liquid(state)
             && !reg.in_tag(state, "minecraft:prevent_mob_spawning_inside")
     };
+    let NaturalSpawnPos { x, y, z } = pos;
     let site = SpawnPlacementContext {
-        ground_supports_spawn: reg.side_solid(block_at(bx, by - 1, bz), 1),
-        clear_here: clear(block_at(bx, by, bz)),
-        clear_above: clear(block_at(bx, by + 1, bz)),
+        ground_supports_spawn: reg.side_solid(block_at_dim(dim, x, y - 1, z), 1),
+        clear_here: clear(block_at_dim(dim, x, y, z)),
+        clear_above: clear(block_at_dim(dim, x, y + 1, z)),
+        water_here: reg.fluid_name(block_at_dim(dim, x, y, z)) == "minecraft:water",
+        above_redstone_conductor: reg.is_redstone_conductor(block_at_dim(dim, x, y + 1, z)),
         ..SpawnPlacementContext::default()
     };
-    SpawnPlacementType::OnGround.allows(site)
+    mob.placement().0.allows(site)
 }
 
 struct OverworldMonsterLight {
@@ -659,6 +1049,23 @@ impl OverworldMonsterLight {
             min,
             max,
         })
+    }
+
+    fn vanilla() -> Self {
+        match crate::structure_transform::pinned_data_bytes(
+            "datapacks/vanilla/data/minecraft/dimension_type/overworld.json",
+        ) {
+            Some(bytes) => Self::from_dimension_type(&bytes)
+                .expect("pinned Overworld dimension type must have valid monster spawn light rules"),
+            // A scratch run with no `datapacks/` tree (the wire-test
+            // `local_server` layout) still spawns by the pinned 1.21.1
+            // values: block-light limit 0, uniform light level 0..=7.
+            None => Self {
+                block_limit: 0,
+                min: 0,
+                max: 7,
+            },
+        }
     }
 }
 
@@ -706,40 +1113,153 @@ fn natural_spawn_light_sources_into(
     }
 }
 
-fn nightly_spawn_is_dark(x: i32, y: i32, z: i32, sources: &GenSources) -> bool {
-    static RULES: OnceLock<OverworldMonsterLight> = OnceLock::new();
-    let rules = RULES.get_or_init(|| {
-        match crate::structure_transform::pinned_data_bytes(
-            "datapacks/vanilla/data/minecraft/dimension_type/overworld.json",
-        ) {
-            Some(bytes) => OverworldMonsterLight::from_dimension_type(&bytes)
-                .expect("pinned Overworld dimension type must have valid monster spawn light rules"),
-            // A scratch run with no `datapacks/` tree (the wire-test
-            // `local_server` layout) still spawns by the pinned 1.21.1
-            // values: block-light limit 0, uniform light level 0..=7.
-            None => OverworldMonsterLight {
-                block_limit: 0,
-                min: 0,
-                max: 7,
-            },
-        }
-    });
-    let (cx, cz) = (x >> 4, z >> 4);
-    let sky_light = nibble_at(&sky_light_sections_world(cx, cz), x, y, z);
-    let sky_roll = world_rng::next_below(32) as i32;
-    let sky_darken = if THUNDERING.load(Ordering::Relaxed) > 0 {
-        10
-    } else {
+/// The live `OverworldSpawnQueries` for a natural tick in `dim`: block and
+/// biome reads come straight off the world, light reads reuse the same
+/// section lookups the old nightly darkness check used.
+struct LiveNaturalSpawnQueries<'a> {
+    dim: DimId,
+    reg: &'a BReg,
+    sources: &'a GenSources,
+}
+
+impl LiveNaturalSpawnQueries<'_> {
+    fn state(&self, pos: NaturalSpawnPos) -> u32 {
+        block_at_dim(self.dim, pos.x, pos.y, pos.z)
+    }
+}
+
+impl OverworldSpawnQueries for LiveNaturalSpawnQueries<'_> {
+    fn is_peaceful(&self) -> bool {
+        DIFFICULTY.load(Ordering::Relaxed) == 0
+    }
+
+    fn spawn_is_spawner(&self) -> bool {
+        false
+    }
+
+    fn ignores_light_requirements(&self) -> bool {
+        false
+    }
+
+    fn is_world_gen(&self) -> bool {
+        false
+    }
+
+    fn biome_id(&self, pos: NaturalSpawnPos) -> Option<String> {
+        worldgen::with_gen_dim(self.dim, |gen| {
+            let (_, leaf) = gen.biome_blended(pos.x, pos.y, pos.z)?;
+            gen.biome_name_of_leaf(leaf)
+        })
+        .flatten()
+    }
+
+    fn block_id(&self, pos: NaturalSpawnPos) -> &str {
+        self.reg.name_of(self.state(pos))
+    }
+
+    fn block_in_tag(&self, pos: NaturalSpawnPos, tag: &str) -> bool {
+        self.reg.in_tag(self.state(pos), tag)
+    }
+
+    fn fluid_is_water(&self, pos: NaturalSpawnPos) -> bool {
+        matches!(
+            self.reg.fluid_name(self.state(pos)),
+            "minecraft:water" | "minecraft:flowing_water"
+        )
+    }
+
+    fn is_valid_spawn(&self, pos: NaturalSpawnPos) -> bool {
+        let state = self.state(pos);
+        // BlockBehaviour.Properties defaults to a sturdy up face and emitted light below 14.
+        // Bedrock and barrier override that predicate for every spawn type.
+        self.reg.side_solid(state, 1)
+            && self.reg.luminance_of(state) < 14
+            && !matches!(
+                self.reg.name_of(state),
+                "minecraft:bedrock" | "minecraft:barrier"
+            )
+    }
+
+    fn sky_light(&self, pos: NaturalSpawnPos) -> i32 {
+        let (cx, cz) = (pos.x >> 4, pos.z >> 4);
+        nibble_at_dim(
+            &sky_light_sections_dim(self.dim, cx, cz),
+            self.dim,
+            pos.x,
+            pos.y,
+            pos.z,
+        )
+    }
+
+    fn block_light(&self, pos: NaturalSpawnPos) -> i32 {
+        let (cx, cz) = (pos.x >> 4, pos.z >> 4);
+        nibble_at_dim(
+            &block_light_sections_dim(self.dim, cx, cz, self.sources),
+            self.dim,
+            pos.x,
+            pos.y,
+            pos.z,
+        )
+    }
+
+    fn sky_darken(&self) -> i32 {
         current_sky_darken()
-    };
-    monster_spawn_light_allows(
-        sky_light,
-        sky_roll,
-        rules.block_limit,
-        || nibble_at(&block_light_sections(cx, cz, sources), x, y, z),
-        sky_darken,
-        || rules.min + world_rng::next_below((rules.max - rules.min + 1) as u32) as i32,
-    )
+    }
+
+    fn thundering(&self) -> bool {
+        THUNDERING.load(Ordering::Relaxed) > 0
+    }
+
+    fn moon_brightness(&self) -> f32 {
+        // DimensionType.getMoonPhase on the cumulative world age: the world
+        // clock's /time and doDaylightCycle adjustments diverge here, which
+        // only changes the slime brightness roll.
+        MOON_BRIGHTNESS_PER_PHASE[(TICK.load(Ordering::Relaxed) / 24000 % 8) as usize]
+    }
+
+    fn sea_level(&self) -> i32 {
+        worldgen::sea_level()
+    }
+
+    fn is_halloween(&self) -> bool {
+        is_around_halloween()
+    }
+
+    fn world_seed(&self) -> u64 {
+        WORLD_SEED.load(Ordering::Relaxed)
+    }
+}
+
+/// SharedConstants.isAroundHalloween: Oct 20 through Nov 3 of the server
+/// clock. Reuses the protocol timestamp, converting its day count to a
+/// calendar date with Howard Hinnant's civil-days algorithm.
+fn is_around_halloween() -> bool {
+    halloween_from_epoch_days(advancement_time_ms().div_euclid(86_400_000))
+}
+
+fn halloween_from_epoch_days(days: i64) -> bool {
+    let doe = (days + 719_468).rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (month == 10 && day >= 20) || (month == 11 && day <= 3)
+}
+
+/// The RandomSource the live natural pass draws from.
+struct WorldRngDraws;
+
+impl OverworldSpawnDraws for WorldRngDraws {
+    fn next_int(&mut self, bound: i32) -> i32 {
+        world_rng::next_below(bound as u32) as i32
+    }
+    fn next_f32(&mut self) -> f32 {
+        nightly_spawn_float()
+    }
+    fn next_bool(&mut self) -> bool {
+        world_rng::next_below(2) != 0
+    }
 }
 
 fn nightly_monster_spawners(pos: NaturalSpawnPos) -> &'static [feature::SpawnerData] {
@@ -864,9 +1384,11 @@ enum NightlySpawnAttempt {
 
 fn try_nightly_monster_at(
     pos: NaturalSpawnPos,
+    mob: OverworldSpawnMob,
     etype: i64,
     cap: usize,
     light_sources: &GenSources,
+    rules: &OverworldSpawnRules,
 ) -> NightlySpawnAttempt {
     // Block edits and spawn insertion share the world-write guard.
     with_save_guard(|| {
@@ -874,10 +1396,18 @@ fn try_nightly_monster_at(
         if !has_room_for_nightly_monster(&mobs().lock().unwrap_or_else(|e| e.into_inner()), cap) {
             return NightlySpawnAttempt::AtCap;
         }
-        // These four types use Monster.checkMonsterSpawnRules. The tick has
-        // already checked difficulty, and the placement gate checked support.
-        if !nightly_spawn_placement_allows(x, y, z)
-            || !nightly_spawn_is_dark(x, y, z, light_sources)
+        let Some(reg) = crate::block_registry::breg() else {
+            return NightlySpawnAttempt::Rejected;
+        };
+        // The tick has already checked difficulty; the per-type predicate does
+        // the rest, including Monster.checkMonsterSpawnRules' darkness roll.
+        let queries = LiveNaturalSpawnQueries {
+            dim: DimId::Overworld,
+            reg,
+            sources: light_sources,
+        };
+        if !natural_spawn_placement_allows(reg, DimId::Overworld, mob, pos)
+            || !rules.allows(mob, pos, &queries, &mut WorldRngDraws)
         {
             return NightlySpawnAttempt::Rejected;
         }
@@ -888,7 +1418,7 @@ fn try_nightly_monster_at(
             return NightlySpawnAttempt::Rejected;
         }
         // Vanilla moves the new mob into place and rolls yaw before instance
-        // checks. Mob.checkSpawnRules is true for these four types.
+        // checks.
         let yaw = nightly_spawn_float() * 360.0;
         if nightly_spawn_obstructed(bounds) {
             return NightlySpawnAttempt::Rejected;
@@ -1106,6 +1636,8 @@ fn spawn_nightly_hostile_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
             + (sz.floor() + 0.5 - z).powi(2)
     };
     sources.clear();
+    static RULES: OnceLock<OverworldSpawnRules> = OnceLock::new();
+    let rules = RULES.get_or_init(OverworldSpawnRules::vanilla);
     let mut spawned = 0;
     for _ in 0..3 {
         let mut pack = SpawnPack::new(origin, nightly_spawn_float());
@@ -1153,16 +1685,44 @@ fn spawn_nightly_hostile_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
                 || !can_spawn_at_distance(nearest_squared, MobCategory::Monster)
                 || !matches!(
                     entry.kind.as_str(),
-                    "minecraft:creeper"
+                    "minecraft:bogged"
+                        | "minecraft:creeper"
+                        | "minecraft:drowned"
+                        | "minecraft:enderman"
+                        | "minecraft:husk"
+                        | "minecraft:ocelot"
                         | "minecraft:skeleton"
+                        | "minecraft:slime"
                         | "minecraft:spider"
+                        | "minecraft:stray"
+                        | "minecraft:witch"
                         | "minecraft:zombie"
+                        | "minecraft:zombie_villager"
                 )
                 || !entries.iter().any(|current| std::ptr::eq(current, entry))
             {
                 continue;
             }
+            let mob = OverworldSpawnMob::from_id(&entry.kind)
+                .expect("nightly monster dispatch covers every matched kind");
             let etype = name_to_etype(&entry.kind).expect("registered nightly monster");
+            // IN_WATER.adjustSpawnPosition drops the heightmap candidate into
+            // the water column: the first water cell at or below the pick.
+            let pos = if mob.placement().0 == SpawnPlacementType::InWater {
+                let Some(reg) = crate::block_registry::breg() else {
+                    continue;
+                };
+                let min_y = DimId::Overworld.min_y();
+                let Some(y) = (min_y..=pos.y)
+                    .rev()
+                    .find(|&y| reg.fluid_name(block_at(pos.x, y, pos.z)) == "minecraft:water")
+                else {
+                    continue;
+                };
+                NaturalSpawnPos { y, ..pos }
+            } else {
+                pos
+            };
             // Streaming can generate chunks while holding the client cache
             // lock. Copy the light sources before taking the world-write guard.
             let light_sources = sources.entry(chunk).or_insert_with(|| {
@@ -1177,7 +1737,7 @@ fn spawn_nightly_hostile_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
                 );
                 nearby
             });
-            match try_nightly_monster_at(pos, etype, cap, light_sources) {
+            match try_nightly_monster_at(pos, mob, etype, cap, light_sources, rules) {
                 NightlySpawnAttempt::Rejected => continue,
                 NightlySpawnAttempt::AtCap => return,
                 NightlySpawnAttempt::Spawned => spawned += 1,
@@ -1188,6 +1748,169 @@ fn spawn_nightly_hostile_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
             }
         }
     }
+}
+
+/// The serialized biome-spawner category key for a `MobCategory`.
+#[allow(dead_code)]
+fn mob_category_key(category: MobCategory) -> &'static str {
+    match category {
+        MobCategory::Monster => "monster",
+        MobCategory::Creature => "creature",
+        MobCategory::Ambient => "ambient",
+        MobCategory::Axolotls => "axolotls",
+        MobCategory::UndergroundWaterCreature => "underground_water_creature",
+        MobCategory::WaterCreature => "water_creature",
+        MobCategory::WaterAmbient => "water_ambient",
+    }
+}
+
+/// The candidate Y for one column: the first non-air cell plus one for
+/// ON_GROUND/NO_RESTRICTIONS mobs, or a uniform cell of the topmost
+/// contiguous water run for IN_WATER mobs, the same band
+/// SpawnPlacements.adjustSpawnPosition picks inside.
+#[allow(dead_code)]
+fn natural_spawn_column_y(
+    reg: &BReg,
+    dim: DimId,
+    mob: OverworldSpawnMob,
+    x: i32,
+    z: i32,
+    rng: &mut generation_math::Lcg,
+) -> Option<i32> {
+    match mob.placement().0 {
+        SpawnPlacementType::InWater => {
+            let top = worldgen::sea_level().min(dim.min_y() + dim.height() - 1);
+            let water_top = (dim.min_y()..=top)
+                .rev()
+                .find(|&y| reg.fluid_name(block_at_dim(dim, x, y, z)) == "minecraft:water")?;
+            let run = (dim.min_y()..water_top)
+                .rev()
+                .take_while(|&y| {
+                    reg.fluid_name(block_at_dim(dim, x, y, z)) == "minecraft:water"
+                })
+                .count() as i32;
+            Some(water_top - rng.next_bound(run + 1))
+        }
+        _ => (dim.min_y()..dim.min_y() + dim.height())
+            .rev()
+            .find(|&y| !reg.is_air(block_at_dim(dim, x, y, z)))
+            .map(|y| y + 1),
+    }
+}
+
+/// One weighted natural-spawn pass for a `(dim, category)` pair the nightly
+/// and Nether scratches do not cover: Overworld `ambient`, `axolotls`,
+/// `underground_water_creature`, `water_creature` and `water_ambient`, and
+/// the End's `monster` enderman rows. It follows the same anchor offset,
+/// spawn-chunk membership, distance, border, category-cap, weighted pick,
+/// group walk, placement, per-mob rules and insertion flow the other live
+/// passes use, and returns how many mobs it inserted.
+///
+/// Wired from `spawn_aquatic_natural`, `spawn_end_natural` and the ambient /
+/// underground passes once `main.rs` can call it.
+#[allow(dead_code)]
+pub(crate) fn spawn_natural_category_scratch(
+    clients: &[Arc<Client>],
+    dim: DimId,
+    category: MobCategory,
+    tick: u64,
+) -> usize {
+    if GR_MOB_SPAWNING.load(Ordering::Relaxed) != 1
+        || (category == MobCategory::Monster && DIFFICULTY.load(Ordering::Relaxed) == 0)
+    {
+        return 0;
+    }
+    let players = live_spawn_anchors(clients, dim);
+    if players.is_empty() {
+        return 0;
+    }
+    let Some(reg) = breg() else {
+        return 0;
+    };
+    let spawn_chunks = live_spawn_chunks(&players);
+    let cap = category.global_cap(spawn_chunks.len() as u32) as usize;
+    if cap == 0 || live_category_count(dim, category) >= cap {
+        return 0;
+    }
+    let attempt = SPAWN_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+    let &[px, _, pz] = &players[attempt as usize % players.len()];
+    let angle = tick as f64 * 2.399 + category.index() as f64;
+    let bx = (px + angle.cos() * 32.0).floor() as i32;
+    let bz = (pz + angle.sin() * 32.0).floor() as i32;
+    // Water-table mobs read the biome at the water column; the rest probe at
+    // mid height like the surface scans below do.
+    let probe_y = if matches!(
+        category,
+        MobCategory::Axolotls
+            | MobCategory::UndergroundWaterCreature
+            | MobCategory::WaterCreature
+            | MobCategory::WaterAmbient
+    ) {
+        worldgen::sea_level()
+    } else {
+        dim.min_y() + dim.height() / 2
+    };
+    if !live_spawn_position_ok(&players, &spawn_chunks, bx, probe_y, bz) {
+        return 0;
+    }
+    // The weighted pick reads the biome's spawner table for this category.
+    let entries = worldgen::with_gen_dim(dim, |gen| {
+        let (_, leaf) = gen.biome_blended(bx, probe_y, bz)?;
+        gen.biome_name_of_leaf(leaf)
+    })
+    .flatten()
+    .and_then(|biome| feature::spawners_for(&biome, mob_category_key(category)))
+    .unwrap_or_default();
+    let Some(entry) = choose_nightly_spawner(entries) else {
+        return 0;
+    };
+    let Some(mob) = OverworldSpawnMob::from_id(&entry.kind) else {
+        return 0;
+    };
+    static RULES: OnceLock<OverworldSpawnRules> = OnceLock::new();
+    let rules = RULES.get_or_init(OverworldSpawnRules::vanilla);
+    let group = entry.min_count
+        + world_rng::next_below((entry.max_count - entry.min_count + 1).max(1) as u32) as i32;
+    let mut rng = generation_math::Lcg::new(
+        WORLD_SEED
+            .load(Ordering::Relaxed)
+            .wrapping_add(tick.wrapping_mul(0x9E37_79B9)),
+    );
+    let mut spawned = 0;
+    for _ in 0..group {
+        let x = bx + rng.next_bound(7) - 3;
+        let z = bz + rng.next_bound(7) - 3;
+        let Some(y) = natural_spawn_column_y(reg, dim, mob, x, z, &mut rng) else {
+            continue;
+        };
+        if !live_spawn_position_ok(&players, &spawn_chunks, x, y, z)
+            || live_category_count(dim, category) >= cap
+        {
+            continue;
+        }
+        let (cx, cz) = (x >> 4, z >> 4);
+        let sources = natural_spawn_light_sources(clients, dim, cx, cz);
+        let queries = LiveNaturalSpawnQueries {
+            dim,
+            reg,
+            sources: &sources,
+        };
+        let pos = NaturalSpawnPos { x, y, z };
+        if !natural_spawn_placement_allows(reg, dim, mob, pos)
+            || !rules.allows(mob, pos, &queries, &mut WorldRngDraws)
+        {
+            continue;
+        }
+        let yaw = nightly_spawn_float() * 360.0;
+        if live_natural_spawn(
+            &entry.kind,
+            dim,
+            (f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5, yaw, 0.0),
+        ) {
+            spawned += 1;
+        }
+    }
+    spawned
 }
 
 #[cfg(test)]
@@ -1978,6 +2701,619 @@ mod natural_spawner_tests {
         eprintln!(
             "xpoll_entity_scratch_spawner: fresh {fresh_us}us vs pooled {pooled_us}us over 500 sweeps"
         );
+    }
+
+    // ---- Vanilla 1.21.1 per-mob spawn rules (decompiled from the pinned jar) ----
+
+    /// Scripted world state for `OverworldSpawnQueries`.
+    #[derive(Default)]
+    struct TestWorld {
+        peaceful: bool,
+        spawner: bool,
+        ignores_light: bool,
+        world_gen: bool,
+        biome: Option<&'static str>,
+        blocks: std::collections::HashMap<(i32, i32, i32), &'static str>,
+        solid: std::collections::HashSet<(i32, i32, i32)>,
+        sky: i32,
+        light: i32,
+        darken: i32,
+        thunder: bool,
+        moon: f32,
+        sea: i32,
+        halloween: bool,
+        seed: u64,
+    }
+
+    impl OverworldSpawnQueries for TestWorld {
+        fn is_peaceful(&self) -> bool {
+            self.peaceful
+        }
+        fn spawn_is_spawner(&self) -> bool {
+            self.spawner
+        }
+        fn ignores_light_requirements(&self) -> bool {
+            self.ignores_light
+        }
+        fn is_world_gen(&self) -> bool {
+            self.world_gen
+        }
+        fn biome_id(&self, _pos: NaturalSpawnPos) -> Option<String> {
+            self.biome.map(str::to_string)
+        }
+        fn block_id(&self, pos: NaturalSpawnPos) -> &str {
+            self.blocks
+                .get(&(pos.x, pos.y, pos.z))
+                .copied()
+                .unwrap_or("minecraft:air")
+        }
+        fn block_in_tag(&self, pos: NaturalSpawnPos, tag: &str) -> bool {
+            tag == AXOLOTLS_SPAWNABLE_ON
+                && self.block_id(pos) == "minecraft:clay"
+        }
+        fn fluid_is_water(&self, pos: NaturalSpawnPos) -> bool {
+            matches!(
+                self.block_id(pos),
+                "minecraft:water" | "minecraft:flowing_water"
+            )
+        }
+        fn is_valid_spawn(&self, pos: NaturalSpawnPos) -> bool {
+            self.solid.contains(&(pos.x, pos.y, pos.z))
+        }
+        fn sky_light(&self, _pos: NaturalSpawnPos) -> i32 {
+            self.sky
+        }
+        fn block_light(&self, _pos: NaturalSpawnPos) -> i32 {
+            self.light
+        }
+        fn sky_darken(&self) -> i32 {
+            self.darken
+        }
+        fn thundering(&self) -> bool {
+            self.thunder
+        }
+        fn moon_brightness(&self) -> f32 {
+            self.moon
+        }
+        fn sea_level(&self) -> i32 {
+            self.sea
+        }
+        fn is_halloween(&self) -> bool {
+            self.halloween
+        }
+        fn world_seed(&self) -> u64 {
+            self.seed
+        }
+    }
+
+    /// Scripted `OverworldSpawnDraws`; `next_int` pops a scripted result (the
+    /// test guarantees it is below the requested bound).
+    #[derive(Default)]
+    struct TestRng {
+        ints: std::collections::VecDeque<i32>,
+        floats: std::collections::VecDeque<f32>,
+        bools: std::collections::VecDeque<bool>,
+    }
+
+    impl TestRng {
+        fn ints(values: &[i32]) -> Self {
+            Self {
+                ints: values.iter().copied().collect(),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl OverworldSpawnDraws for TestRng {
+        fn next_int(&mut self, bound: i32) -> i32 {
+            let v = self.ints.pop_front().unwrap_or(0);
+            assert!(v < bound, "scripted next_int {v} >= bound {bound}");
+            v
+        }
+        fn next_f32(&mut self) -> f32 {
+            self.floats.pop_front().unwrap_or(0.0)
+        }
+        fn next_bool(&mut self) -> bool {
+            self.bools.pop_front().unwrap_or(false)
+        }
+    }
+
+    fn rules() -> OverworldSpawnRules {
+        OverworldSpawnRules::vanilla()
+    }
+
+    /// Dark, supported, non-peaceful natural spawn state: sky 0, block 0, and
+    /// the darkness rolls scripted to pass.
+    fn dark_world() -> TestWorld {
+        TestWorld {
+            sky: 0,
+            light: 0,
+            darken: 0,
+            sea: 63,
+            ..TestWorld::default()
+        }
+    }
+
+    fn support_below(w: &mut TestWorld, pos: NaturalSpawnPos) {
+        w.solid.insert((pos.x, pos.y - 1, pos.z));
+    }
+
+    #[test]
+    fn overworld_spawn_mob_dispatch_covers_every_table_kind() {
+        for (id, expected) in [
+            ("minecraft:bogged", OverworldSpawnMob::Bogged),
+            ("minecraft:creeper", OverworldSpawnMob::Creeper),
+            ("minecraft:drowned", OverworldSpawnMob::Drowned),
+            ("minecraft:enderman", OverworldSpawnMob::Enderman),
+            ("minecraft:husk", OverworldSpawnMob::Husk),
+            ("minecraft:ocelot", OverworldSpawnMob::Ocelot),
+            ("minecraft:skeleton", OverworldSpawnMob::Skeleton),
+            ("minecraft:slime", OverworldSpawnMob::Slime),
+            ("minecraft:spider", OverworldSpawnMob::Spider),
+            ("minecraft:stray", OverworldSpawnMob::Stray),
+            ("minecraft:witch", OverworldSpawnMob::Witch),
+            ("minecraft:zombie", OverworldSpawnMob::Zombie),
+            ("minecraft:zombie_villager", OverworldSpawnMob::ZombieVillager),
+            ("minecraft:bat", OverworldSpawnMob::Bat),
+            ("minecraft:axolotl", OverworldSpawnMob::Axolotl),
+            ("minecraft:glow_squid", OverworldSpawnMob::GlowSquid),
+            ("minecraft:dolphin", OverworldSpawnMob::Dolphin),
+            ("minecraft:squid", OverworldSpawnMob::Squid),
+            ("minecraft:cod", OverworldSpawnMob::Cod),
+            ("minecraft:pufferfish", OverworldSpawnMob::Pufferfish),
+            ("minecraft:salmon", OverworldSpawnMob::Salmon),
+            ("minecraft:tropical_fish", OverworldSpawnMob::TropicalFish),
+        ] {
+            assert_eq!(OverworldSpawnMob::from_id(id), Some(expected), "{id}");
+        }
+        for unsupported in ["minecraft:sheep", "minecraft:armor_stand", "sheep"] {
+            assert_eq!(OverworldSpawnMob::from_id(unsupported), None);
+        }
+    }
+
+    #[test]
+    fn mob_category_keys_match_the_biome_json_names() {
+        for (category, key) in [
+            (MobCategory::Monster, "monster"),
+            (MobCategory::Creature, "creature"),
+            (MobCategory::Ambient, "ambient"),
+            (MobCategory::Axolotls, "axolotls"),
+            (MobCategory::UndergroundWaterCreature, "underground_water_creature"),
+            (MobCategory::WaterCreature, "water_creature"),
+            (MobCategory::WaterAmbient, "water_ambient"),
+        ] {
+            assert_eq!(mob_category_key(category), key);
+        }
+    }
+
+    #[test]
+    fn overworld_placements_match_spawn_placements_registrations() {
+        for mob in [
+            OverworldSpawnMob::Axolotl,
+            OverworldSpawnMob::Cod,
+            OverworldSpawnMob::Dolphin,
+            OverworldSpawnMob::Drowned,
+            OverworldSpawnMob::GlowSquid,
+            OverworldSpawnMob::Pufferfish,
+            OverworldSpawnMob::Salmon,
+            OverworldSpawnMob::Squid,
+            OverworldSpawnMob::TropicalFish,
+        ] {
+            assert_eq!(mob.placement().0, SpawnPlacementType::InWater, "{mob:?}");
+            assert_eq!(mob.placement().1, HeightmapKind::MotionBlockingNoLeaves);
+        }
+        assert_eq!(
+            OverworldSpawnMob::Bat.placement(),
+            (SpawnPlacementType::NoRestrictions, HeightmapKind::MotionBlockingNoLeaves)
+        );
+        // The ocelot is the lone MOTION_BLOCKING registration.
+        assert_eq!(
+            OverworldSpawnMob::Ocelot.placement(),
+            (SpawnPlacementType::OnGround, HeightmapKind::MotionBlocking)
+        );
+        for mob in [
+            OverworldSpawnMob::Bogged,
+            OverworldSpawnMob::Creeper,
+            OverworldSpawnMob::Enderman,
+            OverworldSpawnMob::Husk,
+            OverworldSpawnMob::Skeleton,
+            OverworldSpawnMob::Slime,
+            OverworldSpawnMob::Spider,
+            OverworldSpawnMob::Stray,
+            OverworldSpawnMob::Witch,
+            OverworldSpawnMob::Zombie,
+            OverworldSpawnMob::ZombieVillager,
+        ] {
+            assert_eq!(
+                mob.placement(),
+                (
+                    SpawnPlacementType::OnGround,
+                    HeightmapKind::MotionBlockingNoLeaves
+                ),
+                "{mob:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn monster_rules_need_difficulty_darkness_and_support() {
+        let p = pos(0, 70, 0);
+        let mut w = dark_world();
+        support_below(&mut w, p);
+        // next_int(32) skylight roll then the 0..=7 spawn-light sample.
+        assert!(rules().allows(OverworldSpawnMob::Zombie, p, &w, &mut TestRng::ints(&[0, 0])));
+        // Peaceful rejects before any draw.
+        w.peaceful = true;
+        assert!(!rules().allows(OverworldSpawnMob::Zombie, p, &w, &mut TestRng::ints(&[])));
+        w.peaceful = false;
+        // No valid support below.
+        w.solid.clear();
+        assert!(!rules().allows(OverworldSpawnMob::Zombie, p, &w, &mut TestRng::ints(&[0, 0])));
+        // Sky light above the skylight roll rejects.
+        w.sky = 15;
+        support_below(&mut w, p);
+        assert!(!rules().allows(OverworldSpawnMob::Zombie, p, &w, &mut TestRng::ints(&[0])));
+        w.sky = 0;
+        // Monster table members share checkMonsterSpawnRules.
+        for mob in [
+            OverworldSpawnMob::Bogged,
+            OverworldSpawnMob::Creeper,
+            OverworldSpawnMob::Enderman,
+            OverworldSpawnMob::Skeleton,
+            OverworldSpawnMob::Spider,
+            OverworldSpawnMob::Witch,
+            OverworldSpawnMob::ZombieVillager,
+        ] {
+            assert!(
+                rules().allows(mob, p, &w, &mut TestRng::ints(&[15, 0])),
+                "{mob:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn husk_and_stray_require_sky_visibility() {
+        let p = pos(0, 70, 0);
+        let mut w = dark_world();
+        support_below(&mut w, p);
+        // Desert night: the engine skylight is 15 under open sky even after
+        // dark; the ambient darkening leaves raw brightness 4.
+        w.sky = 15;
+        w.darken = 11;
+        assert!(rules().allows(OverworldSpawnMob::Husk, p, &w, &mut TestRng::ints(&[20, 4])));
+        // Under a roof the engine skylight never reaches 15.
+        w.sky = 14;
+        assert!(!rules().allows(OverworldSpawnMob::Husk, p, &w, &mut TestRng::ints(&[20, 4])));
+        // Stray on open snow: the powder-snow walk ends above the column and
+        // the sky check passes.
+        w.sky = 15;
+        w.blocks.insert((0, 70, 0), "minecraft:powder_snow");
+        w.blocks.insert((0, 71, 0), "minecraft:powder_snow");
+        assert!(rules().allows(OverworldSpawnMob::Stray, p, &w, &mut TestRng::ints(&[20, 4])));
+        // The same column under a roof fails the sky check.
+        w.sky = 14;
+        assert!(!rules().allows(OverworldSpawnMob::Stray, p, &w, &mut TestRng::ints(&[20, 4])));
+    }
+
+    #[test]
+    fn drowned_needs_water_below_then_rolls_by_biome() {
+        let p = pos(0, 55, 0); // below sea_level - 5 = 58
+        let mut w = dark_world();
+        w.blocks.insert((0, 55, 0), "minecraft:water");
+        // Reject when the block below is not water.
+        assert!(!rules().allows(OverworldSpawnMob::Drowned, p, &w, &mut TestRng::ints(&[])));
+        w.blocks.insert((0, 54, 0), "minecraft:water");
+        // Non-river: nextInt(40) must hit 0 after the darkness rolls.
+        assert!(rules().allows(
+            OverworldSpawnMob::Drowned,
+            p,
+            &w,
+            &mut TestRng::ints(&[0, 0, 0])
+        ));
+        assert!(!rules().allows(
+            OverworldSpawnMob::Drowned,
+            p,
+            &w,
+            &mut TestRng::ints(&[0, 0, 5])
+        ));
+        // Rivers use the more_frequent nextInt(15) roll.
+        w.biome = Some("minecraft:river");
+        assert!(rules().allows(
+            OverworldSpawnMob::Drowned,
+            p,
+            &w,
+            &mut TestRng::ints(&[0, 0, 0])
+        ));
+        // Above the deep-water band the non-river branch rejects outright.
+        let shallow = pos(0, 60, 0);
+        w.blocks.insert((0, 60, 0), "minecraft:water");
+        w.blocks.insert((0, 59, 0), "minecraft:water");
+        w.biome = None;
+        assert!(!rules().allows(
+            OverworldSpawnMob::Drowned,
+            shallow,
+            &w,
+            &mut TestRng::ints(&[0, 0, 0])
+        ));
+    }
+
+    #[test]
+    fn slime_surface_roll_consumes_draws_in_vanilla_order() {
+        let p = pos(0, 60, 0);
+        let mut w = dark_world();
+        w.biome = Some("minecraft:swamp");
+        w.moon = 0.75;
+        support_below(&mut w, p);
+        let mut rng = TestRng {
+            // nextFloat < 0.5, nextFloat < moon 0.75, nextInt(8) brightness cap.
+            floats: [0.2f32, 0.5].into_iter().collect(),
+            ints: [3].into_iter().collect(),
+            ..TestRng::default()
+        };
+        assert!(rules().allows(OverworldSpawnMob::Slime, p, &w, &mut rng));
+        // A failed moon-brightness float falls through to the chunk roll,
+        // which the live tick always rejects (not a WorldGenLevel).
+        let mut rng = TestRng {
+            floats: [0.2f32, 0.9].into_iter().collect(),
+            ints: [3, 0].into_iter().collect(),
+            ..TestRng::default()
+        };
+        assert!(!rules().allows(OverworldSpawnMob::Slime, p, &w, &mut rng));
+        // Outside the 51..69 band the surface branch is skipped entirely.
+        let low = pos(0, 40, 0);
+        let mut rng = TestRng {
+            floats: [0.0f32].into_iter().collect(),
+            ints: [0].into_iter().collect(),
+            ..TestRng::default()
+        };
+        assert!(!rules().allows(OverworldSpawnMob::Slime, low, &w, &mut rng));
+    }
+
+    #[test]
+    fn slime_chunk_roll_needs_world_gen_and_seed() {
+        // (0,0) under world seed 0 mixes to the salt itself; next_bound(10) on
+        // the seeded Lcg gives the same 1-in-10 roll as vanilla (see the
+        // slime_chunk_seed golden test below).
+        let p = pos(0, 30, 0);
+        let mut w = dark_world();
+        w.biome = Some("minecraft:plains");
+        w.world_gen = true;
+        w.seed = 0;
+        support_below(&mut w, p);
+        // Seeded roll at chunk (0,0) hits 7 — not a slime chunk.
+        assert!(!rules().allows(OverworldSpawnMob::Slime, p, &w, &mut TestRng::ints(&[0])));
+    }
+
+    #[test]
+    fn slime_chunk_seed_matches_vanilla_arithmetic() {
+        // Golden values from the pinned 1.21.1 seedSlimeChunk formula:
+        // int products widened, (long)(z*z) * 4392871L, salt XOR last.
+        assert_eq!(slime_chunk_seed(0, 0, 0, 987_234_911), 987_234_911);
+        assert_eq!(slime_chunk_seed(1, 1, 0, 987_234_911), 976_736_648);
+        assert_eq!(slime_chunk_seed(7, -13, 12_345, 987_234_911), 103_218_631);
+        assert_eq!(
+            slime_chunk_seed(-500_000, 300_000, 999, 987_234_911),
+            18_445_890_481_434_116_600
+        );
+        assert_eq!(
+            slime_chunk_seed(46_341, -77_777, 42, 987_234_911),
+            7_706_391_955_820_496
+        );
+        // The seeded next_bound(10) roll equals java.util.Random.nextInt(10).
+        assert_eq!(
+            Lcg::new(slime_chunk_seed(0, 0, 0, 987_234_911)).next_bound(10),
+            7
+        );
+        assert_eq!(
+            Lcg::new(slime_chunk_seed(1, 1, 0, 987_234_911)).next_bound(10),
+            1
+        );
+        assert_eq!(
+            Lcg::new(slime_chunk_seed(7, -13, 12_345, 987_234_911)).next_bound(10),
+            2
+        );
+    }
+
+    #[test]
+    fn ocelot_spawn_roll_is_two_in_three() {
+        let p = pos(0, 70, 0);
+        let w = dark_world();
+        // No darkness, support or difficulty gate: a single nextInt(3).
+        assert!(rules().allows(OverworldSpawnMob::Ocelot, p, &w, &mut TestRng::ints(&[1])));
+        assert!(rules().allows(OverworldSpawnMob::Ocelot, p, &w, &mut TestRng::ints(&[2])));
+        assert!(!rules().allows(OverworldSpawnMob::Ocelot, p, &w, &mut TestRng::ints(&[0])));
+    }
+
+    #[test]
+    fn bat_depth_brightness_and_halloween_rolls() {
+        let mut w = dark_world();
+        w.sea = 63;
+        let deep = pos(0, 30, 0);
+        support_below(&mut w, deep);
+        // At or above sea level the bat never rolls.
+        assert!(!rules().allows(
+            OverworldSpawnMob::Bat,
+            pos(0, 63, 0),
+            &w,
+            &mut TestRng::default()
+        ));
+        // Outside Halloween a coin flip gates the brightness roll.
+        let mut rng = TestRng {
+            bools: [true].into_iter().collect(),
+            ..TestRng::default()
+        };
+        assert!(!rules().allows(OverworldSpawnMob::Bat, deep, &w, &mut rng));
+        let mut rng = TestRng {
+            bools: [false].into_iter().collect(),
+            ints: [3].into_iter().collect(),
+            ..TestRng::default()
+        };
+        assert!(rules().allows(OverworldSpawnMob::Bat, deep, &w, &mut rng));
+        // Around Halloween the bound is 7 and there is no coin flip.
+        w.halloween = true;
+        w.light = 6;
+        assert!(rules().allows(
+            OverworldSpawnMob::Bat,
+            deep,
+            &w,
+            &mut TestRng::ints(&[6])
+        ));
+        w.light = 7;
+        assert!(!rules().allows(
+            OverworldSpawnMob::Bat,
+            deep,
+            &w,
+            &mut TestRng::ints(&[6])
+        ));
+    }
+
+    #[test]
+    fn axolotl_needs_the_spawnable_block_below() {
+        let p = pos(0, 40, 0);
+        let mut w = dark_world();
+        w.blocks.insert((0, 40, 0), "minecraft:water");
+        w.blocks.insert((0, 39, 0), "minecraft:clay");
+        assert!(rules().allows(
+            OverworldSpawnMob::Axolotl,
+            p,
+            &w,
+            &mut TestRng::default()
+        ));
+        w.blocks.insert((0, 39, 0), "minecraft:dirt");
+        assert!(!rules().allows(
+            OverworldSpawnMob::Axolotl,
+            p,
+            &w,
+            &mut TestRng::default()
+        ));
+    }
+
+    #[test]
+    fn glow_squid_needs_deep_dark_water() {
+        let mut w = dark_world();
+        w.sea = 63;
+        let p = pos(0, 30, 0); // sea_level - 33 = 30
+        w.blocks.insert((0, 30, 0), "minecraft:water");
+        assert!(rules().allows(
+            OverworldSpawnMob::GlowSquid,
+            p,
+            &w,
+            &mut TestRng::default()
+        ));
+        // One block too shallow.
+        let high = pos(0, 31, 0);
+        w.blocks.insert((0, 31, 0), "minecraft:water");
+        assert!(!rules().allows(
+            OverworldSpawnMob::GlowSquid,
+            high,
+            &w,
+            &mut TestRng::default()
+        ));
+        // Raw brightness above zero rejects.
+        w.light = 1;
+        assert!(!rules().allows(
+            OverworldSpawnMob::GlowSquid,
+            p,
+            &w,
+            &mut TestRng::default()
+        ));
+        w.light = 0;
+        // Not actually in water rejects.
+        w.blocks.insert((0, 30, 0), "minecraft:air");
+        assert!(!rules().allows(
+            OverworldSpawnMob::GlowSquid,
+            p,
+            &w,
+            &mut TestRng::default()
+        ));
+    }
+
+    #[test]
+    fn surface_water_animals_need_the_sea_level_band() {
+        let mut w = dark_world();
+        w.sea = 63;
+        let p = pos(0, 55, 0);
+        w.blocks.insert((0, 55, 0), "minecraft:water");
+        w.blocks.insert((0, 54, 0), "minecraft:water");
+        w.blocks.insert((0, 56, 0), "minecraft:water");
+        for mob in [
+            OverworldSpawnMob::Cod,
+            OverworldSpawnMob::Dolphin,
+            OverworldSpawnMob::Pufferfish,
+            OverworldSpawnMob::Salmon,
+            OverworldSpawnMob::Squid,
+        ] {
+            assert!(
+                rules().allows(mob, p, &w, &mut TestRng::default()),
+                "{mob:?}"
+            );
+        }
+        // Below sea_level - 13 rejects.
+        let deep = pos(0, 49, 0);
+        w.blocks.insert((0, 49, 0), "minecraft:water");
+        w.blocks.insert((0, 48, 0), "minecraft:water");
+        w.blocks.insert((0, 50, 0), "minecraft:water");
+        for mob in [
+            OverworldSpawnMob::Cod,
+            OverworldSpawnMob::Dolphin,
+            OverworldSpawnMob::Squid,
+        ] {
+            assert!(!rules().allows(mob, deep, &w, &mut TestRng::default()));
+        }
+    }
+
+    #[test]
+    fn tropical_fish_lush_caves_bypass_the_height_band() {
+        let mut w = dark_world();
+        w.sea = 63;
+        let p = pos(0, 20, 0);
+        w.blocks.insert((0, 20, 0), "minecraft:water");
+        w.blocks.insert((0, 19, 0), "minecraft:water");
+        w.blocks.insert((0, 21, 0), "minecraft:water");
+        // Outside lush caves the band check applies and this depth rejects.
+        assert!(!rules().allows(
+            OverworldSpawnMob::TropicalFish,
+            p,
+            &w,
+            &mut TestRng::default()
+        ));
+        w.biome = Some("minecraft:lush_caves");
+        assert!(rules().allows(
+            OverworldSpawnMob::TropicalFish,
+            p,
+            &w,
+            &mut TestRng::default()
+        ));
+        // Even in lush caves the below/above water gates apply.
+        w.blocks.insert((0, 21, 0), "minecraft:air");
+        assert!(!rules().allows(
+            OverworldSpawnMob::TropicalFish,
+            p,
+            &w,
+            &mut TestRng::default()
+        ));
+    }
+
+    #[test]
+    fn moon_brightness_table_matches_the_dimension_type() {
+        assert_eq!(
+            MOON_BRIGHTNESS_PER_PHASE,
+            [1.0, 0.75, 0.5, 0.25, 0.0, 0.25, 0.5, 0.75]
+        );
+    }
+
+    #[test]
+    fn halloween_window_covers_oct_20_through_nov_3() {
+        // Epoch-day goldens: 2024-10-19 = 20015, window ends 2024-11-03.
+        assert!(!halloween_from_epoch_days(20_015));
+        assert!(halloween_from_epoch_days(20_016));
+        assert!(halloween_from_epoch_days(20_027));
+        assert!(halloween_from_epoch_days(20_030));
+        assert!(!halloween_from_epoch_days(20_031));
+        assert!(!halloween_from_epoch_days(19_908));
+        // 1970-10-20 and a pre-epoch day both convert correctly.
+        assert!(halloween_from_epoch_days(292));
+        assert!(!halloween_from_epoch_days(-1));
     }
 }
 
