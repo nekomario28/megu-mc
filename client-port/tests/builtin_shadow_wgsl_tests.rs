@@ -184,6 +184,77 @@ fn sun_and_moon_arc_remains_finite_for_every_tick() {
 }
 
 #[test]
+fn inei_shadow_balance_layers_eaves_without_losing_playable_ambient() {
+    let eaves = compute_inei_shadow_balance(0.0, 0.8);
+    assert!(eaves.sky_ambient_scale < 0.55);
+    assert!(eaves.warm_bounce_scale > 1.0);
+    assert!(eaves.lantern_presence_boost > 1.25);
+    assert!((0.15..=0.30).contains(&eaves.shadow_desaturation));
+    assert!((eaves.sky_ambient_scale - 0.42).abs() < 0.00001);
+    assert!((eaves.warm_bounce_scale - 1.15).abs() < 0.00001);
+    assert!((eaves.shadow_desaturation - 0.22).abs() < 0.00001);
+    assert!((eaves.lantern_presence_boost - 1.38).abs() < 0.00001);
+    // Even an upward surface with no warm bounce retains the WGSL ambient floor.
+    assert!((0.11 * eaves.sky_ambient_scale).max(0.065) >= 0.065);
+
+    let day = compute_inei_shadow_balance(1.0, 0.8);
+    assert_eq!(day.sky_ambient_scale, 1.0);
+    assert_eq!(day.warm_bounce_scale, 1.0);
+    assert_eq!(day.shadow_desaturation, 0.0);
+    assert!((day.lantern_presence_boost - 1.0).abs() < 0.00001);
+
+    let night = compute_inei_shadow_balance(1.0, -0.8);
+    assert!((night.lantern_presence_boost - 1.38).abs() < 0.00001);
+
+    let penumbra = compute_inei_shadow_balance(0.5, 0.5);
+    assert!((penumbra.sky_ambient_scale - 0.71).abs() < 0.00001);
+    assert!((penumbra.warm_bounce_scale - 1.075).abs() < 0.00001);
+    assert!((penumbra.shadow_desaturation - 0.11).abs() < 0.00001);
+    assert!((penumbra.lantern_presence_boost - 1.2375).abs() < 0.00001);
+}
+
+#[test]
+fn inei_shadow_balance_sanitizes_nonfinite_and_out_of_range_inputs() {
+    for visibility in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -3.0, 3.0] {
+        for sun in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -3.0, 3.0] {
+            let balance = compute_inei_shadow_balance(visibility, sun);
+            assert!((0.42..=1.0).contains(&balance.sky_ambient_scale));
+            assert!((1.0..=1.15).contains(&balance.warm_bounce_scale));
+            assert!((0.0..=0.22).contains(&balance.shadow_desaturation));
+            assert!((1.0..=1.38).contains(&balance.lantern_presence_boost));
+            assert!(balance.sky_ambient_scale.is_finite());
+            assert!(balance.warm_bounce_scale.is_finite());
+            assert!(balance.shadow_desaturation.is_finite());
+            assert!(balance.lantern_presence_boost.is_finite());
+        }
+    }
+}
+
+#[test]
+fn inei_wgsl_matches_cpu_curves_and_preserves_warm_lantern_color() {
+    let terrain = MEGU_TERRAIN_LIT_WGSL;
+    for expression in [
+        "mix(0.42, 1.0, visibility)",
+        "mix(1.15, 1.0, visibility)",
+        "(1.0 - visibility) * 0.22",
+        "visibility * clamp(shadow.sun_direction.y * 1.5, 0.0, 1.0)",
+        "vec3<f32>(0.065)",
+        "(dot(normal, L_dir) + wrap) / (1.0 + wrap)",
+        "pow(max(dot(normal, half_vec), 0.0), 12.0) * 0.08",
+        "lit_color += input.albedo * lantern_light + lacquer_sheen",
+    ] {
+        assert!(
+            terrain.contains(expression),
+            "missing terrain curve {expression}"
+        );
+    }
+    assert!(terrain.find("let shibumi =").unwrap() < terrain.find("lit_color +=").unwrap());
+    let sky = MEGU_SKY_ATMOSPHERE_WGSL;
+    assert!(sky.contains("vec3<f32>(0.025, 0.040, 0.13)"));
+    assert!(sky.contains("vec3<f32>(0.42, 0.17, 0.10)"));
+}
+
+#[test]
 fn texel_snapping_resists_sub_texel_translation() {
     let camera = ShadowCamera::default();
     let config = BuiltinShadowQuality::High.config();
@@ -679,6 +750,23 @@ fn celestial_state_reaches_shadow_uniforms() {
     ] {
         assert!(field.iter().all(|v| v.is_finite()));
     }
+}
+
+#[test]
+fn twilight_sunlight_favors_muted_vermilion_over_blue() {
+    let camera = ShadowCamera::default();
+    let config = BuiltinShadowQuality::Natural.config();
+    let sunrise = build_shadow_uniforms(camera, config, 0);
+    let sunset = build_shadow_uniforms(camera, config, 12_000);
+    let noon = build_shadow_uniforms(camera, config, 6_000);
+
+    for dusk in [sunrise, sunset] {
+        assert!(dusk.sun_color[0] > dusk.sun_color[1]);
+        assert!(dusk.sun_color[1] > dusk.sun_color[2]);
+        assert!(dusk.sun_color[0] / dusk.sun_color[2] > 2.0);
+        assert!(dusk.sun_color.iter().all(|component| component.is_finite()));
+    }
+    assert!(noon.sun_color[0] / noon.sun_color[2] < 1.2);
 }
 
 #[test]

@@ -164,6 +164,35 @@ pub fn compute_sun_direction(world_time_ticks: u64) -> [f32; 3] {
     [phase.cos(), phase.sin(), 0.0]
 }
 
+/// Deterministic In'ei (layered shadow) balance, mirrored in terrain WGSL.
+/// Visibility is the shadow-map fraction and elevation is the sun's Y component.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IneiShadowBalance {
+    pub sky_ambient_scale: f32,
+    pub warm_bounce_scale: f32,
+    pub shadow_desaturation: f32,
+    pub lantern_presence_boost: f32,
+}
+
+pub fn compute_inei_shadow_balance(visibility: f32, sun_elevation: f32) -> IneiShadowBalance {
+    let visibility = if visibility.is_finite() {
+        visibility.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let daylight = if sun_elevation.is_finite() {
+        (sun_elevation * 1.5).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    IneiShadowBalance {
+        sky_ambient_scale: 0.42 + 0.58 * visibility,
+        warm_bounce_scale: 1.15 - 0.15 * visibility,
+        shadow_desaturation: (1.0 - visibility) * 0.22,
+        lantern_presence_boost: 1.38 - 0.38 * visibility * daylight,
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ShadowCamera {
     pub position: [f32; 3],
@@ -746,7 +775,8 @@ pub fn build_shadow_uniforms_celestial(
 
     let celestial = compute_celestial_lighting(world_time_ticks, moon_phase, eclipse);
     let daylight = ((sun[1] + 0.12) / 0.24).clamp(0.0, 1.0);
-    let twilight = (1.0 - (sun[1].abs() / 0.25).min(1.0)) * 0.35;
+    // Muted akane-iro sunlight near the horizon, without a sudden color step.
+    let twilight = 1.0 - smooth01(sun[1].abs() / 0.28);
     let day_phase = (world_time_ticks % 24_000) as f32 / 24_000.0;
     let moon_strength = (1.0 - daylight) * celestial.moon_illuminance;
     ShadowUniforms {
@@ -762,9 +792,9 @@ pub fn build_shadow_uniforms_celestial(
         cascade_splits: split_uniform,
         sun_direction: [sun[0], sun[1], sun[2], 0.0],
         sun_color: [
-            (0.95 + twilight) * daylight * celestial.sun_illuminance,
-            (0.92 - twilight * 0.3) * daylight * celestial.sun_illuminance,
-            (0.85 - twilight * 0.6) * daylight * celestial.sun_illuminance,
+            (0.95 + 0.16 * twilight) * daylight * celestial.sun_illuminance,
+            (0.92 - 0.18 * twilight) * daylight * celestial.sun_illuminance,
+            (0.85 - 0.40 * twilight) * daylight * celestial.sun_illuminance,
             1.0,
         ],
         moon_color: [
@@ -966,14 +996,29 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
                           vec3<f32>(0.31, 0.37, 0.50), max(normal.y, 0.0));
     let bounce = mix(vec3<f32>(0.19, 0.12, 0.09), vec3<f32>(0.0),
                       max(normal.y, 0.0));
+    // Noki: let deep eaves absorb cool sky while retaining warm indirect light.
+    let shadow_sky_scale = mix(0.42, 1.0, visibility);
+    let warm_bounce_scale = mix(1.15, 1.0, visibility);
     // An eclipse dims hemisphere ambient too, not just the disc light.
     let ambient_dim = 1.0 - shadow.celestial_params.w * 0.55;
     // Lunar shadow strength lets moonlight share the shadow map softly.
     let lunar_visibility = mix(1.0, visibility, shadow.celestial_params.z);
-    var light = (sky_ambient + bounce) * ambient_dim
-                + shadow.sun_color.xyz * sun_power * visibility
+    let ambient = max((sky_ambient * shadow_sky_scale
+                       + bounce * warm_bounce_scale) * ambient_dim,
+                      vec3<f32>(0.065));
+    let light = ambient + shadow.sun_color.xyz * sun_power * visibility
                 + shadow.moon_color.xyz * moon_power * shadow.moon_color.w
                   * lunar_visibility;
+    // Quiet the darkest saturated materials before warm lamplight returns.
+    var lit_color = input.albedo * light;
+    let luma = dot(lit_color, vec3<f32>(0.299, 0.587, 0.114));
+    let shibumi = (1.0 - visibility) * 0.22;
+    lit_color = mix(lit_color, vec3<f32>(luma) * vec3<f32>(0.96, 0.95, 1.02), shibumi);
+    var lantern_light = vec3<f32>(0.0);
+    var lacquer_sheen = vec3<f32>(0.0);
+    let inei_boost = mix(1.38, 1.0,
+                         visibility * clamp(shadow.sun_direction.y * 1.5, 0.0, 1.0));
+    let view_dir = -view_offset / max(view_distance, 0.0001);
     var limit = 8u;
     if (shadow.render_params.x >= 2.0) { limit = 32u; }
     if (shadow.render_params.x >= 3.0) { limit = 64u; }
@@ -985,15 +1030,31 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
         let distance_sq = max(dot(displacement, displacement), 0.0001);
         let distance = sqrt(distance_sq);
         let falloff = pow(max(1.0 - distance / radius, 0.0), 2.0);
-        let diffuse = max(dot(normal, displacement / distance), 0.0);
-        light += point.color_intensity.xyz * point.color_intensity.w
-                 * diffuse * falloff;
+        let L_dir = displacement / distance;
+        let wrap = 0.28;
+        let wrapped_diffuse = clamp((dot(normal, L_dir) + wrap) / (1.0 + wrap), 0.0, 1.0);
+        let radiance = point.color_intensity.xyz * point.color_intensity.w
+                       * falloff * inei_boost;
+        lantern_light += radiance * wrapped_diffuse;
+        // A small muted lacquer/aged-wood glint around nearby warm light.
+        let half_vector = L_dir + view_dir;
+        let half_vec = half_vector / max(length(half_vector), 0.0001);
+        lacquer_sheen += radiance * vec3<f32>(1.0, 0.78, 0.52)
+                         * pow(max(dot(normal, half_vec), 0.0), 12.0) * 0.08;
     }
+    lit_color += input.albedo * lantern_light + lacquer_sheen;
     let atmosphere = 1.0 - exp(-view_distance * shadow.render_params.z);
-    let fog = mix(vec3<f32>(0.23, 0.29, 0.41),
-                  vec3<f32>(0.58, 0.72, 0.95),
-                  clamp(shadow.sun_direction.y * 0.7 + 0.35, 0.0, 1.0));
-    var color = mix(input.albedo * light, fog, atmosphere);
+    let daylight = smoothstep(-0.12, 0.12, shadow.sun_direction.y);
+    let twilight = 1.0 - smoothstep(0.0, 0.28, abs(shadow.sun_direction.y));
+    let gaze = view_offset / max(view_distance, 0.0001);
+    let horizon_mist = pow(1.0 - abs(gaze.y), 3.0);
+    let toward_sun = pow(max(dot(gaze, to_sun), 0.0), 4.0);
+    let indigo_fog = mix(vec3<f32>(0.075, 0.095, 0.17),
+                         vec3<f32>(0.50, 0.59, 0.68), daylight);
+    let mist = twilight * horizon_mist;
+    let fog = mix(indigo_fog, vec3<f32>(0.28, 0.22, 0.25), mist * 0.25)
+              + vec3<f32>(0.18, 0.075, 0.04) * mist * toward_sun;
+    var color = mix(lit_color, fog, atmosphere);
     if (shadow.render_params.x >= 3.0) {
         // Screen-direction sun-shaft hint, without a volumetric buffer.
         let toward = view_offset / max(view_distance, 0.0001);
@@ -1050,17 +1111,22 @@ fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
     let mu = clamp(dot(view, sun), -1.0, 1.0);
     let horizon = pow(1.0 - abs(view.y), 3.0);
     let day = smoothstep(-0.12, 0.12, sun.y);
+    // Tasogare: ai-iro above, restrained akane by the horizon.
+    let twilight = 1.0 - smoothstep(0.0, 0.28, abs(sun.y));
     let night = vec3<f32>(0.006, 0.014, 0.034);
-    let zenith = mix(night, vec3<f32>(0.05, 0.22, 0.52), day);
-    let pale = mix(vec3<f32>(0.02, 0.035, 0.08),
-                   vec3<f32>(0.46, 0.63, 0.92), day);
+    let zenith = mix(mix(night, vec3<f32>(0.06, 0.20, 0.46), day),
+                     vec3<f32>(0.025, 0.040, 0.13), twilight * 0.85);
+    let pale = mix(mix(vec3<f32>(0.02, 0.035, 0.08),
+                       vec3<f32>(0.39, 0.55, 0.74), day),
+                   vec3<f32>(0.19, 0.18, 0.27), twilight * 0.72);
     var color = mix(zenith, pale, clamp(horizon * 0.85, 0.0, 1.0));
     if (shadow.render_params.x >= 2.0) {
         let rayleigh = (1.0 + mu * mu) * 0.75;
         let mie_g = 0.72;
         let denom = max(1.0 + mie_g * mie_g - 2.0 * mie_g * mu, 0.01);
         let mie = (1.0 - mie_g * mie_g) / pow(denom, 1.5);
-        color += vec3<f32>(0.025, 0.072, 0.15) * rayleigh * day;
+        color += vec3<f32>(0.025, 0.072, 0.15) * rayleigh * day
+                 * (1.0 - twilight * 0.65);
         color += vec3<f32>(0.10, 0.075, 0.045) * mie * day * 0.1;
         // Blocky voxel clouds drifting on the dome stay faithful to the
         // voxel world instead of adding a smooth billboard layer.
@@ -1072,15 +1138,17 @@ fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
             if (roll > 0.72) {
                 let fade = smoothstep(0.04, 0.18, view.y)
                     * (1.0 - smoothstep(0.45, 0.75, view.y));
-                let lit = mix(vec3<f32>(0.10, 0.12, 0.19),
-                              vec3<f32>(0.92, 0.94, 1.0), day);
+                let lit = mix(mix(vec3<f32>(0.10, 0.12, 0.19),
+                                  vec3<f32>(0.82, 0.82, 0.86), day),
+                              vec3<f32>(0.28, 0.24, 0.30), twilight * 0.7);
                 color = mix(color, lit, fade * 0.55);
             }
         }
     }
-    let twilight = 1.0 - smoothstep(0.0, 0.28, abs(sun.y));
-    let toward_sun = pow(max(mu, 0.0), 12.0);
-    color += vec3<f32>(0.66, 0.18, 0.045) * twilight * horizon * toward_sun;
+    let toward_sun = pow(max(mu, 0.0), 4.0);
+    // Asa-moya lends the twilight horizon a moist, low-contrast veil.
+    color = mix(color, vec3<f32>(0.24, 0.21, 0.23), twilight * horizon * 0.16);
+    color += vec3<f32>(0.42, 0.17, 0.10) * twilight * horizon * toward_sun;
     // A solar eclipse dims the whole dome with the occluded disc.
     color *= 1.0 - shadow.celestial_params.w * 0.55;
     // Crisp pixel stars: chunky direction cells, no smooth sparkle noise.
