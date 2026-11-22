@@ -3,6 +3,21 @@
 //! Create Contraption assembly, rigid motion, passenger carry, actor collision,
 //! grid-snapped disassembly, and name-based Save v2 snapshot codec backed by
 //! [`mod_offload::contraption::Contraption`].
+//!
+//! Hardened surface (Lane BEDROCK-CREATE-CONTRAPTION):
+//! - [`SuperGlueVolume`] connectivity: adjacent world blocks join a contraption
+//!   only when a [`SuperGlueBox`] welds their shared face or a chassis /
+//!   slime / honey / anchor-style radial rule grabs them, so unglued floor and
+//!   wall blocks are never ripped up.
+//! - Fail-closed immovable guard on [`IMMOVABLE_BLOCK_IDS`] during glued
+//!   assembly and on every breaking actor.
+//! - Bounded linear drivers (Mechanical Piston / Gantry / Rope Pulley) with
+//!   exact travel stops and optional bounce, plus Cart Assembler minecart
+//!   contraptions that yaw the whole rigid body to the rail heading.
+//! - [`ContraptionStorage`] onboard inventory and deterministic
+//!   [`step_actors`](LiveContraption::step_actors) effects for drills, saws,
+//!   harvesters, ploughs, deployers, and portable storage interfaces with
+//!   strict item conservation — drops overflow to the world, never vanish.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -14,6 +29,35 @@ use crate::factory::DimBlockPos;
 /// Maximum block count allowed in one assembled contraption (safety bound).
 pub const DEFAULT_MAX_CONTRAPTION_BLOCKS: usize = 2048;
 
+/// Vanilla block ids a contraption must never rip into itself, break with an
+/// actor, or silently overwrite on disassembly. The guard is fail closed:
+/// assembly errors, drills skip the cell, checked disassembly reports the
+/// conflict before any edit is committed.
+pub const IMMOVABLE_BLOCK_IDS: &[&str] = &[
+    "minecraft:bedrock",
+    "minecraft:obsidian",
+    "minecraft:crying_obsidian",
+    "minecraft:respawn_anchor",
+    "minecraft:reinforced_deepslate",
+    "minecraft:end_portal_frame",
+    "minecraft:command_block",
+];
+
+/// `true` when `name` is on the fail-closed [`IMMOVABLE_BLOCK_IDS`] list.
+pub fn is_immovable_block_id(name: &str) -> bool {
+    IMMOVABLE_BLOCK_IDS.contains(&name)
+}
+
+/// The six face-adjacent neighbour directions used by both flood fills.
+const NEIGHBOR_DIRS: [[i32; 3]; 6] = [
+    [1, 0, 0],
+    [-1, 0, 0],
+    [0, 1, 0],
+    [0, -1, 0],
+    [0, 0, 1],
+    [0, 0, -1],
+];
+
 /// Kind of Create contraption motion driver.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ContraptionKind {
@@ -21,21 +65,388 @@ pub enum ContraptionKind {
     Bearing { angular_deg_per_tick: f32 },
     /// Mechanical Piston or Gantry translating along a linear velocity vector.
     Linear { velocity_per_tick: [f64; 3] },
+    /// Mechanical Piston / Gantry / Rope Pulley with exact travel stops: the
+    /// per-axis offset from the assembly anchor is clamped into
+    /// `[min_offset, max_offset]`; with `reverse_at_bounds` the velocity on the
+    /// clamped axis flips sign (bounce), otherwise it stops cleanly at `0`.
+    BoundedLinear {
+        velocity_per_tick: [f64; 3],
+        min_offset: [f64; 3],
+        max_offset: [f64; 3],
+        reverse_at_bounds: bool,
+    },
+    /// Cart Assembler minecart contraption: translates `speed_per_tick` along
+    /// `heading_yaw` (degrees about +Y, same convention as the rigid pose —
+    /// `0` travels +X, `90` travels -Z) and yaws the body to that heading, so
+    /// curved-rail heading changes rotate every local cell and rider coherently.
+    Minecart {
+        speed_per_tick: f64,
+        heading_yaw: f64,
+    },
+}
+
+impl ContraptionKind {
+    /// Fail-closed driver validation: every rate and bound must be finite,
+    /// and bounded-linear travel needs `min_offset <= max_offset` per axis.
+    pub fn validate(self) -> Result<(), ContraptionError> {
+        match self {
+            Self::Bearing {
+                angular_deg_per_tick,
+            } => {
+                if !angular_deg_per_tick.is_finite() {
+                    return Err(ContraptionError::NonFiniteDriver);
+                }
+            }
+            Self::Linear { velocity_per_tick } => {
+                if !velocity_per_tick.iter().all(|v| v.is_finite()) {
+                    return Err(ContraptionError::NonFiniteDriver);
+                }
+            }
+            Self::BoundedLinear {
+                velocity_per_tick,
+                min_offset,
+                max_offset,
+                ..
+            } => {
+                if !velocity_per_tick.iter().all(|v| v.is_finite())
+                    || !min_offset.iter().all(|v| v.is_finite())
+                    || !max_offset.iter().all(|v| v.is_finite())
+                {
+                    return Err(ContraptionError::NonFiniteDriver);
+                }
+                if (0..3).any(|axis| min_offset[axis] > max_offset[axis]) {
+                    return Err(ContraptionError::InvalidDriverBounds);
+                }
+            }
+            Self::Minecart {
+                speed_per_tick,
+                heading_yaw,
+            } => {
+                if !speed_per_tick.is_finite() || !heading_yaw.is_finite() {
+                    return Err(ContraptionError::NonFiniteDriver);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContraptionError {
     EmptyAssembly,
-    TooLarge { count: usize, limit: usize },
+    TooLarge {
+        count: usize,
+        limit: usize,
+    },
     Cluster(ClusterError),
     InvalidPose,
     /// A world coordinate or local offset fell outside `i32` range.
     CoordinateOverflow,
+    /// A glued/sticky path reached a block on [`IMMOVABLE_BLOCK_IDS`]; the
+    /// assembly refuses instead of ripping bedrock-grade blocks out.
+    ImmovableBlock {
+        pos: [i32; 3],
+    },
+    /// A driver parameter was NaN or infinite; the contraption does not move.
+    NonFiniteDriver,
+    /// Bounded-linear travel had `min_offset > max_offset` on some axis.
+    InvalidDriverBounds,
     CorruptSnapshot(String),
 }
 
+/// Inclusive 3D Super Glue bounding box in world block coordinates. A glued
+/// face between two adjacent cells exists only while one box covers both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SuperGlueBox {
+    pub min: [i32; 3],
+    pub max: [i32; 3],
+}
+
+impl SuperGlueBox {
+    /// Normalize two opposite corners so `min <= max` holds on every axis.
+    pub fn new(a: [i32; 3], b: [i32; 3]) -> Self {
+        Self {
+            min: std::array::from_fn(|i| a[i].min(b[i])),
+            max: std::array::from_fn(|i| a[i].max(b[i])),
+        }
+    }
+
+    /// `true` when `pos` lies inside the glued volume (inclusive).
+    pub fn contains(&self, pos: [i32; 3]) -> bool {
+        (0..3).all(|i| self.min[i] <= pos[i] && pos[i] <= self.max[i])
+    }
+}
+
+/// The complete glued region applied to a contraption: a set of axis-aligned
+/// [`SuperGlueBox`] volumes. Two adjacent world blocks connect only when one
+/// box covers both cells — unglued neighbours are never joined.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SuperGlueVolume {
+    boxes: Vec<SuperGlueBox>,
+}
+
+impl SuperGlueVolume {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_boxes(boxes: Vec<SuperGlueBox>) -> Self {
+        Self { boxes }
+    }
+
+    pub fn add_box(&mut self, glue_box: SuperGlueBox) {
+        self.boxes.push(glue_box);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.boxes.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.boxes.len()
+    }
+
+    pub fn boxes(&self) -> &[SuperGlueBox] {
+        &self.boxes
+    }
+
+    /// `true` when any box covers `pos`.
+    pub fn contains(&self, pos: [i32; 3]) -> bool {
+        self.boxes.iter().any(|b| b.contains(pos))
+    }
+
+    /// `true` when one box covers both adjacent cells, welding their shared
+    /// face. A box touching only one side does not glue the seam.
+    pub fn bridges(&self, a: [i32; 3], b: [i32; 3]) -> bool {
+        self.boxes
+            .iter()
+            .any(|glue_box| glue_box.contains(a) && glue_box.contains(b))
+    }
+}
+
+/// Bounded multi-slot onboard inventory — chests, barrels and item vaults
+/// riding the contraption. `capacity_slots` bounds the number of DISTINCT item
+/// ids held at once; stacking into an already-held item is always accepted.
+/// Conservation is strict: `insert_item` returns the unaccepted remainder, so
+/// `accepted + remainder == requested`, and `extract_item` never removes more
+/// than is stored.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContraptionStorage {
+    capacity_slots: usize,
+    slots: BTreeMap<String, u64>,
+}
+
+impl ContraptionStorage {
+    pub fn new(capacity_slots: usize) -> Self {
+        Self {
+            capacity_slots,
+            slots: BTreeMap::new(),
+        }
+    }
+
+    pub fn capacity_slots(&self) -> usize {
+        self.capacity_slots
+    }
+
+    /// Distinct item ids currently held.
+    pub fn used_slots(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Sorted `(item_id, count)` view — deterministic for snapshots.
+    pub fn slots(&self) -> impl Iterator<Item = (&str, u64)> + '_ {
+        self.slots.iter().map(|(id, &count)| (id.as_str(), count))
+    }
+
+    /// Total stored count of `item_id` (saturates at `u32::MAX`).
+    pub fn total_count_of(&self, item_id: &str) -> u32 {
+        self.slots
+            .get(item_id)
+            .map(|&count| u32::try_from(count).unwrap_or(u32::MAX))
+            .unwrap_or(0)
+    }
+
+    /// Total stored items across all slots.
+    pub fn total_items(&self) -> u64 {
+        self.slots.values().sum()
+    }
+
+    /// Insert up to `count` of `item_id`; returns the remainder that did not
+    /// fit (a new item needs a free slot; an existing stack always accepts).
+    pub fn insert_item(&mut self, item_id: &str, count: u32) -> u32 {
+        if count == 0 {
+            return 0;
+        }
+        if let Some(held) = self.slots.get_mut(item_id) {
+            let next = held.saturating_add(u64::from(count));
+            let accepted = next - *held;
+            *held = next;
+            return count - u32::try_from(accepted).unwrap_or(u32::MAX);
+        }
+        if self.slots.len() >= self.capacity_slots {
+            return count;
+        }
+        self.slots.insert(item_id.to_string(), u64::from(count));
+        0
+    }
+
+    /// Extract up to `count` of `item_id`; returns the amount actually
+    /// removed (never more than stored). Emptied slots are freed.
+    pub fn extract_item(&mut self, item_id: &str, count: u32) -> u32 {
+        let Some(held) = self.slots.get_mut(item_id) else {
+            return 0;
+        };
+        let taken = (*held).min(u64::from(count));
+        *held -= taken;
+        if *held == 0 {
+            self.slots.remove(item_id);
+        }
+        u32::try_from(taken).unwrap_or(u32::MAX)
+    }
+
+    /// Extract up to `count` of ANY held item for unfiltered deployers —
+    /// deterministic: the lexicographically smallest item id goes first.
+    pub fn extract_any(&mut self, count: u32) -> Option<(String, u32)> {
+        let item = self.slots.keys().next()?.clone();
+        Some((item.clone(), self.extract_item(&item, count)))
+    }
+}
+
+/// Kind of onboard machine acting on the world cell it faces.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContraptionActorKind {
+    /// Breaks soft/minable blocks in its swept cell, depositing the block as
+    /// an item into [`ContraptionStorage`]; refuses [`IMMOVABLE_BLOCK_IDS`].
+    MechanicalDrill,
+    /// Breaks blocks like the drill (logs, leaves, foliage).
+    MechanicalSaw,
+    /// Harvests mature crops: the crop resets to age 0 and stays planted —
+    /// the soil is never broken.
+    MechanicalHarvester,
+    /// Breaks blocks like the drill (tillage/harvest line).
+    MechanicalPlough,
+    /// Places a block into an empty swept cell, consuming exactly one
+    /// matching item from [`ContraptionStorage`] — and ONLY when placement
+    /// can succeed. `filter_item: None` deploys the first resolvable held
+    /// item (deterministic smallest id).
+    MechanicalDeployer { filter_item: Option<String> },
+    /// Docked storage handoff marker; performs no world edit by itself.
+    PortableStorageInterface,
+}
+
+/// Onboard machine mounted on a local contraption cell, sweeping the world
+/// cell at `local + facing` (local space) once per actor tick.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContraptionActor {
+    /// Local cell the actor block occupies.
+    pub local: [i32; 3],
+    /// Local-space direction of the swept cell, e.g. `[1, 0, 0]` = +X.
+    pub facing: [i32; 3],
+    pub kind: ContraptionActorKind,
+}
+
+/// Crop state inside an [`ActorCell`]: harvested when `age >= max_age`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CropCell {
+    pub age: u8,
+    pub max_age: u8,
+    /// Item deposited (or world-dropped on overflow) on mature harvest.
+    pub drop_item: String,
+    pub drop_count: u32,
+}
+
+/// A world cell as seen by a contraption actor during
+/// [`LiveContraption::step_actors`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActorCell {
+    /// Canonical block id, e.g. `"minecraft:stone"`; `""` means air/empty.
+    pub name: String,
+    /// Whether the world permits breaking this block. The adapter refuses
+    /// [`IMMOVABLE_BLOCK_IDS`] regardless of this flag.
+    pub breakable: bool,
+    /// Crop state when the cell is a planted crop.
+    pub crop: Option<CropCell>,
+}
+
+impl ActorCell {
+    pub fn air() -> Self {
+        Self {
+            name: String::new(),
+            breakable: false,
+            crop: None,
+        }
+    }
+
+    pub fn block(name: impl Into<String>, breakable: bool) -> Self {
+        Self {
+            name: name.into(),
+            breakable,
+            crop: None,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.name.is_empty()
+    }
+
+    pub fn is_immovable(&self) -> bool {
+        is_immovable_block_id(&self.name)
+    }
+}
+
+/// Read-only world surface for one actor tick. Implemented by the server's
+/// chunk view (or a test stub); actor effects are returned as an
+/// [`ActorTickReport`] and committed by the caller — the world is never
+/// mutated through this trait.
+pub trait ContraptionWorldQuery {
+    /// The block occupying world `pos`; empty cells return [`ActorCell::air`].
+    fn cell_at(&self, pos: [i32; 3]) -> ActorCell;
+
+    /// World state id a deployer places for `item_id`, or `None` when the
+    /// item cannot be placed as a block.
+    fn place_state_for(&self, _item_id: &str) -> Option<u32> {
+        None
+    }
+}
+
+/// A world edit requested by one actor tick; the caller commits these through
+/// the same CAS path as [`WorldBlockEdit`] after checking occupancy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActorWorldEdit {
+    /// Break the block at `pos` (drill / saw / plough).
+    BreakBlock { pos: DimBlockPos },
+    /// Harvester reset: the crop stays planted, its age returns to 0.
+    ResetCrop { pos: DimBlockPos },
+    /// Deployer placed `state_id`, consuming `item_id` from onboard storage.
+    PlaceBlock {
+        pos: DimBlockPos,
+        state_id: u32,
+        item_id: String,
+    },
+}
+
+/// An item ejected into the world because onboard storage had no room —
+/// overflow is NEVER silently deleted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorldItemDrop {
+    pub pos: DimBlockPos,
+    pub item_id: String,
+    pub count: u32,
+}
+
+/// Deterministic result of one [`LiveContraption::step_actors`] tick.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ActorTickReport {
+    pub edits: Vec<ActorWorldEdit>,
+    pub drops: Vec<WorldItemDrop>,
+}
+
 /// Active assembled contraption with rigid pose, previous pose for passenger
-/// carry delta, and sparse local block cluster.
+/// carry delta, sparse local block cluster, onboard storage and actors.
 pub struct LiveContraption {
     pub id: u32,
     pub dim: i32,
@@ -44,6 +455,10 @@ pub struct LiveContraption {
     pub yaw_deg: f32,
     pub pitch_deg: f32,
     pub translation: [f64; 3],
+    /// Onboard inventory (capacity 0 until the caller attaches storage).
+    pub storage: ContraptionStorage,
+    /// Mounted actors in deterministic tick order.
+    pub actors: Vec<ContraptionActor>,
     previous_pose: Pose,
     inner: Contraption,
 }
@@ -70,6 +485,10 @@ pub struct ContraptionSnapshot {
     pub translation: [f64; 3],
     /// Local `(x, y, z)` -> canonical blockstate string (or `"vanilla:<id>"`).
     pub cells: Vec<([i32; 3], String)>,
+    /// Onboard storage contents; empty for a bare contraption.
+    pub storage: ContraptionStorage,
+    /// Mounted actors; empty for a bare contraption.
+    pub actors: Vec<ContraptionActor>,
 }
 
 impl LiveContraption {
@@ -86,6 +505,7 @@ impl LiveContraption {
         kind: ContraptionKind,
         max_blocks: usize,
     ) -> Result<(Self, Vec<WorldBlockEdit>), ContraptionError> {
+        kind.validate()?;
         if !attached_blocks.contains_key(&seed) {
             return Err(ContraptionError::EmptyAssembly);
         }
@@ -95,38 +515,18 @@ impl LiveContraption {
         visited.insert(seed);
         queue.push_back(seed);
 
-        let mut local_cells = Vec::new();
-        let mut world_removals = Vec::new();
+        let mut gathered = Vec::new();
 
         while let Some(pos) = queue.pop_front() {
-            if local_cells.len() >= max_blocks {
+            if gathered.len() >= max_blocks {
                 return Err(ContraptionError::TooLarge {
-                    count: local_cells.len() + 1,
+                    count: gathered.len() + 1,
                     limit: max_blocks,
                 });
             }
-            let state_id = attached_blocks[&pos];
-            let mut local = [0_i32; 3];
-            for axis in 0..3 {
-                local[axis] = pos[axis]
-                    .checked_sub(anchor[axis])
-                    .ok_or(ContraptionError::CoordinateOverflow)?;
-            }
-            local_cells.push((local, state_id));
-            world_removals.push(WorldBlockEdit {
-                pos: DimBlockPos::new(dim, pos[0], pos[1], pos[2]),
-                state_id: None,
-            });
+            gathered.push((pos, attached_blocks[&pos]));
 
-            const DIRS: [[i32; 3]; 6] = [
-                [1, 0, 0],
-                [-1, 0, 0],
-                [0, 1, 0],
-                [0, -1, 0],
-                [0, 0, 1],
-                [0, 0, -1],
-            ];
-            for d in DIRS {
+            for d in NEIGHBOR_DIRS {
                 // A neighbour past the i32 edge cannot be a map key; skip it
                 // instead of panicking on `pos + d` overflow.
                 let (Some(nx), Some(ny), Some(nz)) = (
@@ -143,6 +543,109 @@ impl LiveContraption {
             }
         }
 
+        Self::finish_assembly(id, dim, anchor, gathered, kind)
+    }
+
+    /// Assemble by flood-fill from `seed` over every candidate in
+    /// `world_blocks`, gated by real connectivity: two adjacent cells join
+    /// only when `glue` welds their shared face or either side is a
+    /// chassis/slime/honey/anchor-style radial grabber
+    /// (`is_radial_sticky(state)`). Unglued plain neighbours — floor, walls —
+    /// are never pulled in. Any reached cell on [`IMMOVABLE_BLOCK_IDS`]
+    /// (per `is_immovable`) fails the whole assembly closed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn assemble_with_glue(
+        id: u32,
+        dim: i32,
+        anchor: [i32; 3],
+        seed: [i32; 3],
+        world_blocks: &BTreeMap<[i32; 3], u32>,
+        glue: &SuperGlueVolume,
+        is_radial_sticky: impl Fn(u32) -> bool,
+        is_immovable: impl Fn(u32) -> bool,
+        kind: ContraptionKind,
+        max_blocks: usize,
+    ) -> Result<(Self, Vec<WorldBlockEdit>), ContraptionError> {
+        kind.validate()?;
+        if !world_blocks.contains_key(&seed) {
+            return Err(ContraptionError::EmptyAssembly);
+        }
+
+        let mut visited = BTreeSet::new();
+        let mut queue = VecDeque::new();
+        visited.insert(seed);
+        queue.push_back(seed);
+
+        let mut gathered = Vec::new();
+
+        while let Some(pos) = queue.pop_front() {
+            if gathered.len() >= max_blocks {
+                return Err(ContraptionError::TooLarge {
+                    count: gathered.len() + 1,
+                    limit: max_blocks,
+                });
+            }
+            let state_id = world_blocks[&pos];
+            if is_immovable(state_id) {
+                return Err(ContraptionError::ImmovableBlock { pos });
+            }
+            gathered.push((pos, state_id));
+
+            for d in NEIGHBOR_DIRS {
+                let (Some(nx), Some(ny), Some(nz)) = (
+                    pos[0].checked_add(d[0]),
+                    pos[1].checked_add(d[1]),
+                    pos[2].checked_add(d[2]),
+                ) else {
+                    continue;
+                };
+                let n = [nx, ny, nz];
+                if visited.contains(&n) {
+                    continue;
+                }
+                let Some(&n_state) = world_blocks.get(&n) else {
+                    continue;
+                };
+                // Join only through a glue weld or a radial grabber on either
+                // side of the seam — never through plain adjacency.
+                if !(glue.bridges(pos, n)
+                    || is_radial_sticky(state_id)
+                    || is_radial_sticky(n_state))
+                {
+                    continue;
+                }
+                visited.insert(n);
+                queue.push_back(n);
+            }
+        }
+
+        Self::finish_assembly(id, dim, anchor, gathered, kind)
+    }
+
+    /// Shared tail for both assembly paths: world positions -> local cells,
+    /// cluster, removal edits and identity pose at `anchor`.
+    fn finish_assembly(
+        id: u32,
+        dim: i32,
+        anchor: [i32; 3],
+        gathered: Vec<([i32; 3], u32)>,
+        kind: ContraptionKind,
+    ) -> Result<(Self, Vec<WorldBlockEdit>), ContraptionError> {
+        let mut local_cells = Vec::with_capacity(gathered.len());
+        let mut world_removals = Vec::with_capacity(gathered.len());
+        for (pos, state_id) in gathered {
+            let mut local = [0_i32; 3];
+            for axis in 0..3 {
+                local[axis] = pos[axis]
+                    .checked_sub(anchor[axis])
+                    .ok_or(ContraptionError::CoordinateOverflow)?;
+            }
+            local_cells.push((local, state_id));
+            world_removals.push(WorldBlockEdit {
+                pos: DimBlockPos::new(dim, pos[0], pos[1], pos[2]),
+                state_id: None,
+            });
+        }
         let cluster = BlockCluster::new(local_cells).map_err(ContraptionError::Cluster)?;
         let translation = [
             f64::from(anchor[0]),
@@ -161,6 +664,8 @@ impl LiveContraption {
                 yaw_deg: 0.0,
                 pitch_deg: 0.0,
                 translation,
+                storage: ContraptionStorage::new(0),
+                actors: Vec::new(),
                 previous_pose: pose,
                 inner,
             },
@@ -183,17 +688,61 @@ impl LiveContraption {
     /// Advance the contraption by one game tick according to its motion driver.
     /// Returns `true` if the rigid pose changed.
     pub fn step_tick(&mut self) -> Result<bool, ContraptionError> {
+        // Validate before touching `previous_pose`: a corrupt driver leaves
+        // the contraption exactly where it was (fail closed).
+        self.kind.validate()?;
         self.previous_pose = self.inner.pose();
-        match self.kind {
+        match &mut self.kind {
             ContraptionKind::Bearing {
                 angular_deg_per_tick,
             } => {
-                self.yaw_deg = (self.yaw_deg + angular_deg_per_tick).rem_euclid(360.0);
+                self.yaw_deg = (self.yaw_deg + *angular_deg_per_tick).rem_euclid(360.0);
             }
             ContraptionKind::Linear { velocity_per_tick } => {
-                for (dst, vel) in self.translation.iter_mut().zip(velocity_per_tick) {
-                    *dst += vel;
+                for (dst, vel) in self.translation.iter_mut().zip(velocity_per_tick.iter()) {
+                    *dst += *vel;
                 }
+            }
+            ContraptionKind::BoundedLinear {
+                velocity_per_tick,
+                min_offset,
+                max_offset,
+                reverse_at_bounds,
+            } => {
+                let bounce = *reverse_at_bounds;
+                for axis in 0..3 {
+                    let origin = f64::from(self.anchor[axis]);
+                    let next = self.translation[axis] - origin + velocity_per_tick[axis];
+                    if next > max_offset[axis] {
+                        self.translation[axis] = origin + max_offset[axis];
+                        velocity_per_tick[axis] = if bounce {
+                            -velocity_per_tick[axis]
+                        } else {
+                            0.0
+                        };
+                    } else if next < min_offset[axis] {
+                        self.translation[axis] = origin + min_offset[axis];
+                        velocity_per_tick[axis] = if bounce {
+                            -velocity_per_tick[axis]
+                        } else {
+                            0.0
+                        };
+                    } else {
+                        self.translation[axis] = origin + next;
+                    }
+                }
+            }
+            ContraptionKind::Minecart {
+                speed_per_tick,
+                heading_yaw,
+            } => {
+                self.yaw_deg = heading_yaw.rem_euclid(360.0) as f32;
+                let (sin, cos) = heading_yaw.to_radians().sin_cos();
+                // Quarter-turn headings leave ~6e-17 trig residue; snapping it
+                // keeps rail turns at exactly zero drift.
+                let snap = |v: f64| if v.abs() < 1.0e-15 { 0.0 } else { v };
+                self.translation[0] += *speed_per_tick * snap(cos);
+                self.translation[2] += *speed_per_tick * -snap(sin);
             }
         }
         let next = Pose::from_yaw_pitch(self.translation, self.yaw_deg, self.pitch_deg)
@@ -252,6 +801,127 @@ impl LiveContraption {
             .collect()
     }
 
+    /// Checked variant of [`disassemble_to_world`](Self::disassemble_to_world):
+    /// queries `is_occupied` for every target cell and fails closed with the
+    /// exact conflicting cells — e.g. regenerated bedrock — instead of
+    /// overwriting them. `Ok(edits)` is identical to the unchecked result.
+    pub fn disassemble_to_world_checked(
+        &self,
+        is_occupied: impl Fn(DimBlockPos) -> bool,
+    ) -> Result<Vec<WorldBlockEdit>, Vec<DimBlockPos>> {
+        let edits = self.disassemble_to_world();
+        let conflicts: Vec<DimBlockPos> = edits
+            .iter()
+            .filter(|edit| is_occupied(edit.pos))
+            .map(|edit| edit.pos)
+            .collect();
+        if conflicts.is_empty() {
+            Ok(edits)
+        } else {
+            Err(conflicts)
+        }
+    }
+
+    /// Deterministic onboard-actor tick: every mounted actor acts on its
+    /// swept world cell in mount order. Effects are reported, not applied —
+    /// the caller commits them. Conservation is strict: mined/harvested items
+    /// go to [`ContraptionStorage`], overflow becomes a [`WorldItemDrop`], and
+    /// a deployer consumes an item only when placement can succeed.
+    pub fn step_actors(&mut self, world_query: &dyn ContraptionWorldQuery) -> ActorTickReport {
+        let mut report = ActorTickReport::default();
+        let Self {
+            inner,
+            dim,
+            storage,
+            actors,
+            ..
+        } = self;
+        let dim = *dim;
+        for actor in actors.iter() {
+            let cell_pos = actor_target_cell(inner, actor);
+            let pos = DimBlockPos::new(dim, cell_pos[0], cell_pos[1], cell_pos[2]);
+            match &actor.kind {
+                ContraptionActorKind::MechanicalDrill
+                | ContraptionActorKind::MechanicalSaw
+                | ContraptionActorKind::MechanicalPlough => {
+                    let cell = world_query.cell_at(cell_pos);
+                    if cell.is_empty() || cell.is_immovable() || !cell.breakable {
+                        continue;
+                    }
+                    report.edits.push(ActorWorldEdit::BreakBlock { pos });
+                    let remainder = storage.insert_item(&cell.name, 1);
+                    if remainder > 0 {
+                        report.drops.push(WorldItemDrop {
+                            pos,
+                            item_id: cell.name,
+                            count: remainder,
+                        });
+                    }
+                }
+                ContraptionActorKind::MechanicalHarvester => {
+                    let cell = world_query.cell_at(cell_pos);
+                    if cell.is_immovable() {
+                        continue;
+                    }
+                    if let Some(crop) = &cell.crop {
+                        if crop.age >= crop.max_age {
+                            // Reset to age 0; the plant and soil stay in place.
+                            report.edits.push(ActorWorldEdit::ResetCrop { pos });
+                            let remainder = storage.insert_item(&crop.drop_item, crop.drop_count);
+                            if remainder > 0 {
+                                report.drops.push(WorldItemDrop {
+                                    pos,
+                                    item_id: crop.drop_item.clone(),
+                                    count: remainder,
+                                });
+                            }
+                        }
+                    }
+                }
+                ContraptionActorKind::MechanicalDeployer { filter_item } => {
+                    let cell = world_query.cell_at(cell_pos);
+                    if !cell.is_empty() {
+                        continue;
+                    }
+                    match filter_item {
+                        Some(item) => {
+                            let Some(state_id) = world_query.place_state_for(item) else {
+                                continue;
+                            };
+                            // Consume ONLY on successful placement — zero loss.
+                            if storage.extract_item(item, 1) == 1 {
+                                report.edits.push(ActorWorldEdit::PlaceBlock {
+                                    pos,
+                                    state_id,
+                                    item_id: item.clone(),
+                                });
+                            }
+                        }
+                        None => {
+                            let candidates: Vec<String> =
+                                storage.slots().map(|(id, _)| id.to_string()).collect();
+                            for item in candidates {
+                                let Some(state_id) = world_query.place_state_for(&item) else {
+                                    continue;
+                                };
+                                if storage.extract_item(&item, 1) == 1 {
+                                    report.edits.push(ActorWorldEdit::PlaceBlock {
+                                        pos,
+                                        state_id,
+                                        item_id: item,
+                                    });
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                ContraptionActorKind::PortableStorageInterface => {}
+            }
+        }
+        report
+    }
+
     /// Capture a Save v2 name-based snapshot using `registry` for Create states
     /// and `"vanilla:<id>"` for vanilla states.
     pub fn snapshot(&self, registry: &CreateBlockRegistry) -> ContraptionSnapshot {
@@ -276,6 +946,8 @@ impl LiveContraption {
             pitch_deg: self.pitch_deg,
             translation: self.translation,
             cells,
+            storage: self.storage.clone(),
+            actors: self.actors.clone(),
         }
     }
 
@@ -285,6 +957,7 @@ impl LiveContraption {
         snapshot: &ContraptionSnapshot,
         registry: &CreateBlockRegistry,
     ) -> Result<Self, ContraptionError> {
+        snapshot.kind.validate()?;
         let mut local_cells = Vec::with_capacity(snapshot.cells.len());
         for (local, name) in &snapshot.cells {
             let state_id = if let Some(raw) = name.strip_prefix("vanilla:") {
@@ -309,10 +982,31 @@ impl LiveContraption {
             yaw_deg: snapshot.yaw_deg,
             pitch_deg: snapshot.pitch_deg,
             translation: snapshot.translation,
+            storage: snapshot.storage.clone(),
+            actors: snapshot.actors.clone(),
             previous_pose: pose,
             inner,
         })
     }
+}
+
+/// The world cell swept by `actor` this tick: `local + facing` rotated by the
+/// rigid pose and snapped to the integer grid.
+fn actor_target_cell(inner: &Contraption, actor: &ContraptionActor) -> [i32; 3] {
+    let pose = inner.pose();
+    let rot = pose.rotation();
+    let t = pose.translation();
+    let center = [
+        f64::from(actor.local[0].saturating_add(actor.facing[0])) + 0.5,
+        f64::from(actor.local[1].saturating_add(actor.facing[1])) + 0.5,
+        f64::from(actor.local[2].saturating_add(actor.facing[2])) + 0.5,
+    ];
+    // +epsilon absorbs the ~1e-16 residue exact quarter-turns leave in
+    // sin/cos so the snapped cell never flips on a boundary.
+    std::array::from_fn(|i| {
+        (rot[i][0] * center[0] + rot[i][1] * center[1] + rot[i][2] * center[2] + t[i] + 1.0e-9)
+            .floor() as i32
+    })
 }
 
 #[cfg(test)]
