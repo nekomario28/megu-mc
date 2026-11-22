@@ -9542,7 +9542,8 @@ fn set_block_if_inner_dim(
     // Only Overworld reaches this point (the early return above handles the other
     // dimensions), but pass `dim` so the patched store slot keeps its dimension key.
     store_patch(dim, x, y, z, st);
-    bump_world_epoch_dim(dim, x, z);
+    let blocking_changed = breg().map_or(true, |r| (r.opacity_of(old) > 0) != (r.opacity_of(st) > 0));
+    bump_world_epoch_dim_opts(dim, x, z, blocking_changed);
     note_light_edit(dim, Position::new(x, y, z), old, st);
     let native_fluid_controlled = generated_fluid_changed((x, y, z), old, st);
     if st != old {
@@ -9755,7 +9756,8 @@ fn set_block_if_dim_edit(
     // Overworld slot at the same `(cx, cz)`.
     band_patch_dim(dim, x, y, z, st);
     store_patch(dim, x, y, z, st);
-    bump_world_epoch_dim(dim, x, z);
+    let blocking_changed = breg().map_or(true, |r| (r.opacity_of(old) > 0) != (r.opacity_of(st) > 0));
+    bump_world_epoch_dim_opts(dim, x, z, blocking_changed);
     note_light_edit(dim, Position::new(x, y, z), old, st);
     if old != st {
         // The Overworld path does this in `set_block_if_inner_dim`: a mined neighbour
@@ -13422,14 +13424,28 @@ fn sky_floors_cache() -> &'static Mutex<SkyFloorsCache> {
 /// light pass would rebuild the whole 3x3 (14 ms each). A write only changes its own
 /// chunk's cells, and each cache entry describes one chunk, so the version is per chunk.
 static CHUNK_VERSIONS: OnceLock<LockedMap<DimChunkKey, u64>> = OnceLock::new();
+static CHUNK_OPACITY_VERSIONS: OnceLock<LockedMap<DimChunkKey, u64>> = OnceLock::new();
 static CHUNK_VERSION_SEQ: AtomicU64 = AtomicU64::new(1);
 
 fn chunk_versions() -> &'static LockedMap<DimChunkKey, u64> {
     CHUNK_VERSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn chunk_opacity_versions() -> &'static LockedMap<DimChunkKey, u64> {
+    CHUNK_OPACITY_VERSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn chunk_version_dim(dim: DimId, cx: i32, cz: i32) -> u64 {
     chunk_versions()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(dim, cx, cz))
+        .copied()
+        .unwrap_or(0)
+}
+
+fn chunk_opacity_version_dim(dim: DimId, cx: i32, cz: i32) -> u64 {
+    chunk_opacity_versions()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&(dim, cx, cz))
@@ -13443,17 +13459,75 @@ fn bump_world_epoch(x: i32, z: i32) {
 }
 
 fn bump_world_epoch_dim(dim: DimId, x: i32, z: i32) {
+    bump_world_epoch_dim_opts(dim, x, z, true);
+}
+
+fn bump_world_epoch_dim_opts(dim: DimId, x: i32, z: i32, blocking_changed: bool) {
     let seq = CHUNK_VERSION_SEQ.fetch_add(1, Ordering::Relaxed);
     chunk_versions()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert((dim, x >> 4, z >> 4), seq);
+    if blocking_changed {
+        chunk_opacity_versions()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((dim, x >> 4, z >> 4), seq);
+    }
     // Retire cached `lod_v1` frames for the written chunk promptly; the epoch
     // check alone would only catch them on the next lookup.
     invalidate_lod_v1_chunk(dim, x >> 4, z >> 4);
     if chunkprof::enabled() {
         chunkprof::EPOCH_BUMPS.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+#[derive(Default)]
+struct BiomeColumnCache {
+    map: HashMap<DimChunkKey, std::sync::Arc<Vec<[i64; 64]>>>,
+    order: std::collections::VecDeque<DimChunkKey>,
+    generation: u64,
+}
+
+static BIOME_COLUMN_CACHE: OnceLock<Mutex<BiomeColumnCache>> = OnceLock::new();
+
+fn cached_chunk_biomes(dim: DimId, cx: i32, cz: i32, sections: usize, min_y: i32) -> std::sync::Arc<Vec<[i64; 64]>> {
+    let seq = current_gen_seq();
+    let cache = BIOME_COLUMN_CACHE.get_or_init(|| Mutex::new(BiomeColumnCache::default()));
+    {
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.generation != seq {
+            guard.map.clear();
+            guard.order.clear();
+            guard.generation = seq;
+        }
+        if let Some(hit) = guard.map.get(&(dim, cx, cz)) {
+            if hit.len() == sections {
+                return std::sync::Arc::clone(hit);
+            }
+        }
+    }
+    let mut cols = Vec::with_capacity(sections);
+    for sec in 0..sections {
+        let sy = sec as i32 * 16 + min_y;
+        let b = worldgen::biome_section_dim(dim, cx, sy, cz)
+            .map(|boxed| *boxed)
+            .unwrap_or([39i64; 64]);
+        cols.push(b);
+    }
+    let arc = std::sync::Arc::new(cols);
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.generation == seq {
+        if guard.map.insert((dim, cx, cz), std::sync::Arc::clone(&arc)).is_none() {
+            guard.order.push_back((dim, cx, cz));
+            while guard.order.len() > MAP_CHUNK_CACHE_CAP {
+                if let Some(old) = guard.order.pop_front() {
+                    guard.map.remove(&old);
+                }
+            }
+        }
+    }
+    arc
 }
 
 /// The cell sources a `sky_floors_dim` scan needs for one chunk, snapshotted once so
@@ -13567,7 +13641,7 @@ fn sky_floors_dim(
     opacity: &impl Fn(i32, i32, i32) -> u8,
 ) -> [i32; 256] {
     let __t = chunkprof::enabled().then(std::time::Instant::now);
-    let epoch = chunk_version_dim(dim, cx, cz);
+    let epoch = chunk_opacity_version_dim(dim, cx, cz);
     if let Some(floors) = sky_floors_cache().lock().unwrap_or_else(|e| e.into_inner()).get((dim, cx, cz), epoch) {
         if let Some(t) = __t {
             chunkprof::add(&chunkprof::FLOORS, t);
@@ -13939,14 +14013,14 @@ fn chunk_data_lane(
     // copy nor a repack.
     let mut carried_next: Option<std::sync::Arc<PalettedSection>> = None;
     let mut prev_base: Option<std::sync::Arc<PalettedSection>> = None;
+    let __tb_all = chunkprof::enabled().then(std::time::Instant::now);
+    let cached_biomes = cached_chunk_biomes(dim, cx, cz, sections as usize, min_y);
+    if let Some(t) = __tb_all {
+        chunkprof::add(&chunkprof::BIOMES, t);
+    }
     for sec in 0..sections {
         let sy = sec * 16 + min_y;
-        let __tb = chunkprof::enabled().then(std::time::Instant::now);
-        let biomes = worldgen::biome_section_dim(dim, cx, sy, cz)
-            .unwrap_or_else(|| Box::new([39i64; 64])); // plains
-        if let Some(t) = __tb {
-            chunkprof::add(&chunkprof::BIOMES, t);
-        }
+        let biomes = &cached_biomes[sec as usize];
         // Occluded lane: this section's whole column band is below the ceiling, so
         // it reaches the wire as one solid host-rock palette. No terrain pass, no
         // exposure reads, and no generated emitters — recording one would let cave
