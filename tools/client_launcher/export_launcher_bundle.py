@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export a Prism instance and/or a deterministic Minecraft 1.21.1 .mrpack."""
+"""Export a Prism instance and/or a deterministic Minecraft .mrpack."""
 
 import argparse
 import ctypes
@@ -18,6 +18,12 @@ from build_integrated_mod import build_jar as build_integrated_jar
 HERE = Path(__file__).resolve().parent
 ZIP_TIME = (1980, 1, 1, 0, 0, 0)
 MINECRAFT = "1.21.1"
+MC_VERSIONS = ("1.21.1", "26.3")
+BOOTSTRAP_UID = "net.mcspine.bootstrapper"
+BOOTSTRAP_LIBRARY = "net.mcspine:bootstrapper:1.0.0"
+BOOTSTRAP_JAR = Path("net/mcspine/bootstrapper/1.0.0/bootstrapper-1.0.0.jar")
+BOOTSTRAP_PATCH = "net.mcspine.bootstrapper.json"
+MAX_BOOTSTRAP_JAR = 32 * 1024
 MESH_ABI = 1
 KERNEL_ABI = 1
 LOADER_UID = {"fabric": "net.fabricmc.fabric-loader", "neoforge": "net.neoforged"}
@@ -78,38 +84,76 @@ def json_text(value):
     return json.dumps(value, indent=2, ensure_ascii=False) + "\n"
 
 
-def component_list(loader, loader_version):
-    components = [{"uid": "net.minecraft", "version": MINECRAFT, "important": True}]
+def component_list(loader, loader_version, mc_version=MINECRAFT):
+    components = [{"uid": "net.minecraft", "version": mc_version, "important": True}]
     if loader:
         components.append({"uid": LOADER_UID[loader], "version": loader_version})
     return components
 
 
-def prism_export(directory, loader, loader_version, name, client_bin, client_sha256,
-                 integrated_jar, native_libs):
-    directory.mkdir(parents=True, exist_ok=True)
-    # Prism's wrapper command needs a fully resolved executable. Double quotes
-    # preserve paths containing spaces in Prism's command-line splitter.
-    wrapper = directory / "mc-spine-wrapper"
-    shutil.copyfile(HERE / "mc-spine-wrapper", wrapper)
-    wrapper.chmod(0o755)
-    wrapper_command = f'"{wrapper.resolve()}"'
-    if client_bin:
-        target = directory / "bin/mc-spine-client"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(client_bin, target)
-        target.chmod(0o755)
-        wrapper_command += f" --client-sha256 {client_sha256 or sha(target, 'sha256')}"
-    elif client_sha256:
-        wrapper_command += f" --client-sha256 {client_sha256.lower()}"
-
-    write_text(directory / "mmc-pack.json", json_text({
+def bootstrap_patch(mc_version, client_sha256):
+    """Prism custom patch: the bootstrapper jar becomes the game mainClass."""
+    patch = {
         "formatVersion": 1,
-        "components": component_list(loader, loader_version),
-    }))
-    write_text(directory / "instance.cfg",
-               "[General]\nInstanceType=OneSix\n"
-               f"name={name}\nOverrideCommands=true\nWrapperCommand={wrapper_command}\n")
+        "uid": BOOTSTRAP_UID,
+        "version": "1.0.0",
+        "name": "mc-spine bootstrapper",
+        "mainClass": "net.mcspine.launcher.Main",
+        "inheritsFrom": mc_version,
+        "libraries": [{"name": BOOTSTRAP_LIBRARY, "MMC-hint": "local"}],
+    }
+    if client_sha256:
+        patch["+jvmArgs"] = [f"-Dmc.spine.clientSha256={client_sha256.lower()}"]
+    return patch
+
+
+def prism_export(directory, loader, loader_version, name, client_bin, client_sha256,
+                 integrated_jar, native_libs, mc_version=MINECRAFT, bootstrap_jar=None):
+    directory.mkdir(parents=True, exist_ok=True)
+    if bootstrap_jar is not None:
+        # Zero-shell-wrapper mode: Prism applies patches/*.json itself, so the
+        # bootstrapper JAR is the mainClass on Windows, macOS and Linux alike.
+        library = directory / "libraries" / BOOTSTRAP_JAR
+        library.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(bootstrap_jar, library)
+        patch = directory / "patches" / BOOTSTRAP_PATCH
+        write_text(patch, json_text(bootstrap_patch(mc_version, client_sha256)))
+        if client_bin:
+            exe = ".exe" if client_bin.name.lower().endswith(".exe") else ""
+            target = directory / f".minecraft/bin/mc-spine-client{exe}"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(client_bin, target)
+            target.chmod(0o755)
+        write_text(directory / "mmc-pack.json", json_text({
+            "formatVersion": 1,
+            "components": component_list(loader, loader_version, mc_version),
+        }))
+        write_text(directory / "instance.cfg",
+                   "[General]\nInstanceType=OneSix\n"
+                   f"name={name}\nOverrideCommands=false\n")
+    else:
+        # Prism's wrapper command needs a fully resolved executable. Double quotes
+        # preserve paths containing spaces in Prism's command-line splitter.
+        wrapper = directory / "mc-spine-wrapper"
+        shutil.copyfile(HERE / "mc-spine-wrapper", wrapper)
+        wrapper.chmod(0o755)
+        wrapper_command = f'"{wrapper.resolve()}"'
+        if client_bin:
+            target = directory / "bin/mc-spine-client"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(client_bin, target)
+            target.chmod(0o755)
+            wrapper_command += f" --client-sha256 {client_sha256 or sha(target, 'sha256')}"
+        elif client_sha256:
+            wrapper_command += f" --client-sha256 {client_sha256.lower()}"
+
+        write_text(directory / "mmc-pack.json", json_text({
+            "formatVersion": 1,
+            "components": component_list(loader, loader_version, mc_version),
+        }))
+        write_text(directory / "instance.cfg",
+                   "[General]\nInstanceType=OneSix\n"
+                   f"name={name}\nOverrideCommands=true\nWrapperCommand={wrapper_command}\n")
     if integrated_jar:
         destination = directory / ".minecraft/mods/mc-spine-integrated.jar"
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -128,7 +172,8 @@ def zip_entry(archive, name, data, mode=0o644):
     archive.writestr(info, data, compresslevel=9)
 
 
-def mrpack_export(directory, loader, loader_version, name, version_id, integrated_jar, native_libs):
+def mrpack_export(directory, loader, loader_version, name, version_id, integrated_jar,
+                  native_libs, mc_version=MINECRAFT):
     directory.mkdir(parents=True, exist_ok=True)
     contents = {"overrides/mods/mc-spine-integrated.jar": (integrated_jar.read_bytes(), 0o644)}
     for lib_name, library in native_libs.items():
@@ -147,13 +192,13 @@ def mrpack_export(directory, loader, loader_version, name, version_id, integrate
         "game": "minecraft",
         "versionId": version_id,
         "name": name,
-        "summary": "mc-spine Integrated Server bridge for Minecraft 1.21.1",
+        "summary": f"mc-spine Integrated Server bridge for Minecraft {mc_version}",
         "files": [],
-        "dependencies": {"minecraft": MINECRAFT,
+        "dependencies": {"minecraft": mc_version,
                          LOADER_DEPENDENCY[loader]: loader_version},
         "mcSpine": {"bundledOverrides": bundled},
     }
-    destination = directory / f"mc-spine-{MINECRAFT}.mrpack"
+    destination = directory / f"mc-spine-{mc_version}.mrpack"
     with zipfile.ZipFile(destination, "w") as archive:
         zip_entry(archive, "modrinth.index.json", json_text(index).encode())
         for path, (content, mode) in sorted(contents.items()):
@@ -169,7 +214,9 @@ def main():
     parser.add_argument("--loader", choices=("fabric", "neoforge"))
     parser.add_argument("--loader-version",
                         help="exact Fabric Loader or NeoForge version for this Minecraft release")
-    parser.add_argument("--name", default="mc-spine 1.21.1")
+    parser.add_argument("--mc-version", choices=MC_VERSIONS, default=MINECRAFT,
+                        help="Minecraft release for Prism components and .mrpack dependencies")
+    parser.add_argument("--name", help="instance/pack name (default: mc-spine <mc-version>)")
     parser.add_argument("--version-id", default="0.1.0")
     parser.add_argument("--client-bin", type=Path,
                         help="optional native executable to bundle into the Prism instance")
@@ -180,8 +227,15 @@ def main():
                         help="optional client-port cdylib (C ABI v1 required)")
     parser.add_argument("--kernel-library", type=Path,
                         help="optional client-kernel cdylib (C ABI v1 required)")
+    parser.add_argument("--bootstrap-jar", type=Path,
+                        help="mc-spine-bootstrapper.jar (<32 KiB) for a native Prism "
+                             "patches/*.json install (no shell wrapper)")
     args = parser.parse_args()
     exporting_mrpack = args.format in ("mrpack", "modrinth", "all")
+    if args.name is None:
+        args.name = f"mc-spine {args.mc_version}"
+    if args.bootstrap_jar is not None and args.format not in ("prism", "all"):
+        parser.error("--bootstrap-jar requires --format prism or all")
     if bool(args.loader) != bool(args.loader_version):
         parser.error("--loader and --loader-version must be provided together")
     if exporting_mrpack and not args.loader:
@@ -197,6 +251,7 @@ def main():
         parser.error("--client-sha256 must be 64 hexadecimal characters")
 
     client_bin = args.client_bin.resolve() if args.client_bin else None
+    bootstrap_jar = args.bootstrap_jar.resolve() if args.bootstrap_jar else None
     native_libs = {}
     for name, option in ((MESH_NAME, args.mesh_library), (KERNEL_NAME, args.kernel_library)):
         if option:
@@ -212,6 +267,11 @@ def main():
             raise ValueError("--integrated-jar must be an existing JAR")
         if integrated_jar and not args.loader:
             raise ValueError("--integrated-jar requires --loader and --loader-version")
+        if bootstrap_jar is not None:
+            if not bootstrap_jar.is_file():
+                raise ValueError("--bootstrap-jar must be an existing JAR")
+            if bootstrap_jar.stat().st_size >= MAX_BOOTSTRAP_JAR:
+                raise ValueError("--bootstrap-jar must stay under 32 KiB")
     except (OSError, ValueError) as error:
         parser.error(str(error))
 
@@ -223,11 +283,13 @@ def main():
         if args.format in ("prism", "all"):
             prism_dir = output / "prism" if args.format == "all" else output
             prism_export(prism_dir, args.loader, args.loader_version, args.name,
-                         client_bin, args.client_sha256, integrated_jar, native_libs)
+                         client_bin, args.client_sha256, integrated_jar, native_libs,
+                         mc_version=args.mc_version, bootstrap_jar=bootstrap_jar)
             print(f"Prism instance: {prism_dir}")
         if exporting_mrpack:
             bundle = mrpack_export(output, args.loader, args.loader_version, args.name,
-                                   args.version_id, integrated_jar, native_libs)
+                                   args.version_id, integrated_jar, native_libs,
+                                   mc_version=args.mc_version)
             print(f"Modrinth bundle: {bundle} (sha256={sha(bundle, 'sha256')})")
 
 

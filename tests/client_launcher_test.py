@@ -45,6 +45,11 @@ if os.environ.get('TEST_INTEGRATED_CONNECT'):
         from wire_smoke import status
         status(int(port))
 Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
+if os.environ.get('TEST_NATIVE_ENV_LOG'):
+    Path(os.environ['TEST_NATIVE_ENV_LOG']).write_text(json.dumps({
+        'MC_SPINE_LAUNCHER_ACCESS_TOKEN': os.environ.get('MC_SPINE_LAUNCHER_ACCESS_TOKEN'),
+        'MC_SPINE_TOKEN_ENV': os.environ.get('MC_SPINE_TOKEN_ENV'),
+    }))
 time.sleep(float(os.environ.get('TEST_NATIVE_SLEEP', '0')))
 sys.exit(int(os.environ.get('TEST_NATIVE_EXIT', '0')))
 """)
@@ -363,6 +368,108 @@ with socket.socket() as listener:
         self.assertNotIn("super-secret-token", result.stderr)
         self.assertFalse(log.exists())
 
+    def test_windows_exe_names_resolve_in_gamedir_bin_and_path(self):
+        import shutil
+        cases = []
+        for index, (rel, name) in enumerate((
+                ("", "mc-spine-client.exe"), ("bin", "megu.exe"),
+                ("bin", "mc-spine-client-gpu.exe"), ("", "megu.exe"))):
+            folder = self.root / f"exe-game-{index}" / ("gamedir with spaces" if index % 2 else "gamedir")
+            target = folder / rel / name if rel else folder / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(self.stub, target)
+            target.chmod(0o755)
+            cases.append((folder, target))
+        for folder, target in cases:
+            with self.subTest(binary=target.name):
+                result, log = self.java("--gameDir", str(folder), "--username", "Steve",
+                                        extra_env={"MC_SPINE_CLIENT_BIN": ""})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(log.read_text()),
+                                 ["--gameDir", str(folder), "--username", "Steve"])
+        bindir = self.root / "exe-path-bin"
+        bindir.mkdir()
+        shutil.copyfile(self.stub, bindir / "mc-spine.exe")
+        (bindir / "mc-spine.exe").chmod(0o755)
+        env_path = str(bindir) + os.pathsep + os.environ.get("PATH", "")
+        result, log = self.java("--username", "PATHUser",
+                                extra_env={"MC_SPINE_CLIENT_BIN": "", "PATH": env_path})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(log.read_text()), ["--username", "PATHUser"])
+
+    def test_token_env_flag_and_env_var_strip_access_token(self):
+        env_log = self.root / "token-env.json"
+        extra = {"TEST_NATIVE_ENV_LOG": str(env_log)}
+        for label, token_args, env_extra in (
+                ("flag-space", ("--accessToken", "flag-secret-token"), {"MC_SPINE_TOKEN_ENV": ""}),
+                ("flag-equals", ("--accessToken=equals-secret-token",), {"MC_SPINE_TOKEN_ENV": ""}),
+                ("env-var", ("--accessToken", "envvar-secret-token"), {"MC_SPINE_TOKEN_ENV": "1"})):
+            with self.subTest(mode=label):
+                env_log.unlink(missing_ok=True)
+                args = ["--username", "Steve", "--uuid", "u-1", *token_args,
+                        "--gameDir", "/tmp/game dir", "--assetsDir", "/tmp/äöü assets",
+                        "--assetIndex", "26.3"]
+                if label != "env-var":
+                    args.insert(0, "--mc-spine-token-env")
+                result, log = self.java(*args, extra_env={**extra, **env_extra})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                forwarded = json.loads(log.read_text())
+                self.assertNotIn("--accessToken", forwarded)
+                self.assertNotIn("--mc-spine-token-env", forwarded)
+                self.assertEqual(forwarded, ["--username", "Steve", "--uuid", "u-1",
+                                             "--gameDir", "/tmp/game dir",
+                                             "--assetsDir", "/tmp/äöü assets",
+                                             "--assetIndex", "26.3"])
+                seen = json.loads(env_log.read_text())
+                self.assertEqual(seen["MC_SPINE_LAUNCHER_ACCESS_TOKEN"],
+                                 {"flag-space": "flag-secret-token",
+                                  "flag-equals": "equals-secret-token",
+                                  "env-var": "envvar-secret-token"}[label])
+                self.assertNotIn("secret-token", result.stderr or "")
+
+    def test_access_token_stays_in_argv_without_token_env(self):
+        env_log = self.root / "token-env-default.json"
+        result, log = self.java("--username", "Steve", "--accessToken", "argv-secret-token",
+                                extra_env={"TEST_NATIVE_ENV_LOG": str(env_log),
+                                           "MC_SPINE_TOKEN_ENV": ""})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(log.read_text()),
+                         ["--username", "Steve", "--accessToken", "argv-secret-token"])
+        self.assertIsNone(json.loads(env_log.read_text())["MC_SPINE_LAUNCHER_ACCESS_TOKEN"])
+
+    def test_launcher_forwards_unicode_and_spaced_arguments_verbatim(self):
+        game = self.root / "unicode ゲーム dir" / "saves/ワールド"
+        game.mkdir(parents=True)
+        args = ("--username", "プレイヤー 名前", "--uuid", "00000000-0000-0000-0000-0000000000ff",
+                "--gameDir", str(game), "--assetsDir", str(self.root / "assets 空白"),
+                "--assetIndex", "5", "--quickPlayMultiplayer", "例え.テスト:25565")
+        result, log = self.java(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(log.read_text()), list(args))
+
+    def test_mc_version_263_profile_and_detect_minecraft_dir(self):
+        profile_dir = self.root / "profile-263"
+        self.generate(profile_dir, "--mc-version", "26.3")
+        version = profile_dir / "versions/mc-spine-26.3/mc-spine-26.3.json"
+        profile = json.loads(version.read_text())
+        self.assertEqual(profile["inheritsFrom"], "26.3")
+        self.assertEqual(profile["id"], "mc-spine-26.3")
+        self.assertEqual(profile["mainClass"], "net.mcspine.launcher.Main")
+        custom = self.root / "profile-custom-id"
+        self.generate(custom, "--mc-version", "26.3", "--version-id", "megu-custom")
+        self.assertEqual(json.loads(
+            (custom / "versions/megu-custom/megu-custom.json").read_text())["inheritsFrom"],
+            "26.3")
+        detected = subprocess.run(
+            [sys.executable, str(TOOLS / "gen_launcher_profile.py"), "--detect-minecraft-dir"],
+            capture_output=True, text=True, check=True)
+        expected = (Path.home() / ".minecraft" if sys.platform != "darwin"
+                    else Path.home() / "Library" / "Application Support" / "minecraft")
+        if sys.platform == "win32":
+            expected = Path(os.environ.get("APPDATA", Path.home() / "AppData/Roaming")) / ".minecraft"
+        self.assertEqual(Path(detected.stdout.strip()), expected)
+        self.assertFalse((self.root / "versions").exists())
+
 
 class CF4ExportTest(unittest.TestCase):
     @classmethod
@@ -559,6 +666,93 @@ Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
                     self.assertIn(reason, result.stderr)
                     self.assertFalse(out.exists() and any(out.rglob("*.mrpack")))
                     self.assertFalse((out / "native").exists())
+
+    def build_bootstrap_jar(self, destination):
+        subprocess.run([sys.executable, str(TOOLS / "gen_launcher_profile.py"),
+                        "--out-dir", str(destination), "--build-jar"],
+                       check=True, capture_output=True)
+        jar = destination / "mc-spine-bootstrapper.jar"
+        self.assertLess(jar.stat().st_size, 32 * 1024)
+        return jar
+
+    def test_prism_mc_version_263_components(self):
+        output = self.root / "prism-263"
+        self.export(output, "--format", "prism", "--mc-version", "26.3",
+                    "--loader", "fabric", "--loader-version", "0.16.10")
+        pack = json.loads((output / "mmc-pack.json").read_text())
+        self.assertEqual(pack["components"][0],
+                         {"uid": "net.minecraft", "version": "26.3", "important": True})
+        config = configparser.ConfigParser(interpolation=None)
+        config.read(output / "instance.cfg")
+        self.assertIn("mc-spine 26.3", config["General"]["name"])
+
+    def test_mrpack_mc_version_263(self):
+        output = self.root / "mrpack-263"
+        self.export(output, "--format", "mrpack", "--loader", "fabric",
+                    "--loader-version", "0.16.10", "--mc-version", "26.3",
+                    "--integrated-jar", str(self.integrated))
+        bundle = output / "mc-spine-26.3.mrpack"
+        self.assertTrue(bundle.is_file())
+        with zipfile.ZipFile(bundle) as archive:
+            index = json.loads(archive.read("modrinth.index.json"))
+        self.assertEqual(index["dependencies"]["minecraft"], "26.3")
+        self.assertEqual(index["name"], "mc-spine 26.3")
+        self.assertIn("26.3", index["summary"])
+
+    def test_prism_bootstrap_jar_native_patch_export(self):
+        staging = self.root / "bootstrap-staging"
+        jar = self.build_bootstrap_jar(staging)
+        output = self.root / "prism bootstrap patch"
+        digest = hashlib.sha256(self.native.read_bytes()).hexdigest()
+        self.export(output, "--format", "prism", "--mc-version", "26.3",
+                    "--bootstrap-jar", str(jar), "--client-bin", str(self.native),
+                    "--client-sha256", digest)
+        patch = json.loads((output / "patches/net.mcspine.bootstrapper.json").read_text())
+        self.assertEqual(patch["formatVersion"], 1)
+        self.assertEqual(patch["uid"], "net.mcspine.bootstrapper")
+        self.assertEqual(patch["mainClass"], "net.mcspine.launcher.Main")
+        self.assertEqual(patch["inheritsFrom"], "26.3")
+        self.assertEqual(patch["libraries"],
+                         [{"name": "net.mcspine:bootstrapper:1.0.0", "MMC-hint": "local"}])
+        self.assertEqual(patch["+jvmArgs"], [f"-Dmc.spine.clientSha256={digest}"])
+        library = (output / "libraries/net/mcspine/bootstrapper/1.0.0/"
+                   "bootstrapper-1.0.0.jar")
+        self.assertEqual(library.read_bytes(), jar.read_bytes())
+        self.assertTrue((output / "mmc-pack.json").is_file())
+        pack = json.loads((output / "mmc-pack.json").read_text())
+        self.assertEqual(pack["components"][0]["version"], "26.3")
+        config = configparser.ConfigParser(interpolation=None)
+        config.read(output / "instance.cfg")
+        self.assertNotIn("WrapperCommand", config["General"])
+        self.assertEqual(config["General"]["OverrideCommands"], "false")
+        bundled = output / ".minecraft/bin/mc-spine-client"
+        self.assertEqual(bundled.read_bytes(), self.native.read_bytes())
+        self.assertTrue(os.access(bundled, os.X_OK))
+        self.assertFalse((output / "mc-spine-wrapper").exists())
+        # Export stays reproducible.
+        again = self.root / "prism bootstrap patch again"
+        self.export(again, "--format", "prism", "--mc-version", "26.3",
+                    "--bootstrap-jar", str(jar), "--client-bin", str(self.native),
+                    "--client-sha256", digest)
+        self.assertEqual((again / "patches/net.mcspine.bootstrapper.json").read_bytes(),
+                         (output / "patches/net.mcspine.bootstrapper.json").read_bytes())
+
+    def test_bootstrap_jar_fails_closed(self):
+        missing = self.export(self.root / "bad-bootstrap-missing", "--format", "prism",
+                              "--bootstrap-jar", str(self.root / "absent.jar"), check=False)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("existing JAR", missing.stderr)
+        wrong_format = self.export(self.root / "bad-bootstrap-mrpack", "--format", "mrpack",
+                                   "--loader", "fabric", "--loader-version", "0.16.10",
+                                   "--bootstrap-jar", str(self.root / "x.jar"), check=False)
+        self.assertNotEqual(wrong_format.returncode, 0)
+        self.assertIn("requires --format prism or all", wrong_format.stderr)
+        oversized = self.root / "oversized.jar"
+        oversized.write_bytes(b"x" * (32 * 1024))
+        too_big = self.export(self.root / "bad-bootstrap-big", "--format", "prism",
+                              "--bootstrap-jar", str(oversized), check=False)
+        self.assertNotEqual(too_big.returncode, 0)
+        self.assertIn("32 KiB", too_big.stderr)
 
 
 class IntegratedModTest(unittest.TestCase):

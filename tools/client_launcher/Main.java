@@ -24,8 +24,10 @@ public final class Main {
         String gameDir = null;
         String clientBin = null;
         String clientSha256 = null;
+        String launcherAccessToken = null;
         boolean detach = "1".equals(System.getenv("MC_SPINE_DETACH"));
         boolean integrated = false;
+        boolean tokenEnv = "1".equals(System.getenv("MC_SPINE_TOKEN_ENV"));
         for (int i = 0; i < args.length; i++) {
             String arg = args[i];
             if ("--mc-spine-detach".equals(arg)) {
@@ -36,7 +38,19 @@ public final class Main {
                 integrated = true;
                 continue;
             }
+            if ("--mc-spine-token-env".equals(arg)) {
+                tokenEnv = true;
+                continue;
+            }
             String key = arg.contains("=") ? arg.substring(0, arg.indexOf('=')) : arg;
+            if (tokenEnv && "--accessToken".equals(key)) {
+                if (arg.contains("=")) {
+                    launcherAccessToken = arg.substring(arg.indexOf('=') + 1);
+                } else if (i + 1 < args.length) {
+                    launcherAccessToken = args[++i];
+                }
+                continue;
+            }
             if ("--client-bin".equals(key) || "--client-sha256".equals(key)) {
                 String value;
                 if (arg.contains("=")) {
@@ -73,8 +87,8 @@ public final class Main {
         Path binary = resolveBinary(gameDir, clientBin);
         if (binary == null) {
             System.err.println("mc-spine launcher: native client not found or not executable "
-                    + "(--client-bin, MC_SPINE_CLIENT_BIN, --gameDir/mc-spine-client, "
-                    + "--gameDir/bin/mc-spine-client, PATH)");
+                    + "(--client-bin, MC_SPINE_CLIENT_BIN, --gameDir/<name>, "
+                    + "--gameDir/bin/<name>, PATH; Unix and Windows .exe names)");
             return 2;
         }
 
@@ -90,9 +104,13 @@ public final class Main {
             }
             verifySha256(binary, expectedSha256);
             if (integrated) {
-                return runIntegrated(gameDir, command);
+                return runIntegrated(gameDir, command, launcherAccessToken);
             }
-            Process process = new ProcessBuilder(command).inheritIO().start();
+            ProcessBuilder builder = new ProcessBuilder(command).inheritIO();
+            if (launcherAccessToken != null && !launcherAccessToken.isEmpty()) {
+                builder.environment().put("MC_SPINE_LAUNCHER_ACCESS_TOKEN", launcherAccessToken);
+            }
+            Process process = builder.start();
             writeManifest(detach, process.pid(), gameArgs.size());
             if (detach) {
                 return 0;
@@ -108,7 +126,7 @@ public final class Main {
         }
     }
 
-    private static int runIntegrated(String gameDir, List<String> client)
+    private static int runIntegrated(String gameDir, List<String> client, String accessToken)
             throws IOException, InterruptedException {
         List<String> command;
         try (var source = Main.class.getResourceAsStream("/integrated_bridge.py")) {
@@ -122,10 +140,13 @@ public final class Main {
         command.addAll(client);
 
         // The child watches stdin for EOF, including if the JVM exits abruptly.
-        Process bridge = new ProcessBuilder(command)
+        ProcessBuilder builder = new ProcessBuilder(command)
                 .redirectOutput(ProcessBuilder.Redirect.INHERIT)
-                .redirectError(ProcessBuilder.Redirect.INHERIT)
-                .start();
+                .redirectError(ProcessBuilder.Redirect.INHERIT);
+        if (accessToken != null && !accessToken.isEmpty()) {
+            builder.environment().put("MC_SPINE_LAUNCHER_ACCESS_TOKEN", accessToken);
+        }
+        Process bridge = builder.start();
         try (var parentPipe = bridge.getOutputStream()) {
             return bridge.waitFor();
         }
@@ -143,6 +164,23 @@ public final class Main {
         }
     }
 
+    /** Candidate native client names; platform-preferred order, both OSes searched. */
+    private static List<String> binaryNames() {
+        String[] unix = {"mc-spine-client-gpu", "mc-spine-client", "megu", "mc-spine"};
+        String[] windows = {"mc-spine-client-gpu.exe", "mc-spine-client.exe",
+                            "megu.exe", "mc-spine.exe"};
+        boolean windowsOs = System.getProperty("os.name", "")
+                .toLowerCase(java.util.Locale.ROOT).contains("win");
+        List<String> names = new ArrayList<>();
+        for (String name : windowsOs ? windows : unix) {
+            names.add(name);
+        }
+        for (String name : windowsOs ? unix : windows) {
+            names.add(name);
+        }
+        return names;
+    }
+
     private static Path resolveBinary(String gameDir, String clientBin) {
         if (clientBin != null) {
             return executable(clientBin);
@@ -155,13 +193,16 @@ public final class Main {
         if (property != null && !property.isBlank()) {
             return executable(property);
         }
+        List<String> names = binaryNames();
         if (gameDir != null) {
             try {
                 Path root = Path.of(gameDir);
-                for (String suffix : new String[]{"mc-spine-client", "bin/mc-spine-client"}) {
-                    Path resolved = executable(root.resolve(suffix).toString());
-                    if (resolved != null) {
-                        return resolved;
+                for (String suffix : new String[]{"", "bin/"}) {
+                    for (String name : names) {
+                        Path resolved = executable(root.resolve(suffix + name).toString());
+                        if (resolved != null) {
+                            return resolved;
+                        }
                     }
                 }
             } catch (RuntimeException ignored) {
@@ -172,7 +213,7 @@ public final class Main {
         if (path != null) {
             for (String dir : path.split(java.util.regex.Pattern.quote(
                     java.io.File.pathSeparator), -1)) {
-                for (String name : new String[]{"mc-spine-client", "mc-spine"}) {
+                for (String name : names) {
                     Path found = executable(Path.of(dir.isEmpty() ? "." : dir, name).toString());
                     if (found != null) {
                         return found;

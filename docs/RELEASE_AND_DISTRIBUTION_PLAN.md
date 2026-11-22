@@ -72,7 +72,86 @@ Horizon=GPL-3.0、C2ME=MIT、NeoForge=LGPL-2.1、Fabric=Apache-2.0）との
 
 ## 2. Distribution Channels（配布経路）
 
-### 2.1 GitHub Releases（一次配布）
+### 2.1 Launcher Thin JAR Bootstrapper — **第一配布経路（#1）**
+
+`tools/client_launcher/` の thin Java bootstrapper
+（`mc-spine-bootstrapper.jar`、**32 KiB 未満**・再現ビルド可能）は、
+プレイヤーが普段使うランチャーの Microsoft/Minecraft アカウント
+ログインと Mojang 正規アセットをそのまま使って `mc-spine` / Megu を
+起動する、Fabric / NeoForge と同じ「ワンクリック導入」UX を実現する
+**最優先の配布経路**。対応ランチャー:
+
+- **Official Minecraft Launcher** — `versions/<id>/<id>.json` プロファイル
+  （`inheritsFrom` + `mainClass: net.mcspine.launcher.Main`）を生成。
+  バニラと同じアカウント・アセット解決がそのまま効く。
+- **Prism Launcher / MultiMC** — `patches/net.mcspine.bootstrapper.json`
+  カスタムパッチで `mainClass` を差し替える**ネイティブ patch export**
+  （`--bootstrap-jar`）。シェル wrapper 不要で Windows / macOS / Linux
+  全てで動作。`mmc-pack.json` + `instance.cfg` の従来 export も維持。
+- **Modrinth App** — `.mrpack`（`modrinth.index.json`）を export。
+  `overrides/` に統合 JAR と native library を同梱。
+
+対応 Minecraft バージョンは `1.21.1` と `26.3`（`--mc-version`）。
+
+#### Operator / release 手順
+
+```bash
+# 0) OS 標準の .minecraft ディレクトリを確認（読み取りのみ・実ホームは変更しない）
+python3 tools/client_launcher/gen_launcher_profile.py --detect-minecraft-dir
+#   Linux:   ~/.minecraft
+#   Windows: %APPDATA%\.minecraft
+#   macOS:   ~/Library/Application Support/minecraft
+
+# 1) 再現ビルド可能な bootstrapper JAR（<32 KiB をビルド時に強制）
+for V in 1.21.1 26.3; do
+  python3 tools/client_launcher/gen_launcher_profile.py \
+    --out-dir dist/boot-$V --mc-version $V --build-jar
+done
+
+# 2) Official Minecraft Launcher 用プロファイル（versions/ + libraries/ に配置）
+MC_DIR=$(python3 tools/client_launcher/gen_launcher_profile.py --detect-minecraft-dir)
+for V in 1.21.1 26.3; do
+  python3 tools/client_launcher/gen_launcher_profile.py \
+    --out-dir "$MC_DIR" --mc-version $V --build-jar
+  # 任意: --client-bin /<native client> --client-sha256 <sha256> で native を pin
+  # 任意: --version-id megu-$V でプロファイル ID を変更
+done
+# → ランチャーのバージョン選択に "mc-spine-1.21.1" / "mc-spine-26.3" が出る
+
+# 3) Prism Launcher インスタンス（ネイティブ patch・シェル wrapper 無し）
+for V in 1.21.1 26.3; do
+  python3 tools/client_launcher/export_launcher_bundle.py \
+    --format prism --mc-version $V \
+    --bootstrap-jar dist/boot-$V/mc-spine-bootstrapper.jar \
+    --client-bin target/release/mc-spine-client \
+    --client-sha256 "$(sha256sum target/release/mc-spine-client | cut -d' ' -f1)" \
+    --out-dir dist/prism-$V
+done
+# → Prism のインスタンスフォルダにコピーして起動（patches/ が mainClass を差し替え）
+#   --bootstrap-jar 無しの従来 export は mc-spine-wrapper 経由（互換維持）
+
+# 4) Modrinth App 向け .mrpack（loader はバージョンごとに要確認）
+python3 tools/client_launcher/export_launcher_bundle.py \
+  --format mrpack --mc-version 1.21.1 \
+  --loader fabric --loader-version 0.16.10 \
+  --integrated-jar dist/mc-spine-integrated.jar \
+  --out-dir dist/mrpack-1.21.1
+python3 tools/client_launcher/export_launcher_bundle.py \
+  --format mrpack --mc-version 26.3 \
+  --loader neoforge --loader-version <26.3 対応版> \
+  --integrated-jar dist/mc-spine-integrated.jar \
+  --out-dir dist/mrpack-26.3
+```
+
+`--accessToken` 等の認証情報は argv に残す既定動作を維持しつつ、
+`--mc-spine-token-env` / `MC_SPINE_TOKEN_ENV=1` 指定時は子プロセスへ
+`MC_SPINE_LAUNCHER_ACCESS_TOKEN` 環境変数経由で渡し、ログ・manifest に
+一切残さない（`redact()` が `--accessToken` / `--authToken` /
+`--clientToken` / `--token` と Bearer トークンを常時マスク）。
+Windows `.exe` 名（`mc-spine-client-gpu.exe` 等）も `--gameDir` /
+`--gameDir/bin` / `PATH` から自動検出する。
+
+### 2.2 GitHub Releases（一次配布）
 
 [.github/workflows/release.yml](../.github/workflows/release.yml) が
 既に 6 バイナリのクロスプラットフォームビルドとアーカイブ検証を持つ。
@@ -97,7 +176,7 @@ Horizon=GPL-3.0、C2ME=MIT、NeoForge=LGPL-2.1、Fabric=Apache-2.0）との
 - コンテナイメージ `mc-spine:<ver>` は GHCR (`ghcr.io/<owner>/mc-spine`)
   へ push。Docker Hub は学生アカウントでも可だが GHCR が無料・連携が楽。
 
-### 2.2 Modrinth
+### 2.3 Modrinth
 
 - **Server software listing**: Modrinth は server-side software も
   ホストできる。`mc-spine` を "server software" として登録し、
@@ -109,7 +188,7 @@ Horizon=GPL-3.0、C2ME=MIT、NeoForge=LGPL-2.1、Fabric=Apache-2.0）との
   一覧掲載を目指す。掲載要件（changelog, license 表記, provenance）は
   事前に Modrinth のガイドラインを確認。
 
-### 2.3 Package managers
+### 2.4 Package managers
 
 | Channel | Package | 状態 |
 |---|---|---|
@@ -119,8 +198,10 @@ Horizon=GPL-3.0、C2ME=MIT、NeoForge=LGPL-2.1、Fabric=Apache-2.0）との
 | Scoop | `ScoopInstaller/Extras` or 独自 bucket | Windows 代替。AUR と同様に tarball fetch 型で簡単 |
 | Flathub | `dev.<domain>.Megu.yml` metainfo | Flatpak 化は `org.freedesktop.Platform` runtime + バイナリ同梱。審査に数週間かかるため後追いでよい |
 
-優先順位: **GitHub Releases → Modrinth → AUR/Homebrew → Winget/Scoop →
-Flatpak**。最初の 2 つが全ユーザーに効き、残りは漸進的に。
+優先順位: **Launcher Thin JAR Bootstrapper（§2.1、全ランチャー共通の
+第一導線）→ GitHub Releases → Modrinth → AUR/Homebrew → Winget/Scoop →
+Flatpak**。bootstrapper がプレイヤー導線の入口、binary release と
+package manager はその裏側の配布網として機能する。
 
 ---
 

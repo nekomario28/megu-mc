@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Create a local Minecraft 1.21.1 version profile and reproducible bootstrapper jar."""
+"""Create a local Minecraft version profile and reproducible bootstrapper jar."""
 import argparse
 import hashlib
 import json
+import os
+import sys
 from pathlib import Path
 import shutil
 import subprocess
@@ -14,6 +16,7 @@ ROOT = Path(__file__).resolve().parent
 LIBRARY_NAME = "net.mcspine:bootstrapper:1.0.0"
 LIBRARY_PATH = Path("net/mcspine/bootstrapper/1.0.0/bootstrapper-1.0.0.jar")
 ZIP_TIME = (1980, 1, 1, 0, 0, 0)
+MC_VERSIONS = ("1.21.1", "26.3")
 
 
 def build_jar(out_dir):
@@ -43,15 +46,37 @@ def build_jar(out_dir):
         return jar
 
 
+def detect_minecraft_dir():
+    """Return the OS-standard .minecraft directory without touching the real home."""
+    if sys.platform == "win32" or os.name == "nt":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return Path(appdata) / ".minecraft"
+        return Path.home() / "AppData" / "Roaming" / ".minecraft"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "minecraft"
+    return Path.home() / ".minecraft"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out-dir", type=Path, required=True,
+    parser.add_argument("--out-dir", type=Path,
                         help="Minecraft directory or staging root for versions/ and libraries/")
-    parser.add_argument("--version-id", default="mc-spine-1.21.1")
+    parser.add_argument("--version-id", help="profile id (default: mc-spine-<mc-version>)")
+    parser.add_argument("--mc-version", choices=MC_VERSIONS, default="1.21.1",
+                        help="Minecraft release the profile inheritsFrom (default: 1.21.1)")
+    parser.add_argument("--detect-minecraft-dir", action="store_true",
+                        help="print the OS-standard .minecraft directory and exit")
     parser.add_argument("--client-bin", type=Path, help="native client executable to pin in the profile")
     parser.add_argument("--client-sha256", help="verify native client hash before bootstrapper launch")
     parser.add_argument("--build-jar", action="store_true")
     args = parser.parse_args()
+    if args.detect_minecraft_dir:
+        print(detect_minecraft_dir())
+        return
+    if args.out_dir is None:
+        parser.error("--out-dir is required unless --detect-minecraft-dir is used")
+    args.version_id = args.version_id or f"mc-spine-{args.mc_version}"
     if not args.version_id or args.version_id in (".", "..") or any(
             char in args.version_id for char in "/\\"):
         parser.error("--version-id must be a single safe directory name")
@@ -62,7 +87,7 @@ def main():
         print(f"built {jar} ({jar.stat().st_size} bytes, sha256={hashlib.sha256(jar.read_bytes()).hexdigest()})")
     game_profile = {
         "id": args.version_id,
-        "inheritsFrom": "1.21.1",
+        "inheritsFrom": args.mc_version,
         "type": "release",
         "mainClass": "net.mcspine.launcher.Main",
         "libraries": [{"name": LIBRARY_NAME}],
