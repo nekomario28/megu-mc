@@ -19,10 +19,47 @@ use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
 use crate::live_session::{LiveSession, PlayerMovement, PlayerPose, SessionStatus};
 use crate::renderer::{request_gpu_device, GpuRenderer};
-use crate::{build_demo_scene, present_mode_for, Camera, GpuCliConfig, MoveInput};
+use crate::{
+    build_demo_scene, fingerprint_draw_list, preferred_alpha_mode, preferred_frame_latency,
+    present_mode_for, Camera, GpuCliConfig, MoveInput,
+};
 
 /// Window title.
 pub const WINDOW_TITLE: &str = "mc-spine";
+
+/// Event-loop wake interval while the surface is occluded: slow enough for
+/// zero-GPU sleep, fast enough to keep a live session's network pump alive.
+const OCCLUDED_TICK: Duration = Duration::from_millis(50);
+
+/// Dirty-only gate for the software-rasterized UI framebuffer: remembers
+/// the `(width, height, fingerprint)` of the last uploaded frame so
+/// `render_frame` skips `rasterize_draw_list` + the PCIe texture upload on
+/// frames where the HUD did not change (the common case at 240+ FPS). The
+/// counters let tests prove zero redundant uploads.
+#[derive(Default)]
+pub struct UiUploadCache {
+    last_upload: Option<(u32, u32, u64)>,
+    /// Frames that rasterized and uploaded (first frame, HUD change, resize).
+    pub ui_uploads_performed: u64,
+    /// Frames skipped because `(w, h, fingerprint)` matched the last upload.
+    pub ui_uploads_skipped: u64,
+}
+
+impl UiUploadCache {
+    /// `true` when this `(width, height, fingerprint)` differs from the
+    /// last upload (or none has happened yet); records the key and counts
+    /// the decision either way.
+    pub fn should_upload(&mut self, width: u32, height: u32, fingerprint: u64) -> bool {
+        let key = (width, height, fingerprint);
+        if self.last_upload == Some(key) {
+            self.ui_uploads_skipped += 1;
+            return false;
+        }
+        self.last_upload = Some(key);
+        self.ui_uploads_performed += 1;
+        true
+    }
+}
 
 /// GPU-side state that exists only once the window + surface are up.
 struct ActiveWindow {
@@ -69,11 +106,14 @@ pub struct GpuApp {
     camera: Camera,
     keys: Keys,
     focused: bool,
+    occluded: bool,
+    scale_factor: f64,
     cursor_grabbed: bool,
     paused: bool,
     show_diagnostics: bool,
     mouse_pos: (i32, i32),
     ui: UiState,
+    ui_cache: UiUploadCache,
     render_config: RenderConfig,
     governor: FrameBudgetGovernor,
     last_frame: Instant,
@@ -119,11 +159,14 @@ impl GpuApp {
             camera,
             keys: Keys::default(),
             focused: true,
+            occluded: false,
+            scale_factor: 1.0,
             cursor_grabbed: false,
             paused: false,
             show_diagnostics: false,
             mouse_pos: (0, 0),
             ui,
+            ui_cache: UiUploadCache::default(),
             render_config,
             governor,
             last_frame: Instant::now(),
@@ -142,10 +185,14 @@ impl GpuApp {
             return;
         };
         if grab && !self.cursor_grabbed {
+            // `Locked` first: on Wayland it activates `zwp_locked_pointer_v1`
+            // + `zwp_relative_pointer_v1` unaccelerated raw deltas, so the
+            // invisible cursor can never hit the window borders. `Confined`
+            // is the fallback for platforms without pointer lock.
             active
                 .window
-                .set_cursor_grab(CursorGrabMode::Confined)
-                .or_else(|_| active.window.set_cursor_grab(CursorGrabMode::Locked))
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| active.window.set_cursor_grab(CursorGrabMode::Confined))
                 .ok();
             active.window.set_cursor_visible(false);
             self.cursor_grabbed = true;
@@ -265,6 +312,12 @@ impl GpuApp {
             });
         }
 
+        // Occluded (minimized / fully covered): zero GPU work. The live
+        // session above still polls so the connection stays alive.
+        if self.occluded {
+            return;
+        }
+
         let Some(active) = self.active.as_mut() else {
             return;
         };
@@ -282,10 +335,11 @@ impl GpuApp {
         // HUD/diagnostics through the real client-ui state machine.
         self.ui.hud.actionbar = if self.show_diagnostics {
             format!(
-                "F3 | {} | {} | {:.1} ms{}",
+                "F3 | {} | {} | {:.1} ms | x{:.2}{}",
                 active.renderer.gpu().report.resolution.backend.as_str(),
                 active.renderer.gpu().report.name,
                 self.governor.frame_ms(),
+                self.scale_factor,
                 self.live
                     .as_ref()
                     .map(|live| format!(
@@ -316,10 +370,15 @@ impl GpuApp {
                     .extend(build_magic_hud_draw_list(&live.magic, w, h).commands);
             }
         }
-        let rgba = rasterize_draw_list(w, h, &draw_list);
-        if let Err(e) = active.renderer.update_ui_framebuffer(w, h, &rgba) {
-            self.fatal = Some(format!("UI upload: {e}"));
-            return;
+        // Dirty-only upload: unchanged HUD frames skip the `w*h*4` rasterize
+        // and the texture upload instead of burning GB/s of PCIe bandwidth.
+        let fingerprint = fingerprint_draw_list(w, h, &draw_list);
+        if self.ui_cache.should_upload(w, h, fingerprint) {
+            let rgba = rasterize_draw_list(w, h, &draw_list);
+            if let Err(e) = active.renderer.update_ui_framebuffer(w, h, &rgba) {
+                self.fatal = Some(format!("UI upload: {e}"));
+                return;
+            }
         }
         let sky = active
             .renderer
@@ -331,6 +390,10 @@ impl GpuApp {
                     .texture
                     .create_view(&wgpu::TextureViewDescriptor::default());
                 active.renderer.render_to_view(&view, w, h, &sky);
+                // Wayland `wl_surface.frame` pacing: notify the compositor
+                // right before present so frame callbacks align with the
+                // actual swap.
+                active.window.pre_present_notify();
                 active.renderer.gpu().queue.present(frame);
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {}
@@ -441,12 +504,10 @@ fn surface_config_for(
         width: size.width.max(1),
         height: size.height.max(1),
         present_mode: present_mode_for(vsync, &caps.present_modes),
-        desired_maximum_frame_latency: 2,
-        alpha_mode: caps
-            .alpha_modes
-            .first()
-            .copied()
-            .unwrap_or(wgpu::CompositeAlphaMode::Auto),
+        // `Opaque` unlocks direct scanout + VRR on Wayland compositors;
+        // latency 1 keeps `Mailbox`/`Immediate` input->photon time minimal.
+        desired_maximum_frame_latency: preferred_frame_latency(vsync),
+        alpha_mode: preferred_alpha_mode(&caps.alpha_modes),
         view_formats: vec![],
     }
 }
@@ -483,6 +544,21 @@ impl ApplicationHandler for GpuApp {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => self.reconfigure(size),
+            WindowEvent::Occluded(occluded) => self.occluded = occluded,
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // Fractional HiDPI (e.g. Wayland 125%/150%): clamp into a
+                // sane range and reconfigure — a `Resized` follows on
+                // platforms where the physical size actually moved, and a
+                // no-op reconfigure is cheap where it did not.
+                self.scale_factor = scale_factor.clamp(0.5, 4.0);
+                let size = self
+                    .active
+                    .as_ref()
+                    .map(|active| active.window.inner_size());
+                if let Some(size) = size {
+                    self.reconfigure(size);
+                }
+            }
             WindowEvent::Focused(focused) => {
                 self.focused = focused;
                 if !focused {
@@ -551,22 +627,32 @@ impl ApplicationHandler for GpuApp {
             event_loop.exit();
             return;
         }
-        if let Some(active) = &self.active {
-            active.window.request_redraw();
+        if self.occluded {
+            // Zero-GPU sleep: no redraw requests at all. A slow tick keeps
+            // the live session polled until the surface un-occludes.
+            if let Some(live) = &mut self.live {
+                live.poll(self.camera.position);
+            }
+            let wake = Instant::now() + OCCLUDED_TICK;
+            event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
+            return;
         }
         // The effective cap drops to `background_fps_limit` while unfocused
-        // (the RenderConfig rule); WaitUntil holds the loop to it.
+        // (the RenderConfig rule); WaitUntil holds the loop to it. Calling
+        // `request_redraw` before the deadline would let a 1000 Hz input
+        // event stream bypass the cap and storm redundant redraws.
         let cap = self.render_config.effective_fps_cap(self.focused);
         if cap > 0 {
             let deadline = self.frame_start + Duration::from_secs_f64(1.0 / f64::from(cap));
-            if deadline > Instant::now() {
+            if Instant::now() < deadline {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-            } else {
-                event_loop.set_control_flow(ControlFlow::Poll);
+                return;
             }
-        } else {
-            event_loop.set_control_flow(ControlFlow::Poll);
         }
+        if let Some(active) = &self.active {
+            active.window.request_redraw();
+        }
+        event_loop.set_control_flow(ControlFlow::Poll);
     }
 }
 
@@ -581,5 +667,38 @@ pub fn run(config: GpuCliConfig) -> Result<(), String> {
     match app.fatal {
         Some(fatal) => Err(fatal),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ui_upload_cache_uploads_first_frame_and_skips_identical() {
+        let mut cache = UiUploadCache::default();
+        // First frame always uploads.
+        assert!(cache.should_upload(1280, 720, 0xaaaa));
+        assert_eq!(cache.ui_uploads_performed, 1);
+        assert_eq!(cache.ui_uploads_skipped, 0);
+        // An identical second frame (same size + fingerprint) is skipped.
+        assert!(!cache.should_upload(1280, 720, 0xaaaa));
+        assert!(!cache.should_upload(1280, 720, 0xaaaa));
+        assert_eq!(cache.ui_uploads_performed, 1);
+        assert_eq!(cache.ui_uploads_skipped, 2);
+    }
+
+    #[test]
+    fn ui_upload_cache_reuploads_on_hud_change_and_resize() {
+        let mut cache = UiUploadCache::default();
+        assert!(cache.should_upload(1280, 720, 0xaaaa));
+        // HUD text updated -> new fingerprint -> upload.
+        assert!(cache.should_upload(1280, 720, 0xbbbb));
+        // Resize -> upload even when the fingerprint collides.
+        assert!(cache.should_upload(1920, 1080, 0xbbbb));
+        assert_eq!(cache.ui_uploads_performed, 3);
+        // Steady state resumes skipping.
+        assert!(!cache.should_upload(1920, 1080, 0xbbbb));
+        assert_eq!(cache.ui_uploads_skipped, 1);
     }
 }

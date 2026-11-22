@@ -29,6 +29,7 @@ use mc_spine_client_mesh::{
     mesh_section, resolve_render_backend, Block, GpuCapabilities, GpuShaderCaps, GpuVendor, Layer,
     Quad, RenderBackendPreference, Section, WATER,
 };
+use mc_spine_ui::draw::{UiColor, UiCommand, UiDrawList, UiRect};
 
 /// Crate/binary name used in diagnostics.
 pub const CLIENT_GPU_NAME: &str = "mc-spine-client-gpu";
@@ -597,6 +598,133 @@ pub fn present_mode_for(vsync: bool, supported: &[wgpu::PresentMode]) -> wgpu::P
     }
 }
 
+/// Composite alpha mode a surface should prefer: [`Opaque`](wgpu::CompositeAlphaMode::Opaque)
+/// first so Wayland compositors (KWin, Mutter, Hyprland, Sway) can bypass
+/// alpha blending and put the swapchain on a zero-copy direct-scanout plane
+/// with FreeSync/VRR, then `Inherit`, then the first advertised mode, then
+/// `Auto` when the surface reports nothing at all.
+pub fn preferred_alpha_mode(supported: &[wgpu::CompositeAlphaMode]) -> wgpu::CompositeAlphaMode {
+    let prefer = |mode: wgpu::CompositeAlphaMode| supported.contains(&mode).then_some(mode);
+    prefer(wgpu::CompositeAlphaMode::Opaque)
+        .or_else(|| prefer(wgpu::CompositeAlphaMode::Inherit))
+        .or_else(|| supported.first().copied())
+        .unwrap_or(wgpu::CompositeAlphaMode::Auto)
+}
+
+/// `desired_maximum_frame_latency` for the swapchain: `1` when `vsync` is
+/// off so `Immediate`/`Mailbox` presentation keeps input->photon latency at
+/// one frame, `2` under `Fifo` vsync so the queue holds one buffered frame
+/// without stalling the pipeline.
+pub fn preferred_frame_latency(vsync: bool) -> u32 {
+    if vsync {
+        2
+    } else {
+        1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dirty-only UI upload key (FNV-1a over the rasterized draw list)
+// ---------------------------------------------------------------------------
+
+const FNV1A_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV1A_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv1a_bytes(hash: &mut u64, bytes: &[u8]) {
+    for &byte in bytes {
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(FNV1A_PRIME);
+    }
+}
+
+fn fnv1a_u32(hash: &mut u64, value: u32) {
+    fnv1a_bytes(hash, &value.to_le_bytes());
+}
+
+fn fnv1a_i32(hash: &mut u64, value: i32) {
+    fnv1a_bytes(hash, &value.to_le_bytes());
+}
+
+fn fnv1a_rect(hash: &mut u64, rect: &UiRect) {
+    fnv1a_i32(hash, rect.x);
+    fnv1a_i32(hash, rect.y);
+    fnv1a_u32(hash, rect.w);
+    fnv1a_u32(hash, rect.h);
+}
+
+fn fnv1a_color(hash: &mut u64, color: &UiColor) {
+    fnv1a_bytes(hash, &[color.r, color.g, color.b, color.a]);
+}
+
+/// Deterministic 64-bit FNV-1a fingerprint over everything
+/// [`rasterize_draw_list`](mc_spine_ui::draw::rasterize_draw_list) reads:
+/// the framebuffer size `(width, height)` plus every [`UiCommand`] in
+/// `list` — variant, rects, colors, text payloads and progress fractions.
+/// Two draw lists that paint identical pixels share a fingerprint, so the
+/// window loop can skip the CPU rasterization and the PCIe texture upload
+/// on frames where the HUD did not change.
+pub fn fingerprint_draw_list(width: u32, height: u32, list: &UiDrawList) -> u64 {
+    let mut hash = FNV1A_OFFSET;
+    fnv1a_u32(&mut hash, width);
+    fnv1a_u32(&mut hash, height);
+    for command in &list.commands {
+        match command {
+            UiCommand::FillRect { rect, color } => {
+                fnv1a_bytes(&mut hash, &[0]);
+                fnv1a_rect(&mut hash, rect);
+                fnv1a_color(&mut hash, color);
+            }
+            UiCommand::BorderRect {
+                rect,
+                color,
+                thickness,
+            } => {
+                fnv1a_bytes(&mut hash, &[1]);
+                fnv1a_rect(&mut hash, rect);
+                fnv1a_color(&mut hash, color);
+                fnv1a_u32(&mut hash, *thickness);
+            }
+            UiCommand::Text {
+                x,
+                y,
+                scale,
+                color,
+                text,
+            } => {
+                fnv1a_bytes(&mut hash, &[2]);
+                fnv1a_i32(&mut hash, *x);
+                fnv1a_i32(&mut hash, *y);
+                fnv1a_u32(&mut hash, *scale);
+                fnv1a_color(&mut hash, color);
+                fnv1a_bytes(&mut hash, text.as_bytes());
+                fnv1a_bytes(&mut hash, &[0xff]);
+            }
+            UiCommand::ProgressBar {
+                rect,
+                fraction,
+                fill,
+                back,
+                border,
+            } => {
+                fnv1a_bytes(&mut hash, &[3]);
+                fnv1a_rect(&mut hash, rect);
+                // `-0.0 == 0.0` under PartialEq but hashes differently via
+                // `to_bits`, so equal draw lists must normalize it.
+                let fraction = if *fraction == 0.0 {
+                    0.0f32.to_bits()
+                } else {
+                    fraction.to_bits()
+                };
+                fnv1a_u32(&mut hash, fraction);
+                fnv1a_color(&mut hash, fill);
+                fnv1a_color(&mut hash, back);
+                fnv1a_color(&mut hash, border);
+            }
+        }
+    }
+    hash
+}
+
 // ---------------------------------------------------------------------------
 // Demo chunk scene (real client-port mesher, real packed-vertex buffers)
 // ---------------------------------------------------------------------------
@@ -777,4 +905,130 @@ pub fn negotiate_pipeline(
     caps: &GpuCapabilities,
 ) -> mc_spine_client_mesh::BackendResolution {
     resolve_render_backend(pref, caps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alpha_mode_prefers_opaque_for_direct_scanout() {
+        assert_eq!(
+            preferred_alpha_mode(&[
+                wgpu::CompositeAlphaMode::PostMultiplied,
+                wgpu::CompositeAlphaMode::Opaque,
+                wgpu::CompositeAlphaMode::PreMultiplied,
+            ]),
+            wgpu::CompositeAlphaMode::Opaque
+        );
+    }
+
+    #[test]
+    fn alpha_mode_falls_back_through_inherit_first_auto() {
+        assert_eq!(
+            preferred_alpha_mode(&[
+                wgpu::CompositeAlphaMode::PreMultiplied,
+                wgpu::CompositeAlphaMode::Inherit,
+            ]),
+            wgpu::CompositeAlphaMode::Inherit
+        );
+        assert_eq!(
+            preferred_alpha_mode(&[wgpu::CompositeAlphaMode::PreMultiplied]),
+            wgpu::CompositeAlphaMode::PreMultiplied
+        );
+        assert_eq!(
+            preferred_alpha_mode(&[]),
+            wgpu::CompositeAlphaMode::Auto
+        );
+    }
+
+    #[test]
+    fn frame_latency_is_one_uncapped_two_vsynced() {
+        assert_eq!(preferred_frame_latency(false), 1);
+        assert_eq!(preferred_frame_latency(true), 2);
+    }
+
+    fn hud_draw_list(text: &str) -> UiDrawList {
+        let mut list = UiDrawList::new();
+        list.fill_rect(UiRect::new(4, 4, 120, 40), UiColor::rgb(20, 20, 24));
+        list.border_rect(
+            UiRect::new(4, 4, 120, 40),
+            UiColor::rgb(80, 88, 110),
+            1,
+        );
+        list.text(8, 10, 1, UiColor::rgb(238, 238, 238), text);
+        list.progress_bar(
+            UiRect::new(8, 30, 112, 8),
+            0.5,
+            UiColor::rgb(210, 45, 45),
+            UiColor::rgb(40, 42, 50),
+            UiColor::rgb(14, 15, 20),
+        );
+        list
+    }
+
+    #[test]
+    fn fingerprint_is_stable_for_equal_draw_lists() {
+        let a = hud_draw_list("health 20/20");
+        let b = hud_draw_list("health 20/20");
+        assert_eq!(a, b);
+        assert_eq!(
+            fingerprint_draw_list(1280, 720, &a),
+            fingerprint_draw_list(1280, 720, &b)
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_on_text_rect_color_and_viewport() {
+        let base = hud_draw_list("health 20/20");
+        let fp = fingerprint_draw_list(1280, 720, &base);
+
+        let text_changed = hud_draw_list("health 19/20");
+        assert_ne!(fp, fingerprint_draw_list(1280, 720, &text_changed));
+
+        let mut rect_changed = base.clone();
+        if let UiCommand::FillRect { rect, .. } = &mut rect_changed.commands[0] {
+            rect.w += 1;
+        }
+        assert_ne!(fp, fingerprint_draw_list(1280, 720, &rect_changed));
+
+        let mut color_changed = base.clone();
+        if let UiCommand::FillRect { color, .. } = &mut color_changed.commands[0] {
+            color.g += 1;
+        }
+        assert_ne!(fp, fingerprint_draw_list(1280, 720, &color_changed));
+
+        let mut fraction_changed = base.clone();
+        if let UiCommand::ProgressBar { fraction, .. } = &mut fraction_changed.commands[3] {
+            *fraction = 0.75;
+        }
+        assert_ne!(fp, fingerprint_draw_list(1280, 720, &fraction_changed));
+
+        assert_ne!(fp, fingerprint_draw_list(1920, 720, &base));
+        assert_ne!(fp, fingerprint_draw_list(1280, 1080, &base));
+    }
+
+    #[test]
+    fn fingerprint_treats_negative_zero_fraction_as_zero() {
+        let mut neg = UiDrawList::new();
+        neg.progress_bar(
+            UiRect::new(0, 0, 10, 10),
+            -0.0,
+            UiColor::rgb(1, 1, 1),
+            UiColor::rgb(2, 2, 2),
+            UiColor::rgb(3, 3, 3),
+        );
+        let mut pos = UiDrawList::new();
+        pos.progress_bar(
+            UiRect::new(0, 0, 10, 10),
+            0.0,
+            UiColor::rgb(1, 1, 1),
+            UiColor::rgb(2, 2, 2),
+            UiColor::rgb(3, 3, 3),
+        );
+        assert_eq!(
+            fingerprint_draw_list(64, 64, &neg),
+            fingerprint_draw_list(64, 64, &pos)
+        );
+    }
 }
