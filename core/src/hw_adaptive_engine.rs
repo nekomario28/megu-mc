@@ -1100,6 +1100,14 @@ pub fn build_unified_optimization_plan(
 }
 
 impl UnifiedOptimizationPlan {
+    /// Analytic roofline model (Williams, Waterman & Patterson 2009)
+    /// derived from the same profile this plan was built against, so the
+    /// compute ceiling, memory bandwidth and ridge point a kernel is
+    /// classified with can never drift from the resolved strategy.
+    pub fn roofline_model(&self) -> crate::math_opt_engine::RooflineModel {
+        crate::math_opt_engine::RooflineModel::from_profile(&self.profile)
+    }
+
     pub fn for_domain(&self, domain: DomainKind) -> DomainSpecializationPlan {
         let critical = matches!(
             domain,

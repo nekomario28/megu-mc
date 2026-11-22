@@ -80,6 +80,17 @@
 //!   one level of `META-INF/jarjar`/`META-INF/jars` Jar-in-Jar in place, and
 //!   inflates with the pure-`std` [`zip_archive::inflate_raw_rfc1951`]
 //!   RFC 1951 decompressor under strict fail-closed caps.
+//! * [`math_opt_engine`] — four paper-backed, allocation-free mathematical
+//!   engines: a [`math_opt_engine::DiscountedUcbAutotuner`] Discounted-UCB
+//!   non-stationary bandit (Garivier & Moulines 2011) that detects kernel
+//!   regime switches automatically, a
+//!   [`math_opt_engine::P2QuantileEstimator`]/`WelfordStats` streaming
+//!   P50/P95/P99 tracker (Jain & Chlamtac `P²`, 1985) in `O(1)` memory, a
+//!   [`math_opt_engine::RooflineModel`] analytic roofline (Williams,
+//!   Waterman & Patterson 2009) plus anti-windup PID frame-budget
+//!   controller, and exact 63-bit Morton Z-order keys with the
+//!   Mara-McGuire 2013 closed-form projected sphere diameter for
+//!   sub-pixel LOD/Hi-Z culling.
 
 #![deny(unsafe_code)]
 
@@ -90,6 +101,7 @@ pub mod hw_adaptive_engine;
 pub mod id;
 pub mod i18n;
 pub mod math;
+pub mod math_opt_engine;
 pub mod math_opt_foundation;
 pub mod perf_kit;
 pub mod random;
