@@ -23,6 +23,7 @@ mod region;
 mod section;
 pub mod shaderpack;
 pub mod shaderpack_reflect;
+pub mod space_sky_bridge;
 pub mod upload_budget;
 pub mod vanilla_plus_3d;
 pub mod vanilla_plus_nature;
