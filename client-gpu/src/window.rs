@@ -11,9 +11,10 @@ use mc_spine_client::audio_qol::{ZoomState, DEFAULT_ZOOM_SMOOTHING_RATE};
 use mc_spine_client::friend_client::{FriendGuestBridge, FriendHostSession};
 use mc_spine_client::integrated;
 use mc_spine_client::protocol::encode_slot_stack;
-use mc_spine_client::render::{FrameBudgetGovernor, RenderConfig};
+use mc_spine_client::render::{FrameBudgetGovernor, RenderConfig, ThrottleStage};
 use mc_spine_client::zsh_command_bar::ZshCommandBar;
 use mc_spine_client_mesh::builtin_shadow_wgsl::{BuiltinShadowQuality, RenderScalePreset};
+use mc_spine_client_mesh::ChunkUploadBudget;
 use mc_spine_kernel::debug_chords::{
     finish_gamemode_switcher, handle_f3_chord, DebugChordAction, DebugChordContext,
     DebugChordState, DebugTarget, F3Chord, PlayerDebugInfo,
@@ -53,6 +54,11 @@ pub const WINDOW_TITLE: &str = "mc-spine";
 /// Event-loop wake interval while the surface is occluded: slow enough for
 /// zero-GPU sleep, fast enough to keep a live session's network pump alive.
 const OCCLUDED_TICK: Duration = Duration::from_millis(50);
+
+/// F3 diagnostic line refresh interval: the overlay reads smoothly at
+/// 10 Hz, and a stable actionbar keeps the draw-list fingerprint — and
+/// therefore the UI mesh upload — quiet on steady frames.
+const F3_REFRESH: Duration = Duration::from_millis(100);
 
 const THIRD_PERSON_DISTANCE: f32 = 4.0;
 const SPRINT_FOV_BOOST: f32 = 0.10;
@@ -530,6 +536,20 @@ pub struct GpuApp {
     render_config: RenderConfig,
     policy: DisplayPresentationPolicy,
     governor: FrameBudgetGovernor,
+    /// User-requested shadow quality / render scale, restored when the
+    /// governor steps back to `ThrottleStage::Full`.
+    user_shadow_quality: BuiltinShadowQuality,
+    user_render_scale: RenderScalePreset,
+    /// Renderer upload budget captured at init; `TrimRebuilds` swaps in a
+    /// 1-section / 32 KiB cap and `Full` restores this baseline.
+    baseline_upload_budget: Option<ChunkUploadBudget>,
+    /// Latest F3 diagnostic string and when it was built — refreshed at
+    /// most every `F3_REFRESH` so steady frames never re-format it.
+    f3_text: Option<(String, Instant)>,
+    /// Mouse deltas accumulated while the loop slept, applied once
+    /// immediately before `render_frame` derives the view camera — the
+    /// late-latch: input sampled as close to the draw as possible.
+    pending_mouse_delta: (f64, f64),
     last_frame: Instant,
     frame_start: Instant,
     fatal: Option<String>,
@@ -650,6 +670,11 @@ impl GpuApp {
             render_config,
             policy,
             governor,
+            user_shadow_quality: BuiltinShadowQuality::Off,
+            user_render_scale: RenderScalePreset::Native100,
+            baseline_upload_budget: None,
+            f3_text: None,
+            pending_mouse_delta: (0.0, 0.0),
             last_frame: Instant::now(),
             frame_start: Instant::now(),
             fatal: None,
@@ -833,6 +858,7 @@ impl GpuApp {
                 }
                 VisualStylePreset::MeguNatural => BuiltinShadowQuality::Natural,
             };
+            self.user_shadow_quality = shadow_quality;
             active.renderer.set_shadow_quality(shadow_quality);
             let scale = match video.preset {
                 VideoPreset::Fast => RenderScalePreset::Performance67,
@@ -841,6 +867,7 @@ impl GpuApp {
                 }
                 VideoPreset::Custom => active.renderer.render_scale,
             };
+            self.user_render_scale = scale;
             active.renderer.set_render_scale(scale);
         }
         if vsync_changed {
@@ -1238,6 +1265,7 @@ impl GpuApp {
         };
         let config = surface_config_for(
             self.render_config.vsync,
+            self.render_config.effective_fps_cap(self.focused),
             &self.policy,
             active.surface_format,
             active.size,
@@ -1246,6 +1274,7 @@ impl GpuApp {
         active
             .surface
             .configure(&active.renderer.gpu().device, &config);
+        self.baseline_upload_budget = Some(active.renderer.upload_budget().clone());
         if self.live.is_none() {
             let scene = build_demo_scene(self.camera.position);
             active
@@ -1684,6 +1713,15 @@ impl GpuApp {
         let dt = frame_begin.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = frame_begin;
 
+        // JIT late-latch: mouse deltas that arrived while the loop slept
+        // apply once, right here at the top of the frame, so the camera
+        // pose read below is the freshest input the OS delivered.
+        let (mdx, mdy) = std::mem::take(&mut self.pending_mouse_delta);
+        if mdx != 0.0 || mdy != 0.0 {
+            self.camera_controller
+                .apply_mouse_look(&mut self.camera, mdx, mdy);
+        }
+
         let planes = self.view_frustum_planes();
         if let Some(live) = &mut self.live {
             live.poll(
@@ -1748,8 +1786,27 @@ impl GpuApp {
         let (w, h) = (active.size.width.max(1), active.size.height.max(1));
 
         if let Some(live) = &mut self.live {
-            if live.terrain_dirty {
+            active.renderer.set_player_position(self.camera.position);
+            if live.terrain_full_sync {
+                // First sync / dimension change: full reconcile once.
                 active.renderer.update_live_terrain(&live.world);
+                live.terrain_full_sync = false;
+                live.dirty_terrain_coords.clear();
+                live.terrain_order_sweep = false;
+                live.terrain_dirty = false;
+            } else if live.terrain_dirty
+                || !live.dirty_terrain_coords.is_empty()
+                || live.terrain_order_sweep
+            {
+                // O(1) steady path: only the coords `LiveSession` marked
+                // per play event plus, when the camera re-sorted the
+                // translucent stream, a resident-order sweep. No
+                // full-world mesh scan.
+                let dirty = std::mem::take(&mut live.dirty_terrain_coords);
+                let order_sweep = std::mem::take(&mut live.terrain_order_sweep);
+                active
+                    .renderer
+                    .update_live_terrain_tracked(&live.world, &dirty, order_sweep);
                 live.terrain_dirty = false;
             }
             // Revision-gated HUD sync: unchanged server state skips the
@@ -1785,28 +1842,44 @@ impl GpuApp {
                 .extend(self.debug_messages.iter().cloned());
         }
 
-        // HUD/diagnostics through the real client-ui state machine.
+        // HUD/diagnostics through the real client-ui state machine. The
+        // F3 string refreshes at 10 Hz (`F3_REFRESH`): steady frames reuse
+        // the cached line, which also keeps the draw-list fingerprint
+        // stable so the UI mesh rebuild stays skipped.
         self.ui.hud.actionbar = if self.show_diagnostics {
-            format!(
-                "F3 | {} | {} | {} | {:.1} ms | x{:.2}{}",
-                active.renderer.gpu().report.resolution.backend.as_str(),
-                self.policy.description,
-                active.renderer.gpu().report.name,
-                self.governor.frame_ms(),
-                self.scale_factor,
-                self.live
-                    .as_ref()
-                    .map(|live| format!(
-                        " | chunks {} | sections {} | VFX {} | ANM {} (rejected {}) | MOT {:?}",
-                        live.world.loaded_chunks(),
-                        active.renderer.live_section_count(),
-                        live.vfx_admitted,
-                        live.animation_packets,
-                        live.animation_rejected,
-                        live.motion.as_ref().map(|motion| motion.phase),
-                    ))
-                    .unwrap_or_default(),
-            )
+            let stale = self
+                .f3_text
+                .as_ref()
+                .is_none_or(|(_, built)| built.elapsed() >= F3_REFRESH);
+            if stale {
+                self.f3_text = Some((
+                    format!(
+                        "F3 | {} | {} | {} | {:.1} ms | x{:.2}{}",
+                        active.renderer.gpu().report.resolution.backend.as_str(),
+                        self.policy.description,
+                        active.renderer.gpu().report.name,
+                        self.governor.frame_ms(),
+                        self.scale_factor,
+                        self.live
+                            .as_ref()
+                            .map(|live| format!(
+                                " | chunks {} | sections {} | VFX {} | ANM {} (rejected {}) | MOT {:?}",
+                                live.world.loaded_chunks(),
+                                active.renderer.live_section_count(),
+                                live.vfx_admitted,
+                                live.animation_packets,
+                                live.animation_rejected,
+                                live.motion.as_ref().map(|motion| motion.phase),
+                            ))
+                            .unwrap_or_default(),
+                    ),
+                    Instant::now(),
+                ));
+            }
+            self.f3_text
+                .as_ref()
+                .map(|(text, _)| text.clone())
+                .unwrap_or_default()
         } else {
             self.live
                 .as_ref()
@@ -1878,6 +1951,7 @@ impl GpuApp {
                     .get_capabilities(&active.renderer.gpu().adapter);
                 let cfg = surface_config_for(
                     self.render_config.vsync,
+                    self.render_config.effective_fps_cap(self.focused),
                     &self.policy,
                     active.surface_format,
                     active.size,
@@ -1888,7 +1962,51 @@ impl GpuApp {
                     .configure(&active.renderer.gpu().device, &cfg);
             }
         }
-        self.governor.observe_frame(frame_begin.elapsed());
+        let stage = self.governor.observe_frame(frame_begin.elapsed());
+        self.apply_governor_stage(stage);
+    }
+
+    /// Apply the governor's throttle stage live: `Full` restores the
+    /// baseline upload budget, user shadow quality and user render
+    /// scale; `TrimRebuilds` caps uploads at one section / 32 KiB per
+    /// frame and clamps the dirty rebuild allowance; `TrimLod` adds
+    /// shadow shutdown; `MinBudget` drops the 3D viewport to the 50%
+    /// rung of the render-scale ladder (UI still renders at native).
+    fn apply_governor_stage(&mut self, stage: ThrottleStage) {
+        if stage == ThrottleStage::Full {
+            if let Some(active) = &mut self.active {
+                if let Some(budget) = self.baseline_upload_budget.clone() {
+                    active.renderer.set_upload_budget(budget);
+                }
+                active.renderer.set_shadow_quality(self.user_shadow_quality);
+                active.renderer.set_render_scale(self.user_render_scale);
+            }
+            if let Some(live) = &mut self.live {
+                live.governor_rebuild_cap = usize::MAX;
+            }
+            return;
+        }
+        let Some(active) = &mut self.active else {
+            return;
+        };
+        active.renderer.set_upload_budget(
+            ChunkUploadBudget::with_limits(1, 32 * 1024, 150).with_target_frame_us(1_000),
+        );
+        if let Some(live) = &mut self.live {
+            live.governor_rebuild_cap = 1;
+        }
+        if stage == ThrottleStage::TrimRebuilds {
+            return;
+        }
+        active
+            .renderer
+            .set_shadow_quality(BuiltinShadowQuality::Off);
+        if stage == ThrottleStage::TrimLod {
+            return;
+        }
+        active
+            .renderer
+            .set_render_scale(RenderScalePreset::UltraPerf50);
     }
 
     fn handle_key(&mut self, code: KeyCode, state: ElementState, event_loop: &ActiveEventLoop) {
@@ -2094,6 +2212,7 @@ impl GpuApp {
             .get_capabilities(&active.renderer.gpu().adapter);
         let cfg = surface_config_for(
             self.render_config.vsync,
+            self.render_config.effective_fps_cap(self.focused),
             &self.policy,
             active.surface_format,
             active.size,
@@ -2109,6 +2228,7 @@ impl GpuApp {
 /// detected display server's [`DisplayPresentationPolicy`].
 fn surface_config_for(
     vsync: bool,
+    fps_cap: u32,
     policy: &DisplayPresentationPolicy,
     surface_format: wgpu::TextureFormat,
     size: PhysicalSize<u32>,
@@ -2124,8 +2244,13 @@ fn surface_config_for(
         // Policy frame latency: `1` uncapped on Wayland/X11/Windows DX12
         // keeps `Mailbox`/`Immediate` input->photon time minimal; `2`
         // under vsync and on macOS Metal, where the extra buffered frame
-        // avoids present stalls.
-        desired_maximum_frame_latency: policy.frame_latency(vsync),
+        // avoids present stalls. An active FPS cap always drops to `1`
+        // so the JIT pacing loop never queues a frame behind present.
+        desired_maximum_frame_latency: if fps_cap > 0 {
+            policy.frame_latency_capped()
+        } else {
+            policy.frame_latency(vsync)
+        },
         // `Opaque` unlocks direct scanout + VRR wherever the policy asks
         // for it (Wayland, X11, Windows, macOS all do); otherwise honor
         // the surface's own first choice.
@@ -2320,11 +2445,14 @@ impl ApplicationHandler for GpuApp {
         event: DeviceEvent,
     ) {
         // Raw mouse deltas drive the camera while grabbed — unaffected by
-        // cursor clamping at screen edges.
+        // cursor clamping at screen edges. Deltas accumulate rather than
+        // applying per event: `render_frame` latches the summed delta at
+        // the top of the frame, so a 1000 Hz motion stream during a
+        // WaitUntil sleep costs zero camera math until the pose is read.
         if let DeviceEvent::MouseMotion { delta } = event {
             if self.cursor_grabbed && !self.paused {
-                self.camera_controller
-                    .apply_mouse_look(&mut self.camera, delta.0, delta.1);
+                self.pending_mouse_delta.0 += delta.0;
+                self.pending_mouse_delta.1 += delta.1;
             }
         }
     }
@@ -2363,6 +2491,13 @@ impl ApplicationHandler for GpuApp {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
                 return;
             }
+            // Deadline reached: request one redraw and sleep until it
+            // fires — a capped loop never enters `Poll` spin.
+            if let Some(active) = &self.active {
+                active.window.request_redraw();
+            }
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
         }
         if let Some(active) = &self.active {
             active.window.request_redraw();

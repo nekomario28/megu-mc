@@ -105,7 +105,10 @@ fn subtitle_rows_appear_in_live_hud_draw_list() {
         UiCommand::Text { text, .. } => text.contains("block stone break"),
         _ => false,
     });
-    assert!(has_subtitle_text, "subtitle row text lands in the draw list");
+    assert!(
+        has_subtitle_text,
+        "subtitle row text lands in the draw list"
+    );
 }
 
 #[test]

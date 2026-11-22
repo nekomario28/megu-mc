@@ -405,6 +405,14 @@ impl ChunkFadeTracker {
         self.ages.contains_key(&(cx, cz)) && self.fade_alpha(cx, cz) < 1.0
     }
 
+    /// `true` when any tracked chunk's fade is still animating — the
+    /// opaque-terrain RenderBundle path consults this because fade values
+    /// bake into the recorded draw uniforms.
+    pub fn any_fading(&self) -> bool {
+        let duration = self.resolved_fade_seconds();
+        self.ages.values().any(|age| *age < duration)
+    }
+
     /// Drop every chunk not accepted by `keep` (world unloads, view-radius
     /// shrink). `keep` receives `(cx, cz)`.
     pub fn retain<F: FnMut((i32, i32)) -> bool>(&mut self, mut keep: F) {

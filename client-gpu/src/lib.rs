@@ -946,31 +946,32 @@ impl DisplayPresentationPolicy {
             self.uncapped_frame_latency
         }
     }
+
+    /// `desired_maximum_frame_latency` while an FPS cap drives the
+    /// WaitUntil pacing loop: always `1` — the cap's software deadline
+    /// already paces frames, so an extra buffered frame would only add
+    /// input->photon latency.
+    pub fn frame_latency_capped(&self) -> u32 {
+        1
+    }
 }
 
 /// Select the presentation policy for `display` under backend preference
-/// `pref`. `ClassicLowSpec` is GL-only on every platform — the whole point
-/// of the profile is a pipeline GL 3.3-class hardware can drive. Otherwise
-/// the native modern API leads: Vulkan on Linux, DX12 on Windows (native
+/// `pref`. Every preference — `ClassicLowSpec` included — runs pure
+/// `wgpu::Backends::PRIMARY` native APIs (Vulkan / DX12 / Metal); the
+/// low-spec profile is a feature/limit budget, never a GL fallback.
+/// The native modern API leads: Vulkan on Linux, DX12 on Windows (native
 /// DXGI Independent Flip / Multi-Plane Overlay, zero-flicker Alt+Tab),
 /// Metal on macOS.
 pub fn select_display_presentation_policy(
     display: DisplayServerKind,
-    pref: RenderBackendPreference,
+    _pref: RenderBackendPreference,
 ) -> DisplayPresentationPolicy {
-    let preferred_backends = if pref == RenderBackendPreference::ClassicLowSpec {
-        wgpu::Backends::GL
-    } else {
-        match display {
-            DisplayServerKind::Wayland | DisplayServerKind::X11 => {
-                wgpu::Backends::VULKAN | wgpu::Backends::GL
-            }
-            DisplayServerKind::Windows => {
-                wgpu::Backends::DX12 | wgpu::Backends::VULKAN | wgpu::Backends::GL
-            }
-            DisplayServerKind::MacOs => wgpu::Backends::METAL,
-            DisplayServerKind::Headless => wgpu::Backends::PRIMARY | wgpu::Backends::SECONDARY,
-        }
+    let preferred_backends = match display {
+        DisplayServerKind::Wayland | DisplayServerKind::X11 => wgpu::Backends::VULKAN,
+        DisplayServerKind::Windows => wgpu::Backends::DX12 | wgpu::Backends::VULKAN,
+        DisplayServerKind::MacOs => wgpu::Backends::METAL,
+        DisplayServerKind::Headless => wgpu::Backends::PRIMARY,
     };
     DisplayPresentationPolicy {
         display,
@@ -1347,10 +1348,7 @@ mod tests {
             RenderBackendPreference::Auto,
         );
         assert_eq!(policy.display, DisplayServerKind::Wayland);
-        assert_eq!(
-            policy.preferred_backends,
-            wgpu::Backends::VULKAN | wgpu::Backends::GL
-        );
+        assert_eq!(policy.preferred_backends, wgpu::Backends::VULKAN);
         assert!(policy.prefer_locked_pointer_first);
         assert!(policy.call_pre_present_notify);
         assert!(policy.prefer_opaque_direct_scanout);
@@ -1366,10 +1364,7 @@ mod tests {
             DisplayServerKind::X11,
             RenderBackendPreference::Auto,
         );
-        assert_eq!(
-            policy.preferred_backends,
-            wgpu::Backends::VULKAN | wgpu::Backends::GL
-        );
+        assert_eq!(policy.preferred_backends, wgpu::Backends::VULKAN);
         assert!(!policy.prefer_locked_pointer_first);
         assert_eq!(policy.uncapped_frame_latency, 1);
         assert_eq!(policy.description, "x11/vulkan");
@@ -1403,7 +1398,7 @@ mod tests {
     }
 
     #[test]
-    fn classic_low_spec_is_gl_on_every_display_server() {
+    fn classic_low_spec_is_primary_on_every_display_server() {
         for display in [
             DisplayServerKind::Wayland,
             DisplayServerKind::X11,
@@ -1415,7 +1410,10 @@ mod tests {
                 display,
                 RenderBackendPreference::ClassicLowSpec,
             );
-            assert_eq!(policy.preferred_backends, wgpu::Backends::GL, "{display:?}");
+            assert!(
+                wgpu::Backends::PRIMARY.contains(policy.preferred_backends),
+                "{display:?}"
+            );
         }
     }
 

@@ -15,16 +15,12 @@
 //!   move cleanly on pose-only updates.
 
 use mc_spine_client::protocol::{ClientPlayEvent, PlayEvent};
-use mc_spine_client_gpu::atmosphere::{
-    AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker,
-};
+use mc_spine_client_gpu::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
 use mc_spine_client_gpu::live_session::{KineticPartSpec, LiveSession};
 use mc_spine_client_gpu::renderer::{
     probe_adapters, request_gpu_device, ComposedFrame, GpuRenderer, OFFSCREEN_FORMAT,
 };
-use mc_spine_client_gpu::subworld_render::{
-    box_mesh, quat_from_axis_angle, SubWorldTransform,
-};
+use mc_spine_client_gpu::subworld_render::{box_mesh, quat_from_axis_angle, SubWorldTransform};
 use mc_spine_client_gpu::{select_present_mode, should_call_pre_present_notify, Camera};
 use mc_spine_client_mesh::vfx_engine::DynamicColoredLight;
 use mc_spine_client_mesh::RenderBackendPreference;
@@ -167,7 +163,10 @@ fn f1_f3_f4_f5_gpu_ui_quads_cull_cache_hud_rev_and_shadow_u64() {
             y: 8,
             scale: 2,
             color: palette::TEXT,
-            text: format!("F3 | frame {frame_idx} | {0:.3} ms", frame_idx as f32 * 0.317),
+            text: format!(
+                "F3 | frame {frame_idx} | {0:.3} ms",
+                frame_idx as f32 * 0.317
+            ),
         });
         let mesh = tessellate_draw_list(160, 120, &list);
         assert!(!mesh.indices.is_empty(), "F3 HUD must tessellate");
@@ -186,9 +185,7 @@ fn f1_f3_f4_f5_gpu_ui_quads_cull_cache_hud_rev_and_shadow_u64() {
             assert_nonblank_frame(&pixels, "GPU-quad composed frame");
         }
     }
-    eprintln!(
-        "mega-w4: composed-frame ms = {frame_ms:?} (includes readback)"
-    );
+    eprintln!("mega-w4: composed-frame ms = {frame_ms:?} (includes readback)");
     assert!(
         renderer.ui_gpu_quad_frames >= 2,
         "GPU quad UI path must draw on consecutive changing-F3 frames, got {}",
@@ -293,10 +290,7 @@ fn f5_vsync_off_selects_immediate_and_skips_pre_present_notify() {
         select_present_mode(true, &supported),
         wgpu::PresentMode::Fifo
     );
-    assert_eq!(
-        select_present_mode(true, &[]),
-        wgpu::PresentMode::AutoVsync
-    );
+    assert_eq!(select_present_mode(true, &[]), wgpu::PresentMode::AutoVsync);
     // The Wayland frame-callback notify is a vsync-only pacing hint.
     assert!(!should_call_pre_present_notify(false));
     assert!(should_call_pre_present_notify(true));
@@ -307,8 +301,7 @@ fn f5_vsync_off_selects_immediate_and_skips_pre_present_notify() {
 /// a 6-DOF contraption sub-world renders non-empty pixels that move on
 /// pose-only updates.
 #[test]
-fn c3_2000_kinetic_gears_render_in_single_instanced_batch_and_contraption_subworld_renders()
- {
+fn c3_2000_kinetic_gears_render_in_single_instanced_batch_and_contraption_subworld_renders() {
     let Some(mut renderer) = try_gpu_renderer() else {
         return;
     };
@@ -366,8 +359,7 @@ fn c3_2000_kinetic_gears_render_in_single_instanced_batch_and_contraption_subwor
     );
 
     // One 6-DOF contraption sub-world in front of the camera.
-    let (hull_verts, hull_inds) =
-        box_mesh([-1.5, -1.0, -1.5], [1.5, 1.0, 1.5], [0.8, 0.4, 0.2]);
+    let (hull_verts, hull_inds) = box_mesh([-1.5, -1.0, -1.5], [1.5, 1.0, 1.5], [0.8, 0.4, 0.2]);
     live.upsert_live_contraption_subworld(
         42,
         SubWorldTransform {

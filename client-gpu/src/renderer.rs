@@ -6,7 +6,7 @@
 
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -45,10 +45,10 @@ use crate::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTrack
 use crate::live_session::hw_adaptive_engine::{
     detect_host_hardware_caps, select_compute_strategy, ComputeStrategy, MemoryTransferStrategy,
 };
+use crate::mat4_mul;
 use crate::mesh_pool::{
     compute_opaque_bucket_ranges, HiZSplatSection, MeshJob, MeshJobPool, MeshResult,
 };
-use crate::mat4_mul;
 use crate::subworld_render::{
     CompositeDrawUniforms, CompositeEnvUniforms, DebugLineVertex, SubWorldGpuCache,
     SubWorldRenderBank, TerrainVertex, VfxLightsGpu, COMPOSITE_LIT_WGSL, COMPOSITE_TERRAIN_WGSL,
@@ -234,7 +234,10 @@ pub fn request_gpu_device(
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("mc-spine-client-gpu"),
         required_features: wgpu::Features::empty(),
-        required_limits: wgpu::Limits::default(),
+        // The adapter's own limits: guaranteed grantable, and low-spec
+        // adapters keep their clamped ceilings instead of the inflated
+        // `Limits::default()` a discrete-GPU bucket would request.
+        required_limits: adapter.limits(),
         ..wgpu::DeviceDescriptor::default()
     }))
     .map_err(|e| RendererError::Device(e.to_string()))?;
@@ -305,53 +308,19 @@ pub const TERRAIN_VERTEX_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::Verte
     attributes: &TERRAIN_ATTRS,
 };
 
-/// Opaque terrain vertex for the shared 8x4x8-section region arena: a
-/// region-local `f32` position plus the three packed attribute words of
-/// [`PackedVertex`] (24-byte stride). Keeping the position in floats lets
-/// merged draws span whole regions without repacking coordinates into the
-/// section-local 5/5/22-bit word — the region WGSL feeds `pos` straight
-/// into `section.origin + pos`, where `section.origin` is the region
-/// minimum. Positions decode exactly like the packed path
-/// (`y_fixed / 1024`, power-of-two scale) so rasterization stays
-/// pixel-identical.
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct RegionVertex {
-    position: [f32; 3],
-    state_id: u32,
-    attributes: u32,
-    tint: u32,
+/// Section-in-region offset packed into `PackedVertex::attributes` bits
+/// 24-31 for the shared 8x4x8-section region arena: `sx | (sy << 3) |
+/// (sz << 5)` where `sx, sz in 0..8` and `sy in 0..4`. Every WGSL decode
+/// and post-pack consumer reads only attribute bits 0-17, so the top
+/// byte (quad extents/corner, dead on the GPU) is cleared and reused —
+/// and the section-local `position` word keeps all 25 coordinate bits
+/// (including the 1/1024 `ly` precision) 100% untouched.
+fn region_section_word(origin: [i32; 3], coord: SectionCoord) -> u32 {
+    let sx = (coord.0 - origin[0]) as u32;
+    let sy = (coord.1 - origin[1]) as u32;
+    let sz = (coord.2 - origin[2]) as u32;
+    (sx | (sy << 3) | (sz << 5)) << 24
 }
-
-const REGION_ATTRS: [wgpu::VertexAttribute; 4] = [
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32x3,
-        offset: 0,
-        shader_location: 0,
-    },
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Uint32,
-        offset: 12,
-        shader_location: 1,
-    },
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Uint32,
-        offset: 16,
-        shader_location: 2,
-    },
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Uint32,
-        offset: 20,
-        shader_location: 3,
-    },
-];
-
-/// 24-byte `RegionVertex` stride -> `vec3<f32>` + three `u32` inputs.
-const REGION_VERTEX_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
-    array_stride: std::mem::size_of::<RegionVertex>() as wgpu::BufferAddress,
-    step_mode: wgpu::VertexStepMode::Vertex,
-    attributes: &REGION_ATTRS,
-};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Offscreen/UI-framebuffer pixel format.
@@ -579,19 +548,28 @@ struct ArenaDrawRecord {
 }
 
 /// Shared vertex/index arena over one 8x4x8-section region (the
-/// [`RenderRegions`] grid): repacked opaque vertices live in one vertex
-/// buffer, and one index buffer holds seven contiguous direction-bucket
-/// streams so a frame submits a handful of merged draws per region
-/// instead of per-section buffer binds.
+/// [`RenderRegions`] grid): 16-byte `PackedVertex` streams upload into
+/// one vertex buffer through slot-range partial `queue.write_buffer`s
+/// (no CPU-side vertex copy is retained), and one index buffer holds
+/// seven contiguous direction-bucket streams so a frame submits a
+/// handful of merged draws per region instead of per-section binds.
 struct RegionArena {
-    /// Region-local opaque vertices (holes tracked in `vertex_free`).
-    vertices: Vec<RegionVertex>,
+    /// Vertices appended past the free list (the arena's high-water
+    /// vertex count; holes live in `vertex_free`).
+    vertex_high_water: u32,
     /// First-fit free list of `(offset, len)` vertex holes, coalesced —
     /// the same discipline `client-port`'s arena uses.
     vertex_free: Vec<(u32, u32)>,
     /// Resident sections in deterministic order.
     slots: BTreeMap<SectionCoord, ArenaSlot>,
-    /// Combined index contents: seven contiguous bucket streams.
+    /// Serialized `(byte_offset, bytes)` vertex payloads staged by
+    /// [`Self::insert`] for the next partial upload.
+    pending_vertex_writes: Vec<(u64, Vec<u8>)>,
+    /// Vertices actually present in `vertex_buffer` (for the growth
+    /// copy); tracks `vertex_high_water` once flushes land.
+    flushed_vertex_len: u32,
+    /// Combined index contents: seven contiguous bucket streams —
+    /// rebuild scratch, dropped to the GPU after each flush.
     indices: Vec<u32>,
     /// Per-bucket `(coord, start, end)` draw records in `indices` order.
     bucket_records: [Vec<ArenaDrawRecord>; DIRECTION_BUCKETS],
@@ -623,7 +601,9 @@ impl RegionArena {
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("region-arena-vertices"),
             size: 64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -667,9 +647,11 @@ impl RegionArena {
             ],
         });
         Self {
-            vertices: Vec::new(),
+            vertex_high_water: 0,
             vertex_free: Vec::new(),
             slots: BTreeMap::new(),
+            pending_vertex_writes: Vec::new(),
+            flushed_vertex_len: 0,
             indices: Vec::new(),
             bucket_records: Default::default(),
             vertex_dirty: false,
@@ -716,17 +698,21 @@ impl RegionArena {
             }
             return offset;
         }
-        let offset = self.vertices.len() as u32;
-        self.vertices.resize(offset as usize + len as usize, RegionVertex::zeroed());
+        let offset = self.vertex_high_water;
+        self.vertex_high_water += len;
         offset
     }
 
-    /// Insert or replace `coord`'s opaque stream: vertices repacked into
-    /// region space, indices staged for the next bucket-stream rebuild.
+    /// Insert or replace `coord`'s opaque stream: the 16-byte
+    /// `PackedVertex` payload serializes straight into a staged partial
+    /// write at the slot's byte offset (each vertex's `attributes` gains
+    /// the section-in-region word in its free top byte), and the slot's
+    /// local indices stage for the next bucket-stream rebuild.
     fn insert(
         &mut self,
         coord: SectionCoord,
-        vertices: &[RegionVertex],
+        vertices: &[PackedVertex],
+        section_word: u32,
         local_indices: Arc<[u32]>,
         bucket_ranges: [(u32, u32); DIRECTION_BUCKETS],
     ) {
@@ -735,8 +721,19 @@ impl RegionArena {
         }
         let vertex_count = vertices.len() as u32;
         let vertex_offset = self.alloc_vertices(vertex_count);
-        let start = vertex_offset as usize;
-        self.vertices[start..start + vertices.len()].copy_from_slice(vertices);
+        let mut bytes = Vec::with_capacity(std::mem::size_of_val(vertices));
+        for v in vertices {
+            bytes.extend_from_slice(&v.position.to_ne_bytes());
+            bytes.extend_from_slice(&v.state_id.to_ne_bytes());
+            // Clear — not OR — the top attribute byte: quad extents and
+            // the corner index live there but no shader or post-pack
+            // consumer reads them; the slot needs all 8 bits for the
+            // section-in-region word.
+            bytes.extend_from_slice(&((v.attributes & 0x00ff_ffff) | section_word).to_ne_bytes());
+            bytes.extend_from_slice(&v.tint.to_ne_bytes());
+        }
+        self.pending_vertex_writes
+            .push((u64::from(vertex_offset) * 16, bytes));
         self.slots.insert(
             coord,
             ArenaSlot {
@@ -788,31 +785,57 @@ impl RegionArena {
         self.index_dirty = false;
     }
 
-    /// Upload dirty vertex/index contents, growing the GPU buffers past
-    /// the required capacity in one step.
-    fn flush_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+    /// Upload dirty vertex/index contents. Vertex inserts become
+    /// slot-range partial `queue.write_buffer`s; when the arena outgrows
+    /// the buffer the live slab is preserved by a `copy_buffer_to_buffer`
+    /// (the CPU copy was already dropped), so only the new payload bytes
+    /// ever cross the bus. Returns `(partial vertex writes, buffers
+    /// replaced)` — a replaced vertex/index buffer invalidates any
+    /// recorded `RenderBundle` referencing the old objects.
+    fn flush_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> (u32, bool) {
         let index_rebuilt = self.index_dirty;
         if index_rebuilt {
             self.rebuild_indices();
         }
+        let mut buffers_replaced = false;
+        let mut partial_uploads = 0;
         if self.vertex_dirty {
-            let needed = self.vertices.len();
+            let needed = self.vertex_high_water as usize;
             if needed > self.vertex_capacity {
+                let live_bytes = u64::from(self.flushed_vertex_len) * 16;
                 self.vertex_capacity = needed.max(64) + needed / 2;
-                self.vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                let new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("region-arena-vertices"),
-                    size: (self.vertex_capacity * std::mem::size_of::<RegionVertex>()) as u64,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    size: (self.vertex_capacity * 16) as u64,
+                    usage: wgpu::BufferUsages::VERTEX
+                        | wgpu::BufferUsages::COPY_DST
+                        | wgpu::BufferUsages::COPY_SRC,
                     mapped_at_creation: false,
                 });
+                if live_bytes > 0 {
+                    // Preserve resident slot payloads before the partial
+                    // writes land (the CPU copies are long gone).
+                    let mut encoder =
+                        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("region-arena-grow"),
+                        });
+                    encoder.copy_buffer_to_buffer(
+                        &self.vertex_buffer,
+                        0,
+                        &new_buffer,
+                        0,
+                        live_bytes,
+                    );
+                    queue.submit([encoder.finish()]);
+                }
+                self.vertex_buffer = new_buffer;
+                buffers_replaced = true;
             }
-            if !self.vertices.is_empty() {
-                queue.write_buffer(
-                    &self.vertex_buffer,
-                    0,
-                    bytemuck::cast_slice(&self.vertices),
-                );
+            for (byte_offset, bytes) in self.pending_vertex_writes.drain(..) {
+                queue.write_buffer(&self.vertex_buffer, byte_offset, &bytes);
+                partial_uploads += 1;
             }
+            self.flushed_vertex_len = self.vertex_high_water;
             self.vertex_dirty = false;
         }
         if index_rebuilt {
@@ -825,12 +848,19 @@ impl RegionArena {
                     usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
+                buffers_replaced = true;
             }
             if !self.indices.is_empty() {
                 queue.write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&self.indices));
             }
             self.index_len = self.indices.len() as u32;
+            // Index scratch is rebuild-only; shrink it so a spike doesn't
+            // linger as resident heap.
+            if self.indices.capacity() > self.indices.len().max(4096) * 2 {
+                self.indices.shrink_to_fit();
+            }
         }
+        (partial_uploads, buffers_replaced)
     }
 }
 
@@ -849,6 +879,16 @@ fn strategy_upload_defaults(strategy: &ComputeStrategy) -> (ChunkUploadBudget, u
         MemoryTransferStrategy::DiscreteStagedArena => ChunkUploadBudget::new(),
     };
     (budget, strategy.workers.foreground_threads)
+}
+
+/// The `HardFloor1000Fps` upload-drain preset: at a 1000 fps pace a
+/// frame's upload work must stay under ~150 µs and 128 KiB, with at
+/// most two section installs — the rest of the queue spreads across
+/// following frames so a rebuild burst never spikes a 1 ms frame.
+pub fn hard_floor_upload_budget() -> ChunkUploadBudget {
+    ChunkUploadBudget::with_limits(2, 128 * 1024, 150)
+        .with_target_frame_us(1_000)
+        .with_min_uploads_per_frame(1)
 }
 
 /// Six view-frustum planes in [`box_in_frustum`] form extracted from the
@@ -920,102 +960,51 @@ fn section_draw_mask(min: [f32; 3], camera: [f32; 3]) -> u8 {
     draw
 }
 
-/// Repack the section-local opaque `PackedVertex` stream into
-/// [`RegionVertex`] positions relative to `origin` (the containing
-/// 8x4x8 region's minimum section coordinate). The decode mirrors the
-/// shader's packed decode bit-for-bit; only the block offset changes.
-fn repack_opaque_for_region(
-    origin: [i32; 3],
-    coord: SectionCoord,
-    verts: &[PackedVertex],
-) -> Vec<RegionVertex> {
-    let base = [
-        ((coord.0 - origin[0]) * EDGE as i32) as f32,
-        ((coord.1 - origin[1]) * EDGE as i32) as f32,
-        ((coord.2 - origin[2]) * EDGE as i32) as f32,
-    ];
-    verts
-        .iter()
-        .map(|v| RegionVertex {
-            position: [
-                (v.position & 31) as f32 + base[0],
-                (v.position >> 10) as f32 / 1024.0 + base[1],
-                ((v.position >> 5) & 31) as f32 + base[2],
-            ],
-            state_id: v.state_id,
-            attributes: v.attributes,
-            tint: v.tint,
-        })
-        .collect()
-}
-
-/// Rewrite the packed-position opaque vertex decode of `source` (one of
-/// the built-in terrain WGSL modules) into the [`REGION_VERTEX_LAYOUT`]
-/// `vec3<f32>` region-local position. Only the `TerrainVertex` input and
-/// the first `terrain_*_vs` entry change — the translucent entry keeps
-/// its own `TranslucentVertex` packed layout, so fragment stages and
-/// every other entry stay byte-identical. Panics on anchor drift: a
-/// silently wrong layout is worse than a loud build failure.
+/// Rewrite the section-local opaque vertex decode of `source` (one of
+/// the built-in terrain WGSL modules) so the same 16-byte `PackedVertex`
+/// stream draws region-arena geometry: the section-in-region offset
+/// lives in `attributes` bits 24-31 (`sx | sy<<3 | sz<<5`, written by
+/// [`RegionArena::insert`] via [`region_section_word`]) and is folded
+/// into the integer part of the coordinate decode — `lx`/`lz` gain
+/// `sec*16` block offsets and `ly` gains `sec*16384` fixed-point units,
+/// keeping every `position` bit (including the 1/1024 `y` precision)
+/// bit-exact. Only the first `terrain_*_vs` decode changes; the
+/// translucent entry keeps its own section-local decode, so fragment
+/// stages and every other entry stay byte-identical. Panics on anchor
+/// drift: a silently wrong layout is worse than a loud build failure.
 fn region_opaque_wgsl(source: &str) -> String {
-    let out = source
-        .replacen(
-            "struct TerrainVertex {\n    @location(0) packed_pos: u32,",
-            "struct TerrainVertex {\n    @location(0) pos: vec3<f32>,",
-            1,
-        )
-        .replacen(
-            "let lx = f32(in.packed_pos & 0x1fu);\n    let lz = f32((in.packed_pos >> 5u) & 0x1fu);\n    let ly = f32(in.packed_pos >> 10u) / 1024.0;",
-            "let local = in.pos;",
-            1,
-        )
-        .replacen(
-            "section.origin + vec3<f32>(lx, ly, lz)",
-            "section.origin + local",
-            1,
-        )
-        .replacen(
-            "tiled_uv(vec3<f32>(lx, ly, lz), direction)",
-            "tiled_uv(local, direction)",
-            1,
-        );
+    let out = source.replacen(
+        "let lx = f32(in.packed_pos & 0x1fu);\n    let lz = f32((in.packed_pos >> 5u) & 0x1fu);\n    let ly = f32(in.packed_pos >> 10u) / 1024.0;",
+        "let sec = in.attributes >> 24u;\n    let lx = f32(in.packed_pos & 0x1fu) + f32((sec & 0x7u) * 16u);\n    let lz = f32((in.packed_pos >> 5u) & 0x1fu) + f32((sec >> 5u) * 16u);\n    let ly = f32((in.packed_pos >> 10u) + ((sec >> 3u) & 0x3u) * 16384u) / 1024.0;",
+        1,
+    );
     for anchor in [
-        "@location(0) pos: vec3<f32>,",
-        "let local = in.pos;",
-        "section.origin + local",
+        "let sec = in.attributes >> 24u;",
+        "section.origin + vec3<f32>(lx, ly, lz)",
     ] {
         assert!(out.contains(anchor), "region WGSL anchor missing: {anchor}");
     }
-    // `packed_pos` must not survive inside the *opaque* vertex struct or
-    // the opaque vs decode; the translucent entry keeps its own struct.
-    assert!(
-        !out.contains("struct TerrainVertex {\n    @location(0) packed_pos"),
-        "opaque vertex struct kept packed_pos"
-    );
     out
 }
 
 /// Same transform for the shadow-caster module's `vs_terrain` entry:
-/// the region vertex position arrives as a `vec3<f32>` and replaces the
-/// packed-word unpack.
+/// `attributes` joins `packed_pos` so the section-in-region offset in
+/// its top byte can shift the region-local position by whole sections.
 fn region_caster_wgsl(caster_source: &str) -> String {
     let out = caster_source
         .replacen(
             "fn vs_terrain(@location(0) packed_pos: u32)",
-            "fn vs_terrain(@location(0) pos: vec3<f32>)",
+            "fn vs_terrain(@location(0) packed_pos: u32, @location(2) attributes: u32)",
             1,
         )
         .replacen(
             "let local = vec3<f32>(f32(packed_pos & 31u),\n        f32(packed_pos >> 10u) / 1024.0, f32((packed_pos >> 5u) & 31u));",
-            "let local = pos;",
+            "let sec = attributes >> 24u;\n    let local = vec3<f32>(f32(packed_pos & 31u) + f32((sec & 7u) * 16u),\n        f32((packed_pos >> 10u) + ((sec >> 3u) & 3u) * 16384u) / 1024.0, f32((packed_pos >> 5u) & 31u) + f32(sec >> 5u) * 16.0);",
             1,
         );
     assert!(
-        out.contains("fn vs_terrain(@location(0) pos: vec3<f32>)"),
+        out.contains("fn vs_terrain(@location(0) packed_pos: u32, @location(2) attributes: u32)"),
         "region caster anchor missing"
-    );
-    assert!(
-        !out.contains("packed_pos"),
-        "region caster kept packed_pos decode"
     );
     out
 }
@@ -1031,6 +1020,234 @@ struct CullCacheKey {
     view_proj_bits: [u32; 16],
     world_revision: u64,
     hiz_revision: u64,
+}
+
+/// Inputs that decide whether the pre-recorded opaque-terrain
+/// `RenderBundle` still applies: the camera section (facing-cull masks +
+/// BFS root), the view-projection bits (frustum + Hi-Z view-match), the
+/// residency/graph and Hi-Z revisions, the demo-scene revision, whether
+/// any chunk fade is still animating (fade values bake into the recorded
+/// draw uniforms), and the active shadow pipeline selection.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TerrainBundleKey {
+    camera_section: (i32, i32, i32),
+    view_proj_bits: [u32; 16],
+    world_revision: u64,
+    hiz_revision: u64,
+    scene_revision: u64,
+    fades_active: bool,
+    shadow_active: bool,
+}
+
+/// Inputs that decide whether the pre-recorded UI-quad `RenderBundle`
+/// still applies: the draw's index count plus the vertex/index buffer
+/// identities (capacities only change on reallocation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UiBundleKey {
+    index_count: u32,
+    vertex_capacity: u64,
+    index_capacity: u64,
+}
+
+/// Encode the opaque-terrain portion of the composed world pass into any
+/// [`wgpu::util::RenderEncoder`] — the live `RenderPass` or a
+/// `RenderBundleEncoder` when the frame's opaque terrain is being cached
+/// for steady-state replay. Writes its draw-uniform slots into `scratch`
+/// (the persistent terrain slice at `draw_ubo` offsets `0..len`).
+///
+/// Returns `(skipped_buckets, arena_draws, arena_sections, arena_regions)`
+/// for the renderer counters. Pipelines arrive pre-resolved for shadow
+/// state; `scratch` is deliberately not `'a`-bound — pushing CPU-side
+/// draw-uniform records must end when the call returns.
+#[allow(clippy::too_many_arguments)]
+fn encode_opaque_terrain<'a>(
+    pass: &mut impl wgpu::util::RenderEncoder<'a>,
+    opaque_pipeline: &'a wgpu::RenderPipeline,
+    region_pipeline: &'a wgpu::RenderPipeline,
+    draw_bg: &'a wgpu::BindGroup,
+    scratch: &mut Vec<CompositeDrawUniforms>,
+    scene: Option<&'a TerrainBuffers>,
+    live_sections: &'a HashMap<SectionCoord, LiveTerrainSection>,
+    region_arenas: &'a BTreeMap<[i32; 3], RegionArena>,
+    culled_sections: &HashSet<SectionCoord>,
+    camera_position: [f32; 3],
+    chunk_fades: &ChunkFadeTracker,
+    frame_bind_group: &'a wgpu::BindGroup,
+    env_bind_group: &'a wgpu::BindGroup,
+    shadow_receiver_bg: Option<&'a wgpu::BindGroup>,
+    view_proj: &Mat4,
+) -> (u64, u64, usize, usize) {
+    // Bundle-recorded passes start with empty bind-group state, so the
+    // environment (group 2) and optional shadow receiver (group 3) the
+    // composite pipeline layouts expect are bound here once — the same
+    // bind the inline pass relied on persisting from before the loop.
+    pass.set_bind_group(2, Some(env_bind_group), &[]);
+    if let Some(receiver) = shadow_receiver_bg {
+        pass.set_bind_group(3, Some(receiver), &[]);
+    }
+    let mut skipped_buckets = 0u64;
+    let mut arena_draws = 0u64;
+    let mut arena_sections = 0usize;
+    let mut arena_regions = 0usize;
+    let identity: Mat4 = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ];
+    let mut slot = |model: Mat4, fade: f32, alpha: f32| -> u32 {
+        let index = scratch.len();
+        scratch.push(CompositeDrawUniforms {
+            mvp: mat4_mul(view_proj, &model),
+            model,
+            params: [fade, alpha, 0.0, 0.0],
+            params2: [0.0; 4],
+            _stride_pad: [0.0; 24],
+        });
+        index as u32 * DRAW_UNIFORM_STRIDE
+    };
+    // Opaque terrain: the demo scene, then every live section —
+    // arena-resident sections as merged per-region bucket draws,
+    // the rest through per-section buffers with the same facing
+    // cull applied per bucket.
+    pass.set_pipeline(opaque_pipeline);
+    if let Some(scene) = scene {
+        if scene.opaque_index_count > 0 {
+            let off = slot(identity, 1.0, 1.0);
+            pass.set_bind_group(0, Some(frame_bind_group), &[]);
+            pass.set_bind_group(1, Some(draw_bg), &[off]);
+            pass.set_vertex_buffer(0, Some(scene.opaque_vertices.slice(..)));
+            pass.set_index_buffer(scene.opaque_indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..scene.opaque_index_count, 0, 0..1);
+        }
+    }
+    // S4 shared region arena: one bind group + buffer pair per
+    // 8x4x8 region; seven contiguous direction-bucket streams in
+    // a single index buffer merge into a few draws per region.
+    if !region_arenas.is_empty() {
+        pass.set_pipeline(region_pipeline);
+        for arena in region_arenas.values() {
+            if arena.index_len == 0 {
+                continue;
+            }
+            let mut bound = false;
+            let mut emitted: HashSet<SectionCoord> = HashSet::new();
+            for (bucket, records) in arena.bucket_records.iter().enumerate() {
+                // Merged run of consecutive kept records sharing
+                // one fade value: (start, end, fade_bits).
+                let mut run: Option<(u32, u32, u32)> = None;
+                for record in records {
+                    let coord = &record.coord;
+                    let culled = culled_sections.contains(coord);
+                    let min = [
+                        coord.0 as f32 * EDGE as f32,
+                        coord.1 as f32 * EDGE as f32,
+                        coord.2 as f32 * EDGE as f32,
+                    ];
+                    let kept =
+                        !culled && section_draw_mask(min, camera_position) >> bucket & 1 != 0;
+                    if !kept {
+                        if !culled {
+                            skipped_buckets += 1;
+                        }
+                        if let Some((start, end, fade_bits)) = run.take() {
+                            let off = slot(identity, f32::from_bits(fade_bits), 1.0);
+                            pass.set_bind_group(1, Some(draw_bg), &[off]);
+                            pass.draw_indexed(start..end, 0, 0..1);
+                            arena_draws += 1;
+                        }
+                        continue;
+                    }
+                    if !bound {
+                        pass.set_bind_group(0, Some(&arena.bind_group), &[]);
+                        pass.set_vertex_buffer(0, Some(arena.vertex_buffer.slice(..)));
+                        pass.set_index_buffer(
+                            arena.index_buffer.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
+                        bound = true;
+                    }
+                    emitted.insert(*coord);
+                    let fade = chunk_fades.fade_alpha(coord.0, coord.2);
+                    match run {
+                        Some((start, end, bits))
+                            if end == record.start && bits == fade.to_bits() =>
+                        {
+                            run = Some((start, record.end, bits));
+                        }
+                        _ => {
+                            if let Some((start, end, bits)) = run.take() {
+                                let off = slot(identity, f32::from_bits(bits), 1.0);
+                                pass.set_bind_group(1, Some(draw_bg), &[off]);
+                                pass.draw_indexed(start..end, 0, 0..1);
+                                arena_draws += 1;
+                            }
+                            run = Some((record.start, record.end, fade.to_bits()));
+                        }
+                    }
+                }
+                if let Some((start, end, bits)) = run.take() {
+                    let off = slot(identity, f32::from_bits(bits), 1.0);
+                    pass.set_bind_group(1, Some(draw_bg), &[off]);
+                    pass.draw_indexed(start..end, 0, 0..1);
+                    arena_draws += 1;
+                }
+            }
+            arena_sections += emitted.len();
+            arena_regions += usize::from(bound);
+        }
+        // Restore the per-section pipeline for the fallback path.
+        pass.set_pipeline(opaque_pipeline);
+    }
+    for (coord, section) in live_sections.iter() {
+        if section.arena.is_some()
+            || culled_sections.contains(coord)
+            || section.opaque_index_total == 0
+        {
+            continue;
+        }
+        let fade = chunk_fades.fade_alpha(coord.0, coord.2);
+        let min = [
+            coord.0 as f32 * EDGE as f32,
+            coord.1 as f32 * EDGE as f32,
+            coord.2 as f32 * EDGE as f32,
+        ];
+        match section.opaque_bucket_ranges {
+            Some(ranges) => {
+                let draw_mask = section_draw_mask(min, camera_position);
+                for (bucket, &(start, count)) in ranges.iter().enumerate() {
+                    if count == 0 {
+                        continue;
+                    }
+                    if draw_mask >> bucket & 1 == 0 {
+                        skipped_buckets += 1;
+                        continue;
+                    }
+                    let off = slot(identity, fade, 1.0);
+                    pass.set_bind_group(0, Some(&section.bind_group), &[]);
+                    pass.set_bind_group(1, Some(draw_bg), &[off]);
+                    pass.set_vertex_buffer(0, Some(section.terrain.opaque_vertices.slice(..)));
+                    pass.set_index_buffer(
+                        section.terrain.opaque_indices.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    pass.draw_indexed(start..start + count, 0, 0..1);
+                }
+            }
+            None => {
+                let off = slot(identity, fade, 1.0);
+                pass.set_bind_group(0, Some(&section.bind_group), &[]);
+                pass.set_bind_group(1, Some(draw_bg), &[off]);
+                pass.set_vertex_buffer(0, Some(section.terrain.opaque_vertices.slice(..)));
+                pass.set_index_buffer(
+                    section.terrain.opaque_indices.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                pass.draw_indexed(0..section.terrain.opaque_index_count, 0, 0..1);
+            }
+        }
+    }
+    (skipped_buckets, arena_draws, arena_sections, arena_regions)
 }
 
 /// GPU state for the tessellated-quad UI overlay ([`UI_QUAD_WGSL`]):
@@ -1238,6 +1455,49 @@ pub struct GpuRenderer {
     /// Group-0 bind switches the arena path saved relative to one bind
     /// per drawn section, cumulative.
     pub bind_group_switches_saved: u64,
+    /// Pre-recorded opaque-terrain bundle and the inputs that produced
+    /// it — identical camera/cull/fade/shadow state replays it in a
+    /// single `execute_bundles` call instead of the Rust draw loop.
+    terrain_bundle: Option<wgpu::RenderBundle>,
+    terrain_bundle_key: Option<TerrainBundleKey>,
+    /// Counter deltas captured while recording `terrain_bundle`, re-applied
+    /// on each replay so the totals keep reflecting what the pass drew.
+    terrain_bundle_stats: (u64, u64, usize, usize),
+    /// Composed frames that replayed the cached opaque-terrain bundle.
+    pub terrain_bundle_hits: u64,
+    /// Composed frames that re-recorded the opaque-terrain bundle.
+    pub terrain_bundle_records: u64,
+    /// Pre-recorded UI-quad bundle and the buffer/count key it was
+    /// recorded with — unchanged UI content replays it verbatim.
+    ui_bundle: Option<wgpu::RenderBundle>,
+    ui_bundle_key: Option<UiBundleKey>,
+    /// Frames the UI overlay replayed the cached quad bundle.
+    pub ui_bundle_hits: u64,
+    /// `queue.write_buffer` calls skipped because the byte payload was
+    /// identical to what the buffer already holds (frame/env/lights
+    /// UBOs and the steady-state draw UBO).
+    pub ubo_writes_skipped: u64,
+    /// Slot-range partial vertex uploads through the region arenas,
+    /// cumulative — replaces the old whole-buffer re-uploads.
+    pub region_partial_uploads: u64,
+    /// CPU-side opaque vertex bytes no longer retained after upload
+    /// (region slots serialize straight into staged partial writes, and
+    /// per-section opaque geometry drops after buffer creation).
+    pub cpu_opaque_bytes_freed: u64,
+    /// Byte mirrors of the last frame/env/lights uniform uploads for
+    /// the skip-on-unchanged dedup.
+    last_frame_ubo_bytes: Vec<u8>,
+    last_env_ubo_bytes: Vec<u8>,
+    last_lights_ubo_bytes: Vec<u8>,
+    /// Section uniform + bind group shared by sections the composed pass
+    /// never reaches (arena-resident opaque with no translucent stream):
+    /// installing them costs zero GPU objects.
+    empty_section_uniform: wgpu::Buffer,
+    empty_bind_group: wgpu::BindGroup,
+    /// Bumped by [`Self::set_terrain`]; part of the terrain bundle key.
+    scene_revision: u64,
+    /// Player world position for the upload drain's Priority-0 path.
+    player_position: [f32; 3],
     composite: CompositeGpu,
     debug_line_pipeline: wgpu::RenderPipeline,
     debug_lines: Option<(wgpu::Buffer, u32)>,
@@ -1365,6 +1625,10 @@ struct CompositeGpu {
     draw_ubo: wgpu::Buffer,
     draw_capacity: u64,
     draw_scratch: Vec<CompositeDrawUniforms>,
+    /// Draw uniforms baked into the recorded opaque-terrain bundle; they
+    /// persist at `draw_ubo` offsets `0..len` while the bundle is live so
+    /// replays need no re-upload.
+    terrain_draw_scratch: Vec<CompositeDrawUniforms>,
     env_ubo: wgpu::Buffer,
     lights_ubo: wgpu::Buffer,
     env_bg: wgpu::BindGroup,
@@ -1694,41 +1958,42 @@ impl ShadowGpu {
         });
         let caster_region_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shadow-caster-region-module"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Owned(region_caster_wgsl(
-                &format!("{MEGU_SHADOW_DEPTH_WGSL}\n{MEGU_SHADOW_CASTERS_WGSL}"),
-            ))),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(region_caster_wgsl(&format!(
+                "{MEGU_SHADOW_DEPTH_WGSL}\n{MEGU_SHADOW_CASTERS_WGSL}"
+            )))),
         });
-        let depth_pipeline = |label,
-                              module: &wgpu::ShaderModule,
-                              entry,
-                              buffers: &[Option<wgpu::VertexBufferLayout<'_>>]| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&caster_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module,
-                    entry_point: Some(entry),
-                    compilation_options: Default::default(),
-                    buffers,
-                },
-                primitive: wgpu::PrimitiveState {
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    bias: wgpu::DepthBiasState {
-                        constant: 1,
-                        slope_scale: 1.5,
-                        clamp: 0.0,
+        let depth_pipeline =
+            |label,
+             module: &wgpu::ShaderModule,
+             entry,
+             buffers: &[Option<wgpu::VertexBufferLayout<'_>>]| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&caster_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module,
+                        entry_point: Some(entry),
+                        compilation_options: Default::default(),
+                        buffers,
                     },
-                    ..depth_state(true)
-                }),
-                multisample: Default::default(),
-                fragment: None,
-                multiview_mask: None,
-                cache: None,
-            })
-        };
+                    primitive: wgpu::PrimitiveState {
+                        cull_mode: None,
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        bias: wgpu::DepthBiasState {
+                            constant: 1,
+                            slope_scale: 1.5,
+                            clamp: 0.0,
+                        },
+                        ..depth_state(true)
+                    }),
+                    multisample: Default::default(),
+                    fragment: None,
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
         let terrain_depth = depth_pipeline(
             "shadow-packed-terrain",
             &caster_module,
@@ -1739,7 +2004,7 @@ impl ShadowGpu {
             "shadow-region-terrain",
             &caster_region_module,
             "vs_terrain",
-            &[Some(REGION_VERTEX_LAYOUT)],
+            &[Some(TERRAIN_VERTEX_LAYOUT)],
         );
         let lit_depth = depth_pipeline(
             "shadow-lit",
@@ -1795,7 +2060,7 @@ impl ShadowGpu {
                 false,
             ))),
         });
-        let color_pipeline = |label, layout, module, vs, fs, buffers, blend, write| {
+        let color_pipeline = |label, layout, module, vs, fs, buffers, blend, write, cull| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(layout),
@@ -1806,7 +2071,7 @@ impl ShadowGpu {
                     buffers,
                 },
                 primitive: wgpu::PrimitiveState {
-                    cull_mode: None,
+                    cull_mode: cull,
                     ..Default::default()
                 },
                 depth_stencil: Some(depth_state(write)),
@@ -1834,6 +2099,7 @@ impl ShadowGpu {
             &[Some(TERRAIN_VERTEX_LAYOUT)],
             None,
             true,
+            Some(wgpu::Face::Back),
         );
         let terrain_region_color = color_pipeline(
             "shadowed-terrain-region-color",
@@ -1841,9 +2107,10 @@ impl ShadowGpu {
             &terrain_region_module,
             "terrain_vs",
             "terrain_fs",
-            &[Some(REGION_VERTEX_LAYOUT)],
+            &[Some(TERRAIN_VERTEX_LAYOUT)],
             None,
             true,
+            Some(wgpu::Face::Back),
         );
         let lit_color = color_pipeline(
             "shadowed-lit-color",
@@ -1854,6 +2121,7 @@ impl ShadowGpu {
             &[Some(LIT_VERTEX_LAYOUT)],
             None,
             true,
+            None,
         );
         let lit_alpha_color = color_pipeline(
             "shadowed-lit-alpha",
@@ -1864,6 +2132,7 @@ impl ShadowGpu {
             &[Some(LIT_VERTEX_LAYOUT)],
             Some(ALPHA_BLEND),
             false,
+            None,
         );
         let instanced_color = color_pipeline(
             "shadowed-instanced-color",
@@ -1874,6 +2143,7 @@ impl ShadowGpu {
             &[Some(LIT_VERTEX_LAYOUT), Some(PART_INSTANCE_LAYOUT)],
             None,
             true,
+            None,
         );
         Self {
             config,
@@ -2303,9 +2573,7 @@ impl GpuRenderer {
                             binding: 1,
                             visibility: wgpu::ShaderStages::FRAGMENT,
                             ty: wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Float {
-                                    filterable: true,
-                                },
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
                                 view_dimension: wgpu::TextureViewDimension::D2,
                                 multisampled: false,
                             },
@@ -2451,6 +2719,39 @@ impl GpuRenderer {
             index_count: 0,
         };
         let composite = Self::build_composite(&ctx, target_format, &frame_layout, &frame_ubo);
+        // Shared stand-in uniform + bind group for sections the composed
+        // pass never draws directly (arena-resident opaque with no
+        // translucent stream) — one allocation total, not one per section.
+        let empty_section_uniform = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("empty-section-uniform"),
+            size: std::mem::size_of::<SectionUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        ctx.queue.write_buffer(
+            &empty_section_uniform,
+            0,
+            bytemuck::bytes_of(&SectionUniforms {
+                origin: [0.0; 3],
+                _pad0: 0.0,
+                biome_tint: [1.0; 3],
+                biome_tint_strength: 0.0,
+            }),
+        );
+        let empty_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("empty-section-bind-group"),
+            layout: &frame_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: frame_ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: empty_section_uniform.as_entire_binding(),
+                },
+            ],
+        });
         let debug_line_module = ctx
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -2499,8 +2800,19 @@ impl GpuRenderer {
         // pure `select_compute_strategy` the live session runs, so the
         // upload-budget preset and mesh-worker hint match the session's
         // `compute_strategy` without a window-loop call site.
+        let caps = detect_host_hardware_caps();
         let (upload_budget, mesh_worker_threads) =
-            strategy_upload_defaults(&select_compute_strategy(&detect_host_hardware_caps()));
+            strategy_upload_defaults(&select_compute_strategy(&caps));
+        // Low-core / cache-poor hosts: one background worker keeps
+        // far-mesh generation off the render thread without letting the
+        // pool compete for the few cores the render thread needs.
+        let mesh_worker_threads = if caps.logical_cores <= 4
+            || (caps.l3_cache_kib > 0 && caps.l3_cache_kib <= 4 * 1024)
+        {
+            mesh_worker_threads.min(1)
+        } else {
+            mesh_worker_threads
+        };
         Self {
             ctx,
             target_format,
@@ -2565,6 +2877,24 @@ impl GpuRenderer {
             direction_buckets_skipped: 0,
             region_arena_draws: 0,
             bind_group_switches_saved: 0,
+            terrain_bundle: None,
+            terrain_bundle_key: None,
+            terrain_bundle_stats: (0, 0, 0, 0),
+            terrain_bundle_hits: 0,
+            terrain_bundle_records: 0,
+            ui_bundle: None,
+            ui_bundle_key: None,
+            ui_bundle_hits: 0,
+            ubo_writes_skipped: 0,
+            region_partial_uploads: 0,
+            cpu_opaque_bytes_freed: 0,
+            last_frame_ubo_bytes: Vec::new(),
+            last_env_ubo_bytes: Vec::new(),
+            last_lights_ubo_bytes: Vec::new(),
+            empty_section_uniform,
+            empty_bind_group,
+            scene_revision: 0,
+            player_position: [0.0; 3],
             composite,
             debug_line_pipeline,
             debug_lines: None,
@@ -2824,37 +3154,38 @@ impl GpuRenderer {
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(COMPOSITE_LIT_WGSL)),
         });
 
-        let composite_pipeline = |label, layout, module, vs, fs, buffers, blend, depth_write| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(layout),
-                vertex: wgpu::VertexState {
-                    module,
-                    entry_point: Some(vs),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers,
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: None,
-                    ..wgpu::PrimitiveState::default()
-                },
-                depth_stencil: Some(depth_state(depth_write)),
-                multisample: wgpu::MultisampleState::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module,
-                    entry_point: Some(fs),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: target_format,
-                        blend,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
+        let composite_pipeline =
+            |label, layout, module, vs, fs, buffers, blend, depth_write, cull| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(layout),
+                    vertex: wgpu::VertexState {
+                        module,
+                        entry_point: Some(vs),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        buffers,
+                    },
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        cull_mode: cull,
+                        ..wgpu::PrimitiveState::default()
+                    },
+                    depth_stencil: Some(depth_state(depth_write)),
+                    multisample: wgpu::MultisampleState::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module,
+                        entry_point: Some(fs),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: target_format,
+                            blend,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
         let terrain_buffers = [Some(TERRAIN_VERTEX_LAYOUT)];
         let lit_buffers = [Some(LIT_VERTEX_LAYOUT)];
         let instanced_buffers = [Some(LIT_VERTEX_LAYOUT), Some(PART_INSTANCE_LAYOUT)];
@@ -2867,6 +3198,7 @@ impl GpuRenderer {
             &terrain_buffers,
             None,
             true,
+            Some(wgpu::Face::Back),
         );
         let terrain_region_pipeline = composite_pipeline(
             "composite-terrain-region",
@@ -2874,9 +3206,10 @@ impl GpuRenderer {
             &terrain_region_module,
             "terrain_vs",
             "terrain_fs",
-            &[Some(REGION_VERTEX_LAYOUT)],
+            &[Some(TERRAIN_VERTEX_LAYOUT)],
             None,
             true,
+            Some(wgpu::Face::Back),
         );
         let terrain_alpha_pipeline = composite_pipeline(
             "composite-terrain-alpha",
@@ -2887,6 +3220,7 @@ impl GpuRenderer {
             &terrain_buffers,
             Some(ALPHA_BLEND),
             false,
+            None,
         );
         let lit_pipeline = composite_pipeline(
             "composite-lit-opaque",
@@ -2897,6 +3231,7 @@ impl GpuRenderer {
             &lit_buffers,
             None,
             true,
+            None,
         );
         let lit_alpha_pipeline = composite_pipeline(
             "composite-lit-alpha",
@@ -2907,6 +3242,7 @@ impl GpuRenderer {
             &lit_buffers,
             Some(ALPHA_BLEND),
             false,
+            None,
         );
         let instanced_pipeline = composite_pipeline(
             "composite-instanced",
@@ -2917,6 +3253,7 @@ impl GpuRenderer {
             &instanced_buffers,
             None,
             true,
+            None,
         );
 
         let lit_frame_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3068,6 +3405,7 @@ impl GpuRenderer {
             draw_ubo,
             draw_capacity,
             draw_scratch: Vec::with_capacity(64),
+            terrain_draw_scratch: Vec::with_capacity(64),
             env_ubo,
             lights_ubo,
             env_bg,
@@ -3108,7 +3446,8 @@ impl GpuRenderer {
     }
 
     /// The simple-path region variant: `TERRAIN_OPAQUE_WGSL` with the
-    /// [`REGION_VERTEX_LAYOUT`] decode substituted in.
+    /// section-in-region offset decode substituted in (same 16-byte
+    /// [`TERRAIN_VERTEX_LAYOUT`] stream as the per-section path).
     fn build_terrain_region_pipeline(
         device: &wgpu::Device,
         layout: &wgpu::PipelineLayout,
@@ -3116,9 +3455,7 @@ impl GpuRenderer {
     ) -> wgpu::RenderPipeline {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("terrain-region-opaque"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Owned(region_opaque_wgsl(
-                TERRAIN_OPAQUE_WGSL,
-            ))),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(region_opaque_wgsl(TERRAIN_OPAQUE_WGSL))),
         });
         Self::terrain_pipeline_from_module(
             device,
@@ -3126,7 +3463,7 @@ impl GpuRenderer {
             target_format,
             &module,
             ("terrain_opaque_vs", "terrain_opaque_fs"),
-            &[Some(REGION_VERTEX_LAYOUT)],
+            &[Some(TERRAIN_VERTEX_LAYOUT)],
             false,
             "terrain-region-opaque",
         )
@@ -3154,7 +3491,10 @@ impl GpuRenderer {
             },
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
+                // Solid opaque sections carry outward-facing winding, so
+                // the rasterizer can drop back faces; cutout/translucent
+                // geometry stays double-sided.
+                cull_mode: (!translucent).then_some(wgpu::Face::Back),
                 ..wgpu::PrimitiveState::default()
             },
             depth_stencil: Some(depth_state(!translucent)),
@@ -3365,6 +3705,7 @@ impl GpuRenderer {
             ),
         };
         self.scene = Some(buffers);
+        self.scene_revision += 1;
         self.set_section_origin(scene.section_origin);
         self.shadow_cache.invalidate();
         Ok(())
@@ -3394,15 +3735,7 @@ impl GpuRenderer {
         self.section_graphs.extend(world.section_graphs());
         // Order-independent stamp of the mirrored graph set — a graph-only
         // world change must still invalidate the composed-frame cull cache.
-        let mut graphs_stamp = self.section_graphs.len() as u64;
-        for coord in self.section_graphs.keys() {
-            graphs_stamp = graphs_stamp.wrapping_add(
-                (coord.0 as u64)
-                    .wrapping_mul(0x9e37_79b9)
-                    .wrapping_add((coord.1 as u64).wrapping_mul(0x85eb_ca6b))
-                    .wrapping_add((coord.2 as u64).wrapping_mul(0xc2b2_ae35)),
-            );
-        }
+        let graphs_stamp = self.compute_graphs_stamp();
         let removed_any = !removed.is_empty();
         for (coord, origin) in removed {
             if let Some(origin) = origin {
@@ -3412,37 +3745,11 @@ impl GpuRenderer {
             }
             self.invalidate_hiz();
         }
-        self.region_arenas.retain(|_, arena| !arena.slots.is_empty());
+        self.region_arenas
+            .retain(|_, arena| !arena.slots.is_empty());
         for (coord, packed) in world.packed_meshes() {
             let order = world.translucent_order(coord).unwrap_or(&[]);
-            let up_to_date = match self.pending_uploads.get(&coord) {
-                Some(pending) => pending.matches(packed, order),
-                None => self.live_sections.get(&coord).is_some_and(|existing| {
-                    existing.packed.as_ref() == packed && existing.order.as_ref() == order
-                }),
-            };
-            if up_to_date {
-                continue;
-            }
-            let packed: Arc<[PackedVertex]> = packed.into();
-            let order: Arc<[u32]> = order.into();
-            let buckets = world.direction_buckets(coord);
-            self.pending_uploads.insert(
-                coord,
-                PendingSectionUpload::new(packed.clone(), order.clone(), buckets),
-            );
-            // Speculative geometry build off the render thread: the drain
-            // prefers this result when the worker finishes before the
-            // budget admits the section; a full queue falls back inline.
-            if self.mesh_pool.try_submit(MeshJob::SectionGeometry {
-                coord,
-                packed,
-                order,
-                buckets,
-            }) {
-                self.bg_mesh_jobs_submitted += 1;
-            }
-            scheduled += 1;
+            scheduled += usize::from(self.queue_live_section_upload(world, coord, packed, order));
         }
         if scheduled > 0 {
             self.shadow_cache.invalidate();
@@ -3450,6 +3757,154 @@ impl GpuRenderer {
         if scheduled > 0 || removed_any || graphs_stamp != self.cull_graphs_stamp {
             self.cull_world_revision += 1;
             self.cull_graphs_stamp = graphs_stamp;
+        }
+        scheduled
+    }
+
+    /// Order-independent stamp of the mirrored `section_graphs` set —
+    /// a graph-only world change still invalidates the cull cache.
+    fn compute_graphs_stamp(&self) -> u64 {
+        let mut stamp = self.section_graphs.len() as u64;
+        for coord in self.section_graphs.keys() {
+            stamp = stamp.wrapping_add(
+                (coord.0 as u64)
+                    .wrapping_mul(0x9e37_79b9)
+                    .wrapping_add((coord.1 as u64).wrapping_mul(0x85eb_ca6b))
+                    .wrapping_add((coord.2 as u64).wrapping_mul(0xc2b2_ae35)),
+            );
+        }
+        stamp
+    }
+
+    /// Queue `coord` for upload when its world data differs from both the
+    /// pending queue entry and the resident copy. Shared by the full
+    /// reconcile and the O(1) dirty-coordinate path; returns whether a new
+    /// payload was queued (and speculatively submitted to the worker pool).
+    fn queue_live_section_upload(
+        &mut self,
+        world: &WorldState,
+        coord: SectionCoord,
+        packed: &[PackedVertex],
+        order: &[u32],
+    ) -> bool {
+        let up_to_date = match self.pending_uploads.get(&coord) {
+            Some(pending) => pending.matches(packed, order),
+            None => self.live_sections.get(&coord).is_some_and(|existing| {
+                existing.packed.as_ref() == packed && existing.order.as_ref() == order
+            }),
+        };
+        if up_to_date {
+            return false;
+        }
+        let packed: Arc<[PackedVertex]> = packed.into();
+        let order: Arc<[u32]> = order.into();
+        let buckets = world.direction_buckets(coord);
+        self.pending_uploads.insert(
+            coord,
+            PendingSectionUpload::new(packed.clone(), order.clone(), buckets),
+        );
+        // Speculative geometry build off the render thread: the drain
+        // prefers this result when the worker finishes before the
+        // budget admits the section; a full queue falls back inline.
+        if self.mesh_pool.try_submit(MeshJob::SectionGeometry {
+            coord,
+            packed,
+            order,
+            buckets,
+        }) {
+            self.bg_mesh_jobs_submitted += 1;
+        }
+        true
+    }
+
+    /// O(1) dirty-coordinate reconcile: the live session marks candidate
+    /// sections per play event (column events mark the column and its
+    /// four lateral neighbors, block edits mark the section and its six
+    /// face neighbors — supersets of every coord `MeshCache` can
+    /// invalidate), and this pass touches exactly that set. `order_sweep`
+    /// additionally compares resident translucent orders — the
+    /// camera-driven re-sort can reorder sections outside the marked set.
+    /// Same queueing and revision semantics as the full reconcile; steady
+    /// frames with an empty set and no sweep cost one branch.
+    pub fn update_live_terrain_tracked(
+        &mut self,
+        world: &WorldState,
+        dirty: &BTreeSet<SectionCoord>,
+        order_sweep: bool,
+    ) -> usize {
+        if dirty.is_empty() && !order_sweep {
+            return 0;
+        }
+        let mut scheduled = 0;
+        let mut removed_any = false;
+        for &coord in dirty {
+            match world.packed_mesh(coord) {
+                None => {
+                    self.pending_uploads.remove(&coord);
+                    self.completed_geometry.remove(&coord);
+                    if let Some(section) = self.live_sections.remove(&coord) {
+                        removed_any = true;
+                        if let Some(origin) = section.arena {
+                            if let Some(arena) = self.region_arenas.get_mut(&origin) {
+                                arena.remove(coord);
+                            }
+                        }
+                        self.invalidate_hiz();
+                    }
+                    self.section_graphs.remove(&coord);
+                }
+                Some(packed) => {
+                    let order = world.translucent_order(coord).unwrap_or(&[]);
+                    scheduled +=
+                        usize::from(self.queue_live_section_upload(world, coord, packed, order));
+                }
+            }
+        }
+        // The camera-driven translucent re-sort can rewrite orders for
+        // sections no event marked; sweep residents cheaply (opaque-only
+        // sections have empty orders and skip on length alone).
+        if order_sweep {
+            let mut stale: Vec<SectionCoord> = Vec::new();
+            for (coord, section) in self.live_sections.iter() {
+                if dirty.contains(coord) {
+                    continue;
+                }
+                let order = world.translucent_order(*coord).unwrap_or(&[]);
+                if section.order.as_ref() != order {
+                    stale.push(*coord);
+                }
+            }
+            for coord in stale {
+                let Some(packed) = world.packed_mesh(coord) else {
+                    if let Some(section) = self.live_sections.remove(&coord) {
+                        removed_any = true;
+                        if let Some(origin) = section.arena {
+                            if let Some(arena) = self.region_arenas.get_mut(&origin) {
+                                arena.remove(coord);
+                            }
+                        }
+                        self.invalidate_hiz();
+                    }
+                    self.section_graphs.remove(&coord);
+                    continue;
+                };
+                let order = world.translucent_order(coord).unwrap_or(&[]);
+                scheduled +=
+                    usize::from(self.queue_live_section_upload(world, coord, packed, order));
+            }
+        }
+        if !dirty.is_empty() || removed_any {
+            self.region_arenas
+                .retain(|_, arena| !arena.slots.is_empty());
+            self.section_graphs.clear();
+            self.section_graphs.extend(world.section_graphs());
+            self.cull_graphs_stamp = self.compute_graphs_stamp();
+        }
+        if scheduled > 0 {
+            self.shadow_cache.invalidate();
+        }
+        if scheduled > 0 || removed_any || !dirty.is_empty() || order_sweep {
+            self.cull_world_revision += 1;
         }
         scheduled
     }
@@ -3469,8 +3924,7 @@ impl GpuRenderer {
         buckets: Option<DirectionBuckets>,
     ) {
         let geometry = section_geometry(packed, order);
-        let opaque_bucket_ranges =
-            buckets.map(|b| compute_opaque_bucket_ranges(packed, b));
+        let opaque_bucket_ranges = buckets.map(|b| compute_opaque_bucket_ranges(packed, b));
         self.install_live_section_geometry(
             coord,
             packed.clone(),
@@ -3505,29 +3959,32 @@ impl GpuRenderer {
             }
         }
         let opaque_index_total = geometry.opaque_indices.len() as u32;
-        let arena_origin = (self.arena_enabled
-            && opaque_index_total > 0
-            && buckets.is_some())
-        .then(|| {
-            let origin = RenderRegions::origin_of(coord);
-            let ranges = opaque_bucket_ranges.unwrap_or([(0, 0); DIRECTION_BUCKETS]);
-            let local: Arc<[u32]> = geometry.opaque_indices.as_slice().into();
-            let verts = repack_opaque_for_region(origin, coord, &geometry.opaque);
-            if !self.region_arenas.contains_key(&origin) {
-                let arena = RegionArena::new(
-                    &self.ctx.device,
-                    &self.ctx.queue,
-                    &self.frame_layout,
-                    &self.frame_ubo,
-                    origin,
-                );
-                self.region_arenas.insert(origin, arena);
-            }
-            if let Some(arena) = self.region_arenas.get_mut(&origin) {
-                arena.insert(coord, &verts, local, ranges);
-            }
-            origin
-        });
+        let arena_origin = (self.arena_enabled && opaque_index_total > 0 && buckets.is_some())
+            .then(|| {
+                let origin = RenderRegions::origin_of(coord);
+                let ranges = opaque_bucket_ranges.unwrap_or([(0, 0); DIRECTION_BUCKETS]);
+                let local: Arc<[u32]> = geometry.opaque_indices.as_slice().into();
+                let section_word = region_section_word(origin, coord);
+                if !self.region_arenas.contains_key(&origin) {
+                    let arena = RegionArena::new(
+                        &self.ctx.device,
+                        &self.ctx.queue,
+                        &self.frame_layout,
+                        &self.frame_ubo,
+                        origin,
+                    );
+                    self.region_arenas.insert(origin, arena);
+                }
+                if let Some(arena) = self.region_arenas.get_mut(&origin) {
+                    // The 16-byte stream serializes straight into the staged
+                    // partial write — no CPU vertex copy is retained per
+                    // section (previously a 24-byte `RegionVertex` Vec sat
+                    // resident in the arena for its whole lifetime).
+                    arena.insert(coord, &geometry.opaque, section_word, local, ranges);
+                    self.cpu_opaque_bytes_freed += (geometry.opaque.len() * 16) as u64;
+                }
+                origin
+            });
         let (opaque_vertices, opaque_indices, opaque_index_count) = if arena_origin.is_some() {
             (
                 self.empty_vertex_buffer.clone(),
@@ -3551,60 +4008,86 @@ impl GpuRenderer {
                 opaque_index_total,
             )
         };
+        // Opaque-only sections share the empty translucent buffers and —
+        // when the arena already owns their opaque stream — the shared
+        // dummy bind group too, so an opaque-only section costs zero
+        // `create_buffer`/`create_bind_group` calls.
+        let translucent_index_count = geometry.translucent_indices.len() as u32;
+        let (translucent_vertices, translucent_indices) = if translucent_index_count == 0 {
+            (
+                self.empty_vertex_buffer.clone(),
+                self.empty_index_buffer.clone(),
+            )
+        } else {
+            (
+                vertex_buffer(
+                    &self.ctx.device,
+                    &self.ctx.queue,
+                    "live-translucent-verts",
+                    &geometry.translucent,
+                ),
+                index_buffer(
+                    &self.ctx.device,
+                    &self.ctx.queue,
+                    "live-translucent-indices",
+                    &geometry.translucent_indices,
+                ),
+            )
+        };
         let terrain = TerrainBuffers {
             opaque_index_count,
-            translucent_index_count: geometry.translucent_indices.len() as u32,
+            translucent_index_count,
             opaque_vertices,
             opaque_indices,
-            translucent_vertices: vertex_buffer(
-                &self.ctx.device,
-                &self.ctx.queue,
-                "live-translucent-verts",
-                &geometry.translucent,
-            ),
-            translucent_indices: index_buffer(
-                &self.ctx.device,
-                &self.ctx.queue,
-                "live-translucent-indices",
-                &geometry.translucent_indices,
-            ),
+            translucent_vertices,
+            translucent_indices,
         };
-        let uniform = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("live-section-uniform"),
-            size: std::mem::size_of::<SectionUniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let section_uniform = SectionUniforms {
-            origin: [
-                coord.0 as f32 * 16.0,
-                coord.1 as f32 * 16.0,
-                coord.2 as f32 * 16.0,
-            ],
-            _pad0: 0.0,
-            biome_tint: [1.0; 3],
-            biome_tint_strength: 0.0,
-        };
-        self.ctx
-            .queue
-            .write_buffer(&uniform, 0, bytemuck::bytes_of(&section_uniform));
-        let bind_group = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("live-section-bind-group"),
-                layout: &self.frame_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.frame_ubo.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: uniform.as_entire_binding(),
-                    },
-                ],
+        let shared_group =
+            translucent_index_count == 0 && (arena_origin.is_some() || opaque_index_total == 0);
+        let (uniform, bind_group) = if shared_group {
+            (
+                self.empty_section_uniform.clone(),
+                self.empty_bind_group.clone(),
+            )
+        } else {
+            let uniform = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("live-section-uniform"),
+                size: std::mem::size_of::<SectionUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
             });
+            let section_uniform = SectionUniforms {
+                origin: [
+                    coord.0 as f32 * 16.0,
+                    coord.1 as f32 * 16.0,
+                    coord.2 as f32 * 16.0,
+                ],
+                _pad0: 0.0,
+                biome_tint: [1.0; 3],
+                biome_tint_strength: 0.0,
+            };
+            self.ctx
+                .queue
+                .write_buffer(&uniform, 0, bytemuck::bytes_of(&section_uniform));
+            let bind_group = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("live-section-bind-group"),
+                    layout: &self.frame_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.frame_ubo.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: uniform.as_entire_binding(),
+                        },
+                    ],
+                });
+            (uniform, bind_group)
+        };
         self.live_sections.insert(
             coord,
             LiveTerrainSection {
@@ -3659,10 +4142,7 @@ impl GpuRenderer {
                         },
                     );
                 }
-                MeshResult::HiZDepth {
-                    view_proj,
-                    pyramid,
-                } => {
+                MeshResult::HiZDepth { view_proj, pyramid } => {
                     // `hiz_dirty` means residency moved after the job was
                     // submitted — its pyramid may still hold occluders that
                     // no longer exist, so drop it and let the next frame
@@ -3730,10 +4210,20 @@ impl GpuRenderer {
 
     /// Write dirty region-arena vertex/index streams to their GPU
     /// buffers. Runs at the upload boundary so the render pass reads
-    /// immutable arena state.
+    /// immutable arena state. Vertex inserts land as slot-range partial
+    /// `write_buffer`s — counted in `region_partial_uploads`.
     fn flush_region_arenas(&mut self) {
+        let mut replaced = false;
         for arena in self.region_arenas.values_mut() {
-            arena.flush_gpu(&self.ctx.device, &self.ctx.queue);
+            let (partial, buffers_replaced) = arena.flush_gpu(&self.ctx.device, &self.ctx.queue);
+            self.region_partial_uploads += u64::from(partial);
+            replaced |= buffers_replaced;
+        }
+        if replaced {
+            // The recorded opaque-terrain bundle still references the
+            // retired buffers — the cull revision is the bundle key's
+            // residency term, so bumping it forces a re-record.
+            self.cull_world_revision += 1;
         }
     }
 
@@ -3781,21 +4271,55 @@ impl GpuRenderer {
         sorted[rank.min(sorted.len() - 1)] * 1_000.0
     }
 
+    /// The last player world position reported through
+    /// [`Self::set_player_position`]; the upload drain's Priority-0 path
+    /// admits sections within one section (16 m) of it ahead of the
+    /// budget.
+    pub fn set_player_position(&mut self, position: [f32; 3]) {
+        self.player_position = position;
+    }
+
     /// Admit queued section uploads through the open [`ChunkUploadBudget`]
     /// frame and install the ones that fit; the rest stay queued for later
-    /// frames. Returns the number of sections installed this frame.
+    /// frames. Priority-0 first: sections within one section (16 m) of the
+    /// player bypass the budget and install immediately — a near edit
+    /// must swap its slot atomically this frame, never X-ray-flicker
+    /// behind a far upload. Returns the number installed this frame.
     fn drain_pending_uploads(&mut self) -> usize {
         if self.pending_uploads.is_empty() {
             return 0;
         }
         let mut admitted = 0;
-        let coords: Vec<SectionCoord> = self.pending_uploads.keys().copied().collect();
+        let player_section = SectionCoord(
+            (self.player_position[0] / 16.0).floor() as i32,
+            (self.player_position[1] / 16.0).floor() as i32,
+            (self.player_position[2] / 16.0).floor() as i32,
+        );
+        let near = |coord: &SectionCoord| {
+            (coord.0 - player_section.0).abs() <= 1
+                && (coord.1 - player_section.1).abs() <= 1
+                && (coord.2 - player_section.2).abs() <= 1
+        };
+        // Priority-0 is the *edit* guarantee: a section that is already
+        // resident and within 16 m of the player bypasses the budget so
+        // its slot swaps atomically this frame (no X-ray flicker). New
+        // installs — even near ones — still flow through the per-frame
+        // budget so a chunk burst cannot stall the render thread.
+        let coords: Vec<SectionCoord> = {
+            let (p0, rest): (Vec<SectionCoord>, Vec<SectionCoord>) = self
+                .pending_uploads
+                .keys()
+                .copied()
+                .partition(|c| near(c) && self.live_sections.contains_key(c));
+            p0.into_iter().chain(rest).collect()
+        };
         for coord in coords {
             let Some(pending) = self.pending_uploads.get(&coord) else {
                 continue;
             };
             let (bytes, cost_us) = (pending.upload_bytes, pending.cost_us);
-            if !self.upload_budget.try_schedule(bytes, cost_us) {
+            let priority0 = near(&coord) && self.live_sections.contains_key(&coord);
+            if !priority0 && !self.upload_budget.try_schedule(bytes, cost_us) {
                 self.deferred_uploads += 1;
                 continue;
             }
@@ -3901,9 +4425,7 @@ impl GpuRenderer {
                     .map(|_| view_proj_row_major(view_proj)),
             };
             for (coord, section) in self.live_sections.iter() {
-                if section.opaque_index_total == 0
-                    && section.terrain.translucent_index_count == 0
-                {
+                if section.opaque_index_total == 0 && section.terrain.translucent_index_count == 0 {
                     continue;
                 }
                 let min = [
@@ -3952,6 +4474,14 @@ impl GpuRenderer {
     /// Replace the upload budget outright (tests/embedders tuning caps).
     pub fn set_upload_budget(&mut self, budget: ChunkUploadBudget) {
         self.upload_budget = budget;
+    }
+
+    /// The allocated shadow-map resolution, or `None` while shadow
+    /// quality is `Off` — the whole `ShadowGpu` (depth array, cascade
+    /// views, pipelines, bind groups) stays lazily unallocated until
+    /// shadows are first enabled, saving 16–64 MiB on UMA hosts.
+    pub fn shadow_map_resolution(&self) -> Option<u32> {
+        self.shadow.as_ref().map(|gpu| gpu.config.map_resolution)
     }
 
     /// Section uploads currently queued awaiting budget admission.
@@ -4029,7 +4559,11 @@ impl GpuRenderer {
 
     /// Write the `frame` uniform (camera view-proj + fog from the real
     /// `mc_spine_kernel::evaluate_sky_and_fog` at noon, clear weather).
-    pub fn set_camera(&self, camera: &Camera, aspect: f32) -> SkyFogOutput {
+    /// Store `camera` and upload the frame UBO — with a byte-compare dedup
+    /// so an identical camera costs zero `write_buffer` calls. This is the
+    /// single frame-UBO write per render call; `render_frame` no longer
+    /// uploads a duplicate.
+    pub fn set_camera(&mut self, camera: &Camera, aspect: f32) -> SkyFogOutput {
         self.window_camera.set(Some(*camera));
         let sky = evaluate_sky_and_fog(&SkyFogInput {
             day_time: 6000,
@@ -4053,10 +4587,21 @@ impl GpuRenderer {
             fog_end: sky.fog_end,
             _pad: [0.0; 4],
         };
-        self.ctx
-            .queue
-            .write_buffer(&self.frame_ubo, 0, bytemuck::bytes_of(&uniforms));
+        self.write_frame_ubo_dedup(&uniforms);
         sky
+    }
+
+    /// Byte-compared upload of `frame_ubo`: unchanged payload ⇒ no
+    /// `write_buffer` at all (`ubo_writes_skipped += 1`).
+    fn write_frame_ubo_dedup(&mut self, uniforms: &FrameUniforms) {
+        let bytes = bytemuck::bytes_of(uniforms);
+        if self.last_frame_ubo_bytes.as_slice() == bytes {
+            self.ubo_writes_skipped += 1;
+            return;
+        }
+        self.ctx.queue.write_buffer(&self.frame_ubo, 0, bytes);
+        self.last_frame_ubo_bytes.clear();
+        self.last_frame_ubo_bytes.extend_from_slice(bytes);
     }
 
     /// (Re)create the depth attachment for `width`×`height` when needed.
@@ -4211,11 +4756,50 @@ impl GpuRenderer {
             0,
             bytemuck::cast_slice(&self.ui_quad_vertex_scratch),
         );
-        self.ctx.queue.write_buffer(
-            &quad.indices,
-            0,
-            bytemuck::cast_slice(&mesh.indices),
-        );
+        self.ctx
+            .queue
+            .write_buffer(&quad.indices, 0, bytemuck::cast_slice(&mesh.indices));
+    }
+
+    /// Draw the UI-quad overlay into `pass`, replaying the pre-recorded
+    /// `RenderBundle` while the quad buffer identities and index count
+    /// match. Vertex content flows through `write_buffer` on the same
+    /// buffers, so identical counts replay fresh content without
+    /// re-encoding — only a grow-realloc or count change re-records.
+    fn draw_ui_quads(&mut self, pass: &mut wgpu::RenderPass<'_>) {
+        let key = UiBundleKey {
+            index_count: self.ui_quad.index_count,
+            vertex_capacity: self.ui_quad.vertex_capacity,
+            index_capacity: self.ui_quad.index_capacity,
+        };
+        if self.ui_bundle_key == Some(key) {
+            if let Some(bundle) = &self.ui_bundle {
+                pass.execute_bundles(std::iter::once(bundle));
+                self.ui_bundle_hits += 1;
+                return;
+            }
+        }
+        let mut bundle_encoder =
+            self.ctx
+                .device
+                .create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
+                    label: Some("ui-quad-bundle"),
+                    color_formats: &[Some(self.target_format)],
+                    depth_stencil: None,
+                    sample_count: 1,
+                    multiview: None,
+                });
+        bundle_encoder.set_pipeline(&self.ui_quad.pipeline);
+        bundle_encoder.set_bind_group(0, Some(&self.ui_quad.bind_group), &[]);
+        bundle_encoder.set_vertex_buffer(0, Some(self.ui_quad.vertices.slice(..)));
+        bundle_encoder.set_index_buffer(self.ui_quad.indices.slice(..), wgpu::IndexFormat::Uint32);
+        bundle_encoder.draw_indexed(0..self.ui_quad.index_count, 0, 0..1);
+        let bundle = bundle_encoder.finish(&wgpu::RenderBundleDescriptor {
+            label: Some("ui-quad-bundle"),
+        });
+        pass.execute_bundles(std::iter::once(&bundle));
+        self.ui_bundle = Some(bundle);
+        self.ui_bundle_key = Some(key);
     }
 
     /// Encode one frame into `view`: sky clear + opaque + translucent +
@@ -4389,14 +4973,7 @@ impl GpuRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.ui_quad.pipeline);
-            pass.set_bind_group(0, &self.ui_quad.bind_group, &[]);
-            pass.set_vertex_buffer(0, self.ui_quad.vertices.slice(..));
-            pass.set_index_buffer(
-                self.ui_quad.indices.slice(..),
-                wgpu::IndexFormat::Uint32,
-            );
-            pass.draw_indexed(0..self.ui_quad.index_count, 0, 0..1);
+            self.draw_ui_quads(&mut pass);
             drew_quad_ui = true;
         } else if let Some(ui_bind_group) = &self.ui_bind_group {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -4468,13 +5045,9 @@ impl GpuRenderer {
                 atmo.depth_tint_strength,
             ],
         };
-        self.ctx
-            .queue
-            .write_buffer(&self.composite.env_ubo, 0, bytemuck::bytes_of(&env));
+        self.write_env_ubo_dedup(&env);
         let lights = VfxLightsGpu::from(&pack_vfx1_lights(&[], self.shadow_quality));
-        self.ctx
-            .queue
-            .write_buffer(&self.composite.lights_ubo, 0, bytemuck::bytes_of(&lights));
+        self.write_lights_ubo_dedup(&lights);
         self.write_frame_uniforms(&camera, aspect, atmo.fog_rgb, sky.fog_start, sky.fog_end);
         // Pending uploads may all be admitted by this frame's drain inside
         // `encode_composed_world`, so reserve draw slots for them too.
@@ -4777,9 +5350,7 @@ impl GpuRenderer {
         let section_offsets: Vec<_> = self
             .live_sections
             .iter()
-            .filter(|(_, section)| {
-                section.arena.is_none() && section.opaque_index_total > 0
-            })
+            .filter(|(_, section)| section.arena.is_none() && section.opaque_index_total > 0)
             .map(|(coord, _)| (*coord, push_model(identity)))
             .collect();
         let region_offsets: Vec<_> = self
@@ -4854,10 +5425,7 @@ impl GpuRenderer {
                     pass.set_bind_group(1, &arena.bind_group, &[]);
                     pass.set_bind_group(2, &shadow.draw_bg, &[*offset]);
                     pass.set_vertex_buffer(0, arena.vertex_buffer.slice(..));
-                    pass.set_index_buffer(
-                        arena.index_buffer.slice(..),
-                        wgpu::IndexFormat::Uint32,
-                    );
+                    pass.set_index_buffer(arena.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..arena.index_len, 0, 0..1);
                 }
             }
@@ -4971,7 +5539,7 @@ impl GpuRenderer {
     /// vanilla `evaluate_sky_and_fog` — the composed pass takes its fog
     /// color and distances from the atmosphere blender.
     fn write_frame_uniforms(
-        &self,
+        &mut self,
         camera: &Camera,
         aspect: f32,
         fog_rgb: [f32; 3],
@@ -4986,14 +5554,40 @@ impl GpuRenderer {
             fog_end,
             _pad: [0.0; 4],
         };
+        self.write_frame_ubo_dedup(&uniforms);
+    }
+
+    /// Byte-compared upload of `env_ubo` — steady frames upload zero bytes.
+    fn write_env_ubo_dedup(&mut self, env: &CompositeEnvUniforms) {
+        let bytes = bytemuck::bytes_of(env);
+        if self.last_env_ubo_bytes.as_slice() == bytes {
+            self.ubo_writes_skipped += 1;
+            return;
+        }
         self.ctx
             .queue
-            .write_buffer(&self.frame_ubo, 0, bytemuck::bytes_of(&uniforms));
+            .write_buffer(&self.composite.env_ubo, 0, bytes);
+        self.last_env_ubo_bytes.clear();
+        self.last_env_ubo_bytes.extend_from_slice(bytes);
+    }
+
+    /// Byte-compared upload of `lights_ubo` — steady frames upload zero bytes.
+    fn write_lights_ubo_dedup(&mut self, lights: &VfxLightsGpu) {
+        let bytes = bytemuck::bytes_of(lights);
+        if self.last_lights_ubo_bytes.as_slice() == bytes {
+            self.ubo_writes_skipped += 1;
+            return;
+        }
+        self.ctx
+            .queue
+            .write_buffer(&self.composite.lights_ubo, 0, bytes);
+        self.last_lights_ubo_bytes.clear();
+        self.last_lights_ubo_bytes.extend_from_slice(bytes);
     }
 
     /// Write the shared environment + VFX-light uniforms for one composed
     /// frame from the blender's current atmosphere.
-    fn write_env_uniforms(&self, frame: &ComposedFrame<'_>) {
+    fn write_env_uniforms(&mut self, frame: &ComposedFrame<'_>) {
         let atmo = frame.atmosphere.current();
         let sun_dir = compute_sun_direction(frame.world_time_ticks);
         let env = CompositeEnvUniforms {
@@ -5012,14 +5606,9 @@ impl GpuRenderer {
                 atmo.depth_tint_strength,
             ],
         };
-        self.ctx
-            .queue
-            .write_buffer(&self.composite.env_ubo, 0, bytemuck::bytes_of(&env));
-        let lights = pack_vfx1_lights(frame.lights, self.shadow_quality);
-        let packed = VfxLightsGpu::from(&lights);
-        self.ctx
-            .queue
-            .write_buffer(&self.composite.lights_ubo, 0, bytemuck::bytes_of(&packed));
+        self.write_env_ubo_dedup(&env);
+        let packed = VfxLightsGpu::from(&pack_vfx1_lights(frame.lights, self.shadow_quality));
+        self.write_lights_ubo_dedup(&packed);
     }
 
     /// Grow the dynamic-offset draw-uniform pool past `needed` records
@@ -5145,6 +5734,46 @@ impl GpuRenderer {
         // encodes: the finished Hi-Z pyramid lands on a later frame's
         // upload boundary.
         self.submit_hiz_job(&view_proj, camera_position);
+        // Opaque-terrain bundle key: every input the recorded commands
+        // depend on. `world_revision` covers residency/graph/cull-set
+        // changes (and arena buffer replacement bumps it too), the
+        // view-proj bits pin the camera and culled set, `fades_active`
+        // gates caching entirely — animated fades bake into draw
+        // uniforms and must re-encode every frame.
+        let camera_section = SectionCoord(
+            (camera_position[0] / EDGE as f32).floor() as i32,
+            (camera_position[1] / EDGE as f32).floor() as i32,
+            (camera_position[2] / EDGE as f32).floor() as i32,
+        );
+        let mut view_proj_bits = [0u32; 16];
+        for (dst, src) in view_proj_bits.iter_mut().zip(view_proj.iter().flatten()) {
+            *dst = src.to_bits();
+        }
+        let bundle_eligible = !chunk_fades.any_fading();
+        let terrain_bundle_key = bundle_eligible.then_some(TerrainBundleKey {
+            camera_section: (camera_section.0, camera_section.1, camera_section.2),
+            view_proj_bits,
+            world_revision: self.cull_world_revision,
+            hiz_revision: self.hiz_revision,
+            scene_revision: self.scene_revision,
+            fades_active: false,
+            shadow_active: self.shadow_active,
+        });
+        let bundle_hit = terrain_bundle_key.is_some()
+            && self.terrain_bundle_key == terrain_bundle_key
+            && self.terrain_bundle.is_some();
+        let terrain_bundle = if bundle_hit {
+            self.terrain_bundle_hits += 1;
+            self.terrain_bundle.as_ref()
+        } else {
+            if bundle_eligible && self.terrain_bundle.is_some() {
+                // Key rotated: the recorded commands no longer apply.
+                self.terrain_bundle = None;
+                self.terrain_bundle_key = None;
+            }
+            None
+        };
+        let bundle_stats = self.terrain_bundle_stats;
         // Split disjoint field borrows so the scratch writer and the GPU
         // handles can coexist inside the render pass.
         let culled_sections = &self.cull_result;
@@ -5167,24 +5796,6 @@ impl GpuRenderer {
         let frame_bind_group = &self.frame_bind_group;
         let depth_view = self.depth_view.as_ref().expect("depth ensured");
         gpu.draw_scratch.clear();
-        let scratch = &mut gpu.draw_scratch;
-        let mut slot = |model: Mat4, fade: f32, alpha: f32| -> u32 {
-            let index = scratch.len();
-            scratch.push(CompositeDrawUniforms {
-                mvp: mat4_mul(&view_proj, &model),
-                model,
-                params: [fade, alpha, 0.0, 0.0],
-                params2: [0.0; 4],
-                _stride_pad: [0.0; 24],
-            });
-            index as u32 * DRAW_UNIFORM_STRIDE
-        };
-        let identity: Mat4 = [
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ];
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("composed-world"),
@@ -5219,161 +5830,132 @@ impl GpuRenderer {
                 pass.set_bind_group(3, &shadow.receiver_bg, &[]);
             }
 
-            // Opaque terrain: the demo scene, then every live section —
-            // arena-resident sections as merged per-region bucket draws,
-            // the rest through per-section buffers with the same facing
-            // cull applied per bucket.
-            pass.set_pipeline(shadow.map_or(&gpu.terrain_opaque_pipeline, |s| &s.terrain_color));
-            if let Some(scene) = scene {
-                if scene.opaque_index_count > 0 {
-                    let off = slot(identity, 1.0, 1.0);
-                    pass.set_bind_group(0, frame_bind_group, &[]);
-                    pass.set_bind_group(1, &gpu.draw_bg, &[off]);
-                    pass.set_vertex_buffer(0, scene.opaque_vertices.slice(..));
-                    pass.set_index_buffer(
-                        scene.opaque_indices.slice(..),
-                        wgpu::IndexFormat::Uint32,
+            // Opaque terrain: replayed from the pre-recorded RenderBundle
+            // when (camera section, view-proj bits, world/hi-z/scene
+            // revisions, fade-activity, shadow pipeline) all match the
+            // record key — one `execute_bundles` call, zero Rust draw
+            // loop, zero `HashSet` allocs. Chunk-fade animation bakes its
+            // values into the recorded draw uniforms, so while any fade
+            // is live the pass encodes directly instead. Terrain slots
+            // always occupy `draw_scratch[0..T]` — seeded from the
+            // recorded `terrain_draw_scratch` slice on replay so the
+            // bundle's dynamic offsets still resolve.
+            if let Some(bundle) = terrain_bundle {
+                pass.execute_bundles(std::iter::once(bundle));
+                gpu.draw_scratch
+                    .extend_from_slice(&gpu.terrain_draw_scratch);
+                skipped_buckets += bundle_stats.0;
+                arena_draws += bundle_stats.1;
+                arena_sections += bundle_stats.2;
+                arena_regions += bundle_stats.3;
+            } else {
+                let stats = if bundle_eligible {
+                    let mut bundle_encoder = self.ctx.device.create_render_bundle_encoder(
+                        &wgpu::RenderBundleEncoderDescriptor {
+                            label: Some("terrain-opaque-bundle"),
+                            color_formats: &[Some(self.target_format)],
+                            depth_stencil: Some(wgpu::RenderBundleDepthStencil {
+                                format: DEPTH_FORMAT,
+                                depth_read_only: false,
+                                stencil_read_only: true,
+                            }),
+                            sample_count: 1,
+                            multiview: None,
+                        },
                     );
-                    pass.draw_indexed(0..scene.opaque_index_count, 0, 0..1);
-                }
+                    let stats = encode_opaque_terrain(
+                        &mut bundle_encoder,
+                        shadow.map_or(&gpu.terrain_opaque_pipeline, |s| &s.terrain_color),
+                        shadow.map_or(&gpu.terrain_region_pipeline, |s| &s.terrain_region_color),
+                        &gpu.draw_bg,
+                        &mut gpu.draw_scratch,
+                        scene.as_ref(),
+                        live_sections,
+                        region_arenas,
+                        culled_sections,
+                        camera_position,
+                        chunk_fades,
+                        frame_bind_group,
+                        &gpu.env_bg,
+                        shadow.map(|s| &s.receiver_bg),
+                        &view_proj,
+                    );
+                    let bundle = bundle_encoder.finish(&wgpu::RenderBundleDescriptor {
+                        label: Some("terrain-opaque-bundle"),
+                    });
+                    pass.execute_bundles(std::iter::once(&bundle));
+                    gpu.terrain_draw_scratch.clone_from(&gpu.draw_scratch);
+                    self.terrain_bundle = Some(bundle);
+                    self.terrain_bundle_key = terrain_bundle_key;
+                    self.terrain_bundle_stats = stats;
+                    self.terrain_bundle_records += 1;
+                    stats
+                } else {
+                    self.terrain_bundle = None;
+                    self.terrain_bundle_key = None;
+                    encode_opaque_terrain(
+                        &mut pass,
+                        shadow.map_or(&gpu.terrain_opaque_pipeline, |s| &s.terrain_color),
+                        shadow.map_or(&gpu.terrain_region_pipeline, |s| &s.terrain_region_color),
+                        &gpu.draw_bg,
+                        &mut gpu.draw_scratch,
+                        scene.as_ref(),
+                        live_sections,
+                        region_arenas,
+                        culled_sections,
+                        camera_position,
+                        chunk_fades,
+                        frame_bind_group,
+                        &gpu.env_bg,
+                        shadow.map(|s| &s.receiver_bg),
+                        &view_proj,
+                    )
+                };
+                skipped_buckets += stats.0;
+                arena_draws += stats.1;
+                arena_sections += stats.2;
+                arena_regions += stats.3;
             }
-            // S4 shared region arena: one bind group + buffer pair per
-            // 8x4x8 region; seven contiguous direction-bucket streams in
-            // a single index buffer merge into a few draws per region.
-            if !region_arenas.is_empty() {
-                pass.set_pipeline(
-                    shadow.map_or(&gpu.terrain_region_pipeline, |s| &s.terrain_region_color),
-                );
-                for arena in region_arenas.values() {
-                    if arena.index_len == 0 {
-                        continue;
-                    }
-                    let mut bound = false;
-                    let mut emitted: HashSet<SectionCoord> = HashSet::new();
-                    for (bucket, records) in arena.bucket_records.iter().enumerate() {
-                        // Merged run of consecutive kept records sharing
-                        // one fade value: (start, end, fade_bits).
-                        let mut run: Option<(u32, u32, u32)> = None;
-                        for record in records {
-                            let coord = &record.coord;
-                            let culled = culled_sections.contains(coord);
-                            let min = [
-                                coord.0 as f32 * EDGE as f32,
-                                coord.1 as f32 * EDGE as f32,
-                                coord.2 as f32 * EDGE as f32,
-                            ];
-                            let kept = !culled
-                                && section_draw_mask(min, camera_position) >> bucket & 1 != 0;
-                            if !kept {
-                                if !culled {
-                                    skipped_buckets += 1;
-                                }
-                                if let Some((start, end, fade_bits)) = run.take() {
-                                    let off = slot(identity, f32::from_bits(fade_bits), 1.0);
-                                    pass.set_bind_group(1, &gpu.draw_bg, &[off]);
-                                    pass.draw_indexed(start..end, 0, 0..1);
-                                    arena_draws += 1;
-                                }
-                                continue;
-                            }
-                            if !bound {
-                                pass.set_bind_group(0, &arena.bind_group, &[]);
-                                pass.set_vertex_buffer(0, arena.vertex_buffer.slice(..));
-                                pass.set_index_buffer(
-                                    arena.index_buffer.slice(..),
-                                    wgpu::IndexFormat::Uint32,
-                                );
-                                bound = true;
-                            }
-                            emitted.insert(*coord);
-                            let fade = chunk_fades.fade_alpha(coord.0, coord.2);
-                            match run {
-                                Some((start, end, bits))
-                                    if end == record.start && bits == fade.to_bits() =>
-                                {
-                                    run = Some((start, record.end, bits));
-                                }
-                                _ => {
-                                    if let Some((start, end, bits)) = run.take() {
-                                        let off = slot(identity, f32::from_bits(bits), 1.0);
-                                        pass.set_bind_group(1, &gpu.draw_bg, &[off]);
-                                        pass.draw_indexed(start..end, 0, 0..1);
-                                        arena_draws += 1;
-                                    }
-                                    run = Some((record.start, record.end, fade.to_bits()));
-                                }
-                            }
-                        }
-                        if let Some((start, end, bits)) = run.take() {
-                            let off = slot(identity, f32::from_bits(bits), 1.0);
-                            pass.set_bind_group(1, &gpu.draw_bg, &[off]);
-                            pass.draw_indexed(start..end, 0, 0..1);
-                            arena_draws += 1;
-                        }
-                    }
-                    arena_sections += emitted.len();
-                    arena_regions += usize::from(bound);
-                }
-                // Restore the per-section pipeline for the fallback path.
-                pass.set_pipeline(
-                    shadow.map_or(&gpu.terrain_opaque_pipeline, |s| &s.terrain_color),
-                );
+            // `execute_bundles` clears the pass's bind-group state, so
+            // re-bind env (group 2) and the shadow receiver (group 3)
+            // for the translucent/entity/UI draws that follow.
+            pass.set_bind_group(2, &gpu.env_bg, &[]);
+            if let Some(shadow) = shadow {
+                pass.set_bind_group(3, &shadow.receiver_bg, &[]);
             }
-            for (coord, section) in live_sections.iter() {
-                if section.arena.is_some()
-                    || culled_sections.contains(coord)
-                    || section.opaque_index_total == 0
-                {
-                    continue;
-                }
-                let fade = chunk_fades.fade_alpha(coord.0, coord.2);
-                let min = [
-                    coord.0 as f32 * EDGE as f32,
-                    coord.1 as f32 * EDGE as f32,
-                    coord.2 as f32 * EDGE as f32,
-                ];
-                match section.opaque_bucket_ranges {
-                    Some(ranges) => {
-                        let draw_mask = section_draw_mask(min, camera_position);
-                        for (bucket, &(start, count)) in ranges.iter().enumerate() {
-                            if count == 0 {
-                                continue;
-                            }
-                            if draw_mask >> bucket & 1 == 0 {
-                                skipped_buckets += 1;
-                                continue;
-                            }
-                            let off = slot(identity, fade, 1.0);
-                            pass.set_bind_group(0, &section.bind_group, &[]);
-                            pass.set_bind_group(1, &gpu.draw_bg, &[off]);
-                            pass.set_vertex_buffer(
-                                0,
-                                section.terrain.opaque_vertices.slice(..),
-                            );
-                            pass.set_index_buffer(
-                                section.terrain.opaque_indices.slice(..),
-                                wgpu::IndexFormat::Uint32,
-                            );
-                            pass.draw_indexed(start..start + count, 0, 0..1);
-                        }
-                    }
-                    None => {
-                        let off = slot(identity, fade, 1.0);
-                        pass.set_bind_group(0, &section.bind_group, &[]);
-                        pass.set_bind_group(1, &gpu.draw_bg, &[off]);
-                        pass.set_vertex_buffer(0, section.terrain.opaque_vertices.slice(..));
-                        pass.set_index_buffer(
-                            section.terrain.opaque_indices.slice(..),
-                            wgpu::IndexFormat::Uint32,
-                        );
-                        pass.draw_indexed(0..section.terrain.opaque_index_count, 0, 0..1);
-                    }
-                }
-            }
+            // Non-terrain draws continue in `draw_scratch` past the
+            // terrain slice so one `write_buffer` covers the whole frame.
+            let scratch = &mut gpu.draw_scratch;
+            let mut slot = |model: Mat4, fade: f32, alpha: f32| -> u32 {
+                let index = scratch.len();
+                scratch.push(CompositeDrawUniforms {
+                    mvp: mat4_mul(&view_proj, &model),
+                    model,
+                    params: [fade, alpha, 0.0, 0.0],
+                    params2: [0.0; 4],
+                    _stride_pad: [0.0; 24],
+                });
+                index as u32 * DRAW_UNIFORM_STRIDE
+            };
+            let identity: Mat4 = [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ];
 
             // Translucent terrain (water, stained glass) through the
-            // alpha-blended composite variant.
-            pass.set_pipeline(&gpu.terrain_alpha_pipeline);
+            // alpha-blended composite variant. Short-circuit before
+            // `set_pipeline` when nothing in the world can draw here.
+            let any_translucent = scene
+                .as_ref()
+                .is_some_and(|s| s.translucent_index_count > 0)
+                || live_sections
+                    .values()
+                    .any(|s| s.terrain.translucent_index_count > 0);
+            if any_translucent {
+                pass.set_pipeline(&gpu.terrain_alpha_pipeline);
+            }
             if let Some(scene) = scene {
                 if scene.translucent_index_count > 0 {
                     let off = slot(identity, 1.0, 1.0);
@@ -5387,20 +5969,24 @@ impl GpuRenderer {
                     pass.draw_indexed(0..scene.translucent_index_count, 0, 0..1);
                 }
             }
-            for (coord, section) in live_sections.iter() {
-                if culled_sections.contains(coord) || section.terrain.translucent_index_count == 0 {
-                    continue;
+            if any_translucent {
+                for (coord, section) in live_sections.iter() {
+                    if culled_sections.contains(coord)
+                        || section.terrain.translucent_index_count == 0
+                    {
+                        continue;
+                    }
+                    let fade = chunk_fades.fade_alpha(coord.0, coord.2);
+                    let off = slot(identity, fade, 1.0);
+                    pass.set_bind_group(0, &section.bind_group, &[]);
+                    pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+                    pass.set_vertex_buffer(0, section.terrain.translucent_vertices.slice(..));
+                    pass.set_index_buffer(
+                        section.terrain.translucent_indices.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    pass.draw_indexed(0..section.terrain.translucent_index_count, 0, 0..1);
                 }
-                let fade = chunk_fades.fade_alpha(coord.0, coord.2);
-                let off = slot(identity, fade, 1.0);
-                pass.set_bind_group(0, &section.bind_group, &[]);
-                pass.set_bind_group(1, &gpu.draw_bg, &[off]);
-                pass.set_vertex_buffer(0, section.terrain.translucent_vertices.slice(..));
-                pass.set_index_buffer(
-                    section.terrain.translucent_indices.slice(..),
-                    wgpu::IndexFormat::Uint32,
-                );
-                pass.draw_indexed(0..section.terrain.translucent_index_count, 0, 0..1);
             }
 
             // 6-DOF sub-worlds, opaque first (airship hulls, planets,
@@ -5523,8 +6109,7 @@ impl GpuRenderer {
         let width = width.max(1);
         let height = height.max(1);
         let caster_digest = subworld_caster_digest(frame.subworlds);
-        if subworld_casters_dirty(frame.subworlds) || caster_digest != self.last_shadow_casters
-        {
+        if subworld_casters_dirty(frame.subworlds) || caster_digest != self.last_shadow_casters {
             self.shadow_cache.invalidate();
         }
         self.subworld_gpu
@@ -5670,14 +6255,7 @@ impl GpuRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.ui_quad.pipeline);
-            pass.set_bind_group(0, &self.ui_quad.bind_group, &[]);
-            pass.set_vertex_buffer(0, self.ui_quad.vertices.slice(..));
-            pass.set_index_buffer(
-                self.ui_quad.indices.slice(..),
-                wgpu::IndexFormat::Uint32,
-            );
-            pass.draw_indexed(0..self.ui_quad.index_count, 0, 0..1);
+            self.draw_ui_quads(&mut pass);
             drew_quad_ui = true;
         } else if let Some(ui_bind_group) = &self.ui_bind_group {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

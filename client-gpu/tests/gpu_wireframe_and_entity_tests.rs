@@ -100,7 +100,9 @@ fn rx7800_xt_debug_lines_entities_ber_particles_readback() {
     renderer.set_entity_and_ber_meshes(vec![(&zombie, [7.0, 1.0, 9.0], [0.25, 1.0, 0.2])]);
     let zombie_pixels = render(&mut renderer, &camera);
     let changed_zombie = baseline
-        .as_chunks::<4>().0.iter()
+        .as_chunks::<4>()
+        .0
+        .iter()
         .zip(zombie_pixels.as_chunks::<4>().0.iter())
         .filter(|(a, b)| a[0..3] != b[0..3])
         .count();
@@ -112,7 +114,9 @@ fn rx7800_xt_debug_lines_entities_ber_particles_readback() {
     renderer.set_entity_and_ber_meshes(vec![(&chest, [9.0, 1.0, 9.0], [1.0, 0.55, 0.20])]);
     let chest_pixels = render(&mut renderer, &camera);
     let changed_chest = baseline
-        .as_chunks::<4>().0.iter()
+        .as_chunks::<4>()
+        .0
+        .iter()
         .zip(chest_pixels.as_chunks::<4>().0.iter())
         .filter(|(a, b)| a[0..3] != b[0..3])
         .count();
@@ -127,7 +131,9 @@ fn rx7800_xt_debug_lines_entities_ber_particles_readback() {
     ]);
     let lit = render(&mut renderer, &camera);
     let changed_lit = baseline
-        .as_chunks::<4>().0.iter()
+        .as_chunks::<4>()
+        .0
+        .iter()
         .zip(lit.as_chunks::<4>().0.iter())
         .filter(|(a, b)| a[0..3] != b[0..3])
         .count();
@@ -169,7 +175,9 @@ fn rx7800_xt_debug_lines_entities_ber_particles_readback() {
     renderer.set_debug_lines(&lines);
     let with_lines = render(&mut renderer, &camera);
     let added_pixels = lit
-        .as_chunks::<4>().0.iter()
+        .as_chunks::<4>()
+        .0
+        .iter()
         .zip(with_lines.as_chunks::<4>().0.iter())
         .filter(|(a, b)| a[0..3] != b[0..3])
         .count();
@@ -208,7 +216,9 @@ fn rx7800_xt_debug_lines_entities_ber_particles_readback() {
     let with_particle = render(&mut renderer, &camera);
     assert!(
         with_lines
-            .as_chunks::<4>().0.iter()
+            .as_chunks::<4>()
+            .0
+            .iter()
             .zip(with_particle.as_chunks::<4>().0.iter())
             .any(|(a, b)| a[0..3] != b[0..3]),
         "particle quad must change GPU pixels"

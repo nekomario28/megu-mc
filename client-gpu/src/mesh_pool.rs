@@ -173,10 +173,7 @@ impl Drop for MeshJobPool {
     }
 }
 
-fn worker_loop(
-    job_rx: Arc<Mutex<Receiver<MeshJob>>>,
-    result_tx: SyncSender<MeshResult>,
-) {
+fn worker_loop(job_rx: Arc<Mutex<Receiver<MeshJob>>>, result_tx: SyncSender<MeshResult>) {
     loop {
         let job = {
             let rx = job_rx.lock().unwrap_or_else(|e| e.into_inner());
@@ -200,8 +197,7 @@ fn execute(job: MeshJob) -> MeshResult {
             buckets,
         } => {
             let geometry = section_geometry(&packed, &order);
-            let opaque_bucket_ranges =
-                buckets.map(|b| compute_opaque_bucket_ranges(&packed, b));
+            let opaque_bucket_ranges = buckets.map(|b| compute_opaque_bucket_ranges(&packed, b));
             MeshResult::SectionGeometry {
                 coord,
                 packed,

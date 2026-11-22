@@ -2,7 +2,7 @@
 //! Asynchronous live Protocol 767/777 session and renderer-facing world state.
 //! Socket operations happen on a worker thread; `poll` never performs I/O.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::time::{Duration, Instant};
@@ -36,6 +36,7 @@ use mc_spine_client_mesh::vanilla_plus_nature::{
     compute_cloud_lighting, generate_layered_voxel_clouds, tick_nature_ambience, ActiveSeasonKind,
     NatureAmbienceEnv, NatureAmbienceState, NatureModRegistry, SeasonAmbienceInput,
 };
+use mc_spine_client_mesh::SectionCoord;
 use mc_spine_kernel::player_physics::{
     step_player_physics, PlayerInputState, PlayerPhysicsState, SurfaceKind,
 };
@@ -498,6 +499,24 @@ pub struct LiveSession {
     pub pose: Option<PlayerPose>,
     pub camera_sync: Option<PlayerPose>,
     pub terrain_dirty: bool,
+    /// Sections play events flagged since the last renderer sync —
+    /// `GpuRenderer::update_live_terrain_tracked` reconciles exactly this
+    /// set instead of scanning every world section. Column-level events
+    /// (chunk data/unload, light updates) mark the column plus the four
+    /// lateral neighbor columns so `MeshCache`'s boundary invalidation can
+    /// never escape the tracked set.
+    pub dirty_terrain_coords: BTreeSet<SectionCoord>,
+    /// A non-incremental world transition (dimension reset, first sync)
+    /// demands one legacy full reconcile before dirty tracking is trusted.
+    pub terrain_full_sync: bool,
+    /// The last poll crossed the translucent re-sort threshold, so
+    /// resident-section orders may have changed outside the dirty set —
+    /// the renderer runs its cheap order sweep on the next sync.
+    pub terrain_order_sweep: bool,
+    /// Frame-budget governor override on [`Self::mesh_rebuild_budget`]
+    /// (`usize::MAX` = unlimited): window.rs clamps it live per
+    /// [`ThrottleStage`].
+    pub governor_rebuild_cap: usize,
     /// Lifetime count of sections meshed by the camera-frustum +
     /// distance-ordered dirty drain in [`Self::poll`] — proves the
     /// ordered rebuild path executes live.
@@ -648,9 +667,7 @@ impl LiveSession {
             access_token: access_token
                 .filter(|token| token.is_present())
                 .map(|token| token.reveal().to_owned()),
-            profile_uuid: account_uuid
-                .as_deref()
-                .and_then(|raw| parse_uuid(raw).ok()),
+            profile_uuid: account_uuid.as_deref().and_then(|raw| parse_uuid(raw).ok()),
             ..OnlineAuthOptions::default()
         };
         let login_uuid = match (auth.access_token.is_some(), auth.profile_uuid) {
@@ -786,6 +803,12 @@ impl LiveSession {
             pose: None,
             camera_sync: None,
             terrain_dirty: false,
+            dirty_terrain_coords: BTreeSet::new(),
+            // Until the first sync finishes, residency is unknown — the
+            // renderer needs one legacy full reconcile to establish it.
+            terrain_full_sync: true,
+            terrain_order_sweep: false,
+            governor_rebuild_cap: usize::MAX,
             ordered_rebuilds_count: 0,
             vfx_admitted: 0,
             vfx_rejected: 0,
@@ -1158,6 +1181,16 @@ impl LiveSession {
         // Preserve the last received terrain even if the peer closes immediately
         // after sending chunk data.
         let had_pending = self.world.pending_mesh_sections() > 0;
+        // A committed translucent re-sort can rewrite resident orders far
+        // outside the event-marked dirty set — the renderer runs its cheap
+        // order sweep on this sync instead of a full section scan.
+        if self
+            .world
+            .mesh_cache
+            .translucent_resort_due(camera_position)
+        {
+            self.terrain_order_sweep = true;
+        }
         match self.world.rebuild_dirty_bounded_ordered(
             self.mesh_rebuild_budget(),
             camera_position,
@@ -1810,9 +1843,7 @@ impl LiveSession {
         indices: Vec<u32>,
     ) {
         match self.subworlds.get(contraption_id) {
-            Some(existing)
-                if existing.vertices == vertices && existing.indices == indices =>
-            {
+            Some(existing) if existing.vertices == vertices && existing.indices == indices => {
                 self.subworlds.set_transform(contraption_id, transform);
             }
             Some(_) => {
@@ -1842,16 +1873,19 @@ impl LiveSession {
 
     /// Per-poll dirty-mesh rebuild budget: the base slice scaled by the
     /// adaptive strategy's foreground worker count — the meshing critical
-    /// path — clamped so a many-core host cannot spike one poll.
+    /// path — clamped so a many-core host cannot spike one poll. The live
+    /// frame-budget governor can further cap it via
+    /// [`Self::governor_rebuild_cap`].
     pub fn mesh_rebuild_budget(&self) -> usize {
         const BASE_POLL_MESH_BUDGET: usize = 24;
         const MAX_FOREGROUND_SCALE: u32 = 2;
-        BASE_POLL_MESH_BUDGET
+        (BASE_POLL_MESH_BUDGET
             * self
                 .compute_strategy
                 .workers
                 .foreground_threads
-                .clamp(1, MAX_FOREGROUND_SCALE) as usize
+                .clamp(1, MAX_FOREGROUND_SCALE) as usize)
+            .min(self.governor_rebuild_cap)
     }
 
     /// Push this session's connect-time [`ComputeStrategy`] into
@@ -1979,6 +2013,49 @@ impl LiveSession {
         }
     }
 
+    /// Mark every section of chunk column `(cx, cz)` — plus the four
+    /// lateral neighbor columns — for renderer re-evaluation. `MeshCache`
+    /// only invalidates a neighbor when a shared boundary actually
+    /// changed; over-marking is harmless because the renderer compares
+    /// mesh contents per coord, but under-marking would strand a changed
+    /// neighbor forever.
+    fn mark_chunk_column_dirty(&mut self, cx: i32, cz: i32) {
+        let min_sy = self.world.dimension.min_section_y();
+        let section_count = self.world.dimension.section_count() as i32;
+        for (dx, dz) in [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)] {
+            for sy in min_sy..min_sy + section_count {
+                self.dirty_terrain_coords
+                    .insert(SectionCoord(cx + dx, sy, cz + dz));
+            }
+        }
+    }
+
+    /// Mark the section containing block `pos` plus its six face-adjacent
+    /// sections — `MeshCache::set_cell` can dirty any of them when the
+    /// edit touches a shared boundary.
+    fn mark_block_dirty(&mut self, pos: [i32; 3]) {
+        let section = SectionCoord(
+            pos[0].div_euclid(16),
+            pos[1].div_euclid(16),
+            pos[2].div_euclid(16),
+        );
+        self.dirty_terrain_coords.insert(section);
+        for (dx, dy, dz) in [
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ] {
+            self.dirty_terrain_coords.insert(SectionCoord(
+                section.0 + dx,
+                section.1 + dy,
+                section.2 + dz,
+            ));
+        }
+    }
+
     fn apply_play(&mut self, event: PlayEvent) -> Result<(), String> {
         // World-side tracking (chunks, block/light updates, entities, block
         // entities, time/weather, break overlays) is owned by
@@ -2003,23 +2080,35 @@ impl LiveSession {
                 self.audio.mixer.refresh_acoustics();
                 self.chunk_fades.note_chunk(cx, cz);
                 self.refresh_prefetcher();
+                self.mark_chunk_column_dirty(cx, cz);
                 self.terrain_dirty = true;
             }
             PlayEvent::BlockUpdate { pos, .. } => {
                 self.acoustic_world.sync_block(&self.world, pos);
                 self.audio.mixer.refresh_acoustics();
+                self.mark_block_dirty(pos);
+                self.terrain_dirty = true;
             }
             PlayEvent::SectionBlocksUpdate(changes) => {
                 for (pos, _) in &changes {
                     self.acoustic_world.sync_block(&self.world, *pos);
+                    self.mark_block_dirty(*pos);
                 }
                 self.audio.mixer.refresh_acoustics();
+                if !changes.is_empty() {
+                    self.terrain_dirty = true;
+                }
+            }
+            PlayEvent::UpdateLight { cx, cz, .. } => {
+                self.mark_chunk_column_dirty(cx, cz);
+                self.terrain_dirty = true;
             }
             PlayEvent::UnloadChunk { cx, cz } => {
                 self.acoustic_world.unload_chunk(cx, cz);
                 self.audio.mixer.refresh_acoustics();
                 self.chunk_fades.forget(cx, cz);
                 self.refresh_prefetcher();
+                self.mark_chunk_column_dirty(cx, cz);
                 self.terrain_dirty = true;
             }
             PlayEvent::AddEntity {
@@ -2420,6 +2509,10 @@ impl LiveSession {
         self.audio.mixer.refresh_acoustics();
         self.entity_positions.clear();
         self.terrain_dirty = true;
+        // Every resident coordinate may vanish — a full reconcile is the
+        // only honest answer before dirty tracking resumes.
+        self.terrain_full_sync = true;
+        self.dirty_terrain_coords.clear();
         self.pose = None;
         self.last_motion_delta = [0.0; 2];
         self.chunk_fades = ChunkFadeTracker::new();
