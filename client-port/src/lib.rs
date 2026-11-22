@@ -36,6 +36,7 @@ pub mod vanilla_plus_nature;
 pub mod vanilla_plus_visuals;
 pub mod vfx_engine;
 pub mod visibility;
+pub mod world;
 
 #[cfg(test)]
 mod tests;
@@ -53,7 +54,10 @@ pub use ber_instancing::{
     DEFAULT_NEAR_INTERIOR_DIST, LOW_SPEC_MAX_DYNAMIC_DIST, LOW_SPEC_NEAR_INTERIOR_DIST,
     LOD_SCALE_MAX, LOD_SCALE_MIN,
 };
-pub use cache::{MeshCache, SectionCoord, DEFAULT_RESORT_THRESHOLD};
+pub use cache::{
+    MeshCache, ReleasedMeshMeta, SectionCoord, DEFAULT_RESORT_THRESHOLD,
+    PRIORITY_ZERO_NEAR_RADIUS_BLOCKS,
+};
 pub use cull::{box_facing_mask, box_in_frustum, SectionVis};
 pub use culler::{through_bit, CullResult, GraphCuller, SectionGraph, THROUGH_ALL};
 pub use draw_order::{
@@ -105,9 +109,13 @@ pub use shaderpack::{
     MAX_TOTAL_INCLUDES, MAX_ZIP_FILE_BYTES, MEGU_WGSL_MANIFEST,
 };
 pub use upload_budget::{
-    ChunkUploadBudget, DEFAULT_MAX_UPLOADS_PER_FRAME, DEFAULT_MAX_UPLOAD_BYTES_PER_FRAME,
-    DEFAULT_MAX_UPLOAD_WORK_US_PER_FRAME, DEFAULT_MIN_UPLOADS_PER_FRAME, DEFAULT_TARGET_FRAME_US,
+    ChunkUploadBudget, UploadBudget, UploadBudgetProfile, DEFAULT_MAX_UPLOADS_PER_FRAME,
+    DEFAULT_MAX_UPLOAD_BYTES_PER_FRAME, DEFAULT_MAX_UPLOAD_WORK_US_PER_FRAME,
+    DEFAULT_MIN_UPLOADS_PER_FRAME, DEFAULT_TARGET_FRAME_US,
+    HARD_FLOOR_1000FPS_MAX_UPLOADS_PER_FRAME, HARD_FLOOR_1000FPS_MAX_UPLOAD_BYTES_PER_FRAME,
+    HARD_FLOOR_1000FPS_MAX_UPLOAD_WORK_US_PER_FRAME, HARD_FLOOR_1000FPS_TARGET_FRAME_US,
 };
 pub use visibility::FaceVisibility;
+pub use world::WorldState;
 
 pub const PROTOCOL_VERSION: u32 = 767;

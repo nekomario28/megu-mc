@@ -31,6 +31,31 @@ pub const DEFAULT_MAX_UPLOAD_WORK_US_PER_FRAME: u64 = 2_000;
 /// Default frame-time target used by [`ChunkUploadBudget::adapt`] (~60 fps).
 pub const DEFAULT_TARGET_FRAME_US: u64 = 16_667;
 
+/// `HardFloor1000Fps` profile: at most two section uploads per frame, so a
+/// burst can never stall the 1 ms frame floor even on saturated PCIe.
+pub const HARD_FLOOR_1000FPS_MAX_UPLOADS_PER_FRAME: u32 = 2;
+/// `HardFloor1000Fps` profile: 128 KiB of upload payload per frame.
+pub const HARD_FLOOR_1000FPS_MAX_UPLOAD_BYTES_PER_FRAME: usize = 128 * 1024;
+/// `HardFloor1000Fps` profile: 150 µs of estimated upload CPU work per
+/// frame — the hard cap that keeps the 1,000 FPS floor reachable mid-burst.
+pub const HARD_FLOOR_1000FPS_MAX_UPLOAD_WORK_US_PER_FRAME: u64 = 150;
+/// `HardFloor1000Fps` frame-time target: one millisecond.
+pub const HARD_FLOOR_1000FPS_TARGET_FRAME_US: u64 = 1_000;
+
+/// Named upload-budget presets for
+/// [`ChunkUploadBudget::with_profile`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum UploadBudgetProfile {
+    /// The adaptive defaults (8 uploads, 4 MiB, 2 ms, 60 fps target).
+    #[default]
+    Default,
+    /// [`ChunkUploadBudget::low_spec`] (2 uploads, 1 MiB, 1 ms).
+    LowSpec,
+    /// [`ChunkUploadBudget::hard_floor_1000fps`] (2 uploads, 128 KiB,
+    /// 150 µs): the zero-spike 1,000 FPS floor profile.
+    HardFloor1000Fps,
+}
+
 /// Recover when P95 is at or under `target * RECOVER_PERCENT / 100`.
 const RECOVER_PERCENT: u64 = 90;
 /// Throttle when P95 exceeds `target * THROTTLE_PERCENT / 100`.
@@ -103,6 +128,32 @@ impl ChunkUploadBudget {
             uploads_per_frame: max_uploads_per_frame,
             max_upload_bytes_per_frame,
             max_upload_work_us_per_frame,
+            ..Self::default()
+        }
+    }
+
+    /// Builds the budget for a named [`UploadBudgetProfile`].
+    pub fn with_profile(profile: UploadBudgetProfile) -> Self {
+        match profile {
+            UploadBudgetProfile::Default => Self::new(),
+            UploadBudgetProfile::LowSpec => Self::low_spec(),
+            UploadBudgetProfile::HardFloor1000Fps => Self::hard_floor_1000fps(),
+        }
+    }
+
+    /// The `HardFloor1000Fps` profile: a hard per-frame cap of
+    /// `2` sections / `128 KiB` / `150 µs` upload-side CPU work against a
+    /// `1 ms` frame target. Even a 200-section join burst admits at most two
+    /// uploads per frame — at 1,000 FPS the queue still drains ~2,000
+    /// sections per second, while no single frame can exceed the 1 ms floor.
+    pub fn hard_floor_1000fps() -> Self {
+        Self {
+            max_uploads_per_frame: HARD_FLOOR_1000FPS_MAX_UPLOADS_PER_FRAME,
+            min_uploads_per_frame: 1,
+            max_upload_bytes_per_frame: HARD_FLOOR_1000FPS_MAX_UPLOAD_BYTES_PER_FRAME,
+            max_upload_work_us_per_frame: HARD_FLOOR_1000FPS_MAX_UPLOAD_WORK_US_PER_FRAME,
+            target_frame_us: HARD_FLOOR_1000FPS_TARGET_FRAME_US,
+            uploads_per_frame: HARD_FLOOR_1000FPS_MAX_UPLOADS_PER_FRAME,
             ..Self::default()
         }
     }
@@ -228,4 +279,27 @@ impl ChunkUploadBudget {
     pub fn is_throttled(&self) -> bool {
         self.uploads_per_frame < self.max_uploads_per_frame
     }
+
+    /// Maximum upload payload bytes admitted per frame — the plan's
+    /// `max_bytes_per_frame` (`128 KiB` under `HardFloor1000Fps`).
+    pub fn max_bytes_per_frame(&self) -> usize {
+        self.max_upload_bytes_per_frame
+    }
+
+    /// Maximum sections admitted per frame — the plan's
+    /// `max_sections_per_frame` (`2` under `HardFloor1000Fps`).
+    pub fn max_sections_per_frame(&self) -> u32 {
+        self.max_uploads_per_frame
+    }
+
+    /// Maximum estimated upload CPU microseconds per frame — the plan's
+    /// `max_cost_us` (`150 µs` under `HardFloor1000Fps`).
+    pub fn max_cost_us(&self) -> u64 {
+        self.max_upload_work_us_per_frame
+    }
 }
+
+/// Alias matching the plan's `UploadBudget` naming: the same per-frame
+/// section-upload admission controller, with
+/// [`UploadBudget::hard_floor_1000fps`] as the zero-spike preset.
+pub type UploadBudget = ChunkUploadBudget;

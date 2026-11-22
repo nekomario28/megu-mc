@@ -244,6 +244,218 @@ pub struct Section {
     pub sky_light: [u8; LIGHT_BYTES],
 }
 
+/// Block storage for one section. A section whose 4,096 cells all hold the
+/// same block (uniform air, deep stone, ocean water — the large majority of
+/// sections in a world) allocates nothing: [`SectionBlocks::Uniform`] keeps
+/// the single `Block` value inline. [`SectionBlocks::Dense`] is the full
+/// expanded array and is only materialized by the first non-uniform write
+/// ([`CompressedSection::set`]) or an explicit
+/// [`CompressedSection::expand`].
+#[derive(Clone, Debug)]
+pub enum SectionBlocks {
+    /// Every cell holds this block; zero heap allocation.
+    Uniform(Block),
+    /// Fully expanded per-cell storage.
+    Dense(Box<[Block; SECTION_CELLS]>),
+}
+
+impl SectionBlocks {
+    /// Whether every cell holds one shared block value.
+    pub fn is_uniform(&self) -> bool {
+        matches!(self, Self::Uniform(_))
+    }
+
+    /// The shared block value, or `None` for dense storage.
+    pub fn uniform_block(&self) -> Option<Block> {
+        match self {
+            Self::Uniform(block) => Some(*block),
+            Self::Dense(_) => None,
+        }
+    }
+
+    /// Heap bytes held by the block storage: `0` for `Uniform`, the full
+    /// expanded array for `Dense`. (Inline fields and the two light arrays
+    /// are not heap-allocated and are not counted.)
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Uniform(_) => 0,
+            Self::Dense(dense) => std::mem::size_of_val(&**dense),
+        }
+    }
+
+    /// Cell value at a flat `section_index` position; `index >= SECTION_CELLS`
+    /// is out of range and panics like array indexing.
+    pub fn cell(&self, index: usize) -> Block {
+        match self {
+            Self::Uniform(block) => {
+                assert!(index < SECTION_CELLS);
+                *block
+            }
+            Self::Dense(dense) => dense[index],
+        }
+    }
+
+    /// The expanded array, when the section is dense.
+    pub fn as_dense(&self) -> Option<&[Block; SECTION_CELLS]> {
+        match self {
+            Self::Dense(dense) => Some(dense),
+            Self::Uniform(_) => None,
+        }
+    }
+
+    /// Ensures dense storage and returns the expanded array for mutation.
+    fn promote(&mut self) -> &mut [Block; SECTION_CELLS] {
+        if let Self::Uniform(block) = self {
+            *self = Self::Dense(Box::new([*block; SECTION_CELLS]));
+        }
+        match self {
+            Self::Dense(dense) => dense,
+            Self::Uniform(_) => unreachable!(),
+        }
+    }
+
+    /// Content equality across representations: a `Uniform` equals a `Dense`
+    /// whose cells all hold the same block.
+    fn content_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Uniform(a), Self::Uniform(b)) => a == b,
+            (Self::Dense(a), Self::Dense(b)) => a == b,
+            (Self::Uniform(u), Self::Dense(d)) | (Self::Dense(d), Self::Uniform(u)) => {
+                d.iter().all(|cell| cell == u)
+            }
+        }
+    }
+}
+
+impl PartialEq for SectionBlocks {
+    fn eq(&self, other: &Self) -> bool {
+        self.content_eq(other)
+    }
+}
+
+impl Eq for SectionBlocks {}
+
+/// Stored voxel + light data for one section, keeping [`Section`]'s exact
+/// semantics while compressing uniform sections to zero heap blocks.
+///
+/// `set` promotes `Uniform` to `Dense` only on the first write that changes
+/// the block value (light-only writes keep the zero-heap form) and collapses
+/// back to `Uniform` automatically when a write makes every cell equal
+/// again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompressedSection {
+    pub blocks: SectionBlocks,
+    pub block_light: [u8; LIGHT_BYTES],
+    pub sky_light: [u8; LIGHT_BYTES],
+}
+
+impl CompressedSection {
+    /// A section of one repeated block and uniform light, in zero-heap form.
+    pub fn uniform(block: Block, light: Light) -> Self {
+        Self {
+            blocks: SectionBlocks::Uniform(block),
+            block_light: [light.block() * 17; LIGHT_BYTES],
+            sky_light: [light.sky() * 17; LIGHT_BYTES],
+        }
+    }
+
+    /// Whether the block storage is the zero-heap `Uniform` form.
+    pub fn is_uniform(&self) -> bool {
+        self.blocks.is_uniform()
+    }
+
+    /// Heap bytes held by the block storage (`0` when uniform).
+    pub fn heap_bytes(&self) -> usize {
+        self.blocks.heap_bytes()
+    }
+
+    /// Reads a local cell, identical to [`Section::get`]. Panics when a
+    /// coordinate is outside 0..16.
+    pub fn get(&self, x: usize, y: usize, z: usize) -> Sample {
+        assert!(x < EDGE && y < EDGE && z < EDGE);
+        let index = section_index(x, y, z);
+        Sample::new(
+            self.blocks.cell(index),
+            Light::new(
+                nibble(&self.block_light, index),
+                nibble(&self.sky_light, index),
+            ),
+        )
+    }
+
+    /// Writes a cell with [`Section::set`] semantics. Returns whether the
+    /// cell changed; out-of-section coordinates have no effect. The first
+    /// write of a different block promotes `Uniform` storage to `Dense`; a
+    /// write that makes every cell equal collapses it back.
+    pub fn set(&mut self, x: usize, y: usize, z: usize, block: Block, light: Light) -> bool {
+        if [x, y, z].into_iter().any(|coordinate| coordinate >= EDGE) {
+            return false;
+        }
+        let index = section_index(x, y, z);
+        if self.blocks.cell(index) == block
+            && nibble(&self.block_light, index) == light.block()
+            && nibble(&self.sky_light, index) == light.sky()
+        {
+            return false;
+        }
+        if self.blocks.uniform_block() != Some(block) {
+            self.blocks.promote()[index] = block;
+        }
+        set_nibble(&mut self.block_light, index, light.block());
+        set_nibble(&mut self.sky_light, index, light.sky());
+        self.collapse_if_uniform();
+        true
+    }
+
+    /// Collapses `Dense` storage to `Uniform` when every cell holds the same
+    /// block. Returns whether the representation changed.
+    pub fn collapse_if_uniform(&mut self) -> bool {
+        let SectionBlocks::Dense(dense) = &self.blocks else {
+            return false;
+        };
+        let first = dense[0];
+        if !dense.iter().all(|&cell| cell == first) {
+            return false;
+        }
+        self.blocks = SectionBlocks::Uniform(first);
+        true
+    }
+
+    /// Materializes the fully expanded [`Section`] meshing snapshot. Dense
+    /// sections copy their block array; `Uniform` sections expand the single
+    /// block into it.
+    pub fn expand(&self) -> Section {
+        Section {
+            blocks: match &self.blocks {
+                SectionBlocks::Dense(dense) => dense.clone(),
+                SectionBlocks::Uniform(block) => Box::new([*block; SECTION_CELLS]),
+            },
+            block_light: self.block_light,
+            sky_light: self.sky_light,
+        }
+    }
+}
+
+impl From<Section> for CompressedSection {
+    /// Stores the section, collapsing a fully uniform block array to the
+    /// zero-heap form.
+    fn from(section: Section) -> Self {
+        let mut stored = Self {
+            blocks: SectionBlocks::Dense(section.blocks),
+            block_light: section.block_light,
+            sky_light: section.sky_light,
+        };
+        stored.collapse_if_uniform();
+        stored
+    }
+}
+
+impl From<CompressedSection> for Section {
+    fn from(stored: CompressedSection) -> Self {
+        stored.expand()
+    }
+}
+
 impl Section {
     pub fn filled(block: Block, light: Light) -> Self {
         Self {
