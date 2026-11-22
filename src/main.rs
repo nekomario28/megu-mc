@@ -917,7 +917,7 @@ fn environment_time_tick() {
                             0
                         }
                     };
-                    if frozen >= server_ticks(140) as u64
+                    if frozen >= server_ticks(140)
                         && t.is_multiple_of(server_ticks(40))
                         && GR_FREEZE_DAMAGE.load(Ordering::Relaxed) != 0
                     {
@@ -1163,7 +1163,7 @@ fn environment_time_tick() {
         {
             spawn_nightly_hostile(t);
         }
-        if t % nether_spawn_cycle() == 0 && mob_spawn_permitted(1, mob_scale) {
+        if t.is_multiple_of(nether_spawn_cycle()) && mob_spawn_permitted(1, mob_scale) {
             spawn_nether_natural(t);
         }
         if !(13000..=23000).contains(&wt)
@@ -4346,8 +4346,8 @@ fn w1_vehicle_phys() -> &'static Mutex<HashMap<i32, W1VehiclePhys>> {
 /// Detector-rail cells a live minecart currently occupies: the `powered`
 /// property is written while a cart sits on the rail and cleared when the
 /// last cart leaves, so the cell emits 15 for exactly the occupied window.
-fn w1_detector_rails() -> &'static Mutex<HashSet<(DimId, i32, i32, i32)>> {
-    static RAILS: OnceLock<Mutex<HashSet<(DimId, i32, i32, i32)>>> = OnceLock::new();
+fn w1_detector_rails() -> &'static Mutex<HashSet<DimBlockPos>> {
+    static RAILS: OnceLock<Mutex<HashSet<DimBlockPos>>> = OnceLock::new();
     RAILS.get_or_init(Mutex::default)
 }
 
@@ -4371,6 +4371,7 @@ fn w1_detector_power(dim: DimId, x: i32, y: i32, z: i32, on: bool) {
 /// boost/brake, detector signal), and rideable mobs steer off the driver's
 /// `PlayerInput`. Evaluator outputs move the live entity, re-seat its
 /// passengers, and broadcast a `0x70` teleport.
+type SeatSnapshot = (Option<PaddleBoatPacket>, Option<PlayerInputPacket>, Vec<i32>);
 fn w1_vehicle_tick() {
     let Some(reg) = breg() else { return };
     let snap: Vec<(Arc<Mob>, VehicleKind)> = mobs()
@@ -4389,7 +4390,7 @@ fn w1_vehicle_tick() {
     if snap.is_empty() {
         return;
     }
-    let seats: HashMap<i32, (Option<PaddleBoatPacket>, Option<PlayerInputPacket>, Vec<i32>)> = {
+    let seats: HashMap<i32, SeatSnapshot> = {
         let live = mounts().lock().unwrap_or_else(|e| e.into_inner());
         snap.iter()
             .map(|(mob, _)| {
@@ -4777,7 +4778,7 @@ fn w1_hostile_mob_tick(
                         .lock()
                         .unwrap()
                         .get(&sheep.eid)
-                        .map_or(true, |&color| color == 11)
+                        .is_none_or(|&color| color == 11)
                 })
                 .map(|sheep| {
                     let p = *sheep.pos.lock().unwrap_or_else(|e| e.into_inner());
@@ -5619,11 +5620,11 @@ fn world() -> &'static LockedMap<DimChunkKey, HashMap<u32, u32>> {
 /// light pass, the indexes `rebuild_derived_indexes` restores — and every one of them describes
 /// the Overworld. They ask through this name, so "which dimension does this cache belong to" has
 /// one place to answer in S3 instead of one `(DimId::Overworld, ..)` per reader.
-fn overworld_edits<'a>(
-    w: &'a HashMap<DimChunkKey, HashMap<u32, u32>>,
+fn overworld_edits(
+    w: &HashMap<DimChunkKey, HashMap<u32, u32>>,
     cx: i32,
     cz: i32,
-) -> Option<&'a HashMap<u32, u32>> {
+) -> Option<&HashMap<u32, u32>> {
     w.get(&(DimId::Overworld, cx, cz))
 }
 static CROPS: Registry<DimBlockPos, u8> = OnceLock::new();
@@ -6013,9 +6014,7 @@ fn unpack_cart_loot_if_needed(uuid: [u8; 16]) {
 fn break_generated_cart(target_eid: i32, drop_loot: bool) -> bool {
     let broken = with_save_guard(|| {
         let mut gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
-        let Some(idx) = gen.carts.iter().position(|c| c.eid == target_eid) else {
-            return None;
-        };
+        let idx = gen.carts.iter().position(|c| c.eid == target_eid)?;
         let mut cart = gen.carts.remove(idx);
         let pos = cart.pos().unwrap_or([0.0, 0.0, 0.0]);
         let uuid = cart.uuid().ok();
@@ -6314,11 +6313,13 @@ fn nibble_at_dim(sections: &[[u8; 2048]], dim: DimId, x: i32, y: i32, z: i32) ->
     i32::from((section[(relative_y & 15) * 128 + lz * 8 + lx / 2] >> ((lx & 1) * 4)) & 15)
 }
 
+type SkyBlockPlanes = (Vec<[u8; 2048]>, Vec<[u8; 2048]>);
+
 struct SpawnerRuntimeWorld<'a> {
     clients_snap: &'a [Arc<Client>],
     players: Vec<[f64; 3]>,
     gen_sources: Option<GenSources>,
-    light_cache: HashMap<(i32, i32), (Vec<[u8; 2048]>, Vec<[u8; 2048]>)>,
+    light_cache: HashMap<(i32, i32), SkyBlockPlanes>,
     sky_darken: i32,
     effect_origins: Vec<BlockPos>,
 }
@@ -8216,13 +8217,11 @@ fn crop_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i3
         .and_then(|a| a.parse().ok())
         .unwrap_or(0);
     let mut farmland_3x3 = [[None; 3]; 3];
-    for dz in 0..3usize {
-        for dx in 0..3usize {
+    for (dz, row) in farmland_3x3.iter_mut().enumerate() {
+        for (dx, cell) in row.iter_mut().enumerate() {
             let b = block_at_dim(dim, x + dx as i32 - 1, y - 1, z + dz as i32 - 1);
             if reg.name_of(b) == "minecraft:farmland" {
-                farmland_3x3[dz][dx] = reg
-                    .get_prop(b, "moisture")
-                    .and_then(|m| m.parse().ok());
+                *cell = reg.get_prop(b, "moisture").and_then(|m| m.parse().ok());
             }
         }
     }
@@ -8322,11 +8321,10 @@ fn fire_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i3
             note_block_update_dim(dim, x, y, z, st);
         }
     }
-    for i in 0..6 {
-        if !result.spread[i] {
+    for (&spread, &(dx, dy, dz)) in result.spread.iter().zip(dirs.iter()) {
+        if !spread {
             continue;
         }
-        let (dx, dy, dz) = dirs[i];
         let (nx, ny, nz) = (x + dx, y + dy, z + dz);
         if fire_flammable(reg, block_at_dim(dim, nx, ny, nz)) {
             let fire = reg.state_of("minecraft:fire", None);
@@ -8915,7 +8913,13 @@ fn apply_queued_block_updates() {
 }
 
 fn local_idx(x: i32, y: i32, z: i32) -> u32 {
-    (((y - MIN_Y) as u32) << 8) | (((z & 15) as u32) << 4) | (x & 15) as u32
+    // The offset must fit i32: a y this far out of range would panic on the
+    // subtract (debug) or wrap to an aliased cell (release). u32::MAX is
+    // unreachable for any encodable y, so callers miss this lookup instead.
+    match y.checked_sub(MIN_Y) {
+        Some(off) => ((off as u32) << 8) | (((z & 15) as u32) << 4) | (x & 15) as u32,
+        None => u32::MAX,
+    }
 }
 /// The overlay's state for a cell in one dimension, or `None` when the cell still holds that
 /// dimension's generated terrain. Use this instead of `block_at` where the *only* states that
@@ -8944,6 +8948,17 @@ fn overlay_block(x: i32, y: i32, z: i32) -> Option<u32> {
 /// back as Overworld deepslate instead of the air the Nether's 0/256 window defines — the exact
 /// substitution the per-dimension registry exists to stop.
 fn dim_base_state(dim: DimId, x: i32, y: i32, z: i32) -> Option<u32> {
+    // A y whose offset from the dimension floor overflows i32 cannot be keyed
+    // by the generator either — it panics on the same subtraction. The same
+    // applies horizontally: a query outside ±2^28 asks the generator to
+    // populate a chunk whose *16/+bound sample arithmetic overflows i32.
+    // Vanilla answers air for any cell outside the addressable band.
+    if y.checked_sub(dim.min_y()).is_none()
+        || !(-(1 << 28)..1 << 28).contains(&x)
+        || !(-(1 << 28)..1 << 28).contains(&z)
+    {
+        return Some(0);
+    }
     if dim == DimId::Overworld {
         return Some(base_state(x, y, z));
     }
@@ -9018,6 +9033,9 @@ fn set_block_if_inner_dim(
 ) -> bool {
     if dim != DimId::Overworld {
         return set_block_if_dim_edit(dim, x, y, z, st, expected);
+    }
+    if y.checked_sub(MIN_Y).is_none() {
+        return false;
     }
     let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
     let c = w.entry((dim, x >> 4, z >> 4)).or_default();
@@ -9215,6 +9233,9 @@ fn set_block_if_dim_edit(
 ) -> bool {
     // The generator's answer for this cell does not depend on the overlay, so it is taken before
     // the world lock: the write is the only thing this path serialises, and it is asked once.
+    if y.checked_sub(MIN_Y).is_none() {
+        return false;
+    }
     let base = dim_base_state(dim, x, y, z).unwrap_or(0);
     let cell = local_idx(x, y, z);
     let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
@@ -11325,6 +11346,7 @@ impl SkySpill {
 /// Raise one cell's nibble in the packed light-section output. The single owner of the
 /// layout arithmetic: both the map-shaped composition the tests drive and the dense grid above
 /// write through it.
+#[expect(clippy::too_many_arguments)]
 fn raise_sky_nibble(
     dim: DimId,
     out: &mut [[u8; 2048]],
@@ -11582,9 +11604,11 @@ impl BandCache {
 /// holds a 4-8 bit palette (a few hundred bytes to ~4 KB; Direct is 8 KB), and the delivery
 /// path can now reuse the very same `Arc` it publishes — no 16 KB copy out of the store and
 /// no repack on the way back to the wire. Bounded to the last 32 chunks.
+type PublishedColumn = Vec<Option<std::sync::Arc<PalettedSection>>>;
+
 struct SectionStore {
-    map: HashMap<(DimId, i32, i32), Vec<Option<std::sync::Arc<PalettedSection>>>>,
-    order: std::collections::VecDeque<(DimId, i32, i32)>,
+    map: HashMap<DimChunkKey, PublishedColumn>,
+    order: std::collections::VecDeque<DimChunkKey>,
     generation: u64,
 }
 
@@ -11648,9 +11672,9 @@ fn publish_section(dim: DimId, cx: i32, cz: i32, sy: i32, sec: std::sync::Arc<Pa
         store.generation = seq;
     }
     let key = (dim, cx, cz);
-    if !store.map.contains_key(&key) {
+    if let std::collections::hash_map::Entry::Vacant(vacant) = store.map.entry(key) {
         let (_, count) = section_window(dim);
-        store.map.insert(key, (0..count).map(|_| None).collect());
+        vacant.insert((0..count).map(|_| None).collect());
         store.order.push_back(key);
         while store.order.len() > 32 {
             if let Some(old) = store.order.pop_front() {
@@ -11901,10 +11925,11 @@ thread_local! {
     /// (`Arc::make_mut`), so a read may see the pre-write value for the length of one scan. The
     /// per-chunk version invalidates the derived floors on that same write, so the next pass
     /// recomputes them.
-    static CELL_SOURCE: std::cell::RefCell<
-        Option<(u64, (DimId, i32, i32, i32), CellSource)>,
-    > = const { std::cell::RefCell::new(None) };
+    static CELL_SOURCE: std::cell::RefCell<Option<CellSourceEntry>> =
+        const { std::cell::RefCell::new(None) };
 }
+
+type CellSourceEntry = (u64, DimBlockPos, CellSource);
 
 #[derive(Clone)]
 enum CellSource {
@@ -12058,10 +12083,10 @@ fn sky_floors_cache() -> &'static Mutex<SkyFloorsCache> {
 /// every tick, so one write anywhere would invalidate every cached band and the next
 /// light pass would rebuild the whole 3x3 (14 ms each). A write only changes its own
 /// chunk's cells, and each cache entry describes one chunk, so the version is per chunk.
-static CHUNK_VERSIONS: OnceLock<Mutex<HashMap<(DimId, i32, i32), u64>>> = OnceLock::new();
+static CHUNK_VERSIONS: OnceLock<LockedMap<DimChunkKey, u64>> = OnceLock::new();
 static CHUNK_VERSION_SEQ: AtomicU64 = AtomicU64::new(1);
 
-fn chunk_versions() -> &'static Mutex<HashMap<(DimId, i32, i32), u64>> {
+fn chunk_versions() -> &'static LockedMap<DimChunkKey, u64> {
     CHUNK_VERSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -12140,7 +12165,7 @@ fn sky_floors_dim(
                 let i = (lz << 4) | lx;
                 let base = cols
                     .as_ref()
-                    .map(|c| c.wtop(lx, lz) as i32)
+                    .map(|c| c.wtop(lx, lz))
                     .unwrap_or_else(|| height_at_dim(dim, cx * 16 + lx as i32, cz * 16 + lz as i32));
                 starts[i] = base.max(feature[i]) + 1;
             }
@@ -12491,8 +12516,8 @@ fn chunk_data_lane(
         let wg = worldgen::enabled();
         let __tf = chunkprof::enabled().then(std::time::Instant::now);
         if overlay_empty && ((!wg && sy + 15 < hmin - 4) || sy > hmax + 8) {
-            if __tf.is_some() {
-                chunkprof::add(&chunkprof::FASTPATH, __tf.unwrap());
+            if let Some(t) = __tf {
+                chunkprof::add(&chunkprof::FASTPATH, t);
                 chunkprof::FASTPATH_N.fetch_add(1, Ordering::Relaxed);
             }
             let st = if sy + 15 < hmin - 4 { 1 } else { 0 };
@@ -13273,7 +13298,7 @@ fn build_map_chunk_lane(
     if let Some(t) = __t {
         let n = chunkprof::N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         chunkprof::add(&chunkprof::MAP, t);
-        if n % 30 == 0 {
+        if n.is_multiple_of(30) {
             chunkprof::report();
         }
     }
@@ -14108,9 +14133,6 @@ fn light_dirty_for_dim(dim: DimId, gen: &GenSources, cx: i32, cz: i32) -> Vec<(i
     out
 }
 
-// the window parameters are read together every batch; a struct would add a
-// name without removing a parameter
-#[expect(clippy::too_many_arguments)]
 /// Worker count for terrain prefetch: `MC_SPINE_GEN_JOBS` (0/1 = inline), else
 /// `min(available_parallelism, 8)`. Terrain is pure, so this only trades threads for wall
 /// time and never changes what is generated; the count itself is owned by
@@ -15039,9 +15061,8 @@ fn server_properties_lookup(key: &str) -> Option<String> {
 }
 
 fn gs4_query_enabled() -> bool {
-    match std::env::var("MC_SPINE_ENABLE_QUERY").as_deref() {
-        Ok(v) => return v == "1" || v.eq_ignore_ascii_case("true"),
-        Err(_) => {}
+    if let Ok(v) = std::env::var("MC_SPINE_ENABLE_QUERY").as_deref() {
+        return v == "1" || v.eq_ignore_ascii_case("true");
     }
     server_properties_lookup("enable-query").is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
@@ -15473,7 +15494,7 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     let wire_tick_start = Instant::now();
     let prof = tickprof::enabled();
     let n = tickprof::TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-    if prof && n % 100 == 0 {
+    if prof && n.is_multiple_of(100) {
         tickprof::report();
         lockprof::report();
         loopprof::report();
@@ -15555,7 +15576,7 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .record_tick_us(wire_us);
-    ac_note_server_tick_ms((wire_us / 1000) as u32);
+    ac_note_server_tick_ms(wire_us / 1000);
 }
 
 fn main() {
@@ -16120,9 +16141,9 @@ fn main() {
                                             continue;
                                         }
                                         rows.push((
-                                            cx * 16 + lx as i32,
+                                            cx * 16 + lx,
                                             y,
-                                            cz * 16 + lz as i32,
+                                            cz * 16 + lz,
                                             reg.canonical_state(st),
                                         ));
                                     }
@@ -16742,34 +16763,32 @@ fn main() {
         eprintln!("[security] non-loopback bind (MC_SPINE_ALLOW_PUBLIC_BIND set): restrict access with a firewall/private network");
     }
     static ACTIVE: AtomicUsize = AtomicUsize::new(0);
-    for st in l.incoming() {
-        if let Ok(s) = st {
-            // connection cap: refuse above 64 live handler threads
-            if ACTIVE.fetch_add(1, Ordering::SeqCst) >= 64 {
-                ACTIVE.fetch_sub(1, Ordering::SeqCst);
-                log_refusal(&peer_label(&s), "server connection cap (64) reached");
-                drop(s);
-                continue;
-            }
-            // ...and above the per-IP cap, so one host cannot take all 64 slots
-            let ip_slot = match s.peer_addr() {
-                Ok(a) => match IP_CONNS.acquire(a.ip(), connection_limits::per_ip_limit(a.ip())) {
-                    Some(slot) => Some(slot),
-                    None => {
-                        ACTIVE.fetch_sub(1, Ordering::SeqCst);
-                        log_refusal(&a.ip().to_string(), "per-IP connection limit reached");
-                        drop(s);
-                        continue;
-                    }
-                },
-                Err(_) => None,
-            };
-            thread::spawn(move || {
-                let _slot = ConnectionSlot(&ACTIVE);
-                let _ip_slot = ip_slot;
-                handle(s);
-            });
+    for s in l.incoming().flatten() {
+        // connection cap: refuse above 64 live handler threads
+        if ACTIVE.fetch_add(1, Ordering::SeqCst) >= 64 {
+            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            log_refusal(&peer_label(&s), "server connection cap (64) reached");
+            drop(s);
+            continue;
         }
+        // ...and above the per-IP cap, so one host cannot take all 64 slots
+        let ip_slot = match s.peer_addr() {
+            Ok(a) => match IP_CONNS.acquire(a.ip(), connection_limits::per_ip_limit(a.ip())) {
+                Some(slot) => Some(slot),
+                None => {
+                    ACTIVE.fetch_sub(1, Ordering::SeqCst);
+                    log_refusal(&a.ip().to_string(), "per-IP connection limit reached");
+                    drop(s);
+                    continue;
+                }
+            },
+            Err(_) => None,
+        };
+        thread::spawn(move || {
+            let _slot = ConnectionSlot(&ACTIVE);
+            let _ip_slot = ip_slot;
+            handle(s);
+        });
     }
 }
 
@@ -17088,7 +17107,7 @@ mod mineshaft_runtime_tests {
             }
             out.push((item, cnt as u8, comps));
         }
-        assert!(sl.len() >= 1); // carried item follows
+        assert!(!sl.is_empty()); // carried item follows
         out
     }
 
@@ -19592,6 +19611,7 @@ mod vanilla_leash_tests {
     #[test]
     fn vanilla_leash_attach_pull_snap_and_drop() {
         let _world_guard = world_guard();
+        drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
         let mob = vl_spawn_mob(22, (0.0, 70.0, 8.0)); // cow, 8 blocks out
         let (client, mut peer) = vl_client(42420, (0.0, 70.0, 0.0));
         client
@@ -19670,6 +19690,7 @@ mod vanilla_leash_tests {
     #[test]
     fn vanilla_leash_chain_tether_clamps_at_max_length() {
         let _world_guard = world_guard();
+        drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
         let mob = vl_spawn_mob(22, (20.0, 70.0, 0.0));
         let (client, _peer) = vl_client(42421, (0.0, 70.0, 0.0));
         let _cleanup = VlCleanup {
@@ -19713,6 +19734,7 @@ mod vanilla_leash_tests {
     #[test]
     fn vanilla_leash_fence_hitch_reanchors_and_knot_break_detaches() {
         let _world_guard = world_guard();
+        drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
         let mob = vl_spawn_mob(87, (2.0, 70.0, 2.0)); // sheep
         let (client, mut peer) = vl_client(42422, (0.0, 70.0, 0.0));
         {
@@ -19842,6 +19864,7 @@ mod vanilla_leash_tests {
     #[test]
     fn vanilla_leash_disconnect_detaches_held_leads() {
         let _world_guard = world_guard();
+        drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
         let mob = vl_spawn_mob(22, (4.0, 70.0, 4.0));
         let (client, mut peer) = vl_client(42424, (0.0, 70.0, 0.0));
         client
