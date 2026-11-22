@@ -22,3 +22,10 @@ path = "src/bin/voice_relay.rs"
 [[bin]]
 name = "mc-spine-friend-relay"
 path = "src/bin/friend_relay.rs"
+
+# Standalone manifest: the root `[profile.release]` is not inherited, so the
+# shipped binary opts into full optimisation, LTO and symbol stripping itself.
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

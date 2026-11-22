@@ -10,3 +10,10 @@ description = "Standalone foundational primitives for mc-spine: canonical 1.21.1
 # mc-spine crate (proto, state-store, server-files, worldgen, sim, client-*)
 # builds on, so it must stay pure `std`.
 [dependencies]
+
+# Standalone manifest: the root `[profile.release]` is not inherited, so the
+# shipped binary opts into full optimisation, LTO and symbol stripping itself.
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

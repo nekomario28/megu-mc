@@ -127,6 +127,17 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+~-]*$")
 _GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _SUMS_LINE_RE = re.compile(r"^([0-9a-f]{64}) [ *](\S+)$")
 
+# Gate G3 - binary size budget (`--enforce-size-budget`). The ceilings carry
+# generous headroom over the stripped `mod-suite,create-offload` server build
+# and the `wgpu` client while still catching an unstripped 60+ MiB regression;
+# the launcher bootstrapper JAR must stay under 32 KiB. Sizes are matched on
+# the staged binary basename (`.exe` suffix tolerated).
+SIZE_BUDGET_MAX_BYTES = {
+    "mc-spine": 16 * 1024 * 1024,
+    "mc-spine-client-gpu": 24 * 1024 * 1024,
+}
+BOOTSTRAP_JAR_MAX_BYTES = 32 * 1024
+
 
 class BundleError(Exception):
     """A validation or purity failure. Raised, never sys.exit, so self-test can catch it."""
@@ -261,13 +272,52 @@ def write_tarball(entries, prefix, dest):
     Path(dest).write_bytes(gzip.compress(raw.getvalue(), compresslevel=9, mtime=0))
 
 
-def manifest_body(version, target, sha, prefix, tar_name, tar_bytes, entries):
+def size_budget_report(entries):
+    """Gate G3: per-binary byte counts checked against the release budgets.
+
+    Returns {basename: {"bytes", "max_bytes", "exclusive", "ok"}} for every
+    staged binary the budget names; binaries without a budget are absent.
+    """
+    report = {}
+    for arcname, data, _mode in entries:
+        base = arcname.rsplit("/", 1)[-1]
+        key = base[:-4] if base.endswith(".exe") else base
+        size = len(data)
+        limit = SIZE_BUDGET_MAX_BYTES.get(key)
+        if limit is not None:
+            report[base] = {"bytes": size, "max_bytes": limit,
+                            "exclusive": False, "ok": size <= limit}
+        elif base.endswith("bootstrapper.jar"):
+            report[base] = {"bytes": size, "max_bytes": BOOTSTRAP_JAR_MAX_BYTES,
+                            "exclusive": True,
+                            "ok": size < BOOTSTRAP_JAR_MAX_BYTES}
+    return report
+
+
+def enforce_size_budget(entries):
+    """Fail closed when a staged binary breaks the Gate G3 budget."""
+    report = size_budget_report(entries)
+    failures = []
+    for name, info in sorted(report.items()):
+        if info["ok"]:
+            continue
+        relation = "<" if info["exclusive"] else "<="
+        failures.append(f"{name}: {info['bytes']} bytes exceeds budget "
+                        f"({relation} {info['max_bytes']} bytes)")
+    if failures:
+        raise BundleError("size budget violated (--enforce-size-budget): "
+                          + "; ".join(failures))
+    return report
+
+
+def manifest_body(version, target, sha, prefix, tar_name, tar_bytes, entries,
+                  size_budget=None):
     files = [
         {"path": f"{prefix}/{arcname}", "sha256": sha256_hex(data),
          "bytes": len(data), "mode": f"{mode:04o}"}
         for arcname, data, mode in sorted(entries, key=lambda entry: entry[0])
     ]
-    return {
+    body = {
         "format": FORMAT,
         "product": PRODUCT,
         "version": version,
@@ -280,6 +330,9 @@ def manifest_body(version, target, sha, prefix, tar_name, tar_bytes, entries):
                    "bytes": len(tar_bytes)},
         "files": files,
     }
+    if size_budget is not None:
+        body["size_budget"] = size_budget
+    return body
 
 
 def dump_json(obj):
@@ -291,14 +344,15 @@ def sums_body(records):
     return "".join(f"{digest}  {name}\n" for name, digest in sorted(records.items()))
 
 
-def write_artifacts(entries, version, target, sha, out_dir):
+def write_artifacts(entries, version, target, sha, out_dir, size_budget=None):
     """Build the three release artifacts in `out_dir`; returns their paths."""
     prefix = bundle_stem(version, target)
     tar_name = f"{prefix}.tar.gz"
     tar_path = out_dir / tar_name
     write_tarball(entries, prefix, tar_path)
     tar_bytes = read_bytes(tar_path, tar_name)
-    manifest = manifest_body(version, target, sha, prefix, tar_name, tar_bytes, entries)
+    manifest = manifest_body(version, target, sha, prefix, tar_name, tar_bytes,
+                             entries, size_budget=size_budget)
     manifest_path = out_dir / MANIFEST_NAME
     manifest_path.write_bytes(dump_json(manifest))
     sums_path = out_dir / SUMS_NAME
@@ -527,6 +581,9 @@ def cmd_build(args):
         raise BundleError(f"--repo-root: not a directory: {repo_root}")
     sha = git_sha(repo_root, args.git_sha)
     entries = stage_entries(repo_root, args.binary, args.extra_binary or ())
+    # Gate G3 runs on the staged bytes before anything is written: an
+    # unstripped or oversized binary never reaches the artifact directory.
+    size_budget = enforce_size_budget(entries) if args.enforce_size_budget else None
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     prefix = bundle_stem(args.version, args.target)
@@ -536,7 +593,7 @@ def cmd_build(args):
         raise BundleError(f"refusing to overwrite existing release artifact(s): "
                           f"{', '.join(existing)}")
     tar_path, manifest_path, sums_path = write_artifacts(
-        entries, args.version, args.target, sha, out_dir)
+        entries, args.version, args.target, sha, out_dir, size_budget=size_budget)
     # The guard runs on the staged names above and once more on the bytes on disk,
     # so a build that could not pass `verify` is never reported as written.
     members = verify_bundle(tar_path, manifest_path, sums_path)
@@ -576,9 +633,9 @@ def _fixture_repo(root):
 
 
 def _build(tmp, name, repo, binary, version="0.1.0",
-           target="x86_64-unknown-linux-gnu", extra=()):
+           target="x86_64-unknown-linux-gnu", extra=(), flags=()):
     out = Path(tmp) / name
-    rc = main(["build", "--binary", str(binary), *extra,
+    rc = main(["build", "--binary", str(binary), *extra, *flags,
                "--out-dir", str(out), "--version", version,
                "--target", target, "--repo-root", str(repo),
                "--git-sha", SELFTEST_GIT_SHA])
@@ -937,6 +994,58 @@ def self_test():
                            tampered3 / tar_path.name, tampered3 / MANIFEST_NAME,
                            tampered3 / SUMS_NAME)
 
+        # Gate G3: --enforce-size-budget fails closed on an oversized binary
+        # before anything is written, passes a small one, and records the
+        # per-binary measurement in release-manifest.json.
+        oversized = Path(tmp) / "oversized-bin" / PRODUCT
+        oversized.parent.mkdir(parents=True, exist_ok=True)
+        oversized.write_bytes(b"\x7fELF" + b"\0" * SIZE_BUDGET_MAX_BYTES[PRODUCT])
+        expect_build_fail("build: size budget rejects an oversized mc-spine",
+                          "--binary", str(oversized), "--enforce-size-budget",
+                          "--out-dir", str(Path(tmp) / "out-budget-big"),
+                          "--version", "0.1.0",
+                          "--target", "x86_64-unknown-linux-gnu",
+                          "--repo-root", str(repo), "--git-sha", SELFTEST_GIT_SHA)
+        check("build: oversized mc-spine still builds without the flag",
+              main(["build", "--binary", str(oversized),
+                    "--out-dir", str(Path(tmp) / "out-budget-off"),
+                    "--version", "0.1.0", "--target", "x86_64-unknown-linux-gnu",
+                    "--repo-root", str(repo), "--git-sha", SELFTEST_GIT_SHA]) == 0)
+        rc, out_budget = _build(tmp, "budget-ok", repo, binary,
+                                flags=["--enforce-size-budget"])
+        check("build: size budget passes a small mc-spine", rc == 0)
+        budget_manifest = load_json(out_budget / MANIFEST_NAME, MANIFEST_NAME)
+        report = budget_manifest.get("size_budget", {})
+        check("manifest: size_budget records the mc-spine measurement",
+              report.get(PRODUCT, {}).get("ok") is True
+              and report[PRODUCT]["bytes"] < SIZE_BUDGET_MAX_BYTES[PRODUCT]
+              and report[PRODUCT]["max_bytes"] == SIZE_BUDGET_MAX_BYTES[PRODUCT])
+        rc = main(["verify", "--bundle",
+                   str(out_budget / f"{prefix}.tar.gz"),
+                   "--manifest", str(out_budget / MANIFEST_NAME),
+                   "--sums", str(out_budget / SUMS_NAME)])
+        check("verify: a budget-recorded manifest still passes", rc == 0)
+        # The bootstrapper.jar ceiling is exclusive (< 32 KiB) and the budget
+        # unit is exercised directly because the purity guard already refuses
+        # any *.jar staged as a binary.
+        for jar_size, expect_ok in ((BOOTSTRAP_JAR_MAX_BYTES - 1, True),
+                                    (BOOTSTRAP_JAR_MAX_BYTES, False)):
+            entries = [("mc-spine-bootstrapper.jar", b"x" * jar_size, 0o644)]
+            unit = size_budget_report(entries)["mc-spine-bootstrapper.jar"]
+            check(f"guard: bootstrapper.jar at {jar_size} bytes ok={expect_ok}",
+                  unit["ok"] is expect_ok)
+            try:
+                enforce_size_budget(entries)
+                enforced = True
+            except BundleError:
+                enforced = False
+            check(f"guard: enforce_size_budget {'accepts' if expect_ok else 'rejects'} "
+                  f"a {jar_size}-byte bootstrapper.jar", enforced is expect_ok)
+        gpu_report = size_budget_report(
+            [("mc-spine-client-gpu", b"x" * (24 * 1024 * 1024 + 1), 0o755)])
+        check("guard: size budget flags an oversized mc-spine-client-gpu",
+              gpu_report["mc-spine-client-gpu"]["ok"] is False)
+
         # The purity unit itself is also exercised directly.
         check("guard: unit check accepts the shipped layout",
               all(forbidden_reason(f"{bundle_stem('0.1.0', 'x86_64-unknown-linux-gnu')}/{name}")
@@ -978,6 +1087,11 @@ def main(argv=None):
                          help="tree to take the docs/tools from (default: this repo)")
     p_build.add_argument("--git-sha", default=None,
                          help="source sha to record (default: git rev-parse HEAD)")
+    p_build.add_argument("--enforce-size-budget", action="store_true",
+                         help="Gate G3: fail closed when a staged binary breaks the "
+                              "size budget (mc-spine <= 16 MiB, mc-spine-client-gpu "
+                              "<= 24 MiB, bootstrapper.jar < 32 KiB) and record the "
+                              "per-binary budget in release-manifest.json")
 
     p_verify = sub.add_parser("verify", help="fail-closed bundle verification")
     p_verify.add_argument("--bundle", required=True, help="the .tar.gz artifact")

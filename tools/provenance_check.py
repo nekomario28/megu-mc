@@ -25,6 +25,12 @@ The license scan is the other half of provenance: every workspace manifest must 
 (PolyForm/BUSL/SSPL/ARR-style terms or a prose "all rights reserved"/"proprietary" claim), so a
 crate that cannot be distributed inside this tree fails the gate instead of shipping quietly.
 
+`--strict-zero-gl` is CI gate G1: `client-gpu` renders through the OS-native
+Vulkan/DX12/Metal backends only, so `glow`, `glutin_wgl_sys`, `khronos-egl` or
+`khronos_api` resolving in `client-gpu/Cargo.lock` is a hard failure. Without the
+flag the same residue is reported as a note, so the default run stays green while
+the GPU dependency change is still landing.
+
 Exit status: 0 clean, 1 findings, 2 the check could not run (no git, unreadable asset).
 """
 import argparse
@@ -416,6 +422,37 @@ def check_prod_embeds(root):
     return failures
 
 
+# Gate G1 - zero-GL lockfile. `client-gpu` must render through the OS-native
+# Vulkan/DX12/Metal backends only; the GL/EGL/WGL stack (`glow`,
+# `glutin_wgl_sys`, `khronos-egl`, `khronos_api`) resolving in its Cargo.lock is
+# a CI failure. `--strict-zero-gl` enforces it; until the GPU dependency change
+# lands, the default run downgrades the same residue to a note so the gate
+# stays green on this tree.
+ZERO_GL_LOCKFILE = "client-gpu/Cargo.lock"
+ZERO_GL_PACKAGES = frozenset({"glow", "glutin_wgl_sys", "khronos-egl", "khronos_api"})
+_LOCK_PACKAGE = re.compile(r"(?ms)^\[\[package\]\]\s*\n(.*?)(?=^\[|\Z)")
+_LOCK_NAME = re.compile(r'(?m)^\s*name\s*=\s*"([^"]+)"')
+
+
+def lockfile_packages(text):
+    """Every `[[package]]` name a Cargo.lock resolves, ignoring dependency mentions."""
+    for block in _LOCK_PACKAGE.findall(text):
+        name = _LOCK_NAME.search(block)
+        if name:
+            yield name.group(1)
+
+
+def zero_gl_lockfile_findings(root):
+    """Gate G1 findings: GL/EGL packages resolved by the GPU client's lockfile."""
+    path = root / ZERO_GL_LOCKFILE
+    try:
+        text = path.read_text()
+    except OSError:
+        return [f"{ZERO_GL_LOCKFILE} is missing; the GPU client lockfile is required"]
+    return [f"{ZERO_GL_LOCKFILE} still resolves GL/EGL package {name!r} (Gate G1)"
+            for name in sorted(set(lockfile_packages(text)) & ZERO_GL_PACKAGES)]
+
+
 def check_strict_public(root):
     failures = []
     index = tracked(root)
@@ -428,7 +465,7 @@ def check_strict_public(root):
     return failures
 
 
-def check(root, strict_public=False):
+def check(root, strict_public=False, strict_zero_gl=False):
     index = tracked(root)
     failures = [f"{path} is tracked; it has no usable provenance" for path in GONE if path in index]
     references, notices = scan_for_references(root)
@@ -438,6 +475,12 @@ def check(root, strict_public=False):
     ))
     failures += check_licenses(root)
     failures += check_prod_embeds(root)
+    gl_findings = zero_gl_lockfile_findings(root)
+    if strict_zero_gl:
+        failures += gl_findings
+    else:
+        notices += [f"{finding} - pass --strict-zero-gl to enforce Gate G1"
+                    for finding in gl_findings]
     if strict_public:
         failures += check_strict_public(root)
     return failures, notices
@@ -456,7 +499,8 @@ def synthetic_state_asset():
                            collision_shapes=table, shapes=[[]])).encode()
 
 
-def selftest_case(asset, name, *, index=(), write=(), strict_public=False, missing=False, expect):
+def selftest_case(asset, name, *, index=(), write=(), strict_public=False, missing=False,
+                  strict_zero_gl=False, expect):
     with tempfile.TemporaryDirectory(prefix="provenance-selftest-") as tmp:
         root = Path(tmp)
         git(root, "init", "-q")
@@ -489,7 +533,8 @@ def selftest_case(asset, name, *, index=(), write=(), strict_public=False, missi
             git(root, "add", "-f", path)
         if missing:
             (root / STATE_ASSET).unlink()
-        failures, _ = check(root, strict_public=strict_public)
+        failures, _ = check(root, strict_public=strict_public,
+                            strict_zero_gl=strict_zero_gl)
         ok = bool(failures) == expect
         print(f"  {'ok  ' if ok else 'FAIL'} {name}: {len(failures)} finding(s)")
         for failure in failures[:3]:
@@ -604,6 +649,37 @@ def selftest(root):
                      'const X: &[u8] = '
                      'include_bytes!("../assets/blocks_1211.json");\n')],
              expect=False),
+        # Gate G1: --strict-zero-gl fails closed on any GL/EGL package the GPU
+        # lockfile resolves, passes a GL-free lockfile, ignores bare dependency
+        # mentions, and stays a note without the flag so the gate can land
+        # before the GPU dependency change does.
+        case("strict-zero-gl rejects glow in the GPU lockfile",
+             write=[("client-gpu/Cargo.lock",
+                     'version = 3\n\n[[package]]\nname = "glow"\nversion = "0.16.0"\n')],
+             strict_zero_gl=True, expect=True),
+        case("strict-zero-gl rejects the whole GL stack",
+             write=[("client-gpu/Cargo.lock",
+                     'version = 3\n\n'
+                     '[[package]]\nname = "glow"\nversion = "0.16.0"\n\n'
+                     '[[package]]\nname = "glutin_wgl_sys"\nversion = "0.6.1"\n\n'
+                     '[[package]]\nname = "khronos-egl"\nversion = "6.0.0"\n\n'
+                     '[[package]]\nname = "khronos_api"\nversion = "3.1.0"\n')],
+             strict_zero_gl=True, expect=True),
+        case("strict-zero-gl passes a GL-free lockfile",
+             write=[("client-gpu/Cargo.lock",
+                     'version = 3\n\n[[package]]\nname = "wgpu"\nversion = "30.0.1"\n')],
+             strict_zero_gl=True, expect=False),
+        case("strict-zero-gl ignores a dependency mention without a package",
+             write=[("client-gpu/Cargo.lock",
+                     'version = 3\n\n[[package]]\nname = "wgpu"\nversion = "30.0.1"\n'
+                     'dependencies = [\n "glow",\n]\n')],
+             strict_zero_gl=True, expect=False),
+        case("strict-zero-gl fails closed on a missing lockfile",
+             strict_zero_gl=True, expect=True),
+        case("GL residue stays a note without the strict flag",
+             write=[("client-gpu/Cargo.lock",
+                     'version = 3\n\n[[package]]\nname = "glow"\nversion = "0.16.0"\n')],
+             expect=False),
     ]
     # The reference scan is what makes "reading one again" a failure, so the case that plants a
     # reference must actually have been planted.
@@ -623,6 +699,9 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--strict-public", action="store_true")
+    parser.add_argument("--strict-zero-gl", action="store_true",
+                        help="CI gate G1: fail when client-gpu/Cargo.lock resolves "
+                             "glow/glutin_wgl_sys/khronos-egl/khronos_api")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
@@ -634,7 +713,8 @@ def main():
             ok = selftest(args.root)
             print(f"provenance: self-test {'passed' if ok else 'FAILED'}")
             return 0 if ok else 1
-        failures, notices = check(args.root, strict_public=args.strict_public)
+        failures, notices = check(args.root, strict_public=args.strict_public,
+                                  strict_zero_gl=args.strict_zero_gl)
     except Unrunnable as error:
         print(f"provenance: {error}", file=sys.stderr)
         return 2

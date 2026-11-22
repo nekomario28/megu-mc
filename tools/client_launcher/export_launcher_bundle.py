@@ -252,6 +252,12 @@ def main():
                         help="optional client-port cdylib (C ABI v1 required)")
     parser.add_argument("--kernel-library", type=Path,
                         help="optional client-kernel cdylib (C ABI v1 required)")
+    parser.add_argument("--include-ffi-libs", action="store_true",
+                        help="also bundle the client-port/client-kernel release cdylibs "
+                             "(libmc_spine_client_mesh.so / libmc_spine_kernel.so) found "
+                             "under this repo's target/release dirs - explicit opt-in "
+                             "for external JVM FFI consumers; statically linked clients "
+                             "never need them, so exports omit them by default")
     parser.add_argument("--bootstrap-jar", type=Path,
                         help="mc-spine-bootstrapper.jar (<32 KiB) for a native Prism "
                              "patches/*.json install (no shell wrapper)")
@@ -283,6 +289,18 @@ def main():
     for name, option in ((MESH_NAME, args.mesh_library), (KERNEL_NAME, args.kernel_library)):
         if option:
             native_libs[name] = option.resolve()
+    if args.include_ffi_libs:
+        # Explicit bulk opt-in: pick up the sibling crates' release cdylibs so
+        # release pipelines can bundle the FFI surface without spelling out
+        # each path. An explicit --mesh-library/--kernel-library wins, and a
+        # missing crate target is skipped rather than failing the export.
+        repo = HERE.parents[1]
+        for crate, name in (("client-port", MESH_NAME), ("client-kernel", KERNEL_NAME)):
+            if name in native_libs:
+                continue
+            candidate = repo / crate / "target" / "release" / name
+            if candidate.is_file():
+                native_libs[name] = candidate.resolve()
     integrated_jar = args.integrated_jar.resolve() if args.integrated_jar else None
     try:
         verify_executable(client_bin, args.client_sha256)
