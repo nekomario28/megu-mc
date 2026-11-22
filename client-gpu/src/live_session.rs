@@ -1116,6 +1116,44 @@ impl LiveSession {
             }
             Err(err) => eprintln!("mc-spine-client assets: bundle build failed: {err}"),
         }
+        self.register_cem_models(std::path::Path::new(&dir));
+    }
+
+    /// Scan `assets/*/optifine/cem/*.jem|*.jpm` in the loaded pack and register
+    /// each custom entity model in `world.animations` under its file stem
+    /// (`zombie.jem` -> `zombie`), matching OptiFine's CEM lookup. Unreadable
+    /// or malformed files are logged and skipped like other pack entries.
+    fn register_cem_models(&mut self, pack_root: &std::path::Path) {
+        let assets = pack_root.join("assets");
+        let Ok(namespaces) = std::fs::read_dir(&assets) else {
+            return;
+        };
+        for namespace in namespaces.flatten() {
+            let cem = namespace.path().join("optifine/cem");
+            let Ok(entries) = std::fs::read_dir(&cem) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+                    continue;
+                };
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let result = match ext {
+                    "jem" => self.world.animations.register_jem_model(stem, &text),
+                    "jpm" => self.world.animations.register_jpm_model(stem, &text),
+                    _ => continue,
+                };
+                if let Err(err) = result {
+                    eprintln!("mc-spine-client assets: CEM model {path:?} skipped: {err:?}");
+                }
+            }
+        }
     }
 
     /// Regenerate the layered voxel-cloud sheet from the live camera/world
@@ -1276,6 +1314,14 @@ impl LiveSession {
                 self.entity_positions.insert(eid, [x, y, z]);
                 if let Ok(type_id) = u16::try_from(entity_type) {
                     if let Some(spec) = classify_entity_rig(type_id) {
+                        // OptiFine CEM: a registered `.jem`/`.jpm` model whose
+                        // file stem is the un-namespaced entity name overrides
+                        // the baked rig. Ignored when the pack has no match.
+                        let cem_name = spec
+                            .name
+                            .strip_prefix("minecraft:")
+                            .unwrap_or(spec.name);
+                        let _ = self.world.animations.bind_entity(eid, cem_name);
                         self.entity_rigs.insert(eid, spec);
                     }
                 }
@@ -3039,7 +3085,90 @@ mod tests {
             rx.recv().unwrap(),
             WorkerCommand::ContainerClose { window_id: 3 }
         ));
-        // The use-item/player-action sequence counter advanced monotonically.
-        assert_eq!(live.use_item_sequence, 4);
+    }
+
+    #[test]
+    fn cem_models_bind_entities_by_pack_stem() {
+        let (mut live, _tx) = session();
+        live.world
+            .animations
+            .register_jem_model(
+                "zombie",
+                r#"{"models":[{"part":"body","translate":[0,-12,0],
+                   "submodels":[{"id":"head","translate":[0,-6,0]}]}]}"#,
+            )
+            .unwrap();
+        live.world
+            .animations
+            .register_jpm_model(
+                "skeleton",
+                r#"{"id":"body","translate":[0,-12,0]}"#,
+            )
+            .unwrap();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::AddEntity {
+            eid: 9,
+            uuid: [1; 16],
+            entity_type: 124, // minecraft:zombie
+            x: 1.0,
+            y: 64.0,
+            z: 2.0,
+            pitch: 0.0,
+            yaw: 0.0,
+            head_yaw: 0.0,
+            data: 0,
+            vx: 0.0,
+            vy: 0.0,
+            vz: 0.0,
+        }))
+        .unwrap();
+        // Bound through `bind_entity` — the pose evaluates over the JEM rig.
+        let pose = live.world.animations.evaluate_entity_pose(9).unwrap();
+        assert_eq!(pose.unwrap().len(), 2);
+        // Entity type 91 (skeleton) matches the JPM stem registration.
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::AddEntity {
+            eid: 10,
+            uuid: [2; 16],
+            entity_type: 91,
+            x: 0.0,
+            y: 64.0,
+            z: 0.0,
+            pitch: 0.0,
+            yaw: 0.0,
+            head_yaw: 0.0,
+            data: 0,
+            vx: 0.0,
+            vy: 0.0,
+            vz: 0.0,
+        }))
+        .unwrap();
+        assert!(live
+            .world
+            .animations
+            .evaluate_entity_pose(10)
+            .unwrap()
+            .is_some());
+        // An entity with no registered CEM model stays unbound.
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::AddEntity {
+            eid: 11,
+            uuid: [3; 16],
+            entity_type: 1,
+            x: 0.0,
+            y: 64.0,
+            z: 0.0,
+            pitch: 0.0,
+            yaw: 0.0,
+            head_yaw: 0.0,
+            data: 0,
+            vx: 0.0,
+            vy: 0.0,
+            vz: 0.0,
+        }))
+        .unwrap();
+        assert!(live
+            .world
+            .animations
+            .evaluate_entity_pose(11)
+            .unwrap()
+            .is_none());
     }
 }

@@ -16,8 +16,9 @@ use mc_spine_client_mesh::{
     WATER,
 };
 use mc_spine_kernel::skeletal_anim::{
-    decode_animation_trigger, parse_animation_json, parse_geometry_json, AnimationClip,
-    AnimationController, AnimationError, BoneMask, LoopMode, SkeletonRig, MAX_CLIPS,
+    decode_animation_trigger, parse_animation_json, parse_geometry_json, parse_jem_model,
+    parse_jpm_model, AnimationClip, AnimationController, AnimationError, BoneMask, LoopMode,
+    SkeletonRig, MAX_CLIPS,
 };
 use mc_spine_kernel::{
     Aabb, FluidCell, FluidKind, LightEdit, LightEngine, LightFact, LightUpdateMultiWord,
@@ -1106,6 +1107,29 @@ impl WorldAnimationHost {
         let mut clips = parse_animation_json(animation_json)?;
         clips.sort_by(|a, b| a.name.cmp(&b.name));
         self.register_model(model_id, rig, clips)
+    }
+
+    /// Register an OptiFine `.jem` entity model from a resource pack's
+    /// `optifine/cem/` directory. JEM files carry geometry only — the model
+    /// binds with no clips and drives poses through bind/entity state.
+    pub fn register_jem_model(
+        &mut self,
+        model_id: impl Into<String>,
+        jem_json: &str,
+    ) -> Result<(), AnimationError> {
+        let rig = parse_jem_model(jem_json)?;
+        self.register_model(model_id, rig, Vec::new())
+    }
+
+    /// Register an OptiFine `.jpm` part model the same way; the document root
+    /// is the part tree itself.
+    pub fn register_jpm_model(
+        &mut self,
+        model_id: impl Into<String>,
+        jpm_json: &str,
+    ) -> Result<(), AnimationError> {
+        let rig = parse_jpm_model(jpm_json)?;
+        self.register_model(model_id, rig, Vec::new())
     }
 
     /// Find the ANM1 clip ID for a model's registered animation name.

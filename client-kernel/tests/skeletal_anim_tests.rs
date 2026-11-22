@@ -3,7 +3,8 @@ use std::collections::HashMap;
 
 use mc_spine_kernel::skeletal_anim::{
     decode_animation_trigger, encode_animation_trigger, parse_animation_json, parse_geometry_json,
-    parse_geometry_rigs_json, AnimationClip, AnimationController, AnimationError, AnimationTrigger,
+    parse_geometry_rigs_json, parse_jem_model, parse_jpm_model, AnimationClip, AnimationController,
+    AnimationError, AnimationTrigger,
     BoneDef, BoneMask, BoneTrack, BoneTransform, InterpolationMode, Keyframe, LoopMode,
     SkeletonRig, ANIMATION_CHANNEL, ANM1_BYTES, MAX_BONES, MAX_JSON_DEPTH,
 };
@@ -348,4 +349,61 @@ fn anm1_roundtrip_byte_layout_and_hostile_payloads() {
         ..event
     })
     .is_err());
+}
+
+#[test]
+fn jem_model_parses_part_tree_into_rig() {
+    let jem = r#"{
+        "textureSize": [64, 64],
+        "models": [
+            {
+                "part": "body",
+                "translate": [0, -24, 0],
+                "submodels": [
+                    {
+                        "part": "head",
+                        "id": "antenna",
+                        "translate": [0, -6, 0],
+                        "rotate": [15, 0, 0],
+                        "submodel": {"part": "tip", "translate": [0, -2, 0]}
+                    }
+                ]
+            },
+            {"part": "leg1", "translate": [-2, -6, 4]}
+        ]
+    }"#;
+    let rig = parse_jem_model(jem).unwrap();
+    let bones = rig.bones();
+    assert_eq!(bones.len(), 4);
+    assert_eq!(bones[0].name, "body");
+    assert_eq!(bones[0].parent, None);
+    assert_eq!(bones[1].name, "antenna");
+    assert_eq!(bones[1].parent, Some(0));
+    assert_eq!(bones[1].bind_rotation_deg, [15.0, 0.0, 0.0]);
+    assert_eq!(bones[2].name, "tip");
+    assert_eq!(bones[2].parent, Some(1));
+    assert_eq!(bones[3].name, "leg1");
+    // Malformed/missing structure and duplicate ids fail closed.
+    assert!(parse_jem_model("{}").is_err());
+    let dup = r#"{"models":[{"part":"a"},{"part":"a"}]}"#;
+    assert!(parse_jem_model(dup).is_err());
+}
+
+#[test]
+fn jpm_model_parses_root_part_tree() {
+    let jpm = r#"{
+        "textureSize": [32, 32],
+        "id": "halo",
+        "translate": [0, -28, 0],
+        "submodels": [{"id": "ring", "translate": [0, -1, 0], "rotate": [0, 45, 0]}]
+    }"#;
+    let rig = parse_jpm_model(jpm).unwrap();
+    let bones = rig.bones();
+    assert_eq!(bones.len(), 2);
+    assert_eq!(bones[0].name, "halo");
+    assert_eq!(bones[0].pivot, [0.0, -28.0, 0.0]);
+    assert_eq!(bones[1].name, "ring");
+    assert_eq!(bones[1].parent, Some(0));
+    assert_eq!(bones[1].bind_rotation_deg, [0.0, 45.0, 0.0]);
+    assert!(parse_jpm_model("[]").is_err());
 }

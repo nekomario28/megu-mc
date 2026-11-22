@@ -1352,3 +1352,77 @@ pub fn parse_animation_json(input: &str) -> Result<Vec<AnimationClip>, Animation
     }
     Ok(result)
 }
+
+/// Recursively flatten one OptiFine model node (JEM `models[]` entry or a JPM
+/// root) into `bones`. `id` wins over `part` for the bone name; `translate`
+/// and `rotate` become the pivot and bind rotation; `submodels` and the
+/// legacy singular `submodel` nest children under this bone.
+fn jem_model_bones(
+    model: &JsonValue,
+    parent: Option<usize>,
+    bones: &mut Vec<BoneDef>,
+    index: &mut HashMap<String, usize>,
+    depth: usize,
+) -> Result<(), AnimationError> {
+    if depth > 16 || bones.len() >= MAX_BONES {
+        return Err(AnimationError::LimitExceeded);
+    }
+    model.object()?;
+    let name = match model.field("id") {
+        Some(value) => value.string()?.to_owned(),
+        None => match model.field("part") {
+            Some(value) => value.string()?.to_owned(),
+            None => format!("jem_part_{}", bones.len()),
+        },
+    };
+    if !valid_name(&name) || index.insert(name.clone(), bones.len()).is_some() {
+        return Err(AnimationError::InvalidRig);
+    }
+    bones.push(BoneDef {
+        name,
+        parent,
+        pivot: optional_vector3(model.field("translate"), [0.0; 3])?,
+        bind_rotation_deg: optional_vector3(model.field("rotate"), [0.0; 3])?,
+    });
+    let me = bones.len() - 1;
+    if let Some(submodels) = model.field("submodels") {
+        for sub in submodels.array()? {
+            jem_model_bones(sub, Some(me), bones, index, depth + 1)?;
+        }
+    }
+    if let Some(sub) = model.field("submodel") {
+        jem_model_bones(sub, Some(me), bones, index, depth + 1)?;
+    }
+    Ok(())
+}
+
+/// Parse an OptiFine `.jem` (JSON Entity Model) document into a rig: each
+/// `models[]` entry is a part tree whose `id`/`part` names the bone.
+pub fn parse_jem_model(input: &str) -> Result<SkeletonRig, AnimationError> {
+    let root = JsonParser::parse(input)?;
+    root.object()?;
+    let models = root
+        .field("models")
+        .ok_or(AnimationError::InvalidJson)?
+        .array()?;
+    if models.is_empty() || models.len() > 64 {
+        return Err(AnimationError::LimitExceeded);
+    }
+    let mut bones = Vec::new();
+    let mut index = HashMap::new();
+    for model in models {
+        jem_model_bones(model, None, &mut bones, &mut index, 0)?;
+    }
+    SkeletonRig::new(bones)
+}
+
+/// Parse an OptiFine `.jpm` (JSON Part Model): a single model tree rooted at
+/// the document object, following the same node shape as `.jem` entries.
+pub fn parse_jpm_model(input: &str) -> Result<SkeletonRig, AnimationError> {
+    let root = JsonParser::parse(input)?;
+    root.object()?;
+    let mut bones = Vec::new();
+    let mut index = HashMap::new();
+    jem_model_bones(&root, None, &mut bones, &mut index, 0)?;
+    SkeletonRig::new(bones)
+}
