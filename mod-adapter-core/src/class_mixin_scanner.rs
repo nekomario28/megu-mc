@@ -46,8 +46,8 @@ use std::path::Path;
 use crate::data_loader::{parse_json, DataLoadError, JsonValue};
 use crate::intermediary_map::{parse_tiny_v2, TinyV2MappingTable};
 use crate::mixin_lifter::{
-    classify_mixin_target, lift_mixin_sites_with_mappings, InjectPoint, MixinAnnotationKind,
-    MixinLiftVerdict, MixinTargetScope,
+    classify_mixin_target, is_client_cosmetic_target, lift_mixin_sites_with_mappings,
+    InjectPoint, MixinAnnotationKind, MixinLiftVerdict, MixinTargetScope,
     MixinMemberKind, MixinSite,
 };
 use crate::modpack::{self, ModpackError};
@@ -189,10 +189,12 @@ pub struct JarMixinScanReport {
     pub skipped_client_mixins: usize,
     /// Every [`MixinSite`] extracted whose target is a live-gameplay
     /// class, in member order — these feed `verdict`.
-    /// `@Shadow`/`@Unique` members are [`MixinDeclaration`]s, not sites,
-    /// and `net/minecraft/util/datafix/*` targets are partitioned into
-    /// `legacy_datafix_sites` instead: they run only inside pre-1.21.1
-    /// save upgrades, never during live 1.21.1 gameplay.
+    /// `@Shadow`/`@Unique` members are [`MixinDeclaration`]s, not sites;
+    /// `net/minecraft/util/datafix/*` targets are partitioned into
+    /// `legacy_datafix_sites`, `net/minecraft/gametest/*` targets into
+    /// `gametest_sites`, and (on a server scan) verified
+    /// client-visual-only methods into `client_cosmetic_sites` instead:
+    /// none of them run during live 1.21.1 gameplay.
     pub sites: Vec<MixinSite>,
     /// Sites targeting legacy `net/minecraft/util/datafix/*` (yarn
     /// `net/minecraft/datafixer/*`) classes — recorded verbatim, counted
@@ -202,6 +204,25 @@ pub struct JarMixinScanReport {
     /// Count of `legacy_datafix_sites` — scan telemetry reported as
     /// `legacy_datafix_skipped`.
     pub legacy_datafix_skipped: usize,
+    /// Sites targeting `net/minecraft/gametest/*` (yarn
+    /// `net/minecraft/test/*`) classes — recorded verbatim, counted
+    /// `gametest_skipped`, and never a blocker because GameTest harness
+    /// code only runs when a test is invoked, never during live
+    /// gameplay.
+    pub gametest_sites: Vec<MixinSite>,
+    /// Count of `gametest_sites` — scan telemetry reported as
+    /// `gametest_skipped`.
+    pub gametest_skipped: usize,
+    /// Sites targeting verified client-visual-only vanilla methods
+    /// (armor-trim sprite paths, item eat/drink particles) — recorded
+    /// verbatim, counted `client_cosmetic_skipped`, and never a blocker
+    /// on a dedicated-server scan. Only populated when
+    /// [`JarScanOptions::server_only`] is `true`; a client-including
+    /// scan judges them as ordinary live sites.
+    pub client_cosmetic_sites: Vec<MixinSite>,
+    /// Count of `client_cosmetic_sites` — scan telemetry reported as
+    /// `client_cosmetic_skipped`.
+    pub client_cosmetic_skipped: usize,
     /// Every non-mutating `@Shadow`/`@Unique` declaration found, in member
     /// order — recorded, never silently erased, never a blocker.
     pub declarations: Vec<MixinDeclaration>,
@@ -1158,23 +1179,41 @@ fn scan_jar(
         }
     }
 
-    // Partition legacy save-upgrade-only targets out before the lift
-    // verdict: `net/minecraft/util/datafix/*` (and the identical yarn
+    // Partition non-live targets out before the lift verdict:
+    // `net/minecraft/util/datafix/*` (and the identical yarn
     // `net/minecraft/datafixer/` tree) execute exclusively inside
-    // DataFixerUpper migrations of pre-1.21.1 saves — never during live
-    // gameplay — so they are recorded as `legacy_datafix_skipped` instead
-    // of vetoing the mod's live surface. Classification judges the
-    // canonical class name (so Intermediary spellings resolve first) and
-    // is fail-closed: any unrecognized target is `LiveGameplay`.
+    // DataFixerUpper migrations of pre-1.21.1 saves, `net/minecraft/
+    // gametest/*` (yarn `net/minecraft/test/`) only inside the GameTest
+    // harness, and the verified client-cosmetic table only on the client
+    // renderer — none of them during live gameplay, so they are recorded
+    // as `legacy_datafix_skipped` / `gametest_skipped` /
+    // `client_cosmetic_skipped` instead of vetoing the mod's live
+    // surface. Classification judges the canonical names (so Intermediary
+    // spellings resolve first) and is fail-closed: any unrecognized
+    // target is `LiveGameplay`.
     let mut live_sites = Vec::with_capacity(sites.len());
     let mut legacy_datafix_sites = Vec::new();
+    let mut gametest_sites = Vec::new();
+    let mut client_cosmetic_sites = Vec::new();
     for site in sites {
         let canonical = mappings.canonical_class(&site.target_class);
-        if classify_mixin_target(canonical.as_ref()) == MixinTargetScope::LegacyDataFixOnly {
+        let scope = classify_mixin_target(canonical.as_ref());
+        if scope == MixinTargetScope::LegacyDataFixOnly {
             legacy_datafix_sites.push(site);
-        } else {
-            live_sites.push(site);
+            continue;
         }
+        if scope == MixinTargetScope::GameTestOnly {
+            gametest_sites.push(site);
+            continue;
+        }
+        if opts.server_only {
+            let canonical_method = mappings.canonical_method(&site.target_method);
+            if is_client_cosmetic_target(canonical.as_ref(), canonical_method) {
+                client_cosmetic_sites.push(site);
+                continue;
+            }
+        }
+        live_sites.push(site);
     }
     let sites = live_sites;
 
@@ -1186,6 +1225,10 @@ fn scan_jar(
         sites,
         legacy_datafix_skipped: legacy_datafix_sites.len(),
         legacy_datafix_sites,
+        gametest_skipped: gametest_sites.len(),
+        gametest_sites,
+        client_cosmetic_skipped: client_cosmetic_sites.len(),
+        client_cosmetic_sites,
         declarations_skipped: declarations.len(),
         declarations,
         tiny_mappings_loaded,

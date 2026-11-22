@@ -30,11 +30,18 @@
 //! read-only `@Invoker` calls (a verified pure query method —
 //! [`lift_invoker_sites`]). Mutating accessors (`set*`), constructor or
 //! mutating invokers (`<init>`, `spawnItemParticles`, `set*`), and any
-//! member outside those tables stay strictly fail-closed. Finally,
-//! `net/minecraft/util/datafix/*` targets execute only inside pre-1.21.1
-//! save upgrades — never live gameplay — so [`classify_mixin_target`]
-//! records them `legacy_datafix_skipped` instead of letting them veto a
-//! mod's live-gameplay surface.
+//! member outside those tables stay strictly fail-closed. A
+//! `cancellable = true` `TAIL`/`RETURN` site on a verified
+//! value-returning target lifts as [`LiftedHookKind::ReturnValueOverride`]
+//! (`CIR.setReturnValue`); on a void target it still fails closed as
+//! `NonCancellablePostHook`. Finally, `net/minecraft/util/datafix/*`
+//! targets execute only inside pre-1.21.1 save upgrades and
+//! `net/minecraft/gametest/*` targets only inside the GameTest harness —
+//! never live gameplay — so [`classify_mixin_target`] records them
+//! `legacy_datafix_skipped` / `gametest_skipped` instead of letting them
+//! veto a mod's live-gameplay surface, and a dedicated-server scan
+//! records strictly client-visual-only targets (armor-trim sprite
+//! paths, item eat/drink particles) as `client_cosmetic_skipped`.
 //!
 //! The target table below covers the 1.21.1 vanilla lifecycle in three naming
 //! dialects, normalized by [`lift_mixin_sites`]:
@@ -258,6 +265,12 @@ pub enum StandardEventHook {
     /// A tree/soil suitability query ran (`Feature.isGrassOrDirt` /
     /// `TrunkPlacer.setDirtAt`).
     TreeSoilQuery,
+    /// A loot bonus-count function rolled
+    /// (`EnchantedCountIncreaseFunction.run`).
+    LootBonusRoll,
+    /// A structure pool element placed into the world
+    /// (`SinglePoolElement.place`).
+    StructurePiecePlace,
 }
 
 impl StandardEventHook {
@@ -296,6 +309,8 @@ impl StandardEventHook {
             Self::ResourceReload => "ResourceReload",
             Self::MapDataSync => "MapDataSync",
             Self::TreeSoilQuery => "TreeSoilQuery",
+            Self::LootBonusRoll => "LootBonusRoll",
+            Self::StructurePiecePlace => "StructurePiecePlace",
         }
     }
 }
@@ -306,14 +321,54 @@ impl fmt::Display for StandardEventHook {
     }
 }
 
+/// How a lifted binding relates to the vanilla method's return value.
+/// Plain observation sites are [`LiftedHookKind::Standard`]; a
+/// `cancellable = true` `TAIL`/`RETURN` site on a verified
+/// value-returning target is [`LiftedHookKind::ReturnValueOverride`],
+/// where `CallbackInfoReturnable.setReturnValue` lowers onto a
+/// return-value override — distinct from the fail-closed
+/// [`UnliftableReason::NonCancellablePostHook`] rejection a post hook on
+/// a void target still gets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiftedHookKind {
+    /// A plain pre/post observation binding.
+    Standard,
+    /// A post-phase return-value override (`CIR.setReturnValue`).
+    ReturnValueOverride,
+}
+
+impl LiftedHookKind {
+    /// Stable operator-facing name.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Standard => "Standard",
+            Self::ReturnValueOverride => "ReturnValueOverride",
+        }
+    }
+}
+
+impl fmt::Display for LiftedHookKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One successfully lifted injection site bound to a standard event hook.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiftedBinding {
     pub site: MixinSite,
     pub hook: StandardEventHook,
-    /// Mirrors the site's `cancellable` flag; always `false` for post hooks
-    /// (a cancellable post injection is [`UnliftableReason::NonCancellablePostHook`]).
+    /// Mirrors the site's `cancellable` flag; `false` for non-cancellable
+    /// post hooks and `true` for post hooks only when the verified target
+    /// returns a value ([`LiftedHookKind::ReturnValueOverride`] — a
+    /// cancellable post injection on a void target is
+    /// [`UnliftableReason::NonCancellablePostHook`]).
     pub cancellable: bool,
+    /// Whether the binding observes or overrides the vanilla return
+    /// value. [`LiftedHookKind::ReturnValueOverride`] only on
+    /// `cancellable` `TAIL`/`RETURN` sites against verified
+    /// value-returning targets.
+    pub kind: LiftedHookKind,
 }
 
 /// Why a single site cannot lift. Every variant keeps the mod at Tier 3.
@@ -756,6 +811,43 @@ const STANDARD_TARGETS: &[StandardTarget] = &[
         pre: StandardEventHook::TreeSoilQuery,
         post: StandardEventHook::TreeSoilQuery,
     },
+    // Loot bonus-count roll: `EnchantedCountIncreaseFunction.run` —
+    // Mojmap name of yarn `EnchantedCountIncreaseLootFunction` (class_125),
+    // whose `run`/`process` (method_522) applies the count bonus.
+    StandardTarget {
+        classes: &[
+            "net/minecraft/world/level/storage/loot/functions/EnchantedCountIncreaseFunction",
+            "net/minecraft/loot/function/EnchantedCountIncreaseLootFunction",
+            "net/minecraft/class_125",
+        ],
+        methods: &[
+            "run",
+            "process",
+            "method_522",
+            "run(Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/world/level/storage/loot/LootContext;)Lnet/minecraft/world/item/ItemStack;",
+        ],
+        pre: StandardEventHook::LootBonusRoll,
+        post: StandardEventHook::LootBonusRoll,
+    },
+    // Structure piece placement: `SinglePoolElement.place` (yarn
+    // `StructurePoolElement.generate` = method_16626 on the shared parent;
+    // intermediary numbers are hierarchy-shared so the override on
+    // SinglePoolElement class_3781 carries the same number).
+    StandardTarget {
+        classes: &[
+            "net/minecraft/world/level/levelgen/structure/pools/SinglePoolElement",
+            "net/minecraft/structure/pool/SinglePoolElement",
+            "net/minecraft/class_3781",
+        ],
+        methods: &[
+            "place",
+            "generate",
+            "method_16626",
+            "place(Lnet/minecraft/world/level/levelgen/structure/templatesystem/StructureTemplateManager;Lnet/minecraft/world/level/WorldGenLevel;Lnet/minecraft/world/level/StructureManager;Lnet/minecraft/world/level/chunk/ChunkGenerator;Lnet/minecraft/core/BlockPos;Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/level/block/Rotation;Lnet/minecraft/world/level/levelgen/structure/BoundingBox;Lnet/minecraft/util/RandomSource;Lnet/minecraft/world/level/levelgen/structure/templatesystem/LiquidSettings;Z)Z",
+        ],
+        pre: StandardEventHook::StructurePiecePlace,
+        post: StandardEventHook::StructurePiecePlace,
+    },
 ];
 
 /// Normalize a `target_class` to `a/b/C` internal form: strips an optional
@@ -788,6 +880,27 @@ fn lookup_target(target_class: &str, target_method: &str) -> Option<&'static Sta
         .find(|t| t.classes.contains(&class.as_str()) && t.methods.contains(&method))
 }
 
+/// The canonical hooks whose verified vanilla targets *return a value*:
+/// `Item.useOn` (`InteractionResult`), `Player.canEat`,
+/// `FenceBlock.connectsTo`, `CampfireBlock.isSmokeSource`,
+/// `CropBlock`/`StemBlock.mayPlaceOn`, `FlowingFluid.canPassThrough`
+/// (`Z`), and `MinecraftServer.reloadResources` /
+/// `ReloadableServerResources.loadResources` (`CompletableFuture`). A
+/// `cancellable = true` `TAIL`/`RETURN` site on one of these is a
+/// standard `CallbackInfoReturnable.setReturnValue` override and lifts
+/// as [`LiftedHookKind::ReturnValueOverride`]; a cancellable post hook
+/// on anything else (every `V` target) still fails closed as
+/// [`UnliftableReason::NonCancellablePostHook`].
+const RETURN_VALUE_HOOKS: &[StandardEventHook] = &[
+    StandardEventHook::ItemUseOnBlock,
+    StandardEventHook::PlayerCanEatQuery,
+    StandardEventHook::BlockConnectQuery,
+    StandardEventHook::CampfireSmokeQuery,
+    StandardEventHook::PlantPlaceQuery,
+    StandardEventHook::FluidPassQuery,
+    StandardEventHook::ResourceReload,
+];
+
 /// Lift one site to a standard event binding, or fail closed with the exact
 /// reason. Check order: annotation → locals capture → injection point →
 /// target table → post-hook cancellability. The `(target_class,
@@ -819,14 +932,22 @@ fn lift_site(
         Phase::Post => target.post,
     };
     // A `TAIL`/`RETURN` handler runs after the vanilla work, so cancelling
-    // it could never take the action back; only pre-phase sites may cancel.
+    // it could never take the action back — unless the verified target
+    // returns a value, where `setReturnValue` is a standard override the
+    // hook can reproduce. Every other post cancellation still fails closed.
+    let mut kind = LiftedHookKind::Standard;
     if site.cancellable && phase == Phase::Post {
-        return Err(UnliftableReason::NonCancellablePostHook);
+        if RETURN_VALUE_HOOKS.contains(&hook) {
+            kind = LiftedHookKind::ReturnValueOverride;
+        } else {
+            return Err(UnliftableReason::NonCancellablePostHook);
+        }
     }
     Ok(LiftedBinding {
         site: site.clone(),
         hook,
         cancellable: site.cancellable,
+        kind,
     })
 }
 
@@ -1421,6 +1542,54 @@ const SAFE_ACCESSOR_FIELDS: &[SafeAccessorField] = &[
         canonical: "StructureTemplatePool#templates",
         kind: AccessorValueKind::Ref,
     },
+    // -------------------------------------------------------------------
+    // Diagnostic / state-owner / NeoForge registry plain stored fields.
+    // `SystemReport` (yarn `net/minecraft/util/SystemDetails`, class_6396)
+    // stores crash-report constants; `StateHolder` (yarn `net/minecraft/
+    // state/State`, class_2688) stores the block/item `owner`; the two
+    // `net/neoforged/` rows are NeoForge's fluid-interaction registry and
+    // item-handler backing list. `set*` handlers on any of these still
+    // fail closed as `MutatingSetter`.
+    // -------------------------------------------------------------------
+    SafeAccessorField {
+        classes: &["net/minecraft/SystemReport", "net/minecraft/class_6396"],
+        fields: &["OPERATING_SYSTEM"],
+        canonical: "SystemReport#OPERATING_SYSTEM",
+        kind: AccessorValueKind::Ref,
+    },
+    SafeAccessorField {
+        classes: &["net/minecraft/SystemReport", "net/minecraft/class_6396"],
+        fields: &["JAVA_VERSION"],
+        canonical: "SystemReport#JAVA_VERSION",
+        kind: AccessorValueKind::Ref,
+    },
+    SafeAccessorField {
+        classes: &["net/minecraft/SystemReport", "net/minecraft/class_6396"],
+        fields: &["entries"],
+        canonical: "SystemReport#entries",
+        kind: AccessorValueKind::Ref,
+    },
+    SafeAccessorField {
+        classes: &[
+            "net/minecraft/world/level/block/state/StateHolder",
+            "net/minecraft/class_2688",
+        ],
+        fields: &["owner"],
+        canonical: "StateHolder#owner",
+        kind: AccessorValueKind::Ref,
+    },
+    SafeAccessorField {
+        classes: &["net/neoforged/neoforge/fluids/FluidInteractionRegistry"],
+        fields: &["INTERACTIONS"],
+        canonical: "FluidInteractionRegistry#INTERACTIONS",
+        kind: AccessorValueKind::Ref,
+    },
+    SafeAccessorField {
+        classes: &["net/neoforged/neoforge/items/ItemStackHandler"],
+        fields: &["stacks"],
+        canonical: "ItemStackHandler#stacks",
+        kind: AccessorValueKind::Ref,
+    },
 ];
 
 /// Mixin's member-name prefix convention: real mods namespace their
@@ -1452,14 +1621,28 @@ fn strip_mixin_member_prefix(name: &str) -> &str {
 /// Mixin's own field-name inference for an `@Accessor` without a `value`
 /// element: strip the `get`/`is`/`set` prefix and lowercase the first
 /// remaining character (`getYRot` → `yRot`, `isOnGround` → `onGround`).
-fn infer_accessor_field_name(handler_name: &str) -> Option<String> {
-    let stripped = handler_name
+/// Real mods also name constant-style fields with an all-uppercase
+/// remainder (`getOPERATING_SYSTEM` → `OPERATING_SYSTEM` on
+/// `SystemReport`), so the verbatim remainder is a second candidate;
+/// both are still judged against the fail-closed allowlist table, never
+/// a guessed field.
+fn infer_accessor_field_names(handler_name: &str) -> Vec<String> {
+    let Some(stripped) = handler_name
         .strip_prefix("get")
         .or_else(|| handler_name.strip_prefix("is"))
-        .or_else(|| handler_name.strip_prefix("set"))?;
+        .or_else(|| handler_name.strip_prefix("set"))
+    else {
+        return Vec::new();
+    };
     let mut chars = stripped.chars();
-    let first = chars.next()?;
-    Some(first.to_lowercase().chain(chars).collect())
+    let Some(first) = chars.next() else {
+        return Vec::new();
+    };
+    let mut names = vec![first.to_lowercase().chain(chars).collect::<String>()];
+    if names[0] != stripped {
+        names.push(stripped.to_string());
+    }
+    names
 }
 
 /// Classify one `@Accessor` site: a `get*`/`is*` handler with a `()T`
@@ -1498,18 +1681,22 @@ fn lift_accessor_site(site: &MixinSite) -> Result<LiftedAccessorBinding, Accesso
     // The field is the annotation `value` when present (the scanner then
     // reports it as `target_method`, distinct from the handler name),
     // otherwise Mixin's own name-based inference applies.
-    let field = if site.target_method != site.handler_name {
-        site.target_method.clone()
+    let fields = if site.target_method != site.handler_name {
+        vec![site.target_method.clone()]
     } else {
-        match infer_accessor_field_name(name) {
-            Some(field) => field,
-            None => return Err(AccessorRejection::OpaqueSignature),
+        let candidates = infer_accessor_field_names(name);
+        if candidates.is_empty() {
+            return Err(AccessorRejection::OpaqueSignature);
         }
+        candidates
     };
     let class = normalize_class(&site.target_class);
     let row = SAFE_ACCESSOR_FIELDS
         .iter()
-        .find(|r| r.classes.contains(&class.as_str()) && r.fields.contains(&field.as_str()))
+        .find(|r| {
+            r.classes.contains(&class.as_str())
+                && fields.iter().any(|f| r.fields.contains(&f.as_str()))
+        })
         .ok_or(AccessorRejection::UnknownField)?;
     Ok(LiftedAccessorBinding {
         site: site.clone(),
@@ -1900,6 +2087,11 @@ pub enum MixinTargetScope {
     /// gameplay — so a mixin on one is recorded as
     /// `legacy_datafix_skipped`, not a Tier-3 blocker.
     LegacyDataFixOnly,
+    /// A `net/minecraft/gametest/*` (yarn `net/minecraft/test/*`) class —
+    /// the GameTest harness that only executes when a test run is
+    /// explicitly invoked, never during live gameplay. A mixin on one is
+    /// recorded as `gametest_skipped`, not a Tier-3 blocker.
+    GameTestOnly,
 }
 
 /// Class-name prefixes (normalized internal form) whose members only run
@@ -1910,6 +2102,11 @@ const LEGACY_DATAFIX_PREFIXES: &[&str] = &[
     "net/minecraft/datafixer/",
 ];
 
+/// Class-name prefixes (normalized internal form) whose members only run
+/// inside the GameTest harness: the Mojmap `net/minecraft/gametest/`
+/// tree and the identical yarn `net/minecraft/test/` tree.
+const GAME_TEST_PREFIXES: &[&str] = &["net/minecraft/gametest/", "net/minecraft/test/"];
+
 /// `true` when `target_class` names a legacy datafix-only class in any
 /// accepted spelling (dot, slash, `L...;`, or canonical yarn name).
 pub fn is_legacy_datafix_target(target_class: &str) -> bool {
@@ -1919,16 +2116,100 @@ pub fn is_legacy_datafix_target(target_class: &str) -> bool {
         .any(|prefix| class.starts_with(prefix))
 }
 
-/// Classify a mixin `target_class` as [`MixinTargetScope::LiveGameplay`]
-/// or [`MixinTargetScope::LegacyDataFixOnly`]. Fail-closed by
-/// construction: anything outside the two verified legacy prefixes —
-/// including unrecognized names — is `LiveGameplay`.
+/// `true` when `target_class` names a GameTest-harness-only class in any
+/// accepted spelling (dot, slash, `L...;`, or canonical yarn name).
+pub fn is_gametest_target(target_class: &str) -> bool {
+    let class = normalize_class(target_class);
+    GAME_TEST_PREFIXES
+        .iter()
+        .any(|prefix| class.starts_with(prefix))
+}
+
+/// Classify a mixin `target_class` as [`MixinTargetScope::LiveGameplay`],
+/// [`MixinTargetScope::LegacyDataFixOnly`], or
+/// [`MixinTargetScope::GameTestOnly`]. Fail-closed by construction:
+/// anything outside the verified prefixes — including unrecognized
+/// names — is `LiveGameplay`.
 pub fn classify_mixin_target(target_class: &str) -> MixinTargetScope {
     if is_legacy_datafix_target(target_class) {
         MixinTargetScope::LegacyDataFixOnly
+    } else if is_gametest_target(target_class) {
+        MixinTargetScope::GameTestOnly
     } else {
         MixinTargetScope::LiveGameplay
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pure client-cosmetic mixin targets
+// ---------------------------------------------------------------------------
+
+/// One strictly client-visual-only vanilla method a dedicated server
+/// scan may skip with telemetry: (normalized class names, accepted
+/// method names). Names are factual mapping data only.
+struct ClientCosmeticTarget {
+    classes: &'static [&'static str],
+    methods: &'static [&'static str],
+}
+
+/// The verified client-visual-only target table. Every row names a
+/// vanilla method whose only effect is client rendering — armor-trim
+/// sprite path resolution and item eat/drink particle/sound effects —
+/// so a mixin on one can never alter server gameplay. Anything outside
+/// the table stays live gameplay (fail closed).
+const CLIENT_COSMETIC_TARGETS: &[ClientCosmeticTarget] = &[
+    // Armor trim sprite path resolution — only consulted by the client
+    // renderer when drawing trimmed armor models (yarn `ArmorTrim`
+    // `method_57411`/`method_57413`, the two texture-path methods).
+    ClientCosmeticTarget {
+        classes: &[
+            "net/minecraft/world/item/armortrim/ArmorTrim",
+            "net/minecraft/item/trim/ArmorTrim",
+            "net/minecraft/class_8053",
+        ],
+        methods: &[
+            "innerTexture",
+            "outerTexture",
+            "method_57411",
+            "method_57413",
+        ],
+    },
+    // Item eating/drinking particles and sounds — the entity produces
+    // them only on the client (yarn `shouldSpawnConsumptionEffects`
+    // method_22382, `spawnConsumptionEffects` method_6098,
+    // `spawnItemParticles` method_6037).
+    ClientCosmeticTarget {
+        classes: &[
+            "net/minecraft/world/entity/LivingEntity",
+            "net/minecraft/class_1309",
+        ],
+        methods: &[
+            "shouldTriggerItemUseEffects",
+            "triggerItemUseEffects",
+            "spawnItemParticles",
+            "shouldSpawnConsumptionEffects",
+            "spawnConsumptionEffects",
+            "method_22382",
+            "method_6098",
+            "method_6037",
+            "shouldTriggerItemUseEffects()Z",
+            "triggerItemUseEffects(Lnet/minecraft/world/item/ItemStack;I)V",
+            "spawnItemParticles(Lnet/minecraft/world/item/ItemStack;I)V",
+        ],
+    },
+];
+
+/// `true` when `(target_class, target_method)` names a verified
+/// client-visual-only vanilla method in any accepted spelling — a
+/// dedicated server never runs it, so a server-side mixin scan records
+/// the site as `client_cosmetic_skipped` instead of a Tier-3 blocker.
+/// Fail-closed: anything outside the table is live gameplay.
+pub fn is_client_cosmetic_target(target_class: &str, target_method: &str) -> bool {
+    let class = normalize_class(target_class);
+    let method = target_method.trim();
+    CLIENT_COSMETIC_TARGETS
+        .iter()
+        .any(|t| t.classes.contains(&class.as_str()) && t.methods.contains(&method))
 }
 
 impl MixinLiftVerdict {

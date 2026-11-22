@@ -544,6 +544,20 @@ fn format_scan_human(path: &Path, report: &JarMixinScanReport) -> String {
             report.legacy_datafix_skipped
         );
     }
+    if report.gametest_skipped > 0 {
+        let _ = writeln!(
+            out,
+            "Skipped {} GameTest-only site(s) targeting net/minecraft/gametest/* (not live-gameplay blockers).",
+            report.gametest_skipped
+        );
+    }
+    if report.client_cosmetic_skipped > 0 {
+        let _ = writeln!(
+            out,
+            "Skipped {} client-visual-only site(s) a dedicated server never runs (not live-gameplay blockers).",
+            report.client_cosmetic_skipped
+        );
+    }
     let lifted = lifted_bindings(&report.verdict);
     if !lifted.is_empty() {
         let _ = writeln!(
@@ -699,6 +713,16 @@ fn scan_report_json(path: &Path, report: &JarMixinScanReport) -> String {
         "  \"legacy_datafix_skipped\": {},",
         report.legacy_datafix_skipped
     );
+    let _ = writeln!(
+        out,
+        "  \"gametest_skipped\": {},",
+        report.gametest_skipped
+    );
+    let _ = writeln!(
+        out,
+        "  \"client_cosmetic_skipped\": {},",
+        report.client_cosmetic_skipped
+    );
     json_field_str(
         &mut out,
         1,
@@ -719,6 +743,7 @@ fn scan_report_json(path: &Path, report: &JarMixinScanReport) -> String {
             let last = i + 1 == lifted.len();
             let _ = writeln!(out, "    {{");
             json_field_str(&mut out, 3, "hook", binding.hook.as_str(), true);
+            json_field_str(&mut out, 3, "kind", binding.kind.as_str(), true);
             json_site_fields(&mut out, 3, &binding.site);
             let _ = writeln!(out, "      \"cancellable\": {}", binding.cancellable);
             let _ = writeln!(out, "    }}{}", if last { "" } else { "," });
@@ -1068,6 +1093,20 @@ fn mods_dir_jar_json(out: &mut String, jar: &ModsDirJar, last: bool) {
                 scan.legacy_datafix_skipped as u64,
                 true,
             );
+            json_field_u64(
+                out,
+                3,
+                "gametest_skipped",
+                scan.gametest_skipped as u64,
+                true,
+            );
+            json_field_u64(
+                out,
+                3,
+                "client_cosmetic_skipped",
+                scan.client_cosmetic_skipped as u64,
+                true,
+            );
 
             let lifted = lifted_bindings(&scan.verdict);
             if lifted.is_empty() {
@@ -1078,6 +1117,7 @@ fn mods_dir_jar_json(out: &mut String, jar: &ModsDirJar, last: bool) {
                     let last = i + 1 == lifted.len();
                     let _ = writeln!(out, "        {{");
                     json_field_str(out, 5, "hook", binding.hook.as_str(), true);
+                    json_field_str(out, 5, "kind", binding.kind.as_str(), true);
                     json_site_fields(out, 5, &binding.site);
                     let _ = writeln!(out, "          \"cancellable\": {}", binding.cancellable);
                     let _ = writeln!(out, "        }}{}", if last { "" } else { "," });

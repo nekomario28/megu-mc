@@ -1158,6 +1158,18 @@ pub fn auto_adapt_jar_bytes(
             mixin_scan.legacy_datafix_skipped
         ));
     }
+    if mixin_scan.gametest_skipped > 0 {
+        audit_notes.push(format!(
+            "gametest_skipped: {} mixin site(s) target net/minecraft/gametest/* classes and only execute inside the GameTest harness — recorded, not a live-gameplay blocker",
+            mixin_scan.gametest_skipped
+        ));
+    }
+    if mixin_scan.client_cosmetic_skipped > 0 {
+        audit_notes.push(format!(
+            "client_cosmetic_skipped: {} mixin site(s) target client-visual-only vanilla methods a dedicated server never runs — recorded, not a live-gameplay blocker",
+            mixin_scan.client_cosmetic_skipped
+        ));
+    }
 
     // 11. Tier synthesis.
     let mut blockers = Vec::new();
@@ -1731,6 +1743,20 @@ fn json_mixin_scan(out: &mut String, level: usize, scan: &JarMixinScanReport, co
     jf_u64(
         out,
         level + 1,
+        "gametest_skipped",
+        scan.gametest_skipped as u64,
+        true,
+    );
+    jf_u64(
+        out,
+        level + 1,
+        "client_cosmetic_skipped",
+        scan.client_cosmetic_skipped as u64,
+        true,
+    );
+    jf_u64(
+        out,
+        level + 1,
         "tiny_mappings_loaded",
         scan.tiny_mappings_loaded as u64,
         true,
@@ -1762,6 +1788,7 @@ fn json_mixin_scan(out: &mut String, level: usize, scan: &JarMixinScanReport, co
             let last = i + 1 == lifted.len();
             let _ = writeln!(out, "{:width$}{{", "", width = (level + 2) * 2);
             jf_str(out, level + 3, "hook", binding.hook.as_str(), true);
+            jf_str(out, level + 3, "kind", binding.kind.as_str(), true);
             json_site_fields(out, level + 3, &binding.site);
             let _ = writeln!(
                 out,
