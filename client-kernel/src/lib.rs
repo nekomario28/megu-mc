@@ -20,6 +20,7 @@ mod light;
 pub mod occlusion_table;
 mod physics;
 pub mod player_physics;
+pub mod qol_gameplay;
 pub mod raycast;
 mod registry;
 mod section;
