@@ -96,6 +96,7 @@ python3 tests/pgo_build_test.py
 python3 tools/vanilla_data/version_pack.py --self-test
 python3 tools/parity_cache.py --self-test
 python3 tools/release_bundle.py --self-test
+python3 tests/release_bundle_test.py
 python3 tests/dev_check_test.py
 python3 tests/megu_translate_test.py
 python3 tests/megu_bench_test.py
@@ -176,6 +177,7 @@ echo "== wire smoke"
 cargo build --offline --locked -j 2 --message-format=json-render-diagnostics >"$build_manifest"
 binary=$(python3 tools/cargo_executable.py <"$build_manifest")
 timeout 180 python3 tests/wire_smoke.py "$binary"
+timeout 180 python3 tests/protocol767.py "$binary"
 timeout 180 python3 tests/dimension_wire.py "$binary"
 timeout 180 python3 tests/client_settings_wire.py "$binary"
 timeout 180 python3 tests/gameplay_wire.py "$binary"
@@ -205,6 +207,7 @@ cargo check --offline --locked -j 2 --features create-offload
 cargo test --offline --locked -j 2 --features create-offload -- --test-threads=1 aeronautics_and_dim_bridge_tests
 cargo check --offline --locked -j 2 --features mod-suite
 cargo test --offline --locked -j 2 --features mod-suite -- --test-threads=1 wire_mods_
+cargo test --offline --locked -j 2 --features mod-suite -- --test-threads=1 live_mod_bridge
 
 # Last, because it is the slowest: prove the gates can still fail. A suite that is green over a gate
 # that cannot fail reports safety it does not have, and this is the only check that would notice.

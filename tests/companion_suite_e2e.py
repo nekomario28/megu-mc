@@ -5,15 +5,21 @@
 Proves the five pure-Rust companion CLI binaries and the multi-binary
 release bundler work together through the complete operator lifecycle:
 
-  1. mc-spine-init      (server-files)  — init a server directory, doctor
+  1. mc-spine-init      (server-files)  — the flag-mode bootstrap
+                        (--dir/--mc-version 26.3/--accept-eula/--json)
+                        fails closed on the EULA, then the legacy
+                        init/doctor/op/whitelist/ban/claims subcommands
+                        (re-exec'd to a sibling mc-spine-admin): doctor
                         gating on the EULA (rcon.password never printed),
-                        offline op/whitelist/ban administration, then
-                        claims server-claim/list/unclaim with eula.txt
+                        offline admin, and claims with eula.txt
                         byte-unchanged throughout.
   2. mc-spine-mod-check (mod-adapter-core) — pre-flight a real ZIP_DEFLATED
                         .mrpack; its --json report must match
                         tools/mod_launcher.py --modpack byte-for-byte, and a
-                        mismatched --mc-version must exit 2.
+                        mismatched --mc-version must exit 2. Then
+                        --scaffold-native emits a validated
+                        mc-spine-mod-bundle/1 starter bundle, failing
+                        closed on a malformed mod id.
   3. mc-spine-world-migrate (state-store) — migrate a 1.21.1 (DataVersion
                         3955) level.dat-style JSON document + chunk palette
                         to 26.3 (5023), refuse an unapproved downgrade
@@ -70,6 +76,14 @@ BINARIES = (
     ("client", "client-app", "mc-spine-client", "client_bin"),
     ("voice_relay", "proto", "mc-spine-voice-relay", "voice_relay_bin"),
 )
+
+# Extra bins a companion's crate must leave in the same target dir without
+# being stepped individually: mc-spine-init's legacy subcommands (init,
+# doctor, op, whitelist, ban, claims) re-exec a sibling mc-spine-admin, so
+# building init alone would leave step 1 delegating to a missing binary.
+EXTRA_BINS = {
+    "init": ("mc-spine-admin",),
+}
 
 CARGO_FLAGS = ["--offline", "--locked", "-j1"]
 BUILD_TIMEOUT = 1800
@@ -157,17 +171,21 @@ def ensure_binaries(args):
         env = dict(os.environ)
         env["CARGO_TARGET_DIR"] = str(target_dir)
         for key, crate, name in missing:
-            log(f"building {name} ({crate})")
-            artifact = target_dir / "debug" / name
+            names = (name, *EXTRA_BINS.get(key, ()))
+            log(f"building {' + '.join(names)} ({crate})")
             build = run(["cargo", "build",
                          "--manifest-path", ROOT / crate / "Cargo.toml",
-                         "--bin", name, *CARGO_FLAGS],
+                         *(flag for n in names for flag in ("--bin", n)),
+                         *CARGO_FLAGS],
                         timeout=BUILD_TIMEOUT, cwd=ROOT, env=env)
             check(build.returncode == 0,
-                  f"cargo build {name} exited {build.returncode}\n"
+                  f"cargo build {' + '.join(names)} exited "
+                  f"{build.returncode}\n"
                   f"{tail(build.stdout + build.stderr)}")
-            check(artifact.is_file(), f"build did not produce {artifact}")
-            resolved[key] = artifact
+            for built in names:
+                artifact = target_dir / "debug" / built
+                check(artifact.is_file(), f"build did not produce {artifact}")
+            resolved[key] = target_dir / "debug" / name
         # The contract: every crate's artifacts — the binaries' crates and
         # their path dependencies alike — live under target_dir, never in a
         # stray <crate>/target directory a later run could accidentally reuse.
@@ -185,6 +203,40 @@ def step_init(bins, work):
     binary = bins["init"]
     srv = work / "server"
 
+    # The flag-mode bootstrap is fail-closed on the EULA: eula.txt is only
+    # written eula=true when --accept-eula is passed, and an existing
+    # eula=false is never upgraded without --force.
+    boot = work / "bootstrap"
+    refused = expect([binary, "--dir", boot, "--mc-version", "26.3",
+                      "--json"], 0)
+    report = parse_json_stdout(refused, "init --json without --accept-eula")
+    check(report.get("eula_accepted") is False,
+          "init must not report eula_accepted without --accept-eula")
+    check(report.get("mc_version") == "26.3",
+          f"init --json mc_version is {report.get('mc_version')!r}")
+    check((boot / "world").is_dir() and (boot / "mods").is_dir(),
+          "init did not create the world/mods directories")
+    eula_path = boot / "eula.txt"
+    check("eula=false" in eula_path.read_text(encoding="utf-8"),
+          "init wrote eula=true without --accept-eula")
+
+    kept = expect([binary, "--dir", boot, "--mc-version", "26.3",
+                   "--accept-eula", "--json"], 0)
+    check(parse_json_stdout(kept, "init --accept-eula without --force")
+          .get("eula_accepted") is False,
+          "init flipped an existing eula=false without --force")
+    accepted = expect([binary, "--dir", boot, "--mc-version", "26.3",
+                       "--accept-eula", "--force", "--json"], 0)
+    check(parse_json_stdout(accepted, "init --accept-eula --force")
+          .get("eula_accepted") is True,
+          "init --accept-eula --force did not report eula_accepted")
+    check("eula=true" in eula_path.read_text(encoding="utf-8"),
+          "init --accept-eula --force did not write eula=true")
+    check('mc_version = "26.3"'
+          in (boot / "server.toml").read_text(encoding="utf-8"),
+          "init did not record mc_version 26.3 in server.toml")
+
+    # The legacy subcommands re-exec the sibling mc-spine-admin binary.
     expect([binary, "init", "--dir", srv,
             "--mc-version", "1.21.1",
             "--port", "25565",
@@ -349,7 +401,27 @@ def step_mod_check(bins, work):
                          "--modpack", pack, "--mc-version", "26.3", "--json"], 2)
     check(rust_bad.stdout.encode() == python_bad.stdout.encode(),
           "version-mismatch reports differ between Rust and Python")
-    log("  .mrpack report matches mod_launcher.py byte-for-byte; mismatch exits 2")
+
+    # --scaffold-native emits a validated mc-spine-mod-bundle/1 starter for
+    # native zero-JVM mods; a malformed mod id fails closed with exit 2.
+    bundle_path = work / "demo_mod.bundle.json"
+    expect([binary, "--scaffold-native", "demo_mod", "--out", bundle_path], 0)
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    check(bundle.get("schema") == "mc-spine-mod-bundle/1",
+          f"scaffold bundle schema is {bundle.get('schema')!r}")
+    check(bundle.get("mod_id") == "demo_mod",
+          "scaffold bundle lost the requested mod id")
+    check(set(bundle) == {"schema", "mod_id", "mc_version_range", "portals",
+                          "progression_barriers", "biome_regions",
+                          "creatures", "custom_channels"},
+          f"scaffold bundle is not the closed v1 shape: {sorted(bundle)}")
+    check(all(bundle[key] == [] for key in
+              ("portals", "progression_barriers", "biome_regions",
+               "creatures", "custom_channels")),
+          "scaffold bundle should emit empty section lists")
+    expect([binary, "--scaffold-native", "demo_mod:namespaced"], 2)
+    log("  .mrpack report matches mod_launcher.py byte-for-byte; mismatch "
+        "exits 2; --scaffold-native bundle validated")
 
 
 # ------------------------------------------- step 3: mc-spine-world-migrate
@@ -845,6 +917,10 @@ def self_test():
     check_("binaries table: voice relay ships from proto",
            ("voice_relay", "proto", "mc-spine-voice-relay", "voice_relay_bin")
            in BINARIES)
+    check_("extra bins: delegation helpers sit beside a listed companion",
+           set(EXTRA_BINS) <= {key for key, _, _, _ in BINARIES}
+           and not ({name for names in EXTRA_BINS.values() for name in names}
+                    & {name for _, _, name, _ in BINARIES}))
 
     # the assertion helpers themselves must be able to fail.
     expect_failure("check(): false is a failure", check, False, "boom")
