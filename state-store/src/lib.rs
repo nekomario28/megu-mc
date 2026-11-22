@@ -89,6 +89,7 @@
 
 pub mod anvil_inspect;
 pub mod audit_log;
+pub mod chunk_packet_cache;
 pub mod datafix;
 pub mod incremental_save;
 pub mod migrate;
