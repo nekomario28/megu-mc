@@ -426,7 +426,7 @@ pub enum GpuComputeParadigm {
     DiscretePcieHighBw,
     TileBasedTbdr,
     UnifiedApuSharedRam,
-    LegacyGlMinimal,
+    LowPowerIntegratedWgpu,
     HeadlessNoGpu,
 }
 
@@ -871,7 +871,7 @@ pub fn detect_universal_hardware_profile() -> UniversalHardwareProfile {
         if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
             GpuComputeParadigm::TileBasedTbdr
         } else {
-            GpuComputeParadigm::LegacyGlMinimal
+            GpuComputeParadigm::LowPowerIntegratedWgpu
         },
         PowerThermalProfile::AcDesktop,
         StorageIoClass::HddOrSlowSd,
@@ -1081,7 +1081,7 @@ pub fn build_unified_optimization_plan(
         GpuComputeParadigm::TileBasedTbdr | GpuComputeParadigm::UnifiedApuSharedRam => {
             compute.memory = MemoryTransferStrategy::UnifiedZeroCopy;
         }
-        GpuComputeParadigm::LegacyGlMinimal | GpuComputeParadigm::HeadlessNoGpu => {}
+        GpuComputeParadigm::LowPowerIntegratedWgpu | GpuComputeParadigm::HeadlessNoGpu => {}
     }
     let kernel_mode = autotuner_override.unwrap_or(if compute.prefer_lut_over_recompute() {
         ComputeKernelMode::LutBatch
@@ -1156,7 +1156,7 @@ impl UnifiedOptimizationPlan {
             pool_budget_pages,
             prefer_single_pass_gpu: matches!(
                 self.profile.gpu_paradigm,
-                GpuComputeParadigm::TileBasedTbdr | GpuComputeParadigm::LegacyGlMinimal
+                GpuComputeParadigm::TileBasedTbdr | GpuComputeParadigm::LowPowerIntegratedWgpu
             ),
             coalesce_background_bursts: matches!(
                 self.profile.power_profile,

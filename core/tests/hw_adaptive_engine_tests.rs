@@ -330,7 +330,7 @@ fn two_gib_pi_slow_sd_budgets_less_than_desktop_and_coalesces_io() {
     pi.total_ram_mib = 2048;
     pi.memory_class = MemoryFootprintClass::from_ram_mib(pi.total_ram_mib);
     pi.storage_io = StorageIoClass::HddOrSlowSd;
-    pi.gpu_paradigm = GpuComputeParadigm::LegacyGlMinimal;
+    pi.gpu_paradigm = GpuComputeParadigm::LowPowerIntegratedWgpu;
     let plan = build_unified_optimization_plan(&pi, None);
     let worldgen = plan.for_domain(DomainKind::Worldgen);
     assert!(worldgen.pool_budget_pages < desktop_budget);
