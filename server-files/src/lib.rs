@@ -54,6 +54,7 @@ pub mod directory;
 pub mod eula;
 pub mod json;
 pub mod lists;
+pub mod pack_router;
 pub mod perf_cache;
 pub mod properties;
 pub mod usercache;
@@ -78,6 +79,10 @@ pub use lists::{
     normalize_ban_ip, offline_uuid, valid_player_name, BanEntry, BannedIps, BannedPlayers,
     IpBanEntry, OpEntry, OpsList, Whitelist, WhitelistEntry, BANNED_IPS_FILE, BANNED_PLAYERS_FILE,
     OPS_FILE, WHITELIST_FILE,
+};
+pub use pack_router::{
+    inspect_and_route_pack, PackCapabilities, PackKind, PackRouteDecision, PackRouterPolicy,
+    PackRoutingReport, PackThreat, PackThreatKind, ShaderFallbackTarget,
 };
 pub use perf_cache::{
     look_dir_from_yaw, CacheLookup, CacheMissReason, ChunkCacheStats, ChunkWireKey,
