@@ -90,12 +90,13 @@ pub const BUNDLE_FILE_SUFFIX: &str = ".bundle.json";
 /// admitting both first-class targets (`1.21.1` and `26.3`).
 const DEFAULT_BUNDLE_MC_RANGE: &str = "[1.21,)";
 
-/// Generic `data/` extraction budgets: at most 4096 archive members to
-/// consider, 4 MiB of decoded payload per member, and 32 MiB of decoded
-/// `data/` payload per JAR — all enforced fail-closed.
-const MAX_DATA_MEMBERS: usize = 4096;
-const MAX_DATA_MEMBER_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_DATA_SCAN_BYTES: u64 = 32 * 1024 * 1024;
+/// Generic `data/` extraction budgets: at most 32768 archive members to
+/// consider (real production JARs exceed 12,000), 8 MiB of decoded
+/// payload per member, and 128 MiB of decoded `data/` payload per JAR —
+/// all enforced fail-closed.
+const MAX_DATA_MEMBERS: usize = 32_768;
+const MAX_DATA_MEMBER_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_DATA_SCAN_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Longest accepted scaffold `display_name` / `version` string.
 const MAX_SCAFFOLD_FIELD_CHARS: usize = 128;

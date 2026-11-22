@@ -261,6 +261,19 @@ impl ConstantPool {
         }
     }
 
+    /// A `class_info_index` slot — the `c` element-value payload of JVMS
+    /// §4.7.16.1 — resolved to an internal class name. `javac` stores the
+    /// *field descriptor* (`Lnet/minecraft/...;`) in a `CONSTANT_Utf8`
+    /// here; emitters that store a `CONSTANT_Class` (holding the internal
+    /// name directly) resolve through it the same way.
+    fn class_info_name(&self, index: u16, ctx: &'static str) -> Result<&str, ClassScanError> {
+        match self.entry(index, ctx)? {
+            CpEntry::Class { name_index } => self.utf8(*name_index, ctx),
+            CpEntry::Utf8(desc) => Ok(class_descriptor_name(desc)),
+            _ => Err(ClassScanError::BadConstantPoolTag(ctx)),
+        }
+    }
+
     /// A `CONSTANT_Integer` slot — the storage behind `Z` element values.
     fn int(&self, index: u16, ctx: &'static str) -> Result<i32, ClassScanError> {
         match self.entry(index, ctx)? {
@@ -377,7 +390,8 @@ enum ElementValue {
     Const(u16),
     /// `e` — `type_name_index` + `const_name_index`.
     Enum { const_name: u16 },
-    /// `c` — `class_info_index` (`CONSTANT_Class`).
+    /// `c` — `class_info_index` (a `CONSTANT_Utf8` descriptor per
+    /// JVMS §4.7.16.1; `CONSTANT_Class` emitters are tolerated).
     ClassInfo(u16),
     /// `@` — nested annotation.
     Nested(Annotation),
@@ -516,6 +530,18 @@ fn string_elements(
     }
 }
 
+/// Reduce a `CONSTANT_Utf8` `class_info_index` payload (JVMS §4.7.16.1)
+/// to an internal class name: `Lfoo/Bar;` → `foo/Bar`. Array descriptors
+/// (`[Lfoo/Bar;`, `[I`) already *are* the internal name of the array
+/// class, and anything else (a primitive descriptor such as `I` from
+/// `int.class`, or a bare internal name some emitters store without the
+/// `L;` envelope) is returned unchanged.
+fn class_descriptor_name(desc: &str) -> &str {
+    desc.strip_prefix('L')
+        .and_then(|rest| rest.strip_suffix(';'))
+        .unwrap_or(desc)
+}
+
 /// `value`/`targets`-style `c` (class-info) element values to internal
 /// class names.
 fn class_elements(
@@ -524,13 +550,13 @@ fn class_elements(
 ) -> Result<Vec<String>, ClassScanError> {
     match value {
         ElementValue::ClassInfo(index) => {
-            Ok(vec![cp.class_name(*index, "@Mixin target class")?.to_string()])
+            Ok(vec![cp.class_info_name(*index, "@Mixin target class")?.to_string()])
         }
         ElementValue::Array(items) => {
             let mut out = Vec::new();
             for item in items {
                 if let ElementValue::ClassInfo(index) = item {
-                    out.push(cp.class_name(*index, "@Mixin target class")?.to_string());
+                    out.push(cp.class_info_name(*index, "@Mixin target class")?.to_string());
                 }
             }
             Ok(out)

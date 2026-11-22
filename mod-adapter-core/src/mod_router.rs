@@ -9,9 +9,14 @@ use std::collections::BTreeSet;
 use crate::fallback::BUILTIN_SUPERSEDED_PERF_MODS;
 use crate::modpack::{read_zip_member, zip_member_list};
 
-const MAX_CLASSES: usize = 2048;
-const MAX_MEMBERS: usize = 8192;
-const MAX_SCANNED_BYTES: usize = 32 * 1024 * 1024;
+/// Production mod JARs routinely carry thousands of classes and tens of
+/// thousands of members (a current NeoForge `create` release ships ~2,700
+/// classes across ~12,500 members), so the bounds below sit well past the
+/// largest real packs while still rejecting member-count bombs and
+/// archives whose decompressed footprint is unreasonably large.
+const MAX_CLASSES: usize = 16_384;
+const MAX_MEMBERS: usize = 32_768;
+const MAX_SCANNED_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SecurityThreatKind {
@@ -86,6 +91,16 @@ pub struct CapabilitySignals {
     pub server_engine_hooks: Vec<String>,
     pub has_gameplay_content: bool,
     pub class_files_inspected: usize,
+    /// Classes whose constant pool carried at least one render-engine
+    /// hook. The behavioral route only fires when these dominate the
+    /// archive — a handful of client classes importing `RenderSystem` or
+    /// `com/mojang/blaze3d/` is normal for any mod that draws a HUD icon
+    /// or screen and is not an engine-replacement signature.
+    pub render_hook_classes: usize,
+    /// Same accounting for the light-engine hook family.
+    pub light_hook_classes: usize,
+    /// Same accounting for the server chunk/network-engine hook family.
+    pub server_hook_classes: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,6 +145,7 @@ pub fn inspect_jar_security_and_capabilities(
     let mut light_hooks = BTreeSet::new();
     let mut server_hooks = BTreeSet::new();
     let mut inspected_bytes = 0usize;
+    let mut hook_classes = HookClassCounts::default();
 
     for entry in &entries {
         let name = entry.name.as_str();
@@ -146,7 +162,8 @@ pub fn inspect_jar_security_and_capabilities(
             .ok_or_else(|| format!("{display}: security scan size overflow"))?;
         if inspected_bytes > MAX_SCANNED_BYTES {
             return Err(format!(
-                "{display}: security scan exceeds 32 MiB of archive data"
+                "{display}: security scan exceeds {} MiB of archive data",
+                MAX_SCANNED_BYTES / (1024 * 1024)
             ));
         }
         let lower = name.to_ascii_lowercase();
@@ -174,13 +191,19 @@ pub fn inspect_jar_security_and_capabilities(
                             category,
                             "recipe"
                                 | "recipes"
+                                | "tags"
+                                | "tag"
                                 | "dimension"
                                 | "dimension_type"
                                 | "worldgen"
                                 | "loot_table"
                                 | "loot_tables"
+                                | "loot_modifiers"
                                 | "advancement"
                                 | "advancements"
+                                | "data_maps"
+                                | "neoforge"
+                                | "forge"
                         ) && category_path.contains('/')
                         {
                             signals.has_gameplay_content = true;
@@ -201,14 +224,42 @@ pub fn inspect_jar_security_and_capabilities(
         let strings = constant_pool_utf8(&member_bytes)
             .map_err(|reason| format!("{display}: malformed class {name}: {reason}"))?;
         detect_security_threats(&strings, name, &mut threats);
+        let mut class_hits = HookHits::default();
         for text in &strings {
-            collect_signals(text, &mut render_hooks, &mut light_hooks, &mut server_hooks);
+            collect_signals(
+                text,
+                &mut render_hooks,
+                &mut light_hooks,
+                &mut server_hooks,
+                &mut class_hits,
+            );
+        }
+        if class_hits.render {
+            hook_classes.render += 1;
+        }
+        if class_hits.light {
+            hook_classes.light += 1;
+        }
+        if class_hits.server {
+            hook_classes.server += 1;
         }
     }
 
     signals.render_engine_hooks = render_hooks.into_iter().collect();
     signals.light_engine_hooks = light_hooks.into_iter().collect();
     signals.server_engine_hooks = server_hooks.into_iter().collect();
+    signals.render_hook_classes = hook_classes.render;
+    signals.light_hook_classes = hook_classes.light;
+    signals.server_hook_classes = hook_classes.server;
+    // A behavioral capability route fires only when hook-bearing classes
+    // dominate the archive — the JAR is then, by structure, mostly that
+    // engine's code (the way sodium/starlight/C2ME-class replacements
+    // look). A gameplay, library, or HUD mod that merely touches
+    // `RenderSystem`, `blaze3d`, `ChunkMap`, or `ServerChunkCache` in a
+    // few of its classes stays in the standard pipeline.
+    let render_dominant = hook_classes.render * 2 > signals.class_files_inspected;
+    let light_dominant = hook_classes.light * 2 > signals.class_files_inspected;
+    let server_dominant = hook_classes.server * 2 > signals.class_files_inspected;
     let decision = if !threats.is_empty() {
         ModRouteDecision::SecurityQuarantine { threats }
     } else if signals.has_gameplay_content && !signals.render_engine_hooks.is_empty() {
@@ -218,14 +269,14 @@ pub fn inspect_jar_security_and_capabilities(
         }
     } else if signals.has_gameplay_content {
         ModRouteDecision::StandardPipeline
-    } else if !signals.render_engine_hooks.is_empty() {
+    } else if render_dominant {
         capability_route(
             NativeSubsystem::WgpuRenderBackend,
             &signals.render_engine_hooks,
         )
-    } else if !signals.light_engine_hooks.is_empty() {
+    } else if light_dominant {
         capability_route(NativeSubsystem::LightEngine, &signals.light_engine_hooks)
-    } else if !signals.server_engine_hooks.is_empty() {
+    } else if server_dominant {
         capability_route(
             NativeSubsystem::ServerChunkAndNetEngine,
             &signals.server_engine_hooks,
@@ -514,11 +565,30 @@ fn detect_security_threats(strings: &[Vec<u8>], member: &str, threats: &mut Vec<
     }
 }
 
+/// Whether one constant-pool string matched each capability family —
+/// aggregated per class so [`CapabilitySignals::render_hook_classes`] &
+/// co. count hook-bearing classes, not matching strings.
+#[derive(Default)]
+struct HookHits {
+    render: bool,
+    light: bool,
+    server: bool,
+}
+
+/// Per-family count of classes carrying at least one hook.
+#[derive(Default)]
+struct HookClassCounts {
+    render: usize,
+    light: usize,
+    server: usize,
+}
+
 fn collect_signals(
     text: &[u8],
     render: &mut BTreeSet<String>,
     light: &mut BTreeSet<String>,
     server: &mut BTreeSet<String>,
+    hits: &mut HookHits,
 ) {
     const RENDER: &[&str] = &[
         "org/lwjgl/vulkan/",
@@ -554,16 +624,19 @@ fn collect_signals(
     ];
     for hook in RENDER {
         if contains(text, hook) {
+            hits.render = true;
             render.insert((*hook).to_string());
         }
     }
     for hook in LIGHT {
         if contains(text, hook) {
+            hits.light = true;
             light.insert((*hook).to_string());
         }
     }
     for hook in SERVER {
         if contains(text, hook) {
+            hits.server = true;
             server.insert((*hook).to_string());
         }
     }
