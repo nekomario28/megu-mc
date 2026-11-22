@@ -14517,14 +14517,24 @@ fn map_chunk_cache() -> &'static Mutex<MapChunkCache> {
     MAP_CHUNK_CACHE.get_or_init(|| Mutex::new(MapChunkCache::default()))
 }
 
-/// Snapshot the 3x3 write versions around `(dim, cx, cz)` under a single lock.
+/// Snapshot the center chunk's full write version plus its 8 neighbors' light
+/// (opacity/emission) versions: a neighbor write that changes neither opacity
+/// nor emission (such as a leaf `distance` tick) cannot alter `(cx, cz)`'s
+/// encoded blocks or light arrays.
 fn chunk_versions_3x3(dim: DimId, cx: i32, cz: i32) -> [u64; 9] {
-    let guard = chunk_versions().lock().unwrap_or_else(|e| e.into_inner());
+    let center_ver = chunk_version_dim(dim, cx, cz);
+    let light_guard = chunk_opacity_versions()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut out = [0u64; 9];
     let mut i = 0;
     for dx in -1..=1 {
         for dz in -1..=1 {
-            out[i] = guard.get(&(dim, cx + dx, cz + dz)).copied().unwrap_or(0);
+            out[i] = if dx == 0 && dz == 0 {
+                center_ver
+            } else {
+                light_guard.get(&(dim, cx + dx, cz + dz)).copied().unwrap_or(0)
+            };
             i += 1;
         }
     }
