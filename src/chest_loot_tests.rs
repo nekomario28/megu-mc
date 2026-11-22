@@ -78,6 +78,7 @@ fn item(name: &str, count: i32) -> LootItem {
         count,
         enchantment: None,
         damage: 0,
+        potion: None,
     }
 }
 
@@ -677,4 +678,261 @@ fn table_quality_scales_entry_weight_with_luck() {
         };
         assert_eq!(got[0].item, expected, "wrong pick for seed {seed}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// v1211_adv_loot: vanilla 1.21.1 loot-table catalogue coverage.
+// ---------------------------------------------------------------------------
+
+fn catalogue_roll(id: &str, seed: i64) -> Vec<LootEntry> {
+    vanilla_loot_roll(id, seed)
+}
+
+fn assert_valid_entries(entries: &[LootEntry]) {
+    for entry in entries {
+        assert!((0..27).contains(&entry.slot), "slot {} out of range", entry.slot);
+        assert!(entry.item.starts_with("minecraft:"), "bad item {}", entry.item);
+        assert!(entry.count > 0, "empty stack for {}", entry.item);
+    }
+}
+
+#[test]
+fn v1211_adv_loot_catalogue_embeds_every_staged_table() {
+    // 195 vanilla 1.21.1 tables: chests, archaeology, gameplay, entities,
+    // equipment, dispensers, pots, shearing and spawners.
+    assert_eq!(VANILLA_LOOT_TABLES.len(), 195);
+    let mut ids: Vec<&str> = VANILLA_LOOT_TABLES
+        .iter()
+        .map(|(id, _)| *id)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 195, "duplicate table ids in the catalogue");
+    for required in [
+        "minecraft:chests/ancient_city",
+        "minecraft:chests/ancient_city_ice_box",
+        "minecraft:chests/bastion_bridge",
+        "minecraft:chests/bastion_hoglin_stable",
+        "minecraft:chests/bastion_other",
+        "minecraft:chests/bastion_treasure",
+        "minecraft:chests/trial_chambers/reward",
+        "minecraft:chests/trial_chambers/reward_ominous_unique",
+        "minecraft:archaeology/desert_pyramid",
+        "minecraft:archaeology/desert_well",
+        "minecraft:archaeology/ocean_ruin_cold",
+        "minecraft:archaeology/ocean_ruin_warm",
+        "minecraft:archaeology/trail_ruins_common",
+        "minecraft:archaeology/trail_ruins_rare",
+        "minecraft:gameplay/cat_morning_gift",
+        "minecraft:gameplay/fishing/fish",
+        "minecraft:gameplay/fishing/junk",
+        "minecraft:gameplay/fishing/treasure",
+        "minecraft:gameplay/piglin_bartering",
+        "minecraft:shearing/bogged",
+        "minecraft:entities/sheep/red",
+    ] {
+        assert!(ids.contains(&required), "missing catalogue table {required}");
+    }
+}
+
+#[test]
+fn v1211_adv_loot_ancient_city_rolls_are_seed_deterministic() {
+    for seed in [0i64, 1, 7, 42, 1_000_003] {
+        let first = catalogue_roll("minecraft:chests/ancient_city", seed);
+        let second = catalogue_roll("minecraft:chests/ancient_city", seed);
+        assert_eq!(first, second, "seed {seed} must be deterministic");
+        assert!(!first.is_empty(), "ancient_city seed {seed} produced nothing");
+        assert_valid_entries(&first);
+    }
+    // The sculk-table pool is famous for echo shards and enchanted books.
+    let mut saw_shard = false;
+    let mut saw_book = false;
+    for seed in 0..64i64 {
+        for entry in catalogue_roll("minecraft:chests/ancient_city", seed) {
+            saw_shard |= entry.item == "minecraft:echo_shard";
+            saw_book |= entry.item == "minecraft:enchanted_book";
+        }
+    }
+    assert!(saw_shard, "echo_shard never rolled in 64 seeds");
+    assert!(saw_book, "enchanted_book never rolled in 64 seeds");
+}
+
+#[test]
+fn v1211_adv_loot_bastion_tables_roll_deterministic_treasure() {
+    for id in [
+        "minecraft:chests/bastion_bridge",
+        "minecraft:chests/bastion_hoglin_stable",
+        "minecraft:chests/bastion_other",
+        "minecraft:chests/bastion_treasure",
+    ] {
+        for seed in [3i64, 99, 4_242] {
+            let first = catalogue_roll(id, seed);
+            assert_eq!(first, catalogue_roll(id, seed), "{id} seed {seed}");
+            assert!(!first.is_empty(), "{id} seed {seed} empty");
+            assert_valid_entries(&first);
+        }
+        // Bastion treasure is the only table carrying netherite scraps/ingots
+        // and ancient debris-adjacent rares; sweep seeds for coverage.
+        let mut saw_rare = false;
+        for seed in 0..96i64 {
+            saw_rare |= catalogue_roll(id, seed)
+                .iter()
+                .any(|e| matches!(e.item, "minecraft:netherite_scrap" | "minecraft:netherite_ingot" | "minecraft:soul_elytra" | "minecraft:netherite_upgrade_smithing_template"));
+        }
+        if id == "minecraft:chests/bastion_treasure" {
+            assert!(saw_rare, "bastion_treasure never rolled a rare across 96 seeds");
+        }
+    }
+}
+
+#[test]
+fn v1211_adv_loot_trial_chamber_tables_cover_reward_spectrums() {
+    for id in [
+        "minecraft:chests/trial_chambers/corridor",
+        "minecraft:chests/trial_chambers/entrance",
+        "minecraft:chests/trial_chambers/intersection",
+        "minecraft:chests/trial_chambers/reward",
+        "minecraft:chests/trial_chambers/reward_common",
+        "minecraft:chests/trial_chambers/reward_rare",
+        "minecraft:chests/trial_chambers/reward_unique",
+        "minecraft:chests/trial_chambers/reward_ominous_common",
+        "minecraft:chests/trial_chambers/reward_ominous_rare",
+        "minecraft:chests/trial_chambers/reward_ominous_unique",
+        "minecraft:chests/trial_chambers/supply",
+        "minecraft:pots/trial_chambers/corridor",
+        "minecraft:dispensers/trial_chambers/corridor",
+        "minecraft:spawners/trial_chamber/key",
+        "minecraft:spawners/trial_chamber/consumables",
+    ] {
+        for seed in [11i64, 777] {
+            let first = catalogue_roll(id, seed);
+            assert_eq!(first, catalogue_roll(id, seed), "{id} seed {seed}");
+            assert!(!first.is_empty(), "{id} seed {seed} produced nothing");
+            assert_valid_entries(&first);
+        }
+    }
+    // Equipment tables gate every armor piece behind independent 50% pools, so
+    // a single roll may legitimately be empty; across seeds they must produce
+    // real armor.
+    for id in [
+        "minecraft:equipment/trial_chamber",
+        "minecraft:equipment/trial_chamber_melee",
+        "minecraft:equipment/trial_chamber_ranged",
+    ] {
+        for seed in [11i64, 777] {
+            let first = catalogue_roll(id, seed);
+            assert_eq!(first, catalogue_roll(id, seed), "{id} seed {seed}");
+            assert_valid_entries(&first);
+        }
+        let mut saw_armor = false;
+        for seed in 0..64i64 {
+            saw_armor |= catalogue_roll(id, seed)
+                .iter()
+                .any(|e| e.item.ends_with("_helmet") || e.item.ends_with("_chestplate") || e.item.ends_with("_leggings") || e.item.ends_with("_boots"));
+        }
+        assert!(saw_armor, "{id} never produced armor across 64 seeds");
+    }
+    // reward_ominous_unique is the heavy hitter: breeze rod / heavy core.
+    let mut saw_unique = false;
+    for seed in 0..128i64 {
+        saw_unique |= catalogue_roll("minecraft:chests/trial_chambers/reward_ominous_unique", seed)
+            .iter()
+            .any(|e| matches!(e.item, "minecraft:breeze_rod" | "minecraft:heavy_core" | "minecraft:wind_charge"));
+    }
+    assert!(saw_unique, "ominous_unique never produced its signature drops");
+}
+
+#[test]
+fn v1211_adv_loot_archaeology_tables_roll_sherds_and_pottery() {
+    for id in [
+        "minecraft:archaeology/desert_pyramid",
+        "minecraft:archaeology/desert_well",
+        "minecraft:archaeology/ocean_ruin_cold",
+        "minecraft:archaeology/ocean_ruin_warm",
+        "minecraft:archaeology/trail_ruins_common",
+        "minecraft:archaeology/trail_ruins_rare",
+    ] {
+        for seed in [5i64, 31337] {
+            let first = catalogue_roll(id, seed);
+            assert_eq!(first, catalogue_roll(id, seed), "{id} seed {seed}");
+            assert!(!first.is_empty(), "{id} seed {seed} produced nothing");
+            assert_valid_entries(&first);
+        }
+    }
+    // Desert pyramid brushing yields pottery sherds or precious items.
+    let mut saw_sherd = false;
+    for seed in 0..64i64 {
+        saw_sherd |= catalogue_roll("minecraft:archaeology/desert_pyramid", seed)
+            .iter()
+            .any(|e| e.item.contains("sherd") || e.item == "minecraft:suspicious_sand");
+    }
+    assert!(saw_sherd, "desert_pyramid never produced sherds/sand");
+}
+
+#[test]
+fn v1211_adv_loot_nested_entity_tables_resolve_through_catalogue() {
+    // entities/sheep/<color> rolls its own wool plus the shared mutton table.
+    for color in ["red", "blue", "white"] {
+        let entries = catalogue_roll(&format!("minecraft:entities/sheep/{color}"), 21);
+        assert_eq!(entries, catalogue_roll(&format!("minecraft:entities/sheep/{color}"), 21));
+        assert!(
+            entries.iter().any(|e| e.item == format!("minecraft:{color}_wool")),
+            "{color} sheep missing {color}_wool: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| e.item == "minecraft:mutton"),
+            "{color} sheep missing nested mutton drop: {entries:?}"
+        );
+    }
+    // Creeper drops gunpowder unconditionally; the skeleton-only music-disc
+    // pool stays closed without attacker context.
+    let creeper = catalogue_roll("minecraft:entities/creeper", 9);
+    assert!(creeper.iter().any(|e| e.item == "minecraft:gunpowder"));
+    assert!(!creeper.iter().any(|e| e.item.starts_with("minecraft:music_disc_")));
+}
+
+#[test]
+fn v1211_adv_loot_gameplay_and_shearing_tables_are_reachable() {
+    for id in [
+        "minecraft:gameplay/cat_morning_gift",
+        "minecraft:gameplay/piglin_bartering",
+        "minecraft:gameplay/sniffer_digging",
+        "minecraft:gameplay/fishing/fish",
+        "minecraft:gameplay/fishing/junk",
+        "minecraft:gameplay/fishing/treasure",
+        "minecraft:shearing/bogged",
+        "minecraft:gameplay/hero_of_the_village/armorer_gift",
+        "minecraft:gameplay/hero_of_the_village/weaponsmith_gift",
+    ] {
+        let first = catalogue_roll(id, 17);
+        assert_eq!(first, catalogue_roll(id, 17), "{id} not deterministic");
+        assert!(!first.is_empty(), "{id} produced nothing");
+        assert_valid_entries(&first);
+    }
+    // panda_sneeze is a gift table whose slime_ball sits at weight 1 against a
+    // weight-699 empty entry, so a single roll is empty almost every time; over
+    // enough deterministic seeds the rare drop must still surface.
+    assert_eq!(
+        catalogue_roll("minecraft:gameplay/panda_sneeze", 17),
+        catalogue_roll("minecraft:gameplay/panda_sneeze", 17),
+        "panda_sneeze not deterministic"
+    );
+    let mut saw_slime = false;
+    for seed in 0..8192i64 {
+        saw_slime |= catalogue_roll("minecraft:gameplay/panda_sneeze", seed)
+            .iter()
+            .any(|e| e.item == "minecraft:slime_ball");
+        if saw_slime {
+            break;
+        }
+    }
+    assert!(saw_slime, "panda_sneeze never produced slime_ball");
+    // Piglin bartering is the enchanted-gear-and-rare-mats table.
+    let mut saw_barter_good = false;
+    for seed in 0..64i64 {
+        saw_barter_good |= catalogue_roll("minecraft:gameplay/piglin_bartering", seed)
+            .iter()
+            .any(|e| matches!(e.item, "minecraft:obsidian" | "minecraft:fire_charge" | "minecraft:blackstone" | "minecraft:spectral_arrow" | "minecraft:ender_pearl"));
+    }
+    assert!(saw_barter_good, "piglin_bartering never produced its rare drops across 64 seeds");
 }

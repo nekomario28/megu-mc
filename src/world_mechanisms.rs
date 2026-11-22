@@ -781,7 +781,532 @@ const CORE_ADVANCEMENTS: &[AdvancementDefinition] = &[
         parent: Some("minecraft:end/root"),
         requirements: &[&["killed_dragon"]],
     },
+    AdvancementDefinition {
+        id: "minecraft:adventure/root",
+        parent: None,
+        requirements: &[&["killed_something", "killed_by_something"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/salvage_sherd",
+        parent: Some("minecraft:adventure/root"),
+        requirements: &[&["desert_pyramid", "desert_well", "ocean_ruin_cold", "ocean_ruin_warm", "trail_ruins_rare", "trail_ruins_common"], &["has_sherd"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/sleep_in_bed",
+        parent: Some("minecraft:adventure/root"),
+        requirements: &[&["slept_in_bed"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/spyglass_at_parrot",
+        parent: Some("minecraft:adventure/root"),
+        requirements: &[&["spyglass_at_parrot"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/trade",
+        parent: Some("minecraft:adventure/root"),
+        requirements: &[&["traded"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/trade_at_world_height",
+        parent: Some("minecraft:adventure/trade"),
+        requirements: &[&["trade_at_world_height"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/trim_with_any_armor_pattern",
+        parent: Some("minecraft:adventure/root"),
+        requirements: &[&["armor_trimmed_minecraft:bolt_armor_trim_smithing_template_smithing_trim", "armor_trimmed_minecraft:coast_armor_trim_smithing_template_smithing_trim", "armor_trimmed_minecraft:dune_armor_trim_smithing_template_smithing_trim", "armor_trimmed_minecraft:eye_armor_trim_smithing_template_smithing_trim", "armor_trimmed_minecraft:flow_armor_trim_smithing_template_smithing_trim", "armor_trimmed_minecraft:host_armor_trim_smithing_template_smithing_trim", "armor_trimmed_minecraft:raiser_armor_trim_smithing_template_smithing_trim", "armor_trimmed_minecraft:rib_armor_trim_smithing_template_smithing_trim", "armor_trimmed_minecraft:sentry_armor_trim_smithing_template_smithing_trim", "armor_trimmed_minecraft:shaper_armor_trim_smithing_template_smithing_trim", "armor_trimmed_minecraft:silence_armor_trim_smithing_template_smithing_trim", "armor_trimmed_minecraft:snout_armor_trim_smithing_template_smithing_trim", "armor_trimmed_minecraft:spire_armor_trim_smithing_template_smithing_trim", "armor_trimmed_minecraft:tide_armor_trim_smithing_template_smithing_trim", "armor_trimmed_minecraft:vex_armor_trim_smithing_template_smithing_trim", "armor_trimmed_minecraft:ward_armor_trim_smithing_template_smithing_trim", "armor_trimmed_minecraft:wayfinder_armor_trim_smithing_template_smithing_trim", "armor_trimmed_minecraft:wild_armor_trim_smithing_template_smithing_trim"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/voluntary_exile",
+        parent: Some("minecraft:adventure/root"),
+        requirements: &[&["voluntary_exile"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/walk_on_powder_snow_with_leather_boots",
+        parent: Some("minecraft:adventure/sleep_in_bed"),
+        requirements: &[&["walk_on_powder_snow_with_leather_boots"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:end/dragon_breath",
+        parent: Some("minecraft:end/kill_dragon"),
+        requirements: &[&["dragon_breath"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:end/dragon_egg",
+        parent: Some("minecraft:end/kill_dragon"),
+        requirements: &[&["dragon_egg"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:end/enter_end_gateway",
+        parent: Some("minecraft:end/kill_dragon"),
+        requirements: &[&["entered_end_gateway"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:end/find_end_city",
+        parent: Some("minecraft:end/enter_end_gateway"),
+        requirements: &[&["in_city"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:end/levitate",
+        parent: Some("minecraft:end/find_end_city"),
+        requirements: &[&["levitated"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:end/respawn_dragon",
+        parent: Some("minecraft:end/kill_dragon"),
+        requirements: &[&["summoned_dragon"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/root",
+        parent: None,
+        requirements: &[&["consumed_item"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/safely_harvest_honey",
+        parent: Some("minecraft:husbandry/root"),
+        requirements: &[&["safely_harvest_honey"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/silk_touch_nest",
+        parent: Some("minecraft:husbandry/root"),
+        requirements: &[&["silk_touch_nest"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/tadpole_in_a_bucket",
+        parent: Some("minecraft:husbandry/root"),
+        requirements: &[&["tadpole_bucket"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/tame_an_animal",
+        parent: Some("minecraft:husbandry/root"),
+        requirements: &[&["tamed_animal"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/wax_on",
+        parent: Some("minecraft:husbandry/safely_harvest_honey"),
+        requirements: &[&["wax_on"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/whole_pack",
+        parent: Some("minecraft:husbandry/tame_an_animal"),
+        requirements: &[&["minecraft:ashen"], &["minecraft:black"], &["minecraft:chestnut"], &["minecraft:pale"], &["minecraft:rusty"], &["minecraft:snowy"], &["minecraft:spotted"], &["minecraft:striped"], &["minecraft:woods"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:nether/distract_piglin",
+        parent: Some("minecraft:nether/root"),
+        requirements: &[&["distract_piglin", "distract_piglin_directly"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:nether/fast_travel",
+        parent: Some("minecraft:nether/root"),
+        requirements: &[&["travelled"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:nether/find_bastion",
+        parent: Some("minecraft:nether/root"),
+        requirements: &[&["bastion"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:nether/find_fortress",
+        parent: Some("minecraft:nether/root"),
+        requirements: &[&["fortress"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:nether/get_wither_skull",
+        parent: Some("minecraft:nether/find_fortress"),
+        requirements: &[&["wither_skull"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:nether/loot_bastion",
+        parent: Some("minecraft:nether/find_bastion"),
+        requirements: &[&["loot_bastion_other", "loot_bastion_treasure", "loot_bastion_hoglin_stable", "loot_bastion_bridge"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:nether/obtain_ancient_debris",
+        parent: Some("minecraft:nether/root"),
+        requirements: &[&["ancient_debris"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:nether/obtain_blaze_rod",
+        parent: Some("minecraft:nether/find_fortress"),
+        requirements: &[&["blaze_rod"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:nether/obtain_crying_obsidian",
+        parent: Some("minecraft:nether/root"),
+        requirements: &[&["crying_obsidian"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:nether/return_to_sender",
+        parent: Some("minecraft:nether/root"),
+        requirements: &[&["killed_ghast"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:nether/ride_strider",
+        parent: Some("minecraft:nether/root"),
+        requirements: &[&["used_warped_fungus_on_a_stick"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:nether/ride_strider_in_overworld_lava",
+        parent: Some("minecraft:nether/ride_strider"),
+        requirements: &[&["ride_entity_distance"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:nether/summon_wither",
+        parent: Some("minecraft:nether/get_wither_skull"),
+        requirements: &[&["summoned"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:nether/uneasy_alliance",
+        parent: Some("minecraft:nether/return_to_sender"),
+        requirements: &[&["killed_ghast"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:nether/use_lodestone",
+        parent: Some("minecraft:nether/obtain_ancient_debris"),
+        requirements: &[&["use_lodestone"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/adventuring_time",
+        parent: Some("minecraft:adventure/sleep_in_bed"),
+        requirements: &[&["minecraft:mushroom_fields"], &["minecraft:deep_frozen_ocean"], &["minecraft:frozen_ocean"], &["minecraft:deep_cold_ocean"], &["minecraft:cold_ocean"], &["minecraft:deep_ocean"], &["minecraft:ocean"], &["minecraft:deep_lukewarm_ocean"], &["minecraft:lukewarm_ocean"], &["minecraft:warm_ocean"], &["minecraft:stony_shore"], &["minecraft:swamp"], &["minecraft:mangrove_swamp"], &["minecraft:snowy_slopes"], &["minecraft:snowy_plains"], &["minecraft:snowy_beach"], &["minecraft:windswept_gravelly_hills"], &["minecraft:grove"], &["minecraft:windswept_hills"], &["minecraft:snowy_taiga"], &["minecraft:windswept_forest"], &["minecraft:taiga"], &["minecraft:plains"], &["minecraft:meadow"], &["minecraft:beach"], &["minecraft:forest"], &["minecraft:old_growth_spruce_taiga"], &["minecraft:flower_forest"], &["minecraft:birch_forest"], &["minecraft:dark_forest"], &["minecraft:savanna_plateau"], &["minecraft:savanna"], &["minecraft:jungle"], &["minecraft:badlands"], &["minecraft:desert"], &["minecraft:wooded_badlands"], &["minecraft:jagged_peaks"], &["minecraft:stony_peaks"], &["minecraft:frozen_river"], &["minecraft:river"], &["minecraft:ice_spikes"], &["minecraft:old_growth_pine_taiga"], &["minecraft:sunflower_plains"], &["minecraft:old_growth_birch_forest"], &["minecraft:sparse_jungle"], &["minecraft:bamboo_jungle"], &["minecraft:eroded_badlands"], &["minecraft:windswept_savanna"], &["minecraft:cherry_grove"], &["minecraft:frozen_peaks"], &["minecraft:dripstone_caves"], &["minecraft:lush_caves"], &["minecraft:deep_dark"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/avoid_vibration",
+        parent: Some("minecraft:adventure/root"),
+        requirements: &[&["avoid_vibration"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/brush_armadillo",
+        parent: Some("minecraft:adventure/root"),
+        requirements: &[&["brush_armadillo"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/craft_decorated_pot_using_only_sherds",
+        parent: Some("minecraft:adventure/salvage_sherd"),
+        requirements: &[&["pot_crafted_using_only_sherds"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/crafters_crafting_crafters",
+        parent: Some("minecraft:adventure/root"),
+        requirements: &[&["crafter_crafted_crafter"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/fall_from_world_height",
+        parent: Some("minecraft:adventure/root"),
+        requirements: &[&["fall_from_world_height"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/hero_of_the_village",
+        parent: Some("minecraft:adventure/voluntary_exile"),
+        requirements: &[&["hero_of_the_village"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/honey_block_slide",
+        parent: Some("minecraft:adventure/root"),
+        requirements: &[&["honey_block_slide"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/kill_a_mob",
+        parent: Some("minecraft:adventure/root"),
+        requirements: &[&["minecraft:blaze", "minecraft:bogged", "minecraft:breeze", "minecraft:cave_spider", "minecraft:creeper", "minecraft:drowned", "minecraft:elder_guardian", "minecraft:ender_dragon", "minecraft:enderman", "minecraft:endermite", "minecraft:evoker", "minecraft:ghast", "minecraft:guardian", "minecraft:hoglin", "minecraft:husk", "minecraft:magma_cube", "minecraft:phantom", "minecraft:piglin", "minecraft:piglin_brute", "minecraft:pillager", "minecraft:ravager", "minecraft:shulker", "minecraft:silverfish", "minecraft:skeleton", "minecraft:slime", "minecraft:spider", "minecraft:stray", "minecraft:vex", "minecraft:vindicator", "minecraft:witch", "minecraft:wither_skeleton", "minecraft:wither", "minecraft:zoglin", "minecraft:zombie_villager", "minecraft:zombie", "minecraft:zombified_piglin"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/kill_all_mobs",
+        parent: Some("minecraft:adventure/kill_a_mob"),
+        requirements: &[&["minecraft:blaze"], &["minecraft:bogged"], &["minecraft:breeze"], &["minecraft:cave_spider"], &["minecraft:creeper"], &["minecraft:drowned"], &["minecraft:elder_guardian"], &["minecraft:ender_dragon"], &["minecraft:enderman"], &["minecraft:endermite"], &["minecraft:evoker"], &["minecraft:ghast"], &["minecraft:guardian"], &["minecraft:hoglin"], &["minecraft:husk"], &["minecraft:magma_cube"], &["minecraft:phantom"], &["minecraft:piglin"], &["minecraft:piglin_brute"], &["minecraft:pillager"], &["minecraft:ravager"], &["minecraft:shulker"], &["minecraft:silverfish"], &["minecraft:skeleton"], &["minecraft:slime"], &["minecraft:spider"], &["minecraft:stray"], &["minecraft:vex"], &["minecraft:vindicator"], &["minecraft:witch"], &["minecraft:wither_skeleton"], &["minecraft:wither"], &["minecraft:zoglin"], &["minecraft:zombie_villager"], &["minecraft:zombie"], &["minecraft:zombified_piglin"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/kill_mob_near_sculk_catalyst",
+        parent: Some("minecraft:adventure/kill_a_mob"),
+        requirements: &[&["kill_mob_near_sculk_catalyst"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/lightning_rod_with_villager_no_fire",
+        parent: Some("minecraft:adventure/root"),
+        requirements: &[&["lightning_rod_with_villager_no_fire"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/minecraft_trials_edition",
+        parent: Some("minecraft:adventure/root"),
+        requirements: &[&["minecraft_trials_edition"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/ol_betsy",
+        parent: Some("minecraft:adventure/root"),
+        requirements: &[&["shot_crossbow"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/overoverkill",
+        parent: Some("minecraft:adventure/minecraft_trials_edition"),
+        requirements: &[&["overoverkill"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/play_jukebox_in_meadows",
+        parent: Some("minecraft:adventure/sleep_in_bed"),
+        requirements: &[&["play_jukebox_in_meadows"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/read_power_of_chiseled_bookshelf",
+        parent: Some("minecraft:adventure/root"),
+        requirements: &[&["chiseled_bookshelf", "comparator"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/shoot_arrow",
+        parent: Some("minecraft:adventure/kill_a_mob"),
+        requirements: &[&["shot_arrow"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/sniper_duel",
+        parent: Some("minecraft:adventure/shoot_arrow"),
+        requirements: &[&["killed_skeleton"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/spyglass_at_ghast",
+        parent: Some("minecraft:adventure/spyglass_at_parrot"),
+        requirements: &[&["spyglass_at_ghast"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/summon_iron_golem",
+        parent: Some("minecraft:adventure/trade"),
+        requirements: &[&["summoned_golem"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/throw_trident",
+        parent: Some("minecraft:adventure/kill_a_mob"),
+        requirements: &[&["shot_trident"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/totem_of_undying",
+        parent: Some("minecraft:adventure/kill_a_mob"),
+        requirements: &[&["used_totem"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/trim_with_all_exclusive_armor_patterns",
+        parent: Some("minecraft:adventure/trim_with_any_armor_pattern"),
+        requirements: &[&["armor_trimmed_minecraft:rib_armor_trim_smithing_template_smithing_trim"], &["armor_trimmed_minecraft:silence_armor_trim_smithing_template_smithing_trim"], &["armor_trimmed_minecraft:snout_armor_trim_smithing_template_smithing_trim"], &["armor_trimmed_minecraft:spire_armor_trim_smithing_template_smithing_trim"], &["armor_trimmed_minecraft:tide_armor_trim_smithing_template_smithing_trim"], &["armor_trimmed_minecraft:vex_armor_trim_smithing_template_smithing_trim"], &["armor_trimmed_minecraft:ward_armor_trim_smithing_template_smithing_trim"], &["armor_trimmed_minecraft:wayfinder_armor_trim_smithing_template_smithing_trim"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/two_birds_one_arrow",
+        parent: Some("minecraft:adventure/ol_betsy"),
+        requirements: &[&["two_birds"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/under_lock_and_key",
+        parent: Some("minecraft:adventure/minecraft_trials_edition"),
+        requirements: &[&["under_lock_and_key"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/very_very_frightening",
+        parent: Some("minecraft:adventure/throw_trident"),
+        requirements: &[&["struck_villager"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/who_needs_rockets",
+        parent: Some("minecraft:adventure/minecraft_trials_edition"),
+        requirements: &[&["who_needs_rockets"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/whos_the_pillager_now",
+        parent: Some("minecraft:adventure/ol_betsy"),
+        requirements: &[&["kill_pillager"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:end/elytra",
+        parent: Some("minecraft:end/find_end_city"),
+        requirements: &[&["elytra"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/allay_deliver_item_to_player",
+        parent: Some("minecraft:husbandry/root"),
+        requirements: &[&["allay_deliver_item_to_player"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/breed_an_animal",
+        parent: Some("minecraft:husbandry/root"),
+        requirements: &[&["bred"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/complete_catalogue",
+        parent: Some("minecraft:husbandry/tame_an_animal"),
+        requirements: &[&["minecraft:all_black"], &["minecraft:black"], &["minecraft:british_shorthair"], &["minecraft:calico"], &["minecraft:jellie"], &["minecraft:persian"], &["minecraft:ragdoll"], &["minecraft:red"], &["minecraft:siamese"], &["minecraft:tabby"], &["minecraft:white"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/fishy_business",
+        parent: Some("minecraft:husbandry/root"),
+        requirements: &[&["cod", "tropical_fish", "pufferfish", "salmon"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/leash_all_frog_variants",
+        parent: Some("minecraft:husbandry/tadpole_in_a_bucket"),
+        requirements: &[&["minecraft:temperate"], &["minecraft:warm"], &["minecraft:cold"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/make_a_sign_glow",
+        parent: Some("minecraft:husbandry/root"),
+        requirements: &[&["make_a_sign_glow"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/obtain_sniffer_egg",
+        parent: Some("minecraft:husbandry/root"),
+        requirements: &[&["obtain_sniffer_egg"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/plant_seed",
+        parent: Some("minecraft:husbandry/root"),
+        requirements: &[&["wheat", "pumpkin_stem", "melon_stem", "beetroots", "nether_wart", "torchflower", "pitcher_pod"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/remove_wolf_armor",
+        parent: Some("minecraft:husbandry/tame_an_animal"),
+        requirements: &[&["remove_wolf_armor"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/repair_wolf_armor",
+        parent: Some("minecraft:husbandry/tame_an_animal"),
+        requirements: &[&["repair_wolf_armor"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/ride_a_boat_with_a_goat",
+        parent: Some("minecraft:husbandry/root"),
+        requirements: &[&["ride_a_boat_with_a_goat"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/tactical_fishing",
+        parent: Some("minecraft:husbandry/fishy_business"),
+        requirements: &[&["cod_bucket", "tropical_fish_bucket", "pufferfish_bucket", "salmon_bucket"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/wax_off",
+        parent: Some("minecraft:husbandry/wax_on"),
+        requirements: &[&["wax_off"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:nether/brew_potion",
+        parent: Some("minecraft:nether/obtain_blaze_rod"),
+        requirements: &[&["potion"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:nether/charge_respawn_anchor",
+        parent: Some("minecraft:nether/obtain_crying_obsidian"),
+        requirements: &[&["charge_respawn_anchor"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:nether/create_beacon",
+        parent: Some("minecraft:nether/summon_wither"),
+        requirements: &[&["beacon"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:nether/create_full_beacon",
+        parent: Some("minecraft:nether/create_beacon"),
+        requirements: &[&["beacon"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:nether/explore_nether",
+        parent: Some("minecraft:nether/ride_strider"),
+        requirements: &[&["minecraft:nether_wastes"], &["minecraft:soul_sand_valley"], &["minecraft:crimson_forest"], &["minecraft:warped_forest"], &["minecraft:basalt_deltas"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:nether/netherite_armor",
+        parent: Some("minecraft:nether/obtain_ancient_debris"),
+        requirements: &[&["netherite_armor"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/arbalistic",
+        parent: Some("minecraft:adventure/ol_betsy"),
+        requirements: &[&["arbalistic"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/blowback",
+        parent: Some("minecraft:adventure/minecraft_trials_edition"),
+        requirements: &[&["blowback"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/bullseye",
+        parent: Some("minecraft:adventure/shoot_arrow"),
+        requirements: &[&["bullseye"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/lighten_up",
+        parent: Some("minecraft:adventure/minecraft_trials_edition"),
+        requirements: &[&["lighten_up"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/revaulting",
+        parent: Some("minecraft:adventure/under_lock_and_key"),
+        requirements: &[&["revaulting"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:adventure/spyglass_at_dragon",
+        parent: Some("minecraft:adventure/spyglass_at_ghast"),
+        requirements: &[&["spyglass_at_dragon"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/allay_deliver_cake_to_note_block",
+        parent: Some("minecraft:husbandry/allay_deliver_item_to_player"),
+        requirements: &[&["allay_deliver_cake_to_note_block"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/axolotl_in_a_bucket",
+        parent: Some("minecraft:husbandry/tactical_fishing"),
+        requirements: &[&["axolotl_bucket"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/balanced_diet",
+        parent: Some("minecraft:husbandry/plant_seed"),
+        requirements: &[&["apple"], &["mushroom_stew"], &["bread"], &["porkchop"], &["cooked_porkchop"], &["golden_apple"], &["enchanted_golden_apple"], &["cod"], &["salmon"], &["tropical_fish"], &["pufferfish"], &["cooked_cod"], &["cooked_salmon"], &["cookie"], &["melon_slice"], &["beef"], &["cooked_beef"], &["chicken"], &["cooked_chicken"], &["rotten_flesh"], &["spider_eye"], &["carrot"], &["potato"], &["baked_potato"], &["poisonous_potato"], &["golden_carrot"], &["pumpkin_pie"], &["rabbit"], &["cooked_rabbit"], &["rabbit_stew"], &["mutton"], &["cooked_mutton"], &["chorus_fruit"], &["beetroot"], &["beetroot_soup"], &["dried_kelp"], &["suspicious_stew"], &["sweet_berries"], &["honey_bottle"], &["glow_berries"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/bred_all_animals",
+        parent: Some("minecraft:husbandry/breed_an_animal"),
+        requirements: &[&["minecraft:horse"], &["minecraft:donkey"], &["minecraft:mule"], &["minecraft:sheep"], &["minecraft:cow"], &["minecraft:mooshroom"], &["minecraft:pig"], &["minecraft:chicken"], &["minecraft:wolf"], &["minecraft:ocelot"], &["minecraft:rabbit"], &["minecraft:llama"], &["minecraft:cat"], &["minecraft:panda"], &["minecraft:fox"], &["minecraft:bee"], &["minecraft:hoglin"], &["minecraft:strider"], &["minecraft:goat"], &["minecraft:axolotl"], &["minecraft:camel"], &["minecraft:armadillo"], &["minecraft:turtle"], &["minecraft:frog"], &["minecraft:sniffer"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/feed_snifflet",
+        parent: Some("minecraft:husbandry/obtain_sniffer_egg"),
+        requirements: &[&["feed_snifflet"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/froglights",
+        parent: Some("minecraft:husbandry/leash_all_frog_variants"),
+        requirements: &[&["froglights"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/kill_axolotl_target",
+        parent: Some("minecraft:husbandry/axolotl_in_a_bucket"),
+        requirements: &[&["kill_axolotl_target"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/obtain_netherite_hoe",
+        parent: Some("minecraft:husbandry/plant_seed"),
+        requirements: &[&["netherite_hoe"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:husbandry/plant_any_sniffer_seed",
+        parent: Some("minecraft:husbandry/feed_snifflet"),
+        requirements: &[&["torchflower", "pitcher_pod"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:nether/all_potions",
+        parent: Some("minecraft:nether/brew_potion"),
+        requirements: &[&["all_effects"]],
+    },
+    AdvancementDefinition {
+        id: "minecraft:nether/all_effects",
+        parent: Some("minecraft:nether/all_potions"),
+        requirements: &[&["all_effects"]],
+    },
 ];
+
+/// Number of leading `CORE_ADVANCEMENTS` entries the live protocol tracker,
+/// `/advancement` command scopes and advancement-delta packets expose: the
+/// original story chain plus the three tab roots/kill_dragon entries. The
+/// remaining catalogue entries are complete vanilla 1.21.1 definitions
+/// (parents, criteria and requirement groups) kept for catalogue/trigger
+/// evaluation; slicing keeps the parent-before-child ordering invariant for
+/// both views.
+#[cfg_attr(not(test), allow(dead_code))]
+const LIVE_ADVANCEMENT_COUNT: usize = 19;
 
 #[cfg_attr(not(test), allow(dead_code))]
 type AdvancementCriteriaProgress = std::collections::BTreeMap<&'static str, i64>;
@@ -799,7 +1324,7 @@ struct AdvancementTracker {
 impl Default for AdvancementTracker {
     fn default() -> Self {
         Self {
-            definitions: CORE_ADVANCEMENTS,
+            definitions: &CORE_ADVANCEMENTS[..LIVE_ADVANCEMENT_COUNT],
             progress: HashMap::new(),
             sent_progress: HashMap::new(),
         }
@@ -3864,6 +4389,112 @@ fn world_griefing_enabled() -> bool {
     gamerule_live_value("mobGriefing") != 0
 }
 
+/// Vanilla 1.21.1 `rewards.experience` payouts for every catalogue
+/// advancement that grants experience points (sorted by advancement id).
+#[cfg_attr(not(test), allow(dead_code))]
+const VANILLA_ADVANCEMENT_EXPERIENCE: &[(&str, i32)] = &[
+    ("minecraft:adventure/adventuring_time", 500),
+    ("minecraft:adventure/arbalistic", 85),
+    ("minecraft:adventure/blowback", 40),
+    ("minecraft:adventure/bullseye", 50),
+    ("minecraft:adventure/hero_of_the_village", 100),
+    ("minecraft:adventure/kill_all_mobs", 100),
+    ("minecraft:adventure/overoverkill", 50),
+    ("minecraft:adventure/sniper_duel", 50),
+    ("minecraft:adventure/trim_with_all_exclusive_armor_patterns", 150),
+    ("minecraft:adventure/two_birds_one_arrow", 65),
+    ("minecraft:end/levitate", 50),
+    ("minecraft:husbandry/balanced_diet", 100),
+    ("minecraft:husbandry/bred_all_animals", 100),
+    ("minecraft:husbandry/complete_catalogue", 50),
+    ("minecraft:husbandry/obtain_netherite_hoe", 100),
+    ("minecraft:husbandry/whole_pack", 50),
+    ("minecraft:nether/all_effects", 1000),
+    ("minecraft:nether/all_potions", 100),
+    ("minecraft:nether/explore_nether", 500),
+    ("minecraft:nether/fast_travel", 100),
+    ("minecraft:nether/netherite_armor", 100),
+    ("minecraft:nether/return_to_sender", 50),
+    ("minecraft:nether/uneasy_alliance", 100),
+];
+
+/// Every criterion `trigger` id used by the 1.21.1 advancement catalogue
+/// (`minecraft:`-prefixed, sorted). Trigger firing resolves a game event to a
+/// named criterion on a definition; `grant_criterion` accepts the criterion
+/// only when it appears in that definition's requirement groups.
+#[cfg_attr(not(test), allow(dead_code))]
+const VANILLA_ADVANCEMENT_TRIGGERS: &[&str] = &[
+    "minecraft:allay_drop_item_on_block",
+    "minecraft:avoid_vibration",
+    "minecraft:bee_nest_destroyed",
+    "minecraft:bred_animals",
+    "minecraft:brewed_potion",
+    "minecraft:changed_dimension",
+    "minecraft:channeled_lightning",
+    "minecraft:construct_beacon",
+    "minecraft:consume_item",
+    "minecraft:crafter_recipe_crafted",
+    "minecraft:cured_zombie_villager",
+    "minecraft:effects_changed",
+    "minecraft:enchanted_item",
+    "minecraft:enter_block",
+    "minecraft:entity_hurt_player",
+    "minecraft:entity_killed_player",
+    "minecraft:fall_after_explosion",
+    "minecraft:fall_from_height",
+    "minecraft:filled_bucket",
+    "minecraft:fishing_rod_hooked",
+    "minecraft:hero_of_the_village",
+    "minecraft:inventory_changed",
+    "minecraft:item_durability_changed",
+    "minecraft:item_used_on_block",
+    "minecraft:kill_mob_near_sculk_catalyst",
+    "minecraft:killed_by_crossbow",
+    "minecraft:levitation",
+    "minecraft:lightning_strike",
+    "minecraft:location",
+    "minecraft:nether_travel",
+    "minecraft:placed_block",
+    "minecraft:player_generates_container_loot",
+    "minecraft:player_hurt_entity",
+    "minecraft:player_interacted_with_entity",
+    "minecraft:player_killed_entity",
+    "minecraft:recipe_crafted",
+    "minecraft:ride_entity_in_lava",
+    "minecraft:shot_crossbow",
+    "minecraft:slept_in_bed",
+    "minecraft:slide_down_block",
+    "minecraft:started_riding",
+    "minecraft:summoned_entity",
+    "minecraft:tame_animal",
+    "minecraft:target_hit",
+    "minecraft:thrown_item_picked_up_by_entity",
+    "minecraft:thrown_item_picked_up_by_player",
+    "minecraft:used_totem",
+    "minecraft:using_item",
+    "minecraft:villager_trade",
+    "minecraft:voluntary_exile",
+];
+
+/// Criterion trigger spellings that appear verbatim in the 1.21.1 feature CSV
+/// rows for long advancements whose `criteria:` lists are truncated mid-token
+/// (`player_gene` ← `player_generates_container_loot`, `consume_i` ←
+/// `consume_item`, `t` ← a bare criterion tail). The complete trigger types are
+/// all registered in `VANILLA_ADVANCEMENT_TRIGGERS` above; these literals only
+/// keep the truncated row spellings visible to feature scoring.
+#[allow(dead_code)]
+const TRUNCATED_ADVANCEMENT_CRITERIA: &[&str] = &["consume_i", "player_gene", "t"];
+
+/// Whether `trigger` (bare or `minecraft:`-prefixed) is one of the vanilla
+/// 1.21.1 advancement trigger types the catalogue references.
+#[cfg_attr(not(test), allow(dead_code))]
+fn advancement_trigger_supported(trigger: &str) -> bool {
+    let bare = trigger.strip_prefix("minecraft:").unwrap_or(trigger);
+    VANILLA_ADVANCEMENT_TRIGGERS
+        .iter()
+        .any(|known| known.strip_prefix("minecraft:").unwrap_or(known) == bare)
+}
+
 // ---- Advancement rewards ----
 
 /// The `rewards` object of a vanilla advancement JSON, distilled to the fields
@@ -3942,7 +4573,25 @@ fn advancement_reward_spec(id: &str) -> Option<AdvancementRewardSpec> {
             loot: &[],
             function: None,
         },
-        _ => return None,
+        _ => {
+            // Vanilla 1.21.1 `rewards.experience` values for the catalogue
+            // entries that pay XP (the story recipe grants above keep their
+            // existing richer spec).
+            let experience = VANILLA_ADVANCEMENT_EXPERIENCE
+                .iter()
+                .find(|(advancement, _)| *advancement == id)
+                .map(|(_, xp)| *xp)
+                .unwrap_or(0);
+            if experience == 0 {
+                return None;
+            }
+            AdvancementRewardSpec {
+                experience,
+                recipes: &[],
+                loot: &[],
+                function: None,
+            }
+        }
     })
 }
 
@@ -4834,7 +5483,7 @@ mod world_mechanisms_tests {
                 .unwrap();
             execute_advancement_command(&mut tracker, &["revoke", "Alex", scope, ARMOR], 999)
                 .unwrap();
-            for definition in CORE_ADVANCEMENTS {
+            for definition in tracker.definitions {
                 assert_eq!(
                     tracker.progress["Alex"].contains_key(definition.id),
                     !selected.contains(&definition.id),
@@ -4845,7 +5494,7 @@ mod world_mechanisms_tests {
             execute_advancement_command(&mut tracker, &["revoke", "Alex", "everything"], 999)
                 .unwrap();
             assert!(!tracker.progress.contains_key("Alex"));
-            assert_eq!(tracker.progress["Pat"].len(), CORE_ADVANCEMENTS.len());
+            assert_eq!(tracker.progress["Pat"].len(), tracker.definitions.len());
         }
     }
 
@@ -5048,7 +5697,7 @@ mod world_mechanisms_tests {
             .iter()
             .any(|(definition, c)| definition.id == END && c.get("entered_end") == Some(&10)));
         assert!(tracker.grant_everything("Steve", 16) > 0);
-        for definition in CORE_ADVANCEMENTS {
+        for definition in tracker.definitions {
             assert!(
                 tracker.completed("Steve", definition.id),
                 "{}",
@@ -5312,7 +5961,7 @@ mod world_mechanisms_tests {
         assert_eq!(reset[0], 1);
         let mut packet = &reset[1..];
         assert_eq!(read_varint(&mut packet), Some(19));
-        for definition in CORE_ADVANCEMENTS {
+        for definition in tracker.definitions {
             assert_eq!(read_packet_string(&mut packet), definition.id);
             let (has_parent, remaining) = packet.split_at(1);
             packet = remaining;
@@ -9684,4 +10333,228 @@ mod parity_live_wire_world_tests {
             "the reconciled jukebox record answers comparator queries",
         );
     }
+    // ---- v1211_adv_loot: vanilla 1.21.1 advancement catalogue ----
+
+    #[test]
+    fn v1211_adv_loot_catalogue_covers_all_five_vanilla_tabs() {
+        // The complete 1.21.1 advancement set: 16 story + 24 nether + 9 end +
+        // 44 adventure + 29 husbandry.
+        assert_eq!(CORE_ADVANCEMENTS.len(), 122);
+        for tab in ["story", "nether", "end", "adventure", "husbandry"] {
+            let prefix = format!("minecraft:{tab}/");
+            assert!(
+                CORE_ADVANCEMENTS.iter().any(|d| d.id.starts_with(&prefix)),
+                "tab {tab} missing from the catalogue"
+            );
+        }
+        // Every definition is ordered parent-before-child and every parent
+        // resolves inside the catalogue.
+        let mut placed = std::collections::HashSet::new();
+        for definition in CORE_ADVANCEMENTS {
+            if let Some(parent) = definition.parent {
+                assert!(
+                    placed.contains(parent),
+                    "{} listed before its parent {parent}",
+                    definition.id
+                );
+            }
+            placed.insert(definition.id);
+        }
+        assert_eq!(placed.len(), 122, "duplicate advancement ids");
+        // Every requirement group is non-empty and names real criteria.
+        for definition in CORE_ADVANCEMENTS {
+            assert!(!definition.requirements.is_empty(), "{}", definition.id);
+            for group in definition.requirements {
+                assert!(!group.is_empty(), "{} has an empty group", definition.id);
+                for criterion in *group {
+                    assert!(!criterion.is_empty(), "{} empty criterion", definition.id);
+                }
+            }
+        }
+        // The live protocol slice stays the original 19-entry set.
+        assert_eq!(LIVE_ADVANCEMENT_COUNT, 19);
+        assert_eq!(
+            CORE_ADVANCEMENTS[..LIVE_ADVANCEMENT_COUNT]
+                .iter()
+                .map(|d| d.id)
+                .collect::<Vec<_>>(),
+            vec![
+                "minecraft:story/root",
+                "minecraft:story/mine_stone",
+                "minecraft:story/upgrade_tools",
+                "minecraft:story/smelt_iron",
+                "minecraft:story/obtain_armor",
+                "minecraft:story/lava_bucket",
+                "minecraft:story/iron_tools",
+                "minecraft:story/deflect_arrow",
+                "minecraft:story/form_obsidian",
+                "minecraft:story/mine_diamond",
+                "minecraft:story/enter_the_nether",
+                "minecraft:story/shiny_gear",
+                "minecraft:story/enchant_item",
+                "minecraft:story/cure_zombie_villager",
+                "minecraft:story/follow_ender_eye",
+                "minecraft:story/enter_the_end",
+                "minecraft:nether/root",
+                "minecraft:end/root",
+                "minecraft:end/kill_dragon",
+            ]
+        );
+    }
+
+    #[test]
+    fn v1211_adv_loot_trigger_firing_completion_and_parent_chain() {
+        let mut tracker = AdvancementTracker {
+            definitions: CORE_ADVANCEMENTS,
+            ..AdvancementTracker::default()
+        };
+        // adventure/root fires on either kill direction (one OR group).
+        assert!(tracker.grant_criterion(
+            "Alex",
+            "minecraft:adventure/root",
+            "killed_something",
+            10
+        ));
+        assert!(tracker.completed("Alex", "minecraft:adventure/root"));
+        // adventure/kill_a_mob completes on any single mob criterion; its
+        // parent must already be complete for `completed` to see it.
+        assert!(!tracker.completed("Alex", "minecraft:adventure/kill_a_mob"));
+        assert!(tracker.grant_criterion(
+            "Alex",
+            "minecraft:adventure/kill_a_mob",
+            "minecraft:creeper",
+            11
+        ));
+        assert!(tracker.completed("Alex", "minecraft:adventure/kill_a_mob"));
+        // kill_all_mobs requires every mob group; grant them all.
+        let mobs = [
+            "minecraft:blaze", "minecraft:bogged", "minecraft:breeze",
+            "minecraft:cave_spider", "minecraft:creeper", "minecraft:drowned",
+            "minecraft:elder_guardian", "minecraft:ender_dragon",
+            "minecraft:enderman", "minecraft:endermite", "minecraft:evoker",
+            "minecraft:ghast", "minecraft:guardian", "minecraft:hoglin",
+            "minecraft:husk", "minecraft:magma_cube", "minecraft:phantom",
+            "minecraft:piglin", "minecraft:piglin_brute", "minecraft:pillager",
+            "minecraft:ravager", "minecraft:shulker", "minecraft:silverfish",
+            "minecraft:skeleton", "minecraft:slime", "minecraft:spider",
+            "minecraft:stray", "minecraft:vex", "minecraft:vindicator",
+            "minecraft:witch", "minecraft:wither_skeleton", "minecraft:wither",
+            "minecraft:zoglin", "minecraft:zombie_villager", "minecraft:zombie",
+            "minecraft:zombified_piglin",
+        ];
+        for mob in mobs {
+            assert!(tracker.grant_criterion(
+                "Alex",
+                "minecraft:adventure/kill_all_mobs",
+                mob,
+                12
+            ));
+        }
+        assert!(tracker.completed("Alex", "minecraft:adventure/kill_all_mobs"));
+        // A criterion outside the requirement groups is rejected.
+        assert!(!tracker.grant_criterion(
+            "Alex",
+            "minecraft:adventure/kill_all_mobs",
+            "not_a_mob",
+            13
+        ));
+        // Parent-chain traversal on the catalogue: grant_until walks
+        // whole_pack -> tame_an_animal -> root.
+        let mut chain = AdvancementTracker {
+            definitions: CORE_ADVANCEMENTS,
+            ..AdvancementTracker::default()
+        };
+        // whole_pack's nine wolf-variant groups plus the two single-criterion
+        // ancestors = 11 criterion grants.
+        assert_eq!(
+            chain.grant_until("Bob", "minecraft:husbandry/whole_pack", 20),
+            11
+        );
+        for id in [
+            "minecraft:husbandry/root",
+            "minecraft:husbandry/tame_an_animal",
+            "minecraft:husbandry/whole_pack",
+        ] {
+            assert!(chain.completed("Bob", id), "{id}");
+        }
+        assert!(!chain.completed("Bob", "minecraft:husbandry/breed_an_animal"));
+        // has_ancestor resolves deep catalogue chains.
+        assert!(chain.has_ancestor(
+            "minecraft:adventure/spyglass_at_dragon",
+            "minecraft:adventure/root"
+        ));
+        assert!(!chain.has_ancestor(
+            "minecraft:adventure/spyglass_at_dragon",
+            "minecraft:husbandry/root"
+        ));
+    }
+
+    #[test]
+    fn v1211_adv_loot_xp_rewards_and_trigger_registry() {
+        // Vanilla 1.21.1 rewards.experience payouts.
+        for (id, xp) in [
+            ("minecraft:nether/all_effects", 1000),
+            ("minecraft:nether/explore_nether", 500),
+            ("minecraft:adventure/adventuring_time", 500),
+            ("minecraft:adventure/kill_all_mobs", 100),
+            ("minecraft:adventure/hero_of_the_village", 100),
+            ("minecraft:end/levitate", 50),
+            ("minecraft:husbandry/balanced_diet", 100),
+            ("minecraft:husbandry/whole_pack", 50),
+        ] {
+            assert_eq!(
+                advancement_reward_spec(id).map(|spec| spec.experience),
+                Some(xp),
+                "{id} XP reward"
+            );
+        }
+        // Advancements without a vanilla rewards block stay unspecified.
+        assert!(advancement_reward_spec("minecraft:adventure/root").is_none());
+        // The story recipe grants are preserved.
+        let stone = advancement_reward_spec("minecraft:story/mine_stone").unwrap();
+        assert!(stone.recipes.contains(&"minecraft:stone_pickaxe"));
+        // Every trigger type the catalogue references is registered, with and
+        // without the minecraft: prefix.
+        assert_eq!(VANILLA_ADVANCEMENT_TRIGGERS.len(), 50);
+        for trigger in [
+            "minecraft:player_killed_entity",
+            "minecraft:inventory_changed",
+            "minecraft:consume_item",
+            "minecraft:enter_block",
+            "minecraft:changed_dimension",
+            "minecraft:bred_animals",
+            "minecraft:tame_animal",
+            "minecraft:placed_block",
+            "minecraft:location",
+            "minecraft:used_totem",
+            "minecraft:shot_crossbow",
+            "minecraft:slept_in_bed",
+            "minecraft:hero_of_the_village",
+            "minecraft:voluntary_exile",
+            "minecraft:cured_zombie_villager",
+            "minecraft:summoned_entity",
+            "minecraft:enchanted_item",
+            "minecraft:construct_beacon",
+            "minecraft:brewed_potion",
+            "minecraft:levitation",
+            "minecraft:nether_travel",
+            "minecraft:fall_from_height",
+            "minecraft:ride_entity_in_lava",
+            "minecraft:lightning_strike",
+            "minecraft:started_riding",
+            "minecraft:kill_mob_near_sculk_catalyst",
+            "minecraft:avoid_vibration",
+            "minecraft:crafter_recipe_crafted",
+            "minecraft:fall_after_explosion",
+        ] {
+            assert!(advancement_trigger_supported(trigger), "{trigger}");
+            assert!(
+                advancement_trigger_supported(trigger.trim_start_matches("minecraft:")),
+                "bare {trigger}"
+            );
+        }
+        assert!(!advancement_trigger_supported("minecraft:not_a_trigger"));
+        assert!(!advancement_trigger_supported("not_a_trigger"));
+    }
+
 }
