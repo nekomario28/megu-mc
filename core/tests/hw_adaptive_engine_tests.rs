@@ -2,11 +2,14 @@
 //! Unit, parity and live-host tests for `mc_spine_core::hw_adaptive_engine`.
 
 use mc_spine_core::hw_adaptive_engine::{
-    detect_host_hardware_caps, max_nibble_arrays_adaptive, max_nibble_arrays_tiered,
-    select_compute_strategy, CacheStrategy, ComputeStrategy, HostHardwareCaps, MemoryTopology,
-    MemoryTransferStrategy, PagePoolError, PagedSectionPool, QuantizedVoxelVertex, SimdKernelTier,
-    SparseDirtyTileMask, SpeculativeChunkPrefetcher, SpeculativeState, L3_LARGE_KIB, L3_MEDIUM_KIB,
-    LIGHT_BUFFER_BYTES, PAGE_SIZE,
+    build_unified_optimization_plan, detect_host_hardware_caps, detect_universal_hardware_profile,
+    max_nibble_arrays_adaptive, max_nibble_arrays_tiered, select_compute_strategy,
+    CacheDomainTopology, CacheStrategy, ComputeKernelMode, ComputeStrategy, CoreAffinityHint,
+    CoreHeterogeneity, DomainKind, ExtendedSimdTier, GpuComputeParadigm, HostHardwareCaps,
+    KernelAutotuner, MemoryFootprintClass, MemoryTopology, MemoryTransferStrategy, PagePoolError,
+    PagedSectionPool, PowerThermalProfile, QuantizedVoxelVertex, SimdKernelTier,
+    SparseDirtyTileMask, SpeculativeChunkPrefetcher, SpeculativeState, StorageIoClass,
+    UniversalHardwareProfile, L3_LARGE_KIB, L3_MEDIUM_KIB, LIGHT_BUFFER_BYTES, PAGE_SIZE,
 };
 
 /// Deterministic per-nibble reference implementation every optimized path
@@ -37,6 +40,28 @@ fn caps(
         hybrid_cores,
         simd_tier,
         memory_topology,
+    }
+}
+
+fn synthetic_desktop() -> UniversalHardwareProfile {
+    UniversalHardwareProfile {
+        base: caps(
+            16,
+            32 * 1024,
+            false,
+            SimdKernelTier::Avx2,
+            MemoryTopology::DiscreteVram,
+        ),
+        l2_per_core_kib: 1024,
+        cache_line_bytes: 64,
+        cache_domains: CacheDomainTopology::SingleSharedLlc,
+        core_layout: CoreHeterogeneity::Uniform { cores: 16 },
+        total_ram_mib: 32 * 1024,
+        memory_class: MemoryFootprintClass::Abundant,
+        gpu_paradigm: GpuComputeParadigm::DiscretePcieHighBw,
+        power_profile: PowerThermalProfile::AcDesktop,
+        storage_io: StorageIoClass::NvmeFastRandom,
+        extended_simd: ExtendedSimdTier::Avx2,
     }
 }
 
@@ -194,6 +219,283 @@ fn strategy_l3_thresholds_are_exact() {
         MemoryTopology::UnifiedUma,
     ));
     assert_eq!(just_below_medium.cache, CacheStrategy::FlashRecomputeStream);
+}
+
+// ===========================================================================
+// Universal profile, domain plans and deterministic feedback
+// ===========================================================================
+
+#[test]
+fn universal_live_probe_has_sane_cores_ram_and_cache_line() {
+    let profile = detect_universal_hardware_profile();
+    assert!(profile.base.logical_cores > 0);
+    assert!(matches!(profile.cache_line_bytes, 64 | 128));
+    if cfg!(target_os = "linux") {
+        assert!(profile.total_ram_mib > 0);
+        assert!(profile.l2_per_core_kib > 0);
+    }
+    let plan = build_unified_optimization_plan(&profile, None);
+    for domain in [
+        DomainKind::Worldgen,
+        DomainKind::Lighting,
+        DomainKind::Meshing,
+        DomainKind::PhysicsAndContraptions,
+        DomainKind::NetworkBroadcast,
+        DomainKind::SpatialAudio,
+    ] {
+        let specialized = plan.for_domain(domain);
+        assert!(specialized.worker_threads > 0);
+        assert!(specialized.pool_budget_pages > 0);
+        assert_eq!(
+            specialized.false_sharing_pad_bytes,
+            profile.cache_line_bytes
+        );
+    }
+}
+
+#[test]
+fn apple_silicon_tbdr_uses_128_byte_padding_uma_and_efficiency_cores() {
+    let mut apple = synthetic_desktop();
+    apple.base = caps(
+        10,
+        0,
+        true,
+        SimdKernelTier::Neon,
+        MemoryTopology::UnifiedUma,
+    );
+    apple.l2_per_core_kib = 12 * 1024;
+    apple.cache_line_bytes = 128;
+    apple.core_layout = CoreHeterogeneity::Hybrid {
+        p_cores: 6,
+        e_cores: 4,
+    };
+    apple.gpu_paradigm = GpuComputeParadigm::TileBasedTbdr;
+    apple.extended_simd = ExtendedSimdTier::Neon;
+    let plan = build_unified_optimization_plan(&apple, None);
+    assert_eq!(
+        plan.memory_transfer,
+        MemoryTransferStrategy::UnifiedZeroCopy
+    );
+
+    let lighting = plan.for_domain(DomainKind::Lighting);
+    let physics = plan.for_domain(DomainKind::PhysicsAndContraptions);
+    let worldgen = plan.for_domain(DomainKind::Worldgen);
+    assert_eq!(lighting.false_sharing_pad_bytes, 128);
+    assert!(lighting.prefer_single_pass_gpu);
+    assert_eq!(lighting.core_affinity, CoreAffinityHint::Performance);
+    assert_eq!(physics.core_affinity, CoreAffinityHint::Performance);
+    assert_eq!(lighting.worker_threads, 6);
+    assert_eq!(worldgen.core_affinity, CoreAffinityHint::Efficiency);
+    assert_eq!(worldgen.worker_threads, 4);
+}
+
+#[test]
+fn asymmetric_dual_ccd_schedules_latency_sensitive_domains_near_vcache() {
+    let mut x3d = synthetic_desktop();
+    // cpu0 may sit on the 32 MiB CCD; the asymmetric cache domain still
+    // enables the 96 MiB tier for critical processing.
+    x3d.cache_domains = CacheDomainTopology::AsymmetricDualCcd {
+        big_llc_cores: 8,
+        fast_cores: 8,
+    };
+    let plan = build_unified_optimization_plan(&x3d, None);
+    assert_eq!(plan.compute.cache, CacheStrategy::LargeL3LutBatch);
+    for domain in [DomainKind::Lighting, DomainKind::PhysicsAndContraptions] {
+        let specialized = plan.for_domain(domain);
+        assert!(specialized.pin_to_primary_llc_domain);
+        assert!(specialized.use_lut_over_recompute);
+        assert_eq!(specialized.tile_edge_chunks, 4);
+    }
+    assert!(
+        !plan
+            .for_domain(DomainKind::Worldgen)
+            .pin_to_primary_llc_domain
+    );
+}
+
+#[test]
+fn two_gib_pi_slow_sd_budgets_less_than_desktop_and_coalesces_io() {
+    let desktop = synthetic_desktop();
+    let desktop_budget = build_unified_optimization_plan(&desktop, None)
+        .for_domain(DomainKind::Worldgen)
+        .pool_budget_pages;
+    let mut pi = desktop;
+    pi.base = caps(
+        4,
+        1024,
+        false,
+        SimdKernelTier::Neon,
+        MemoryTopology::UnifiedUma,
+    );
+    pi.total_ram_mib = 2048;
+    pi.memory_class = MemoryFootprintClass::from_ram_mib(pi.total_ram_mib);
+    pi.storage_io = StorageIoClass::HddOrSlowSd;
+    pi.gpu_paradigm = GpuComputeParadigm::LegacyGlMinimal;
+    let plan = build_unified_optimization_plan(&pi, None);
+    let worldgen = plan.for_domain(DomainKind::Worldgen);
+    assert!(worldgen.pool_budget_pages < desktop_budget);
+    assert!(worldgen.pool_budget_pages * PAGE_SIZE <= 1024 * 1024);
+    assert!(worldgen.coalesce_background_bursts);
+    assert!(worldgen.prefer_single_pass_gpu);
+    assert!(!worldgen.use_lut_over_recompute);
+    assert_eq!(plan.compute.cache, CacheStrategy::FlashRecomputeStream);
+}
+
+#[test]
+fn handheld_apu_uses_uma_bounded_workers_and_burst_coalescing() {
+    let mut deck = synthetic_desktop();
+    deck.base.memory_topology = MemoryTopology::UnifiedUma;
+    deck.gpu_paradigm = GpuComputeParadigm::UnifiedApuSharedRam;
+    deck.power_profile = PowerThermalProfile::HandheldTdp;
+    let plan = build_unified_optimization_plan(&deck, None);
+    assert_eq!(
+        plan.memory_transfer,
+        MemoryTransferStrategy::UnifiedZeroCopy
+    );
+    for domain in [
+        DomainKind::Worldgen,
+        DomainKind::Lighting,
+        DomainKind::Meshing,
+    ] {
+        let specialized = plan.for_domain(domain);
+        assert!(specialized.coalesce_background_bursts);
+        assert!((1..=2).contains(&specialized.worker_threads));
+    }
+}
+
+#[test]
+fn discrete_gpu_uses_staged_transfers_even_if_legacy_memory_hint_is_uma() {
+    let mut discrete = synthetic_desktop();
+    discrete.base.memory_topology = MemoryTopology::UnifiedUma;
+    let plan = build_unified_optimization_plan(&discrete, None);
+    assert_eq!(
+        plan.memory_transfer,
+        MemoryTransferStrategy::DiscreteStagedArena
+    );
+}
+
+#[test]
+fn ram_band_edges_and_battery_policy_are_stable() {
+    assert_eq!(
+        MemoryFootprintClass::from_ram_mib(0),
+        MemoryFootprintClass::Constrained
+    );
+    assert_eq!(
+        MemoryFootprintClass::from_ram_mib(4096),
+        MemoryFootprintClass::Constrained
+    );
+    assert_eq!(
+        MemoryFootprintClass::from_ram_mib(4097),
+        MemoryFootprintClass::Standard
+    );
+    assert_eq!(
+        MemoryFootprintClass::from_ram_mib(16383),
+        MemoryFootprintClass::Standard
+    );
+    assert_eq!(
+        MemoryFootprintClass::from_ram_mib(16384),
+        MemoryFootprintClass::Abundant
+    );
+    let mut laptop = synthetic_desktop();
+    laptop.power_profile = PowerThermalProfile::BatteryLaptop;
+    assert!(
+        build_unified_optimization_plan(&laptop, None)
+            .for_domain(DomainKind::NetworkBroadcast)
+            .coalesce_background_bursts
+    );
+}
+
+#[test]
+fn autotuner_converges_after_sustained_win_and_overrides_static_cache_hint() {
+    let mut tuner = KernelAutotuner::new(ComputeKernelMode::LutBatch);
+    for _ in 0..4 {
+        assert_eq!(
+            tuner.observe_sample(ComputeKernelMode::LutBatch, 1000),
+            ComputeKernelMode::LutBatch
+        );
+    }
+    // A 20% faster challenger needs four qualifying updates after warmup.
+    for _ in 0..6 {
+        assert_eq!(
+            tuner.observe_sample(ComputeKernelMode::RecomputeSwar, 800),
+            ComputeKernelMode::LutBatch
+        );
+    }
+    assert_eq!(
+        tuner.observe_sample(ComputeKernelMode::RecomputeSwar, 800),
+        ComputeKernelMode::RecomputeSwar
+    );
+    let plan = build_unified_optimization_plan(&synthetic_desktop(), Some(tuner.selected_mode()));
+    assert!(!plan.for_domain(DomainKind::Lighting).use_lut_over_recompute);
+}
+
+#[test]
+fn autotuner_hysteresis_ignores_noise_and_subthreshold_advantage() {
+    let mut tuner = KernelAutotuner::default();
+    for _ in 0..8 {
+        tuner.observe_sample(ComputeKernelMode::LutBatch, 1000);
+        tuner.observe_sample(ComputeKernelMode::RecomputeSwar, 900);
+    }
+    assert_eq!(tuner.selected_mode(), ComputeKernelMode::LutBatch);
+    // A single unusually fast observation may improve an EMA briefly,
+    // but cannot switch without sustained independent measurements.
+    tuner.observe_sample(ComputeKernelMode::RecomputeSwar, 1);
+    assert_eq!(tuner.selected_mode(), ComputeKernelMode::LutBatch);
+    for _ in 0..4 {
+        tuner.observe_sample(ComputeKernelMode::LutBatch, 1000);
+        tuner.observe_sample(ComputeKernelMode::RecomputeSwar, 1000);
+    }
+    assert_eq!(tuner.selected_mode(), ComputeKernelMode::LutBatch);
+}
+
+#[test]
+fn autotuner_rejects_invalid_samples_without_overflow_or_mode_changes() {
+    let mut tuner = KernelAutotuner::new(ComputeKernelMode::RecomputeSwar);
+    assert_eq!(tuner.estimated_ns(ComputeKernelMode::LutBatch), None);
+    for invalid in [0, 60_000_000_001, u64::MAX] {
+        assert_eq!(
+            tuner.observe_sample(ComputeKernelMode::LutBatch, invalid),
+            ComputeKernelMode::RecomputeSwar
+        );
+    }
+    assert_eq!(tuner.estimated_ns(ComputeKernelMode::LutBatch), None);
+    tuner.observe_sample(ComputeKernelMode::LutBatch, 1);
+    assert_eq!(tuner.estimated_ns(ComputeKernelMode::LutBatch), Some(1));
+    tuner.observe_sample(ComputeKernelMode::LutBatch, 60_000_000_000);
+    assert!(tuner.estimated_ns(ComputeKernelMode::LutBatch).unwrap() > 1);
+    assert_eq!(tuner.selected_mode(), ComputeKernelMode::RecomputeSwar);
+}
+
+#[test]
+fn autotuner_accepts_exactly_twelve_percent_sustained_advantage() {
+    let mut tuner = KernelAutotuner::new(ComputeKernelMode::RecomputeSwar);
+    for _ in 0..4 {
+        tuner.observe_sample(ComputeKernelMode::RecomputeSwar, 1000);
+    }
+    for _ in 0..6 {
+        assert_eq!(
+            tuner.observe_sample(ComputeKernelMode::LutBatch, 880),
+            ComputeKernelMode::RecomputeSwar
+        );
+    }
+    assert_eq!(
+        tuner.observe_sample(ComputeKernelMode::LutBatch, 880),
+        ComputeKernelMode::LutBatch
+    );
+    tuner.observe_sample(ComputeKernelMode::RecomputeSwar, 1);
+    assert_eq!(tuner.selected_mode(), ComputeKernelMode::LutBatch);
+}
+
+#[test]
+fn invalid_synthetic_cache_line_defaults_to_safe_64_byte_padding() {
+    let mut profile = synthetic_desktop();
+    profile.cache_line_bytes = 0;
+    assert_eq!(
+        build_unified_optimization_plan(&profile, None)
+            .for_domain(DomainKind::Meshing)
+            .false_sharing_pad_bytes,
+        64
+    );
 }
 
 // ===========================================================================

@@ -3,8 +3,8 @@
 //! LLM-inference-inspired and hardware-adaptive ultra-lightweight compute
 //! toolkit for the voxel engine hot paths.
 //!
-//! The five primitives in this module borrow the structural tricks that
-//! made modern LLM serving stacks fast and re-apply them to chunk data:
+//! These primitives borrow structural tricks from modern LLM serving stacks
+//! and apply them to chunk data and other latency-sensitive engine domains:
 //!
 //! * [`detect_host_hardware_caps`] + [`select_compute_strategy`] — a real
 //!   host hardware probe (Linux sysfs L3 cache size, `cpu_capacity` hybrid
@@ -14,6 +14,10 @@
 //!   cache-poor hosts, KV-cache-style LUT batching on large-L3 hosts such
 //!   as 3D V-Cache parts, unified-memory zero-copy vs staged-arena transfer
 //!   plans, and a foreground/background [`WorkerSplitPlan`].
+//! * [`detect_universal_hardware_profile`] + [`build_unified_optimization_plan`]
+//!   — hardware axes for cache sharing, core layout, GPU, RAM, power, storage
+//!   and SIMD, with [`KernelAutotuner`] feedback and per-domain scheduling
+//!   hints resolved from one consistent plan.
 //! * [`max_nibble_arrays_adaptive`] — a bit-exact packed 4-bit
 //!   element-wise max over two 2048-byte light buffers (4096 nibbles each),
 //!   with both a resident LUT path (cache-rich) and a pure-safe-Rust
@@ -394,6 +398,772 @@ pub fn select_compute_strategy(caps: &HostHardwareCaps) -> ComputeStrategy {
         memory,
         simd: caps.simd_tier,
         workers: plan_workers(caps.logical_cores, caps.hybrid_cores),
+    }
+}
+
+// ===========================================================================
+// Universal hardware profile: independent axes and domain-specific plans
+// ===========================================================================
+
+/// How last-level caches are shared between physical CPU cores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CacheDomainTopology {
+    SingleSharedLlc,
+    AsymmetricDualCcd { big_llc_cores: u32, fast_cores: u32 },
+    MultiSocketNuma { node_count: u32 },
+}
+
+/// Physical performance/efficiency core counts, when available.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CoreHeterogeneity {
+    Uniform { cores: u32 },
+    Hybrid { p_cores: u32, e_cores: u32 },
+}
+
+/// GPU execution and memory-sharing model. Hints may be overridden by callers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GpuComputeParadigm {
+    DiscretePcieHighBw,
+    TileBasedTbdr,
+    UnifiedApuSharedRam,
+    LegacyGlMinimal,
+    HeadlessNoGpu,
+}
+
+/// Conservative pool-sizing bands. Exactly 4 GiB is constrained, exactly
+/// 16 GiB is abundant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemoryFootprintClass {
+    Constrained,
+    Standard,
+    Abundant,
+}
+
+impl MemoryFootprintClass {
+    pub const fn from_ram_mib(total_ram_mib: u64) -> Self {
+        match total_ram_mib {
+            0..=4096 => Self::Constrained,
+            4097..=16383 => Self::Standard,
+            _ => Self::Abundant,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PowerThermalProfile {
+    AcDesktop,
+    BatteryLaptop,
+    HandheldTdp,
+    ServerHeadless,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StorageIoClass {
+    NvmeFastRandom,
+    SataSsd,
+    HddOrSlowSd,
+    RamBacked,
+}
+
+/// SIMD capabilities broader than the legacy executable kernel tiers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ExtendedSimdTier {
+    Avx512,
+    Avx2,
+    Sse42,
+    Sve2,
+    Neon,
+    Rvv,
+    WasmSimd128,
+    Scalar,
+}
+
+/// Independent, caller-overridable hardware hints. The legacy `base` retains
+/// its exact public representation and dispatch behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UniversalHardwareProfile {
+    pub base: HostHardwareCaps,
+    /// L2 capacity visible to cpu0; it may be shared by several cores.
+    pub l2_per_core_kib: u32,
+    pub cache_line_bytes: u16,
+    pub cache_domains: CacheDomainTopology,
+    pub core_layout: CoreHeterogeneity,
+    pub total_ram_mib: u64,
+    pub memory_class: MemoryFootprintClass,
+    pub gpu_paradigm: GpuComputeParadigm,
+    pub power_profile: PowerThermalProfile,
+    pub storage_io: StorageIoClass,
+    pub extended_simd: ExtendedSimdTier,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cache_attribute(level: u32, attribute: &str) -> Option<String> {
+    let base = Path::new("/sys/devices/system/cpu/cpu0/cache");
+    for idx in 0..MAX_CACHE_INDEX {
+        let dir = base.join(format!("index{idx}"));
+        let Ok(level_text) = fs::read_to_string(dir.join("level")) else {
+            continue;
+        };
+        if level_text.trim().parse::<u32>().ok() != Some(level) {
+            continue;
+        }
+        if let Ok(kind) = fs::read_to_string(dir.join("type")) {
+            if kind.trim() == "Instruction" {
+                continue;
+            }
+        }
+        if let Ok(value) = fs::read_to_string(dir.join(attribute)) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_ram_mib() -> Option<u64> {
+    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
+    let kib = meminfo.lines().find_map(|line| {
+        line.strip_prefix("MemTotal:")?
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()
+    })?;
+    // Linux containers often expose the host's /proc/meminfo. Honor an
+    // applicable cgroup limit so a small VPS does not inherit a large pool.
+    let cgroup_limit = [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ]
+    .iter()
+    .filter_map(|path| fs::read_to_string(path).ok())
+    .filter_map(|limit| limit.trim().parse::<u64>().ok())
+    .filter(|&limit| limit > 0)
+    .min();
+    Some(cgroup_limit.map_or(kib / 1024, |bytes| (kib / 1024).min(bytes / 1_048_576)))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_numa_nodes() -> u32 {
+    let Ok(online) = fs::read_to_string("/sys/devices/system/node/online") else {
+        return 1;
+    };
+    let mut nodes = 0u32;
+    for range in online.trim().split(',') {
+        let (first, last) = range.split_once('-').unwrap_or((range, range));
+        let (Ok(first), Ok(last)) = (first.parse::<u32>(), last.parse::<u32>()) else {
+            return 1;
+        };
+        if last < first || last - first >= 256 {
+            return 1;
+        }
+        nodes = nodes.saturating_add(last - first + 1);
+    }
+    nodes.max(1)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cpu_physical_id(cpu: u32) -> (u32, u32, u32) {
+    let base = format!("/sys/devices/system/cpu/cpu{cpu}/topology");
+    let read = |name: &str| {
+        fs::read_to_string(format!("{base}/{name}"))
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+    };
+    (
+        read("physical_package_id").unwrap_or(0),
+        read("die_id").unwrap_or(0),
+        read("core_id").unwrap_or(cpu),
+    )
+}
+
+/// Count physical cores once even if each core exposes multiple SMT threads.
+/// `cpu_capacity` on ARM and `core_type` on recent Intel Linux kernels provide
+/// relative core classes. An absent or partial contract remains uniform.
+#[cfg(target_os = "linux")]
+fn linux_core_layout(logical_cores: u32) -> CoreHeterogeneity {
+    let mut capacities = HashMap::new();
+    for cpu in 0..MAX_CPUS_SCANNED {
+        let dir = format!("/sys/devices/system/cpu/cpu{cpu}");
+        if !Path::new(&dir).exists() {
+            continue;
+        }
+        let capacity = fs::read_to_string(format!("{dir}/cpu_capacity"))
+            .or_else(|_| fs::read_to_string(format!("{dir}/topology/core_type")))
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        let Some(capacity) = capacity else {
+            return CoreHeterogeneity::Uniform {
+                cores: logical_cores.max(1),
+            };
+        };
+        capacities.insert(linux_cpu_physical_id(cpu), capacity);
+    }
+    let Some(&highest) = capacities.values().max() else {
+        return CoreHeterogeneity::Uniform {
+            cores: logical_cores.max(1),
+        };
+    };
+    let p_cores = capacities.values().filter(|&&c| c == highest).count() as u32;
+    let e_cores = capacities.len() as u32 - p_cores;
+    if e_cores > 0 {
+        CoreHeterogeneity::Hybrid { p_cores, e_cores }
+    } else {
+        CoreHeterogeneity::Uniform {
+            cores: capacities.len().max(1) as u32,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cache_domains(node_count: u32) -> CacheDomainTopology {
+    if node_count > 1 {
+        return CacheDomainTopology::MultiSocketNuma { node_count };
+    }
+    let mut core_l3 = HashMap::new();
+    let mut domains = std::collections::HashSet::new();
+    for cpu in 0..MAX_CPUS_SCANNED {
+        let root = format!("/sys/devices/system/cpu/cpu{cpu}/cache");
+        for idx in 0..MAX_CACHE_INDEX {
+            let dir = Path::new(&root).join(format!("index{idx}"));
+            if fs::read_to_string(dir.join("level"))
+                .ok()
+                .and_then(|level| level.trim().parse::<u32>().ok())
+                != Some(3)
+            {
+                continue;
+            }
+            let Some(kib) = fs::read_to_string(dir.join("size"))
+                .ok()
+                .and_then(|size| parse_sysfs_cache_size_kib(&size))
+            else {
+                continue;
+            };
+            let Ok(shared) = fs::read_to_string(dir.join("shared_cpu_list")) else {
+                continue;
+            };
+            domains.insert(shared.trim().to_string());
+            core_l3.insert(linux_cpu_physical_id(cpu), kib);
+            break;
+        }
+    }
+    if domains.len() != 2 {
+        return CacheDomainTopology::SingleSharedLlc;
+    }
+    let biggest = core_l3.values().copied().max().unwrap_or(0);
+    let smallest = core_l3.values().copied().min().unwrap_or(0);
+    if biggest >= L3_LARGE_KIB && smallest < biggest {
+        CacheDomainTopology::AsymmetricDualCcd {
+            big_llc_cores: core_l3.values().filter(|&&size| size == biggest).count() as u32,
+            fast_cores: core_l3.values().filter(|&&size| size == smallest).count() as u32,
+        }
+    } else {
+        CacheDomainTopology::SingleSharedLlc
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_gpu_paradigm(base: &HostHardwareCaps) -> GpuComputeParadigm {
+    if base.memory_topology == MemoryTopology::DiscreteVram {
+        return GpuComputeParadigm::DiscretePcieHighBw;
+    }
+    // NVIDIA's DRM driver does not necessarily expose AMD's VRAM sysfs key.
+    // The vendor ID is a stronger signal than an absent memory hint.
+    if (0..MAX_DRM_CARDS_SCANNED).any(|card| {
+        fs::read_to_string(format!("/sys/class/drm/card{card}/device/vendor"))
+            .is_ok_and(|vendor| vendor.trim() == "0x10de")
+    }) {
+        return GpuComputeParadigm::DiscretePcieHighBw;
+    }
+    if (0..MAX_DRM_CARDS_SCANNED)
+        .any(|card| Path::new(&format!("/sys/class/drm/card{card}/device")).exists())
+    {
+        if cfg!(target_arch = "aarch64") || cfg!(target_arch = "arm") {
+            GpuComputeParadigm::TileBasedTbdr
+        } else {
+            GpuComputeParadigm::UnifiedApuSharedRam
+        }
+    } else {
+        GpuComputeParadigm::HeadlessNoGpu
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_power_profile(gpu: GpuComputeParadigm) -> PowerThermalProfile {
+    let dmi = fs::read_to_string("/sys/class/dmi/id/product_name")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if ["steam deck", "jupiter", "galileo", "rog ally", "legion go"]
+        .iter()
+        .any(|model| dmi.contains(model))
+    {
+        return PowerThermalProfile::HandheldTdp;
+    }
+    if let Ok(supplies) = fs::read_dir("/sys/class/power_supply") {
+        for supply in supplies.flatten() {
+            if fs::read_to_string(supply.path().join("type"))
+                .is_ok_and(|kind| kind.trim() == "Battery")
+            {
+                return PowerThermalProfile::BatteryLaptop;
+            }
+        }
+    }
+    if gpu == GpuComputeParadigm::HeadlessNoGpu {
+        PowerThermalProfile::ServerHeadless
+    } else {
+        PowerThermalProfile::AcDesktop
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_storage_io() -> StorageIoClass {
+    let Ok(devices) = fs::read_dir("/sys/block") else {
+        return StorageIoClass::HddOrSlowSd;
+    };
+    let mut solid_state = false;
+    let mut rotating_or_sd = false;
+    let mut ram_backed = false;
+    for device in devices.flatten() {
+        let name = device.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("loop") || name.starts_with("dm-") || name.starts_with("md") {
+            continue;
+        }
+        if name.starts_with("ram") || name.starts_with("zram") {
+            ram_backed = true;
+            continue;
+        }
+        let Ok(rotational) = fs::read_to_string(device.path().join("queue/rotational")) else {
+            continue;
+        };
+        if rotational.trim() == "1" || name.starts_with("mmcblk") {
+            rotating_or_sd = true;
+        } else if rotational.trim() == "0" {
+            if name.starts_with("nvme") {
+                return StorageIoClass::NvmeFastRandom;
+            }
+            solid_state = true;
+        }
+    }
+    if solid_state {
+        StorageIoClass::SataSsd
+    } else if rotating_or_sd {
+        StorageIoClass::HddOrSlowSd
+    } else if ram_backed {
+        StorageIoClass::RamBacked
+    } else {
+        StorageIoClass::HddOrSlowSd
+    }
+}
+
+fn detect_extended_simd() -> ExtendedSimdTier {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::arch::is_x86_feature_detected!("avx512f") {
+            return ExtendedSimdTier::Avx512;
+        }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return ExtendedSimdTier::Avx2;
+        }
+        if std::arch::is_x86_feature_detected!("sse4.2") {
+            return ExtendedSimdTier::Sse42;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("sve2") {
+            return ExtendedSimdTier::Sve2;
+        }
+        return ExtendedSimdTier::Neon;
+    }
+    #[cfg(target_arch = "arm")]
+    if cfg!(target_feature = "neon") {
+        return ExtendedSimdTier::Neon;
+    }
+    #[cfg(target_arch = "riscv64")]
+    if cfg!(target_feature = "v") {
+        return ExtendedSimdTier::Rvv;
+    }
+    #[cfg(target_arch = "wasm32")]
+    if cfg!(target_feature = "simd128") {
+        return ExtendedSimdTier::WasmSimd128;
+    }
+    ExtendedSimdTier::Scalar
+}
+
+#[cfg(target_os = "macos")]
+fn macos_sysctl_u64(name: &str) -> Option<u64> {
+    let output = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", name])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    std::str::from_utf8(&output.stdout)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+/// Read independent hardware hints without using clocks or external crates.
+/// Unknown RAM is classified as constrained to keep pool budgets conservative.
+pub fn detect_universal_hardware_profile() -> UniversalHardwareProfile {
+    let base = detect_host_hardware_caps();
+    #[cfg(target_os = "linux")]
+    let (
+        l2_per_core_kib,
+        cache_line_bytes,
+        total_ram_mib,
+        cache_domains,
+        core_layout,
+        gpu_paradigm,
+        power_profile,
+        storage_io,
+    ) = {
+        let l2 = linux_cache_attribute(2, "size")
+            .and_then(|size| parse_sysfs_cache_size_kib(&size))
+            .unwrap_or(0);
+        let line = linux_cache_attribute(2, "coherency_line_size")
+            .and_then(|size| size.trim().parse::<u16>().ok())
+            .filter(|&size| size == 64 || size == 128)
+            .unwrap_or(if cfg!(target_arch = "aarch64") {
+                128
+            } else {
+                64
+            });
+        let nodes = linux_numa_nodes();
+        let gpu = linux_gpu_paradigm(&base);
+        (
+            l2,
+            line,
+            linux_ram_mib().unwrap_or(0),
+            linux_cache_domains(nodes),
+            linux_core_layout(base.logical_cores),
+            gpu,
+            linux_power_profile(gpu),
+            linux_storage_io(),
+        )
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (
+        l2_per_core_kib,
+        cache_line_bytes,
+        total_ram_mib,
+        cache_domains,
+        core_layout,
+        gpu_paradigm,
+        power_profile,
+        storage_io,
+    ) = (
+        0,
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            128
+        } else {
+            64
+        },
+        0,
+        CacheDomainTopology::SingleSharedLlc,
+        CoreHeterogeneity::Uniform {
+            cores: base.logical_cores,
+        },
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            GpuComputeParadigm::TileBasedTbdr
+        } else {
+            GpuComputeParadigm::LegacyGlMinimal
+        },
+        PowerThermalProfile::AcDesktop,
+        StorageIoClass::HddOrSlowSd,
+    );
+    #[cfg(target_os = "macos")]
+    let (l2_per_core_kib, cache_line_bytes, total_ram_mib, core_layout) = {
+        let p_cores = macos_sysctl_u64("hw.perflevel0.physicalcpu").unwrap_or(0);
+        let e_cores = macos_sysctl_u64("hw.perflevel1.physicalcpu").unwrap_or(0);
+        let layout = if p_cores > 0 && e_cores > 0 {
+            CoreHeterogeneity::Hybrid {
+                p_cores: u32::try_from(p_cores).unwrap_or(u32::MAX),
+                e_cores: u32::try_from(e_cores).unwrap_or(u32::MAX),
+            }
+        } else {
+            core_layout
+        };
+        (
+            l2_per_core_kib,
+            macos_sysctl_u64("hw.cachelinesize")
+                .and_then(|bytes| u16::try_from(bytes).ok())
+                .filter(|&bytes| bytes == 64 || bytes == 128)
+                .unwrap_or(cache_line_bytes),
+            macos_sysctl_u64("hw.memsize").unwrap_or(0) / 1_048_576,
+            layout,
+        )
+    };
+    UniversalHardwareProfile {
+        base,
+        l2_per_core_kib,
+        cache_line_bytes,
+        cache_domains,
+        core_layout,
+        total_ram_mib,
+        memory_class: MemoryFootprintClass::from_ram_mib(total_ram_mib),
+        gpu_paradigm,
+        power_profile,
+        storage_io,
+        extended_simd: detect_extended_simd(),
+    }
+}
+
+/// Two interchangeable, bit-exact packed-nibble kernels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ComputeKernelMode {
+    LutBatch,
+    RecomputeSwar,
+}
+
+impl ComputeKernelMode {
+    const fn index(self) -> usize {
+        match self {
+            Self::LutBatch => 0,
+            Self::RecomputeSwar => 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct KernelTiming {
+    ema_ns: u64,
+    samples: u32,
+}
+
+/// Deterministic, bounded feedback controller. Both kernels need at least
+/// four accepted measurements and the challenger needs four consecutive
+/// qualifying observations before a 12% improvement can switch the mode.
+/// Callers supply externally measured durations, never a clock handle.
+#[derive(Clone, Debug)]
+pub struct KernelAutotuner {
+    selected: ComputeKernelMode,
+    timings: [KernelTiming; 2],
+    challenger_wins: u8,
+}
+
+impl Default for KernelAutotuner {
+    fn default() -> Self {
+        Self::new(ComputeKernelMode::LutBatch)
+    }
+}
+
+impl KernelAutotuner {
+    /// Begin with the static profile's preferred kernel mode.
+    pub fn new(initial_mode: ComputeKernelMode) -> Self {
+        Self {
+            selected: initial_mode,
+            timings: [KernelTiming::default(); 2],
+            challenger_wins: 0,
+        }
+    }
+
+    pub const fn selected_mode(&self) -> ComputeKernelMode {
+        self.selected
+    }
+
+    /// Observe one comparable benchmark/frame measurement. Zero and values
+    /// above 60 seconds are discarded as invalid instrumentation samples.
+    /// The 1/8 EMA uses widened integer arithmetic, including at extremes.
+    pub fn observe_sample(
+        &mut self,
+        mode: ComputeKernelMode,
+        elapsed_ns: u64,
+    ) -> ComputeKernelMode {
+        const MAX_VALID_NS: u64 = 60_000_000_000;
+        if !(1..=MAX_VALID_NS).contains(&elapsed_ns) {
+            return self.selected;
+        }
+        let timing = &mut self.timings[mode.index()];
+        timing.ema_ns = if timing.samples == 0 {
+            elapsed_ns
+        } else {
+            ((u128::from(timing.ema_ns) * 7 + u128::from(elapsed_ns) + 4) / 8) as u64
+        };
+        timing.samples = timing.samples.saturating_add(1);
+
+        if mode != self.selected {
+            let current = self.timings[self.selected.index()];
+            let challenger = self.timings[mode.index()];
+            let qualifies = current.samples >= 4
+                && challenger.samples >= 4
+                && u128::from(challenger.ema_ns) * 100 <= u128::from(current.ema_ns) * 88
+                && u128::from(elapsed_ns) * 100 <= u128::from(current.ema_ns) * 88;
+            self.challenger_wins = if qualifies {
+                self.challenger_wins.saturating_add(1)
+            } else {
+                0
+            };
+            if self.challenger_wins >= 4 {
+                self.selected = mode;
+                self.challenger_wins = 0;
+            }
+        }
+        self.selected
+    }
+
+    /// Latest EMA in nanoseconds, if the kernel has valid observations.
+    pub fn estimated_ns(&self, mode: ComputeKernelMode) -> Option<u64> {
+        let timing = self.timings[mode.index()];
+        (timing.samples > 0).then_some(timing.ema_ns)
+    }
+}
+
+/// Engine subsystems that consume one shared hardware policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DomainKind {
+    Worldgen,
+    Lighting,
+    Meshing,
+    PhysicsAndContraptions,
+    NetworkBroadcast,
+    SpatialAudio,
+}
+
+/// Scheduling preference; the engine's worker scheduler applies affinity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CoreAffinityHint {
+    Any,
+    Performance,
+    Efficiency,
+}
+
+/// A per-domain projection of a single hardware profile and kernel decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DomainSpecializationPlan {
+    pub domain: DomainKind,
+    pub use_morton_layout: bool,
+    pub use_lut_over_recompute: bool,
+    pub tile_edge_chunks: u32,
+    pub worker_threads: u32,
+    pub pin_to_primary_llc_domain: bool,
+    pub false_sharing_pad_bytes: u16,
+    pub pool_budget_pages: usize,
+    pub prefer_single_pass_gpu: bool,
+    pub coalesce_background_bursts: bool,
+    pub core_affinity: CoreAffinityHint,
+}
+
+/// Shared, immutable optimization policy. Domain plans derive from the same
+/// resolved kernel and transfer modes, so consumers cannot drift apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnifiedOptimizationPlan {
+    pub profile: UniversalHardwareProfile,
+    pub compute: ComputeStrategy,
+    pub kernel_mode: ComputeKernelMode,
+    pub memory_transfer: MemoryTransferStrategy,
+}
+
+/// Build a plan from the hardware snapshot and optional measured kernel choice.
+/// Passing `autotuner.selected_mode()` applies the controller's latest choice.
+pub fn build_unified_optimization_plan(
+    profile: &UniversalHardwareProfile,
+    autotuner_override: Option<ComputeKernelMode>,
+) -> UnifiedOptimizationPlan {
+    let mut compute = select_compute_strategy(&profile.base);
+    if matches!(
+        profile.cache_domains,
+        CacheDomainTopology::AsymmetricDualCcd { .. }
+    ) {
+        compute.cache = CacheStrategy::LargeL3LutBatch;
+    }
+    if profile.memory_class == MemoryFootprintClass::Constrained {
+        compute.cache = CacheStrategy::FlashRecomputeStream;
+    }
+    match profile.gpu_paradigm {
+        GpuComputeParadigm::DiscretePcieHighBw => {
+            compute.memory = MemoryTransferStrategy::DiscreteStagedArena;
+        }
+        GpuComputeParadigm::TileBasedTbdr | GpuComputeParadigm::UnifiedApuSharedRam => {
+            compute.memory = MemoryTransferStrategy::UnifiedZeroCopy;
+        }
+        GpuComputeParadigm::LegacyGlMinimal | GpuComputeParadigm::HeadlessNoGpu => {}
+    }
+    let kernel_mode = autotuner_override.unwrap_or(if compute.prefer_lut_over_recompute() {
+        ComputeKernelMode::LutBatch
+    } else {
+        ComputeKernelMode::RecomputeSwar
+    });
+    UnifiedOptimizationPlan {
+        profile: *profile,
+        compute,
+        kernel_mode,
+        memory_transfer: compute.memory,
+    }
+}
+
+impl UnifiedOptimizationPlan {
+    pub fn for_domain(&self, domain: DomainKind) -> DomainSpecializationPlan {
+        let critical = matches!(
+            domain,
+            DomainKind::Lighting | DomainKind::PhysicsAndContraptions
+        );
+        let background = matches!(
+            domain,
+            DomainKind::Worldgen | DomainKind::Meshing | DomainKind::NetworkBroadcast
+        );
+        let core_affinity = match self.profile.core_layout {
+            CoreHeterogeneity::Hybrid { .. } if critical => CoreAffinityHint::Performance,
+            CoreHeterogeneity::Hybrid { .. } if background => CoreAffinityHint::Efficiency,
+            _ => CoreAffinityHint::Any,
+        };
+        let base_workers = if background {
+            self.compute.workers.background_threads
+        } else {
+            self.compute.workers.foreground_threads
+        };
+        let affinity_workers = match (core_affinity, self.profile.core_layout) {
+            (CoreAffinityHint::Performance, CoreHeterogeneity::Hybrid { p_cores, .. }) => p_cores,
+            (CoreAffinityHint::Efficiency, CoreHeterogeneity::Hybrid { e_cores, .. }) => e_cores,
+            _ => base_workers,
+        };
+        let worker_threads = match self.profile.power_profile {
+            PowerThermalProfile::HandheldTdp => affinity_workers.clamp(1, 2),
+            _ => affinity_workers.max(1),
+        }
+        .min(self.profile.base.logical_cores.max(1));
+        let pool_budget_pages = match self.profile.memory_class {
+            MemoryFootprintClass::Constrained => 256,
+            MemoryFootprintClass::Standard => 2_048,
+            MemoryFootprintClass::Abundant => 8_192,
+        };
+        DomainSpecializationPlan {
+            domain,
+            use_morton_layout: matches!(
+                domain,
+                DomainKind::Worldgen
+                    | DomainKind::Lighting
+                    | DomainKind::Meshing
+                    | DomainKind::PhysicsAndContraptions
+            ),
+            use_lut_over_recompute: self.kernel_mode == ComputeKernelMode::LutBatch,
+            tile_edge_chunks: self.compute.chunk_batch_edge(),
+            worker_threads,
+            pin_to_primary_llc_domain: critical
+                && matches!(
+                    self.profile.cache_domains,
+                    CacheDomainTopology::AsymmetricDualCcd { .. }
+                ),
+            false_sharing_pad_bytes: if self.profile.cache_line_bytes == 128 {
+                128
+            } else {
+                64
+            },
+            pool_budget_pages,
+            prefer_single_pass_gpu: matches!(
+                self.profile.gpu_paradigm,
+                GpuComputeParadigm::TileBasedTbdr | GpuComputeParadigm::LegacyGlMinimal
+            ),
+            coalesce_background_bursts: matches!(
+                self.profile.power_profile,
+                PowerThermalProfile::BatteryLaptop | PowerThermalProfile::HandheldTdp
+            ) || self.profile.storage_io == StorageIoClass::HddOrSlowSd,
+            core_affinity,
+        }
     }
 }
 
