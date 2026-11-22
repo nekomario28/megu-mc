@@ -58,8 +58,8 @@ fn fx3_shadow_wgsl_has_blend_guard_vogel_const_no_loop_trig_and_region_light_mas
     let sampling = MEGU_SHADOW_SAMPLING_WGSL;
     // Next-cascade guard: the second cascade PCF only runs in the blend band.
     assert!(sampling.contains("if (blend > 0.001)"));
-    // Sun-backface early-out.
-    assert!(sampling.contains("dot(n, normalize(shadow.sun_direction.xyz)) <= 0.0"));
+    // Caster-backface early-out (sun by day, moon at -sun by night).
+    assert!(sampling.contains("dot(n, shadow_caster_direction()) <= 0.0"));
     // Compile-time Vogel disk replaces per-tap sqrt/trigonometry.
     assert!(sampling.contains("const VOGEL_16 = array<vec2<f32>, 16>"));
     assert!(sampling.contains("VOGEL_16[i] * disk_scale"));
@@ -80,8 +80,8 @@ fn fx3_shadow_wgsl_has_blend_guard_vogel_const_no_loop_trig_and_region_light_mas
     assert!(!terrain.contains("sin(angle)"));
     assert!(!terrain.contains("sqrt((f32(i)"));
     assert!(terrain.contains("inverseSqrt(f32(taps))"));
-    // Backface early-out in the cascade sampler.
-    assert!(terrain.contains("dot(normal, normalize(shadow.sun_direction.xyz)) <= 0.0"));
+    // Caster-backface early-out in the cascade sampler.
+    assert!(terrain.contains("dot(normal, caster) <= 0.0"));
     // u64 capability-mask walk over the fixed 64-light binding.
     for needle in [
         "light_mask_prefix",

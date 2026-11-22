@@ -536,6 +536,17 @@ pub struct CelestialLightingState {
     pub eclipse_dim: f32,
 }
 
+/// Vanilla 8-phase lunar contrast shared by the CPU uniforms and the WGSL
+/// lunar terms: `moon_phase` wraps modulo 8 like the vanilla
+/// `level.getMoonPhase()`/`day % 8` cycle — phase 0 (full moon) returns
+/// `1.0`, phase 4 (new moon) returns near-zero, so a full moon keeps crisp
+/// silver-blue moon shadows while a new moon leaves only starlight and
+/// torches.
+pub fn moon_phase_intensity(moon_phase: u8) -> f32 {
+    const PHASE_LIGHT: [f32; 8] = [1.0, 0.78, 0.55, 0.32, 0.06, 0.32, 0.55, 0.78];
+    PHASE_LIGHT[(moon_phase % 8) as usize]
+}
+
 /// Vanilla 8-phase lunar cycle: `moon_phase` wraps modulo 8 like the vanilla
 /// `level.getMoonPhase()` (0 = full moon, 4 = new moon).
 pub fn compute_celestial_lighting(
@@ -543,8 +554,7 @@ pub fn compute_celestial_lighting(
     moon_phase: u8,
     eclipse: EclipseMode,
 ) -> CelestialLightingState {
-    const PHASE_LIGHT: [f32; 8] = [1.0, 0.78, 0.55, 0.32, 0.06, 0.32, 0.55, 0.78];
-    let phase_strength = PHASE_LIGHT[(moon_phase % 8) as usize];
+    let phase_strength = moon_phase_intensity(moon_phase);
     let sun = compute_sun_direction(world_time_ticks);
     let mut state = CelestialLightingState {
         sun_illuminance: 1.0,
@@ -579,6 +589,160 @@ pub fn compute_celestial_lighting(
         }
     }
     state
+}
+
+/// Deep-cave floor ambient mirrored by the `MEGU_TERRAIN_LIT_WGSL` ambient
+/// floor: a sealed-off space (`sky_light == 0`) rests just above a crushed
+/// black, so torch and moon light read as real pools of colour.
+pub const INEI_DEEP_CAVE_AMBIENT: [f32; 3] = [0.008, 0.009, 0.014];
+
+/// Non-linear sky-light falloff `pow(sky_light / 15, 1.8)` over the vanilla
+/// `0..=15` range. The WGSL `sky_light_factor` mirrors the same curve and
+/// gates sky ambient plus the cave-entrance indirect bounce.
+pub fn compute_sky_light_factor(sky_light: f32) -> f32 {
+    let n = if sky_light.is_finite() {
+        (sky_light / 15.0).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if n <= 0.0 {
+        0.0
+    } else {
+        n.powf(1.8)
+    }
+}
+
+/// Strict underground direct-light gate `smoothstep(0, 2, sky_light)`.
+/// A sealed cave (`sky_light == 0`) returns exactly `0.0`, so sun and moon
+/// direct light can never bleed through rock even where the shadow map or
+/// a missing cascade still reports `visibility == 1.0`.
+pub fn compute_direct_light_gate(sky_light: f32) -> f32 {
+    if !sky_light.is_finite() {
+        return 0.0;
+    }
+    smooth01(sky_light / 2.0)
+}
+
+/// Warm blackbody-style block-light temperature, mirrored by the WGSL
+/// `color_temp`: incandescent gold beside a torch or lantern, deepening to
+/// amber-orange as the light level falls off.
+pub fn compute_block_light_color_temp(block_light: f32) -> [f32; 3] {
+    let n = if block_light.is_finite() {
+        (block_light / 15.0).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    [1.0, 0.32 + 0.55 * n, 0.08 + 0.42 * n * n]
+}
+
+/// Cave-entrance indirect bounce tint, mirrored by the WGSL
+/// `cave_bounce_color`: warm daylight scatter by day, akane-iro depth at
+/// dusk, and a quiet silver-blue under moonlight. `sun_elevation` is
+/// `sun_direction.y`; `moon_strength` is `moon_color.w`.
+pub fn compute_cave_bounce_color(sun_elevation: f32, moon_strength: f32) -> [f32; 3] {
+    let elevation = if sun_elevation.is_finite() {
+        sun_elevation
+    } else {
+        0.0
+    };
+    let moon = if moon_strength.is_finite() {
+        moon_strength.clamp(0.0, 4.0)
+    } else {
+        0.0
+    };
+    let mix = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    let day = smooth01((elevation + 0.12) / 0.24);
+    let twilight = 1.0 - smooth01(elevation.abs() / 0.28);
+    let mut out = [0.0; 3];
+    for (index, channel) in out.iter_mut().enumerate() {
+        let day_bounce = mix(
+            mix([0.26, 0.18, 0.11][index], [0.16, 0.20, 0.30][index], 0.55),
+            [0.30, 0.13, 0.06][index],
+            twilight * 0.6,
+        );
+        let moon_bounce = [0.035, 0.05, 0.10][index] * (0.3 + moon);
+        *channel = mix(moon_bounce, day_bounce, day);
+    }
+    out
+}
+
+/// Sanitized `sky_light`/`block_light` pair with every A1 term the
+/// `MEGU_TERRAIN_LIT_WGSL` fragment stage derives — a CPU mirror used to
+/// verify the shader math without a GPU.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IneiSkyBlockLight {
+    /// `sky_light` clamped into the vanilla `0..=15` range.
+    pub sky_light: f32,
+    /// `block_light` clamped into the vanilla `0..=15` range.
+    pub block_light: f32,
+    /// `pow(sky_light / 15, 1.8)`: gates sky ambient and entrance bounce.
+    pub sky_factor: f32,
+    /// `smoothstep(0, 2, sky_light)`: zero direct sun/moon in sealed caves.
+    pub direct_gate: f32,
+    /// Time-of-day tinted cave-entrance bounce colour.
+    pub cave_bounce: [f32; 3],
+    /// Warm blackbody block-light colour under quadratic falloff.
+    pub block_rgb: [f32; 3],
+}
+
+/// Mirror of the light fields the packed terrain vertex already carries
+/// (`block_light << 5 | sky_light << 9` inside `attributes`): unpacks both
+/// channels and derives every sky/block lighting term the terrain shader
+/// consumes.
+pub fn compute_inei_sky_block_light(
+    sky_light: f32,
+    block_light: f32,
+    sun_elevation: f32,
+    moon_strength: f32,
+) -> IneiSkyBlockLight {
+    let sanitize = |value: f32| {
+        if value.is_finite() {
+            value.clamp(0.0, 15.0)
+        } else {
+            0.0
+        }
+    };
+    let sky = sanitize(sky_light);
+    let block = sanitize(block_light);
+    let block_n = block / 15.0;
+    IneiSkyBlockLight {
+        sky_light: sky,
+        block_light: block,
+        sky_factor: compute_sky_light_factor(sky),
+        direct_gate: compute_direct_light_gate(sky),
+        cave_bounce: compute_cave_bounce_color(sun_elevation, moon_strength),
+        block_rgb: scale(
+            compute_block_light_color_temp(block),
+            block_n * block_n,
+        ),
+    }
+}
+
+/// Multiplicative transmission RGB for one stained-glass colour index —
+/// the CPU mirror of the WGSL `stained_glass_transmission_rgb` table in
+/// [`MEGU_STAINED_GLASS_SHADOW_COLOR_WGSL`]. Indices follow the vanilla
+/// `DyeColor` order (0 = white, 15 = black); anything else clamps to the
+/// table ends instead of guessing a tint.
+pub fn stained_glass_transmission_rgb(color_idx: u8) -> [f32; 3] {
+    const TABLE: [[f32; 3]; 16] = [
+        [0.97, 0.97, 0.97], // white
+        [0.95, 0.52, 0.14], // orange
+        [0.86, 0.30, 0.80], // magenta
+        [0.36, 0.68, 0.92], // light blue
+        [0.98, 0.84, 0.16], // yellow
+        [0.52, 0.86, 0.14], // lime
+        [0.95, 0.60, 0.72], // pink
+        [0.34, 0.36, 0.38], // gray
+        [0.64, 0.66, 0.68], // light gray
+        [0.13, 0.60, 0.62], // cyan
+        [0.56, 0.26, 0.76], // purple
+        [0.22, 0.32, 0.86], // blue
+        [0.46, 0.29, 0.17], // brown
+        [0.36, 0.56, 0.13], // green
+        [0.86, 0.14, 0.13], // red
+        [0.09, 0.09, 0.10], // black
+    ];
+    TABLE[usize::from(color_idx.min(15))]
 }
 
 /// Why a cached shadow map can no longer be reused this frame.
@@ -866,10 +1030,17 @@ pub fn build_shadow_uniforms_celestial(
     };
     let tan_half_fov = (fov * 0.5).tan();
     let sun = compute_sun_direction(world_time_ticks);
-    // The solar arc lies in XY, so Z is a continuous light-space reference
-    // even at noon and midnight. Switching axes here would rotate shadows.
-    let light_right = normalize(cross([0.0, 0.0, 1.0], sun), [1.0, 0.0, 0.0]);
-    let light_up = cross(sun, light_right);
+    // Sun by day, moon by night: below the horizon the shadow caster is the
+    // real moon at -sun instead of a disabled map. The solar arc lies in
+    // XY, so Z stays a continuous light-space reference at noon and
+    // midnight alike; switching axes would rotate shadows.
+    let caster = if sun[1] >= 0.0 {
+        sun
+    } else {
+        scale(sun, -1.0)
+    };
+    let light_right = normalize(cross([0.0, 0.0, 1.0], caster), [1.0, 0.0, 0.0]);
+    let light_up = cross(caster, light_right);
     let count = config.cascade_count.min(3);
     let splits = compute_cascade_splits(near, far, count, 0.65);
     let mut matrices = [[[0.0; 4]; 4]; 3];
@@ -896,26 +1067,26 @@ pub fn build_shadow_uniforms_celestial(
         let snap = |coordinate: f32| (coordinate / texel).round() * texel;
         let cx = snap(dot(center, light_right));
         let cy = snap(dot(center, light_up));
-        let cz = snap(dot(center, sun));
+        let cz = snap(dot(center, caster));
         let depth_radius = radius * 4.0;
         let inverse_depth = 1.0 / (2.0 * depth_radius);
         matrices[index] = [
             [
                 light_right[0] / radius,
                 light_up[0] / radius,
-                -sun[0] * inverse_depth,
+                -caster[0] * inverse_depth,
                 0.0,
             ],
             [
                 light_right[1] / radius,
                 light_up[1] / radius,
-                -sun[1] * inverse_depth,
+                -caster[1] * inverse_depth,
                 0.0,
             ],
             [
                 light_right[2] / radius,
                 light_up[2] / radius,
-                -sun[2] * inverse_depth,
+                -caster[2] * inverse_depth,
                 0.0,
             ],
             [
@@ -933,7 +1104,10 @@ pub fn build_shadow_uniforms_celestial(
     // Muted akane-iro sunlight near the horizon, without a sudden color step.
     let twilight = 1.0 - smooth01(sun[1].abs() / 0.28);
     let day_phase = (world_time_ticks % 24_000) as f32 / 24_000.0;
-    let moon_strength = (1.0 - daylight) * celestial.moon_illuminance;
+    // smoothstep(0.02, 0.08, |sun.y|): moonlight fades in across the horizon
+    // so the sun->moon caster handover never pops a hard shadow edge.
+    let horizon_fade = smooth01((sun[1].abs() - 0.02) / 0.06);
+    let moon_strength = (1.0 - daylight) * celestial.moon_illuminance * horizon_fade;
     ShadowUniforms {
         light_view_proj: matrices,
         camera_view_proj: camera_matrix(
@@ -1113,9 +1287,17 @@ const VOGEL_16 = array<vec2<f32>, 16>(
     vec2<f32>(-0.1264883130788803, -0.9760894775390625)
 );
 
-fn shadow_cascade_visibility(world: vec3<f32>, n: vec3<f32>, layer: u32) -> f32 {
+// Day casts from the sun, night casts from the real moon at -sun — the
+// shadow map stays live through the whole day cycle instead of disabling
+// at dusk. The caller fades the horizon handover via |sun.y|.
+fn shadow_caster_direction() -> vec3<f32> {
     let sun = normalize(shadow.sun_direction.xyz);
-    let incidence = clamp(dot(n, sun), 0.0, 1.0);
+    return select(-sun, sun, sun.y >= 0.0);
+}
+
+fn shadow_cascade_visibility(world: vec3<f32>, n: vec3<f32>, layer: u32) -> f32 {
+    let caster = shadow_caster_direction();
+    let incidence = clamp(dot(n, caster), 0.0, 1.0);
     let receiver = world + n * (0.015 + 0.05 * (1.0 - incidence));
     let clip = shadow.light_view_proj[layer] * vec4<f32>(receiver, 1.0);
     let uv = clip.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
@@ -1139,14 +1321,16 @@ fn shadow_cascade_visibility(world: vec3<f32>, n: vec3<f32>, layer: u32) -> f32 
 }
 
 fn shadow_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {
-    if (shadow.sun_direction.y <= 0.08) { return 1.0; }
+    // Horizon handover: |sun.y| < 0.02 fades to fully lit so the sun->moon
+    // caster swap never pops a hard edge at dusk or dawn.
+    let horizon_fade = smoothstep(0.02, 0.08, abs(shadow.sun_direction.y));
+    if (horizon_fade <= 0.0) { return 1.0; }
     let count = u32(shadow.shadow_params.y);
     if (count == 0u) { return 1.0; }
-    // Sun-backface early-out: a face strictly turned away from the sun is
-    // self-shadowed by its own block, so no shadow tap is ever needed. The
-    // moon sits at -sun, so moonlit faces have dot(n, sun) > 0 and still
-    // sample the map — komorebi/moonlight semantics are preserved exactly.
-    if (dot(n, normalize(shadow.sun_direction.xyz)) <= 0.0) { return 0.0; }
+    // Caster-backface early-out: a face strictly turned away from the
+    // active caster — the sun by day, the moon at -sun by night — is
+    // self-shadowed by its own block, so no shadow tap is ever needed.
+    if (dot(n, shadow_caster_direction()) <= 0.0) { return 0.0; }
     let distance_along_view = dot(world - shadow.camera_position.xyz,
                                     shadow.camera_forward.xyz);
     var layer = 0u;
@@ -1168,7 +1352,7 @@ fn shadow_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {
                 shadow_cascade_visibility(world, n, layer + 1u), blend);
         }
     }
-    return visibility;
+    return mix(1.0, visibility, horizon_fade);
 }
 "#;
 
@@ -1207,12 +1391,17 @@ struct TerrainInput {
     @location(0) world_position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) albedo: vec3<f32>,
+    // Packed terrain attribute word matching PackedVertex.attributes:
+    // block_light at bits 5..8, sky_light at bits 9..12.
+    @location(3) light_attr: u32,
 };
 struct TerrainOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) world_position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) albedo: vec3<f32>,
+    // x = sky_light (0..15), y = block_light (0..15).
+    @location(3) sky_block_light: vec2<f32>,
 };
 @vertex
 fn vs_main(input: TerrainInput) -> TerrainOutput {
@@ -1221,6 +1410,8 @@ fn vs_main(input: TerrainInput) -> TerrainOutput {
     out.world_position = input.world_position;
     out.normal = input.normal;
     out.albedo = input.albedo;
+    out.sky_block_light = vec2<f32>(f32((input.light_attr >> 9u) & 0xfu),
+                                    f32((input.light_attr >> 5u) & 0xfu));
     return out;
 }
 fn poisson(i: u32) -> vec2<f32> {
@@ -1300,18 +1491,25 @@ fn light_mask_take(mask: ptr<function, vec2<u32>>) -> u32 {
     return 64u;
 }
 
+// Day casts from the sun, night casts from the real moon at -sun.
+fn shadow_caster_direction() -> vec3<f32> {
+    let sun = normalize(shadow.sun_direction.xyz);
+    return select(-sun, sun, sun.y >= 0.0);
+}
+
 fn sample_cascade(position: vec3<f32>, normal: vec3<f32>, cascade: u32) -> f32 {
-    // Sun-backface early-out: a face strictly turned away from the sun is
-    // self-shadowed, so no tap is needed. Komorebi still applies on the
-    // dimmed path and the moon (at -sun) is untouched.
-    if (dot(normal, normalize(shadow.sun_direction.xyz)) <= 0.0) {
+    // Caster-backface early-out: a face strictly turned away from the
+    // active caster — the sun by day, the moon at -sun by night — is
+    // self-shadowed, so no tap is needed.
+    let caster = shadow_caster_direction();
+    if (dot(normal, caster) <= 0.0) {
         return 0.0;
     }
     let quality = u32(shadow.render_params.x);
     // A solar eclipse softens penumbrae by widening the filter footprint.
     let texel = (1.0 + shadow.celestial_params.w * 1.5)
         / max(shadow.shadow_params.x, 1.0);
-    let incidence = abs(dot(normal, normalize(shadow.sun_direction.xyz)));
+    let incidence = abs(dot(normal, caster));
     let receiver = position + normal * (0.012 + 0.06 * (1.0 - incidence));
     let clip = shadow.light_view_proj[cascade] * vec4<f32>(receiver, 1.0);
     let uv = clip.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
@@ -1380,6 +1578,29 @@ fn komorebi_dapple(world_xz: vec2<f32>, day_phase: f32, sun_elevation: f32) -> f
     let daylight = smoothstep(0.08, 0.20, sun_elevation);
     return 1.0 + daylight * (-0.03 + 0.11 * (0.72 * broad + 0.28 * fine));
 }
+// A1: non-linear sky-light falloff n^1.8 as a single exp2/log2 pair
+// — the dark-vision curve that lets cave depth swallow skylight fast.
+fn sky_light_factor(sky_light: f32) -> f32 {
+    let n = clamp(sky_light / 15.0, 0.0, 1.0);
+    return exp2(1.8 * log2(max(n, 0.00001)));
+}
+// A1: warm blackbody-style temperature for baked block light —
+// incandescent gold beside a torch, deep amber-orange farther out.
+fn color_temp(block_light: f32) -> vec3<f32> {
+    let n = clamp(block_light / 15.0, 0.0, 1.0);
+    return vec3<f32>(1.0, 0.32 + 0.55 * n, 0.08 + 0.42 * pow2(n));
+}
+// A1: cave-entrance indirect bounce tint — warm daylight scatter by day,
+// akane-iro depth at dusk, quiet silver-blue under moonlight.
+fn cave_bounce_color() -> vec3<f32> {
+    let day = smoothstep(-0.12, 0.12, shadow.sun_direction.y);
+    let twilight = 1.0 - smoothstep(0.0, 0.28, abs(shadow.sun_direction.y));
+    var day_bounce = mix(vec3<f32>(0.26, 0.18, 0.11),
+                         vec3<f32>(0.16, 0.20, 0.30), 0.55);
+    day_bounce = mix(day_bounce, vec3<f32>(0.30, 0.13, 0.06), twilight * 0.6);
+    let moon_bounce = vec3<f32>(0.035, 0.05, 0.10) * (0.3 + shadow.moon_color.w);
+    return mix(moon_bounce, day_bounce, day);
+}
 @fragment
 fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
     let normal = normalize(input.normal);
@@ -1400,7 +1621,18 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
             layer = 2u;
         }
         visibility = sample_cascade(input.world_position, normal, layer);
+        // The sun->moon caster handover fades shadow strength across the
+        // horizon so the flip never pops a hard edge.
+        visibility = mix(1.0, visibility,
+                         smoothstep(0.02, 0.08, abs(shadow.sun_direction.y)));
     }
+    // A1: vertex sky/block light drive the physical cave light model.
+    let sky_light = clamp(input.sky_block_light.x, 0.0, 15.0);
+    let block_light = clamp(input.sky_block_light.y, 0.0, 15.0);
+    let sky_factor = sky_light_factor(sky_light);
+    // Strict underground gate: sealed caves receive exactly zero direct
+    // sun/moon even where the shadow map still reports visibility = 1.
+    let direct_gate = smoothstep(0.0, 2.0, sky_light);
     let sky_ambient = mix(vec3<f32>(0.11, 0.14, 0.23),
                           vec3<f32>(0.31, 0.37, 0.50), max(normal.y, 0.0));
     let bounce = mix(vec3<f32>(0.19, 0.12, 0.09), vec3<f32>(0.0),
@@ -1412,18 +1644,30 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
     let ambient_dim = 1.0 - shadow.celestial_params.w * 0.55;
     // Lunar shadow strength lets moonlight share the shadow map softly.
     let lunar_visibility = mix(1.0, visibility, shadow.celestial_params.z);
-    let ambient = max((sky_ambient * shadow_sky_scale
-                       + bounce * warm_bounce_scale) * ambient_dim,
-                      vec3<f32>(0.065));
-    // Komorebi travels with the daylight across partially shaded block faces.
+    // The sky_light gradient carries the outside sky into enclosed spaces
+    // as entrance bounce before dissolving into deep cave darkness.
+    let enclosure = 1.0 - smoothstep(12.0, 15.0, sky_light);
+    let entrance_bounce = cave_bounce_color() * sky_factor * enclosure
+                          * (0.6 + 0.4 * max(normal.y, 0.0));
+    let ambient = max(((sky_ambient * shadow_sky_scale
+                        + bounce * warm_bounce_scale) * sky_factor
+                       + entrance_bounce) * ambient_dim,
+                      vec3<f32>(0.008, 0.009, 0.014));
+    // Komorebi is real leaf cutout + wind caster geometry whenever the
+    // shadow map is live; the analytic dapple survives only as the
+    // map-free fallback so walls never show fake wave artifacts.
     var komorebi = 1.0;
-    if (visibility < 0.95 || cascade_count == 0u) {
+    if (cascade_count == 0u) {
         komorebi = komorebi_dapple(input.world_position.xz, shadow.render_params.y,
                                    shadow.sun_direction.y);
     }
+    // Baked block light burns warm through the deepest dark.
+    let block_glow = color_temp(block_light) * pow2(block_light / 15.0) * 0.85;
     let light = ambient + shadow.sun_color.xyz * sun_power * visibility * komorebi
+                          * direct_gate
                 + shadow.moon_color.xyz * moon_power * shadow.moon_color.w
-                  * lunar_visibility;
+                  * lunar_visibility * direct_gate
+                + block_glow;
     let view_dir = -view_offset / max(view_distance, 0.0001);
     // Nure-iro: damp upward stone and timber retain a restrained sky glint.
     let wetness = clamp(shadow.render_params.z * 24.0, 0.0, 1.0)
@@ -1815,6 +2059,232 @@ fn fs_main(input: SharpenOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(clamp(sharpened, lo, hi), 1.0);
 }
 "#;
+
+/// Lightweight alpha-test shadow depth caster for cutout blocks — window
+/// glass panes, iron bars, trapdoors, flowers, and leaves. Transparent
+/// texels `discard`, so sun- and moonlight pass through real openings
+/// while frames, mullions and leaf texels still write depth. The optional
+/// `sway_kind` vertex input (`0` = rigid) applies the same
+/// [`crate::vanilla_plus_nature::MEGU_WIND_SWAY_WGSL_FN`] motion the main
+/// pass uses, so leaf shadows sway in sync with the visible canopy — the
+/// real-geometry komorebi source.
+///
+/// Bindings: `0/0` shared [`ShadowUniforms`], `1/1` section origin,
+/// `3/0..3` atlas texture + sampler + rect/state storage buffers. The
+/// renderer chooses the cascade layer via `shadow_params.w` exactly like
+/// [`MEGU_SHADOW_DEPTH_WGSL`].
+pub const MEGU_SHADOW_CUTOUT_DEPTH_WGSL: &str = r#"
+struct ShadowUniforms {
+    light_view_proj: array<mat4x4<f32>, 3>,
+    camera_view_proj: mat4x4<f32>,
+    cascade_splits: vec4<f32>,
+    sun_direction: vec4<f32>,
+    sun_color: vec4<f32>,
+    moon_color: vec4<f32>,
+    camera_position: vec4<f32>,
+    camera_forward: vec4<f32>,
+    camera_right: vec4<f32>,
+    camera_up: vec4<f32>,
+    shadow_params: vec4<f32>,
+    render_params: vec4<f32>,
+    celestial_params: vec4<f32>,
+};
+struct ShadowSection {
+    origin: vec3<f32>,
+    _pad0: f32,
+    biome_tint: vec3<f32>,
+    biome_tint_strength: f32,
+};
+struct AtlasRects { rects: array<vec4<f32>> };
+struct AtlasStates { sprites: array<u32> };
+@group(0) @binding(0) var<uniform> shadow: ShadowUniforms;
+@group(1) @binding(1) var<uniform> section: ShadowSection;
+@group(3) @binding(0) var atlas_tex: texture_2d<f32>;
+@group(3) @binding(1) var atlas_sampler: sampler;
+@group(3) @binding(2) var<storage, read> atlas_rects: AtlasRects;
+@group(3) @binding(3) var<storage, read> atlas_states: AtlasStates;
+
+fn megu_wind_sway(local_pos: vec3<f32>, block_phase: f32, time_sec: f32,
+                  strength: f32, kind: u32) -> vec3<f32> {
+    let phase = time_sec * 1.4 + block_phase;
+    let s0 = sin(phase);
+    let s1 = sin(phase * 0.63 + 1.3);
+    var attach = clamp(local_pos.y, 0.0, 1.0);
+    var amp = strength * 0.12;
+    if (kind == 2u) {
+        attach = 1.0;
+        amp = strength * 0.05;
+    } else if (kind == 3u) {
+        attach = clamp(1.0 - local_pos.y, 0.0, 1.0);
+        amp = strength * 0.10;
+    }
+    if (kind == 2u) {
+        return vec3<f32>(amp * sin(phase * 1.7 + local_pos.x * 3.1),
+                         amp * 0.4 * cos(phase * 1.9 + local_pos.y * 2.3),
+                         amp * sin(phase * 1.6 + local_pos.z * 2.7));
+    }
+    return vec3<f32>(amp * attach * s0, 0.0, amp * attach * s1 * 0.6);
+}
+
+// Per-block sway phase so neighbouring leaves never move in lockstep.
+fn cutout_block_phase(block: vec3<f32>) -> f32 {
+    return fract(sin(dot(floor(block), vec3<f32>(31.0, 17.0, 13.0)))
+                 * 43758.55) * 6.2831853;
+}
+
+fn cutout_tiled_uv(p: vec3<f32>, direction: u32) -> vec2<f32> {
+    if direction < 2u { return p.xz; }
+    if direction < 4u { return p.xy; }
+    return p.zy;
+}
+
+struct CutoutInput {
+    @location(0) packed_pos: u32,
+    @location(1) state_id: u32,
+    @location(2) attributes: u32,
+    // 0 = rigid (panes, bars); 1/2/3 = the WindSwayCategory discriminants
+    // (grass / leaves / hanging) shared with the main wind pass.
+    @location(3) sway_kind: u32,
+};
+struct CutoutOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) sprite_id: u32,
+};
+
+@vertex
+fn vs_cutout(input: CutoutInput) -> CutoutOutput {
+    let local = vec3<f32>(f32(input.packed_pos & 31u),
+        f32(input.packed_pos >> 10u) / 1024.0,
+        f32((input.packed_pos >> 5u) & 31u));
+    var world = section.origin + local;
+    // Optional wind sway: rigid casters (kind 0) skip the offset entirely,
+    // so window glass stays fixed while leaves rustle the sun's shadow.
+    if (input.sway_kind != 0u) {
+        let wind_time = shadow.render_params.y * 1200.0;
+        world = world + megu_wind_sway(local, cutout_block_phase(world),
+                                       wind_time, 0.35, input.sway_kind);
+    }
+    var out: CutoutOutput;
+    out.position = shadow.light_view_proj[
+        min(u32(shadow.shadow_params.w), 2u)] * vec4<f32>(world, 1.0);
+    out.uv = cutout_tiled_uv(local, input.attributes & 0x7u);
+    out.sprite_id = input.state_id;
+    return out;
+}
+
+fn sample_atlas_alpha(sprite_id: u32, uv: vec2<f32>) -> f32 {
+    if (sprite_id >= arrayLength(&atlas_states.sprites)) {
+        return 1.0;
+    }
+    let mapped = atlas_states.sprites[sprite_id];
+    if (mapped >= arrayLength(&atlas_rects.rects)) {
+        return 1.0;
+    }
+    let rect = atlas_rects.rects[mapped];
+    return textureSampleLevel(atlas_tex, atlas_sampler,
+        rect.xy + fract(uv) * rect.zw, 0.0).a;
+}
+
+@fragment
+fn fs_cutout(input: CutoutOutput) {
+    let atlas_alpha = sample_atlas_alpha(input.sprite_id, input.uv);
+    if (atlas_alpha < 0.5) { discard; }
+}
+"#;
+
+/// Lightweight color-transmission shadow caster for stained glass. It
+/// renders into a small `Rgba8Unorm` shadow-color map under multiplicative
+/// blending (`Dst` factor), so layered panes compose physically and sun-
+/// or moonlight arrives tinted on interior floors and walls. The pass
+/// runs only when a stained-glass caster exists in the covered cascades —
+/// with none present its cost is exactly zero.
+///
+/// Bindings: `0/0` shared [`ShadowUniforms`]; the color index arrives as a
+/// flat vertex attribute following the vanilla `DyeColor` order.
+pub const MEGU_STAINED_GLASS_SHADOW_COLOR_WGSL: &str = r#"
+struct ShadowUniforms {
+    light_view_proj: array<mat4x4<f32>, 3>,
+    camera_view_proj: mat4x4<f32>,
+    cascade_splits: vec4<f32>,
+    sun_direction: vec4<f32>,
+    sun_color: vec4<f32>,
+    moon_color: vec4<f32>,
+    camera_position: vec4<f32>,
+    camera_forward: vec4<f32>,
+    camera_right: vec4<f32>,
+    camera_up: vec4<f32>,
+    shadow_params: vec4<f32>,
+    render_params: vec4<f32>,
+    celestial_params: vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> shadow: ShadowUniforms;
+
+// Multiplicative light transmission per vanilla dye index (0 = white ..
+// 15 = black); the CPU mirror is `stained_glass_transmission_rgb`.
+fn stained_glass_transmission_rgb(color_idx: u32) -> vec3<f32> {
+    let table = array<vec3<f32>, 16>(
+        vec3<f32>(0.97, 0.97, 0.97), // white
+        vec3<f32>(0.95, 0.52, 0.14), // orange
+        vec3<f32>(0.86, 0.30, 0.80), // magenta
+        vec3<f32>(0.36, 0.68, 0.92), // light blue
+        vec3<f32>(0.98, 0.84, 0.16), // yellow
+        vec3<f32>(0.52, 0.86, 0.14), // lime
+        vec3<f32>(0.95, 0.60, 0.72), // pink
+        vec3<f32>(0.34, 0.36, 0.38), // gray
+        vec3<f32>(0.64, 0.66, 0.68), // light gray
+        vec3<f32>(0.13, 0.60, 0.62), // cyan
+        vec3<f32>(0.56, 0.26, 0.76), // purple
+        vec3<f32>(0.22, 0.32, 0.86), // blue
+        vec3<f32>(0.46, 0.29, 0.17), // brown
+        vec3<f32>(0.36, 0.56, 0.13), // green
+        vec3<f32>(0.86, 0.14, 0.13), // red
+        vec3<f32>(0.09, 0.09, 0.10)  // black
+    );
+    return table[min(color_idx, 15u)];
+}
+
+struct StainedInput {
+    @location(0) world_position: vec3<f32>,
+    @location(1) color_idx: u32,
+};
+struct StainedOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) color_idx: u32,
+};
+
+@vertex
+fn vs_stained(input: StainedInput) -> StainedOutput {
+    var out: StainedOutput;
+    // The same light-space projection as the depth casters, so the
+    // transmission tint lands exactly where the depth map says light was
+    // blocked.
+    out.position = shadow.light_view_proj[
+        min(u32(shadow.shadow_params.w), 2u)]
+        * vec4<f32>(input.world_position, 1.0);
+    out.color_idx = input.color_idx;
+    return out;
+}
+
+@fragment
+fn fs_stained(input: StainedOutput) -> @location(0) vec4<f32> {
+    // Rgba8Unorm target under multiplicative blending: each fragment
+    // multiplies the running transmission colour.
+    return vec4<f32>(stained_glass_transmission_rgb(input.color_idx), 1.0);
+}
+"#;
+
+/// Optional shadow casters published alongside the builtin pack. The five
+/// [`BUILTIN_SHADOW_SHADERS`] passes are always present; these two are
+/// wired only when the scene actually has cutout or stained-glass casters,
+/// so they cost nothing otherwise.
+pub const BUILTIN_SHADOW_CASTER_SHADERS: [(&str, &str); 2] = [
+    ("shadow_cutout_depth.wgsl", MEGU_SHADOW_CUTOUT_DEPTH_WGSL),
+    (
+        "shadow_stained_glass_color.wgsl",
+        MEGU_STAINED_GLASS_SHADOW_COLOR_WGSL,
+    ),
+];
 
 /// File names and sources accepted by the native shaderpack loader.
 pub const BUILTIN_SHADOW_SHADERS: [(&str, &str); 5] = [
