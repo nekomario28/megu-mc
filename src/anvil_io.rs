@@ -1348,8 +1348,9 @@ fn anvil_sign_id(dim: DimId, x: i32, y: i32, z: i32) -> &'static str {
 }
 
 /// `SignText`-shaped compound for one side of a sign, matching the shape
-/// `sign_side_nbt` writes for the wire: color, glow flag, both message lists,
-/// each message a JSON string component.
+/// `sign_side_nbt` writes for the wire: color, glow flag, and the message list —
+/// each message a JSON string component. `filtered_messages` is omitted the way
+/// the game omits it for a sign that was never chat-filtered.
 fn anvil_sign_side(lines: &[String; 4], filled: bool, color: &str, glow: bool) -> AnvilNbt {
     let to_list = |values: Vec<String>| {
         AnvilNbt::List(
@@ -1360,10 +1361,6 @@ fn anvil_sign_side(lines: &[String; 4], filled: bool, color: &str, glow: bool) -
     anvil_obj(&[
         ("color", anvil_s(color)),
         ("has_glowing_text", AnvilNbt::Byte(i8::from(glow))),
-        (
-            "filtered_messages",
-            to_list(vec![String::new(), String::new(), String::new(), String::new()]),
-        ),
         (
             "messages",
             to_list(if filled {

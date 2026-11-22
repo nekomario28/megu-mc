@@ -1502,15 +1502,6 @@ fn execute_sign_block_data(dim: DimId, (x, y, z): BlockPos) -> ExecTag {
             ("color", ExecTag::String(NbtString::text("white"))),
             ("has_glowing_text", ExecTag::Byte(0)),
             (
-                "filtered_messages",
-                ExecTag::List(
-                    8,
-                    [""; 4]
-                        .map(|line| ExecTag::String(NbtString::text(line)))
-                        .into(),
-                ),
-            ),
-            (
                 "messages",
                 ExecTag::List(
                     8,

@@ -5422,17 +5422,20 @@ fn run_block_modification(ctx: &CmdCtx, cmd: &str, args: &[&str]) -> Result<Stri
                         block_drops(previous)
                             .into_iter()
                             .take(remaining)
-                            .map(|item| Drop {
-                                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                x: f64::from(x) + 0.5,
-                                y: f64::from(y) + 0.5,
-                                z: f64::from(z) + 0.5,
-                                item,
-                                cnt: 1,
-                                comps: Vec::new(),
-                                age: 0,
-                                target: None,
-                                thrower: None,
+                            .map(|item| {
+                                Drop {
+                                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                    x: f64::from(x) + 0.5,
+                                    y: f64::from(y) + 0.5,
+                                    z: f64::from(z) + 0.5,
+                                    item,
+                                    cnt: 1,
+                                    comps: Vec::new(),
+                                    age: 0,
+                                    target: None,
+                                    thrower: None,
+                                }
+                                .world_scatter(dim)
                             }),
                     );
                 }
@@ -7636,7 +7639,7 @@ fn loot_give_stack(client: &Arc<Client>, stack: &Stack) {
     };
     drop(inv);
     let mut p = vec![0u8];
-    write_varint(&mut p, 0);
+    write_varint(&mut p, i64::from(inv_state_next(client)));
     p.extend_from_slice(&slot.to_be_bytes());
     p.extend_from_slice(&slot_wire(&st));
     if let Ok(mut w) = client.sock.lock() {
@@ -7917,7 +7920,7 @@ fn run_loot_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> St
                                 *c.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&inv);
                             }
                             let mut p = vec![0u8];
-                            write_varint(&mut p, 0);
+                            write_varint(&mut p, i64::from(inv_state_next(c)));
                             p.extend_from_slice(&slot.to_be_bytes());
                             p.extend_from_slice(&slot_wire(st));
                             if let Ok(mut w) = c.sock.lock() {
@@ -7948,18 +7951,21 @@ fn run_loot_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> St
             };
             let n = items.len();
             for (item, cnt, ic) in items {
-                drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
-                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                    x: lx,
-                    y: ly,
-                    z: lz,
-                    item,
-                    cnt,
-                    comps: ic,
-                    age: 0,
-                    target: None,
-                    thrower: None,
-                });
+                drops().lock().unwrap_or_else(|e| e.into_inner()).push(
+                    Drop {
+                        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                        x: lx,
+                        y: ly,
+                        z: lz,
+                        item,
+                        cnt,
+                        comps: ic,
+                        age: 0,
+                        target: None,
+                        thrower: None,
+                    }
+                    .world_scatter(DimId::Overworld),
+                );
             }
             format!("Dropped {} item stack(s)", n)
         }
@@ -8497,17 +8503,20 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                         block_drops(old)
                             .into_iter()
                             .take(remaining)
-                            .map(|item| Drop {
-                                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                x: f64::from(x) + 0.5,
-                                y: f64::from(y) + 0.5,
-                                z: f64::from(z) + 0.5,
-                                item,
-                                cnt: 1,
-                                comps: Vec::new(),
-                                age: 0,
-                                target: None,
-                                thrower: None,
+                            .map(|item| {
+                                Drop {
+                                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                    x: f64::from(x) + 0.5,
+                                    y: f64::from(y) + 0.5,
+                                    z: f64::from(z) + 0.5,
+                                    item,
+                                    cnt: 1,
+                                    comps: Vec::new(),
+                                    age: 0,
+                                    target: None,
+                                    thrower: None,
+                                }
+                                .world_scatter(dim)
                             }),
                     );
                 }
@@ -8659,7 +8668,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                         .or_else(|| (36..=44).chain(9..=35).find(|sl| !inv.contains_key(sl)))
                         .unwrap_or(36);
                     let st = if let Some(st0) = inv.get_mut(&slot) { st0.1 = st0.1.saturating_add(cnt); st0.clone() } else { inv.insert(slot, st.clone()); st };
-                    let mut p = vec![0u8]; write_varint(&mut p, 0);
+                    let mut p = vec![0u8]; write_varint(&mut p, i64::from(inv_state_next(c)));
                     p.extend_from_slice(&slot.to_be_bytes());
                     p.extend_from_slice(&slot_wire(&st));
                     if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x15, p); }
@@ -8765,7 +8774,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                                     *c.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&inv);
                                 }
                                 {   // resync the touched slot (held fast path + generic)
-                                    let mut p = vec![0u8]; write_varint(&mut p, 0);
+                                    let mut p = vec![0u8]; write_varint(&mut p, i64::from(inv_state_next(c)));
                                     p.extend_from_slice(&slot.to_be_bytes());
                                     p.extend_from_slice(&slot_wire(&(item, cnt, comps.clone())));
                                     if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x15, p); }
@@ -8813,7 +8822,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                                 if let Some(st) = inv.get_mut(&slot) { apply_loot_funcs(st, &fns); done += 1; }
                                 let ns = inv.get(&slot).cloned().unwrap_or((0, 0, Vec::new()));
                                 drop(inv);
-                                {   let mut p = vec![0u8]; write_varint(&mut p, 0);
+                                {   let mut p = vec![0u8]; write_varint(&mut p, i64::from(inv_state_next(c)));
                                     p.extend_from_slice(&slot.to_be_bytes());
                                     p.extend_from_slice(&slot_wire(&ns));
                                     if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x15, p); } }

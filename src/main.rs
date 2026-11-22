@@ -2225,7 +2225,8 @@ fn actor_tick() {
                                 age: 0,
                                 target: None,
                                 thrower: None,
-                            };
+                            }
+                            .world_scatter(DimId::Overworld);
                             drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
                             // spawn streams via interest_tick
                         }
@@ -2329,7 +2330,8 @@ fn wash_away(x: i32, y: i32, z: i32) {
             age: 0,
             target: None,
             thrower: None,
-        };
+        }
+        .world_scatter(DimId::Overworld);
         drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
     }
 }
@@ -2768,18 +2770,21 @@ fn detach_tether(target_eid: i32, drop_pos: Option<(f64, f64, f64)>) -> Option<E
         (0x59, set_entity_link_pkt(target_eid, -1))
     });
     if let (Some(item), Some((x, y, z))) = (tether.drop_item_on_break, drop_pos) {
-        drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
-            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-            x,
-            y,
-            z,
-            item: i64::from(item),
-            cnt: 1,
-            comps: Vec::new(),
-            age: 0,
-            target: None,
-            thrower: None,
-        });
+        drops().lock().unwrap_or_else(|e| e.into_inner()).push(
+            Drop {
+                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                x,
+                y,
+                z,
+                item: i64::from(item),
+                cnt: 1,
+                comps: Vec::new(),
+                age: 0,
+                target: None,
+                thrower: None,
+            }
+            .world_scatter(DimId::Overworld),
+        );
     }
     Some(tether)
 }
@@ -6515,32 +6520,38 @@ fn break_generated_cart(target_eid: i32, drop_loot: bool) -> bool {
     if drop_loot && gr_do_entity_drops() {
         let mut ds = drops().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cart_item) = name_to_item("chest_minecart") {
-            ds.push(Drop {
-                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                x: pos[0],
-                y: pos[1] + 0.1,
-                z: pos[2],
-                item: cart_item,
-                cnt: 1,
-                comps: Vec::new(),
-                age: 0,
-                target: None,
-                thrower: None,
-            });
+            ds.push(
+                Drop {
+                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                    x: pos[0],
+                    y: pos[1] + 0.1,
+                    z: pos[2],
+                    item: cart_item,
+                    cnt: 1,
+                    comps: Vec::new(),
+                    age: 0,
+                    target: None,
+                    thrower: None,
+                }
+                .world_scatter(DimId::Overworld),
+            );
         }
         for (item, cnt, comps) in spilled {
-            ds.push(Drop {
-                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                x: pos[0],
-                y: pos[1] + 0.1,
-                z: pos[2],
-                item,
-                cnt,
-                comps,
-                age: 0,
-                target: None,
-                thrower: None,
-            });
+            ds.push(
+                Drop {
+                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                    x: pos[0],
+                    y: pos[1] + 0.1,
+                    z: pos[2],
+                    item,
+                    cnt,
+                    comps,
+                    age: 0,
+                    target: None,
+                    thrower: None,
+                }
+                .world_scatter(DimId::Overworld),
+            );
         }
     }
     if let Some(uuid) = uuid {
@@ -8833,18 +8844,21 @@ fn leaf_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i3
     note_block_update_dim(dim, x, y, z, 0);
     if result.drop_item && GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0 {
         for item in block_drops(st) {
-            drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
-                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                x: x as f64 + 0.5,
-                y: y as f64 + 0.4,
-                z: z as f64 + 0.5,
-                item,
-                cnt: 1,
-                comps: Vec::new(),
-                age: 0,
-                target: None,
-                thrower: None,
-            });
+            drops().lock().unwrap_or_else(|e| e.into_inner()).push(
+                Drop {
+                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                    x: x as f64 + 0.5,
+                    y: y as f64 + 0.4,
+                    z: z as f64 + 0.5,
+                    item,
+                    cnt: 1,
+                    comps: Vec::new(),
+                    age: 0,
+                    target: None,
+                    thrower: None,
+                }
+                .world_scatter(dim),
+            );
         }
     }
 }
@@ -9375,17 +9389,63 @@ fn apply_queued_block_updates() {
     // The tick and connection threads can both flush. Publish batches in order.
     static FLUSH: Mutex<()> = Mutex::new(());
     let _flush = FLUSH.lock().unwrap_or_else(|e| e.into_inner());
-    let map = std::mem::take(&mut *pending_blocks().lock().unwrap_or_else(|e| e.into_inner()));
-    for ((dim, sx, sy, sz), recs) in map {
-        let mut p = Vec::with_capacity(9 + recs.len() * 5);
-        let key =
-            ((sx as i64 & 0x3fffff) << 42) | ((sz as i64 & 0x3fffff) << 20) | (sy as i64 & 0xfffff);
-        p.extend_from_slice(&key.to_be_bytes());
-        write_varint(&mut p, recs.len() as i64);
-        for (idx, st) in &recs {
-            write_varint(&mut p, ((*st as i64) << 12) | *idx as i64);
+    // `handleUseItemOn` resends `ClientboundBlockUpdatePacket` for the clicked
+    // cell and `clicked + face` to the acting client at the end of every
+    // use_on; they precede the dirty-cell batch like vanilla's tail sends.
+    for c in client_snapshot() {
+        let resend = c.use_on_resend.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some((dim, rx, ry, rz, rface)) = resend {
+            let (fx, fy, fz) = FACE_OFF[(rface.clamp(0, 5)) as usize];
+            for (px, py, pz) in [(rx, ry, rz), (rx + fx, ry + fy, rz + fz)] {
+                let mut p = Vec::with_capacity(13);
+                write_pos(&mut p, px, py, pz);
+                write_varint(&mut p, block_at_dim(dim, px, py, pz) as i64);
+                let _ = send_packet(&mut c.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x09, p);
+            }
         }
-        broadcast_chunk_dim(dim, sx, sz, |_c| (0x49, p.clone()));
+    }
+    let map = std::mem::take(&mut *pending_blocks().lock().unwrap_or_else(|e| e.into_inner()));
+    // `PlayerChunk.broadcastChanges` counts dirty cells per *chunk*: exactly
+    // one dirty cell anywhere in the column goes out as `block_update` (0x09);
+    // two or more emit `section_blocks_update` (0x49) per section, even when a
+    // section holds a single dirty cell.
+    let mut by_chunk: BTreeMap<(DimId, i32, i32), Vec<((i32, i32, i32), HashMap<u16, u32>)>> =
+        BTreeMap::new();
+    for ((dim, sx, sy, sz), recs) in map {
+        by_chunk
+            .entry((dim, sx, sz))
+            .or_default()
+            .push(((sx, sy, sz), recs));
+    }
+    for ((dim, cx, cz), sections) in by_chunk {
+        if sections.len() == 1 {
+            let ((sx, sy, sz), recs) = &sections[0];
+            if recs.len() == 1 {
+                let (idx, st) = recs.iter().next().map(|(i, s)| (*i, *s)).unwrap();
+                let mut p = Vec::with_capacity(13);
+                write_pos(
+                    &mut p,
+                    sx * 16 + ((idx >> 8) & 15) as i32,
+                    sy * 16 + (idx & 15) as i32,
+                    sz * 16 + ((idx >> 4) & 15) as i32,
+                );
+                write_varint(&mut p, st as i64);
+                broadcast_chunk_dim(dim, cx, cz, |_c| (0x09, p.clone()));
+                continue;
+            }
+        }
+        for ((sx, sy, sz), recs) in sections {
+            let mut p = Vec::with_capacity(9 + recs.len() * 5);
+            let key = ((sx as i64 & 0x3fffff) << 42)
+                | ((sz as i64 & 0x3fffff) << 20)
+                | (sy as i64 & 0xfffff);
+            p.extend_from_slice(&key.to_be_bytes());
+            write_varint(&mut p, recs.len() as i64);
+            for (idx, st) in &recs {
+                write_varint(&mut p, ((*st as i64) << 12) | *idx as i64);
+            }
+            broadcast_chunk_dim(dim, cx, cz, |_c| (0x49, p.clone()));
+        }
     }
     apply_queued_light_updates();
 }
@@ -9634,18 +9694,21 @@ fn set_block_if_inner_dim(
             {
                 let mut ds = drops().lock().unwrap_or_else(|e| e.into_inner());
                 for (item, cnt, comps) in spill {
-                    ds.push(Drop {
-                        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                        x: x as f64 + 0.5,
-                        y: y as f64 + 0.5,
-                        z: z as f64 + 0.5,
-                        item,
-                        cnt,
-                        comps,
-                        age: 0,
-                        target: None,
-                        thrower: None,
-                    });
+                    ds.push(
+                        Drop {
+                            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                            x: x as f64 + 0.5,
+                            y: y as f64 + 0.5,
+                            z: z as f64 + 0.5,
+                            item,
+                            cnt,
+                            comps,
+                            age: 0,
+                            target: None,
+                            thrower: None,
+                        }
+                        .world_scatter(DimId::Overworld),
+                    );
                 }
             }
             // `ChestBlockEntity.setRemoved` -> `recheckOpeners`: a menu built on a
@@ -12245,18 +12308,21 @@ fn falling_tick() {
                 // destroying the item that left the world when the fall started. The drop is
                 // the entity's, so `doEntityDrops` gates it.
                 if let Some(item) = block_drop(f.state).filter(|_| gr_do_entity_drops()) {
-                    below.push(Drop {
-                        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                        x: f.x,
-                        y: f.y,
-                        z: f.z,
-                        item,
-                        cnt: 1,
-                        comps: Vec::new(),
-                        age: 0,
-                        target: None,
-                        thrower: None,
-                    });
+                    below.push(
+                        Drop {
+                            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                            x: f.x,
+                            y: f.y,
+                            z: f.z,
+                            item,
+                            cnt: 1,
+                            comps: Vec::new(),
+                            age: 0,
+                            target: None,
+                            thrower: None,
+                        }
+                        .world_scatter(DimId::Overworld),
+                    );
                 }
                 despawn.push(f.eid);
                 continue;
@@ -12402,18 +12468,21 @@ fn note_fragile_supports(x: i32, y: i32, z: i32) {
                 .block_drop(state)
                 .filter(|_| GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0)
             {
-                drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
-                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                    x: q.0 as f64 + 0.5,
-                    y: q.1 as f64 + 0.5,
-                    z: q.2 as f64 + 0.5,
-                    item,
-                    cnt: 1,
-                    comps: Vec::new(),
-                    age: 0,
-                    target: None,
-                    thrower: None,
-                });
+                drops().lock().unwrap_or_else(|e| e.into_inner()).push(
+                    Drop {
+                        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                        x: q.0 as f64 + 0.5,
+                        y: q.1 as f64 + 0.5,
+                        z: q.2 as f64 + 0.5,
+                        item,
+                        cnt: 1,
+                        comps: Vec::new(),
+                        age: 0,
+                        target: None,
+                        thrower: None,
+                    }
+                    .world_scatter(DimId::Overworld),
+                );
             }
         }
     }
@@ -12510,18 +12579,21 @@ fn note_doors(x: i32, y: i32, z: i32) {
                 .block_drop(st)
                 .filter(|_| GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0)
             {
-                drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
-                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                    x: qx as f64 + 0.5,
-                    y: qy as f64 + 0.5,
-                    z: qz as f64 + 0.5,
-                    item,
-                    cnt: 1,
-                    comps: Vec::new(),
-                    age: 0,
-                    target: None,
-                    thrower: None,
-                });
+                drops().lock().unwrap_or_else(|e| e.into_inner()).push(
+                    Drop {
+                        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                        x: qx as f64 + 0.5,
+                        y: qy as f64 + 0.5,
+                        z: qz as f64 + 0.5,
+                        item,
+                        cnt: 1,
+                        comps: Vec::new(),
+                        age: 0,
+                        target: None,
+                        thrower: None,
+                    }
+                    .world_scatter(DimId::Overworld),
+                );
             }
         }
     }
@@ -20288,6 +20360,17 @@ mod mineshaft_runtime_tests {
                 break;
             }
         }
+        // `PlayerList.placeNewPlayer` sends one window-0 SetContainerContent
+        // (0x13) right after the position sync; consume it here so tests that
+        // read the next packet see the answer to their own action.
+        let login_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (pid, _) = read_server_packet(&mut cli, login_deadline)
+                .expect("login window-0 content");
+            if pid == 0x13 {
+                break;
+            }
+        }
 
         let reg_deadline = Instant::now() + Duration::from_secs(2);
         let me = loop {
@@ -23203,7 +23286,13 @@ mod vanilla_leash_tests {
         let ds = drops().lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(ds.len(), 1);
         assert_eq!((ds[0].item, ds[0].cnt), (lead, 1));
-        assert_eq!((ds[0].x, ds[0].y, ds[0].z), (0.0, 70.0, 11.0));
+        assert!(
+            (ds[0].x - 0.0).abs() <= 1.6
+                && (ds[0].z - 11.0).abs() <= 1.6
+                && ds[0].y == 70.0,
+            "leash drop scatters within spawnAtLocation reach, got {:?}",
+            (ds[0].x, ds[0].y, ds[0].z)
+        );
     }
 
     #[test]
@@ -23414,7 +23503,14 @@ mod vanilla_leash_tests {
         let ds = drops().lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(ds.len(), 1);
         assert_eq!(ds[0].item, name_to_item("lead").unwrap());
-        assert_eq!((ds[0].x, ds[0].y, ds[0].z), (4.0, 70.0, 4.0));
+        assert!(
+            (ds[0].x - 4.0).abs() <= 1.6
+                && (ds[0].z - 4.0).abs() <= 1.6
+                && ds[0].y <= 71.0
+                && ds[0].y > -64.0,
+            "leash drop scatters within spawnAtLocation reach, got {:?}",
+            (ds[0].x, ds[0].y, ds[0].z)
+        );
     }
 }
 

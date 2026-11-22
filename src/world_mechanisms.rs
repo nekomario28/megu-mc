@@ -7192,6 +7192,7 @@ mod p1a_random_tick_and_gamerule_tests {
             underground_revealed: AtomicBool::new(false),
             sleeping: Mutex::new(None),
             inv_state_id: AtomicI32::new(0),
+            use_on_resend: Mutex::new(None),
         });
         let old_clients = std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner()));
         let old_mobs = std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner()));
@@ -7544,6 +7545,7 @@ mod p2_parity_world_tests {
             underground_revealed: AtomicBool::new(false),
             sleeping: Mutex::new(None),
             inv_state_id: AtomicI32::new(0),
+            use_on_resend: Mutex::new(None),
         })
     }
 

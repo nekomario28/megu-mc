@@ -1121,6 +1121,14 @@ def sc_support_cascade(env):
         env.check(place["ok"], f"{name} placed on support", place["state"])
         env.check(brk["ok"], f"{name} support broke")
         env.check(is_air(fragile_state), f"{name} cascade popped", fragile_state)
+    # Vanilla `popResource` throws each drop with a random delta, so where a
+    # pop lands — and whether it ends inside the touch AABB — is a coin flip on
+    # both implementations. Sweep every broken cell afterwards so the persisted
+    # inventory compares the cascade's items, not that run's dice.
+    for _, _, rel in cases:
+        support = env.abs(rel)
+        env.tp((support[0] + 0.5, float(support[1]), support[2] + 0.5))
+        read_for(c, 0.5)
     obs["cases"] = results
     return obs
 
@@ -1622,7 +1630,8 @@ def run_target(kind, binary, jar, root):
             client.login()
             env0 = Env(client, rcon_port, (0, 0, 0), kind=kind)
             for text in ("difficulty peaceful", "gamerule doMobSpawning false",
-                         "gamerule doDaylightCycle false"):
+                         "gamerule doDaylightCycle false",
+                         "gamerule randomTickSpeed 0", "gamerule doFireTick false"):
                 env0.soft_cmd(text)
             origin = build_arena(client, rcon_port)
             env = Env(client, rcon_port, origin, kind=kind)

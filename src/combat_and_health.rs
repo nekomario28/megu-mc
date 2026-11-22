@@ -1849,7 +1849,7 @@ fn damage_armor(me: &Arc<Client>, raw_dmg: f32) {
             .cloned()
             .unwrap_or((0, 0, Vec::new()));
         let mut p = vec![0u8];
-        write_varint(&mut p, 0);
+        write_varint(&mut p, i64::from(inv_state_next(me)));
         p.extend_from_slice(&slot.to_be_bytes());
         p.extend_from_slice(&slot_wire(&st));
         if let Ok(mut w) = me.sock.lock() {
@@ -1926,7 +1926,7 @@ fn kill_mob(deid: i32, etype: i64, mx: f64, my: f64, mz: f64) {
         .filter(|st| !(was_sheared && st.0 == 202))
         .filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1)
     {
-        drop_spawn(mx, my, mz, item, cnt, comps, 0, None, None);
+        drop_spawn_scattered(DimId::Overworld, mx, my, mz, item, cnt, comps, 0, None, None);
     }
     xp_spawn(mx, my, mz, mob_xp(etype));
     // spawn streams via interest_tick
@@ -1944,7 +1944,7 @@ fn mob_env_die(deid: i32, etype: i64, mx: f64, my: f64, mz: f64, burning: bool) 
         .into_iter()
         .filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1)
     {
-        drop_spawn(mx, my, mz, item, cnt, comps, 0, None, None);
+        drop_spawn_scattered(DimId::Overworld, mx, my, mz, item, cnt, comps, 0, None, None);
     }
 }
 static LOOT_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -2717,7 +2717,7 @@ fn arrow_tick() {
                             .cloned()
                             .unwrap_or((802, 1, Vec::new()));
                     let mut p = vec![0u8];
-                    write_varint(&mut p, 0);
+                    write_varint(&mut p, i64::from(inv_state_next(&*c)));
                     p.extend_from_slice(&slot.to_be_bytes());
                     p.extend_from_slice(&slot_wire(&st));
                     if let Ok(mut w) = c.sock.lock() {

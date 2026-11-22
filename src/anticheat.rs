@@ -1590,7 +1590,7 @@ fn ac_consume_placed_item(me: &Client, held_slot: i16) {
         inv.get(&slot).cloned().unwrap_or_default()
     };
     let mut packet = vec![0u8];
-    write_varint(&mut packet, 0);
+    write_varint(&mut packet, i64::from(inv_state_next(me)));
     packet.extend_from_slice(&slot.to_be_bytes());
     packet.extend_from_slice(&slot_wire(&stack));
     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, packet);

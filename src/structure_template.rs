@@ -2496,10 +2496,11 @@ mod tests {
         );
     }
 
-    /// The sign NBT the port emits must be the shape the game writes, or a client shows
-    /// blank lines: `messages` are JSON string components and a `filtered_messages` list
-    /// is present. The expectation is the encoding native produced in
-    /// `sign-probe6.log`, kept here as the contract this owner has to match.
+    /// The sign NBT the port emits must be the shape the game writes: `messages`
+    /// are JSON string components and `filtered_messages` is *absent* — the codec
+    /// field is optional and the game only emits it for chat-filtered lines. The
+    /// contract is the live-1.21.1 differential oracle (`be_after_edit`), which
+    /// shows the key omitted for an unfiltered sign.
     #[test]
     fn sign_side_nbt_matches_the_shape_the_game_writes() {
         let lines = [
@@ -2528,11 +2529,10 @@ mod tests {
             crate::nbt::Tag::String(crate::nbt::NbtString::text("\"Hi\"")),
             "a literal is a JSON string component, not a text object"
         );
-        let filtered = match tag.get("filtered_messages") {
-            Some(crate::nbt::Tag::List(_, items)) => items.clone(),
-            other => panic!("filtered_messages must be present, got {other:?}"),
-        };
-        assert_eq!(filtered.len(), 4, "native always writes four filtered slots");
+        assert!(
+            tag.get("filtered_messages").is_none(),
+            "filtered_messages is omitted unless lines were chat-filtered"
+        );
     }
 
     /// The fossil contract must not move: a chest is still refused there, even though the

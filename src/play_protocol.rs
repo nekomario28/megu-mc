@@ -1688,6 +1688,10 @@ struct Client {
     // Window-0/container stateId counter: every server-initiated full-content
     // resync bumps it so a stale client echo on 0x0e can be detected.
     inv_state_id: AtomicI32,
+    // `handleUseItemOn` resends `ClientboundBlockUpdatePacket` for the clicked
+    // cell and `clicked + face` at the end of every use_on; the next queued
+    // flush emits them so they carry post-write states like vanilla's tail.
+    use_on_resend: Mutex<Option<(DimId, i32, i32, i32, i64)>>,
 }
 
 // Per-player bed occupancy: the bed position, game ticks slept so far and the
@@ -3286,7 +3290,8 @@ fn finish_block_break_one(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, 
                 age: 0,
                 target: None,
                 thrower: None,
-            };
+            }
+            .world_scatter(dim);
             drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
         }
         if let Some(item) = if !can_harvest(old as i64, held.0)
@@ -3307,7 +3312,8 @@ fn finish_block_break_one(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, 
                 age: 0,
                 target: None,
                 thrower: None,
-            };
+            }
+            .world_scatter(dim);
             drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
         }
     }
@@ -6993,18 +6999,21 @@ fn eye_of_ender_expire(e: EnderEye, roll: u64) {
     if roll.is_multiple_of(5) {
         return;
     }
-    drops().lock().unwrap_or_else(|e2| e2.into_inner()).push(Drop {
-        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-        x: e.x,
-        y: e.y,
-        z: e.z,
-        item: 1006,
-        cnt: 1,
-        comps: Vec::new(),
-        age: 0,
-        target: None,
-        thrower: None,
-    });
+    drops().lock().unwrap_or_else(|e2| e2.into_inner()).push(
+        Drop {
+            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+            x: e.x,
+            y: e.y,
+            z: e.z,
+            item: 1006,
+            cnt: 1,
+            comps: Vec::new(),
+            age: 0,
+            target: None,
+            thrower: None,
+        }
+        .world_scatter(DimId::Overworld),
+    );
 }
 
 /// The End column's highest safe landing at (x, z): the top non-air,
@@ -7382,12 +7391,10 @@ fn json_text(s: &str) -> String {
 }
 /// A sign side, in the shape the game itself writes.
 ///
-/// Measured from native (`SignText.DIRECT_CODEC` encoded with the level's ops, see
-/// `~/.cache/megu-audit/save-booking-20261110/sign-probe6.log`):
-/// `{color, filtered_messages:[4], has_glowing_text, messages:[4]}` with each message a
-/// **JSON string** component (`'"Hi"'`), not a `{"text":...}` object, and with
-/// `filtered_messages` present. A tag without that list loads as empty text natively, so
-/// writing the shorter shape here would make a client show blank lines.
+/// Live-1.21.1 `SignText.DIRECT_CODEC` writes `{color, has_glowing_text, messages:[4]}`
+/// with each message a **JSON string** component (`'"Hi"'`), not a `{"text":...}`
+/// object. `filtered_messages` is an optional codec field the game only emits
+/// when chat filtering actually replaced a line; an unfiltered sign omits it.
 fn sign_side_nbt_meta(
     v: &mut Vec<u8>,
     name: &str,
@@ -7399,15 +7406,12 @@ fn sign_side_nbt_meta(
     nbt_str(v, name); // TAG_Compound <name>
     nbt_named_str(v, "color", color);
     nbt_named_byte(v, "has_glowing_text", u8::from(has_glowing_text));
-    for list in ["filtered_messages", "messages"] {
-        v.push(9);
-        nbt_str(v, list); // TAG_List<String>
-        v.push(8);
-        v.extend_from_slice(&4i32.to_be_bytes());
-        for l in lines {
-            let text = if list == "messages" { json_text(l) } else { String::new() };
-            nbt_str(v, &text);
-        }
+    v.push(9);
+    nbt_str(v, "messages"); // TAG_List<String>
+    v.push(8);
+    v.extend_from_slice(&4i32.to_be_bytes());
+    for l in lines {
+        nbt_str(v, &json_text(l));
     }
     v.push(0);
 }
@@ -8017,18 +8021,21 @@ fn drop_player_items_on_death(player: &Arc<Client>) {
             .into_iter()
             .filter(|stack| stack.1 > 0 && enchant_level(&stack.2, 40) == 0)
         {
-            spawned.push(Drop {
-                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                x: dx,
-                y: dy + 0.4,
-                z: dz,
-                item,
-                cnt,
-                comps,
-                age: 0,
-                target: None,
-                thrower: None,
-            });
+            spawned.push(
+                Drop {
+                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                    x: dx,
+                    y: dy + 0.4,
+                    z: dz,
+                    item,
+                    cnt,
+                    comps,
+                    age: 0,
+                    target: None,
+                    thrower: None,
+                }
+                .world_scatter(DimId::Overworld),
+            );
         }
     }
     let mut experience = take_dropped_experience(player);
@@ -9791,6 +9798,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         underground_revealed: AtomicBool::new(!initial_occluded),
         sleeping: Mutex::new(None),
         inv_state_id: AtomicI32::new(0),
+        use_on_resend: Mutex::new(None),
     });
     // Published to the panic cleanup in `handle` before the client list sees
     // the player, so a panic anywhere below still unregisters this eid.
@@ -9802,6 +9810,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     if !me.enter_play_wire(compression, chunk_delivery) {
         return;
     }
+    // `PlayerList.placeNewPlayer` -> `inventoryMenu.sendAllDataToRemote`: the
+    // joining client gets one full window-0 SetContainerContent whose stateId
+    // consumes the first increment, so the first slot echo carries state 2.
+    resend_container_content(&me, 0);
     {
         let border = world_border().lock().unwrap_or_else(|e| e.into_inner());
         let board = scoreboard().lock().unwrap_or_else(|e| e.into_inner());
@@ -10892,6 +10904,11 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 let (dx, dy, dz) = FACE_OFF[(face.clamp(0, 5)) as usize];
                 let (tx, ty, tz) = (x + dx, y + dy, z + dz);
                 let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                // `handleUseItemOn` resends the clicked and face-adjacent cell
+                // states after the interaction; the next flush emits them so
+                // they carry the post-write states like vanilla's tail sends.
+                *me.use_on_resend.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((dim, x, y, z, face));
                 let clicked = block_at_dim(dim, x, y, z);
                 // `EndPortalFrameBlock.useItemOn`: an `ender_eye` on an eyeless
                 // frame sets its eye and tries the 5x5 ring activation.
@@ -11295,23 +11312,41 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     continue;
                 }
-                // door toggle: flip open bit on both halves
+                // door toggle: flip `open` on both halves. The target is a
+                // shared value, not an xor of each half's state: `note_doors`
+                // mirrors a written half into its partner, so toggling the
+                // partner again would undo the click.
                 if let Some(base) = door_base(block_at_dim(dim, x, y, z)) {
-                    for dy in [-1i32, 0, 1] {
-                        let st = block_at_dim(dim, x, y + dy, z);
-                        if door_base(st) == Some(base) {
-                            set_block_dim(dim, x, y + dy, z, st ^ 2);
-                            note_block_update_dim(dim, x, y + dy, z, st ^ 2);
+                    if let Some(reg) = block_registry::breg() {
+                        let clicked = block_at_dim(dim, x, y, z);
+                        let was_open =
+                            reg.get_prop(clicked, "open").as_deref() == Some("true");
+                        let to = if was_open { "false" } else { "true" };
+                        for dy in [-1i32, 0, 1] {
+                            let st = block_at_dim(dim, x, y + dy, z);
+                            if door_base(st) == Some(base) {
+                                let nst = reg.with_prop(st, "open", to);
+                                set_block_dim(dim, x, y + dy, z, nst);
+                                note_block_update_dim(dim, x, y + dy, z, nst);
+                            }
                         }
                     }
                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     continue;
                 }
-                // fence gate toggle (open bit = stride 2)
+                // fence gate toggle: `FenceGateBlock.useWithoutItem` cycles the
+                // `open` property only — `in_wall`/`facing`/`powered` are left
+                // untouched (a stride-XOR here lands on facing/in_wall bits).
                 if gate_base(block_at_dim(dim, x, y, z)).is_some() {
                     let st = block_at_dim(dim, x, y, z);
-                    set_block_dim(dim, x, y, z, st ^ 2);
-                    note_block_update_dim(dim, x, y, z, st ^ 2);
+                    if let Some(reg) = block_registry::breg() {
+                        if let Some(open) = reg.get_prop(st, "open").map(|v| v == "true") {
+                            let nst =
+                                reg.with_prop(st, "open", if open { "false" } else { "true" });
+                            set_block_dim(dim, x, y, z, nst);
+                            note_block_update_dim(dim, x, y, z, nst);
+                        }
+                    }
                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     continue;
                 }
@@ -11719,7 +11754,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     age: 0,
                                     target: None,
                                     thrower: None,
-                                };
+                                }
+                                .world_scatter(DimId::Overworld);
                                 drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
                             }
                             continue;
@@ -12368,7 +12404,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 age: 0,
                                 target: None,
                                 thrower: None,
-                            };
+                            }
+                            .world_scatter(DimId::Overworld);
                             drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
                         }
                         let xeid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
@@ -12587,9 +12624,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         let iv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                         *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&iv);
                     }
-                    // echo container set_slot (0x15): window 0, stateId 0
+                    // echo container set_slot (0x15): window 0 echoes carry the
+                    // shared inventory counter (`incrementStateId`), not 0.
                     let mut p = vec![0u8];
-                    write_varint(&mut p, 0);
+                    write_varint(&mut p, i64::from(inv_state_next(&me)));
                     p.extend_from_slice(&slot.to_be_bytes());
                     p.extend_from_slice(&slot_wire(&st));
                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
@@ -17405,6 +17443,7 @@ mod p5c_live_tests {
             underground_revealed: AtomicBool::new(false),
             sleeping: Mutex::new(None),
             inv_state_id: AtomicI32::new(0),
+            use_on_resend: Mutex::new(None),
         });
         (me, peer)
     }
@@ -18889,7 +18928,14 @@ mod p5c_live_tests {
             let last = dl.iter().last().unwrap();
             assert_eq!(dl.len(), drops0 + 1, "an 80% roll drops the eye");
             assert_eq!(last.item, 1006, "the drop is an ender_eye");
-            assert_eq!((last.x, last.y, last.z), (4.0, 5.0, 6.0));
+            assert!(
+                (last.x - 4.0).abs() <= 1.6
+                    && (last.z - 6.0).abs() <= 1.6
+                    && last.y <= 6.0
+                    && last.y > -64.0,
+                "the drop scatters within spawnAtLocation reach, got {:?}",
+                (last.x, last.y, last.z)
+            );
             drop(dl);
             drops().lock().unwrap_or_else(|e| e.into_inner()).pop();
         }
@@ -19495,6 +19541,7 @@ mod p8a_parity_protocol_tests {
             underground_revealed: AtomicBool::new(false),
             sleeping: Mutex::new(None),
             inv_state_id: AtomicI32::new(0),
+            use_on_resend: Mutex::new(None),
         });
         (me, peer)
     }
@@ -20141,6 +20188,7 @@ mod parity_58_c2s_tests {
             underground_revealed: AtomicBool::new(false),
             sleeping: Mutex::new(None),
             inv_state_id: AtomicI32::new(0),
+            use_on_resend: Mutex::new(None),
         });
         (me, peer)
     }

@@ -640,7 +640,7 @@ fn held_slot_resync(me: &Client) {
         .cloned()
         .unwrap_or((0, 0, Vec::new()));
     let mut p = vec![0u8];
-    write_varint(&mut p, 0);
+    write_varint(&mut p, i64::from(inv_state_next(me)));
     p.extend_from_slice(&slot.to_be_bytes());
     p.extend_from_slice(&slot_wire(&st));
     if let Ok(mut w) = me.sock.lock() {
@@ -715,6 +715,52 @@ impl Drop {
             alive,
             player_aabb,
         )
+    }
+
+    /// Vanilla `Level.popResource`/`spawnAtLocation` plus `ItemEntity`
+    /// construction: the entity is created at `±0.125` jitter per axis (y biased
+    /// by half the 0.25 height) with delta `(±0.1, 0.2, ±0.1)` and then flies
+    /// ~5-10 ticks under gravity, so the landing offset is triangular over
+    /// roughly ±0.8 cells — most pops land within one block, a tail reaches
+    /// past a player's touch AABB. Engine item entities keep no velocity, so
+    /// the flight is folded into the resting spot: jitter plus a triangular
+    /// drift, then a settle onto the first non-air cell top below the drifted
+    /// column. That is the position every later system (pickup AABB, merge,
+    /// despawn) observes: a pop whose vanilla flight would leave the player's
+    /// reach is out of reach here too, and one dropped into a dug-out cell
+    /// sinks the same way. Player-thrown and restored drops never take this
+    /// path.
+    fn world_scatter(mut self, dim: DimId) -> Drop {
+        let jit = || (world_rng::next_below(250) as f64 - 125.0) / 1000.0;
+        let drift = || {
+            (world_rng::next_below(200) as i64 + world_rng::next_below(200) as i64
+                - 200) as f64
+                / 1000.0
+                * 8.0
+        };
+        let mut x = self.x + jit() + drift();
+        let mut z = self.z + jit() + drift();
+        for _ in 0..4 {
+            if block_at_dim(dim, x.floor() as i32, self.y.floor() as i32, z.floor() as i32)
+                == 0
+            {
+                break;
+            }
+            x = (x + self.x) * 0.5;
+            z = (z + self.z) * 0.5;
+        }
+        let mut y = self.y;
+        for step in 0..12 {
+            let cy = y.floor() as i32 - step;
+            if block_at_dim(dim, x.floor() as i32, cy, z.floor() as i32) != 0 {
+                y = cy as f64 + 1.0;
+                break;
+            }
+        }
+        self.x = x;
+        self.y = y;
+        self.z = z;
+        self
     }
 }
 static DROPS: OnceLock<Mutex<Vec<Drop>>> = OnceLock::new();
@@ -1036,6 +1082,44 @@ fn drop_spawn(
         target,
         thrower,
     });
+    drop_pending()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(eid);
+    eid
+}
+
+/// `drop_spawn` for world drops: the vanilla `popResource` scatter runs first,
+/// then the same merge-pending mark so a loot burst still collapses inside the
+/// tick it lands in. Player-thrown and restored drops never take this path.
+fn drop_spawn_scattered(
+    dim: DimId,
+    x: f64,
+    y: f64,
+    z: f64,
+    item: i64,
+    cnt: u8,
+    comps: Comps,
+    age: i32,
+    target: Option<[u8; 16]>,
+    thrower: Option<[u8; 16]>,
+) -> i32 {
+    let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+    drops().lock().unwrap_or_else(|e| e.into_inner()).push(
+        Drop {
+            eid,
+            x,
+            y,
+            z,
+            item,
+            cnt,
+            comps,
+            age,
+            target,
+            thrower,
+        }
+        .world_scatter(dim),
+    );
     drop_pending()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2304,7 +2388,7 @@ fn drop_tick() {
         };
         for (slot, st) in changed {
             let mut p = vec![0u8];
-            write_varint(&mut p, 0);
+            write_varint(&mut p, i64::from(inv_state_next(&*c)));
             p.extend_from_slice(&slot.to_be_bytes());
             p.extend_from_slice(&slot_wire(&st));
             if let Ok(mut w) = c.sock.lock() {
@@ -5392,7 +5476,11 @@ fn stack_to_nbt(slot: i16, (item, count, comps): &Stack) -> Option<crate::nbt::T
                 COMP_UNBREAKABLE => {
                     let show = data.first().copied().unwrap_or(1) != 0;
                     let mut inner = std::collections::BTreeMap::new();
-                    inner.insert(NbtString::text("show_in_tooltip"), Tag::Byte(i8::from(show)));
+                    // `show_in_tooltip` is an optionalFieldOf(default true) — the
+                    // game only serializes it when it is false.
+                    if !show {
+                        inner.insert(NbtString::text("show_in_tooltip"), Tag::Byte(0));
+                    }
                     comp_map.insert(
                         NbtString::text("minecraft:unbreakable"),
                         Tag::Compound(inner),
@@ -5435,7 +5523,11 @@ fn stack_to_nbt(slot: i16, (item, count, comps): &Stack) -> Option<crate::nbt::T
                     let show = data.get(p).copied().unwrap_or(1) != 0;
                     let mut inner = std::collections::BTreeMap::new();
                     inner.insert(NbtString::text("levels"), Tag::Compound(levels));
-                    inner.insert(NbtString::text("show_in_tooltip"), Tag::Byte(i8::from(show)));
+                    // `show_in_tooltip` defaults to true and is only written when
+                    // the stack hides its enchantments.
+                    if !show {
+                        inner.insert(NbtString::text("show_in_tooltip"), Tag::Byte(0));
+                    }
                     let key = if *ty == COMP_STORED_ENCHANTMENTS {
                         "minecraft:stored_enchantments"
                     } else {
@@ -5481,10 +5573,14 @@ fn stack_to_nbt(slot: i16, (item, count, comps): &Stack) -> Option<crate::nbt::T
                             NbtString::text("modifiers"),
                             Tag::List(if list.is_empty() { 0 } else { 10 }, list),
                         );
-                        inner.insert(
-                            NbtString::text("show_in_tooltip"),
-                            Tag::Byte(i8::from(amc.show_in_tooltip)),
-                        );
+                        // `show_in_tooltip` defaults to true; only written when
+                        // the modifiers are hidden.
+                        if !amc.show_in_tooltip {
+                            inner.insert(
+                                NbtString::text("show_in_tooltip"),
+                                Tag::Byte(0),
+                            );
+                        }
                         comp_map.insert(
                             NbtString::text("minecraft:attribute_modifiers"),
                             Tag::Compound(inner),
@@ -9852,7 +9948,12 @@ fn resync_slot(me: &Client, wid: u8, wslot: i16, st: &Stack) {
         return;
     }
     let mut p = vec![wid];
-    write_varint(&mut p, 0);
+    // The player inventory menu shares `inv_state_id`; other windows keep
+    // their own counters (`send_chest_slot` for wid 1).
+    write_varint(
+        &mut p,
+        if wid == 0 { i64::from(inv_state_next(me)) } else { 0 },
+    );
     p.extend_from_slice(&wslot.to_be_bytes());
     p.extend_from_slice(&slot_wire(st));
     if let Ok(mut w) = me.sock.lock() {
@@ -12823,7 +12924,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                     .cloned()
                     .unwrap_or((0, 0, Vec::new()));
                 let mut p = vec![0u8];
-                write_varint(&mut p, 0);
+                write_varint(&mut p, i64::from(inv_state_next(me)));
                 p.extend_from_slice(&asl.to_be_bytes());
                 p.extend_from_slice(&slot_wire(&st));
                 if let Ok(mut w) = me.sock.lock() {
@@ -12965,7 +13066,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                 .cloned()
                 .unwrap_or((0, 0, Vec::new()));
             let mut p = vec![0u8];
-            write_varint(&mut p, 0);
+            write_varint(&mut p, i64::from(inv_state_next(me)));
             p.extend_from_slice(&slot.to_be_bytes());
             p.extend_from_slice(&slot_wire(&st_now));
             let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
