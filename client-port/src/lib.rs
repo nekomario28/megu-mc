@@ -55,8 +55,8 @@ pub use ber_instancing::{
     LOD_SCALE_MAX, LOD_SCALE_MIN,
 };
 pub use cache::{
-    MeshCache, ReleasedMeshMeta, SectionCoord, DEFAULT_RESORT_THRESHOLD,
-    PRIORITY_ZERO_NEAR_RADIUS_BLOCKS,
+    build_and_pack_section_mesh, BuiltSectionMesh, MeshCache, ReleasedMeshMeta, SectionCoord,
+    SectionMeshInput, DEFAULT_RESORT_THRESHOLD, PRIORITY_ZERO_NEAR_RADIUS_BLOCKS,
 };
 pub use cull::{box_facing_mask, box_in_frustum, SectionVis};
 pub use culler::{through_bit, CullResult, GraphCuller, SectionGraph, THROUGH_ALL};
@@ -80,6 +80,7 @@ pub use gpu_pipeline::{
     MAX_QUADS_PER_MESHLET, MIN_GUARANTEED_UBO_BYTES, REQUIRED_MESH_OUTPUT_PRIMITIVES,
     REQUIRED_MESH_OUTPUT_VERTICES,
 };
+pub use ffi::PackedVertex;
 pub use hiz_culler::{HiZCullStats, HiZError, HiZPyramid, MAX_DEPTH_DIMENSION};
 pub use lod::{summarize_column, LodCell, LodSummary, LOD_COARSE, LOD_FINE};
 pub use mesh::{

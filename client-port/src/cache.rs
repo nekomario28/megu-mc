@@ -2,12 +2,14 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Range;
+use std::sync::Arc;
 
 use crate::cull::box_in_frustum;
-use crate::packed::{depth_key, is_translucent};
+use crate::packed::{depth_key, is_translucent, pack_quad, PackedVertex};
 use crate::{
-    edge_corner_index, mesh_section, Block, CompressedSection, Direction, Light, MissingNeighbor,
-    Quad, Section, SectionBlocks, SectionView, EDGE, EDGE_CORNER_CELLS, FACE_CELLS, SECTION_CELLS,
+    edge_corner_index, mesh_section, Block, CompressedSection, Direction, DirectionBuckets,
+    Light, MissingNeighbor, Quad, Sample, Section, SectionBlocks, SectionView, EDGE,
+    EDGE_CORNER_CELLS, FACE_CELLS, SECTION_CELLS, DIRECTION_BUCKETS,
 };
 
 /// Signed section coordinates in one world/dimension, measured in 16-block units.
@@ -53,6 +55,218 @@ fn boundary(offset: [i32; 3]) -> impl Iterator<Item = [usize; 3]> {
     })
 }
 
+/// Canonical 3x3x3 neighborhood order for [`SectionMeshInput`]: slot 0 is the
+/// center `[0, 0, 0]`, slots 1..=26 enumerate the 26 neighbor offsets in
+/// y/z/x ascending order — the same set [`SectionCoord::neighbors`] yields.
+const fn neighbor_offsets() -> [[i32; 3]; 27] {
+    let mut offsets = [[0i32; 3]; 27];
+    let mut slot = 1usize;
+    let mut y = -1i32;
+    while y <= 1 {
+        let mut z = -1i32;
+        while z <= 1 {
+            let mut x = -1i32;
+            while x <= 1 {
+                if x != 0 || y != 0 || z != 0 {
+                    offsets[slot] = [x, y, z];
+                    slot += 1;
+                }
+                x += 1;
+            }
+            z += 1;
+        }
+        y += 1;
+    }
+    offsets
+}
+
+const NEIGHBOR_OFFSETS: [[i32; 3]; 27] = neighbor_offsets();
+
+/// Inverse of [`NEIGHBOR_OFFSETS`]: `NEIGHBOR_SLOTS[dx + 1][dy + 1][dz + 1]`
+/// is the cell slot holding the neighbor at offset `[dx, dy, dz]`.
+const fn neighbor_slots() -> [[[usize; 3]; 3]; 3] {
+    let mut slots = [[[0usize; 3]; 3]; 3];
+    let mut slot = 0usize;
+    while slot < NEIGHBOR_OFFSETS.len() {
+        let offset = NEIGHBOR_OFFSETS[slot];
+        slots[(offset[0] + 1) as usize][(offset[1] + 1) as usize][(offset[2] + 1) as usize] =
+            slot;
+        slot += 1;
+    }
+    slots
+}
+
+const NEIGHBOR_SLOTS: [[[usize; 3]; 3]; 3] = neighbor_slots();
+
+/// Lock-free mesh-job input: an immutable snapshot of one section plus its 26
+/// neighbors, captured as `Arc` clones only — no voxel data is copied. Safe to
+/// send to any worker thread (`Send + Sync`) and to keep building from after
+/// the [`MeshCache`] mutates: in-flight [`CompressedSection`] snapshots stay
+/// alive through the `Arc`s and [`MeshCache::set_cell`] copy-on-writes.
+///
+/// Obtain one via [`MeshCache::snapshot_section_input`]; the private fields
+/// keep the center/neighbor slot invariant intact.
+pub struct SectionMeshInput {
+    /// Section coordinate being meshed.
+    pub coord: SectionCoord,
+    /// Generation counter supplied by the caller; compare against the world's
+    /// current revision on result receipt and discard stale meshes in O(1).
+    pub revision: u64,
+    missing: MissingNeighbor,
+    /// `cells[0]` is the center section; `cells[i]` for `i >= 1` is the
+    /// neighbor at [`NEIGHBOR_OFFSETS`][i], `None` when not loaded.
+    cells: [Option<Arc<CompressedSection>>; 27],
+}
+
+impl SectionMeshInput {
+    /// The neighbor snapshot at a `-1..=1` offset from [`Self::coord`], or the
+    /// center itself for `[0, 0, 0]`.
+    fn cell_at_offset(&self, offset: [i32; 3]) -> Option<&CompressedSection> {
+        let slot = NEIGHBOR_SLOTS[(offset[0] + 1) as usize][(offset[1] + 1) as usize]
+            [(offset[2] + 1) as usize];
+        self.cells[slot].as_deref()
+    }
+}
+
+/// Result of [`build_and_pack_section_mesh`]: the fully packed, upload-ready
+/// mesh for one [`SectionMeshInput`]. `Send` so workers can hand it back
+/// through a channel.
+#[derive(Debug, PartialEq)]
+pub struct BuiltSectionMesh {
+    /// Section coordinate the mesh was built for.
+    pub coord: SectionCoord,
+    /// Copied from [`SectionMeshInput::revision`].
+    pub revision: u64,
+    /// 16-byte packed vertices of every non-translucent quad (opaque,
+    /// cutout, non-water fluid), grouped into the seven direction buckets and
+    /// packed four vertices per quad in bucket order. Quads whose greedy-mesh
+    /// diagonal flag was set are stored rotated one slot
+    /// (`[v0, v1, v2, v3] -> [v1, v2, v3, v0]`, bit 17 cleared) so consumers
+    /// can always index with the canonical static `[0, 1, 2, 0, 2, 3]`
+    /// pattern.
+    pub opaque_packed: Vec<PackedVertex>,
+    /// `(first_vertex, vertex_count)` span of each direction bucket inside
+    /// [`Self::opaque_packed`], scaled by four vertices per quad — the
+    /// packed-vertex analogue of [`DirectionBuckets::vertex_ranges`].
+    pub opaque_bucket_ranges: [(u32, u32); DIRECTION_BUCKETS],
+    /// Translucent and water quads in original mesh order, kept as [`Quad`]s
+    /// so the camera-driven back-to-front re-sort still applies.
+    pub translucent_quads: Vec<Quad>,
+    /// `Direction::bit` mask of every face direction present in the meshed
+    /// section (opaque and translucent), for whole-section culling.
+    pub visibility_mask: u8,
+}
+
+/// Appends `quad`'s four packed vertices, normalizing the diagonal flip:
+/// `diagonal != 0` quads rotate `[v0, v1, v2, v3] -> [v1, v2, v3, v0]` and
+/// clear attribute bit 17, preserving the exact triangulation under the
+/// canonical `[0, 1, 2, 0, 2, 3]` index pattern.
+fn push_normalized_packed_quad(quad: &Quad, out: &mut Vec<PackedVertex>) {
+    let mut verts = pack_quad(quad);
+    if quad.diagonal != 0 {
+        verts.rotate_left(1);
+        for vertex in &mut verts {
+            vertex.attributes &= !(1 << 17);
+        }
+    }
+    out.extend_from_slice(&verts);
+}
+
+/// Pure, stateless section mesher: builds the same [`Quad`] stream as
+/// [`MeshCache::build`], then performs the direction-bucket grouping, 16-byte
+/// packing (with diagonal-flip normalization) and translucent split in one
+/// pass. Holds no shared mutable state, so N workers can call it concurrently
+/// on independent [`SectionMeshInput`] snapshots.
+pub fn build_and_pack_section_mesh(input: &SectionMeshInput) -> BuiltSectionMesh {
+    let coord = input.coord;
+    let mut out = BuiltSectionMesh {
+        coord,
+        revision: input.revision,
+        opaque_packed: Vec::new(),
+        opaque_bucket_ranges: [(0, 0); DIRECTION_BUCKETS],
+        translucent_quads: Vec::new(),
+        visibility_mask: 0,
+    };
+    let Some(center) = input.cells[0].as_deref() else {
+        return out;
+    };
+    // `Uniform` centers hold no dense array; materialize one for this pass so
+    // `SectionView` keeps its flat-block layout, bit-identical to `build`.
+    let expanded;
+    let blocks: &[Block; SECTION_CELLS] = match &center.blocks {
+        SectionBlocks::Dense(dense) => dense,
+        SectionBlocks::Uniform(block) => {
+            expanded = Box::new([*block; SECTION_CELLS]);
+            &expanded
+        }
+    };
+    let (borders, edges) =
+        sample_neighbor_halo(coord, input.missing, |_, offset| input.cell_at_offset(offset));
+    let view = SectionView {
+        blocks,
+        block_light: &center.block_light,
+        sky_light: &center.sky_light,
+        borders: borders.each_ref().map(Some),
+        edges_and_corners: Some(&edges),
+        missing: input.missing,
+    };
+    let quads = mesh_section(&view);
+
+    let mut opaque_counts = [0u32; DIRECTION_BUCKETS];
+    let mut opaque_total = 0usize;
+    for quad in &quads {
+        out.visibility_mask |= quad.direction.bit();
+        if is_translucent(quad) {
+            out.translucent_quads.push(*quad);
+        } else {
+            opaque_counts[DirectionBuckets::index_of(quad.direction)] += 1;
+            opaque_total += 1;
+        }
+    }
+    let buckets = DirectionBuckets::laid_out(opaque_counts, 0);
+    out.opaque_bucket_ranges = buckets.vertex_ranges();
+    out.opaque_packed = Vec::with_capacity(opaque_total * 4);
+    for bucket in 0..DIRECTION_BUCKETS {
+        for quad in quads.iter().filter(|quad| {
+            !is_translucent(quad) && DirectionBuckets::index_of(quad.direction) == bucket
+        }) {
+            push_normalized_packed_quad(quad, &mut out.opaque_packed);
+        }
+    }
+    out
+}
+
+/// Samples the 6 face borders and 12 edge + 8 corner halo cells around `coord`
+/// from whichever neighbors `section_at` resolves, filling every unresolved
+/// cell with the `missing` policy sample — the exact halo [`MeshCache::build`]
+/// and [`build_and_pack_section_mesh`] share so both produce identical quads.
+fn sample_neighbor_halo<'a>(
+    coord: SectionCoord,
+    missing: MissingNeighbor,
+    mut section_at: impl FnMut(SectionCoord, [i32; 3]) -> Option<&'a CompressedSection>,
+) -> ([[Sample; FACE_CELLS]; 6], [Sample; EDGE_CORNER_CELLS]) {
+    let mut borders = [[missing.sample(); FACE_CELLS]; 6];
+    let mut edges = [missing.sample(); EDGE_CORNER_CELLS];
+    for (neighbor, offset) in coord.neighbors() {
+        let Some(section) = section_at(neighbor, offset) else {
+            continue;
+        };
+        let direction = Direction::ALL
+            .into_iter()
+            .find(|&d| d.offset([0; 3]) == offset);
+        for p @ [x, y, z] in boundary(offset.map(|n| -n)) {
+            let sample = section.get(x, y, z);
+            if let Some(direction) = direction {
+                borders[direction as usize][direction.border_index(p)] = sample;
+            } else {
+                let halo_pos = std::array::from_fn(|axis| p[axis] as i32 + offset[axis] * 16);
+                edges[edge_corner_index(halo_pos).expect("edge or corner")] = sample;
+            }
+        }
+    }
+    (borders, edges)
+}
+
 /// Default camera displacement, in blocks, that re-triggers a translucent
 /// sort. Below it the previous back-to-front order is kept.
 pub const DEFAULT_RESORT_THRESHOLD: f32 = 1.0;
@@ -93,7 +307,10 @@ pub struct ReleasedMeshMeta {
 /// reports exactly the sections rebuilt (or re-sorted) since the last call,
 /// so consumers never scan the whole world to find GPU work.
 pub struct MeshCache {
-    sections: HashMap<SectionCoord, CompressedSection>,
+    /// `Arc` storage lets [`snapshot_section_input`](Self::snapshot_section_input)
+    /// hand out lock-free [`SectionMeshInput`] jobs with zero voxel copies;
+    /// [`set_cell`](Self::set_cell) copy-on-writes through `Arc::make_mut`.
+    sections: HashMap<SectionCoord, Arc<CompressedSection>>,
     meshes: HashMap<SectionCoord, Vec<Quad>>,
     dirty: BTreeSet<SectionCoord>,
     /// FIFO queue of coordinates whose mesh was rebuilt or re-sorted and not
@@ -149,7 +366,7 @@ impl MeshCache {
     /// [`SectionBlocks::Uniform`].
     pub fn insert_compressed(&mut self, coord: SectionCoord, section: CompressedSection) -> bool {
         let old = self.sections.get(&coord);
-        if old == Some(&section) {
+        if old.is_some_and(|old| **old == section) {
             return false;
         }
         self.dirty.insert(coord);
@@ -163,7 +380,7 @@ impl MeshCache {
                 self.dirty.insert(neighbor);
             }
         }
-        self.sections.insert(coord, section);
+        self.sections.insert(coord, Arc::new(section));
         true
     }
 
@@ -199,7 +416,7 @@ impl MeshCache {
         let Some(section) = self.sections.get_mut(&coord) else {
             return false;
         };
-        if !section.set(x, y, z, block, light) {
+        if !Arc::make_mut(section).set(x, y, z, block, light) {
             return false;
         }
         self.dirty.insert(coord);
@@ -231,17 +448,17 @@ impl MeshCache {
 
     /// The stored section snapshot, in [`CompressedSection`] form.
     pub fn section(&self, coord: SectionCoord) -> Option<&CompressedSection> {
-        self.sections.get(&coord)
+        self.sections.get(&coord).map(|arc| &**arc)
     }
 
     /// Whether the section's block storage is the zero-heap uniform form.
     pub fn is_uniform_section(&self, coord: SectionCoord) -> Option<bool> {
-        self.sections.get(&coord).map(CompressedSection::is_uniform)
+        self.sections.get(&coord).map(|arc| arc.is_uniform())
     }
 
     /// Heap bytes held by the section's block storage (`0` when uniform).
     pub fn blocks_heap_bytes(&self, coord: SectionCoord) -> Option<usize> {
-        self.sections.get(&coord).map(CompressedSection::heap_bytes)
+        self.sections.get(&coord).map(|arc| arc.heap_bytes())
     }
 
     pub fn pending(&self) -> usize {
@@ -573,6 +790,35 @@ impl MeshCache {
         true
     }
 
+    /// Captures a lock-free mesh-job snapshot for `coord`: the center section
+    /// plus its 26 neighbors as `Arc` clones (about 27 reference counts, zero
+    /// voxel copies). Returns `None` when the center section is not loaded.
+    /// Pair with [`build_and_pack_section_mesh`] on a worker thread; tag the
+    /// result with `revision` and discard it if the world's revision moved on.
+    pub fn snapshot_section_input(
+        &self,
+        coord: SectionCoord,
+        revision: u64,
+    ) -> Option<SectionMeshInput> {
+        let center = self.sections.get(&coord)?;
+        let mut cells = std::array::from_fn(|_| None);
+        cells[0] = Some(Arc::clone(center));
+        for (slot, offset) in NEIGHBOR_OFFSETS.iter().enumerate().skip(1) {
+            if let Some(neighbor) = coord
+                .offset(*offset)
+                .and_then(|neighbor| self.sections.get(&neighbor))
+            {
+                cells[slot] = Some(Arc::clone(neighbor));
+            }
+        }
+        Some(SectionMeshInput {
+            coord,
+            revision,
+            missing: self.missing,
+            cells,
+        })
+    }
+
     fn build(&self, coord: SectionCoord) -> Vec<Quad> {
         let stored = &self.sections[&coord];
         // `Uniform` sections hold no dense array; materialize one just for
@@ -586,35 +832,17 @@ impl MeshCache {
                 &expanded
             }
         };
-        let mut view = SectionView {
+        let (borders, edges) = sample_neighbor_halo(coord, self.missing, |neighbor, _| {
+            self.sections.get(&neighbor).map(|arc| &**arc)
+        });
+        let view = SectionView {
             blocks,
             block_light: &stored.block_light,
             sky_light: &stored.sky_light,
-            borders: [None; 6],
-            edges_and_corners: None,
+            borders: borders.each_ref().map(Some),
+            edges_and_corners: Some(&edges),
             missing: self.missing,
         };
-        let mut borders = [[self.missing.sample(); FACE_CELLS]; 6];
-        let mut edges = [self.missing.sample(); EDGE_CORNER_CELLS];
-        for (neighbor, offset) in coord.neighbors() {
-            let Some(section) = self.sections.get(&neighbor) else {
-                continue;
-            };
-            let direction = Direction::ALL
-                .into_iter()
-                .find(|&d| d.offset([0; 3]) == offset);
-            for p @ [x, y, z] in boundary(offset.map(|n| -n)) {
-                let sample = section.get(x, y, z);
-                if let Some(direction) = direction {
-                    borders[direction as usize][direction.border_index(p)] = sample;
-                } else {
-                    let halo_pos = std::array::from_fn(|axis| p[axis] as i32 + offset[axis] * 16);
-                    edges[edge_corner_index(halo_pos).expect("edge or corner")] = sample;
-                }
-            }
-        }
-        view.borders = borders.each_ref().map(Some);
-        view.edges_and_corners = Some(&edges);
         mesh_section(&view)
     }
 }
