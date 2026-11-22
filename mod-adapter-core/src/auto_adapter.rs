@@ -444,6 +444,9 @@ fn synthesize_bundle(
         biome_regions: Vec::new(),
         creatures: Vec::new(),
         custom_channels: Vec::new(),
+        spells: Vec::new(),
+        custom_statuses: Vec::new(),
+        rituals: Vec::new(),
     };
     bundle
         .validate()
@@ -1003,6 +1006,9 @@ pub fn scaffold_native_bundle(
         biome_regions: Vec::new(),
         creatures: Vec::new(),
         custom_channels: Vec::new(),
+        spells: Vec::new(),
+        custom_statuses: Vec::new(),
+        rituals: Vec::new(),
     };
     bundle
         .validate()

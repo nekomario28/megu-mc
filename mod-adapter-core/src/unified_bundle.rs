@@ -6,7 +6,7 @@
 //! One pure-JSON schema onboards an entire dimension/biome/creature/QoL mod
 //! with **zero mod-specific Rust code**: a [`DeclarativeModBundle`] declares
 //! the mod's portals, progression barriers, biome regions, creature specs,
-//! and custom payload channels; [`UnifiedModRuntime::register_bundle`] folds
+//! spells, custom statuses, rituals, and custom payload channels; [`UnifiedModRuntime::register_bundle`] folds
 //! the whole document into one runtime registry that drives the existing
 //! generic primitives ([`PortalRegistry`], [`ProgressionBarrierEngine`],
 //! [`BiomeRegionBlender`], [`CreatureSpec`]) directly.
@@ -33,6 +33,11 @@ use crate::data_loader::{parse_json, DataLoadError, JsonValue};
 use crate::dimension_mod::{
     builtin_dimension_mod_profiles, PortalRegistry, PortalRule, PortalTrigger,
 };
+use crate::magic_primitives::{
+    CustomStatusRegistry, RitualRecipe, SpellCastState, SpellDefinition, SpellEffect, SpellForm,
+    SpellNode, StatusEffectDefinition, MAX_ATTRIBUTE_MODIFIERS, MAX_EFFECTS_PER_STEP, MAX_REAGENTS,
+    MAX_RITUAL_OFFSET, MAX_RITUAL_PATTERN_BLOCKS, MAX_SPELL_STEPS, MAX_STATUS_DEFS,
+};
 use crate::version_compat::{McVersion, VersionRange};
 use crate::world_extensions::{
     BiomeRegion, BiomeRegionBlender, ProgressionBarrierEngine, ProgressionRule,
@@ -42,7 +47,8 @@ use crate::world_extensions::{
 pub const BUNDLE_SCHEMA: &str = "mc-spine-mod-bundle/1";
 
 /// Bound on each top-level section (`portals`, `progression_barriers`,
-/// `biome_regions`, `creatures`, `custom_channels`) so a hostile bundle
+/// `biome_regions`, `creatures`, `custom_channels`, `spells`,
+/// `custom_statuses`, `rituals`) so a hostile bundle
 /// cannot request unbounded allocations; the 4 MiB parser cap applies first.
 const MAX_SECTION_ENTRIES: usize = 1024;
 /// Bound on nested lists/maps inside a single section entry (tag borders,
@@ -74,7 +80,10 @@ impl fmt::Display for BundleError {
         match self {
             Self::Json(msg) => write!(f, "bundle JSON: {msg}"),
             Self::UnknownSchema(found) => {
-                write!(f, "unknown bundle schema {found:?} (want {BUNDLE_SCHEMA:?})")
+                write!(
+                    f,
+                    "unknown bundle schema {found:?} (want {BUNDLE_SCHEMA:?})"
+                )
             }
             Self::Validation(msg) => write!(f, "bundle validation: {msg}"),
             Self::IncompatibleVersion {
@@ -115,6 +124,12 @@ pub struct DeclarativeModBundle {
     pub creatures: Vec<CreatureSpec>,
     /// `CustomPacketPayload` channel ids the bundle listens on.
     pub custom_channels: Vec<String>,
+    /// Optional composable spell definitions.
+    pub spells: Vec<SpellDefinition>,
+    /// Optional custom status effect definitions.
+    pub custom_statuses: Vec<StatusEffectDefinition>,
+    /// Optional multiblock ritual recipes.
+    pub rituals: Vec<RitualRecipe>,
 }
 
 impl DeclarativeModBundle {
@@ -141,6 +156,36 @@ impl DeclarativeModBundle {
     /// hand-constructed) bundle by round-tripping its AST through the same
     /// checks [`from_json`](Self::from_json) applies.
     pub fn validate(&self) -> Result<(), BundleError> {
+        // Cast templates contain runtime counters that are intentionally absent
+        // from JSON, so validate the original values before serialization.
+        for spell in &self.spells {
+            spell
+                .validate()
+                .map_err(|e| verr("spells", format!("{e:?}")))?;
+        }
+        // JSON rendering replaces non-finite numbers with 0. Check the
+        // original definitions before they reach the emitter.
+        let mut statuses = CustomStatusRegistry::default();
+        for status in &self.custom_statuses {
+            statuses
+                .register(status.clone())
+                .map_err(|e| verr("custom_statuses", format!("{e:?}")))?;
+        }
+        for ritual in &self.rituals {
+            // The primitive validator uses signed abs(). Reject i32::MIN
+            // before it can overflow on a hand-constructed bundle.
+            for &(dx, dy, dz) in ritual.pattern.keys() {
+                if [dx, dy, dz]
+                    .into_iter()
+                    .any(|v| !(-MAX_RITUAL_OFFSET..=MAX_RITUAL_OFFSET).contains(&v))
+                {
+                    return Err(verr("rituals", "pattern offset out of range"));
+                }
+            }
+            ritual
+                .validate()
+                .map_err(|e| verr("rituals", format!("{e:?}")))?;
+        }
         Self::from_ast(&self.to_ast()).map(|_| ())
     }
 
@@ -156,7 +201,7 @@ impl DeclarativeModBundle {
     /// The bundle as a [`JsonValue`] tree; `BTreeMap` object ordering *is*
     /// the deterministic sorted-key wire order.
     fn to_ast(&self) -> JsonValue {
-        obj(vec![
+        let mut fields = vec![
             ("schema", jstr(BUNDLE_SCHEMA)),
             ("mod_id", jstr(&self.mod_id)),
             ("mc_version_range", jstr(&self.mc_version_range)),
@@ -182,7 +227,26 @@ impl DeclarativeModBundle {
                 JsonValue::Array(self.creatures.iter().map(creature_ast).collect()),
             ),
             ("custom_channels", str_arr(&self.custom_channels)),
-        ])
+        ];
+        if !self.spells.is_empty() {
+            fields.push((
+                "spells",
+                JsonValue::Array(self.spells.iter().map(spell_ast).collect()),
+            ));
+        }
+        if !self.custom_statuses.is_empty() {
+            fields.push((
+                "custom_statuses",
+                JsonValue::Array(self.custom_statuses.iter().map(status_ast).collect()),
+            ));
+        }
+        if !self.rituals.is_empty() {
+            fields.push((
+                "rituals",
+                JsonValue::Array(self.rituals.iter().map(ritual_ast).collect()),
+            ));
+        }
+        obj(fields)
     }
 
     /// Build a bundle from a parsed [`JsonValue`] root under the same
@@ -197,6 +261,9 @@ impl DeclarativeModBundle {
             "biome_regions",
             "creatures",
             "custom_channels",
+            "spells",
+            "custom_statuses",
+            "rituals",
         ];
         let top = obj_of(root, "bundle")?;
         check_keys(top, TOP_KEYS, "bundle")?;
@@ -229,7 +296,28 @@ impl DeclarativeModBundle {
                 }
                 list
             },
+            spells: optional_section(top, "spells", parse_spell)?,
+            custom_statuses: optional_section(top, "custom_statuses", parse_status)?,
+            rituals: optional_section(top, "rituals", parse_ritual)?,
         };
+        let mut spell_ids = BTreeSet::new();
+        for spell in &bundle.spells {
+            if !spell_ids.insert(&spell.id) {
+                return Err(verr("spells", format!("duplicate id '{}'", spell.id)));
+            }
+        }
+        let mut statuses = CustomStatusRegistry::default();
+        for def in &bundle.custom_statuses {
+            statuses
+                .register(def.clone())
+                .map_err(|e| verr("custom_statuses", format!("{e:?}")))?;
+        }
+        let mut ritual_ids = BTreeSet::new();
+        for ritual in &bundle.rituals {
+            if !ritual_ids.insert(&ritual.id) {
+                return Err(verr("rituals", format!("duplicate id '{}'", ritual.id)));
+            }
+        }
         Ok(bundle)
     }
 }
@@ -318,8 +406,7 @@ fn parse_trigger(v: &JsonValue) -> Result<PortalTrigger, BundleError> {
                 ],
                 CTX,
             )?;
-            let border_tags_or_blocks =
-                tag_list_field(obj, "border_tags_or_blocks", CTX)?;
+            let border_tags_or_blocks = tag_list_field(obj, "border_tags_or_blocks", CTX)?;
             if border_tags_or_blocks.is_empty() {
                 return Err(verr(CTX, "border_tags_or_blocks must be non-empty"));
             }
@@ -343,11 +430,7 @@ fn parse_trigger(v: &JsonValue) -> Result<PortalTrigger, BundleError> {
             )?;
             Ok(PortalTrigger::AltitudeThreshold {
                 min_y_trigger: i32_field(obj, "min_y_trigger", CTX)?,
-                required_vehicle_or_item: opt_rl_field(
-                    obj,
-                    "required_vehicle_or_item",
-                    CTX,
-                )?,
+                required_vehicle_or_item: opt_rl_field(obj, "required_vehicle_or_item", CTX)?,
             })
         }
         "direct_block_interact" => {
@@ -357,10 +440,7 @@ fn parse_trigger(v: &JsonValue) -> Result<PortalTrigger, BundleError> {
                 required_item: opt_rl_field(obj, "required_item", CTX)?,
             })
         }
-        other => Err(verr(
-            CTX,
-            format!("unknown portal trigger kind '{other}'"),
-        )),
+        other => Err(verr(CTX, format!("unknown portal trigger kind '{other}'"))),
     }
 }
 
@@ -525,12 +605,7 @@ fn parse_creature(v: &JsonValue) -> Result<CreatureSpec, BundleError> {
         tame_chance: tame_chance as f32,
         breed_items: opt_tag_list_field(obj, "breed_items", CTX)?,
         heal_items,
-        baby_growth_ticks: opt_u32_field(
-            obj,
-            "baby_growth_ticks",
-            CTX,
-            DEFAULT_BABY_GROWTH_TICKS,
-        )?,
+        baby_growth_ticks: opt_u32_field(obj, "baby_growth_ticks", CTX, DEFAULT_BABY_GROWTH_TICKS)?,
         breed_cooldown_ticks: opt_u32_field(
             obj,
             "breed_cooldown_ticks",
@@ -542,6 +617,341 @@ fn parse_creature(v: &JsonValue) -> Result<CreatureSpec, BundleError> {
         rideable_when_tamed: bool_field(obj, "rideable_when_tamed", CTX, false)?,
         movement: parse_movement(field(obj, "movement", CTX)?)?,
     })
+}
+
+// The magic sections are optional in bundle/1. Their nested shapes follow
+// the public magic_primitives types, and every enum variant has an explicit
+// kind so unknown variants cannot silently become defaults.
+fn parse_spell(v: &JsonValue) -> Result<SpellDefinition, BundleError> {
+    const CTX: &str = "spells[]";
+    let o = obj_of(v, CTX)?;
+    check_keys(
+        o,
+        &[
+            "id",
+            "mana_cost",
+            "base_cooldown_ticks",
+            "cast",
+            "interrupt_on_damage",
+            "interrupt_on_move",
+            "steps",
+        ],
+        CTX,
+    )?;
+    let steps = field(o, "steps", CTX)?
+        .as_array()
+        .ok_or_else(|| verr(CTX, "steps must be an array"))?;
+    bounded(steps.len(), MAX_SPELL_STEPS, CTX)?;
+    let mut nodes = Vec::with_capacity(steps.len());
+    for step in steps {
+        let node = obj_of(step, "spells[].steps[]")?;
+        check_keys(node, &["form", "effects"], "spells[].steps[]")?;
+        let effects = field(node, "effects", CTX)?
+            .as_array()
+            .ok_or_else(|| verr(CTX, "effects must be an array"))?;
+        bounded(effects.len(), MAX_EFFECTS_PER_STEP, CTX)?;
+        nodes.push(SpellNode {
+            form: parse_spell_form(field(node, "form", CTX)?)?,
+            effects: effects
+                .iter()
+                .map(parse_spell_effect)
+                .collect::<Result<_, _>>()?,
+        });
+    }
+    let def = SpellDefinition {
+        id: rl_field(o, "id", CTX)?,
+        mana_cost: f32_field(o, "mana_cost", CTX)?,
+        base_cooldown_ticks: u32_field(o, "base_cooldown_ticks", CTX)?,
+        cast: parse_spell_cast(field(o, "cast", CTX)?)?,
+        interrupt_on_damage: bool_field(o, "interrupt_on_damage", CTX, false)?,
+        interrupt_on_move: bool_field(o, "interrupt_on_move", CTX, false)?,
+        steps: nodes,
+    };
+    def.validate().map_err(|e| verr(CTX, format!("{e:?}")))?;
+    Ok(def)
+}
+
+fn parse_spell_cast(v: &JsonValue) -> Result<SpellCastState, BundleError> {
+    const CTX: &str = "spells[].cast";
+    let o = obj_of(v, CTX)?;
+    match str_field(o, "kind", CTX)? {
+        "instant" => {
+            check_keys(o, &["kind"], CTX)?;
+            Ok(SpellCastState::Instant)
+        }
+        "cast_time" => {
+            check_keys(o, &["kind", "total_ticks"], CTX)?;
+            Ok(SpellCastState::cast_time(u32_field(o, "total_ticks", CTX)?))
+        }
+        "channeled" => {
+            check_keys(
+                o,
+                &["kind", "interval_ticks", "max_ticks", "mana_per_pulse"],
+                CTX,
+            )?;
+            Ok(SpellCastState::channeled(
+                u32_field(o, "interval_ticks", CTX)?,
+                u32_field(o, "max_ticks", CTX)?,
+                f32_field(o, "mana_per_pulse", CTX)?,
+            ))
+        }
+        kind => Err(verr(CTX, format!("unknown cast kind '{kind}'"))),
+    }
+}
+
+fn parse_spell_form(v: &JsonValue) -> Result<SpellForm, BundleError> {
+    const CTX: &str = "spells[].steps[].form";
+    let o = obj_of(v, CTX)?;
+    match str_field(o, "kind", CTX)? {
+        "self_cast" => {
+            check_keys(o, &["kind"], CTX)?;
+            Ok(SpellForm::SelfCast)
+        }
+        "touch" => {
+            check_keys(o, &["kind", "range"], CTX)?;
+            Ok(SpellForm::Touch {
+                range: f32_field(o, "range", CTX)?,
+            })
+        }
+        "projectile" => {
+            check_keys(o, &["kind", "speed", "gravity", "max_ticks"], CTX)?;
+            Ok(SpellForm::Projectile {
+                speed: f32_field(o, "speed", CTX)?,
+                gravity: f32_field(o, "gravity", CTX)?,
+                max_ticks: u32_field(o, "max_ticks", CTX)?,
+            })
+        }
+        "raycast_beam" => {
+            check_keys(o, &["kind", "range", "pierce_cap"], CTX)?;
+            Ok(SpellForm::RaycastBeam {
+                range: f32_field(o, "range", CTX)?,
+                pierce_cap: u32_field(o, "pierce_cap", CTX)?,
+            })
+        }
+        "aoe_zone" => {
+            check_keys(
+                o,
+                &["kind", "radius", "duration_ticks", "pulse_interval"],
+                CTX,
+            )?;
+            Ok(SpellForm::AoeZone {
+                radius: f32_field(o, "radius", CTX)?,
+                duration_ticks: u32_field(o, "duration_ticks", CTX)?,
+                pulse_interval: u32_field(o, "pulse_interval", CTX)?,
+            })
+        }
+        "chain" => {
+            check_keys(o, &["kind", "max_hops", "hop_radius"], CTX)?;
+            Ok(SpellForm::Chain {
+                max_hops: u32_field(o, "max_hops", CTX)?,
+                hop_radius: f32_field(o, "hop_radius", CTX)?,
+            })
+        }
+        "orbit" => {
+            check_keys(o, &["kind", "count", "radius", "duration_ticks"], CTX)?;
+            Ok(SpellForm::Orbit {
+                count: u32_field(o, "count", CTX)?,
+                radius: f32_field(o, "radius", CTX)?,
+                duration_ticks: u32_field(o, "duration_ticks", CTX)?,
+            })
+        }
+        "summon" => {
+            check_keys(
+                o,
+                &["kind", "entity_type", "duration_ticks", "max_active"],
+                CTX,
+            )?;
+            Ok(SpellForm::Summon {
+                entity_type: rl_field(o, "entity_type", CTX)?,
+                duration_ticks: u32_field(o, "duration_ticks", CTX)?,
+                max_active: u32_field(o, "max_active", CTX)?,
+            })
+        }
+        kind => Err(verr(CTX, format!("unknown form kind '{kind}'"))),
+    }
+}
+
+fn parse_spell_effect(v: &JsonValue) -> Result<SpellEffect, BundleError> {
+    const CTX: &str = "spells[].steps[].effects[]";
+    let o = obj_of(v, CTX)?;
+    match str_field(o, "kind", CTX)? {
+        "damage" => {
+            check_keys(o, &["kind", "school", "base_amount"], CTX)?;
+            Ok(SpellEffect::Damage {
+                school: rl_field(o, "school", CTX)?,
+                base_amount: f32_field(o, "base_amount", CTX)?,
+            })
+        }
+        "heal" => {
+            check_keys(o, &["kind", "base_amount"], CTX)?;
+            Ok(SpellEffect::Heal {
+                base_amount: f32_field(o, "base_amount", CTX)?,
+            })
+        }
+        "shield" => {
+            check_keys(o, &["kind", "amount", "duration_ticks"], CTX)?;
+            Ok(SpellEffect::Shield {
+                amount: f32_field(o, "amount", CTX)?,
+                duration_ticks: u32_field(o, "duration_ticks", CTX)?,
+            })
+        }
+        "apply_status" => {
+            check_keys(
+                o,
+                &["kind", "status_id", "amplifier", "duration_ticks"],
+                CTX,
+            )?;
+            Ok(SpellEffect::ApplyStatus {
+                status_id: rl_field(o, "status_id", CTX)?,
+                amplifier: u8_field(o, "amplifier", CTX)?,
+                duration_ticks: u32_field(o, "duration_ticks", CTX)?,
+            })
+        }
+        "knockback" => {
+            check_keys(o, &["kind", "strength"], CTX)?;
+            Ok(SpellEffect::Knockback {
+                strength: f32_field(o, "strength", CTX)?,
+            })
+        }
+        "blink" => {
+            check_keys(o, &["kind", "max_distance"], CTX)?;
+            Ok(SpellEffect::Blink {
+                max_distance: f32_field(o, "max_distance", CTX)?,
+            })
+        }
+        "conjure_light" => {
+            check_keys(o, &["kind", "level", "duration_ticks"], CTX)?;
+            Ok(SpellEffect::ConjureLight {
+                level: u8_field(o, "level", CTX)?,
+                duration_ticks: u32_field(o, "duration_ticks", CTX)?,
+            })
+        }
+        "break_block" => {
+            check_keys(o, &["kind", "max_tier"], CTX)?;
+            Ok(SpellEffect::BreakBlock {
+                max_tier: u8_field(o, "max_tier", CTX)?,
+            })
+        }
+        "emit_vfx" => {
+            check_keys(o, &["kind", "vfx_id"], CTX)?;
+            Ok(SpellEffect::EmitVfx {
+                vfx_id: rl_field(o, "vfx_id", CTX)?,
+            })
+        }
+        kind => Err(verr(CTX, format!("unknown effect kind '{kind}'"))),
+    }
+}
+
+fn parse_status(v: &JsonValue) -> Result<StatusEffectDefinition, BundleError> {
+    const CTX: &str = "custom_statuses[]";
+    let o = obj_of(v, CTX)?;
+    check_keys(
+        o,
+        &[
+            "id",
+            "max_amplifier",
+            "pulse_interval_ticks",
+            "damage_per_pulse",
+            "heal_per_pulse",
+            "absorption_per_level",
+            "frozen",
+            "rooted",
+            "silenced",
+            "disarmed",
+            "attribute_modifiers",
+            "vfx_aura",
+        ],
+        CTX,
+    )?;
+    let modifiers = match o.get("attribute_modifiers") {
+        None => BTreeMap::new(),
+        Some(v) => {
+            let entries = obj_of(v, "custom_statuses[].attribute_modifiers")?;
+            bounded(entries.len(), MAX_ATTRIBUTE_MODIFIERS, CTX)?;
+            entries
+                .iter()
+                .map(|(name, value)| {
+                    check_rl(name, "custom_statuses[].attribute_modifiers")?;
+                    Ok((
+                        name.clone(),
+                        f32_of(value, "custom_statuses[].attribute_modifiers")?,
+                    ))
+                })
+                .collect::<Result<_, BundleError>>()?
+        }
+    };
+    Ok(StatusEffectDefinition {
+        id: rl_field(o, "id", CTX)?,
+        max_amplifier: match o.get("max_amplifier") {
+            None => 0,
+            Some(_) => u8_field(o, "max_amplifier", CTX)?,
+        },
+        pulse_interval_ticks: opt_u32_field(o, "pulse_interval_ticks", CTX, 0)?,
+        damage_per_pulse: opt_f32_field(o, "damage_per_pulse", CTX, 0.0)?,
+        heal_per_pulse: opt_f32_field(o, "heal_per_pulse", CTX, 0.0)?,
+        absorption_per_level: opt_f32_field(o, "absorption_per_level", CTX, 0.0)?,
+        frozen: bool_field(o, "frozen", CTX, false)?,
+        rooted: bool_field(o, "rooted", CTX, false)?,
+        silenced: bool_field(o, "silenced", CTX, false)?,
+        disarmed: bool_field(o, "disarmed", CTX, false)?,
+        attribute_modifiers: modifiers,
+        vfx_aura: opt_rl_field(o, "vfx_aura", CTX)?,
+    })
+}
+
+fn parse_ritual(v: &JsonValue) -> Result<RitualRecipe, BundleError> {
+    const CTX: &str = "rituals[]";
+    let o = obj_of(v, CTX)?;
+    check_keys(
+        o,
+        &[
+            "id",
+            "pattern",
+            "reagents",
+            "duration_ticks",
+            "mana_per_tick",
+        ],
+        CTX,
+    )?;
+    let blocks = field(o, "pattern", CTX)?
+        .as_array()
+        .ok_or_else(|| verr(CTX, "pattern must be an array"))?;
+    bounded(blocks.len(), MAX_RITUAL_PATTERN_BLOCKS, CTX)?;
+    let mut pattern = BTreeMap::new();
+    for block in blocks {
+        let b = obj_of(block, "rituals[].pattern[]")?;
+        check_keys(b, &["dx", "dy", "dz", "block"], "rituals[].pattern[]")?;
+        let offset = (
+            i32_field(b, "dx", CTX)?,
+            i32_field(b, "dy", CTX)?,
+            i32_field(b, "dz", CTX)?,
+        );
+        if [offset.0, offset.1, offset.2]
+            .into_iter()
+            .any(|v| !(-MAX_RITUAL_OFFSET..=MAX_RITUAL_OFFSET).contains(&v))
+        {
+            return Err(verr(CTX, "pattern offset out of range"));
+        }
+        if pattern.insert(offset, rl_field(b, "block", CTX)?).is_some() {
+            return Err(verr(CTX, "duplicate pattern offset"));
+        }
+    }
+    let items = obj_of(field(o, "reagents", CTX)?, "rituals[].reagents")?;
+    bounded(items.len(), MAX_REAGENTS, CTX)?;
+    let mut reagents = BTreeMap::new();
+    for (item, count) in items {
+        check_rl(item, CTX)?;
+        reagents.insert(item.clone(), u32_of(count, CTX)?);
+    }
+    let recipe = RitualRecipe {
+        id: rl_field(o, "id", CTX)?,
+        pattern,
+        reagents,
+        duration_ticks: u32_field(o, "duration_ticks", CTX)?,
+        mana_per_tick: f32_field(o, "mana_per_tick", CTX)?,
+    };
+    recipe.validate().map_err(|e| verr(CTX, format!("{e:?}")))?;
+    Ok(recipe)
 }
 
 fn parse_movement(v: &JsonValue) -> Result<MovementProfile, BundleError> {
@@ -563,11 +973,7 @@ fn parse_movement(v: &JsonValue) -> Result<MovementProfile, BundleError> {
             })
         }
         "aquatic" => {
-            check_keys(
-                obj,
-                &["kind", "swim_speed", "suffocates_in_air_ticks"],
-                CTX,
-            )?;
+            check_keys(obj, &["kind", "swim_speed", "suffocates_in_air_ticks"], CTX)?;
             Ok(MovementProfile::Aquatic {
                 swim_speed: speed_field(obj, "swim_speed", CTX)?,
                 suffocates_in_air_ticks: u32_field(obj, "suffocates_in_air_ticks", CTX)?,
@@ -616,12 +1022,7 @@ fn jbool(v: bool) -> JsonValue {
 }
 
 fn obj(pairs: Vec<(&str, JsonValue)>) -> JsonValue {
-    JsonValue::Object(
-        pairs
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect(),
-    )
+    JsonValue::Object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
 }
 
 fn opt_str(v: &Option<String>) -> JsonValue {
@@ -782,10 +1183,7 @@ fn creature_ast(spec: &CreatureSpec) -> JsonValue {
                     .collect(),
             ),
         ),
-        (
-            "baby_growth_ticks",
-            jnum(f64::from(spec.baby_growth_ticks)),
-        ),
+        ("baby_growth_ticks", jnum(f64::from(spec.baby_growth_ticks))),
         (
             "breed_cooldown_ticks",
             jnum(f64::from(spec.breed_cooldown_ticks)),
@@ -841,6 +1239,247 @@ fn movement_ast(profile: &MovementProfile) -> JsonValue {
             ("climb_speed", jnum(*climb_speed)),
         ]),
     }
+}
+
+fn spell_ast(def: &SpellDefinition) -> JsonValue {
+    obj(vec![
+        ("id", jstr(&def.id)),
+        ("mana_cost", jnum(f64::from(def.mana_cost))),
+        (
+            "base_cooldown_ticks",
+            jnum(f64::from(def.base_cooldown_ticks)),
+        ),
+        ("cast", spell_cast_ast(&def.cast)),
+        ("interrupt_on_damage", jbool(def.interrupt_on_damage)),
+        ("interrupt_on_move", jbool(def.interrupt_on_move)),
+        (
+            "steps",
+            JsonValue::Array(
+                def.steps
+                    .iter()
+                    .map(|node| {
+                        obj(vec![
+                            ("form", spell_form_ast(&node.form)),
+                            (
+                                "effects",
+                                JsonValue::Array(
+                                    node.effects.iter().map(spell_effect_ast).collect(),
+                                ),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+fn spell_cast_ast(cast: &SpellCastState) -> JsonValue {
+    match cast {
+        SpellCastState::Instant => obj(vec![("kind", jstr("instant"))]),
+        SpellCastState::CastTime { total_ticks, .. } => obj(vec![
+            ("kind", jstr("cast_time")),
+            ("total_ticks", jnum(f64::from(*total_ticks))),
+        ]),
+        SpellCastState::Channeled {
+            interval_ticks,
+            max_ticks,
+            mana_per_pulse,
+            ..
+        } => obj(vec![
+            ("kind", jstr("channeled")),
+            ("interval_ticks", jnum(f64::from(*interval_ticks))),
+            ("max_ticks", jnum(f64::from(*max_ticks))),
+            ("mana_per_pulse", jnum(f64::from(*mana_per_pulse))),
+        ]),
+    }
+}
+
+fn spell_form_ast(form: &SpellForm) -> JsonValue {
+    match form {
+        SpellForm::SelfCast => obj(vec![("kind", jstr("self_cast"))]),
+        SpellForm::Touch { range } => obj(vec![
+            ("kind", jstr("touch")),
+            ("range", jnum(f64::from(*range))),
+        ]),
+        SpellForm::Projectile {
+            speed,
+            gravity,
+            max_ticks,
+        } => obj(vec![
+            ("kind", jstr("projectile")),
+            ("speed", jnum(f64::from(*speed))),
+            ("gravity", jnum(f64::from(*gravity))),
+            ("max_ticks", jnum(f64::from(*max_ticks))),
+        ]),
+        SpellForm::RaycastBeam { range, pierce_cap } => obj(vec![
+            ("kind", jstr("raycast_beam")),
+            ("range", jnum(f64::from(*range))),
+            ("pierce_cap", jnum(f64::from(*pierce_cap))),
+        ]),
+        SpellForm::AoeZone {
+            radius,
+            duration_ticks,
+            pulse_interval,
+        } => obj(vec![
+            ("kind", jstr("aoe_zone")),
+            ("radius", jnum(f64::from(*radius))),
+            ("duration_ticks", jnum(f64::from(*duration_ticks))),
+            ("pulse_interval", jnum(f64::from(*pulse_interval))),
+        ]),
+        SpellForm::Chain {
+            max_hops,
+            hop_radius,
+        } => obj(vec![
+            ("kind", jstr("chain")),
+            ("max_hops", jnum(f64::from(*max_hops))),
+            ("hop_radius", jnum(f64::from(*hop_radius))),
+        ]),
+        SpellForm::Orbit {
+            count,
+            radius,
+            duration_ticks,
+        } => obj(vec![
+            ("kind", jstr("orbit")),
+            ("count", jnum(f64::from(*count))),
+            ("radius", jnum(f64::from(*radius))),
+            ("duration_ticks", jnum(f64::from(*duration_ticks))),
+        ]),
+        SpellForm::Summon {
+            entity_type,
+            duration_ticks,
+            max_active,
+        } => obj(vec![
+            ("kind", jstr("summon")),
+            ("entity_type", jstr(entity_type)),
+            ("duration_ticks", jnum(f64::from(*duration_ticks))),
+            ("max_active", jnum(f64::from(*max_active))),
+        ]),
+    }
+}
+
+fn spell_effect_ast(effect: &SpellEffect) -> JsonValue {
+    match effect {
+        SpellEffect::Damage {
+            school,
+            base_amount,
+        } => obj(vec![
+            ("kind", jstr("damage")),
+            ("school", jstr(school)),
+            ("base_amount", jnum(f64::from(*base_amount))),
+        ]),
+        SpellEffect::Heal { base_amount } => obj(vec![
+            ("kind", jstr("heal")),
+            ("base_amount", jnum(f64::from(*base_amount))),
+        ]),
+        SpellEffect::Shield {
+            amount,
+            duration_ticks,
+        } => obj(vec![
+            ("kind", jstr("shield")),
+            ("amount", jnum(f64::from(*amount))),
+            ("duration_ticks", jnum(f64::from(*duration_ticks))),
+        ]),
+        SpellEffect::ApplyStatus {
+            status_id,
+            amplifier,
+            duration_ticks,
+        } => obj(vec![
+            ("kind", jstr("apply_status")),
+            ("status_id", jstr(status_id)),
+            ("amplifier", jnum(f64::from(*amplifier))),
+            ("duration_ticks", jnum(f64::from(*duration_ticks))),
+        ]),
+        SpellEffect::Knockback { strength } => obj(vec![
+            ("kind", jstr("knockback")),
+            ("strength", jnum(f64::from(*strength))),
+        ]),
+        SpellEffect::Blink { max_distance } => obj(vec![
+            ("kind", jstr("blink")),
+            ("max_distance", jnum(f64::from(*max_distance))),
+        ]),
+        SpellEffect::ConjureLight {
+            level,
+            duration_ticks,
+        } => obj(vec![
+            ("kind", jstr("conjure_light")),
+            ("level", jnum(f64::from(*level))),
+            ("duration_ticks", jnum(f64::from(*duration_ticks))),
+        ]),
+        SpellEffect::BreakBlock { max_tier } => obj(vec![
+            ("kind", jstr("break_block")),
+            ("max_tier", jnum(f64::from(*max_tier))),
+        ]),
+        SpellEffect::EmitVfx { vfx_id } => {
+            obj(vec![("kind", jstr("emit_vfx")), ("vfx_id", jstr(vfx_id))])
+        }
+    }
+}
+
+fn status_ast(def: &StatusEffectDefinition) -> JsonValue {
+    obj(vec![
+        ("id", jstr(&def.id)),
+        ("max_amplifier", jnum(f64::from(def.max_amplifier))),
+        (
+            "pulse_interval_ticks",
+            jnum(f64::from(def.pulse_interval_ticks)),
+        ),
+        ("damage_per_pulse", jnum(f64::from(def.damage_per_pulse))),
+        ("heal_per_pulse", jnum(f64::from(def.heal_per_pulse))),
+        (
+            "absorption_per_level",
+            jnum(f64::from(def.absorption_per_level)),
+        ),
+        ("frozen", jbool(def.frozen)),
+        ("rooted", jbool(def.rooted)),
+        ("silenced", jbool(def.silenced)),
+        ("disarmed", jbool(def.disarmed)),
+        (
+            "attribute_modifiers",
+            JsonValue::Object(
+                def.attribute_modifiers
+                    .iter()
+                    .map(|(key, value)| (key.clone(), jnum(f64::from(*value))))
+                    .collect(),
+            ),
+        ),
+        ("vfx_aura", opt_str(&def.vfx_aura)),
+    ])
+}
+
+fn ritual_ast(recipe: &RitualRecipe) -> JsonValue {
+    obj(vec![
+        ("id", jstr(&recipe.id)),
+        (
+            "pattern",
+            JsonValue::Array(
+                recipe
+                    .pattern
+                    .iter()
+                    .map(|(&(dx, dy, dz), block)| {
+                        obj(vec![
+                            ("dx", jnum(f64::from(dx))),
+                            ("dy", jnum(f64::from(dy))),
+                            ("dz", jnum(f64::from(dz))),
+                            ("block", jstr(block)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "reagents",
+            JsonValue::Object(
+                recipe
+                    .reagents
+                    .iter()
+                    .map(|(item, count)| (item.clone(), jnum(f64::from(*count))))
+                    .collect(),
+            ),
+        ),
+        ("duration_ticks", jnum(f64::from(recipe.duration_ticks))),
+        ("mana_per_tick", jnum(f64::from(recipe.mana_per_tick))),
+    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -976,10 +1615,7 @@ fn check_tag_or_rl(s: &str, ctx: &str) -> Result<(), BundleError> {
     }
 }
 
-fn obj_of<'a>(
-    v: &'a JsonValue,
-    ctx: &str,
-) -> Result<&'a BTreeMap<String, JsonValue>, BundleError> {
+fn obj_of<'a>(v: &'a JsonValue, ctx: &str) -> Result<&'a BTreeMap<String, JsonValue>, BundleError> {
     v.as_object()
         .ok_or_else(|| verr(ctx, "must be a JSON object"))
 }
@@ -1041,8 +1677,7 @@ fn tag_field(
 }
 
 fn bool_of(v: &JsonValue, ctx: &str) -> Result<bool, BundleError> {
-    v.as_bool()
-        .ok_or_else(|| verr(ctx, "must be a boolean"))
+    v.as_bool().ok_or_else(|| verr(ctx, "must be a boolean"))
 }
 
 fn bool_field(
@@ -1062,11 +1697,32 @@ fn f64_of(v: &JsonValue, ctx: &str) -> Result<f64, BundleError> {
         .ok_or_else(|| verr(ctx, "must be a finite number"))
 }
 
-fn f64_field(
+fn f32_of(v: &JsonValue, ctx: &str) -> Result<f32, BundleError> {
+    let number = f64_of(v, ctx)?;
+    let value = number as f32;
+    if !value.is_finite() || (number != 0.0 && value == 0.0) {
+        return Err(verr(ctx, "number outside the f32 range"));
+    }
+    Ok(value)
+}
+
+fn f32_field(obj: &BTreeMap<String, JsonValue>, key: &str, ctx: &str) -> Result<f32, BundleError> {
+    f32_of(field(obj, key, ctx)?, ctx)
+}
+
+fn opt_f32_field(
     obj: &BTreeMap<String, JsonValue>,
     key: &str,
     ctx: &str,
-) -> Result<f64, BundleError> {
+    default: f32,
+) -> Result<f32, BundleError> {
+    match obj.get(key) {
+        Some(value) => f32_of(value, ctx),
+        None => Ok(default),
+    }
+}
+
+fn f64_field(obj: &BTreeMap<String, JsonValue>, key: &str, ctx: &str) -> Result<f64, BundleError> {
     f64_of(field(obj, key, ctx)?, ctx)
 }
 
@@ -1098,11 +1754,7 @@ fn u32_of(v: &JsonValue, ctx: &str) -> Result<u32, BundleError> {
     Ok(n as u32)
 }
 
-fn u32_field(
-    obj: &BTreeMap<String, JsonValue>,
-    key: &str,
-    ctx: &str,
-) -> Result<u32, BundleError> {
+fn u32_field(obj: &BTreeMap<String, JsonValue>, key: &str, ctx: &str) -> Result<u32, BundleError> {
     u32_of(field(obj, key, ctx)?, ctx)
 }
 
@@ -1118,11 +1770,7 @@ fn opt_u32_field(
     }
 }
 
-fn u8_field(
-    obj: &BTreeMap<String, JsonValue>,
-    key: &str,
-    ctx: &str,
-) -> Result<u8, BundleError> {
+fn u8_field(obj: &BTreeMap<String, JsonValue>, key: &str, ctx: &str) -> Result<u8, BundleError> {
     let n = int_of(field(obj, key, ctx)?, ctx)?;
     if !(0.0..=f64::from(u8::MAX)).contains(&n) {
         return Err(verr(ctx, "must be a u8 integer"));
@@ -1130,11 +1778,7 @@ fn u8_field(
     Ok(n as u8)
 }
 
-fn i32_field(
-    obj: &BTreeMap<String, JsonValue>,
-    key: &str,
-    ctx: &str,
-) -> Result<i32, BundleError> {
+fn i32_field(obj: &BTreeMap<String, JsonValue>, key: &str, ctx: &str) -> Result<i32, BundleError> {
     let n = int_of(field(obj, key, ctx)?, ctx)?;
     if !(f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&n) {
         return Err(verr(ctx, "must be an i32 integer"));
@@ -1147,9 +1791,7 @@ fn string_list(
     ctx: &str,
     check: fn(&str, &str) -> Result<(), BundleError>,
 ) -> Result<Vec<String>, BundleError> {
-    let items = v
-        .as_array()
-        .ok_or_else(|| verr(ctx, "must be an array"))?;
+    let items = v.as_array().ok_or_else(|| verr(ctx, "must be an array"))?;
     bounded(items.len(), MAX_INNER_ENTRIES, ctx)?;
     let mut out = Vec::with_capacity(items.len());
     for item in items {
@@ -1207,6 +1849,23 @@ fn section<T>(
     items.iter().map(parse).collect()
 }
 
+fn optional_section<T>(
+    top: &BTreeMap<String, JsonValue>,
+    key: &str,
+    parse: fn(&JsonValue) -> Result<T, BundleError>,
+) -> Result<Vec<T>, BundleError> {
+    match top.get(key) {
+        Some(items) => {
+            let array = items
+                .as_array()
+                .ok_or_else(|| verr("bundle", format!("'{key}' must be an array")))?;
+            bounded(array.len(), MAX_SECTION_ENTRIES, key)?;
+            array.iter().map(parse).collect()
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unified runtime: one registry for every declared section
 // ---------------------------------------------------------------------------
@@ -1223,6 +1882,9 @@ pub struct BundleInstallSummary {
     pub progression_barriers_installed: usize,
     pub biome_regions_installed: usize,
     pub creatures_installed: usize,
+    pub spells_installed: usize,
+    pub custom_statuses_installed: usize,
+    pub rituals_installed: usize,
     /// Channel ids declared by the bundle.
     pub custom_channels_declared: usize,
     /// Channel ids that were not already registered.
@@ -1238,6 +1900,9 @@ pub struct UnifiedModRuntime {
     progression_rules: Vec<ProgressionRule>,
     biome_blender: BiomeRegionBlender,
     creatures: BTreeMap<String, CreatureSpec>,
+    spells: BTreeMap<String, SpellDefinition>,
+    custom_statuses: CustomStatusRegistry,
+    rituals: BTreeMap<String, RitualRecipe>,
     custom_channels: BTreeSet<String>,
     installed_mod_ids: Vec<String>,
 }
@@ -1257,6 +1922,9 @@ impl UnifiedModRuntime {
             progression_rules: Vec::new(),
             biome_blender: BiomeRegionBlender::new(vanilla_region_weight),
             creatures: BTreeMap::new(),
+            spells: BTreeMap::new(),
+            custom_statuses: CustomStatusRegistry::default(),
+            rituals: BTreeMap::new(),
             custom_channels: BTreeSet::new(),
             installed_mod_ids: Vec::new(),
         }
@@ -1288,6 +1956,31 @@ impl UnifiedModRuntime {
             });
         }
 
+        // Validate all magic insertions against the complete installed state
+        // before modifying any runtime registry, including legacy sections.
+        for spell in &bundle.spells {
+            if self.spells.contains_key(&spell.id) {
+                return Err(verr("spells", format!("already registered '{}'", spell.id)));
+            }
+        }
+        for ritual in &bundle.rituals {
+            if self.rituals.contains_key(&ritual.id) {
+                return Err(verr(
+                    "rituals",
+                    format!("already registered '{}'", ritual.id),
+                ));
+            }
+        }
+        let mut new_statuses = self.custom_statuses.clone();
+        if new_statuses.len() + bundle.custom_statuses.len() > MAX_STATUS_DEFS {
+            return Err(verr("custom_statuses", "registry capacity exceeded"));
+        }
+        for status in &bundle.custom_statuses {
+            new_statuses
+                .register(status.clone())
+                .map_err(|e| verr("custom_statuses", format!("{e:?}")))?;
+        }
+
         for rule in &bundle.portals {
             self.portals.register(rule.clone());
         }
@@ -1297,7 +1990,15 @@ impl UnifiedModRuntime {
             self.biome_blender.add_region(region.clone());
         }
         for spec in &bundle.creatures {
-            self.creatures.insert(spec.entity_type.clone(), spec.clone());
+            self.creatures
+                .insert(spec.entity_type.clone(), spec.clone());
+        }
+        for spell in &bundle.spells {
+            self.spells.insert(spell.id.clone(), spell.clone());
+        }
+        self.custom_statuses = new_statuses;
+        for ritual in &bundle.rituals {
+            self.rituals.insert(ritual.id.clone(), ritual.clone());
         }
         let mut new_channels = 0usize;
         for channel in &bundle.custom_channels {
@@ -1314,6 +2015,9 @@ impl UnifiedModRuntime {
             progression_barriers_installed: bundle.progression_barriers.len(),
             biome_regions_installed: bundle.biome_regions.len(),
             creatures_installed: bundle.creatures.len(),
+            spells_installed: bundle.spells.len(),
+            custom_statuses_installed: bundle.custom_statuses.len(),
+            rituals_installed: bundle.rituals.len(),
             custom_channels_declared: bundle.custom_channels.len(),
             custom_channels_newly_registered: new_channels,
         })
@@ -1347,6 +2051,33 @@ impl UnifiedModRuntime {
     /// All installed creature specs keyed by `entity_type`.
     pub fn creature_specs(&self) -> &BTreeMap<String, CreatureSpec> {
         &self.creatures
+    }
+
+    /// Registered spell by resource ID.
+    pub fn spell(&self, id: &str) -> Option<&SpellDefinition> {
+        self.spells.get(id)
+    }
+
+    pub fn spell_count(&self) -> usize {
+        self.spells.len()
+    }
+
+    /// Registered custom status by resource ID.
+    pub fn custom_status(&self, id: &str) -> Option<&StatusEffectDefinition> {
+        self.custom_statuses.get(id)
+    }
+
+    pub fn custom_status_count(&self) -> usize {
+        self.custom_statuses.len()
+    }
+
+    /// Registered ritual by resource ID.
+    pub fn ritual(&self, id: &str) -> Option<&RitualRecipe> {
+        self.rituals.get(id)
+    }
+
+    pub fn ritual_count(&self) -> usize {
+        self.rituals.len()
     }
 
     /// Every registered custom payload channel id.
@@ -1387,6 +2118,268 @@ pub fn export_builtin_dimension_bundles() -> Vec<DeclarativeModBundle> {
             biome_regions: Vec::new(),
             creatures: Vec::new(),
             custom_channels: Vec::new(),
+            spells: Vec::new(),
+            custom_statuses: Vec::new(),
+            rituals: Vec::new(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod magic_bundle_tests {
+    use super::*;
+
+    fn document(extra: &str) -> String {
+        format!(
+            r#"{{"schema":"mc-spine-mod-bundle/1","mod_id":"demo","mc_version_range":"[1.21,)","portals":[],"progression_barriers":[],"biome_regions":[],"creatures":[],"custom_channels":[]{extra}}}"#
+        )
+    }
+
+    const SPELL: &str = r#"{"id":"demo:ember","mana_cost":2.5,"base_cooldown_ticks":10,"cast":{"kind":"instant"},"steps":[{"form":{"kind":"aoe_zone","radius":4,"duration_ticks":40,"pulse_interval":10},"effects":[{"kind":"damage","school":"demo:fire","base_amount":3},{"kind":"apply_status","status_id":"demo:burn","amplifier":1,"duration_ticks":60}]}]}"#;
+    const STATUS: &str = r#"{"id":"demo:burn","max_amplifier":3,"pulse_interval_ticks":10,"damage_per_pulse":1.5,"heal_per_pulse":0.25,"absorption_per_level":2,"frozen":true,"rooted":true,"silenced":true,"disarmed":true,"attribute_modifiers":{"demo:power":-0.5},"vfx_aura":"demo:fire_aura"}"#;
+    const RITUAL: &str = r#"{"id":"demo:altar","pattern":[{"dx":0,"dy":0,"dz":0,"block":"demo:core"},{"dx":1,"dy":0,"dz":0,"block":"minecraft:gold_block"}],"reagents":{"minecraft:diamond":2},"duration_ticks":100,"mana_per_tick":0.75}"#;
+
+    fn with_magic() -> DeclarativeModBundle {
+        DeclarativeModBundle::from_json(&document(&format!(
+            r#", "spells":[{SPELL}], "custom_statuses":[{STATUS}], "rituals":[{RITUAL}]"#
+        )))
+        .expect("valid declarative magic bundle")
+    }
+
+    #[test]
+    fn old_bundles_remain_accepted_without_magic_keys() {
+        let old = DeclarativeModBundle::from_json(&document("")).unwrap();
+        assert!(old.spells.is_empty() && old.custom_statuses.is_empty() && old.rituals.is_empty());
+        assert!(!old.to_json().contains("\"spells\""));
+        assert!(!old.to_json().contains("\"rituals\""));
+        assert_eq!(
+            old,
+            DeclarativeModBundle::from_json(&old.to_json()).unwrap()
+        );
+        let explicit_empty = document(r#", "spells":[], "custom_statuses":[], "rituals":[]"#);
+        assert_eq!(
+            old,
+            DeclarativeModBundle::from_json(&explicit_empty).unwrap()
+        );
+        let mut runtime = UnifiedModRuntime::default();
+        let receipt = runtime
+            .register_bundle(&old, McVersion::new(1, 21, 1))
+            .unwrap();
+        assert_eq!(
+            (
+                receipt.spells_installed,
+                receipt.custom_statuses_installed,
+                receipt.rituals_installed
+            ),
+            (0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn parses_roundtrips_and_registers_all_magic_sections() {
+        let bundle = with_magic();
+        assert_eq!(
+            bundle,
+            DeclarativeModBundle::from_json(&bundle.to_json()).unwrap()
+        );
+        assert_eq!(
+            bundle.to_json(),
+            DeclarativeModBundle::from_json(&bundle.to_json())
+                .unwrap()
+                .to_json()
+        );
+        assert_eq!(bundle.spells[0].steps[0].form.max_targets(), 128);
+        assert!(bundle.custom_statuses[0].silenced);
+        assert_eq!(bundle.rituals[0].pattern.len(), 2);
+        let mut runtime = UnifiedModRuntime::default();
+        let summary = runtime
+            .register_bundle(&bundle, McVersion::new(1, 21, 1))
+            .unwrap();
+        assert_eq!(
+            (
+                summary.spells_installed,
+                summary.custom_statuses_installed,
+                summary.rituals_installed
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            (
+                runtime.spell_count(),
+                runtime.custom_status_count(),
+                runtime.ritual_count()
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(runtime.spell("demo:ember"), Some(&bundle.spells[0]));
+        assert_eq!(
+            runtime.custom_status("demo:burn"),
+            Some(&bundle.custom_statuses[0])
+        );
+        assert_eq!(runtime.ritual("demo:altar"), Some(&bundle.rituals[0]));
+        assert!(runtime.spell("demo:missing").is_none());
+    }
+
+    #[test]
+    fn supports_every_spell_cast_form_and_effect_variant() {
+        let casts = [
+            r#"{"kind":"instant"}"#,
+            r#"{"kind":"cast_time","total_ticks":10}"#,
+            r#"{"kind":"channeled","interval_ticks":2,"max_ticks":10,"mana_per_pulse":0.5}"#,
+        ];
+        let forms = [
+            r#"{"kind":"self_cast"}"#,
+            r#"{"kind":"touch","range":3}"#,
+            r#"{"kind":"projectile","speed":2,"gravity":0.05,"max_ticks":10}"#,
+            r#"{"kind":"raycast_beam","range":10,"pierce_cap":2}"#,
+            r#"{"kind":"aoe_zone","radius":3,"duration_ticks":10,"pulse_interval":2}"#,
+            r#"{"kind":"chain","max_hops":3,"hop_radius":4}"#,
+            r#"{"kind":"orbit","count":3,"radius":2,"duration_ticks":12}"#,
+            r#"{"kind":"summon","entity_type":"minecraft:pig","duration_ticks":12,"max_active":2}"#,
+        ];
+        let effects = [
+            r#"{"kind":"damage","school":"demo:arcane","base_amount":2}"#,
+            r#"{"kind":"heal","base_amount":3}"#,
+            r#"{"kind":"shield","amount":2,"duration_ticks":20}"#,
+            r#"{"kind":"apply_status","status_id":"demo:burn","amplifier":2,"duration_ticks":20}"#,
+            r#"{"kind":"knockback","strength":3}"#,
+            r#"{"kind":"blink","max_distance":4}"#,
+            r#"{"kind":"conjure_light","level":8,"duration_ticks":10}"#,
+            r#"{"kind":"break_block","max_tier":2}"#,
+            r#"{"kind":"emit_vfx","vfx_id":"demo:flash"}"#,
+        ];
+        for cast in casts {
+            for (idx, form) in forms.iter().enumerate() {
+                let effect = effects[idx % effects.len()];
+                let input = document(&format!(
+                    r#", "spells":[{{"id":"demo:test","mana_cost":1,"base_cooldown_ticks":1,"cast":{cast},"steps":[{{"form":{form},"effects":[{effect}]}}]}}]"#
+                ));
+                let bundle = DeclarativeModBundle::from_json(&input).unwrap();
+                assert_eq!(
+                    bundle,
+                    DeclarativeModBundle::from_json(&bundle.to_json()).unwrap()
+                );
+            }
+        }
+        // Exercise the remaining effect independent of form choice.
+        let input = document(&format!(
+            r#", "spells":[{{"id":"demo:test","mana_cost":0,"base_cooldown_ticks":0,"cast":{{"kind":"instant"}},"steps":[{{"form":{{"kind":"self_cast"}},"effects":[{}]}}]}}]"#,
+            effects[8]
+        ));
+        assert!(DeclarativeModBundle::from_json(&input).is_ok());
+    }
+
+    #[test]
+    fn rejects_malformed_and_over_cap_magic_fail_closed() {
+        let baseline = document(&format!(r#", "spells":[{SPELL}]"#));
+        for (before, after) in [
+            ("\"radius\":4", "\"radius\":33"),
+            ("\"radius\":4", "\"radius\":1e100"),
+            ("\"radius\":4", "\"radius\":null"),
+            ("\"kind\":\"aoe_zone\"", "\"kind\":\"unknown_form\""),
+            ("\"kind\":\"damage\"", "\"kind\":\"unknown_effect\""),
+            ("\"kind\":\"instant\"", "\"kind\":\"unknown_cast\""),
+            ("\"mana_cost\":2.5", "\"mana_cost\":-1"),
+            ("\"mana_cost\":2.5", "\"mana_cost\":1e100"),
+            ("\"mana_cost\":2.5", "\"mana_cost\":1e-100"),
+            ("\"mana_cost\":2.5", "\"mana_cost\":\"NaN\""),
+            ("\"base_cooldown_ticks\":10", "\"base_cooldown_ticks\":1.5"),
+            ("\"base_amount\":3", "\"base_amount\":-1"),
+            ("\"base_amount\":3", "\"base_amount\":2,\"extra\":1"),
+        ] {
+            let invalid = baseline.replacen(before, after, 1);
+            assert!(
+                DeclarativeModBundle::from_json(&invalid).is_err(),
+                "accepted {after}"
+            );
+        }
+        for extra in [
+            r#", "spells":{}"#,
+            r#", "rituals":null"#,
+            r#", "custom_statuses":[{"id":"demo:burn","damage_per_pulse":1}]"#,
+            r#", "custom_statuses":[{"id":"demo:burn","vfx_aura":"demo:fx","unexpected":1}]"#,
+            r#", "custom_statuses":[{"id":"demo:burn","attribute_modifiers":{"INVALID:Name":1}}]"#,
+            r#", "rituals":[{"id":"demo:altar","pattern":[{"dx":17,"dy":0,"dz":0,"block":"minecraft:stone"}],"reagents":{},"duration_ticks":1,"mana_per_tick":1}]"#,
+            r#", "rituals":[{"id":"demo:altar","pattern":[{"dx":-2147483648,"dy":0,"dz":0,"block":"minecraft:stone"}],"reagents":{},"duration_ticks":1,"mana_per_tick":1}]"#,
+            r#", "rituals":[{"id":"demo:altar","pattern":[{"dx":0,"dy":0,"dz":0,"block":"minecraft:stone"},{"dx":0,"dy":0,"dz":0,"block":"minecraft:dirt"}],"reagents":{},"duration_ticks":1,"mana_per_tick":1}]"#,
+            r#", "rituals":[{"id":"demo:altar","pattern":[],"reagents":{"minecraft:diamond":0},"duration_ticks":1,"mana_per_tick":1}]"#,
+            r#", "unknown_section":[]"#,
+        ] {
+            assert!(
+                DeclarativeModBundle::from_json(&document(extra)).is_err(),
+                "accepted {extra}"
+            );
+        }
+        assert!(DeclarativeModBundle::from_json(&document(&format!(
+            r#", "spells":[{SPELL},{SPELL}]"#
+        )))
+        .is_err());
+        assert!(DeclarativeModBundle::from_json(&document(&format!(
+            r#", "custom_statuses":[{STATUS},{STATUS}]"#
+        )))
+        .is_err());
+        assert!(DeclarativeModBundle::from_json(&document(&format!(
+            r#", "rituals":[{RITUAL},{RITUAL}]"#
+        )))
+        .is_err());
+    }
+
+    #[test]
+    fn failed_registration_never_mutates_runtime() {
+        let mut runtime = UnifiedModRuntime::default();
+        let original = with_magic();
+        runtime
+            .register_bundle(&original, McVersion::new(1, 21, 1))
+            .unwrap();
+        for invalid in [
+            original.clone(),
+            {
+                let mut copy = original.clone();
+                copy.spells.clear();
+                copy.rituals.clear();
+                copy
+            },
+            {
+                let mut copy = original.clone();
+                copy.spells.clear();
+                copy.custom_statuses.clear();
+                copy
+            },
+        ] {
+            assert!(runtime
+                .register_bundle(&invalid, McVersion::new(1, 21, 1))
+                .is_err());
+            assert_eq!(
+                (
+                    runtime.spell_count(),
+                    runtime.custom_status_count(),
+                    runtime.ritual_count()
+                ),
+                (1, 1, 1)
+            );
+            assert_eq!(runtime.installed_mod_ids().len(), 1);
+        }
+        let mut tampered = original.clone();
+        tampered.spells[0].cast = SpellCastState::CastTime {
+            total_ticks: 4,
+            elapsed_ticks: 1,
+        };
+        assert!(tampered.validate().is_err());
+        tampered = original.clone();
+        tampered.spells[0].mana_cost = f32::NAN;
+        assert!(tampered.validate().is_err());
+        tampered = original.clone();
+        tampered.custom_statuses[0]
+            .attribute_modifiers
+            .insert("demo:speed".into(), f32::INFINITY);
+        assert!(tampered.validate().is_err());
+        tampered = original.clone();
+        tampered.custom_statuses[0].damage_per_pulse = f32::NAN;
+        assert!(tampered.validate().is_err());
+        tampered = original;
+        tampered.rituals[0]
+            .pattern
+            .insert((i32::MIN, 0, 0), "minecraft:stone".into());
+        assert!(tampered.validate().is_err());
+    }
 }

@@ -129,9 +129,60 @@ Mod ID は安全な小文字の英数字・`_`・`.`・`-` のみで構成され
 
 `portals` は対象ディメンションと起動条件、`biome_regions` はディメンション内のバイオーム置換、`creatures` は種別と飼育・移動の振る舞いを宣言します。`progression_barriers` には実績による進行制限を追加できます。`custom_channels` は **ネットワーク payload チャネル ID** であり、任意の実行可能イベントハンドラを宣言するフィールドではありません。イベントの lift は既存 JAR の Mixin 解析経路が担当します。
 
+### 魔法・カスタム状態異常・儀式（任意）
+
+`spells`、`custom_statuses`、`rituals` は Bundle のトップレベルに追加できる任意フィールドです。従来の Bundle は変更不要です。次の JSON は既存の `bundle.json` に追加する3フィールドの抜粋です。
+
+```json
+{
+  "spells": [
+    {
+      "id": "starling:ember_burst",
+      "mana_cost": 8.0,
+      "base_cooldown_ticks": 40,
+      "cast": { "kind": "cast_time", "total_ticks": 10 },
+      "interrupt_on_damage": true,
+      "steps": [{
+        "form": { "kind": "aoe_zone", "radius": 4, "duration_ticks": 60, "pulse_interval": 10 },
+        "effects": [
+          { "kind": "damage", "school": "starling:fire", "base_amount": 3 },
+          { "kind": "apply_status", "status_id": "starling:scorch", "amplifier": 1, "duration_ticks": 80 },
+          { "kind": "emit_vfx", "vfx_id": "starling:ember_cloud" }
+        ]
+      }]
+    }
+  ],
+  "custom_statuses": [{
+    "id": "starling:scorch",
+    "max_amplifier": 3,
+    "pulse_interval_ticks": 20,
+    "damage_per_pulse": 1,
+    "heal_per_pulse": 0,
+    "absorption_per_level": 2,
+    "silenced": true,
+    "attribute_modifiers": { "starling:fire_resistance": -0.25 },
+    "vfx_aura": "starling:scorch_aura"
+  }],
+  "rituals": [{
+    "id": "starling:moon_altar",
+    "pattern": [
+      { "dx": 0, "dy": 0, "dz": 0, "block": "starling:altar_core" },
+      { "dx": 1, "dy": 0, "dz": 0, "block": "minecraft:amethyst_block" }
+    ],
+    "reagents": { "minecraft:amethyst_shard": 4 },
+    "duration_ticks": 100,
+    "mana_per_tick": 0.5
+  }]
+}
+```
+
+`spells[].cast.kind` は `instant` / `cast_time` / `channeled`、`steps[].form.kind` は `self_cast` / `touch` / `projectile` / `raycast_beam` / `aoe_zone` / `chain` / `orbit` / `summon`、`effects[].kind` は `damage` / `heal` / `shield` / `apply_status` / `knockback` / `blink` / `conjure_light` / `break_block` / `emit_vfx` に対応します。`custom_statuses` は DoT、HoT、吸収シールド、行動制限（`frozen` / `rooted` / `silenced` / `disarmed`）、属性補正、VFX オーラを定義します。儀式の `pattern` は祭壇原点からの相対座標で、`reagents` はアイテム ID ごとの必要数です。
+
+宣言は `SpellDefinition::validate`、`CustomStatusRegistry`、`RitualRecipe::validate` によって制限され、未知のキー・種類、重複 ID、上限を超えるパラメータは拒否されます。Bundle のパースとランタイム登録により魔法定義を参照できます。ゲーム内の発動操作・描画・ワールドへの効果適用には対応する実行経路との接続が必要です。魔法同期用の `MAG1` コーデックは `mc-spine:magic_v1` チャネルを使用します。
+
 ### ブロック・アイテム・レシピ・タグとディメンション
 
-現行 Bundle のトップレベルキーは `schema` / `mod_id` / `mc_version_range` / `portals` / `progression_barriers` / `biome_regions` / `creatures` / `custom_channels` の8種です。**`blocks`、`items`、`recipes`、`tags`、`events`、`dimensions` のキーを足すと検証に失敗します。** カスタムブロック・アイテム・生物種別やディメンションの **ID を参照すること**と、その実体を新規登録することは別です。該当 ID は互換レイヤ・レジストリなどで別途提供してください。
+現行 Bundle のトップレベルキーは `schema` / `mod_id` / `mc_version_range` / `portals` / `progression_barriers` / `biome_regions` / `creatures` / `custom_channels` / `spells` / `custom_statuses` / `rituals` の11種です。**`blocks`、`items`、`recipes`、`tags`、`events`、`dimensions` のキーを足すと検証に失敗します。** カスタムブロック・アイテム・生物種別やディメンションの **ID を参照すること**と、その実体を新規登録することは別です。該当 ID は互換レイヤ・レジストリなどで別途提供してください。
 
 レシピやタグ、dimension/worldgen の JSON は標準データパックとして配置します。Minecraft 1.21.1 の例です。
 
@@ -251,7 +302,7 @@ Fabric / NeoForge 互換レイヤ経由で動的ロードする **独立した�
 - `--adapt-*` exits 0 for accepted/skipped/Tier 2 mods, 2 for Tier 3 or invalid arguments, and 1 for unreadable or unsafe input.
 - `live_mod_bridge` auto-classifies JARs and registers validated bundles during boot. `tools/mod_launcher.py --auto-adapt` enables launcher preflight classification.
 - Native bundle authors can avoid Gradle, JDK, mappings and Mixin boilerplate.
-- The current bundle schema defines portals, biome regions, creatures and custom channels.
+- The current bundle schema defines portals, biome regions, creatures, custom channels, spells, custom statuses, and rituals.
 - Recipes, tags and dimensions use separate standard datapack JSON assets.
 - Custom block/item registration and arbitrary event handlers need separate support.
 - Eligible pure-data bundles can be classified as hot-reloadable.
