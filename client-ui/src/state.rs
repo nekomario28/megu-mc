@@ -1259,6 +1259,8 @@ pub struct UiState {
     pub active_shaderpack_name: String,
     /// Current shaderpack profile label, if provided by the host.
     pub active_shaderpack_profile: String,
+    /// Shaderpack selection and options supplied by the host loader.
+    pub shader_packs: crate::shader_screen::ShaderPackScreenState,
 
     /// The integrated ModMenu-style Mods & Packs screen
     /// ([`Screen::ModMenu`]). The host fills `entries`; `lang`/`ui_scale`
@@ -1307,6 +1309,7 @@ impl Default for UiState {
             report_url: String::new(),
             active_shaderpack_name: String::new(),
             active_shaderpack_profile: String::new(),
+            shader_packs: crate::shader_screen::ShaderPackScreenState::default(),
             mod_menu: crate::mod_menu::ModMenuState::default(),
             recipe_browser: crate::recipe_browser::RecipeBrowserState::default(),
             invite_counter: 0,

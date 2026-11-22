@@ -31,8 +31,14 @@ WIRING_CONTRACTS = {
     },
     "client-port": {
         "vanilla_plus_3d": (("client-kernel/src/mesher.rs", "client-gpu/src/*"),),
-        "classic_ores": (("client-kernel/src/mesher.rs", "client-gpu/src/*"),),
-        "vanilla_plus_visuals": (("client-kernel/src/mesher.rs", "client-gpu/src/*"),),
+        "classic_ores": ((
+            "client-kernel/src/mesher.rs", "client-port/src/mesher.rs",
+            "client-gpu/src/live_session.rs",
+        ),),
+        "vanilla_plus_visuals": ((
+            "client-kernel/src/mesher.rs", "client-port/src/mesher.rs",
+            "client-gpu/src/live_session.rs",
+        ),),
         "vanilla_plus_nature": (("client-kernel/src/mesher.rs", "client-gpu/src/*"),),
         "space_sky_bridge": (("client-gpu/src/*",),),
         "builtin_shadow_wgsl": (("client-gpu/src/*",),),

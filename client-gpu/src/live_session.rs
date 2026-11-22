@@ -12,6 +12,10 @@ use mc_spine_client::protocol::{
 use mc_spine_client::render::ClientVfxHost;
 use mc_spine_client::render_graph::GpuPipelineKind;
 use mc_spine_client::world::{BlockTable, WorldState};
+use mc_spine_client_mesh::mesher::{
+    BlockVisualEnhancementResult, BlockVisualInput, VanillaPlusPipelineConfig,
+};
+use mc_spine_client_mesh::vanilla_plus_nature::NatureModRegistry;
 use mc_spine_ui::magic_hud::{CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState};
 use mc_spine_ui::state::{HudState, MiniHudPreset, UiState};
 
@@ -127,6 +131,8 @@ pub struct LiveSession {
     pub atmosphere_blender: BiomeAtmosphereBlender,
     pub chunk_fades: ChunkFadeTracker,
     pub subworlds: SubWorldRenderBank,
+    pub vanilla_plus_cfg: VanillaPlusPipelineConfig,
+    pub nature_mod_registry: NatureModRegistry,
     last_motion_delta: [f64; 2],
     last_vfx_tick: Instant,
     last_animation_tick: Instant,
@@ -173,10 +179,22 @@ impl LiveSession {
             atmosphere_blender: BiomeAtmosphereBlender::new(AtmosphereParams::default()),
             chunk_fades: ChunkFadeTracker::new(),
             subworlds: SubWorldRenderBank::new(),
+            vanilla_plus_cfg: VanillaPlusPipelineConfig::default(),
+            nature_mod_registry: NatureModRegistry::default(),
             last_motion_delta: [0.0; 2],
             last_vfx_tick: Instant::now(),
             last_animation_tick: Instant::now(),
         }
+    }
+
+    /// Evaluate opt-in block enhancements with the session's active pack
+    /// configuration and modded-nature registry.
+    pub fn evaluate_block_visuals(&self, input: &BlockVisualInput) -> BlockVisualEnhancementResult {
+        mc_spine_client_mesh::mesher::evaluate_block_visual_pipeline(
+            input,
+            &self.vanilla_plus_cfg,
+            &self.nature_mod_registry,
+        )
     }
 
     /// Limit main-thread packet work per frame. No reads, writes or DNS on this thread.

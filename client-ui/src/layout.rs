@@ -621,6 +621,21 @@ fn shaders_tab(ctx: &mut Ctx, y0: i32) {
         lr(x, y0 + 68, 320, 20),
         tr(lang, "Open Shader Options...", "シェーダー設定を開く..."),
     );
+    if let Some(pack) = ctx.state.shader_packs.selected() {
+        let label = if pack.title.is_empty() {
+            &pack.id
+        } else {
+            &pack.title
+        };
+        ctx.ctext(
+            cx,
+            y0 + 96,
+            1,
+            pal::TEXT_DIM,
+            tr(lang, "Selected Shaderpack", "選択中のシェーダーパック"),
+        );
+        ctx.ctext(cx, y0 + 108, 1, pal::TEXT, first_chars(label, 38));
+    }
 }
 
 fn video_tab(ctx: &mut Ctx, y0: i32) {

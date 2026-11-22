@@ -12,9 +12,11 @@ use mc_spine_client::crash_reporter::{
     self, parse_report_receipt, parse_report_url, CrashSubmitPolicy, ReportTransport,
     SessionReportDeduper, StdHttpReportTransport, DEFAULT_REPORT_TIMEOUT, MAX_BODY_BYTES,
 };
+use mc_spine_client::frame_pacer::FrameBudgetPacer;
 use mc_spine_client::friend_client::FriendGuestBridge;
 use mc_spine_client::integrated;
 use mc_spine_client::protocol::ping_server;
+use mc_spine_client::session::ClientSession;
 use mc_spine_client::settings::ClientSettings;
 use mc_spine_client::sim::run_session;
 
@@ -167,8 +169,16 @@ fn main() -> ExitCode {
     let _friend_bridge = friend_bridge;
 
     crash_reporter::set_active_stage("play_session");
+    let _client_session = ClientSession::new(crash_reporter::ReportEnv::detect(), crash_dir);
+    let mut frame_pacer = FrameBudgetPacer::new();
+    if cfg.render_png.is_some() {
+        frame_pacer.begin_frame();
+    }
     match run_session(&cfg) {
         Ok(summary) => {
+            if cfg.render_png.is_some() {
+                frame_pacer.end_frame((summary.render_ms * 1_000.0).round() as u64);
+            }
             if cfg.json_summary {
                 println!("{}", summary.to_json());
             } else {
