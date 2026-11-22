@@ -1151,11 +1151,22 @@ fn send_broadcast_frame(
 struct PendingDig {
     pos: DimBlockPos,
     state: u32,
-    started: Instant,
+    start_tick: u64,
     seconds: f32,
     /// The last crack stage broadcast to viewers (`-1` = none yet) —
     /// vanilla `destroyBlockProgress` emits only on stage changes.
     last_stage: i8,
+}
+
+/// Mining acceptance follows simulated server ticks, even if wall-clock time
+/// advances while the server is stalled. The 70% tolerance is for early client
+/// FINISH packets, while server-driven completion uses the full duration.
+fn dig_required_ticks(seconds: f32, fraction: f64) -> u64 {
+    (f64::from(seconds.max(0.0)) * 20.0 * fraction).ceil() as u64
+}
+
+fn dig_min_ticks(seconds: f32) -> u64 {
+    dig_required_ticks(seconds, 0.7)
 }
 
 struct Client {
@@ -2364,15 +2375,17 @@ fn dig_progress_tick(cls: &[Arc<Client>]) {
             *c.dig.lock().unwrap_or_else(|e| e.into_inner()) = None;
             continue;
         }
-        let stage =
-            ((dig.started.elapsed().as_secs_f32() / dig.seconds) * 10.0).clamp(0.0, 9.0) as i8;
+        let elapsed_ticks = TICK_IDX.load(Ordering::Relaxed).saturating_sub(dig.start_tick);
+        let required_ticks = dig_required_ticks(dig.seconds, 1.0).max(1);
+        let stage = ((elapsed_ticks as f64 / required_ticks as f64) * 10.0)
+            .clamp(0.0, 9.0) as i8;
         if stage != dig.last_stage {
             if let Some(d) = c.dig.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                 d.last_stage = stage;
             }
             broadcast_block_destroy(cls, dim, (x, y, z), c.eid, stage);
         }
-        if dig.started.elapsed().as_secs_f32() >= dig.seconds {
+        if elapsed_ticks >= required_ticks {
             *c.dig.lock().unwrap_or_else(|e| e.into_inner()) = None;
             finish_block_break(c, dim, x, y, z, dig.state);
         }
@@ -5119,6 +5132,29 @@ fn live_block_entity_wire_id(id: &str) -> Option<i64> {
     })
 }
 
+/// Chunk block-entity NBT is visible to clients before the container menu is
+/// opened. Keep loot generation data, private server metadata and inventories
+/// out of the unsolicited chunk payload.
+fn block_entity_client_fields(mut fields: BlockEntityNbtFields) -> BlockEntityNbtFields {
+    for key in ["LootTable", "LootTableSeed", "server_data", "Items"] {
+        fields.remove(&NbtString::text(key));
+    }
+    fields
+}
+
+/// A block entity enclosed on every face cannot render in the chunk view.
+/// Preserve the old behaviour when no block-state registry is available.
+fn block_entity_fully_buried(dim: DimId, x: i32, y: i32, z: i32) -> bool {
+    let Some(reg) = crate::block_registry::breg() else {
+        return false;
+    };
+    [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
+        .iter()
+        .all(|&(dx, dy, dz)| {
+            reg.is_solid_render(block_at_dim(dim, x + dx, y + dy, z + dz))
+        })
+}
+
 /// The live block entities a 0x27 chunk packet must carry for `(dim, cx, cz)`:
 /// each is encoded as `ChunkBlockEntity` (position, type id, network NBT with
 /// `x`/`y`/`z`/`id` — the same payload `live_block_entity_snapshot` produces).
@@ -5140,11 +5176,15 @@ fn live_chunk_block_entities(dim: DimId, cx: i32, cz: i32) -> Vec<ChunkBlockEnti
                 if reg.block_id_of(state) != Some(block) {
                     return None;
                 }
+                if block_entity_fully_buried(edim, x, y, z) {
+                    return None;
+                }
                 let id = live_block_entity_id(reg.name_of(state))?;
                 let wire_id = live_block_entity_wire_id(id)?;
-                let Tag::Compound(mut fields) = entity.to_nbt() else {
+                let Tag::Compound(fields) = entity.to_nbt() else {
                     return None;
                 };
+                let mut fields = block_entity_client_fields(fields);
                 for (field, value) in [("x", x), ("y", y), ("z", z)] {
                     block_entity_put(&mut fields, field, Tag::Int(value));
                 }
@@ -6423,6 +6463,28 @@ fn is_sign_block_state(state: u32) -> bool {
         })
     })
 }
+/// Remove legacy formatting sequences and C0/C1 controls before any sign text
+/// reaches persistent state or a block-entity broadcast. Retain normal Unicode.
+fn sanitize_sign_line(input: &str) -> String {
+    let mut clean = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '§' {
+            // A legacy formatting code consists of the section sign and one
+            // colour/style byte. Removing both avoids retaining stray "4red".
+            if chars.peek().is_some_and(|next| next.is_ascii_hexdigit()
+                || matches!(next.to_ascii_lowercase(), 'k'..='o' | 'r' | 'x')) {
+                chars.next();
+            }
+            continue;
+        }
+        if !matches!(ch as u32, 0..=0x1f | 0x7f..=0x9f) {
+            clean.push(ch);
+        }
+    }
+    clean
+}
+
 fn sign_edit_in_range(pos: (f64, f64, f64), x: i32, y: i32, z: i32) -> bool {
     let (dx, dy, dz) = (
         pos.0 - (x as f64 + 0.5),
@@ -7902,10 +7964,6 @@ fn live_chat_message(
     }
     if !chat_throttle.allow(Instant::now()) {
         return Err("Kicked for spamming!");
-    }
-    if m.starts_with('/') {
-        run_command(Some(me), &m, &mut Some(me));
-        return Ok(());
     }
     #[cfg(feature = "neoforge-events")]
     let m = if java_compat::NEOFORGE.get().is_some() {
@@ -9765,20 +9823,20 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 *me.dig.lock().unwrap_or_else(|e| e.into_inner()) = Some(PendingDig {
                                     pos: (dim, x, y, z),
                                     state: old,
-                                    started: Instant::now(),
+                                    start_tick: TICK_IDX.load(Ordering::Relaxed),
                                     seconds: t,
                                     last_stage: -1,
                                 });
                             } else {
-                                let t0 = me.dig.lock().unwrap_or_else(|e| e.into_inner()).and_then(|d| {
-                                    if (d.pos.1, d.pos.2, d.pos.3) == (x, y, z) {
-                                        Some(d.started)
+                                let started = me.dig.lock().unwrap_or_else(|e| e.into_inner()).and_then(|d| {
+                                    if d.pos == (dim, x, y, z) && d.state == old {
+                                        Some(d.start_tick)
                                     } else {
                                         None
                                     }
                                 });
-                                if t0
-                                    .map(|t0| t0.elapsed().as_secs_f32() >= t * 0.7)
+                                if started
+                                    .map(|tick| TICK_IDX.load(Ordering::Relaxed).saturating_sub(tick) >= dig_min_ticks(t))
                                     .unwrap_or(false)
                                 {
                                     break_now = true;
@@ -10521,6 +10579,15 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         .unwrap_or(false);
                     if !ok {
                         continue;
+                    }
+                    if mouse == 1 {
+                        if let Some((tx, ty, tz, is_cart)) = tp {
+                            let target_center = [tx, ty + if is_cart { 0.35 } else { 0.9 }, tz];
+                            let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                            if !ac_check_attack(&me, dim, target_center) {
+                                continue;
+                            }
+                        }
                     }
                 }
                 if mouse == 0 || mouse == 2 {
@@ -11436,7 +11503,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     for l in lines.iter_mut() {
                         let n = read_varint(&mut sl).unwrap_or(0).clamp(0, 256) as usize;
                         let m = n.min(sl.len());
-                        *l = String::from_utf8_lossy(&sl[..m]).into_owned();
+                        *l = sanitize_sign_line(&String::from_utf8_lossy(&sl[..m]));
                         sl = &sl[m..];
                     }
                     let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
@@ -11463,7 +11530,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
             0x32 => {
                 // set_creative_slot: slot i16 + slot data (creative only)
                 if b.len() >= 3 && *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
-                    let Some((slot, st)) = slot_read_wire(&b) else {
+                    let Some((slot, mut st)) = slot_read_wire(&b) else {
                         continue;
                     };
                     // Player inventory menu slots are crafting output/input, armor,
@@ -11477,6 +11544,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     if !creative_slot_acceptable(&st) {
                         continue;
                     }
+                    creative_slot_clamp(&mut st);
                     if st.1 > 0 {
                         me.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(slot, st.clone());
                     } else {
@@ -16106,6 +16174,62 @@ mod p5c_live_tests {
     use std::io::Read;
     use std::net::TcpListener;
 
+    #[test]
+    fn sign_text_strips_formatting_and_controls_but_preserves_unicode() {
+        assert_eq!(sanitize_sign_line("§4red"), "red");
+        assert_eq!(sanitize_sign_line("a\nb\x07c\u{0085}d"), "abcd");
+        assert_eq!(sanitize_sign_line("Hello 世界 🌸"), "Hello 世界 🌸");
+        assert_eq!(sanitize_sign_line("a§qb"), "aqb");
+    }
+
+    #[test]
+    fn dig_min_ticks_are_derived_from_server_tick_time() {
+        assert_eq!(dig_min_ticks(1.0), 14);
+        assert_eq!(dig_min_ticks(0.51), 8);
+        assert_eq!(dig_required_ticks(1.0, 1.0), 20);
+        assert_eq!(dig_min_ticks(0.0), 0);
+    }
+
+    #[test]
+    fn block_entity_client_nbt_omits_private_fields_on_wire() {
+        let mut fields = BlockEntityNbtFields::new();
+        for key in ["LootTable", "LootTableSeed", "server_data", "Items", "front_text"] {
+            block_entity_put(&mut fields, key, block_entity_string("value"));
+        }
+        let bytes = crate::nbt::write_network_nbt(&Tag::Compound(block_entity_client_fields(fields)))
+            .expect("block entity NBT serializes");
+        let mut input = bytes.as_slice();
+        let Tag::Compound(sent) = crate::nbt::read_network_nbt(&mut input).unwrap() else {
+            panic!("must decode compound");
+        };
+        assert!(input.is_empty());
+        for key in ["LootTable", "LootTableSeed", "server_data", "Items"] {
+            assert!(!sent.contains_key(&NbtString::text(key)), "{key} was sent");
+        }
+        assert!(sent.contains_key(&NbtString::text("front_text")));
+    }
+
+    #[test]
+    fn block_entity_chunk_skips_buried_but_sends_exposed_entity() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let reg = crate::block_registry::breg().unwrap();
+        let (x, y, z) = (128, 90, 128);
+        let mut cells = Cells::new();
+        cells.set(x, y, z, reg.state_of("minecraft:jukebox", None));
+        for (dx, dy, dz) in [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)] {
+            cells.set(x + dx, y + dy, z + dz, reg.state_of("minecraft:stone", None));
+        }
+        assert!(block_entity_fully_buried(DimId::Overworld, x, y, z));
+        assert!(live_chunk_block_entities(DimId::Overworld, x >> 4, z >> 4)
+            .iter().all(|entry| entry.0 != (x, y, z)));
+
+        cells.set(x + 1, y, z, reg.state_of("minecraft:air", None));
+        assert!(!block_entity_fully_buried(DimId::Overworld, x, y, z));
+        assert!(live_chunk_block_entities(DimId::Overworld, x >> 4, z >> 4)
+            .iter().any(|entry| entry.0 == (x, y, z)));
+    }
+
     /// Restores every `world()` cell a fixture wrote, in reverse order.
     struct Cells(Vec<(i32, i32, i32, u32)>);
     impl Cells {
@@ -17083,6 +17207,29 @@ mod p5c_live_tests {
         let (id, _) = read_frame(&mut recv_peer).expect("receiver must get a chat frame");
         assert_eq!(id, S2C_PLAYER_CHAT_767, "unsigned chat to a session client relays as 0x39");
         chat_sessions().lock().unwrap_or_else(|e| e.into_inner()).remove(&recv.eid);
+    }
+
+    #[test]
+    fn w1_slash_chat_message_is_relayed_as_chat() {
+        let _guard = world_guard();
+        let (sender, _sender_peer) = loopback_client("slash_sender", 0x7191);
+        let (receiver, mut receiver_peer) = loopback_client("slash_receiver", 0x7192);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(sender.clone());
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(receiver.clone());
+        let _sender_cleanup = LiveCleanup {
+            eid: sender.eid,
+            difficulty: DIFFICULTY.load(Ordering::Relaxed),
+        };
+        let _receiver_cleanup = LiveCleanup {
+            eid: receiver.eid,
+            difficulty: DIFFICULTY.load(Ordering::Relaxed),
+        };
+        let mut throttle = connection_limits::ChatThrottle::new(Instant::now());
+        live_chat_message(&sender, &w1_chat_body("/not_a_command", false), &mut throttle)
+            .expect("slash-prefixed chat must pass admission");
+        let (id, body) = read_frame(&mut receiver_peer).expect("receiver must get a chat frame");
+        assert_eq!(id, 0x6c, "slash-prefixed text must be system chat for session-less recipient");
+        assert!(body.windows(b"/not_a_command".len()).any(|part| part == b"/not_a_command"));
     }
 
     #[test]

@@ -8810,6 +8810,15 @@ fn slot_component_wire_bytes(st: &Stack) -> usize {
 /// the bound — anything larger is dropped fail-closed before mutation.
 fn creative_slot_acceptable(st: &Stack) -> bool {
     slot_component_wire_bytes(st) <= SLOT_COMPONENT_WIRE_LIMIT
+        && (st.1 == 0 || (st.0 > 0 && item_to_name(st.0).is_some()))
+}
+
+/// The creative wire count can exceed the resolved item's stack limit. Apply
+/// the same component-aware maximum as every other inventory entry point.
+fn creative_slot_clamp(st: &mut Stack) {
+    if st.1 > 0 {
+        st.1 = st.1.min(item_stack_max(st.0, &st.2).clamp(1, 99) as u8);
+    }
 }
 
 fn creative_inventory_slot(slot: i16) -> bool {
@@ -8849,6 +8858,29 @@ mod creative_slot_wire_tests {
         assert!(creative_inventory_slot(0));
         assert!(creative_inventory_slot(45));
         assert!(!creative_inventory_slot(46));
+    }
+
+    #[test]
+    fn creative_unknown_item_is_rejected_and_empty_stack_is_allowed() {
+        assert!(!creative_slot_acceptable(&(i64::MAX, 1, Vec::new())));
+        assert!(creative_slot_acceptable(&(0, 0, Vec::new())));
+    }
+
+    #[test]
+    fn creative_count_uses_item_and_component_maximum() {
+        let mut sixty_four = (name_to_item("stone").unwrap(), 127, Vec::new());
+        assert!(creative_slot_acceptable(&sixty_four));
+        creative_slot_clamp(&mut sixty_four);
+        assert_eq!(sixty_four.1, 64);
+
+        let mut pearl = (name_to_item("ender_pearl").unwrap(), 127, Vec::new());
+        creative_slot_clamp(&mut pearl);
+        assert_eq!(pearl.1, 16);
+
+        let mut override_stack = (name_to_item("stone").unwrap(), 127, Vec::new());
+        comp_set_varint(&mut override_stack.2, 1, 120);
+        creative_slot_clamp(&mut override_stack);
+        assert_eq!(override_stack.1, 99);
     }
 }
 fn write_open_chest_packets(

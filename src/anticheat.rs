@@ -400,11 +400,12 @@ enum AcCheckId {
     Place,
     Movement,
     NoFall,
+    Attack,
 }
 
 impl AcCheckId {
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) const ALL: [AcCheckId; 3] = [AcCheckId::Place, AcCheckId::Movement, AcCheckId::NoFall];
+    pub(crate) const ALL: [AcCheckId; 4] = [AcCheckId::Place, AcCheckId::Movement, AcCheckId::NoFall, AcCheckId::Attack];
     fn index(self) -> usize {
         self as usize
     }
@@ -413,6 +414,7 @@ impl AcCheckId {
             AcCheckId::Place => "place",
             AcCheckId::Movement => "movement",
             AcCheckId::NoFall => "nofall",
+            AcCheckId::Attack => "attack",
         }
     }
 }
@@ -449,6 +451,7 @@ trait AcCheck {
 pub(crate) struct PlaceCheck;
 pub(crate) struct MovementCheck;
 pub(crate) struct NoFallCheck;
+pub(crate) struct AttackCheck;
 
 const fn ac_pol(slack: f64, burst_ticks: f64, decay_per_sec: f64) -> Option<AcPolicy> {
     Some(AcPolicy {
@@ -492,6 +495,18 @@ impl AcCheck for NoFallCheck {
     }
 }
 
+impl AcCheck for AttackCheck {
+    const ID: AcCheckId = AcCheckId::Attack;
+    const ACTION: Action = Action::Cancel;
+    fn policy(preset: AcPreset) -> Option<AcPolicy> {
+        match preset {
+            AcPreset::Off => None,
+            // A single odd hit is evidence, not grounds to cancel legitimate PvP.
+            AcPreset::Standard => ac_pol(1.0, 0.0, 1.0),
+        }
+    }
+}
+
 /// One registered check.
 #[derive(Clone, Copy)]
 struct AcRegistered {
@@ -510,10 +525,11 @@ const fn ac_register<C: AcCheck>() -> AcRegistered {
 
 /// The registry: every check, its action and its policy per preset. A new check is a
 /// type implementing [`Check`] plus one line here.
-const AC_REGISTRY: [AcRegistered; 3] = [
+const AC_REGISTRY: [AcRegistered; 4] = [
     ac_register::<PlaceCheck>(),
     ac_register::<MovementCheck>(),
     ac_register::<NoFallCheck>(),
+    ac_register::<AttackCheck>(),
 ];
 
 fn ac_registered(check: AcCheckId) -> &'static AcRegistered {
@@ -868,10 +884,11 @@ impl AcMoveState {
 struct PlayerAc {
     #[cfg_attr(not(test), allow(dead_code))]
     name: String,
-    vl: [f64; 3],
-    vl_at: [Option<Instant>; 3],
-    alert_at: [Option<Instant>; 3],
-    flags: [u64; 3],
+    vl: [f64; 4],
+    vl_at: [Option<Instant>; 4],
+    alert_at: [Option<Instant>; 4],
+    flags: [u64; 4],
+    attack_clicks: std::collections::VecDeque<Instant>,
     moves: AcMoveState,
     nofall_reported: bool,
     last_game_mode: Option<u8>,
@@ -882,10 +899,11 @@ impl PlayerAc {
     fn new(name: &str) -> PlayerAc {
         PlayerAc {
             name: name.to_owned(),
-            vl: [0.0; 3],
-            vl_at: [None; 3],
-            alert_at: [None; 3],
-            flags: [0; 3],
+            vl: [0.0; 4],
+            vl_at: [None; 4],
+            alert_at: [None; 4],
+            flags: [0; 4],
+            attack_clicks: std::collections::VecDeque::new(),
             moves: AcMoveState::default(),
             nofall_reported: false,
             last_game_mode: None,
@@ -1285,6 +1303,91 @@ fn ac_flag_count(eid: i32, check: AcCheckId) -> u64 {
         .unwrap_or(0)
 }
 
+// ---------- melee attack ----------
+
+/// Protocol yaw faces +Z at zero degrees and pitch is positive downwards.
+/// Ignore almost coincident positions where a meaningful direction is undefined.
+fn attack_angle_off_axis(yaw: f32, pitch: f32, eye: [f64; 3], target: [f64; 3]) -> Option<f64> {
+    let delta = [target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]];
+    let distance = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+    if distance < 0.75 || !distance.is_finite() || !yaw.is_finite() || !pitch.is_finite() {
+        return None;
+    }
+    let (yaw, pitch) = ((yaw as f64).to_radians(), (pitch as f64).to_radians());
+    let facing = [-yaw.sin() * pitch.cos(), -pitch.sin(), yaw.cos() * pitch.cos()];
+    let dot = (facing[0] * delta[0] + facing[1] * delta[1] + facing[2] * delta[2]) / distance;
+    Some(dot.clamp(-1.0, 1.0).acos().to_degrees())
+}
+
+/// Sample the short melee ray; exclude the eye's and target's own block cells.
+/// A hitbox can intersect its containing block without that block occluding it.
+fn attack_segment_obstructed(
+    eye: [f64; 3],
+    target: [f64; 3],
+    mut solid: impl FnMut(i32, i32, i32) -> bool,
+) -> bool {
+    let delta = [target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]];
+    let distance = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+    if !distance.is_finite() || distance == 0.0 {
+        return false;
+    }
+    let cell = |p: [f64; 3]| (p[0].floor() as i32, p[1].floor() as i32, p[2].floor() as i32);
+    let start_cell = cell(eye);
+    let end_cell = cell(target);
+    let steps = (distance * 4.0).ceil() as usize;
+    for i in 1..steps {
+        let t = i as f64 / steps as f64;
+        let pos = cell([
+            eye[0] + delta[0] * t,
+            eye[1] + delta[1] * t,
+            eye[2] + delta[2] * t,
+        ]);
+        if pos != start_cell && pos != end_cell && solid(pos.0, pos.1, pos.2) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Count clicks in the last second, bounded even under packet floods. The
+/// caller supplies time so the 25 CPS threshold can be tested deterministically.
+fn attack_click_window(clicks: &mut std::collections::VecDeque<Instant>, now: Instant) -> usize {
+    while clicks.front().is_some_and(|t| now.saturating_duration_since(*t) >= Duration::from_secs(1)) {
+        clicks.pop_front();
+    }
+    clicks.push_back(now);
+    if clicks.len() > 32 {
+        clicks.pop_front();
+    }
+    clicks.len()
+}
+
+/// Accumulate weak evidence across hits, cancelling only sustained anomalies.
+/// This lets lag spikes and legitimate fast turns pass without an immediate setback.
+fn ac_check_attack(me: &Client, dim: DimId, target: [f64; 3]) -> bool {
+    if ac_policy(AcCheckId::Attack, ac_checked_preset(me)).is_none() {
+        return true;
+    }
+    let now = Instant::now();
+    let clicks = ac_with_player(me, |p| attack_click_window(&mut p.attack_clicks, now));
+    if clicks > 25 {
+        ac_flag(me, AcCheckId::Attack, 1.0, "more than 25 attacks per second");
+    }
+    let (x, y, z, yaw, pitch, _) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+    let eye = [x, y + 1.62, z];
+    if attack_angle_off_axis(yaw, pitch, eye, target).is_some_and(|angle| angle > 85.0) {
+        ac_flag(me, AcCheckId::Attack, 1.0, "attack outside view angle");
+    }
+    if let Some(reg) = crate::block_registry::breg() {
+        if attack_segment_obstructed(eye, target, |x, y, z| {
+            reg.is_solid(block_at_dim(dim, x, y, z))
+        }) {
+            ac_flag(me, AcCheckId::Attack, 2.0, "attack through solid block");
+        }
+    }
+    ac_violation_level(me.eid, AcCheckId::Attack) < 6.0
+}
+
 // ---------- placement ----------
 
 /// Vanilla refuses a placement that targets an occupied cell or clicks no block.
@@ -1636,6 +1739,40 @@ mod anticheat_unit_tests {
         assert_eq!(ac_action(AcCheckId::Movement), Action::Setback);
         assert_eq!(ac_action(AcCheckId::Place), Action::Cancel);
         assert_eq!(ac_action(AcCheckId::NoFall), Action::Correct);
+        assert_eq!(ac_action(AcCheckId::Attack), Action::Cancel);
+    }
+
+    #[test]
+    fn attack_angle_follows_protocol_yaw_and_pitch() {
+        let eye = [0.0, 1.62, 0.0];
+        assert!(attack_angle_off_axis(0.0, 0.0, eye, [0.0, 1.62, 3.0]).unwrap() < 0.01);
+        assert!(attack_angle_off_axis(90.0, 0.0, eye, [-3.0, 1.62, 0.0]).unwrap() < 0.01);
+        assert!(attack_angle_off_axis(0.0, 0.0, eye, [0.0, 1.62, -3.0]).unwrap() > 170.0);
+        assert_eq!(attack_angle_off_axis(0.0, 0.0, eye, eye), None);
+    }
+
+    #[test]
+    fn attack_solid_line_of_sight_excludes_target_cell() {
+        let eye = [0.5, 1.5, 0.5];
+        let target = [3.5, 1.5, 0.5];
+        assert!(attack_segment_obstructed(eye, target, |x, _, _| x == 2));
+        assert!(!attack_segment_obstructed(eye, target, |x, _, _| x == 3));
+        assert!(!attack_segment_obstructed(eye, target, |_, _, _| false));
+    }
+
+    #[test]
+    fn attack_clicks_keep_bounded_sliding_second() {
+        let now = Instant::now();
+        let mut clicks = std::collections::VecDeque::new();
+        for _ in 0..26 {
+            attack_click_window(&mut clicks, now);
+        }
+        assert_eq!(clicks.len(), 26);
+        assert_eq!(attack_click_window(&mut clicks, now + Duration::from_secs(1)), 1);
+        for _ in 0..100 {
+            attack_click_window(&mut clicks, now + Duration::from_secs(2));
+        }
+        assert_eq!(clicks.len(), 32);
     }
 
     #[test]
