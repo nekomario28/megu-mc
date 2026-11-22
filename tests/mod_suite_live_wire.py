@@ -29,10 +29,27 @@ CUSTOM_PAYLOAD_ID = 0x19
 DOWNLOAD_URL = "https://cdn.modrinth.com/data/test/versions/1/example.jar"
 JAR_NAMES = ("farmersdelight-1.21.1.jar", "custom_hearth_delight-1.0.jar")
 NAMESPACES = ("farmersdelight", "custom_hearth_delight")
+RENAMED_PERF_JAR = "custom-renamed-perf.jar"
+SUPERSEDED_DECLARED_ID = "lithium"
+NATIVE_BUNDLE_FILE = "demo_native.bundle.json"
+NATIVE_BUNDLE_ID = "demo_native"
+NATIVE_BUNDLE_CHANNEL = "demo_native:sync"
+
+
+def fabric_manifest(mod_id):
+    """Minimal valid `fabric.mod.json` declaring `mod_id` for all envs."""
+    return json.dumps({
+        "schemaVersion": 1,
+        "id": mod_id,
+        "version": "1.0.0",
+        "environment": "*",
+    })
 
 
 def culinary_jar(path, namespace):
-    """Create a real ZIP/JAR with one cooking and one cutting recipe."""
+    """Create a real ZIP/JAR with a loader manifest plus one cooking and
+    one cutting recipe -- the manifest lets `auto_adapt_mods_dir` promote
+    the archive to a synthesized NativeBundle instead of Tier 3."""
     cooking = {
         "type": f"{namespace}:cooking",
         "ingredients": [{"item": "minecraft:carrot"}],
@@ -48,8 +65,31 @@ def culinary_jar(path, namespace):
         "result": [{"item": f"{namespace}:soup_slice", "count": 2}],
     }
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("fabric.mod.json", fabric_manifest(namespace))
         archive.writestr(f"data/{namespace}/recipe/test_soup.json", json.dumps(cooking))
         archive.writestr(f"data/{namespace}/recipe/test_soup_slice.json", json.dumps(cutting))
+
+
+def renamed_perf_jar(path):
+    """A valid JAR whose file name hides the mod: the superseded perf id
+    lives only in the manifest-declared `id`, so filename inference alone
+    cannot skip it."""
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("fabric.mod.json", fabric_manifest(SUPERSEDED_DECLARED_ID))
+
+
+def native_bundle_document():
+    """A standalone `mc-spine-mod-bundle/1` document for `mods/` auto-load."""
+    return {
+        "schema": "mc-spine-mod-bundle/1",
+        "mod_id": NATIVE_BUNDLE_ID,
+        "mc_version_range": "[1.21,)",
+        "portals": [],
+        "progression_barriers": [],
+        "biome_regions": [],
+        "creatures": [],
+        "custom_channels": [NATIVE_BUNDLE_CHANNEL],
+    }
 
 
 def make_fixture(root):
@@ -58,6 +98,11 @@ def make_fixture(root):
     # Deliberately invalid ZIP bytes: the performance-mod shortcut must run
     # before either culinary or bytecode parsing tries to open this file.
     (mods / "sodium-neoforge-0.6.0.jar").write_bytes(b"not a ZIP or a JAR\n")
+    # A renamed superseded perf JAR: only the manifest-declared id catches it.
+    renamed_perf_jar(mods / RENAMED_PERF_JAR)
+    # A standalone native bundle picked up by the mods/ bundle scan.
+    (mods / NATIVE_BUNDLE_FILE).write_text(
+        json.dumps(native_bundle_document()), encoding="utf-8")
     for name, namespace in zip(JAR_NAMES, NAMESPACES):
         culinary_jar(mods / name, namespace)
     jar_bytes = (mods / JAR_NAMES[0]).read_bytes()
@@ -140,9 +185,23 @@ def self_test():
         require(len(entry["sha256_hex"]) == 64, "selftest-sha256-length")
         require(not zipfile.is_zipfile(mods / "sodium-neoforge-0.6.0.jar"),
                 "selftest-sodium-must-be-garbage")
+        # The renamed perf JAR is a valid archive whose only superseded
+        # signal is the manifest-declared id.
+        with zipfile.ZipFile(mods / RENAMED_PERF_JAR) as archive:
+            require(archive.testzip() is None, "selftest-renamed-jar-corrupt")
+            declared = json.loads(archive.read("fabric.mod.json"))
+            require(declared["id"] == SUPERSEDED_DECLARED_ID,
+                    "selftest-renamed-jar-manifest")
+        bundle = json.loads((mods / NATIVE_BUNDLE_FILE).read_text())
+        require(bundle == native_bundle_document()
+                and bundle["schema"] == "mc-spine-mod-bundle/1",
+                "selftest-native-bundle-document")
         for name, namespace in zip(JAR_NAMES, NAMESPACES):
             with zipfile.ZipFile(mods / name) as archive:
                 require(archive.testzip() is None, "selftest-jar-corrupt")
+                declared = json.loads(archive.read("fabric.mod.json"))
+                require(declared["id"] == namespace,
+                        "selftest-jar-manifest")
                 for kind, recipe in (("cooking", "test_soup"),
                                      ("cutting", "test_soup_slice")):
                     item = json.loads(archive.read(
@@ -263,19 +322,53 @@ def run_live(binary):
             logs = log_path.read_text(errors="replace")
             require(proc.returncode == 0,
                     f"server-graceful-shutdown-exit: {proc.returncode}")
-            require("[live-mods] 3 jar(s): 1 superseded, 0 native, "
-                    "2 data-only, 0 bounded-shim, 0 tier3" in logs,
+            require("[live-mods] 4 jar(s): 2 auto-skipped, 2 native-bundle, "
+                    "0 tier2-shim, 0 tier3" in logs,
                     "live-mod-boot-classification")
-            require("[live-mods] culinary: 2 cooking, 2 cutting" in logs,
+            require("[live-mods] culinary: 2 cooking, 2 cutting, 0 loot "
+                    "modifiers, 0 food specs, 0 tag values" in logs,
                     "live-mod-boot-culinary")
             require("[live-mods] mod sync manifest armed: 1 entry" in logs,
                     "live-mod-boot-sync")
+            # The renamed perf JAR is caught on its manifest-declared id
+            # (filename inference alone yields a non-superseded id); the
+            # corrupt sodium JAR is loudly rejected, never silently dropped.
+            require("[live-mods] dual-loader: 2 unified, 0 client-only, "
+                    "1 superseded, 1 rejected, 0 duplicate ids, "
+                    "0 missing deps, 0 verified damage hooks" in logs,
+                    "live-mod-dual-loader-plan")
+            require("[live-mods] rejected sodium-neoforge-0.6.0.jar:" in logs,
+                    "live-mod-corrupt-jar-report")
+            require(f"rejected {RENAMED_PERF_JAR}" not in logs,
+                    "live-mod-renamed-jar-rejected")
+            # The standalone *.bundle.json and both adapter-synthesized
+            # bundles register into the unified runtime at boot.
+            require(re.search(
+                    r"\[live-mods\] native bundle demo_native "
+                    r"\([^)]*demo_native\.bundle\.json\): 0 portals, "
+                    r"0 progression barriers, 0 regions, 0 creatures, "
+                    r"1 channels", logs) is not None,
+                    "live-mod-native-bundle-boot")
+            require(f"{NATIVE_BUNDLE_FILE} rejected" not in logs,
+                    "live-mod-native-bundle-rejected")
+            require("[live-mods] native bundle farmersdelight "
+                    "(farmersdelight-1.21.1.jar): 0 portals, "
+                    "0 progression barriers, 0 regions, 0 creatures, "
+                    "0 channels" in logs, "live-mod-synthesized-farmersdelight")
+            require("[live-mods] native bundle custom_hearth_delight "
+                    "(custom_hearth_delight-1.0.jar): 0 portals, "
+                    "0 progression barriers, 0 regions, 0 creatures, "
+                    "0 channels" in logs,
+                    "live-mod-synthesized-hearth")
             require(not re.search(r"(?i)panicked at|thread .* panicked|stack backtrace", logs),
                     "server-panic-in-logs")
             require("culinary scan skipped" not in logs and "mixin scan failed closed" not in logs,
                     "live-mod-jar-scan-failed")
-            print("PASS live boot: sodium auto-skipped, 2 culinary JARs loaded "
+            print("PASS live boot: sodium + renamed lithium auto-skipped, "
+                  "2 culinary JARs promoted to native bundles "
                   "(2 cooking, 2 cutting), sync armed", flush=True)
+            print("PASS live boot: demo_native.bundle.json + 2 synthesized "
+                  "bundles registered in the unified runtime", flush=True)
             print("PASS graceful shutdown (exit 0, no panics, disposable files cleaned)",
                   flush=True)
         except BaseException:
