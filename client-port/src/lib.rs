@@ -25,6 +25,7 @@ pub mod shaderpack;
 pub mod shaderpack_reflect;
 pub mod upload_budget;
 pub mod vanilla_plus_3d;
+pub mod vanilla_plus_visuals;
 pub mod vfx_engine;
 pub mod visibility;
 
