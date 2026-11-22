@@ -32,6 +32,7 @@ use crate::classic_ores::{
     evaluate_ore_adaptation, ClassicOresConfig, OreAdaptationDecision, OreTextureInput,
     SynthesisPlan, CLASSIC_ORE_DIM,
 };
+use crate::crop_archetype::{self, CropInput};
 use crate::section::Direction;
 use crate::vanilla_plus_3d::{
     build_3d_crop_mesh, build_3d_cross_mesh, build_3d_crystal_mesh, build_3d_fixture_mesh,
@@ -160,6 +161,13 @@ pub struct BlockVisualInput<'a> {
     /// blocks to [`build_3d_crop_mesh`] instead of the generic cross-plane
     /// extrusion; `None` preserves the existing cross fallback.
     pub crop_3d: Option<Crop3dSpec>,
+    /// Automatic mod-crop facts for [`crop_archetype::classify`]. When
+    /// `crop_3d` is `None` and this is `Some`, eligible `CropsAndFlora`
+    /// blocks are classified from registry tags, blockstate and sprite
+    /// features: a confident archetype routes to [`build_3d_crop_mesh`],
+    /// while non-crops and ambiguous sprites fail closed to the cross-plane
+    /// extrusion. `None` (the default) preserves the existing behaviour.
+    pub crop_auto_input: Option<CropInput<'a>>,
     /// `16x16` ore-vein occupancy mask for the 0.5-texel outward relief;
     /// `None` (or a non-ore block) emits no relief geometry.
     pub ore_vein_mask: Option<&'a [u8; 256]>,
@@ -216,6 +224,7 @@ impl<'a> Default for BlockVisualInput<'a> {
             cross_layout: None,
             cross_alpha: None,
             crop_3d: None,
+            crop_auto_input: None,
             ore_vein_mask: None,
             exposed_faces: 0x3F,
             moon_phase: 0,
@@ -497,6 +506,8 @@ fn build_upgrade_mesh(input: &BlockVisualInput, category: VanillaPlusCategory) -
         VanillaPlusCategory::CropsAndFlora => {
             if let Some(spec) = input.crop_3d {
                 build_3d_crop_mesh(&spec)
+            } else if let Some(spec) = auto_crop_spec(input) {
+                build_3d_crop_mesh(&spec)
             } else {
                 let alpha = input.cross_alpha.unwrap_or(&FULL_ALPHA_MASK);
                 build_3d_cross_mesh(alpha, cross_layout_for(path, input), input.block_pos)
@@ -526,6 +537,41 @@ fn build_upgrade_mesh(input: &BlockVisualInput, category: VanillaPlusCategory) -
             }
         }
     }
+}
+
+/// Derives a [`Crop3dSpec`] from `input.crop_auto_input` via the
+/// deterministic [`crop_archetype::classify`] pass. Returns `Some` only when
+/// the crop gate passes *and* an archetype clears the confidence bar —
+/// non-crops and ambiguous sprites fail closed so the caller falls back to
+/// the generic cross extrusion. The per-block seed is a stable FNV-1a of the
+/// block id so neighbouring identical crops still vary their pose.
+fn auto_crop_spec(input: &BlockVisualInput) -> Option<Crop3dSpec> {
+    let crop_in = input.crop_auto_input.as_ref()?;
+    let decision = crop_archetype::classify(crop_in);
+    if !decision.is_crop {
+        return None;
+    }
+    let archetype = decision.archetype?;
+    Some(Crop3dSpec {
+        archetype: archetype.into(),
+        stage: decision.stage,
+        max_stage: decision.max_stage,
+        seed: fnv1a64(input.block_id.as_bytes()),
+        block_pos: input.block_pos,
+    })
+}
+
+/// FNV-1a 64-bit hash over raw bytes — the same offset/prime pair as
+/// [`crop_archetype::decision_fingerprint`], applied to the block id.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(PRIME);
+    }
+    h
 }
 
 /// Crop-field `#` grid for farmed crops, the diagonal flower cross for
