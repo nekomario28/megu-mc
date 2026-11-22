@@ -19,7 +19,10 @@
 //! injection point, a cancellable injection at a point where the vanilla
 //! work is already done, and any target class or method outside the standard
 //! table — is reported [`UnliftableReason`] and keeps the whole mod at
-//! Tier 3. It never guesses.
+//! Tier 3. It never guesses. The non-mutating `@Shadow`/`@Unique`
+//! member *declarations* are not injection sites at all and never reach the
+//! lifter (see [`MixinMemberKind`]); a manually constructed site carrying
+//! one still fails closed here.
 //!
 //! The target table below covers the 1.21.1 vanilla lifecycle in three naming
 //! dialects, normalized by [`lift_mixin_sites`]:
@@ -46,6 +49,8 @@
 
 use std::fmt;
 
+use crate::intermediary_map::TinyV2MappingTable;
+
 /// The Mixin annotation attached to one injection site, as reported by the
 /// caller's bytecode/config scan.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,7 +63,25 @@ pub enum MixinAnnotationKind {
     ModifyConstant,
     Accessor,
     Invoker,
+    /// `@Shadow` — declares a reference to an existing vanilla member.
+    Shadow,
+    /// `@Unique` — marks a mixin-private helper member.
+    Unique,
     Unknown(String),
+}
+
+/// Whether one mixin member annotation injects/overwrites vanilla behavior
+/// or merely *declares* a member. `@Shadow` only references an existing
+/// vanilla field/method and `@Unique` only marks a mixin-private helper —
+/// neither injects into, wraps, redirects, nor overwrites vanilla code, so
+/// neither is an injection site (and neither is a Tier-3 blocker).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MixinMemberKind {
+    /// An injection/transformation the lifter must judge fail-closed.
+    Injection,
+    /// A non-mutating declaration (`@Shadow`, `@Unique`) — recorded in
+    /// scan diagnostics, never lifted and never a blocker.
+    Declaration,
 }
 
 impl MixinAnnotationKind {
@@ -73,7 +96,18 @@ impl MixinAnnotationKind {
             Self::ModifyConstant => "@ModifyConstant",
             Self::Accessor => "@Accessor",
             Self::Invoker => "@Invoker",
+            Self::Shadow => "@Shadow",
+            Self::Unique => "@Unique",
             Self::Unknown(name) => name.as_str(),
+        }
+    }
+
+    /// [`MixinMemberKind::Declaration`] for `@Shadow`/`@Unique`;
+    /// [`MixinMemberKind::Injection`] for everything else.
+    pub fn member_kind(&self) -> MixinMemberKind {
+        match self {
+            Self::Shadow | Self::Unique => MixinMemberKind::Declaration,
+            _ => MixinMemberKind::Injection,
         }
     }
 }
@@ -456,8 +490,15 @@ fn lookup_target(target_class: &str, target_method: &str) -> Option<&'static Sta
 
 /// Lift one site to a standard event binding, or fail closed with the exact
 /// reason. Check order: annotation → locals capture → injection point →
-/// target table → post-hook cancellability.
-fn lift_site(site: &MixinSite) -> Result<LiftedBinding, UnliftableReason> {
+/// target table → post-hook cancellability. The `(target_class,
+/// target_method)` pair is first normalized through `mappings`
+/// (Intermediary → canonical `named` resolution, including the built-in
+/// hook anchors), so a Fabric Intermediary name and its NeoForge Mojmap
+/// equivalent judge against the *same* `STANDARD_TARGETS` row.
+fn lift_site(
+    site: &MixinSite,
+    mappings: &TinyV2MappingTable,
+) -> Result<LiftedBinding, UnliftableReason> {
     if site.annotation != MixinAnnotationKind::Inject {
         return Err(UnliftableReason::UnsupportedAnnotation);
     }
@@ -469,8 +510,10 @@ fn lift_site(site: &MixinSite) -> Result<LiftedBinding, UnliftableReason> {
         Some(InjectPoint::Tail) | Some(InjectPoint::Return) => Phase::Post,
         _ => return Err(UnliftableReason::UnsupportedInjectPoint),
     };
-    let target = lookup_target(&site.target_class, &site.target_method)
-        .ok_or(UnliftableReason::UnknownTarget)?;
+    let (canonical_class, canonical_method) =
+        mappings.canonical_target(&site.target_class, &site.target_method);
+    let target =
+        lookup_target(&canonical_class, canonical_method).ok_or(UnliftableReason::UnknownTarget)?;
     let hook = match phase {
         Phase::Pre => target.pre,
         Phase::Post => target.post,
@@ -494,11 +537,28 @@ fn lift_site(site: &MixinSite) -> Result<LiftedBinding, UnliftableReason> {
 /// unliftable site flips the verdict to
 /// [`MixinLiftVerdict::RequiresFallback`], preserving both the lifted
 /// bindings and every rejected site with its reason for diagnostics.
+///
+/// Target names resolve through the built-in canonical Intermediary→Mojmap
+/// hook anchors (`TinyV2MappingTable::default()`), so Fabric Intermediary
+/// sites lift to the exact same hooks as NeoForge Mojmap sites even when no
+/// `.tiny` document was supplied.
 pub fn lift_mixin_sites(sites: &[MixinSite]) -> MixinLiftVerdict {
+    lift_mixin_sites_with_mappings(sites, &TinyV2MappingTable::default())
+}
+
+/// [`lift_mixin_sites`] with an explicit Intermediary→canonical mapping
+/// table merged in (e.g. a `*.tiny` document found inside the mod JAR).
+/// The table only *renames* lookup keys — the fail-closed
+/// `STANDARD_TARGETS` table still decides every hook, so mappings can
+/// never promote an otherwise unmapped target.
+pub fn lift_mixin_sites_with_mappings(
+    sites: &[MixinSite],
+    mappings: &TinyV2MappingTable,
+) -> MixinLiftVerdict {
     let mut lifted = Vec::with_capacity(sites.len());
     let mut unliftable = Vec::new();
     for site in sites {
-        match lift_site(site) {
+        match lift_site(site, mappings) {
             Ok(binding) => lifted.push(binding),
             Err(reason) => unliftable.push((site.clone(), reason)),
         }

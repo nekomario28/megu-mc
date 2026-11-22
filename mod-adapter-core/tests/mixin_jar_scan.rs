@@ -706,16 +706,27 @@ fn unliftable_mixins_fail_closed() {
         "{unliftable:?}"
     );
     assert!(has_reason(UnliftableReason::UnknownTarget), "{unliftable:?}");
-    // @Accessor-style `value` fallback and Unknown naming reach the site.
-    let shadow = unliftable
+    // @Shadow is a non-mutating declaration since Lane
+    // MOD-TIER2-SINYTRA-FREE: it is recorded as a declaration, never a
+    // site — so the `hurt`-method unliftable sites found here are the
+    // @Redirect/@locals ones, which keep UnsupportedAnnotation covered.
+    assert_eq!(
+        report.declarations_skipped, 1,
+        "the @Shadow member is a recorded declaration, not a blocker"
+    );
+    assert_eq!(report.declarations.len(), 1);
+    assert_eq!(
+        report.declarations[0].annotation,
+        MixinAnnotationKind::Shadow
+    );
+    assert_eq!(report.declarations[0].member_name, "bad$shadow");
+    let hurt_blocker = unliftable
         .iter()
         .find(|(site, _)| site.target_method == "hurt" && site.mixin_class.ends_with("BadMixin"))
-        .expect("shadow site recorded");
+        .expect("unliftable hurt site recorded");
     assert!(matches!(
-        shadow.0.annotation,
-        MixinAnnotationKind::Unknown(_)
-            | MixinAnnotationKind::Redirect
-            | MixinAnnotationKind::Overwrite
+        hurt_blocker.0.annotation,
+        MixinAnnotationKind::Redirect | MixinAnnotationKind::Inject
     ));
 
     // The classifier keeps the mod in Tier 3.

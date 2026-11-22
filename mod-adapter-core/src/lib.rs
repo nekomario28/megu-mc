@@ -47,7 +47,18 @@
 //!   JAR Mixin scanner — extracts `@Mixin`/`@Inject` (and every other
 //!   `org.spongepowered.asm.mixin` annotation) from real mod JAR bytecode
 //!   with zero JVM invocation, feeding [`mixin_lifter::MixinSite`]s
-//!   directly into [`mixin_lifter::lift_mixin_sites`].
+//!   directly into [`mixin_lifter::lift_mixin_sites`]. Non-mutating
+//!   `@Shadow`/`@Unique` members are recorded as declarations in scan
+//!   telemetry — never sites, never blockers.
+//! - [`intermediary_map`]: clean-room Tiny v2 (`*.tiny`) runtime mapping
+//!   loader and canonical Intermediary→Mojmap name resolver —
+//!   [`intermediary_map::parse_tiny_v2`] produces the
+//!   [`intermediary_map::TinyV2MappingTable`] that
+//!   [`mixin_lifter::lift_mixin_sites_with_mappings`] normalizes Fabric
+//!   Intermediary targets through, so they bind the exact same
+//!   [`mixin_lifter::StandardEventHook`] as NeoForge Mojmap targets; a
+//!   built-in anchor table covers the standard hook classes/methods when
+//!   no `.tiny` document is supplied.
 //! - [`culinary_adapter`]: clean-room, fully generic Farmer's Delight
 //!   culinary engine — auto-discovers any `*:cooking` / `*:fermenting` /
 //!   `*:cutting` recipe, item/block tag, `*:add_item` / `*:add_table` loot
@@ -162,6 +173,7 @@ pub mod dimension_mod;
 pub mod ecosystem_compat;
 pub mod fallback;
 pub mod hard_mod_primitives;
+pub mod intermediary_map;
 pub mod loader_extensions;
 pub mod magic_primitives;
 pub mod mine_cut_all;

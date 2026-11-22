@@ -1119,11 +1119,14 @@ pub fn auto_adapt_jar_bytes(
     )
     .map_err(|e| format!("{display}: mixin scan: {e}"))?;
     audit_notes.push(format!(
-        "mixin bytecode scan: {} config(s), {} class(es) scanned, {} site(s), {} client-only class(es) skipped",
+        "mixin bytecode scan: {} config(s), {} class(es) scanned, {} site(s), {} @Shadow/@Unique declaration(s), {} client-only class(es) skipped, {} tiny mapping(s) applied ({} skipped)",
         mixin_scan.mixin_configs_found,
         mixin_scan.classes_scanned,
         mixin_scan.sites.len(),
+        mixin_scan.declarations_skipped,
         mixin_scan.skipped_client_mixins,
+        mixin_scan.tiny_mappings_loaded,
+        mixin_scan.tiny_mappings_skipped,
     ));
 
     // 10. Tier synthesis.
@@ -1640,6 +1643,27 @@ fn json_mixin_scan(out: &mut String, level: usize, scan: &JarMixinScanReport, co
         level + 1,
         "sites_found",
         scan.sites.len() as u64,
+        true,
+    );
+    jf_u64(
+        out,
+        level + 1,
+        "declarations_skipped",
+        scan.declarations_skipped as u64,
+        true,
+    );
+    jf_u64(
+        out,
+        level + 1,
+        "tiny_mappings_loaded",
+        scan.tiny_mappings_loaded as u64,
+        true,
+    );
+    jf_u64(
+        out,
+        level + 1,
+        "tiny_mappings_skipped",
+        scan.tiny_mappings_skipped as u64,
         true,
     );
     jf_str(
@@ -2239,9 +2263,10 @@ fn format_adapt_human(result: &JarAdaptationResult) -> String {
     if let Some(scan) = &result.mixin_scan {
         let _ = writeln!(
             out,
-            "  mixins: {} config(s), {} site(s), {}",
+            "  mixins: {} config(s), {} site(s), {} declaration(s), {}",
             scan.mixin_configs_found,
             scan.sites.len(),
+            scan.declarations_skipped,
             match &scan.verdict {
                 MixinLiftVerdict::FullyLiftable(b) =>
                     format!("{} lifted", b.len()),

@@ -19,11 +19,21 @@
 //! scan asks to skip them) are parsed, matching what the Mixin runtime
 //! would actually apply. With no config, every `.class` member is scanned
 //! defensively. Either way the collected sites feed
-//! [`lift_mixin_sites`] and the verdict lands in
+//! [`lift_mixin_sites_with_mappings`] and the verdict lands in
 //! [`JarMixinScanReport::verdict`], ready for
 //! [`crate::fallback::classify_mod_with_mixins`].
 //!
-//! Everything is fail closed: bad magic, truncation, out-of-range or
+//! Non-mutating `@Shadow`/`@Unique` member annotations (method *and*
+//! field level) are classified [`MixinMemberKind::Declaration`] —
+//! collected into [`JarMixinScanReport::declarations`] for diagnostics
+//! and counted in `declarations_skipped`, never emitted as sites and
+//! never counted as Tier-3 blockers. Every other mixin annotation keeps
+//! its fail-closed site semantics. `*.tiny` Tiny v2 mapping members in
+//! the archive merge into the Intermediary→canonical table
+//! [`lift_mixin_sites_with_mappings`] resolves targets through (parse
+//! failures are counted `tiny_mappings_skipped`, never silently used).
+//!
+//! Everything else is fail closed: bad magic, truncation, out-of-range or
 //! wrong-tag constant-pool indices, malformed modified UTF-8, excessive
 //! annotation nesting, corrupt archives, unreadable mixin configs, and
 //! config-registered classes missing from the archive are all hard errors
@@ -34,8 +44,10 @@ use std::fmt;
 use std::path::Path;
 
 use crate::data_loader::{parse_json, DataLoadError, JsonValue};
+use crate::intermediary_map::{parse_tiny_v2, TinyV2MappingTable};
 use crate::mixin_lifter::{
-    lift_mixin_sites, InjectPoint, MixinAnnotationKind, MixinLiftVerdict, MixinSite,
+    lift_mixin_sites_with_mappings, InjectPoint, MixinAnnotationKind, MixinLiftVerdict,
+    MixinMemberKind, MixinSite,
 };
 use crate::modpack::{self, ModpackError};
 
@@ -142,6 +154,28 @@ impl Default for JarScanOptions {
     }
 }
 
+/// One non-mutating mixin member declaration — a `@Shadow` reference to an
+/// existing vanilla member or a `@Unique` mixin-private helper. Declarations
+/// are recorded here for scan diagnostics: they are not [`MixinSite`]s, are
+/// never lifted, and are never counted as Tier-3 blockers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MixinDeclaration {
+    /// Internal name of the mixin class declaring the member.
+    pub mixin_class: String,
+    /// Name of the annotated member inside the mixin class.
+    pub member_name: String,
+    /// The vanilla member the declaration refers to (the annotation's
+    /// `method`/`value` element when present, else the member's own name —
+    /// Mixin's defaulting rule for `@Shadow`).
+    pub target_member: String,
+    /// `mixin_class`'s declared `@Mixin` targets (`value`/`targets`),
+    /// resolved like a site's `target_class`; empty when the class has no
+    /// `@Mixin`.
+    pub target_classes: Vec<String>,
+    /// `@Shadow` or `@Unique`.
+    pub annotation: MixinAnnotationKind,
+}
+
 /// The complete result of one mod-JAR Mixin scan.
 #[derive(Clone, Debug)]
 pub struct JarMixinScanReport {
@@ -152,9 +186,24 @@ pub struct JarMixinScanReport {
     pub classes_scanned: usize,
     /// `client`-array entries skipped by a server-side scan.
     pub skipped_client_mixins: usize,
-    /// Every [`MixinSite`] extracted, in member order.
+    /// Every [`MixinSite`] extracted, in member order. `@Shadow`/`@Unique`
+    /// members are [`MixinDeclaration`]s, not sites.
     pub sites: Vec<MixinSite>,
-    /// [`lift_mixin_sites`] verdict over `sites`.
+    /// Every non-mutating `@Shadow`/`@Unique` declaration found, in member
+    /// order — recorded, never silently erased, never a blocker.
+    pub declarations: Vec<MixinDeclaration>,
+    /// Count of `declarations` — scan telemetry.
+    pub declarations_skipped: usize,
+    /// `*.tiny` Tiny v2 mapping documents parsed and merged into the
+    /// Intermediary→canonical name table used while lifting.
+    pub tiny_mappings_loaded: usize,
+    /// `*.tiny` members that failed bounds/UTF-8/`parse_tiny_v2` checks —
+    /// recorded (never silently used), and never a scan error: the mapping
+    /// table is a name-resolution hint only, and the built-in canonical
+    /// anchors plus the fail-closed target table still apply.
+    pub tiny_mappings_skipped: usize,
+    /// [`crate::mixin_lifter::lift_mixin_sites_with_mappings`] verdict over
+    /// `sites`.
     pub verdict: MixinLiftVerdict,
 }
 
@@ -501,6 +550,8 @@ fn mixin_annotation_kind(desc: &str) -> Option<MixinAnnotationKind> {
         "injection/ModifyConstant" => MixinAnnotationKind::ModifyConstant,
         "gen/Accessor" => MixinAnnotationKind::Accessor,
         "gen/Invoker" => MixinAnnotationKind::Invoker,
+        "Shadow" => MixinAnnotationKind::Shadow,
+        "Unique" => MixinAnnotationKind::Unique,
         other => MixinAnnotationKind::Unknown(format!(
             "@{}",
             other.rsplit('/').next().unwrap_or(other)
@@ -741,8 +792,22 @@ fn collect_mixin_targets(
 // Public API
 // ---------------------------------------------------------------------------
 
+/// What [`parse_mixin_class_full`] extracted from one `.class`: the
+/// injection sites the lifter judges plus the non-mutating
+/// `@Shadow`/`@Unique` member declarations recorded for diagnostics.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MixinClassScan {
+    /// One [`MixinSite`] per `(target_class, method, at)` combination of
+    /// every mixin annotation that injects or transforms behavior.
+    pub sites: Vec<MixinSite>,
+    /// `@Shadow`/`@Unique` declarations — not sites, never blockers.
+    pub declarations: Vec<MixinDeclaration>,
+}
+
 /// Parse one JVM `.class` file (JVMS §4) and reduce every
 /// `org.spongepowered.asm.mixin` method annotation to [`MixinSite`]s.
+/// [`parse_mixin_class_full`] additionally reports the non-mutating
+/// `@Shadow`/`@Unique` declarations.
 ///
 /// Class-level `Runtime*Annotations` are searched for
 /// `@org.spongepowered.asm.mixin.Mixin`, whose `value` (class literals)
@@ -751,13 +816,21 @@ fn collect_mixin_targets(
 /// `(target_class, method_name, at_point)` combination. A `@Inject`
 /// without an explicit `method` element falls back to the handler's own
 /// name, matching Mixin's defaulting rule; a missing `at` yields
-/// `at: None` so [`lift_mixin_sites`] fails closed on it.
+/// `at: None` so the lifter fails closed on it.
 ///
 /// A class carrying no mixin annotations at all yields `Ok(vec![])`.
 /// Anything malformed — bad magic, truncation, out-of-range or wrong-tag
 /// constant-pool references, invalid modified UTF-8, runaway nesting —
 /// is a [`ClassScanError`], never a panic.
 pub fn parse_mixin_class(bytes: &[u8]) -> Result<Vec<MixinSite>, ClassScanError> {
+    Ok(parse_mixin_class_full(bytes)?.sites)
+}
+
+/// [`parse_mixin_class`] plus the non-mutating `@Shadow`/`@Unique`
+/// member declarations (method *and* field level), which are recorded
+/// for diagnostics but never emitted as [`MixinSite`]s — declarations
+/// reference or mark members, they do not inject.
+pub fn parse_mixin_class_full(bytes: &[u8]) -> Result<MixinClassScan, ClassScanError> {
     let mut r = Cursor::new(bytes);
     if r.u4("magic")? != 0xCAFE_BABE {
         return Err(ClassScanError::BadMagic);
@@ -783,15 +856,16 @@ pub fn parse_mixin_class(bytes: &[u8]) -> Result<Vec<MixinSite>, ClassScanError>
         "interfaces",
     )?;
 
-    // Fields: everything is skipped by declared length — @Shadow fields
-    // declare state, not injection sites.
+    // Fields: annotation attributes are read so @Shadow/@Unique members
+    // register as declarations (they declare state, never inject). Any
+    // other mixin annotation on a field holds no injection semantics for
+    // the lifter and is ignored, exactly as before.
+    let mut fields = Vec::new();
     for _ in 0..usize::from(r.u2("fields_count")?) {
-        r.skip(6, "field_info")?;
-        for _ in 0..usize::from(r.u2("field attributes_count")?) {
-            r.skip(2, "field attribute_name_index")?;
-            let len = r.u4("field attribute_length")? as usize;
-            r.skip(len, "field attribute")?;
-        }
+        r.skip(2, "field access_flags")?;
+        let name_index = r.u2("field name_index")?;
+        r.skip(2, "field descriptor_index")?;
+        fields.push((name_index, read_annotation_attributes(&mut r, &cp)?));
     }
 
     // Methods: name + descriptor + annotation attributes (Code etc.
@@ -820,11 +894,38 @@ pub fn parse_mixin_class(bytes: &[u8]) -> Result<Vec<MixinSite>, ClassScanError>
             collect_mixin_targets(ann, &cp, &mut targets)?;
         }
     }
+    let declared_targets = targets.clone();
     if targets.is_empty() {
         // A class with mixin method annotations but no @Mixin (or an
         // empty target list) still emits sites — with an empty target
         // class, which the lifter rejects as UnknownTarget.
         targets.push(String::new());
+    }
+
+    let mut declarations = Vec::new();
+    for (name_index, annotations) in &fields {
+        for ann in annotations {
+            let desc = cp.utf8(ann.type_index, "field annotation type")?;
+            let Some(kind) = mixin_annotation_kind(desc) else {
+                continue;
+            };
+            if kind.member_kind() != MixinMemberKind::Declaration {
+                continue;
+            }
+            let spec = site_spec(ann, &cp)?;
+            let member_name = cp.utf8(*name_index, "field name")?.to_string();
+            declarations.push(MixinDeclaration {
+                mixin_class: mixin_class.clone(),
+                target_member: spec
+                    .methods
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| member_name.clone()),
+                target_classes: declared_targets.clone(),
+                annotation: kind.clone(),
+                member_name,
+            });
+        }
     }
 
     let mut sites = Vec::new();
@@ -835,14 +936,27 @@ pub fn parse_mixin_class(bytes: &[u8]) -> Result<Vec<MixinSite>, ClassScanError>
                 continue;
             };
             let mut spec = site_spec(ann, &cp)?;
+            let handler_name = cp.utf8(*name_index, "method name")?.to_string();
+            if kind.member_kind() == MixinMemberKind::Declaration {
+                declarations.push(MixinDeclaration {
+                    mixin_class: mixin_class.clone(),
+                    target_member: spec
+                        .methods
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| handler_name.clone()),
+                    target_classes: declared_targets.clone(),
+                    annotation: kind.clone(),
+                    member_name: handler_name,
+                });
+                continue;
+            }
             if spec.methods.is_empty() {
-                spec.methods
-                    .push(cp.utf8(*name_index, "method name")?.to_string());
+                spec.methods.push(handler_name.clone());
             }
             if spec.ats.is_empty() {
                 spec.ats.push(None);
             }
-            let handler_name = cp.utf8(*name_index, "method name")?.to_string();
             let handler_descriptor =
                 cp.utf8(*descriptor_index, "method descriptor")?.to_string();
             for target in &targets {
@@ -864,7 +978,7 @@ pub fn parse_mixin_class(bytes: &[u8]) -> Result<Vec<MixinSite>, ClassScanError>
             }
         }
     }
-    Ok(sites)
+    Ok(MixinClassScan { sites, declarations })
 }
 
 /// Resolve one mixin-config class entry (`"LivingEntityMixin"`,
@@ -945,7 +1059,31 @@ fn scan_jar(
     let mut skipped_client = 0usize;
     let mut extracted = 0u64;
 
+    // `*.tiny` members (Tiny v2 Intermediary->named mapping documents a
+    // mod JAR may ship) merge into one name-resolution table used while
+    // lifting. A member that fails the byte budget, UTF-8, or
+    // `parse_tiny_v2` is counted `tiny_mappings_skipped`, never silently
+    // used: the table is a lookup hint only and the built-in canonical
+    // anchors plus the fail-closed target table still apply.
+    let mut mappings = TinyV2MappingTable::default();
+    let mut tiny_mappings_loaded = 0usize;
+    let mut tiny_mappings_skipped = 0usize;
+
     for entry in &entries {
+        if entry.name.ends_with(".tiny") {
+            let parsed = read_member_budget(jar_bytes, entry, display, &mut extracted)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .and_then(|text| parse_tiny_v2(&text).ok());
+            match parsed {
+                Some(table) => {
+                    mappings.merge_from(table);
+                    tiny_mappings_loaded += 1;
+                }
+                None => tiny_mappings_skipped += 1,
+            }
+            continue;
+        }
         if !entry.name.ends_with(".mixins.json") {
             continue;
         }
@@ -973,6 +1111,7 @@ fn scan_jar(
     }
 
     let mut sites = Vec::new();
+    let mut declarations = Vec::new();
     let mut classes_scanned = 0usize;
     if configs_found > 0 {
         // Configs exist: only the registered classes can apply, so only
@@ -985,7 +1124,9 @@ fn scan_jar(
                 .ok_or_else(|| ClassScanError::MissingMixinClass(path.clone()))?;
             let bytes = read_member_budget(jar_bytes, entry, display, &mut extracted)?;
             classes_scanned += 1;
-            sites.extend(parse_mixin_class(&bytes)?);
+            let parsed = parse_mixin_class_full(&bytes)?;
+            sites.extend(parsed.sites);
+            declarations.extend(parsed.declarations);
         }
     } else {
         // No config: defensively parse every class member.
@@ -998,16 +1139,22 @@ fn scan_jar(
             }
             let bytes = read_member_budget(jar_bytes, entry, display, &mut extracted)?;
             classes_scanned += 1;
-            sites.extend(parse_mixin_class(&bytes)?);
+            let parsed = parse_mixin_class_full(&bytes)?;
+            sites.extend(parsed.sites);
+            declarations.extend(parsed.declarations);
         }
     }
 
-    let verdict = lift_mixin_sites(&sites);
+    let verdict = lift_mixin_sites_with_mappings(&sites, &mappings);
     Ok(JarMixinScanReport {
         mixin_configs_found: configs_found,
         classes_scanned,
         skipped_client_mixins: skipped_client,
         sites,
+        declarations_skipped: declarations.len(),
+        declarations,
+        tiny_mappings_loaded,
+        tiny_mappings_skipped,
         verdict,
     })
 }
