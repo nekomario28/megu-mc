@@ -231,6 +231,102 @@ fn inei_shadow_balance_sanitizes_nonfinite_and_out_of_range_inputs() {
 }
 
 #[test]
+fn yugen_mist_layers_valleys_and_grows_near_dawn_and_dusk() {
+    let river = compute_yugen_valley_mist(62.0, 80.0, 80.0, 0.012, 0.25);
+    let ridge = compute_yugen_valley_mist(140.0, 80.0, 80.0, 0.012, 0.25);
+    assert!(river > ridge, "river {river}, ridge {ridge}");
+    let dawn = compute_yugen_valley_mist(62.0, 80.0, 80.0, 0.012, 0.0);
+    let dusk = compute_yugen_valley_mist(62.0, 80.0, 80.0, 0.012, 0.5);
+    assert!(dawn > river, "dawn {dawn}, noon {river}");
+    assert!(dusk > river, "dusk {dusk}, noon {river}");
+    assert!(compute_yugen_valley_mist(62.0, 80.0, 1e9, 100.0, 0.0) <= 0.92);
+    assert_eq!(compute_yugen_valley_mist(62.0, 80.0, 0.0, 0.012, 0.0), 0.0);
+    assert_eq!(compute_yugen_valley_mist(62.0, 80.0, 80.0, 0.0, 0.0), 0.0);
+}
+
+#[test]
+fn yugen_mist_sanitizes_nonfinite_inputs() {
+    let baseline = [62.0, 80.0, 64.0, 0.012, 0.25];
+    for index in 0..5 {
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut inputs = baseline;
+            inputs[index] = invalid;
+            let result =
+                compute_yugen_valley_mist(inputs[0], inputs[1], inputs[2], inputs[3], inputs[4]);
+            assert!(result.is_finite(), "index {index}, value {invalid}");
+            assert!((0.0..=0.92).contains(&result));
+        }
+    }
+    assert_eq!(
+        compute_yugen_valley_mist(62.0, 80.0, -10.0, -0.012, 0.0),
+        0.0
+    );
+    assert_eq!(
+        compute_yugen_valley_mist(62.0, 80.0, 0.0, f32::MAX, 0.0),
+        0.0
+    );
+    let saturated = compute_yugen_valley_mist(62.0, 80.0, f32::MAX, f32::MAX, 0.0);
+    assert_eq!(saturated, 0.92);
+}
+
+#[test]
+fn komorebi_dapple_is_bounded_smooth_and_neutral_at_night() {
+    let pos = [17.25, 71.0, -22.5];
+    let first = compute_komorebi_dapple(pos, 0.25, 0.8);
+    let shifted = compute_komorebi_dapple([17.27, 71.0, -22.48], 0.25, 0.8);
+    let morning = compute_komorebi_dapple(pos, 0.10, 0.8);
+    let later = compute_komorebi_dapple(pos, 0.101, 0.8);
+    assert!((first - shifted).abs() < 0.02);
+    assert!((morning - later).abs() < 0.02);
+    assert!((first - shifted).abs() > 1e-6);
+    assert!((morning - later).abs() > 1e-6);
+    assert_eq!(compute_komorebi_dapple(pos, 0.25, 0.0), 1.0);
+    assert_eq!(compute_komorebi_dapple(pos, 0.25, -0.8), 1.0);
+    assert_eq!(compute_komorebi_dapple(pos, 0.25, 0.08), 1.0);
+    assert_eq!(
+        compute_komorebi_dapple(pos, 0.0, 0.8),
+        compute_komorebi_dapple(pos, 1.0, 0.8)
+    );
+
+    for x in -10..=10 {
+        for phase in [0.0, 0.1, 0.25, 0.49, 0.75, 0.99] {
+            let value = compute_komorebi_dapple([x as f32, 63.0, x as f32 * 0.7], phase, 0.8);
+            assert!((0.85..=1.10).contains(&value), "dapple {value}");
+        }
+    }
+    assert_eq!(
+        compute_komorebi_dapple([f32::NAN, 0.0, 2.0], 0.25, 0.8),
+        1.0
+    );
+    assert_eq!(compute_komorebi_dapple(pos, f32::NAN, 0.8), 1.0);
+}
+
+#[test]
+fn nure_iro_patina_deepens_wet_colors_and_reveals_grazing_sheen() {
+    let albedo = [0.65, 0.40, 0.20];
+    assert_eq!(
+        compute_nure_iro_patina(albedo, 1.0, 0.0, 0.2),
+        (albedo, 0.0)
+    );
+    let (damp, sheen) = compute_nure_iro_patina(albedo, 1.0, 1.0, 0.1);
+    for (wet, dry) in damp.into_iter().zip(albedo) {
+        assert!(wet > 0.0 && wet < dry, "wet {wet}, dry {dry}");
+    }
+    assert!(sheen > 0.0 && sheen <= 0.12);
+    let (_, facing_sheen) = compute_nure_iro_patina(albedo, 1.0, 1.0, 0.95);
+    assert!(facing_sheen < sheen);
+    let (_, downward_sheen) = compute_nure_iro_patina(albedo, -1.0, 1.0, 0.1);
+    assert_eq!(downward_sheen, 0.0);
+    assert_eq!(
+        compute_nure_iro_patina(albedo, 1.0, -2.0, 0.1),
+        (albedo, 0.0)
+    );
+    assert!(compute_nure_iro_patina(albedo, 1.0, f32::NAN, 0.1)
+        .1
+        .is_finite());
+}
+
+#[test]
 fn inei_wgsl_matches_cpu_curves_and_preserves_warm_lantern_color() {
     let terrain = MEGU_TERRAIN_LIT_WGSL;
     for expression in [
@@ -241,7 +337,7 @@ fn inei_wgsl_matches_cpu_curves_and_preserves_warm_lantern_color() {
         "vec3<f32>(0.065)",
         "(dot(normal, L_dir) + wrap) / (1.0 + wrap)",
         "pow(max(dot(normal, half_vec), 0.0), 12.0) * 0.08",
-        "lit_color += input.albedo * lantern_light + lacquer_sheen",
+        "lit_color += rich_albedo * lantern_light + lacquer_sheen",
     ] {
         assert!(
             terrain.contains(expression),
@@ -252,6 +348,37 @@ fn inei_wgsl_matches_cpu_curves_and_preserves_warm_lantern_color() {
     let sky = MEGU_SKY_ATMOSPHERE_WGSL;
     assert!(sky.contains("vec3<f32>(0.025, 0.040, 0.13)"));
     assert!(sky.contains("vec3<f32>(0.42, 0.17, 0.10)"));
+}
+
+#[test]
+fn japanese_aesthetics_curves_are_mirrored_in_wgsl_without_new_bindings() {
+    let terrain = MEGU_TERRAIN_LIT_WGSL;
+    for curve in [
+        "fn yugen_valley_mist(",
+        "smoothstep(63.0, 96.0, world_y)",
+        "smoothstep(0.0, 0.28, abs(sin(day_phase * 6.2831853)))",
+        "clamp(1.0 - exp(-max(view_distance, 0.0) * density), 0.0, 0.92)",
+        "let atmosphere = yugen_valley_mist(",
+        "fn komorebi_dapple(",
+        "0.11 * (0.72 * broad + 0.28 * fine)",
+        "visibility < 0.95 || cascade_count == 0u",
+        "let wetness = clamp(shadow.render_params.z * 24.0, 0.0, 1.0)",
+        "(1.0 - 0.18 * wetness)",
+        "pow(1.0 - clamp(dot(normal, view_dir), 0.0, 1.0), 4.0)",
+    ] {
+        assert!(terrain.contains(curve), "missing terrain curve {curve}");
+    }
+    let water = MEGU_WATER_SURFACE_WGSL;
+    for curve in [
+        "if (shadow.sun_direction.y < 0.0)",
+        "let lunar_path = pow(max(dot(reflected, moon_axis), 0.0), 72.0)",
+        "* rise * shadow.moon_color.w",
+        "return vec4<f32>(color + suigetsu, 0.88)",
+    ] {
+        assert!(water.contains(curve), "missing water curve {curve}");
+    }
+    assert_eq!(terrain.matches("@binding(").count(), 4);
+    assert_eq!(water.matches("@binding(").count(), 1);
 }
 
 #[test]

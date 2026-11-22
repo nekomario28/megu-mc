@@ -193,6 +193,106 @@ pub fn compute_inei_shadow_balance(visibility: f32, sun_elevation: f32) -> IneiS
     }
 }
 
+/// Yūgen: distance mist gathers in low valleys and thickens at dawn and dusk.
+/// The same height and phase curves are used by the terrain shader.
+pub fn compute_yugen_valley_mist(
+    world_y: f32,
+    camera_y: f32,
+    view_distance: f32,
+    base_fog_density: f32,
+    day_phase: f32,
+) -> f32 {
+    let world_y = if world_y.is_finite() { world_y } else { 96.0 };
+    let camera_y = if camera_y.is_finite() { camera_y } else { 96.0 };
+    let distance = if view_distance.is_finite() {
+        view_distance.max(0.0)
+    } else {
+        0.0
+    };
+    let base_density = if base_fog_density.is_finite() {
+        base_fog_density.max(0.0)
+    } else {
+        0.0
+    };
+    if distance <= 0.0 || base_density <= 0.0 {
+        return 0.0;
+    }
+    let phase = if day_phase.is_finite() {
+        day_phase.rem_euclid(1.0)
+    } else {
+        0.25
+    };
+    let valley = 1.0 - smooth01((world_y - 63.0) / 33.0);
+    let camera_proximity = 1.0 - smooth01(((camera_y - world_y).abs() / 128.0).min(1.0));
+    let twilight = 1.0 - smooth01((phase * TAU).sin().abs() / 0.28);
+    let density = base_density
+        * (0.32 + valley * (0.78 + 0.22 * camera_proximity) * (0.80 + 0.50 * twilight));
+    (1.0 - (-distance * density).exp()).clamp(0.0, 0.92)
+}
+
+/// Komorebi: two smooth, world-block-scaled waves suggest moving leaf shade.
+/// The caller applies the factor only in penumbra or the Feather tier.
+pub fn compute_komorebi_dapple(world_pos: [f32; 3], day_phase: f32, sun_elevation: f32) -> f32 {
+    if !world_pos[0].is_finite()
+        || !world_pos[2].is_finite()
+        || !day_phase.is_finite()
+        || !sun_elevation.is_finite()
+        || sun_elevation <= 0.08
+    {
+        return 1.0;
+    }
+    let drift = (day_phase.rem_euclid(1.0) * TAU).sin() * 0.35;
+    let x = world_pos[0];
+    let z = world_pos[2];
+    let broad = (x * 0.31 + z * 0.21 + drift).sin() * (z * 0.27 - x * 0.17 - drift * 0.7).sin();
+    let fine =
+        (x * 0.62 - z * 0.42 + drift * 1.7).sin() * (z * 0.54 + x * 0.34 - drift * 1.3).sin();
+    let daylight = smooth01((sun_elevation - 0.08) / 0.12);
+    1.0 + daylight * (-0.03 + 0.11 * (0.72 * broad + 0.28 * fine))
+}
+
+/// Nure-iro: porous surfaces darken slightly when wet, with a grazing sky sheen.
+/// Moisture is normalized to 0..=1 and does not depend on wall-clock time.
+pub fn compute_nure_iro_patina(
+    albedo: [f32; 3],
+    normal_y: f32,
+    wetness: f32,
+    view_dot_normal: f32,
+) -> ([f32; 3], f32) {
+    let wetness = if wetness.is_finite() {
+        wetness.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if wetness <= 0.0 {
+        return (albedo, 0.0);
+    }
+    let albedo = albedo.map(|channel| {
+        if channel.is_finite() {
+            channel.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    });
+    let luma = albedo[0] * 0.2126 + albedo[1] * 0.7152 + albedo[2] * 0.0722;
+    let scale = 1.0 - 0.18 * wetness;
+    let rich_albedo = albedo.map(|channel| {
+        (channel * (1.0 + (channel - luma) * 0.08 * wetness) * scale).clamp(0.0, 1.0)
+    });
+    let normal_y = if normal_y.is_finite() {
+        normal_y.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let facing = if view_dot_normal.is_finite() {
+        view_dot_normal.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let sheen = (1.0 - facing).powi(4) * 0.12 * wetness * normal_y;
+    (rich_albedo, sheen)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ShadowCamera {
     pub position: [f32; 3],
@@ -971,6 +1071,26 @@ fn aces(color: vec3<f32>) -> vec3<f32> {
     let b = color * (2.43 * color + vec3<f32>(0.59)) + vec3<f32>(0.14);
     return clamp(a / b, vec3<f32>(0.0), vec3<f32>(1.0));
 }
+fn yugen_valley_mist(world_y: f32, camera_y: f32, view_distance: f32,
+                     base_fog_density: f32, day_phase: f32) -> f32 {
+    let valley = 1.0 - smoothstep(63.0, 96.0, world_y);
+    let camera_proximity = 1.0 - smoothstep(0.0, 128.0, abs(camera_y - world_y));
+    let twilight = 1.0 - smoothstep(0.0, 0.28, abs(sin(day_phase * 6.2831853)));
+    let density = max(base_fog_density, 0.0)
+        * (0.32 + valley * (0.78 + 0.22 * camera_proximity) * (0.80 + 0.50 * twilight));
+    return clamp(1.0 - exp(-max(view_distance, 0.0) * density), 0.0, 0.92);
+}
+fn komorebi_dapple(world_xz: vec2<f32>, day_phase: f32, sun_elevation: f32) -> f32 {
+    let drift = sin(day_phase * 6.2831853) * 0.35;
+    let x = world_xz.x;
+    let z = world_xz.y;
+    let broad = sin(x * 0.31 + z * 0.21 + drift)
+        * sin(z * 0.27 - x * 0.17 - drift * 0.7);
+    let fine = sin(x * 0.62 - z * 0.42 + drift * 1.7)
+        * sin(z * 0.54 + x * 0.34 - drift * 1.3);
+    let daylight = smoothstep(0.08, 0.20, sun_elevation);
+    return 1.0 + daylight * (-0.03 + 0.11 * (0.72 * broad + 0.28 * fine));
+}
 @fragment
 fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
     let normal = normalize(input.normal);
@@ -1006,11 +1126,27 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
     let ambient = max((sky_ambient * shadow_sky_scale
                        + bounce * warm_bounce_scale) * ambient_dim,
                       vec3<f32>(0.065));
-    let light = ambient + shadow.sun_color.xyz * sun_power * visibility
+    // Komorebi travels with the daylight across partially shaded block faces.
+    var komorebi = 1.0;
+    if (visibility < 0.95 || cascade_count == 0u) {
+        komorebi = komorebi_dapple(input.world_position.xz, shadow.render_params.y,
+                                   shadow.sun_direction.y);
+    }
+    let light = ambient + shadow.sun_color.xyz * sun_power * visibility * komorebi
                 + shadow.moon_color.xyz * moon_power * shadow.moon_color.w
                   * lunar_visibility;
+    let view_dir = -view_offset / max(view_distance, 0.0001);
+    // Nure-iro: damp upward stone and timber retain a restrained sky glint.
+    let wetness = clamp(shadow.render_params.z * 24.0, 0.0, 1.0)
+        * smoothstep(0.15, 0.85, normal.y);
+    let wet_luma = dot(input.albedo, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let rich_albedo = clamp(input.albedo
+        * (vec3<f32>(1.0) + (input.albedo - vec3<f32>(wet_luma)) * (0.08 * wetness))
+        * (1.0 - 0.18 * wetness), vec3<f32>(0.0), vec3<f32>(1.0));
+    let grazing_sheen = pow(1.0 - clamp(dot(normal, view_dir), 0.0, 1.0), 4.0)
+        * 0.12 * wetness * max(normal.y, 0.0);
     // Quiet the darkest saturated materials before warm lamplight returns.
-    var lit_color = input.albedo * light;
+    var lit_color = rich_albedo * light;
     let luma = dot(lit_color, vec3<f32>(0.299, 0.587, 0.114));
     let shibumi = (1.0 - visibility) * 0.22;
     lit_color = mix(lit_color, vec3<f32>(luma) * vec3<f32>(0.96, 0.95, 1.02), shibumi);
@@ -1018,7 +1154,6 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
     var lacquer_sheen = vec3<f32>(0.0);
     let inei_boost = mix(1.38, 1.0,
                          visibility * clamp(shadow.sun_direction.y * 1.5, 0.0, 1.0));
-    let view_dir = -view_offset / max(view_distance, 0.0001);
     var limit = 8u;
     if (shadow.render_params.x >= 2.0) { limit = 32u; }
     if (shadow.render_params.x >= 3.0) { limit = 64u; }
@@ -1042,8 +1177,11 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
         lacquer_sheen += radiance * vec3<f32>(1.0, 0.78, 0.52)
                          * pow(max(dot(normal, half_vec), 0.0), 12.0) * 0.08;
     }
-    lit_color += input.albedo * lantern_light + lacquer_sheen;
-    let atmosphere = 1.0 - exp(-view_distance * shadow.render_params.z);
+    lit_color += rich_albedo * lantern_light + lacquer_sheen
+                 + sky_ambient * grazing_sheen;
+    let atmosphere = yugen_valley_mist(input.world_position.y, shadow.camera_position.y,
+                                       view_distance, shadow.render_params.z,
+                                       shadow.render_params.y);
     let daylight = smoothstep(-0.12, 0.12, shadow.sun_direction.y);
     let twilight = 1.0 - smoothstep(0.0, 0.28, abs(shadow.sun_direction.y));
     let gaze = view_offset / max(view_distance, 0.0001);
@@ -1235,15 +1373,27 @@ fn fs_main(input: WaterOutput) -> @location(0) vec4<f32> {
     let shallow = vec3<f32>(0.04, 0.32, 0.37);
     let deep = vec3<f32>(0.012, 0.065, 0.15);
     var color = mix(shallow, deep, depth);
-    if (quality <= 1.0) {
-        return vec4<f32>(color, 0.88);
-    }
     let phase = shadow.render_params.y * 6.2831853;
     let normal = wave_normal(input.world_position.xz, phase, quality);
     let to_camera = shadow.camera_position.xyz - input.world_position;
     let view = to_camera / max(length(to_camera), 0.0001);
-    let fresnel = 0.02 + 0.98 * pow(1.0 - max(dot(normal, view), 0.0), 5.0);
     let reflected = reflect(-view, normal);
+    // Suigetsu: moonlight gathers into a rippling silver-blue path after sunset.
+    var suigetsu = vec3<f32>(0.0);
+    if (shadow.sun_direction.y < 0.0) {
+        let moon_axis = -normalize(shadow.sun_direction.xyz);
+        let lunar_path = pow(max(dot(reflected, moon_axis), 0.0), 72.0);
+        let ripple = 0.70 + 0.30
+            * sin(input.world_position.x * 0.83 + phase * 1.8)
+            * sin(input.world_position.z * 0.91 - phase * 1.4);
+        let rise = smoothstep(0.0, 0.16, -shadow.sun_direction.y);
+        suigetsu = vec3<f32>(0.36, 0.45, 0.62) * lunar_path * ripple
+            * rise * shadow.moon_color.w;
+    }
+    if (quality <= 1.0) {
+        return vec4<f32>(color + suigetsu, 0.88);
+    }
+    let fresnel = 0.02 + 0.98 * pow(1.0 - max(dot(normal, view), 0.0), 5.0);
     let sky = mix(vec3<f32>(0.02, 0.035, 0.085),
                   vec3<f32>(0.18, 0.44, 0.78), day);
     let sky_reflection = mix(sky * 0.6, sky, clamp(reflected.y, 0.0, 1.0))
@@ -1252,7 +1402,7 @@ fn fs_main(input: WaterOutput) -> @location(0) vec4<f32> {
     let halfway = half_vector / max(length(half_vector), 0.0001);
     let sparkle = pow(max(dot(normal, halfway), 0.0), 180.0);
     color = mix(color, sky_reflection, fresnel)
-            + shadow.sun_color.xyz * sparkle * day * 0.8;
+            + shadow.sun_color.xyz * sparkle * day * 0.8 + suigetsu;
     if (quality >= 3.0) {
         let ripple = sin(input.world_position.x * 1.7 + phase * 3.0)
                      * sin(input.world_position.z * 1.9 - phase * 2.0);
