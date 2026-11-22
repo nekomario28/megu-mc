@@ -972,6 +972,21 @@ impl GpuApp {
             }
             self.ui.hud = live.hud.clone();
             live.record_frame_and_refresh_minihud(dt, &mut self.ui);
+            if live.asset_bundle_pending_upload {
+                if let Some(bundle) = &live.asset_bundle {
+                    match active
+                        .renderer
+                        .upload_block_atlas(&bundle.atlas, &bundle.mipmaps)
+                    {
+                        Ok(()) => live.asset_bundle_pending_upload = false,
+                        Err(err) => {
+                            eprintln!("mc-spine-client assets: atlas upload failed: {err}");
+                            live.asset_bundle_pending_upload = false;
+                        }
+                    }
+                }
+            }
+            active.renderer.sync_subworlds(&mut live.subworlds);
             self.ui
                 .hud
                 .chat_lines

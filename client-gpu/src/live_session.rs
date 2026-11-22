@@ -23,6 +23,7 @@ use mc_spine_client::render_graph::GpuPipelineKind;
 use mc_spine_client::session::{AudioStats, WorldAcousticSnapshot};
 use mc_spine_client::spatial_audio::{SpatialSubtitleCue, SubtitleDirection};
 use mc_spine_client::world::{BlockTable, WorldState};
+use mc_spine_client_mesh::asset_pipeline::{CompiledAssetBundle, ResourcePackLayer};
 use mc_spine_client_mesh::entity_rig::{classify_entity_rig, EntityRigSpec};
 use mc_spine_client_mesh::mesher::{
     BlockVisualEnhancementResult, BlockVisualInput, VanillaPlusPipelineConfig,
@@ -33,8 +34,9 @@ use mc_spine_client_mesh::tactile_effects::{
     NightSkyDrama, TactileEffectsConfig, TactileEffectsSim,
 };
 use mc_spine_client_mesh::vanilla_plus_nature::{
-    tick_nature_ambience, ActiveSeasonKind, NatureAmbienceEnv, NatureAmbienceState,
-    NatureModRegistry, SeasonAmbienceInput,
+    compute_cloud_lighting, generate_layered_voxel_clouds, tick_nature_ambience,
+    ActiveSeasonKind, NatureAmbienceEnv, NatureAmbienceState, NatureModRegistry,
+    SeasonAmbienceInput,
 };
 use mc_spine_ui::magic_hud::{CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState};
 use mc_spine_ui::state::{HudState, MiniHudPreset, UiState};
@@ -49,8 +51,11 @@ pub mod hw_adaptive_engine;
 #[path = "../../core/src/sys_metrics.rs"]
 pub mod sys_metrics;
 
-use crate::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
-use crate::subworld_render::SubWorldRenderBank;
+use crate::atmosphere::{
+    voxel_clouds_to_geometry, AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker,
+    CLOUD_RENDER_ALPHA,
+};
+use crate::subworld_render::{SubWorldRenderBank, SubWorldRenderEntry, SubWorldTransform};
 use hw_adaptive_engine::{
     detect_host_hardware_caps, select_compute_strategy, ComputeStrategy, HostHardwareCaps,
     PagedSectionPool, SpeculativeChunkPrefetcher,
@@ -243,6 +248,14 @@ pub struct LiveSession {
     /// Vanilla use-item/container sequence counter echoed on `use_item`,
     /// `use_item_on`, `player_action`, and `container_click` packets.
     use_item_sequence: i32,
+    /// Lazily compiled resource-pack bundle (atlas + mip chain + blockstates)
+    /// built once when `MC_SPINE_RESOURCE_PACK_DIR` points at a pack root
+    /// containing `assets/`; absent env keeps the procedural fallback.
+    pub asset_bundle: Option<CompiledAssetBundle>,
+    asset_bundle_tried: bool,
+    /// Set when `asset_bundle` landed but `GpuRenderer::upload_block_atlas`
+    /// has not consumed it yet (window.rs owns the GPU upload).
+    pub asset_bundle_pending_upload: bool,
     player_entity_id: Option<i32>,
     pub hud: HudState,
     pub magic: MagicHudState,
@@ -387,6 +400,9 @@ impl LiveSession {
             actionbar_nbt: None,
             pending_transfer: None,
             use_item_sequence: 0,
+            asset_bundle: None,
+            asset_bundle_tried: false,
+            asset_bundle_pending_upload: false,
             player_entity_id: None,
             hud: HudState::default(),
             magic: MagicHudState::default(),
@@ -1068,6 +1084,70 @@ impl LiveSession {
         }
     }
 
+    /// Compile the resource-pack bundle once (`MC_SPINE_RESOURCE_PACK_DIR`
+    /// = pack root containing `assets/`). `CompiledAssetBundle::build`
+    /// produces the gutter-padded block atlas and its linear-sRGB mip
+    /// chain; `window.rs` uploads it via `upload_block_atlas`.
+    fn ensure_asset_bundle(&mut self) {
+        if self.asset_bundle_tried {
+            return;
+        }
+        self.asset_bundle_tried = true;
+        let Some(dir) = std::env::var_os("MC_SPINE_RESOURCE_PACK_DIR") else {
+            return;
+        };
+        match ResourcePackLayer::from_dir(std::path::Path::new(&dir))
+            .and_then(|layer| CompiledAssetBundle::build(&[layer]))
+        {
+            Ok(bundle) => {
+                if !bundle.skipped_errors.is_empty() {
+                    eprintln!(
+                        "mc-spine-client assets: {} pack entries skipped",
+                        bundle.skipped_errors.len()
+                    );
+                }
+                self.asset_bundle = Some(bundle);
+                self.asset_bundle_pending_upload = true;
+            }
+            Err(err) => eprintln!("mc-spine-client assets: bundle build failed: {err}"),
+        }
+    }
+
+    /// Regenerate the layered voxel-cloud sheet from the live camera/world
+    /// time and mirror it into `subworlds` for the translucent lit pass.
+    /// Cells come from `generate_layered_voxel_clouds`; the pack's
+    /// `enabled`/`layered_voxel_clouds` toggles gate emission (an empty set
+    /// removes the sheet instead of leaving a stale frame).
+    fn refresh_voxel_clouds(&mut self) {
+        let (cam_x, cam_z) = self
+            .pose
+            .map(|pose| (pose.feet[0] as f32, pose.feet[2] as f32))
+            .unwrap_or((0.0, 0.0));
+        let time = self.world.time_of_day.max(0) as u64;
+        let cells =
+            generate_layered_voxel_clouds(&self.vanilla_plus_cfg.nature, cam_x, cam_z, time);
+        if cells.is_empty() {
+            self.subworlds.remove(CLOUD_SUBWORLD_ID);
+            return;
+        }
+        // Vanilla celestial angle: 0 = sunrise, 6000 = noon, 18000 = midnight.
+        let sun_elevation = ((time % 24_000) as f32 * (std::f32::consts::TAU / 24_000.0)).sin();
+        let lighting = compute_cloud_lighting(
+            sun_elevation,
+            self.world.rain_level,
+            self.world.thunder_level,
+        );
+        let (vertices, indices) = voxel_clouds_to_geometry(&cells, &lighting);
+        let mut entry = SubWorldRenderEntry::new(
+            CLOUD_SUBWORLD_ID,
+            SubWorldTransform::IDENTITY,
+            vertices,
+            indices,
+        );
+        entry.alpha = CLOUD_RENDER_ALPHA;
+        self.subworlds.upsert(entry);
+    }
+
     /// Record frame timing and advance visual transitions before HUD rendering.
     pub fn record_frame_and_refresh_minihud(&mut self, frame_dt_sec: f32, ui: &mut UiState) {
         let frame_us = f64::from(frame_dt_sec) * 1_000_000.0;
@@ -1076,6 +1156,8 @@ impl LiveSession {
         self.atmosphere_blender.advance(frame_dt_sec);
         self.refresh_subtitle_hud(frame_dt_sec, &mut ui.hud);
         self.looking_at_entity = self.crosshair_entity().map(|(eid, _)| eid);
+        self.ensure_asset_bundle();
+        self.refresh_voxel_clouds();
 
         if ui.settings.qol.mini_hud_preset() == MiniHudPreset::Off {
             return;
@@ -1807,6 +1889,10 @@ fn run_connection(
         }
     }
 }
+
+/// Reserved `subworlds` id for the layered voxel-cloud sheet (kept clear of
+/// contraption ids, which allocate from 1 upward).
+const CLOUD_SUBWORLD_ID: u64 = u64::MAX;
 
 /// Resolve the vanilla `SurfaceKind` for the block at `pos`, consulting the
 /// version-pack registry name first and falling back to the built-in 1.21.1

@@ -2550,8 +2550,8 @@
       "id": "render.atlas_gutters",
       "category": "rendering_and_assets",
       "description": "Atlas gutter padding modes (Wrap/Clamp) + padding texels for bleed-free mips.",
-      "kernel_file": "client-port/src/atlas.rs",
-      "kernel_symbol": "PaddingMode",
+      "kernel_file": "client-port/src/asset_pipeline.rs",
+      "kernel_symbol": "CompiledAssetBundle::build",
       "live_consumers": [
         "client-app/src/render.rs",
         "client-app/src/world.rs",
@@ -2563,8 +2563,8 @@
       "id": "render.srgb_mipmaps",
       "category": "rendering_and_assets",
       "description": "Linear-filtered sRGB mipmap chain build for the atlas.",
-      "kernel_file": "client-port/src/atlas.rs",
-      "kernel_symbol": "build_mipmaps_linear",
+      "kernel_file": "client-port/src/asset_pipeline.rs",
+      "kernel_symbol": "CompiledAssetBundle::build",
       "live_consumers": [
         "client-app/src/render.rs",
         "client-app/src/world.rs",
@@ -2602,7 +2602,8 @@
       "kernel_symbol": "bake_blockstate",
       "live_consumers": [
         "client-app/src/world.rs",
-        "client-app/src/render.rs"
+        "client-app/src/render.rs",
+        "client-port/src/asset_pipeline.rs"
       ]
     },
     {
@@ -2755,7 +2756,7 @@
       "category": "audio_and_protocol",
       "description": "OGG Vorbis decode to mono f32 (symphonia vorbis+ogg).",
       "kernel_file": "client-app/src/sound_assets.rs",
-      "kernel_symbol": "decode_ogg_mono",
+      "kernel_symbol": "SoundLibrary::decode",
       "live_consumers": [
         "client-app/src/audio_out.rs"
       ]
@@ -2786,7 +2787,7 @@
       "category": "audio_and_protocol",
       "description": "Acoustic occlusion between listener and source (voxel tracer).",
       "kernel_file": "client-app/src/spatial_audio.rs",
-      "kernel_symbol": "occlusion_between",
+      "kernel_symbol": "SpatialAudioEngine::analyze",
       "live_consumers": [
         "client-app/src/session.rs",
         "client-app/src/audio_out.rs"
