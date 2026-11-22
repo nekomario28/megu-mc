@@ -3,6 +3,12 @@
 
 The modpack checker classifies referenced files but does not download them.
 No server process is started for --dry-run, including with --json.
+
+`megu_start.py [--dir <dir>] mods <search|add|resolve-deps> ...` delegates to
+tools/megu_mods.py for Modrinth search/install/dependency work, defaulting
+--mods-dir to <dir>/mods. Before launch, installed JARs are scanned locally
+for missing required dependencies; --fix-deps/--fix-deps-yes (or an
+interactive prompt) can fetch them from Modrinth with verified downloads.
 """
 
 import argparse
@@ -19,6 +25,8 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
+MODS_TOOL = ROOT / "tools" / "megu_mods.py"
+TUI_TOOL = ROOT / "tools" / "megu_tui.py"
 SCHEMA = "megu-start-plan/1"
 DEFAULT_PORT = 25565
 MAX_ARCHIVE_MEMBERS = 8192
@@ -342,6 +350,237 @@ def safe_names(names):
                    and len(name) <= 96 and re.fullmatch(r"[a-zA-Z0-9_. -]+", name)})
 
 
+# ---------------------------------------------------------------------------
+# `mods` subcommand passthrough to tools/megu_mods.py
+# ---------------------------------------------------------------------------
+
+def split_mods_passthrough(argv):
+    """Split `... mods <args>` into (megu_start args, megu_mods args).
+
+    A bare `mods` token is only the subcommand when it is not consumed as
+    the value of an option that takes one.
+    """
+    value_options = {
+        "--dir", "--modpack", "--mods-dir", "--mod-check-bin",
+        "--mc-version", "--port", "--lang", "--modrinth-api-base",
+    }
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            break
+        if token == "mods":
+            return argv[:index], argv[index + 1:]
+        index += 2 if token in value_options else 1
+    return argv, None
+
+
+def mods_subcommand_name(argv):
+    """First bare megu_mods subcommand token, skipping --api-base's value."""
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in ("search", "add", "resolve-deps"):
+            return token
+        index += 2 if token == "--api-base" else 1
+    return None
+
+
+def mods_passthrough(head, mods_argv):
+    """Delegate `megu_start.py mods ...` to tools/megu_mods.py verbatim.
+
+    Only --dir and --modrinth-api-base are meaningful on the megu_start side;
+    every token after `mods` is forwarded untouched and the child's exit
+    code is returned as-is.
+    """
+    server_dir = None
+    api_base = None
+    index = 0
+    while index < len(head):
+        token = head[index]
+        if token in ("--dir", "--modrinth-api-base"):
+            index += 1
+            if index >= len(head):
+                sys.stderr.write(f"megu_start: {token} requires a value\n")
+                return 2
+            if token == "--dir":
+                server_dir = head[index]
+            else:
+                api_base = head[index]
+        elif token.startswith("--dir="):
+            server_dir = token.split("=", 1)[1]
+        elif token.startswith("--modrinth-api-base="):
+            api_base = token.split("=", 1)[1]
+        else:
+            sys.stderr.write(
+                f"megu_start: unrecognized argument '{token}' before 'mods'\n"
+                "usage: megu_start.py [--dir <dir>] [--modrinth-api-base <url>] "
+                "mods <search|add|resolve-deps> [...]\n")
+            return 2
+        index += 1
+    forwarded = list(mods_argv)
+    if api_base is not None:
+        forwarded = ["--api-base", api_base] + forwarded
+    if (mods_subcommand_name(forwarded) in ("add", "resolve-deps")
+            and server_dir is not None
+            and not any(a == "--mods-dir" or a.startswith("--mods-dir=")
+                        for a in forwarded)):
+        forwarded += ["--mods-dir", str(Path(server_dir) / "mods")]
+    try:
+        return subprocess.run([sys.executable, str(MODS_TOOL), *forwarded],
+                              shell=False, check=False).returncode
+    except OSError as error:
+        sys.stderr.write(f"megu_start: could not run {MODS_TOOL}: {error}\n")
+        return 1
+
+
+# ---------------------------------------------------------------------------
+# Pre-boot missing-dependency check (local scan + explicit-consent fix)
+# ---------------------------------------------------------------------------
+
+def load_megu_mods():
+    """Import tools/megu_mods.py lazily for its local JAR dependency scanner."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("megu_mods", MODS_TOOL)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def safe_console_text(value, limit=96):
+    """Render untrusted manifest text on a terminal, or None to omit it."""
+    if not isinstance(value, str):
+        return None
+    trimmed = value[:limit]
+    if not trimmed.isascii() or any(ord(c) < 0x20 or ord(c) == 0x7F
+                                    for c in trimmed):
+        return None
+    return trimmed
+
+
+def missing_deps_report(missing, mods_dir, lang):
+    """EN/JA summary naming each missing mod id, its requiring mod, and fix."""
+    rows = []
+    for mod_id, dep_id, rng in missing:
+        dep = safe_console_text(dep_id) or "(unprintable id)"
+        owner = safe_console_text(mod_id) or "(unprintable id)"
+        rng_text = safe_console_text(rng)
+        if lang == "ja":
+            line = f"  '{dep}'（'{owner}' が必須としています）"
+            if rng_text:
+                line += f" 指定範囲 {rng_text}"
+        else:
+            line = f"  '{dep}' required by '{owner}'"
+            if rng_text:
+                line += f" (declared {rng_text})"
+        rows.append(line)
+    command = ("python3 tools/megu_start.py mods resolve-deps "
+               f"--mods-dir {mods_dir} --yes")
+    if lang == "ja":
+        header = "Megu: 必須の依存 Mod が不足しています:"
+        tail = f"修復するには次を実行してください: {command}"
+    else:
+        header = "Megu: missing required mod dependencies:"
+        tail = f"To fix them run: {command}"
+    return "\n".join([header, *rows, tail])
+
+
+def run_resolve_deps(args, mods_dir, plan):
+    """Invoke tools/megu_mods.py resolve-deps; consent was already given."""
+    command = [sys.executable, str(MODS_TOOL)]
+    if args.modrinth_api_base:
+        command += ["--api-base", args.modrinth_api_base]
+    command += ["resolve-deps", "--mods-dir", str(mods_dir),
+                "--mc-version", args.mc_version, "--yes"]
+    try:
+        if args.json:
+            command.append("--json")
+            result = subprocess.run(command, shell=False, capture_output=True,
+                                    text=True, encoding="utf-8",
+                                    errors="replace", timeout=600, check=False)
+            if result.stderr:
+                sys.stderr.write(result.stderr)
+            try:
+                plan["mod_deps_fix"] = json.loads(result.stdout)
+            except (ValueError, TypeError):
+                plan["mod_deps_fix"] = {"exit_code": result.returncode}
+            return result.returncode
+        return subprocess.run(command, shell=False, timeout=600,
+                              check=False).returncode
+    except (OSError, subprocess.TimeoutExpired):
+        return 1
+
+
+def check_missing_dependencies(args, directory, plan, lang):
+    """Scan mods/ for missing required deps; optionally fix via Modrinth.
+
+    Returns an exit status when the launch must stop, else None. Purely
+    local JAR scanning — zero network traffic unless the operator gives
+    explicit consent through --fix-deps-yes or the interactive prompt.
+    """
+    mods_dir = (checked_path(args.mods_dir, "mods directory")
+                if args.mods_dir else directory / "mods")
+    try:
+        has_jars = mods_dir.is_dir() and any(
+            p.is_file() and p.suffix.lower() == ".jar"
+            for p in mods_dir.iterdir())
+    except OSError:
+        return None
+    if not has_jars:
+        return None
+    megu_mods = load_megu_mods()
+    _provided, missing, _rejected, _skipped = megu_mods.scan_mods_dir(mods_dir)
+    if not missing:
+        return None
+    plan["missing_mod_deps"] = [
+        {"required_by": mod_id, "missing_mod_id": dep_id,
+         "version_range": rng if isinstance(rng, str) else None}
+        for mod_id, dep_id, rng in missing]
+    report = missing_deps_report(missing, mods_dir, lang)
+    consent = bool(args.fix_deps_yes) and not args.dry_run
+    can_prompt = (not consent and not args.dry_run and not args.json
+                  and sys.stdin.isatty())
+    if can_prompt:
+        print(report, flush=True)
+        prompt = ("不足している依存 Mod を Modrinth からダウンロードしますか？"
+                  if lang == "ja" else
+                  "Download missing dependencies from Modrinth?")
+        try:
+            answer = input(f"{prompt} [y/N] ")
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        consent = answer.strip().lower() in ("y", "yes")
+    if not consent:
+        plan["action_items"].append(report)
+        if args.dry_run:
+            plan["action_items"].append(
+                "Megu: --dry-run のため依存 Mod はダウンロードされませんでした。"
+                if lang == "ja" else
+                "Megu: --dry-run — dependencies were not downloaded.")
+        else:
+            plan["action_items"].append(
+                "Megu: 非対話端末では自動ダウンロードしません。上記コマンドを実行するか、"
+                "--fix-deps-yes を付けて再実行してください。"
+                if lang == "ja" else
+                "Megu: not downloading on a non-interactive terminal — run "
+                "the command above or re-run with --fix-deps-yes.")
+        return 2
+    if not args.json and not can_prompt:
+        print(report, flush=True)
+    if run_resolve_deps(args, mods_dir, plan):
+        plan["action_items"].append(
+            "Megu: 依存 Mod の自動修復に失敗しました。" if lang == "ja" else
+            "Megu: automatic dependency fix failed.")
+        return 1
+    _provided, still_missing, _rejected, _skipped = \
+        megu_mods.scan_mods_dir(mods_dir)
+    if still_missing:
+        plan["action_items"].append(
+            missing_deps_report(still_missing, mods_dir, lang))
+        return 2
+    return None
+
+
 def runtime_settings(directory, properties, requested_port):
     settings = {}
     config_file = directory / "server.toml"
@@ -427,7 +666,14 @@ def output(plan, json_mode, lang, code):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Start mc-spine with a guided, safe setup")
+    raw = sys.argv[1:] if argv is None else list(argv)
+    head, mods_argv = split_mods_passthrough(raw)
+    if mods_argv is not None:
+        return mods_passthrough(head, mods_argv)
+    parser = argparse.ArgumentParser(
+        description="Start mc-spine with a guided, safe setup",
+        epilog="also: megu_start.py [--dir <dir>] mods "
+               "<search|add|resolve-deps> ... — delegate to tools/megu_mods.py")
     parser.add_argument("--dir", required=True, help="server directory")
     parser.add_argument("--modpack", help="Modrinth or CurseForge modpack for pre-flight checks")
     parser.add_argument("--mods-dir", help="existing installed mods directory")
@@ -435,15 +681,29 @@ def main(argv=None):
     parser.add_argument("--mc-version", choices=("1.21.1", "26.3"), default="1.21.1")
     parser.add_argument("--port", type=int)
     parser.add_argument("--accept-eula", action="store_true")
+    parser.add_argument("--fix-deps", action="store_true",
+                        help="offer to fetch missing required mod dependencies "
+                             "from Modrinth before starting")
+    parser.add_argument("--fix-deps-yes", action="store_true",
+                        help="non-interactive consent to download missing mod "
+                             "dependencies (CI/scripts)")
+    parser.add_argument("--modrinth-api-base", default=None,
+                        help=argparse.SUPPRESS)  # loopback test override only
+    parser.add_argument("--tui", action="store_true",
+                        help="launch through tools/megu_tui.py when it exists "
+                             "and stdout is a TTY")
+    parser.add_argument("--plain", action="store_true",
+                        help="force plain output; disables --tui")
     parser.add_argument("--lang", choices=("auto", "en", "ja"), default="auto")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--json", action="store_true")
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw)
     lang = language_for(args.lang)
     plan = {"schema": SCHEMA, "ready": False, "bind_address": "127.0.0.1",
             "port": args.port or DEFAULT_PORT, "mc_version": args.mc_version,
             "skipped_perf_mods": [], "native_mods": [], "client_only_mods": [],
-            "needs_inspection_mods": [], "action_items": [], "launch_argv": launch_command(),
+            "needs_inspection_mods": [], "missing_mod_deps": [],
+            "action_items": [], "launch_argv": launch_command(),
             "server_properties": {}, "dry_run": bool(args.dry_run)}
     try:
         if args.modpack and args.mods_dir:
@@ -465,6 +725,9 @@ def main(argv=None):
         status = mod_preflight(args, plan, lang)
         if status:
             return output(plan, args.json, lang, status)
+        dep_status = check_missing_dependencies(args, directory, plan, lang)
+        if dep_status is not None:
+            return output(plan, args.json, lang, dep_status)
         if not data_ready(args.mc_version):
             plan["action_items"].append("\n".join(MESSAGES["data"][lang]))
             plan["action_items"].append(data_command(args.accept_eula))
@@ -491,10 +754,14 @@ def main(argv=None):
         if not args.json:
             notice = "サーバーを起動します。" if lang == "ja" else "Starting server."
             print(f"Megu: {notice}", flush=True)
+        launch = plan["launch_argv"]
+        if (args.tui and not args.plain and not os.environ.get("NO_COLOR")
+                and sys.stdout.isatty() and TUI_TOOL.is_file()):
+            launch = [sys.executable, str(TUI_TOOL), "--"] + launch
         try:
             # Drain error output as the server runs, retaining only a bounded
             # suffix for diagnosis. Raw logs may contain credentials.
-            with subprocess.Popen(plan["launch_argv"], shell=False, cwd=directory,
+            with subprocess.Popen(launch, shell=False, cwd=directory,
                                   env=env, stdin=None, stdout=subprocess.DEVNULL,
                                   stderr=subprocess.PIPE) as process:
                 tail = b""

@@ -10,9 +10,11 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 import zipfile
+from http.server import ThreadingHTTPServer
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +22,12 @@ SCRIPT = ROOT / "tools" / "megu_start.py"
 SPEC = importlib.util.spec_from_file_location("megu_start", SCRIPT)
 megu_start = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(megu_start)
+
+# Reuse the loopback Modrinth mock + fixture helpers from megu_mods_test.py.
+MODS_SPEC = importlib.util.spec_from_file_location(
+    "megu_mods_test", ROOT / "tests" / "megu_mods_test.py")
+megu_mods_test = importlib.util.module_from_spec(MODS_SPEC)
+MODS_SPEC.loader.exec_module(megu_mods_test)
 
 
 def pack_index():
@@ -426,6 +434,225 @@ class MeguStartTest(unittest.TestCase):
         message = megu_start.diagnose_error("sensitive-content in stack trace", "en")
         self.assertEqual(len(message.splitlines()), 2)
         self.assertNotIn("sensitive-content", message)
+
+
+class MeguStartModsTest(unittest.TestCase):
+    """`mods` passthrough and the pre-boot missing-dependency check."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="megu-start-mods-")
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.server_dir = self.base / "server"
+        self.mods_dir = self.server_dir / "mods"
+        self.api = ThreadingHTTPServer(
+            ("127.0.0.1", 0), megu_mods_test.MockModrinthHandler)
+        self.api.pages = {}
+        self.api.requests = []
+        self.thread = threading.Thread(target=self.api.serve_forever,
+                                       daemon=True)
+        self.thread.start()
+        self.addCleanup(self.api.shutdown)
+        self.addCleanup(self.api.server_close)
+        self.loopback = f"http://127.0.0.1:{self.api.server_address[1]}"
+        self.api_base = f"{self.loopback}/v2"
+        self.env_patch = mock.patch.dict(os.environ, {
+            "MC_SPINE_PORT": "", "MC_SPINE_BIND_ADDR": "",
+            "MC_SPINE_VERSION_DIR": "",
+        })
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
+
+    def cli(self, *options, env=None):
+        environment = os.environ.copy()
+        if env:
+            environment.update(env)
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), *options], shell=False,
+            capture_output=True, text=True, env=environment,
+            stdin=subprocess.DEVNULL, timeout=30, check=False)
+
+    def route_json(self, path, doc):
+        self.api.pages[path] = (200, json.dumps(doc).encode("utf-8"))
+
+    def fabric_jar_bytes(self, mod_id, depends):
+        buffer = io.BytesIO()
+        manifest = {"schemaVersion": 1, "id": mod_id, "version": "1.0.0",
+                    "depends": depends}
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("fabric.mod.json", json.dumps(manifest))
+        return buffer.getvalue()
+
+    def route_jar(self, name, data):
+        entry = megu_mods_test.make_file_entry(self.loopback, name, data)
+        self.route_json("/v2/project/mylib/version", [
+            megu_mods_test.make_version("MYLIBID", "2.0", [entry])])
+        self.api.pages[f"/files/{name}"] = (200, data)
+
+    def write_fabric_jar(self, name, mod_id, depends):
+        self.mods_dir.mkdir(parents=True, exist_ok=True)
+        (self.mods_dir / name).write_bytes(
+            self.fabric_jar_bytes(mod_id, depends))
+
+    def launch_guard(self, launched):
+        """Popen wrapper: fakes the server launch, delegates everything else."""
+        real_popen = subprocess.Popen
+
+        def fake_popen(argv, *pargs, **kwargs):
+            if kwargs.get("cwd") is not None:
+                proc = mock.MagicMock()
+                proc.__enter__.return_value = proc
+                proc.stderr = io.BytesIO(b"")
+                proc.wait.return_value = 0
+                launched.append(list(argv))
+                return proc
+            return real_popen(argv, *pargs, **kwargs)
+
+        return mock.patch.object(megu_start.subprocess, "Popen",
+                                 side_effect=fake_popen)
+
+    def test_mods_subcommand_split_ignores_option_values(self):
+        self.assertEqual(megu_start.split_mods_passthrough(
+            ["--dir", "mods", "--accept-eula"]),
+            (["--dir", "mods", "--accept-eula"], None))
+        self.assertEqual(megu_start.split_mods_passthrough(
+            ["mods", "search", "sodium"]), ([], ["search", "sodium"]))
+        self.assertEqual(megu_start.split_mods_passthrough(
+            ["--dir", "/srv", "mods", "add", "mymod", "--yes"]),
+            (["--dir", "/srv"], ["add", "mymod", "--yes"]))
+
+    def test_mods_search_passthrough_hits_loopback(self):
+        self.route_json("/v2/search", {"hits": [
+            {"slug": "mymod", "title": "My Mod", "project_id": "MYMODID",
+             "downloads": 42, "versions": ["1.21.1"],
+             "categories": ["neoforge"]}]})
+        process = self.cli("--dir", str(self.server_dir), "mods",
+                           "--api-base", self.api_base, "search", "mymod")
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertIn("mymod", process.stdout)
+        self.assertTrue(any(r.startswith("/v2/search")
+                            for r in self.api.requests))
+
+    def test_mods_resolve_deps_defaults_mods_dir_and_installs(self):
+        jar = b"PK-mylib-" + b"\x07" * 128
+        self.route_jar("mylib-2.0.jar", jar)
+        self.write_fabric_jar("mymod.jar", "mymod", {"mylib": "*"})
+        process = self.cli("--dir", str(self.server_dir),
+                           "--modrinth-api-base", self.api_base,
+                           "mods", "resolve-deps", "--yes")
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual((self.mods_dir / "mylib-2.0.jar").read_bytes(), jar)
+        self.assertIn("/files/mylib-2.0.jar", self.api.requests)
+
+    def test_mods_add_passthrough_superseded_never_downloads(self):
+        self.write_fabric_jar("mymod.jar", "mymod", {})
+        process = self.cli("--dir", str(self.server_dir), "mods",
+                           "add", "sodium", "--yes")
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertIn("built-in optimizations", process.stdout)
+        self.assertEqual(self.api.requests, [])
+
+    def test_mods_passthrough_preserves_failure_exit_code(self):
+        process = self.cli("mods", "add", "BAD SLUG!",
+                           "--mods-dir", str(self.mods_dir), "--yes")
+        self.assertEqual(process.returncode, 1)
+        self.assertIn("not a valid", process.stderr)
+
+    def test_mods_passthrough_rejects_unknown_head_flag(self):
+        process = self.cli("--accept-eula", "mods", "search", "x")
+        self.assertEqual(process.returncode, 2)
+        self.assertIn("unrecognized argument", process.stderr)
+
+    def test_missing_dep_non_tty_refuses_with_fix_command(self):
+        self.write_fabric_jar("mymod.jar", "mymod", {"mylib": "*"})
+        process = self.cli("--dir", str(self.server_dir), "--accept-eula",
+                           "--dry-run", "--lang", "en")
+        self.assertEqual(process.returncode, 2, process.stderr)
+        self.assertIn("'mylib'", process.stdout)
+        self.assertIn("'mymod'", process.stdout)
+        self.assertIn("python3 tools/megu_start.py mods resolve-deps "
+                      f"--mods-dir {self.mods_dir} --yes", process.stdout)
+        self.assertEqual(self.api.requests, [])
+        self.assertEqual([p.name for p in self.mods_dir.iterdir()],
+                         ["mymod.jar"])
+
+    def test_missing_dep_json_reports_exact_ids(self):
+        self.write_fabric_jar("mymod.jar", "mymod", {"mylib": "[2.0,)"})
+        process = self.cli("--dir", str(self.server_dir), "--accept-eula",
+                           "--dry-run", "--json")
+        self.assertEqual(process.returncode, 2, process.stderr)
+        report = json.loads(process.stdout)
+        self.assertFalse(report["ready"])
+        self.assertEqual(report["missing_mod_deps"], [{
+            "required_by": "mymod", "missing_mod_id": "mylib",
+            "version_range": "[2.0,)"}])
+        self.assertEqual(self.api.requests, [])
+
+    def test_fix_deps_yes_installs_missing_jar_before_launch(self):
+        self.write_fabric_jar("mymod.jar", "mymod", {"mylib": "*"})
+        jar = self.fabric_jar_bytes("mylib", {"minecraft": "*"})
+        self.route_jar("mylib-2.0.jar", jar)
+        launched = []
+        with mock.patch.object(megu_start, "data_ready", return_value=True), \
+                mock.patch.object(megu_start, "init_binary", return_value=None), \
+                self.launch_guard(launched), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            status = megu_start.main([
+                "--dir", str(self.server_dir), "--accept-eula",
+                "--fix-deps", "--fix-deps-yes",
+                "--modrinth-api-base", self.api_base, "--json"])
+        self.assertEqual(status, 0, output.getvalue())
+        report = json.loads(output.getvalue())
+        self.assertEqual(report["missing_mod_deps"][0]["missing_mod_id"],
+                         "mylib")
+        self.assertEqual(report["mod_deps_fix"]["status"], "installed")
+        self.assertEqual((self.mods_dir / "mylib-2.0.jar").read_bytes(), jar)
+        self.assertIn("/files/mylib-2.0.jar", self.api.requests)
+        self.assertEqual(len(launched), 1)
+
+    def test_fix_deps_non_tty_without_yes_never_downloads(self):
+        self.write_fabric_jar("mymod.jar", "mymod", {"mylib": "*"})
+        launched = []
+        fake_stdin = mock.Mock()
+        fake_stdin.isatty.return_value = False
+        with mock.patch.object(megu_start, "data_ready", return_value=True), \
+                mock.patch.object(megu_start, "init_binary", return_value=None), \
+                self.launch_guard(launched), \
+                mock.patch.object(sys, "stdin", fake_stdin), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            status = megu_start.main(["--dir", str(self.server_dir),
+                                      "--accept-eula", "--fix-deps"])
+        self.assertEqual(status, 2, output.getvalue())
+        self.assertIn("python3 tools/megu_start.py mods resolve-deps",
+                      output.getvalue())
+        self.assertEqual(launched, [])
+        self.assertEqual(self.api.requests, [])
+        self.assertEqual([p.name for p in self.mods_dir.iterdir()],
+                         ["mymod.jar"])
+
+    def test_clean_mods_dir_boot_check_uses_zero_network(self):
+        self.write_fabric_jar("mymod.jar", "mymod",
+                              {"minecraft": "*", "neoforge": "*"})
+        with mock.patch("socket.create_connection",
+                        side_effect=AssertionError("network use")):
+            with mock.patch.object(megu_start, "data_ready", return_value=True):
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    status = megu_start.main([
+                        "--dir", str(self.server_dir), "--accept-eula",
+                        "--dry-run", "--json"])
+        self.assertEqual(status, 0, output.getvalue())
+        report = json.loads(output.getvalue())
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["missing_mod_deps"], [])
+
+    def test_tui_and_plain_flags_fall_back_without_ansi(self):
+        for flags in (("--plain",), ("--tui",), ("--tui", "--plain")):
+            with self.subTest(flags=flags):
+                process = self.cli("--dir", str(self.server_dir),
+                                   "--accept-eula", "--dry-run", *flags)
+                self.assertEqual(process.returncode, 0, process.stderr)
+                self.assertNotIn("\x1b", process.stdout)
+                self.assertNotIn("\x1b", process.stderr)
 
 
 if __name__ == "__main__":
