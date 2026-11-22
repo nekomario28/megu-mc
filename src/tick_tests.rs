@@ -1926,6 +1926,7 @@ fn furnace(input_count: u8) -> Furnace {
 #[test]
 fn game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged() {
     let _world_guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
     let old_furnaces = std::mem::take(&mut *furnaces().lock().unwrap_or_else(|e| e.into_inner()));
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let (old_hot, old_warm) = test_region();
@@ -2112,6 +2113,7 @@ fn region_membership_matches_hot_plus_skirt_across_input_changes() {
 #[test]
 fn cadence_owner_keeps_world_clock_at_vanilla_rate() {
     let _world_guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
     // 20 game ticks per real second is the invariant the world clock must keep.
     // A cadence change is only coherent if this product stays 20.
     assert_eq!(TICKS_PER_SECOND * GAME_TICKS_PER_TICK, 20);
@@ -2138,6 +2140,7 @@ fn cadence_owner_keeps_world_clock_at_vanilla_rate() {
 #[test]
 fn wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count() {
     let _world_guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
     let (client, mut receiver) = client_pair();
     let old_clients = std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner()));
     let old_tick = TICK.swap(0, Ordering::Relaxed);
@@ -2284,6 +2287,7 @@ fn per_tick_rates_keep_the_same_chance_per_real_second() {
 #[test]
 fn tnt_fuse_counts_down_in_server_ticks_and_pauses_when_cold() {
     let _world_guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
     let old_primed = std::mem::take(&mut *primed().lock().unwrap_or_else(|e| e.into_inner()));
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let old_tick = TICK.swap(1, Ordering::Relaxed);
@@ -2356,6 +2360,7 @@ fn tnt_fuse_counts_down_in_server_ticks_and_pauses_when_cold() {
 #[test]
 fn entity_life_and_pickup_delay_count_server_ticks_and_freeze_when_cold() {
     let _world_guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
     let old_drops = std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner()));
     let old_xps = std::mem::take(&mut *xps().lock().unwrap_or_else(|e| e.into_inner()));
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));

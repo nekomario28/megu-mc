@@ -889,10 +889,11 @@ fn rs_wire_connection(world: &impl RedstoneWorld, pos: RsPos, dir: RsDir) -> RsW
         };
     }
 
-    // Vanilla `connectsTo`: only a repeater is directional; every other
-    // signal source — observer included — connects dust on all four sides.
+    // Vanilla `RedStoneWireBlock.shouldConnectTo`: repeaters connect along
+    // their axis and observers connect only on their output (back) face.
     let connects = match block {
         RsBlock::Repeater(repeater) => repeater.facing == dir || repeater.facing == dir.opposite(),
+        RsBlock::Observer { facing, .. } => facing == dir,
         _ => block.is_signal_source(),
     };
     if connects
@@ -5232,9 +5233,9 @@ mod p6c_redstone_parity_tests {
 
     #[test]
     fn bedrock_dust_connects_to_observer_on_every_side() {
-        // Vanilla `RedStoneWireBlock.connectsTo` is directional only for
-        // repeaters: an observer is a signal source, so dust connects to it
-        // on all four horizontal sides — the watched face included.
+        // Vanilla Java 1.21.1 `RedStoneWireBlock.shouldConnectTo`: an observer
+        // connects dust only when `dir == observer.facing` (dust behind the
+        // observer's output face), never on its watched front or side faces.
         let mut grid = RedstoneSimGrid::default();
         grid.set_block(
             RsPos(0, 0, 0),
@@ -5243,16 +5244,16 @@ mod p6c_redstone_parity_tests {
                 powered: false,
             },
         );
-        for (pos, dir) in [
-            (RsPos(1, 0, 0), RsDir::West),
-            (RsPos(-1, 0, 0), RsDir::East),
-            (RsPos(0, 0, 1), RsDir::North),
-            (RsPos(0, 0, -1), RsDir::South),
+        for (pos, dir, expected) in [
+            (RsPos(1, 0, 0), RsDir::West, RsWireConnection::None),
+            (RsPos(-1, 0, 0), RsDir::East, RsWireConnection::Side),
+            (RsPos(0, 0, 1), RsDir::North, RsWireConnection::None),
+            (RsPos(0, 0, -1), RsDir::South, RsWireConnection::None),
         ] {
             assert_eq!(
                 rs_wire_connection(&grid, pos, dir),
-                RsWireConnection::Side,
-                "dust at {pos:?} must connect to the observer"
+                expected,
+                "dust at {pos:?} observer connection mismatch"
             );
         }
         // The observer still emits only out its back (opposite `facing`).
