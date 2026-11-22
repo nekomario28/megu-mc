@@ -20,6 +20,7 @@ pub mod live_session;
 mod mesh_pool;
 pub mod renderer;
 pub mod subworld_render;
+pub mod vanilla_jar;
 pub mod window;
 
 use std::path::PathBuf;
@@ -39,16 +40,110 @@ pub const CLIENT_GPU_NAME: &str = "mc-spine-client-gpu";
 // CLI
 // ---------------------------------------------------------------------------
 
+/// A credential value accepted from the launcher (`--accessToken`,
+/// `--xuid`, `MC_SPINE_LAUNCHER_ACCESS_TOKEN`) that must never appear in
+/// diagnostics: `Debug` prints `<redacted>` and no `Display` exists.
+/// `reveal` is deliberately the *only* way to read the value back so call
+/// sites that format it stand out in review.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct SecretString(String);
+
+impl SecretString {
+    /// Wrap a raw secret.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Expose the inner secret for wire use only; never format it.
+    pub fn reveal(&self) -> &str {
+        &self.0
+    }
+
+    /// `true` when a real (non-empty) secret is present.
+    pub fn is_present(&self) -> bool {
+        !self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 /// Everything `mc-spine-client-gpu` accepts on the command line.
+///
+/// The Official/Prism/Modrinth launchers invoke the game with a fixed
+/// argument surface (`--username`, `--version`, `--gameDir`,
+/// `--quickPlayMultiplayer`, ...). Every one of those flags parses
+/// cleanly here; mc-spine's own flags (`--connect`, `--mc-version`,
+/// `--shader-pack`, `--gpu-backend`, `--offline-demo`, `--headless-probe`,
+/// `--vsync`, `--relay`, `--server-bin`) keep their existing meanings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GpuCliConfig {
-    /// `--connect <host[:port]>` — the server the window session targets.
+    /// `--connect <host[:port]>` or `--quickPlayMultiplayer <host[:port]>` —
+    /// the server the window session targets.
     /// Connect to a live offline-authenticated Protocol 767/777 server.
     pub connect: Option<(String, u16)>,
     /// Offline-mode player name, 1–16 ASCII letters/digits/underscores.
     pub username: String,
     /// Minecraft protocol, 767 (1.21.1) or 777 (26.3).
     pub mc_version: String,
+    /// Launcher `--version <id>` (`1.21.1`, `mc-spine-1.21.1`): the
+    /// `<gameDir>/versions/<id>/<id>.jar` discovery key. When the id also
+    /// parses as a protocol (`1.21.1`/`767`/`26.3`/`777`), `mc_version`
+    /// follows it.
+    pub version_id: Option<String>,
+    /// `--uuid <uuid>` — the account id the launcher reports (kept for
+    /// parity; offline sessions still use `offline_uuid(username)`).
+    pub uuid: Option<String>,
+    /// `--accessToken <token>` or `MC_SPINE_LAUNCHER_ACCESS_TOKEN`; always
+    /// [`SecretString`]-wrapped so `Debug` of this config can never leak it.
+    pub access_token: Option<SecretString>,
+    /// `--clientToken`/`--authToken`/`--token` — Mojang session id.
+    pub client_token: Option<SecretString>,
+    /// `--xuid <x>` — Xbox user id (token-class data, redacted).
+    pub xuid: Option<SecretString>,
+    /// `--clientId <id>`.
+    pub client_id: Option<String>,
+    /// `--userType <t>` (`msa`, `mojang`, `legacy`).
+    pub user_type: Option<String>,
+    /// `--versionType <t>` (`release`, `snapshot`, custom labels).
+    pub version_type: Option<String>,
+    /// `--userProperties <json>` — accepted verbatim; not interpreted.
+    pub user_properties: Option<String>,
+    /// `--gameDir <dir>` — the user's `.minecraft` root: versioned client
+    /// JARs, `resourcepacks/`, `saves/` and `options.txt` all resolve here.
+    pub game_dir: Option<PathBuf>,
+    /// `--assetsDir <dir>` — the asset store for
+    /// `indexes/<assetIndex>.json` + `objects/` sound resolution.
+    pub assets_dir: Option<PathBuf>,
+    /// `--assetIndex <id>` — e.g. `17` for 1.21.1.
+    pub asset_index: Option<String>,
+    /// `--resourcePackDir <dir>` — the launcher's resourcepacks folder
+    /// (defaults to `<gameDir>/resourcepacks` when absent).
+    pub resource_pack_dir: Option<PathBuf>,
+    /// `--quickPlaySingleplayer <world>` — validated by
+    /// `mc_spine_client::integrated::validate_world_name` at launch time.
+    pub quick_play_singleplayer: Option<String>,
+    /// `--quickPlayPath <path>` — accepted for compatibility; no consumer.
+    pub quick_play_path: Option<String>,
+    /// `--quickPlayRealms <id>` — accepted; realms join is unimplemented
+    /// and surfaces a status message rather than failing silently.
+    pub quick_play_realms: Option<String>,
+    /// `--server-bin <path>` — explicit `mc-spine` binary for the
+    /// integrated singleplayer server.
+    pub server_bin: Option<PathBuf>,
+    /// `--relay <host:port>` — friend-invite relay (`JoinWithCode`
+    /// dispatches a [`mc_spine_client::friend_client::FriendGuestBridge`]
+    /// to it).
+    pub relay: Option<String>,
+    /// `--width <px>` — initial window width.
+    pub width: Option<u32>,
+    /// `--height <px>` — initial window height.
+    pub height: Option<u32>,
+    /// `--fullscreen` — start fullscreen instead of windowed.
+    pub fullscreen: bool,
     /// `--shader-pack <path>` — directory or `.zip` holding a
     /// `megu-shader.toml` Megu native WGSL pack (or an OptiFine/Iris pack,
     /// which fails closed to built-in rendering with a notice).
@@ -66,19 +161,10 @@ pub struct GpuCliConfig {
     pub vsync: bool,
     /// `--help`.
     pub show_help: bool,
-    /// `--version`.
+    /// Bare `--version` at end-of-args or `-V` — print the binary version.
+    /// (`--version <id>` with a real value is the launcher version id and
+    /// lands in [`Self::version_id`] instead.)
     pub show_version: bool,
-}
-
-impl GpuCliConfig {
-    fn new() -> Self {
-        Self {
-            vsync: true,
-            username: "MeguGpu".to_owned(),
-            mc_version: "767".to_owned(),
-            ..Self::default()
-        }
-    }
 }
 
 impl Default for GpuCliConfig {
@@ -87,6 +173,27 @@ impl Default for GpuCliConfig {
             connect: None,
             username: "MeguGpu".into(),
             mc_version: "767".into(),
+            version_id: None,
+            uuid: None,
+            access_token: None,
+            client_token: None,
+            xuid: None,
+            client_id: None,
+            user_type: None,
+            version_type: None,
+            user_properties: None,
+            game_dir: None,
+            assets_dir: None,
+            asset_index: None,
+            resource_pack_dir: None,
+            quick_play_singleplayer: None,
+            quick_play_path: None,
+            quick_play_realms: None,
+            server_bin: None,
+            relay: None,
+            width: None,
+            height: None,
+            fullscreen: false,
             shader_pack: None,
             gpu_backend: RenderBackendPreference::default(),
             offline_demo: false,
@@ -98,10 +205,22 @@ impl Default for GpuCliConfig {
     }
 }
 
+/// Record the launcher's `--version <id>`: `version_id` keeps the raw id
+/// for JAR discovery, and `mc_version` follows when the id (or the part
+/// after a `mc-spine-` prefix) parses as a supported protocol.
+fn apply_launcher_version_id(cfg: &mut GpuCliConfig, id: &str) {
+    cfg.version_id = Some(id.to_owned());
+    let stripped = id.strip_prefix("mc-spine-").unwrap_or(id);
+    if mc_spine_client::cli::parse_mc_version(stripped).is_ok() {
+        cfg.mc_version = stripped.to_owned();
+    }
+}
+
 /// Parse the GPU-client argument vector (`argv[1..]`). Unknown flags and
-/// missing values fail closed with a human-readable error.
+/// missing values fail closed with a human-readable error. Secret-flag
+/// values are never echoed back inside the error text.
 pub fn parse_gpu_args<S: AsRef<str>>(args: &[S]) -> Result<GpuCliConfig, String> {
-    let mut cfg = GpuCliConfig::new();
+    let mut cfg = GpuCliConfig::default();
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_ref();
@@ -124,12 +243,41 @@ pub fn parse_gpu_args<S: AsRef<str>>(args: &[S]) -> Result<GpuCliConfig, String>
         };
         match flag {
             "--help" | "-h" => cfg.show_help = true,
-            "--version" | "-V" => cfg.show_version = true,
+            "-V" => cfg.show_version = true,
+            // Launchers pass `--version <id>`; the bare flag (end of args or
+            // before another flag) is this binary's own version request.
+            "--version" => match value.take() {
+                Some(v) => apply_launcher_version_id(&mut cfg, &v),
+                None => {
+                    let next_is_value = args
+                        .get(i + 1)
+                        .is_some_and(|s| !s.as_ref().starts_with('-'));
+                    if next_is_value {
+                        i += 1;
+                        let v = args[i].as_ref();
+                        apply_launcher_version_id(&mut cfg, v);
+                    } else {
+                        cfg.show_version = true;
+                    }
+                }
+            },
             "--connect" => {
                 let raw = take_value(&mut i)?;
                 cfg.connect =
                     Some(parse_host_port(&raw, 25565).map_err(|e| format!("--connect: {e}"))?);
             }
+            "--quickPlayMultiplayer" => {
+                let raw = take_value(&mut i)?;
+                cfg.connect = Some(
+                    parse_host_port(&raw, 25565)
+                        .map_err(|e| format!("--quickPlayMultiplayer: {e}"))?,
+                );
+            }
+            "--quickPlaySingleplayer" => {
+                cfg.quick_play_singleplayer = Some(take_value(&mut i)?);
+            }
+            "--quickPlayPath" => cfg.quick_play_path = Some(take_value(&mut i)?),
+            "--quickPlayRealms" => cfg.quick_play_realms = Some(take_value(&mut i)?),
             "--username" => {
                 let name = take_value(&mut i)?;
                 if !(1..=16).contains(&name.len())
@@ -140,6 +288,49 @@ pub fn parse_gpu_args<S: AsRef<str>>(args: &[S]) -> Result<GpuCliConfig, String>
                     );
                 }
                 cfg.username = name;
+            }
+            "--uuid" => cfg.uuid = Some(take_value(&mut i)?),
+            "--accessToken" => cfg.access_token = Some(SecretString::new(take_value(&mut i)?)),
+            "--clientToken" | "--authToken" | "--token" => {
+                cfg.client_token = Some(SecretString::new(take_value(&mut i)?));
+            }
+            "--xuid" => cfg.xuid = Some(SecretString::new(take_value(&mut i)?)),
+            "--clientId" => cfg.client_id = Some(take_value(&mut i)?),
+            "--userType" => cfg.user_type = Some(take_value(&mut i)?),
+            "--versionType" => cfg.version_type = Some(take_value(&mut i)?),
+            "--userProperties" => cfg.user_properties = Some(take_value(&mut i)?),
+            "--gameDir" => cfg.game_dir = Some(PathBuf::from(take_value(&mut i)?)),
+            "--assetsDir" => cfg.assets_dir = Some(PathBuf::from(take_value(&mut i)?)),
+            "--assetIndex" => cfg.asset_index = Some(take_value(&mut i)?),
+            "--resourcePackDir" => {
+                cfg.resource_pack_dir = Some(PathBuf::from(take_value(&mut i)?));
+            }
+            "--width" => {
+                let raw = take_value(&mut i)?;
+                cfg.width = Some(raw.parse::<u32>().map_err(|_| {
+                    format!("--width: expected a positive pixel count, got {raw:?}")
+                })?);
+            }
+            "--height" => {
+                let raw = take_value(&mut i)?;
+                cfg.height = Some(raw.parse::<u32>().map_err(|_| {
+                    format!("--height: expected a positive pixel count, got {raw:?}")
+                })?);
+            }
+            "--fullscreen" => cfg.fullscreen = true,
+            "--relay" => cfg.relay = Some(take_value(&mut i)?),
+            "--server-bin" => cfg.server_bin = Some(PathBuf::from(take_value(&mut i)?)),
+            "--seed" => {
+                // Accepted for integrated-server parity with the headless
+                // client; the windowed path currently spawns default seeds.
+                let _ = take_value(&mut i)?;
+            }
+            // Launcher/loader flags with no GPU-session meaning; accepting
+            // them keeps the real argv surface crash-free.
+            "--demo" | "--disableMultiplayer" | "--disableChat" => {}
+            "--proxyHost" | "--proxyPort" | "--proxyUser" | "--proxyPass" | "--natives"
+            | "--classpath" | "--windowTitle" | "--iconPath" => {
+                let _ = take_value(&mut i)?;
             }
             "--mc-version" => {
                 let version = take_value(&mut i)?;
@@ -167,6 +358,15 @@ pub fn parse_gpu_args<S: AsRef<str>>(args: &[S]) -> Result<GpuCliConfig, String>
         }
         i += 1;
     }
+    // Launcher-env credential fallback: the launcher can hand the token via
+    // the environment instead of argv; argv wins when both are present.
+    if cfg.access_token.is_none() {
+        if let Ok(token) = std::env::var("MC_SPINE_LAUNCHER_ACCESS_TOKEN") {
+            if !token.is_empty() {
+                cfg.access_token = Some(SecretString::new(token));
+            }
+        }
+    }
     Ok(cfg)
 }
 
@@ -187,8 +387,19 @@ pub fn gpu_help_text() -> String {
          \x20   --offline-demo              render the built-in demo section, no server\n\
          \x20   --headless-probe            list wgpu adapters + chosen pipeline, then exit\n\
          \x20   --vsync <on|off|mailbox>    presentation mode (default: on)\n\
+         \x20   --relay <host:port>         friend-invite relay for invite-code joins\n\
+         \x20   --server-bin <path>         explicit mc-spine binary for singleplayer\n\
          \x20   -h, --help                  print this help\n\
          \x20   -V, --version               print the version\n\
+         \n\
+         Standard launcher arguments are also accepted: --version <id>,\n\
+         \x20   --uuid, --accessToken, --clientToken/--authToken/--token, --xuid,\n\
+         \x20   --clientId, --userType, --versionType, --userProperties, --gameDir,\n\
+         \x20   --assetsDir, --assetIndex, --resourcePackDir, --quickPlayMultiplayer\n\
+         \x20   (same as --connect), --quickPlaySingleplayer <world>,\n\
+         \x20   --quickPlayPath, --quickPlayRealms, --width, --height, --fullscreen.\n\
+         \x20   Textures auto-load from <gameDir>/versions/<id>/<id>.jar and\n\
+         \x20   sounds from <assetsDir>/indexes/<assetIndex>.json when present.\n\
          \n\
          CONTROLS:\n\
          \x20   WASD move, Space/Shift up/down, mouse look, F3 diagnostics,\n\
@@ -740,9 +951,7 @@ pub fn select_display_presentation_policy(
                 wgpu::Backends::DX12 | wgpu::Backends::VULKAN | wgpu::Backends::GL
             }
             DisplayServerKind::MacOs => wgpu::Backends::METAL,
-            DisplayServerKind::Headless => {
-                wgpu::Backends::PRIMARY | wgpu::Backends::SECONDARY
-            }
+            DisplayServerKind::Headless => wgpu::Backends::PRIMARY | wgpu::Backends::SECONDARY,
         }
     };
     DisplayPresentationPolicy {
@@ -1082,10 +1291,7 @@ mod tests {
             preferred_alpha_mode(&[wgpu::CompositeAlphaMode::PreMultiplied]),
             wgpu::CompositeAlphaMode::PreMultiplied
         );
-        assert_eq!(
-            preferred_alpha_mode(&[]),
-            wgpu::CompositeAlphaMode::Auto
-        );
+        assert_eq!(preferred_alpha_mode(&[]), wgpu::CompositeAlphaMode::Auto);
     }
 
     #[test]
@@ -1191,22 +1397,14 @@ mod tests {
                 display,
                 RenderBackendPreference::ClassicLowSpec,
             );
-            assert_eq!(
-                policy.preferred_backends,
-                wgpu::Backends::GL,
-                "{display:?}"
-            );
+            assert_eq!(policy.preferred_backends, wgpu::Backends::GL, "{display:?}");
         }
     }
 
     fn hud_draw_list(text: &str) -> UiDrawList {
         let mut list = UiDrawList::new();
         list.fill_rect(UiRect::new(4, 4, 120, 40), UiColor::rgb(20, 20, 24));
-        list.border_rect(
-            UiRect::new(4, 4, 120, 40),
-            UiColor::rgb(80, 88, 110),
-            1,
-        );
+        list.border_rect(UiRect::new(4, 4, 120, 40), UiColor::rgb(80, 88, 110), 1);
         list.text(8, 10, 1, UiColor::rgb(238, 238, 238), text);
         list.progress_bar(
             UiRect::new(8, 30, 112, 8),

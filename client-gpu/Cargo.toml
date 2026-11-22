@@ -18,6 +18,7 @@ path = "src/main.rs"
 mc_spine_client = { package = "mc-spine-client", path = "../client-app" }
 mc_spine_client_mesh = { package = "mc-spine-client-mesh", path = "../client-port" }
 mc_spine_kernel = { package = "mc-spine-kernel", path = "../client-kernel" }
+mc_spine_proto = { package = "mc-spine-proto", path = "../proto" }
 mc_spine_ui = { package = "mc-spine-client-ui", path = "../client-ui" }
 bytemuck = { version = "1.25", features = ["derive"] }
 pollster = "0.4"

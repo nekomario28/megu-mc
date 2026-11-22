@@ -3,25 +3,17 @@
 //! Socket operations happen on a worker thread; `poll` never performs I/O.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use mc_spine_client::audio_out::{AudioRuntime, AudioSessionConfig, AudioSinkKind};
 use mc_spine_client::protocol::{
-    decode_item_stack_components, handle_transfer_packet, offline_uuid,
-    ClientCustomChannelEvent, ClientPlayEvent, DecodedMagicCastState, DecodedMagicSync,
-    DecodedMotionTrigger, DimensionMeta, ItemStackComponents, PlayEvent, PlayerInfoUpdateEntry,
-    ProtocolClient, SeasonWireSync, TeleportSync, TransferTarget, WireReader, WireSoundEvent,
-    WireStopSound,
+    decode_item_stack_components, handle_transfer_packet, offline_uuid, ClientCustomChannelEvent,
+    ClientPlayEvent, DecodedMagicCastState, DecodedMagicSync, DecodedMotionTrigger, DimensionMeta,
+    ItemStackComponents, PlayEvent, PlayerInfoUpdateEntry, ProtocolClient, SeasonWireSync,
+    TeleportSync, TransferTarget, WireReader, WireSoundEvent, WireStopSound,
 };
-use mc_spine_kernel::CommandDispatcher;
-use mc_spine_kernel::player_physics::{
-    step_player_physics, PlayerInputState, PlayerPhysicsState, SurfaceKind,
-};
-use mc_spine_kernel::raycast::{
-    raycast_blocks, raycast_entities, FluidClipMode, RayBlockShapes,
-};
-use mc_spine_kernel::Aabb;
 use mc_spine_client::render::ClientVfxHost;
 use mc_spine_client::render_graph::GpuPipelineKind;
 use mc_spine_client::session::{AudioStats, WorldAcousticSnapshot};
@@ -39,10 +31,15 @@ use mc_spine_client_mesh::tactile_effects::{
     NightSkyDrama, TactileEffectsConfig, TactileEffectsSim,
 };
 use mc_spine_client_mesh::vanilla_plus_nature::{
-    compute_cloud_lighting, generate_layered_voxel_clouds, tick_nature_ambience,
-    ActiveSeasonKind, NatureAmbienceEnv, NatureAmbienceState, NatureModRegistry,
-    SeasonAmbienceInput,
+    compute_cloud_lighting, generate_layered_voxel_clouds, tick_nature_ambience, ActiveSeasonKind,
+    NatureAmbienceEnv, NatureAmbienceState, NatureModRegistry, SeasonAmbienceInput,
 };
+use mc_spine_kernel::player_physics::{
+    step_player_physics, PlayerInputState, PlayerPhysicsState, SurfaceKind,
+};
+use mc_spine_kernel::raycast::{raycast_blocks, raycast_entities, FluidClipMode, RayBlockShapes};
+use mc_spine_kernel::Aabb;
+use mc_spine_kernel::CommandDispatcher;
 use mc_spine_ui::magic_hud::{CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState};
 use mc_spine_ui::state::{HudState, MiniHudPreset, UiState};
 use mc_spine_ui::subtitle_hud::{SubtitleArrow, DEFAULT_TTL_SECS};
@@ -140,13 +137,88 @@ enum WorkerMessage {
     Closed(String),
 }
 
+/// Launcher-supplied filesystem locations: the parsed `--gameDir`,
+/// `--assetsDir`, `--assetIndex`, `--version` and `--resourcePackDir`
+/// values a `GpuCliConfig` carries into the session. `None` fields fall
+/// back to the historical `MC_SPINE_*` environment lookups.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionPaths {
+    /// `--gameDir` — `.minecraft` root; client JARs, `resourcepacks/`,
+    /// `saves/` and `options.txt` resolve under it.
+    pub game_dir: Option<PathBuf>,
+    /// `--assetsDir` — sound asset store root (`indexes/`, `objects/`).
+    pub assets_dir: Option<PathBuf>,
+    /// `--assetIndex` — index id (`17` for 1.21.1).
+    pub asset_index: Option<String>,
+    /// Launcher `--version` id — `<gameDir>/versions/<id>/<id>.jar`.
+    pub version_id: Option<String>,
+    /// `--resourcePackDir` — the launcher's pack folder; the env var
+    /// `MC_SPINE_RESOURCE_PACK_DIR` keeps its higher priority.
+    pub resource_pack_dir: Option<PathBuf>,
+}
+
+/// One advancement tree entry mirrored for the `L`-key overlay: display
+/// text already extracted from the wire's anonymous-NBT components.
+#[derive(Clone, Debug)]
+pub struct LiveAdvancement {
+    /// Resource-location key (`minecraft:adventure/root`).
+    pub key: String,
+    /// Parent key in the advancement tree.
+    pub parent_id: Option<String>,
+    /// Plain-text title (empty when the entry has no display block).
+    pub title: String,
+    /// Plain-text description.
+    pub description: String,
+    /// 0 = task, 1 = challenge, 2 = goal.
+    pub frame_type: i32,
+    /// `flags & 0x04` — hidden until unlocked.
+    pub hidden: bool,
+    /// Tab-grid coordinates from the display block.
+    pub x: f32,
+    /// Tab-grid coordinates from the display block.
+    pub y: f32,
+    /// Criteria required to complete (flattened OR-of-ANDs count).
+    pub criteria_total: usize,
+}
+
+/// Per-advancement progress mirror keyed by advancement id.
+#[derive(Clone, Debug, Default)]
+pub struct LiveAdvancementProgress {
+    /// `(criterion_id, achieved)` — `true` entries are done.
+    pub criteria: Vec<(String, bool)>,
+    /// Criteria with an achieved timestamp (done count).
+    pub done: usize,
+}
+
+/// What the asset discovery pass resolved — every source tried, what it
+/// yielded, and every skip, so a dropped source never reads as a clean
+/// negative result.
+#[derive(Clone, Debug, Default)]
+pub struct AssetDiscovery {
+    /// Client JAR actually read (`<gameDir>/versions/<id>/<id>.jar`).
+    pub jar_path: Option<PathBuf>,
+    /// Decoded block/item sprites contributed by the JAR.
+    pub jar_textures: usize,
+    /// Resource-pack layers contributed (dir or zip), in priority order.
+    pub pack_sources: Vec<String>,
+    /// Per-entry/per-source failures recorded instead of silently dropped.
+    pub notes: Vec<String>,
+    /// Total `assets/`-shaped ZIP entries inspected.
+    pub zip_entries_seen: usize,
+}
+
 enum WorkerCommand {
     Movement(PlayerMovement),
     /// `chat`/`chat_command` — the worker splits on a leading `/` exactly
     /// like vanilla's chat screen.
     Chat(String),
     /// `use_item` — right-click in air (no block target).
-    UseItem { hand: i32, sequence: i32, yaw: f32, pitch: f32 },
+    UseItem {
+        hand: i32,
+        sequence: i32,
+        yaw: f32,
+        pitch: f32,
+    },
     /// `use_item_on` — right-click on a block face.
     UseItemOn {
         hand: i32,
@@ -157,9 +229,16 @@ enum WorkerCommand {
         sequence: i32,
     },
     /// `player_action` — dig/drop/swap statuses (see `send_player_action`).
-    PlayerAction { status: i32, pos: [i32; 3], face: i8, sequence: i32 },
+    PlayerAction {
+        status: i32,
+        pos: [i32; 3],
+        face: i8,
+        sequence: i32,
+    },
     /// `swing` — arm-swing animation.
-    Swing { hand: i32 },
+    Swing {
+        hand: i32,
+    },
     /// `container_click` — a slot transaction on the open window; slot
     /// payloads are owned `Slot` wire blobs.
     ContainerClick {
@@ -172,9 +251,19 @@ enum WorkerCommand {
         carried: Vec<u8>,
     },
     /// `container_button_click` — enchant-table-style button.
-    ContainerButtonClick { window_id: u8, button_id: i32 },
+    ContainerButtonClick {
+        window_id: u8,
+        button_id: i32,
+    },
     /// `container_close` — client-initiated window close.
-    ContainerClose { window_id: u8 },
+    ContainerClose {
+        window_id: u8,
+    },
+    /// `seen_advancements` — the advancements screen opened (`Some(tab)`)
+    /// or closed (`None`), per vanilla's screen-notification packet.
+    SeenAdvancements {
+        tab: Option<String>,
+    },
 }
 
 /// Live view of the server's open-container instruction: the decoded
@@ -286,6 +375,31 @@ pub struct LiveSession {
     /// Vanilla use-item/container sequence counter echoed on `use_item`,
     /// `use_item_on`, `player_action`, and `container_click` packets.
     use_item_sequence: i32,
+    /// Launcher filesystem paths this session resolves assets against
+    /// (`--gameDir`/`--assetsDir`/`--assetIndex`/`--version`/
+    /// `--resourcePackDir`). Empty means env-lookup defaults only.
+    pub session_paths: SessionPaths,
+    /// Asset store root actually handed to the audio runtime (CLI wins over
+    /// `MC_SPINE_ASSETS_DIR`).
+    pub resolved_assets_dir: Option<PathBuf>,
+    /// Asset index id actually handed to the audio runtime (CLI wins over
+    /// `MC_SPINE_ASSET_INDEX`).
+    pub resolved_asset_index: Option<String>,
+    /// Window-0 player-inventory slot mirror: `container_set_content` /
+    /// `container_set_slot` targeting window 0 lands here even without an
+    /// `open_screen` — the `E`-key inventory renders from it.
+    pub player_inventory: BTreeMap<i32, ItemStackComponents>,
+    /// Window-0 carried (cursor) stack, when the server set one.
+    pub player_carried: Option<ItemStackComponents>,
+    /// `state_id` of the latest window-0 content sync (echoed on clicks).
+    pub player_inventory_state_id: i32,
+    /// `update_advancements` tree mirror keyed by advancement id.
+    pub advancements: BTreeMap<String, LiveAdvancement>,
+    /// `update_advancements` progress mirror keyed by advancement id.
+    pub advancement_progress: BTreeMap<String, LiveAdvancementProgress>,
+    /// Tab the server last selected via `select_advancements_tab`, or the
+    /// tab we announced when opening the screen.
+    pub advancements_tab: Option<String>,
     /// Lazily compiled resource-pack bundle (atlas + mip chain + blockstates)
     /// built once when `MC_SPINE_RESOURCE_PACK_DIR` points at a pack root
     /// containing `assets/`; absent env keeps the procedural fallback.
@@ -294,6 +408,9 @@ pub struct LiveSession {
     /// Set when `asset_bundle` landed but `GpuRenderer::upload_block_atlas`
     /// has not consumed it yet (window.rs owns the GPU upload).
     pub asset_bundle_pending_upload: bool,
+    /// Source-by-source record of the last asset discovery pass — which
+    /// JAR/packs loaded, what they contributed, and what was skipped.
+    pub asset_discovery: AssetDiscovery,
     /// Client-side command dispatcher seeded with the vanilla command-name
     /// set; `complete_suggestions` feeds chat autocomplete while typing.
     pub commands: CommandDispatcher,
@@ -393,25 +510,52 @@ pub struct LiveSession {
 
 impl LiveSession {
     pub fn connect(host: String, port: u16, username: String, version: String) -> Self {
+        Self::connect_with_paths(host, port, username, version, SessionPaths::default())
+    }
+
+    /// Connect like [`Self::connect`], carrying the launcher's asset paths
+    /// (`--gameDir`/`--assetsDir`/`--assetIndex`/`--version`/
+    /// `--resourcePackDir`) into the sound library and texture discovery.
+    pub fn connect_with_paths(
+        host: String,
+        port: u16,
+        username: String,
+        version: String,
+        paths: SessionPaths,
+    ) -> Self {
         let (tx, incoming) = mpsc::sync_channel(256);
         let (outgoing, rx) = mpsc::sync_channel(8);
         std::thread::spawn(move || run_worker(host, port, username, version, tx, rx));
-        Self::with_channels_and_sink(incoming, outgoing, AudioSinkKind::Auto)
+        Self::with_channels_and_sink(incoming, outgoing, AudioSinkKind::Auto, paths)
     }
 
+    #[cfg(test)]
     fn with_channels(
         incoming: Receiver<WorkerMessage>,
         outgoing: SyncSender<WorkerCommand>,
     ) -> Self {
-        Self::with_channels_and_sink(incoming, outgoing, AudioSinkKind::Null)
+        Self::with_channels_and_sink(
+            incoming,
+            outgoing,
+            AudioSinkKind::Null,
+            SessionPaths::default(),
+        )
     }
 
     /// Offline live-session fixture with deterministic null audio output.
     /// Accepts the same chunk, block and sound events as the network path.
     pub fn offline_with_null_audio() -> Self {
+        Self::offline_with_paths(SessionPaths::default())
+    }
+
+    /// [`Self::offline_with_null_audio`] carrying launcher asset paths —
+    /// the display-free way tests prove `--assetsDir`/`--assetIndex` and
+    /// `--gameDir` JAR discovery reach the session.
+    pub fn offline_with_paths(paths: SessionPaths) -> Self {
         let (tx, incoming) = mpsc::sync_channel(256);
         let (outgoing, _rx) = mpsc::sync_channel(8);
-        let mut session = Self::with_channels(incoming, outgoing);
+        let mut session =
+            Self::with_channels_and_sink(incoming, outgoing, AudioSinkKind::Null, paths);
         session._offline_sender = Some(tx);
         session
     }
@@ -420,6 +564,7 @@ impl LiveSession {
         incoming: Receiver<WorkerMessage>,
         outgoing: SyncSender<WorkerCommand>,
         sink: AudioSinkKind,
+        paths: SessionPaths,
     ) -> Self {
         let hw_caps = detect_host_hardware_caps();
         let compute_strategy = select_compute_strategy(&hw_caps);
@@ -436,10 +581,20 @@ impl LiveSession {
         let tactile_config = TactileEffectsConfig::default();
         let world = WorldState::new(DimensionMeta::default(), BlockTable::load(None));
         let acoustic_world = WorldAcousticSnapshot::new(&world);
+        // Launcher `--assetsDir`/`--assetIndex` win over the env fallbacks;
+        // the resolved pair is what `SoundLibrary::load` actually opens.
+        let resolved_assets_dir = paths
+            .assets_dir
+            .clone()
+            .or_else(|| std::env::var_os("MC_SPINE_ASSETS_DIR").map(Into::into));
+        let resolved_asset_index = paths
+            .asset_index
+            .clone()
+            .or_else(|| std::env::var("MC_SPINE_ASSET_INDEX").ok());
         let mut audio = AudioRuntime::new(&AudioSessionConfig {
             sink,
-            assets_dir: std::env::var_os("MC_SPINE_ASSETS_DIR").map(Into::into),
-            asset_index: std::env::var("MC_SPINE_ASSET_INDEX").ok(),
+            assets_dir: resolved_assets_dir.clone(),
+            asset_index: resolved_asset_index.clone(),
             max_volume_cap: 1.0,
             max_concurrent_same_sound: 8,
             subtitle_path: None,
@@ -473,9 +628,19 @@ impl LiveSession {
             actionbar_nbt: None,
             pending_transfer: None,
             use_item_sequence: 0,
+            session_paths: paths,
+            resolved_assets_dir,
+            resolved_asset_index,
+            player_inventory: BTreeMap::new(),
+            player_carried: None,
+            player_inventory_state_id: 0,
+            advancements: BTreeMap::new(),
+            advancement_progress: BTreeMap::new(),
+            advancements_tab: None,
             asset_bundle: None,
             asset_bundle_tried: false,
             asset_bundle_pending_upload: false,
+            asset_discovery: AssetDiscovery::default(),
             commands: seeded_command_dispatcher(),
             player_entity_id: None,
             hud: HudState::default(),
@@ -903,7 +1068,9 @@ impl LiveSession {
         if !matches!(self.status, SessionStatus::Playing) {
             return;
         }
-        let _ = self.outgoing.try_send(WorkerCommand::Chat(message.to_string()));
+        let _ = self
+            .outgoing
+            .try_send(WorkerCommand::Chat(message.to_string()));
     }
 
     /// `use_item` — right-click in air with `hand` (0 main, 1 off), using
@@ -996,9 +1163,26 @@ impl LiveSession {
 
     /// `container_button_click` — enchant-table-style button press.
     pub fn container_button_click(&mut self, window_id: u8, button_id: i32) {
-        let _ = self
-            .outgoing
-            .try_send(WorkerCommand::ContainerButtonClick { window_id, button_id });
+        let _ = self.outgoing.try_send(WorkerCommand::ContainerButtonClick {
+            window_id,
+            button_id,
+        });
+    }
+
+    /// `seen_advancements` — announce the advancements screen opened on
+    /// `tab` (`Some`) or closed (`None`), like vanilla's `L` key handler.
+    /// The tab we announce is also remembered locally so the overlay can
+    /// highlight it even before the server echoes a select packet.
+    pub fn seen_advancements(&mut self, tab: Option<&str>) {
+        if !matches!(self.status, SessionStatus::Playing) {
+            return;
+        }
+        if let Some(tab) = tab {
+            self.advancements_tab = Some(tab.to_owned());
+        }
+        let _ = self.outgoing.try_send(WorkerCommand::SeenAdvancements {
+            tab: tab.map(str::to_owned),
+        });
     }
 
     /// `container_close` — client-initiated close; also clears the tracked
@@ -1051,10 +1235,7 @@ impl LiveSession {
         });
         self.physics_state.pos = base.feet;
         let bounds = self.physics_state.aabb();
-        let margin = self
-            .physics_state
-            .vel
-            .map(|velocity| velocity.abs() + 1.0);
+        let margin = self.physics_state.vel.map(|velocity| velocity.abs() + 1.0);
         let sweep = Aabb {
             min: std::array::from_fn(|axis| bounds.min[axis] - margin[axis]),
             max: std::array::from_fn(|axis| bounds.max[axis] + margin[axis]),
@@ -1074,7 +1255,11 @@ impl LiveSession {
         } else {
             surface_kind(
                 &self.world,
-                [feet[0], (base.feet[1] - 0.500_000_1).floor() as i32, feet[2]],
+                [
+                    feet[0],
+                    (base.feet[1] - 0.500_000_1).floor() as i32,
+                    feet[2],
+                ],
             )
         };
         let state = PlayerPhysicsState {
@@ -1146,8 +1331,7 @@ impl LiveSession {
                 },
             ));
         }
-        raycast_entities(eye, direction, 4.5, &targets)
-            .map(|hit| (hit.entity_id, hit.distance))
+        raycast_entities(eye, direction, 4.5, &targets).map(|hit| (hit.entity_id, hit.distance))
     }
 
     /// Block under the crosshair ray (`raycast_blocks`, vanilla 4.5-block
@@ -1165,8 +1349,12 @@ impl LiveSession {
             -pitch.sin(),
             yaw.cos() * pitch.cos(),
         ];
-        raycast_blocks(eye, direction, 4.5, FluidClipMode::None, |x, y, z| {
-            match self.world.get_block_state(x, y, z) {
+        raycast_blocks(
+            eye,
+            direction,
+            4.5,
+            FluidClipMode::None,
+            |x, y, z| match self.world.get_block_state(x, y, z) {
                 Some(0) | None => RayBlockShapes::default(),
                 Some(_) => RayBlockShapes {
                     boxes: vec![Aabb {
@@ -1176,8 +1364,8 @@ impl LiveSession {
                     is_fluid: false,
                     is_fluid_source: false,
                 },
-            }
-        })
+            },
+        )
         .map(|hit| (hit.block_pos, hit.distance))
     }
 
@@ -1222,21 +1410,39 @@ impl LiveSession {
         }
     }
 
-    /// Compile the resource-pack bundle once (`MC_SPINE_RESOURCE_PACK_DIR`
-    /// = pack root containing `assets/`). `CompiledAssetBundle::build`
-    /// produces the gutter-padded block atlas and its linear-sRGB mip
-    /// chain; `window.rs` uploads it via `upload_block_atlas`.
+    /// Compile the asset bundle once. Layer order is lowest-to-highest
+    /// priority (last layer wins): the vanilla client JAR at
+    /// `<gameDir>/versions/<version>/<version>.jar` first, then every
+    /// `options.txt`-configured pack from `resourcepacks/` (dir or `.zip`),
+    /// then the explicit `MC_SPINE_RESOURCE_PACK_DIR` override.
+    /// `CompiledAssetBundle::build` produces the gutter-padded block atlas
+    /// and its linear-sRGB mip chain; `window.rs` uploads it via
+    /// `upload_block_atlas`. What was resolved (and skipped) lands in
+    /// [`Self::asset_discovery`].
     fn ensure_asset_bundle(&mut self) {
         if self.asset_bundle_tried {
             return;
         }
         self.asset_bundle_tried = true;
-        let Some(dir) = std::env::var_os("MC_SPINE_RESOURCE_PACK_DIR") else {
-            return;
-        };
-        match ResourcePackLayer::from_dir(std::path::Path::new(&dir))
-            .and_then(|layer| CompiledAssetBundle::build(&[layer]))
+        let (layers, discovery, cem_dirs) = discover_asset_layers(&self.session_paths);
+        if discovery.jar_path.is_none()
+            && discovery.pack_sources.is_empty()
+            && discovery.notes.is_empty()
         {
+            // Nothing configured at all — historical env-var-only behaviour.
+        } else {
+            for note in &discovery.notes {
+                eprintln!("mc-spine-client assets: {note}");
+            }
+        }
+        self.asset_discovery = discovery;
+        if layers.is_empty() {
+            return;
+        }
+        for dir in &cem_dirs {
+            self.register_cem_models(dir);
+        }
+        match CompiledAssetBundle::build(&layers) {
             Ok(bundle) => {
                 if !bundle.skipped_errors.is_empty() {
                     eprintln!(
@@ -1249,7 +1455,6 @@ impl LiveSession {
             }
             Err(err) => eprintln!("mc-spine-client assets: bundle build failed: {err}"),
         }
-        self.register_cem_models(std::path::Path::new(&dir));
     }
 
     /// Scan `assets/*/optifine/cem/*.jem|*.jpm` in the loaded pack and register
@@ -1527,10 +1732,7 @@ impl LiveSession {
                         // OptiFine CEM: a registered `.jem`/`.jpm` model whose
                         // file stem is the un-namespaced entity name overrides
                         // the baked rig. Ignored when the pack has no match.
-                        let cem_name = spec
-                            .name
-                            .strip_prefix("minecraft:")
-                            .unwrap_or(spec.name);
+                        let cem_name = spec.name.strip_prefix("minecraft:").unwrap_or(spec.name);
                         let _ = self.world.animations.bind_entity(eid, cem_name);
                         self.entity_rigs.insert(eid, spec);
                     }
@@ -1592,7 +1794,30 @@ impl LiveSession {
                 slot_count,
                 raw_payload,
             } => {
-                if let Some(screen) = &mut self.open_screen {
+                if window_id == 0 {
+                    // The player's own inventory: servers sync window 0
+                    // without an `open_screen`, so the `E`-key screen has a
+                    // live slot source of its own.
+                    self.player_inventory_state_id = state_id;
+                    let mut offset = 0usize;
+                    for index in 0..slot_count {
+                        let tail = &raw_payload[offset.min(raw_payload.len())..];
+                        match decode_item_stack_components(tail) {
+                            Ok((stack, consumed)) => {
+                                offset += consumed;
+                                self.player_inventory.insert(index, stack);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if offset < raw_payload.len() {
+                        if let Ok((carried, _)) =
+                            decode_item_stack_components(&raw_payload[offset..])
+                        {
+                            self.player_carried = Some(carried);
+                        }
+                    }
+                } else if let Some(screen) = &mut self.open_screen {
                     if screen.window_id == i32::from(window_id) {
                         screen.state_id = state_id;
                         let mut offset = 0usize;
@@ -1623,7 +1848,21 @@ impl LiveSession {
                 slot,
                 raw_item,
             } => {
-                if let Some(screen) = &mut self.open_screen {
+                if window_id == 0 {
+                    self.player_inventory_state_id = state_id;
+                    match decode_item_stack_components(&raw_item) {
+                        Ok((stack, _)) => {
+                            if slot < 0 {
+                                self.player_carried = Some(stack);
+                            } else {
+                                self.player_inventory.insert(i32::from(slot), stack);
+                            }
+                        }
+                        Err(_) => {
+                            self.player_inventory.remove(&i32::from(slot));
+                        }
+                    }
+                } else if let Some(screen) = &mut self.open_screen {
                     if screen.window_id == i32::from(window_id) {
                         screen.state_id = state_id;
                         match decode_item_stack_components(&raw_item) {
@@ -1640,6 +1879,70 @@ impl LiveSession {
                         }
                     }
                 }
+            }
+            PlayEvent::UpdateAdvancements {
+                reset,
+                advancements,
+                removed,
+                progress,
+            } => {
+                if reset {
+                    self.advancements.clear();
+                    self.advancement_progress.clear();
+                }
+                for key in &removed {
+                    self.advancements.remove(key);
+                    self.advancement_progress.remove(key);
+                }
+                for wire in &advancements {
+                    let (title, description, frame_type, hidden, x, y) = match &wire.display {
+                        Some(display) => (
+                            nbt_text(&display.title_nbt).unwrap_or_default(),
+                            nbt_text(&display.description_nbt).unwrap_or_default(),
+                            display.frame_type,
+                            display.flags & 0x04 != 0,
+                            display.x,
+                            display.y,
+                        ),
+                        None => (String::new(), String::new(), 0, false, 0.0, 0.0),
+                    };
+                    self.advancements.insert(
+                        wire.key.clone(),
+                        LiveAdvancement {
+                            key: wire.key.clone(),
+                            parent_id: wire.parent_id.clone(),
+                            title,
+                            description,
+                            frame_type,
+                            hidden,
+                            x,
+                            y,
+                            criteria_total: wire
+                                .requirements
+                                .iter()
+                                .map(|group| group.len().max(1))
+                                .sum(),
+                        },
+                    );
+                }
+                for wire in &progress {
+                    let entry = self
+                        .advancement_progress
+                        .entry(wire.key.clone())
+                        .or_default();
+                    let mut done = 0usize;
+                    for (criterion, achieved) in &wire.criteria {
+                        let got = achieved.is_some();
+                        if got {
+                            done += 1;
+                        }
+                        entry.criteria.push((criterion.clone(), got));
+                    }
+                    entry.done = done;
+                }
+            }
+            PlayEvent::SelectAdvancementsTab { tab } => {
+                self.advancements_tab = tab;
             }
             PlayEvent::SetHealth { health, food, .. } => {
                 self.hud.health = health;
@@ -1685,25 +1988,29 @@ impl LiveSession {
                 if action == 1 {
                     self.boss_bars.remove(&uuid);
                 } else {
-                    self.boss_bars
-                        .insert(uuid, LiveBossBar { action, raw_payload });
+                    self.boss_bars.insert(
+                        uuid,
+                        LiveBossBar {
+                            action,
+                            raw_payload,
+                        },
+                    );
                 }
             }
             PlayEvent::PlayerInfo { actions, entries } => {
                 for update in &entries {
-                    let entry =
-                        self.player_info.entry(update.uuid).or_insert_with(|| {
-                            PlayerInfoUpdateEntry {
-                                uuid: update.uuid,
-                                name: None,
-                                properties: Vec::new(),
-                                chat_session: None,
-                                game_mode: None,
-                                listed: None,
-                                latency: None,
-                                display_name_nbt: None,
-                            }
-                        });
+                    let entry = self.player_info.entry(update.uuid).or_insert_with(|| {
+                        PlayerInfoUpdateEntry {
+                            uuid: update.uuid,
+                            name: None,
+                            properties: Vec::new(),
+                            chat_session: None,
+                            game_mode: None,
+                            listed: None,
+                            latency: None,
+                            display_name_nbt: None,
+                        }
+                    });
                     if actions & 0x01 != 0 {
                         entry.name = update.name.clone();
                         entry.properties = update.properties.clone();
@@ -1768,18 +2075,13 @@ impl LiveSession {
             PlayEvent::SetDisplayObjective { slot, objective } => {
                 self.scoreboard.display_slots.insert(slot, objective);
             }
-            PlayEvent::ResetScore { owner, objective } => {
-                match objective {
-                    Some(objective) => self
-                        .scoreboard
-                        .scores
-                        .retain(|(obj, who), _| obj != &objective || who != &owner),
-                    None => self
-                        .scoreboard
-                        .scores
-                        .retain(|(_, who), _| who != &owner),
-                }
-            }
+            PlayEvent::ResetScore { owner, objective } => match objective {
+                Some(objective) => self
+                    .scoreboard
+                    .scores
+                    .retain(|(obj, who), _| obj != &objective || who != &owner),
+                None => self.scoreboard.scores.retain(|(_, who), _| who != &owner),
+            },
             PlayEvent::Transfer { host, port } => match handle_transfer_packet(&host, port) {
                 Ok(target) => self.pending_transfer = Some(target),
                 Err(reason) => {
@@ -2068,13 +2370,7 @@ fn run_connection(
                         .map(|(slot, item)| (*slot, item.as_slice()))
                         .collect();
                     client.send_container_click(
-                        window_id,
-                        state_id,
-                        slot,
-                        button,
-                        mode,
-                        &borrowed,
-                        &carried,
+                        window_id, state_id, slot, button, mode, &borrowed, &carried,
                     )?;
                 }
                 Ok(WorkerCommand::ContainerButtonClick {
@@ -2085,6 +2381,9 @@ fn run_connection(
                 }
                 Ok(WorkerCommand::ContainerClose { window_id }) => {
                     client.send_container_close(window_id)?;
+                }
+                Ok(WorkerCommand::SeenAdvancements { tab }) => {
+                    client.send_seen_advancements(tab.as_deref())?;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
@@ -2160,13 +2459,147 @@ fn run_connection(
 /// contraption ids, which allocate from 1 upward).
 const CLOUD_SUBWORLD_ID: u64 = u64::MAX;
 
+/// Candidate client-JAR version ids, `--version` id first: `1.21.1` stays
+/// a fallback because a launcher that omits `--version` still keeps the
+/// JAR under the well-known release dir.
+fn jar_version_ids(paths: &SessionPaths) -> Vec<String> {
+    let mut ids = Vec::with_capacity(2);
+    if let Some(id) = paths
+        .version_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && !id.contains(['/', '\\', ':']))
+    {
+        ids.push(id.to_owned());
+    }
+    if ids.iter().all(|id| id != "1.21.1") {
+        ids.push("1.21.1".to_owned());
+    }
+    ids
+}
+
+/// Resolve the full texture layer stack for a session: the vanilla client
+/// JAR (`<gameDir>/versions/<id>/<id>.jar`) as the base layer, then every
+/// pack `options.txt` enables inside `resourcepacks/` (dir or `.zip`), then
+/// the explicit `MC_SPINE_RESOURCE_PACK_DIR` override on top. Returns the
+/// layers in lowest-to-highest priority order, an [`AssetDiscovery`] report
+/// of every source resolved or skipped, and the on-disk pack roots CEM
+/// model scanning can still walk (zip packs contribute no CEM dir).
+pub fn discover_asset_layers(
+    paths: &SessionPaths,
+) -> (Vec<ResourcePackLayer>, AssetDiscovery, Vec<PathBuf>) {
+    let mut layers = Vec::new();
+    let mut report = AssetDiscovery::default();
+    let mut cem_dirs = Vec::new();
+
+    if let Some(game_dir) = paths.game_dir.as_deref() {
+        for version_id in jar_version_ids(paths) {
+            let jar = game_dir
+                .join("versions")
+                .join(&version_id)
+                .join(format!("{version_id}.jar"));
+            if !jar.is_file() {
+                continue;
+            }
+            match crate::vanilla_jar::vanilla_jar_texture_layer(&jar) {
+                Ok((layer, jar_report)) => {
+                    report.jar_textures = layer.sprites.len();
+                    report.jar_path = Some(jar.clone());
+                    report.zip_entries_seen += jar_report.entries_seen;
+                    for (entry, reason) in jar_report.skipped {
+                        report
+                            .notes
+                            .push(format!("{}: {entry}: {reason}", jar.display()));
+                    }
+                    layers.push(layer);
+                    break;
+                }
+                Err(err) => {
+                    report
+                        .notes
+                        .push(format!("client JAR {} unreadable: {err}", jar.display()));
+                }
+            }
+        }
+    }
+
+    // `options.txt`-configured packs, vanilla order: the file lists them
+    // bottom-to-top, so each later layer overrides the earlier ones.
+    if let Some(game_dir) = paths.game_dir.as_deref() {
+        let pack_root = paths
+            .resource_pack_dir
+            .clone()
+            .unwrap_or_else(|| game_dir.join("resourcepacks"));
+        for file in crate::vanilla_jar::configured_resource_packs(game_dir) {
+            // options.txt names are pack-root-relative; refuse anything
+            // trying to walk out of it.
+            if file.contains("..") || file.starts_with('/') || file.contains('\\') {
+                report
+                    .notes
+                    .push(format!("options.txt pack {file:?} rejected: unsafe path"));
+                continue;
+            }
+            let candidate = pack_root.join(&file);
+            let layer_result = if candidate.is_dir() {
+                ResourcePackLayer::from_dir(&candidate).map_err(|e| e.to_string())
+            } else if candidate.is_file() {
+                crate::vanilla_jar::zip_pack_layer(&candidate)
+                    .map(|(layer, zip_report)| {
+                        report.zip_entries_seen += zip_report.entries_seen;
+                        for (entry, reason) in zip_report.skipped {
+                            report
+                                .notes
+                                .push(format!("{}: {entry}: {reason}", candidate.display()));
+                        }
+                        layer
+                    })
+                    .map_err(|e| e.to_string())
+            } else {
+                report.notes.push(format!(
+                    "options.txt pack {file:?} missing from resourcepacks/"
+                ));
+                continue;
+            };
+            match layer_result {
+                Ok(layer) => {
+                    report.pack_sources.push(candidate.display().to_string());
+                    if candidate.is_dir() {
+                        cem_dirs.push(candidate);
+                    }
+                    layers.push(layer);
+                }
+                Err(err) => report.notes.push(format!(
+                    "resource pack {} failed: {err}",
+                    candidate.display()
+                )),
+            }
+        }
+    }
+
+    // Explicit override stays last and wins every earlier layer, matching
+    // the historical env-var behaviour.
+    if let Some(dir) = std::env::var_os("MC_SPINE_RESOURCE_PACK_DIR") {
+        let dir = PathBuf::from(dir);
+        match ResourcePackLayer::from_dir(&dir) {
+            Ok(layer) => {
+                report.pack_sources.push(dir.display().to_string());
+                cem_dirs.push(dir);
+                layers.push(layer);
+            }
+            Err(err) => report.notes.push(format!(
+                "MC_SPINE_RESOURCE_PACK_DIR {} failed: {err}",
+                dir.display()
+            )),
+        }
+    }
+
+    (layers, report, cem_dirs)
+}
+
 /// Decode an anonymous-NBT text component (title/subtitle/action-bar payloads)
 /// into plain text via `NbtValue::extract_text`.
 fn nbt_text(nbt_bytes: &[u8]) -> Option<String> {
-    let text = WireReader::new(nbt_bytes)
-        .read_nbt()
-        .ok()?
-        .extract_text();
+    let text = WireReader::new(nbt_bytes).read_nbt().ok()?.extract_text();
     (!text.is_empty()).then_some(text)
 }
 
@@ -3092,7 +3525,10 @@ mod tests {
                 .get(&("kills".to_string(), "Steve".to_string())),
             Some(&42)
         );
-        assert_eq!(live.scoreboard.display_slots.get(&1).map(String::as_str), Some("kills"));
+        assert_eq!(
+            live.scoreboard.display_slots.get(&1).map(String::as_str),
+            Some("kills")
+        );
 
         live.apply_event(ClientPlayEvent::Play(PlayEvent::ResetScore {
             owner: "Steve".into(),
@@ -3241,10 +3677,7 @@ mod tests {
             port: 25565,
         }))
         .unwrap();
-        assert_eq!(
-            live.pending_transfer.as_ref().map(|t| t.port),
-            Some(25565)
-        );
+        assert_eq!(live.pending_transfer.as_ref().map(|t| t.port), Some(25565));
         live.apply_event(ClientPlayEvent::Play(PlayEvent::Transfer {
             host: String::new(),
             port: 0,
@@ -3309,7 +3742,10 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(rx.recv().unwrap(), WorkerCommand::Swing { hand: 1 }));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            WorkerCommand::Swing { hand: 1 }
+        ));
         assert!(matches!(
             rx.recv().unwrap(),
             WorkerCommand::ContainerClose { window_id: 3 }
@@ -3329,10 +3765,7 @@ mod tests {
             .unwrap();
         live.world
             .animations
-            .register_jpm_model(
-                "skeleton",
-                r#"{"id":"body","translate":[0,-12,0]}"#,
-            )
+            .register_jpm_model("skeleton", r#"{"id":"body","translate":[0,-12,0]}"#)
             .unwrap();
         live.apply_event(ClientPlayEvent::Play(PlayEvent::AddEntity {
             eid: 9,

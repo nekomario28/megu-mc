@@ -785,6 +785,7 @@ dependencies = [
  "mc-spine-client-mesh",
  "mc-spine-client-ui",
  "mc-spine-kernel",
+ "mc-spine-proto",
  "pollster",
  "wgpu",
  "winit",

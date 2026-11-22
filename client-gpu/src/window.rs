@@ -6,26 +6,31 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::live_session::LiveHudFeed;
 use mc_spine_client::audio_qol::{ZoomState, DEFAULT_ZOOM_SMOOTHING_RATE};
+use mc_spine_client::friend_client::{FriendGuestBridge, FriendHostSession};
+use mc_spine_client::integrated;
+use mc_spine_client::protocol::encode_slot_stack;
 use mc_spine_client::render::{FrameBudgetGovernor, RenderConfig};
+use mc_spine_client::zsh_command_bar::ZshCommandBar;
 use mc_spine_client_mesh::builtin_shadow_wgsl::{BuiltinShadowQuality, RenderScalePreset};
 use mc_spine_kernel::debug_chords::{
     finish_gamemode_switcher, handle_f3_chord, DebugChordAction, DebugChordContext,
     DebugChordState, DebugTarget, F3Chord, PlayerDebugInfo,
 };
-use mc_spine_client::protocol::encode_slot_stack;
-use mc_spine_client::zsh_command_bar::ZshCommandBar;
 use mc_spine_ui::container_screen::{
-    menu_schema, ContainerScreenState, DragState, InventorySortState, UiItemStack,
+    menu_schema, ContainerScreenState, DragState, InventorySortState, MenuScreenSchema, SlotDef,
+    SlotKind, UiItemStack,
 };
-use mc_spine_ui::hud_widgets::ScoreboardEntry;
-use mc_spine_ui::magic_hud::LookingAtBlockState;
-use mc_spine_ui::state::{ScoreboardState, TitleOverlayState};
-use crate::live_session::LiveHudFeed;
 use mc_spine_ui::draw::rasterize_draw_list;
+use mc_spine_ui::draw::{UiColor, UiRect};
+use mc_spine_ui::hud_widgets::ScoreboardEntry;
 use mc_spine_ui::magic_hud::build_magic_hud_draw_list;
+use mc_spine_ui::magic_hud::LookingAtBlockState;
+use mc_spine_ui::state::{invite_code_display, ScoreboardState, TitleOverlayState};
 use mc_spine_ui::state::{
-    Screen, UiAction, UiInputEvent, UiKey, UiSettings, UiState, VideoPreset, VisualStylePreset,
+    Screen, SettingsTab, UiAction, UiInputEvent, UiKey, UiSettings, UiState, VideoPreset,
+    VisualStylePreset,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -34,7 +39,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
-use crate::live_session::{LiveSession, PlayerMovement, PlayerPose, SessionStatus};
+use crate::live_session::{LiveSession, PlayerMovement, PlayerPose, SessionPaths, SessionStatus};
 use crate::renderer::{request_gpu_device, GpuRenderer};
 use crate::{
     build_demo_scene, detect_display_server_kind, fingerprint_draw_list, preferred_alpha_mode,
@@ -52,6 +57,46 @@ const OCCLUDED_TICK: Duration = Duration::from_millis(50);
 const THIRD_PERSON_DISTANCE: f32 = 4.0;
 const SPRINT_FOV_BOOST: f32 = 0.10;
 const SPRINT_FOV_SMOOTHING_RATE: f32 = 12.0;
+
+/// Friend-relay session timeout (register, join, revoke round-trips).
+const FRIEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Non-registry menu id for the client-side window-0 player inventory —
+/// `menu_schema` owns `0..=24` and this sentinel can never collide.
+pub const PLAYER_INVENTORY_MENU_ID: u32 = u32::MAX;
+
+/// Vanilla window-0 player inventory layout (46 slots): crafting output +
+/// 2x2 grid + 4 armor + offhand as "container" slots, then the standard
+/// 27+9 region `inventory_start = 9` describes.
+static PLAYER_INVENTORY_SLOTS: [SlotDef; 10] = [
+    SlotDef::new(0, 144, 36, SlotKind::Output),
+    SlotDef::new(1, 98, 18, SlotKind::Input),
+    SlotDef::new(2, 116, 18, SlotKind::Input),
+    SlotDef::new(3, 98, 36, SlotKind::Input),
+    SlotDef::new(4, 116, 36, SlotKind::Input),
+    SlotDef::new(5, 8, 8, SlotKind::Armor),
+    SlotDef::new(6, 8, 26, SlotKind::Armor),
+    SlotDef::new(7, 8, 44, SlotKind::Armor),
+    SlotDef::new(8, 8, 62, SlotKind::Armor),
+    SlotDef::new(45, 77, 62, SlotKind::Offhand),
+];
+
+/// The `E`-key screen's schema: vanilla's own 46-slot player inventory,
+/// rendered by the same [`ContainerScreenState`] every server menu uses.
+pub static PLAYER_INVENTORY_SCHEMA: MenuScreenSchema = MenuScreenSchema {
+    menu_id: PLAYER_INVENTORY_MENU_ID,
+    name: "minecraft:inventory",
+    panel_w: 176.0,
+    panel_h: 166.0,
+    container_slots: &PLAYER_INVENTORY_SLOTS,
+    has_player_inventory: true,
+    inventory_start: 9,
+    slot_count: 46,
+    inventory_origin_x: 8,
+    inventory_origin_y: 84,
+    buttons: &[],
+    property_bars: &[],
+};
 
 /// Display-independent output of the Minecraft keyboard bindings.
 #[derive(Clone, Debug, PartialEq)]
@@ -455,11 +500,27 @@ pub struct GpuApp {
     mouse_pos: (i32, i32),
     left_mouse_held: bool,
     container_screen: Option<ContainerScreenState>,
+    /// `container_screen` currently holds the client-side window-0 player
+    /// inventory opened by `E` (not a server `open_screen`).
+    own_inventory_open: bool,
+    /// `L`-key advancements overlay; opening announces the tab via
+    /// `seen_advancements`, closing retracts it.
+    advancements_open: bool,
     chat_bar: Option<ZshCommandBar>,
     /// Latest `complete_suggestions` hit for the open chat bar's `/`-input.
     chat_suggestions: Vec<String>,
     /// QoL container sorter armed by the `SortInventory` keybind.
     inventory_sort: InventorySortState,
+    /// Launcher filesystem paths handed to every `LiveSession` this app
+    /// spawns (`--gameDir`/`--assetsDir`/`--assetIndex`/`--version`/
+    /// `--resourcePackDir`).
+    session_paths: SessionPaths,
+    /// Integrated `mc-spine` server guard while a singleplayer world runs.
+    singleplayer_server: Option<integrated::SingleplayerServer>,
+    /// Friend-relay host session while an invite code is live.
+    friend_host: Option<FriendHostSession>,
+    /// Friend-relay guest bridge while joined through an invite code.
+    friend_bridge: Option<FriendGuestBridge>,
     /// Last live `title_revision` applied to `ui.hud.title_overlay`.
     title_seen_rev: u64,
     /// Fractional-tick accumulator driving `TitleOverlayState::tick` at 20/s.
@@ -477,15 +538,47 @@ pub struct GpuApp {
 impl GpuApp {
     /// Build the app state (no GPU or window yet — `resumed` does that).
     pub fn new(config: GpuCliConfig) -> Self {
+        let session_paths = SessionPaths {
+            game_dir: config.game_dir.clone(),
+            assets_dir: config.assets_dir.clone(),
+            asset_index: config.asset_index.clone(),
+            version_id: config.version_id.clone(),
+            resource_pack_dir: config.resource_pack_dir.clone(),
+        };
+        // `--quickPlaySingleplayer`: launch the integrated server first so
+        // the session can bind its loopback endpoint. Failures surface as a
+        // title-screen status line, never a silent no-op.
+        let mut singleplayer_server = None;
+        let mut startup_status = Vec::new();
+        if !config.offline_demo {
+            if let Some(world) = &config.quick_play_singleplayer {
+                match Self::launch_singleplayer(&config, world) {
+                    Ok(server) => singleplayer_server = Some(server),
+                    Err(err) => {
+                        startup_status.push(format!("Singleplayer {world:?}: {err}"));
+                    }
+                }
+            }
+        }
         let live = if config.offline_demo {
             None
+        } else if let Some(server) = &singleplayer_server {
+            let addr = server.addr();
+            Some(LiveSession::connect_with_paths(
+                addr.ip().to_string(),
+                addr.port(),
+                config.username.clone(),
+                config.mc_version.clone(),
+                session_paths.clone(),
+            ))
         } else {
             config.connect.as_ref().map(|(host, port)| {
-                LiveSession::connect(
+                LiveSession::connect_with_paths(
                     host.clone(),
                     *port,
                     config.username.clone(),
                     config.mc_version.clone(),
+                    session_paths.clone(),
                 )
             })
         };
@@ -508,9 +601,18 @@ impl GpuApp {
         };
         let mut ui = UiState::new();
         ui.settings.video.vsync = render_config.vsync;
-        ui.screen = Screen::InGameHud;
-        ui.hud = mc_spine_ui::state::HudState::demo();
-        Self {
+        // Straight into gameplay when a world/server is already targeted;
+        // the title screen otherwise — like a vanilla launch with no
+        // quick-play argument.
+        ui.screen = if live.is_some() || config.offline_demo {
+            Screen::InGameHud
+        } else {
+            Screen::Title
+        };
+        if ui.screen == Screen::InGameHud {
+            ui.hud = mc_spine_ui::state::HudState::demo();
+        }
+        let mut app = Self {
             config,
             live,
             active: None,
@@ -528,9 +630,15 @@ impl GpuApp {
             mouse_pos: (0, 0),
             left_mouse_held: false,
             container_screen: None,
+            own_inventory_open: false,
+            advancements_open: false,
             chat_bar: None,
             chat_suggestions: Vec::new(),
             inventory_sort: InventorySortState::default(),
+            session_paths,
+            singleplayer_server,
+            friend_host: None,
+            friend_bridge: None,
             title_seen_rev: 0,
             title_tick_accum: 0.0,
             ui,
@@ -541,12 +649,143 @@ impl GpuApp {
             last_frame: Instant::now(),
             frame_start: Instant::now(),
             fatal: None,
+        };
+        for message in startup_status {
+            app.status_line(message);
         }
+        app
     }
 
     /// The fatal setup error, if `resumed` hit one (`run` reports it).
     pub fn fatal(&self) -> Option<&str> {
         self.fatal.as_deref()
+    }
+
+    /// The top-level UI screen (Title, Pause, InGameHud, ...).
+    pub fn screen(&self) -> Screen {
+        self.ui.screen
+    }
+
+    /// The active live session, when one was spawned.
+    pub fn live(&self) -> Option<&LiveSession> {
+        self.live.as_ref()
+    }
+
+    /// `true` while `container_screen` is the window-0 player inventory.
+    pub fn own_inventory_open(&self) -> bool {
+        self.own_inventory_open
+    }
+
+    /// `true` while the `L`-key advancements overlay is up.
+    pub fn advancements_open(&self) -> bool {
+        self.advancements_open
+    }
+
+    /// Slot count of the open container surface (own inventory or server
+    /// screen), `None` when no surface is up.
+    pub fn container_slot_count(&self) -> Option<usize> {
+        self.container_screen
+            .as_ref()
+            .map(ContainerScreenState::slot_count)
+    }
+
+    /// One slot of the open container surface.
+    pub fn container_slot(&self, index: usize) -> Option<UiItemStack> {
+        self.container_screen.as_ref()?.slot(index).cloned()
+    }
+
+    /// Status lines surfaced by dispatched actions (join failures, invite
+    /// results, statistics summaries) — never silently dropped.
+    pub fn status_messages(&self) -> &[String] {
+        &self.debug_messages
+    }
+
+    /// Inject a session without a real socket — tests use the
+    /// `offline_with_*` fixtures to drive the same window-0/advancements
+    /// mirrors the network path fills.
+    pub fn attach_live(&mut self, live: LiveSession) {
+        self.live = Some(live);
+    }
+
+    /// Drive one [`WindowInputEvent`] through the same handler `handle_key`
+    /// uses — the display-free way tests exercise the keybind path.
+    pub fn dispatch_input(&mut self, event: WindowInputEvent) {
+        self.apply_window_input(event);
+    }
+
+    /// Apply a [`UiAction`] that needs no event loop. `QuitGame` is handled
+    /// inside `apply_ui_action` instead — it owns `event_loop.exit()`.
+    pub fn dispatch_ui_action(&mut self, action: &UiAction) {
+        match action {
+            UiAction::OpenScreen(screen) => self.ui.navigate(*screen),
+            UiAction::Back => {
+                self.ui
+                    .handle_input(UiInputEvent::KeyPressed(UiKey::Escape));
+            }
+            UiAction::SettingsChanged => {
+                let settings = self.ui.settings.clone();
+                self.apply_settings(&settings);
+            }
+            UiAction::StartSingleplayer => {
+                if let Err(err) = self.start_singleplayer() {
+                    self.status_line(format!("Singleplayer: {err}"));
+                }
+            }
+            UiAction::StartMultiplayer => {
+                if let Err(err) = self.join_multiplayer() {
+                    self.status_line(format!("Multiplayer: {err}"));
+                }
+            }
+            UiAction::JoinWithCode(code) => {
+                if let Err(err) = self.join_with_code(*code) {
+                    self.status_line(format!("Join with code: {err}"));
+                }
+            }
+            UiAction::GenerateInvite => match self.generate_invite() {
+                Ok(()) => {
+                    self.status_line(format!("Invite ready: {}", self.ui.invite_display()));
+                }
+                Err(err) => self.status_line(format!("Invite: {err}")),
+            },
+            UiAction::CopyInvite(code) => {
+                // No clipboard backend is linked into this binary; the code
+                // stays visible on the Friends screen and the status line
+                // reports the dispatch instead of dropping it.
+                self.status_line(format!("Invite code {code} — share it with a friend"));
+            }
+            UiAction::RevokeInvite => {
+                self.ui.active_invite = None;
+                match self.friend_host.as_mut().map(|host| host.revoke()) {
+                    None => self.status_line("Invite revoked (no live relay session)"),
+                    Some(Ok(())) => self.status_line("Invite revoked"),
+                    Some(Err(err)) => self.status_line(format!("Revoke invite: {err}")),
+                }
+                self.friend_host = None;
+            }
+            UiAction::ShowStatistics => {
+                let stats = self.live.as_ref().map_or_else(
+                    || "Statistics: no live session".to_owned(),
+                    |live| {
+                        format!(
+                            "Statistics: {} chunks, {} subworlds, {} advancements",
+                            live.world.loaded_chunks(),
+                            live.subworlds.len(),
+                            live.advancements.len(),
+                        )
+                    },
+                );
+                self.status_line(stats);
+            }
+            UiAction::OpenShaderOptions => {
+                self.ui.navigate(Screen::Settings(SettingsTab::Shaders));
+            }
+            UiAction::OpenUrl(url) => {
+                if let Err(err) = open_url(url) {
+                    self.status_line(format!("Open link: {err}"));
+                }
+            }
+            _ => {}
+        }
     }
 
     pub fn camera_controller(&self) -> &CameraController {
@@ -638,11 +877,320 @@ impl GpuApp {
         }
     }
 
+    /// True when the pointer should be captured for mouselook: in-game,
+    /// unpaused, no chat bar, no container/inventory screen, no
+    /// advancements overlay.
+    fn wants_cursor_grab(&self) -> bool {
+        self.ui.screen == Screen::InGameHud
+            && !self.paused
+            && self.focused
+            && self.chat_bar.is_none()
+            && self.container_screen.is_none()
+            && !self.advancements_open
+    }
+
+    /// Re-apply the grab decision after an overlay/screen transition.
+    fn maybe_regrab(&mut self) {
+        let grab = self.wants_cursor_grab();
+        self.set_cursor_grab(grab);
+    }
+
+    /// True when key/mouse input belongs to the UI layer (pause menus and
+    /// every non-HUD screen) rather than gameplay movement.
+    fn ui_wants_input(&self) -> bool {
+        self.paused || self.ui.screen != Screen::InGameHud
+    }
+
+    /// A user-visible status line for actions that can't silently no-op:
+    /// the message lands in chat both offline and live.
+    fn status_line(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.debug_messages.push(message.clone());
+        if self.debug_messages.len() > 100 {
+            let excess = self.debug_messages.len() - 100;
+            self.debug_messages.drain(..excess);
+        }
+        self.ui.hud.chat_lines.push(message.clone());
+        if self.ui.hud.chat_lines.len() > 100 {
+            let excess = self.ui.hud.chat_lines.len() - 100;
+            self.ui.hud.chat_lines.drain(..excess);
+        }
+        if let Some(live) = &mut self.live {
+            live.hud.chat_lines.push(message);
+        }
+    }
+
+    /// Spawn a session against `host:port` and switch the UI into gameplay.
+    fn connect_to(&mut self, host: String, port: u16) {
+        self.live = Some(LiveSession::connect_with_paths(
+            host,
+            port,
+            self.config.username.clone(),
+            self.config.mc_version.clone(),
+            self.session_paths.clone(),
+        ));
+        self.ui.screen = Screen::InGameHud;
+        self.ui.hud = mc_spine_ui::state::HudState::default();
+        self.paused = false;
+        self.maybe_regrab();
+    }
+
+    /// Launch the integrated server for world `world` (validated by
+    /// `integrated::launch`, which also resolves the server binary and
+    /// runtime assets) and return the running guard.
+    fn launch_singleplayer(
+        config: &GpuCliConfig,
+        world: &str,
+    ) -> Result<integrated::SingleplayerServer, String> {
+        let mut cli = mc_spine_client::cli::CliConfig::default();
+        cli.quick_play_singleplayer = Some(world.to_owned());
+        cli.server_bin = config.server_bin.clone();
+        cli.game_dir = config.game_dir.clone();
+        integrated::launch(&cli)
+    }
+
+    /// Title Singleplayer: launch the integrated loopback world named by
+    /// `--quickPlaySingleplayer` (or `New World`), then connect to it.
+    fn start_singleplayer(&mut self) -> Result<(), String> {
+        let world = self
+            .config
+            .quick_play_singleplayer
+            .clone()
+            .unwrap_or_else(|| "New World".to_owned());
+        let server = Self::launch_singleplayer(&self.config, &world)?;
+        let addr = server.addr();
+        self.singleplayer_server = Some(server);
+        self.connect_to(addr.ip().to_string(), addr.port());
+        Ok(())
+    }
+
+    /// Title Multiplayer: connect to the configured server target.
+    fn join_multiplayer(&mut self) -> Result<(), String> {
+        let (host, port) = self.config.connect.clone().ok_or_else(|| {
+            "no server configured — pass --connect host:port or \
+             --quickPlayMultiplayer host:port"
+                .to_owned()
+        })?;
+        self.connect_to(host, port);
+        Ok(())
+    }
+
+    /// Friends "join with code": bind a [`FriendGuestBridge`] to the
+    /// configured relay, then run the normal session over its loopback
+    /// endpoint — exactly the headless client's relay path.
+    fn join_with_code(&mut self, code_value: u64) -> Result<(), String> {
+        let relay = self
+            .config
+            .relay
+            .clone()
+            .ok_or_else(|| "friend invites need --relay host:port".to_owned())?;
+        let display = invite_code_display(code_value);
+        let code = mc_spine_proto::InviteCode::parse(&display)
+            .map_err(|e| format!("invite code {display}: {e}"))?;
+        let bridge =
+            FriendGuestBridge::start(&relay, &code, &self.config.username, FRIEND_TIMEOUT)?;
+        let addr = bridge.local_addr();
+        self.friend_bridge = Some(bridge);
+        self.connect_to(addr.ip().to_string(), addr.port());
+        Ok(())
+    }
+
+    /// Host side of "Play with Friends": register a live invite code on
+    /// the relay while the integrated world is running.
+    fn generate_invite(&mut self) -> Result<(), String> {
+        if self.singleplayer_server.is_none() {
+            return Err("friend invites need a hosted world — start singleplayer first".to_owned());
+        }
+        let relay = self
+            .config
+            .relay
+            .clone()
+            .ok_or_else(|| "friend invites need --relay host:port".to_owned())?;
+        let protocol = self.config.mc_version.parse::<i32>().unwrap_or(767);
+        let world = self
+            .config
+            .quick_play_singleplayer
+            .clone()
+            .unwrap_or_else(|| "New World".to_owned());
+        let session = FriendHostSession::register(
+            &relay,
+            protocol,
+            &world,
+            8,
+            host_secret_bytes(),
+            FRIEND_TIMEOUT,
+        )?;
+        let code = session.invite_code();
+        let value = invite_code_value(&code);
+        self.friend_host = Some(session);
+        self.ui.active_invite = Some(value);
+        Ok(())
+    }
+
+    /// `E` opens the window-0 player inventory: a 46-slot
+    /// [`ContainerScreenState`] fed by `live.player_inventory`, the mirror
+    /// the server's window-0 `container_set_content`/`set_slot` packets
+    /// keep current even with no `open_screen`.
+    fn open_own_inventory(&mut self) {
+        let mut screen = ContainerScreenState::new(&PLAYER_INVENTORY_SCHEMA, 0, 0, "Inventory");
+        if let Some(live) = &self.live {
+            screen.state_id = live.player_inventory_state_id;
+            for (index, stack) in &live.player_inventory {
+                if let Ok(index) = usize::try_from(*index) {
+                    screen.set_slot(
+                        index,
+                        UiItemStack::new(
+                            stack.item_id.max(0) as u32,
+                            stack.count.clamp(0, 255) as u8,
+                        ),
+                    );
+                }
+            }
+            screen.set_cursor(live.player_carried.as_ref().map(|carried| {
+                UiItemStack::new(
+                    carried.item_id.max(0) as u32,
+                    carried.count.clamp(0, 255) as u8,
+                )
+            }));
+        }
+        self.container_screen = Some(screen);
+        self.own_inventory_open = true;
+        self.set_cursor_grab(false);
+    }
+
+    /// Close the window-0 inventory: `E` or `Escape`, with the vanilla
+    /// `container_close(0)` notification when a session is live.
+    fn close_own_inventory(&mut self) {
+        self.own_inventory_open = false;
+        self.container_screen = None;
+        if let Some(live) = &mut self.live {
+            live.container_close(0);
+        }
+        self.maybe_regrab();
+    }
+
+    /// Close whatever container surface is up: the own inventory, or the
+    /// server-driven screen (sending its `container_close`).
+    fn close_container_surface(&mut self) -> bool {
+        if self.own_inventory_open {
+            self.close_own_inventory();
+            return true;
+        }
+        if let Some(screen) = self.container_screen.take() {
+            if let Some(live) = &mut self.live {
+                live.container_close(screen.window_id);
+            }
+            self.maybe_regrab();
+            return true;
+        }
+        false
+    }
+
+    /// `L` toggles the advancements overlay; vanilla announces the screen
+    /// through `seen_advancements` on open (`Some(tab)`) and close (`None`).
+    fn toggle_advancements(&mut self) {
+        if self.advancements_open {
+            self.advancements_open = false;
+            if let Some(live) = &mut self.live {
+                live.seen_advancements(None);
+            }
+            self.maybe_regrab();
+        } else {
+            self.advancements_open = true;
+            let tab = self.live.as_ref().and_then(|live| {
+                live.advancements_tab
+                    .clone()
+                    .or_else(|| live.advancements.keys().next().cloned())
+            });
+            if let Some(live) = &mut self.live {
+                live.seen_advancements(tab.as_deref());
+            }
+            self.set_cursor_grab(false);
+        }
+    }
+
+    /// The `L` overlay: a parchment-dark panel listing the mirrored
+    /// advancement tree with progress, drawn through the normal UI draw
+    /// list so it shares HUD compositing.
+    fn render_advancements_overlay(
+        live: Option<&LiveSession>,
+        w: i32,
+        h: i32,
+        out: &mut mc_spine_ui::draw::UiDrawList,
+    ) {
+        let panel_w = w.saturating_sub(80).clamp(200, 520);
+        let rows = live.map_or(0, |live| live.advancements.len()) as i32;
+        let panel_h = (60 + rows * 14).min(h.saturating_sub(80)).max(80);
+        let x0 = ((w - panel_w) / 2).max(8);
+        let y0 = ((h - panel_h) / 2).max(8);
+        let rect = UiRect::new(x0, y0, panel_w as u32, panel_h as u32);
+        out.fill_rect(rect, UiColor::rgba(12, 12, 14, 222));
+        out.border_rect(rect, UiColor::rgba(84, 84, 96, 255), 2);
+        out.text(
+            x0 + 12,
+            y0 + 10,
+            1,
+            UiColor::rgba(255, 213, 79, 255),
+            "Advancements",
+        );
+        let Some(live) = live else {
+            out.text_str(
+                x0 + 12,
+                y0 + 30,
+                1,
+                UiColor::rgba(170, 170, 178, 255),
+                "no live session",
+            );
+            return;
+        };
+        if live.advancements.is_empty() {
+            out.text_str(
+                x0 + 12,
+                y0 + 30,
+                1,
+                UiColor::rgba(170, 170, 178, 255),
+                "no advancements synced yet",
+            );
+            return;
+        }
+        let mut y = y0 + 28;
+        let max_y = y0 + panel_h - 12;
+        for (key, advancement) in &live.advancements {
+            if y >= max_y {
+                out.text_str(x0 + 12, y, 1, UiColor::rgba(170, 170, 178, 255), "...");
+                break;
+            }
+            let progress = live.advancement_progress.get(key);
+            let done = progress.map_or(0, |p| p.done);
+            let total = advancement.criteria_total.max(1);
+            let complete = done >= total;
+            let color = if complete {
+                UiColor::rgba(85, 255, 85, 255)
+            } else {
+                UiColor::rgba(220, 220, 226, 255)
+            };
+            let title = if advancement.title.is_empty() {
+                key.as_str()
+            } else {
+                advancement.title.as_str()
+            };
+            out.text(x0 + 12, y, 1, color, format!("{title}  {done}/{total}"));
+            y += 14;
+        }
+    }
+
     fn init_gpu(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
-        let attrs = WindowAttributes::default()
+        let size = PhysicalSize::new(
+            self.config.width.unwrap_or(1280).max(1),
+            self.config.height.unwrap_or(720).max(1),
+        );
+        let mut attrs = WindowAttributes::default()
             .with_title(WINDOW_TITLE)
-            .with_inner_size(PhysicalSize::new(1280u32, 720u32))
+            .with_inner_size(size)
             .with_resizable(true);
+        if self.config.fullscreen {
+            attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+        }
         let window = Arc::new(
             event_loop
                 .create_window(attrs)
@@ -704,7 +1252,7 @@ impl GpuApp {
         self.active = Some(active);
         let settings = self.ui.settings.clone();
         self.apply_settings(&settings);
-        self.set_cursor_grab(true);
+        self.maybe_regrab();
         Ok(())
     }
 
@@ -741,6 +1289,9 @@ impl GpuApp {
                 window_id,
                 state_id,
             }) => {
+                // A server-opened window always replaces the local
+                // inventory surface.
+                self.own_inventory_open = false;
                 let opened_now = !matches!(
                     &self.container_screen,
                     Some(screen) if screen.window_id == window_id
@@ -783,12 +1334,33 @@ impl GpuApp {
                 }
             }
             None => {
-                if self.container_screen.take().is_some()
-                    && self.live.is_some()
-                    && !self.paused
-                    && self.focused
-                {
-                    self.set_cursor_grab(true);
+                if self.own_inventory_open {
+                    // Window-0 sync without an `open_screen`: refresh the
+                    // local inventory's slots when `state_id` bumps.
+                    if let (Some(live), Some(screen)) = (&self.live, &mut self.container_screen) {
+                        if screen.state_id != live.player_inventory_state_id {
+                            screen.state_id = live.player_inventory_state_id;
+                            for (index, stack) in &live.player_inventory {
+                                if let Ok(index) = usize::try_from(*index) {
+                                    screen.set_slot(
+                                        index,
+                                        UiItemStack::new(
+                                            stack.item_id.max(0) as u32,
+                                            stack.count.clamp(0, 255) as u8,
+                                        ),
+                                    );
+                                }
+                            }
+                            screen.set_cursor(live.player_carried.as_ref().map(|carried| {
+                                UiItemStack::new(
+                                    carried.item_id.max(0) as u32,
+                                    carried.count.clamp(0, 255) as u8,
+                                )
+                            }));
+                        }
+                    }
+                } else if self.container_screen.take().is_some() {
+                    self.maybe_regrab();
                 }
             }
         }
@@ -847,22 +1419,14 @@ impl GpuApp {
         match state {
             ElementState::Pressed => {
                 let layout = screen.layout(w, h);
-                if let Some(hit) = layout
-                    .slots
-                    .iter()
-                    .find(|slot| slot.rect.contains(mx, my))
-                {
+                if let Some(hit) = layout.slots.iter().find(|slot| slot.rect.contains(mx, my)) {
                     let slot_index = hit.index;
                     if let Some(action) = screen.click(slot_index, button_id) {
                         if let Some(live) = &mut self.live {
                             Self::forward_click_action(live, action);
                         }
                     }
-                } else if let Some(hit) = layout
-                    .buttons
-                    .iter()
-                    .find(|b| b.rect.contains(mx, my))
-                {
+                } else if let Some(hit) = layout.buttons.iter().find(|b| b.rect.contains(mx, my)) {
                     let id = hit.id;
                     if let Some(action) = screen.button_click(id) {
                         if let Some(live) = &mut self.live {
@@ -1030,9 +1594,7 @@ impl GpuApp {
         if close {
             self.chat_bar = None;
             self.chat_suggestions.clear();
-            if self.live.is_some() && !self.paused && self.focused {
-                self.set_cursor_grab(true);
-            }
+            self.maybe_regrab();
         }
     }
 
@@ -1257,6 +1819,14 @@ impl GpuApp {
         if let Some(screen) = &self.container_screen {
             screen.render(w as f32, h as f32, &mut draw_list);
         }
+        if self.advancements_open {
+            Self::render_advancements_overlay(
+                self.live.as_ref(),
+                w as i32,
+                h as i32,
+                &mut draw_list,
+            );
+        }
         // Dirty-only upload: unchanged HUD frames skip the `w*h*4` rasterize
         // and the texture upload instead of burning GB/s of PCIe bandwidth.
         let fingerprint = fingerprint_draw_list(w, h, &draw_list);
@@ -1340,15 +1910,33 @@ impl GpuApp {
                 self.camera_controller.cycle_mode();
             }
             KeyCode::Escape if pressed => {
-                self.paused = !self.paused;
-                if self.paused {
-                    self.camera_controller.set_zoomed(false);
-                    if let Some(event) = self.input_router.release_held_keys() {
-                        self.apply_window_input(event);
-                    }
+                // Vanilla close order: chat (handled before this point) ->
+                // container/inventory screen -> advancements overlay ->
+                // pause menu -> UI back-navigation on non-HUD screens.
+                if self.close_container_surface() {
+                    return;
                 }
-                if self.paused {
-                    self.ui.navigate(Screen::Pause);
+                if self.advancements_open {
+                    self.toggle_advancements();
+                    return;
+                }
+                if self.ui.screen == Screen::InGameHud || self.paused {
+                    self.paused = !self.paused;
+                    if self.paused {
+                        self.camera_controller.set_zoomed(false);
+                        if let Some(event) = self.input_router.release_held_keys() {
+                            self.apply_window_input(event);
+                        }
+                        self.ui.navigate(Screen::Pause);
+                    } else {
+                        for action in self
+                            .ui
+                            .handle_input(UiInputEvent::KeyPressed(UiKey::Escape))
+                        {
+                            self.apply_ui_action(&action, event_loop);
+                        }
+                    }
+                    self.maybe_regrab();
                 } else {
                     for action in self
                         .ui
@@ -1357,10 +1945,9 @@ impl GpuApp {
                         self.apply_ui_action(&action, event_loop);
                     }
                 }
-                self.set_cursor_grab(!self.paused);
             }
             _ => {
-                if pressed && self.paused {
+                if pressed && self.ui_wants_input() {
                     if let Some(key) = ui_key(code) {
                         let actions = self.ui.handle_input(UiInputEvent::KeyPressed(key));
                         for action in actions {
@@ -1458,26 +2045,23 @@ impl GpuApp {
                     }
                 }
             }
-            // These bindings are emitted by the router. Inventory and
-            // advancements screens require their own runtime APIs.
-            WindowInputEvent::OpenInventory
-            | WindowInputEvent::OpenAdvancements => {}
+            WindowInputEvent::OpenInventory => {
+                if self.own_inventory_open {
+                    self.close_own_inventory();
+                } else if !self.close_container_surface() {
+                    self.open_own_inventory();
+                }
+            }
+            WindowInputEvent::OpenAdvancements => {
+                self.toggle_advancements();
+            }
         }
     }
 
     fn apply_ui_action(&mut self, action: &UiAction, event_loop: &ActiveEventLoop) {
         match action {
             UiAction::QuitGame => event_loop.exit(),
-            UiAction::OpenScreen(screen) => self.ui.navigate(*screen),
-            UiAction::Back => {
-                self.ui
-                    .handle_input(UiInputEvent::KeyPressed(UiKey::Escape));
-            }
-            UiAction::SettingsChanged => {
-                let settings = self.ui.settings.clone();
-                self.apply_settings(&settings);
-            }
-            _ => {}
+            other => self.dispatch_ui_action(other),
         }
     }
 
@@ -1541,6 +2125,73 @@ fn surface_config_for(
     }
 }
 
+/// The 40-bit value inside an [`mc_spine_proto::InviteCode`], matching
+/// `InviteCode`'s private `value()` — `as_bytes` is the code big-endian.
+fn invite_code_value(code: &mc_spine_proto::InviteCode) -> u64 {
+    let b = code.as_bytes();
+    u64::from_be_bytes([0, 0, 0, b[0], b[1], b[2], b[3], b[4]])
+}
+
+/// Entropy for the friend-host session secret: `/dev/urandom` where it
+/// exists, with the same pid/ASLR/monotonic-jitter mixer the relay crate
+/// falls back to when it does not.
+fn host_secret_bytes() -> [u8; 16] {
+    let mut buf = [0u8; 16];
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut buf))
+            .is_ok()
+        {
+            return buf;
+        }
+    }
+    let marker = Box::new(0u8);
+    let mut x = (u64::from(std::process::id()) << 32)
+        ^ (&*marker as *const u8 as usize) as u64
+        ^ 0x9E37_79B9_7F4A_7C15;
+    let t0 = Instant::now();
+    for chunk in buf.chunks_mut(8) {
+        x ^= t0.elapsed().as_nanos() as u64;
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^= x >> 31;
+        chunk.copy_from_slice(&x.to_le_bytes()[..chunk.len()]);
+    }
+    buf
+}
+
+/// `UiAction::OpenUrl` — hand the link to the platform's URL handler and
+/// report spawn failures back through the status line (the UI only emits
+/// configured `https?` links).
+fn open_url(url: &str) -> Result<(), String> {
+    let spawn = |program: &str, args: &[&str]| {
+        std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("{program}: {e}"))
+    };
+    #[cfg(target_os = "macos")]
+    {
+        return spawn("open", &[url]);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return spawn("rundll32", &["url.dll,FileProtocolHandler", url]);
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        spawn("xdg-open", &[url])
+    }
+}
+
 fn ui_key(code: KeyCode) -> Option<UiKey> {
     Some(match code {
         KeyCode::Tab => UiKey::Tab,
@@ -1598,7 +2249,7 @@ impl ApplicationHandler for GpuApp {
                     self.camera_controller.set_zoomed(false);
                     self.set_cursor_grab(false);
                 } else if !self.paused {
-                    self.set_cursor_grab(true);
+                    self.maybe_regrab();
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -1612,7 +2263,7 @@ impl ApplicationHandler for GpuApp {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = (position.x as i32, position.y as i32);
-                if self.paused {
+                if self.ui_wants_input() {
                     let actions = self.ui.handle_input(UiInputEvent::MouseMove {
                         x: position.x as i32,
                         y: position.y as i32,
@@ -1630,14 +2281,14 @@ impl ApplicationHandler for GpuApp {
                 if self.container_screen.is_some() {
                     self.container_mouse_input(state, button);
                 } else if state == ElementState::Pressed && button == MouseButton::Left {
-                    if self.paused {
+                    if self.ui_wants_input() {
                         let (x, y) = self.mouse_pos;
                         let actions = self.ui.handle_input(UiInputEvent::Click { x, y });
                         for action in actions {
                             self.apply_ui_action(&action, event_loop);
                         }
                     } else {
-                        self.set_cursor_grab(true);
+                        self.maybe_regrab();
                     }
                 }
             }
