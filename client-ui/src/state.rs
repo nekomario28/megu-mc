@@ -1350,6 +1350,14 @@ pub struct HudState {
     /// Crafting-conflict switcher: `total_candidates >= 2` draws one
     /// compact `< k/N >` cycle button; `<= 1` emits nothing at all.
     pub crafting_conflict: CraftingConflictOverlay,
+    /// Scoreboard sidebar state (`hud.scoreboard`): objective title +
+    /// sorted score entries; hidden until `visible` is set.
+    pub scoreboard: ScoreboardState,
+    /// Title/subtitle overlay (`hud.title`): vanilla fade timing driven
+    /// by [`TitleOverlayState::tick`].
+    pub title_overlay: TitleOverlayState,
+    /// Jade/WAILA-style looking-at-block overlay (`hud.jade_looking_at`).
+    pub looking_at: crate::magic_hud::LookingAtBlockState,
 }
 
 /// Compact in-HUD recipe-conflict resolver state.
@@ -1383,6 +1391,184 @@ impl CraftingConflictOverlay {
     }
 }
 
+// ---------------------------------------------------------------------------
+// HUD feature states (scoreboard sidebar, title overlay)
+// ---------------------------------------------------------------------------
+
+/// Vanilla sidebar cap: an objective display renders at most 15 rows.
+pub const SCOREBOARD_SIDEBAR_MAX_ROWS: usize = 15;
+
+/// Sidebar scoreboard state (`hud.scoreboard`): an objective title plus
+/// score entries the game fills from scoreboard S2C packets. Pure data —
+/// [`ScoreboardState::sidebar`] converts to the
+/// [`crate::hud_widgets::ScoreboardSidebar`] render model and
+/// [`crate::layout::layout_scoreboard_sidebar`] draws it on the right
+/// edge while [`visible`](Self::visible) is set.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScoreboardState {
+    /// Sidebar title; `None` (or empty) draws rows without a header,
+    /// matching vanilla's untitled sidebar.
+    pub objective_title: Option<String>,
+    /// Unsorted score entries; [`sorted_entries`](Self::sorted_entries)
+    /// orders them score-descending (label ascending on ties) and caps
+    /// at [`SCOREBOARD_SIDEBAR_MAX_ROWS`].
+    pub entries: Vec<crate::hud_widgets::ScoreboardEntry>,
+    /// Show/hide flag: `false` draws nothing even when populated.
+    pub visible: bool,
+}
+
+impl ScoreboardState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `true` when a non-empty title or at least one labelled entry
+    /// exists to show.
+    pub fn has_content(&self) -> bool {
+        self.objective_title.as_ref().is_some_and(|t| !t.is_empty())
+            || self.entries.iter().any(|e| !e.label.is_empty())
+    }
+
+    /// `true` while the sidebar should draw this frame.
+    pub fn should_render(&self) -> bool {
+        self.visible && self.has_content()
+    }
+
+    /// Entries sorted score-descending with label-ascending tie-break,
+    /// truncated to the vanilla 15-row sidebar limit.
+    pub fn sorted_entries(&self) -> Vec<crate::hud_widgets::ScoreboardEntry> {
+        let mut rows = self.entries.clone();
+        rows.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.label.cmp(&b.label)));
+        rows.truncate(SCOREBOARD_SIDEBAR_MAX_ROWS);
+        rows
+    }
+
+    /// Convert into the widget-pack render model consumed by
+    /// [`crate::layout::layout_scoreboard_sidebar`].
+    pub fn sidebar(&self) -> crate::hud_widgets::ScoreboardSidebar {
+        crate::hud_widgets::ScoreboardSidebar {
+            title: self.objective_title.clone().filter(|t| !t.is_empty()),
+            entries: self.sorted_entries(),
+        }
+    }
+}
+
+/// Title/subtitle overlay state (`hud.title`) with vanilla's
+/// fade-in / hold / fade-out tick timing. The game calls
+/// [`show`](Self::show) when the Set Titles packet arrives and
+/// [`tick`](Self::tick) once per client tick; the HUD composites
+/// [`overlay`](Self::overlay) — a [`crate::hud_widgets::TitleOverlay`]
+/// of [`TimedText`](crate::hud_widgets::TimedText) — while any part is
+/// visible.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TitleOverlayState {
+    /// Big centered title; empty means no title line this overlay.
+    pub title: String,
+    /// Smaller line under the title.
+    pub subtitle: String,
+    /// Ticks spent fading in (vanilla default 10).
+    pub fade_in_ticks: u32,
+    /// Ticks held at full alpha (vanilla default 70).
+    pub stay_ticks: u32,
+    /// Ticks spent fading out (vanilla default 20).
+    pub fade_out_ticks: u32,
+    /// Ticks since [`show`](Self::show); saturates at `u32::MAX`.
+    pub age_ticks: u32,
+}
+
+impl Default for TitleOverlayState {
+    fn default() -> Self {
+        Self::vanilla()
+    }
+}
+
+impl TitleOverlayState {
+    /// An idle overlay with vanilla 1.21.1 timing (10 in / 70 stay /
+    /// 20 out ticks) and no text.
+    pub fn vanilla() -> Self {
+        Self {
+            title: String::new(),
+            subtitle: String::new(),
+            fade_in_ticks: 10,
+            stay_ticks: 70,
+            fade_out_ticks: 20,
+            age_ticks: 0,
+        }
+    }
+
+    /// Show `title`/`subtitle` with explicit phase lengths and reset the
+    /// clock. Empty strings omit that line.
+    pub fn show(
+        &mut self,
+        title: impl Into<String>,
+        subtitle: impl Into<String>,
+        fade_in_ticks: u32,
+        stay_ticks: u32,
+        fade_out_ticks: u32,
+    ) {
+        self.title = title.into();
+        self.subtitle = subtitle.into();
+        self.fade_in_ticks = fade_in_ticks;
+        self.stay_ticks = stay_ticks;
+        self.fade_out_ticks = fade_out_ticks;
+        self.age_ticks = 0;
+    }
+
+    /// [`show`](Self::show) with the vanilla 10/70/20 timing.
+    pub fn show_vanilla(&mut self, title: impl Into<String>, subtitle: impl Into<String>) {
+        self.show(title, subtitle, 10, 70, 20);
+    }
+
+    /// Hide the overlay immediately (next render emits nothing).
+    pub fn clear(&mut self) {
+        self.title.clear();
+        self.subtitle.clear();
+        self.age_ticks = 0;
+    }
+
+    /// Advance the overlay one client tick (20 ticks per second).
+    pub fn tick(&mut self) {
+        self.age_ticks = self.age_ticks.saturating_add(1);
+    }
+
+    /// Total lifetime in ticks: `fade_in + stay + fade_out`.
+    pub fn total_ticks(&self) -> u32 {
+        self.fade_in_ticks
+            .saturating_add(self.stay_ticks)
+            .saturating_add(self.fade_out_ticks)
+    }
+
+    /// `true` while title or subtitle text exists and the timing window
+    /// has not fully elapsed.
+    pub fn is_active(&self) -> bool {
+        (!self.title.is_empty() || !self.subtitle.is_empty()) && self.age_ticks < self.total_ticks()
+    }
+
+    /// Convert into the widget-pack render model. Returns `None` once
+    /// the overlay has fully expired; individual lines may still be
+    /// mid-fade (alpha &lt; 1) or fully transparent on the first fade-in
+    /// tick — the renderer filters those itself.
+    pub fn overlay(&self) -> Option<crate::hud_widgets::TitleOverlay> {
+        if !self.is_active() {
+            return None;
+        }
+        let timed = |text: &str| {
+            (!text.is_empty()).then(|| crate::hud_widgets::TimedText {
+                text: text.to_string(),
+                age_ticks: self.age_ticks,
+                fade_in_ticks: self.fade_in_ticks,
+                stay_ticks: self.stay_ticks,
+                fade_out_ticks: self.fade_out_ticks,
+            })
+        };
+        Some(crate::hud_widgets::TitleOverlay {
+            title: timed(&self.title),
+            subtitle: timed(&self.subtitle),
+            actionbar: None,
+        })
+    }
+}
+
 impl Default for HudState {
     fn default() -> Self {
         Self {
@@ -1406,6 +1592,9 @@ impl Default for HudState {
             subtitles: Vec::new(),
             subtitle_hud: crate::subtitle_hud::SubtitleHudState::default(),
             crafting_conflict: CraftingConflictOverlay::default(),
+            scoreboard: ScoreboardState::default(),
+            title_overlay: TitleOverlayState::default(),
+            looking_at: crate::magic_hud::LookingAtBlockState::default(),
         }
     }
 }
@@ -1444,6 +1633,9 @@ impl HudState {
             subtitles: Vec::new(),
             subtitle_hud: crate::subtitle_hud::SubtitleHudState::default(),
             crafting_conflict: CraftingConflictOverlay::default(),
+            scoreboard: ScoreboardState::default(),
+            title_overlay: TitleOverlayState::default(),
+            looking_at: crate::magic_hud::LookingAtBlockState::default(),
         }
     }
 }
@@ -2139,6 +2331,9 @@ impl UiState {
         layout::layout_screen_into(self, width, height, out, &mut regions);
         if self.screen == Screen::InGameHud {
             layout::layout_subtitle_hud(self, &self.hud.subtitle_hud, width, height, out);
+            layout::layout_scoreboard_sidebar(self, width, height, out);
+            layout::layout_title_overlay(self, width, height, out);
+            layout::layout_looking_at(self, width, height, out);
         }
         self.hit_regions = regions;
         if let Some(i) = self.focus_index {

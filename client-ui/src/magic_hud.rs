@@ -61,6 +61,55 @@ impl MagicHudState {
     }
 }
 
+/// Maximum extra tooltip lines the looking-at overlay renders.
+pub const LOOKING_AT_MAX_EXTRA_LINES: usize = 4;
+
+/// Jade/WAILA-style "what am I looking at" overlay state
+/// (`hud.jade_looking_at`).
+///
+/// Pure data: the game fills it from the block/entity under the crosshair
+/// (plus mod-provided tooltip lines) and
+/// [`crate::layout::layout_looking_at`] draws the panel while
+/// [`is_visible`](Self::is_visible) holds. `enabled = false` — the
+/// default — draws nothing even when populated, so the vanilla HUD is
+/// untouched until a host opts in.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LookingAtBlockState {
+    /// Master switch; `false` suppresses the overlay entirely.
+    pub enabled: bool,
+    /// Registry id of the targeted block, e.g. `"minecraft:oak_log"`.
+    pub block_id: String,
+    /// Localized display name; [`name`](Self::name) falls back to
+    /// `block_id` when this is empty.
+    pub display_name: String,
+    /// Target block position `[x, y, z]`; `None` omits the coordinate
+    /// line.
+    pub position: Option<[i32; 3]>,
+    /// Owning mod id/name shown on the dim info line.
+    pub mod_name: Option<String>,
+    /// Required-tool hint, e.g. `"Needs diamond pickaxe"`.
+    pub tool_hint: Option<String>,
+    /// Extra mod-provided tooltip lines (rendered dim, capped at
+    /// [`LOOKING_AT_MAX_EXTRA_LINES`]).
+    pub extra_lines: Vec<String>,
+}
+
+impl LookingAtBlockState {
+    /// `true` while enabled and a target (id or display name) exists.
+    pub fn is_visible(&self) -> bool {
+        self.enabled && !(self.block_id.is_empty() && self.display_name.is_empty())
+    }
+
+    /// The name line to render: `display_name`, else `block_id`.
+    pub fn name(&self) -> &str {
+        if self.display_name.is_empty() {
+            &self.block_id
+        } else {
+            &self.display_name
+        }
+    }
+}
+
 const MARGIN: i32 = 8;
 const PANEL_WIDTH: i32 = 194;
 const BAR_HEIGHT: i32 = 25;

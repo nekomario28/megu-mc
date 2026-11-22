@@ -17,6 +17,7 @@ use mc_spine_core::i18n::UiTextKey;
 use mc_spine_core::sys_metrics::{format_mini_hud_lines, MiniHudAnchor};
 
 use crate::draw::{palette as pal, text_width, UiColor, UiCommand, UiDrawList, UiRect};
+use crate::hud_widgets::{HudSnapshot, HudWidgetsRenderer};
 use crate::magic_hud::MagicHudState;
 use crate::state::{
     tr, HitRegion, HudState, HudSubtitle, MiniHudPreset, ModSyncChange, Screen, SettingKey,
@@ -2133,6 +2134,192 @@ pub fn layout_subtitle_hud(
     }
     let reserved = hud_occupied_rects(state, width, height);
     subtitles.render_avoiding(width as f32, height as f32, &reserved, out)
+}
+
+// ---------------------------------------------------------------------------
+// HUD feature overlays: scoreboard sidebar, title, looking-at block
+// ---------------------------------------------------------------------------
+//
+// These composite after [`layout_screen`] exactly like
+// [`layout_subtitle_hud`]: each reads its slice of [`HudState`], emits
+// nothing while the feature is unpopulated/disabled, and appends to `out`.
+// The scoreboard and title reuse the landed `hud_widgets` pack through a
+// minimal [`HudSnapshot`] (vitals explicitly disabled so the widget
+// renderer never double-draws the hotbar chrome `hud()` already emits);
+// the looking-at panel is drawn directly since the widget pack has no
+// Jade-style element.
+
+/// Vanilla-style empty snapshot for single-widget renders: every widget
+/// off except the one the caller fills in.
+fn hud_feature_snapshot() -> HudSnapshot {
+    HudSnapshot {
+        // `show_vitals = false` + zero XP suppresses every vitals
+        // element; the remaining widgets default to empty/hidden.
+        vitals: crate::hud_widgets::VitalsState {
+            show_vitals: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// Append the scoreboard sidebar (`hud.scoreboard`) to the HUD draw
+/// list: right-edge panel, objective title, score-descending rows capped
+/// at the vanilla 15. Returns `false` — emitting nothing — while the
+/// state is hidden or empty.
+pub fn layout_scoreboard_sidebar(
+    state: &UiState,
+    width: u32,
+    height: u32,
+    out: &mut UiDrawList,
+) -> bool {
+    let scoreboard = &state.hud.scoreboard;
+    if !scoreboard.should_render() {
+        return false;
+    }
+    let mut snapshot = hud_feature_snapshot();
+    snapshot.scoreboard = scoreboard.sidebar();
+    let before = out.len();
+    HudWidgetsRenderer::new().render(&snapshot, width, height, out);
+    out.len() > before
+}
+
+/// Append the title/subtitle overlay (`hud.title`) to the HUD draw list:
+/// the big title and subtitle centered in the upper third with vanilla
+/// fade-in/hold/fade-out alpha driven by
+/// [`TitleOverlayState::tick`](crate::state::TitleOverlayState::tick).
+/// Returns `false` once the overlay has fully expired.
+pub fn layout_title_overlay(
+    state: &UiState,
+    width: u32,
+    height: u32,
+    out: &mut UiDrawList,
+) -> bool {
+    let Some(overlay) = state.hud.title_overlay.overlay() else {
+        return false;
+    };
+    let mut snapshot = hud_feature_snapshot();
+    snapshot.title = overlay;
+    let before = out.len();
+    HudWidgetsRenderer::new().render(&snapshot, width, height, out);
+    out.len() > before
+}
+
+/// Append the Jade-style looking-at-block panel (`hud.jade_looking_at`)
+/// to the HUD draw list: a compact top-left tooltip with the targeted
+/// block's name, mod/position info, tool hint, and mod-provided extra
+/// lines. Returns `false` while disabled or targeting nothing.
+pub fn layout_looking_at(state: &UiState, width: u32, height: u32, out: &mut UiDrawList) -> bool {
+    let looking = &state.hud.looking_at;
+    if !looking.is_visible() {
+        return false;
+    }
+    // Same auto GUI scale the other corner overlays use so panels agree.
+    let ms = ((height as f32 / 360.0).floor() as u32)
+        .clamp(1, 4)
+        .min(((width as f32 / 320.0).floor() as u32).max(1));
+    let lw = (width / ms) as i32;
+    let lh = (height / ms) as i32;
+    if lw < 48 || lh < 44 {
+        return false;
+    }
+
+    // Content lines: name, then dim mod/position info, tool hint, and
+    // capped extra tooltip lines.
+    let mut lines: Vec<(String, UiColor)> = Vec::new();
+    let name_cells = ((lw / 2 - 12) / 8).max(1) as usize;
+    lines.push((hud_str(looking.name(), name_cells), pal::TEXT));
+    let mut info_parts: Vec<String> = Vec::new();
+    if let Some(mod_name) = looking.mod_name.as_ref().filter(|m| !m.is_empty()) {
+        info_parts.push(hud_str(mod_name, 24));
+    }
+    if let Some([x, y, z]) = looking.position {
+        info_parts.push(format!("{x} {y} {z}"));
+    }
+    if !info_parts.is_empty() {
+        lines.push((info_parts.join("  "), pal::TEXT_DIM));
+    }
+    if let Some(hint) = looking.tool_hint.as_ref().filter(|t| !t.is_empty()) {
+        lines.push((hud_str(hint, name_cells), pal::WARNING));
+    }
+    for extra in looking
+        .extra_lines
+        .iter()
+        .filter(|l| !l.is_empty())
+        .take(crate::magic_hud::LOOKING_AT_MAX_EXTRA_LINES)
+    {
+        lines.push((hud_str(extra, name_cells), pal::TEXT_DIM));
+    }
+
+    const EDGE_L: i32 = 4;
+    const ROW_H: i32 = 10;
+    const PAD_X: i32 = 4;
+    const PAD_Y: i32 = 3;
+    // Rows that fit above the bottom edge; oldest extras drop first is
+    // wrong here — extras are already capped, so tail rows drop instead.
+    let max_rows = ((lh - 2 * EDGE_L) / ROW_H).max(0) as usize;
+    let shown = lines.len().min(max_rows);
+    if shown == 0 {
+        return false;
+    }
+    let lines = &lines[..shown];
+    let panel_w = lines
+        .iter()
+        .map(|(text, _)| text.chars().count() as i32 * 8)
+        .max()
+        .unwrap_or(0)
+        + 2 * PAD_X;
+    let panel_h = shown as i32 * ROW_H + 2 * PAD_Y - 2;
+    if panel_w > lw - 2 * EDGE_L || panel_h > lh - 2 * EDGE_L {
+        return false;
+    }
+
+    // Reserved HUD chrome in this overlay's logical space; the panel
+    // slides down past whatever it would intersect (top-left anchor).
+    let reserved: Vec<UiRect> = hud_occupied_rects(state, width, height)
+        .iter()
+        .map(|r| {
+            let x0 = (r.x as f32 / ms as f32).floor() as i32;
+            let y0 = (r.y as f32 / ms as f32).floor() as i32;
+            let x1 = (r.right() as f32 / ms as f32).ceil() as i32;
+            let y1 = (r.bottom() as f32 / ms as f32).ceil() as i32;
+            UiRect::new(x0, y0, (x1 - x0).max(0) as u32, (y1 - y0).max(0) as u32)
+        })
+        .collect();
+    let panel_x = EDGE_L;
+    let mut top = EDGE_L;
+    loop {
+        let rect = UiRect::new(panel_x, top, panel_w as u32, panel_h as u32);
+        match reserved.iter().find(|r| rect.intersects(**r)) {
+            Some(r) => top = r.bottom() + 2,
+            None => break,
+        }
+        if top + panel_h > lh - EDGE_L {
+            return false;
+        }
+    }
+
+    let px = panel_x * ms as i32;
+    let py = top * ms as i32;
+    let pw = (panel_w * ms as i32) as u32;
+    let ph = (panel_h * ms as i32) as u32;
+    out.fill_rect(UiRect::new(px, py, pw, ph), pal::PANEL);
+    out.border_rect(UiRect::new(px, py, pw, ph), pal::PANEL_BORDER, ms);
+    for (i, (text, color)) in lines.iter().enumerate() {
+        let cells = ((panel_w - 2 * PAD_X) / 8).max(0) as usize;
+        let clipped = first_chars(text, cells);
+        if clipped.is_empty() {
+            continue;
+        }
+        out.text_str(
+            (panel_x + PAD_X) * ms as i32,
+            (top + PAD_Y + i as i32 * ROW_H) * ms as i32,
+            ms,
+            *color,
+            clipped,
+        );
+    }
+    true
 }
 
 /// Every rectangle the in-game HUD occupies, in *physical* pixels, for
