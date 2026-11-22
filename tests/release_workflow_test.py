@@ -123,6 +123,18 @@ class ReleaseWorkflowTest(unittest.TestCase):
         for binary in BINARIES:
             self.assertIn(f"release/{binary}$suffix", job)
         self.assertIn("if-no-files-found: error", job)
+        self.assertIn(
+            "cargo build --locked --release --features mod-suite,create-offload --bin mc-spine",
+            job,
+        )
+
+    def test_publish_release_includes_bootstrapper_bundles_and_sbom(self):
+        job = self.jobs["publish-release"]
+        self.assertIn("tools/client_launcher/gen_launcher_profile.py", job)
+        self.assertIn("--build-jar", job)
+        self.assertIn("tools/client_launcher/export_launcher_bundle.py", job)
+        self.assertIn("CycloneDX", job)
+        self.assertIn("sbom.cdx.json", job)
 
     def test_client_gpu_headless_probe_smoke(self):
         job = self.jobs["build-matrix"]

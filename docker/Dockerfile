@@ -20,7 +20,7 @@ WORKDIR /build
 
 # Everything `cargo build --release --locked` (including `--features mod-suite`
 # and the companion CLI crates) resolves, and nothing more.
-ARG CARGO_FEATURES=""
+ARG CARGO_FEATURES="mod-suite,create-offload"
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY core/Cargo.toml core/Cargo.lock core/

@@ -74,7 +74,7 @@ jobs:
       - name: Build server and standalone release binaries (locked)
         shell: bash
         run: |
-          cargo build --locked --release --bin mc-spine
+          cargo build --locked --release --features mod-suite,create-offload --bin mc-spine
           cargo build --locked --release --manifest-path client-app/Cargo.toml --bin mc-spine-client
           cargo build --locked --release --manifest-path mod-adapter-core/Cargo.toml --bin mc-spine-mod-check
           cargo build --locked --release --manifest-path state-store/Cargo.toml --bin mc-spine-world-migrate
@@ -143,6 +143,65 @@ jobs:
         with:
           pattern: release-*
           path: dist
+      - name: Build launcher bootstrapper JAR, Prism/Modrinth bundles, and CycloneDX SBOM
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          mkdir -p dist/launcher-stage dist/launcher-bundles dist/publish
+          python3 tools/client_launcher/gen_launcher_profile.py \
+            --out-dir dist/launcher-stage --mc-version 1.21.1 --build-jar
+          test -f dist/launcher-stage/mc-spine-bootstrapper.jar
+          cp dist/launcher-stage/mc-spine-bootstrapper.jar dist/publish/mc-spine-bootstrapper.jar
+          python3 tools/client_launcher/export_launcher_bundle.py \
+            --out-dir dist/launcher-bundles/prism --format prism --mc-version 1.21.1 \
+            --bootstrap-jar dist/publish/mc-spine-bootstrapper.jar
+          python3 tools/client_launcher/export_launcher_bundle.py \
+            --out-dir dist/launcher-bundles/mrpack --format mrpack --mc-version 1.21.1 \
+            --loader fabric --loader-version 0.16.9
+          find dist/launcher-bundles -maxdepth 3 \( -name '*.zip' -o -name '*.mrpack' \) -type f -exec cp {} dist/publish/ \;
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          components = {}
+          pkg_re = re.compile(r'(?ms)^\[\[package\]\]\s*\n(.*?)(?=^\[\[package\]\]|\Z)')
+          name_re = re.compile(r'(?m)^name\s*=\s*"([^"]+)"')
+          ver_re = re.compile(r'(?m)^version\s*=\s*"([^"]+)"')
+          for lock in sorted(Path('.').glob('**/Cargo.lock')):
+              if 'target' in lock.parts or '.git' in lock.parts:
+                  continue
+              text = lock.read_text(encoding='utf-8')
+              for block in pkg_re.findall(text):
+                  nm = name_re.search(block)
+                  vm = ver_re.search(block)
+                  if nm and vm:
+                      key = (nm.group(1), vm.group(1))
+                      components[key] = {
+                          'type': 'library',
+                          'name': key[0],
+                          'version': key[1],
+                          'purl': f'pkg:cargo/{key[0]}@{key[1]}',
+                      }
+          sbom = {
+              'bomFormat': 'CycloneDX',
+              'specVersion': '1.5',
+              'version': 1,
+              'metadata': {
+                  'component': {
+                      'type': 'application',
+                      'name': 'mc-spine',
+                      'version': os.environ['RELEASE_VERSION'],
+                      'licenses': [{'license': {'id': 'LGPL-3.0-or-later'}}],
+                  }
+              },
+              'components': [components[k] for k in sorted(components)],
+          }
+          out = Path('dist/publish') / f'mc-spine-{os.environ["RELEASE_VERSION"]}-sbom.cdx.json'
+          out.write_text(json.dumps(sbom, indent=2) + '\n', encoding='utf-8')
+          PY
       - name: Verify archives and generate combined checksums
         shell: bash
         env:
@@ -187,7 +246,9 @@ jobs:
                                        (manifest, f'release-manifest-{target}.json')):
                   destination = output / filename
                   shutil.copyfile(source, destination)
-                  checksums[filename] = hashlib.sha256(destination.read_bytes()).hexdigest()
+          for artifact in sorted(output.iterdir()):
+              if artifact.is_file() and artifact.name != 'SHA256SUMS-all.txt':
+                  checksums[artifact.name] = hashlib.sha256(artifact.read_bytes()).hexdigest()
           (output / 'SHA256SUMS-all.txt').write_text(
               ''.join(f'{checksums[name]}  {name}\n' for name in sorted(checksums)),
               encoding='utf-8')
