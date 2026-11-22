@@ -1936,12 +1936,16 @@ check "generated handoff counts each chunk rather than the whole batch" \
             *counts.entry((pos.0 >> 4, pos.2 >> 4)).or_default() += 1;
         }
         for (pos, block) in pending {
-            let remaining = counts.get_mut(&(pos.0 >> 4, pos.2 >> 4)).unwrap();' \
+            let Some(remaining) = counts.get_mut(&(pos.0 >> 4, pos.2 >> 4)) else {
+                continue;
+            };' \
   '        for _ in &pending {
             *counts.entry((0, 0)).or_default() += 1;
         }
         for (pos, block) in pending {
-            let remaining = counts.get_mut(&(0, 0)).unwrap();' \
+            let Some(remaining) = counts.get_mut(&(0, 0)) else {
+                continue;
+            };' \
   tick_tests::generated_fluid_handoff_matches_native_proto_unpack
 
 check "generated handoff uses the activation time" \
@@ -1961,8 +1965,8 @@ check "a sign message is a JSON string component" \
   src/play_protocol.rs "    o.push('\"');" "    o.push(' ');" \
   sign_side_nbt_matches_the_shape_the_game_writes
 
-check "a sign side carries filtered_messages" \
-  src/play_protocol.rs '    for list in ["filtered_messages", "messages"] {' '    for list in ["messages"] {' \
+check "a sign side omits filtered_messages" \
+  src/play_protocol.rs '    nbt_str(v, "messages"); // TAG_List<String>' '    nbt_str(v, "filtered_messages"); // TAG_List<String>' \
   sign_side_nbt_matches_the_shape_the_game_writes
 
 check "the open window reads the live store, not a copy" \
@@ -3675,12 +3679,10 @@ check "chest_contract_3d_block_loot_lazy_defers_materialization" \
 check "chest_contract_3d_block_loot_spectator_gate_unpacks_for_viewers" \
   src/menus_and_items.rs '    if !me.is_spectator() {
         unpack_window_loot_if_needed(window);
-    }
-    let initial = chest_window_slots(window);' \
+        let locked = [window.0, window.1.unwrap_or(window.0)].iter().any(|key| {' \
   '    if me.is_spectator() {
         unpack_window_loot_if_needed(window);
-    }
-    let initial = chest_window_slots(window);' \
+        let locked = [window.0, window.1.unwrap_or(window.0)].iter().any(|key| {' \
   tick_tests::chest_contract_3d_block_loot_stays_lazy_until_first_open
 
 check "chest_contract_3d_barrel_toggles_open_without_lid_event" \
