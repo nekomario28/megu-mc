@@ -8208,9 +8208,9 @@ mod p6d_parity_tests {
             .unwrap()
             .insert(key, HashMap::from([(0i16, (stone, 3u8, Vec::new()))]));
         let got = p6d_run(&ctx, "/data get block 40 90 40 Items");
-        assert!(got.starts_with("Storage has the following contents"), "{got}");
+        assert!(got.starts_with("40, 90, 40 has the following block data"), "{got}");
         assert!(got.contains("\"minecraft:stone\""), "{got}");
-        assert!(got.contains("\"count\":3"), "{got}");
+        assert!(got.contains("count: 3"), "{got}");
         // merge lands in the live container store — a list field replaces
         // whole (vanilla `Items` is a flat list, not slot-keyed).
         assert_eq!(
@@ -8233,7 +8233,7 @@ mod p6d_parity_tests {
         );
         assert_eq!(
             p6d_run(&ctx, "/data get block 40 90 40 Items[0].count"),
-            "Storage has the following contents: 7"
+            "40, 90, 40 has the following block data: 7"
         );
         assert_eq!(
             chests().lock().unwrap_or_else(|e| e.into_inner()).get(&key).and_then(|s| s.get(&2)).map(|s| s.1),

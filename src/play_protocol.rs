@@ -6118,7 +6118,7 @@ fn apply_underground_lane(me: &Client, dim: DimId, py: f64, surface: i32, gm: u8
         return occluded;
     }
     me.underground_revealed.store(!occluded, Ordering::Relaxed);
-    queue_lane_work(me.eid, LaneWork::Resend(occluded));
+    run_or_queue_lane_work(me, LaneWork::Resend(occluded));
     occluded
 }
 
@@ -6145,6 +6145,21 @@ fn lane_probe_queue() -> &'static (
             std::sync::Condvar::new(),
         )
     })
+}
+
+/// Dispatch one lane job. Connected clients go through the `spine-lane` worker
+/// so the packet-dispatch path never stalls; a `Client` that is not in the
+/// global client list (test fixtures, pre-registration logins) runs the work
+/// inline because the worker could never resolve its entity id.
+fn run_or_queue_lane_work(me: &Client, work: LaneWork) {
+    if client_snapshot().into_iter().any(|c| c.eid == me.eid) {
+        queue_lane_work(me.eid, work);
+    } else {
+        match work {
+            LaneWork::Probe => evaluate_underground_lane(me),
+            LaneWork::Resend(occluded) => resend_loaded_chunks(me, occluded),
+        }
+    }
 }
 
 fn queue_lane_work(eid: i32, work: LaneWork) {
@@ -6197,9 +6212,9 @@ fn evaluate_underground_lane(me: &Client) {
 /// Returns the lane to stream in; on a flip it also re-sends every held chunk
 /// in the new lane so the transition is seamless both ways (descend: caves and
 /// strongholds appear; resurface: anti-cave-xray re-arms). When the column's
-/// surface height is not already built — or the generation lock is contended —
-/// the real evaluation runs on the `spine-lane` probe thread and this returns
-/// the lane as last decided.
+/// surface height cannot be read without contending the generation lock, the
+/// real evaluation runs on the `spine-lane` probe thread and this returns the
+/// lane as last decided.
 fn update_underground_lane(me: &Client) -> bool {
     let (dim, px, py, pz, ..) = client_dim_pos(me);
     let gm = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
@@ -6217,13 +6232,20 @@ fn update_underground_lane(me: &Client) -> bool {
             None => None,
         }
     } else if worldgen::enabled() {
-        worldgen::peek_cols_dim(dim, x >> 4, z >> 4)
-            .map(|cols| cols.surface((x & 15) as usize, (z & 15) as usize))
+        match worldgen::peek_cols_dim(dim, x >> 4, z >> 4) {
+            worldgen::PeekCols::Ready(cols) => {
+                Some(cols.surface((x & 15) as usize, (z & 15) as usize))
+            }
+            // The generator lock is free but the column was never built —
+            // `height_at_dim` builds it inline (the pre-defer behaviour).
+            worldgen::PeekCols::Absent => Some(height_at_dim(dim, x, z)),
+            worldgen::PeekCols::Contended => None,
+        }
     } else {
         Some(height_at_dim(dim, x, z))
     };
     let Some(surface) = surface else {
-        queue_lane_work(me.eid, LaneWork::Probe);
+        run_or_queue_lane_work(me, LaneWork::Probe);
         return !me.underground_revealed.load(Ordering::Relaxed);
     };
     apply_underground_lane(me, dim, py, surface, gm)

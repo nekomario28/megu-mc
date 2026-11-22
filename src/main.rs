@@ -11782,26 +11782,20 @@ fn try_live_block_placement(
     // The slab-absorb special case writes `double` over the clicked cell.
     let (tx, ty, tz) = ctx.target;
     let clicked_st = block_at_dim(dim, x, y, z);
+    if reg.is_air(clicked_st) {
+        // A use packet pointing at air is exploit-shaped — a real client's
+        // raycast can never produce it — so `ac_check_place`'s "clicked air"
+        // flag owns the verdict. Returning false falls through to the legacy
+        // `place()` path, which flags under a live policy and writes
+        // unconditionally under `off`.
+        return false;
+    }
     if slab_absorbs(reg, clicked_st, &name, &ctx) {
         let doubled = reg.with_prop(clicked_st, "type", "double");
         with_save_guard(|| {
             if set_block_if_inner_dim(dim, x, y, z, doubled, Some(clicked_st)) {
                 note_block_update_dim(dim, x, y, z, doubled);
-                if game_mode != 1 {
-                    let mut inventory = c.inv.lock().unwrap_or_else(|e| e.into_inner());
-                    map_take(&mut inventory, 36 + held, 1);
-                    let mut packet = vec![0];
-                    write_varint(&mut packet, 0);
-                    packet.extend_from_slice(&(36 + held).to_be_bytes());
-                    packet.extend_from_slice(&slot_wire(
-                        inventory.get(&(36 + held)).unwrap_or(&Stack::default()),
-                    ));
-                    let _ = send_packet(
-                        &mut c.sock.lock().unwrap_or_else(|e| e.into_inner()),
-                        0x15,
-                        packet,
-                    );
-                }
+                ac_consume_placed_item(c, held);
             }
         });
         return true;
@@ -11812,10 +11806,19 @@ fn try_live_block_placement(
         }
         return false;
     };
-    if writes.is_empty() || !reg.is_replaceable(ctx.target_old) {
+    if !reg.is_replaceable(ctx.target_old) {
+        // Occupied target: `ac_check_place` flags "target occupied" under a
+        // live policy; under `off` the legacy path's unconditional write is the
+        // preset's contract. `placement_target` already derived the vanilla
+        // clicked/face target, so defer rather than double-reject.
         if prof {
-            eprintln!("[place-prof] {item_name} target=({tx},{ty},{tz}) writes={} old={} reject",
-                writes.len(), reg.name_of(ctx.target_old));
+            eprintln!("[place-prof] {item_name} target=({tx},{ty},{tz}) occupied -> defer");
+        }
+        return false;
+    }
+    if writes.is_empty() {
+        if prof {
+            eprintln!("[place-prof] {item_name} target=({tx},{ty},{tz}) writes=0 reject");
         }
         return true;
     }
@@ -11854,17 +11857,7 @@ fn try_live_block_placement(
                 rail_update_at(reg, dim, (tx + dx, ty + dy, tz + dz));
             }
             rail_update_at(reg, dim, (tx, ty, tz));
-            if game_mode != 1 {
-                let mut inventory = c.inv.lock().unwrap_or_else(|e| e.into_inner());
-                map_take(&mut inventory, 36 + held, 1);
-                let mut packet = vec![0];
-                write_varint(&mut packet, 0);
-                packet.extend_from_slice(&(36 + held).to_be_bytes());
-                packet.extend_from_slice(&slot_wire(
-                    inventory.get(&(36 + held)).unwrap_or(&Stack::default()),
-                ));
-                let _ = send_packet(&mut c.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, packet);
-            }
+            ac_consume_placed_item(c, held);
         }
     });
     true

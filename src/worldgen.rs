@@ -9936,12 +9936,28 @@ pub fn chunk_cols_dim(dimension: DimId, cx: i32, cz: i32) -> Option<std::sync::A
     gen_lock_dim(dimension).as_mut()?.cols(cx, cz)
 }
 
-/// `chunk_cols_dim` for a column that is already built: `None` on a cache miss
-/// and also `None` when the generator lock is contended, so a latency-critical
-/// reader can defer instead of queueing behind a section pass.
-pub(crate) fn peek_cols_dim(dimension: DimId, cx: i32, cz: i32) -> Option<std::sync::Arc<ChunkCols>> {
-    let guard = PER_DIM.gens.try_lock().ok()?;
-    guard.get(dimension.index())?.as_ref()?.col_c.get(&(cx, cz)).cloned()
+/// Tri-state `chunk_cols_dim` for latency-critical readers: a built column
+/// comes back `Ready`, an uncontended cache miss is `Absent` (the caller may
+/// build it synchronously), and a contended generator lock is `Contended`,
+/// where the caller should defer instead of queueing behind a section pass.
+pub(crate) enum PeekCols {
+    Ready(std::sync::Arc<ChunkCols>),
+    Absent,
+    Contended,
+}
+
+pub(crate) fn peek_cols_dim(dimension: DimId, cx: i32, cz: i32) -> PeekCols {
+    let Some(guard) = PER_DIM.gens.try_lock().ok() else {
+        return PeekCols::Contended;
+    };
+    match guard
+        .get(dimension.index())
+        .and_then(|g| g.as_ref())
+        .and_then(|g| g.col_c.get(&(cx, cz)).cloned())
+    {
+        Some(cols) => PeekCols::Ready(cols),
+        None => PeekCols::Absent,
+    }
 }
 
 type ChunkBiomeEntries = Vec<((i32, i32), std::sync::Arc<Vec<String>>)>;
