@@ -116,9 +116,11 @@ pub struct CliConfig {
     /// `MC_SPINE_VERSION_DIR`) for `Registry::from_version_dir`.
     pub version_dir: Option<PathBuf>,
     pub headless: bool,
-    /// `--audio-sink <auto|pipewire|alsa|null|off>`: playback backend for
-    /// the live sound path; `auto` (default) tries `pw-cat` then `aplay`
-    /// and fails closed to the null sink.
+    /// `--audio-sink <auto|pipewire|alsa|coreaudio|winmm|null|off>`:
+    /// playback backend for the live sound path; `auto` (default) tries
+    /// `pw-cat` then `aplay` and fails closed to the null sink.
+    /// `coreaudio`/`winmm` select the native macOS/Windows sinks and fall
+    /// back to `null` on other operating systems.
     pub audio_sink: AudioSinkKind,
     pub ticks: u32,
     pub view_distance: i8,
@@ -781,15 +783,18 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
             "--assetIndex" => cfg.asset_index = Some(take_val(flag, &mut i)?),
             "--audio-sink" => {
                 let raw = take_val(flag, &mut i)?;
+                let raw = raw.to_ascii_lowercase();
                 cfg.audio_sink = match raw.as_str() {
                     "auto" => AudioSinkKind::Auto,
                     "pipewire" | "pw-cat" => AudioSinkKind::PipeWire,
                     "alsa" | "aplay" => AudioSinkKind::Alsa,
+                    "coreaudio" => AudioSinkKind::CoreAudio,
+                    "winmm" => AudioSinkKind::WinMm,
                     "null" => AudioSinkKind::Null,
                     "off" => AudioSinkKind::Off,
                     other => {
                         return Err(format!(
-                            "invalid --audio-sink '{other}' (expected auto, pipewire, alsa, null, or off)"
+                            "invalid --audio-sink '{other}' (expected auto, pipewire, alsa, coreaudio, winmm, null, or off)"
                         ));
                     }
                 };
@@ -1133,8 +1138,9 @@ NATIVE CLIENT FLAGS:
   --version-dir <path>               Kernel version pack directory for the block
                                      registry (env: MC_SPINE_VERSION_DIR)
   --headless                         Run headless protocol + meshing + physics session
-  --audio-sink <backend>             Sound playback: auto|pipewire|alsa|null|off
-                                     (default: auto = pw-cat, else aplay, else null)
+  --audio-sink <backend>             Sound playback: auto|pipewire|alsa|coreaudio|winmm|null|off
+                                     (default: auto = pw-cat, else aplay, else null;
+                                     coreaudio/winmm fall back to null on other OSes)
   --audio-wav <path>                 Write mixed 48 kHz s16 stereo audio to a WAV
                                      file instead of a playback backend; a
                                      <path>.subtitles.txt sidecar records cues

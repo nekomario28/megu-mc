@@ -2108,8 +2108,218 @@ pub enum PlayEvent {
         host: String,
         port: i32,
     },
+    // -- Play coverage expansion (v1211 lane) --------------------------------
+    /// `pong_response` — echoes the client's play `ping_request` i64 payload.
+    PongResponse {
+        id: i64,
+    },
+    /// `initialize_border` — full world-border state pushed on join/respawn.
+    InitializeBorder {
+        x: f64,
+        z: f64,
+        old_diameter: f64,
+        new_diameter: f64,
+        /// Lerp time in real-time milliseconds (`VarLong`; 0 when static).
+        lerp_ms: i64,
+        portal_boundary: i32,
+        warning_blocks: i32,
+        warning_time: i32,
+    },
+    /// `set_border_center` — world-border centre move.
+    SetBorderCenter {
+        x: f64,
+        z: f64,
+    },
+    /// `set_border_size` — instant world-border diameter.
+    SetBorderSize {
+        diameter: f64,
+    },
+    /// `set_border_lerp_size` — animated diameter change (VarLong ms).
+    SetBorderLerpSize {
+        old_diameter: f64,
+        new_diameter: f64,
+        lerp_ms: i64,
+    },
+    /// `set_player_team` — scoreboard-team create/remove/update/membership.
+    SetPlayerTeam {
+        name: String,
+        /// 0 create, 1 remove, 2 update info, 3 add entities, 4 remove
+        /// entities; `info` is `Some` only for modes 0 and 2.
+        mode: u8,
+        info: Option<Box<PlayerTeamInfo>>,
+        entities: Vec<String>,
+    },
+    /// `merchant_offers` — villager trade list for the open merchant window.
+    MerchantOffers {
+        window_id: i32,
+        offers: Vec<MerchantOfferEntry>,
+        villager_level: i32,
+        villager_xp: i32,
+        show_progress: bool,
+        can_restock: bool,
+    },
+    /// `horse_screen_open` — horse inventory screen request.
+    HorseScreenOpen {
+        window_id: u8,
+        slots: i32,
+        entity_id: i32,
+    },
+    /// `map_item_data` — map-item patch; `colors` is the `columns * rows`
+    /// pixel block when `columns > 0` (empty otherwise).
+    MapItemData {
+        map_id: i32,
+        scale: i8,
+        locked: bool,
+        icons: Option<Vec<MapItemIcon>>,
+        columns: u8,
+        rows: u8,
+        x: u8,
+        y: u8,
+        colors: Vec<u8>,
+    },
+    /// `player_look_at` — rotate the client player toward a point or entity.
+    PlayerLookAt {
+        /// 0 = feet, 1 = eyes.
+        anchor: i32,
+        target: [f64; 3],
+        /// `(entity_id, entity_anchor)` when `is_entity` was set.
+        entity: Option<(i32, i32)>,
+    },
+    /// `update_advancements` — full advancement tree + progress sync.
+    UpdateAdvancements {
+        reset: bool,
+        advancements: Vec<WireAdvancement>,
+        removed: Vec<String>,
+        progress: Vec<WireAdvancementProgress>,
+    },
+    /// `select_advancements_tab` — switch the advancements screen tab.
+    SelectAdvancementsTab {
+        tab: Option<String>,
+    },
+    /// `award_stats` — statistic counter updates (stat-request reply).
+    AwardStats {
+        entries: Vec<AwardStatEntry>,
+    },
+    /// `server_data` — MOTD component plus optional PNG favicon bytes.
+    ServerData {
+        motd_nbt: Vec<u8>,
+        icon: Option<Vec<u8>>,
+    },
+    /// `chunks_biomes` — per-chunk-column biome payloads (opaque `data`
+    /// kept raw; the biome paletted-container lives inside it).
+    ChunksBiomes {
+        chunks: Vec<ChunkBiomeData>,
+    },
     Disconnect(String),
     Other(i32),
+}
+
+/// Parameter block of `set_player_team` modes 0 (create) and 2 (update).
+#[derive(Clone, Debug)]
+pub struct PlayerTeamInfo {
+    /// Display-name text component as raw anonymous-NBT bytes.
+    pub display_name_nbt: Vec<u8>,
+    /// Friendly-fire (0x01) / see-invisible-teammates (0x02) bitmask.
+    pub friendly_flags: u8,
+    /// `always`/`never`/`hide_for_other_teams`/`hide_for_own_team`.
+    pub nametag_visibility: String,
+    /// `always`/`never`/`push_other_teams`/`push_own_team`.
+    pub collision_rule: String,
+    /// Team colour/formatting id (-1 = none).
+    pub color: i32,
+    /// Prefix/suffix text components as raw anonymous-NBT bytes.
+    pub prefix_nbt: Vec<u8>,
+    pub suffix_nbt: Vec<u8>,
+}
+
+/// One merchant `ItemCost` (item id, count, added-component wire blob).
+#[derive(Clone, Debug)]
+pub struct MerchantItemCost {
+    pub item: i64,
+    pub count: i32,
+    /// Raw bytes of the `addedComponentCount` varint plus every
+    /// `SlotComponent` entry — kept verbatim for component-aware consumers.
+    pub components_wire: Vec<u8>,
+}
+
+/// One `merchant_offers` trade entry.
+#[derive(Clone, Debug)]
+pub struct MerchantOfferEntry {
+    pub cost_a: MerchantItemCost,
+    /// Result stack as raw `Slot` wire bytes.
+    pub result_slot_wire: Vec<u8>,
+    pub cost_b: Option<MerchantItemCost>,
+    pub disabled: bool,
+    pub uses: i32,
+    pub max_uses: i32,
+    pub xp: i32,
+    /// Special price adjustment (reputation discounts go negative).
+    pub special_price: i32,
+    pub price_multiplier: f32,
+    pub demand: i32,
+}
+
+/// One `map_item_data` icon.
+#[derive(Clone, Debug)]
+pub struct MapItemIcon {
+    pub kind: i32,
+    pub x: i8,
+    pub z: i8,
+    pub direction: u8,
+    /// Display-name text component as raw anonymous-NBT bytes.
+    pub name_nbt: Option<Vec<u8>>,
+}
+
+/// Display block of one `update_advancements` entry.
+#[derive(Clone, Debug)]
+pub struct WireAdvancementDisplay {
+    pub title_nbt: Vec<u8>,
+    pub description_nbt: Vec<u8>,
+    /// Icon `Slot` as raw wire bytes.
+    pub icon_slot_wire: Vec<u8>,
+    /// 0 = task, 1 = challenge, 2 = goal.
+    pub frame_type: i32,
+    /// 0x01 background texture, 0x02 show toast, 0x04 hidden.
+    pub flags: i32,
+    pub background: Option<String>,
+    pub x: f32,
+    pub y: f32,
+}
+
+/// One `update_advancements` tree entry.
+#[derive(Clone, Debug)]
+pub struct WireAdvancement {
+    pub key: String,
+    pub parent_id: Option<String>,
+    pub display: Option<WireAdvancementDisplay>,
+    /// OR-of-ANDs criterion lists.
+    pub requirements: Vec<Vec<String>>,
+    pub sends_telemetry: bool,
+}
+
+/// One `update_advancements` progress entry.
+#[derive(Clone, Debug)]
+pub struct WireAdvancementProgress {
+    pub key: String,
+    /// `(criterion_id, achieved_millis)` — `None` when not yet achieved.
+    pub criteria: Vec<(String, Option<i64>)>,
+}
+
+/// One `award_stats` counter update.
+#[derive(Clone, Debug)]
+pub struct AwardStatEntry {
+    pub category: i32,
+    pub statistic: i32,
+    pub value: i32,
+}
+
+/// One `chunks_biomes` column payload.
+#[derive(Clone, Debug)]
+pub struct ChunkBiomeData {
+    pub cx: i32,
+    pub cz: i32,
+    /// Raw biome paletted-container bytes for the column.
+    pub data: Vec<u8>,
 }
 
 /// One `player_info_update` entry: the UUID plus each field carried by the
@@ -2831,6 +3041,113 @@ pub fn handle_transfer_packet(host: &str, port: i32) -> Result<TransferTarget, S
     })
 }
 
+/// Read one `Slot` payload from `r`, returning its raw wire bytes — bounded
+/// by the same fail-closed walker the container decoders use.
+fn read_slot_wire(r: &mut WireReader<'_>) -> Result<Vec<u8>, String> {
+    let end = slot_skip_extent(r.rest(), 0).ok_or("malformed slot payload")?;
+    Ok(r.take(end)?.to_vec())
+}
+
+/// Read one merchant `ItemCost`: varint item id, varint count, then the
+/// `addedComponentCount` varint plus every `SlotComponent` entry kept as
+/// raw wire bytes (`components_wire` covers the count prefix too).
+fn read_merchant_item_cost(r: &mut WireReader<'_>) -> Result<MerchantItemCost, String> {
+    let item = i64::from(r.read_varint()?);
+    let count = r.read_varint()?;
+    let body = r.rest();
+    let mut p = 0usize;
+    let ncomp_raw = slot_varint(body, &mut p).ok_or("truncated component count")?;
+    if ncomp_raw < 0 {
+        return Err("negative component count".into());
+    }
+    let ncomp = ncomp_raw as usize;
+    // Each component is at least a type varint plus a payload byte.
+    if ncomp > body.len().saturating_sub(p) {
+        return Err("component count exceeds remaining input".into());
+    }
+    for _ in 0..ncomp {
+        let ty = slot_varint(body, &mut p).ok_or("truncated component type")?;
+        if !(0..SLOT_COMPONENT_TYPE_COUNT).contains(&ty) {
+            return Err("unknown component type".into());
+        }
+        slot_component(body, &mut p, ty, 0).ok_or("malformed component payload")?;
+    }
+    let components_wire = r.take(p)?.to_vec();
+    Ok(MerchantItemCost {
+        item,
+        count,
+        components_wire,
+    })
+}
+
+/// Read one `update_advancements` display block (title/description NBT,
+/// icon slot, frame, flags, optional background texture, x/y floats).
+fn read_advancement_display(r: &mut WireReader<'_>) -> Result<WireAdvancementDisplay, String> {
+    let title_nbt = read_nbt_raw(r)?.to_vec();
+    let description_nbt = read_nbt_raw(r)?.to_vec();
+    let icon_slot_wire = read_slot_wire(r)?;
+    let frame_type = r.read_varint()?;
+    let flags = r.read_i32()?;
+    let background = if flags & 0x01 != 0 {
+        Some(r.read_string(256)?)
+    } else {
+        None
+    };
+    let x = r.read_f32()?;
+    let y = r.read_f32()?;
+    Ok(WireAdvancementDisplay {
+        title_nbt,
+        description_nbt,
+        icon_slot_wire,
+        frame_type,
+        flags,
+        background,
+        x,
+        y,
+    })
+}
+
+/// Read one `update_advancements` tree entry.
+fn read_wire_advancement(r: &mut WireReader<'_>) -> Result<WireAdvancement, String> {
+    let key = r.read_string(32767)?;
+    let parent_id = if r.read_bool()? {
+        Some(r.read_string(32767)?)
+    } else {
+        None
+    };
+    let display = if r.read_bool()? {
+        Some(read_advancement_display(r)?)
+    } else {
+        None
+    };
+    let nreq = usize::try_from(r.read_varint()?)
+        .map_err(|_| "negative requirement count".to_string())?;
+    if nreq > r.remaining() {
+        return Err("requirement count exceeds remaining input".into());
+    }
+    let mut requirements = Vec::with_capacity(nreq.min(64));
+    for _ in 0..nreq {
+        let ncrit = usize::try_from(r.read_varint()?)
+            .map_err(|_| "negative criterion count".to_string())?;
+        if ncrit > r.remaining() {
+            return Err("criterion count exceeds remaining input".into());
+        }
+        let mut group = Vec::with_capacity(ncrit.min(32));
+        for _ in 0..ncrit {
+            group.push(r.read_string(32767)?);
+        }
+        requirements.push(group);
+    }
+    let sends_telemetry = r.read_bool()?;
+    Ok(WireAdvancement {
+        key,
+        parent_id,
+        display,
+        requirements,
+        sends_telemetry,
+    })
+}
+
 // --- Extended play event decoding -----------------------------------------
 
 /// Decode one clientbound play packet body into a [`PlayEvent`] for the
@@ -3348,6 +3665,322 @@ pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<Play
             stay: r.read_i32()?,
             fade_out: r.read_i32()?,
         },
+        "pong_response" => PlayEvent::PongResponse {
+            id: r.read_i64()?,
+        },
+        "initialize_border" => PlayEvent::InitializeBorder {
+            x: r.read_f64()?,
+            z: r.read_f64()?,
+            old_diameter: r.read_f64()?,
+            new_diameter: r.read_f64()?,
+            lerp_ms: r.read_varlong()?,
+            portal_boundary: r.read_varint()?,
+            warning_blocks: r.read_varint()?,
+            warning_time: r.read_varint()?,
+        },
+        "set_border_center" => PlayEvent::SetBorderCenter {
+            x: r.read_f64()?,
+            z: r.read_f64()?,
+        },
+        "set_border_size" => PlayEvent::SetBorderSize {
+            diameter: r.read_f64()?,
+        },
+        "set_border_lerp_size" => PlayEvent::SetBorderLerpSize {
+            old_diameter: r.read_f64()?,
+            new_diameter: r.read_f64()?,
+            lerp_ms: r.read_varlong()?,
+        },
+        "set_player_team" => {
+            let name = r.read_string(32767)?;
+            let mode = r.read_u8()?;
+            if mode > 4 {
+                return Err("invalid team mode".into());
+            }
+            let info = if mode == 0 || mode == 2 {
+                Some(Box::new(PlayerTeamInfo {
+                    display_name_nbt: read_nbt_raw(&mut r)?.to_vec(),
+                    friendly_flags: r.read_u8()?,
+                    nametag_visibility: r.read_string(64)?,
+                    collision_rule: r.read_string(64)?,
+                    color: r.read_varint()?,
+                    prefix_nbt: read_nbt_raw(&mut r)?.to_vec(),
+                    suffix_nbt: read_nbt_raw(&mut r)?.to_vec(),
+                }))
+            } else {
+                None
+            };
+            let entities = if matches!(mode, 0 | 3 | 4) {
+                let count = usize::try_from(r.read_varint()?)
+                    .map_err(|_| "negative entity count".to_string())?;
+                // Each entity entry is at least a one-byte length prefix.
+                if count > r.remaining() {
+                    return Err("entity count exceeds remaining input".into());
+                }
+                let mut list = Vec::with_capacity(count.min(64));
+                for _ in 0..count {
+                    list.push(r.read_string(32767)?);
+                }
+                list
+            } else {
+                Vec::new()
+            };
+            PlayEvent::SetPlayerTeam {
+                name,
+                mode,
+                info,
+                entities,
+            }
+        }
+        "merchant_offers" => {
+            let window_id = r.read_varint()?;
+            let count = usize::try_from(r.read_varint()?)
+                .map_err(|_| "negative trade count".to_string())?;
+            // Each offer needs at least ~30 bytes (two costs + slot + two
+            // flags + six i32 fields); reject impossible counts up front.
+            if count > r.remaining() / 30 {
+                return Err("trade count exceeds remaining input".into());
+            }
+            let mut offers = Vec::with_capacity(count.min(64));
+            for _ in 0..count {
+                let cost_a = read_merchant_item_cost(&mut r)?;
+                let result_slot_wire = read_slot_wire(&mut r)?;
+                let cost_b = if r.read_bool()? {
+                    Some(read_merchant_item_cost(&mut r)?)
+                } else {
+                    None
+                };
+                let disabled = r.read_bool()?;
+                let uses = r.read_i32()?;
+                let max_uses = r.read_i32()?;
+                let xp = r.read_i32()?;
+                let special_price = r.read_i32()?;
+                let price_multiplier = r.read_f32()?;
+                let demand = r.read_i32()?;
+                offers.push(MerchantOfferEntry {
+                    cost_a,
+                    result_slot_wire,
+                    cost_b,
+                    disabled,
+                    uses,
+                    max_uses,
+                    xp,
+                    special_price,
+                    price_multiplier,
+                    demand,
+                });
+            }
+            let villager_level = r.read_varint()?;
+            let villager_xp = r.read_varint()?;
+            let show_progress = r.read_bool()?;
+            let can_restock = r.read_bool()?;
+            PlayEvent::MerchantOffers {
+                window_id,
+                offers,
+                villager_level,
+                villager_xp,
+                show_progress,
+                can_restock,
+            }
+        }
+        "horse_screen_open" => PlayEvent::HorseScreenOpen {
+            window_id: r.read_u8()?,
+            slots: r.read_varint()?,
+            entity_id: r.read_i32()?,
+        },
+        "map_item_data" => {
+            let map_id = r.read_varint()?;
+            let scale = r.read_i8()?;
+            let locked = r.read_bool()?;
+            let icons = if r.read_bool()? {
+                let count = usize::try_from(r.read_varint()?)
+                    .map_err(|_| "negative icon count".to_string())?;
+                // Each icon is at least five bytes (type, x, z, direction,
+                // name flag).
+                if count > r.remaining() / 5 {
+                    return Err("icon count exceeds remaining input".into());
+                }
+                let mut list = Vec::with_capacity(count.min(64));
+                for _ in 0..count {
+                    let kind = r.read_varint()?;
+                    let x = r.read_i8()?;
+                    let z = r.read_i8()?;
+                    let direction = r.read_u8()?;
+                    let name_nbt = if r.read_bool()? {
+                        Some(read_nbt_raw(&mut r)?.to_vec())
+                    } else {
+                        None
+                    };
+                    list.push(MapItemIcon {
+                        kind,
+                        x,
+                        z,
+                        direction,
+                        name_nbt,
+                    });
+                }
+                Some(list)
+            } else {
+                None
+            };
+            let columns = r.read_u8()?;
+            let (rows, x, y, colors) = if columns == 0 {
+                (0, 0, 0, Vec::new())
+            } else {
+                let rows = r.read_u8()?;
+                let x = r.read_u8()?;
+                let y = r.read_u8()?;
+                let len = usize::try_from(r.read_varint()?)
+                    .map_err(|_| "negative color count".to_string())?;
+                // Vanilla always sends exactly columns * rows pixels.
+                if len != usize::from(columns) * usize::from(rows) {
+                    return Err("map color count mismatch".into());
+                }
+                let colors = r.take(len)?.to_vec();
+                (rows, x, y, colors)
+            };
+            PlayEvent::MapItemData {
+                map_id,
+                scale,
+                locked,
+                icons,
+                columns,
+                rows,
+                x,
+                y,
+                colors,
+            }
+        }
+        "player_look_at" => {
+            let anchor = r.read_varint()?;
+            if !(0..=1).contains(&anchor) {
+                return Err("invalid look-at anchor".into());
+            }
+            let target = [r.read_f64()?, r.read_f64()?, r.read_f64()?];
+            let entity = if r.read_bool()? {
+                let entity_id = r.read_varint()?;
+                let entity_anchor = r.read_varint()?;
+                if !(0..=1).contains(&entity_anchor) {
+                    return Err("invalid entity look-at anchor".into());
+                }
+                Some((entity_id, entity_anchor))
+            } else {
+                None
+            };
+            PlayEvent::PlayerLookAt {
+                anchor,
+                target,
+                entity,
+            }
+        }
+        "update_advancements" => {
+            let reset = r.read_bool()?;
+            let count = usize::try_from(r.read_varint()?)
+                .map_err(|_| "negative advancement count".to_string())?;
+            // Each entry needs at least a key string, two option flags, a
+            // requirements count and the telemetry byte.
+            if count > r.remaining() / 5 {
+                return Err("advancement count exceeds remaining input".into());
+            }
+            let mut advancements = Vec::with_capacity(count.min(64));
+            for _ in 0..count {
+                advancements.push(read_wire_advancement(&mut r)?);
+            }
+            let nremoved = usize::try_from(r.read_varint()?)
+                .map_err(|_| "negative removed count".to_string())?;
+            if nremoved > r.remaining() {
+                return Err("removed count exceeds remaining input".into());
+            }
+            let mut removed = Vec::with_capacity(nremoved.min(64));
+            for _ in 0..nremoved {
+                removed.push(r.read_string(32767)?);
+            }
+            let nprogress = usize::try_from(r.read_varint()?)
+                .map_err(|_| "negative progress count".to_string())?;
+            if nprogress > r.remaining() / 2 {
+                return Err("progress count exceeds remaining input".into());
+            }
+            let mut progress = Vec::with_capacity(nprogress.min(64));
+            for _ in 0..nprogress {
+                let key = r.read_string(32767)?;
+                let ncrit = usize::try_from(r.read_varint()?)
+                    .map_err(|_| "negative criterion count".to_string())?;
+                if ncrit > r.remaining() {
+                    return Err("criterion count exceeds remaining input".into());
+                }
+                let mut criteria = Vec::with_capacity(ncrit.min(64));
+                for _ in 0..ncrit {
+                    let criterion = r.read_string(32767)?;
+                    let achieved = if r.read_bool()? {
+                        Some(r.read_i64()?)
+                    } else {
+                        None
+                    };
+                    criteria.push((criterion, achieved));
+                }
+                progress.push(WireAdvancementProgress { key, criteria });
+            }
+            PlayEvent::UpdateAdvancements {
+                reset,
+                advancements,
+                removed,
+                progress,
+            }
+        }
+        "select_advancements_tab" => PlayEvent::SelectAdvancementsTab {
+            tab: if r.read_bool()? {
+                Some(r.read_string(256)?)
+            } else {
+                None
+            },
+        },
+        "award_stats" => {
+            let count = usize::try_from(r.read_varint()?)
+                .map_err(|_| "negative stat count".to_string())?;
+            // Each entry is three varints — at least three bytes.
+            if count > r.remaining() / 3 {
+                return Err("stat count exceeds remaining input".into());
+            }
+            let mut entries = Vec::with_capacity(count.min(256));
+            for _ in 0..count {
+                entries.push(AwardStatEntry {
+                    category: r.read_varint()?,
+                    statistic: r.read_varint()?,
+                    value: r.read_varint()?,
+                });
+            }
+            PlayEvent::AwardStats { entries }
+        }
+        "server_data" => {
+            let motd_nbt = read_nbt_raw(&mut r)?.to_vec();
+            let icon = if r.read_bool()? {
+                let len = usize::try_from(r.read_varint()?)
+                    .map_err(|_| "negative icon length".to_string())?;
+                Some(r.take(len)?.to_vec())
+            } else {
+                None
+            };
+            PlayEvent::ServerData { motd_nbt, icon }
+        }
+        "chunks_biomes" => {
+            let count = usize::try_from(r.read_varint()?)
+                .map_err(|_| "negative chunk count".to_string())?;
+            // Each entry is at least nine bytes (8-byte packed pos + a
+            // one-byte data length).
+            if count > r.remaining() / 9 {
+                return Err("chunk count exceeds remaining input".into());
+            }
+            let mut chunks = Vec::with_capacity(count.min(256));
+            for _ in 0..count {
+                // ChunkPos wire order is Z then X (big-endian i64 layout).
+                let cz = r.read_i32()?;
+                let cx = r.read_i32()?;
+                let len = usize::try_from(r.read_varint()?)
+                    .map_err(|_| "negative biome data length".to_string())?;
+                let data = r.take(len)?.to_vec();
+                chunks.push(ChunkBiomeData { cx, cz, data });
+            }
+            PlayEvent::ChunksBiomes { chunks }
+        }
         "transfer" => PlayEvent::Transfer {
             host: r.read_string(255)?,
             port: r.read_varint()?,
@@ -3526,6 +4159,185 @@ pub fn encode_chat_message(message: &str) -> (&'static str, Vec<u8>) {
     write_varint(&mut p, 0); // offset / last seen index
     p.extend_from_slice(&[0, 0, 0]); // acknowledged bitset
     ("chat", p)
+}
+
+/// `ping_request` — play-phase latency probe; the server mirrors the i64
+/// back on `pong_response` (S2C 0x36).
+pub fn encode_ping_request(id: i64) -> (&'static str, Vec<u8>) {
+    ("ping_request", id.to_be_bytes().to_vec())
+}
+
+/// `pong` — answers the clientbound play `ping` (S2C 0x35) with its i32 id.
+pub fn encode_pong(id: i32) -> (&'static str, Vec<u8>) {
+    ("pong", id.to_be_bytes().to_vec())
+}
+
+/// `player_abilities` — flags byte (bit 0x02 flying); vanilla 767 carries
+/// only the flags byte on this packet.
+pub fn encode_player_abilities(flags: u8) -> (&'static str, Vec<u8>) {
+    ("player_abilities", vec![flags])
+}
+
+/// `edit_book` — writable-book page edits. `slot` is the inventory slot
+/// holding the book (vanilla bounds 0..=40); `pages` are capped at 100
+/// entries of 1024 chars; `title` is present only for signed books.
+pub fn encode_edit_book(slot: i32, pages: &[&str], title: Option<&str>) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(16 + pages.iter().map(|s| s.len() + 5).sum::<usize>());
+    write_varint(&mut p, slot);
+    write_varint(&mut p, pages.len() as i32);
+    for page in pages {
+        write_string(&mut p, page);
+    }
+    match title {
+        Some(t) => {
+            p.push(1);
+            write_string(&mut p, t);
+        }
+        None => p.push(0),
+    }
+    ("edit_book", p)
+}
+
+/// `set_command_block` — command-block editor update: packed `BlockPos`,
+/// command string, mode (`0` sequence, `1` auto, `2` redstone) and the
+/// track-output/conditional/automatic flag bits (0x01/0x02/0x04).
+pub fn encode_set_command_block(
+    pos: [i32; 3],
+    command: &str,
+    mode: i32,
+    track_output: bool,
+    conditional: bool,
+    automatic: bool,
+) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(16 + command.len());
+    p.extend_from_slice(&pack_position(pos).to_be_bytes());
+    write_string(&mut p, command);
+    write_varint(&mut p, mode);
+    p.push(
+        (u8::from(track_output))
+            | (u8::from(conditional) << 1)
+            | (u8::from(automatic) << 2),
+    );
+    ("set_command_block", p)
+}
+
+/// `set_command_minecart` — command-minecart update: entity id, command
+/// string, track-output flag.
+pub fn encode_set_command_minecart(
+    entity_id: i32,
+    command: &str,
+    track_output: bool,
+) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(8 + command.len());
+    write_varint(&mut p, entity_id);
+    write_string(&mut p, command);
+    p.push(u8::from(track_output));
+    ("set_command_minecart", p)
+}
+
+/// `set_beacon` — beacon effect selection: primary/secondary mob-effect
+/// registry ids, each `None` for "no effect".
+pub fn encode_set_beacon(primary: Option<i32>, secondary: Option<i32>) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(10);
+    for effect in [primary, secondary] {
+        match effect {
+            Some(id) => {
+                p.push(1);
+                write_varint(&mut p, id);
+            }
+            None => p.push(0),
+        }
+    }
+    ("set_beacon", p)
+}
+
+/// `select_trade` — pick a villager trade index in the open merchant menu.
+pub fn encode_select_trade(index: i32) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(5);
+    write_varint(&mut p, index);
+    ("select_trade", p)
+}
+
+/// `place_recipe` — recipe-book "place recipe" request: `window_id` is the
+/// open container id, `recipe` the recipe identifier, `make_all` requests
+/// the shift-click (fill-all) variant.
+pub fn encode_place_recipe(
+    window_id: u8,
+    recipe: &str,
+    make_all: bool,
+) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(8 + recipe.len());
+    p.push(window_id);
+    write_string(&mut p, recipe);
+    p.push(u8::from(make_all));
+    ("place_recipe", p)
+}
+
+/// `recipe_book_change_settings` — recipe-book category (`book_type`),
+/// open state and active-filter flags.
+pub fn encode_recipe_book_change_settings(
+    book_type: i32,
+    book_open: bool,
+    filter_active: bool,
+) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(6);
+    write_varint(&mut p, book_type);
+    p.push(u8::from(book_open));
+    p.push(u8::from(filter_active));
+    ("recipe_book_change_settings", p)
+}
+
+/// `recipe_book_seen_recipe` — mark one recipe id as seen in the book.
+pub fn encode_recipe_book_seen_recipe(recipe: &str) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::new();
+    write_string(&mut p, recipe);
+    ("recipe_book_seen_recipe", p)
+}
+
+/// `rename_item` — anvil rename text (vanilla caps at 150 chars).
+pub fn encode_rename_item(name: &str) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::new();
+    write_string(&mut p, name);
+    ("rename_item", p)
+}
+
+/// `container_slot_state_changed` — crafter-grid slot toggle: slot index,
+/// window id, new disabled state (vanilla only honours slots 0..9).
+pub fn encode_container_slot_state_changed(
+    slot_id: i32,
+    window_id: i32,
+    state: bool,
+) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(10);
+    write_varint(&mut p, slot_id);
+    write_varint(&mut p, window_id);
+    p.push(u8::from(state));
+    ("container_slot_state_changed", p)
+}
+
+/// `seen_advancements` — advancements screen opened on `tab` (when `Some`)
+/// or closed (`None`).
+pub fn encode_seen_advancements(tab: Option<&str>) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(8);
+    match tab {
+        Some(id) => {
+            write_varint(&mut p, 0);
+            write_string(&mut p, id);
+        }
+        None => write_varint(&mut p, 1),
+    }
+    ("seen_advancements", p)
+}
+
+/// `teleport_to_entity` — spectator `/spectate`-style request carrying the
+/// bare 16-byte target entity UUID.
+pub fn encode_teleport_to_entity(uuid: [u8; 16]) -> (&'static str, Vec<u8>) {
+    ("teleport_to_entity", uuid.to_vec())
+}
+
+/// `lock_difficulty` — OP-level difficulty lock flag.
+pub fn encode_lock_difficulty(locked: bool) -> (&'static str, Vec<u8>) {
+    ("lock_difficulty", vec![u8::from(locked)])
 }
 
 // ---------------------------------------------------------------------------
@@ -4200,6 +5012,143 @@ impl ProtocolClient {
         sequence: i32,
     ) -> Result<(), String> {
         let (name, payload) = encode_use_item_on(hand, pos, face, hit, inside, sequence);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `ping_request` — play-phase latency probe (`pong_response` echoes it).
+    pub fn send_ping_request(&mut self, id: i64) -> Result<(), String> {
+        let (name, payload) = encode_ping_request(id);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `pong` — answer a clientbound play `ping` (S2C 0x35).
+    pub fn send_pong(&mut self, id: i32) -> Result<(), String> {
+        let (name, payload) = encode_pong(id);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `player_abilities` — flags byte; only bit 0x02 (flying) is honoured
+    /// server-side while `mayfly` is set.
+    pub fn send_player_abilities(&mut self, flags: u8) -> Result<(), String> {
+        let (name, payload) = encode_player_abilities(flags);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `edit_book` — writable-book edits on the stack in `slot`.
+    pub fn send_edit_book(
+        &mut self,
+        slot: i32,
+        pages: &[&str],
+        title: Option<&str>,
+    ) -> Result<(), String> {
+        let (name, payload) = encode_edit_book(slot, pages, title);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `set_command_block` — command-block editor update (gamemaster only).
+    pub fn send_set_command_block(
+        &mut self,
+        pos: [i32; 3],
+        command: &str,
+        mode: i32,
+        track_output: bool,
+        conditional: bool,
+        automatic: bool,
+    ) -> Result<(), String> {
+        let (name, payload) =
+            encode_set_command_block(pos, command, mode, track_output, conditional, automatic);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `set_command_minecart` — command-minecart update (gamemaster only).
+    pub fn send_set_command_minecart(
+        &mut self,
+        entity_id: i32,
+        command: &str,
+        track_output: bool,
+    ) -> Result<(), String> {
+        let (name, payload) = encode_set_command_minecart(entity_id, command, track_output);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `set_beacon` — beacon primary/secondary effect selection.
+    pub fn send_set_beacon(
+        &mut self,
+        primary: Option<i32>,
+        secondary: Option<i32>,
+    ) -> Result<(), String> {
+        let (name, payload) = encode_set_beacon(primary, secondary);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `select_trade` — pick villager trade `index` in the open menu.
+    pub fn send_select_trade(&mut self, index: i32) -> Result<(), String> {
+        let (name, payload) = encode_select_trade(index);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `place_recipe` — recipe-book place-recipe request.
+    pub fn send_place_recipe(
+        &mut self,
+        window_id: u8,
+        recipe: &str,
+        make_all: bool,
+    ) -> Result<(), String> {
+        let (name, payload) = encode_place_recipe(window_id, recipe, make_all);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `recipe_book_change_settings` — book type/open/filter flags.
+    pub fn send_recipe_book_change_settings(
+        &mut self,
+        book_type: i32,
+        book_open: bool,
+        filter_active: bool,
+    ) -> Result<(), String> {
+        let (name, payload) =
+            encode_recipe_book_change_settings(book_type, book_open, filter_active);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `recipe_book_seen_recipe` — mark `recipe` as seen.
+    pub fn send_recipe_book_seen_recipe(&mut self, recipe: &str) -> Result<(), String> {
+        let (name, payload) = encode_recipe_book_seen_recipe(recipe);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `rename_item` — anvil rename text.
+    pub fn send_rename_item(&mut self, name: &str) -> Result<(), String> {
+        let (name, payload) = encode_rename_item(name);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `container_slot_state_changed` — crafter-grid slot toggle.
+    pub fn send_container_slot_state_changed(
+        &mut self,
+        slot_id: i32,
+        window_id: i32,
+        state: bool,
+    ) -> Result<(), String> {
+        let (name, payload) = encode_container_slot_state_changed(slot_id, window_id, state);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `seen_advancements` — open the advancements tab (`Some`) or close the
+    /// screen (`None`).
+    pub fn send_seen_advancements(&mut self, tab: Option<&str>) -> Result<(), String> {
+        let (name, payload) = encode_seen_advancements(tab);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `teleport_to_entity` — spectate-target request by entity UUID.
+    pub fn send_teleport_to_entity(&mut self, uuid: [u8; 16]) -> Result<(), String> {
+        let (name, payload) = encode_teleport_to_entity(uuid);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `lock_difficulty` — difficulty-lock flag (server enforces OP>=2).
+    pub fn send_lock_difficulty(&mut self, locked: bool) -> Result<(), String> {
+        let (name, payload) = encode_lock_difficulty(locked);
         self.send_named(PacketPhase::Play, name, &payload)
     }
 
