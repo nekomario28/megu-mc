@@ -142,14 +142,17 @@ impl AtmosphereParams {
     /// orbital look, breathable dimensions get the overworld tinted by the
     /// policy's `sky_tint_rgb`.
     pub fn for_policy(policy: &DimensionAdaptationPolicy) -> Self {
-        if policy.is_orbit
-            || !policy.has_oxygen
-            || policy.acoustic_air_transmission < 0.05
-        {
+        if policy.is_orbit || !policy.has_oxygen || policy.acoustic_air_transmission < 0.05 {
             let mut params = Self::vacuum_orbit();
             let tint = policy.sky_tint_rgb;
-            params.sky_zenith_rgb = scale3(params.sky_zenith_rgb, 0.5 + tint[0].max(tint[1]).max(tint[2]));
-            params.sky_horizon_rgb = scale3(params.sky_horizon_rgb, 0.5 + tint[0].max(tint[1]).max(tint[2]));
+            params.sky_zenith_rgb = scale3(
+                params.sky_zenith_rgb,
+                0.5 + tint[0].max(tint[1]).max(tint[2]),
+            );
+            params.sky_horizon_rgb = scale3(
+                params.sky_horizon_rgb,
+                0.5 + tint[0].max(tint[1]).max(tint[2]),
+            );
             params.fog_rgb = params.sky_horizon_rgb;
             params.ambient_rgb = [
                 params.ambient_rgb[0] * (0.5 + tint[0]),
@@ -427,12 +430,7 @@ impl ChunkFadeTracker {
 pub const CLOUD_RENDER_ALPHA: f32 = 0.8;
 
 const CLOUD_FACE_BITS: [u8; 6] = [
-    FACE_POS_X,
-    FACE_NEG_X,
-    FACE_POS_Y,
-    FACE_NEG_Y,
-    FACE_POS_Z,
-    FACE_NEG_Z,
+    FACE_POS_X, FACE_NEG_X, FACE_POS_Y, FACE_NEG_Y, FACE_POS_Z, FACE_NEG_Z,
 ];
 
 /// Sanitize one cloud-lighting channel: `CloudLighting` fields are public,
@@ -489,11 +487,13 @@ pub fn voxel_clouds_to_geometry(
                 (cloud_channel(rgb[2]) * cap_boost).min(1.0),
             ];
             let base = vertices.len() as u32;
-            for &position in corners {
+            for (corner, &position) in corners.iter().enumerate() {
                 vertices.push(TerrainVertex {
                     position,
                     normal: *normal,
                     albedo,
+                    uv: [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]][corner],
+                    atlas_index: u32::MAX,
                 });
             }
             indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -522,6 +522,7 @@ pub fn extruded_mesh_to_geometry(
         // albedo to linear `0..=1`.
         if !quad.positions.iter().flatten().all(|c| c.is_finite())
             || !quad.normal.iter().all(|c| c.is_finite())
+            || !quad.uv.iter().flatten().all(|c| c.is_finite())
         {
             continue;
         }
@@ -533,11 +534,15 @@ pub fn extruded_mesh_to_geometry(
             }
         });
         let base = vertices.len() as u32;
-        for &position in &quad.positions {
+        for (&position, &uv) in quad.positions.iter().zip(quad.uv.iter()) {
             vertices.push(TerrainVertex {
                 position,
                 normal: quad.normal,
                 albedo,
+                uv,
+                // ExtrudedMesh has UVs but no texture identifier. Callers
+                // can select a sprite on the returned vertices.
+                atlas_index: u32::MAX,
             });
         }
         indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);

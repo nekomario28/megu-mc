@@ -14,6 +14,7 @@ use mc_spine_client::shaders::{
     validate_wgsl_module, WgslStage, TERRAIN_OPAQUE_WGSL, TERRAIN_TRANSLUCENT_WGSL,
 };
 use mc_spine_client::world::WorldState;
+use mc_spine_client_mesh::atlas::{AtlasMip, PackedAtlas};
 use mc_spine_client_mesh::builtin_shadow_wgsl::{
     build_shadow_uniforms_celestial, compute_sun_direction, negotiate_builtin_shadow_quality,
     pack_vfx1_lights, BuiltinShadowQuality, CascadeConfig, DirtyOnlyShadowCache, EclipseMode,
@@ -496,6 +497,51 @@ struct CompositeGpu {
     env_ubo: wgpu::Buffer,
     lights_ubo: wgpu::Buffer,
     env_bg: wgpu::BindGroup,
+    atlas: AtlasGpu,
+}
+
+struct AtlasGpu {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+    rects: wgpu::Buffer,
+    state_sprites: wgpu::Buffer,
+    sprite_indices: HashMap<String, u32>,
+}
+
+impl AtlasGpu {
+    fn bind_group(&self, device: &wgpu::Device, composite: &CompositeGpu) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("composite-env-atlas-bind-group"),
+            layout: &composite.env_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: composite.env_ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: composite.lights_ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.rects.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.state_sprites.as_entire_binding(),
+                },
+            ],
+        })
+    }
 }
 
 /// Shadow resources exist only while a nonzero-cascade preset is active.
@@ -997,6 +1043,175 @@ impl GpuRenderer {
         &self.ctx
     }
 
+    /// Sorted-by-name sprite index for lit geometry's `atlas_index`.
+    pub fn atlas_sprite_index(&self, name: &str) -> Option<u32> {
+        self.composite.atlas.sprite_indices.get(name).copied()
+    }
+
+    /// Replace the GPU atlas and its sprite rectangle table atomically.
+    /// The caller supplies consecutive mip levels built from `PackedAtlas`.
+    pub fn upload_block_atlas(
+        &mut self,
+        atlas: &PackedAtlas,
+        mips: &[AtlasMip],
+    ) -> Result<(), String> {
+        let limit = self.ctx.device.limits().max_texture_dimension_2d;
+        if atlas.width == 0 || atlas.height == 0 || atlas.width > limit || atlas.height > limit {
+            return Err(format!("atlas dimensions must be within 1..={limit}"));
+        }
+        let checked_len = |w: u32, h: u32| {
+            usize::try_from(u64::from(w) * u64::from(h) * 4)
+                .map_err(|_| "atlas byte length exceeds usize".to_string())
+        };
+        if atlas.rgba.len() != checked_len(atlas.width, atlas.height)? {
+            return Err("atlas base RGBA byte length mismatch".into());
+        }
+        let mut expected_w = atlas.width;
+        let mut expected_h = atlas.height;
+        for (i, mip) in mips.iter().enumerate() {
+            expected_w = (expected_w / 2).max(1);
+            expected_h = (expected_h / 2).max(1);
+            if mip.level != (i + 1) as u32
+                || mip.width != expected_w
+                || mip.height != expected_h
+                || mip.rgba.len() != checked_len(expected_w, expected_h)?
+            {
+                return Err(format!("invalid atlas mip level {}", i + 1));
+            }
+            if expected_w == 1 && expected_h == 1 && i + 1 < mips.len() {
+                return Err("atlas mip chain exceeds 1x1".into());
+            }
+        }
+        let mut rects = Vec::<[f32; 4]>::new();
+        let mut sprite_indices = HashMap::new();
+        for name in atlas.placements.keys() {
+            let tile = atlas
+                .tile_rect(name)
+                .ok_or_else(|| format!("missing tile: {name}"))?;
+            sprite_indices.insert(name.clone(), rects.len() as u32);
+            rects.push([tile.u0, tile.v0, tile.u_scale, tile.v_scale]);
+        }
+        if rects.is_empty() {
+            return Err("atlas must contain at least one sprite".into());
+        }
+        if (rects.len() as u64) * 16 > self.ctx.device.limits().max_storage_buffer_binding_size {
+            return Err("atlas rectangle table exceeds GPU storage buffer limit".into());
+        }
+        let device = &self.ctx.device;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("block-atlas"),
+            size: wgpu::Extent3d {
+                width: atlas.width,
+                height: atlas.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1 + mips.len() as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for (level, (w, h, rgba)) in
+            std::iter::once((atlas.width, atlas.height, atlas.rgba.as_slice()))
+                .chain(mips.iter().map(|m| (m.width, m.height, m.rgba.as_slice())))
+                .enumerate()
+        {
+            self.ctx.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("block-atlas-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..wgpu::SamplerDescriptor::default()
+        });
+        let rects_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("block-atlas-rects"),
+            size: (rects.len() * 16) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.ctx
+            .queue
+            .write_buffer(&rects_buffer, 0, bytemuck::cast_slice(&rects));
+        // A replacement atlas may assign different indices to the same states.
+        // Reset mappings until the caller installs a matching state table.
+        let state_sprites = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("block-state-atlas-lookup"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.ctx
+            .queue
+            .write_buffer(&state_sprites, 0, bytemuck::bytes_of(&u32::MAX));
+        let gpu_atlas = AtlasGpu {
+            _texture: texture,
+            view,
+            sampler,
+            rects: rects_buffer,
+            state_sprites,
+            sprite_indices,
+        };
+        let bind_group = gpu_atlas.bind_group(device, &self.composite);
+        self.composite.atlas = gpu_atlas;
+        self.composite.env_bg = bind_group;
+        Ok(())
+    }
+
+    /// Bind packed terrain state IDs to atlas sprites. Unknown states remain
+    /// untextured, so existing worlds render with their original vertex tint.
+    /// Call again after changing atlases to refresh the state mapping.
+    pub fn set_block_state_sprites(&mut self, assignments: &[(u32, &str)]) -> Result<(), String> {
+        let sprite_indices = &self.composite.atlas.sprite_indices;
+        let max_id = assignments.iter().map(|(id, _)| *id).max().unwrap_or(0);
+        let bytes = (u64::from(max_id) + 1) * 4;
+        if bytes > self.ctx.device.limits().max_storage_buffer_binding_size {
+            return Err("block state texture table exceeds GPU storage buffer limit".into());
+        }
+        let mut states = vec![u32::MAX; (max_id as usize) + 1];
+        for &(id, sprite) in assignments {
+            states[id as usize] = *sprite_indices
+                .get(sprite)
+                .ok_or_else(|| format!("unknown atlas sprite: {sprite}"))?;
+        }
+        let state_sprites = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("block-state-atlas-lookup"),
+            size: bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.ctx
+            .queue
+            .write_buffer(&state_sprites, 0, bytemuck::cast_slice(&states));
+        self.composite.atlas.state_sprites = state_sprites;
+        self.composite.env_bg = self
+            .composite
+            .atlas
+            .bind_group(&self.ctx.device, &self.composite);
+        Ok(())
+    }
+
     /// Build all pipelines against `target_format` on `ctx`.
     pub fn new(ctx: GpuDevice, target_format: wgpu::TextureFormat) -> Self {
         let frame_ubo = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1190,7 +1405,46 @@ impl GpuRenderer {
         });
         let env_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("composite-env-layout"),
-            entries: &[uniform_entry(0), uniform_entry(1)],
+            entries: &[
+                uniform_entry(0),
+                uniform_entry(1),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(16),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(4),
+                    },
+                    count: None,
+                },
+            ],
         });
         let lit_frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("lit-frame-layout"),
@@ -1326,6 +1580,71 @@ impl GpuRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("block-atlas-white-fallback"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        ctx.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &atlas_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[255, 255, 255, 255],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let atlas_rects = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("block-atlas-fallback-rect"),
+            size: 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        ctx.queue.write_buffer(
+            &atlas_rects,
+            0,
+            bytemuck::cast_slice(&[[0.0f32, 0.0, 1.0, 1.0]]),
+        );
+        let state_sprites = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("block-atlas-empty-state-lookup"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        ctx.queue
+            .write_buffer(&state_sprites, 0, bytemuck::bytes_of(&u32::MAX));
+        let atlas = AtlasGpu {
+            view: atlas_texture.create_view(&wgpu::TextureViewDescriptor::default()),
+            sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("block-atlas-fallback-sampler"),
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..wgpu::SamplerDescriptor::default()
+            }),
+            _texture: atlas_texture,
+            rects: atlas_rects,
+            state_sprites,
+            sprite_indices: HashMap::new(),
+        };
         let env_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("composite-env-bind-group"),
             layout: &env_layout,
@@ -1337,6 +1656,22 @@ impl GpuRenderer {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: lights_ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&atlas.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&atlas.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: atlas.rects.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: atlas.state_sprites.as_entire_binding(),
                 },
             ],
         });
@@ -1376,6 +1711,7 @@ impl GpuRenderer {
             env_ubo,
             lights_ubo,
             env_bg,
+            atlas,
         }
     }
 
@@ -1907,6 +2243,32 @@ impl GpuRenderer {
         height: u32,
         sky: &SkyFogOutput,
     ) {
+        let params = AtmosphereParams {
+            fog_rgb: sky.fog_rgb,
+            sky_horizon_rgb: sky.fog_rgb,
+            ..AtmosphereParams::default()
+        };
+        self.render_to_view_with_env(
+            view,
+            width,
+            height,
+            sky,
+            &BiomeAtmosphereBlender::new(params),
+            &ChunkFadeTracker::new(),
+        );
+    }
+
+    /// Render the live window with the current biome, depth tint and chunk
+    /// fade progress. Requires a camera set by `set_camera` for world draws.
+    pub fn render_to_view_with_env(
+        &mut self,
+        view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        sky: &SkyFogOutput,
+        atmosphere: &BiomeAtmosphereBlender,
+        chunk_fades: &ChunkFadeTracker,
+    ) {
         self.ensure_depth(width, height);
         let mut encoder = self
             .ctx
@@ -1914,8 +2276,15 @@ impl GpuRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
-        if self.shadow_quality != BuiltinShadowQuality::Off && self.window_camera.get().is_some() {
-            self.encode_window_composed_world(&mut encoder, view, width, height, sky);
+        if self.window_camera.get().is_some() {
+            self.encode_window_composed_world(
+                &mut encoder,
+                view,
+                (width, height),
+                sky,
+                atmosphere,
+                chunk_fades,
+            );
         } else {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("terrain"),
@@ -2020,18 +2389,18 @@ impl GpuRenderer {
         self.ctx.queue.submit([encoder.finish()]);
     }
 
-    /// The regular window and `render_offscreen_rgba` use this path when a
-    /// non-Off preset is selected. The window camera currently uses the same
-    /// fixed noon time as `set_camera`; the composed-frame API accepts live
-    /// world time, biome and light data from its caller.
+    /// Window camera currently uses the same fixed noon time as `set_camera`.
+    /// The composed-frame API also accepts live world time and VFX lights.
     fn encode_window_composed_world(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
-        width: u32,
-        height: u32,
+        size: (u32, u32),
         sky: &SkyFogOutput,
+        atmosphere: &BiomeAtmosphereBlender,
+        chunk_fades: &ChunkFadeTracker,
     ) {
+        let (width, height) = size;
         let camera = self.window_camera.get().expect("checked by caller");
         let aspect = width.max(1) as f32 / height.max(1) as f32;
         const NOON: u64 = 6000;
@@ -2045,7 +2414,7 @@ impl GpuRenderer {
             }
         }
 
-        let atmo = AtmosphereParams::default();
+        let atmo = atmosphere.current();
         let sun = compute_sun_direction(NOON);
         let env = CompositeEnvUniforms {
             sun: [sun[0], sun[1], sun[2], atmo.sun_intensity],
@@ -2070,7 +2439,7 @@ impl GpuRenderer {
         self.ctx
             .queue
             .write_buffer(&self.composite.lights_ubo, 0, bytemuck::bytes_of(&lights));
-        self.write_frame_uniforms(&camera, aspect, sky.fog_rgb, sky.fog_start, sky.fog_end);
+        self.write_frame_uniforms(&camera, aspect, atmo.fog_rgb, sky.fog_start, sky.fog_end);
         let draws = self.live_sections.len() * 2
             + 2
             + self.subworld_gpu.entry_count()
@@ -2082,8 +2451,12 @@ impl GpuRenderer {
                 view,
                 size: (width, height),
                 view_proj: camera.view_projection(aspect),
-                clear_rgb: sky.fog_rgb,
-                chunk_fades: &ChunkFadeTracker::new(),
+                clear_rgb: [
+                    atmo.sky_horizon_rgb[0].max(atmo.fog_rgb[0] * 0.8),
+                    atmo.sky_horizon_rgb[1].max(atmo.fog_rgb[1] * 0.8),
+                    atmo.sky_horizon_rgb[2].max(atmo.fog_rgb[2] * 0.8),
+                ],
+                chunk_fades,
             },
         );
     }

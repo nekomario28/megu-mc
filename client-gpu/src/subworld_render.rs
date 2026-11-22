@@ -26,11 +26,11 @@ use mc_spine_client_mesh::BerInstanceData;
 use crate::{mat4_mul, Mat4};
 
 // ---------------------------------------------------------------------------
-// Shared lit-geometry vertex (`position`/`normal`/`albedo`)
+// Shared lit-geometry vertex (`position`/`normal`/`albedo`/`uv`)
 // ---------------------------------------------------------------------------
 
 /// World-space lit vertex for sub-worlds, voxel clouds, and cubic
-/// planets/suns. 36 bytes; bound as `@location(0..2)` `vec3<f32>` inputs in
+/// planets/suns. 48 bytes; bound as `@location(0..2, 7..8)` inputs in
 /// [`COMPOSITE_LIT_WGSL`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
@@ -41,9 +41,13 @@ pub struct TerrainVertex {
     pub normal: [f32; 3],
     /// Linear-ish albedo `0.0..=1.0` per channel.
     pub albedo: [f32; 3],
+    /// Original unwrapped sprite UV, including fractional texel geometry.
+    pub uv: [f32; 2],
+    /// Index into the uploaded atlas rectangle table. `u32::MAX` is untextured.
+    pub atlas_index: u32,
 }
 
-const LIT_VERTEX_ATTRS: [wgpu::VertexAttribute; 3] = [
+const LIT_VERTEX_ATTRS: [wgpu::VertexAttribute; 5] = [
     wgpu::VertexAttribute {
         format: wgpu::VertexFormat::Float32x3,
         offset: 0,
@@ -58,6 +62,16 @@ const LIT_VERTEX_ATTRS: [wgpu::VertexAttribute; 3] = [
         format: wgpu::VertexFormat::Float32x3,
         offset: 24,
         shader_location: 2,
+    },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x2,
+        offset: 36,
+        shader_location: 7,
+    },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Uint32,
+        offset: 44,
+        shader_location: 8,
     },
 ];
 
@@ -155,7 +169,12 @@ pub fn quat_from_axis_angle(axis: [f32; 3], radians: f32) -> [f32; 4] {
     }
     let inv = len2.sqrt().recip();
     let (sin, cos) = (radians * 0.5).sin_cos();
-    [axis[0] * inv * sin, axis[1] * inv * sin, axis[2] * inv * sin, cos]
+    [
+        axis[0] * inv * sin,
+        axis[1] * inv * sin,
+        axis[2] * inv * sin,
+        cos,
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -871,12 +890,30 @@ pub(crate) fn box_face_corners(min: [f32; 3], max: [f32; 3]) -> [([f32; 3], [[f3
     let (x0, y0, z0) = (min[0], min[1], min[2]);
     let (x1, y1, z1) = (max[0], max[1], max[2]);
     [
-        ([1.0, 0.0, 0.0], [[x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]]),
-        ([-1.0, 0.0, 0.0], [[x0, y0, z1], [x0, y1, z1], [x0, y1, z0], [x0, y0, z0]]),
-        ([0.0, 1.0, 0.0], [[x0, y1, z0], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0]]),
-        ([0.0, -1.0, 0.0], [[x0, y0, z1], [x0, y0, z0], [x1, y0, z0], [x1, y0, z1]]),
-        ([0.0, 0.0, 1.0], [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]]),
-        ([0.0, 0.0, -1.0], [[x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0]]),
+        (
+            [1.0, 0.0, 0.0],
+            [[x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]],
+        ),
+        (
+            [-1.0, 0.0, 0.0],
+            [[x0, y0, z1], [x0, y1, z1], [x0, y1, z0], [x0, y0, z0]],
+        ),
+        (
+            [0.0, 1.0, 0.0],
+            [[x0, y1, z0], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0]],
+        ),
+        (
+            [0.0, -1.0, 0.0],
+            [[x0, y0, z1], [x0, y0, z0], [x1, y0, z0], [x1, y0, z1]],
+        ),
+        (
+            [0.0, 0.0, 1.0],
+            [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]],
+        ),
+        (
+            [0.0, 0.0, -1.0],
+            [[x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0]],
+        ),
     ]
 }
 
@@ -884,21 +921,19 @@ pub(crate) fn box_face_corners(min: [f32; 3], max: [f32; 3]) -> [([f32; 3], [[f3
 /// `min..=max`, outward unit normals, uniform `albedo`). Returns
 /// `(vertices, indices)` — 24 verts / 36 indices — for airship hulls,
 /// cloud cells, and instanced mechanical-part templates.
-pub fn box_mesh(
-    min: [f32; 3],
-    max: [f32; 3],
-    albedo: [f32; 3],
-) -> (Vec<TerrainVertex>, Vec<u32>) {
+pub fn box_mesh(min: [f32; 3], max: [f32; 3], albedo: [f32; 3]) -> (Vec<TerrainVertex>, Vec<u32>) {
     let faces = box_face_corners(min, max);
     let mut vertices = Vec::with_capacity(24);
     let mut indices = Vec::with_capacity(36);
     for (normal, corners) in faces {
         let base = vertices.len() as u32;
-        for position in corners {
+        for (corner, position) in corners.into_iter().enumerate() {
             vertices.push(TerrainVertex {
                 position,
                 normal,
                 albedo,
+                uv: [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]][corner],
+                atlas_index: u32::MAX,
             });
         }
         indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -966,6 +1001,12 @@ struct DynamicLights {
 @group(1) @binding(0) var<uniform> draw: DrawUniforms;
 @group(2) @binding(0) var<uniform> env: EnvUniforms;
 @group(2) @binding(1) var<uniform> dyn_lights: DynamicLights;
+struct AtlasRects { rects: array<vec4<f32>> };
+@group(2) @binding(2) var atlas_tex: texture_2d<f32>;
+@group(2) @binding(3) var atlas_sampler: sampler;
+@group(2) @binding(4) var<storage, read> atlas_rects: AtlasRects;
+struct AtlasStates { sprites: array<u32> };
+@group(2) @binding(5) var<storage, read> atlas_states: AtlasStates;
 
 struct TerrainVertex {
     @location(0) packed_pos: u32,
@@ -980,6 +1021,8 @@ struct TerrainFragment {
     @location(1) normal: vec3<f32>,
     @location(2) albedo: vec3<f32>,
     @location(3) illum: f32,
+    @location(4) uv: vec2<f32>,
+    @location(5) @interpolate(flat) sprite_id: u32,
 };
 
 const FACE_SHADE = array<f32, 6>(0.45, 1.0, 0.75, 0.85, 0.7, 0.95);
@@ -1023,6 +1066,36 @@ fn tint_rgb(tint: u32) -> vec3<f32> {
     );
 }
 
+fn tiled_uv(p: vec3<f32>, direction: u32) -> vec2<f32> {
+    if direction < 2u { return p.xz; }
+    if direction < 4u { return p.xy; }
+    return p.zy;
+}
+
+fn atlas_sample(state_id: u32, uv: vec2<f32>) -> vec3<f32> {
+    if state_id >= arrayLength(&atlas_states.sprites) {
+        return vec3<f32>(1.0);
+    }
+    let sprite_id = atlas_states.sprites[state_id];
+    if sprite_id >= arrayLength(&atlas_rects.rects) {
+        return vec3<f32>(1.0);
+    }
+    let rect = atlas_rects.rects[sprite_id];
+    return textureSampleGrad(
+        atlas_tex, atlas_sampler,
+        rect.xy + fract(uv) * rect.zw,
+        dpdx(uv) * rect.zw, dpdy(uv) * rect.zw,
+    ).rgb;
+}
+
+// Apply one luminance-independent shoulder to preserve highlight chromaticity.
+fn filmic(color: vec3<f32>) -> vec3<f32> {
+    let peak = max(max(color.r, color.g), color.b);
+    let mapped = min((peak * (2.51 * peak + 0.03)) /
+        max(peak * (2.43 * peak + 0.59) + 0.14, 0.00001), 1.0);
+    return color * (mapped / max(peak, 0.00001));
+}
+
 @vertex
 fn terrain_vs(in: TerrainVertex) -> TerrainFragment {
     let lx = f32(in.packed_pos & 0x1fu);
@@ -1056,6 +1129,8 @@ fn terrain_vs(in: TerrainVertex) -> TerrainFragment {
     out.normal = face_normal(direction);
     out.albedo = albedo * shade;
     out.illum = shade;
+    out.uv = tiled_uv(vec3<f32>(lx, ly, lz), direction);
+    out.sprite_id = in.state_id;
     return out;
 }
 
@@ -1072,6 +1147,8 @@ struct TranslucentFragment {
     @location(1) normal: vec3<f32>,
     @location(2) albedo: vec3<f32>,
     @location(3) alpha: f32,
+    @location(4) uv: vec2<f32>,
+    @location(5) @interpolate(flat) sprite_id: u32,
 };
 
 @vertex
@@ -1116,13 +1193,18 @@ fn terrain_translucent_vs(in: TranslucentVertex) -> TranslucentFragment {
     out.normal = face_normal(direction);
     out.albedo = albedo * shade;
     out.alpha = alpha;
+    out.uv = tiled_uv(vec3<f32>(lx, ly, lz), direction);
+    out.sprite_id = in.state_id;
     return out;
 }
 
 @fragment
 fn terrain_fs(in: TerrainFragment) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
+    let texel = atlas_sample(in.sprite_id, in.uv);
     var color = in.albedo;
+    let surface = in.albedo * texel;
+    color *= texel;
     let count = min(dyn_lights.light_count.x, 64u);
     for (var i = 0u; i < count; i = i + 1u) {
         let pl = dyn_lights.lights[i];
@@ -1132,7 +1214,7 @@ fn terrain_fs(in: TerrainFragment) -> @location(0) vec4<f32> {
         let dist = sqrt(dist_sq);
         let falloff = pow(max(1.0 - dist / radius, 0.0), 2.0);
         let diffuse = max(dot(n, delta / dist), 0.0);
-        color += in.albedo * pl.color_intensity.xyz * pl.color_intensity.w
+        color += surface * pl.color_intensity.xyz * pl.color_intensity.w
             * diffuse * falloff;
     }
     color = mix(color, color * env.depth_tint.rgb, env.depth_tint.w);
@@ -1146,13 +1228,14 @@ fn terrain_fs(in: TerrainFragment) -> @location(0) vec4<f32> {
     color = mix(color, frame.fog_color, clamp(max(linear, expo), 0.0, 1.0));
     let fade = clamp(draw.params.x, 0.0, 1.0);
     color = mix(frame.fog_color, color, fade);
-    return vec4<f32>(color, 1.0);
+    return vec4<f32>(filmic(color), 1.0);
 }
 
 @fragment
 fn terrain_translucent_fs(in: TranslucentFragment) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
-    var color = in.albedo;
+    let surface = in.albedo * atlas_sample(in.sprite_id, in.uv);
+    var color = surface;
     let count = min(dyn_lights.light_count.x, 64u);
     for (var i = 0u; i < count; i = i + 1u) {
         let pl = dyn_lights.lights[i];
@@ -1162,7 +1245,7 @@ fn terrain_translucent_fs(in: TranslucentFragment) -> @location(0) vec4<f32> {
         let dist = sqrt(dist_sq);
         let falloff = pow(max(1.0 - dist / radius, 0.0), 2.0);
         let diffuse = max(dot(n, delta / dist), 0.0);
-        color += in.albedo * pl.color_intensity.xyz * pl.color_intensity.w
+        color += surface * pl.color_intensity.xyz * pl.color_intensity.w
             * diffuse * falloff;
     }
     color = mix(color, color * env.depth_tint.rgb, env.depth_tint.w);
@@ -1178,7 +1261,7 @@ fn terrain_translucent_fs(in: TranslucentFragment) -> @location(0) vec4<f32> {
     color = mix(color, frame.fog_color, fog_smooth);
     let fade = clamp(draw.params.x, 0.0, 1.0);
     color = mix(frame.fog_color, color, fade);
-    return vec4<f32>(color, in.alpha * (1.0 - 0.35 * fog_smooth) * fade);
+    return vec4<f32>(filmic(color), in.alpha * (1.0 - 0.35 * fog_smooth) * fade);
 }
 ";
 
@@ -1230,11 +1313,17 @@ struct DynamicLights {
 @group(1) @binding(0) var<uniform> draw: DrawUniforms;
 @group(2) @binding(0) var<uniform> env: EnvUniforms;
 @group(2) @binding(1) var<uniform> dyn_lights: DynamicLights;
+struct AtlasRects { rects: array<vec4<f32>> };
+@group(2) @binding(2) var atlas_tex: texture_2d<f32>;
+@group(2) @binding(3) var atlas_sampler: sampler;
+@group(2) @binding(4) var<storage, read> atlas_rects: AtlasRects;
 
 struct LitVertex {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) albedo: vec3<f32>,
+    @location(7) uv: vec2<f32>,
+    @location(8) atlas_index: u32,
 };
 
 struct PartInstance {
@@ -1250,7 +1339,28 @@ struct LitFragment {
     @location(1) normal: vec3<f32>,
     @location(2) albedo: vec3<f32>,
     @location(3) light_add: f32,
+    @location(4) uv: vec2<f32>,
+    @location(5) @interpolate(flat) atlas_index: u32,
 };
+
+fn atlas_sample(sprite_id: u32, uv: vec2<f32>) -> vec3<f32> {
+    if sprite_id >= arrayLength(&atlas_rects.rects) {
+        return vec3<f32>(1.0);
+    }
+    let rect = atlas_rects.rects[sprite_id];
+    return textureSampleGrad(
+        atlas_tex, atlas_sampler,
+        rect.xy + fract(uv) * rect.zw,
+        dpdx(uv) * rect.zw, dpdy(uv) * rect.zw,
+    ).rgb;
+}
+
+fn filmic(color: vec3<f32>) -> vec3<f32> {
+    let peak = max(max(color.r, color.g), color.b);
+    let mapped = min((peak * (2.51 * peak + 0.03)) /
+        max(peak * (2.43 * peak + 0.59) + 0.14, 0.00001), 1.0);
+    return color * (mapped / max(peak, 0.00001));
+}
 
 fn rotate_euler(p: vec3<f32>, rot: vec3<f32>) -> vec3<f32> {
     let cx = cos(rot.x);
@@ -1279,6 +1389,8 @@ fn lit_emit(
     normal: vec3<f32>,
     albedo: vec3<f32>,
     light_add: f32,
+    uv: vec2<f32>,
+    atlas_index: u32,
 ) -> LitFragment {
     var out: LitFragment;
     out.clip = clip;
@@ -1286,6 +1398,8 @@ fn lit_emit(
     out.normal = normal;
     out.albedo = albedo;
     out.light_add = light_add;
+    out.uv = uv;
+    out.atlas_index = atlas_index;
     return out;
 }
 
@@ -1299,6 +1413,8 @@ fn lit_vs(in: LitVertex) -> LitFragment {
         nrm,
         in.albedo,
         0.0,
+        in.uv,
+        in.atlas_index,
     );
 }
 
@@ -1318,17 +1434,20 @@ fn inst_vs(in: LitVertex, inst: PartInstance) -> LitFragment {
         n_world,
         albedo,
         max(light, 0.25),
+        in.uv,
+        in.atlas_index,
     );
 }
 
 @fragment
 fn lit_fs(in: LitFragment) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
+    let surface = in.albedo * atlas_sample(in.atlas_index, in.uv);
     var light = env.ambient.rgb * mix(0.55, 1.0, n.y * 0.5 + 0.5)
         * env.ambient.w;
     light += vec3<f32>(env.sun.w) * max(dot(n, normalize(env.sun.xyz)), 0.0);
     light += vec3<f32>(in.light_add);
-    var color = in.albedo * light;
+    var color = surface * light;
     let count = min(dyn_lights.light_count.x, 64u);
     for (var i = 0u; i < count; i = i + 1u) {
         let pl = dyn_lights.lights[i];
@@ -1338,7 +1457,7 @@ fn lit_fs(in: LitFragment) -> @location(0) vec4<f32> {
         let dist = sqrt(dist_sq);
         let falloff = pow(max(1.0 - dist / radius, 0.0), 2.0);
         let diffuse = max(dot(n, delta / dist), 0.0);
-        color += in.albedo * pl.color_intensity.xyz * pl.color_intensity.w
+        color += surface * pl.color_intensity.xyz * pl.color_intensity.w
             * diffuse * falloff;
     }
     color = mix(color, color * env.depth_tint.rgb, env.depth_tint.w);
@@ -1352,6 +1471,6 @@ fn lit_fs(in: LitFragment) -> @location(0) vec4<f32> {
     color = mix(color, frame.fog_color, clamp(max(linear, expo), 0.0, 1.0));
     let fade = clamp(draw.params.x, 0.0, 1.0);
     color = mix(frame.fog_color, color, fade);
-    return vec4<f32>(color, draw.params.y * fade);
+    return vec4<f32>(filmic(color), draw.params.y * fade);
 }
 ";
