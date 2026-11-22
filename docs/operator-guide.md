@@ -5,7 +5,7 @@ knobs, Docker, world migration and status probing. Every command below is
 copied from the binaries in this tree — each binary's `--help` is the
 authoritative flag list.
 
-Six primary operator-facing binaries ship in this repository, alongside
+Seven primary operator-facing binaries ship in this repository, alongside
 `mc-spine-admin` for the legacy offline administration commands:
 
 | binary | built from | job |
@@ -16,6 +16,7 @@ Six primary operator-facing binaries ship in this repository, alongside
 | `mc-spine-mod-check` | [../mod-adapter-core](../mod-adapter-core) | modpack pre-flight checker |
 | `mc-spine-world-migrate` | [../state-store](../state-store) | inspect and migrate world data between 1.21.1 and 26.3 |
 | `mc-spine-client` | [../client-app](../client-app) | native client; `--ping` doubles as a status probe |
+| `mc-spine-client-gpu` | [../client-gpu](../client-gpu) | wgpu client; adapter probe and offline demo |
 | `mc-spine-voice-relay` | [../proto](../proto) | zero-dependency `VCR1` UDP proximity voice relay sidecar |
 
 The server and the tools target two Minecraft versions: `1.21.1`
@@ -113,6 +114,24 @@ mc-spine-init claims --dir /srv/spine unclaim overworld 3 -2
 ```
 
 ## 2. Modpack pre-flight
+
+**Modrinth installer.** The bundled `tools/megu_mods.py` searches Modrinth,
+installs a chosen mod with required dependencies, or resolves missing
+dependencies of installed JARs:
+
+```sh
+python3 tools/megu_mods.py search sodium --mc-version 1.21.1
+python3 tools/megu_mods.py add <slug> --mods-dir ./mods --dry-run
+python3 tools/megu_mods.py add <slug> --mods-dir ./mods --yes
+python3 tools/megu_mods.py resolve-deps --mods-dir ./mods --dry-run
+python3 tools/megu_mods.py resolve-deps --mods-dir ./mods --yes
+```
+
+Installs require explicit interactive consent or `--yes`. `--dry-run`
+downloads nothing. Downloads use the exact HTTPS `cdn.modrinth.com`
+allowlist and verify the declared size plus SHA-512 and/or SHA-256 (whichever
+hashes Modrinth provides) before atomic installation. Built-in superseded
+performance mods are skipped by default; `add --force` overrides the skip.
 
 Before a pack is downloaded or launched, `mc-spine-mod-check` reports
 whether it can run on this server. It accepts a Modrinth `.mrpack`
@@ -425,6 +444,20 @@ online/max with the sample name list, MOTD, latency and favicon.
 `767`/`777` (default `1.21.1`); `--json`/`--json-summary` prints the
 machine-readable status.
 
+**Crash reporting flags.** `mc-spine-client` installs a redacted panic hook at
+startup, writes local `crash-<fp>.md` reports, and supports `ask` (default),
+`auto_crash_only`, and `off` policies via:
+
+```sh
+mc-spine-client --crash-report-mode ask|auto_crash_only|off
+mc-spine-client --report-endpoint https://<host>/api/report
+mc-spine-client --crash-reports-dir <dir> --flush-crash-reports [--confirm-send]
+```
+
+`--report-endpoint` enforces HTTPS (or loopback HTTP for local testing) and
+fails closed with exit code 2 on unsafe URLs. Under `ask` mode, pending reports
+are never transmitted without `--confirm-send`.
+
 ## 6. Proximity voice relay
 
 `mc-spine-voice-relay` is the zero-dependency UDP sidecar for the
@@ -479,6 +512,21 @@ mc-spine-client --gpu-backend compute-indirect
 mc-spine-client --gpu-backend classic-low-spec
 mc-spine-client --gpu-backend classic
 ```
+
+The optional `mc-spine-client-gpu` binary accepts a separate CLI:
+
+```sh
+mc-spine-client-gpu --headless-probe
+mc-spine-client-gpu --offline-demo
+mc-spine-client-gpu --connect 127.0.0.1:25565
+```
+
+`--headless-probe` enumerates GPU adapters and the selected pipeline without
+opening a window. `--offline-demo` opens a built-in scene without a server.
+`--connect` currently records the target and shows it in the HUD; the live
+gameplay wire session is still being integrated. Ship this optional binary
+with `release_bundle.py build --extra-binary <path/to/mc-spine-client-gpu>`
+(or `.exe` on Windows).
 
 **External shader packs.** Supply a shaderpack ZIP or directory and,
 optionally, a named `profile.<NAME>` in its `shaders.properties`:

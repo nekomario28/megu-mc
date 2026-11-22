@@ -10,7 +10,7 @@
 
 `build` packages the primary release binary plus any companion binaries given
 with the repeatable `--extra-binary` flag, the licence/legal/docs files and
-the user-facing setup, translation and vanilla-data tools into
+the user-facing setup, translation, Modrinth and vanilla-data tools into
 
   <out-dir>/mc-spine-<version>-<target>.tar.gz   the bundle
   <out-dir>/release-manifest.json                machine-readable contents
@@ -27,15 +27,17 @@ Inside the tarball every member lives under the single directory
   <prefix>/tools/vanilla_data/version_pack.py
   <prefix>/tools/mod_launcher.py
   <prefix>/tools/megu_start.py
-  <prefix>/tools/megu_translate.py               public setup/translation and
-                                                 data regeneration helpers
+  <prefix>/tools/megu_translate.py
+  <prefix>/tools/megu_mods.py                    public setup/mod management,
+                                                translation and data helpers
 
 The five-binary release suite is `mc-spine` plus `mc-spine-client`,
 `mc-spine-mod-check`, `mc-spine-world-migrate` and `mc-spine-init`. Pass the
 server as `--binary` and each of the other four as `--extra-binary`, for example
 from the same Cargo release directory. Each binary is recorded independently
 in `release-manifest.json` under `files`, with its SHA-256, size and mode.
-The CLI also supports single-binary bundles and other companion binaries.
+The CLI also supports single-binary bundles and other companion binaries,
+including `mc-spine-client-gpu` and `mc-spine-client-gpu.exe`.
 
 Determinism: members are sorted by name, written to a USTAR archive with
 mtime 0, uid/gid 0, empty uname/gname and modes normalised to 0644/0755, and
@@ -109,6 +111,7 @@ REQUIRED_TOOLS = (
     "tools/mod_launcher.py",
     "tools/megu_start.py",
     "tools/megu_translate.py",
+    "tools/megu_mods.py",
 )
 
 # Basenames that are forbidden wherever they appear in a bundle. The two
@@ -206,9 +209,9 @@ def stage_entries(repo_root, binary, extra_binaries=()):
     """The (arcname, data, mode) list the bundle is built from, before the prefix.
 
     Every binary ships under its own basename with mode 0755; docs ship 0644 and
-    the tools keep their tracked executable bit (0755/0644), so the layout is a
-    pure function of the inputs. Two binaries may not share a basename, and no
-    binary may shadow a required doc/tool path.
+    the tools keep their tracked executable bit (0755/0644) except for the
+    public megu_mods.py CLI, which always ships as 0755. Two binaries may not
+    share a basename, and no binary may shadow a required doc/tool path.
     """
     repo_root = Path(repo_root)
     entries = []
@@ -234,7 +237,7 @@ def stage_entries(repo_root, binary, extra_binaries=()):
         source = repo_root / rel
         if source.is_symlink() or not source.is_file():
             raise BundleError(f"required release tool missing: {rel}")
-        mode = 0o755 if source.stat().st_mode & 0o111 else 0o644
+        mode = 0o755 if rel == "tools/megu_mods.py" or source.stat().st_mode & 0o111 else 0o644
         entries.append((rel, read_bytes(source, rel), mode))
     names = [arcname for arcname, _, _ in entries]
     if len(set(names)) != len(names):
@@ -564,7 +567,7 @@ def _fixture_repo(root):
         target = root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(f"#!/bin/sh\n# stub {rel}\n")
-        target.chmod(0o755)
+        target.chmod(0o644 if rel == "tools/megu_mods.py" else 0o755)
     binary = root / "build" / PRODUCT
     binary.parent.mkdir(parents=True, exist_ok=True)
     binary.write_bytes(b"\x7fELF fake mc-spine binary v1\n")
@@ -722,9 +725,10 @@ def self_test():
               and manifest["license"] == LICENSE_ID
               and manifest["subcrate_license"] == SUBCRATE_LICENSE)
         modes = {record["path"]: record["mode"] for record in manifest["files"]}
-        check("manifest: onboarding and translation helpers record mode 0755",
+        check("manifest: public megu helpers record mode 0755",
               all(modes[f"{prefix}/{name}"] == "0755"
-                  for name in ("tools/megu_start.py", "tools/megu_translate.py")))
+                  for name in ("tools/megu_start.py", "tools/megu_translate.py",
+                               "tools/megu_mods.py")))
 
         # Multi-binary suite: repeatable --extra-binary stages each companion
         # under its own basename with mode 0755, keeps the whole artifact set

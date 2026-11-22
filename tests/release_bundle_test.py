@@ -34,6 +34,7 @@ TOOLS = (
     "tools/mod_launcher.py",
     "tools/megu_start.py",
     "tools/megu_translate.py",
+    "tools/megu_mods.py",
 )
 VERSION = "0.1.0"
 TARGET = "x86_64-unknown-linux-gnu"
@@ -117,6 +118,10 @@ def test_five_binary_bundle():
                     assert item["mode"] == "0644"
                 else:
                     assert payload == (ROOT / relative).read_bytes(), relative
+                    if relative in ("tools/megu_start.py", "tools/megu_translate.py",
+                                    "tools/megu_mods.py"):
+                        assert item["mode"] == "0755", relative
+                        assert member.mode == 0o755, relative
 
         # The guard must reject a vendored file even when supplied as a companion.
         for name in ("mojang.jar", "foreign.class", "world_overlay.bin"):
@@ -131,10 +136,40 @@ def test_five_binary_bundle():
             assert not out.exists(), name
 
 
+def test_optional_gpu_companion():
+    with tempfile.TemporaryDirectory(prefix="release-gpu-test-") as tmp:
+        work = Path(tmp)
+        server = work / "mc-spine"
+        server.write_bytes(b"\x7fELF fake server\n")
+        for gpu_name in ("mc-spine-client-gpu", "mc-spine-client-gpu.exe"):
+            gpu = work / gpu_name
+            gpu_bytes = f"fake gpu companion {gpu_name}\n".encode()
+            gpu.write_bytes(gpu_bytes)
+            out = work / f"bundle-{gpu_name}"
+            run("build", "--binary", server, "--extra-binary", gpu,
+                "--out-dir", out, "--version", VERSION, "--target", TARGET,
+                "--repo-root", ROOT, "--git-sha", GIT_SHA)
+
+            bundle = out / f"{PREFIX}.tar.gz"
+            manifest = out / "release-manifest.json"
+            run("verify", "--bundle", bundle, "--manifest", manifest,
+                "--sums", out / "SHA256SUMS")
+            records = {item["path"]: item for item in json.loads(manifest.read_text())["files"]}
+            assert records[f"{PREFIX}/{gpu_name}"]["mode"] == "0755"
+            assert records[f"{PREFIX}/tools/megu_mods.py"]["mode"] == "0755"
+            with tarfile.open(bundle, "r:gz") as archive:
+                gpu_member = archive.getmember(f"{PREFIX}/{gpu_name}")
+                assert gpu_member.mode == 0o755
+                assert archive.extractfile(gpu_member).read() == gpu_bytes
+                mods_member = archive.getmember(f"{PREFIX}/tools/megu_mods.py")
+                assert mods_member.mode == 0o755 and mods_member.mtime == 0
+
+
 def main():
     run("--self-test")
     test_five_binary_bundle()
-    print("release bundle: self-test and real-document five-binary suite verified")
+    test_optional_gpu_companion()
+    print("release bundle: self-test, five-binary suite, and optional GPU companions verified")
 
 
 if __name__ == "__main__":
