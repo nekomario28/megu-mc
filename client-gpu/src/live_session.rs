@@ -273,7 +273,7 @@ impl LiveSession {
                 self.motion_packets += 1;
                 self.motion = Some(trigger);
             }
-            ClientCustomChannelEvent::Unknown { .. } => {}
+            ClientCustomChannelEvent::Season(_) | ClientCustomChannelEvent::Unknown { .. } => {}
         }
         Ok(())
     }
