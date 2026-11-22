@@ -35,6 +35,6 @@ compatibility_date = "2025-01-01"
 # Create once with:  wrangler kv namespace create CRASH_INDEX
 # then paste the returned id below.
 #
-# [[kv_namespaces]]
-# binding = "CRASH_INDEX"
-# id = "<kv-namespace-id>"
+[[kv_namespaces]]
+binding = "CRASH_INDEX"
+id = "0c161ec5a9ab442395dfd3b808e2f849"
