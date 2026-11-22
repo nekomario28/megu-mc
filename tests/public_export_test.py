@@ -2,6 +2,7 @@
 """Exercise the public export without a jar, network, or changes to the source checkout."""
 import argparse
 import json
+import os
 import re
 import subprocess
 import tarfile
@@ -16,16 +17,18 @@ SUITE = ('mc-spine', 'mc-spine-client', 'mc-spine-mod-check',
          'mc-spine-world-migrate', 'mc-spine-init')
 
 
-def run(cwd, *cmd, expect=0):
+def run(cwd, *cmd, expect=0, env=None):
     proc = subprocess.run(cmd, cwd=cwd, text=True, stdout=subprocess.PIPE,
-                          stderr=subprocess.STDOUT)
+                          stderr=subprocess.STDOUT, env=env)
     if proc.returncode != expect:
         raise AssertionError(f'{cmd} exited {proc.returncode}, expected {expect}:\n{proc.stdout}')
     return proc.stdout
 
 
 def check_docs(root):
-    assert re.search(r'^license\s*=\s*"GPL-3.0-or-later"$', (root / 'Cargo.toml').read_text(), re.M)
+    assert re.search(r'^license\s*=\s*"LGPL-3.0-or-later"$', (root / 'Cargo.toml').read_text(), re.M)
+    assert re.search(r'GNU LESSER GENERAL PUBLIC LICENSE\s+Version 3',
+                     (root / 'COPYING.LESSER').read_text())
     assert re.search(r'GNU GENERAL PUBLIC LICENSE\s+Version 3', (root / 'LICENSE').read_text())
     notice = (root / 'NOTICE').read_text()
     assert 'does not contain Mojang data' not in ' '.join(notice.split())
@@ -95,9 +98,16 @@ def test_export(from_worktree):
     with tempfile.TemporaryDirectory(prefix='public-export-test-', dir='/tmp') as tmp:
         out = Path(tmp) / 'export'
         extra = ['--from-worktree'] if from_worktree else []
-        run(ROOT, EXPORT, '--out', out, '--verify', *extra)
+        export_env = os.environ.copy()
+        for name in ('GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL',
+                     'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'):
+            export_env.pop(name, None)
+        run(ROOT, EXPORT, '--out', out, '--verify', *extra, env=export_env)
         assert run(out, 'git', 'rev-list', '--count', 'HEAD').strip() == '1'
         assert not run(out, 'git', 'show', '-s', '--format=%P').strip()
+        release_identity = 'mc-spine release <release@mc-spine.invalid>'
+        identities = run(out, 'git', 'show', '-s', '--format=%an <%ae>%n%cn <%ce>').splitlines()
+        assert identities == [release_identity, release_identity], identities
         assert run(out, 'git', 'branch', '--show-current').strip() == 'public-export'
         assert not run(out, 'git', 'status', '--porcelain')
         strict = ('python3', 'tools/provenance_check.py', '--strict-public')
