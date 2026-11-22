@@ -193,8 +193,28 @@ fn row_of(slots: &[(i16, i64)]) -> HashMap<i16, Stack> {
         .collect()
 }
 
+/// `load_datapacks` republishes the fixture packs' advancement table process-wide;
+/// tests elsewhere pin the unloaded baseline, so keep whatever was registered before
+/// the load and restore it on drop.
+struct AdvancementRegistrySnapshot(HashMap<String, Advancement>);
+
+impl AdvancementRegistrySnapshot {
+    fn take() -> Self {
+        Self(std::mem::take(
+            &mut *advancements().lock().unwrap_or_else(|e| e.into_inner()),
+        ))
+    }
+}
+
+impl std::ops::Drop for AdvancementRegistrySnapshot {
+    fn drop(&mut self) {
+        *advancements().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.0);
+    }
+}
+
 #[test]
 fn a_shaped_recipe_matches_at_a_non_zero_grid_offset() {
+    let _advs = AdvancementRegistrySnapshot::take();
     load_datapacks();
     let diamond_block = name_to_item("minecraft:diamond_block").expect("diamond_block");
     let emerald = name_to_item("minecraft:emerald").expect("emerald");
@@ -221,6 +241,7 @@ fn a_shaped_recipe_matches_at_a_non_zero_grid_offset() {
 
 #[test]
 fn vanilla_stonecutting_json_parses_ingredient_and_result_count() {
+    let _advs = AdvancementRegistrySnapshot::take();
     load_datapacks();
     let recipe = parse_special_recipe(
         r#"{"type":"minecraft:stonecutting","ingredient":{"item":"minecraft:andesite"},"result":{"id":"minecraft:polished_andesite","count":2}}"#,
@@ -238,6 +259,7 @@ fn vanilla_stonecutting_json_parses_ingredient_and_result_count() {
 
 #[test]
 fn vanilla_smithing_transform_json_preserves_base_components() {
+    let _advs = AdvancementRegistrySnapshot::take();
     load_datapacks();
     let recipe = parse_special_recipe(
         r##"{"type":"minecraft:smithing_transform","template":{"item":"minecraft:netherite_upgrade_smithing_template"},"base":{"tag":"minecraft:diamond_tool_materials"},"addition":{"item":"minecraft:netherite_ingot"},"result":{"id":"minecraft:netherite_sword"}}"##,
@@ -261,6 +283,7 @@ fn vanilla_smithing_transform_json_preserves_base_components() {
 
 #[test]
 fn vanilla_smithing_trim_json_applies_the_trim_component_to_armor() {
+    let _advs = AdvancementRegistrySnapshot::take();
     load_datapacks();
     let recipe = parse_special_recipe(
         r##"{"type":"minecraft:smithing_trim","template":{"item":"minecraft:bolt_armor_trim_smithing_template"},"base":{"tag":"minecraft:trimmable_armor"},"addition":{"tag":"minecraft:trim_materials"}}"##,
@@ -282,6 +305,7 @@ fn vanilla_smithing_trim_json_applies_the_trim_component_to_armor() {
 
 #[test]
 fn vanilla_decorated_pot_keeps_north_east_south_west_decoration_order() {
+    let _advs = AdvancementRegistrySnapshot::take();
     load_datapacks();
     let recipe = parse_special_recipe(
         r#"{"type":"minecraft:crafting_decorated_pot","category":"misc"}"#,

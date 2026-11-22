@@ -1798,7 +1798,9 @@ fn game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged() {
 #[test]
 fn region_membership_matches_hot_plus_skirt_across_input_changes() {
     let _world_guard = world_guard();
-    assert!(clients().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+    // A client left behind by an earlier live-connection test would show up as an
+    // extra region voter, so park the registry and restore it at the end.
+    let old_clients = std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner()));
     let old_actors = std::mem::take(&mut *actors().lock().unwrap_or_else(|e| e.into_inner()));
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
     let (old_hot, old_warm) = test_region();
@@ -1923,6 +1925,7 @@ fn region_membership_matches_hot_plus_skirt_across_input_changes() {
         HashSet::new(),
         HashSet::new(),
     ));
+    *clients().lock().unwrap_or_else(|e| e.into_inner()) = old_clients;
     *actors().lock().unwrap_or_else(|e| e.into_inner()) = old_actors;
     *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     set_test_region(old_hot, old_warm);
@@ -3704,6 +3707,10 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
     crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
     let _snap = WorldSnapshot::take();
+    // Earlier tests can leave mobs in the global registry; every save/load
+    // round-trip here serialises `mobs()` wholesale and the loader appends, so a
+    // leaked baseline is re-saved and re-loaded until it crosses MOB_CAP.
+    let _runtime = RuntimeRegistrySnapshot::take();
     let (_, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
@@ -3848,6 +3855,10 @@ fn a_saved_below_world_drop_is_not_duplicated() {
     crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
     let _snap = WorldSnapshot::take();
+    // Earlier tests can leave mobs in the global registry; every save/load
+    // round-trip here serialises `mobs()` wholesale and the loader appends, so a
+    // leaked baseline is re-saved and re-loaded until it crosses MOB_CAP.
+    let _runtime = RuntimeRegistrySnapshot::take();
     let (_, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0)]);
@@ -4605,6 +4616,10 @@ fn a_support_placed_under_a_falling_entity_is_landed_on() {
     crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
     let _snap = WorldSnapshot::take();
+    // Earlier tests can leave mobs in the global registry; every save/load
+    // round-trip here serialises `mobs()` wholesale and the loader appends, so a
+    // leaked baseline is re-saved and re-loaded until it crosses MOB_CAP.
+    let _runtime = RuntimeRegistrySnapshot::take();
     let (_, ow) = test_region();
     let mut warm = ow.clone();
     warm.insert((0, 0));
@@ -4692,6 +4707,10 @@ fn a_support_placed_under_a_falling_entity_is_landed_on() {
 fn a_knockout_and_a_save_in_the_same_tick_conserve_the_block() {
     let _world_guard = world_guard();
     let _snap = WorldSnapshot::take();
+    // Earlier tests can leave mobs in the global registry; every save/load
+    // round-trip here serialises `mobs()` wholesale and the loader appends, so a
+    // leaked baseline is re-saved and re-loaded until it crosses MOB_CAP.
+    let _runtime = RuntimeRegistrySnapshot::take();
     let (_, ow) = test_region();
     let mut warm = ow.clone();
     warm.insert((0, 0));
@@ -4832,6 +4851,10 @@ fn a_save_during_entity_conversion_has_no_duplicate_drop() {
     crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
     let _snap = WorldSnapshot::take();
+    // Earlier tests can leave mobs in the global registry; every save/load
+    // round-trip here serialises `mobs()` wholesale and the loader appends, so a
+    // leaked baseline is re-saved and re-loaded until it crosses MOB_CAP.
+    let _runtime = RuntimeRegistrySnapshot::take();
     let (_, ow) = test_region();
     let mut warm = ow.clone();
     warm.insert((0, 0));
@@ -6265,6 +6288,10 @@ fn a_saved_snapshot_never_holds_an_unbooked_gravity_block() {
     crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
     let _snap = WorldSnapshot::take();
+    // Earlier tests can leave mobs in the global registry; every save/load
+    // round-trip here serialises `mobs()` wholesale and the loader appends, so a
+    // leaked baseline is re-saved and re-loaded until it crosses MOB_CAP.
+    let _runtime = RuntimeRegistrySnapshot::take();
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0)]);
@@ -7714,6 +7741,10 @@ fn chest_contract_3d_block_loot_stays_lazy_until_first_open() {
     crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
     let _snapshot = WorldSnapshot::take();
+    // Earlier tests can leave mobs in the global registry; every save/load
+    // round-trip here serialises `mobs()` wholesale and the loader appends, so a
+    // leaked baseline is re-saved and re-loaded until it crosses MOB_CAP.
+    let _runtime = RuntimeRegistrySnapshot::take();
 
     let reg = breg().expect("block registry");
     let chest_pos: BlockPos = (92, 170, 60);

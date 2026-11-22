@@ -6241,6 +6241,12 @@ mod teams_and_commands_tests {
     #[test]
     fn locate_biome_and_poi_find_real_positions_and_respect_bounds() {
         crate::test_support::require_vanilla_data();
+        // Generator initialisation is process-global: run in a child like the
+        // other generated-world fixtures, or later tests read generated terrain
+        // instead of an uninitialised world.
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
         let _guard = world_guard();
         // Overlay restore on any path: a panic must not leak the seeded blocks.
         let saved_world = std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner()));

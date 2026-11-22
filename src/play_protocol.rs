@@ -15235,6 +15235,12 @@ mod w4_tests {
 
     #[test]
     fn w4_status_ping_includes_player_sample_and_valid_favicon() {
+        // The favicon cache is process-global and every login's Server Data
+        // packet also resolves it, so the OnceLock must be captured in a fresh
+        // process: run in a child like the other process-global fixtures.
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
         // The favicon cache is process-global; write the icon before the first
         // ping this binary ever answers so the OnceLock captures it.
         let icon = std::path::Path::new("server-icon.png");

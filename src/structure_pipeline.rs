@@ -2780,6 +2780,12 @@ mod pipeline_tests {
     /// nested build could not ask for.
     #[test]
     fn preliminary_columns_are_not_cached_as_final() {
+        // The installed generator and the process-wide beard resolver this fixture
+        // registers cannot be undone; run in a child like the other generated-world
+        // fixtures so later tests still see an uninitialised worldgen.
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
         use std::sync::atomic::{AtomicBool, Ordering};
         static NESTED: AtomicBool = AtomicBool::new(false);
         // A resolver for every chunk: the first call forces a nested terrain read (as a

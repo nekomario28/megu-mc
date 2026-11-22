@@ -1976,8 +1976,8 @@ mod fortress_monument_tests {
             .map(|(idx, id)| {
                 let r = &layout.rooms[*id as usize];
                 let mut mask = 0u32;
-                for d in 0..6 {
-                    if r.has_opening[d] {
+                for (d, open) in r.has_opening.iter().enumerate() {
+                    if *open {
                         mask |= 1 << d;
                     }
                 }
