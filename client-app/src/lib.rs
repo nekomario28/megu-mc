@@ -18,4 +18,5 @@ pub mod settings;
 pub mod shaderpack_runtime;
 pub mod shaders;
 pub mod sim;
+pub mod spatial_audio;
 pub mod world;
