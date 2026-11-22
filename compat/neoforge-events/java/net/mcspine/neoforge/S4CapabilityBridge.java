@@ -73,6 +73,13 @@ public final class S4CapabilityBridge {
         PROVIDERS.clear();
     }
 
+    /** Frozen provider count for the host's zero-callback fast path. */
+    static synchronized int registeredProviderCount() {
+        long count = 0;
+        for (var providers : PROVIDERS.values()) count += providers.size();
+        return (int) Math.min(count, Integer.MAX_VALUE);
+    }
+
     public static <T, C> void register(BlockCapability<T, C> capability,
             IBlockCapabilityProvider<T, C> provider, Block[] blocks) {
         checkRegistration(capability);

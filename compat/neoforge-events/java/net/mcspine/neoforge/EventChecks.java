@@ -26,6 +26,28 @@ public final class EventChecks {
         if (bus.post(event()).isCanceled() || !trace.isEmpty()) throw new AssertionError("Shutdown bus dispatched");
         bus.start();
         if (!bus.post(event()).isCanceled() || !trace.equals(List.of("high","low-canceled"))) throw new AssertionError("Priority/cancellation contract: " + trace);
+        // Registration order must not matter: all five phases run HIGHEST to LOWEST.
+        var ordered = BusBuilder.builder().startShutdown().build();
+        var phases = new ArrayList<String>();
+        ordered.addListener(EventPriority.LOW, FarmlandTrampleEvent.class, e -> phases.add("low"));
+        ordered.addListener(EventPriority.LOWEST, FarmlandTrampleEvent.class, e -> phases.add("lowest"));
+        ordered.addListener(EventPriority.HIGH, FarmlandTrampleEvent.class, e -> phases.add("high"));
+        ordered.addListener(EventPriority.HIGHEST, FarmlandTrampleEvent.class, e -> phases.add("highest"));
+        ordered.addListener(EventPriority.NORMAL, FarmlandTrampleEvent.class, e -> phases.add("normal"));
+        ordered.start();
+        ordered.post(event());
+        if (!phases.equals(List.of("highest", "high", "normal", "low", "lowest")))
+            throw new AssertionError("Five-phase listener ordering: " + phases);
+        // A canceling HIGHEST listener short-circuits lower phases unless they opt in.
+        var shortCircuit = BusBuilder.builder().startShutdown().build();
+        var skipped = new ArrayList<String>();
+        shortCircuit.addListener(EventPriority.HIGHEST, FarmlandTrampleEvent.class, e -> { skipped.add("highest"); e.setCanceled(true); });
+        shortCircuit.addListener(EventPriority.NORMAL, FarmlandTrampleEvent.class, e -> skipped.add("normal"));
+        shortCircuit.addListener(EventPriority.LOWEST, true, FarmlandTrampleEvent.class, e -> skipped.add("lowest-canceled"));
+        shortCircuit.start();
+        if (!shortCircuit.post(event()).isCanceled()
+                || !skipped.equals(List.of("highest", "lowest-canceled")))
+            throw new AssertionError("Cancellation short-circuit: " + skipped);
         try {
             NeoForge.EVENT_BUS.addListener(EventPriority.NORMAL, InvalidModBusEvent.class, event -> {});
             throw new AssertionError("Game bus accepted mod lifecycle event");

@@ -120,6 +120,11 @@ public final class S4NetworkBridge {
         CHANNELS.clear();
     }
 
+    /** Frozen channel count for the host's zero-callback fast path. */
+    static synchronized int registeredChannelCount() {
+        return CHANNELS.size();
+    }
+
     static void requireOutsideDispatch() {
         if (ACTIVE.get() != null) throw fail("Legacy native world access is unavailable during S4 dispatch");
     }

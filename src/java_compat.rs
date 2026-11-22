@@ -3,15 +3,19 @@ use crate::landing_types::{
     decode_mutation_batch, Loader, MutationOp, Request, S1EventOutcome, Trample,
     FIRST_MOD_BLOCK_STATE_ID,
 };
-#[cfg(feature = "neoforge-events")]
+#[cfg(any(test, feature = "neoforge-events"))]
 use crate::landing_types::{
-    decode_s3_response_batch, encode_s3_request_batch, S3BatchOp, S3TickRequest, S3_CAPACITY,
+    ModRegistry, ModRegistryEntry, ModRegistrySnapshot, FIRST_MOD_ITEM_ID,
 };
 #[cfg(feature = "neoforge-events")]
 use crate::landing_types::{
-    decode_s4_payload_batch, encode_s4_payload_batch, CustomPayloadEnvelope, ModRegistrySnapshot,
-    S4ContainerOp, S4ContainerOutcome, S4ContainerSnapshot, S4_MAX_CHANNEL, S4_MAX_PAYLOAD,
-    S4_PAYLOAD_CAPACITY,
+    decode_s3_response_batch, encode_s3_request_batch, S3BatchOp, S3TickRequest, S3_CAPACITY,
+    S3_MAX_RECORDS,
+};
+#[cfg(feature = "neoforge-events")]
+use crate::landing_types::{
+    decode_s4_payload_batch, encode_s4_payload_batch, CustomPayloadEnvelope, S4ContainerOp,
+    S4ContainerOutcome, S4ContainerSnapshot, S4_MAX_CHANNEL, S4_MAX_PAYLOAD, S4_PAYLOAD_CAPACITY,
 };
 #[cfg(feature = "neoforge-events")]
 use jni::{
@@ -39,6 +43,23 @@ static OWNER: OnceLock<ThreadId> = OnceLock::new();
 static SERVER: OnceLock<bool> = OnceLock::new();
 static COMMITTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static ACTIVE: std::sync::Mutex<Option<Trample>> = std::sync::Mutex::new(None);
+
+/// Java method invocations actually issued through the dispatch layer. JVM
+/// lifecycle/bootstrap calls are excluded; the counter tracks the per-call
+/// S1/S3/S4 and trample surface so tests can prove the idle path — a frozen
+/// bootstrap that reported zero registered callbacks — never reaches JNI.
+static JNI_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_jni_dispatch() {
+    JNI_DISPATCHES.fetch_add(1, super::Ordering::Relaxed);
+}
+
+/// Dispatched Java invocations so far. The zero-callback fast path must
+/// never move this counter.
+#[allow(dead_code)] // Telemetry read by feature-gated contract tests.
+pub(crate) fn jni_dispatch_count() -> u64 {
+    JNI_DISPATCHES.load(super::Ordering::Relaxed)
+}
 
 const S1_MAX_FRAME_BYTES: usize = 256 * 1024;
 const S1_MAX_MUTATIONS: usize = 4096;
@@ -230,6 +251,7 @@ pub(crate) fn dispatch_s1_event(
     if OWNER.get() != Some(&thread::current().id()) {
         return Err("S1 dispatch requires the JVM owner thread".into());
     }
+    note_jni_dispatch();
     let wire = env.with_local_frame(16, |env| -> jni::errors::Result<String> {
         // Java's int carries the same 32 bits as each u32 block state ID.
         let result = match event {
@@ -361,6 +383,7 @@ pub(crate) fn fetch_registry_snapshot(env: &mut JNIEnv) -> Result<ModRegistrySna
     if OWNER.get() != Some(&thread::current().id()) {
         return Err("S2 registry snapshot requires the JVM owner thread".into());
     }
+    note_jni_dispatch();
     let wire = env.with_local_frame(4, |env| -> jni::errors::Result<String> {
         let encoded = env
             .call_static_method(
@@ -375,6 +398,29 @@ pub(crate) fn fetch_registry_snapshot(env: &mut JNIEnv) -> Result<ModRegistrySna
         Ok(wire)
     });
     ModRegistrySnapshot::from_wire(&wire.map_err(|error| java_error(env, error))?)
+}
+
+/// Frozen Java-callback census taken once at bootstrap. `false` means the
+/// adapter proved no game-bus listeners and no S3/S4 registrations exist, so
+/// every post-freeze dispatch is a deterministic no-op the host shortcuts
+/// without JNI while Rust alone owns Tick, World and persistence.
+#[cfg(feature = "neoforge-events")]
+fn fetch_java_callbacks(env: &mut JNIEnv) -> Result<bool, String> {
+    if OWNER.get() != Some(&thread::current().id()) {
+        return Err("Java callback census requires the JVM owner thread".into());
+    }
+    note_jni_dispatch();
+    let count = env
+        .with_local_frame(4, |env| -> jni::errors::Result<jint> {
+            Ok(env
+                .call_static_method("net/mcspine/neoforge/Bootstrap", "javaCallbacks", "()I", &[])?
+                .i()?)
+        })
+        .map_err(|error| java_error(env, error))?;
+    if count < 0 {
+        return Err(format!("invalid Java callback census {count}"));
+    }
+    Ok(count > 0)
 }
 
 #[cfg(feature = "neoforge-events")]
@@ -473,6 +519,7 @@ impl<'local> S3BatchBridge<'local> {
         {
             self.jni_crossings += 1;
         }
+        note_jni_dispatch();
         // bind resolves this exact signature against the retained class. The
         // two direct buffers and the Int argument match that signature.
         let result = unsafe {
@@ -521,6 +568,7 @@ fn dispatch_s4_payload_frame(
 ) -> Result<Vec<CustomPayloadEnvelope>, String> {
     require_s4_owner()?;
     validate_s4_inbound_frame(frame)?;
+    note_jni_dispatch();
     let result = env
         .with_local_frame(8, |env| -> jni::errors::Result<_> {
             let input = env.byte_array_from_slice(frame)?;
@@ -573,6 +621,7 @@ pub(crate) fn query_s4_block_items(
     ops: &[S4ContainerOp],
 ) -> Result<Option<S4ContainerOutcome>, String> {
     require_s4_owner()?;
+    note_jni_dispatch();
     let input = snapshot.encode_query(ops)?;
     let expected = snapshot.response_len(ops);
     let result = env
@@ -989,6 +1038,7 @@ pub fn serve(
 
 fn serve_trample(env: &mut JNIEnv, hooks: &JClass, request: Request) -> bool {
     let input = request.trample;
+    note_jni_dispatch();
     COMMITTED.store(false, super::Ordering::Relaxed);
     *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(input);
     let (x, y, z) = input.position;
@@ -1010,6 +1060,30 @@ fn serve_trample(env: &mut JNIEnv, hooks: &JClass, request: Request) -> bool {
     let result = outcome
         .map(|()| COMMITTED.load(super::Ordering::Relaxed))
         .map_err(|error| java_error(env, error));
+    let succeeded = result.is_ok();
+    let _ = request.reply.send(result);
+    succeeded
+}
+
+/// Zero-callback farmland trample for the NeoForge runtime. `javaCallbacks()
+/// == 0` proves the `land` post runs zero listeners, so the event cannot be
+/// canceled and Java would unconditionally call `Host.setBlock(x, y, z, 10)`.
+/// Apply that exact commit in Rust with no JNI crossing and report the same
+/// `changed` flag the native ABI would have committed.
+#[cfg(feature = "neoforge-events")]
+fn serve_trample_idle(request: Request) -> bool {
+    let input = request.trample;
+    let (x, y, z) = input.position;
+    let dim = super::DimId::ALL
+        .get(usize::from(input.dim))
+        .copied()
+        .unwrap_or(super::DimId::Overworld);
+    let result = match catch_unwind(AssertUnwindSafe(|| {
+        super::set_block_if_dim(dim, x, y, z, 10, Some(input.state))
+    })) {
+        Ok(changed) => Ok(changed),
+        Err(_) => Err("java.lang.IllegalStateException: Rust world mutation failed".to_owned()),
+    };
     let succeeded = result.is_ok();
     let _ = request.reply.send(result);
     succeeded
@@ -1065,6 +1139,10 @@ type NeoForgeJob = Box<
 pub(crate) struct NeoForgeRuntime {
     pub(crate) registry: ModRegistrySnapshot,
     pub(crate) commands: Vec<String>,
+    /// Frozen census from `Bootstrap.javaCallbacks()`. When false the
+    /// bootstrap proved no post-freeze Java callback can run, so dispatch
+    /// methods answer deterministically without queuing JNI work.
+    java_callbacks: bool,
     jobs: std::sync::mpsc::SyncSender<NeoForgeJob>,
     staged: std::sync::Mutex<Option<StagedMods>>,
 }
@@ -1101,6 +1179,9 @@ impl NeoForgeRuntime {
     }
 
     pub(crate) fn event(&self, event: S1Event<String>) -> Result<S1EventOutcome, String> {
+        if !self.java_callbacks {
+            return idle_s1_outcome(&event);
+        }
         let outcome = self.call(move |env, hooks, _| dispatch_s1_event(env, hooks, event))?;
         validate_mod_block_states(&self.registry, &outcome)?;
         Ok(outcome)
@@ -1112,6 +1193,26 @@ impl NeoForgeRuntime {
         &self,
         requests: Vec<S3TickRequest>,
     ) -> Result<S1EventOutcome, String> {
+        if !self.java_callbacks {
+            // Mirror the encode preflight: count and identity checks happen
+            // before any Java call, and an empty callback registry yields an
+            // empty response batch.
+            if requests.len() > S3_MAX_RECORDS {
+                return Err("S3 request exceeds capacity".into());
+            }
+            if requests
+                .iter()
+                .any(|request| request.dim > 2 || request.generation == 0)
+            {
+                return Err("invalid S3 request identity".into());
+            }
+            return Ok(S1EventOutcome {
+                canceled: false,
+                break_exp: None,
+                chat_message: None,
+                mutations: Vec::new(),
+            });
+        }
         let mutations = self.call(move |env, _, batch| {
             batch
                 .dispatch(env, &requests)?
@@ -1156,7 +1257,189 @@ impl NeoForgeRuntime {
         name: String,
         payload: CustomPayloadEnvelope,
     ) -> Result<Vec<CustomPayloadEnvelope>, String> {
+        if !self.java_callbacks {
+            // The frozen registration table is empty, so the dispatch-time
+            // channel lookup still fails closed with the same diagnostic.
+            if payload.target_eid.is_some() {
+                return Err("S4 C2S payload has a target".into());
+            }
+            let frame = encode_s4_payload_batch(std::slice::from_ref(&payload))?;
+            validate_s4_inbound_frame(&frame)?;
+            return Err(format!(
+                "java.lang.IllegalStateException: Unregistered S4 C2S channel {} in PLAY",
+                payload.channel
+            ));
+        }
         self.call(move |env, _, _| dispatch_s4_payload(env, eid, &name, &payload))
+    }
+}
+
+/// Deterministic S1 outcome when `javaCallbacks()` proved zero registered
+/// callbacks: posting runs zero listeners, so the wire batch is the empty
+/// uncanceled frame. The Java entry points validate the dimension slot
+/// before posting, and an empty command registry rejects every literal —
+/// both stay fail-closed with the identical diagnostics.
+#[cfg(feature = "neoforge-events")]
+fn idle_s1_outcome(event: &S1Event<String>) -> Result<S1EventOutcome, String> {
+    match event {
+        S1Event::BlockBreak { dim, .. } | S1Event::BlockPlace { dim, .. } if *dim > 2 => {
+            return Err(format!(
+                "java.lang.IllegalArgumentException: Invalid S1 dimension slot {dim}"
+            ));
+        }
+        S1Event::Command { dim, literal, .. } => {
+            if *dim > 2 {
+                return Err(format!(
+                    "java.lang.IllegalArgumentException: Invalid S1 dimension slot {dim}"
+                ));
+            }
+            return Err(format!(
+                "java.lang.IllegalArgumentException: Unknown command: {literal}"
+            ));
+        }
+        _ => {}
+    }
+    Ok(S1EventOutcome {
+        canceled: false,
+        break_exp: None,
+        chat_message: None,
+        mutations: Vec::new(),
+    })
+}
+
+/// Valid dynamic registry names match the wire decoder and the adapter's
+/// `ResourceLocation` facade: a non-reserved lowercase namespace and path.
+#[cfg(any(test, feature = "neoforge-events"))]
+#[allow(dead_code)]
+fn valid_mod_registry_name(name: &str) -> bool {
+    let common_char =
+        |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_.-".contains(&byte);
+    match name.split_once(':') {
+        Some((namespace, path)) => {
+            !namespace.is_empty()
+                && namespace != "minecraft"
+                && namespace.bytes().all(common_char)
+                && !path.is_empty()
+                && path.bytes().all(|byte| common_char(byte) || byte == b'/')
+        }
+        None => false,
+    }
+}
+
+/// Rust mirror of the Java S2 `Open` → `Frozen` lifecycle enforced by
+/// `RegisterEvent`/`DeferredRegister`: registrations are admitted only while
+/// open, dynamic names and duplicate registry entries are rejected, and
+/// `freeze` seals the table into the same sorted, contiguous wire snapshot
+/// `ModRegistrySnapshot::from_wire` validates at bootstrap.
+#[cfg(any(test, feature = "neoforge-events"))]
+#[allow(dead_code)]
+#[derive(Default)]
+pub(crate) struct ModRegistryBuilder {
+    entries: Vec<ModRegistryEntry>,
+    frozen: bool,
+}
+
+#[cfg(any(test, feature = "neoforge-events"))]
+#[allow(dead_code)]
+impl ModRegistryBuilder {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn frozen(&self) -> bool {
+        self.frozen
+    }
+
+    pub(crate) fn register_block(&mut self, name: &str) -> Result<(), String> {
+        self.register(ModRegistry::Block, name)
+    }
+
+    pub(crate) fn register_item(&mut self, name: &str) -> Result<(), String> {
+        self.register(ModRegistry::Item, name)
+    }
+
+    fn register(&mut self, registry: ModRegistry, name: &str) -> Result<(), String> {
+        if self.frozen {
+            return Err("Registration outside the register phase".into());
+        }
+        if !valid_mod_registry_name(name) {
+            return Err(format!("Invalid dynamic registry name: {name}"));
+        }
+        let key = match registry {
+            ModRegistry::Block => "minecraft:block",
+            ModRegistry::Item => "minecraft:item",
+        };
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.registry == registry && entry.name == name)
+        {
+            return Err(format!("Duplicate registry entry {key} {name}"));
+        }
+        // Runtime IDs are only assigned in sorted order at freeze, so nothing
+        // provisional escapes to a caller.
+        self.entries.push(ModRegistryEntry {
+            registry,
+            name: name.into(),
+            runtime_id: 0,
+        });
+        Ok(())
+    }
+
+    /// Seal the table. IDs are assigned in `namespace:path` order per
+    /// registry, exactly like the sorted wire the adapter publishes.
+    pub(crate) fn freeze(&mut self) {
+        self.entries.sort_by(|first, second| {
+            let (first_namespace, first_path) = first.name.split_once(':').unwrap();
+            let (second_namespace, second_path) = second.name.split_once(':').unwrap();
+            (
+                first.registry,
+                first_namespace,
+                first_path,
+                first.runtime_id,
+            )
+                .cmp(&(
+                    second.registry,
+                    second_namespace,
+                    second_path,
+                    second.runtime_id,
+                ))
+        });
+        let mut next_block = FIRST_MOD_BLOCK_STATE_ID;
+        let mut next_item = FIRST_MOD_ITEM_ID;
+        for entry in &mut self.entries {
+            let next = match entry.registry {
+                ModRegistry::Block => &mut next_block,
+                ModRegistry::Item => &mut next_item,
+            };
+            entry.runtime_id = *next;
+            *next += 1;
+        }
+        self.frozen = true;
+    }
+
+    /// The exact S2 wire the owner publishes; open tables have no snapshot.
+    pub(crate) fn to_wire(&self) -> Result<String, String> {
+        if !self.frozen {
+            return Err("Registration phase still open".into());
+        }
+        let mut wire = String::from("S2\n");
+        for entry in &self.entries {
+            let key = match entry.registry {
+                ModRegistry::Block => "minecraft:block",
+                ModRegistry::Item => "minecraft:item",
+            };
+            wire.push_str(&format!("{key}\t{}\t{}\n", entry.runtime_id, entry.name));
+        }
+        wire.push_str("end");
+        Ok(wire)
+    }
+
+    /// Round-trip through the production decoder so the builder can only
+    /// emit snapshots the host would accept.
+    #[cfg(feature = "neoforge-events")]
+    pub(crate) fn snapshot(&self) -> Result<ModRegistrySnapshot, String> {
+        ModRegistrySnapshot::from_wire(&self.to_wire()?)
     }
 }
 
@@ -1189,6 +1472,7 @@ fn serve_neoforge(
     staged: Option<StagedMods>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let registry = fetch_registry_snapshot(env)?;
+    let java_callbacks = fetch_java_callbacks(env)?;
     let outcome = dispatch_s1_event(env, hooks, S1Event::<&str>::RegisterCommands)?;
     validate_mod_block_states(&registry, &outcome)?;
     let mut commands = apply_s1_outcome(outcome)?.registered_commands;
@@ -1217,7 +1501,11 @@ fn serve_neoforge(
             for request in trample {
                 if trample_jobs
                     .send(Box::new(move |env, hooks, _| {
-                        serve_trample(env, hooks, request)
+                        if java_callbacks {
+                            serve_trample(env, hooks, request)
+                        } else {
+                            serve_trample_idle(request)
+                        }
                     }))
                     .is_err()
                 {
@@ -1229,6 +1517,7 @@ fn serve_neoforge(
         .set(NeoForgeRuntime {
             registry,
             commands,
+            java_callbacks,
             jobs: send,
             staged: std::sync::Mutex::new(staged),
         })
@@ -1987,5 +2276,493 @@ mod tests {
             bytes: oversized,
         }])
         .is_err());
+    }
+
+    /// S2 Open → Frozen lifecycle: post-freeze and duplicate or
+    /// reserved-namespace registrations fail closed, and the sealed table
+    /// round-trips through the production wire decoder.
+    #[test]
+    fn jni_contract_registry_open_to_frozen() {
+        use crate::landing_types::ModRegistry;
+
+        let mut registry = ModRegistryBuilder::new();
+        assert!(!registry.frozen());
+        assert!(registry.to_wire().is_err());
+        registry.register_block("beta:zeta").unwrap();
+        registry.register_block("alpha:stone").unwrap();
+        registry.register_item("alpha:gem").unwrap();
+
+        for name in [
+            "minecraft:stone",
+            "Alpha:bad",
+            "nonsense",
+            "mod:",
+            ":path",
+            "mod name:x",
+            "mod:bad path",
+        ] {
+            assert!(registry.register_block(name).is_err(), "{name} admitted");
+            assert!(registry.register_item(name).is_err(), "{name} admitted");
+        }
+        assert!(registry
+            .register_block("beta:zeta")
+            .unwrap_err()
+            .contains("Duplicate registry entry minecraft:block beta:zeta"));
+        // The same name in another registry is a distinct entry, not a collision.
+        registry.register_item("beta:zeta").unwrap();
+        assert!(registry
+            .register_item("beta:zeta")
+            .unwrap_err()
+            .contains("Duplicate registry entry minecraft:item beta:zeta"));
+
+        registry.freeze();
+        assert!(registry.frozen());
+        for name in ["late:block"] {
+            let error = registry.register_block(name).unwrap_err();
+            assert!(error.contains("outside the register phase"), "{error}");
+        }
+        assert_eq!(
+            registry.to_wire().unwrap(),
+            "S2\nminecraft:block\t26684\talpha:stone\nminecraft:block\t26685\tbeta:zeta\nminecraft:item\t1333\talpha:gem\nminecraft:item\t1334\tbeta:zeta\nend"
+        );
+        // The frozen snapshot is exactly what ModRegistrySnapshot::from_wire accepts.
+        let snapshot = ModRegistrySnapshot::from_wire(&registry.to_wire().unwrap()).unwrap();
+        assert_eq!(
+            snapshot
+                .entries()
+                .iter()
+                .map(|entry| (entry.registry, entry.name.as_str(), entry.runtime_id))
+                .collect::<Vec<_>>(),
+            vec![
+                (ModRegistry::Block, "alpha:stone", FIRST_MOD_BLOCK_STATE_ID),
+                (ModRegistry::Block, "beta:zeta", FIRST_MOD_BLOCK_STATE_ID + 1),
+                (ModRegistry::Item, "alpha:gem", FIRST_MOD_ITEM_ID),
+                (ModRegistry::Item, "beta:zeta", FIRST_MOD_ITEM_ID + 1),
+            ]
+        );
+    }
+
+    /// Java→Rust world commit consistency: a Java-staged batch is validated
+    /// and committed atomically by Rust, while canceled or CAS-violating
+    /// batches leave every dimension untouched.
+    #[test]
+    fn jni_contract_world_commit_atomic_consistency() {
+        let _world = super::super::world_guard();
+        let dim = super::super::DimId::Overworld;
+        let pos = (3317, 84, -3321);
+        let before = super::super::block_at_dim(dim, pos.0, pos.1, pos.2);
+        let replacement = if before == 1 { 2 } else { 1 };
+
+        // A canceled Java outcome must not stage any world mutation.
+        let report = apply_s1_outcome(S1EventOutcome {
+            canceled: true,
+            break_exp: None,
+            chat_message: None,
+            mutations: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(report, super::BatchCommitReport::default());
+        assert_eq!(super::super::block_at_dim(dim, pos.0, pos.1, pos.2), before);
+
+        // A staged CAS that matches commits exactly once.
+        let report = apply_s1_outcome(S1EventOutcome {
+            canceled: false,
+            break_exp: Some(3),
+            chat_message: None,
+            mutations: vec![
+                MutationOp::SetBlockIf {
+                    dim: 0,
+                    pos,
+                    new_state: replacement,
+                    expected_state: Some(before),
+                },
+                MutationOp::SendSystemMessage {
+                    player_eid: 9,
+                    message: "committed".into(),
+                },
+            ],
+        })
+        .unwrap();
+        assert_eq!(report.applied_blocks, 1);
+        assert_eq!(report.system_messages, vec![(9, "committed".to_owned())]);
+        assert_eq!(
+            super::super::block_at_dim(dim, pos.0, pos.1, pos.2),
+            replacement
+        );
+
+        // A stale CAS anywhere in the batch rejects it wholesale — including
+        // the already-staged earlier entries.
+        let stale = if replacement == 1 { 2 } else { 1 };
+        let neighbor_before =
+            super::super::block_at_dim(dim, pos.0 + 1, pos.1, pos.2);
+        let neighbor_stale = if neighbor_before == 1 { 2 } else { 1 };
+        assert!(apply_s1_outcome(S1EventOutcome {
+            canceled: false,
+            break_exp: None,
+            chat_message: None,
+            mutations: vec![
+                MutationOp::SetBlockIf {
+                    dim: 0,
+                    pos,
+                    new_state: stale,
+                    expected_state: Some(replacement),
+                },
+                MutationOp::SetBlockIf {
+                    dim: 0,
+                    pos: (pos.0 + 1, pos.1, pos.2),
+                    new_state: 1,
+                    expected_state: Some(neighbor_stale),
+                },
+            ],
+        })
+        .unwrap_err()
+        .contains("CAS precondition"));
+        assert_eq!(
+            super::super::block_at_dim(dim, pos.0, pos.1, pos.2),
+            replacement
+        );
+    }
+
+    /// Zero registered callbacks: 1,000 dispatches across every entry point
+    /// must execute exactly 0 Java invocations. `java_callbacks == false`
+    /// mirrors `Bootstrap.javaCallbacks() == 0`, so dispatch answers
+    /// deterministically in Rust and never queues a job for the JVM owner.
+    #[cfg(feature = "neoforge-events")]
+    #[test]
+    fn jni_contract_zero_listeners_makes_zero_jvm_calls() {
+        use crate::landing_types::S3Activation;
+
+        let (send, receive) = std::sync::mpsc::sync_channel::<NeoForgeJob>(1024);
+        let runtime = NeoForgeRuntime {
+            registry: ModRegistrySnapshot::from_wire("S2\nend").unwrap(),
+            commands: Vec::new(),
+            java_callbacks: false,
+            jobs: send,
+            staged: std::sync::Mutex::new(None),
+        };
+        let baseline = jni_dispatch_count();
+        for i in 0..1_000 {
+            let event = match i % 3 {
+                0 => S1Event::PlayerLogout(7, "Alex".to_string()),
+                1 => S1Event::ServerChat {
+                    player: (7, "Alex".to_string()),
+                    raw_text: "hello".to_string(),
+                },
+                _ => S1Event::BlockBreak {
+                    dim: 0,
+                    pos: (i as i32, 70, -i as i32),
+                    state: 1,
+                    player: (7, "Alex".to_string()),
+                    exp_to_drop: 0,
+                },
+            };
+            let outcome = runtime.event(event).unwrap();
+            assert!(!outcome.canceled && outcome.mutations.is_empty());
+            let ticks = runtime
+                .player_ticks(vec![S3TickRequest {
+                    activation: S3Activation::EntityTick,
+                    dim: 0,
+                    kind: 7,
+                    id: i as i32,
+                    generation: 1,
+                    pos: (i as i32, 64, -i as i32),
+                    state: 5,
+                }])
+                .unwrap();
+            assert!(ticks.mutations.is_empty());
+        }
+        // Idle dispatch still fails closed exactly like the empty Java side.
+        assert_eq!(
+            runtime
+                .event(S1Event::Command {
+                    dim: 0,
+                    pos: (0, 0, 0),
+                    name: "Alex".into(),
+                    literal: "greet".into(),
+                })
+                .unwrap_err(),
+            "java.lang.IllegalArgumentException: Unknown command: greet"
+        );
+        assert_eq!(
+            runtime
+                .event(S1Event::BlockBreak {
+                    dim: 3,
+                    pos: (0, 70, 0),
+                    state: 1,
+                    player: (7, "Alex".to_string()),
+                    exp_to_drop: 0,
+                })
+                .unwrap_err(),
+            "java.lang.IllegalArgumentException: Invalid S1 dimension slot 3"
+        );
+        assert!(runtime
+            .player_ticks(vec![S3TickRequest {
+                activation: S3Activation::EntityTick,
+                dim: 0,
+                kind: 1,
+                id: 1,
+                generation: 0,
+                pos: (0, 64, 0),
+                state: 1,
+            }])
+            .unwrap_err()
+            .contains("invalid S3 request identity"));
+        assert_eq!(
+            runtime
+                .payload(
+                    7,
+                    "Alex".into(),
+                    CustomPayloadEnvelope {
+                        channel: "fixture:probe".into(),
+                        target_eid: Some(3),
+                        bytes: vec![1],
+                    },
+                )
+                .unwrap_err(),
+            "S4 C2S payload has a target"
+        );
+        assert_eq!(
+            runtime
+                .payload(
+                    7,
+                    "Alex".into(),
+                    CustomPayloadEnvelope {
+                        channel: "fixture:probe".into(),
+                        target_eid: None,
+                        bytes: vec![1],
+                    },
+                )
+                .unwrap_err(),
+            "java.lang.IllegalStateException: Unregistered S4 C2S channel fixture:probe in PLAY"
+        );
+        // Counter-proven idle: no Java dispatch ran and no job ever reached
+        // the JVM owner's queue.
+        assert_eq!(jni_dispatch_count() - baseline, 0);
+        assert!(matches!(
+            receive.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        // With callbacks present the same methods must take the JNI path;
+        // a dead owner channel proves the flag routes the call to Java.
+        let (dead_send, dead_receive) = std::sync::mpsc::sync_channel::<NeoForgeJob>(4);
+        drop(dead_receive);
+        let subscribed = NeoForgeRuntime {
+            registry: ModRegistrySnapshot::from_wire("S2\nend").unwrap(),
+            commands: Vec::new(),
+            java_callbacks: true,
+            jobs: dead_send,
+            staged: std::sync::Mutex::new(None),
+        };
+        for result in [
+            subscribed
+                .event(S1Event::PlayerLogout(7, "Alex".into()))
+                .unwrap_err(),
+            subscribed
+                .player_ticks(vec![S3TickRequest {
+                    activation: S3Activation::EntityTick,
+                    dim: 0,
+                    kind: 1,
+                    id: 1,
+                    generation: 1,
+                    pos: (0, 64, 0),
+                    state: 1,
+                }])
+                .unwrap_err(),
+            subscribed
+                .payload(
+                    7,
+                    "Alex".into(),
+                    CustomPayloadEnvelope {
+                        channel: "fixture:probe".into(),
+                        target_eid: None,
+                        bytes: vec![1],
+                    },
+                )
+                .unwrap_err(),
+        ] {
+            assert_eq!(result, "NeoForge JVM owner stopped");
+        }
+    }
+
+    /// The zero-callback trample shortcut applies `Host.setBlock(x,y,z,10)`
+    /// semantics in Rust: a matching CAS commits once and reports the same
+    /// `changed` flag with zero dispatches.
+    #[cfg(feature = "neoforge-events")]
+    #[test]
+    fn jni_contract_idle_trample_commits_without_jni() {
+        let _world = super::super::world_guard();
+        let dim = super::super::DimId::Overworld;
+        let pos = (3401, 83, -3407);
+        let farmland = 4286;
+        assert!(super::super::set_block_if_dim(dim, pos.0, pos.1, pos.2, farmland, None));
+        let baseline = jni_dispatch_count();
+
+        let (reply, receive) = std::sync::mpsc::sync_channel(1);
+        let served = serve_trample_idle(Request {
+            trample: Trample {
+                dim: 0,
+                position: pos,
+                state: farmland,
+                distance: 3.5,
+            },
+            reply,
+        });
+        assert!(served);
+        assert_eq!(receive.recv().unwrap(), Ok(true));
+        assert_eq!(super::super::block_at_dim(dim, pos.0, pos.1, pos.2), 10);
+        assert_eq!(jni_dispatch_count() - baseline, 0);
+
+        // A stale expected state fails the CAS the same way the native
+        // setBlock ABI reports no commit.
+        let (reply, receive) = std::sync::mpsc::sync_channel(1);
+        let served = serve_trample_idle(Request {
+            trample: Trample {
+                dim: 0,
+                position: pos,
+                state: 1,
+                distance: 3.5,
+            },
+            reply,
+        });
+        assert!(served);
+        assert_eq!(receive.recv().unwrap(), Ok(false));
+        assert_eq!(super::super::block_at_dim(dim, pos.0, pos.1, pos.2), 10);
+        assert_eq!(jni_dispatch_count() - baseline, 0);
+    }
+
+    /// The frozen-callback census the host consumes from `Bootstrap` must
+    /// agree with what the bootstrap actually registered.
+    #[cfg(feature = "neoforge-events")]
+    #[test]
+    fn jni_contract_callback_census_matches_fixture() {
+        let (Some(directory), Some(expected)) = (
+            std::env::var_os("MC_SPINE_JNI_FIXTURE"),
+            std::env::var_os("MC_SPINE_JNI_EXPECT_CALLBACKS"),
+        ) else {
+            return;
+        };
+        let directory = Path::new(&directory);
+        let classpath = std::fs::read_to_string(directory.join("classpath.txt")).unwrap();
+        let jvm = create_jvm(&classpath).unwrap();
+        let mut env = jvm.attach_current_thread().unwrap();
+        let path = JObject::from(env.new_string(directory.to_str().unwrap()).unwrap());
+        let host = env.call_static_method(
+            "net/mcspine/neoforge/Bootstrap",
+            "initialize",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[JValue::Object(&path)],
+        );
+        let host = host.unwrap_or_else(|error| panic!("{}", java_error(&mut env, error)));
+        register_host(&mut env, host.l().unwrap()).unwrap();
+        assert_eq!(
+            fetch_java_callbacks(&mut env).unwrap(),
+            expected.to_string_lossy() == "1",
+            "javaCallbacks() disagrees with fixture mod set"
+        );
+    }
+
+    /// 10,000 consecutive dispatch invocations through bounded local frames:
+    /// an unbounded frame would overflow the JVM local reference table, Java
+    /// exceptions must clear into `Err` without poisoning `JNIEnv`, and
+    /// scoped thread attachment must never detach an owner or leak.
+    #[cfg(feature = "neoforge-events")]
+    #[test]
+    fn jni_contract_10k_localref_exception_and_thread_attach_stress() {
+        // The Python suite supplies the audited fixture dir (classpath.txt +
+        // mods/) and runs this test alone: one JavaVM per process.
+        let Some(directory) = std::env::var_os("MC_SPINE_JNI_FIXTURE") else {
+            return;
+        };
+        let directory = Path::new(&directory);
+        let classpath = std::fs::read_to_string(directory.join("classpath.txt")).unwrap();
+        let jvm = create_jvm(&classpath).unwrap();
+        let mut env = jvm.attach_current_thread().unwrap();
+        let path = JObject::from(env.new_string(directory.to_str().unwrap()).unwrap());
+        let host = env.call_static_method(
+            "net/mcspine/neoforge/Bootstrap",
+            "initialize",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[JValue::Object(&path)],
+        );
+        let host = host.unwrap_or_else(|error| panic!("{}", java_error(&mut env, error)));
+        register_host(&mut env, host.l().unwrap()).unwrap();
+        let hooks = env
+            .call_static_method(
+                "net/mcspine/neoforge/Bootstrap",
+                "initializeServer",
+                "()Ljava/lang/Class;",
+                &[],
+            )
+            .unwrap_or_else(|error| panic!("{}", java_error(&mut env, error)))
+            .l()
+            .unwrap();
+        let hooks = <&JClass>::from(&hooks);
+        assert!(fetch_java_callbacks(&mut env).unwrap(), "fixture has listeners");
+
+        let mut exceptions = 0u64;
+        let baseline = jni_dispatch_count();
+        for i in 0..10_000i32 {
+            let outcome = dispatch_s1_event(
+                &mut env,
+                hooks,
+                S1Event::ServerChat {
+                    player: (i, "Alex"),
+                    raw_text: "hi",
+                },
+            )
+            .unwrap_or_else(|error| panic!("dispatch {i}: {error}"));
+            assert!(!outcome.canceled);
+            if i % 500 == 499 {
+                // A Java exception must surface as a clean Err and leave the
+                // owner able to keep dispatching.
+                let error = dispatch_s1_event(
+                    &mut env,
+                    hooks,
+                    S1Event::Command {
+                        dim: 0,
+                        pos: (0, 0, 0),
+                        name: "Alex",
+                        literal: "not-a-command",
+                    },
+                )
+                .unwrap_err();
+                assert!(error.contains("java.lang.IllegalArgumentException"), "{error}");
+                exceptions += 1;
+            }
+        }
+        assert_eq!(jni_dispatch_count() - baseline, 10_000 + exceptions);
+
+        // Scoped attach on the already-attached owner is a no-op: it must not
+        // detach the pre-existing attachment when the guard drops.
+        let attached = jvm.threads_attached();
+        {
+            let _nested = jvm.attach_current_thread().unwrap();
+            assert_eq!(jvm.threads_attached(), attached);
+            assert!(jvm.get_env().is_ok());
+        }
+        assert!(jvm.get_env().is_ok(), "nested attach detached the owner");
+        assert_eq!(jvm.threads_attached(), attached);
+
+        // A worker attaches for scoped JNI work and the guard detaches it.
+        let vm = &jvm;
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    assert!(vm.get_env().is_err());
+                    {
+                        let _guard = vm.attach_current_thread().unwrap();
+                        assert!(vm.get_env().is_ok());
+                        assert_eq!(vm.threads_attached(), attached + 1);
+                    }
+                    assert!(vm.get_env().is_err(), "worker survived guard drop");
+                    assert_eq!(vm.threads_attached(), attached);
+                })
+                .join()
+                .unwrap();
+        });
+        println!(
+            "PASS 10000 local-frame dispatches, {exceptions} exception clears, scoped attach/detach"
+        );
     }
 }

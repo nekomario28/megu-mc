@@ -82,6 +82,15 @@ public final class DirectBatchBridge {
         registrations.clear();
     }
 
+    /** Frozen callback count; an unfrozen registry saturates so the host keeps dispatching. */
+    static synchronized int callbackCount() {
+        Registry frozen = registry;
+        if (frozen == null) return Integer.MAX_VALUE;
+        long count = 0;
+        for (List<Callback> callbacks : frozen.callbacks.values()) count += callbacks.size();
+        return (int) Math.min(count, Integer.MAX_VALUE);
+    }
+
     static void requireOutsideBatch() {
         Batch active = ACTIVE.get();
         if (active != null) throw fail(active, "Legacy native world access is unavailable during S3 dispatch");

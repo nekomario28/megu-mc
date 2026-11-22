@@ -155,6 +155,38 @@ public final class Bootstrap {
         return frozenRegistry;
     }
 
+    /**
+     * Frozen count of every post-bootstrap Java callback the host can reach:
+     * game-bus listeners plus the S3/S4 registrations. Zero lets the host
+     * skip JNI dispatch entirely, so Rust alone owns Tick, World and save.
+     */
+    public static synchronized int javaCallbacks() {
+        if (!initialized) throw new IllegalStateException("NeoForge adapter is not initialized");
+        long count = gameBusListeners()
+            + DirectBatchBridge.callbackCount()
+            + S4NetworkBridge.registeredChannelCount()
+            + S4CapabilityBridge.registeredProviderCount();
+        return (int) Math.min(count, Integer.MAX_VALUE);
+    }
+
+    private static long gameBusListeners() {
+        // EventBus.listeners maps every registered target to its listener
+        // list; register(Object), static subscribers and addListener all flow
+        // through it, so the map size is the complete game-bus surface.
+        try {
+            var field = net.neoforged.bus.EventBus.class.getDeclaredField("listeners");
+            field.setAccessible(true);
+            var listeners = (Map<?, ?>) field.get(NeoForge.EVENT_BUS);
+            long count = 0;
+            for (Object value : listeners.values()) count += ((List<?>) value).size();
+            return count;
+        } catch (RuntimeException | ReflectiveOperationException | Error error) {
+            // Fail conservative: an unreadable bus counts as fully subscribed,
+            // so the host keeps JNI dispatch rather than dropping callbacks.
+            return Integer.MAX_VALUE;
+        }
+    }
+
     private static Object construct(Class<?> type, String modId, IEventBus modBus) throws Exception {
         List<Constructor<?>> supported = new ArrayList<>();
         for (Constructor<?> constructor : type.getDeclaredConstructors()) {
