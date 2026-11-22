@@ -13,6 +13,7 @@ REQUIRED_JOBS = {"preflight", "build-matrix", "docker-check", "publish-release"}
 BINARIES = (
     "mc-spine", "mc-spine-client", "mc-spine-mod-check",
     "mc-spine-world-migrate", "mc-spine-init", "mc-spine-admin",
+    "mc-spine-client-gpu",
 )
 
 
@@ -110,16 +111,45 @@ class ReleaseWorkflowTest(unittest.TestCase):
         for manifest in (
             "client-app/Cargo.toml", "mod-adapter-core/Cargo.toml",
             "state-store/Cargo.toml", "server-files/Cargo.toml",
+            "client-gpu/Cargo.toml",
         ):
             self.assertIn(manifest, job)
-        self.assertEqual(job.count("cargo build --locked --release"), 5)
+        self.assertEqual(job.count("cargo build --locked --release"), 6)
         self.assertIn("--manifest-path server-files/Cargo.toml --bins", job)
+        self.assertIn("--manifest-path client-gpu/Cargo.toml --bin mc-spine-client-gpu", job)
         self.assertIn("tools/release_bundle.py build", job)
         self.assertIn("tools/release_bundle.py verify", job)
-        self.assertEqual(job.count("--extra-binary"), 5)
+        self.assertEqual(job.count("--extra-binary"), 6)
         for binary in BINARIES:
             self.assertIn(f"release/{binary}$suffix", job)
         self.assertIn("if-no-files-found: error", job)
+
+    def test_client_gpu_headless_probe_smoke(self):
+        job = self.jobs["build-matrix"]
+        self.assertIn(
+            "cargo build --locked --release --manifest-path client-gpu/Cargo.toml"
+            " --bin mc-spine-client-gpu",
+            job,
+        )
+        self.assertNotIn("cargo build --offline", job)
+        self.assertIn(
+            '"client-gpu/target/release/mc-spine-client-gpu$suffix" --headless-probe',
+            job,
+        )
+        self.assertIn(
+            '--extra-binary "client-gpu/target/release/mc-spine-client-gpu$suffix"',
+            job,
+        )
+        self.assertIn("'mc-spine-client-gpu'", self.jobs["publish-release"])
+
+    def test_workflow_yaml_parses(self):
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("PyYAML not installed; yaml_sections checks above stand in")
+        document = yaml.safe_load(self.workflow)
+        self.assertIsInstance(document, dict)
+        self.assertEqual(set(document["jobs"]), REQUIRED_JOBS)
 
     def test_publishing_checksums_and_release_flags(self):
         job = self.jobs["publish-release"]

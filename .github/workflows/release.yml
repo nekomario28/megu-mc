@@ -79,6 +79,13 @@ jobs:
           cargo build --locked --release --manifest-path mod-adapter-core/Cargo.toml --bin mc-spine-mod-check
           cargo build --locked --release --manifest-path state-store/Cargo.toml --bin mc-spine-world-migrate
           cargo build --locked --release --manifest-path server-files/Cargo.toml --bins
+          cargo build --locked --release --manifest-path client-gpu/Cargo.toml --bin mc-spine-client-gpu
+      - name: Smoke test mc-spine-client-gpu headless probe
+        shell: bash
+        run: |
+          suffix=''
+          if [[ "$RUNNER_OS" == Windows ]]; then suffix='.exe'; fi
+          "client-gpu/target/release/mc-spine-client-gpu$suffix" --headless-probe
       - name: Package and verify release archive
         shell: bash
         env:
@@ -97,6 +104,7 @@ jobs:
             --extra-binary "state-store/target/release/mc-spine-world-migrate$suffix" \
             --extra-binary "server-files/target/release/mc-spine-init$suffix" \
             --extra-binary "server-files/target/release/mc-spine-admin$suffix" \
+            --extra-binary "client-gpu/target/release/mc-spine-client-gpu$suffix" \
             --out-dir "$out_dir" --version "$RELEASE_VERSION" --target "$RELEASE_TARGET"
           "$PY" tools/release_bundle.py verify \
             --bundle "$out_dir/mc-spine-$RELEASE_VERSION-$RELEASE_TARGET.tar.gz" \
@@ -151,7 +159,8 @@ jobs:
 
           targets = ('linux-x86_64', 'macos-arm64', 'windows-x86_64')
           binaries = ('mc-spine', 'mc-spine-client', 'mc-spine-mod-check',
-                      'mc-spine-world-migrate', 'mc-spine-init', 'mc-spine-admin')
+                      'mc-spine-world-migrate', 'mc-spine-init', 'mc-spine-admin',
+                      'mc-spine-client-gpu')
           output = Path('dist/publish')
           output.mkdir(parents=True, exist_ok=True)
           checksums = {}
