@@ -1,0 +1,204 @@
+name: Release binaries and Docker validation
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version, for example v0.1.0-alpha.1'
+        required: true
+        type: string
+      draft:
+        description: 'Create the release as a draft'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Validate release version
+        id: version
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+        run: |
+          if [[ ! "$RELEASE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] \
+              || [[ "$RELEASE_VERSION" == *..* ]]; then
+            echo '::error::Version must be a safe v-prefixed semantic version'
+            exit 1
+          fi
+          printf 'version=%s\n' "$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+      - name: Release policy and reproducibility gates
+        run: |
+          python3 tools/provenance_check.py
+          python3 tools/provenance_check.py --self-test
+          bash tools/debt_ratchet.sh
+          python3 tools/vanilla_parity_audit.py --format text --strict --min-c2s-handled 58 --min-gamerules-wired 51
+          python3 tools/modloader_parity_audit.py --format text --strict --min-overall-pct 100
+          python3 website/check_site.py
+          python3 tests/release_bundle_test.py
+          python3 tests/release_workflow_test.py
+
+  build-matrix:
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: macos-latest
+            target: macos-arm64
+          - os: windows-latest
+            target: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.98.0
+      - name: Build server and standalone release binaries (locked)
+        shell: bash
+        run: |
+          cargo build --locked --release --bin mc-spine
+          cargo build --locked --release --manifest-path client-app/Cargo.toml --bin mc-spine-client
+          cargo build --locked --release --manifest-path mod-adapter-core/Cargo.toml --bin mc-spine-mod-check
+          cargo build --locked --release --manifest-path state-store/Cargo.toml --bin mc-spine-world-migrate
+          cargo build --locked --release --manifest-path server-files/Cargo.toml --bins
+      - name: Package and verify release archive
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          PY=python3
+          command -v python3 >/dev/null 2>&1 || PY=python
+          suffix=''
+          if [[ "$RUNNER_OS" == Windows ]]; then suffix='.exe'; fi
+          out_dir="dist/$RELEASE_TARGET"
+          "$PY" tools/release_bundle.py build \
+            --binary "target/release/mc-spine$suffix" \
+            --extra-binary "client-app/target/release/mc-spine-client$suffix" \
+            --extra-binary "mod-adapter-core/target/release/mc-spine-mod-check$suffix" \
+            --extra-binary "state-store/target/release/mc-spine-world-migrate$suffix" \
+            --extra-binary "server-files/target/release/mc-spine-init$suffix" \
+            --extra-binary "server-files/target/release/mc-spine-admin$suffix" \
+            --out-dir "$out_dir" --version "$RELEASE_VERSION" --target "$RELEASE_TARGET"
+          "$PY" tools/release_bundle.py verify \
+            --bundle "$out_dir/mc-spine-$RELEASE_VERSION-$RELEASE_TARGET.tar.gz" \
+            --manifest "$out_dir/release-manifest.json" \
+            --sums "$out_dir/SHA256SUMS"
+      - name: Upload verified platform artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/${{ matrix.target }}/
+          if-no-files-found: error
+
+  docker-check:
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Build release Docker image
+        run: docker build -f docker/Dockerfile .
+
+  publish-release:
+    needs: [preflight, build-matrix, docker-check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Download platform artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: dist
+      - name: Verify archives and generate combined checksums
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import shutil
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          targets = ('linux-x86_64', 'macos-arm64', 'windows-x86_64')
+          binaries = ('mc-spine', 'mc-spine-client', 'mc-spine-mod-check',
+                      'mc-spine-world-migrate', 'mc-spine-init', 'mc-spine-admin')
+          output = Path('dist/publish')
+          output.mkdir(parents=True, exist_ok=True)
+          checksums = {}
+          for target in targets:
+              folder = Path('dist') / f'release-{target}'
+              archive = folder / f'mc-spine-{os.environ["RELEASE_VERSION"]}-{target}.tar.gz'
+              manifest = folder / 'release-manifest.json'
+              sums = folder / 'SHA256SUMS'
+              subprocess.run([sys.executable, 'tools/release_bundle.py', 'verify',
+                              '--bundle', str(archive), '--manifest', str(manifest),
+                              '--sums', str(sums)], check=True)
+              metadata = json.loads(manifest.read_text(encoding='utf-8'))
+              if (metadata['version'] != os.environ['RELEASE_VERSION']
+                      or metadata['target_triple'] != target
+                      or metadata['git_sha'] != os.environ['GITHUB_SHA']):
+                  raise SystemExit(f'manifest identity mismatch for {target}')
+              suffix = '.exe' if target.startswith('windows-') else ''
+              members = {entry['path'].rsplit('/', 1)[-1]
+                         for entry in metadata['files']}
+              missing = {name + suffix for name in binaries} - members
+              if missing:
+                  raise SystemExit(f'{target} missing release binaries: {sorted(missing)}')
+              for source, filename in ((archive, archive.name),
+                                       (manifest, f'release-manifest-{target}.json')):
+                  destination = output / filename
+                  shutil.copyfile(source, destination)
+                  checksums[filename] = hashlib.sha256(destination.read_bytes()).hexdigest()
+          (output / 'SHA256SUMS-all.txt').write_text(
+              ''.join(f'{checksums[name]}  {name}\n' for name in sorted(checksums)),
+              encoding='utf-8')
+          PY
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          RELEASE_DRAFT: ${{ inputs.draft }}
+        run: |
+          options=(--title "$RELEASE_VERSION" --generate-notes)
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            options+=(--verify-tag)
+          else
+            options+=(--target "$GITHUB_SHA")
+            if [[ "$RELEASE_DRAFT" == true ]]; then options+=(--draft); fi
+          fi
+          if [[ "$RELEASE_VERSION" == *-alpha* || "$RELEASE_VERSION" == *-beta* || "$RELEASE_VERSION" == *-rc* ]]; then
+            options+=(--prerelease)
+          fi
+          gh release create "$RELEASE_VERSION" dist/publish/* "${options[@]}"
