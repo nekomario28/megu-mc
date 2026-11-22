@@ -155,8 +155,8 @@ jobs:
           cp dist/launcher-stage/mc-spine-bootstrapper.jar dist/publish/mc-spine-bootstrapper.jar
           python3 tools/client_launcher/export_launcher_bundle.py \
             --out-dir dist/launcher-bundles/prism --format prism --mc-version 1.21.1 \
-            --bootstrap-jar dist/publish/mc-spine-bootstrapper.jar
-          python3 -c "import shutil; shutil.make_archive('dist/publish/mc-spine-1.21.1-prism', 'zip', 'dist/launcher-bundles/prism')"
+            --bootstrap-jar dist/publish/mc-spine-bootstrapper.jar --prism-zip
+          cp dist/launcher-bundles/prism/mc-spine-prism-1.21.1.zip dist/publish/mc-spine-prism-1.21.1.zip
           python3 tools/client_launcher/export_launcher_bundle.py \
             --out-dir dist/launcher-bundles/mrpack --format mrpack --mc-version 1.21.1 \
             --loader fabric --loader-version 0.16.9

@@ -60,11 +60,11 @@ def manifests():
         "environment": "client",
         "entrypoints": {"client": ["net.mcspine.integrated.FabricIntegratedMod"]},
         "depends": {"fabricloader": ">=0.16.0", "minecraft": "1.21.1", "java": ">=21"},
-        "license": "GPL-3.0-or-later",
+        "license": "LGPL-3.0-or-later",
     }
     neoforge = """modLoader="javafml"
 loaderVersion="[1,)"
-license="GPL-3.0-or-later"
+license="LGPL-3.0-or-later"
 
 [[mods]]
 modId="mc_spine_integrated"

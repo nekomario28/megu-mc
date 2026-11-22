@@ -89,8 +89,14 @@ public final class IntegratedServerBridge implements AutoCloseable {
         if (timeout == null || timeout.toMillis() < 100 || timeout.toMillis() > 120_000) {
             throw new IllegalArgumentException("timeout must be between 100 and 120000 ms");
         }
-        if (binary == null || !Files.isRegularFile(binary) || !Files.isExecutable(binary)) {
+        if (binary == null || !Files.isRegularFile(binary)) {
             throw new IOException("server binary is missing or not executable");
+        }
+        if (!Files.isExecutable(binary)) {
+            binary.toFile().setExecutable(true);
+            if (!Files.isExecutable(binary)) {
+                throw new IOException("server binary is missing or not executable");
+            }
         }
         Path executable = binary.toRealPath();
         if (gameDir == null || !Files.isDirectory(gameDir)) {
@@ -541,9 +547,27 @@ public final class IntegratedServerBridge implements AutoCloseable {
         }
     }
 
-    /** Optional mod loader entry point; activated by an explicit Java property. */
+    private static java.util.Properties loadConfigProperties(Path gameDir) {
+        java.util.Properties props = new java.util.Properties();
+        Path cfg = gameDir.resolve("config").resolve("mc-spine-integrated.properties");
+        if (!Files.isRegularFile(cfg)) {
+            return props;
+        }
+        try (InputStream in = Files.newInputStream(cfg)) {
+            props.load(in);
+        } catch (IOException ignored) {
+            // Malformed/unreadable config stays inert unless explicit JVM props enable it.
+        }
+        return props;
+    }
+
+    /** Optional mod loader entry point; activated by Java property or config/mc-spine-integrated.properties. */
     public static synchronized void startConfigured() {
-        if (!Boolean.getBoolean("mc.spine.integrated.enabled")) {
+        String gameDirProp = System.getProperty("mc.spine.integrated.gameDir", ".");
+        java.util.Properties fileProps = loadConfigProperties(Path.of(gameDirProp));
+        boolean enabled = Boolean.getBoolean("mc.spine.integrated.enabled")
+                || "true".equalsIgnoreCase(fileProps.getProperty("enabled", "").trim());
+        if (!enabled) {
             return;
         }
         if (configuredBridge != null) {
@@ -552,13 +576,33 @@ public final class IntegratedServerBridge implements AutoCloseable {
         String binary = System.getProperty("mc.spine.integrated.serverBin",
                 System.getenv("MC_SPINE_SERVER_BIN"));
         if (binary == null || binary.isBlank()) {
+            String cfgBin = fileProps.getProperty("serverBin", "").trim();
+            if (!cfgBin.isEmpty()) {
+                Path candidate = Path.of(cfgBin);
+                if (!candidate.isAbsolute()) {
+                    candidate = Path.of(gameDirProp).resolve(candidate).normalize();
+                }
+                binary = candidate.toString();
+            }
+        }
+        if (binary == null || binary.isBlank()) {
             throw new IllegalStateException("mc.spine.integrated.serverBin is required");
+        }
+        String worldName = System.getProperty("mc.spine.integrated.world",
+                fileProps.getProperty("world", "mc-spine").trim());
+        if (worldName.isEmpty()) {
+            worldName = "mc-spine";
+        }
+        String seed = System.getProperty("mc.spine.integrated.seed",
+                fileProps.getProperty("seed", "0").trim());
+        if (seed.isEmpty()) {
+            seed = "0";
         }
         try {
             IntegratedServerBridge bridge = start(Path.of(binary),
-                    Path.of(System.getProperty("mc.spine.integrated.gameDir", ".")),
-                    System.getProperty("mc.spine.integrated.world", "mc-spine"),
-                    System.getProperty("mc.spine.integrated.seed", "0"), LOOPBACK, 0,
+                    Path.of(gameDirProp),
+                    worldName,
+                    seed, LOOPBACK, 0,
                     Duration.ofSeconds(30));
             configuredBridge = bridge;
             Thread monitor = new Thread(() -> {

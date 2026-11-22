@@ -1848,5 +1848,108 @@ public final class LifecycleHarness {
 }
 
 
+class ThreeLauncherEasyInstallTests(unittest.TestCase):
+    """Pins the 5 thin-JAR 3-launcher easy-install contracts (zero python3 runtime dep)."""
+
+    def test_bootstrapper_self_install_and_auto_chmod_after_sha256(self):
+        with tempfile.TemporaryDirectory(prefix="mc-spine-easy-inst-") as td:
+            root = Path(td)
+            stage = root / "stage"
+            subprocess.run(
+                [sys.executable, str(TOOLS / "gen_launcher_profile.py"),
+                 "--out-dir", str(stage), "--mc-version", "1.21.1", "--build-jar"],
+                check=True, capture_output=True, text=True,
+            )
+            jar = stage / "mc-spine-bootstrapper.jar"
+            self.assertLess(jar.stat().st_size, 32 * 1024)
+            with zipfile.ZipFile(jar) as zf:
+                self.assertNotIn("integrated_bridge.py", zf.namelist())
+
+            mc_dir = root / "dot_minecraft"
+            mc_dir.mkdir()
+            (mc_dir / "launcher_profiles.json").write_text(
+                json.dumps({"profiles": {"existing": {"name": "Vanilla"}}, "version": 3}, indent=2)
+            )
+            res = subprocess.run(
+                ["java", "-Djava.io.tmpdir=" + tempfile.gettempdir(), "-XX:-UsePerfData",
+                 "-jar", str(jar), "--install", "--minecraft-dir", str(mc_dir)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+            self.assertTrue((mc_dir / "libraries/net/mcspine/bootstrapper/1.0.0/bootstrapper-1.0.0.jar").is_file())
+            self.assertTrue((mc_dir / "versions/mc-spine-1.21.1/mc-spine-1.21.1.json").is_file())
+            profiles = json.loads((mc_dir / "launcher_profiles.json").read_text())
+            self.assertIn("existing", profiles["profiles"])
+            self.assertIn("mc-spine-1.21.1", profiles["profiles"])
+
+            # Non-executable client binary: bad SHA fails closed WITHOUT setting +x; good SHA restores +x and runs.
+            client = root / "client-stub"
+            client.write_text("#!/bin/sh\nexit 0\n")
+            client.chmod(0o644)
+            good_sha = hashlib.sha256(client.read_bytes()).hexdigest()
+            bad = subprocess.run(
+                ["java", "-Djava.io.tmpdir=" + tempfile.gettempdir(), "-XX:-UsePerfData",
+                 "-jar", str(jar), "--client-bin", str(client),
+                 "--client-sha256", "0" * 64, "--gameDir", str(root)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(bad.returncode, 2)
+            self.assertFalse(os.access(client, os.X_OK))
+            ok = subprocess.run(
+                ["java", "-Djava.io.tmpdir=" + tempfile.gettempdir(), "-XX:-UsePerfData",
+                 "-jar", str(jar), "--client-bin", str(client),
+                 "--client-sha256", good_sha, "--gameDir", str(root)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(ok.returncode, 0, ok.stderr + ok.stdout)
+            self.assertTrue(os.access(client, os.X_OK))
+
+    def test_mrpack_client_bin_config_and_deterministic_prism_zip(self):
+        with tempfile.TemporaryDirectory(prefix="mc-spine-easy-bundles-") as td:
+            root = Path(td)
+            stage = root / "stage"
+            subprocess.run(
+                [sys.executable, str(TOOLS / "gen_launcher_profile.py"),
+                 "--out-dir", str(stage), "--mc-version", "1.21.1", "--build-jar"],
+                check=True, capture_output=True, text=True,
+            )
+            jar = stage / "mc-spine-bootstrapper.jar"
+            fake_bin = root / "mc-spine-client"
+            fake_bin.write_text("#!/bin/sh\nexit 0\n")
+            fake_bin.chmod(0o755)
+
+            out_a, out_b = root / "out-a", root / "out-b"
+            for out in (out_a, out_b):
+                subprocess.run(
+                    [sys.executable, str(TOOLS / "export_launcher_bundle.py"),
+                     "--out-dir", str(out), "--format", "all", "--mc-version", "1.21.1",
+                     "--loader", "fabric", "--loader-version", "0.16.9",
+                     "--bootstrap-jar", str(jar), "--client-bin", str(fake_bin),
+                     "--prism-zip"],
+                    check=True, capture_output=True, text=True,
+                )
+            prism_a = out_a / "mc-spine-prism-1.21.1.zip"
+            prism_b = out_b / "mc-spine-prism-1.21.1.zip"
+            self.assertEqual(prism_a.read_bytes(), prism_b.read_bytes())
+            with zipfile.ZipFile(prism_a) as zf:
+                self.assertIn("patches/net.mcspine.bootstrapper.json", zf.namelist())
+                self.assertIn(".minecraft/bin/mc-spine-client", zf.namelist())
+                for info in zf.infolist():
+                    self.assertEqual(info.date_time, (1980, 1, 1, 0, 0, 0))
+
+            mrpack = out_a / "mc-spine-1.21.1.mrpack"
+            with zipfile.ZipFile(mrpack) as zf:
+                names = set(zf.namelist())
+                self.assertIn("overrides/bin/mc-spine-client", names)
+                self.assertIn("overrides/config/mc-spine-integrated.properties", names)
+                cfg = zf.read("overrides/config/mc-spine-integrated.properties").decode()
+                self.assertIn("enabled=true", cfg)
+                self.assertIn("serverBin=bin/mc-spine-client", cfg)
+                import io
+                with zipfile.ZipFile(io.BytesIO(zf.read("overrides/mods/mc-spine-integrated.jar"))) as mod_jar:
+                    fabric = json.loads(mod_jar.read("fabric.mod.json"))
+                    self.assertEqual(fabric["license"], "LGPL-3.0-or-later")
+
+
 if __name__ == "__main__":
     unittest.main()
