@@ -38,11 +38,12 @@
   var DEFAULT_CONFIG = {
     projectName: "mc-spine",
     cliPrefix: "mc-spine",
-    tagline: "A Rust-native Minecraft server & client runtime",
+    tagline: "Experimental Rust Minecraft runtime and standalone CLI tools",
     statusBadge: "Experimental Alpha",
     valueProp:
-      "A Rust-native Minecraft server & client runtime with tiered " +
-      "NeoForge/Fabric mod compatibility and Velocity forwarding support.",
+      "An experimental Rust Minecraft runtime with a five-binary CLI suite, " +
+      "bounded NeoForge/Fabric JAR adaptation and external shaderpack parsing. " +
+      "Windowed GPU rendering remains post-Alpha.",
     mcTargets: ["1.21.1", "26.3"],
     githubUrl: "https://github.com/nekomario28/mc-spine",
     reportApiUrl: "",
@@ -2220,21 +2221,25 @@
   READINESS_LABEL[READINESS_READY_NATIVE] = {
     icon: "✓",
     text: "no unknown Java mod IDs found; validate JAR support locally.",
+    jaText: "未知の Java Mod ID は見つかりませんでした。JAR の実行互換性はローカルで検査してください。",
   };
   READINESS_LABEL[READINESS_READY_WITH_AUTO_SKIPS] = {
     icon: "✓",
     text: "redundant and client-only files can be skipped; " +
       "validate remaining JAR support locally.",
+    jaText: "置き換え済み軽量化 Mod とクライアント専用ファイルをスキップできます。残りの JAR はローカルで検査してください。",
   };
   READINESS_LABEL[READINESS_NEEDS_JAR_INSPECTION] = {
     icon: "⚠",
     text: "unrecognized Java mods need local Mixin/.class " +
       "inspection before launch.",
+    jaText: "未知の Java Mod があります。起動前にローカルで Mixin/.class を検査してください。",
   };
   READINESS_LABEL[READINESS_VERSION_MISMATCH] = {
     icon: "✕",
     text: "not compatible — this pack was built for a different " +
       "Minecraft version.",
+    jaText: "Minecraft の対象バージョンが異なります。",
   };
 
   function addGroup(container, cls, title, names, extra) {
@@ -2274,14 +2279,16 @@
 
     var banner = $("readiness");
     var label = READINESS_LABEL[report.readiness];
+    var ja = document.documentElement.lang === "ja";
     banner.className = "readiness " + report.readiness;
     $("readiness-icon").textContent = label.icon;
     $("readiness-text").textContent =
-      "Pre-flight for \"" + report.pack_name + "\" " + report.pack_version +
-      " (" + report.format + ", declared MC " + report.mc_version_declared +
-      ", server " + report.target + "): " + label.text;
+      (ja ? "事前診断「" : "Pre-flight for \"") + report.pack_name +
+      (ja ? "」 " : "\" ") + report.pack_version + " (" + report.format +
+      (ja ? ", 申告 MC " : ", declared MC ") + report.mc_version_declared +
+      (ja ? ", サーバー " : ", server ") + report.target + "): " +
+      (ja ? label.jaText : label.text);
 
-    var ja = document.documentElement.lang === "ja";
     var verdictOk = report.version_verdict.kind === "compatible";
     var nativeAdapterCount = report.entries.filter(function (entry) {
       return entry["class"] === CLASS_NATIVE_FLAGSHIP ||
@@ -2326,14 +2333,19 @@
     var groups = $("report-groups");
     groups.textContent = "";
     addGroup(
-      groups, "superseded", "Skipped perf mods — already built in",
+      groups, "superseded", ja ? "スキップする軽量化 Mod（独自実装あり）" :
+        "Skipped perf mods — already built in",
       report.skipped_perf_mods,
-      "Neutral id match only: " + CFG.projectName + " ships its own " +
+      ja ? "Mod ID による分類のみ。" + CFG.projectName +
+        " は独立した Rust 実装を備えます。該当 Mod の作者との提携関係はなく、" +
+        "コードや素材の複製・移植・同梱は行っていません。" :
+        "Neutral id match only: " + CFG.projectName + " ships its own " +
         "clean-room Rust implementations of these optimizations. No " +
         "affiliation with the named mods is claimed, and no mod code or " +
         "assets are copied, ported, or bundled.");
     addGroup(
-      groups, "client-only", "Client-side only — server skips",
+      groups, "client-only", ja ? "クライアント専用（サーバーではスキップ）" :
+        "Client-side only — server skips",
       report.client_only_mods);
     addGroup(
       groups, "native", ja ? "ネイティブ／アダプター候補・データファイル" :
@@ -2346,6 +2358,12 @@
 
     var body = $("entries-body");
     body.textContent = "";
+    var jaNotes = {};
+    jaNotes[CLASS_CLIENT_ONLY_SKIPPED] = "クライアント専用。専用サーバーには導入しません。";
+    jaNotes[CLASS_SUPERSEDED_PERF_MOD] = "置き換え済み軽量化 Mod。独立した Rust 最適化があります。";
+    jaNotes[CLASS_NATIVE_FLAGSHIP] = "既知のネイティブ／アダプター候補。JAR と Mixin のローカル検査が必要です。";
+    jaNotes[CLASS_UNIVERSAL_NATIVE] = "データ／宣言プロファイル候補。必要に応じてローカル検査してください。";
+    jaNotes[CLASS_NEEDS_INSPECTION] = "未確認の Java Mod。mc-spine-mod-check --scan-mods-dir で Mixin/.class を検査してください。";
     report.entries.forEach(function (entry) {
       var tr = document.createElement("tr");
       var tdPath = document.createElement("td");
@@ -2361,7 +2379,7 @@
       tdClass.appendChild(chip);
       var tdNote = document.createElement("td");
       tdNote.className = "note";
-      tdNote.textContent = entry.note;
+      tdNote.textContent = (ja && jaNotes[entry["class"]]) || entry.note;
       tr.appendChild(tdPath);
       tr.appendChild(tdId);
       tr.appendChild(tdClass);

@@ -4,9 +4,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Megu — Blazingly fast. Lightweight. Mod-compatible.</title>
+  <title>Megu — Experimental Rust Minecraft runtime and tools</title>
   <meta name="description"
-        content="Megu (codename mc-spine) is a blazingly fast, lightweight, mod-compatible Minecraft: Java Edition 1.21.1 &amp; 26.3 engine built for everything from low-end Intel laptops to Vulkan GPUs.">
+        content="Megu (codename mc-spine) is an experimental Rust Minecraft runtime with five standalone tools, bounded NeoForge/Fabric mod adaptation, and external shaderpack specifications for 1.21.1 and 26.3.">
   <link rel="stylesheet" href="style.css">
   <script src="site-config.js"></script>
   <script src="app.js" defer></script>
@@ -20,6 +20,7 @@
         <a href="#benchmarks" data-i18n="nav_bench">Benchmarks</a>
         <a href="#checker" data-i18n="nav_checker">Modpack check</a>
         <a href="#how" data-i18n="nav_how">How it works</a>
+        <a href="#mods" data-i18n="nav_mods">Mods &amp; shaders</a>
         <a href="#quickstart" data-i18n="nav_quickstart">Quickstart</a>
         <a href="#scope" data-i18n="nav_scope">Status</a>
         <a href="https://github.com/nekomario28/mc-spine"
@@ -47,12 +48,12 @@
 
         <h1 class="hero-title">
           <span data-cfg="projectName">Megu</span>
-          <span class="hero-sub" data-i18n="hero_headline">Blazingly fast. Lightweight. Mod-compatible.</span>
+          <span class="hero-sub" data-i18n="hero_headline">Rust runtime. Mod adaptation. Tooling.</span>
         </h1>
 
         <p class="lead" data-i18n="hero_lead">
-          A Minecraft: Java Edition engine for 1.21.1 and 26.3 — engineered for heavy Create factories, NeoForge/Fabric modpacks,
-          Vulkan rendering, and ultra-low-spec PCs (including legacy Intel HD/UHD graphics) with ~1/10 the RAM footprint.
+          Experimental Minecraft: Java Edition runtime targeting 1.21.1 and 26.3. The Alpha includes five standalone CLI binaries,
+          automatic analysis and partial native adaptation of NeoForge/Fabric JARs, and external shaderpack parsing. Full vanilla/mod parity and windowed GPU rendering remain in progress.
         </p>
 
         <div class="hero-actions">
@@ -67,8 +68,8 @@
     <section id="benchmarks">
       <div class="wrap">
         <div class="section-head">
-          <h2 data-i18n="bench_title">~1/9.6 the RAM usage.</h2>
-          <p class="section-note" data-i18n="bench_meta">Measured on Linux x86_64 · 3-run mean · seed 0 · view 4</p>
+          <h2 data-i18n="bench_title">Measured memory use in one comparison</h2>
+          <p class="section-note" data-i18n="bench_meta">Linux x86_64 · 20-second moving-viewer workload · 3-run mean · seed 0 · view 4</p>
         </div>
 
         <div class="bench-grid">
@@ -122,7 +123,7 @@
         <p class="bench-caveat" data-i18n="bench_caveat">
           RAM &amp; threads: tools/load_compare.sh (20s moving viewer, same seed &amp; machine; evidence/gameplay/load-compare/receipt.json).
           Section wire: issue41-palette-bench (release); voice relay: mc-spine-voice-relay --bench-packets (32 players, 3 dims, ~640k frames/s).
-          Caveat: Alpha implements fewer vanilla features than server.jar, and full release-mode datapack startup &amp; worldgen CPU benchmarks are still being finalized.
+          These are workload-specific measurements, not equivalent-feature performance claims. Alpha implements fewer vanilla features than server.jar; full datapack startup and worldgen CPU comparisons are still in progress.
         </p>
       </div>
     </section>
@@ -134,8 +135,7 @@
           <p class="section-note" data-i18n="checker_note">Runs 100% locally in your browser — nothing is uploaded.</p>
         </div>
         <p class="section-desc" data-i18n="checker_desc">
-          Drop a Modrinth <code>.mrpack</code> or CurseForge <code>.zip</code> to see which optimization mods are skipped automatically,
-          which mods run natively in Rust, and which JARs still need a JVM bridge or fallback.
+          Inspect a Modrinth .mrpack or CurseForge .zip manifest for candidate auto-skips and mod families. This browser check cannot inspect JAR bytecode or certify runtime compatibility; use the local mc-spine-mod-check CLI for JAR inspection.
         </p>
 
         <div class="checker">
@@ -178,7 +178,7 @@
             <div class="entries-table-wrap">
               <table class="entries-table">
                 <thead>
-                  <tr><th>Path</th><th>Mod</th><th>Handling</th><th>Note</th></tr>
+                  <tr><th data-i18n="checker_col_path">Path</th><th>Mod</th><th data-i18n="checker_col_handling">Handling</th><th data-i18n="checker_col_note">Note</th></tr>
                 </thead>
                 <tbody id="entries-body"></tbody>
               </table>
@@ -195,90 +195,139 @@
 
     <section id="how">
       <div class="wrap">
-        <h2 data-i18n="how_title">How it stays lightweight</h2>
+        <h2 data-i18n="how_title">Implemented components and boundaries</h2>
         <div class="pillars">
           <article class="pillar">
-            <h3 data-i18n="p1_title">Create factories without TPS drops</h3>
+            <h3 data-i18n="p1_title">Native simulation paths</h3>
             <p data-i18n="p1_body">
-              Kinetic networks, belts, fluids, 6-DOF airships, and Farmer's Delight cooking pots run natively in Rust with O(1) sleeping machines (zero idle CPU) and GPU instancing that packs 10,000 rotating gears into one draw call per mesh kind.
+              Rust systems cover selected Create kinetics, belts, fluids, and culinary data. The supported behaviors and workloads are still being checked against Minecraft and mod implementations.
             </p>
           </article>
           <article class="pillar">
-            <h3 data-i18n="p2_title">Vulkan to ultra-low-spec Intel GPUs</h3>
+            <h3 data-i18n="p2_title">Client and rendering work</h3>
             <p data-i18n="p2_body">
-              Selectable rendering pipeline: Vulkan Mesh Shaders (RTX, Radeon RDNA2+, Arc), Compute + Multi-Draw Indirect,
-              and a ClassicLowSpec mode (16 KiB UBO batches + low-VRAM Horizon LOD) tuned for older Intel HD 4000 / UHD 630 laptops.
+              The client implements protocol probing and shaderpack capability planning, including conservative fallback selection. Real winit + wgpu windowed rendering and hardware validation are post-Alpha work.
             </p>
           </article>
           <article class="pillar">
-            <h3 data-i18n="p3_title">Drop-in modpacks &amp; safe fallback</h3>
+            <h3 data-i18n="p3_title">Automatic mod adaptation at boot</h3>
             <p data-i18n="p3_body">
-              36 optimization mods (Sodium, Lithium, ModernFix, Distant Horizons, and more) are skipped automatically.
-              OpenPAC/FTB Chunks and simple @Inject Mixins run natively or via bounded bridge; unsupported heavy Mixins delegate safely to NeoForge.
+              The mods/ startup scan skips a catalog of 36 superseded performance mods and attempts bounded data, culinary, and Mixin lifting through live_mod_bridge / auto_adapter. Unsupported code is classified for fallback or quarantine.
             </p>
           </article>
           <article class="pillar">
-            <h3 data-i18n="p4_title">Low latency, lean packets &amp; fast boot</h3>
+            <h3 data-i18n="p4_title">Standalone CLI binaries</h3>
             <p data-i18n="p4_body">
-              Single native binary with no JVM warm-up or stop-the-world GC spikes. Cached clean-wire chunk sections (289 ns),
-              256 B threshold zlib compression, relative delta entity packets, per-connection backpressure, and a 1.4 µs UDP voice relay keep latency flat.
+              The five tools are mc-spine (server), mc-spine-client (client utilities), mc-spine-mod-check (inspect/adapt/scaffold), mc-spine-world-migrate (1.21.1 ↔ 26.3), and mc-spine-init (server setup with explicit EULA acceptance).
             </p>
           </article>
         </div>
       </div>
     </section>
 
+    <section id="mods">
+      <div class="wrap">
+        <h2 data-i18n="mods_title">Mod adaptation and native authoring</h2>
+        <p class="section-desc" data-i18n="mods_intro">
+          Put existing NeoForge or Fabric JARs in mods/ for automatic startup inspection. The Rust live_mod_bridge / auto_adapter can skip superseded performance mods and lift supported data, culinary, and Mixin patterns without launching a JVM.
+        </p>
+        <div class="pillars">
+          <article class="pillar">
+            <h3 data-i18n="mods_auto_title">Automatic boot-time classification</h3>
+            <p data-i18n="mods_auto_body">
+              Supported JAR contents can become native bundles or bounded lifted shims. Unsupported Tier 3 Java/Mixin behavior is reported for fallback, delegation, or quarantine; arbitrary existing mods are not guaranteed to run.
+            </p>
+          </article>
+          <article class="pillar">
+            <h3 data-i18n="mods_native_title">Native mods without a JVM</h3>
+            <p data-i18n="mods_native_body">
+              Authors can use mc-spine-mod-check --scaffold-native to generate a validated mc-spine-mod-bundle/1 starter. This declarative format supports native authoring; additional mod data and behavior must still be implemented.
+            </p>
+          </article>
+        </div>
+        <p class="feature-link"><a href="https://github.com/nekomario28/mc-spine/blob/main/docs/mod-author-guide.md" data-i18n="mods_guide">Read the mod and shaderpack author guide →</a></p>
+      </div>
+    </section>
+
+    <section id="shaderpacks">
+      <div class="wrap">
+        <h2 data-i18n="shader_title">External shaderpack formats and native WGSL</h2>
+        <p class="section-desc" data-i18n="shader_intro">
+          The Alpha parses user-provided shaderpacks and plans pipelines against GPU capabilities. No third-party shaders are bundled. Unsupported GPU features select a safe built-in rendering fallback in the planner.
+        </p>
+        <div class="pillars">
+          <article class="pillar">
+            <h3 data-i18n="shader_classic_title">Classic OptiFine and Iris</h3>
+            <p data-i18n="shader_classic_body">
+              Classic OptiFine GLSL 120–330 passes are recognized. The Iris 1.7–1.11+ specification covers GLSL 430–460 compute shaders, SSBOs, images, and dual-hand uniforms.
+            </p>
+          </article>
+          <article class="pillar">
+            <h3 data-i18n="shader_dh_title">DistantHorizons LOD and Megu WGSL</h3>
+            <p data-i18n="shader_dh_body">
+              DistantHorizons LOD stages include dh_shadow, dh_terrain, and dh_water. Native WGSL packs use megu-shader.toml with explicit pass declarations and .wgsl files.
+            </p>
+          </article>
+        </div>
+        <p class="feature-note" data-i18n="shader_boundary">
+          These are parser/specification and fallback-planning capabilities. Real winit + wgpu windowed GPU execution and shader compatibility testing remain post-Alpha.
+        </p>
+      </div>
+    </section>
+
     <section id="quickstart">
       <div class="wrap">
-        <h2 data-i18n="qs_title">Three commands to launch.</h2>
+        <h2 data-i18n="qs_title">Start a server with explicit EULA acceptance</h2>
         <div class="steps">
           <div class="step">
-            <div class="step-label" data-i18n="qs_1">1. Initialize a server directory</div>
-            <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="{{cli}}-init init --dir ./server --mc-version 1.21.1">mc-spine-init init --dir ./server --mc-version 1.21.1</code></pre>
+            <div class="step-label" data-i18n="qs_1">1. Initialize for 1.21.1 and accept the EULA explicitly</div>
+            <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="{{cli}}-init --dir ./server --mc-version 1.21.1 --accept-eula">mc-spine-init --dir ./server --mc-version 1.21.1 --accept-eula</code></pre>
           </div>
           <div class="step">
-            <div class="step-label" data-i18n="qs_2">2. Inspect a modpack or mods/ folder (no JVM needed)</div>
+            <div class="step-label" data-i18n="qs_2">2. Optionally scan the mods/ folder without a JVM</div>
             <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="{{cli}}-mod-check --scan-mods-dir ./server/mods">mc-spine-mod-check --scan-mods-dir ./server/mods</code></pre>
           </div>
           <div class="step">
-            <div class="step-label" data-i18n="qs_3">3. Accept eula.txt and start</div>
+            <div class="step-label" data-i18n="qs_3">3. Start the server from its directory</div>
             <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="cd ./server &amp;&amp; {{cli}}">cd ./server &amp;&amp; mc-spine</code></pre>
           </div>
         </div>
 
         <details class="more-cmds">
-          <summary data-i18n="qs_more">Docker, world migration (1.21.1 ↔ 26.3), server ping, voice relay &amp; source build</summary>
-          <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="# Docker (requires explicit EULA=TRUE)
-docker build -f docker/Dockerfile -t {{cli}}:alpha .
-docker run --name {{cli}} -e EULA=TRUE -p 25565:25565 -v {{cli}}-data:/data {{cli}}:alpha
+          <summary data-i18n="qs_more">All six mod-check modes, 26.3 initialization, world migration and client ping</summary>
+          <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="# Initialize a 26.3 server (requires explicit EULA acceptance)
+{{cli}}-init --dir ./server-26.3 --mc-version 26.3 --accept-eula
 
-# Inspect or migrate a Vanilla world between 1.21.1 and 26.3
+# Six mutually exclusive mod-check modes
+{{cli}}-mod-check --modpack ./pack.mrpack
+{{cli}}-mod-check --scan-jar ./mods/example.jar
+{{cli}}-mod-check --scan-mods-dir ./mods
+{{cli}}-mod-check --adapt-jar ./mods/example.jar --out ./adapted
+{{cli}}-mod-check --adapt-mods-dir ./mods --out ./adapted
+{{cli}}-mod-check --scaffold-native my_mod --out ./my_mod.bundle.json
+
+# Inspect or migrate a world between 1.21.1 and 26.3
 {{cli}}-world-migrate inspect-anvil ./world
-{{cli}}-world-migrate migrate-level --in ./world/level.dat --out ./world/level.dat --to 26.3 --backup-old
+{{cli}}-world-migrate migrate-level --in ./world/level.dat --out ./converted-level.dat --to 26.3
 
-# Probe a running server (SRV-aware, 1.21.1 or 26.3)
-{{cli}}-client --ping localhost:25565
+# Ping a running server
+{{cli}}-client --ping localhost:25565"># Initialize a 26.3 server (requires explicit EULA acceptance)
+mc-spine-init --dir ./server-26.3 --mc-version 26.3 --accept-eula
 
-# Run the standalone UDP proximity voice relay self-test
-{{cli}}-voice-relay --self-test
+# Six mutually exclusive mod-check modes
+mc-spine-mod-check --modpack ./pack.mrpack
+mc-spine-mod-check --scan-jar ./mods/example.jar
+mc-spine-mod-check --scan-mods-dir ./mods
+mc-spine-mod-check --adapt-jar ./mods/example.jar --out ./adapted
+mc-spine-mod-check --adapt-mods-dir ./mods --out ./adapted
+mc-spine-mod-check --scaffold-native my_mod --out ./my_mod.bundle.json
 
-# Build from source (Rust 1.98.0)
-cargo run --locked"># Docker (requires explicit EULA=TRUE)
-docker build -f docker/Dockerfile -t mc-spine:alpha .
-docker run --name mc-spine -e EULA=TRUE -p 25565:25565 -v mc-spine-data:/data mc-spine:alpha
-
-# Inspect or migrate a Vanilla world between 1.21.1 and 26.3
+# Inspect or migrate a world between 1.21.1 and 26.3
 mc-spine-world-migrate inspect-anvil ./world
-mc-spine-world-migrate migrate-level --in ./world/level.dat --out ./world/level.dat --to 26.3 --backup-old
+mc-spine-world-migrate migrate-level --in ./world/level.dat --out ./converted-level.dat --to 26.3
 
-# Probe a running server (SRV-aware, 1.21.1 or 26.3)
-mc-spine-client --ping localhost:25565
-
-# Run the standalone UDP proximity voice relay self-test
-mc-spine-voice-relay --self-test
-
-# Build from source (Rust 1.98.0)
-cargo run --locked</code></pre>
+# Ping a running server
+mc-spine-client --ping localhost:25565</code></pre>
         </details>
       </div>
     </section>
@@ -292,7 +341,7 @@ cargo run --locked</code></pre>
             <ul>
               <li data-i18n="scope_now_1">Vanilla 1.21.1 protocol, online-mode AES-CFB8 auth, and Velocity modern forwarding</li>
               <li data-i18n="scope_now_2">Deterministic worldgen, random ticks, villagers, commands, ops/bans/whitelist, RCON, and async backups</li>
-              <li data-i18n="scope_now_3">Standalone CLI suite: server bootstrapper &amp; OpenPAC claims, zero-JVM mod/Mixin scanner, Anvil &amp; 26.3 migrator, SRV client ping, and UDP voice relay</li>
+              <li data-i18n="scope_now_3">Five standalone binaries: server, client utility, mod checker/adaptor/scaffolder, 1.21.1 ↔ 26.3 world migrator, and EULA-aware initializer</li>
             </ul>
           </div>
           <div class="scope-col">
@@ -300,7 +349,7 @@ cargo run --locked</code></pre>
             <ul>
               <li data-i18n="scope_wip_1">Full vanilla parity across combat, remaining gamerules, and general-seed worldgen</li>
               <li data-i18n="scope_wip_2">Native Anvil live world storage and broader live modpack execution</li>
-              <li data-i18n="scope_wip_3">Standalone GPU client rendering (Bukkit/Spigot/Paper plugins are out of scope — use Velocity plugins or NeoForge/Fabric mods)</li>
+              <li data-i18n="scope_wip_3">Windowed winit + wgpu GPU execution, shaderpack hardware validation, and wider mod compatibility</li>
             </ul>
           </div>
         </div>
@@ -420,15 +469,16 @@ cargo run --locked</code></pre>
       nav_bench: "実測値",
       nav_checker: "Modpack診断",
       nav_how: "設計",
+      nav_mods: "Mod・シェーダー",
       nav_quickstart: "起動手順",
       nav_scope: "対応状況",
-      hero_headline: "爆速。軽量。Mod 互換。",
-      hero_lead: "重い Create 工場も NeoForge/Fabric Modpack も軽快に動かす Minecraft 互換エンジン（1.21.1 / 26.3）。Vulkan 駆動から旧世代 Intel 内蔵 GPU の超低スペック PC まで対応し、RAM 使用量は約 1/10。",
+      hero_headline: "Rust ランタイム・Mod 自動適応・CLI ツール。",
+      hero_lead: "Minecraft: Java Edition 1.21.1 / 26.3 を対象とする実験的 Rust ランタイム。Alpha には独立した 5 個の CLI、NeoForge/Fabric JAR の自動解析と一部ネイティブ適応、外部シェーダーパックの解析機能があります。Vanilla / Mod の完全互換性とウィンドウ表示の GPU 描画は開発中です。",
       cta_start: "起動手順へ",
       cta_check: "Modpackを診断",
       cta_github: "GitHub を見る",
-      bench_title: "RAM 使用量、約 1/10（1/9.6）。",
-      bench_meta: "Linux x86_64 実測 · 3 回平均 · seed 0 · 描画距離 4",
+      bench_title: "特定の測定条件におけるメモリ使用量",
+      bench_meta: "Linux x86_64 · 20 秒のプレイヤー移動負荷 · 3 回平均 · seed 0 · 描画距離 4",
       bench_ram_label: "常駐メモリ (VmRSS)",
       bench_thr_label: "負荷時の OS スレッド数",
       bench_net_label: "パケット・遅延・起動特性",
@@ -436,10 +486,10 @@ cargo run --locked</code></pre>
       m_voice_lat: "UDP 近接ボイス中継遅延 (p50 / p99)",
       m_startup: "起動・GC 停止",
       m_startup_val: "JVM 不要 / GC 停止 0 ms",
-      bench_caveat: "RAM・スレッド数：tools/load_compare.sh（同一マシン・20 秒移動負荷、evidence/gameplay/load-compare/receipt.json）。セクション直列化：issue41-palette-bench（release）。ボイス中継：mc-spine-voice-relay --bench-packets（32人・3次元・約64万 frame/s）。※ Alpha 版は本家より機能が少なく、データパック込みの本番起動速度・地形生成 CPU 最適化は引き続き計測・改善中です。",
+      bench_caveat: "RAM・スレッド数：tools/load_compare.sh（同一マシン・20 秒移動負荷、evidence/gameplay/load-compare/receipt.json）。セクション直列化：issue41-palette-bench（release）。ボイス中継：mc-spine-voice-relay --bench-packets（32人・3次元・約64万 frame/s）。これらは指定した負荷での値であり、同等機能での性能比較ではありません。Alpha 版は本家より機能が少なく、データパック込みの起動・地形生成 CPU 比較は進行中です。",
       checker_title: "手元の Modpack をその場で診断。",
       checker_note: "ブラウザ内で完結します — ファイルは一切送信されません。",
-      checker_desc: "Modrinth の .mrpack や CurseForge の .zip を落とすだけで、自動スキップされる軽量化 Mod・ネイティブ動作・要検査 JAR を即座に表示します。",
+      checker_desc: "Modrinth .mrpack や CurseForge .zip の manifest から、自動スキップ候補と既知の Mod 系統を確認できます。ブラウザでは JAR バイトコードの検査や実行互換性の保証はできません。詳細はローカルの mc-spine-mod-check CLI で検査してください。",
       checker_target: "対象バージョン",
       checker_sample: "サンプルパックを試す",
       checker_drop: ".mrpack / CurseForge .zip / manifest .json をドロップ",
@@ -450,30 +500,47 @@ cargo run --locked</code></pre>
       checker_paste_button: "貼り付けた JSON を診断",
       checker_inspection: "任意の Java Mod の互換性を推測しません。Mixin/.class の検査には mc-spine-mod-check --scan-mods-dir が必要です。",
       checker_stats_aria: "互換性の概要",
+      checker_col_path: "パス",
+      checker_col_handling: "処理区分",
+      checker_col_note: "備考",
       checker_raw: "JSON レポートとテキスト要約",
-      how_title: "軽さの理由と仕組み",
-      p1_title: "Create 工場が重くならない設計",
-      p1_body: "動力網・ベルト・流体・6-DOF 飛行船・Farmer's Delight 調理鍋をネイティブ Rust で処理。アイドル機械は O(1) 睡眠で CPU 消費 0、回転歯車 1 万個も GPU インスタンシングでメッシュ種あたり 1 ドローコールへ集約します。",
-      p2_title: "Vulkan 駆動 ＋ 超低スペ PC 対応",
-      p2_body: "RTX / Radeon RDNA2+ / Arc 向け Vulkan Mesh Shader、Compute + Multi-Draw Indirect に加え、旧世代 Intel HD 4000 / UHD 630 ノート向けの ClassicLowSpec（16 KiB UBO バッチ＋省 VRAM 遠景 LOD）を選択できます。",
-      p3_title: "Modpack をそのまま投入＆安全フォールバック",
-      p3_body: "Sodium・Lithium・ModernFix・Distant Horizons 等 36 種の軽量化 Mod を自動スキップ。OpenPAC/FTB Chunks や単純な @Inject Mixin はネイティブ／軽量実行し、未対応の重 Mixin は本家 NeoForge へ安全に委譲します。",
-      p4_title: "高速起動・低遅延・省パケット設計",
-      p4_body: "JVM ウォームアップや GC ストップ・ザ・ワールドなしの単一ネイティブバイナリ。クリーンワイヤーキャッシュ（289 ns/セクション）・256B 閾値 zlib 圧縮・エンティティ相対移動差分・接続別バックプレッシャ・p50 1.4 µs の UDP ボイス中継で遅延スパイクを抑えます。",
-      qs_title: "3 コマンドで起動。",
-      qs_1: "1. サーバーディレクトリを初期化",
-      qs_2: "2. Modpack や mods/ フォルダを事前診断（JVM 不要）",
-      qs_3: "3. eula.txt に同意して起動",
-      qs_more: "Docker・ワールド移行 (1.21.1 ↔ 26.3)・サーバー Ping・ボイスリレー・ソースビルド",
+      how_title: "実装済みの構成要素と対応範囲",
+      p1_title: "ネイティブなシミュレーション処理",
+      p1_body: "Rust 実装は Create の一部の動力・ベルト・流体や調理データに対応しています。対応する動作・負荷条件について、Minecraft と Mod の実装との比較検証を継続しています。",
+      p2_title: "クライアントと描画の実装状況",
+      p2_body: "クライアントにはプロトコル Ping と、保守的なフォールバック選択を含むシェーダーパックの GPU 機能計画があります。winit + wgpu による実ウィンドウ描画と実機検証は Alpha 後の作業です。",
+      p3_title: "起動時の Mod 自動適応",
+      p3_body: "mods/ の起動時スキャンで、置き換え済みの軽量化 Mod 36 種をスキップし、live_mod_bridge / auto_adapter によりデータ・調理・Mixin の対応範囲を適応します。未対応コードはフォールバック・隔離の必要性を分類します。",
+      p4_title: "独立した 5 個の CLI バイナリ",
+      p4_body: "mc-spine（サーバー）、mc-spine-client（クライアント補助）、mc-spine-mod-check（検査・適応・雛形生成）、mc-spine-world-migrate（1.21.1 ↔ 26.3 のワールド移行）、mc-spine-init（EULA 明示同意付き初期化）を提供します。",
+      mods_title: "Mod の自動適応とネイティブ制作",
+      mods_intro: "既存の NeoForge / Fabric JAR を mods/ に配置すると、起動時に自動解析されます。Rust の live_mod_bridge / auto_adapter は、置き換え済み軽量化 Mod のスキップと、対応するデータ・調理・Mixin の JVM 不要な変換を試みます。",
+      mods_auto_title: "起動時に自動分類",
+      mods_auto_body: "対応する JAR の内容はネイティブ Bundle または限定的なリフト済み shim に変換できます。未対応の Tier 3 Java / Mixin 動作はフォールバック・委譲・隔離の対象として報告します。すべての既存 Mod が動作する保証はありません。",
+      mods_native_title: "JVM 不要のネイティブ Mod 制作",
+      mods_native_body: "作者は mc-spine-mod-check --scaffold-native で、検証済みの mc-spine-mod-bundle/1 雛形を生成できます。宣言形式によるネイティブ制作の出発点であり、必要なデータと動作は別途実装します。",
+      mods_guide: "Mod・シェーダーパック作者ガイドを読む →",
+      shader_title: "外部シェーダーパック仕様とネイティブ WGSL",
+      shader_intro: "Alpha はユーザーが配置したシェーダーパックを解析し、GPU 機能に応じたパイプラインを計画します。第三者製シェーダーは同梱していません。非対応の GPU 機能には組み込み描画への安全なフォールバックを選択します。",
+      shader_classic_title: "Classic OptiFine と Iris",
+      shader_classic_body: "Classic OptiFine の GLSL 120–330 パスに対応する解析機構があります。Iris 1.7–1.11+ 仕様は GLSL 430–460 の compute・SSBO・image・両手照明 uniform を扱います。",
+      shader_dh_title: "DistantHorizons LOD と Megu WGSL",
+      shader_dh_body: "DistantHorizons LOD の dh_shadow・dh_terrain・dh_water パスを扱います。ネイティブ WGSL パックは megu-shader.toml のパス宣言と .wgsl ファイルを使用します。",
+      shader_boundary: "現時点では解析・仕様とフォールバック計画の機能です。winit + wgpu の実ウィンドウ GPU 描画とシェーダーの実機互換性試験は Alpha 後を予定しています。",
+      qs_title: "EULA に明示同意してサーバーを開始",
+      qs_1: "1. 1.21.1 用のサーバーを初期化し、EULA に明示同意",
+      qs_2: "2. 必要なら mods/ を JVM 不要でスキャン",
+      qs_3: "3. サーバーディレクトリから起動",
+      qs_more: "Mod 検査の 6 モード・26.3 初期化・ワールド移行・クライアント Ping",
       scope_title: "現在の対応状況",
       scope_now_h: "Alpha で動作するもの",
       scope_now_1: "Vanilla 1.21.1 プロトコル、online-mode AES-CFB8 認証、Velocity Modern Forwarding",
       scope_now_2: "決定論的ワールド生成、ランダムティック、村人・取引、管理コマンド、ops/BAN/ホワイトリスト、RCON、非同期バックアップ",
-      scope_now_3: "純 Rust コンパニオン CLI 群（初期化＆OpenPAC クレーム、JVM 不要 Mod/Mixin スキャナ、Anvil/26.3 移行、SRV 対応 Ping、UDP 近接ボイスリレー）",
+      scope_now_3: "独立した 5 個のバイナリ（サーバー、クライアント補助、Mod 検査・適応・雛形生成、1.21.1 ↔ 26.3 ワールド移行、EULA 同意付き初期化）",
       scope_wip_h: "開発中・対象外",
       scope_wip_1: "戦闘・残りゲームルール・一般シード地形の完全 Vanilla パリティ",
       scope_wip_2: "ライブサーバーのネイティブ Anvil 保存と実 Mod 実行範囲の拡大",
-      scope_wip_3: "独立 GPU クライアント実描画（Bukkit/Spigot/Paper プラグインは対象外 — Velocity プラグインまたは NeoForge/Fabric Mod を利用してください）",
+      scope_wip_3: "winit + wgpu ウィンドウ GPU 描画、シェーダーパックの実機検証、Mod 互換範囲の拡大",
       footer_legal: "独立したクリーンルーム OSS プロジェクトです。Mojang・Microsoft および記載の各 Mod 作者とは一切関係ありません。",
       feedback_open: "不具合報告・要望",
       feedback_title: "クラッシュ・不具合・要望を送る",
