@@ -808,8 +808,12 @@ public final class ShimCheck {
                     String section = trimmed.substring(2, trimmed.length() - 2).trim();
                     current = new LinkedHashMap<>();
                     if (section.equals("mods")) meta.mods.add(current);
-                    else if (section.startsWith("dependencies.") && section.substring(13).matches("[a-zA-Z0-9_]+")) {
-                        meta.dependencies.computeIfAbsent(section.substring(13), ignored -> new ArrayList<>()).add(current);
+                    else if (section.startsWith("dependencies.")) {
+                        String owner = unquoteKeySegment(section.substring(13));
+                        if (owner == null || !owner.matches("[a-zA-Z0-9_]+")) {
+                            throw new IllegalArgumentException("Unknown array table at line " + lineNumber + ": " + section);
+                        }
+                        meta.dependencies.computeIfAbsent(owner, ignored -> new ArrayList<>()).add(current);
                     } else if (section.equals("mixins")) meta.mixins.add(current);
                     else if (section.equals("accessTransformers")) meta.accessTransformers.add(current);
                     else throw new IllegalArgumentException("Unknown array table at line " + lineNumber + ": " + section);
@@ -857,6 +861,17 @@ public final class ShimCheck {
             }
             return -1;
         }
+        /** A TOML key segment may be quoted: `dependencies."create"` ≡ `dependencies.create`. */
+        private static String unquoteKeySegment(String segment) {
+            if (segment.length() >= 2 && segment.startsWith("\"") && segment.endsWith("\"")) {
+                try { return (String) Json.parse(segment); }
+                catch (IllegalArgumentException | ClassCastException error) { return null; }
+            }
+            if (segment.length() >= 2 && segment.startsWith("'") && segment.endsWith("'")) {
+                return segment.substring(1, segment.length() - 1);
+            }
+            return segment;
+        }
         private static Object tomlScalar(String raw, int line) {
             if (raw.equals("true")) return true;
             if (raw.equals("false")) return false;
@@ -880,34 +895,69 @@ public final class ShimCheck {
             catch (IllegalArgumentException error) { return false; }
         }
         static boolean contains(String range, String version) {
-            List<Integer> candidate = numbers(version);
-            if (!range.startsWith("[") && !range.startsWith("(")) return compare(candidate, numbers(range)) == 0;
+            Version candidate = Version.parse(version);
+            if (!range.startsWith("[") && !range.startsWith("(")) return candidate.compareTo(Version.parse(range)) == 0;
             if (range.length() < 3 || !(range.endsWith("]") || range.endsWith(")"))) throw new IllegalArgumentException("Malformed range");
             if (range.startsWith("[") && range.endsWith("]") && !range.contains(",")) {
-                return compare(candidate, numbers(range.substring(1, range.length() - 1))) == 0;
+                return candidate.compareTo(Version.parse(range.substring(1, range.length() - 1))) == 0;
             }
             String[] parts = range.substring(1, range.length() - 1).split(",", -1);
             if (parts.length != 2) throw new IllegalArgumentException("Malformed range");
             if (!parts[0].isBlank()) {
-                int lower = compare(candidate, numbers(parts[0].trim()));
+                int lower = candidate.compareTo(Version.parse(parts[0].trim()));
                 if (lower < 0 || (lower == 0 && range.charAt(0) == '(')) return false;
             }
             if (!parts[1].isBlank()) {
-                int upper = compare(candidate, numbers(parts[1].trim()));
+                int upper = candidate.compareTo(Version.parse(parts[1].trim()));
                 if (upper > 0 || (upper == 0 && range.endsWith(")"))) return false;
             }
             return true;
         }
-        private static List<Integer> numbers(String value) {
-            if (!value.matches("[0-9]+(\\.[0-9]+)*")) throw new IllegalArgumentException("Unsupported version " + value);
-            return Arrays.stream(value.split("\\.")).map(Integer::parseInt).toList();
-        }
-        private static int compare(List<Integer> a, List<Integer> b) {
-            for (int i = 0; i < Math.max(a.size(), b.size()); i++) {
-                int cmp = Integer.compare(i < a.size() ? a.get(i) : 0, i < b.size() ? b.get(i) : 0);
-                if (cmp != 0) return cmp;
+
+        /** Maven `N(.N)*(-qualifier)?`: qualifier segments are pre-release
+         * identifiers, so `21-beta` orders before the `21` release. */
+        private record Version(List<Integer> numbers, List<String> qualifier) implements Comparable<Version> {
+            static Version parse(String value) {
+                String core = value;
+                List<String> qualifier = List.of();
+                int dash = value.indexOf('-');
+                if (dash >= 0) {
+                    core = value.substring(0, dash);
+                    String tail = value.substring(dash + 1);
+                    if (!tail.matches("[0-9A-Za-z]+([._-][0-9A-Za-z]+)*")) {
+                        throw new IllegalArgumentException("Unsupported version " + value);
+                    }
+                    qualifier = Arrays.asList(tail.split("[._-]"));
+                }
+                if (!core.matches("[0-9]+(\\.[0-9]+)*")) throw new IllegalArgumentException("Unsupported version " + value);
+                return new Version(Arrays.stream(core.split("\\.")).map(Integer::parseInt).toList(), qualifier);
             }
-            return 0;
+            @Override public int compareTo(Version other) {
+                for (int i = 0; i < Math.max(numbers.size(), other.numbers.size()); i++) {
+                    int cmp = Integer.compare(i < numbers.size() ? numbers.get(i) : 0,
+                                              i < other.numbers.size() ? other.numbers.get(i) : 0);
+                    if (cmp != 0) return cmp;
+                }
+                // An unqualified release outranks every pre-release of the same numeric core.
+                if (qualifier.isEmpty() != other.qualifier.isEmpty()) return qualifier.isEmpty() ? 1 : -1;
+                for (int i = 0; i < Math.max(qualifier.size(), other.qualifier.size()); i++) {
+                    if (i >= qualifier.size()) return -1;
+                    if (i >= other.qualifier.size()) return 1;
+                    String a = qualifier.get(i), b = other.qualifier.get(i);
+                    boolean numericA = a.chars().allMatch(Character::isDigit);
+                    boolean numericB = b.chars().allMatch(Character::isDigit);
+                    int cmp;
+                    if (numericA && numericB) {
+                        cmp = a.length() != b.length() ? Integer.compare(a.length(), b.length()) : a.compareTo(b);
+                    } else if (numericA != numericB) {
+                        cmp = numericA ? -1 : 1;
+                    } else {
+                        cmp = a.compareToIgnoreCase(b);
+                    }
+                    if (cmp != 0) return cmp;
+                }
+                return 0;
+            }
         }
     }
 

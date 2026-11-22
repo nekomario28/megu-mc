@@ -1443,6 +1443,286 @@ impl ModRegistryBuilder {
     }
 }
 
+/// Deterministic cross-loader dispatch rank. `Loader` declares Fabric before
+/// NeoForge, and the discriminant fixes the merge order of staged outcomes so
+/// a remounted host set can never reorder the canonical CAS sequence.
+#[cfg(any(test, feature = "neoforge-events"))]
+#[allow(dead_code)]
+fn dual_loader_rank(loader: Loader) -> u8 {
+    loader as u8
+}
+
+/// Canonical game-bus event staged identically to every mounted loader host.
+/// Each host returns only staged mutations; the host layer owns the world
+/// commit, so the merged CAS sequence lands atomically through the single
+/// Rust commit path with all-or-nothing rollback.
+#[cfg(any(test, feature = "neoforge-events"))]
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) enum DualLoaderEvent {
+    BlockBreak {
+        dim: u8,
+        pos: (i32, i32, i32),
+        state: u32,
+        player_eid: i32,
+        exp_to_drop: i32,
+    },
+    UseBlock {
+        dim: u8,
+        pos: (i32, i32, i32),
+        state: u32,
+        player_eid: i32,
+    },
+    ServerTick {
+        tick: u64,
+    },
+}
+
+#[cfg(any(test, feature = "neoforge-events"))]
+#[allow(dead_code)]
+impl DualLoaderEvent {
+    /// Fail-closed dimension-slot preflight shared by the idle and live paths.
+    fn validate(&self) -> Result<(), String> {
+        let dim = match *self {
+            DualLoaderEvent::BlockBreak { dim, .. } | DualLoaderEvent::UseBlock { dim, .. } => dim,
+            DualLoaderEvent::ServerTick { .. } => return Ok(()),
+        };
+        if dim > 2 {
+            return Err(format!("invalid dual-loader dimension slot {dim}"));
+        }
+        Ok(())
+    }
+}
+
+/// Normalize a `#ns:path` / `ns:path` tag reference to `ns:path`. Both
+/// loaders mount their own entries onto shared `#c:*` common tags, so a
+/// NeoForge item and a Fabric item resolve inside one canonical tag set.
+#[cfg(any(test, feature = "neoforge-events"))]
+#[allow(dead_code)]
+fn dual_loader_tag(tag: &str) -> Option<&str> {
+    let tag = tag.strip_prefix('#').unwrap_or(tag);
+    let (namespace, path) = tag.split_once(':')?;
+    let common_char =
+        |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_.-".contains(&byte);
+    if namespace.is_empty()
+        || !namespace.bytes().all(common_char)
+        || path.is_empty()
+        || !path.bytes().all(|byte| common_char(byte) || byte == b'/')
+    {
+        return None;
+    }
+    Some(tag)
+}
+
+/// Shared canonical registry every mounted loader registers into. Names are
+/// validated and duplicate `(registry, name)` IDs are rejected fail-closed
+/// across loaders — a Fabric host cannot steal `create:brass_ingot` — while
+/// `#c:*` common tags merge both loaders' contents into one authoritative
+/// set. The open/frozen lifecycle, sorted contiguous runtime IDs, and the
+/// S2 wire contract are inherited verbatim from `ModRegistryBuilder`.
+#[cfg(any(test, feature = "neoforge-events"))]
+#[allow(dead_code)]
+#[derive(Default)]
+pub(crate) struct DualLoaderRegistry {
+    builder: ModRegistryBuilder,
+    tags: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    owners: std::collections::BTreeMap<(ModRegistry, String), Loader>,
+}
+
+#[cfg(any(test, feature = "neoforge-events"))]
+#[allow(dead_code)]
+impl DualLoaderRegistry {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn frozen(&self) -> bool {
+        self.builder.frozen()
+    }
+
+    pub(crate) fn entries(&self) -> &[ModRegistryEntry] {
+        &self.builder.entries
+    }
+
+    /// Sorted member names of a `#c:*` common tag across every mounted loader.
+    pub(crate) fn members(&self, tag: &str) -> Vec<&str> {
+        dual_loader_tag(tag)
+            .and_then(|tag| self.tags.get(tag))
+            .map(|members| members.iter().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn register(
+        &mut self,
+        loader: Loader,
+        registry: ModRegistry,
+        name: &str,
+        tags: &[&str],
+    ) -> Result<(), String> {
+        if self.builder.frozen() {
+            return Err("Registration outside the register phase".into());
+        }
+        if let Some(owner) = self.owners.get(&(registry, name.to_owned())) {
+            return Err(format!("Duplicate registry entry {name} already owned by {owner:?}"));
+        }
+        // Tag validation completes before any table mutation, so a malformed
+        // tag cannot leave a half-registered entry behind.
+        let mut normalized = Vec::with_capacity(tags.len());
+        for tag in tags {
+            normalized.push(
+                dual_loader_tag(tag)
+                    .ok_or_else(|| format!("Invalid common tag {tag}"))?
+                    .to_owned(),
+            );
+        }
+        self.builder.register(registry, name)?;
+        self.owners.insert((registry, name.to_owned()), loader);
+        for tag in normalized {
+            self.tags.entry(tag).or_default().insert(name.to_owned());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn freeze(&mut self) {
+        self.builder.freeze();
+    }
+
+    pub(crate) fn to_wire(&self) -> Result<String, String> {
+        self.builder.to_wire()
+    }
+}
+
+/// One isolated loader bus mounted on the shared host. `post` receives the
+/// canonical event and returns only a staged `S1EventOutcome`; the host — not
+/// the bus — owns the world commit, so callbacks never touch the world.
+#[cfg(any(test, feature = "neoforge-events"))]
+#[allow(dead_code)]
+pub(crate) trait DualLoaderBus {
+    /// Which loader this bus belongs to; the discriminant fixes dispatch order.
+    fn loader(&self) -> Loader;
+    /// Frozen listener census; 0 means every post is a deterministic no-op.
+    fn callbacks(&self) -> usize;
+    /// Stage the canonical event; must not mutate the world.
+    fn post(&self, event: &DualLoaderEvent) -> Result<S1EventOutcome, String>;
+}
+
+/// Commit summary for one cross-loader dispatch. `report` is the atomic
+/// `apply_s1_outcome` result; `break_exp`/`chat_message` are the merged
+/// outcome fields where the later dispatcher in loader rank order wins.
+#[cfg(any(test, feature = "neoforge-events"))]
+#[allow(dead_code)]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DualLoaderCommit {
+    pub(crate) report: BatchCommitReport,
+    pub(crate) break_exp: Option<i32>,
+    pub(crate) chat_message: Option<String>,
+}
+
+/// Rust-mediated dual-loader host: a NeoForge bus and a Fabric bus mount onto
+/// the single authoritative Rust world, registry, and CAS event bus — the
+/// deterministic alternative to single-classloader bytecode remapping.
+/// Events fan out to every live bus in `Loader` rank order; outcomes merge
+/// into one batch committed atomically by `apply_s1_outcome`, so a stale CAS
+/// or a cancellation on either bus rolls back every host's staging. When the
+/// frozen census proves `total_callbacks() == 0`, dispatch answers the
+/// deterministic empty outcome with zero host invocations and zero JNI calls.
+#[cfg(any(test, feature = "neoforge-events"))]
+#[allow(dead_code)]
+pub(crate) struct DualLoaderHost {
+    registry: DualLoaderRegistry,
+    hosts: Vec<Box<dyn DualLoaderBus>>,
+}
+
+#[cfg(any(test, feature = "neoforge-events"))]
+#[allow(dead_code)]
+impl DualLoaderHost {
+    pub(crate) fn new(registry: DualLoaderRegistry) -> Self {
+        Self {
+            registry,
+            hosts: Vec::new(),
+        }
+    }
+
+    /// Mount a bus at its deterministic rank; equal loaders keep mount order.
+    pub(crate) fn mount(&mut self, bus: Box<dyn DualLoaderBus>) {
+        let rank = dual_loader_rank(bus.loader());
+        let index = self
+            .hosts
+            .partition_point(|host| dual_loader_rank(host.loader()) <= rank);
+        self.hosts.insert(index, bus);
+    }
+
+    pub(crate) fn total_callbacks(&self) -> usize {
+        self.hosts.iter().map(|host| host.callbacks()).sum()
+    }
+
+    pub(crate) fn registry(&self) -> &DualLoaderRegistry {
+        &self.registry
+    }
+
+    /// Fan `event` out to every live bus in loader rank order, merge the
+    /// staged outcomes into one canonical batch, and commit it atomically.
+    /// A cancellation on any bus revokes the whole cross-loader commit, and
+    /// a stale CAS anywhere rejects the merged batch before one world write.
+    pub(crate) fn dispatch(&self, event: &DualLoaderEvent) -> Result<DualLoaderCommit, String> {
+        event.validate()?;
+        if self.total_callbacks() == 0 {
+            // The frozen census proved every mounted bus is empty: the merged
+            // outcome is deterministically empty with zero host invocations.
+            return Ok(DualLoaderCommit::default());
+        }
+        let mut merged = S1EventOutcome {
+            canceled: false,
+            break_exp: None,
+            chat_message: None,
+            mutations: Vec::new(),
+        };
+        for host in &self.hosts {
+            // A frozen-empty bus posts a deterministic empty outcome; skipping
+            // it is identical to dispatching it and pays no JNI crossing.
+            if host.callbacks() == 0 {
+                continue;
+            }
+            let outcome = host.post(event)?;
+            // Mod block states must resolve in the shared cross-loader
+            // registry — not just the posting loader's slice. Admission is
+            // checked before generic wire validation so an unregistered state
+            // gets the loader-aware diagnostic instead of the generic one.
+            for mutation in &outcome.mutations {
+                if let MutationOp::SetBlockIf { new_state, .. } = mutation {
+                    if *new_state >= FIRST_MOD_BLOCK_STATE_ID
+                        && !self.registry.entries().iter().any(|entry| {
+                            entry.registry == ModRegistry::Block && entry.runtime_id == *new_state
+                        })
+                    {
+                        return Err(format!("unknown dual-loader block state {new_state}"));
+                    }
+                }
+            }
+            validate_s1_outcome(&outcome)?;
+            if outcome.canceled {
+                // Cancellation on either bus revokes the entire cross-loader
+                // commit; a canceled wire can carry no staged changes.
+                return Ok(DualLoaderCommit::default());
+            }
+            if outcome.break_exp.is_some() {
+                merged.break_exp = outcome.break_exp;
+            }
+            if outcome.chat_message.is_some() {
+                merged.chat_message = outcome.chat_message;
+            }
+            merged.mutations.extend(outcome.mutations);
+        }
+        let commit = DualLoaderCommit {
+            break_exp: merged.break_exp,
+            chat_message: merged.chat_message.clone(),
+            ..DualLoaderCommit::default()
+        };
+        let report = apply_s1_outcome(merged)?;
+        Ok(DualLoaderCommit { report, ..commit })
+    }
+}
+
 #[cfg(feature = "neoforge-events")]
 fn validate_mod_block_states(
     registry: &ModRegistrySnapshot,
@@ -2764,5 +3044,493 @@ mod tests {
         println!(
             "PASS 10000 local-frame dispatches, {exceptions} exception clears, scoped attach/detach"
         );
+    }
+
+    /// Counting stub bus: `post` is the only JNI-relevant crossing, so the
+    /// invocation cell proves exactly which hosts the dispatch layer reached.
+    struct StubBus {
+        loader: Loader,
+        callbacks: usize,
+        invocations: std::rc::Rc<std::cell::Cell<usize>>,
+        respond: Box<dyn Fn(&DualLoaderEvent) -> Result<S1EventOutcome, String>>,
+    }
+
+    impl DualLoaderBus for StubBus {
+        fn loader(&self) -> Loader {
+            self.loader
+        }
+        fn callbacks(&self) -> usize {
+            self.callbacks
+        }
+        fn post(&self, event: &DualLoaderEvent) -> Result<S1EventOutcome, String> {
+            self.invocations.set(self.invocations.get() + 1);
+            (self.respond)(event)
+        }
+    }
+
+    fn stub_bus(
+        loader: Loader,
+        callbacks: usize,
+        invocations: &std::rc::Rc<std::cell::Cell<usize>>,
+        respond: impl Fn(&DualLoaderEvent) -> Result<S1EventOutcome, String> + 'static,
+    ) -> StubBus {
+        StubBus {
+            loader,
+            callbacks,
+            invocations: invocations.clone(),
+            respond: Box::new(respond),
+        }
+    }
+
+    /// The deterministic Sinytra-free bridge: NeoForge `create:brass_ingot`
+    /// and Fabric `my_fabric:brass_gear` register into one canonical table,
+    /// share `#c:*` common tags, reject cross-loader duplicate IDs, and merge
+    /// staged CAS mutations in loader rank order onto the one Rust world.
+    #[test]
+    fn dual_loader_neoforge_and_fabric_share_registry_tags_and_commit_cas_atomically() {
+        let _world = super::super::world_guard();
+        let dim = super::super::DimId::Overworld;
+        let pos = (3511, 91, -3512);
+        let neighbor = (3512, 91, -3512);
+        let before = super::super::block_at_dim(dim, pos.0, pos.1, pos.2);
+        let neighbor_before = super::super::block_at_dim(dim, neighbor.0, neighbor.1, neighbor.2);
+
+        let mut registry = DualLoaderRegistry::new();
+        registry
+            .register(
+                Loader::NeoForge,
+                ModRegistry::Item,
+                "create:brass_ingot",
+                &["c:ingots/brass"],
+            )
+            .unwrap();
+        registry
+            .register(
+                Loader::Fabric,
+                ModRegistry::Item,
+                "my_fabric:brass_gear",
+                &["#c:ingots/brass"],
+            )
+            .unwrap();
+        registry
+            .register(
+                Loader::NeoForge,
+                ModRegistry::Block,
+                "create:brass_block",
+                &["c:storage_blocks/brass"],
+            )
+            .unwrap();
+
+        // Cross-loader duplicate IDs fail closed no matter which bus retries.
+        let error = registry
+            .register(Loader::Fabric, ModRegistry::Item, "create:brass_ingot", &[])
+            .unwrap_err();
+        assert!(
+            error.contains("Duplicate registry entry create:brass_ingot"),
+            "{error}"
+        );
+        assert!(registry
+            .register(Loader::NeoForge, ModRegistry::Item, "my_fabric:brass_gear", &[])
+            .is_err());
+        // The same name in another registry stays a distinct entry.
+        registry
+            .register(Loader::Fabric, ModRegistry::Block, "my_fabric:brass_gear", &[])
+            .unwrap();
+        for (loader, name, tags) in [
+            (Loader::NeoForge, "minecraft:brass", &[][..]),
+            (Loader::Fabric, "UPPER:name", &[][..]),
+            (Loader::Fabric, "x:ok_name", &["not a tag"][..]),
+        ] {
+            assert!(
+                registry
+                    .register(loader, ModRegistry::Item, name, tags)
+                    .is_err(),
+                "{name} admitted"
+            );
+        }
+
+        // Both loaders merge into the shared `#c:*` common-tag view.
+        for tag in ["c:ingots/brass", "#c:ingots/brass"] {
+            assert_eq!(
+                registry.members(tag),
+                ["create:brass_ingot", "my_fabric:brass_gear"]
+            );
+        }
+        assert_eq!(
+            registry.members("c:storage_blocks/brass"),
+            ["create:brass_block"]
+        );
+        assert!(registry.members("c:missing/tag").is_empty());
+
+        registry.freeze();
+        assert!(registry
+            .register(Loader::NeoForge, ModRegistry::Item, "late:item", &[])
+            .unwrap_err()
+            .contains("outside the register phase"));
+        // The shared table still produces the exact S2 wire contract.
+        let snapshot = ModRegistrySnapshot::from_wire(&registry.to_wire().unwrap()).unwrap();
+        assert_eq!(
+            snapshot
+                .entries()
+                .iter()
+                .map(|entry| (entry.registry, entry.name.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (ModRegistry::Block, "create:brass_block"),
+                (ModRegistry::Block, "my_fabric:brass_gear"),
+                (ModRegistry::Item, "create:brass_ingot"),
+                (ModRegistry::Item, "my_fabric:brass_gear"),
+            ]
+        );
+
+        // Mount out of rank order on purpose: Fabric must still dispatch
+        // first, so its staged write is the state NeoForge's CAS expects.
+        let mid = if before == 1 { 2 } else { 1 };
+        let end_state = 10;
+        let event = DualLoaderEvent::BlockBreak {
+            dim: 0,
+            pos,
+            state: before,
+            player_eid: 7,
+            exp_to_drop: 0,
+        };
+        let neo_invocations = std::rc::Rc::new(std::cell::Cell::new(0));
+        let fab_invocations = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut host = DualLoaderHost::new(registry);
+        host.mount(Box::new(stub_bus(Loader::NeoForge, 1, &neo_invocations, move |event| {
+            assert!(matches!(event, DualLoaderEvent::BlockBreak { .. }));
+            Ok(S1EventOutcome {
+                canceled: false,
+                break_exp: Some(4),
+                chat_message: None,
+                mutations: vec![
+                    MutationOp::SetBlockIf {
+                        dim: 0,
+                        pos,
+                        new_state: end_state,
+                        expected_state: Some(mid),
+                    },
+                    MutationOp::SendSystemMessage {
+                        player_eid: 7,
+                        message: "neoforge".into(),
+                    },
+                    MutationOp::RegisterCommand {
+                        literal: "nf_greet".into(),
+                    },
+                ],
+            })
+        })));
+        host.mount(Box::new(stub_bus(Loader::Fabric, 1, &fab_invocations, move |event| {
+            assert!(matches!(event, DualLoaderEvent::BlockBreak { .. }));
+            Ok(S1EventOutcome {
+                canceled: false,
+                break_exp: Some(2),
+                chat_message: Some("fabric".into()),
+                mutations: vec![
+                    MutationOp::SetBlockIf {
+                        dim: 0,
+                        pos,
+                        new_state: mid,
+                        expected_state: Some(before),
+                    },
+                    MutationOp::SetBlockIf {
+                        dim: 0,
+                        pos: neighbor,
+                        new_state: 10,
+                        expected_state: Some(neighbor_before),
+                    },
+                    MutationOp::SendSystemMessage {
+                        player_eid: 7,
+                        message: "fabric".into(),
+                    },
+                ],
+            })
+        })));
+        assert_eq!(host.total_callbacks(), 2);
+
+        let commit = host.dispatch(&event).unwrap();
+        assert_eq!(fab_invocations.get(), 1);
+        assert_eq!(neo_invocations.get(), 1);
+        // Deterministic order: Fabric's staged write landed first, so
+        // NeoForge's CAS on expected=mid validated inside one atomic batch,
+        // and the later dispatcher's break_exp won the merge.
+        assert_eq!(
+            commit.report,
+            BatchCommitReport {
+                applied_blocks: 3,
+                skipped_cas_blocks: 0,
+                system_messages: vec![(7, "fabric".into()), (7, "neoforge".into())],
+                registered_commands: vec!["nf_greet".into()],
+            }
+        );
+        assert_eq!(commit.break_exp, Some(4));
+        assert_eq!(commit.chat_message.as_deref(), Some("fabric"));
+        assert_eq!(super::super::block_at_dim(dim, pos.0, pos.1, pos.2), end_state);
+        assert_eq!(
+            super::super::block_at_dim(dim, neighbor.0, neighbor.1, neighbor.2),
+            10
+        );
+
+        // A stale CAS anywhere in the merged batch rejects every host's
+        // staging before a single world write lands.
+        let stale_pos = (3513, 91, -3512);
+        let stale_before = super::super::block_at_dim(dim, stale_pos.0, stale_pos.1, stale_pos.2);
+        let neo_invocations = std::rc::Rc::new(std::cell::Cell::new(0));
+        let fab_invocations = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut registry = DualLoaderRegistry::new();
+        registry.freeze();
+        let mut host = DualLoaderHost::new(registry);
+        host.mount(Box::new(stub_bus(Loader::NeoForge, 1, &neo_invocations, move |_| {
+            Ok(S1EventOutcome {
+                canceled: false,
+                break_exp: None,
+                chat_message: None,
+                mutations: vec![MutationOp::SetBlockIf {
+                    dim: 0,
+                    pos: stale_pos,
+                    new_state: 10,
+                    // Stale after Fabric's staged write: the merged batch must
+                    // roll back before either host's edit reaches the world.
+                    expected_state: Some(stale_before),
+                }],
+            })
+        })));
+        host.mount(Box::new(stub_bus(Loader::Fabric, 1, &fab_invocations, move |_| {
+            Ok(S1EventOutcome {
+                canceled: false,
+                break_exp: None,
+                chat_message: None,
+                mutations: vec![MutationOp::SetBlockIf {
+                    dim: 0,
+                    pos: stale_pos,
+                    new_state: if stale_before == 1 { 2 } else { 1 },
+                    expected_state: Some(stale_before),
+                }],
+            })
+        })));
+        let stale_event = DualLoaderEvent::UseBlock {
+            dim: 0,
+            pos: stale_pos,
+            state: stale_before,
+            player_eid: 7,
+        };
+        let error = host.dispatch(&stale_event).unwrap_err();
+        assert!(error.contains("CAS precondition"), "{error}");
+        assert_eq!(fab_invocations.get(), 1);
+        assert_eq!(neo_invocations.get(), 1);
+        assert_eq!(
+            super::super::block_at_dim(dim, stale_pos.0, stale_pos.1, stale_pos.2),
+            stale_before
+        );
+
+        // Cancellation on either bus revokes the entire cross-loader commit:
+        // Fabric's earlier staging must not reach the world.
+        let canceled_pos = (3514, 91, -3512);
+        let canceled_before =
+            super::super::block_at_dim(dim, canceled_pos.0, canceled_pos.1, canceled_pos.2);
+        let mut registry = DualLoaderRegistry::new();
+        registry.freeze();
+        let mut host = DualLoaderHost::new(registry);
+        host.mount(Box::new(stub_bus(
+            Loader::NeoForge,
+            1,
+            &std::rc::Rc::new(std::cell::Cell::new(0)),
+            |_| {
+                Ok(S1EventOutcome {
+                    canceled: true,
+                    break_exp: None,
+                    chat_message: None,
+                    mutations: Vec::new(),
+                })
+            },
+        )));
+        host.mount(Box::new(stub_bus(
+            Loader::Fabric,
+            1,
+            &std::rc::Rc::new(std::cell::Cell::new(0)),
+            move |_| {
+                Ok(S1EventOutcome {
+                    canceled: false,
+                    break_exp: None,
+                    chat_message: None,
+                    mutations: vec![MutationOp::SetBlockIf {
+                        dim: 0,
+                        pos: canceled_pos,
+                        new_state: 10,
+                        expected_state: Some(canceled_before),
+                    }],
+                })
+            },
+        )));
+        let commit = host
+            .dispatch(&DualLoaderEvent::UseBlock {
+                dim: 0,
+                pos: canceled_pos,
+                state: canceled_before,
+                player_eid: 7,
+            })
+            .unwrap();
+        assert_eq!(commit, DualLoaderCommit::default());
+        assert_eq!(
+            super::super::block_at_dim(dim, canceled_pos.0, canceled_pos.1, canceled_pos.2),
+            canceled_before
+        );
+
+        // A mod block state must resolve in the shared cross-loader registry,
+        // not only in the posting loader's own slice: an ID absent from the
+        // shared table fails closed at the dual-loader gate, while a
+        // registered ID clears that gate and is then left to the mounted
+        // runtime contract inside `apply_s1_outcome` (none is mounted in a
+        // standalone host, so the world-commit layer still rejects it).
+        for (pos, new_state, reason) in [
+            (
+                (3515, 91, -3512),
+                FIRST_MOD_BLOCK_STATE_ID,
+                "invalid S1 block state",
+            ),
+            (
+                (3516, 91, -3512),
+                FIRST_MOD_BLOCK_STATE_ID + 40,
+                "unknown dual-loader block state",
+            ),
+        ] {
+            let mut registry = DualLoaderRegistry::new();
+            registry
+                .register(Loader::NeoForge, ModRegistry::Block, "create:brass_block", &[])
+                .unwrap();
+            registry.freeze();
+            assert_eq!(
+                registry.entries()[0].runtime_id,
+                FIRST_MOD_BLOCK_STATE_ID
+            );
+            let mut host = DualLoaderHost::new(registry);
+            host.mount(Box::new(stub_bus(
+                Loader::Fabric,
+                1,
+                &std::rc::Rc::new(std::cell::Cell::new(0)),
+                move |_| {
+                    Ok(S1EventOutcome {
+                        canceled: false,
+                        break_exp: None,
+                        chat_message: None,
+                        mutations: vec![MutationOp::SetBlockIf {
+                            dim: 0,
+                            pos,
+                            new_state,
+                            expected_state: None,
+                        }],
+                    })
+                },
+            )));
+            let error = host
+                .dispatch(&DualLoaderEvent::UseBlock {
+                    dim: 0,
+                    pos,
+                    state: 1,
+                    player_eid: 7,
+                })
+                .unwrap_err();
+            assert!(error.contains(reason), "{new_state}: {error}");
+        }
+    }
+
+    /// `total_callbacks() == 0` proves every mounted bus is frozen-empty:
+    /// dispatch answers the deterministic empty outcome with zero host
+    /// invocations and zero JNI crossings — the idle fast path is preserved.
+    #[test]
+    fn dual_loader_idle_zero_callbacks_makes_zero_calls() {
+        let _world = super::super::world_guard();
+        let mut registry = DualLoaderRegistry::new();
+        registry
+            .register(
+                Loader::NeoForge,
+                ModRegistry::Item,
+                "create:brass_ingot",
+                &["c:ingots/brass"],
+            )
+            .unwrap();
+        registry
+            .register(
+                Loader::Fabric,
+                ModRegistry::Item,
+                "my_fabric:brass_gear",
+                &["c:ingots/brass"],
+            )
+            .unwrap();
+        registry.freeze();
+
+        let neo_invocations = std::rc::Rc::new(std::cell::Cell::new(0));
+        let fab_invocations = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut host = DualLoaderHost::new(registry);
+        host.mount(Box::new(stub_bus(Loader::NeoForge, 0, &neo_invocations, |_| {
+            panic!("idle bus must never be posted")
+        })));
+        host.mount(Box::new(stub_bus(Loader::Fabric, 0, &fab_invocations, |_| {
+            panic!("idle bus must never be posted")
+        })));
+        assert_eq!(host.total_callbacks(), 0);
+        let baseline = jni_dispatch_count();
+
+        for event in [
+            DualLoaderEvent::BlockBreak {
+                dim: 0,
+                pos: (3601, 92, -3601),
+                state: 1,
+                player_eid: 7,
+                exp_to_drop: 0,
+            },
+            DualLoaderEvent::UseBlock {
+                dim: 1,
+                pos: (3601, 92, -3601),
+                state: 1,
+                player_eid: 7,
+            },
+            DualLoaderEvent::ServerTick { tick: 42 },
+        ] {
+            assert_eq!(host.dispatch(&event).unwrap(), DualLoaderCommit::default());
+        }
+        // Counter-proven idle: no host post and no Java dispatch ever ran.
+        assert_eq!(neo_invocations.get(), 0);
+        assert_eq!(fab_invocations.get(), 0);
+        assert_eq!(jni_dispatch_count() - baseline, 0);
+
+        // Fail-closed dimension validation still runs on the idle path.
+        assert!(host
+            .dispatch(&DualLoaderEvent::BlockBreak {
+                dim: 3,
+                pos: (0, 64, 0),
+                state: 1,
+                player_eid: 7,
+                exp_to_drop: 0,
+            })
+            .unwrap_err()
+            .contains("invalid dual-loader dimension slot 3"));
+        assert_eq!(neo_invocations.get(), 0);
+        assert_eq!(fab_invocations.get(), 0);
+        assert_eq!(jni_dispatch_count() - baseline, 0);
+
+        // With a live bus mounted, the same event must reach exactly that
+        // host — the census flag routes the call, never the fast path.
+        let neo_invocations = std::rc::Rc::new(std::cell::Cell::new(0));
+        let fab_invocations = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut host = DualLoaderHost::new(DualLoaderRegistry::new());
+        host.mount(Box::new(stub_bus(Loader::NeoForge, 1, &neo_invocations, |_| {
+            Ok(S1EventOutcome {
+                canceled: false,
+                break_exp: None,
+                chat_message: None,
+                mutations: Vec::new(),
+            })
+        })));
+        host.mount(Box::new(stub_bus(Loader::Fabric, 0, &fab_invocations, |_| {
+            panic!("empty bus must be skipped")
+        })));
+        assert_eq!(host.total_callbacks(), 1);
+        let commit = host
+            .dispatch(&DualLoaderEvent::ServerTick { tick: 7 })
+            .unwrap();
+        assert_eq!(commit, DualLoaderCommit::default());
+        assert_eq!(neo_invocations.get(), 1);
+        assert_eq!(fab_invocations.get(), 0);
     }
 }
