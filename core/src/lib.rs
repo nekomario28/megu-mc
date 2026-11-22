@@ -64,6 +64,12 @@
 //!   (commands, escape prefix, existing Japanese, URLs, mentions,
 //!   numerics, all-caps acronyms) with a vanilla-safe 256-char bound.
 //!   [`romaji_ime::RomajiChatMode::Off`] is the strict vanilla default.
+//! * [`zip_archive`] — lazy, zero-dependency, zero-disk-extraction ZIP/JAR
+//!   indexing: [`zip_archive::LazyZipIndex`] reads only the EOCD tail +
+//!   Central Directory (ZIP64 included), seeks per entry on demand, resolves
+//!   one level of `META-INF/jarjar`/`META-INF/jars` Jar-in-Jar in place, and
+//!   inflates with the pure-`std` [`zip_archive::inflate_raw_rfc1951`]
+//!   RFC 1951 decompressor under strict fail-closed caps.
 
 #![deny(unsafe_code)]
 
@@ -81,3 +87,4 @@ pub mod romaji_ime;
 pub mod server_perf_governors;
 pub mod sys_metrics;
 pub mod version;
+pub mod zip_archive;
