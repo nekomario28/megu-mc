@@ -177,6 +177,315 @@ impl ModMenuEntry {
 }
 
 // ---------------------------------------------------------------------------
+// Curated Modrinth 1.21.1 recommendations and built-in QoL deference
+// ---------------------------------------------------------------------------
+
+/// The categories offered by the Recommended QoL browser.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QolSubCategory {
+    HudInfo,
+    InventoryInput,
+    Recipes,
+    VisualsCompat,
+}
+
+impl QolSubCategory {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::HudInfo => "HUD / Info",
+            Self::InventoryInput => "Inventory / Input",
+            Self::Recipes => "Recipes",
+            Self::VisualsCompat => "Visuals / Compat",
+        }
+    }
+}
+
+/// A built-in clean-room feature that should yield to an installed mod.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BuiltinQolFeature {
+    LookingAtHud,
+    MouseTweaksGestures,
+    InventorySort,
+    HungerSaturationPreview,
+    ContainerTooltipPreview,
+    RecipeBrowser,
+    ConnectedTextures,
+    EmfModels,
+    EtfTextures,
+}
+
+/// How the caller should resolve one built-in feature at runtime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BuiltinQolResolution {
+    UseBuiltin,
+    DeferToInstalledMod { mod_id: String },
+}
+
+/// Active overrides derived from the host's enabled, installed mod IDs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BuiltinQolDeference {
+    overrides: BTreeMap<BuiltinQolFeature, BuiltinQolResolution>,
+}
+
+impl BuiltinQolDeference {
+    pub fn resolution(&self, feature: BuiltinQolFeature) -> BuiltinQolResolution {
+        self.overrides
+            .get(&feature)
+            .cloned()
+            .unwrap_or(BuiltinQolResolution::UseBuiltin)
+    }
+
+    pub fn use_builtin(&self, feature: BuiltinQolFeature) -> bool {
+        self.resolution(feature) == BuiltinQolResolution::UseBuiltin
+    }
+}
+
+/// Static catalog metadata. Versions are target Minecraft versions, not mod
+/// binary versions; the host must resolve a compatible release via Modrinth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CuratedModrinthQolMod {
+    pub slug: &'static str,
+    pub name: &'static str,
+    pub summary_en: &'static str,
+    pub summary_ja: &'static str,
+    pub category: QolSubCategory,
+    pub loaders: &'static [ModLoaderTag],
+    pub target_version: &'static str,
+    pub yields_builtin_qol: Option<BuiltinQolFeature>,
+}
+
+const QOL_LOADERS: &[ModLoaderTag] = &[ModLoaderTag::Fabric, ModLoaderTag::NeoForge];
+
+/// Project slugs and 1.21.1 loader availability verified against Modrinth.
+/// No jars or mod binaries are bundled with this catalog.
+pub const CURATED_MODRINTH_QOL_MODS: [CuratedModrinthQolMod; 15] = [
+    CuratedModrinthQolMod {
+        slug: "jade",
+        name: "Jade",
+        summary_en: "Shows block, entity, and fluid information in a HUD.",
+        summary_ja: "ブロックやエンティティの情報をHUDに表示。",
+        category: QolSubCategory::HudInfo,
+        loaders: QOL_LOADERS,
+        target_version: "1.21.1",
+        yields_builtin_qol: Some(BuiltinQolFeature::LookingAtHud),
+    },
+    CuratedModrinthQolMod {
+        slug: "mouse-tweaks",
+        name: "Mouse Tweaks",
+        summary_en: "Faster inventory dragging and item transfers.",
+        summary_ja: "インベントリのドラッグ操作と移動を改善。",
+        category: QolSubCategory::InventoryInput,
+        loaders: QOL_LOADERS,
+        target_version: "1.21.1",
+        yields_builtin_qol: Some(BuiltinQolFeature::MouseTweaksGestures),
+    },
+    CuratedModrinthQolMod {
+        slug: "inventory-profiles-next",
+        name: "Inventory Profiles Next",
+        summary_en: "Inventory sorting and configurable item management.",
+        summary_ja: "インベントリの整理とアイテム管理。",
+        category: QolSubCategory::InventoryInput,
+        loaders: QOL_LOADERS,
+        target_version: "1.21.1",
+        yields_builtin_qol: Some(BuiltinQolFeature::InventorySort),
+    },
+    CuratedModrinthQolMod {
+        slug: "inventory-essentials",
+        name: "Inventory Essentials",
+        summary_en: "Convenient inventory and item movement shortcuts.",
+        summary_ja: "インベントリ操作とアイテム移動の補助。",
+        category: QolSubCategory::InventoryInput,
+        loaders: QOL_LOADERS,
+        target_version: "1.21.1",
+        yields_builtin_qol: Some(BuiltinQolFeature::InventorySort),
+    },
+    CuratedModrinthQolMod {
+        slug: "appleskin",
+        name: "AppleSkin",
+        summary_en: "Previews food, hunger, and saturation values.",
+        summary_ja: "食料の回復量や隠し満腹度を表示。",
+        category: QolSubCategory::HudInfo,
+        loaders: QOL_LOADERS,
+        target_version: "1.21.1",
+        yields_builtin_qol: Some(BuiltinQolFeature::HungerSaturationPreview),
+    },
+    CuratedModrinthQolMod {
+        slug: "shulkerboxtooltip",
+        name: "ShulkerBoxTooltip",
+        summary_en: "Previews contents of shulker boxes in tooltips.",
+        summary_ja: "シュルカーボックスの中身をツールチップで確認。",
+        category: QolSubCategory::InventoryInput,
+        loaders: QOL_LOADERS,
+        target_version: "1.21.1",
+        yields_builtin_qol: Some(BuiltinQolFeature::ContainerTooltipPreview),
+    },
+    CuratedModrinthQolMod {
+        slug: "emi",
+        name: "EMI",
+        summary_en: "Searchable recipe and item browser.",
+        summary_ja: "レシピとアイテムの検索ブラウザ。",
+        category: QolSubCategory::Recipes,
+        loaders: QOL_LOADERS,
+        target_version: "1.21.1",
+        yields_builtin_qol: Some(BuiltinQolFeature::RecipeBrowser),
+    },
+    CuratedModrinthQolMod {
+        slug: "jei",
+        name: "Just Enough Items (JEI)",
+        summary_en: "Displays item lists and crafting recipes.",
+        summary_ja: "アイテム一覧とクラフトレシピを表示。",
+        category: QolSubCategory::Recipes,
+        loaders: QOL_LOADERS,
+        target_version: "1.21.1",
+        yields_builtin_qol: Some(BuiltinQolFeature::RecipeBrowser),
+    },
+    CuratedModrinthQolMod {
+        slug: "controlling",
+        name: "Controlling",
+        summary_en: "Finds key bindings and their conflicts.",
+        summary_ja: "キー割り当てと競合を検索。",
+        category: QolSubCategory::InventoryInput,
+        loaders: QOL_LOADERS,
+        target_version: "1.21.1",
+        yields_builtin_qol: None,
+    },
+    CuratedModrinthQolMod {
+        slug: "searchables",
+        name: "Searchables",
+        summary_en: "Shared search utilities for modded interfaces.",
+        summary_ja: "Modの検索UIを支える共通ライブラリ。",
+        category: QolSubCategory::InventoryInput,
+        loaders: QOL_LOADERS,
+        target_version: "1.21.1",
+        yields_builtin_qol: None,
+    },
+    CuratedModrinthQolMod {
+        slug: "betterf3",
+        name: "BetterF3",
+        summary_en: "Customizable, readable debug HUD.",
+        summary_ja: "デバッグHUDの表示を整理・カスタマイズ。",
+        category: QolSubCategory::HudInfo,
+        loaders: QOL_LOADERS,
+        target_version: "1.21.1",
+        yields_builtin_qol: None,
+    },
+    CuratedModrinthQolMod {
+        slug: "continuity",
+        name: "Continuity",
+        summary_en: "Connected textures for compatible resource packs.",
+        summary_ja: "対応リソースパックの連結テクスチャ。",
+        category: QolSubCategory::VisualsCompat,
+        loaders: QOL_LOADERS,
+        target_version: "1.21.1",
+        yields_builtin_qol: Some(BuiltinQolFeature::ConnectedTextures),
+    },
+    CuratedModrinthQolMod {
+        slug: "entity-model-features",
+        name: "Entity Model Features (EMF)",
+        summary_en: "Custom entity models from compatible resource packs.",
+        summary_ja: "対応パックのカスタムエンティティモデル。",
+        category: QolSubCategory::VisualsCompat,
+        loaders: QOL_LOADERS,
+        target_version: "1.21.1",
+        yields_builtin_qol: Some(BuiltinQolFeature::EmfModels),
+    },
+    CuratedModrinthQolMod {
+        // Modrinth's canonical project slug has no hyphens.
+        slug: "entitytexturefeatures",
+        name: "Entity Texture Features (ETF)",
+        summary_en: "Custom entity textures from compatible resource packs.",
+        summary_ja: "対応パックのカスタムエンティティテクスチャ。",
+        category: QolSubCategory::VisualsCompat,
+        loaders: QOL_LOADERS,
+        target_version: "1.21.1",
+        yields_builtin_qol: Some(BuiltinQolFeature::EtfTextures),
+    },
+    CuratedModrinthQolMod {
+        slug: "chat-heads",
+        name: "Chat Heads",
+        summary_en: "Displays player avatars next to chat messages.",
+        summary_ja: "チャットにプレイヤーアイコンを表示。",
+        category: QolSubCategory::VisualsCompat,
+        loaders: QOL_LOADERS,
+        target_version: "1.21.1",
+        yields_builtin_qol: None,
+    },
+];
+
+/// Only ASCII lowercase project slugs can enter a Modrinth URL path.
+pub fn valid_modrinth_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// API endpoint for 1.21.1 versions. The host resolves the loader and
+/// dependencies before installing a returned release.
+pub fn modrinth_version_lookup_url(slug: &str) -> Option<String> {
+    valid_modrinth_slug(slug).then(|| {
+        format!(
+            "https://api.modrinth.com/v2/project/{slug}/version?game_versions=%5B%221.21.1%22%5D"
+        )
+    })
+}
+
+/// Public project page used by the recommendation's install/browser action.
+pub fn modrinth_project_url(slug: &str) -> Option<String> {
+    valid_modrinth_slug(slug).then(|| format!("https://modrinth.com/mod/{slug}"))
+}
+
+fn matches_installed_mod_id(slug: &str, mod_id: &str) -> bool {
+    if slug == mod_id {
+        return true;
+    }
+    matches!(
+        (slug, mod_id),
+        ("mouse-tweaks", "mousetweaks")
+            | ("inventory-profiles-next", "inventoryprofilesnext")
+            | ("inventory-profiles-next", "inventory_profiles_next")
+            | ("inventory-essentials", "inventoryessentials")
+            | ("inventory-essentials", "inventory_essentials")
+            | ("entity-model-features", "entity_model_features")
+            | ("entitytexturefeatures", "entity_texture_features")
+            | ("entitytexturefeatures", "entity-texture-features")
+    )
+}
+
+/// Resolve clean-room feature ownership from installed, enabled loader IDs.
+/// If several mods provide the same feature, the catalog order determines the
+/// reported owner. Unrecognized IDs leave the built-in implementation active.
+pub fn active_builtin_qol_overrides(installed_mod_ids: &[&str]) -> BuiltinQolDeference {
+    let mut deference = BuiltinQolDeference::default();
+    for mod_info in CURATED_MODRINTH_QOL_MODS {
+        let Some(feature) = mod_info.yields_builtin_qol else {
+            continue;
+        };
+        if let Some(mod_id) = installed_mod_ids
+            .iter()
+            .find(|id| matches_installed_mod_id(mod_info.slug, id))
+        {
+            deference.overrides.entry(feature).or_insert_with(|| {
+                BuiltinQolResolution::DeferToInstalledMod {
+                    mod_id: (*mod_id).to_owned(),
+                }
+            });
+        }
+    }
+    deference
+}
+
+fn curated_entry(mod_info: &CuratedModrinthQolMod) -> ModMenuEntry {
+    let mut entry = ModMenuEntry::new(mod_info.slug, mod_info.name, "MC 1.21.1");
+    entry.summary = mod_info.summary_en.to_owned();
+    entry.enabled = false;
+    entry.loader = mod_info.loaders[0];
+    entry.tier = ModAdaptationBadge::ClientOnly;
+    entry.modrinth_url = modrinth_project_url(mod_info.slug).unwrap_or_default();
+    entry
+}
+
+// ---------------------------------------------------------------------------
 // Filters, sort, widget ids, actions
 // ---------------------------------------------------------------------------
 
@@ -192,6 +501,8 @@ pub enum ModMenuFilter {
     Issues,
     /// Tier-1 native ports only.
     Native,
+    /// Curated 1.21.1 Modrinth mods (separate from installed entries).
+    RecommendedQol,
 }
 
 /// The clickable sort toggle.
@@ -241,6 +552,11 @@ pub enum ModMenuWidgetId {
     FilterEnabled,
     FilterIssues,
     FilterNative,
+    FilterRecommendedQol,
+    QolHudInfo,
+    QolInventoryInput,
+    QolRecipes,
+    QolVisualsCompat,
     /// `Libs: ON/OFF` library visibility toggle.
     ToggleLibraries,
     /// Cycles A-Z → Z-A → Status.
@@ -261,6 +577,8 @@ pub enum ModMenuWidgetId {
     LinkIssues,
     LinkSource,
     LinkModrinth,
+    /// Open the selected catalog mod's Modrinth project page.
+    InstallRecommended,
     /// Footer "+ Add from Modrinth".
     AddFromModrinth,
     /// Footer "Open Mods Folder".
@@ -450,10 +768,14 @@ fn tag_matches(tag: Tag, entry: &ModMenuEntry, enabled: bool) -> bool {
 pub struct ModMenuState {
     /// All installed mods/packs/libraries, in host-supplied order.
     pub entries: Vec<ModMenuEntry>,
+    /// Curated recommendations kept separate from host-owned installations.
+    recommended_entries: Vec<ModMenuEntry>,
     /// Live search text (edited by typing / Backspace / SearchClear).
     pub search: String,
     /// Active filter pill.
     pub filter: ModMenuFilter,
+    /// Optional sub-category when browsing Recommended QoL.
+    pub recommended_category: Option<QolSubCategory>,
     /// Active sort mode.
     pub sort: ModMenuSort,
     /// Whether `is_library` entries appear without a `#lib` query.
@@ -478,8 +800,13 @@ impl Default for ModMenuState {
     fn default() -> Self {
         Self {
             entries: Vec::new(),
+            recommended_entries: CURATED_MODRINTH_QOL_MODS
+                .iter()
+                .map(curated_entry)
+                .collect(),
             search: String::new(),
             filter: ModMenuFilter::All,
+            recommended_category: None,
             sort: ModMenuSort::NameAsc,
             show_libraries: false,
             lang: UiLang::En,
@@ -530,7 +857,35 @@ impl ModMenuState {
     pub fn selected_entry(&self) -> Option<&ModMenuEntry> {
         self.visible_indices()
             .get(self.selected)
-            .and_then(|&i| self.entries.get(i))
+            .and_then(|&i| self.browsed_entries().get(i))
+    }
+
+    /// Entry slice indexed by [`visible_indices`](Self::visible_indices).
+    /// In Recommended QoL mode these are catalog entries awaiting install.
+    pub fn browsed_entries(&self) -> &[ModMenuEntry] {
+        if self.filter == ModMenuFilter::RecommendedQol {
+            &self.recommended_entries
+        } else {
+            &self.entries
+        }
+    }
+
+    /// Deference for the currently enabled installed mods, including staged
+    /// enable/disable changes. The embedding renderer can query this before
+    /// deciding whether to draw a built-in QoL feature.
+    pub fn active_builtin_qol_deference(&self) -> BuiltinQolDeference {
+        let ids: Vec<&str> = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                self.pending
+                    .get(&entry.mod_id)
+                    .copied()
+                    .unwrap_or(entry.enabled)
+            })
+            .map(|entry| entry.mod_id.as_str())
+            .collect();
+        active_builtin_qol_overrides(&ids)
     }
 
     /// `true` when at least one enable/disable toggle is staged.
@@ -550,6 +905,9 @@ impl ModMenuState {
     }
 
     fn enabled_at(&self, index: usize) -> bool {
+        if self.filter == ModMenuFilter::RecommendedQol {
+            return false;
+        }
         let entry = &self.entries[index];
         self.pending
             .get(&entry.mod_id)
@@ -557,7 +915,9 @@ impl ModMenuState {
             .unwrap_or(entry.enabled)
     }
 
-    /// Entry indices visible under the current filter pill, library toggle,
+    /// Indices into the active entries slice (`entries` when installed,
+    /// curated entries when browsing Recommended QoL), subject to the filter,
+    /// category, library toggle,
     /// search query, and sort mode — in display order.
     ///
     /// Every whitespace-separated search token must match (`AND` semantics):
@@ -569,11 +929,20 @@ impl ModMenuState {
     /// so libraries can be found without flipping the pill.
     pub fn visible_indices(&self) -> Vec<usize> {
         let tokens = parse_query(&self.search);
+        let recommended = self.filter == ModMenuFilter::RecommendedQol;
+        let entries = self.browsed_entries();
         let lib_requested = tokens
             .iter()
             .any(|t| matches!(t, QueryToken::Tag(Some(Tag::Lib))));
-        let mut scored: Vec<(usize, u32)> = Vec::with_capacity(self.entries.len());
-        for (index, entry) in self.entries.iter().enumerate() {
+        let mut scored: Vec<(usize, u32)> = Vec::with_capacity(entries.len());
+        for (index, entry) in entries.iter().enumerate() {
+            if recommended
+                && self
+                    .recommended_category
+                    .is_some_and(|category| CURATED_MODRINTH_QOL_MODS[index].category != category)
+            {
+                continue;
+            }
             if !self.show_libraries && entry.is_library && !lib_requested {
                 continue;
             }
@@ -583,6 +952,7 @@ impl ModMenuState {
                 ModMenuFilter::Enabled => enabled,
                 ModMenuFilter::Issues => entry.has_issue(),
                 ModMenuFilter::Native => entry.tier == ModAdaptationBadge::Tier1Native,
+                ModMenuFilter::RecommendedQol => true,
             };
             if !passes_pill {
                 continue;
@@ -641,8 +1011,9 @@ impl ModMenuState {
     }
 
     fn cmp_entries(&self, a: usize, b: usize) -> std::cmp::Ordering {
-        let ea = &self.entries[a];
-        let eb = &self.entries[b];
+        let entries = self.browsed_entries();
+        let ea = &entries[a];
+        let eb = &entries[b];
         let name = |e: &ModMenuEntry| e.name.to_lowercase();
         let by_name = name(ea)
             .cmp(&name(eb))
@@ -652,7 +1023,7 @@ impl ModMenuState {
             ModMenuSort::NameDesc => by_name.reverse(),
             ModMenuSort::Status => {
                 let rank = |i: usize| {
-                    let e = &self.entries[i];
+                    let e = &entries[i];
                     if e.has_issue() {
                         0u8
                     } else if self.enabled_at(i) {
@@ -686,6 +1057,9 @@ impl ModMenuState {
     }
 
     fn toggle_selected(&mut self) {
+        if self.filter == ModMenuFilter::RecommendedQol {
+            return;
+        }
         let Some(&index) = self.visible_indices().get(self.selected) else {
             return;
         };
@@ -755,6 +1129,22 @@ impl ModMenuState {
             ModMenuWidgetId::FilterEnabled => self.set_filter(ModMenuFilter::Enabled),
             ModMenuWidgetId::FilterIssues => self.set_filter(ModMenuFilter::Issues),
             ModMenuWidgetId::FilterNative => self.set_filter(ModMenuFilter::Native),
+            ModMenuWidgetId::FilterRecommendedQol => {
+                if self.filter == ModMenuFilter::RecommendedQol {
+                    self.recommended_category = None;
+                    self.after_view_change();
+                } else {
+                    self.set_filter(ModMenuFilter::RecommendedQol);
+                }
+            }
+            ModMenuWidgetId::QolHudInfo => self.set_recommended_category(QolSubCategory::HudInfo),
+            ModMenuWidgetId::QolInventoryInput => {
+                self.set_recommended_category(QolSubCategory::InventoryInput)
+            }
+            ModMenuWidgetId::QolRecipes => self.set_recommended_category(QolSubCategory::Recipes),
+            ModMenuWidgetId::QolVisualsCompat => {
+                self.set_recommended_category(QolSubCategory::VisualsCompat)
+            }
             ModMenuWidgetId::ToggleLibraries => {
                 self.show_libraries = !self.show_libraries;
                 self.after_view_change();
@@ -809,6 +1199,13 @@ impl ModMenuState {
                     }
                 }
             }
+            ModMenuWidgetId::InstallRecommended => {
+                if self.filter == ModMenuFilter::RecommendedQol {
+                    if let Some(entry) = self.selected_entry() {
+                        return vec![ModMenuAction::OpenUrl(entry.modrinth_url.clone())];
+                    }
+                }
+            }
             ModMenuWidgetId::AddFromModrinth => {
                 return vec![ModMenuAction::OpenModrinthBrowser];
             }
@@ -828,6 +1225,14 @@ impl ModMenuState {
     fn set_filter(&mut self, filter: ModMenuFilter) {
         if self.filter != filter {
             self.filter = filter;
+            self.after_view_change();
+        }
+    }
+
+    fn set_recommended_category(&mut self, category: QolSubCategory) {
+        if self.filter == ModMenuFilter::RecommendedQol {
+            self.recommended_category =
+                (self.recommended_category != Some(category)).then_some(category);
             self.after_view_change();
         }
     }
@@ -909,6 +1314,8 @@ impl ModMenuState {
             UiKey::Enter | UiKey::Space => {
                 if self.search_focused {
                     self.search_focused = false;
+                } else if self.filter == ModMenuFilter::RecommendedQol {
+                    return self.activate(ModMenuWidgetId::InstallRecommended);
                 } else {
                     self.toggle_selected();
                 }
@@ -977,11 +1384,16 @@ impl ModMenuState {
     fn render_header(&self, lay: &mut Lay, hits: &mut Vec<ModMenuHitRegion>) {
         let lang = self.lang;
         let visible = self.visible_indices().len();
+        let total = self.browsed_entries().len();
         let title = format!(
             "{} ({} / {})",
-            tr(lang, "Mods & Packs", "Modとパック"),
+            if self.filter == ModMenuFilter::RecommendedQol {
+                tr(lang, "Recommended QoL", "おすすめQoL")
+            } else {
+                tr(lang, "Mods & Packs", "Modとパック")
+            },
             visible,
-            self.entries.len()
+            total
         );
         lay.text_fit(
             MARGIN + 4,
@@ -1080,37 +1492,74 @@ impl ModMenuState {
 
     fn render_filter_row(&self, lay: &mut Lay, hits: &mut Vec<ModMenuHitRegion>) {
         let lang = self.lang;
-        let pills: [(&str, ModMenuWidgetId, bool); 5] = [
-            (
-                tr(lang, "All", "すべて"),
-                ModMenuWidgetId::FilterAll,
-                self.filter == ModMenuFilter::All,
-            ),
-            (
-                tr(lang, "Enabled", "有効"),
-                ModMenuWidgetId::FilterEnabled,
-                self.filter == ModMenuFilter::Enabled,
-            ),
-            (
-                tr(lang, "Issues", "問題あり"),
-                ModMenuWidgetId::FilterIssues,
-                self.filter == ModMenuFilter::Issues,
-            ),
-            (
-                tr(lang, "Native", "ネイティブ"),
-                ModMenuWidgetId::FilterNative,
-                self.filter == ModMenuFilter::Native,
-            ),
-            (
-                if self.show_libraries {
-                    tr(lang, "Libs: ON", "ライブラリ: ON")
-                } else {
-                    tr(lang, "Libs: OFF", "ライブラリ: OFF")
-                },
-                ModMenuWidgetId::ToggleLibraries,
-                self.show_libraries,
-            ),
-        ];
+        let pills: Vec<(&str, ModMenuWidgetId, bool)> =
+            if self.filter == ModMenuFilter::RecommendedQol {
+                vec![
+                    (
+                        tr(lang, "Installed", "インストール済"),
+                        ModMenuWidgetId::FilterAll,
+                        false,
+                    ),
+                    (
+                        "Recommended QoL",
+                        ModMenuWidgetId::FilterRecommendedQol,
+                        self.recommended_category.is_none(),
+                    ),
+                    (
+                        "HUD",
+                        ModMenuWidgetId::QolHudInfo,
+                        self.recommended_category == Some(QolSubCategory::HudInfo),
+                    ),
+                    (
+                        "Inventory",
+                        ModMenuWidgetId::QolInventoryInput,
+                        self.recommended_category == Some(QolSubCategory::InventoryInput),
+                    ),
+                    (
+                        "Recipes",
+                        ModMenuWidgetId::QolRecipes,
+                        self.recommended_category == Some(QolSubCategory::Recipes),
+                    ),
+                    (
+                        "Visuals",
+                        ModMenuWidgetId::QolVisualsCompat,
+                        self.recommended_category == Some(QolSubCategory::VisualsCompat),
+                    ),
+                ]
+            } else {
+                vec![
+                    (
+                        tr(lang, "All", "すべて"),
+                        ModMenuWidgetId::FilterAll,
+                        self.filter == ModMenuFilter::All,
+                    ),
+                    (
+                        tr(lang, "Enabled", "有効"),
+                        ModMenuWidgetId::FilterEnabled,
+                        self.filter == ModMenuFilter::Enabled,
+                    ),
+                    (
+                        tr(lang, "Issues", "問題あり"),
+                        ModMenuWidgetId::FilterIssues,
+                        self.filter == ModMenuFilter::Issues,
+                    ),
+                    (
+                        tr(lang, "Native", "ネイティブ"),
+                        ModMenuWidgetId::FilterNative,
+                        self.filter == ModMenuFilter::Native,
+                    ),
+                    ("QoL", ModMenuWidgetId::FilterRecommendedQol, false),
+                    (
+                        if self.show_libraries {
+                            tr(lang, "Libs: ON", "ライブラリ: ON")
+                        } else {
+                            tr(lang, "Libs: OFF", "ライブラリ: OFF")
+                        },
+                        ModMenuWidgetId::ToggleLibraries,
+                        self.show_libraries,
+                    ),
+                ]
+            };
         let mut x = MARGIN + 4;
         for (label, id, active) in pills {
             let w = label.chars().count() as i32 * 8 + 12;
@@ -1160,6 +1609,7 @@ impl ModMenuState {
         lay.border_rect(list_rect, palette::PANEL_BORDER);
 
         let visible = self.visible_indices();
+        let recommended = self.filter == ModMenuFilter::RecommendedQol;
         let page = ((bottom - top - 4) / ROW_PITCH).max(0) as usize;
         let max_scroll = visible.len().saturating_sub(page);
         let scroll = self.scroll.min(max_scroll);
@@ -1177,7 +1627,7 @@ impl ModMenuState {
         let rows_w = list_w - 4 - scrollbar_w;
 
         if visible.is_empty() {
-            let msg = if self.entries.is_empty() {
+            let msg = if self.browsed_entries().is_empty() {
                 tr(
                     self.lang,
                     "No mods installed",
@@ -1199,7 +1649,7 @@ impl ModMenuState {
         for (row_slot, &entry_index) in visible.iter().enumerate().skip(scroll).take(page) {
             let y = top + 2 + (row_slot - scroll) as i32 * ROW_PITCH;
             let row = UiRect::new(list_x + 2, y, rows_w as u32, ROW_H as u32);
-            let entry = &self.entries[entry_index];
+            let entry = &self.browsed_entries()[entry_index];
             let enabled = self.enabled_at(entry_index);
             let is_sel = row_slot == self.selected;
             let is_hover = self.hover == Some(ModMenuWidgetId::ModRow(row_slot));
@@ -1217,7 +1667,9 @@ impl ModMenuState {
                 lay.fill(row.x, row.y, 2, row.h as i32, palette::ACCENT);
             }
             // Status pill (right-aligned on the name line).
-            let (pill_text, pill_bg, pill_fg) = if !entry.missing_deps.is_empty() {
+            let (pill_text, pill_bg, pill_fg) = if recommended {
+                ("GET", palette::AIR, palette::TEXT_DARK)
+            } else if !entry.missing_deps.is_empty() {
                 ("MISSING", palette::DANGER, palette::TEXT)
             } else if !enabled {
                 ("OFF", palette::BUTTON_DISABLED, palette::TEXT_DIM)
@@ -1247,7 +1699,15 @@ impl ModMenuState {
                 palette::TEXT_DIM
             };
             lay.text_fit(row.x + 5, y + 3, 1, name_color, &entry.name, name_cells);
-            let sub = format!("{} · {}", entry.version, entry.loader.label());
+            let sub = if recommended {
+                format!(
+                    "{} · {}",
+                    entry.version,
+                    CURATED_MODRINTH_QOL_MODS[entry_index].category.label()
+                )
+            } else {
+                format!("{} · {}", entry.version, entry.loader.label())
+            };
             lay.text_fit(
                 row.x + 5,
                 y + 13,
@@ -1308,7 +1768,8 @@ impl ModMenuState {
         entry_index: usize,
     ) {
         let lang = self.lang;
-        let entry = &self.entries[entry_index];
+        let entry = &self.browsed_entries()[entry_index];
+        let recommended = self.filter == ModMenuFilter::RecommendedQol;
         let enabled = self.enabled_at(entry_index);
         let tx = pane.x + 6;
         let tw = (pane.w as i32 - 12).max(8);
@@ -1322,16 +1783,24 @@ impl ModMenuState {
         } else {
             tr(lang, "Enable", "有効化")
         };
-        buttons.push((
-            ModMenuWidgetId::ToggleEnabled,
-            toggle_label.to_owned(),
-            true,
-        ));
-        buttons.push((
-            ModMenuWidgetId::ConfigureMod,
-            tr(lang, "Configure", "設定").to_owned(),
-            entry.has_config,
-        ));
+        if recommended {
+            buttons.push((
+                ModMenuWidgetId::InstallRecommended,
+                tr(lang, "Get on Modrinth", "Modrinthで入手").to_owned(),
+                true,
+            ));
+        } else {
+            buttons.push((
+                ModMenuWidgetId::ToggleEnabled,
+                toggle_label.to_owned(),
+                true,
+            ));
+            buttons.push((
+                ModMenuWidgetId::ConfigureMod,
+                tr(lang, "Configure", "設定").to_owned(),
+                entry.has_config,
+            ));
+        }
         for (id, url, label) in [
             (
                 ModMenuWidgetId::LinkWebsite,
@@ -1354,7 +1823,7 @@ impl ModMenuState {
                 "Modrinth",
             ),
         ] {
-            if !url.is_empty() {
+            if !recommended && !url.is_empty() {
                 buttons.push((id, label.to_owned(), true));
             }
         }
@@ -1484,6 +1953,53 @@ impl ModMenuState {
 
         // Badge row: loader / tier / reloadability — badges that would
         // cross the pane edge are skipped, not clipped.
+        if recommended {
+            let mod_info = &CURATED_MODRINTH_QOL_MODS[entry_index];
+            lay.text_fit(
+                tx,
+                y,
+                1,
+                palette::TEXT_DIM,
+                &format!("Fabric / NeoForge · {}", mod_info.category.label()),
+                cells,
+            );
+            y += 17;
+            let summary = if lang == UiLang::Ja {
+                mod_info.summary_ja
+            } else {
+                mod_info.summary_en
+            };
+            let avail = (warn_bottom - y).max(0);
+            for line in wrap_text(summary, cells)
+                .into_iter()
+                .take((avail / 10).max(0) as usize)
+            {
+                lay.text_fit(tx, y, 1, palette::TEXT_DIM, &line, cells);
+                y += 10;
+            }
+            for row in &rows {
+                let mut bx = tx;
+                for (id, label, live, w) in row {
+                    let rect = UiRect::new(bx, actions_top, *w as u32, btn_h as u32);
+                    lay.fill_rect(
+                        rect,
+                        if self.hover == Some(*id) {
+                            palette::BUTTON_HOVER
+                        } else {
+                            palette::BUTTON
+                        },
+                    );
+                    lay.border_rect(rect, palette::BUTTON_BORDER);
+                    lay.ctext_in(rect, 1, palette::TEXT, label);
+                    if *live {
+                        lay.region(hits, *id, rect);
+                    }
+                    bx += w + btn_gap;
+                }
+                actions_top += btn_h + btn_gap;
+            }
+            return;
+        }
         let badge_right = tx + tw;
         let mut bx = tx;
         let loader_bg = match entry.loader {
@@ -1500,7 +2016,14 @@ impl ModMenuState {
             ModAdaptationBadge::Superseded => (palette::BUTTON_DISABLED, palette::TEXT_DIM),
             ModAdaptationBadge::ClientOnly => (palette::AIR, palette::TEXT_DARK),
         };
-        bx += self.badge_fg(lay, bx, y, entry.tier.label(), (tier_bg, tier_fg), badge_right);
+        bx += self.badge_fg(
+            lay,
+            bx,
+            y,
+            entry.tier.label(),
+            (tier_bg, tier_fg),
+            badge_right,
+        );
         let (reload_bg, reload_fg) = match entry.reload_mode {
             ModReloadBadge::HotReload => (palette::ACCENT, palette::TEXT_DARK),
             ModReloadBadge::SoftRestart => (palette::WARNING, palette::TEXT_DARK),
@@ -1676,8 +2199,7 @@ impl ModMenuState {
             .max(24);
         let done = UiRect::new(lay.w - MARGIN - done_w, y2, done_w as u32, 16);
         // Apply shrinks to the space left of Done; below ~60px it hides.
-        let apply_w = (apply_label.chars().count() as i32 * 8 + 14)
-            .min(done.x - 6 - MARGIN);
+        let apply_w = (apply_label.chars().count() as i32 * 8 + 14).min(done.x - 6 - MARGIN);
         if apply_w >= 24 {
             let apply = UiRect::new(done.x - 6 - apply_w, y2, apply_w as u32, 16);
             let apply_bg = if !dirty {
