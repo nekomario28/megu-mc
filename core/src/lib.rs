@@ -86,5 +86,6 @@ pub mod random;
 pub mod romaji_ime;
 pub mod server_perf_governors;
 pub mod sys_metrics;
+pub mod task_pool;
 pub mod version;
 pub mod zip_archive;
