@@ -8,6 +8,7 @@
 #[path = "../../src/brigadier.rs"]
 mod brigadier;
 mod command;
+pub mod debug_chords;
 pub mod entity_interp;
 mod ffi;
 mod gzip;
