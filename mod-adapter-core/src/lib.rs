@@ -161,6 +161,7 @@ pub mod dep_resolver;
 pub mod dimension_mod;
 pub mod ecosystem_compat;
 pub mod fallback;
+pub mod hard_mod_primitives;
 pub mod loader_extensions;
 pub mod magic_primitives;
 pub mod mine_cut_all;
