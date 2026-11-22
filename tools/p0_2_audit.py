@@ -536,6 +536,71 @@ def parse_spawn_runtime(root=ROOT, sources=None):
         if fn == "spawn_nether_natural":
             require_runtime(body, r"spawn_nether_natural_scratch", "Nether wrapper -> scratch")
 
+    # A category is reachable only when the gated tick calls a weighted
+    # biome-table selector whose selected mob reaches the live insertion path.
+    scratch = rust_function(natural, "spawn_natural_category_scratch")
+    for pattern, label in (
+        (r"feature::spawners_for\(&biome,\s*mob_category_key\(category\)\)", "weighted category biome table"),
+        (r"choose_nightly_spawner\(entries\)", "weighted category selection"),
+        (r"OverworldSpawnMob::from_id\(&entry.kind\)", "category entity dispatch"),
+        (r"category\.global_cap\(", "category mob cap"),
+        (r"natural_spawn_placement_allows\(", "category fluid and placement guard"),
+        (r"rules\.allows\(", "category species predicate"),
+        (r"live_natural_spawn\(", "category live insertion"),
+    ):
+        require_runtime(scratch, pattern, label)
+    mob_keys = rust_function(natural, "mob_category_key")
+    for category, enum in SPAWNER_CATEGORIES.items():
+        if category == "misc":
+            continue
+        require_runtime(mob_keys, rf'MobCategory::{enum}\s*=>\s*"{category}"',
+                        f"weighted category key {category}")
+    aquatic = rust_function(main, "spawn_aquatic_natural")
+    ending = rust_function(main, "spawn_end_natural")
+    overworld_categories = set()
+    for name, body, dimension in (("spawn_aquatic_natural", aquatic, "Overworld"),
+                                  ("spawn_end_natural", ending, "End")):
+        for enum in re.findall(
+            rf"spawn_natural_category_scratch\(&clients,\s*DimId::{dimension},\s*MobCategory::(\w+),\s*tick\)",
+            body,
+        ):
+            if enum not in SPAWNER_CATEGORIES.values():
+                raise AuditError(f"unknown live category in {name}: {enum}")
+            if dimension == "Overworld":
+                overworld_categories.add(enum)
+    end_categories = set(re.findall(
+        r"spawn_natural_category_scratch\(&clients,\s*DimId::End,\s*MobCategory::(\w+),\s*tick\)",
+        ending,
+    ))
+    require_runtime(tick, r"\bspawn_underground_natural\(t\)\s*;", "main tick -> underground categories")
+    underground = rust_function(main, "spawn_underground_natural")
+    category_loop = re.search(r"for\s+category\s+in\s+\[([^]]+)\]", underground)
+    if not category_loop:
+        raise AuditError("missing live underground category loop")
+    underground_categories = set(re.findall(r"MobCategory::(\w+)", category_loop.group(1)))
+    for pattern, label in (
+        (r"feature::spawners_for\(&biome,\s*mob_category_key\(category\)\)", "underground biome table"),
+        (r"biome_name_at\(x,\s*y,\s*z\)", "underground biome sampled at spawn depth"),
+        (r"choose_nightly_spawner\(entries\)", "underground weighted selection"),
+        (r"category\.global_cap\(", "underground mob cap"),
+        (r"live_underground_spawn_attempt\(", "underground live attempt"),
+    ):
+        require_runtime(underground, pattern, label)
+    subterranean_attempt = rust_function(main, "live_underground_spawn_attempt")
+    for pattern, label in (
+        (r"OverworldSpawnMob::from_id\(&entry.kind\)", "underground entity dispatch"),
+        (r"natural_spawn_placement_allows\(", "underground fluid and placement guard"),
+        (r"rules\.allows\(", "underground darkness and species rules"),
+        (r"live_category_count\(", "underground cap enforcement"),
+        (r"live_natural_spawn\(", "underground live insertion"),
+    ):
+        require_runtime(subterranean_attempt, pattern, label)
+    overworld_categories.update(underground_categories)
+    natural_dispatch = set(re.findall(
+        r'"(minecraft:[a-z_]+)"\s*=>\s*Self::',
+        rust_function(natural, "from_id"),
+    ))
+
     chunkgen = rust_function(main, "live_chunkgen_run")
     require_runtime(chunkgen, r"spawner::spawn_mobs_for_chunk_generation\(", "chunkgen -> spawner")
     require_runtime(chunkgen, r"feature::spawners_for\(b,\s*category\)", "chunkgen biome entry lookup")
@@ -555,6 +620,9 @@ def parse_spawn_runtime(root=ROOT, sources=None):
         "nether_categories": nether_categories,
         "nether_dispatch": nether_dispatch,
         "overworld_monsters": overworld_monsters,
+        "overworld_categories": overworld_categories,
+        "end_categories": end_categories,
+        "natural_dispatch": natural_dispatch,
         "tick_calls": list(live_calls),
     }
 
@@ -593,10 +661,18 @@ def audit_spawn_reachability(biomes, dim_biomes, runtime):
                     failures.append(f"{biome}/{category}[{index}]: unmapped spawner entity {entity!r}")
                     continue
                 expected_category = SPAWNER_CATEGORIES[category]
-                # Vanilla's ocelot has category Creature in the registry but
-                # historically appears under Monster in the jungle biome JSON.
-                # Record the mismatch as a dispatch gap rather than discarding it.
-                if registry[entity] != expected_category:
+                # Vanilla Java 1.21.1's Ocelot has registry category Creature,
+                # yet its exactly two biome entries are Monster list slot 8
+                # in jungle and bamboo_jungle. The nightly Monster list picks
+                # it and its live instance still counts under the Creature cap.
+                # Every other registry/biome category mismatch is a hard error.
+                vanilla_ocelot_quirk = (
+                    entity == "minecraft:ocelot" and category == "monster" and index == 8
+                    and biome in ("minecraft:jungle", "minecraft:bamboo_jungle")
+                    and registry[entity] == "Creature"
+                    and entity in runtime["overworld_monsters"]
+                )
+                if registry[entity] != expected_category and not vanilla_ocelot_quirk:
                     failures.append(f"{biome}/{category}[{index}]: {entity} registry category "
                                     f"{registry[entity]} differs from biome {expected_category}")
                 if any(type(entry.get(key)) is not int for key in ("weight", "minCount", "maxCount")) or (
@@ -617,6 +693,11 @@ def audit_spawn_reachability(biomes, dim_biomes, runtime):
                         or (dim == "overworld" and category == "creature")
                         or (dim == "overworld" and category == "monster"
                             and entity in runtime["overworld_monsters"])
+                        or (dim == "overworld"
+                            and expected_category in runtime["overworld_categories"]
+                            and entity in runtime["natural_dispatch"])
+                        or (dim == "end" and expected_category in runtime["end_categories"]
+                            and entity in runtime["natural_dispatch"])
                     )
                     if supported:
                         summary["reachable_spawner_uses"] += 1

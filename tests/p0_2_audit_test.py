@@ -43,6 +43,8 @@ class P02AuditTests(unittest.TestCase):
         self.assertEqual(spawn["registry_entities"], 130)
         self.assertEqual(spawn["spawner_entries"], 746)
         self.assertEqual(spawn["valid_spawner_entries"], 746)
+        self.assertEqual(spawn["reachable_spawner_uses"], 746)
+        self.assertEqual(spawn["unreachable_spawner_uses"], 0)
         self.assertEqual(spawn["spawn_cost_entries"], 5)
         self.assertEqual(spawn["reachable_spawn_cost_uses"], 5)
         self.assertEqual(spawn["invalid_spawn_costs"], [])
@@ -152,6 +154,60 @@ class P02AuditTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(audit.AuditError, "Nether spawn cost"):
             audit.parse_spawn_runtime(sources=changed_natural)
+
+    def test_new_live_spawn_dispatch_requires_gated_tick_and_weighted_rules(self):
+        sources = self.spawn_sources()
+        baseline = audit.parse_spawn_runtime(sources=sources)
+        self.assertEqual(baseline["end_categories"], {"Monster"})
+        self.assertTrue({"WaterCreature", "WaterAmbient", "Ambient", "Axolotls",
+                         "UndergroundWaterCreature"}.issubset(baseline["overworld_categories"]))
+        for name in ("spawn_aquatic_natural", "spawn_end_natural",
+                     "spawn_underground_natural"):
+            changed = dict(sources)
+            old = f"{name}(t);"
+            assert old in sources["main"]
+            changed["main"] = sources["main"].replace(old, f"disabled_{name}(t);", 1)
+            with self.subTest(name=name), self.assertRaises(audit.AuditError):
+                audit.parse_spawn_runtime(sources=changed)
+
+        for snippet in ("choose_nightly_spawner(entries)",
+                        "rules.allows(mob, pos, queries, draws)"):
+            changed = dict(sources)
+            assert snippet in sources["main"]
+            changed["main"] = sources["main"].replace(snippet, "disabled_dispatch()", 1)
+            with self.subTest(snippet=snippet), self.assertRaises(audit.AuditError):
+                audit.parse_spawn_runtime(sources=changed)
+
+        changed = dict(sources)
+        loop_member = "        MobCategory::UndergroundWaterCreature,\n"
+        assert loop_member in sources["main"]
+        changed["main"] = sources["main"].replace(loop_member, "", 1)
+        runtime = audit.parse_spawn_runtime(sources=changed)
+        self.assertNotIn("UndergroundWaterCreature", runtime["overworld_categories"])
+        all_biomes = audit.load_json_dir("biome")
+        _, failures = audit.audit_spawn_reachability(all_biomes, audit.tree_biomes(), runtime)
+        self.assertIn("unreachable weighted underground_water_creature", "\n".join(failures))
+
+    def test_jungle_ocelot_quirk_only_allows_the_two_pinned_monster_rows(self):
+        biomes = audit.load_json_dir("biome")
+        names = ("minecraft:jungle", "minecraft:bamboo_jungle")
+        subset = {name: copy.deepcopy(biomes[name]) for name in names}
+        runtime = audit.parse_spawn_runtime()
+        for name in names:
+            self.assertEqual(subset[name]["spawners"]["monster"][8]["type"], "minecraft:ocelot")
+        _, failures = audit.audit_spawn_reachability(subset, {"overworld": names}, runtime)
+        self.assertEqual(failures, [])
+
+        duplicate = copy.deepcopy(subset)
+        duplicate["minecraft:jungle"]["spawners"]["monster"].append(
+            copy.deepcopy(subset["minecraft:jungle"]["spawners"]["monster"][8]))
+        _, failures = audit.audit_spawn_reachability(duplicate, {"overworld": names}, runtime)
+        self.assertIn("registry category Creature differs from biome Monster", "\n".join(failures))
+
+        swapped = copy.deepcopy(subset)
+        swapped["minecraft:jungle"]["spawners"]["monster"][8]["type"] = "minecraft:cow"
+        _, failures = audit.audit_spawn_reachability(swapped, {"overworld": names}, runtime)
+        self.assertIn("minecraft:cow registry category Creature differs from biome Monster", "\n".join(failures))
 
     def test_cond_biome_anchor_fails_closed_on_revert_or_mismatch(self):
         wg_src = (ROOT / "src/worldgen.rs").read_text()

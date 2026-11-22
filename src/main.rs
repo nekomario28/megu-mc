@@ -1174,6 +1174,7 @@ fn environment_time_tick() {
         }
         if t % cycle == cycle / 2 + 1 && mob_spawn_permitted(3, mob_scale) {
             spawn_aquatic_natural(t);
+            spawn_underground_natural(t);
         }
         if t % cycle == cycle / 4 + 1 && mob_spawn_permitted(4, mob_scale) {
             spawn_end_natural(t);
@@ -1505,6 +1506,10 @@ fn environment_time_tick() {
 
 /// The `MobCategory` a live mob counts under, or `None` for `Misc` entities —
 /// vanilla never lets those into the spawn-cap counts.
+/// Vanilla 1.21.1 lists ocelots in the `monster` spawn tables of jungle and
+/// bamboo_jungle, while their actual entity category remains `Creature`.
+/// The nightly monster-table picker handles those rows, but a spawned ocelot
+/// contributes to the Creature cap, exactly as its registry category requires.
 fn live_mob_category(etype: i64) -> Option<MobCategory> {
     Some(match entity_category_1211(etype) {
         EntityMobCategory::Monster => MobCategory::Monster,
@@ -1733,6 +1738,7 @@ fn spawn_passive_natural(tick: u64) {
 
 /// One water-mob attempt: the cell holds water in the sea-level band vanilla
 /// water spawning reads (50..=63), under the category's cap.
+#[cfg(test)]
 fn live_aquatic_spawn_attempt(
     x: i32,
     y: i32,
@@ -1759,50 +1765,119 @@ fn live_aquatic_spawn_attempt(
     )
 }
 
-/// Water-column spawning: squid for `water_creature` and a cod/salmon school
-/// for `water_ambient`, each under its own cap like the vanilla category loop.
+/// Weighted Vanilla biome water tables, with each category's own cap and
+/// IN_WATER placement and per-species rule checks in the shared live scratch.
 fn spawn_aquatic_natural(tick: u64) {
+    let clients = client_snapshot();
+    spawn_natural_category_scratch(&clients, DimId::Overworld, MobCategory::WaterCreature, tick);
+    spawn_natural_category_scratch(&clients, DimId::Overworld, MobCategory::WaterAmbient, tick);
+}
+
+/// Validate one actual underground cell against Vanilla placement, species
+/// predicates and the category cap before inserting a live entity.
+fn live_underground_spawn_attempt(
+    category: MobCategory,
+    entry: &feature::SpawnerData,
+    pos: NaturalSpawnPos,
+    cap: usize,
+    queries: &impl OverworldSpawnQueries,
+    draws: &mut dyn OverworldSpawnDraws,
+) -> bool {
+    let Some(mob) = OverworldSpawnMob::from_id(&entry.kind) else {
+        return false;
+    };
+    let Some(spec) = entity_spec_by_name(&entry.kind) else {
+        return false;
+    };
+    if live_mob_category(spec.id) != Some(category)
+        || live_category_count(DimId::Overworld, category) >= cap
+    {
+        return false;
+    }
+    let Some(reg) = breg() else {
+        return false;
+    };
+    static RULES: OnceLock<OverworldSpawnRules> = OnceLock::new();
+    let rules = RULES.get_or_init(OverworldSpawnRules::vanilla);
+    if !natural_spawn_placement_allows(reg, DimId::Overworld, mob, pos)
+        || !rules.allows(mob, pos, queries, draws)
+    {
+        return false;
+    }
+    live_natural_spawn(
+        &entry.kind,
+        DimId::Overworld,
+        (f64::from(pos.x) + 0.5, f64::from(pos.y), f64::from(pos.z) + 0.5,
+         nightly_spawn_float() * 360.0, 0.0),
+    )
+}
+
+/// Subterranean spawner tables must be resolved at the candidate's actual Y:
+/// surface-biome probes cannot find lush-cave axolotls or deep glow squid.
+/// The fish pass also visits lush-cave depths for tropical fish, whose Vanilla
+/// rules permit water at any Y in that biome.
+fn spawn_underground_natural(tick: u64) {
     let clients = client_snapshot();
     let players = live_spawn_anchors(&clients, DimId::Overworld);
     let Some(reg) = breg().filter(|_| !players.is_empty()) else {
         return;
     };
-    let spawn_chunks = live_spawn_chunks(&players);
-    for (category, kinds) in [
-        (MobCategory::WaterCreature, &["squid"][..]),
-        (MobCategory::WaterAmbient, &["cod", "salmon"][..]),
+    let chunks = live_spawn_chunks(&players);
+    let sea = worldgen::sea_level();
+    let min_y = DimId::Overworld.min_y() + 1;
+    let mut rng = generation_math::Lcg::new(
+        WORLD_SEED.load(Ordering::Relaxed)
+            .wrapping_add(tick.wrapping_mul(0xD1B5_4A32_D192_ED03)),
+    );
+    for category in [
+        MobCategory::Ambient,
+        MobCategory::Axolotls,
+        MobCategory::UndergroundWaterCreature,
+        MobCategory::WaterAmbient,
     ] {
-        let cap = category.global_cap(spawn_chunks.len() as u32) as usize;
+        let cap = category.global_cap(chunks.len() as u32) as usize;
         if cap == 0 || live_category_count(DimId::Overworld, category) >= cap {
             continue;
         }
-        let attempt = SPAWN_ATTEMPT.fetch_add(1, Ordering::Relaxed);
-        let &[px, _, pz] = &players[attempt as usize % players.len()];
+        let max_y = match category {
+            MobCategory::UndergroundWaterCreature => sea - 33,
+            MobCategory::WaterAmbient => sea - 14,
+            _ => sea - 1,
+        };
+        if max_y < min_y {
+            continue;
+        }
+        let &[px, _, pz] = &players[rng.next_bound(players.len() as i32) as usize];
         let angle = tick as f64 * 2.399 + category.index() as f64;
         let bx = (px + angle.cos() * 32.0).floor() as i32;
         let bz = (pz + angle.sin() * 32.0).floor() as i32;
-        if !live_spawn_position_ok(&players, &spawn_chunks, bx, 56, bz) {
-            continue;
-        }
-        let mut rng = generation_math::Lcg::new(
-            WORLD_SEED
-                .load(Ordering::Relaxed)
-                .wrapping_add(tick.wrapping_mul(0x85EB_CA6B)),
-        );
-        for _ in 0..4 {
-            let x = bx + rng.next_bound(7) - 3;
-            let z = bz + rng.next_bound(7) - 3;
-            if !live_spawn_position_ok(&players, &spawn_chunks, x, 56, z) {
+        for _ in 0..8 {
+            let x = bx + rng.next_bound(9) - 4;
+            let z = bz + rng.next_bound(9) - 4;
+            let y = min_y + rng.next_bound(max_y - min_y + 1);
+            if !live_spawn_position_ok(&players, &chunks, x, y, z) {
                 continue;
             }
-            let Some(y) = (50..=63)
-                .rev()
-                .find(|&y| reg.name_of(block_at(x, y, z)) == "minecraft:water")
-            else {
+            let Some(biome) = worldgen::with_gen_dim(DimId::Overworld, |gen| {
+                gen.biome_name_at(x, y, z)
+            }).flatten() else {
                 continue;
             };
-            let kind = kinds[rng.next_bound(kinds.len() as i32) as usize];
-            live_aquatic_spawn_attempt(x, y, z, category, cap, kind);
+            let entries = feature::spawners_for(&biome, mob_category_key(category))
+                .unwrap_or_default();
+            let Some(entry) = choose_nightly_spawner(entries) else {
+                continue;
+            };
+            let pos = NaturalSpawnPos { x, y, z };
+            let sources = natural_spawn_light_sources(&clients, DimId::Overworld, x >> 4, z >> 4);
+            let queries = LiveNaturalSpawnQueries {
+                dim: DimId::Overworld,
+                reg,
+                sources: &sources,
+            };
+            // Depth, fluids, light and (for axolotls) clay are checked again
+            // by the actual per-mob spawn rules at this candidate cell.
+            live_underground_spawn_attempt(category, entry, pos, cap, &queries, &mut WorldRngDraws);
         }
     }
 }
@@ -1810,6 +1885,7 @@ fn spawn_aquatic_natural(tick: u64) {
 /// One enderman attempt in the End: `end_stone` below, clear standing room,
 /// light level 7 or darker, under the hostile cap and a non-peaceful
 /// difficulty — `Monster.checkMonsterSpawnRules` for `the_end`.
+#[cfg(test)]
 fn live_end_spawn_attempt(x: i32, y: i32, z: i32, light: i32, cap: usize) -> bool {
     if DIFFICULTY.load(Ordering::Relaxed) == 0
         || live_category_count(DimId::End, MobCategory::Monster) >= cap
@@ -1835,52 +1911,8 @@ fn live_end_spawn_attempt(x: i32, y: i32, z: i32, light: i32, cap: usize) -> boo
 /// The End's only natural spawn: endermen near End-resident players, gated by
 /// `doMobSpawning`, difficulty and the hostile cap like every monster pass.
 fn spawn_end_natural(tick: u64) {
-    if DIFFICULTY.load(Ordering::Relaxed) == 0 {
-        return;
-    }
     let clients = client_snapshot();
-    let players = live_spawn_anchors(&clients, DimId::End);
-    if players.is_empty() {
-        return;
-    }
-    let spawn_chunks = live_spawn_chunks(&players);
-    let cap = MobCategory::Monster.global_cap(spawn_chunks.len() as u32) as usize;
-    if cap == 0 || live_category_count(DimId::End, MobCategory::Monster) >= cap {
-        return;
-    }
-    let attempt = SPAWN_ATTEMPT.fetch_add(1, Ordering::Relaxed);
-    let &[px, _, pz] = &players[attempt as usize % players.len()];
-    let angle = tick as f64 * 2.399;
-    let bx = (px + angle.cos() * 32.0).floor() as i32;
-    let bz = (pz + angle.sin() * 32.0).floor() as i32;
-    if !live_spawn_position_ok(&players, &spawn_chunks, bx, 64, bz) {
-        return;
-    }
-    let Some(reg) = breg() else {
-        return;
-    };
-    let mut rng = generation_math::Lcg::new(
-        WORLD_SEED
-            .load(Ordering::Relaxed)
-            .wrapping_add(tick.wrapping_mul(0x27D4_EB2F)),
-    );
-    for _ in 0..4 {
-        let x = bx + rng.next_bound(7) - 3;
-        let z = bz + rng.next_bound(7) - 3;
-        // The End surface: the first non-air cell below the spawn band.
-        let Some(y) = (DimId::End.min_y()..=128)
-            .rev()
-            .find(|&y| !reg.is_air(block_at_dim(DimId::End, x, y, z)))
-            .map(|y| y + 1)
-        else {
-            continue;
-        };
-        if !live_spawn_position_ok(&players, &spawn_chunks, x, y, z) {
-            continue;
-        }
-        let light = live_light_at(&clients, DimId::End, x, y, z);
-        live_end_spawn_attempt(x, y, z, light, cap);
-    }
+    spawn_natural_category_scratch(&clients, DimId::End, MobCategory::Monster, tick);
 }
 
 /// Chunks whose first-visit creature herd already ran, per dimension. Vanilla

@@ -1,6 +1,180 @@
 use super::*;
 use effect_tests::client_pair;
 
+/// Fixed light/biome samples let the test exercise the production spawn-at-cell
+/// insertion path with real block/fluid placement and deterministic rule draws.
+struct P02SpawnQueries {
+    y: i32,
+    biome: &'static str,
+    water: bool,
+    clay: bool,
+    dark: bool,
+}
+
+impl OverworldSpawnQueries for P02SpawnQueries {
+    fn is_peaceful(&self) -> bool { false }
+    fn spawn_is_spawner(&self) -> bool { false }
+    fn ignores_light_requirements(&self) -> bool { false }
+    fn is_world_gen(&self) -> bool { false }
+    fn biome_id(&self, _: NaturalSpawnPos) -> Option<String> { Some(self.biome.to_owned()) }
+    fn block_id(&self, pos: NaturalSpawnPos) -> &str {
+        if pos.y == self.y - 1 {
+            if self.clay { "minecraft:clay" } else if self.water { "minecraft:water" } else { "minecraft:stone" }
+        } else if self.water && (pos.y == self.y || pos.y == self.y + 1) {
+            "minecraft:water"
+        } else {
+            "minecraft:air"
+        }
+    }
+    fn block_in_tag(&self, pos: NaturalSpawnPos, tag: &str) -> bool {
+        self.clay && pos.y == self.y - 1 && tag == "minecraft:axolotls_spawnable_on"
+    }
+    fn fluid_is_water(&self, pos: NaturalSpawnPos) -> bool {
+        self.block_id(pos) == "minecraft:water"
+    }
+    fn is_valid_spawn(&self, pos: NaturalSpawnPos) -> bool {
+        !self.water && pos.y == self.y - 1
+    }
+    fn sky_light(&self, _: NaturalSpawnPos) -> i32 { if self.dark { 0 } else { 15 } }
+    fn block_light(&self, _: NaturalSpawnPos) -> i32 { if self.dark { 0 } else { 15 } }
+    fn sky_darken(&self) -> i32 { 0 }
+    fn thundering(&self) -> bool { false }
+    fn moon_brightness(&self) -> f32 { 0.0 }
+    fn sea_level(&self) -> i32 { 63 }
+    fn is_halloween(&self) -> bool { false }
+    fn world_seed(&self) -> u64 { 1 }
+}
+
+struct P02ZeroDraws;
+
+impl OverworldSpawnDraws for P02ZeroDraws {
+    fn next_int(&mut self, _: i32) -> i32 { 0 }
+    fn next_f32(&mut self) -> f32 { 0.0 }
+    fn next_bool(&mut self) -> bool { false }
+}
+
+struct P02SpawnFlagRestore(u8, u8);
+
+impl P02SpawnFlagRestore {
+    fn enable() -> Self {
+        Self(
+            GR_MOB_SPAWNING.swap(1, Ordering::Relaxed),
+            DIFFICULTY.swap(1, Ordering::Relaxed),
+        )
+    }
+}
+
+impl std::ops::Drop for P02SpawnFlagRestore {
+    fn drop(&mut self) {
+        GR_MOB_SPAWNING.store(self.0, Ordering::Relaxed);
+        DIFFICULTY.store(self.1, Ordering::Relaxed);
+    }
+}
+
+fn p02_biome_row(biome: &str, category: &str, mob: &str) -> feature::SpawnerData {
+    let entries = feature::spawners_for(biome, category).expect("pinned Vanilla spawner table");
+    let entry = entries.iter().find(|entry| entry.kind == mob)
+        .unwrap_or_else(|| panic!("missing {mob} in {biome}/{category}"));
+    assert_eq!(choose_nightly_spawner(std::slice::from_ref(entry)).unwrap().kind, mob);
+    entry.clone()
+}
+
+#[test]
+fn p02_end_biome_weighted_enderman_reaches_live_entity_registry() {
+    crate::test_support::require_vanilla_data();
+    let _guard = world_guard();
+    let _world = WorldSnapshot::take();
+    let _runtime = RuntimeRegistrySnapshot::take();
+    let _flags = P02SpawnFlagRestore::enable();
+    for biome in [
+        "minecraft:the_end", "minecraft:end_highlands", "minecraft:end_midlands",
+        "minecraft:small_end_islands", "minecraft:end_barrens",
+    ] {
+        let entry = p02_biome_row(biome, "monster", "minecraft:enderman");
+        assert_eq!(OverworldSpawnMob::from_id(&entry.kind), Some(OverworldSpawnMob::Enderman));
+    }
+    let (x, y, z) = (80_000, 100, 80_010);
+    set_block_dim(DimId::End, x, y - 1, z, name_to_state("end_stone").unwrap());
+    set_block_dim(DimId::End, x, y, z, name_to_state("air").unwrap());
+    set_block_dim(DimId::End, x, y + 1, z, name_to_state("air").unwrap());
+    assert!(live_end_spawn_attempt(x, y, z, 7, usize::MAX));
+    assert!(mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|mob| {
+        mob.dim == DimId::End && mob.etype == entity_spec_by_name("enderman").unwrap().id
+    }));
+}
+
+#[test]
+fn p02_water_biome_rows_spawn_in_water_and_reject_dry_cells() {
+    crate::test_support::require_vanilla_data();
+    let _guard = world_guard();
+    let _world = WorldSnapshot::take();
+    let _runtime = RuntimeRegistrySnapshot::take();
+    let _flags = P02SpawnFlagRestore::enable();
+    let water = name_to_state("water").unwrap();
+    let air = name_to_state("air").unwrap();
+    for (i, (biome, category, mob, cap_category)) in [
+        ("minecraft:cold_ocean", "water_ambient", "minecraft:cod", MobCategory::WaterAmbient),
+        ("minecraft:river", "water_ambient", "minecraft:salmon", MobCategory::WaterAmbient),
+        ("minecraft:ocean", "water_creature", "minecraft:dolphin", MobCategory::WaterCreature),
+        ("minecraft:ocean", "water_creature", "minecraft:squid", MobCategory::WaterCreature),
+        ("minecraft:warm_ocean", "water_ambient", "minecraft:pufferfish", MobCategory::WaterAmbient),
+        ("minecraft:warm_ocean", "water_ambient", "minecraft:tropical_fish", MobCategory::WaterAmbient),
+    ].into_iter().enumerate() {
+        let entry = p02_biome_row(biome, category, mob);
+        let pos = NaturalSpawnPos { x: 80_100 + i as i32 * 4, y: 55, z: 80_010 };
+        for y in (pos.y - 1)..=(pos.y + 1) {
+            set_block_dim(DimId::Overworld, pos.x, y, pos.z, water);
+        }
+        let queries = P02SpawnQueries { y: pos.y, biome, water: true, clay: false, dark: true };
+        assert!(live_underground_spawn_attempt(cap_category, &entry, pos, usize::MAX, &queries, &mut P02ZeroDraws),
+                "{mob} should spawn in submerged {biome}");
+        set_block_dim(DimId::Overworld, pos.x, pos.y, pos.z, air);
+        assert!(!live_underground_spawn_attempt(cap_category, &entry, pos, usize::MAX, &queries, &mut P02ZeroDraws),
+                "{mob} must reject dry spawn cells");
+        assert!(mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|entity| {
+            entity.dim == DimId::Overworld && entity.etype == entity_spec_by_name(mob).unwrap().id
+        }));
+    }
+}
+
+#[test]
+fn p02_underground_bat_glow_squid_and_lush_axolotl_require_valid_sites() {
+    crate::test_support::require_vanilla_data();
+    let _guard = world_guard();
+    let _world = WorldSnapshot::take();
+    let _runtime = RuntimeRegistrySnapshot::take();
+    let _flags = P02SpawnFlagRestore::enable();
+    let water = name_to_state("water").unwrap();
+    let air = name_to_state("air").unwrap();
+    let clay = name_to_state("clay").unwrap();
+    let stone = name_to_state("stone").unwrap();
+    for (i, (biome, category, mob, cap_category, y, is_water, is_clay)) in [
+        ("minecraft:plains", "ambient", "minecraft:bat", MobCategory::Ambient, 20, false, false),
+        ("minecraft:plains", "underground_water_creature", "minecraft:glow_squid", MobCategory::UndergroundWaterCreature, 20, true, false),
+        ("minecraft:lush_caves", "axolotls", "minecraft:axolotl", MobCategory::Axolotls, 20, true, true),
+        ("minecraft:lush_caves", "water_ambient", "minecraft:tropical_fish", MobCategory::WaterAmbient, 20, true, false),
+    ].into_iter().enumerate() {
+        let entry = p02_biome_row(biome, category, mob);
+        let pos = NaturalSpawnPos { x: 80_200 + i as i32 * 4, y, z: 80_010 };
+        set_block_dim(DimId::Overworld, pos.x, y - 1, pos.z, if is_clay { clay } else if is_water { water } else { stone });
+        set_block_dim(DimId::Overworld, pos.x, y, pos.z, if is_water { water } else { air });
+        set_block_dim(DimId::Overworld, pos.x, y + 1, pos.z, if is_water { water } else { air });
+        let mut queries = P02SpawnQueries { y, biome, water: is_water, clay: is_clay, dark: true };
+        assert!(live_underground_spawn_attempt(cap_category, &entry, pos, usize::MAX, &queries, &mut P02ZeroDraws),
+                "{mob} should spawn in its dark underground habitat");
+        if mob == "minecraft:axolotl" {
+            set_block_dim(DimId::Overworld, pos.x, y - 1, pos.z, stone);
+            queries.clay = false;
+        } else if is_water {
+            set_block_dim(DimId::Overworld, pos.x, y, pos.z, air);
+        } else {
+            queries.dark = false;
+        }
+        assert!(!live_underground_spawn_attempt(cap_category, &entry, pos, usize::MAX, &queries, &mut P02ZeroDraws),
+                "{mob} must reject invalid underground habitat");
+    }
+}
+
 #[test]
 fn combat_enchantment_targets_and_critical_gates_follow_vanilla_sets() {
     for name in ["husk", "drowned", "wither", "phantom", "zombie_horse"] {
